@@ -16,6 +16,7 @@ when the same observation is emitted via both paths.
 """
 
 from __future__ import annotations
+import hashlib
 import json
 import re
 from datetime import date, datetime
@@ -24,13 +25,19 @@ from typing import Any
 
 import frontmatter
 
-from ._io import atomic_write
+from ._io import atomic_write, atomic_append_jsonl
 from ._schema import (
     derive_filename,
     validate_capture,
     CURRENT_SCHEMA_VERSION,
 )
-from .exceptions import CaptureParseError, SchemaValidationError, WritePathViolation
+from ._versioning import snapshot_memory_version
+from .exceptions import (
+    CaptureParseError,
+    MemoryPreconditionFailed,
+    SchemaValidationError,
+    WritePathViolation,
+)
 from .types import Capture
 
 # Match ```atomic_capture or ````atomic_capture (3+ backticks) blocks
@@ -246,31 +253,55 @@ def write_atomic_note(
     capture: Capture,
     write_paths: list[Path],
     today: date | None = None,
+    expected_content_sha256: str | None = None,
+    read_only_paths: list[Path] | None = None,
+    log_target: Path | None = None,
 ) -> Path:
     """Write a captured atomic note to memory/, then update memory/INDEX.md.
 
     Atomic write order per spec/04:
-    1. Write the note file (temp + fsync + rename)
-    2. Update INDEX.md (temp + fsync + rename)
+    1. Snapshot old content (versioning) — before any overwrite or merge
+    2. Write the note file (temp + fsync + rename)
+    3. Update INDEX.md (temp + fsync + rename)
 
-    If step 2 fails, the result is an orphan note (lint catches it).
-    Step 1 failing leaves nothing behind.
+    If step 3 fails, the result is an orphan note (lint catches it).
+    Step 2 failing leaves nothing behind.
 
     Returns the path of the written note. Raises WritePathViolation if the
-    target is outside any of `write_paths`.
+    target is outside any of `write_paths` or inside a read-only path.
+
+    Args:
+        agent_root: Path to the agent's root directory.
+        capture: The Capture to write.
+        write_paths: Directories the agent is allowed to write to.
+        today: Override for today's date (used in tests).
+        expected_content_sha256: Optional precondition. When provided:
+            - For new notes (target doesn't exist): raises MemoryPreconditionFailed
+              (caller expected an existing note).
+            - For overwrite/merge: reads current content, hashes it, compares.
+              Mismatch raises MemoryPreconditionFailed. Match proceeds normally.
+        read_only_paths: Paths that must not be written to even if under write_paths.
+        log_target: Optional JSONL log file path for versioning events.
     """
     today = today or date.today()
     memory_dir = agent_root / "memory"
-    enforce_write_path(memory_dir, write_paths)
+    enforce_write_path(memory_dir, write_paths, read_only_paths=read_only_paths)
 
     if capture.merge_into:
         # Merge: update an existing note's last_seen + sources rather than create new
         target = memory_dir / capture.merge_into
-        enforce_write_path(target.resolve(), write_paths)
+        enforce_write_path(target.resolve(), write_paths, read_only_paths=read_only_paths)
         if not target.exists():
             raise SchemaValidationError(
                 f"merge_into target {capture.merge_into} doesn't exist"
             )
+        # Optimistic concurrency check (for merge target)
+        if expected_content_sha256 is not None:
+            _check_precondition(target, expected_content_sha256)
+        # Snapshot before merge
+        version_path = snapshot_memory_version(target)
+        if version_path is not None and log_target is not None:
+            _log_version_created(log_target, target.name, version_path, agent_root)
         _merge_into_existing(target, capture, today)
         # INDEX entry already exists for the existing note; nothing to add
         return target
@@ -286,13 +317,27 @@ def write_atomic_note(
         # If the content differs, this is a real name conflict; raise as before.
         if _is_same_capture_content(target, capture):
             # Orphan-recovery path: re-run INDEX update idempotently.
+            # Snapshot before overwriting (orphan repair is still a mutation)
+            if expected_content_sha256 is not None:
+                _check_precondition(target, expected_content_sha256)
+            version_path = snapshot_memory_version(target)
+            if version_path is not None and log_target is not None:
+                _log_version_created(log_target, target.name, version_path, agent_root)
             _update_index(memory_dir / "INDEX.md", capture, filename)
             return target
         raise SchemaValidationError(
             f"atomic note {filename} already exists; use merge_into to update"
         )
 
-    # Phase 1 — write the note
+    # Fresh write — target does not exist
+    if expected_content_sha256 is not None:
+        # Caller supplied a precondition but the note doesn't exist yet.
+        raise MemoryPreconditionFailed(
+            f"expected_content_sha256 was provided but {filename} doesn't exist",
+            actual_sha256=None,
+        )
+
+    # Phase 1 — write the note (no snapshot: no prior version exists)
     note_content = _render_note(capture, today)
     atomic_write(target, note_content)
 
@@ -300,6 +345,33 @@ def write_atomic_note(
     _update_index(memory_dir / "INDEX.md", capture, filename)
 
     return target
+
+
+def _check_precondition(target: Path, expected_sha256: str) -> None:
+    """Raise MemoryPreconditionFailed if target content sha256 != expected_sha256."""
+    current_content = target.read_text(encoding="utf-8")
+    actual = hashlib.sha256(current_content.encode("utf-8")).hexdigest()
+    if actual != expected_sha256:
+        raise MemoryPreconditionFailed(
+            f"content of {target.name} has changed (expected {expected_sha256[:16]}..., "
+            f"actual {actual[:16]}...); re-read and retry",
+            actual_sha256=actual,
+        )
+
+
+def _log_version_created(
+    log_target: Path, note_name: str, version_path: Path, agent_root: Path
+) -> None:
+    """Append a memory_version_created event to the agent log."""
+    try:
+        rel = version_path.relative_to(agent_root)
+    except ValueError:
+        rel = version_path
+    atomic_append_jsonl(log_target, json.dumps({
+        "trigger": "memory_version_created",
+        "note": note_name,
+        "version_path": str(rel),
+    }))
 
 
 def _is_same_capture_content(existing_path: Path, capture: Capture) -> bool:
@@ -419,13 +491,33 @@ def _section_for_type(type_str: str) -> str:
     }[type_str]
 
 
-def enforce_write_path(target: Path, allowed: list[Path]) -> None:
-    """Raise WritePathViolation if `target` is outside any allowed write path.
+def enforce_write_path(
+    target: Path,
+    allowed: list[Path],
+    read_only_paths: list[Path] | None = None,
+) -> None:
+    """Raise WritePathViolation if `target` is outside allowed write paths or
+    inside a read-only path.
 
     Per spec/01-anatomy + Codex finding #6: this is the helper-side enforcement
     layer. tools.md is policy; this is enforcement.
+
+    read_only paths win even when a target is also under an allowed write path —
+    the explicit read-only declaration is the stronger constraint.
     """
     target_resolved = target.resolve()
+
+    # Check read-only paths first — they override write_paths.
+    if read_only_paths:
+        for ro_path in read_only_paths:
+            try:
+                target_resolved.relative_to(ro_path.resolve())
+                raise WritePathViolation(
+                    f"write to {target} blocked — path is declared read-only: {ro_path}"
+                )
+            except ValueError:
+                continue  # not under this read-only path
+
     for allowed_path in allowed:
         try:
             target_resolved.relative_to(allowed_path.resolve())

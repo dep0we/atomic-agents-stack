@@ -79,3 +79,24 @@ class ToolInputInvalid(AtomicAgentsError):
 
 class ToolHandlerError(AtomicAgentsError):
     """Handler raised an exception; the result was captured in ToolCallResult.error."""
+
+
+# ──────────────────────────────────────────────────────────────────
+# Memory versioning exceptions (spec/02 versioning section)
+
+class MemoryPreconditionFailed(AtomicAgentsError):
+    """write_atomic_note expected_content_sha256 precondition did not match.
+
+    Raised when the caller supplied an expected_content_sha256 that doesn't
+    match the current on-disk sha256 of the target note (concurrent write
+    detected), or when the caller supplied a precondition but the target note
+    doesn't exist yet.
+
+    Attributes:
+        actual_sha256: the sha256 of the current on-disk content (or None
+            when the file doesn't exist).
+    """
+
+    def __init__(self, message: str, actual_sha256: str | None = None):
+        self.actual_sha256 = actual_sha256
+        super().__init__(message)

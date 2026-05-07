@@ -211,6 +211,7 @@ class AtomicAgent:
             alert_channel=model_data["alert_channel"],
             read_paths=tools_data["read_paths"],
             write_paths=tools_data["write_paths"],
+            read_only_paths=tools_data.get("read_only_paths", []),
             external_apis=tools_data["external_apis"],
             hard_nos=tools_data["hard_nos"],
             roster=roster,
@@ -644,7 +645,8 @@ class AtomicAgent:
                     seen_capture_keys.add(key)
                     try:
                         _capture.write_atomic_note(
-                            self.agent_root, c, self.config.write_paths
+                            self.agent_root, c, self.config.write_paths,
+                            read_only_paths=self.config.read_only_paths,
                         )
                         written_captures.append(c)
                     except Exception as e:

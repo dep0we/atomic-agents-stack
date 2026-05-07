@@ -33,6 +33,7 @@ class AgentConfig:
     # From tools.md (parsed)
     read_paths: list[Path] = field(default_factory=list)
     write_paths: list[Path] = field(default_factory=list)
+    read_only_paths: list[Path] = field(default_factory=list)
     external_apis: list[str] = field(default_factory=list)
     hard_nos: list[str] = field(default_factory=list)
 

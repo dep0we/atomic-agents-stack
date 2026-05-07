@@ -44,6 +44,7 @@ def test_parse_tools_md_missing_file(tmp_path):
     assert parsed == {
         "read_paths": [],
         "write_paths": [],
+        "read_only_paths": [],
         "external_apis": [],
         "hard_nos": [],
     }
