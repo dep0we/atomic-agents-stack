@@ -23,7 +23,7 @@ from typing import Any
 
 import frontmatter
 
-from . import _capture, _costs, _llm, _model, _tools
+from . import _capture, _cascade, _costs, _llm, _model, _tools
 from ._io import atomic_append_jsonl, atomic_write
 from ._locks import AgentLock
 from ._platform import get_agents_root
@@ -78,6 +78,10 @@ class AtomicAgent:
                 f"Set ATOMIC_AGENTS_ROOT env var or create the agent."
             )
 
+        # Cascade detection — None for single-agent layouts (load behaves as before),
+        # populated for paths shaped <system>/projects/<project>/agents/<role>/.
+        self.cascade: _cascade.CascadePaths | None = _cascade.detect_cascade(self.agent_root)
+
         # Loaded later via load() — populated in __init__ for clarity
         self._persona_text: str = ""
         self._tools_text: str = ""
@@ -86,6 +90,12 @@ class AtomicAgent:
         self._pinned_notes: list[str] = []
         self._recent_notes: list[str] = []
         self._recent_journal: list[str] = []
+        # Cascade-only sections (empty when not cascaded)
+        self._role_prompt_text: str = ""
+        self._project_canon_text: str = ""
+        self._project_style_guide_text: str = ""
+        self._project_goal_text: str = ""
+        self._project_policy_text: str = ""
 
         # Parse config files
         self.config = self._load_config()
@@ -111,8 +121,16 @@ class AtomicAgent:
     # Config loading
 
     def _load_config(self) -> AgentConfig:
-        model_data = _model.parse_model_md(self.agent_root / "model.md")
-        tools_data = _tools.parse_tools_md(self.agent_root / "tools.md")
+        if self.cascade:
+            # model.md: instance overrides role; if neither, defaults
+            model_path = _cascade.resolve_model_md(self.cascade)
+            model_data = _model.parse_model_md(model_path)
+            # tools.md: instance .override.md merges with role; instance tools.md replaces role
+            _, tools_text = _cascade.resolve_tools_md(self.cascade)
+            tools_data = _tools.parse_tools_md_text(tools_text)
+        else:
+            model_data = _model.parse_model_md(self.agent_root / "model.md")
+            tools_data = _tools.parse_tools_md(self.agent_root / "tools.md")
 
         return AgentConfig(
             default_model=model_data["default_model"],
@@ -137,12 +155,27 @@ class AtomicAgent:
 
     def load(self) -> None:
         """Load all the agent's files for this run. Idempotent."""
+        if self.cascade:
+            self._load_role_prompt()
+            self._load_project_layer_text()
         self._load_persona()
         self._load_tools_text()
         self._load_indexes()
         self._load_pinned_notes()
         self._load_recent_notes(n=RECENT_NOTES_DEFAULT)
         self._load_recent_journal(n=RECENT_JOURNAL_DEFAULT)
+
+    def _load_role_prompt(self) -> None:
+        if self.cascade:
+            self._role_prompt_text = _cascade.load_role_prompt(self.cascade)
+
+    def _load_project_layer_text(self) -> None:
+        if self.cascade:
+            layer = _cascade.load_project_layer(self.cascade)
+            self._project_canon_text = layer["canon"]
+            self._project_style_guide_text = layer["style_guide"]
+            self._project_goal_text = layer["goal"]
+            self._project_policy_text = layer["policy"]
 
     def _load_persona(self) -> None:
         parts = []
@@ -153,6 +186,9 @@ class AtomicAgent:
         self._persona_text = "\n\n".join(parts)
 
     def _load_tools_text(self) -> None:
+        if self.cascade:
+            _, self._tools_text = _cascade.resolve_tools_md(self.cascade)
+            return
         path = self.agent_root / "tools.md"
         if path.exists():
             self._tools_text = path.read_text(encoding="utf-8")
@@ -235,12 +271,38 @@ class AtomicAgent:
     # System prompt assembly
 
     def assemble_system_prompt(self) -> str:
-        """Per spec/04 canonical load order. Returns the full system prompt."""
-        sections = []
+        """Assemble the full system prompt.
+
+        Single-agent layout uses spec/04 order. Cascaded multi-agent project
+        agents use spec/06 order:
+
+            [1] role PROMPT.md
+            [2-4] instance IDENTITY/SOUL/USER (loaded into _persona_text)
+            [5/5b] role tools.md (or instance override) — already merged in _tools_text
+            [7] project canon.md
+            [7.5] project goal.md (optional, if present)
+            [8] project style_guide.md
+            [9] project policy/* (all)
+            [10-13] memory/INDEX, wiki/INDEX, pinned, recent atomic notes
+            [14] recent journal
+        """
+        sections: list[str] = []
+
+        if self.cascade and self._role_prompt_text:
+            sections.append("# role PROMPT.md\n\n" + self._role_prompt_text)
         if self._persona_text:
             sections.append(self._persona_text)
         if self._tools_text:
             sections.append("# tools.md\n\n" + self._tools_text)
+        if self.cascade:
+            if self._project_canon_text:
+                sections.append("# project canon.md\n\n" + self._project_canon_text)
+            if self._project_goal_text:
+                sections.append("# project goal.md\n\n" + self._project_goal_text)
+            if self._project_style_guide_text:
+                sections.append("# project style_guide.md\n\n" + self._project_style_guide_text)
+            if self._project_policy_text:
+                sections.append("# project policy/\n\n" + self._project_policy_text)
         if self._memory_index_text:
             sections.append("# memory/INDEX.md\n\n" + self._memory_index_text)
         if self._wiki_index_text:
