@@ -48,3 +48,11 @@ class CaptureParseError(AtomicAgentsError):
 
 class GoalCorrupted(AtomicAgentsError):
     """goal.md is missing required fields or invalid."""
+
+
+class NotInRoster(AtomicAgentsError):
+    """Target agent not in the coordinator's roster.md."""
+
+
+class SelfDelegationError(AtomicAgentsError):
+    """An agent tried to delegate to itself — one-level delegation only."""

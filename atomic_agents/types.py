@@ -33,6 +33,10 @@ class AgentConfig:
     external_apis: list[str] = field(default_factory=list)
     hard_nos: list[str] = field(default_factory=list)
 
+    # From roster.md (parsed) — agent names this coordinator may delegate to.
+    # Empty list = no delegation allowed.
+    roster: list[str] = field(default_factory=list)
+
 
 @dataclass
 class CostCheckResult:

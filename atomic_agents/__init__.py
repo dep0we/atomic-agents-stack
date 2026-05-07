@@ -25,6 +25,8 @@ from .exceptions import (
     NoJudgeAvailable,
     HelperBatchPartialFailure,
     WritePathViolation,
+    NotInRoster,
+    SelfDelegationError,
 )
 from .types import Capture, Response, AgentConfig, CostCheckResult
 from .outcome import OutcomeRunner, OutcomeResult, IterationRecord
@@ -40,6 +42,8 @@ __all__ = [
     "NoJudgeAvailable",
     "HelperBatchPartialFailure",
     "WritePathViolation",
+    "NotInRoster",
+    "SelfDelegationError",
     "Capture",
     "Response",
     "AgentConfig",
