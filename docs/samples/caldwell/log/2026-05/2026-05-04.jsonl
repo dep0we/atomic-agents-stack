@@ -1,0 +1,1 @@
+{"ts":"2026-05-04T07:00:00-05:00","trigger":"cron","model":"claude-opus-4-7-20260101","input_tokens":3398,"output_tokens":620,"cost_usd":0.0975,"cache_hit_tokens":2400,"cache_miss_tokens":998,"latency_ms":4720,"status":"ok","summary":"Daily morning brief — credit card balance update reflected"}

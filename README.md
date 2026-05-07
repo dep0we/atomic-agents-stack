@@ -48,30 +48,32 @@ print(f"Captures: {len(response.captures)}")
 
 ---
 
-## What's in v0.1
+## What's shipped
 
 | Component | Status |
 |---|---|
-| `AtomicAgent` runtime | ✅ |
-| Persona loading (IDENTITY, SOUL, USER) | ✅ |
-| `memory/` + `wiki/` INDEX-driven recall | ✅ |
-| Helper-mediated atomic captures (fenced JSON) | ✅ |
-| Multi-tier cost guardrails (50%/80%/100%) | ✅ |
-| Helper calls — sequential + parallel | ✅ |
-| Anthropic / OpenAI / Moonshot Kimi routing | ✅ |
-| File locking with stale-lock recovery | ✅ |
-| Schema validation incl. date-suffix filenames | ✅ |
-| Cost dashboard (HTML, global + per-agent) | ✅ |
-| Optional local dashboard server | ✅ |
-| Eval runner | ❌ v0.2 |
-| Tuning analyzer | ❌ v0.3 |
-| Goal manager | ❌ v0.4 |
-| Schema migration runner | ❌ v0.5 |
-| Tool-call captures (Path 1) | ❌ v0.6 |
-| Multi-agent project cascade loader | ❌ v0.7 |
-| Helper provenance enforcement | ❌ v0.8 |
+| `AtomicAgent` runtime | ✅ v0.1 |
+| Persona loading (IDENTITY, SOUL, USER) | ✅ v0.1 |
+| `memory/` + `wiki/` INDEX-driven recall | ✅ v0.1 |
+| Helper-mediated atomic captures (fenced JSON) | ✅ v0.1 |
+| Multi-tier cost guardrails (50%/80%/100%) | ✅ v0.1 |
+| Helper calls — sequential + parallel | ✅ v0.1 |
+| Anthropic / OpenAI / Moonshot Kimi routing | ✅ v0.1 |
+| File locking with stale-lock recovery | ✅ v0.1 |
+| Schema validation incl. date-suffix filenames | ✅ v0.1 |
+| Cost dashboard (HTML, global + per-agent) | ✅ v0.1 |
+| Optional local dashboard server | ✅ v0.1 |
+| Eval runner — `atomic_agents.eval` | ✅ v0.2 |
+| Tuning analyzer — `atomic_agents.tuning` | ✅ v0.3 |
+| Goal manager — `atomic_agents.goal` | ✅ v0.4 |
+| Schema migration runner — `atomic_agents.migrate` | ✅ v0.5 |
+| Tool-call captures (Path 1) | ✅ v0.6 |
+| Multi-agent project cascade loader — `atomic_agents._cascade` | ✅ v0.7 |
+| Helper provenance enforcement | ⏳ planned |
+| Research integrity layers 2+3 | ⏳ planned |
+| Claude Code skill wrappers | ⏳ planned |
 
-The spec for everything is finalized; the Python implementation lands incrementally.
+The spec is finalized; the Python implementation lands incrementally. See [CHANGELOG.md](CHANGELOG.md) for per-version detail.
 
 ---
 
@@ -116,28 +118,36 @@ atomic_agents/                  # the Python package
     ├── serve.py                # optional local web server
     └── __main__.py             # python -m atomic_agents.dashboard ...
 
-tests/                          # 67 tests, all passing on Python 3.11+
+tests/                          # 257 tests, all passing on Python 3.11+
 docs/                           # spec + implementation guides
+├── README.md                   # spec entry point
+├── architecture.md             # 30-second mental model + design rationale
+├── spec/                       # 13 locked spec docs (anatomy → research integrity)
+├── implementation/             # build guides per runtime (cron, Claude skill, dashboard, ...)
+├── samples/caldwell/           # complete worked single-agent example
+├── appendix/portability.md     # using Atomic Agents without Obsidian / on any OS
+└── package-readme.md           # this package's PyPI/distribution readme
 ```
 
 ---
 
 ## The spec
 
-The Atomic Agents v1 specification is documented in `docs/`. It covers:
+Start at [`docs/README.md`](docs/README.md) for the spec entry point. The 13 spec docs in [`docs/spec/`](docs/spec/) cover:
 
-- Anatomy of an agent (file layout, persona, memory, wiki, journal, log)
-- Atomic Memory (Notes + Wiki + INDEX-driven recall)
-- File formats and frontmatter schemas
-- Runtime assembly order (the canonical load sequence)
-- Capture rules (when and how agents write to memory)
-- Multi-agent projects with role cascade
-- Cost & observability
-- Helpers (cheap-LLM workers for transformation subtasks)
-- Evaluation framework
-- Tuning (eval-driven improvement)
-- Goals & intent (for goal-driven agents)
-- Research integrity (citation requirements + factual accuracy)
+- [01 — Anatomy](docs/spec/01-anatomy.md) (file layout, persona, memory, wiki, journal, log)
+- [02 — Atomic Memory](docs/spec/02-atomic-memory.md) (Notes + Wiki + INDEX-driven recall)
+- [03 — File formats](docs/spec/03-file-formats.md) (frontmatter schemas + filename conventions)
+- [04 — Runtime assembly](docs/spec/04-runtime-assembly.md) (canonical load sequence)
+- [05 — Capture rules](docs/spec/05-capture-rules.md) (when and how agents write to memory)
+- [06 — Multi-agent projects](docs/spec/06-multi-agent-projects.md) (role cascade for shared-team agents)
+- [07 — Research foundations](docs/spec/07-research-foundations.md) (lineage and citations)
+- [08 — Evaluation](docs/spec/08-evaluation.md) (rubrics + LLM-as-judge framework)
+- [09 — Cost & observability](docs/spec/09-cost-observability.md) (pricing, dashboard, guardrails)
+- [10 — Helpers](docs/spec/10-helpers.md) (cheap-LLM workers for transformation subtasks)
+- [11 — Tuning](docs/spec/11-tuning.md) (eval-driven self-improvement)
+- [12 — Goals & intent](docs/spec/12-goals-and-intent.md) (goal-driven agents)
+- [13 — Research integrity](docs/spec/13-research-integrity.md) (citations + factual accuracy)
 
 ---
 
