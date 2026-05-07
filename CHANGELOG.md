@@ -27,7 +27,7 @@ Spec-completion release. The full v0.x build sequence is landed: every deferred 
 - `EditProposal` dataclass: each detected pattern emits a concrete proposed edit with the eval evidence inline.
 - Optional LLM polish (~$0.02 per proposal) to improve report wording without changing recommendations.
 - Reports land in `evals/tuning_reports/YYYY-MM-DD_proposal.md`. Operator approves/rejects in the report file.
-- `--apply` records operator decisions to `evals/tuning_history.jsonl` for audit; v0.3 does not auto-write diffs (operator applies edits manually after approval — auto-edit deferred until the workflow proves out).
+- `--apply` writes approved diffs to the target persona/memory/tools files via `atomic_write`, respecting `tools.md` write_paths. Diffs that are instructional (multi-step, comment-only) are flagged as manual-apply with a skip reason; all decisions (applied, skipped, rejected, deferred) land in `evals/tuning_history.jsonl`. Use `--dry-run` with `--apply` to preview what would change without writing.
 - CLI: `python -m atomic_agents.tuning <agent> [--since|--apply|--polish|--dry-run]`.
 
 **Goal manager** (`atomic_agents.goal`, was issue #3, PR #14)
