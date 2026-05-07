@@ -1,8 +1,10 @@
 """Tests for atomic_agents.migrate."""
 
 from __future__ import annotations
+import io
 import json
 import tarfile
+import unittest.mock
 from datetime import date
 from pathlib import Path
 
@@ -419,3 +421,140 @@ def test_vault_status_no_scripts(vault):
     status = vault_status(vault)
     assert status["available_scripts"] == []
     assert status["snapshots"] == []
+
+
+# ──────────────────────────────────────────────────────────────────
+# P1 regression: atomic rollback
+
+def test_restore_snapshot_atomic_on_corrupt_tar(vault):
+    """A corrupt (truncated) snapshot must leave the live vault untouched."""
+    note_path = vault / "alice" / "memory" / "feedback_note_1.md"
+    original = note_path.read_text()
+
+    # Take a good snapshot, then corrupt it by truncating
+    snap = create_snapshot(vault, target_version=2)
+    corrupt_snap = snap.parent / "corrupt.tar.gz"
+    # Write only the first 64 bytes — definitely not a valid gzip/tar
+    corrupt_snap.write_bytes(snap.read_bytes()[:64])
+
+    with pytest.raises(Exception):
+        restore_snapshot(vault, corrupt_snap)
+
+    # Live vault must be unchanged
+    assert note_path.exists(), "note_path was deleted before extract failed"
+    assert note_path.read_text() == original, "note_path content was modified"
+
+
+def test_restore_snapshot_atomic_on_partial_extract(vault, monkeypatch):
+    """If extraction raises mid-stream, the live vault must be untouched.
+
+    The new restore_snapshot extracts into a sibling temp dir, so the live
+    vault is only touched during the final atomic rename — never during
+    extraction.  We simulate an extraction failure by patching extractall
+    to raise on the first (and only) real extract call.
+    """
+    note_path = vault / "alice" / "memory" / "feedback_note_1.md"
+    original = note_path.read_text()
+
+    snap = create_snapshot(vault, target_version=2)
+
+    real_extractall = tarfile.TarFile.extractall
+
+    def boom_extractall(self, *args, **kwargs):
+        raise OSError("simulated mid-extract failure")
+
+    monkeypatch.setattr(tarfile.TarFile, "extractall", boom_extractall)
+
+    with pytest.raises(OSError, match="simulated mid-extract failure"):
+        restore_snapshot(vault, snap)
+
+    # Live vault must be unchanged — the bomb went off before the atomic swap
+    assert note_path.exists(), "note_path was deleted before extract completed"
+    assert note_path.read_text() == original, "note_path content was modified"
+
+
+# ──────────────────────────────────────────────────────────────────
+# P1 regression: wiki page validation
+
+@pytest.fixture
+def vault_with_wiki_and_v1_to_v2_script(tmp_path):
+    """Vault with both atomic notes and a wiki page, plus a noop v1→v2 script.
+
+    The migration script is a true noop (reads schema_version, writes it back
+    unchanged so files stay at v1 and post-validation doesn't reject them on
+    schema_version mismatch).  The goal is to exercise the dispatch logic in
+    _validate_post_migration: wiki files should use validate_wiki_frontmatter,
+    not validate_atomic_note_frontmatter.
+    """
+    agents_root = tmp_path / "agents"
+    agent_root = agents_root / "alice"
+    memory = agent_root / "memory"
+    wiki = agent_root / "wiki"
+    memory.mkdir(parents=True)
+    wiki.mkdir(parents=True)
+
+    # One valid atomic note
+    note = frontmatter.Post(
+        "Body",
+        schema_version=1,
+        name="Some Note",
+        description="x" * 30,
+        type="feedback",
+        captured="2026-01-01",
+        last_seen="2026-05-01",
+        sources=["conversation_1"],
+        confidence="high",
+    )
+    (memory / "feedback_some_note.md").write_text(frontmatter.dumps(note) + "\n")
+
+    # One valid wiki page
+    wiki_page = frontmatter.Post(
+        "# Overview\nThis is the overview wiki page.",
+        schema_version=1,
+        name="Overview",
+        description="High-level overview of the project.",
+        type="wiki_page",
+    )
+    (wiki / "overview.md").write_text(frontmatter.dumps(wiki_page) + "\n")
+
+    # Noop migration script: touches nothing, returns summary
+    migrations = agents_root / "_migrations"
+    migrations.mkdir()
+    (migrations / "v1_to_v2.py").write_text(
+        "import frontmatter\n"
+        "FROM_VERSION = 1\n"
+        "TO_VERSION = 2\n"
+        "def applies_to(path):\n"
+        "    return path.suffix == '.md'\n"
+        "def migrate(path, dry_run):\n"
+        "    return {'path': str(path), 'changes': ['noop'], 'dry_run': dry_run}\n"
+    )
+    return agents_root
+
+
+def test_migration_validates_wiki_pages_with_wiki_schema(vault_with_wiki_and_v1_to_v2_script):
+    """Post-migration validation must not fail on wiki pages.
+
+    Previously, _validate_post_migration called validate_atomic_note_frontmatter
+    for every file, which rejects type: wiki_page.  After the fix, wiki files
+    are dispatched to validate_wiki_frontmatter instead.
+
+    The noop migration script keeps all files at schema_version=1, so validation
+    succeeds — this test would fail before the fix with a SchemaValidationError
+    about 'type must be one of {...}; got wiki_page'.
+    """
+    vault = vault_with_wiki_and_v1_to_v2_script
+
+    # Dry run first to confirm plan is built
+    plan = build_migration_plan(vault, target_version=2)
+    assert len(plan.candidate_files) == 2  # 1 memory note + 1 wiki page
+
+    # Real run — snapshot taken, noop applied, validation runs
+    result = run_migration(vault, target_version=2, dry_run=False)
+
+    # Should NOT roll back; validation must pass for both file types
+    assert result.rolled_back is False, (
+        f"Unexpected rollback. Validation errors: {result.validation_errors}"
+    )
+    assert result.validation_passed is True
+    assert result.validation_errors == []

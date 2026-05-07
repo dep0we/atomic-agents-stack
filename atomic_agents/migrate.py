@@ -58,10 +58,13 @@ from __future__ import annotations
 import datetime
 import importlib.util
 import json
+import os
 import re
 import shutil
 import sys
 import tarfile
+import tempfile
+import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date
@@ -71,7 +74,11 @@ from typing import Any, Callable, Protocol
 import frontmatter
 
 from ._platform import get_agents_root
-from ._schema import CURRENT_SCHEMA_VERSION, validate_atomic_note_frontmatter
+from ._schema import (
+    CURRENT_SCHEMA_VERSION,
+    validate_atomic_note_frontmatter,
+    validate_wiki_frontmatter,
+)
 from .exceptions import (
     AtomicAgentsError,
     SchemaValidationError,
@@ -294,38 +301,95 @@ def create_snapshot(agents_root: Path, target_version: int, today: date | None =
     return snapshot_path
 
 
-def restore_snapshot(agents_root: Path, snapshot_path: Path) -> None:
-    """Extract a snapshot back over the vault.
+def _validate_tar_members(tar: tarfile.TarFile) -> None:
+    """Refuse any snapshot that contains absolute paths or path-traversal sequences.
 
-    Atomic-ish: clears the to-be-restored content first, then extracts.
-    If extract fails midway, the vault is in a half-state — operator
-    intervention required (the partial extraction is preserved for inspection).
+    Raises AtomicAgentsError if any member is unsafe.
+    """
+    for member in tar.getmembers():
+        name = member.name
+        # Absolute paths
+        if name.startswith("/") or name.startswith("\\"):
+            raise AtomicAgentsError(
+                f"Unsafe snapshot: member '{name}' has an absolute path. Refusing restore."
+            )
+        # Path traversal
+        if ".." in name.replace("\\", "/").split("/"):
+            raise AtomicAgentsError(
+                f"Unsafe snapshot: member '{name}' contains '..' path traversal. Refusing restore."
+            )
+
+
+def restore_snapshot(agents_root: Path, snapshot_path: Path) -> None:
+    """Extract a snapshot back over the vault atomically.
+
+    Strategy: extract to a sibling temp directory first, then atomically swap.
+    Failure before the swap leaves the live vault completely untouched.
+
+    Safety: refuses snapshots with absolute paths or '..' path traversal.
     """
     if not snapshot_path.exists():
         raise AtomicAgentsError(f"Snapshot not found: {snapshot_path}")
 
-    # Clear out content that will be replaced (don't touch _migrations/snapshots/)
-    for child in agents_root.iterdir():
-        if child.name in EXCLUDED_DIRS or child.name.startswith("."):
-            continue
-        if child == agents_root / "_migrations":
-            # Replace migration scripts but keep snapshots/
-            for script in list(child.iterdir()):
-                if script.name == "snapshots":
-                    continue
-                if script.is_file():
-                    script.unlink()
-                else:
-                    shutil.rmtree(script)
-            continue
-        if child.is_file():
-            child.unlink()
-        else:
-            shutil.rmtree(child)
+    # Staging area sits next to agents_root so rename() stays on the same volume
+    parent = agents_root.parent
+    tmp_dir = Path(tempfile.mkdtemp(
+        prefix=f"_restore-tmp-{uuid.uuid4().hex[:8]}-",
+        dir=str(parent),
+    ))
 
-    # Extract snapshot
-    with tarfile.open(snapshot_path, "r:gz") as tar:
-        tar.extractall(path=str(agents_root), filter="data")
+    try:
+        # 1. Validate member paths before extracting anything
+        with tarfile.open(snapshot_path, "r:gz") as tar:
+            _validate_tar_members(tar)
+
+        # 2. Extract into staging area
+        with tarfile.open(snapshot_path, "r:gz") as tar:
+            tar.extractall(path=str(tmp_dir), filter="data")
+
+        # 3. Verify the staging area has at least some content
+        if not any(tmp_dir.iterdir()):
+            raise AtomicAgentsError(
+                f"Snapshot '{snapshot_path.name}' extracted empty. Refusing to restore."
+            )
+
+        # 4. Swap: rename live aside, rename staging into place, delete aside.
+        #    Keep snapshots/ alive across the swap so we don't lose the snapshot
+        #    we're restoring from (or any others).
+
+        # Re-create _migrations/snapshots/ in staging so rename doesn't lose them
+        staging_migrations = tmp_dir / "_migrations"
+        staging_snapshots = staging_migrations / "snapshots"
+        staging_snapshots.mkdir(parents=True, exist_ok=True)
+
+        # Copy existing snapshots into staging so they survive the swap
+        live_snapshots_dir = agents_root / "_migrations" / "snapshots"
+        if live_snapshots_dir.exists():
+            for snap in live_snapshots_dir.iterdir():
+                dest = staging_snapshots / snap.name
+                if not dest.exists():
+                    if snap.is_file():
+                        shutil.copy2(str(snap), str(dest))
+                    else:
+                        shutil.copytree(str(snap), str(dest))
+
+        # Atomically replace agents_root with staging
+        aside_dir = parent / f"_restore-aside-{uuid.uuid4().hex[:8]}"
+        os.rename(str(agents_root), str(aside_dir))
+        try:
+            os.rename(str(tmp_dir), str(agents_root))
+        except Exception:
+            # Undo the aside rename so the live vault is left intact
+            os.rename(str(aside_dir), str(agents_root))
+            raise
+        # Delete the aside (old live content) — best effort
+        shutil.rmtree(str(aside_dir), ignore_errors=True)
+
+    except Exception:
+        # Clean up staging if swap hasn't happened yet (tmp_dir still exists)
+        if tmp_dir.exists():
+            shutil.rmtree(str(tmp_dir), ignore_errors=True)
+        raise
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -491,8 +555,23 @@ def run_migration(
         return result
 
 
+def _is_wiki_file(path: Path) -> bool:
+    """Return True if path lives inside a wiki/ content directory.
+
+    The vault layout is <agents_root>/<agent>/wiki/<file>.md
+    so we check whether "wiki" appears as a directory component in the path.
+    """
+    return "wiki" in path.parts
+
+
 def _validate_post_migration(files: list[Path]) -> list[dict]:
-    """Validate every touched file passes the current schema. Returns list of errors."""
+    """Validate every touched file passes the current schema. Returns list of errors.
+
+    Dispatches by location: files under wiki/ validate against the wiki schema;
+    all others (memory/) validate against the atomic-note schema.
+    This prevents wiki pages (type: wiki_page) from being incorrectly rejected
+    by the atomic-note validator, which does not allow that type.
+    """
     errors: list[dict] = []
     for path in files:
         try:
@@ -501,7 +580,10 @@ def _validate_post_migration(files: list[Path]) -> list[dict]:
             errors.append({"path": str(path), "error": f"unparseable: {e}"})
             continue
         try:
-            validate_atomic_note_frontmatter(dict(parsed.metadata), filename=path.name)
+            if _is_wiki_file(path):
+                validate_wiki_frontmatter(dict(parsed.metadata), filename=path.name)
+            else:
+                validate_atomic_note_frontmatter(dict(parsed.metadata), filename=path.name)
         except SchemaValidationError as e:
             errors.append({"path": str(path), "error": str(e)})
         except Exception as e:
