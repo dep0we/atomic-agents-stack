@@ -29,6 +29,7 @@ from ._io import atomic_append_jsonl, atomic_write
 from ._locks import AgentLock
 from ._platform import get_agents_root
 from ._schema import validate_atomic_note_frontmatter
+from .goal import parse_agent_mode
 from .exceptions import (
     AgentLockBusy,
     AtomicAgentsError,
@@ -102,6 +103,14 @@ class AtomicAgent:
         self._project_style_guide_text: str = ""
         self._project_goal_text: str = ""
         self._project_policy_text: str = ""
+        # Single-agent goal context (per spec/04 step 3.5; empty for cascaded agents)
+        self._goal_text: str = ""
+
+        # Agent operating mode (reactive / goal-driven / hybrid), parsed from
+        # IDENTITY.md at init time. Defaults to "reactive" if no IDENTITY.md or
+        # no Operating-mode section.
+        identity_path = self.agent_root / "persona" / "IDENTITY.md"
+        self.agent_mode: str = parse_agent_mode(identity_path)
 
         # Parse config files
         self.config = self._load_config()
@@ -164,6 +173,8 @@ class AtomicAgent:
         if self.cascade:
             self._load_role_prompt()
             self._load_project_layer_text()
+        else:
+            self._load_goal_text()
         self._load_persona()
         self._load_tools_text()
         self._load_indexes()
@@ -182,6 +193,19 @@ class AtomicAgent:
             self._project_style_guide_text = layer["style_guide"]
             self._project_goal_text = layer["goal"]
             self._project_policy_text = layer["policy"]
+
+    def _load_goal_text(self) -> None:
+        """Load single-agent goal.md if present (spec/04 step 3.5).
+
+        Only called for non-cascaded agents. Cascaded agents pick up the
+        project-level goal via _load_project_layer_text(); loading the
+        instance goal.md on top would create duplicate sections.
+        """
+        goal_path = self.agent_root / "goal.md"
+        if goal_path.exists():
+            self._goal_text = goal_path.read_text(encoding="utf-8")
+        else:
+            self._goal_text = ""
 
     def _load_persona(self) -> None:
         parts = []
@@ -298,6 +322,10 @@ class AtomicAgent:
             sections.append("# role PROMPT.md\n\n" + self._role_prompt_text)
         if self._persona_text:
             sections.append(self._persona_text)
+        # spec/04 step 3.5 — single-agent goal.md injected between persona and tools.
+        # Cascaded agents already get project-level goal via _project_goal_text below.
+        if not self.cascade and self._goal_text:
+            sections.append("# goal.md\n\n" + self._goal_text)
         if self._tools_text:
             sections.append("# tools.md\n\n" + self._tools_text)
         if self.cascade:
@@ -458,6 +486,7 @@ class AtomicAgent:
                 "status": "ok",
                 "summary": response.summary,
                 "run_id": self.run_id,
+                "agent_mode": self.agent_mode,
             }
             if check.action == "fallback":
                 log_record["fallback"] = True
