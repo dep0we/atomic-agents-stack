@@ -537,3 +537,125 @@ def test_history_entries_appended_on_lifecycle(agent_with_goal):
     g2 = gm2.load()
     assert "ch_6_outline" in g2.body
     assert "in_progress" in g2.body
+
+
+# ──────────────────────────────────────────────────────────────────
+# P2 regression tests — state-machine hardening
+
+# #6 — Unknown blocker references
+
+def test_validate_goal_rejects_blocked_by_unknown_id():
+    """validate_goal should raise if blocked_by references an id not in sub_goals."""
+    with pytest.raises(SchemaValidationError, match="unknown id"):
+        validate_goal({
+            "schema_version": 1, "active": True, "intent": "x", "priority": "high",
+            "created": "2026-01-01", "last_progress_check": "2026-01-01",
+            "success_criteria": ["a"],
+            "sub_goals": [
+                {"id": "task_a", "label": "A", "status": "pending"},
+                {"id": "task_b", "label": "B", "status": "pending",
+                 "blocked_by": "nonexistent_id"},
+            ],
+        })
+
+
+def test_add_sub_goal_rejects_blocked_by_unknown(agent_with_goal):
+    """add_sub_goal should reject blocked_by referencing an id that doesn't exist."""
+    agents_root, agent_name = agent_with_goal
+    gm = GoalManager(agents_root, agent_name)
+    gm.load()
+    with pytest.raises(AtomicAgentsError, match="unknown id"):
+        gm.add_sub_goal("ch_7_draft", "Chapter 7 draft", blocked_by="nonexistent_id")
+
+
+# #7 — Self-blocks and cycles
+
+def test_mark_blocked_rejects_self_block(agent_with_goal):
+    """mark_blocked should refuse when sub_goal_id == blocked_by."""
+    agents_root, agent_name = agent_with_goal
+    gm = GoalManager(agents_root, agent_name)
+    gm.load()
+    with pytest.raises(AtomicAgentsError, match="cannot block itself"):
+        gm.mark_blocked("ch_6_outline", blocked_by="ch_6_outline")
+
+
+def test_mark_blocked_rejects_cycle_creation(agent_with_goal):
+    """mark_blocked should refuse when the operation would create a cycle (A→B, B→A)."""
+    agents_root, agent_name = agent_with_goal
+    gm = GoalManager(agents_root, agent_name)
+    gm.load()
+    # Block ch_6_outline by ch_5_draft (valid — ch_5_draft exists)
+    gm.mark_blocked("ch_6_outline", blocked_by="ch_5_draft")
+    # Now try to block ch_5_draft by ch_6_outline — this would form a cycle
+    with pytest.raises(AtomicAgentsError, match="cycle"):
+        gm.mark_blocked("ch_5_draft", blocked_by="ch_6_outline")
+
+
+# #8 — blocked → in_progress clears blocked_by
+
+def test_blocked_to_in_progress_clears_blocked_by(agent_with_goal):
+    """Transitioning blocked → in_progress must clear blocked_by."""
+    agents_root, agent_name = agent_with_goal
+    gm = GoalManager(agents_root, agent_name)
+    gm.load()
+    # ch_5_edit is pending with blocked_by=ch_5_draft; mark it formally blocked first
+    gm.mark_blocked("ch_5_edit", blocked_by="ch_5_draft")
+    assert gm.find_sub_goal("ch_5_edit").blocked_by == "ch_5_draft"
+    # Transition to in_progress — blocked_by must be cleared
+    sg = gm.mark_in_progress("ch_5_edit")
+    assert sg.status == "in_progress"
+    assert sg.blocked_by is None
+    # History should record the previous blocker
+    assert "ch_5_draft" in gm._goal.body
+
+
+# #9 — Archive path collision safety
+
+def test_archive_increments_suffix_on_collision(agent_with_goal):
+    """Archiving twice on the same day must produce distinct files, not overwrite."""
+    agents_root, agent_name = agent_with_goal
+    today = date(2026, 5, 8)
+    gm = GoalManager(agents_root, agent_name, today=today)
+    gm.load()
+    first_path = gm.archive(reason="completed")
+    assert first_path.exists()
+
+    # Re-create goal.md to simulate a second archive on same day+slug
+    (agents_root / agent_name / "goal.md").write_text(
+        (agents_root / agent_name / "goal_archive" / first_path.name).read_text()
+    )
+    gm2 = GoalManager(agents_root, agent_name, today=today)
+    gm2.load()
+    second_path = gm2.archive(reason="re-archived")
+
+    assert second_path != first_path
+    assert first_path.exists(), "first archive must not be overwritten"
+    assert second_path.exists()
+    # Second path should have a numeric suffix
+    assert second_path.stem.endswith("_1") or "_1" in second_path.name
+
+
+def test_archive_writes_before_unlinking_goal_md(agent_with_goal, monkeypatch):
+    """If unlink raises after archive write, archive file is preserved (recoverable state)."""
+    agents_root, agent_name = agent_with_goal
+    gm = GoalManager(agents_root, agent_name, today=date(2026, 5, 8))
+    gm.load()
+
+    unlink_called = []
+
+    original_unlink = Path.unlink
+
+    def failing_unlink(self, missing_ok=False):
+        unlink_called.append(str(self))
+        raise OSError("simulated unlink failure")
+
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+
+    with pytest.raises(OSError, match="simulated unlink failure"):
+        gm.archive(reason="test")
+
+    # Archive file must have been written before unlink was attempted
+    assert len(unlink_called) == 1, "unlink should have been attempted exactly once"
+    # The archive directory should have a file in it (the written archive)
+    archive_files = list(gm.archive_dir.glob("*.md"))
+    assert len(archive_files) == 1, "archive file must be present even after unlink failure"
