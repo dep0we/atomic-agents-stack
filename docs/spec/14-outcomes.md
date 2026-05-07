@@ -220,12 +220,36 @@ Exit codes: 0 = satisfied, 1 = failed/max_iterations_reached, 2 = interrupted.
 
 ---
 
+## Composing with the goal manager
+
+Goal sub-goals can be dispatched as outcomes via `GoalManager.dispatch_as_outcome`. This lets an operator (or future per-mode dispatcher) say: "run this sub-goal as an outcome loop and let the runner machine-decide whether it's done."
+
+```python
+result, sg = gm.dispatch_as_outcome(
+    sub_goal_id="ch_5_draft",
+    rubric=Path("evals/rubric.md"),
+    max_iterations=3,
+)
+```
+
+The outcome's terminal state maps to a sub-goal status update:
+
+| Outcome status | Sub-goal status |
+|---|---|
+| `satisfied` | `complete` |
+| `max_iterations_reached` | `blocked` |
+| `failed` | `blocked` |
+| `interrupted` | stays `in_progress` |
+
+*See [12-goals-and-intent.md](12-goals-and-intent.md#dispatching-a-sub-goal-as-an-outcome) for the full dispatch specification, guards, and history logging.*
+
+---
+
 ## What is NOT an outcome
 
 - **Running eval on a completed output** — use `eval/` for that.
 - **Multi-step objectives spanning many sessions** — use `goal/` for that.
 - **Generating many variants and picking the best** — that's a different pattern (not yet in the framework).
-- **Goal-manager composition (dispatching a sub-goal as an outcome)** — designed but deferred to a follow-up; see `goal/` spec for context.
 
 ---
 
