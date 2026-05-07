@@ -56,3 +56,11 @@ class NotInRoster(AtomicAgentsError):
 
 class SelfDelegationError(AtomicAgentsError):
     """An agent tried to delegate to itself — one-level delegation only."""
+
+
+class DreamInProgress(AtomicAgentsError):
+    """A dream run is already in progress for this agent — lock held."""
+
+
+class DreamNotFound(AtomicAgentsError):
+    """No dream with the given ID exists for this agent."""

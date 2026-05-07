@@ -27,9 +27,19 @@ from .exceptions import (
     WritePathViolation,
     NotInRoster,
     SelfDelegationError,
+    DreamInProgress,
+    DreamNotFound,
 )
 from .types import Capture, Response, AgentConfig, CostCheckResult
 from .outcome import OutcomeRunner, OutcomeResult, IterationRecord
+from .dream import (
+    DreamRunner,
+    DreamResult,
+    DreamInputs,
+    ConsolidatedNote,
+    PromotedNote,
+    StaleMarking,
+)
 
 __version__ = "0.1.0"
 
@@ -44,6 +54,8 @@ __all__ = [
     "WritePathViolation",
     "NotInRoster",
     "SelfDelegationError",
+    "DreamInProgress",
+    "DreamNotFound",
     "Capture",
     "Response",
     "AgentConfig",
@@ -51,4 +63,10 @@ __all__ = [
     "OutcomeRunner",
     "OutcomeResult",
     "IterationRecord",
+    "DreamRunner",
+    "DreamResult",
+    "DreamInputs",
+    "ConsolidatedNote",
+    "PromotedNote",
+    "StaleMarking",
 ]
