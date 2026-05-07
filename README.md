@@ -78,7 +78,6 @@ print(f"Captures: {len(response.captures)}")
 | Claude Code skill wrappers — `extras/claude-code-skills/` | ✅ v0.9 |
 | Spec docs in repo — `docs/` | ✅ v0.9 |
 | CI (Python 3.11 + 3.12 matrix) | ✅ v0.9 |
-| First non-Bishop Atomic Agent built end-to-end | ⏳ next |
 
 The spec is feature-complete relative to the v1 lock. See [CHANGELOG.md](CHANGELOG.md) for per-version detail.
 
