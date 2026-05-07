@@ -23,10 +23,12 @@ from atomic_agents.tuning import (
     parse_report_proposals,
     polish_proposal_text,
     render_report,
+    _apply_diff_to_file,
+    _diff_is_auto_applicable,
     _extract_distinctive_phrases,
     _parse_since,
 )
-from atomic_agents.exceptions import AtomicAgentsError
+from atomic_agents.exceptions import AtomicAgentsError, WritePathViolation
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -491,3 +493,319 @@ def test_polish_falls_back_silently_on_failure(agent_with_data):
         polished = polish_proposal_text(proposal, runner.agent_root)
     # Should fall back to the original diff, no exception
     assert "original" in polished.proposed_diff
+
+
+# ──────────────────────────────────────────────────────────────────
+# P1 regression: --apply must actually write approved proposals
+# (Codex finding: summary["applied"] was always zero)
+
+def test_diff_is_auto_applicable_with_additions():
+    diff = " ## Voice\n [existing]\n+- New rule here.\n"
+    ok, reason = _diff_is_auto_applicable(diff)
+    assert ok, reason
+
+
+def test_diff_is_auto_applicable_rejects_empty():
+    ok, reason = _diff_is_auto_applicable("")
+    assert not ok
+    assert "empty" in reason
+
+
+def test_diff_is_auto_applicable_rejects_no_additions():
+    diff = " context line only\n - removed line\n"
+    ok, reason = _diff_is_auto_applicable(diff)
+    assert not ok
+    assert "addition" in reason
+
+
+def test_diff_is_auto_applicable_rejects_instructional():
+    # Diff that is mostly comments (instructional / multi-step)
+    diff = (
+        "# Step 1: edit persona/SOUL.md\n"
+        "# Step 2: mark note archived\n"
+        "# Step 3: update INDEX.md\n"
+        "+  superseded_by: persona/SOUL.md\n"
+    )
+    ok, reason = _diff_is_auto_applicable(diff)
+    assert not ok
+    assert "manual" in reason or "instructional" in reason
+
+
+def test_apply_diff_appends_when_no_context(tmp_path):
+    target = tmp_path / "SOUL.md"
+    target.write_text("## Voice\n\nDirect.\n")
+    diff = "+- Never open with hedge language.\n"
+    result = _apply_diff_to_file(target, diff)
+    assert "Never open with hedge language." in result
+    assert "Direct." in result  # original preserved
+
+
+def test_apply_diff_inserts_after_context(tmp_path):
+    target = tmp_path / "SOUL.md"
+    target.write_text("## Voice\n\nExisting rule.\n\n## Other\n\nFoo.\n")
+    diff = " Existing rule.\n+- New rule after existing.\n"
+    result = _apply_diff_to_file(target, diff)
+    lines = result.splitlines()
+    existing_idx = next(i for i, l in enumerate(lines) if "Existing rule." in l)
+    new_idx = next(i for i, l in enumerate(lines) if "New rule after existing." in l)
+    assert new_idx == existing_idx + 1
+
+
+def test_apply_diff_handles_missing_context_gracefully(tmp_path):
+    """Context line not found — additions should still be appended at end."""
+    target = tmp_path / "SOUL.md"
+    target.write_text("## Voice\n\nSomething else.\n")
+    diff = " Context that doesn't exist\n+- Addition.\n"
+    result = _apply_diff_to_file(target, diff)
+    assert "Addition." in result
+    assert "Something else." in result  # original still present
+
+
+def test_apply_diff_on_new_file(tmp_path):
+    """Target file doesn't exist yet — additions create it."""
+    target = tmp_path / "nonexistent.md"
+    diff = "+- First line.\n+- Second line.\n"
+    result = _apply_diff_to_file(target, diff)
+    assert "First line." in result
+    assert "Second line." in result
+
+
+def _make_report_with_proposals(reports_dir, agent_name, today, proposals):
+    """Helper: write a tuning report and return its filename."""
+    body = render_report(proposals, agent_name, today, 60)
+    report_path = reports_dir / f"{today.isoformat()}_proposal.md"
+    report_path.write_text(body)
+    return report_path.name
+
+
+def test_apply_writes_accepted_proposal_to_file(agent_with_data):
+    """Core regression: apply_proposals with an accepted proposal must write the file."""
+    agents_root, agent_name, today = agent_with_data
+    agent_root = agents_root / agent_name
+
+    # Create a target file that the proposal will edit
+    soul_path = agent_root / "persona" / "SOUL.md"
+    soul_path.parent.mkdir(parents=True, exist_ok=True)
+    soul_path.write_text("## Voice\n\nDirect.\n")
+
+    proposal = EditProposal(
+        proposal_id=f"{agent_name}-{today.isoformat()}-001",
+        target_agent=agent_name,
+        target_file="persona/SOUL.md",
+        target_section="Voice",
+        edit_type="addition",
+        confidence="high",
+        reversibility="high",
+        pattern_summary="hedge language pattern",
+        proposed_diff=" Direct.\n+- Never open with hedge language.\n",
+        rationale="r",
+        risks="r",
+        verification_plan="v",
+        operator_decision="accepted",
+    )
+
+    reports_dir = agent_root / "evals" / "tuning_reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    report_name = _make_report_with_proposals(reports_dir, agent_name, today, [proposal])
+
+    summary = apply_proposals(agents_root, agent_name, report_name)
+
+    # The key regression: applied must be > 0
+    assert summary["applied"] == 1, f"applied={summary['applied']}, skipped={summary['skipped_ids']}, failed={summary['failed_ids']}"
+    assert proposal.proposal_id in summary["applied_ids"]
+
+    # The file must actually be modified
+    new_content = soul_path.read_text()
+    assert "Never open with hedge language." in new_content
+    assert "Direct." in new_content  # original preserved
+
+
+def test_apply_does_not_write_on_dry_run(agent_with_data):
+    """dry_run=True must not modify any persona/memory files."""
+    agents_root, agent_name, today = agent_with_data
+    agent_root = agents_root / agent_name
+
+    soul_path = agent_root / "persona" / "SOUL.md"
+    soul_path.parent.mkdir(parents=True, exist_ok=True)
+    original_content = "## Voice\n\nOriginal.\n"
+    soul_path.write_text(original_content)
+
+    proposal = EditProposal(
+        proposal_id=f"{agent_name}-001",
+        target_agent=agent_name,
+        target_file="persona/SOUL.md",
+        target_section="Voice",
+        edit_type="addition",
+        confidence="high",
+        reversibility="high",
+        pattern_summary="p",
+        proposed_diff=" Original.\n+- New rule.\n",
+        rationale="r",
+        risks="r",
+        verification_plan="v",
+        operator_decision="accepted",
+    )
+
+    reports_dir = agent_root / "evals" / "tuning_reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    report_name = _make_report_with_proposals(reports_dir, agent_name, today, [proposal])
+
+    summary = apply_proposals(agents_root, agent_name, report_name, dry_run=True)
+
+    assert summary["dry_run"] is True
+    # File must NOT be modified
+    assert soul_path.read_text() == original_content
+    # History should still be written (dry_run records decisions)
+    history = agents_root / agent_name / "evals" / "tuning_history.jsonl"
+    assert history.exists()
+
+
+def test_apply_respects_write_path_enforcement(agent_with_data):
+    """Proposals targeting files outside tools.md write_paths must be blocked."""
+    agents_root, agent_name, today = agent_with_data
+    agent_root = agents_root / agent_name
+
+    # Write a tools.md that only allows writes to persona/
+    tools_path = agent_root / "tools.md"
+    persona_path = agent_root / "persona"
+    persona_path.mkdir(parents=True, exist_ok=True)
+    tools_path.write_text(
+        f"## Write paths\n\n- `{persona_path}`\n"
+    )
+
+    # Proposal targets memory/ which is NOT in write_paths
+    proposal = EditProposal(
+        proposal_id=f"{agent_name}-001",
+        target_agent=agent_name,
+        target_file="memory/some_note.md",
+        target_section="frontmatter",
+        edit_type="modification",
+        confidence="high",
+        reversibility="high",
+        pattern_summary="p",
+        proposed_diff="+pinned: true\n",
+        rationale="r",
+        risks="r",
+        verification_plan="v",
+        operator_decision="accepted",
+    )
+
+    reports_dir = agent_root / "evals" / "tuning_reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    report_name = _make_report_with_proposals(reports_dir, agent_name, today, [proposal])
+
+    summary = apply_proposals(agents_root, agent_name, report_name)
+
+    # Should be skipped (write_path violation), not applied
+    assert summary["applied"] == 0
+    assert summary["skipped"] == 1
+    assert proposal.proposal_id in summary["skipped_ids"]
+
+    # History should still record the decision
+    history = agents_root / agent_name / "evals" / "tuning_history.jsonl"
+    rec = json.loads(history.read_text().strip())
+    assert rec["applied"] is False
+    assert "write_path" in (rec.get("skip_reason") or "")
+
+
+def test_apply_skips_instructional_diffs(agent_with_data):
+    """Proposals with instructional (comment-heavy) diffs must be marked manual."""
+    agents_root, agent_name, today = agent_with_data
+    agent_root = agents_root / agent_name
+
+    proposal = EditProposal(
+        proposal_id=f"{agent_name}-001",
+        target_agent=agent_name,
+        target_file="persona/SOUL.md",
+        target_section="Voice",
+        edit_type="addition",
+        confidence="medium",
+        reversibility="medium",
+        pattern_summary="p",
+        proposed_diff=(
+            "# Step 1: append note body to persona/SOUL.md\n"
+            "# Step 2: mark note archived\n"
+            "# Step 3: update INDEX.md\n"
+            "+  superseded_by: persona/SOUL.md\n"
+        ),
+        rationale="r",
+        risks="r",
+        verification_plan="v",
+        operator_decision="accepted",
+    )
+
+    reports_dir = agent_root / "evals" / "tuning_reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    report_name = _make_report_with_proposals(reports_dir, agent_name, today, [proposal])
+
+    summary = apply_proposals(agents_root, agent_name, report_name)
+
+    assert summary["applied"] == 0
+    assert summary["skipped"] == 1
+    assert proposal.proposal_id in summary["skipped_ids"]
+
+
+def test_parse_report_proposals_extracts_diff(agent_with_data, tmp_path):
+    """parse_report_proposals must recover proposed_diff from the report body."""
+    agents_root, agent_name, today = agent_with_data
+    agent_root = agents_root / agent_name
+
+    proposal = EditProposal(
+        proposal_id=f"{agent_name}-diff-001",
+        target_agent=agent_name,
+        target_file="persona/SOUL.md",
+        target_section="Voice",
+        edit_type="addition",
+        confidence="high",
+        reversibility="high",
+        pattern_summary="p",
+        proposed_diff=" Direct.\n+- Never hedge.\n",
+        rationale="r",
+        risks="r",
+        verification_plan="v",
+        operator_decision="accepted",
+    )
+
+    body = render_report([proposal], agent_name, today, 60)
+    report_path = tmp_path / "report.md"
+    report_path.write_text(body)
+
+    parsed = parse_report_proposals(report_path)
+    assert len(parsed) == 1
+    assert "Never hedge." in parsed[0].proposed_diff
+
+
+def test_apply_history_records_applied_true_when_written(agent_with_data):
+    """tuning_history.jsonl must record applied=True when a file was actually written."""
+    agents_root, agent_name, today = agent_with_data
+    agent_root = agents_root / agent_name
+
+    soul_path = agent_root / "persona" / "SOUL.md"
+    soul_path.parent.mkdir(parents=True, exist_ok=True)
+    soul_path.write_text("## Voice\n\nDirect.\n")
+
+    proposal = EditProposal(
+        proposal_id=f"{agent_name}-{today.isoformat()}-001",
+        target_agent=agent_name,
+        target_file="persona/SOUL.md",
+        target_section="Voice",
+        edit_type="addition",
+        confidence="high",
+        reversibility="high",
+        pattern_summary="hedge language",
+        proposed_diff=" Direct.\n+- No hedge openers.\n",
+        rationale="r",
+        risks="r",
+        verification_plan="v",
+        operator_decision="accepted",
+    )
+
+    reports_dir = agent_root / "evals" / "tuning_reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    report_name = _make_report_with_proposals(reports_dir, agent_name, today, [proposal])
+    apply_proposals(agents_root, agent_name, report_name)
+
+    history_path = agents_root / agent_name / "evals" / "tuning_history.jsonl"
+    rec = json.loads(history_path.read_text().strip())
+    assert rec["applied"] is True
+    assert rec["diff_applied"] is not None

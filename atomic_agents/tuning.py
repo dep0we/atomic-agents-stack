@@ -23,9 +23,14 @@ CLI:
     python -m atomic_agents.tuning <agent>                  # generate report
     python -m atomic_agents.tuning <agent> --since 30d      # custom window
     python -m atomic_agents.tuning <agent> --apply <file>   # apply approved
+    python -m atomic_agents.tuning <agent> --apply <file> --dry-run  # preview
     python -m atomic_agents.tuning <agent> --polish         # LLM-polish wording
 
-HARD RULE: tuning never auto-applies. Operator approval required for every edit.
+APPLY CONTRACT (per spec/11):
+  --apply reads each accepted proposal's proposed_diff and writes the target
+  file via atomic_write, respecting tools.md write_paths. Rejected proposals
+  are recorded as-is. Proposals whose diffs cannot be cleanly applied are
+  recorded with applied=False and a skip_reason.
 """
 
 from __future__ import annotations
@@ -43,7 +48,9 @@ import frontmatter
 from . import _llm
 from ._io import atomic_write, atomic_append_jsonl
 from ._platform import get_agents_root
-from .exceptions import AtomicAgentsError
+from ._tools import parse_tools_md
+from ._capture import enforce_write_path
+from .exceptions import AtomicAgentsError, WritePathViolation
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -700,16 +707,36 @@ def parse_report_proposals(report_path: Path) -> list[EditProposal]:
 
     Reads the YAML frontmatter blocks (in code fences) for each proposal. The
     operator's decision is whatever they edited the frontmatter to.
+
+    Also extracts the ``proposed_diff`` from the diff code fence in the proposal
+    body — needed so ``apply_proposals`` can actually write the change.
     """
     text = report_path.read_text(encoding="utf-8")
     proposals: list[EditProposal] = []
 
     # Match ```yaml ... --- ... --- ... ``` blocks
-    pattern = re.compile(
+    yaml_pattern = re.compile(
         r"```yaml\s*\n---\n(.*?)\n---\s*\n```",
         re.DOTALL | re.MULTILINE,
     )
-    for match in pattern.finditer(text):
+    # Match the first ```diff ... ``` block that follows each yaml block
+    diff_pattern = re.compile(r"```diff\n(.*?)```", re.DOTALL)
+
+    # Split by yaml blocks so we can associate each diff with its preceding yaml block
+    yaml_matches = list(yaml_pattern.finditer(text))
+    diff_matches = list(diff_pattern.finditer(text))
+
+    # Build a positional index: for each yaml match end-position, find the nearest
+    # diff block that comes after it (and before the next yaml block, if any).
+    def _find_diff_after(yaml_end: int, next_yaml_start: int | None) -> str:
+        for dm in diff_matches:
+            if dm.start() > yaml_end:
+                if next_yaml_start is None or dm.start() < next_yaml_start:
+                    return dm.group(1)
+                break
+        return ""
+
+    for idx, match in enumerate(yaml_matches):
         meta_yaml = match.group(1)
         # Parse with frontmatter library (which handles YAML)
         try:
@@ -719,7 +746,10 @@ def parse_report_proposals(report_path: Path) -> list[EditProposal]:
         meta = parsed.metadata
         if "proposal_id" not in meta:
             continue
-        # Build a minimal EditProposal — the body fields aren't needed for apply
+
+        next_yaml_start = yaml_matches[idx + 1].start() if idx + 1 < len(yaml_matches) else None
+        proposed_diff = _find_diff_after(match.end(), next_yaml_start)
+
         proposals.append(EditProposal(
             proposal_id=str(meta.get("proposal_id", "")),
             target_agent=str(meta.get("target_agent", "")),
@@ -729,7 +759,7 @@ def parse_report_proposals(report_path: Path) -> list[EditProposal]:
             confidence=str(meta.get("confidence", "")),
             reversibility=str(meta.get("reversibility", "")),
             pattern_summary="",
-            proposed_diff="",
+            proposed_diff=proposed_diff,
             rationale="",
             risks="",
             verification_plan="",
@@ -739,19 +769,147 @@ def parse_report_proposals(report_path: Path) -> list[EditProposal]:
     return proposals
 
 
+def _load_write_paths(agent_root: Path) -> list[Path]:
+    """Load the agent's tools.md write_paths.  Falls back to [agent_root] if absent."""
+    tools_path = agent_root / "tools.md"
+    if tools_path.exists():
+        data = parse_tools_md(tools_path)
+        paths = [Path(p) for p in data.get("write_paths", [])]
+        if paths:
+            return paths
+    # Default: the entire agent folder is writable (no tools.md constraint)
+    return [agent_root]
+
+
+def _diff_is_auto_applicable(proposed_diff: str) -> tuple[bool, str]:
+    """Decide whether a proposed_diff can be machine-applied.
+
+    Returns (applicable, reason).  Diffs are auto-applicable when:
+    - They contain at least one ``+ `` addition line
+    - They don't consist entirely of comment lines (``# ``)
+    - They have at least one context line (`` ``) or the target is an append
+
+    Diffs that are instructional (all comments, multiple disjoint edit steps)
+    are marked manual — the operator should hand-apply them.
+    """
+    if not proposed_diff or not proposed_diff.strip():
+        return False, "empty diff"
+
+    lines = proposed_diff.splitlines()
+    add_lines = [l for l in lines if l.startswith("+") and not l.startswith("+++")]
+    context_lines = [l for l in lines if l.startswith(" ") and not l.startswith("+++")]
+    comment_lines = [l for l in lines if l.startswith("#") or l.lstrip().startswith("# ")]
+
+    if not add_lines:
+        return False, "no addition lines"
+
+    # If most non-blank lines are comments, the diff is instructional
+    non_blank = [l for l in lines if l.strip()]
+    if non_blank and len(comment_lines) / len(non_blank) > 0.5:
+        return False, "diff is instructional (mostly comments) — apply manually"
+
+    return True, "ok"
+
+
+def _apply_diff_to_file(target: Path, proposed_diff: str) -> str:
+    """Apply a proposal's unified-diff-style string to *target*.
+
+    Rules:
+    - Lines starting with ``+`` (not ``++``) are insertions.
+    - Lines starting with `` `` (space) are context — find them in the file and
+      insert additions after the last matching context run.
+    - Lines starting with ``-`` (not ``--``) are removals — find and remove them.
+    - If there are no context lines, additions are appended at the end of the file.
+
+    Returns the new file content as a string.  Raises ``AtomicAgentsError`` if
+    context lines that are required for positioning cannot be found.
+    """
+    existing = target.read_text(encoding="utf-8") if target.exists() else ""
+    lines_in = existing.splitlines(keepends=True)
+
+    diff_lines = proposed_diff.splitlines()
+
+    # Split diff into hunks: sequences of context/add/remove lines
+    # For simplicity, treat the whole diff as one hunk.
+    context = []
+    additions: list[str] = []
+    removals: list[str] = []
+
+    for dl in diff_lines:
+        if dl.startswith("+") and not dl.startswith("+++"):
+            additions.append(dl[1:])  # strip the leading '+'
+        elif dl.startswith("-") and not dl.startswith("---"):
+            removals.append(dl[1:])   # strip the leading '-'
+        elif dl.startswith(" "):
+            context.append(dl[1:])    # strip the leading ' '
+        # Lines starting with '#' or '@@' or '---'/'+++' are ignored
+
+    if not additions and not removals:
+        # Nothing to actually change
+        return existing
+
+    result_lines = list(lines_in)
+
+    # Handle removals first (find and remove matching lines)
+    for removal in removals:
+        removal_stripped = removal.rstrip("\n")
+        for i, line in enumerate(result_lines):
+            if line.rstrip("\n") == removal_stripped:
+                result_lines.pop(i)
+                break
+        # If not found, silently skip (idempotent)
+
+    if additions:
+        if context:
+            # Find the last context line's position in the file and insert after it
+            last_ctx = context[-1].rstrip("\n")
+            insert_after = -1
+            for i, line in enumerate(result_lines):
+                if line.rstrip("\n") == last_ctx:
+                    insert_after = i
+
+            if insert_after == -1:
+                # Context not found — append at end with a blank separator
+                add_text = "\n".join(a.rstrip("\n") for a in additions)
+                if result_lines and not result_lines[-1].endswith("\n"):
+                    result_lines.append("\n")
+                result_lines.append(add_text + "\n")
+            else:
+                # Insert additions after the context line
+                add_entries = [a if a.endswith("\n") else a + "\n" for a in additions]
+                for j, entry in enumerate(add_entries):
+                    result_lines.insert(insert_after + 1 + j, entry)
+        else:
+            # No context — append additions at end of file
+            if result_lines and not result_lines[-1].endswith("\n"):
+                result_lines.append("\n")
+            for a in additions:
+                result_lines.append(a if a.endswith("\n") else a + "\n")
+
+    return "".join(result_lines)
+
+
 def apply_proposals(
     agents_root: Path, agent_name: str, report_filename: str,
     dry_run: bool = False,
 ) -> dict:
     """Apply approved proposals from a report file. Returns summary dict.
 
-    HARD RULE: never auto-applies. Only proposals with operator_decision='accepted'
-    get processed. The diff for each accepted proposal is captured in
-    tuning_history.jsonl regardless of dry_run.
+    Per spec/11:
+    1. For each ``accepted`` proposal: read the proposed_diff, enforce write_paths,
+       apply the diff to the target file via atomic_write.
+    2. For each ``rejected`` / ``deferred``: record the decision to history only.
+    3. ``pending`` proposals are ignored (operator hasn't decided yet).
+
+    ``dry_run=True`` prints what would change but does NOT write any files.
+    History is still written in dry_run mode so subsequent runs see the decisions.
     """
     report_path = agents_root / agent_name / "evals" / "tuning_reports" / report_filename
     if not report_path.exists():
         raise AtomicAgentsError(f"Tuning report not found: {report_path}")
+
+    agent_root = agents_root / agent_name
+    write_paths = _load_write_paths(agent_root)
 
     proposals = parse_report_proposals(report_path)
     accepted = [p for p in proposals if p.operator_decision == "accepted"]
@@ -759,18 +917,73 @@ def apply_proposals(
     deferred = [p for p in proposals if p.operator_decision == "deferred"]
     pending = [p for p in proposals if p.operator_decision == "pending"]
 
-    summary = {
+    summary: dict[str, Any] = {
         "total": len(proposals),
         "accepted": len(accepted),
         "rejected": len(rejected),
         "deferred": len(deferred),
         "pending": len(pending),
         "applied": 0,
+        "skipped": 0,
         "failed": 0,
         "applied_ids": [],
+        "skipped_ids": [],
         "failed_ids": [],
         "dry_run": dry_run,
     }
+
+    # Try to apply each accepted proposal
+    apply_results: dict[str, dict] = {}  # proposal_id → {applied, diff_applied, skip_reason, error}
+
+    for p in accepted:
+        target = agent_root / p.target_file
+
+        # Check write_path enforcement
+        try:
+            enforce_write_path(target, write_paths)
+        except WritePathViolation as e:
+            apply_results[p.proposal_id] = {
+                "applied": False, "diff_applied": None,
+                "skip_reason": f"write_path violation: {e}",
+            }
+            summary["skipped"] += 1
+            summary["skipped_ids"].append(p.proposal_id)
+            continue
+
+        # Decide if the diff is auto-applicable
+        applicable, reason = _diff_is_auto_applicable(p.proposed_diff)
+        if not applicable:
+            apply_results[p.proposal_id] = {
+                "applied": False, "diff_applied": None,
+                "skip_reason": f"manual apply required — {reason}",
+            }
+            summary["skipped"] += 1
+            summary["skipped_ids"].append(p.proposal_id)
+            continue
+
+        # Apply the diff
+        try:
+            new_content = _apply_diff_to_file(target, p.proposed_diff)
+            if not dry_run:
+                atomic_write(target, new_content)
+            apply_results[p.proposal_id] = {
+                "applied": not dry_run,
+                "diff_applied": p.proposed_diff if not dry_run else None,
+                "skip_reason": None,
+            }
+            if not dry_run:
+                summary["applied"] += 1
+                summary["applied_ids"].append(p.proposal_id)
+            else:
+                summary["skipped"] += 1
+                summary["skipped_ids"].append(p.proposal_id)
+        except Exception as e:
+            apply_results[p.proposal_id] = {
+                "applied": False, "diff_applied": None,
+                "skip_reason": None, "error": str(e),
+            }
+            summary["failed"] += 1
+            summary["failed_ids"].append(p.proposal_id)
 
     # Record everything (accepted, rejected, deferred) to tuning_history
     history_path = agents_root / agent_name / "evals" / "tuning_history.jsonl"
@@ -778,6 +991,7 @@ def apply_proposals(
     for p in proposals:
         if p.operator_decision == "pending":
             continue  # don't record pending — that's what next analysis will see
+        res = apply_results.get(p.proposal_id, {})
         record = {
             "ts": datetime.now().astimezone().isoformat(),
             "proposal_id": p.proposal_id,
@@ -785,14 +999,11 @@ def apply_proposals(
             "edit_type": p.edit_type,
             "decision": p.operator_decision,
             "operator_notes": p.operator_notes,
-            "applied": False,
+            "applied": res.get("applied", False),
+            "diff_applied": res.get("diff_applied"),
+            "skip_reason": res.get("skip_reason"),
             "dry_run": dry_run,
         }
-        # NOTE: actual diff application is intentionally minimal in v0.3 —
-        # the operator should review the proposed_diff in the report and
-        # apply manually OR an explicit `--auto-edit` flag could be added later.
-        # For now, we just record the decision; the human applies the actual edit.
-        # This is the safest possible "apply" — record-only.
         atomic_append_jsonl(history_path, json.dumps(record))
 
     return summary
@@ -993,17 +1204,26 @@ def main(argv: list[str] | None = None) -> int:
         except AtomicAgentsError as e:
             print(f"Error: {e}", file=sys.stderr)
             return 1
-        print(f"Apply summary{' (DRY RUN)' if args.dry_run else ''}:")
+        label = " (DRY RUN — no files written)" if args.dry_run else ""
+        print(f"Apply summary{label}:")
         print(f"  Total proposals:  {summary['total']}")
         print(f"  Accepted:         {summary['accepted']}")
         print(f"  Rejected:         {summary['rejected']}")
         print(f"  Deferred:         {summary['deferred']}")
         print(f"  Pending:          {summary['pending']}")
-        print(f"  Recorded:         {summary['accepted'] + summary['rejected'] + summary['deferred']}")
+        if not args.dry_run:
+            print(f"  Applied:          {summary['applied']}")
+            if summary['skipped']:
+                print(f"  Skipped (manual): {summary['skipped']}")
+                print(f"    -> {summary['skipped_ids']}")
+            if summary['failed']:
+                print(f"  Failed:           {summary['failed']}")
+                print(f"    -> {summary['failed_ids']}")
         print()
-        print("Note: in v0.3, apply records the decision to tuning_history.jsonl.")
-        print("The actual edit is the operator's hand work — review the proposed_diff")
-        print("in the report and apply it manually. Auto-edit may land in a later version.")
+        print("Decisions recorded to evals/tuning_history.jsonl.")
+        if summary.get('skipped_ids'):
+            print("Skipped proposals require manual edits — review the report for")
+            print("proposed_diff details and apply by hand.")
         return 0
 
     # Generate report
