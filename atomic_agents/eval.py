@@ -80,6 +80,7 @@ class EvalResult:
     judge_raw: str = ""                  # full judge output, for debugging
     error: str = ""                      # populated on agent or judge failure
     timestamp: str = ""
+    setup_applied: bool = False          # True when test.setup was prepended to work item
 
 
 @dataclass
@@ -258,14 +259,44 @@ class EvalRunner:
 
         ts_str = datetime.now().astimezone().isoformat()
 
-        # 1. Run the agent against the test input
+        # 1. Build the work item — prepend setup context when present.
+        #
+        # Interpretation in force: **Option A — setup as agent context**.
+        #
+        # spec/08 describes the Setup section as prose describing vault state
+        # ("pinned notes, recent journal entries, balance sheet state").  It is
+        # NOT a structured directive block for automated vault mutation (that
+        # would be Option B, a larger design, flagged as out-of-scope for a P1
+        # fix).
+        #
+        # Option A: when test.setup is non-empty, we prepend it to the work item
+        # with a clear separator so the agent has the stated context available
+        # when forming its response.  This makes the test deterministic — the
+        # "vault state" is explicit in the prompt rather than assumed from
+        # whatever the live vault happens to contain.
+        #
+        # The separator is a horizontal rule + label so the agent can clearly
+        # distinguish setup context from the real user request.
+        if test.setup:
+            work_item = (
+                f"[EVAL SETUP CONTEXT — vault state assumed for this test]\n\n"
+                f"{test.setup}\n\n"
+                f"---\n\n"
+                f"{test.input}"
+            )
+            setup_applied = True
+        else:
+            work_item = test.input
+            setup_applied = False
+
+        # 1. Run the agent against the (possibly setup-prepended) work item
         agent = AtomicAgent(
             name=self.agent_name,
             trigger="eval",
             agents_root=self.agents_root,
         )
         try:
-            agent_response = agent.call(work_item=test.input, write_captures=False)
+            agent_response = agent.call(work_item=work_item, write_captures=False)
         except Exception as e:
             return EvalResult(
                 test_id=test.test_id, category=test.category,
@@ -275,6 +306,7 @@ class EvalRunner:
                 verdict="fail",
                 overall_justification=f"Agent crashed: {e}",
                 error=str(e), timestamp=ts_str,
+                setup_applied=setup_applied,
             )
 
         if agent_response.skipped:
@@ -286,6 +318,7 @@ class EvalRunner:
                 verdict="judge_error",
                 overall_justification=f"Agent run skipped: {agent_response.skip_reason}",
                 error=agent_response.skip_reason, timestamp=ts_str,
+                setup_applied=setup_applied,
             )
 
         # 2. Pick judge model + build prompt
@@ -300,6 +333,7 @@ class EvalRunner:
                 verdict="judge_error",
                 overall_justification=str(e),
                 error=str(e), timestamp=ts_str,
+                setup_applied=setup_applied,
             )
 
         judge_prompt = self._build_judge_prompt(test, agent_response.text)
@@ -326,6 +360,7 @@ class EvalRunner:
                 agent_output_tokens=agent_response.output_tokens,
                 agent_cost_usd=agent_response.cost_usd,
                 error=str(e), timestamp=ts_str,
+                setup_applied=setup_applied,
             )
 
         judge_cost = _costs.calc_cost(
@@ -369,6 +404,7 @@ class EvalRunner:
                     judge_cost_usd=judge_cost,
                     judge_raw=judge_response.text,
                     error=str(e2), timestamp=ts_str,
+                    setup_applied=setup_applied,
                 )
 
         # 5. Compute weighted score + verdict
@@ -406,6 +442,7 @@ class EvalRunner:
             judge_cost_usd=round(judge_cost, 6),
             judge_raw=judge_response.text,
             timestamp=ts_str,
+            setup_applied=setup_applied,
         )
 
     # ────────────────────────────────────────────────────────────
@@ -610,6 +647,7 @@ class EvalRunner:
             "verdict": result.verdict,
             "overall_justification": result.overall_justification,
             "factual_checks": result.factual_checks,
+            "setup_applied": result.setup_applied,
             "agent_response_path": response_path_rel,
             "agent_input_tokens": result.agent_input_tokens,
             "agent_output_tokens": result.agent_output_tokens,
