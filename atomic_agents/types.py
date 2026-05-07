@@ -1,0 +1,100 @@
+"""Shared dataclasses for the atomic_agents package."""
+
+from __future__ import annotations
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any
+
+
+@dataclass
+class AgentConfig:
+    """Loaded from model.md + tools.md at agent init."""
+
+    # From model.md
+    default_model: str
+    fallback_model: str | None
+    max_input_tokens: int = 12_000
+    max_output_tokens: int = 4_000
+    temperature: float = 0.6
+
+    # cost_guardrails block from model.md
+    cost_guardrails_enabled: bool = False
+    daily_cap_usd: float = 0.0
+    monthly_cap_usd: float = 0.0
+    daily_cap_action: str = "skip"      # skip | fallback | alert
+    monthly_cap_action: str = "alert"
+    warning_thresholds: list[float] = field(default_factory=lambda: [0.50, 0.80])
+    alert_channel: str = "log_only"     # telegram | email | journal | log_only
+
+    # From tools.md (parsed)
+    read_paths: list[Path] = field(default_factory=list)
+    write_paths: list[Path] = field(default_factory=list)
+    external_apis: list[str] = field(default_factory=list)
+    hard_nos: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CostCheckResult:
+    allow: bool
+    action: str | None = None         # 'skip' | 'fallback' | 'alert' | None
+    reason: str = ""
+    fallback_model: str | None = None
+
+
+@dataclass
+class Capture:
+    """One atomic note to be written, parsed from a capture marker."""
+    type: str                          # user | feedback | project | decision | reference
+    name: str
+    description: str
+    confidence: str                    # high | medium | low
+    sources: list[str]
+    body: str
+    supersedes: str | None = None
+    merge_into: str | None = None
+    pinned: bool = False
+    expires_at: str | None = None
+    tags: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Response:
+    """Result of an LLM call via AtomicAgent.call()."""
+    text: str
+    model: str                         # the model actually used (may differ if fallback)
+    input_tokens: int
+    output_tokens: int
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
+    cost_usd: float = 0.0
+    latency_ms: int = 0
+    summary: str = ""
+    raw: dict[str, Any] = field(default_factory=dict)
+    captures: list[Capture] = field(default_factory=list)
+    skipped: bool = False              # True if cost guardrail blocked the call
+    skip_reason: str = ""
+
+    @classmethod
+    def skipped_response(cls, reason: str, model: str) -> "Response":
+        """Build a Response that represents a skipped (guardrailed) call."""
+        return cls(
+            text="",
+            model=model,
+            input_tokens=0,
+            output_tokens=0,
+            skipped=True,
+            skip_reason=reason,
+            summary=f"skipped: {reason}",
+        )
+
+
+@dataclass
+class HelperResult:
+    """One helper_call result (returned to the parent agent)."""
+    text: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+    latency_ms: int

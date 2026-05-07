@@ -1,0 +1,50 @@
+"""Custom exceptions for the atomic_agents package."""
+
+
+class AtomicAgentsError(Exception):
+    """Base for all atomic_agents exceptions."""
+
+
+class SchemaValidationError(AtomicAgentsError):
+    """Frontmatter or capture failed validation per spec/03."""
+
+
+class WritePathViolation(AtomicAgentsError):
+    """Attempted write outside the agent's tools.md write paths."""
+
+
+class AgentLockBusy(AtomicAgentsError):
+    """Could not acquire the agent's lock — another process holds it."""
+
+
+class CostGuardrailBlocked(AtomicAgentsError):
+    """Call blocked because the agent's daily/monthly cap was hit."""
+
+
+class HelperBatchPartialFailure(AtomicAgentsError):
+    """Some calls in helper_call_parallel succeeded; some failed.
+
+    Attributes:
+        failures: list of (index, exception) tuples
+        partial_results: list of results, with exceptions in failed slots
+    """
+
+    def __init__(self, failures, partial_results):
+        self.failures = failures
+        self.partial_results = partial_results
+        super().__init__(
+            f"helper_call_parallel had {len(failures)} failures out of "
+            f"{len(partial_results)} calls"
+        )
+
+
+class NoJudgeAvailable(AtomicAgentsError):
+    """No judge model is reachable — check API keys."""
+
+
+class CaptureParseError(AtomicAgentsError):
+    """Could not parse a capture marker from agent response."""
+
+
+class GoalCorrupted(AtomicAgentsError):
+    """goal.md is missing required fields or invalid."""

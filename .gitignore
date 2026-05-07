@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# uv
+.uv/
+uv.lock
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Secrets / local config (never commit)
+.env
+.env.local
+*.local
+~/.config/atomic_agents/
+keys.json
+
+# Operator-specific (never commit — operator's actual agent vault)
+agents/
+_dashboard/
+
+# Atomic Agents runtime artifacts (never commit anyone's actual data)
+**/log/*.jsonl
+**/journal/**/*.md
+**/.cost-warnings.json
+**/.lock

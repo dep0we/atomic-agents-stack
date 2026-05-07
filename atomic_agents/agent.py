@@ -1,0 +1,575 @@
+"""AtomicAgent class — the main runtime per spec/04.
+
+Loads persona/tools/model/memory/journal in canonical order, calls the LLM,
+extracts captures, writes them helper-mediated, logs the run.
+
+Usage:
+
+    from atomic_agents import AtomicAgent
+
+    agent = AtomicAgent(name="caldwell", trigger="cron")
+    response = agent.call(work_item="Daily morning brief")
+    print(response.text)
+"""
+
+from __future__ import annotations
+import concurrent.futures
+import json
+import time
+from dataclasses import asdict
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any
+
+import frontmatter
+
+from . import _capture, _costs, _llm, _model, _tools
+from ._io import atomic_append_jsonl, atomic_write
+from ._locks import AgentLock
+from ._platform import get_agents_root
+from ._schema import validate_atomic_note_frontmatter
+from .exceptions import (
+    AgentLockBusy,
+    AtomicAgentsError,
+    CostGuardrailBlocked,
+    HelperBatchPartialFailure,
+)
+from .types import (
+    AgentConfig,
+    Capture,
+    CostCheckResult,
+    HelperResult,
+    Response,
+)
+
+
+PINNED_MAX = 5
+RECENT_NOTES_DEFAULT = 5
+RECENT_JOURNAL_DEFAULT = 1
+
+
+class AtomicAgent:
+    """The main agent runtime.
+
+    Responsible for:
+    - Loading agent files in canonical order (per spec/04)
+    - Calling the LLM with cost-guardrail enforcement
+    - Extracting and writing captures (helper-mediated, atomic)
+    - Logging every run to log/YYYY-MM/YYYY-MM-DD.jsonl
+    - Helper calls (sequential and parallel) per spec/10
+    """
+
+    def __init__(
+        self,
+        name: str,
+        trigger: str = "manual",
+        agents_root: Path | None = None,
+        run_id: str | None = None,
+    ):
+        self.name = name
+        self.trigger = trigger
+        self.agents_root = agents_root or get_agents_root()
+        self.agent_root = self.agents_root / name
+        self.run_id = run_id or self._generate_run_id()
+
+        if not self.agent_root.exists():
+            raise AtomicAgentsError(
+                f"Agent folder not found: {self.agent_root}. "
+                f"Set ATOMIC_AGENTS_ROOT env var or create the agent."
+            )
+
+        # Loaded later via load() — populated in __init__ for clarity
+        self._persona_text: str = ""
+        self._tools_text: str = ""
+        self._memory_index_text: str = ""
+        self._wiki_index_text: str = ""
+        self._pinned_notes: list[str] = []
+        self._recent_notes: list[str] = []
+        self._recent_journal: list[str] = []
+
+        # Parse config files
+        self.config = self._load_config()
+
+    @staticmethod
+    def _generate_run_id() -> str:
+        return f"run-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
+
+    # ────────────────────────────────────────────────────────────
+    # Config loading
+
+    def _load_config(self) -> AgentConfig:
+        model_data = _model.parse_model_md(self.agent_root / "model.md")
+        tools_data = _tools.parse_tools_md(self.agent_root / "tools.md")
+
+        return AgentConfig(
+            default_model=model_data["default_model"],
+            fallback_model=model_data["fallback_model"],
+            max_input_tokens=model_data["max_input_tokens"],
+            max_output_tokens=model_data["max_output_tokens"],
+            cost_guardrails_enabled=model_data["cost_guardrails_enabled"],
+            daily_cap_usd=model_data["daily_cap_usd"],
+            monthly_cap_usd=model_data["monthly_cap_usd"],
+            daily_cap_action=model_data["daily_cap_action"],
+            monthly_cap_action=model_data["monthly_cap_action"],
+            warning_thresholds=model_data["warning_thresholds"],
+            alert_channel=model_data["alert_channel"],
+            read_paths=tools_data["read_paths"],
+            write_paths=tools_data["write_paths"],
+            external_apis=tools_data["external_apis"],
+            hard_nos=tools_data["hard_nos"],
+        )
+
+    # ────────────────────────────────────────────────────────────
+    # File loaders (per spec/04 canonical order)
+
+    def load(self) -> None:
+        """Load all the agent's files for this run. Idempotent."""
+        self._load_persona()
+        self._load_tools_text()
+        self._load_indexes()
+        self._load_pinned_notes()
+        self._load_recent_notes(n=RECENT_NOTES_DEFAULT)
+        self._load_recent_journal(n=RECENT_JOURNAL_DEFAULT)
+
+    def _load_persona(self) -> None:
+        parts = []
+        for filename in ("IDENTITY.md", "SOUL.md", "USER.md"):
+            path = self.agent_root / "persona" / filename
+            if path.exists():
+                parts.append(f"# {filename}\n\n" + path.read_text(encoding="utf-8").strip())
+        self._persona_text = "\n\n".join(parts)
+
+    def _load_tools_text(self) -> None:
+        path = self.agent_root / "tools.md"
+        if path.exists():
+            self._tools_text = path.read_text(encoding="utf-8")
+        else:
+            self._tools_text = ""
+
+    def _load_indexes(self) -> None:
+        memory_index = self.agent_root / "memory" / "INDEX.md"
+        if memory_index.exists():
+            self._memory_index_text = memory_index.read_text(encoding="utf-8")
+        wiki_index = self.agent_root / "wiki" / "INDEX.md"
+        if wiki_index.exists():
+            self._wiki_index_text = wiki_index.read_text(encoding="utf-8")
+
+    def _load_pinned_notes(self) -> None:
+        memory_dir = self.agent_root / "memory"
+        if not memory_dir.exists():
+            return
+        pinned = []
+        for path in sorted(memory_dir.glob("*.md")):
+            if path.name == "INDEX.md":
+                continue
+            try:
+                parsed = frontmatter.load(path)
+                if parsed.metadata.get("pinned") is True:
+                    pinned.append(self._render_note_for_context(path, parsed))
+            except Exception:
+                continue
+        self._pinned_notes = pinned[:PINNED_MAX]
+
+    def _load_recent_notes(self, n: int = RECENT_NOTES_DEFAULT) -> None:
+        memory_dir = self.agent_root / "memory"
+        if not memory_dir.exists():
+            return
+        notes_with_dates = []
+        for path in memory_dir.glob("*.md"):
+            if path.name == "INDEX.md":
+                continue
+            try:
+                parsed = frontmatter.load(path)
+                # Skip pinned (already loaded) and archived
+                if parsed.metadata.get("pinned"):
+                    continue
+                if parsed.metadata.get("archived"):
+                    continue
+                if parsed.metadata.get("superseded_by"):
+                    continue
+                last_seen = parsed.metadata.get("last_seen", "0000-00-00")
+                notes_with_dates.append((str(last_seen), path, parsed))
+            except Exception:
+                continue
+        notes_with_dates.sort(reverse=True)
+        self._recent_notes = [
+            self._render_note_for_context(path, parsed)
+            for _, path, parsed in notes_with_dates[:n]
+        ]
+
+    def _load_recent_journal(self, n: int = RECENT_JOURNAL_DEFAULT) -> None:
+        journal_dir = self.agent_root / "journal"
+        if not journal_dir.exists():
+            return
+        entries = sorted(journal_dir.rglob("*.md"), reverse=True)[:n]
+        self._recent_journal = [
+            f"# Journal — {p.stem}\n\n" + p.read_text(encoding="utf-8")
+            for p in entries
+        ]
+
+    @staticmethod
+    def _render_note_for_context(path: Path, parsed: frontmatter.Post) -> str:
+        """Format an atomic note for inclusion in the system prompt."""
+        meta_summary = (
+            f"name: {parsed.metadata.get('name', 'unnamed')}\n"
+            f"type: {parsed.metadata.get('type', '?')}\n"
+            f"confidence: {parsed.metadata.get('confidence', '?')}\n"
+            f"last_seen: {parsed.metadata.get('last_seen', '?')}"
+        )
+        return f"# {path.name}\n\n{meta_summary}\n\n{parsed.content}"
+
+    # ────────────────────────────────────────────────────────────
+    # System prompt assembly
+
+    def assemble_system_prompt(self) -> str:
+        """Per spec/04 canonical load order. Returns the full system prompt."""
+        sections = []
+        if self._persona_text:
+            sections.append(self._persona_text)
+        if self._tools_text:
+            sections.append("# tools.md\n\n" + self._tools_text)
+        if self._memory_index_text:
+            sections.append("# memory/INDEX.md\n\n" + self._memory_index_text)
+        if self._wiki_index_text:
+            sections.append("# wiki/INDEX.md\n\n" + self._wiki_index_text)
+        if self._pinned_notes:
+            sections.append("# Pinned atomic notes\n\n" + "\n\n---\n\n".join(self._pinned_notes))
+        if self._recent_notes:
+            sections.append("# Recent atomic notes\n\n" + "\n\n---\n\n".join(self._recent_notes))
+        if self._recent_journal:
+            sections.append("# Recent journal\n\n" + "\n\n---\n\n".join(self._recent_journal))
+        return "\n\n═══════════════════════════\n\n".join(sections)
+
+    # ────────────────────────────────────────────────────────────
+    # The main call
+
+    def call(
+        self,
+        work_item: str,
+        model_override: str | None = None,
+        critical: bool = False,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        write_captures: bool = True,
+    ) -> Response:
+        """Make the LLM call. Returns a Response with captures populated.
+
+        critical=True bypasses cost guardrails (still logged with critical: true).
+        write_captures=False extracts but doesn't persist captures (dry-run mode).
+        """
+        # Lazy load if not already
+        if not self._persona_text:
+            self.load()
+
+        # Acquire agent lock
+        try:
+            lock = AgentLock(self.agent_root, wait_seconds=30 if self.trigger == "skill" else 0)
+            lock.acquire()
+        except AgentLockBusy as e:
+            self._log({
+                "trigger": self.trigger,
+                "model": self.config.default_model,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "status": "lock_busy",
+                "summary": str(e),
+            })
+            raise
+
+        try:
+            # Cost guardrails check
+            check = self._check_cost_guardrails(critical=critical)
+            if not check.allow:
+                self._log({
+                    "trigger": self.trigger,
+                    "model": self.config.default_model,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "status": "skipped",
+                    "summary": f"Skipped: {check.reason}",
+                })
+                return Response.skipped_response(check.reason, self.config.default_model)
+
+            # Pick model — fallback if guardrail says so, else override, else default
+            if check.action == "fallback" and check.fallback_model:
+                model = check.fallback_model
+            else:
+                model = model_override or self.config.default_model
+
+            # Build prompt
+            system_prompt = self.assemble_system_prompt()
+            messages = [{"role": "user", "content": work_item}]
+
+            # Call LLM
+            start = time.time()
+            raw = _llm.call_llm(
+                model=model,
+                system_prompt=system_prompt,
+                messages=messages,
+                max_tokens=max_tokens or self.config.max_output_tokens,
+                temperature=temperature if temperature is not None else 0.6,
+                cache_control_breakpoints=[len(system_prompt)],
+            )
+            latency_ms = int((time.time() - start) * 1000)
+
+            cost = _costs.calc_cost(
+                model, raw.input_tokens, raw.output_tokens, raw.cache_hit_tokens
+            )
+
+            # Extract captures
+            captures, parse_failures = _capture.extract_captures(raw.text)
+
+            # Write captures if enabled
+            written_captures = []
+            if write_captures and captures:
+                for c in captures:
+                    try:
+                        path = _capture.write_atomic_note(
+                            self.agent_root, c, self.config.write_paths
+                        )
+                        written_captures.append(c)
+                    except Exception as e:
+                        # Log capture write failure but don't fail the whole call
+                        self._log({
+                            "trigger": "capture_write_error",
+                            "parent_run_id": self.run_id,
+                            "model": "n/a",
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "status": "error",
+                            "summary": f"capture write failed for {c.name}: {e}",
+                        })
+
+            # Build response
+            response = Response(
+                text=raw.text,
+                model=model,
+                input_tokens=raw.input_tokens,
+                output_tokens=raw.output_tokens,
+                cache_hit_tokens=raw.cache_hit_tokens,
+                cache_miss_tokens=raw.cache_miss_tokens,
+                cost_usd=cost,
+                latency_ms=latency_ms,
+                summary=self._derive_summary(work_item),
+                raw=raw.raw or {},
+                captures=written_captures,
+            )
+
+            # Log
+            log_record: dict = {
+                "trigger": self.trigger,
+                "model": model,
+                "input_tokens": raw.input_tokens,
+                "output_tokens": raw.output_tokens,
+                "cache_hit_tokens": raw.cache_hit_tokens,
+                "cache_miss_tokens": raw.cache_miss_tokens,
+                "cost_usd": cost,
+                "latency_ms": latency_ms,
+                "status": "ok",
+                "summary": response.summary,
+                "run_id": self.run_id,
+            }
+            if check.action == "fallback":
+                log_record["fallback"] = True
+            if critical:
+                log_record["critical"] = True
+            if parse_failures:
+                log_record["capture_parse_failures"] = len(parse_failures)
+            self._log(log_record)
+
+            return response
+
+        finally:
+            lock.release()
+
+    # ────────────────────────────────────────────────────────────
+    # Helpers (Patterns A + B per spec/10)
+
+    def helper_call(
+        self,
+        prompt: str,
+        model: str = "claude-haiku-4-5-20251001",
+        max_tokens: int = 1024,
+        temperature: float = 0.3,
+        summary: str = "",
+    ) -> HelperResult:
+        """One sequential helper call. Bound by parent's cost guardrails.
+
+        Returns HelperResult with text + cost + token counts.
+        """
+        # Inherit parent's guardrails — block if cap hit
+        check = self._check_cost_guardrails(critical=False)
+        if not check.allow:
+            raise CostGuardrailBlocked(
+                f"Helper call blocked: {check.reason}"
+            )
+
+        actual_model = check.fallback_model if check.action == "fallback" else model
+
+        start = time.time()
+        raw = _llm.call_llm(
+            model=actual_model,
+            system_prompt="",  # helpers don't load full persona
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        latency_ms = int((time.time() - start) * 1000)
+        cost = _costs.calc_cost(actual_model, raw.input_tokens, raw.output_tokens)
+
+        self._log({
+            "trigger": "helper",
+            "parent_agent": self.name,
+            "parent_run_id": self.run_id,
+            "model": actual_model,
+            "input_tokens": raw.input_tokens,
+            "output_tokens": raw.output_tokens,
+            "cost_usd": cost,
+            "latency_ms": latency_ms,
+            "status": "ok",
+            "summary": summary or "helper call",
+        })
+
+        return HelperResult(
+            text=raw.text,
+            model=actual_model,
+            input_tokens=raw.input_tokens,
+            output_tokens=raw.output_tokens,
+            cost_usd=cost,
+            latency_ms=latency_ms,
+        )
+
+    def helper_call_parallel(
+        self,
+        prompts: list[str],
+        model: str = "claude-haiku-4-5-20251001",
+        max_tokens: int = 1024,
+        temperature: float = 0.3,
+        max_concurrent: int = 5,
+        summary_template: str = "helper call {idx} of {total}",
+    ) -> list[HelperResult]:
+        """Parallel helper calls. Pre-checks guardrails ONCE; if cap hit, refuses the batch."""
+        check = self._check_cost_guardrails(critical=False)
+        if not check.allow:
+            raise CostGuardrailBlocked(
+                f"Parallel helper batch blocked: {check.reason}"
+            )
+
+        total = len(prompts)
+        results: list[Any] = [None] * total  # list[HelperResult | Exception]
+
+        def call_one(idx: int, prompt: str):
+            return idx, self.helper_call(
+                prompt=prompt,
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                summary=summary_template.format(idx=idx + 1, total=total),
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent) as pool:
+            futures = {pool.submit(call_one, i, p): i for i, p in enumerate(prompts)}
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    idx, helper_result = future.result()
+                    results[idx] = helper_result
+                except Exception as e:
+                    idx = futures[future]
+                    results[idx] = e
+
+        failures = [(i, r) for i, r in enumerate(results) if isinstance(r, Exception)]
+        if failures:
+            raise HelperBatchPartialFailure(failures, results)
+
+        return results  # type: ignore
+
+    # ────────────────────────────────────────────────────────────
+    # Cost guardrails
+
+    def _check_cost_guardrails(self, critical: bool = False) -> CostCheckResult:
+        """Run before each LLM call. Returns CostCheckResult."""
+        if not self.config.cost_guardrails_enabled:
+            return CostCheckResult(allow=True)
+
+        if critical:
+            return CostCheckResult(allow=True, reason="critical_override")
+
+        log_dir = self.agent_root / "log"
+        today_cost = _costs.sum_cost_for_period(log_dir, "today")
+        month_cost = _costs.sum_cost_for_period(log_dir, "this_month")
+
+        daily_pct = (today_cost / self.config.daily_cap_usd) if self.config.daily_cap_usd > 0 else 0
+        monthly_pct = (month_cost / self.config.monthly_cap_usd) if self.config.monthly_cap_usd > 0 else 0
+
+        # Fire warnings (idempotent — won't fire twice for same threshold/day)
+        self._maybe_fire_warning("daily", daily_pct)
+        self._maybe_fire_warning("monthly", monthly_pct)
+
+        if daily_pct >= 1.0:
+            return self._cap_action(
+                self.config.daily_cap_action,
+                f"daily cap hit (${today_cost:.2f}/${self.config.daily_cap_usd:.2f})",
+            )
+        if monthly_pct >= 1.0:
+            return self._cap_action(
+                self.config.monthly_cap_action,
+                f"monthly cap hit (${month_cost:.2f}/${self.config.monthly_cap_usd:.2f})",
+            )
+
+        return CostCheckResult(allow=True)
+
+    def _maybe_fire_warning(self, period: str, pct: float) -> None:
+        state_path = self.agent_root / ".cost-warnings.json"
+        state = _costs.load_warning_state(state_path)
+        today_key = date.today().isoformat() if period == "daily" else date.today().strftime("%Y-%m")
+
+        for threshold in self.config.warning_thresholds:
+            already = state.get(period, {}).get(today_key, {}).get(str(threshold), False)
+            if pct >= threshold and not already:
+                # Fire (just log to journal/log for v1; future: telegram/email)
+                severity = "WARN" if threshold >= 0.80 else "INFO"
+                self._log({
+                    "trigger": "cost_warning",
+                    "model": "n/a",
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "status": "ok",
+                    "summary": f"{severity}: {period} cost at {pct*100:.0f}% of cap (threshold {threshold*100:.0f}%)",
+                })
+                state.setdefault(period, {}).setdefault(today_key, {})[str(threshold)] = True
+
+        _costs.save_warning_state(state_path, state)
+
+    def _cap_action(self, action: str, reason: str) -> CostCheckResult:
+        if action == "skip":
+            return CostCheckResult(allow=False, action="skip", reason=reason)
+        if action == "fallback":
+            return CostCheckResult(
+                allow=True, action="fallback", reason=reason,
+                fallback_model=self.config.fallback_model,
+            )
+        if action == "alert":
+            return CostCheckResult(allow=True, action="alert", reason=reason)
+        raise ValueError(f"unknown cap action: {action}")
+
+    # ────────────────────────────────────────────────────────────
+    # Logging
+
+    def _log(self, record: dict) -> None:
+        """Append one JSONL line to log/YYYY-MM/YYYY-MM-DD.jsonl."""
+        record = {"ts": datetime.now().astimezone().isoformat(), **record}
+        today = date.today()
+        log_path = self.agent_root / "log" / today.strftime("%Y-%m") / f"{today.isoformat()}.jsonl"
+        atomic_append_jsonl(log_path, json.dumps(record))
+
+    def _derive_summary(self, work_item: str) -> str:
+        """Short summary of the work item for log records."""
+        if len(work_item) <= 80:
+            return work_item.strip()
+        return work_item[:77].strip() + "..."
+
+    # ────────────────────────────────────────────────────────────
+    # Convenience
+
+    def __repr__(self):
+        return f"AtomicAgent(name={self.name!r}, trigger={self.trigger!r}, root={self.agent_root})"
