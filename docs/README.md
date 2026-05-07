@@ -114,8 +114,6 @@ The spec docs are numbered for reading order. The samples are populated with rea
 | Path 1 tool-call captures | ✅ `atomic_agents._capture` |
 | Multi-agent project cascade loader | ✅ `atomic_agents._cascade` |
 | Cost dashboard module | ✅ `atomic_agents.dashboard` |
-| Bishop adaptation plan | 🔜 next, separate doc |
-| First non-Bishop Atomic Agent built | ❌ not yet |
 
 ## Portability note
 
