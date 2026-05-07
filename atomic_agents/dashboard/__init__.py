@@ -8,12 +8,13 @@ Quick use:
     from pathlib import Path
 
     render_all(Path.home() / "agents")
-    # → writes <agents_root>/_dashboard/index.html + per-agent dashboards
+    # → writes <agents_root>/_dashboard/index.html + activity/quality/memory/goals
 
 CLI:
 
     python -m atomic_agents.dashboard render
-    python -m atomic_agents.dashboard serve   # optional Flask server
+    python -m atomic_agents.dashboard render --tab activity
+    python -m atomic_agents.dashboard serve   # optional local server
 
 Reads each agent's `log/YYYY-MM/*.jsonl` files, aggregates by
 (agent, model, day, month), and renders self-contained HTML.
@@ -33,6 +34,10 @@ from .costs import (
     helper_savings,
 )
 from .render import render_all, render_global, render_agent
+from .activity import aggregate_activity, render_activity
+from .quality import aggregate_quality, render_quality
+from .memory import aggregate_memory, render_memory
+from .goals import aggregate_goals, render_goals, has_any_goal
 
 __all__ = [
     "RunRecord",
@@ -47,4 +52,13 @@ __all__ = [
     "render_all",
     "render_global",
     "render_agent",
+    "aggregate_activity",
+    "render_activity",
+    "aggregate_quality",
+    "render_quality",
+    "aggregate_memory",
+    "render_memory",
+    "aggregate_goals",
+    "render_goals",
+    "has_any_goal",
 ]
