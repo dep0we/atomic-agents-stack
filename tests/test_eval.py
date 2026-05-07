@@ -310,8 +310,9 @@ def test_compute_weighted_score_basic(agent_vault):
         "output_quality": {"score": 4, "justification": "y"},
     }
     # 50% × 5 + 50% × 4 = 4.5
-    weighted = runner._compute_weighted_score(scores)
+    weighted, clamped = runner._compute_weighted_score(scores)
     assert weighted == 4.5
+    assert clamped == []
 
 
 def test_compute_weighted_score_handles_missing_dimensions(agent_vault):
@@ -319,14 +320,17 @@ def test_compute_weighted_score_handles_missing_dimensions(agent_vault):
     runner = EvalRunner(agents_root, agent_name)
     scores = {"persona_fidelity": {"score": 5}}  # output_quality missing
     # Only persona_fidelity contributes (weight 50%) → 5.0 (since weight_sum is also 50)
-    weighted = runner._compute_weighted_score(scores)
+    weighted, clamped = runner._compute_weighted_score(scores)
     assert weighted == 5.0
+    assert clamped == []
 
 
 def test_compute_weighted_score_zero_when_no_scores(agent_vault):
     agents_root, agent_name = agent_vault
     runner = EvalRunner(agents_root, agent_name)
-    assert runner._compute_weighted_score({}) == 0.0
+    weighted, clamped = runner._compute_weighted_score({})
+    assert weighted == 0.0
+    assert clamped == []
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -698,3 +702,134 @@ def test_provider_available_no_key_returns_false(monkeypatch, tmp_path):
     monkeypatch.setattr(subprocess, "run", mock_run)
 
     assert _provider_available("claude-opus-4-7-20260101") is False
+
+
+# ──────────────────────────────────────────────────────────────────
+# P2 regression tests: judge score validation + clamping (#10)
+
+def test_judge_score_above_range_clamped_to_5(agent_vault):
+    """Judge returns score 10 (above max 5) — weighted score must use 5, not 10."""
+    agents_root, agent_name = agent_vault
+    runner = EvalRunner(agents_root, agent_name)
+    scores = {
+        "persona_fidelity": {"score": 10, "justification": "judge hallucinated scale"},
+        "output_quality": {"score": 4, "justification": "normal"},
+    }
+    weighted, clamped = runner._compute_weighted_score(scores)
+    # Clamped: persona_fidelity → 5; 50% × 5 + 50% × 4 = 4.5
+    assert weighted == 4.5
+    # Clamped record must be present for persona_fidelity
+    assert len(clamped) == 1
+    assert clamped[0]["dimension"] == "persona_fidelity"
+    assert clamped[0]["raw"] == 10
+    assert clamped[0]["clamped"] == 5.0
+
+
+def test_judge_score_below_range_clamped_to_1(agent_vault):
+    """Judge returns score 0 (below min 1) — weighted score must use 1, not 0."""
+    agents_root, agent_name = agent_vault
+    runner = EvalRunner(agents_root, agent_name)
+    scores = {
+        "persona_fidelity": {"score": 0, "justification": "judge returned zero"},
+        "output_quality": {"score": 3, "justification": "normal"},
+    }
+    weighted, clamped = runner._compute_weighted_score(scores)
+    # Clamped: persona_fidelity → 1; 50% × 1 + 50% × 3 = 2.0
+    assert weighted == 2.0
+    assert len(clamped) == 1
+    assert clamped[0]["dimension"] == "persona_fidelity"
+    assert clamped[0]["raw"] == 0
+    assert clamped[0]["clamped"] == 1.0
+
+
+def test_judge_score_string_coerced_or_skipped(agent_vault):
+    """Judge returns score as string "5" — must coerce to float 5.0 without exception."""
+    agents_root, agent_name = agent_vault
+    runner = EvalRunner(agents_root, agent_name)
+    scores = {
+        "persona_fidelity": {"score": "5", "justification": "string value"},
+        "output_quality": {"score": 4, "justification": "normal"},
+    }
+    # Must not raise; "5" coerces to 5.0, which is on the boundary (valid)
+    weighted, clamped = runner._compute_weighted_score(scores)
+    # 50% × 5 + 50% × 4 = 4.5; "5" is within range so no clamped record
+    assert weighted == 4.5
+    assert clamped == []
+
+
+def test_judge_score_invalid_type_skipped_with_clamped_record(agent_vault):
+    """Judge returns non-numeric score "abc" — dimension skipped, clamped_scores records it."""
+    agents_root, agent_name = agent_vault
+    runner = EvalRunner(agents_root, agent_name)
+    scores = {
+        "persona_fidelity": {"score": "abc", "justification": "malformed"},
+        "output_quality": {"score": 4, "justification": "normal"},
+    }
+    weighted, clamped = runner._compute_weighted_score(scores)
+    # persona_fidelity skipped; only output_quality (weight 50) contributes → 4.0
+    assert weighted == 4.0
+    # Non-numeric value captured in clamped_scores with clamped=None
+    assert len(clamped) == 1
+    assert clamped[0]["dimension"] == "persona_fidelity"
+    assert clamped[0]["raw"] == "abc"
+    assert clamped[0]["clamped"] is None
+
+
+def test_eval_result_clamped_scores_field():
+    """EvalResult must have a clamped_scores field initialized to empty list."""
+    from atomic_agents.eval import EvalResult
+    result = EvalResult(
+        test_id="t1",
+        category="happy",
+        agent_model="claude-sonnet-4-6-20260101",
+        judge_model="gpt-5",
+        scores={},
+        score_justifications={},
+        weighted_score=0.0,
+        hard_fails=[],
+        verdict="judge_error",
+        overall_justification="",
+    )
+    assert hasattr(result, "clamped_scores")
+    assert result.clamped_scores == []
+
+
+# ──────────────────────────────────────────────────────────────────
+# P2 regression tests: factual accuracy rounding mode (#11)
+
+def test_factual_accuracy_half_score_rounding():
+    """2.5 raw score → 2 under banker's rounding (not 3).
+
+    This test documents the rounding mode in force. If spec/08 or spec/13 ever
+    mandates "round half up", this assertion should change to == 3 and the
+    compute_factual_accuracy_from_checks docstring should be updated to match.
+    """
+    from atomic_agents.eval import compute_factual_accuracy_from_checks
+    # 1 fully-verified out of 2, but with partial credit: 0.5/2 = 0.25 proportion
+    # Better case: 1 fully verified + 1 half-verified = 1.5 / 2 = 0.75 → round(3.75) = 4
+    # Exact half case: proportion = 0.5, so 5 * 0.5 = 2.5 → banker's → 2
+    # Build: 2 checks where each gets 0.5 partial credit (stated + correct but uncited)
+    checks = [
+        {"stated_in_response": True, "value_correct": True, "cited": False},
+        {"stated_in_response": True, "value_correct": True, "cited": False},
+    ]
+    # verified = 2 * 0.5 = 1.0 out of 2 total → proportion 0.5 → 5 * 0.5 = 2.5
+    # banker's rounding: round(2.5) = 2 (rounds to even)
+    score = compute_factual_accuracy_from_checks(checks)
+    # Under banker's rounding this is 2; if someone switches to round-half-up it becomes 3.
+    # The assertion intentionally pins the currently-in-force behavior.
+    assert score == 2, (
+        "Banker's rounding: round(2.5) == 2. If this fails, someone changed the "
+        "rounding mode. Update the docstring in compute_factual_accuracy_from_checks "
+        "and this assertion to match."
+    )
+
+
+def test_factual_accuracy_docstring_states_rounding_mode():
+    """compute_factual_accuracy_from_checks docstring must name the rounding mode."""
+    from atomic_agents.eval import compute_factual_accuracy_from_checks
+    doc = compute_factual_accuracy_from_checks.__doc__ or ""
+    assert "banker" in doc.lower() or "round-half-to-even" in doc.lower(), (
+        "Docstring must explicitly state the rounding mode (banker's / round-half-to-even). "
+        "Operators need to know what to expect from 0.5-boundary rubric outputs."
+    )
