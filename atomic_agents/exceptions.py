@@ -100,3 +100,14 @@ class MemoryPreconditionFailed(AtomicAgentsError):
     def __init__(self, message: str, actual_sha256: str | None = None):
         self.actual_sha256 = actual_sha256
         super().__init__(message)
+
+
+# ──────────────────────────────────────────────────────────────────
+# Skills exceptions (spec/18)
+
+class SkillFileTraversal(AtomicAgentsError):
+    """Attempted path traversal (../) in a skill file reference.
+
+    Security parity with the capture path-traversal fix. load_skill_referenced_file
+    raises this when a relative_path contains '..' or resolves outside the skill_dir.
+    """
