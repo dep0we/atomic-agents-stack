@@ -109,7 +109,7 @@ If someone hands you this spec and you want to set it up from scratch:
 3. **Install the helper** — `pip install atomic-agents` (when published; today: clone the repo).
 4. **Create your first agent** — copy `samples/caldwell/` into `<agents_root>/myagent/`. Strip Sam-specific content from `persona/USER.md`. Replace with your own.
 5. **Add an API key** — Keychain, `.env`, or `~/.config/atomic_agents/keys.json` (chmod 600). See [../implementation/cron-agent#secrets-handling](../implementation/cron-agent.md#secrets-handling).
-6. **Run it** — `python -m atomic_agents.run myagent` or invoke the skill.
+6. **Run it** — `atomic-agents run myagent` (console script) or `python -m atomic_agents.cli run myagent`, or invoke the skill.
 7. **Verify** — check the journal entry got written, check the log JSONL, check the INDEX wasn't corrupted.
 8. **Iterate** — edit `persona/IDENTITY.md` and `persona/SOUL.md`. Re-run. Watch the agent change.
 

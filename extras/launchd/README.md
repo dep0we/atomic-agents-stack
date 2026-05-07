@@ -31,17 +31,15 @@ These are templates, not ready-to-load files. You substitute placeholders (paths
    | Placeholder | What to replace with | Example |
    |---|---|---|
    | `__LABEL__` | A unique label, conventionally reverse-DNS | `com.atomic-agents.run.caldwell` |
-   | `__PYTHON_BIN__` | Absolute path to your Python or `uv run` wrapper | `/usr/local/bin/python3` or `/Users/me/.cargo/bin/uv` |
+   | `__PYTHON_BIN__` | Absolute path to your Python interpreter | `/usr/local/bin/python3` or `/opt/homebrew/bin/python3.12` |
    | `__PROJECT_DIR__` | Absolute path to a directory where commands run from (only relevant for `uv run`) | `/Users/me/Projects/atomic-agents-stack` |
    | `__AGENTS_ROOT__` | Your agent vault root | `/Users/me/agents` |
    | `__AGENT_NAME__` | The agent to invoke | `caldwell` |
    | `__WORK_ITEM__` | The work item text | `Daily morning briefing` |
    | `<integer>7</integer>` / `<integer>0</integer>` | When to run (24-hour) — these are real integers in `<integer>...</integer>` blocks, not `__KEY__` placeholders. Templates default to **7:00 am**; edit the integers directly to change the schedule. |
-   | `__API_KEY_ENV_VAR__` | The env var your provider key lives in | `ANTHROPIC_API_KEY` |
-   | `__API_KEY_VALUE__` | The actual key | `sk-ant-...` |
    | `__LOG_DIR__` | Where stdout/stderr logs go | `/Users/me/Library/Logs/atomic-agents` |
 
-   You can keep the API key out of the plist by reading it from macOS Keychain — see the "Keychain alternative" section below.
+   **API keys are not in these templates.** The default path is Keychain — see "Keychain (default — recommended)" below. If you need env-var delivery instead, see "Env-var alternative (less secure)" below.
 
 3. Load it:
    ```bash
@@ -75,9 +73,9 @@ launchctl unload ~/Library/LaunchAgents/com.atomic-agents.run.<your-agent>.plist
 
 Then either delete the plist or leave it disabled.
 
-## Keychain alternative (recommended for production)
+## Keychain (default — recommended)
 
-Don't paste API keys into plists. The Atomic Agents key loader checks macOS Keychain after env vars. Add the key once:
+The templates ship **without** an API key in `EnvironmentVariables`. The Atomic Agents key loader checks macOS Keychain automatically, so you just need to add the key once:
 
 ```bash
 security add-generic-password \
@@ -86,7 +84,28 @@ security add-generic-password \
   -w "sk-ant-..."
 ```
 
-Then **delete** the `EnvironmentVariables` block for the API key from your plist. The package will pick it up from Keychain at runtime.
+Nothing else required. The package picks it up at runtime. The key never appears in the plist file, in `launchctl print gui/$UID/<label>` output, or in process metadata visible to other users on the machine.
+
+## Env-var alternative (less secure)
+
+If you cannot use Keychain (e.g., a headless CI machine without a login keychain), you can put the key directly in `EnvironmentVariables`. Be aware of the trade-offs:
+
+- **Readable by any local user** who can read `~/Library/LaunchAgents/` (permissions are 644 by default).
+- **Visible in process metadata** — `launchctl print gui/$UID/<label>` shows all env vars.
+- **Logged in error output** if the plist is ever echoed in debugging.
+
+To opt in, add this block inside `<dict>` under `<key>EnvironmentVariables</key>`:
+
+```xml
+<key>ANTHROPIC_API_KEY</key>
+<string>sk-ant-...</string>
+```
+
+Lock down the file permissions after editing:
+
+```bash
+chmod 600 ~/Library/LaunchAgents/com.atomic-agents.run.<agent>.plist
+```
 
 ## Verifying the schedule fires
 

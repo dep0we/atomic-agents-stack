@@ -6,6 +6,7 @@
 #     run-atomic-agent.sh <agent-name> "<work item text>"
 #     run-atomic-agent.sh eval <agent-name>
 #     run-atomic-agent.sh tune <agent-name>
+#     run-atomic-agent.sh goal <subcommand> <agent-name> [args...]
 #     run-atomic-agent.sh dashboard
 #     run-atomic-agent.sh status
 #
@@ -20,8 +21,12 @@ set -euo pipefail
 # Where your agent vault lives.
 export ATOMIC_AGENTS_ROOT="${ATOMIC_AGENTS_ROOT:-$HOME/agents}"
 
-# Python interpreter or `uv run` wrapper.
-PYTHON="${ATOMIC_AGENTS_PYTHON:-python3}"
+# Python interpreter — or a multi-word command like "uv run" or "python3.12 -W ignore".
+# Stored as an array so word-splitting is handled safely under set -u.
+#   ATOMIC_AGENTS_PYTHON=python3              (default)
+#   ATOMIC_AGENTS_PYTHON="uv run"            (uv-managed project)
+#   ATOMIC_AGENTS_PYTHON="python3.12 -W ignore"
+read -ra PYTHON_CMD <<< "${ATOMIC_AGENTS_PYTHON:-python3}"
 
 # Where logs land (wrapper logs, not the agent's own JSONL log).
 LOG_DIR="${ATOMIC_AGENTS_LOG_DIR:-$HOME/.local/state/atomic-agents}"
@@ -59,7 +64,7 @@ Usage:
     $0 <agent-name> "<work item text>"     # run an agent
     $0 eval <agent-name>                    # run eval suite
     $0 tune <agent-name>                    # tuning analysis
-    $0 goal <agent-name> <subcommand>       # goal manager
+    $0 goal <subcommand> <agent-name>       # goal manager
     $0 dashboard                            # re-render cost dashboard
     $0 status                               # vault status (schema, snapshots)
 EOF
@@ -70,33 +75,37 @@ case "$1" in
     eval)
         agent="$2"
         run_logged "${agent}-eval.log" \
-            "$PYTHON" -m atomic_agents.eval "$agent" --summary-only
+            "${PYTHON_CMD[@]}" -m atomic_agents.eval "$agent" --summary-only
         ;;
     tune)
         agent="$2"
         run_logged "${agent}-tune.log" \
-            "$PYTHON" -m atomic_agents.tuning "$agent"
+            "${PYTHON_CMD[@]}" -m atomic_agents.tuning "$agent"
         ;;
     goal)
-        agent="$2"
-        shift 2
+        # CLI shape: atomic_agents.goal <subcommand> <agent> [args...]
+        # e.g.: run-atomic-agent.sh goal status caldwell
+        #        run-atomic-agent.sh goal advance caldwell sg-01 --complete
+        subcmd="$2"
+        agent="$3"
+        shift 3
         run_logged "${agent}-goal.log" \
-            "$PYTHON" -m atomic_agents.goal "$agent" "$@"
+            "${PYTHON_CMD[@]}" -m atomic_agents.goal "$subcmd" "$agent" "$@"
         ;;
     dashboard)
         run_logged "dashboard.log" \
-            "$PYTHON" -m atomic_agents.dashboard render
+            "${PYTHON_CMD[@]}" -m atomic_agents.dashboard render
         ;;
     status)
         run_logged "migrate-status.log" \
-            "$PYTHON" -m atomic_agents.migrate --status
+            "${PYTHON_CMD[@]}" -m atomic_agents.migrate --status
         ;;
     *)
         # First arg is treated as an agent name; second is the work item.
         agent="$1"
         work_item="${2:?work item text required}"
         run_logged "${agent}-run.log" \
-            "$PYTHON" -m atomic_agents.cli run "$agent" \
+            "${PYTHON_CMD[@]}" -m atomic_agents.cli run "$agent" \
                 --trigger cron \
                 --work-item "$work_item"
         ;;

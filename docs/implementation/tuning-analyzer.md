@@ -369,7 +369,7 @@ For each proposal: edit its frontmatter `operator_decision` to one of:
 - `deferred` — decide later (re-surfaces in next tuning run)
 
 Then run:
-    python -m atomic_agents.tune {agent_name} --apply {filename}
+    python -m atomic_agents.tuning {agent_name} --apply {filename}
 """
     proposals_rendered = "\n\n---\n\n".join(
         render_proposal(p) for p in proposals
@@ -424,7 +424,7 @@ operator_notes: ""
 ## CLI entry point
 
 ```python
-"""python -m atomic_agents.tune <agent> [options]"""
+"""python -m atomic_agents.tuning <agent> [options]"""
 
 import argparse
 from pathlib import Path
@@ -455,7 +455,7 @@ def main():
         runner.write_report(proposals)
         print(f"Report written to {runner.report_path_for_today}")
         print(f"{len(proposals)} proposal(s); review and run "
-              f"`python -m atomic_agents.tune {args.agent} --apply ...` to land changes")
+              f"`python -m atomic_agents.tuning {args.agent} --apply ...` to land changes")
 ```
 
 Sample output:
@@ -475,7 +475,7 @@ Report written to:
   ~/agents/caldwell/evals/tuning_reports/2026-05-08_proposal.md
 
 Review the report. To apply approved proposals:
-  python -m atomic_agents.tune caldwell --apply 2026-05-08_proposal.md
+  python -m atomic_agents.tuning caldwell --apply 2026-05-08_proposal.md
 
 Total analysis cost: $0.06 (3 LLM polish calls)
 ```
@@ -502,7 +502,7 @@ When invoked:
 2. Optionally ask for a window (default 60d)
 3. Optionally ask whether to polish proposal text via LLM (~$0.02/proposal, default no)
 4. Run via Bash:
-    python -m atomic_agents.tune $AGENT --since $WINDOW [--polish]
+    python -m atomic_agents.tuning $AGENT --since $WINDOW [--polish]
 5. After completion, read the generated report file and surface:
     - Number of proposals
     - For each: target_file, edit_type, confidence, one-sentence summary
@@ -510,7 +510,7 @@ When invoked:
 6. Ask Sam whether to mark proposals accepted/rejected interactively
 7. If yes, edit the frontmatter on each proposal as decided
 8. Run apply step:
-    python -m atomic_agents.tune $AGENT --apply $REPORT_FILE
+    python -m atomic_agents.tuning $AGENT --apply $REPORT_FILE
 9. Report what landed
 ```
 
