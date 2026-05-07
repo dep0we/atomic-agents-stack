@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template: run the eval suite for one Atomic Agent every day.
+
+  Useful for catching regressions when persona/memory changes accumulate
+  outside of explicit tuning runs. Pairs naturally with the dashboard
+  template (run dashboard right after evals so the latest scores show up).
+
+  Replace every __KEY__ placeholder before loading.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON_BIN__</string>
+        <string>-m</string>
+        <string>atomic_agents.eval</string>
+        <string>__AGENT_NAME__</string>
+        <string>--summary-only</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ATOMIC_AGENTS_ROOT</key>
+        <string>__AGENTS_ROOT__</string>
+        <key>__API_KEY_ENV_VAR__</key>
+        <string>__API_KEY_VALUE__</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    </dict>
+
+    <!-- Daily at __HOUR__:__MINUTE__. Pick a quiet time so you're not paying
+         judge-call costs during peak interactive use. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>7</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/eval-__AGENT_NAME__.out</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/eval-__AGENT_NAME__.err</string>
+</dict>
+</plist>

@@ -127,6 +127,11 @@ docs/                           # spec + implementation guides
 ├── samples/caldwell/           # complete worked single-agent example
 ├── appendix/portability.md     # using Atomic Agents without Obsidian / on any OS
 └── package-readme.md           # this package's PyPI/distribution readme
+
+extras/                         # operational templates (skills, schedulers)
+├── claude-code-skills/         # SKILL.md wrappers for Claude Code
+├── launchd/                    # macOS LaunchAgent .plist templates
+└── cron/                       # crontab examples + portable wrapper script
 ```
 
 ---
