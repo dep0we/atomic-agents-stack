@@ -46,8 +46,9 @@ Two layers per agent: human-curated persona on top, agent-curated memory below. 
 
 | If you want to... | Read |
 |---|---|
+| **Get an agent running in 15 minutes** | [getting-started](getting-started.md) |
 | Understand the architecture at a glance | [architecture](architecture.md) |
-| Build a new agent from zero | [implementation/cron-agent](implementation/cron-agent.md), [implementation/claude-skill-agent](implementation/claude-skill-agent.md), or [implementation/chatgpt-skill-agent](implementation/chatgpt-skill-agent.md) |
+| Build a new agent from zero (per-runtime) | [implementation/cron-agent](implementation/cron-agent.md), [implementation/claude-skill-agent](implementation/claude-skill-agent.md), or [implementation/chatgpt-skill-agent](implementation/chatgpt-skill-agent.md) |
 | Look at a complete worked example (single-agent) | [samples/caldwell](samples/caldwell/README.md) |
 | Understand a specific design choice | [spec/01-anatomy](spec/01-anatomy.md) through [spec/09-cost-observability](spec/09-cost-observability.md) |
 | Build multi-agent with shared role templates (Muse-style) | [spec/06-multi-agent-projects](spec/06-multi-agent-projects.md) — the three-layer cascade section |
