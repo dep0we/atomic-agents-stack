@@ -6,9 +6,15 @@ from pathlib import Path
 import pytest
 
 from atomic_agents._capture import (
+    CAPTURE_TOOL_DESCRIPTION,
+    CAPTURE_TOOL_SCHEMA,
+    anthropic_tool_definition,
+    extract_all_captures,
     extract_captures,
-    write_atomic_note,
+    extract_tool_call_captures,
     enforce_write_path,
+    openai_tool_definition,
+    write_atomic_note,
 )
 from atomic_agents.exceptions import (
     SchemaValidationError,
@@ -155,3 +161,211 @@ def test_enforce_write_path_outside_raises(tmp_path):
     target = tmp_path / "elsewhere" / "x.md"
     with pytest.raises(WritePathViolation):
         enforce_write_path(target, [tmp_path / "memory"])
+
+
+# ──────────────────────────────────────────────────────────────────
+# Path 1: tool-call schema and extractor
+
+
+def test_anthropic_tool_definition_shape():
+    td = anthropic_tool_definition()
+    assert td["name"] == "atomic_capture"
+    assert td["description"] == CAPTURE_TOOL_DESCRIPTION
+    assert td["input_schema"] is CAPTURE_TOOL_SCHEMA
+
+
+def test_openai_tool_definition_shape():
+    td = openai_tool_definition()
+    assert td["type"] == "function"
+    assert td["function"]["name"] == "atomic_capture"
+    assert td["function"]["description"] == CAPTURE_TOOL_DESCRIPTION
+    assert td["function"]["parameters"] is CAPTURE_TOOL_SCHEMA
+
+
+def test_capture_tool_schema_required_fields():
+    """Schema must require the same 6 fields the fenced-block validator does."""
+    required = set(CAPTURE_TOOL_SCHEMA["required"])
+    assert required == {"type", "name", "description", "confidence", "sources", "body"}
+
+
+def test_capture_tool_schema_type_enum_matches_taxonomy():
+    type_enum = set(CAPTURE_TOOL_SCHEMA["properties"]["type"]["enum"])
+    assert type_enum == {"user", "feedback", "project", "decision", "reference"}
+
+
+def test_capture_tool_schema_disallows_additional_properties():
+    """No surprise fields — keeps the schema and the validator in sync."""
+    assert CAPTURE_TOOL_SCHEMA["additionalProperties"] is False
+
+
+def test_extract_tool_call_captures_one_valid():
+    tool_uses = [{
+        "id": "toolu_01abc",
+        "name": "atomic_capture",
+        "input": {
+            "type": "feedback",
+            "name": "Path 1 works",
+            "description": "tool-call extracted via SDK",
+            "confidence": "high",
+            "sources": ["conversation_2026-05-06"],
+            "body": "Body from a tool call.",
+        },
+    }]
+    captures, failures = extract_tool_call_captures(tool_uses)
+    assert len(captures) == 1
+    assert len(failures) == 0
+    assert captures[0].name == "Path 1 works"
+    assert captures[0].body == "Body from a tool call."
+
+
+def test_extract_tool_call_captures_ignores_other_tools():
+    """Non-atomic_capture tool calls should be ignored, not error."""
+    tool_uses = [
+        {"id": "t1", "name": "some_other_tool", "input": {"foo": "bar"}},
+        {"id": "t2", "name": "atomic_capture", "input": {
+            "type": "decision", "name": "Pick X",
+            "description": "We picked X for reason Y",
+            "confidence": "high", "sources": ["s1"], "body": "Body.",
+        }},
+    ]
+    captures, failures = extract_tool_call_captures(tool_uses)
+    assert len(captures) == 1
+    assert captures[0].name == "Pick X"
+    assert len(failures) == 0
+
+
+def test_extract_tool_call_captures_invalid_input_recorded_as_failure():
+    """Schema-invalid tool input should land in failures, not raise."""
+    tool_uses = [{
+        "id": "t1", "name": "atomic_capture",
+        "input": {"type": "bogus_type", "name": "x", "description": "y",
+                  "confidence": "high", "sources": ["s1"], "body": "b"},
+    }]
+    captures, failures = extract_tool_call_captures(tool_uses)
+    assert len(captures) == 0
+    assert len(failures) == 1
+    assert "bogus" in failures[0][1].lower() or "type" in failures[0][1].lower()
+
+
+def test_extract_tool_call_captures_missing_required_field():
+    tool_uses = [{
+        "id": "t1", "name": "atomic_capture",
+        "input": {"type": "feedback", "name": "x"},  # missing description, confidence, sources, body
+    }]
+    captures, failures = extract_tool_call_captures(tool_uses)
+    assert len(captures) == 0
+    assert len(failures) == 1
+
+
+def test_extract_tool_call_captures_empty_input_ignored():
+    tool_uses = [{"id": "t1", "name": "atomic_capture", "input": {}}]
+    captures, failures = extract_tool_call_captures(tool_uses)
+    assert len(captures) == 0
+    assert len(failures) == 1
+
+
+def test_extract_tool_call_captures_empty_list():
+    captures, failures = extract_tool_call_captures([])
+    assert captures == []
+    assert failures == []
+
+
+def test_extract_all_captures_combines_both_paths():
+    """Both tool_use AND fenced JSON in same response — both captured, deduped."""
+    text = '''Some text.
+
+```atomic_capture
+{"type":"feedback","name":"From text","description":"x","confidence":"high","sources":["s1"],"body":"text body"}
+```
+
+End.'''
+    tool_uses = [{
+        "id": "t1", "name": "atomic_capture",
+        "input": {
+            "type": "decision", "name": "From tool call",
+            "description": "y", "confidence": "high",
+            "sources": ["s2"], "body": "tool body",
+        },
+    }]
+    captures, failures = extract_all_captures(text, tool_uses=tool_uses)
+    names = {c.name for c in captures}
+    assert names == {"From text", "From tool call"}
+    assert len(failures) == 0
+
+
+def test_extract_all_captures_dedupes_when_both_paths_emit_same_observation():
+    """If model emits same capture in both tool_use and fenced block, keep one."""
+    same_input = {
+        "type": "feedback", "name": "Same observation",
+        "description": "x", "confidence": "high",
+        "sources": ["s1"], "body": "Identical body.",
+    }
+    text = f'''Response.
+
+```atomic_capture
+{json.dumps(same_input)}
+```'''
+    tool_uses = [{"id": "t1", "name": "atomic_capture", "input": same_input}]
+    captures, failures = extract_all_captures(text, tool_uses=tool_uses)
+    assert len(captures) == 1
+    assert captures[0].name == "Same observation"
+
+
+def test_extract_all_captures_with_no_tool_uses_falls_back_to_text():
+    text = '''```atomic_capture
+{"type":"feedback","name":"Only text","description":"x","confidence":"high","sources":["s1"],"body":"b"}
+```'''
+    captures, failures = extract_all_captures(text, tool_uses=None)
+    assert len(captures) == 1
+    assert captures[0].name == "Only text"
+
+
+def test_extract_all_captures_empty_text_only_tool_uses():
+    tool_uses = [{
+        "id": "t1", "name": "atomic_capture",
+        "input": {
+            "type": "user", "name": "Tool only",
+            "description": "x", "confidence": "high",
+            "sources": ["s1"], "body": "b",
+        },
+    }]
+    captures, failures = extract_all_captures("", tool_uses=tool_uses)
+    assert len(captures) == 1
+    assert captures[0].name == "Tool only"
+
+
+def test_extract_all_captures_aggregates_failures_from_both_paths():
+    """Bad fenced block + bad tool input → both reported in failures."""
+    bad_text = '''```atomic_capture
+{"type": "feedback", malformed
+```'''
+    bad_tool_uses = [{
+        "id": "t1", "name": "atomic_capture",
+        "input": {"type": "bogus", "name": "x", "description": "y",
+                  "confidence": "high", "sources": ["s1"], "body": "b"},
+    }]
+    captures, failures = extract_all_captures(bad_text, tool_uses=bad_tool_uses)
+    assert len(captures) == 0
+    assert len(failures) == 2  # one fenced, one tool
+
+
+def test_extract_tool_call_captures_with_optional_fields():
+    """Optional fields (pinned, expires_at, supersedes, tags) flow through."""
+    tool_uses = [{
+        "id": "t1", "name": "atomic_capture",
+        "input": {
+            "type": "project", "name": "Big project",
+            "description": "Q3 launch coordination",
+            "confidence": "medium", "sources": ["s1"],
+            "body": "Body.",
+            "pinned": True,
+            "expires_at": "2026-09-30",
+            "tags": ["q3", "launch"],
+        },
+    }]
+    captures, failures = extract_tool_call_captures(tool_uses)
+    assert len(captures) == 1
+    cap = captures[0]
+    assert cap.pinned is True
+    assert cap.expires_at == "2026-09-30"
+    assert cap.tags == ["q3", "launch"]

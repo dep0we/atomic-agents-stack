@@ -94,6 +94,19 @@ class AtomicAgent:
     def _generate_run_id() -> str:
         return f"run-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
 
+    @staticmethod
+    def _capture_tool_definitions(model: str) -> list[dict] | None:
+        """Return the atomic_capture tool definition formatted for the agent's provider.
+
+        Returns None for providers without tool-call support — the agent then
+        falls back to Path 2 fenced-block parsing only.
+        """
+        if model.startswith("claude-"):
+            return [_capture.anthropic_tool_definition()]
+        if model.startswith("gpt-") or model.startswith("moonshot/"):
+            return [_capture.openai_tool_definition()]
+        return None
+
     # ────────────────────────────────────────────────────────────
     # Config loading
 
@@ -300,7 +313,11 @@ class AtomicAgent:
             system_prompt = self.assemble_system_prompt()
             messages = [{"role": "user", "content": work_item}]
 
-            # Call LLM
+            # Call LLM with the atomic_capture tool available — agent can use
+            # Path 1 (tool call) or Path 2 (fenced JSON block) per spec/05; we
+            # extract from both and dedupe.
+            tool_definitions = self._capture_tool_definitions(model)
+
             start = time.time()
             raw = _llm.call_llm(
                 model=model,
@@ -309,6 +326,7 @@ class AtomicAgent:
                 max_tokens=max_tokens or self.config.max_output_tokens,
                 temperature=temperature if temperature is not None else 0.6,
                 cache_control_breakpoints=[len(system_prompt)],
+                tools=tool_definitions,
             )
             latency_ms = int((time.time() - start) * 1000)
 
@@ -316,8 +334,10 @@ class AtomicAgent:
                 model, raw.input_tokens, raw.output_tokens, raw.cache_hit_tokens
             )
 
-            # Extract captures
-            captures, parse_failures = _capture.extract_captures(raw.text)
+            # Extract captures from BOTH text (Path 2) and tool_use blocks (Path 1)
+            captures, parse_failures = _capture.extract_all_captures(
+                raw.text, tool_uses=raw.tool_uses,
+            )
 
             # Write captures if enabled
             written_captures = []
