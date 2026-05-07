@@ -393,3 +393,77 @@ def test_extract_tool_call_captures_with_optional_fields():
     assert cap.pinned is True
     assert cap.expires_at == "2026-09-30"
     assert cap.tags == ["q3", "launch"]
+
+
+# ──────────────────────────────────────────────────────────────────
+# Orphan recovery (Codex finding #2)
+
+
+def test_capture_orphan_recovery_repairs_index(tmp_path):
+    """If a note exists but INDEX is missing/stale, re-submitting the same
+    capture must repair the INDEX instead of raising 'already exists'."""
+    agent_root = tmp_path / "myagent"
+    memory_dir = agent_root / "memory"
+    memory_dir.mkdir(parents=True)
+
+    capture = Capture(
+        type="feedback",
+        name="Orphan note",
+        description="This note was written but INDEX update failed.",
+        confidence="high",
+        sources=["conversation_orphan"],
+        body="The orphaned body content.",
+    )
+
+    # Phase 1: write the note directly (simulating a successful Phase 1 +
+    # failed Phase 2 on a previous run). INDEX intentionally absent.
+    from atomic_agents._capture import _render_note
+    from atomic_agents._io import atomic_write
+    from datetime import date
+
+    filename = "feedback_orphan_note.md"
+    target = memory_dir / filename
+    atomic_write(target, _render_note(capture, date.today()))
+
+    # Verify INDEX doesn't mention this note yet.
+    index_path = memory_dir / "INDEX.md"
+    assert not index_path.exists() or filename not in index_path.read_text()
+
+    # Phase 2: submit the identical capture again — should repair, not raise.
+    result_path = write_atomic_note(agent_root, capture, write_paths=[memory_dir])
+
+    assert result_path == target
+    index_text = (memory_dir / "INDEX.md").read_text()
+    assert "Orphan note" in index_text
+    assert filename in index_text
+
+
+def test_capture_existing_note_different_content_still_raises(tmp_path):
+    """Same filename, different body — must still raise SchemaValidationError
+    (real conflict, operator must investigate)."""
+    agent_root = tmp_path / "myagent"
+    memory_dir = agent_root / "memory"
+    memory_dir.mkdir(parents=True)
+
+    original_capture = Capture(
+        type="feedback",
+        name="Same name note",
+        description="Original description.",
+        confidence="high",
+        sources=["s1"],
+        body="Original body.",
+    )
+    # Write original note + INDEX.
+    write_atomic_note(agent_root, original_capture, write_paths=[memory_dir])
+
+    # Now try a second capture with same name but different body.
+    conflicting_capture = Capture(
+        type="feedback",
+        name="Same name note",
+        description="Original description.",  # same description
+        confidence="high",
+        sources=["s2"],
+        body="Completely different body — real conflict.",
+    )
+    with pytest.raises(SchemaValidationError, match="already exists"):
+        write_atomic_note(agent_root, conflicting_capture, write_paths=[memory_dir])

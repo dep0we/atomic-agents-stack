@@ -280,7 +280,14 @@ def write_atomic_note(
     target = memory_dir / filename
 
     if target.exists():
-        # Same-name file already exists; treat as duplicate, refuse rather than overwrite
+        # Same-name file already exists. Check if it's an INDEX orphan (the note
+        # was written but INDEX update failed on a previous run). If the content
+        # matches the incoming capture, repair the INDEX and return — don't refuse.
+        # If the content differs, this is a real name conflict; raise as before.
+        if _is_same_capture_content(target, capture):
+            # Orphan-recovery path: re-run INDEX update idempotently.
+            _update_index(memory_dir / "INDEX.md", capture, filename)
+            return target
         raise SchemaValidationError(
             f"atomic note {filename} already exists; use merge_into to update"
         )
@@ -293,6 +300,29 @@ def write_atomic_note(
     _update_index(memory_dir / "INDEX.md", capture, filename)
 
     return target
+
+
+def _is_same_capture_content(existing_path: Path, capture: Capture) -> bool:
+    """Return True if the existing note on disk matches the incoming capture.
+
+    Compares the fields most likely to identify a duplicate vs a conflict:
+    type, name, description, and body. Sources and metadata are intentionally
+    excluded — the orphan-recovery path should tolerate minor metadata drift
+    (e.g., a different run_id in sources) while still repairing the index.
+
+    If the file cannot be read or parsed, returns False (safe default — refuse
+    rather than silently repair something we can't verify).
+    """
+    try:
+        parsed = frontmatter.load(existing_path)
+    except Exception:
+        return False
+    return (
+        parsed.metadata.get("type") == capture.type
+        and parsed.metadata.get("name") == capture.name
+        and parsed.metadata.get("description") == capture.description
+        and parsed.content.strip() == capture.body.strip()
+    )
 
 
 def _render_note(capture: Capture, captured_date: date) -> str:

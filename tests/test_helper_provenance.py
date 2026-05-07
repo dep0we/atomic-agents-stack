@@ -330,3 +330,123 @@ def test_helper_call_parallel_no_sources_unchanged_behavior(agent):
     for r in results:
         assert r.sources == []
         assert r.provenance_preserved is True
+
+
+# ──────────────────────────────────────────────────────────────────
+# Parallel helper cost reservation (Codex finding #12)
+
+
+def _agent_with_tight_cap(tmp_path: Path, monkeypatch, daily_cap_usd: float) -> AtomicAgent:
+    """Build a minimal agent whose model.md sets a tight daily cap."""
+    monkeypatch.setenv("ATOMIC_AGENTS_ANTHROPIC_KEY", "fake-key")
+    agents_root = tmp_path / "agents"
+    agent_dir = agents_root / "capper"
+    (agent_dir / "persona").mkdir(parents=True)
+    (agent_dir / "persona" / "IDENTITY.md").write_text("# I\nCapper.")
+    (agent_dir / "tools.md").write_text("## Read paths\n- ~/docs/\n")
+    # model.md must embed guardrails in a ```yaml block — that's what _model.py parses.
+    (agent_dir / "model.md").write_text(
+        "## Default model\nclaude-haiku-4-5-20251001\n\n"
+        "```yaml\n"
+        "cost_guardrails:\n"
+        "  enabled: true\n"
+        f"  daily_cap_usd: {daily_cap_usd}\n"
+        "  monthly_cap_usd: 100.0\n"
+        "  daily_cap_action: skip\n"
+        "  monthly_cap_action: alert\n"
+        "```\n"
+    )
+    (agent_dir / "memory").mkdir()
+    (agent_dir / "log").mkdir()
+    return AtomicAgent(name="capper", agents_root=agents_root)
+
+
+def test_parallel_helpers_reserve_against_cost_cap(tmp_path, monkeypatch):
+    """A batch whose worst-case cost exceeds remaining headroom must raise
+    CostGuardrailBlocked BEFORE any helper actually runs."""
+    from atomic_agents.exceptions import CostGuardrailBlocked
+
+    # claude-haiku-4-5-20251001 output rate: $4.0/M tokens.
+    # 3 helpers × 1024 max_tokens = 3072 output tokens → ~$0.000012288
+    # Set a cap so tiny that the reservation check fires: $0.000001 daily cap
+    # (0 spent so far, so headroom = $0.000001 < $0.000012288 reservation).
+    agent = _agent_with_tight_cap(tmp_path, monkeypatch, daily_cap_usd=0.000001)
+
+    fake_client = MagicMock()
+    fake_anthropic = types.SimpleNamespace(Anthropic=lambda api_key: fake_client)
+
+    with patch.dict(sys.modules, {"anthropic": fake_anthropic}):
+        with pytest.raises(CostGuardrailBlocked, match="reservation"):
+            agent.helper_call_parallel(
+                prompts=["a", "b", "c"],
+                model="claude-haiku-4-5-20251001",
+                max_tokens=1024,
+                max_concurrent=3,
+            )
+
+    # No actual LLM calls should have been made.
+    assert not fake_client.messages.create.called
+
+
+def test_parallel_helpers_logs_reservation_and_release(tmp_path, monkeypatch):
+    """A successful batch logs helper_batch_reservation before fanout and
+    helper_batch_release with actual cost after completion."""
+    # Use a large enough cap so the reservation check passes.
+    agent = _agent_with_tight_cap(tmp_path, monkeypatch, daily_cap_usd=10.0)
+
+    resp = _make_anthropic_resp("ok")
+    fake_client = MagicMock()
+    fake_client.messages.create.return_value = resp
+    fake_anthropic = types.SimpleNamespace(Anthropic=lambda api_key: fake_client)
+
+    with patch.dict(sys.modules, {"anthropic": fake_anthropic}):
+        results = agent.helper_call_parallel(
+            prompts=["x", "y"],
+            model="claude-haiku-4-5-20251001",
+            max_tokens=256,
+            max_concurrent=1,
+        )
+    assert len(results) == 2
+
+    from datetime import date
+    today = date.today()
+    log_path = (
+        agent.agent_root / "log" / today.strftime("%Y-%m") / f"{today.isoformat()}.jsonl"
+    )
+    lines = log_path.read_text().strip().splitlines()
+    records = [json.loads(L) for L in lines]
+
+    reservation_recs = [r for r in records if r.get("trigger") == "helper_batch_reservation"]
+    release_recs = [r for r in records if r.get("trigger") == "helper_batch_release"]
+
+    assert len(reservation_recs) == 1, "Expected exactly one reservation log entry"
+    assert len(release_recs) == 1, "Expected exactly one release log entry"
+
+    res_rec = reservation_recs[0]
+    rel_rec = release_recs[0]
+
+    # Reservation must carry a positive reserved_usd estimate.
+    assert res_rec["reserved_usd"] > 0
+    assert res_rec["batch_size"] == 2
+
+    # Release must report both reserved and actual cost.
+    assert "reserved_usd" in rel_rec
+    assert "actual_usd" in rel_rec
+    assert rel_rec["actual_usd"] >= 0
+
+
+# ──────────────────────────────────────────────────────────────────
+# Provenance docstring trade-off statement (Codex finding #14)
+
+
+def test_detect_provenance_docstring_states_tradeoff(agent):
+    """The _detect_provenance docstring must document the false-positive trade-off
+    so a future reader (Codex or human) can't mistake it for a defect."""
+    doc = AtomicAgent._detect_provenance.__doc__ or ""
+    doc_lower = doc.lower()
+    assert "false-positive" in doc_lower, (
+        "_detect_provenance docstring must mention 'false-positive' to explain the heuristic intent"
+    )
+    assert "trade-off" in doc_lower or "tradeoff" in doc_lower, (
+        "_detect_provenance docstring must use 'trade-off' or 'tradeoff' to signal deliberate choice"
+    )
