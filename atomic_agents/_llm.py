@@ -10,12 +10,15 @@ API keys loaded via _platform.get_api_key().
 """
 
 from __future__ import annotations
+import logging
 import os
 import time
 from dataclasses import dataclass
 from typing import Any
 
 from .exceptions import AtomicAgentsError
+
+_logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -232,7 +235,12 @@ def _extract_openai_tool_calls(msg: Any) -> list[dict]:
     """Convert OpenAI/Moonshot ChatCompletion message tool_calls into normalized dicts.
 
     OpenAI returns msg.tool_calls = list of objects with id + function {name, arguments}.
-    arguments is a JSON string; we parse it.
+    arguments is *usually* a JSON string per OpenAI spec, but some compatible providers
+    (e.g. Moonshot) may return an already-parsed dict. We handle all cases:
+    - dict   → use directly
+    - str    → json.loads
+    - None / empty string → default to {}
+    - anything else → log a warning, default to {}
     """
     tool_calls = getattr(msg, "tool_calls", None)
     if not tool_calls:
@@ -243,10 +251,24 @@ def _extract_openai_tool_calls(msg: Any) -> list[dict]:
         fn = getattr(tc, "function", None)
         if fn is None:
             continue
-        raw_args = getattr(fn, "arguments", "") or ""
-        try:
-            args = _json.loads(raw_args) if raw_args else {}
-        except _json.JSONDecodeError:
+        raw_args = getattr(fn, "arguments", None)
+        if isinstance(raw_args, dict):
+            args = raw_args
+        elif isinstance(raw_args, str):
+            if raw_args.strip():
+                try:
+                    args = _json.loads(raw_args)
+                except _json.JSONDecodeError:
+                    args = {}
+            else:
+                args = {}
+        elif raw_args is None:
+            args = {}
+        else:
+            _logger.warning(
+                "unexpected type %r for tool_call arguments — defaulting to {}",
+                type(raw_args).__name__,
+            )
             args = {}
         out.append({
             "id": getattr(tc, "id", ""),

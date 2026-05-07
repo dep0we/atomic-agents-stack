@@ -367,7 +367,7 @@ class EvalRunner:
                 setup_applied=setup_applied,
             )
 
-        judge_cost = _costs.calc_cost(
+        judge_cost, _ = _costs.calc_cost(
             judge_model, judge_response.input_tokens, judge_response.output_tokens
         )
 
@@ -387,9 +387,10 @@ class EvalRunner:
                     max_tokens=2048, temperature=0.0,
                 )
                 scores_dict = self._parse_judge_response(judge_response_2.text)
-                judge_cost += _costs.calc_cost(
+                _retry_cost, _ = _costs.calc_cost(
                     judge_model, judge_response_2.input_tokens, judge_response_2.output_tokens
                 )
+                judge_cost += _retry_cost
                 judge_response.text = judge_response_2.text  # use the cleaner output for the record
             except Exception as e2:
                 return EvalResult(

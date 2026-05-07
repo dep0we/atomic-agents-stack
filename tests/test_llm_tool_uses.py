@@ -306,3 +306,38 @@ def test_raw_response_dataclass_default_tool_uses_is_empty_list():
     r2 = _llm._RawLLMResponse(text="b", input_tokens=1, output_tokens=1)
     r1.tool_uses.append({"id": "x"})
     assert r2.tool_uses == []  # not shared
+
+
+# --- P2 regression tests: defensive coercion of tool_call arguments ---
+
+
+def _make_tc(args_value):
+    """Build a fake tool_call object with the given arguments value."""
+    fn = types.SimpleNamespace(name="some_tool", arguments=args_value)
+    return types.SimpleNamespace(id="tc_1", function=fn)
+
+
+def test_openai_tool_calls_handles_dict_arguments():
+    """Provider returns an already-parsed dict — should pass through without error."""
+    parsed_dict = {"key": "value", "nested": [1, 2, 3]}
+    msg = types.SimpleNamespace(tool_calls=[_make_tc(parsed_dict)])
+    result = _llm._extract_openai_tool_calls(msg)
+    assert len(result) == 1
+    assert result[0]["input"] == parsed_dict
+
+
+def test_openai_tool_calls_handles_none_arguments():
+    """arguments=None → input={}, no exception."""
+    msg = types.SimpleNamespace(tool_calls=[_make_tc(None)])
+    result = _llm._extract_openai_tool_calls(msg)
+    assert len(result) == 1
+    assert result[0]["input"] == {}
+
+
+def test_openai_tool_calls_handles_unexpected_type():
+    """arguments of unexpected type (int, list) → input={}, no exception, warning logged."""
+    for bad_value in [42, [1, 2, 3], 3.14]:
+        msg = types.SimpleNamespace(tool_calls=[_make_tc(bad_value)])
+        result = _llm._extract_openai_tool_calls(msg)
+        assert len(result) == 1, f"expected 1 result for args={bad_value!r}"
+        assert result[0]["input"] == {}, f"expected empty dict for args={bad_value!r}"

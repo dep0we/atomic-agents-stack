@@ -258,7 +258,7 @@ def helper_savings(runs: list[RunRecord], main_model: str) -> HelperSavings | No
         return None
     actual = sum(r.cost_usd for r in helpers)
     hypothetical = sum(
-        calc_cost(main_model, r.input_tokens, r.output_tokens) for r in helpers
+        calc_cost(main_model, r.input_tokens, r.output_tokens)[0] for r in helpers
     )
     saved = max(0.0, hypothetical - actual)
     ratio = (hypothetical / actual) if actual > 0 else 0.0

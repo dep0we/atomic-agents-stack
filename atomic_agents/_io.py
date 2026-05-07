@@ -11,10 +11,34 @@ import tempfile
 from pathlib import Path
 
 
+def _fsync_dir(directory: Path) -> None:
+    """Fsync the parent directory so the renamed directory entry is durable.
+
+    POSIX requires fsyncing the *directory* after os.replace() to guarantee the
+    new entry survives a power loss.  Windows raises OSError when you try to
+    fsync a directory — that is expected and harmless; we swallow it.
+    """
+    # O_DIRECTORY is POSIX-only; fall back to O_RDONLY on platforms that don't
+    # define it (some older Linuxes, Windows headers).
+    flags = getattr(os, "O_DIRECTORY", 0) | os.O_RDONLY
+    try:
+        dir_fd = os.open(str(directory), flags)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        # Expected on Windows; silently ignored everywhere else too since
+        # a missing dir-fsync degrades to the pre-fix behaviour rather than
+        # corrupting data.
+        pass
+
+
 def atomic_write(target: Path, content: str, encoding: str = "utf-8") -> None:
     """Write `content` to `target` atomically.
 
-    Strategy: write to a temp file in the same directory, fsync, rename.
+    Strategy: write to a temp file in the same directory, fsync, rename,
+    then fsync the parent directory so the new directory entry is durable.
     Rename is atomic on POSIX — `target` either exists with full contents or
     doesn't exist at all. Crash mid-write leaves a recoverable .tmp file.
 
@@ -36,6 +60,9 @@ def atomic_write(target: Path, content: str, encoding: str = "utf-8") -> None:
             os.fsync(f.fileno())
         # Atomic rename
         os.replace(tmp_path, target)
+        # Fsync the parent directory so the new directory entry is durable
+        # across a power loss.
+        _fsync_dir(target.parent)
     except Exception:
         # Cleanup the temp file on failure
         try:

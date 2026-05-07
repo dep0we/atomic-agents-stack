@@ -68,6 +68,7 @@ class Response:
     cache_hit_tokens: int = 0
     cache_miss_tokens: int = 0
     cost_usd: float = 0.0
+    cost_estimated_via_fallback: bool = False  # True when model id was not in PRICING
     latency_ms: int = 0
     summary: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
