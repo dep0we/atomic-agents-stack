@@ -1,0 +1,43 @@
+# ─────────────────────────────────────────────────────────────────────────
+# Atomic Agents — example crontab
+#
+# Copy entries you want into your crontab via `crontab -e`.
+# Update the paths and agent names to your setup.
+#
+# IMPORTANT: cron has no shell profile, so we either set the env in the
+# wrapper script (recommended — see run-atomic-agent.sh) or set it here.
+# ─────────────────────────────────────────────────────────────────────────
+
+# Send failure notifications to this address (requires local mail).
+# Comment out if you don't want emails.
+MAILTO=you@example.com
+
+# Make sure cron can find python and the wrapper script.
+PATH=/usr/local/bin:/usr/bin:/bin:/home/USER/.local/bin
+
+# ─── Daily agent runs ────────────────────────────────────────────────────
+
+# 7:00 AM — daily briefing for the morning
+0 7 * * *  ~/bin/run-atomic-agent.sh caldwell "Daily morning brief"
+
+# 9:00 AM Mon-Fri — work-day kick-off
+0 9 * * 1-5  ~/bin/run-atomic-agent.sh paul "What needs attention today?"
+
+# ─── Eval & quality checks ───────────────────────────────────────────────
+
+# Daily eval run at 1:00 AM (cheap; helps catch drift overnight)
+0 1 * * *  ~/bin/run-atomic-agent.sh eval caldwell
+
+# Weekly tuning analysis on Mondays at 6:00 AM
+0 6 * * 1  ~/bin/run-atomic-agent.sh tune caldwell
+
+# ─── Dashboard refresh ───────────────────────────────────────────────────
+
+# Re-render cost dashboard every hour (cheap; pure JSONL aggregation)
+0 * * * *  ~/bin/run-atomic-agent.sh dashboard
+
+# ─── Schema migration check ──────────────────────────────────────────────
+
+# Once a week, print vault status — surfaces any unexpected schema drift.
+# Doesn't migrate; you'd run --to v<n> manually after reading the output.
+30 6 * * 0  ~/bin/run-atomic-agent.sh status

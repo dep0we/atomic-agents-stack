@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template: run one Atomic Agent on a daily schedule.
+
+  Replace every __KEY__ placeholder before loading.
+  See README.md in this directory for guidance.
+
+  After substitution:
+    cp this-file ~/Library/LaunchAgents/__LABEL__.plist
+    launchctl load ~/Library/LaunchAgents/__LABEL__.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+
+    <!-- The command. Two patterns:
+         1) Direct python:        ProgramArguments = [python, -m, atomic_agents.cli, run, ...]
+         2) uv-run wrapper:       ProgramArguments = [uv, run, atomic-agents, run, ...]
+                                  + WorkingDirectory = __PROJECT_DIR__
+    -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON_BIN__</string>
+        <string>-m</string>
+        <string>atomic_agents.cli</string>
+        <string>run</string>
+        <string>__AGENT_NAME__</string>
+        <string>--trigger</string>
+        <string>cron</string>
+        <string>--work-item</string>
+        <string>__WORK_ITEM__</string>
+    </array>
+
+    <!-- Required so the agent finds your vault. Either set it here or rely on the
+         user's shell profile (which launchd does NOT source). -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ATOMIC_AGENTS_ROOT</key>
+        <string>__AGENTS_ROOT__</string>
+        <key>__API_KEY_ENV_VAR__</key>
+        <string>__API_KEY_VALUE__</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    </dict>
+
+    <!-- Schedule: run once a day at __HOUR__:__MINUTE__. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>7</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- Don't restart if the agent exits successfully. -->
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+
+    <!-- Logs. Create __LOG_DIR__ before loading or the job will silently fail. -->
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/run-__AGENT_NAME__.out</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/run-__AGENT_NAME__.err</string>
+</dict>
+</plist>

@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template: re-render the cost dashboard hourly.
+
+  Cheap (no LLM calls — pure JSONL aggregation). Keeps the static HTML at
+  __AGENTS_ROOT__/_dashboard/index.html fresh so you can open it any time
+  without running the command yourself.
+
+  Replace every __KEY__ placeholder before loading.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON_BIN__</string>
+        <string>-m</string>
+        <string>atomic_agents.dashboard</string>
+        <string>render</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ATOMIC_AGENTS_ROOT</key>
+        <string>__AGENTS_ROOT__</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    </dict>
+
+    <!-- Every hour. -->
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/dashboard.out</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/dashboard.err</string>
+</dict>
+</plist>
