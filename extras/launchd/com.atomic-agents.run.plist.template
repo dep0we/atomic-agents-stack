@@ -7,6 +7,27 @@
   Replace every __KEY__ placeholder before loading.
   See README.md in this directory for guidance.
 
+  ── API key security ─────────────────────────────────────────────────────
+  This template does NOT include an API key in EnvironmentVariables.
+  The recommended path is macOS Keychain:
+
+    security add-generic-password \
+      -a "$USER" \
+      -s "atomic-agents-anthropic" \
+      -w "sk-ant-..."
+
+  The atomic_agents package key loader checks Keychain automatically — no
+  env var required, and the key never appears in the plist file, in
+  `launchctl print` output, or in process metadata visible to other users.
+
+  If you prefer env-var delivery (less secure — see README.md for
+  trade-offs), add the key block to EnvironmentVariables manually:
+      <key>ANTHROPIC_API_KEY</key>
+      <string>sk-ant-...</string>
+  but understand that anyone who can read ~/Library/LaunchAgents/ or run
+  `launchctl print gui/$UID/<label>` can see the key in plaintext.
+  ─────────────────────────────────────────────────────────────────────────
+
   After substitution:
     cp this-file ~/Library/LaunchAgents/__LABEL__.plist
     launchctl load ~/Library/LaunchAgents/__LABEL__.plist
@@ -35,13 +56,13 @@
     </array>
 
     <!-- Required so the agent finds your vault. Either set it here or rely on the
-         user's shell profile (which launchd does NOT source). -->
+         user's shell profile (which launchd does NOT source).
+         API key is intentionally absent — loaded from Keychain at runtime.
+         See the comment block at the top of this file for the trade-offs. -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>ATOMIC_AGENTS_ROOT</key>
         <string>__AGENTS_ROOT__</string>
-        <key>__API_KEY_ENV_VAR__</key>
-        <string>__API_KEY_VALUE__</string>
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
     </dict>

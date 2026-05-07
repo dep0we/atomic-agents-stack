@@ -191,9 +191,9 @@ A scheduled job runs the full pattern detection across recent eval runs. This is
 Operator triggers manually:
 
 ```bash
-python -m atomic_agents.tune <agent>              # full analysis
-python -m atomic_agents.tune <agent> --since 30d  # restrict to recent runs
-python -m atomic_agents.tune <agent> --dry-run    # don't write the report file
+python -m atomic_agents.tuning <agent>              # full analysis
+python -m atomic_agents.tuning <agent> --since 30d  # restrict to recent runs
+python -m atomic_agents.tuning <agent> --dry-run    # don't write the report file
 ```
 
 Or via Claude Code skill: `/tune caldwell`
@@ -221,7 +221,7 @@ operator_decided_at: 2026-05-08
 Then runs the apply step:
 
 ```bash
-python -m atomic_agents.tune <agent> --apply <YYYY-MM-DD_proposal.md>
+python -m atomic_agents.tuning <agent> --apply <YYYY-MM-DD_proposal.md>
 ```
 
 The applier:
@@ -309,7 +309,7 @@ So: tuning is essentially free. The expensive step is the **eval run** that prod
 1. **Mon**: weekly eval cron runs full Caldwell suite. 5 tests pass; 2 score below 4.0 on persona_fidelity. Result lands in `evals/runs/2026-05-04.jsonl`.
 2. **Mon (later)**: tuning cron runs. Reads runs from past 4 weeks, finds `persona_fidelity` averaging 3.4 with recurring judge phrase "hedge openers." Generates 1 proposal: edit SOUL.md voice section. Writes report to `evals/tuning_reports/2026-05-04_proposal.md`. Surfaces via Telegram alert: "Tuning report ready: 1 proposal."
 3. **Tue**: Sam opens the report in Obsidian. Reads the rationale. Agrees. Edits frontmatter `operator_decision: accepted`.
-4. **Tue (later)**: Sam runs `python -m atomic_agents.tune caldwell --apply 2026-05-04_proposal.md`. Diff applied to SOUL.md. Journal entry written.
+4. **Tue (later)**: Sam runs `python -m atomic_agents.tuning caldwell --apply 2026-05-04_proposal.md`. Diff applied to SOUL.md. Journal entry written.
 5. **Wed**: next scheduled eval run. Same 5 tests. Now 5/5 pass; persona_fidelity at 4.6 average. Improvement attributed to the SOUL.md edit. Tuning history updated.
 6. **Future runs**: pattern doesn't recur (the rule worked). Tuning generates no new proposals on this dimension.
 

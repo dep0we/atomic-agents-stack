@@ -9,6 +9,25 @@
   template (run dashboard right after evals so the latest scores show up).
 
   Replace every __KEY__ placeholder before loading.
+
+  ── API key security ─────────────────────────────────────────────────────
+  This template does NOT include an API key in EnvironmentVariables.
+  The recommended path is macOS Keychain:
+
+    security add-generic-password \
+      -a "$USER" \
+      -s "atomic-agents-anthropic" \
+      -w "sk-ant-..."
+
+  The atomic_agents package key loader checks Keychain automatically — no
+  env var required, and the key never appears in the plist file, in
+  `launchctl print` output, or in process metadata visible to other users.
+
+  If you prefer env-var delivery (less secure — see README.md for
+  trade-offs), add the key block to EnvironmentVariables manually:
+      <key>ANTHROPIC_API_KEY</key>
+      <string>sk-ant-...</string>
+  ─────────────────────────────────────────────────────────────────────────
 -->
 <plist version="1.0">
 <dict>
@@ -24,12 +43,12 @@
         <string>--summary-only</string>
     </array>
 
+    <!-- API key intentionally absent — loaded from Keychain at runtime.
+         See the comment block at the top of this file for the trade-offs. -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>ATOMIC_AGENTS_ROOT</key>
         <string>__AGENTS_ROOT__</string>
-        <key>__API_KEY_ENV_VAR__</key>
-        <string>__API_KEY_VALUE__</string>
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
     </dict>

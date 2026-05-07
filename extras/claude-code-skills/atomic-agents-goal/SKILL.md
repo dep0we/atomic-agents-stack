@@ -18,12 +18,12 @@ This skill is **not** for reactive agents (those without a `goal.md`). If the ag
 
 ## Subcommands
 
-The CLI is `python -m atomic_agents.goal <agent> <subcommand>`.
+The CLI is `python -m atomic_agents.goal <subcommand> <agent>`.
 
 ### `status` — what's the current state?
 
 ```bash
-python -m atomic_agents.goal <agent> status
+python -m atomic_agents.goal status <agent>
 ```
 
 Shows: goal name, overall completion %, sub-goals broken into pending/in_progress/blocked/complete buckets, the next dispatchable sub-goal.
@@ -31,7 +31,7 @@ Shows: goal name, overall completion %, sub-goals broken into pending/in_progres
 ### `next` — what should the agent work on next?
 
 ```bash
-python -m atomic_agents.goal <agent> next
+python -m atomic_agents.goal next <agent>
 ```
 
 Returns the highest-priority sub-goal that:
@@ -43,25 +43,28 @@ If nothing is dispatchable (everything is complete or all pending sub-goals are 
 ### `advance` — move a sub-goal forward
 
 ```bash
-python -m atomic_agents.goal <agent> advance <sub-goal-id> --to in_progress
-python -m atomic_agents.goal <agent> advance <sub-goal-id> --to complete
-python -m atomic_agents.goal <agent> advance <sub-goal-id> --to blocked --reason "<text>"
+# Mark a sub-goal in_progress (default):
+python -m atomic_agents.goal advance <agent> <sub-goal-id>
+# Mark a sub-goal complete:
+python -m atomic_agents.goal advance <agent> <sub-goal-id> --complete
+# Mark complete and record an output artifact:
+python -m atomic_agents.goal advance <agent> <sub-goal-id> --complete --output path/to/artifact
 ```
 
-Status transitions enforce sanity (can't go from complete back to pending without explicit `--force`). Each advance appends to `<agent>/goal_history.jsonl`.
+Each advance appends to `<agent>/goal_history.jsonl`.
 
 ### `complete` — entire goal done
 
 ```bash
-python -m atomic_agents.goal <agent> complete
+python -m atomic_agents.goal complete <agent>
 ```
 
-Marks the goal as complete (refuses if any sub-goals are still incomplete unless `--force`), archives `goal.md` to `<agent>/goal_archive/<date>_<slug>.md`, and the agent reverts to reactive mode until a new goal is set.
+Marks the goal as complete, archives `goal.md` to `<agent>/goal_archive/<date>_<slug>.md`, and the agent reverts to reactive mode until a new goal is set.
 
 ### `abandon` — stop pursuing this goal (non-destructive)
 
 ```bash
-python -m atomic_agents.goal <agent> abandon --reason "scope changed; new goal coming"
+python -m atomic_agents.goal abandon <agent> --reason "scope changed; new goal coming"
 ```
 
 Same as `complete` but recorded as `abandoned`. Goal archive preserved for context.
@@ -69,7 +72,7 @@ Same as `complete` but recorded as `abandoned`. Goal archive preserved for conte
 ### `report` — periodic progress for the journal
 
 ```bash
-python -m atomic_agents.goal <agent> report
+python -m atomic_agents.goal report <agent>
 ```
 
 Produces a markdown progress report with:
