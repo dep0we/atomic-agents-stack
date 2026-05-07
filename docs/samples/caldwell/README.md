@@ -2,6 +2,8 @@
 
 This folder is a complete worked example of a single-agent Atomic Agents deployment. It's used throughout the spec as a reference.
 
+> **See the dashboard:** [`../dashboard_examples/`](../dashboard_examples/) ships pre-rendered HTML of the cost + 4 visibility tabs the framework generates against this sample. Open `index.html` and click the nav bar to walk all four.
+
 > **About the names in this sample.** Caldwell is a fictional financial-planning agent for a fictional user named **Sam** (with spouse **Maya**). Sam works at **Acme Industries** and runs a side consulting practice called **SamCo** with two retainer clients (**ClientCo A** and **ClientCo B**). All of these are illustrative — pick your own names when you build your own agent. Specs throughout `docs/spec/` use Caldwell + Sam as a worked example for the same reason.
 
 ---

@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Activity Pulse — Atomic Agents</title>
+<style>
+:root {
+  --bg: #0f1419; --card: #1a2028; --text: #e6e6e6; --muted: #8a96a3;
+  --accent: #4ec9b0; --warn: #d19a66; --error: #e06c75; --good: #98c379;
+  --border: #2a323d;
+  --opus: #c678dd; --sonnet: #61afef; --haiku: #98c379;
+  --gpt: #c0a050; --kimi: #5fb3b3; --local: #888;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", system-ui, sans-serif;
+  background: var(--bg); color: var(--text); line-height: 1.5;
+  padding: 32px 48px; max-width: 1400px; margin: 0 auto;
+}
+header {
+  display: flex; justify-content: space-between; align-items: baseline;
+  margin-bottom: 16px; padding-bottom: 16px; border-bottom: 1px solid var(--border);
+}
+h1 { font-size: 24px; font-weight: 600; }
+h2 { font-size: 16px; font-weight: 600; margin: 32px 0 12px;
+     color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.period { color: var(--muted); font-size: 14px; }
+.breadcrumb { color: var(--muted); font-size: 13px; margin-bottom: 4px; }
+.breadcrumb a { color: var(--accent); text-decoration: none; }
+.breadcrumb a:hover { text-decoration: underline; }
+.refresh-btn {
+  background: var(--card); color: var(--text); border: 1px solid var(--border);
+  padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px;
+}
+.refresh-btn:hover { border-color: var(--accent); }
+
+/* Top navigation bar */
+.tab-nav {
+  display: flex; gap: 4px; margin-bottom: 24px;
+  border-bottom: 1px solid var(--border); padding-bottom: 0;
+}
+.tab-nav a {
+  display: inline-block; padding: 8px 16px; font-size: 13px; font-weight: 500;
+  color: var(--muted); text-decoration: none; border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+.tab-nav a:hover { color: var(--text); border-bottom-color: var(--border); }
+.tab-nav a.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+.kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 8px; }
+.kpis-5 { display: grid; grid-template-columns: repeat(5, 1fr); gap: 16px; margin-bottom: 8px; }
+.kpi {
+  background: var(--card); border: 1px solid var(--border);
+  padding: 20px; border-radius: 10px;
+}
+.kpi .value { font-size: 28px; font-weight: 700; margin-bottom: 4px; }
+.kpi .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.kpi .delta { font-size: 12px; margin-top: 6px; }
+.kpi .delta.up { color: var(--error); }
+.kpi .delta.down { color: var(--good); }
+.kpi .delta.neutral { color: var(--muted); }
+
+.panel {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 10px; padding: 24px; margin-bottom: 16px;
+}
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+thead th {
+  text-align: left; color: var(--muted); font-weight: 500; font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.05em;
+  padding: 8px 12px; border-bottom: 1px solid var(--border);
+}
+tbody td { padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+tbody tr:last-child td { border-bottom: none; }
+tbody tr:hover { background: rgba(78, 201, 176, 0.04); }
+.num { font-variant-numeric: tabular-nums; }
+.right { text-align: right; }
+.muted { color: var(--muted); font-size: 12px; }
+.pill {
+  display: inline-block; padding: 2px 8px; border-radius: 10px;
+  font-size: 11px; font-weight: 500; border: 1px solid;
+}
+.pill.opus { color: var(--opus); border-color: var(--opus); background: rgba(198, 120, 221, 0.1); }
+.pill.sonnet { color: var(--sonnet); border-color: var(--sonnet); background: rgba(97, 175, 239, 0.1); }
+.pill.haiku { color: var(--haiku); border-color: var(--haiku); background: rgba(152, 195, 121, 0.1); }
+.pill.ok { color: var(--good); border-color: var(--good); background: rgba(152, 195, 121, 0.1); }
+.pill.error { color: var(--error); border-color: var(--error); background: rgba(224, 108, 117, 0.1); }
+.pill.warn { color: var(--warn); border-color: var(--warn); background: rgba(209, 154, 102, 0.1); }
+.pill.neutral { color: var(--muted); border-color: var(--border); background: transparent; }
+.row-error td { background: rgba(224, 108, 117, 0.05); }
+.row-warn td { background: rgba(209, 154, 102, 0.05); }
+
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
+
+.empty-note { color: var(--muted); font-style: italic; font-size: 13px; padding: 12px 0; }
+
+/* Sparkline via Unicode block chars */
+.sparkline { font-family: monospace; letter-spacing: 2px; font-size: 14px; color: var(--accent); }
+
+footer {
+  margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border);
+  color: var(--muted); font-size: 12px;
+  display: flex; justify-content: space-between;
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Activity Pulse</h1>
+    <div class="period">as of 2026-05-07 21:03 UTC</div>
+  </div>
+  <div>
+    <button class="refresh-btn" onclick="refresh()">&#8635; Refresh</button>
+  </div>
+</header>
+
+<nav class="tab-nav"><a href="index.html">Cost</a><a href="activity.html" class="active">Activity</a><a href="quality.html">Quality</a><a href="memory.html">Memory</a></nav>
+
+
+
+<section class="kpis">
+  <div class="kpi">
+    <div class="value">4</div>
+    <div class="label">Runs last 24h</div>
+  </div>
+  <div class="kpi">
+    <div class="value">12</div>
+    <div class="label">Runs last 7d</div>
+  </div>
+  <div class="kpi">
+    <div class="value" style="color: var(--good)">0</div>
+    <div class="label">Failures 24h</div>
+  </div>
+  <div class="kpi">
+    <div class="value">1 / 1</div>
+    <div class="label">Agents active 24h</div>
+  </div>
+</section>
+
+
+<section class="panel">
+  <h2>Last 12 runs</h2>
+  <table><thead><tr><th>When</th><th>Agent</th><th>Trigger</th><th>Status</th><th>Summary</th><th class="right">Duration</th><th class="right">Cost</th></tr></thead><tbody><tr><td class="num" title="May 07 07:00">9h ago</td><td>caldwell</td><td>cron</td><td><span class="pill ok">ok</span></td><td>Daily morning brief — used 3 parallel Haiku helpers; saved ~76% vs all-Opus</td><td class="right num">7204ms</td><td class="right num">$0.0830</td></tr><tr><td class="num" title="May 07 07:00">9h ago</td><td>caldwell</td><td>helper</td><td><span class="pill ok">ok</span></td><td>Extract decisions/actions from prospect notes</td><td class="right num">541ms</td><td class="right num">$0.0008</td></tr><tr><td class="num" title="May 07 07:00">9h ago</td><td>caldwell</td><td>helper</td><td><span class="pill ok">ok</span></td><td>Diff balance sheet vs last week</td><td class="right num">708ms</td><td class="right num">$0.0011</td></tr><tr><td class="num" title="May 07 07:00">9h ago</td><td>caldwell</td><td>helper</td><td><span class="pill ok">ok</span></td><td>Summarize CPA memo in 5 bullets</td><td class="right num">612ms</td><td class="right num">$0.0009</td></tr><tr><td class="num" title="May 06 14:18">1d ago</td><td>caldwell</td><td>skill</td><td><span class="pill ok">ok</span></td><td>Q3 income progression review — on track, Maya launch flagged as variable compon…</td><td class="right num">7910ms</td><td class="right num">$0.1690</td></tr><tr><td class="num" title="May 06 11:32">1d ago</td><td>caldwell</td><td>skill</td><td><span class="pill ok">ok</span></td><td>Q1 bonus allocation question — applied locked debt priority</td><td class="right num">6230ms</td><td class="right num">$0.1287</td></tr><tr><td class="num" title="May 06 07:00">1d ago</td><td>caldwell</td><td>cron</td><td><span class="pill ok">ok</span></td><td>Daily morning brief — debt-payoff progress check, no anomalies</td><td class="right num">4810ms</td><td class="right num">$0.0975</td></tr><tr><td class="num" title="May 05 15:42">2d ago</td><td>caldwell</td><td>skill</td><td><span class="pill ok">ok</span></td><td>Maya&#x27;s consulting launch — pricing scenarios</td><td class="right num">7104ms</td><td class="right num">$0.1504</td></tr><tr><td class="num" title="May 05 07:00">2d ago</td><td>caldwell</td><td>cron</td><td><span class="pill ok">ok</span></td><td>Daily morning brief — no anomalies</td><td class="right num">4612ms</td><td class="right num">$0.0959</td></tr><tr><td class="num" title="May 04 07:00">3d ago</td><td>caldwell</td><td>cron</td><td><span class="pill ok">ok</span></td><td>Daily morning brief — credit card balance update reflected</td><td class="right num">4720ms</td><td class="right num">$0.0975</td></tr><tr><td class="num" title="May 03 19:18">3d ago</td><td>caldwell</td><td>skill</td><td><span class="pill ok">ok</span></td><td>Spending tradeoff question — quality OK on Sonnet, cost dropped 80%</td><td class="right num">2810ms</td><td class="right num">$0.0257</td></tr><tr><td class="num" title="May 03 07:00">4d ago</td><td>caldwell</td><td>cron</td><td><span class="pill ok">ok</span></td><td>Daily morning brief — model fallback to Sonnet (Opus daily cap N/A; Sam manuall…</td><td class="right num">2104ms</td><td class="right num">$0.0192</td></tr></tbody></table>
+</section>
+
+<section class="panel">
+  <h2>Recent failures · 24h (0)</h2>
+  <p class="empty-note">No failures in the last 24 hours.</p>
+</section>
+
+<div class="grid-2">
+  <section class="panel">
+    <h2>Recent tool calls · last 7d</h2>
+    <p class="empty-note">No tool calls in the last 7 days.</p>
+  </section>
+  <section class="panel">
+    <h2>Recent delegations · last 7d</h2>
+    <p class="empty-note">No delegations in the last 7 days.</p>
+  </section>
+</div>
+
+<section class="panel">
+  <h2>Recent memory captures</h2>
+  <table><thead><tr><th>When</th><th>Agent</th><th>File</th></tr></thead><tbody><tr><td class="num">4h ago</td><td>caldwell</td><td>user_risk_tolerance.md</td></tr><tr><td class="num">4h ago</td><td>caldwell</td><td>user_money_stress.md</td></tr><tr><td class="num">4h ago</td><td>caldwell</td><td>reference_financial_vault.md</td></tr><tr><td class="num">4h ago</td><td>caldwell</td><td>reference_cpa_contact.md</td></tr><tr><td class="num">4h ago</td><td>caldwell</td><td>project_maya_consulting_launch.md</td></tr><tr><td class="num">4h ago</td><td>caldwell</td><td>project_acme_retainers.md</td></tr><tr><td class="num">4h ago</td><td>caldwell</td><td>feedback_debt_priority_order.md</td></tr><tr><td class="num">4h ago</td><td>caldwell</td><td>feedback_communication_style.md</td></tr><tr><td class="num">4h ago</td><td>caldwell</td><td>decision_q3_income_target.md</td></tr></tbody></table>
+</section>
+
+<section class="panel">
+  <h2>Recent dream runs</h2>
+  <p class="empty-note">No dream runs found.</p>
+</section>
+
+<section class="panel">
+  <h2>Lock state — stale locks (0 detected)</h2>
+  <p class="empty-note">No stale locks detected. All clear.</p>
+</section>
+
+
+<footer>
+  <div>Generated 2026-05-07 by atomic_agents.dashboard</div>
+  <div>Atomic Agents fleet observability</div>
+</footer>
+
+<script>
+function refresh() {
+  fetch('/regenerate', {method: 'POST'})
+    .then(r => { if (r.ok) location.reload(); else fallback(); })
+    .catch(fallback);
+}
+function fallback() { location.reload(); }
+</script>
+
+</body>
+</html>

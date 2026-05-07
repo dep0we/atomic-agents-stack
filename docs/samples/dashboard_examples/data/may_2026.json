@@ -1,0 +1,152 @@
+{
+  "period_label": "May 2026",
+  "period_start": "2026-05-01",
+  "today": "2026-05-07",
+  "total_cost": 0.8697,
+  "total_runs": 12,
+  "composite_cache_hit_pct": 74.1,
+  "total_errors": 0,
+  "agents": [
+    {
+      "name": "caldwell",
+      "runs": 12,
+      "cost_usd": 0.86974,
+      "input_tokens": 48849,
+      "output_tokens": 8283,
+      "cache_hit_pct": 74.1,
+      "errors": 0,
+      "helper_runs": 3,
+      "helper_cost_usd": 0.00284,
+      "models_used": [
+        "claude-haiku-4-5-20251001",
+        "claude-opus-4-7-20260101",
+        "claude-sonnet-4-6-20260101"
+      ],
+      "cost_by_model": {
+        "claude-sonnet-4-6-20260101": 0.0449,
+        "claude-opus-4-7-20260101": 0.822,
+        "claude-haiku-4-5-20251001": 0.00284
+      },
+      "runs_by_model": {
+        "claude-sonnet-4-6-20260101": 2,
+        "claude-opus-4-7-20260101": 7,
+        "claude-haiku-4-5-20251001": 3
+      }
+    }
+  ],
+  "top_runs": [
+    {
+      "ts": "2026-05-06T14:18:00-05:00",
+      "agent": "caldwell",
+      "trigger": "skill",
+      "model": "claude-opus-4-7-20260101",
+      "input_tokens": 3987,
+      "output_tokens": 1456,
+      "cost_usd": 0.169,
+      "cache_hit_tokens": 3200,
+      "cache_miss_tokens": 787,
+      "latency_ms": 7910,
+      "status": "ok",
+      "summary": "Q3 income progression review \u2014 on track, Maya launch flagged as variable component",
+      "fallback": false,
+      "critical": false,
+      "parent_agent": null,
+      "parent_run_id": null,
+      "run_id": null
+    },
+    {
+      "ts": "2026-05-05T15:42:00-05:00",
+      "agent": "caldwell",
+      "trigger": "skill",
+      "model": "claude-opus-4-7-20260101",
+      "input_tokens": 4521,
+      "output_tokens": 1102,
+      "cost_usd": 0.1504,
+      "cache_hit_tokens": 3200,
+      "cache_miss_tokens": 1321,
+      "latency_ms": 7104,
+      "status": "ok",
+      "summary": "Maya's consulting launch \u2014 pricing scenarios",
+      "fallback": false,
+      "critical": false,
+      "parent_agent": null,
+      "parent_run_id": null,
+      "run_id": null
+    },
+    {
+      "ts": "2026-05-06T11:32:00-05:00",
+      "agent": "caldwell",
+      "trigger": "skill",
+      "model": "claude-opus-4-7-20260101",
+      "input_tokens": 4102,
+      "output_tokens": 892,
+      "cost_usd": 0.1287,
+      "cache_hit_tokens": 3200,
+      "cache_miss_tokens": 902,
+      "latency_ms": 6230,
+      "status": "ok",
+      "summary": "Q1 bonus allocation question \u2014 applied locked debt priority",
+      "fallback": false,
+      "critical": false,
+      "parent_agent": null,
+      "parent_run_id": null,
+      "run_id": null
+    },
+    {
+      "ts": "2026-05-04T07:00:00-05:00",
+      "agent": "caldwell",
+      "trigger": "cron",
+      "model": "claude-opus-4-7-20260101",
+      "input_tokens": 3398,
+      "output_tokens": 620,
+      "cost_usd": 0.0975,
+      "cache_hit_tokens": 2400,
+      "cache_miss_tokens": 998,
+      "latency_ms": 4720,
+      "status": "ok",
+      "summary": "Daily morning brief \u2014 credit card balance update reflected",
+      "fallback": false,
+      "critical": false,
+      "parent_agent": null,
+      "parent_run_id": null,
+      "run_id": null
+    },
+    {
+      "ts": "2026-05-06T07:00:00-05:00",
+      "agent": "caldwell",
+      "trigger": "cron",
+      "model": "claude-opus-4-7-20260101",
+      "input_tokens": 3421,
+      "output_tokens": 612,
+      "cost_usd": 0.0975,
+      "cache_hit_tokens": 2400,
+      "cache_miss_tokens": 1021,
+      "latency_ms": 4810,
+      "status": "ok",
+      "summary": "Daily morning brief \u2014 debt-payoff progress check, no anomalies",
+      "fallback": false,
+      "critical": false,
+      "parent_agent": null,
+      "parent_run_id": null,
+      "run_id": null
+    }
+  ],
+  "delta_vs_prior_period": {
+    "cost_pct": 0.0
+  },
+  "monthly_trend": [
+    {
+      "month": "2026-05",
+      "agent": "caldwell",
+      "cost": 0.8697
+    }
+  ],
+  "by_model_global": {
+    "claude-sonnet-4-6-20260101": 0.0449,
+    "claude-opus-4-7-20260101": 0.822,
+    "claude-haiku-4-5-20251001": 0.0028
+  },
+  "by_provider": {
+    "anthropic": 0.8697
+  }
+}

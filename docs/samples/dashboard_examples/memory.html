@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Memory Snapshot — Atomic Agents</title>
+<style>
+:root {
+  --bg: #0f1419; --card: #1a2028; --text: #e6e6e6; --muted: #8a96a3;
+  --accent: #4ec9b0; --warn: #d19a66; --error: #e06c75; --good: #98c379;
+  --border: #2a323d;
+  --opus: #c678dd; --sonnet: #61afef; --haiku: #98c379;
+  --gpt: #c0a050; --kimi: #5fb3b3; --local: #888;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", system-ui, sans-serif;
+  background: var(--bg); color: var(--text); line-height: 1.5;
+  padding: 32px 48px; max-width: 1400px; margin: 0 auto;
+}
+header {
+  display: flex; justify-content: space-between; align-items: baseline;
+  margin-bottom: 16px; padding-bottom: 16px; border-bottom: 1px solid var(--border);
+}
+h1 { font-size: 24px; font-weight: 600; }
+h2 { font-size: 16px; font-weight: 600; margin: 32px 0 12px;
+     color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.period { color: var(--muted); font-size: 14px; }
+.breadcrumb { color: var(--muted); font-size: 13px; margin-bottom: 4px; }
+.breadcrumb a { color: var(--accent); text-decoration: none; }
+.breadcrumb a:hover { text-decoration: underline; }
+.refresh-btn {
+  background: var(--card); color: var(--text); border: 1px solid var(--border);
+  padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px;
+}
+.refresh-btn:hover { border-color: var(--accent); }
+
+/* Top navigation bar */
+.tab-nav {
+  display: flex; gap: 4px; margin-bottom: 24px;
+  border-bottom: 1px solid var(--border); padding-bottom: 0;
+}
+.tab-nav a {
+  display: inline-block; padding: 8px 16px; font-size: 13px; font-weight: 500;
+  color: var(--muted); text-decoration: none; border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+.tab-nav a:hover { color: var(--text); border-bottom-color: var(--border); }
+.tab-nav a.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+.kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 8px; }
+.kpis-5 { display: grid; grid-template-columns: repeat(5, 1fr); gap: 16px; margin-bottom: 8px; }
+.kpi {
+  background: var(--card); border: 1px solid var(--border);
+  padding: 20px; border-radius: 10px;
+}
+.kpi .value { font-size: 28px; font-weight: 700; margin-bottom: 4px; }
+.kpi .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.kpi .delta { font-size: 12px; margin-top: 6px; }
+.kpi .delta.up { color: var(--error); }
+.kpi .delta.down { color: var(--good); }
+.kpi .delta.neutral { color: var(--muted); }
+
+.panel {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 10px; padding: 24px; margin-bottom: 16px;
+}
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+thead th {
+  text-align: left; color: var(--muted); font-weight: 500; font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.05em;
+  padding: 8px 12px; border-bottom: 1px solid var(--border);
+}
+tbody td { padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+tbody tr:last-child td { border-bottom: none; }
+tbody tr:hover { background: rgba(78, 201, 176, 0.04); }
+.num { font-variant-numeric: tabular-nums; }
+.right { text-align: right; }
+.muted { color: var(--muted); font-size: 12px; }
+.pill {
+  display: inline-block; padding: 2px 8px; border-radius: 10px;
+  font-size: 11px; font-weight: 500; border: 1px solid;
+}
+.pill.opus { color: var(--opus); border-color: var(--opus); background: rgba(198, 120, 221, 0.1); }
+.pill.sonnet { color: var(--sonnet); border-color: var(--sonnet); background: rgba(97, 175, 239, 0.1); }
+.pill.haiku { color: var(--haiku); border-color: var(--haiku); background: rgba(152, 195, 121, 0.1); }
+.pill.ok { color: var(--good); border-color: var(--good); background: rgba(152, 195, 121, 0.1); }
+.pill.error { color: var(--error); border-color: var(--error); background: rgba(224, 108, 117, 0.1); }
+.pill.warn { color: var(--warn); border-color: var(--warn); background: rgba(209, 154, 102, 0.1); }
+.pill.neutral { color: var(--muted); border-color: var(--border); background: transparent; }
+.row-error td { background: rgba(224, 108, 117, 0.05); }
+.row-warn td { background: rgba(209, 154, 102, 0.05); }
+
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
+
+.empty-note { color: var(--muted); font-style: italic; font-size: 13px; padding: 12px 0; }
+
+/* Sparkline via Unicode block chars */
+.sparkline { font-family: monospace; letter-spacing: 2px; font-size: 14px; color: var(--accent); }
+
+footer {
+  margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border);
+  color: var(--muted); font-size: 12px;
+  display: flex; justify-content: space-between;
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Memory Snapshot</h1>
+    <div class="period">as of 2026-05-07 21:03 UTC</div>
+  </div>
+  <div>
+    <button class="refresh-btn" onclick="refresh()">&#8635; Refresh</button>
+  </div>
+</header>
+
+<nav class="tab-nav"><a href="index.html">Cost</a><a href="activity.html">Activity</a><a href="quality.html">Quality</a><a href="memory.html" class="active">Memory</a></nav>
+
+
+<section class="panel">
+  <h2>Note counts per agent per type</h2>
+  <table><thead><tr><th>Agent</th><th class="right">User</th><th class="right">Feedback</th><th class="right">Project</th><th class="right">Decision</th><th class="right">Reference</th><th class="right">Other</th><th class="right">Total</th></tr></thead><tbody><tr><td>caldwell</td><td class="right num">2</td><td class="right num">1</td><td class="right num">2</td><td class="right num">1</td><td class="right num">2</td><td class="right num">1</td><td class="right num"><strong>9</strong></td></tr></tbody></table>
+</section>
+
+<section class="panel">
+  <h2>Staleness candidates (&gt; 90 days, not pinned)</h2>
+  <p class="empty-note">No staleness candidates (threshold: 90 days).</p>
+</section>
+
+<section class="panel">
+  <h2>Orphan check — in memory/ but missing from INDEX.md</h2>
+  <p class="empty-note">No orphan notes detected. INDEX.md is in sync.</p>
+</section>
+
+<section class="panel">
+  <h2>Version-churn leaders — top 0 most-versioned notes</h2>
+  <p class="empty-note">No version history found.</p>
+</section>
+
+<section class="panel">
+  <h2>Dream history</h2>
+  <p class="empty-note">No dream history found.</p>
+</section>
+
+<section class="panel">
+  <h2>Memory size + growth</h2>
+  <table><thead><tr><th>Agent</th><th class="right">Live memory</th><th class="right">Version history</th><th class="right">History/Live ratio</th></tr></thead><tbody><tr><td>caldwell</td><td class="right num">16.9 KB</td><td class="right num">0 B</td><td class="right num" style="color: var(--good)">0.0×</td></tr></tbody></table>
+</section>
+
+
+<footer>
+  <div>Generated 2026-05-07 by atomic_agents.dashboard</div>
+  <div>Atomic Agents fleet observability</div>
+</footer>
+
+<script>
+function refresh() {
+  fetch('/regenerate', {method: 'POST'})
+    .then(r => { if (r.ok) location.reload(); else fallback(); })
+    .catch(fallback);
+}
+function fallback() { location.reload(); }
+</script>
+
+</body>
+</html>

@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Atomic Agents — May 2026</title>
+<style>
+:root {
+  --bg: #0f1419; --card: #1a2028; --text: #e6e6e6; --muted: #8a96a3;
+  --accent: #4ec9b0; --warn: #d19a66; --error: #e06c75; --good: #98c379;
+  --border: #2a323d;
+  --opus: #c678dd; --sonnet: #61afef; --haiku: #98c379;
+  --gpt: #c0a050; --kimi: #5fb3b3; --local: #888;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", system-ui, sans-serif;
+  background: var(--bg); color: var(--text); line-height: 1.5;
+  padding: 32px 48px; max-width: 1400px; margin: 0 auto;
+}
+header {
+  display: flex; justify-content: space-between; align-items: baseline;
+  margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--border);
+}
+h1 { font-size: 24px; font-weight: 600; }
+h2 { font-size: 16px; font-weight: 600; margin: 32px 0 12px;
+     color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.period { color: var(--muted); font-size: 14px; }
+.breadcrumb { color: var(--muted); font-size: 13px; margin-bottom: 4px; }
+.breadcrumb a { color: var(--accent); text-decoration: none; }
+.breadcrumb a:hover { text-decoration: underline; }
+.refresh-btn {
+  background: var(--card); color: var(--text); border: 1px solid var(--border);
+  padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px;
+}
+.refresh-btn:hover { border-color: var(--accent); }
+
+.kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 8px; }
+.kpi {
+  background: var(--card); border: 1px solid var(--border);
+  padding: 20px; border-radius: 10px;
+}
+.kpi .value { font-size: 28px; font-weight: 700; margin-bottom: 4px; }
+.kpi .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.kpi .delta { font-size: 12px; margin-top: 6px; }
+.kpi .delta.up { color: var(--error); }
+.kpi .delta.down { color: var(--good); }
+.kpi .delta.neutral { color: var(--muted); }
+
+.panel {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 10px; padding: 24px; margin-bottom: 16px;
+}
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+thead th {
+  text-align: left; color: var(--muted); font-weight: 500; font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.05em;
+  padding: 8px 12px; border-bottom: 1px solid var(--border);
+}
+tbody td { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+tbody tr:last-child td { border-bottom: none; }
+tbody tr:hover { background: rgba(78, 201, 176, 0.04); }
+.num { font-variant-numeric: tabular-nums; }
+.right { text-align: right; }
+.muted { color: var(--muted); font-size: 12px; }
+.pill {
+  display: inline-block; padding: 2px 8px; border-radius: 10px;
+  font-size: 11px; font-weight: 500; border: 1px solid;
+}
+.pill.opus { color: var(--opus); border-color: var(--opus); background: rgba(198, 120, 221, 0.1); }
+.pill.sonnet { color: var(--sonnet); border-color: var(--sonnet); background: rgba(97, 175, 239, 0.1); }
+.pill.haiku { color: var(--haiku); border-color: var(--haiku); background: rgba(152, 195, 121, 0.1); }
+.pill.gpt { color: var(--gpt); border-color: var(--gpt); background: rgba(192, 160, 80, 0.1); }
+.pill.kimi { color: var(--kimi); border-color: var(--kimi); background: rgba(95, 179, 179, 0.1); }
+.pill.local { color: var(--local); border-color: var(--local); background: rgba(136, 136, 136, 0.1); }
+.pill.fallback { color: var(--warn); border-color: var(--warn); background: rgba(209, 154, 102, 0.1); margin-left: 4px; }
+.pill.helper { color: var(--haiku); border-color: var(--haiku); background: rgba(152, 195, 121, 0.05); font-size: 10px; }
+
+.day-chart { display: flex; align-items: flex-end; height: 220px; gap: 12px; padding: 16px 0; }
+.day-col { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.day-stack { width: 100%; display: flex; flex-direction: column-reverse; min-height: 1px; }
+.day-seg { width: 100%; transition: opacity 0.2s; }
+.day-seg.opus { background: var(--opus); }
+.day-seg.sonnet { background: var(--sonnet); }
+.day-seg.haiku { background: var(--haiku); }
+.day-col:hover .day-seg { opacity: 0.7; }
+.day-label { font-size: 11px; color: var(--muted); }
+.day-value { font-size: 12px; font-variant-numeric: tabular-nums; font-weight: 500; }
+
+.model-mix-bar { display: flex; height: 32px; border-radius: 6px; overflow: hidden; margin: 12px 0; }
+.model-mix-seg { display: flex; align-items: center; justify-content: center;
+                  font-size: 11px; color: rgba(0,0,0,0.7); font-weight: 600; min-width: 0; }
+.model-mix-seg.opus { background: var(--opus); }
+.model-mix-seg.sonnet { background: var(--sonnet); }
+.model-mix-seg.haiku { background: var(--haiku); }
+.model-mix-seg.gpt { background: var(--gpt); }
+.model-mix-seg.kimi { background: var(--kimi); }
+.model-mix-seg.local { background: var(--local); }
+
+.legend { display: flex; gap: 16px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+.legend-item { display: flex; align-items: center; gap: 6px; }
+.legend-dot { width: 10px; height: 10px; border-radius: 2px; }
+
+.savings-card {
+  background: linear-gradient(135deg, rgba(152, 195, 121, 0.08), rgba(78, 201, 176, 0.04));
+  border: 1px solid rgba(152, 195, 121, 0.2); padding: 20px; border-radius: 10px;
+}
+.savings-headline { font-size: 22px; font-weight: 700; color: var(--good); }
+.savings-detail { font-size: 13px; color: var(--muted); margin-top: 6px; }
+
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+
+.empty-note { color: var(--muted); font-style: italic; font-size: 13px; padding: 12px 0; }
+
+footer {
+  margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border);
+  color: var(--muted); font-size: 12px;
+  display: flex; justify-content: space-between;
+}
+/* Top navigation bar */
+.tab-nav {
+  display: flex; gap: 4px; margin-bottom: 24px;
+  border-bottom: 1px solid var(--border); padding-bottom: 0;
+}
+.tab-nav a {
+  display: inline-block; padding: 8px 16px; font-size: 13px; font-weight: 500;
+  color: var(--muted); text-decoration: none; border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+.tab-nav a:hover { color: var(--text); border-bottom-color: var(--border); }
+.tab-nav a.active { color: var(--accent); border-bottom-color: var(--accent); }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Atomic Agents</h1>
+    <div class="period">May 2026 · as of 2026-05-07</div>
+  </div>
+  <div>
+    <button class="refresh-btn" onclick="refresh()">↻ Refresh</button>
+  </div>
+</header>
+
+<nav class="tab-nav"><a href="index.html" class="active">Cost</a><a href="activity.html">Activity</a><a href="quality.html">Quality</a><a href="memory.html">Memory</a></nav>
+
+<section class="kpis">
+  <div class="kpi">
+    <div class="value">$0.87</div>
+    <div class="label">Spend this month</div>
+    <div class="delta neutral">no change vs. last month</div>
+  </div>
+  <div class="kpi">
+    <div class="value">12</div>
+    <div class="label">Total runs</div>
+  </div>
+  <div class="kpi">
+    <div class="value">74.1%</div>
+    <div class="label">Cache hit rate</div>
+  </div>
+  <div class="kpi">
+    <div class="value">0</div>
+    <div class="label">Errors</div>
+  </div>
+</section>
+
+<section class="panel">
+  <h2>Per-agent breakdown</h2>
+  <table><thead><tr><th>Agent</th><th class="right">Cost</th><th class="right">Runs</th><th class="right">Errors</th><th class="right">Cache hit</th><th>Models used</th></tr></thead><tbody><tr><td><a href="../caldwell/dashboard.html" style="color: var(--accent); text-decoration: none;">caldwell</a></td><td class="right num">$0.8697</td><td class="right num">12</td><td class="right num">0</td><td class="right num">74.1%</td><td><span class="pill sonnet" style="margin-right: 4px;">Sonnet: $0.0449</span><span class="pill opus" style="margin-right: 4px;">Opus: $0.8220</span><span class="pill haiku" style="margin-right: 4px;">Haiku: $0.0028</span></td></tr></tbody></table>
+</section>
+
+<div class="grid-2">
+  <section class="panel">
+    <h2>Model mix · this month</h2>
+    <div class="model-mix-bar"><div class="model-mix-seg opus" style="width: 94.51535012073128%" title="claude-opus-4-7-20260101: $0.8220">Opus 94.5%</div><div class="model-mix-seg sonnet" style="width: 5.162699781533862%" title="claude-sonnet-4-6-20260101: $0.0449">Sonnet 5.2%</div><div class="model-mix-seg haiku" style="width: 0.32195009773485106%" title="claude-haiku-4-5-20251001: $0.0028"></div></div><table><thead><tr><th>Model</th><th class="right">Cost</th><th class="right">% spend</th></tr></thead><tbody><tr><td><span class="pill opus">claude-opus-4-7-20260101</span></td><td class="right num">$0.8220</td><td class="right num">94.5%</td></tr><tr><td><span class="pill sonnet">claude-sonnet-4-6-20260101</span></td><td class="right num">$0.0449</td><td class="right num">5.2%</td></tr><tr><td><span class="pill haiku">claude-haiku-4-5-20251001</span></td><td class="right num">$0.0028</td><td class="right num">0.3%</td></tr></tbody></table>
+  </section>
+
+  <section class="panel">
+    <h2>Provider breakdown</h2>
+    <table><thead><tr><th>Provider</th><th class="right">Cost</th><th class="right">% of spend</th></tr></thead><tbody><tr><td>anthropic</td><td class="right num">$0.8697</td><td class="right num">100.0%</td></tr></tbody></table>
+  </section>
+</div>
+
+<section class="panel">
+  <h2>Top 5 most expensive runs</h2>
+  <table><thead><tr><th>Date</th><th>Agent</th><th>Trigger</th><th>Model</th><th class="right">Tokens (in / out)</th><th class="right">Cost</th><th>Summary</th></tr></thead><tbody><tr><td class="num">May 06 · 14:18</td><td>caldwell</td><td>skill</td><td><span class="pill opus">Opus</span></td><td class="right num">3,987 / 1,456</td><td class="right num"><strong>$0.1690</strong></td><td>Q3 income progression review — on track, Maya launch flagge…</td></tr><tr><td class="num">May 05 · 15:42</td><td>caldwell</td><td>skill</td><td><span class="pill opus">Opus</span></td><td class="right num">4,521 / 1,102</td><td class="right num"><strong>$0.1504</strong></td><td>Maya's consulting launch — pricing scenarios</td></tr><tr><td class="num">May 06 · 11:32</td><td>caldwell</td><td>skill</td><td><span class="pill opus">Opus</span></td><td class="right num">4,102 / 892</td><td class="right num"><strong>$0.1287</strong></td><td>Q1 bonus allocation question — applied locked debt priority</td></tr><tr><td class="num">May 04 · 07:00</td><td>caldwell</td><td>cron</td><td><span class="pill opus">Opus</span></td><td class="right num">3,398 / 620</td><td class="right num"><strong>$0.0975</strong></td><td>Daily morning brief — credit card balance update reflected</td></tr><tr><td class="num">May 06 · 07:00</td><td>caldwell</td><td>cron</td><td><span class="pill opus">Opus</span></td><td class="right num">3,421 / 612</td><td class="right num"><strong>$0.0975</strong></td><td>Daily morning brief — debt-payoff progress check, no anomal…</td></tr></tbody></table>
+</section>
+
+<footer>
+  <div>Generated 2026-05-07 by atomic_agents.dashboard</div>
+  <div>Aggregated from log/YYYY-MM/*.jsonl across 1 agents</div>
+</footer>
+
+<script>
+function refresh() {
+  fetch('/regenerate', {method: 'POST'})
+    .then(r => { if (r.ok) location.reload(); else fallback(); })
+    .catch(fallback);
+}
+function fallback() {
+  // No server running. Plain reload — shows last cron-built data.
+  location.reload();
+}
+</script>
+
+</body>
+</html>
