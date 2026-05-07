@@ -31,6 +31,36 @@ NOTE_FILENAME_PATTERN = re.compile(
 )
 
 
+def validate_wiki_frontmatter(meta: dict[str, Any], filename: str | None = None) -> None:
+    """Validate a wiki page's frontmatter. Raises SchemaValidationError on first failure.
+
+    Wiki pages live under <agent>/wiki/ and use type: wiki_page.
+    `meta` is the dict from a parsed frontmatter file.
+    `filename` is the bare filename for basic sanity checks.
+    """
+    _require(meta, "schema_version", int)
+    if meta["schema_version"] != CURRENT_SCHEMA_VERSION:
+        raise SchemaValidationError(
+            f"schema_version is {meta['schema_version']}; current is {CURRENT_SCHEMA_VERSION}. "
+            f"Run migrations per spec/03."
+        )
+
+    _require(meta, "type", str)
+    if meta["type"] not in VALID_WIKI_TYPES:
+        raise SchemaValidationError(
+            f"wiki page type must be one of {VALID_WIKI_TYPES}; got '{meta['type']}'"
+        )
+
+    _require(meta, "name", str, max_length=NAME_MAX)
+    _require(meta, "description", str, max_length=DESCRIPTION_MAX)
+
+    # Optional fields — if present, validate
+    if "tags" in meta and not isinstance(meta["tags"], list):
+        raise SchemaValidationError("tags must be a list of strings")
+    if "pinned" in meta and not isinstance(meta["pinned"], bool):
+        raise SchemaValidationError("pinned must be a boolean")
+
+
 def validate_atomic_note_frontmatter(meta: dict[str, Any], filename: str | None = None) -> None:
     """Validate one atomic note's frontmatter. Raises SchemaValidationError on first failure.
 
