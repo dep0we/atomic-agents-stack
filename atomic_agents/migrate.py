@@ -87,7 +87,9 @@ from .exceptions import (
 
 VERSION_RE = re.compile(r"^v?(\d+)$")
 SCRIPT_NAME_RE = re.compile(r"^v(\d+)_to_v(\d+)\.py$")
-SNAPSHOT_NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_pre_v(\d+)_migration\.tar\.gz$")
+SNAPSHOT_NAME_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})T(\d{6})_pre_v(\d+)_migration\.tar\.gz$"
+)
 
 # When walking the vault for migration, these directories are skipped
 EXCLUDED_DIRS = {
@@ -226,29 +228,53 @@ def _load_module(path: Path) -> Any:
 def find_content_files(agents_root: Path) -> list[Path]:
     """Walk the vault and return all *.md files in agent content dirs.
 
-    Skips _dashboard, _migrations, _cache, and other meta dirs.
-    Within each agent, only walks memory/, wiki/, and similar content dirs.
-    Skips INDEX.md and other non-frontmatter files.
+    Handles both single-agent layouts and cascaded agent layouts:
+
+    - **Single-agent**: ``<agents_root>/<agent>/memory/`` or ``<agents_root>/<agent>/wiki/``
+    - **Cascaded**: ``<agents_root>/<system>/projects/<project>/agents/<role>/memory/``
+      (any depth under agents_root)
+
+    Strategy: find every ``memory/`` or ``wiki/`` directory anywhere under
+    ``agents_root`` using ``rglob``, skipping ``EXCLUDED_DIRS`` and dotfile
+    directories.  Deduplicates by absolute resolved path so no file is counted
+    twice.
+
+    Skips ``_dashboard``, ``_migrations``, ``_cache``, dotfile dirs, INDEX.md,
+    and other non-frontmatter files.
     """
-    files: list[Path] = []
     if not agents_root.exists():
-        return files
+        return []
 
-    for agent_dir in agents_root.iterdir():
-        if not agent_dir.is_dir():
-            continue
-        if agent_dir.name in EXCLUDED_DIRS or agent_dir.name.startswith("."):
-            continue
+    seen: set[Path] = set()
+    files: list[Path] = []
 
-        for content_dir_name in AGENT_CONTENT_DIRS:
-            content_dir = agent_dir / content_dir_name
-            if not content_dir.exists():
+    def _is_excluded(path: Path) -> bool:
+        """True if any component of path (relative to agents_root) is excluded."""
+        try:
+            rel = path.relative_to(agents_root)
+        except ValueError:
+            return False
+        return any(
+            part in EXCLUDED_DIRS or part.startswith(".")
+            for part in rel.parts
+        )
+
+    for content_dir_name in AGENT_CONTENT_DIRS:
+        for content_dir in agents_root.rglob(content_dir_name):
+            if not content_dir.is_dir():
+                continue
+            # Skip if any ancestor component is excluded / a dotfile dir
+            if _is_excluded(content_dir):
                 continue
             for path in content_dir.rglob("*.md"):
                 if path.name == "INDEX.md":
                     continue
-                if any(part in EXCLUDED_DIRS for part in path.parts):
+                if _is_excluded(path):
                     continue
+                resolved = path.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
                 files.append(path)
 
     return files
@@ -257,17 +283,27 @@ def find_content_files(agents_root: Path) -> list[Path]:
 # ──────────────────────────────────────────────────────────────────
 # Snapshot
 
-def create_snapshot(agents_root: Path, target_version: int, today: date | None = None) -> Path:
+def create_snapshot(
+    agents_root: Path,
+    target_version: int,
+    today: date | None = None,
+    _now: datetime.datetime | None = None,
+) -> Path:
     """Tar+gzip the entire vault (excluding caches, logs, snapshots) to
-    `<agents_root>/_migrations/snapshots/YYYY-MM-DD_pre_vN_migration.tar.gz`.
+    `<agents_root>/_migrations/snapshots/YYYY-MM-DDT<HHMMSS>_pre_vN_migration.tar.gz`.
+
+    The HHMMSS component prevents collisions when a migration is re-run on the
+    same day (e.g., dry-run then real run, or rollback + retry).
 
     Returns the snapshot path.
     """
-    today = today or date.today()
+    now = _now or datetime.datetime.now()
+    today = today or now.date()
+    time_str = now.strftime("%H%M%S")
     snapshots_dir = agents_root / "_migrations" / "snapshots"
     snapshots_dir.mkdir(parents=True, exist_ok=True)
 
-    snapshot_path = snapshots_dir / f"{today.isoformat()}_pre_v{target_version}_migration.tar.gz"
+    snapshot_path = snapshots_dir / f"{today.isoformat()}T{time_str}_pre_v{target_version}_migration.tar.gz"
 
     def _filter(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo | None:
         # Use forward slashes for tar paths (cross-platform)
