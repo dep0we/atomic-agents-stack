@@ -98,3 +98,11 @@ class HelperResult:
     output_tokens: int
     cost_usd: float
     latency_ms: int
+    # Provenance fields (per spec/10 Wave 8)
+    # `sources` echoes the sources passed in so the parent agent can
+    # cite them in its response without keeping the original list around.
+    sources: list[str] = field(default_factory=list)
+    # True when the helper output appears to preserve attribution (citation-like
+    # brackets or named source mentions). Heuristic — defaults to True when
+    # no sources were passed (no provenance to preserve in that case).
+    provenance_preserved: bool = True
