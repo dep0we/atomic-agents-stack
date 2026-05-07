@@ -638,8 +638,30 @@ class AtomicAgent:
                 f"Parallel helper batch blocked: {check.reason}"
             )
 
+        # Worst-case reservation: check that the parent's remaining headroom can
+        # cover all helpers at max_tokens output each. This prevents the "each
+        # thread sees the same pre-batch snapshot" race where collective cost
+        # overruns the cap even though no individual thread sees a breach.
+        actual_model = check.fallback_model if check.action == "fallback" else model
+        reserved_usd = self._estimate_batch_cost(actual_model, max_tokens, len(prompts))
+        self._check_batch_reservation(reserved_usd)
+
         total = len(prompts)
         results: list[Any] = [None] * total  # list[HelperResult | Exception]
+
+        # Log the reservation so an audit trail can see what was reserved.
+        self._log({
+            "trigger": "helper_batch_reservation",
+            "parent_agent": self.name,
+            "parent_run_id": self.run_id,
+            "model": actual_model,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "reserved_usd": reserved_usd,
+            "batch_size": total,
+            "status": "ok",
+            "summary": f"reserved worst-case ${reserved_usd:.6f} for {total}-helper batch",
+        })
 
         def sources_for(idx: int) -> list[str] | None:
             if sources_per_prompt is not None:
@@ -670,7 +692,66 @@ class AtomicAgent:
         if failures:
             raise HelperBatchPartialFailure(failures, results)
 
+        # Log the release: actual aggregate cost vs what was reserved.
+        actual_usd = sum(r.cost_usd for r in results if isinstance(r, HelperResult))
+        self._log({
+            "trigger": "helper_batch_release",
+            "parent_agent": self.name,
+            "parent_run_id": self.run_id,
+            "model": actual_model,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "reserved_usd": reserved_usd,
+            "actual_usd": actual_usd,
+            "batch_size": total,
+            "status": "ok",
+            "summary": (
+                f"batch complete: actual ${actual_usd:.6f} vs "
+                f"reserved ${reserved_usd:.6f}"
+            ),
+        })
+
         return results  # type: ignore
+
+    def _estimate_batch_cost(self, model: str, max_tokens: int, batch_size: int) -> float:
+        """Compute a worst-case USD estimate for a helper batch.
+
+        Uses max_tokens output per helper at the model's output rate. Input
+        tokens are omitted from the estimate (conservative in the other direction,
+        but output dominates for short prompts against a haiku-class model).
+        Unknown models return 0 — can't estimate, so we don't block.
+        """
+        output_rate = _costs.PRICING.get(model, {}).get("output", 0.0)
+        return round(output_rate * max_tokens / 1_000_000 * batch_size, 6)
+
+    def _check_batch_reservation(self, reserved_usd: float) -> None:
+        """Raise CostGuardrailBlocked if the reservation exceeds remaining headroom.
+
+        Remaining headroom is the lower of (daily_cap - today_cost) and
+        (monthly_cap - month_cost). If cost_guardrails_enabled is False or
+        the reservation is zero, the check is skipped.
+        """
+        if not self.config.cost_guardrails_enabled or reserved_usd <= 0:
+            return
+        log_dir = self.agent_root / "log"
+        today_cost = _costs.sum_cost_for_period(log_dir, "today")
+        month_cost = _costs.sum_cost_for_period(log_dir, "this_month")
+        daily_remaining = (
+            self.config.daily_cap_usd - today_cost
+            if self.config.daily_cap_usd > 0
+            else float("inf")
+        )
+        monthly_remaining = (
+            self.config.monthly_cap_usd - month_cost
+            if self.config.monthly_cap_usd > 0
+            else float("inf")
+        )
+        headroom = min(daily_remaining, monthly_remaining)
+        if reserved_usd > headroom:
+            raise CostGuardrailBlocked(
+                f"Parallel helper batch reservation ${reserved_usd:.6f} exceeds "
+                f"remaining headroom ${headroom:.6f}"
+            )
 
     def _build_helper_system_prompt(self, sources: list[str]) -> str:
         """Build the helper's system prompt. Empty when no sources are passed."""
@@ -689,9 +770,22 @@ class AtomicAgent:
         ("according to", "per memo", "§3"), or a verbatim mention of any
         source's basename.
 
-        Conservative: prefers a False-positive over a False-negative — we'd
-        rather rare flag something as preserved when it wasn't than miss real
-        provenance loss.
+        **Deliberate trade-off — prefers false-positives over false-negatives.**
+        The parent agent treats ``provenance_preserved=False`` as "not citable",
+        which silently downgrades the quality of every fact in that helper
+        output. A false-negative (missing real provenance loss) therefore has a
+        much higher consequence than a false-positive (letting a borderline
+        output through unchallenged). The heuristic is intentionally lenient:
+        any attribution-shaped signal in the output counts, even if it's weak.
+
+        **Consequences for operators:** if your use-case requires strict
+        provenance verification, override ``HelperResult.provenance_preserved``
+        to ``False`` after inspecting the output before passing facts downstream.
+
+        This behaviour is specified in spec/10 Wave 8 (helper provenance) and
+        was reviewed and retained intentionally — do not tighten the heuristic
+        without updating that spec section and re-evaluating the false-negative
+        rate on the existing eval corpus.
         """
         if not sources:
             return True
