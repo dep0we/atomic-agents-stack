@@ -27,6 +27,7 @@ from .exceptions import (
     WritePathViolation,
 )
 from .types import Capture, Response, AgentConfig, CostCheckResult
+from .outcome import OutcomeRunner, OutcomeResult, IterationRecord
 
 __version__ = "0.1.0"
 
@@ -43,4 +44,7 @@ __all__ = [
     "Response",
     "AgentConfig",
     "CostCheckResult",
+    "OutcomeRunner",
+    "OutcomeResult",
+    "IterationRecord",
 ]
