@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+import json
+
 from atomic_agents import _cascade
 from atomic_agents._cascade import (
     CascadePaths,
@@ -23,6 +25,7 @@ from atomic_agents._cascade import (
     move_to_dead_letter,
     recover_stale_claims,
     release_claim,
+    renew_lease,
     resolve_model_md,
     resolve_tools_md,
 )
@@ -293,6 +296,7 @@ def test_claim_next_queued_returns_none_when_no_queue_dir(tmp_path):
 
 
 def test_release_claim_moves_to_done(tmp_path):
+    # done/ is namespaced by lease_token to prevent silent overwrites.
     instance = _build_cascade_layout(tmp_path)
     project = tmp_path / "muse" / "projects" / "the-unfinished"
     qd = project / "queue" / "queued" / "writer"
@@ -301,11 +305,12 @@ def test_release_claim_moves_to_done(tmp_path):
 
     item = claim_next_queued(project, role="writer", lease_token="lease-1")
     release_claim(item, project)
-    assert (project / "queue" / "done" / "task.md").exists()
+    assert (project / "queue" / "done" / "lease-1" / "task.md").exists()
     assert not item.path.exists()
 
 
 def test_move_to_dead_letter_writes_reason(tmp_path):
+    # dead-letter/ is namespaced by lease_token to prevent silent overwrites.
     instance = _build_cascade_layout(tmp_path)
     project = tmp_path / "muse" / "projects" / "the-unfinished"
     qd = project / "queue" / "queued" / "writer"
@@ -315,27 +320,34 @@ def test_move_to_dead_letter_writes_reason(tmp_path):
     item = claim_next_queued(project, role="writer", lease_token="lease-1")
     move_to_dead_letter(item, project, reason="Failed validation 3 times")
 
-    dl_path = project / "queue" / "dead-letter" / "bad.md"
-    assert dl_path.exists()
-    assert (project / "queue" / "dead-letter" / "bad.md.reason.txt").read_text() == "Failed validation 3 times"
+    dl_dir = project / "queue" / "dead-letter" / "lease-1"
+    assert (dl_dir / "bad.md").exists()
+    assert (dl_dir / "bad.md.reason.txt").read_text() == "Failed validation 3 times"
 
 
 def test_recover_stale_claims_moves_old_files_back(tmp_path):
+    # Legacy-path: sidecar has been backdated so lease_expires_at is in the past.
     instance = _build_cascade_layout(tmp_path)
     project = tmp_path / "muse" / "projects" / "the-unfinished"
     qd = project / "queue" / "queued" / "writer"
     qd.mkdir(parents=True)
     (qd / "stuck.md").write_text("Stuck task")
-    item = claim_next_queued(project, role="writer", lease_token="dead-lease")
+    item = claim_next_queued(project, role="writer", lease_token="dead-lease",
+                             lease_seconds=3600)
 
-    # Backdate the claim file's mtime by 2 hours
-    old_time = time.time() - 7200
-    os.utime(item.path, (old_time, old_time))
+    # Backdate the sidecar's lease_expires_at to 2 hours ago so it looks expired.
+    sidecar_path = item.path.parent / (item.original_name + ".lease.json")
+    data = json.loads(sidecar_path.read_text())
+    from datetime import datetime, timezone
+    past = datetime.fromtimestamp(time.time() - 7200, tz=timezone.utc)
+    data["lease_expires_at"] = past.isoformat()
+    sidecar_path.write_text(json.dumps(data))
 
     recovered = recover_stale_claims(project, lease_seconds=3600)
     assert len(recovered) == 1
     assert recovered[0].name == "stuck.md"
-    assert recovered[0].parent == project / "queue" / "queued" / "_recovered"
+    # Recovery is now namespaced by lease_token.
+    assert recovered[0].parent == project / "queue" / "queued" / "_recovered" / "dead-lease"
 
 
 def test_recover_stale_claims_leaves_fresh_claims_alone(tmp_path):
@@ -363,3 +375,160 @@ def test_two_workers_racing_only_one_claims(tmp_path, monkeypatch):
     item2 = claim_next_queued(project, role="writer", lease_token="worker-B")
     assert item1 is not None
     assert item2 is None  # second worker finds nothing left
+
+
+# ──────────────────────────────────────────────────────────────────
+# Regression tests — Bug 1: collision-safe namespaced destinations
+
+
+def test_release_claim_no_overwrite_with_namespaced_dest(tmp_path):
+    """Two leases with same-named files both released → both preserved (different done/ dirs)."""
+    instance = _build_cascade_layout(tmp_path)
+    project = tmp_path / "muse" / "projects" / "the-unfinished"
+
+    for lease_token, content in [("lease-A", "Work A"), ("lease-B", "Work B")]:
+        qd = project / "queue" / "queued" / "writer"
+        qd.mkdir(parents=True, exist_ok=True)
+        (qd / "task.md").write_text(content)
+        item = claim_next_queued(project, role="writer", lease_token=lease_token)
+        release_claim(item, project)
+
+    done_a = project / "queue" / "done" / "lease-A" / "task.md"
+    done_b = project / "queue" / "done" / "lease-B" / "task.md"
+    assert done_a.exists(), "lease-A item should be in done/lease-A/"
+    assert done_b.exists(), "lease-B item should be in done/lease-B/"
+    assert done_a.read_text() == "Work A"
+    assert done_b.read_text() == "Work B"
+
+
+def test_dead_letter_no_overwrite(tmp_path):
+    """Two leases with same-named files dead-lettered → both preserved (different dirs)."""
+    instance = _build_cascade_layout(tmp_path)
+    project = tmp_path / "muse" / "projects" / "the-unfinished"
+
+    for lease_token, content in [("lease-X", "Bad X"), ("lease-Y", "Bad Y")]:
+        qd = project / "queue" / "queued" / "writer"
+        qd.mkdir(parents=True, exist_ok=True)
+        (qd / "bad.md").write_text(content)
+        item = claim_next_queued(project, role="writer", lease_token=lease_token)
+        move_to_dead_letter(item, project, reason=f"reason-{lease_token}")
+
+    dl_x = project / "queue" / "dead-letter" / "lease-X" / "bad.md"
+    dl_y = project / "queue" / "dead-letter" / "lease-Y" / "bad.md"
+    assert dl_x.exists(), "lease-X item should be in dead-letter/lease-X/"
+    assert dl_y.exists(), "lease-Y item should be in dead-letter/lease-Y/"
+    assert dl_x.read_text() == "Bad X"
+    assert dl_y.read_text() == "Bad Y"
+    assert (project / "queue" / "dead-letter" / "lease-X" / "bad.md.reason.txt").read_text() == "reason-lease-X"
+    assert (project / "queue" / "dead-letter" / "lease-Y" / "bad.md.reason.txt").read_text() == "reason-lease-Y"
+
+
+# ──────────────────────────────────────────────────────────────────
+# Regression tests — Bug 2: explicit lease sidecar prevents false recovery
+
+
+def test_recover_stale_claims_uses_explicit_lease(tmp_path):
+    """A fresh claim with a future lease_expires_at is NOT recovered even if mtime is old."""
+    instance = _build_cascade_layout(tmp_path)
+    project = tmp_path / "muse" / "projects" / "the-unfinished"
+    qd = project / "queue" / "queued" / "writer"
+    qd.mkdir(parents=True)
+    (qd / "active.md").write_text("Active work")
+    item = claim_next_queued(project, role="writer", lease_token="active-lease",
+                             lease_seconds=3600)
+
+    # Backdate the work file's mtime to 2 hours ago — this would have triggered
+    # recovery under the old mtime-only logic.
+    old_time = time.time() - 7200
+    os.utime(item.path, (old_time, old_time))
+    # The sidecar still has lease_expires_at in the future (just written), so
+    # recover_stale_claims should leave this item alone.
+
+    recovered = recover_stale_claims(project, lease_seconds=3600)
+    assert recovered == [], "Item with valid sidecar lease must not be recovered despite old mtime"
+    assert item.path.exists()
+
+
+def test_recover_stale_claims_recovers_expired_lease(tmp_path):
+    """A claim whose sidecar lease_expires_at is in the past IS recovered."""
+    from datetime import datetime, timezone as tz
+
+    instance = _build_cascade_layout(tmp_path)
+    project = tmp_path / "muse" / "projects" / "the-unfinished"
+    qd = project / "queue" / "queued" / "writer"
+    qd.mkdir(parents=True)
+    (qd / "expired.md").write_text("Expired work")
+    item = claim_next_queued(project, role="writer", lease_token="expired-lease",
+                             lease_seconds=3600)
+
+    # Rewrite the sidecar with lease_expires_at 2 hours in the past.
+    sidecar_path = item.path.parent / (item.original_name + ".lease.json")
+    data = json.loads(sidecar_path.read_text())
+    past = datetime.fromtimestamp(time.time() - 7200, tz=tz.utc)
+    data["lease_expires_at"] = past.isoformat()
+    sidecar_path.write_text(json.dumps(data))
+
+    recovered = recover_stale_claims(project, lease_seconds=3600)
+    assert len(recovered) == 1
+    assert recovered[0].name == "expired.md"
+    assert recovered[0].parent == project / "queue" / "queued" / "_recovered" / "expired-lease"
+    # Sidecar should be deleted after recovery.
+    assert not sidecar_path.exists()
+
+
+def test_renew_lease_updates_sidecar(tmp_path):
+    """renew_lease(item, 3600) updates lease_expires_at in the sidecar."""
+    from datetime import datetime, timezone as tz
+
+    instance = _build_cascade_layout(tmp_path)
+    project = tmp_path / "muse" / "projects" / "the-unfinished"
+    qd = project / "queue" / "queued" / "writer"
+    qd.mkdir(parents=True)
+    (qd / "renew.md").write_text("Long work")
+    item = claim_next_queued(project, role="writer", lease_token="renew-lease",
+                             lease_seconds=60)  # short initial lease
+
+    sidecar_path = item.path.parent / (item.original_name + ".lease.json")
+    original_expires = datetime.fromisoformat(
+        json.loads(sidecar_path.read_text())["lease_expires_at"]
+    )
+
+    # Renew with a longer lease.
+    renew_lease(item, additional_seconds=3600)
+
+    updated_data = json.loads(sidecar_path.read_text())
+    updated_expires = datetime.fromisoformat(updated_data["lease_expires_at"])
+    if updated_expires.tzinfo is None:
+        updated_expires = updated_expires.replace(tzinfo=tz.utc)
+
+    # New expiry must be later than the original (which was only 60s).
+    assert updated_expires > original_expires
+    # Sanity: new expiry should be roughly 1 hour from now.
+    delta = updated_expires.timestamp() - time.time()
+    assert 3500 < delta < 3700, f"Expected ~3600s lease, got {delta:.0f}s"
+    assert updated_data["lease_seconds"] == 3600
+
+
+def test_recover_stale_claims_legacy_mtime_fallback(tmp_path):
+    """A claim with NO sidecar (legacy state) triggers recovery via mtime fallback."""
+    instance = _build_cascade_layout(tmp_path)
+    project = tmp_path / "muse" / "projects" / "the-unfinished"
+    qd = project / "queue" / "queued" / "writer"
+    qd.mkdir(parents=True)
+    (qd / "legacy.md").write_text("Legacy task")
+    item = claim_next_queued(project, role="writer", lease_token="legacy-lease",
+                             lease_seconds=3600)
+
+    # Remove the sidecar to simulate a legacy claim (written before this fix).
+    sidecar_path = item.path.parent / (item.original_name + ".lease.json")
+    sidecar_path.unlink()
+    assert not sidecar_path.exists()
+
+    # Backdate work file mtime to 2 hours ago.
+    old_time = time.time() - 7200
+    os.utime(item.path, (old_time, old_time))
+
+    recovered = recover_stale_claims(project, lease_seconds=3600)
+    assert len(recovered) == 1
+    assert recovered[0].name == "legacy.md"
+    assert recovered[0].parent == project / "queue" / "queued" / "_recovered" / "legacy-lease"
