@@ -2,10 +2,17 @@
 
 Usage:
     atomic-agents run <agent> [options]
+    atomic-agents info <agent> [options]
+    atomic-agents skills <agent> [options]
     atomic-agents version <agent> <note-filename>
     atomic-agents restore <agent> <note-filename> <version-name>
 
-Supports: run, info, version, restore subcommands.
+Subcommands:
+    run     — Run an agent against a work item
+    info    — Show config for an agent without running it
+    skills  — List all skills for an agent with metadata and warnings
+    version — List memory note version snapshots
+    restore — Restore a memory note from a snapshot
 """
 
 from __future__ import annotations
@@ -17,6 +24,7 @@ from .agent import AtomicAgent
 from ._platform import get_agents_root
 from ._versioning import list_versions, restore_version
 from .exceptions import AtomicAgentsError
+from .skills import discover_skills, validate_skill_manifest
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -38,6 +46,14 @@ def main(argv: list[str] | None = None) -> int:
     info.add_argument("agent")
     info.add_argument("--agents-root", default=None)
 
+    skills_cmd = sub.add_parser(
+        "skills",
+        help="List all skills for an agent (name, description, body line count, warnings)",
+    )
+    skills_cmd.add_argument("agent", help="agent name (folder under agents-root)")
+    skills_cmd.add_argument("--agents-root", default=None,
+                             help="override ATOMIC_AGENTS_ROOT")
+
     version_cmd = sub.add_parser("version", help="List versions for a memory note")
     version_cmd.add_argument("agent", help="agent name (folder under agents-root)")
     version_cmd.add_argument("note_filename", help="bare filename, e.g. feedback_comm_style.md")
@@ -58,6 +74,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_run(args, agents_root)
         elif args.cmd == "info":
             return _cmd_info(args, agents_root)
+        elif args.cmd == "skills":
+            return _cmd_skills(args, agents_root)
         elif args.cmd == "version":
             return _cmd_version(args, agents_root)
         elif args.cmd == "restore":
@@ -121,6 +139,56 @@ def _cmd_info(args, agents_root: Path) -> int:
     print(f"External APIs: {cfg.external_apis}")
     print(f"Hard NOs:      {len(cfg.hard_nos)} entries")
     return 0
+
+
+def _cmd_skills(args, agents_root: Path) -> int:
+    """List all skills for an agent — name, description, body lines, warnings."""
+    agent_root = agents_root / args.agent
+    if not agent_root.exists():
+        print(f"Error: agent folder not found: {agent_root}", file=sys.stderr)
+        return 1
+
+    skills_dir = agent_root / "skills"
+    if not skills_dir.is_dir():
+        print(f"No skills/ directory found at {agent_root}")
+        print("To add skills, create: <agent>/skills/<skill-name>/SKILL.md")
+        return 0
+
+    # Re-validate each skill dir to surface per-skill warnings for the operator
+    found_any = False
+    has_warnings = False
+    for skill_subdir in sorted(skills_dir.iterdir()):
+        if not skill_subdir.is_dir():
+            continue
+        skill_md = skill_subdir / "SKILL.md"
+        if not skill_md.is_file():
+            print(f"  [skip] {skill_subdir.name}/ — no SKILL.md")
+            continue
+        manifest, warnings = validate_skill_manifest(skill_subdir)
+        found_any = True
+        if manifest is None:
+            print(f"  [ERROR] {skill_subdir.name}/: {warnings[0] if warnings else 'unknown error'}")
+            has_warnings = True
+            continue
+        status = "ok" if not warnings else "warn"
+        desc_preview = manifest.description[:80] + "..." if len(manifest.description) > 80 else manifest.description
+        print(f"  [{status}] {manifest.name}")
+        print(f"         description: {desc_preview}")
+        print(f"         body lines:  {manifest.body_lines}"
+              + (" (> 500 — consider splitting)" if manifest.body_lines > 500 else ""))
+        if manifest.when_to_use:
+            wtu_preview = manifest.when_to_use[:60] + "..." if len(manifest.when_to_use) > 60 else manifest.when_to_use
+            print(f"         when_to_use: {wtu_preview}")
+        for w in warnings:
+            print(f"         WARNING: {w}")
+            has_warnings = True
+        print()
+
+    if not found_any:
+        print(f"No skills with SKILL.md found under {skills_dir}")
+        print("To add skills, create: <agent>/skills/<skill-name>/SKILL.md")
+
+    return 1 if has_warnings else 0
 
 
 def _cmd_version(args, agents_root: Path) -> int:

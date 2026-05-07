@@ -43,10 +43,12 @@ from .tools import (
     DEFAULT_MAX_TOOL_ITERATIONS,
     MAX_TOOL_ITERATIONS,
     ToolCallResult,
+    ToolDefinition,
     ToolRegistry,
     build_tool_result_blocks_anthropic,
     build_tool_result_blocks_openai,
 )
+from .skills import SkillManifest, discover_skills, load_skill_body, load_skill_referenced_file
 from .types import (
     AgentConfig,
     Capture,
@@ -101,6 +103,16 @@ class AtomicAgent:
         # populated for paths shaped <system>/projects/<project>/agents/<role>/.
         self.cascade: _cascade.CascadePaths | None = _cascade.detect_cascade(self.agent_root)
 
+        # Skills (spec/18) — discover at init so metadata is available for
+        # system-prompt assembly. Empty list when no skills/ directory exists.
+        self.skills: list[SkillManifest] = discover_skills(self.agent_root)
+
+        # Register built-in skill tools if any skills were discovered.
+        # This runs after tool_registry is created but before _load_config
+        # so operators can still register their own tools on the same registry.
+        if self.skills:
+            self._register_skill_tools()
+
         # Per-call helper-provenance rollup (spec/13 Layer 3). Reset at the
         # start of each call(); appended to by helper_call(). Empty list
         # means either no helpers ran or the call started outside call().
@@ -136,6 +148,87 @@ class AtomicAgent:
 
         # Parse config files
         self.config = self._load_config()
+
+    def _register_skill_tools(self) -> None:
+        """Register load_skill and load_skill_file as built-in tools in the registry.
+
+        Called once during __init__ when skills are present. Handlers close over
+        ``self.skills`` so they work with the skills discovered at init time.
+        """
+        # Build lookup index by name for fast handler access
+        skill_index: dict[str, SkillManifest] = {m.name: m for m in self.skills}
+        skill_names = sorted(skill_index.keys())
+
+        def _handle_load_skill(inp: dict) -> str:
+            skill_name = inp.get("skill_name", "")
+            manifest = skill_index.get(skill_name)
+            if manifest is None:
+                from .exceptions import ToolHandlerError
+                raise ToolHandlerError(
+                    f"Unknown skill {skill_name!r}. "
+                    f"Available skills: {skill_names}"
+                )
+            return load_skill_body(manifest)
+
+        def _handle_load_skill_file(inp: dict) -> str:
+            skill_name = inp.get("skill_name", "")
+            relative_path = inp.get("relative_path", "")
+            manifest = skill_index.get(skill_name)
+            if manifest is None:
+                from .exceptions import ToolHandlerError
+                raise ToolHandlerError(
+                    f"Unknown skill {skill_name!r}. "
+                    f"Available skills: {skill_names}"
+                )
+            return load_skill_referenced_file(manifest, relative_path)
+
+        self.tool_registry.register(ToolDefinition(
+            name="load_skill",
+            description=(
+                "Loads the full instructions for a skill by name. "
+                "Use this when a skill listed in the system prompt is relevant "
+                "to the current task and you need its detailed guidance."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "skill_name": {
+                        "type": "string",
+                        "description": "Name of the skill to load (as listed in Available skills).",
+                    }
+                },
+                "required": ["skill_name"],
+            },
+            handler=_handle_load_skill,
+        ))
+
+        self.tool_registry.register(ToolDefinition(
+            name="load_skill_file",
+            description=(
+                "Loads a supporting file referenced by a skill (one level deep from "
+                "the skill's SKILL.md). Use after calling load_skill when you need "
+                "extended reference material that was not included in the main body."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "skill_name": {
+                        "type": "string",
+                        "description": "Name of the skill that owns the file.",
+                    },
+                    "relative_path": {
+                        "type": "string",
+                        "description": (
+                            "Path to the file relative to the skill directory "
+                            "(e.g. 'reference.md', 'examples.md'). "
+                            "Must be one level deep — no subdirectory traversal."
+                        ),
+                    },
+                },
+                "required": ["skill_name", "relative_path"],
+            },
+            handler=_handle_load_skill_file,
+        ))
 
     @staticmethod
     def _generate_run_id() -> str:
@@ -380,6 +473,20 @@ class AtomicAgent:
             sections.append("# goal.md\n\n" + self._goal_text)
         if self._tools_text:
             sections.append("# tools.md\n\n" + self._tools_text)
+        # spec/18 — skills metadata injected after tools, before memory.
+        # Only metadata (name + description) lands here; full body is loaded
+        # on demand via the load_skill tool.
+        if self.skills:
+            skill_lines = [
+                "# Available skills",
+                "",
+                "The following skills are available. Use the load_skill tool to load a "
+                "skill's full instructions when relevant to the task.",
+                "",
+            ]
+            for skill in self.skills:
+                skill_lines.append(f"- **{skill.name}**: {skill.description}")
+            sections.append("\n".join(skill_lines))
         if self.cascade:
             if self._project_canon_text:
                 sections.append("# project canon.md\n\n" + self._project_canon_text)

@@ -32,8 +32,10 @@ from .exceptions import (
     ToolNotRegistered,
     ToolInputInvalid,
     ToolHandlerError,
+    SkillFileTraversal,
 )
 from .tools import ToolDefinition, ToolRegistry, ToolCallResult
+from .skills import SkillManifest, discover_skills, load_skill_body, load_skill_referenced_file
 from .types import Capture, Response, AgentConfig, CostCheckResult
 from .outcome import OutcomeRunner, OutcomeResult, IterationRecord
 from .dream import (
@@ -63,9 +65,14 @@ __all__ = [
     "ToolNotRegistered",
     "ToolInputInvalid",
     "ToolHandlerError",
+    "SkillFileTraversal",
     "ToolDefinition",
     "ToolRegistry",
     "ToolCallResult",
+    "SkillManifest",
+    "discover_skills",
+    "load_skill_body",
+    "load_skill_referenced_file",
     "Capture",
     "Response",
     "AgentConfig",
