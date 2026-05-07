@@ -23,11 +23,14 @@ CLI:
 
 from __future__ import annotations
 import json
+import logging
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, date
 from pathlib import Path
 from typing import Any
+
+_log = logging.getLogger(__name__)
 
 import frontmatter
 
@@ -70,6 +73,7 @@ class EvalResult:
     verdict: str                         # 'pass' | 'fail' | 'judge_error'
     overall_justification: str
     factual_checks: list[dict] = field(default_factory=list)  # populated when expected_facts present
+    clamped_scores: list[dict] = field(default_factory=list)  # records out-of-range judge scores: [{dimension, raw, clamped}]
     agent_response: str = ""
     agent_input_tokens: int = 0
     agent_output_tokens: int = 0
@@ -408,7 +412,7 @@ class EvalRunner:
                 )
 
         # 5. Compute weighted score + verdict
-        weighted = self._compute_weighted_score(scores_dict)
+        weighted, clamped_scores = self._compute_weighted_score(scores_dict)
         hard_fails = list(scores_dict.get("hard_fails", []))
         if hard_fails:
             verdict = "fail"
@@ -433,6 +437,7 @@ class EvalRunner:
                                   if isinstance(scores_dict.get("overall"), dict)
                                   else "",
             factual_checks=list(scores_dict.get("factual_checks", [])),
+            clamped_scores=clamped_scores,
             agent_response=agent_response.text,
             agent_input_tokens=agent_response.input_tokens,
             agent_output_tokens=agent_response.output_tokens,
@@ -582,7 +587,9 @@ class EvalRunner:
             text = text.strip()
         return json.loads(text)
 
-    def _compute_weighted_score(self, scores_dict: dict) -> float:
+    def _compute_weighted_score(
+        self, scores_dict: dict
+    ) -> tuple[float, list[dict]]:
         """Apply rubric weights to the judge's per-dimension scores.
 
         Per spec/13 Layer 2: when the rubric declares ``factual_accuracy`` as
@@ -592,7 +599,26 @@ class EvalRunner:
         the judge already returned a numeric score for ``factual_accuracy``,
         the judge's score takes priority (the LLM may apply nuance the bare
         proportion misses).
+
+        Score validation and clamping:
+        - Each dimension score is coerced to float. If the value is not
+          numeric (e.g., the judge returned a string like "abc"), the
+          dimension is skipped and a warning is logged.
+        - Scores are clamped to [1, 5]. A judge that returns 0 or 10 has
+          hallucinated outside the valid rubric range; clamping prevents those
+          values from distorting the weighted total.
+        - Any dimension whose raw score fell outside [1, 5] (including
+          numeric strings that coerced successfully but were out of range)
+          is recorded in the returned ``clamped_scores`` list so audits can
+          flag judges that frequently misbehave.
+
+        Returns:
+            (weighted_score, clamped_scores) where clamped_scores is a list
+            of dicts ``{dimension, raw, clamped}`` for every out-of-range value.
         """
+        _SCORE_MIN = 1.0
+        _SCORE_MAX = 5.0
+
         # Inject a derived factual_accuracy score if the rubric expects one
         # but the judge didn't return a numeric score for it.
         if "factual_accuracy" in self.weights:
@@ -608,14 +634,43 @@ class EvalRunner:
 
         total = 0.0
         weight_sum = 0.0
+        clamped_scores: list[dict] = []
+
         for dim, weight_pct in self.weights.items():
             d = scores_dict.get(dim)
-            if isinstance(d, dict) and "score" in d:
-                total += float(d["score"]) * weight_pct
-                weight_sum += weight_pct
+            if not (isinstance(d, dict) and "score" in d):
+                continue
+
+            raw_value = d["score"]
+            # Coerce to float; skip non-numeric values.
+            try:
+                score = float(raw_value)
+            except (TypeError, ValueError):
+                _log.warning(
+                    "eval: judge returned non-numeric score %r for dimension %r — "
+                    "skipping dimension",
+                    raw_value, dim,
+                )
+                clamped_scores.append({"dimension": dim, "raw": raw_value, "clamped": None})
+                continue
+
+            # Clamp to valid rubric range [1, 5].
+            if score < _SCORE_MIN or score > _SCORE_MAX:
+                clamped = max(_SCORE_MIN, min(_SCORE_MAX, score))
+                _log.warning(
+                    "eval: judge score %.3g for dimension %r is outside valid range "
+                    "[%g, %g]; clamping to %.3g",
+                    score, dim, _SCORE_MIN, _SCORE_MAX, clamped,
+                )
+                clamped_scores.append({"dimension": dim, "raw": raw_value, "clamped": clamped})
+                score = clamped
+
+            total += score * weight_pct
+            weight_sum += weight_pct
+
         if weight_sum == 0:
-            return 0.0
-        return total / weight_sum
+            return 0.0, clamped_scores
+        return total / weight_sum, clamped_scores
 
     def _write_run_log(self, result: EvalResult) -> None:
         """Append one EvalResult to evals/runs/YYYY-MM-DD.jsonl + write the response."""
@@ -656,6 +711,8 @@ class EvalRunner:
             "judge_output_tokens": result.judge_output_tokens,
             "judge_cost_usd": result.judge_cost_usd,
         }
+        if result.clamped_scores:
+            line["clamped_scores"] = result.clamped_scores
         if result.error:
             line["error"] = result.error
         atomic_append_jsonl(log_path, json.dumps(line))
@@ -675,6 +732,16 @@ def compute_factual_accuracy_from_checks(checks: list[dict]) -> float | None:
 
     A claim that's correctly stated but uncited counts as half-verified
     (we still want some signal — the value is right, but it's not auditable).
+
+    Rounding mode: Python's built-in ``round()`` — banker's rounding
+    (round-half-to-even, per IEEE 754).  The spec (spec/08-evaluation.md and
+    spec/13-research-integrity.md) does not mandate a rounding mode.  Banker's
+    rounding is retained here for its statistical neutrality over repeated
+    evaluations: it avoids the cumulative upward bias that "round half up"
+    introduces when many scores land exactly on 0.5 boundaries.  Operators
+    should be aware that ``round(2.5) == 2`` under this convention, not 3.
+    If rubric expectations ever require "round half up," switch to
+    ``int(x + 0.5)`` and update this docstring.
     """
     if not checks:
         return None

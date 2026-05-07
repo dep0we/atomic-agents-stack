@@ -210,9 +210,10 @@ def test_weighted_score_derives_factual_accuracy_from_checks(tmp_path):
             {"stated_in_response": True, "value_correct": True, "cited": True},
         ],
     }
-    weighted = runner._compute_weighted_score(scores_dict)
+    weighted, clamped = runner._compute_weighted_score(scores_dict)
     # All three dimensions at 5 → weighted = 5.0
     assert weighted == pytest.approx(5.0, abs=0.01)
+    assert clamped == []
     # Mutated dict should have factual_accuracy injected
     assert scores_dict["factual_accuracy"]["score"] == 5
     assert "derived" in scores_dict["factual_accuracy"]["justification"]
@@ -229,9 +230,10 @@ def test_weighted_score_judge_score_overrides_derivation(tmp_path):
             {"stated_in_response": True, "value_correct": True, "cited": True},
         ],
     }
-    weighted = runner._compute_weighted_score(scores_dict)
+    weighted, clamped = runner._compute_weighted_score(scores_dict)
     # Weighted = (5 + 5 + 3) / (40 + 20 + 40) * weight_norm — judge's 3 stays
     assert scores_dict["factual_accuracy"]["score"] == 3
+    assert clamped == []
 
 
 def test_weighted_score_no_derivation_when_no_checks_and_no_judge_score(tmp_path):
@@ -242,10 +244,11 @@ def test_weighted_score_no_derivation_when_no_checks_and_no_judge_score(tmp_path
         "format_compliance": {"score": 5, "justification": "x"},
         # No factual_accuracy, no factual_checks
     }
-    weighted = runner._compute_weighted_score(scores_dict)
+    weighted, clamped = runner._compute_weighted_score(scores_dict)
     # Only 2 dimensions scored — weight_sum = 60, total = 5*40 + 5*20 = 300
     # → 300/60 = 5.0
     assert weighted == pytest.approx(5.0, abs=0.01)
+    assert clamped == []
     # No derivation happened
     assert "factual_accuracy" not in scores_dict
 
