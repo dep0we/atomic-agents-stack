@@ -1,5 +1,9 @@
 # atomic-agents-stack
 
+[![Tests](https://github.com/dep0we/atomic-agents-stack/actions/workflows/test.yml/badge.svg)](https://github.com/dep0we/atomic-agents-stack/actions/workflows/test.yml)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)](pyproject.toml)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 Spec + reference implementation for **vault-native, multi-runtime AI agents**.
 
 Atomic Agents is a layered system for building AI agents that:
