@@ -1,6 +1,6 @@
 # Claude-skill-version Atomic Agent
 
-How to build the interactive version of an Atomic Agent — a Claude Code skill (e.g., `/caldwell`, `/harper`, `/paul`) that loads the agent's vault folder and chats with Dan in-session.
+How to build the interactive version of an Atomic Agent — a Claude Code skill (e.g., `/caldwell`, `/harper`, `/paul`) that loads the agent's vault folder and chats with Sam in-session.
 
 This is the second of two runtime forms. The other is the [cron-agent](cron-agent.md) for autonomous scheduled work. Both read/write the same vault folder, so the agent stays consistent across runtimes.
 
@@ -8,11 +8,11 @@ This is the second of two runtime forms. The other is the [cron-agent](cron-agen
 
 ## When to use the skill version
 
-✅ Dan wants to chat with the agent interactively (`/caldwell` "should I prepay this card?")
+✅ Sam wants to chat with the agent interactively (`/caldwell` "should I prepay this card?")
 
 ✅ The interaction needs back-and-forth exchange, not a one-shot run
 
-✅ The agent's job benefits from Dan's iterative input (clarifying questions, exploring tradeoffs)
+✅ The agent's job benefits from Sam's iterative input (clarifying questions, exploring tradeoffs)
 
 ❌ The work is autonomous and scheduled — that's cron
 
@@ -35,7 +35,7 @@ User-level Claude Code skills:
 └── ...
 ```
 
-Each skill is just a `SKILL.md` file with frontmatter + instructions. Claude Code loads it when Dan types `/caldwell`.
+Each skill is just a `SKILL.md` file with frontmatter + instructions. Claude Code loads it when Sam types `/caldwell`.
 
 ---
 
@@ -44,9 +44,9 @@ Each skill is just a `SKILL.md` file with frontmatter + instructions. Claude Cod
 ```yaml
 ---
 name: caldwell
-description: Caldwell — Dan's personal financial advisor. Loads the agent's vault folder
+description: Caldwell — Sam's personal financial advisor. Loads the agent's vault folder
   and provides direct, calm financial counsel on debt strategy, income planning, and
-  spending decisions. Calm posture, no judgment, never leaves Dan stuck.
+  spending decisions. Calm posture, no judgment, never leaves Sam stuck.
 ---
 
 # Caldwell — financial advisor skill
@@ -57,26 +57,26 @@ You are Caldwell. Load this agent's persona and memory from the vault before res
 
 Read these files in order, IN A SINGLE PARALLEL TOOL CALL where possible:
 
-1. `~/docs/agents/caldwell/persona/IDENTITY.md`
-2. `~/docs/agents/caldwell/persona/SOUL.md`
-3. `~/docs/agents/caldwell/persona/USER.md`
-4. `~/docs/agents/caldwell/tools.md`
-5. `~/docs/agents/caldwell/memory/INDEX.md`
-6. `~/docs/agents/caldwell/wiki/INDEX.md`
+1. `~/agents/caldwell/persona/IDENTITY.md`
+2. `~/agents/caldwell/persona/SOUL.md`
+3. `~/agents/caldwell/persona/USER.md`
+4. `~/agents/caldwell/tools.md`
+5. `~/agents/caldwell/memory/INDEX.md`
+6. `~/agents/caldwell/wiki/INDEX.md`
 
 After reading these, you embody Caldwell. The persona files define who you are; the
 INDEX files tell you what additional memory exists.
 
 ## Recall pattern
 
-When Dan asks a question:
+When Sam asks a question:
 
 1. Identify which atomic notes from `memory/INDEX.md` are relevant.
 2. Read those specific note files.
 3. Identify which wiki pages from `wiki/INDEX.md` are relevant (if any).
 4. Read those specific wiki pages.
 5. If the question requires current dollar amounts, read
-   `~/docs/finance/balance_sheet.md` AND any relevant `~/docs/finance/accounts/*` files.
+   `~/agents/finance/balance_sheet.md` AND any relevant `~/agents/finance/accounts/*` files.
 6. Now reason and respond per Caldwell's persona.
 
 Do NOT load the entire `memory/` folder. The INDEX is the routing layer; load atomic
@@ -84,7 +84,7 @@ notes by name on demand.
 
 ## Capture rule
 
-If during the conversation Dan says something durable that should be remembered
+If during the conversation Sam says something durable that should be remembered
 (corrections, locked decisions, validated approaches, new user-profile observations),
 emit a capture marker in your response:
 
@@ -101,7 +101,7 @@ body: |
 The skill harness will detect the marker and write the file. You don't write the
 files yourself — that's the harness's job.
 
-Apply the capture rules from `~/docs/Atomic Agents/spec/05-capture-rules.md`. When
+Apply the capture rules from `~/agents/Atomic Agents/spec/05-capture-rules.md`. When
 in doubt, capture less rather than more.
 
 ## End of session
@@ -121,15 +121,15 @@ Before exiting, emit a journal block in the same helper-mediated pattern:
 
 The harness writes the journal file. The skill does NOT use the Write tool directly — same atomicity / validation / path-enforcement reasoning as captures.
 
-For sessions where a harness isn't available, journal entries can be Dan-curated post-hoc. Don't have the agent freelance writes to the vault.
+For sessions where a harness isn't available, journal entries can be Sam-curated post-hoc. Don't have the agent freelance writes to the vault.
 
 ## Hard rules
 
-- Never write outside `~/docs/agents/caldwell/` — see tools.md
+- Never write outside `~/agents/caldwell/` — see tools.md
 - Never recommend specific securities by ticker
 - Never take external actions (email, transfer, login)
 - Bottom line first in every response (per pinned feedback memory)
-- Match Dan's communication preferences (per persona/USER.md)
+- Match Sam's communication preferences (per persona/USER.md)
 ```
 
 ---
@@ -143,10 +143,10 @@ Claude Code:
 2. The SKILL.md instructions tell Claude to read the vault files first
 3. Claude reads persona + INDEXes (parallel tool calls — fast)
 4. Claude identifies relevant memories, reads them
-5. Claude reads `~/docs/finance/balance_sheet.md` if dollar amounts are needed
+5. Claude reads `~/agents/finance/balance_sheet.md` if dollar amounts are needed
 6. Claude responds *as Caldwell*
 
-Dan sees the response. He can keep chatting; Claude maintains context within the session.
+Sam sees the response. He can keep chatting; Claude maintains context within the session.
 
 ---
 
@@ -172,12 +172,12 @@ Two pathways depending on what the runtime supports — see [../spec/05-capture-
 {
   "type": "feedback",
   "name": "Q1-bonus-allocation reaffirmation",
-  "description": "Dan reaffirmed bonuses route to credit-cards-first per locked priority order",
+  "description": "Sam reaffirmed bonuses route to credit-cards-first per locked priority order",
   "confidence": "high",
   "sources": ["conversation_2026-05-06"],
   "supersedes": null,
   "merge_into": "feedback_debt_priority_order.md",
-  "body": "Dan reaffirmed today (re: Q1 bonus question) that bonus checks route to highest-rate credit card first.\n\nThis isn't a new rule — it's the existing locked debt priority being applied to bonus income specifically. The merge_into directive tells the helper to update last_seen and append to sources on the existing note rather than creating a duplicate."
+  "body": "Sam reaffirmed today (re: Q1 bonus question) that bonus checks route to highest-rate credit card first.\n\nThis isn't a new rule — it's the existing locked debt priority being applied to bonus income specifically. The merge_into directive tells the helper to update last_seen and append to sources on the existing note rather than creating a duplicate."
 }
 ```
 ````
@@ -209,7 +209,7 @@ The persona is in `IDENTITY.md`/`SOUL.md`/`USER.md`. The skill just says "go rea
 ### Reference the spec, don't restate it
 
 ```markdown
-Apply capture rules from `~/docs/Atomic Agents/spec/05-capture-rules.md`.
+Apply capture rules from `~/agents/Atomic Agents/spec/05-capture-rules.md`.
 ```
 
 This way, spec updates propagate to all skills automatically.
@@ -242,9 +242,9 @@ The only caveat: don't run cron and skill *simultaneously* writing the same file
 
 ---
 
-## Bishop's skill version
+## another agent's skill version
 
-Bishop already has Telegram as its interactive surface, so a Claude Code skill version isn't necessary. But if Dan ever wants to chat with Bishop from a Claude Code session, a `/bishop` skill could be added that reads from Bishop's openclaw paths instead of `~/docs/agents/bishop/`.
+another agent already has Telegram as its interactive surface, so a Claude Code skill version isn't necessary. But if Sam ever wants to chat with another agent from a Claude Code session, a `/bishop` skill could be added that reads from another agent's openclaw paths instead of `~/agents/bishop/`.
 
 For all other agents (Caldwell, Harper, Paul, Muse), the skill version is the primary interactive surface.
 
@@ -254,7 +254,7 @@ For all other agents (Caldwell, Harper, Paul, Muse), the skill version is the pr
 
 | | Cron | Skill |
 |---|---|---|
-| **Trigger** | LaunchAgent on schedule | Dan types `/agent` |
+| **Trigger** | LaunchAgent on schedule | Sam types `/agent` |
 | **Code** | Python script in automations repo | SKILL.md in `~/.claude/skills/` |
 | **Conversation** | Single shot | Multi-turn |
 | **Load order** | Same canonical order | Same canonical order |
@@ -262,7 +262,7 @@ For all other agents (Caldwell, Harper, Paul, Muse), the skill version is the pr
 | **Journal** | Written by Python wrapper | Written by Claude at end-of-session |
 | **Log** | Written by Python wrapper | Optional (skill harness can log invocation) |
 | **Cost tracking** | Per-run in log JSONL | Per-session, harder to track without harness |
-| **Failure handling** | `lib.logger.run()` Telegram alerting | Visible to Dan in chat — failures can't hide |
+| **Failure handling** | `lib.logger.run()` Telegram alerting | Visible to Sam in chat — failures can't hide |
 
 Most agents have BOTH a cron version (autonomous scheduled work) and a skill version (interactive chat). They share the same vault folder; the runtimes are just different doors into the same agent.
 

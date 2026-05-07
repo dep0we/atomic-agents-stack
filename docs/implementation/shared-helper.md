@@ -1,6 +1,6 @@
 # Shared Helper — `atomic_agents`
 
-The Python module both the cron and skill runtimes can call to do the boilerplate of being an Atomic Agent. Lives in `~/Projects/automations/atomic_agents` (deployed to `<deployed copy of the package>`).
+The Python module both the cron and skill runtimes can call to do the boilerplate of being an Atomic Agent. Lives in `~/projects/automations/atomic_agents` (deployed to `<deployed copy of the package>`).
 
 This doc sketches the public API. Implementation lives in the automations repo.
 
@@ -268,7 +268,7 @@ def _acquire_lock(self):
     except BlockingIOError:
         # Lock held by another process. Either wait or fail.
         # For cron: fail fast and skip — try again next cycle.
-        # For skill: wait up to 30 seconds, then surface to Dan.
+        # For skill: wait up to 30 seconds, then surface to Sam.
         raise AgentLockBusy(f"Agent {self.name} is locked by another process")
 
 def _release_lock(self):
@@ -288,7 +288,7 @@ def _release_lock(self):
 |---|---|---|
 | Cron job | Another cron job | Skip this run. Log skip. Try again next cycle. |
 | Cron job | Skill session | Skip. Don't compete with interactive session. |
-| Skill session | Cron job | Wait up to 30 seconds; cron is fast. If still locked, surface to Dan. |
+| Skill session | Cron job | Wait up to 30 seconds; cron is fast. If still locked, surface to Sam. |
 | Skill session | Another skill session | Wait up to 30 seconds. Probably stale state from a crashed prior session. |
 
 **Obsidian Sync considerations:**
@@ -297,7 +297,7 @@ Obsidian Sync writes can land mid-operation. The atomic rename pattern protects 
 
 - Obsidian Sync detects local changes and queues them; brief writes from the helper land cleanly
 - Run cron jobs at low-activity times (e.g., 3am) to minimize collision
-- Lint pass detects content divergence (e.g., frontmatter inconsistency) and flags it for Dan
+- Lint pass detects content divergence (e.g., frontmatter inconsistency) and flags it for Sam
 - Long-term fix: a small Sync-aware wrapper that quiesces sync briefly during writes (deferred to v2)
 
 ### Write-path enforcement
@@ -798,9 +798,9 @@ When the spec bumps (frontmatter schema changes, new required fields, etc.), the
 
 ---
 
-## Eventual integration with Bishop / openclaw
+## Eventual integration with another agent / openclaw
 
-Bishop's openclaw runtime already provides equivalents to most of these helper methods (memory-core's `memory_search`, `memory_append`; memory-wiki's `wiki_apply`, `wiki_get`, `wiki_lint`). When we adapt Atomic Agents to Bishop, we'll write a thin `OpenClawAtomicAgent` adapter that maps the helper's API onto openclaw's tools.
+another agent's openclaw runtime already provides equivalents to most of these helper methods (memory-core's `memory_search`, `memory_append`; memory-wiki's `wiki_apply`, `wiki_get`, `wiki_lint`). When we adapt Atomic Agents to another agent, we'll write a thin `OpenClawAtomicAgent` adapter that maps the helper's API onto openclaw's tools.
 
 For now, `AtomicAgent` targets non-openclaw agents. The contract is identical; the implementation differs.
 

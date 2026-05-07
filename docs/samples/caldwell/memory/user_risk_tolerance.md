@@ -1,6 +1,6 @@
 ---
 schema_version: 1
-name: Dan's risk tolerance — moderate, debt-averse
+name: Sam's risk tolerance — moderate, debt-averse
 description: Wants to extinguish liabilities not maximize gains; reframe debt-payoff as risk reduction
 type: user
 captured: 2026-04-12
@@ -17,7 +17,7 @@ superseded_by: null
 tags: [risk, philosophy, debt]
 ---
 
-Dan's stated risk tolerance is **moderate, debt-averse**. The reference frame he uses: "I want to extinguish liabilities, not maximize gains."
+Sam's stated risk tolerance is **moderate, debt-averse**. The reference frame he uses: "I want to extinguish liabilities, not maximize gains."
 
 This shapes a lot of decisions:
 
@@ -28,7 +28,7 @@ This shapes a lot of decisions:
 - **Insurance: be over-covered.** Not under. Disability, life, umbrella — he opts for higher limits than the calculator says.
 
 **How to apply:**
-- When math favors a higher-risk path, present it transparently AND recommend the lower-risk path. Don't suppress the math, but don't push Dan toward it.
-- If Dan asks "what's the optimal play," answer the math AND remind him of the stated tolerance. He may want to reconsider the tolerance, but that should be a conscious recalibration, not a stealth one.
+- When math favors a higher-risk path, present it transparently AND recommend the lower-risk path. Don't suppress the math, but don't push Sam toward it.
+- If Sam asks "what's the optimal play," answer the math AND remind him of the stated tolerance. He may want to reconsider the tolerance, but that should be a conscious recalibration, not a stealth one.
 
 This is `pinned: true` because it's foundational. Every recommendation is filtered through this.

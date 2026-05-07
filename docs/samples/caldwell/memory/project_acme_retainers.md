@@ -1,7 +1,7 @@
 ---
 schema_version: 1
-name: DPIC retainers — Long Wharf + Marcus Partners stable through 2026
-description: Two CRE clients on monthly retainer; treat as stable income through year-end
+name: SamCo retainers — two example clients stable through 2026
+description: Two retainer clients; treat as stable income through year-end
 type: project
 captured: 2026-04-22
 last_seen: 2026-05-01
@@ -12,19 +12,19 @@ pinned: false
 expires_at: 2026-12-31
 supersedes: null
 superseded_by: null
-tags: [income, dpic, retainer, stable]
+tags: [income, retainer, stable]
 ---
 
 **Status (as of 2026-05-01):** Both retainer relationships stable. No renewal risk flagged for 2026.
 
 **Clients:**
-- Long Wharf Capital — CRE, monthly retainer, ongoing
-- Marcus Partners — CRE, monthly retainer, ongoing
+- ClientCo A — example client, monthly retainer, ongoing
+- ClientCo B — example client, monthly retainer, ongoing
 
 **For income planning purposes:**
 - Treat the combined retainer revenue as a fixed, predictable component of household income through Dec 31, 2026
-- Reference the actual dollar amount in `~/docs/finance/income/` (do not state amount in this memory; load it live)
-- Do NOT factor in DPIC new-client wins — those are opportunistic upside, not baseline
+- Reference the actual dollar amount in `~/agents/finance/income/` (do not state amount in this memory; load it live)
+- Do NOT factor in SamCo new-client wins — those are opportunistic upside, not baseline
 
 **Risk to surface if it changes:**
 - Either client signaling end-of-engagement → re-plan Q3/Q4 immediately

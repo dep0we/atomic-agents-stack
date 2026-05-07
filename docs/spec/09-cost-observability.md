@@ -38,7 +38,7 @@ The dashboard depends on these being populated. A runtime that doesn't write the
 
 ### Why model is critical
 
-Codex's review flagged this and Dan reinforced it: **when the model changes mid-month for an agent (Caldwell goes from Opus to Sonnet because of a budget cap, or because Dan manually flipped the default), the dashboard must reflect that switch**.
+Codex's review flagged this and Sam reinforced it: **when the model changes mid-month for an agent (Caldwell goes from Opus to Sonnet because of a budget cap, or because Sam manually flipped the default), the dashboard must reflect that switch**.
 
 The fix is mechanical: every record carries its own `model` field. Aggregations group by `(agent, model, day)` rather than just `(agent, day)`. Charts and tables surface the model breakdown explicitly.
 
@@ -67,7 +67,7 @@ Sections, top to bottom:
 3. **Month-over-month chart** (rolling 12 months)
    - Stacked bar: each bar is one month, segments are agents
    - Hover for breakdown
-   - Shows composition shifts (Caldwell took over from Bishop in spend; new agent appeared)
+   - Shows composition shifts (Caldwell took over from another agent in spend; new agent appeared)
 
 4. **Top 5 most expensive runs this month**
    - Date | Agent | Trigger | Model | Tokens (in/out) | Cost | Summary
@@ -274,7 +274,7 @@ For runtimes that can't use the helper (Claude Code skill without the helper ins
 | Action | What happens at 100% | When to use |
 |---|---|---|
 | `skip` | Run is aborted before the API call. Log entry written with `status: skipped`. No tokens spent, no LLM call made. | Cron jobs where missing a run is OK (daily brief can wait until tomorrow). |
-| `fallback` | Default model is swapped for the model.md `fallback`. Run proceeds at lower cost. Log entry tagged with `fallback: true`. | Skill sessions where Dan needs a response but Sonnet is fine. |
+| `fallback` | Default model is swapped for the model.md `fallback`. Run proceeds at lower cost. Log entry tagged with `fallback: true`. | Skill sessions where Sam needs a response but Sonnet is fine. |
 | `alert` | Run proceeds with default model. Warning surfaced to alert_channel. | High-priority interactive sessions where you'd rather pay than fail. |
 
 For Caldwell on cron: `skip`. For Caldwell on skill: `fallback`. Both alert.
@@ -306,9 +306,9 @@ After 14 days of observed data, the per-agent dashboard surfaces a banner:
 > Suggested caps: daily $0.50 (3× avg), monthly $7 (1.5× avg)
 > [Apply suggested caps] [Use my own values] [Keep observe-only]
 
-If Dan clicks "Apply", the dashboard writes the values into the agent's `model.md` `cost_guardrails` block (with `enabled: true`). The next run picks them up.
+If Sam clicks "Apply", the dashboard writes the values into the agent's `model.md` `cost_guardrails` block (with `enabled: true`). The next run picks them up.
 
-This converts the guardrails from "thing I had to guess at" to "thing the data set for me." Dan's specific UX point.
+This converts the guardrails from "thing I had to guess at" to "thing the data set for me." Sam's specific UX point.
 
 ---
 

@@ -35,7 +35,7 @@ This order is **mandatory**. Every runtime must follow it. The order is what giv
 |---|---|---|---|
 | 1 | IDENTITY.md | Who, mission, scope, doctrine | ~500-1500 tokens |
 | 2 | SOUL.md | Personality, voice, evolution discipline | ~500-1000 tokens |
-| 3 | USER.md | About Dan (relevant slice) | ~500-1000 tokens |
+| 3 | USER.md | About Sam (relevant slice) | ~500-1000 tokens |
 | 4 | tools.md | Capability boundaries | ~200-500 tokens |
 | 5 | (model.md) | (informational, not always loaded) | 0-200 tokens |
 | 6 | memory/INDEX.md | Atomic Notes routing layer | ~500-2000 tokens |
@@ -85,7 +85,7 @@ The system prompt only loads INDEXes + recent + pinned. Everything else is selec
 The agent is instructed to use a tool / convention to load specific atomic units when reasoning needs them:
 
 ```
-The agent thinks: "Dan asked about debt strategy. The INDEX shows
+The agent thinks: "Sam asked about debt strategy. The INDEX shows
 `Debt priority order` is relevant.
 I'll read that file before responding."
 ```
@@ -122,7 +122,7 @@ At step [9], load the last N atomic units by `captured` date. Default N=5.
 
 **Why recency matters**: the agent's most recent learnings are most likely to be relevant to the next interaction. This gives the agent natural session-to-session continuity without requiring it to dig through INDEX every time.
 
-**Tunable**: increase N for high-information-density agents (Bishop, Caldwell), decrease for narrow-task agents.
+**Tunable**: increase N for high-information-density agents (another agent, Caldwell), decrease for narrow-task agents.
 
 ---
 
@@ -209,7 +209,7 @@ The canonical order extends with three layers — role-shared, project-shared, a
 [1]  ROLE      roles/<role>/PROMPT.md           ← who I am as a Writer in general
 [2]  INSTANCE  agents/<role>/persona/IDENTITY   ← who I am as Writer ON THIS PROJECT
 [3]  INSTANCE  agents/<role>/persona/SOUL       ← my voice on this project
-[4]  INSTANCE  agents/<role>/persona/USER       ← about Dan
+[4]  INSTANCE  agents/<role>/persona/USER       ← about Sam
 [5]  ROLE      roles/<role>/tools.md            ← role-level tools (override at instance if needed)
 [5b] INSTANCE  agents/<role>/tools.md           ← OPTIONAL — overrides 5 if file exists
 [6]  ROLE      roles/<role>/model.md
@@ -278,7 +278,7 @@ The promise of Atomic Agents is **shared source files, runtime-specific adapters
 | Codex CLI skill | ⚠️ partial | ⚠️ partial | Same as Claude Code; tool names differ |
 | ChatGPT web skill | ❌ limited | ❌ no | Bundle-snapshot mode only; no live vault read/write without MCP bridge |
 | OpenAI API skill | ✅ if helper installed | ✅ if helper installed | Same as cron pattern with different SDK |
-| OpenClaw | ✅ via memory-core/wiki plugins | ✅ via memory-core/wiki plugins | Bishop's case; native compliance |
+| OpenClaw | ✅ via memory-core/wiki plugins | ✅ via memory-core/wiki plugins | another agent's case; native compliance |
 
 Where a runtime is `❌`, it means deploying an Atomic Agent there gives you a *degraded* experience — not a broken one. The persona still loads, the agent still responds; what's missing is the capture/promotion/lint cycle that makes the agent self-improving over time.
 

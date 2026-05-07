@@ -23,7 +23,7 @@ The `journal/` folder handles narrative and content. This folder handles *operat
 ## Sample query: today's cost
 
 ```bash
-cd ~/docs/agents/caldwell/log/2026-05
+cd ~/agents/caldwell/log/2026-05
 jq -s 'map(.cost_usd // 0) | add' 2026-05-06.jsonl
 ```
 
@@ -31,7 +31,7 @@ jq -s 'map(.cost_usd // 0) | add' 2026-05-06.jsonl
 
 ```bash
 jq -s 'group_by(.status) | map({status: .[0].status, count: length})' \
-  ~/docs/agents/caldwell/log/2026-05/*.jsonl
+  ~/agents/caldwell/log/2026-05/*.jsonl
 ```
 
 ## Sample record

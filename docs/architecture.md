@@ -6,7 +6,7 @@ The big picture, in diagrams.
 
 ## Two scopes: Agent and Project
 
-Most Atomic Agents are single-agent, single-domain — Caldwell handles money, Harper handles Highland, Paul handles DPIC. Each is one self-contained Atomic Agent.
+Most Atomic Agents are single-agent, single-domain — Caldwell handles money, Harper handles Acme, Paul handles Acme. Each is one self-contained Atomic Agent.
 
 A few systems are **multi-agent across one or more projects** — Muse has Director, Writer, Editor, Outliner, Visual, Artist, Developer roles, currently working on The Unfinished project (with future creative projects expected). Each role × project combination is an Atomic Agent; Muse adds two layers above them: shared role templates and per-project shared world (canon, style, policy).
 
@@ -22,7 +22,7 @@ Cases:
 
 | | Agent scope | Project scope |
 |---|---|---|
-| **Bishop / Caldwell / Harper / Paul** (single-agent, single-domain) | ✅ | — (collapsed) |
+| **another agent / Caldwell / Harper / Paul** (single-agent, single-domain) | ✅ | — (collapsed) |
 | **Muse on The Unfinished** (multi-agent, single-project today, more expected) | ✅ (one per role × project) | ✅ + role templates |
 | **Multi-agent across multiple projects** (e.g., Muse with N fiction projects) | ✅ × N projects × M roles | ✅ × N + role templates shared |
 
@@ -32,14 +32,14 @@ The per-agent spec (this folder) defines agent scope. Project scope is a thin ex
 
 ## File layout per agent
 
-> The example paths use `~/docs/agents/` because that's Dan's setup. Substitute `<agents_root>/` with your actual directory — see [appendix/portability](appendix/portability.md).
+> The example paths use `~/agents/` because that's Sam's setup. Substitute `<agents_root>/` with your actual directory — see [appendix/portability](appendix/portability.md).
 
 ```
 <agents_root>/{agent_name}/
 ├── persona/
 │   ├── IDENTITY.md            ← who I am, mission, role
 │   ├── SOUL.md                ← personality, voice, evolution discipline
-│   └── USER.md                ← about Dan
+│   └── USER.md                ← about Sam
 ├── tools.md                   ← read paths, write paths, APIs, hard NOs
 ├── model.md                   ← LLM, token budget, caching strategy
 ├── memory/                    ← Atomic Notes (semantic memory)
@@ -133,7 +133,7 @@ ATOMIC MEMORY
 
 The two layers share the same mechanic — atomic markdown files + frontmatter + INDEX-driven recall — but they store fundamentally different content. Atomic Notes are *what the agent learned*. Atomic Wiki is *what the agent read*.
 
-Most agents need both. Caldwell needs Atomic Notes (debt priorities, risk tolerance) AND Atomic Wiki (distilled tax docs, financial frameworks). Bishop has both via openclaw's memory-core + memory-wiki plugins.
+Most agents need both. Caldwell needs Atomic Notes (debt priorities, risk tolerance) AND Atomic Wiki (distilled tax docs, financial frameworks). another agent has both via openclaw's memory-core + memory-wiki plugins.
 
 ---
 
@@ -144,7 +144,7 @@ Every time an agent runs (cron tick, skill invocation, openclaw gateway request)
 ```
 1. IDENTITY.md          ← who I am, my mission
 2. SOUL.md              ← personality, voice, evolution discipline
-3. USER.md              ← about Dan
+3. USER.md              ← about Sam
 4. tools.md             ← what I can touch
 5. model.md             ← (informational only — runtime already picked the model)
 6. memory/INDEX.md      ← Atomic Notes routing layer
@@ -206,7 +206,7 @@ The vault is the only persistent state. The runtime is stateless — kill it, re
 │                         persona/  (HUMAN-CURATED, STABLE)            │
 │   ┌────────────┐  ┌────────────┐  ┌────────────┐                   │
 │   │ IDENTITY   │  │   SOUL     │  │   USER     │                   │
-│   │ who+role   │  │ personality│  │ about Dan  │                   │
+│   │ who+role   │  │ personality│  │ about Sam  │                   │
 │   └────────────┘  └────────────┘  └────────────┘                   │
 └─────────────────────────────────────────────────────────────────────┘
               │

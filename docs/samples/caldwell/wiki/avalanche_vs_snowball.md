@@ -50,24 +50,24 @@ For people with high adherence (consistent income, no impulse spending, can grin
 
 Some advisors recommend a hybrid: list debts by rate, but if there's a tiny balance you can clear in 1-2 months, do that first to establish the win, then switch to avalanche. Sometimes called "snow-valanche" or "hybrid avalanche."
 
-## For Dan specifically
+## For Sam specifically
 
-Dan has chosen **avalanche on credit cards**, with mortgage prepayment deferred until all credit cards are at zero. See [../memory/feedback_debt_priority_order](../memory/feedback_debt_priority_order.md).
+Sam has chosen **avalanche on credit cards**, with mortgage prepayment deferred until all credit cards are at zero. See [../memory/feedback_debt_priority_order](../memory/feedback_debt_priority_order.md).
 
-This is technically a constrained avalanche — it doesn't include the mortgage in the priority list, which means it's not pure-math-optimal. But it matches Dan's stated preference: extinguish credit liabilities first, then think about mortgage.
+This is technically a constrained avalanche — it doesn't include the mortgage in the priority list, which means it's not pure-math-optimal. But it matches Sam's stated preference: extinguish credit liabilities first, then think about mortgage.
 
-The constrained-avalanche approach is sound at his rates. The math advantage of pure avalanche (including mortgage) over Dan's chosen approach is small — basis points per year, recoverable later.
+The constrained-avalanche approach is sound at his rates. The math advantage of pure avalanche (including mortgage) over Sam's chosen approach is small — basis points per year, recoverable later.
 
 ## Sources
 
 - `raw/financial_freedom_book_ch7.md` — original avalanche/snowball framing, page 142-167
-- `raw/cpa_advice_2026-04-15.md` — Dan's CPA endorsement of avalanche given Dan's specific rates and balances
+- `raw/cpa_advice_2026-04-15.md` — Sam's CPA endorsement of avalanche given Sam's specific rates and balances
 
 ## Backlinks
 
-- [../memory/feedback_debt_priority_order](../memory/feedback_debt_priority_order.md) — Dan's locked decision implementing constrained avalanche
+- [../memory/feedback_debt_priority_order](../memory/feedback_debt_priority_order.md) — Sam's locked decision implementing constrained avalanche
 - [../memory/user_risk_tolerance](../memory/user_risk_tolerance.md) — context: debt-averse posture is why this matters
 
 ## Lint notes
 
-This page is stable — methodology doesn't change. Refresh `last_seen` when Dan re-confirms during a quarterly review. Re-derive from `raw/` only if a methodology update enters the source documents.
+This page is stable — methodology doesn't change. Refresh `last_seen` when Sam re-confirms during a quarterly review. Re-derive from `raw/` only if a methodology update enters the source documents.

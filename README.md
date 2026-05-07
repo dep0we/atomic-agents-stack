@@ -1,6 +1,6 @@
 # atomic-agents-stack
 
-[![Tests](https://github.com/dep0we/atomic-agents-stack/actions/workflows/test.yml/badge.svg)](https://github.com/dep0we/atomic-agents-stack/actions/workflows/test.yml)
+[![Tests](https://github.com/user/atomic-agents-stack/actions/workflows/test.yml/badge.svg)](https://github.com/user/atomic-agents-stack/actions/workflows/test.yml)
 [![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
@@ -22,7 +22,7 @@ The spec is the central artifact. This repo is the reference Python implementati
 
 ```bash
 # Install (development)
-git clone https://github.com/dep0we/atomic-agents-stack.git
+git clone https://github.com/user/atomic-agents-stack.git
 cd atomic-agents-stack
 uv sync
 
@@ -166,7 +166,7 @@ Start at [`docs/README.md`](docs/README.md) for the spec entry point. The 13 spe
 
 ### `ATOMIC_AGENTS_ROOT`
 
-Tells the framework where to find your agent vault. Default: `~/docs/agents`.
+Tells the framework where to find your agent vault. Default: `~/agents/agents`.
 
 ```bash
 export ATOMIC_AGENTS_ROOT=/path/to/your/agents
@@ -208,4 +208,4 @@ MIT — see [LICENSE](LICENSE).
 
 ## Status
 
-**v0.1, alpha.** Core runtime is stable and tested. Subsequent versions add eval, tuning, goals, and other modules per the spec. Currently developed by a single user (Dan Powers); reference implementation that anyone can use, fork, or extend.
+**v0.1, alpha.** Core runtime is stable and tested. Subsequent versions add eval, tuning, goals, and other modules per the spec. Currently developed by a single user (Sam); reference implementation that anyone can use, fork, or extend.

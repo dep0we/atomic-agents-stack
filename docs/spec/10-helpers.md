@@ -125,7 +125,7 @@ When a helper extracts facts from a source document, the helper output must pres
 Helper output template (recommended):
 
 ```
-Summary of CPA memo (~/docs/finance/cpa/2026-05-tax-mid-year.md):
+Summary of CPA memo (~/agents/finance/cpa/2026-05-tax-mid-year.md):
 
 1. Q3 estimated tax payment timing flagged for review [memo §2, p3]
 2. Federal bracket changes minimal at current income level [memo §3, p5]
@@ -138,7 +138,7 @@ Each fact carries a citation back to the section/page in the source. This lets t
 
 Helper system prompts should include the provenance instruction:
 
-> When summarizing or extracting facts from a source document, cite the location (section, page, or paragraph) of each fact. If you can't pinpoint a location, say so explicitly. Do not return facts without provenance — the calling agent depends on traceability for citation in its response to Dan.
+> When summarizing or extracting facts from a source document, cite the location (section, page, or paragraph) of each fact. If you can't pinpoint a location, say so explicitly. Do not return facts without provenance — the calling agent depends on traceability for citation in its response to Sam.
 
 When a helper returns text without provenance (older prompts, model formatting drift), the parent agent treats the helper output as **uncited prose**, not citable facts. The parent then either re-verifies the source directly or marks claims as uncited per spec/13's rules.
 
@@ -238,7 +238,7 @@ When you find yourself wanting any of these for a helper, stop. You're describin
 
 Heuristic: **does this helper need to learn?**
 
-If yes (it should remember Dan prefers 5-bullet summaries, or it should remember which financial terms Dan finds confusing) → graduate to Agent. Get a folder under `<agents_root>/`, get a SOUL.md, get a memory layer.
+If yes (it should remember Sam prefers 5-bullet summaries, or it should remember which financial terms Sam finds confusing) → graduate to Agent. Get a folder under `<agents_root>/`, get a SOUL.md, get a memory layer.
 
 If no (it's a transformation that should be the same every time) → stays a Helper.
 
@@ -257,7 +257,7 @@ Reserved for when a Helper genuinely needs persistence. Layout would be:
 │   │   ├── persona/
 │   │   │   ├── IDENTITY.md     (lightweight: "you summarize text")
 │   │   │   └── SOUL.md         (preferences accumulated over time)
-│   │   ├── memory/             (typed atomic notes about how Dan likes summaries)
+│   │   ├── memory/             (typed atomic notes about how Sam likes summaries)
 │   │   ├── tools.md            (read-only by default; no vault writes)
 │   │   └── model.md            (cheap default)
 │   └── translator/
@@ -279,8 +279,8 @@ Helper Agents would get the full evolution loop — capture, promotion, lint —
 ```python
 # Daily brief flow
 def caldwell_daily_brief(self):
-    # Load Dan's latest CPA memo if dropped in vault recently
-    new_docs = self.scan_for_new_documents("~/docs/finance/cpa/")
+    # Load Sam's latest CPA memo if dropped in vault recently
+    new_docs = self.scan_for_new_documents("~/agents/finance/cpa/")
     if new_docs:
         summaries = self.helper_call_parallel(
             prompts=[f"Summarize in 5 bullets: {doc.text}" for doc in new_docs],
@@ -309,7 +309,7 @@ def write_scene(self, brief):
     )
 ```
 
-### Bishop classifies incoming emails before deciding action
+### another agent classifies incoming emails before deciding action
 
 ```python
 # Email triage flow
@@ -319,7 +319,7 @@ def triage_inbox(self, emails):
                  for e in emails],
         model="claude-haiku-4-5-20251001",
     )
-    # Bishop reasons only over the urgent ones
+    # another agent reasons only over the urgent ones
     urgent = [e for e, c in zip(emails, classifications) if "urgent" in c.lower()]
     if urgent:
         action = self.call(work_item=f"Decide action for these urgent emails: {urgent}")

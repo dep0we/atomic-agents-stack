@@ -21,12 +21,12 @@ When reading this index, the agent identifies which atomic notes are relevant to
 
 ## Active Projects
 
-- [April's consulting launch](project_april_consulting_launch.md) — B2B service practice, Q3 2026 launch target
-- [DPIC retainer stability](project_dpic_retainers.md) — Long Wharf + Marcus = stable income through 2026
+- [Maya's consulting launch](project_maya_consulting_launch.md) — B2B service practice, Q3 2026 launch target
+- [Acme retainer stability](project_acme_retainers.md) — ClientCo A + Marcus = stable income through 2026
 
 ## Reference
 
-- [Financial vault path](reference_financial_vault.md) — `~/docs/finance/` — load before specific dollar advice
+- [Financial vault path](reference_financial_vault.md) — `~/agents/finance/` — load before specific dollar advice
 - [CPA contact](reference_cpa_contact.md) — when to recommend professional involvement (tax/basis/business structure)
 
 ## Recently Promoted to Persona
