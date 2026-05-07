@@ -25,27 +25,71 @@ from .costs import (
     discover_agents,
     to_json_dict,
 )
+from ._shared import nav_bar as _nav_bar, CSS as _SHARED_CSS
 
 
 # ──────────────────────────────────────────────────────────────────
 # Public entry points
 
-def render_all(agents_root: Path, today: date | None = None) -> dict:
-    """Render the global dashboard + per-agent dashboards.
+def render_all(
+    agents_root: Path,
+    today: date | None = None,
+    tab: str = "all",
+) -> dict:
+    """Render the global dashboard + per-agent dashboards + new tabs.
+
+    tab: "all" (default) renders everything; or one of
+         "cost" | "activity" | "quality" | "memory" | "goals"
+         to render only that tab (useful for fast iteration).
 
     Returns a dict with paths of files written, for caller logging.
     """
+    from datetime import datetime, timezone
+    from .activity import aggregate_activity, render_activity
+    from .quality import aggregate_quality, render_quality
+    from .memory import aggregate_memory, render_memory
+    from .goals import aggregate_goals, render_goals, has_any_goal
+
     today = today or date.today()
-    written = {"global": None, "per_agent": []}
+    now = datetime.now(tz=timezone.utc)
+    written: dict = {"global": None, "per_agent": []}
 
-    global_summary = aggregate_global(agents_root, today=today)
-    global_path = render_global(agents_root, global_summary)
-    written["global"] = str(global_path)
+    render_cost    = tab in ("all", "cost")
+    render_activity_tab = tab in ("all", "activity")
+    render_quality_tab  = tab in ("all", "quality")
+    render_memory_tab   = tab in ("all", "memory")
+    render_goals_tab    = tab in ("all", "goals")
 
-    for agent_name in discover_agents(agents_root):
-        data = aggregate_agent(agents_root, agent_name, today=today)
-        agent_path = render_agent(agents_root, data)
-        written["per_agent"].append(str(agent_path))
+    if render_cost:
+        global_summary = aggregate_global(agents_root, today=today)
+        global_path = render_global(agents_root, global_summary)
+        written["global"] = str(global_path)
+
+        for agent_name in discover_agents(agents_root):
+            data = aggregate_agent(agents_root, agent_name, today=today)
+            agent_path = render_agent(agents_root, data)
+            written["per_agent"].append(str(agent_path))
+
+    if render_activity_tab:
+        activity_data = aggregate_activity(agents_root, now=now)
+        activity_path = render_activity(agents_root, activity_data)
+        written["activity"] = str(activity_path)
+
+    if render_quality_tab:
+        quality_data = aggregate_quality(agents_root, today=today, now=now)
+        quality_path = render_quality(agents_root, quality_data)
+        written["quality"] = str(quality_path)
+
+    if render_memory_tab:
+        memory_data = aggregate_memory(agents_root, today=today, now=now)
+        memory_path = render_memory(agents_root, memory_data)
+        written["memory"] = str(memory_path)
+
+    if render_goals_tab and has_any_goal(agents_root):
+        goals_data = aggregate_goals(agents_root, today=today, now=now)
+        goals_path = render_goals(agents_root, goals_data)
+        if goals_path:
+            written["goals"] = str(goals_path)
 
     return written
 
@@ -55,7 +99,11 @@ def render_global(agents_root: Path, summary: GlobalSummary) -> Path:
     out_dir = agents_root / "_dashboard"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    html = _render_global_template(summary)
+    has_goals = any(
+        (agents_root / agent / "goal.md").exists()
+        for agent in discover_agents(agents_root)
+    )
+    html = _render_global_template(summary, has_goals=has_goals)
     out_path = out_dir / "index.html"
     atomic_write(out_path, html)
 
@@ -196,6 +244,18 @@ footer {
   color: var(--muted); font-size: 12px;
   display: flex; justify-content: space-between;
 }
+/* Top navigation bar */
+.tab-nav {
+  display: flex; gap: 4px; margin-bottom: 24px;
+  border-bottom: 1px solid var(--border); padding-bottom: 0;
+}
+.tab-nav a {
+  display: inline-block; padding: 8px 16px; font-size: 13px; font-weight: 500;
+  color: var(--muted); text-decoration: none; border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+.tab-nav a:hover { color: var(--text); border-bottom-color: var(--border); }
+.tab-nav a.active { color: var(--accent); border-bottom-color: var(--accent); }
 """
 
 
@@ -242,7 +302,7 @@ def _delta_label(pct: float) -> str:
     return f"{sign}{pct:.1f}% vs. last month"
 
 
-def _render_global_template(s: GlobalSummary) -> str:
+def _render_global_template(s: GlobalSummary, has_goals: bool = True) -> str:
     """The global dashboard HTML."""
     delta_pct = s.delta_vs_prior_period.get("cost_pct", 0.0)
 
@@ -323,6 +383,8 @@ def _render_global_template(s: GlobalSummary) -> str:
     else:
         provider_html = '<p class="empty-note">No provider activity.</p>'
 
+    _nav = _nav_bar("cost", has_goals=has_goals)
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -341,6 +403,8 @@ def _render_global_template(s: GlobalSummary) -> str:
     <button class="refresh-btn" onclick="refresh()">↻ Refresh</button>
   </div>
 </header>
+
+{_nav}
 
 <section class="kpis">
   <div class="kpi">

@@ -353,4 +353,104 @@ The HTML files are world-readable on disk by default. If your `<agents_root>` is
 
 ---
 
+## The five tabs
+
+The dashboard has grown from a cost-only view to a five-tab observability surface. Each tab answers a different operator question at a different cadence.
+
+### Tab 1: Cost (`index.html`) — **Daily / weekly**
+
+The original dashboard. Answers: *"Where am I spending?"*
+
+Sections: global spend KPIs, per-agent cost breakdown, model mix bar, provider breakdown, top N most expensive runs. Data source: `log/YYYY-MM/*.jsonl`. When to use: whenever you want a cost baseline or notice an unexpected charge.
+
+### Tab 2: Activity Pulse (`activity.html`) — **Daily check-in**
+
+Answers: *"What's happening with my fleet right now?"*
+
+Sections:
+- Headline stats — runs in last 24h / 7d, failure count, agents-active count
+- Last 50 runs table — timestamp (relative), agent, trigger, status, summary, duration, cost
+- Recent failures (24h) — color-highlighted error rows
+- Recent tool calls and delegations — filtered by trigger type
+- Recent memory captures — newest `.md` files across all agent memory dirs
+- Recent dream runs — last 20 dream manifests with consolidation/promotion counts
+- Stale lock detector — agents whose `.lock` file has been held > 5 minutes
+
+When to use: start of each day to confirm the fleet ran cleanly overnight, or after a deployment to spot regressions.
+
+### Tab 3: Quality Trends (`quality.html`) — **Weekly review**
+
+Answers: *"Are my agents getting better or worse?"*
+
+Sections:
+- Eval score trend per agent — sparkline of weighted_score over last 90 days
+- Per-dimension breakdown — latest score and 30-day delta per rubric dimension
+- Hard-fail occurrences (30d) — table of tests with non-empty hard_fails
+- Pending tuning proposals — list of `evals/tuning_reports/*.md` files with file:// links
+- Helper provenance health — per-agent percentage of helper calls where `provenance_preserved=True`
+
+Data sources: `evals/runs/<YYYY-MM-DD>.jsonl`, `evals/tuning_reports/*.md`, `log/YYYY-MM/*.jsonl` (for provenance). When to use: weekly, before deciding whether to promote a tuning diff.
+
+### Tab 4: Memory Snapshot (`memory.html`) — **Monthly review**
+
+Answers: *"What does my fleet know, and is it healthy?"*
+
+Sections:
+- Note counts per agent per type (user / feedback / project / decision / reference / other)
+- Staleness candidates — notes last_seen > N days ago (default 90) that aren't pinned; shows up to 5 per agent
+- Orphan check — notes present in `memory/` but missing from `INDEX.md` (post-dream these should be zero)
+- Version-churn leaders — top 20 notes by snapshot count in `.versions/`
+- Dream history — all dream runs with consolidation/promotion/stale counts and applied status
+- Memory size + growth — per agent: live bytes, version-history bytes, ratio
+
+When to use: monthly, to decide what to prune, and after every major dream run to confirm it applied correctly.
+
+### Tab 5: Goals & Outcomes (`goals.html`) — **As-needed; conditional**
+
+Answers: *"What are my agents working on?"*
+
+**Conditionally generated** — `goals.html` is only written if at least one agent has a `goal.md` file. If no agent has goals, the file is omitted and the Goals link is absent from every page's nav bar. This keeps the dashboard honest: empty tabs are noise.
+
+Sections:
+- Active goals — per goal: intent, priority, days since start, deadline status, sub-goal counts by status
+- Sub-goal grid — per goal, a table of all sub-goals with status badges and last-advance timestamp
+- Blocked sub-goals (operator action queue) — across all goals, all blocked sub-goals with reason and blocking dep
+- Recent outcome runs — last 50 from `outcomes/runs/*/result.json`: status, iterations, cost
+- Outcome iteration histogram — for satisfied outcomes in last 90 days: how many took 1 vs 2 vs 3 etc. iterations
+
+Data sources: `goal.md`, `goal_history.jsonl`, `outcomes/runs/*/result.json`. When to use: whenever reviewing goal progress or deciding whether to manually unblock a stalled sub-goal.
+
+---
+
+## Dashboard file layout
+
+```
+<agents_root>/
+├── _dashboard/
+│   ├── index.html          ← Cost tab (global view)
+│   ├── activity.html       ← Activity Pulse tab
+│   ├── quality.html        ← Quality Trends tab
+│   ├── memory.html         ← Memory Snapshot tab
+│   ├── goals.html          ← Goals & Outcomes tab (CONDITIONAL — only if any goal.md)
+│   └── data/
+│       └── <month>.json    ← pre-aggregated cost JSON
+├── <agent>/
+│   └── dashboard.html      ← per-agent cost drilldown
+└── ...
+```
+
+All five pages are self-contained HTML — inline CSS, no JS frameworks, no external assets. A top nav bar links all five tabs; the current page is highlighted. The nav bar omits Goals when `goals.html` is not rendered.
+
+## CLI
+
+```bash
+python -m atomic_agents.dashboard render           # render all tabs
+python -m atomic_agents.dashboard render --tab activity  # render one tab only
+python -m atomic_agents.dashboard serve            # local dev server
+```
+
+The `--tab` flag accepts: `all` (default), `cost`, `activity`, `quality`, `memory`, `goals`. Use it for fast single-tab iteration during development without re-running the full aggregation pipeline.
+
+---
+
 *Next (Wave 4): [08-evaluation](08-evaluation.md) — quality scoring with rubrics + LLM-as-judge.*

@@ -38,11 +38,29 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     agents_root: Path = None  # set by serve()
 
+    # Dashboard tab filenames served at root-level paths
+    _TAB_FILES = {
+        "/activity":      "activity.html",
+        "/activity.html": "activity.html",
+        "/quality":       "quality.html",
+        "/quality.html":  "quality.html",
+        "/memory":        "memory.html",
+        "/memory.html":   "memory.html",
+        "/goals":         "goals.html",
+        "/goals.html":    "goals.html",
+    }
+
     def do_GET(self):
         path = urlparse(self.path).path
 
         if path == "/" or path == "/index.html":
             self._serve_file(self.agents_root / "_dashboard" / "index.html", "text/html")
+            return
+
+        # New tab routes
+        if path in self._TAB_FILES:
+            tab_file = self._TAB_FILES[path]
+            self._serve_file(self.agents_root / "_dashboard" / tab_file, "text/html")
             return
 
         if path.startswith("/agents/"):

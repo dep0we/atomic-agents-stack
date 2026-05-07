@@ -5,7 +5,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from .render import render_all
+from .render import render_all, render_global
 from .serve import serve as serve_cmd
 from .._platform import get_agents_root
 
@@ -17,9 +17,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    render = sub.add_parser("render", help="Render dashboards (default)")
+    render = sub.add_parser("render", help="Render dashboards (default: all tabs)")
     render.add_argument("--agents-root", default=None,
                          help="Override ATOMIC_AGENTS_ROOT")
+    render.add_argument(
+        "--tab",
+        default="all",
+        choices=["all", "cost", "activity", "quality", "memory", "goals"],
+        help="Render only one tab (default: all)",
+    )
 
     serve_p = sub.add_parser("serve", help="Run a local web server (port 8765)")
     serve_p.add_argument("--agents-root", default=None)
@@ -38,10 +44,15 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.cmd == "render":
-        written = render_all(agents_root)
-        print(f"Wrote global dashboard:  {written['global']}")
-        for path in written["per_agent"]:
+        tab = getattr(args, "tab", "all")
+        written = render_all(agents_root, tab=tab)
+        if written.get("global"):
+            print(f"Wrote global dashboard:  {written['global']}")
+        for path in written.get("per_agent", []):
             print(f"Wrote per-agent dashboard: {path}")
+        for key in ("activity", "quality", "memory", "goals"):
+            if written.get(key):
+                print(f"Wrote {key} dashboard: {written[key]}")
         return 0
 
     if args.cmd == "serve":
