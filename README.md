@@ -20,9 +20,11 @@ The spec is the central artifact. This repo is the reference Python implementati
 
 ## Quick start
 
+> **First time?** Read the **[Getting Started guide](docs/getting-started.md)** for a 15-minute walk-through from clone to running agent. The block below is the abbreviated version.
+
 ```bash
 # Install (development)
-git clone https://github.com/user/atomic-agents-stack.git
+git clone https://github.com/dep0we/atomic-agents-stack.git
 cd atomic-agents-stack
 uv sync
 
