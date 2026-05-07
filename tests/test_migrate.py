@@ -1,6 +1,7 @@
 """Tests for atomic_agents.migrate."""
 
 from __future__ import annotations
+import datetime
 import io
 import json
 import tarfile
@@ -289,9 +290,10 @@ def test_build_migration_plan_no_scripts_for_chain_raises(vault):
 
 def test_create_snapshot_writes_tarball(vault):
     today = date(2026, 8, 12)
-    path = create_snapshot(vault, target_version=2, today=today)
+    _now = datetime.datetime(2026, 8, 12, 14, 30, 0)
+    path = create_snapshot(vault, target_version=2, today=today, _now=_now)
     assert path.exists()
-    assert path.name == "2026-08-12_pre_v2_migration.tar.gz"
+    assert path.name == "2026-08-12T143000_pre_v2_migration.tar.gz"
     assert path.suffix == ".gz"
 
 
@@ -558,3 +560,107 @@ def test_migration_validates_wiki_pages_with_wiki_schema(vault_with_wiki_and_v1_
     )
     assert result.validation_passed is True
     assert result.validation_errors == []
+
+
+# ──────────────────────────────────────────────────────────────────
+# P2 regression: timestamped snapshots (no same-day collision)
+
+def test_snapshot_filename_includes_time_or_counter(vault):
+    """Two snapshots on the same day with the same target version get distinct names."""
+    today = date(2026, 8, 12)
+    now1 = datetime.datetime(2026, 8, 12, 9, 0, 0)
+    now2 = datetime.datetime(2026, 8, 12, 9, 0, 5)  # 5 seconds later
+
+    p1 = create_snapshot(vault, target_version=2, today=today, _now=now1)
+    p2 = create_snapshot(vault, target_version=2, today=today, _now=now2)
+
+    assert p1 != p2, "Snapshot paths must differ when taken at different times"
+    assert p1.exists(), "First snapshot must still exist after second is taken"
+    assert p2.exists(), "Second snapshot must exist"
+    assert p1.name != p2.name, "Snapshot filenames must differ"
+
+
+def test_snapshot_dry_run_then_real_no_overwrite(vault):
+    """dry-run snapshot (if any) and real-run snapshot do not collide."""
+    today = date(2026, 8, 12)
+    now1 = datetime.datetime(2026, 8, 12, 10, 0, 0)
+    now2 = datetime.datetime(2026, 8, 12, 10, 0, 1)
+
+    # dry-run doesn't create a snapshot, but if a caller manually creates
+    # two snapshots in quick succession they must not overwrite each other.
+    p1 = create_snapshot(vault, target_version=2, today=today, _now=now1)
+    p2 = create_snapshot(vault, target_version=2, today=today, _now=now2)
+
+    assert p1.name != p2.name
+    assert p1.exists()
+    assert p2.exists()
+
+
+# ──────────────────────────────────────────────────────────────────
+# P2 regression: cascade-aware file discovery
+
+def test_find_content_files_walks_cascaded_agents(tmp_path):
+    """Cascaded agent memory/wiki files are included in migration discovery.
+
+    Cascade layout: <agents_root>/<system>/projects/<project>/agents/<role>/memory/
+    """
+    agents_root = tmp_path / "agents"
+
+    # Single-agent note (top-level)
+    single_memory = agents_root / "solo" / "memory"
+    single_memory.mkdir(parents=True)
+    (single_memory / "feedback_x.md").write_text("---\n---\n")
+
+    # Cascaded agent note (nested under system/projects/proj/agents/role)
+    cascade_memory = agents_root / "muse_system" / "projects" / "novel" / "agents" / "writer" / "memory"
+    cascade_memory.mkdir(parents=True)
+    (cascade_memory / "feedback_cascade.md").write_text("---\n---\n")
+
+    # Cascaded agent wiki page
+    cascade_wiki = agents_root / "muse_system" / "projects" / "novel" / "agents" / "writer" / "wiki"
+    cascade_wiki.mkdir(parents=True)
+    (cascade_wiki / "overview.md").write_text("---\n---\n")
+
+    files = find_content_files(agents_root)
+    names = {f.name for f in files}
+
+    assert "feedback_x.md" in names, "Single-agent note must be found"
+    assert "feedback_cascade.md" in names, "Cascaded agent memory note must be found"
+    assert "overview.md" in names, "Cascaded agent wiki page must be found"
+    assert len(files) == 3
+
+
+def test_find_content_files_dedupes_by_path(tmp_path):
+    """No file is returned twice even when rglob could match via multiple routes."""
+    agents_root = tmp_path / "agents"
+    memory = agents_root / "alice" / "memory"
+    memory.mkdir(parents=True)
+    (memory / "feedback_a.md").write_text("---\n---\n")
+    (memory / "feedback_b.md").write_text("---\n---\n")
+
+    files = find_content_files(agents_root)
+    paths = [f.resolve() for f in files]
+    assert len(paths) == len(set(paths)), "Duplicate paths returned by find_content_files"
+
+
+def test_find_content_files_excludes_meta_dirs(tmp_path):
+    """_migrations/, _dashboard/, and dotfile dirs are never returned."""
+    agents_root = tmp_path / "agents"
+
+    # Real content
+    (agents_root / "alice" / "memory").mkdir(parents=True)
+    (agents_root / "alice" / "memory" / "feedback_real.md").write_text("---\n---\n")
+
+    # Meta dirs that must be excluded
+    (agents_root / "_migrations" / "memory").mkdir(parents=True)
+    (agents_root / "_migrations" / "memory" / "skip1.md").write_text("---\n---\n")
+    (agents_root / "_dashboard" / "memory").mkdir(parents=True)
+    (agents_root / "_dashboard" / "memory" / "skip2.md").write_text("---\n---\n")
+    # Dotfile directory
+    (agents_root / ".hidden" / "memory").mkdir(parents=True)
+    (agents_root / ".hidden" / "memory" / "skip3.md").write_text("---\n---\n")
+
+    files = find_content_files(agents_root)
+    names = {f.name for f in files}
+
+    assert names == {"feedback_real.md"}, f"Unexpected files found: {names}"
