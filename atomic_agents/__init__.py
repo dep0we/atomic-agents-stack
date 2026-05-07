@@ -29,7 +29,11 @@ from .exceptions import (
     SelfDelegationError,
     DreamInProgress,
     DreamNotFound,
+    ToolNotRegistered,
+    ToolInputInvalid,
+    ToolHandlerError,
 )
+from .tools import ToolDefinition, ToolRegistry, ToolCallResult
 from .types import Capture, Response, AgentConfig, CostCheckResult
 from .outcome import OutcomeRunner, OutcomeResult, IterationRecord
 from .dream import (
@@ -56,6 +60,12 @@ __all__ = [
     "SelfDelegationError",
     "DreamInProgress",
     "DreamNotFound",
+    "ToolNotRegistered",
+    "ToolInputInvalid",
+    "ToolHandlerError",
+    "ToolDefinition",
+    "ToolRegistry",
+    "ToolCallResult",
     "Capture",
     "Response",
     "AgentConfig",

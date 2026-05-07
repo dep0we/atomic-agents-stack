@@ -37,6 +37,15 @@ from .exceptions import (
     HelperBatchPartialFailure,
     NotInRoster,
     SelfDelegationError,
+    ToolNotRegistered,
+)
+from .tools import (
+    DEFAULT_MAX_TOOL_ITERATIONS,
+    MAX_TOOL_ITERATIONS,
+    ToolCallResult,
+    ToolRegistry,
+    build_tool_result_blocks_anthropic,
+    build_tool_result_blocks_openai,
 )
 from .types import (
     AgentConfig,
@@ -69,12 +78,18 @@ class AtomicAgent:
         trigger: str = "manual",
         agents_root: Path | None = None,
         run_id: str | None = None,
+        tools: ToolRegistry | None = None,
+        max_tool_iterations: int = DEFAULT_MAX_TOOL_ITERATIONS,
     ):
         self.name = name
         self.trigger = trigger
         self.agents_root = agents_root or get_agents_root()
         self.agent_root = self.agents_root / name
         self.run_id = run_id or self._generate_run_id()
+        # Custom tool registry (spec/17). Empty registry = no custom tools.
+        self.tool_registry = tools if tools is not None else ToolRegistry()
+        # Bound the multi-turn tool loop. Clamped to [1, MAX_TOOL_ITERATIONS].
+        self.max_tool_iterations = max(1, min(max_tool_iterations, MAX_TOOL_ITERATIONS))
 
         if not self.agent_root.exists():
             raise AtomicAgentsError(
@@ -132,11 +147,36 @@ class AtomicAgent:
 
         Returns None for providers without tool-call support — the agent then
         falls back to Path 2 fenced-block parsing only.
+
+        This is the static, registry-unaware version used by existing tests and
+        callers that only need the built-in capture definition. See
+        _all_tool_definitions() for the full list including custom tools.
         """
         if model.startswith("claude-"):
             return [_capture.anthropic_tool_definition()]
         if model.startswith("gpt-") or model.startswith("moonshot/"):
             return [_capture.openai_tool_definition()]
+        return None
+
+    def _all_tool_definitions(self, model: str) -> list[dict] | None:
+        """Return all tool definitions (atomic_capture + custom tools) for the provider.
+
+        Includes:
+        - atomic_capture (built-in, always included for supported providers)
+        - All tools registered in self.tool_registry (operator-supplied)
+
+        Returns None for providers without tool-call support — the agent then
+        falls back to Path 2 fenced-block parsing only (atomic_capture only;
+        custom tools are unavailable for unsupported providers).
+        """
+        if model.startswith("claude-"):
+            defs: list[dict] = [_capture.anthropic_tool_definition()]
+            defs.extend(self.tool_registry.to_anthropic_definitions())
+            return defs
+        if model.startswith("gpt-") or model.startswith("moonshot/"):
+            defs = [_capture.openai_tool_definition()]
+            defs.extend(self.tool_registry.to_openai_definitions())
+            return defs
         return None
 
     # ────────────────────────────────────────────────────────────
@@ -376,6 +416,19 @@ class AtomicAgent:
 
         critical=True bypasses cost guardrails (still logged with critical: true).
         write_captures=False extracts but doesn't persist captures (dry-run mode).
+
+        When self.tool_registry has registered tools, call() runs a multi-turn
+        loop (up to self.max_tool_iterations iterations):
+          1. LLM call with tool definitions
+          2. Parse tool_uses from response
+          3. Execute custom tools via registry (atomic_capture handled separately)
+          4. Build follow-up message with tool_result blocks
+          5. Repeat until no custom tool_uses returned OR cap hit
+
+        Each iteration counts against the same cost cap. The final Response has:
+          - tool_calls: list of all ToolCallResult from all iterations
+          - tool_iterations: how many LLM turns were made (1 = no tools)
+          - tool_iterations_maxed: True if loop was stopped by cap
         """
         # Lazy load if not already
         if not self._persona_text:
@@ -422,45 +475,179 @@ class AtomicAgent:
 
             # Build prompt
             system_prompt = self.assemble_system_prompt()
-            messages = [{"role": "user", "content": work_item}]
+            messages: list[dict] = [{"role": "user", "content": work_item}]
 
-            # Call LLM with the atomic_capture tool available — agent can use
-            # Path 1 (tool call) or Path 2 (fenced JSON block) per spec/05; we
-            # extract from both and dedupe.
-            tool_definitions = self._capture_tool_definitions(model)
+            # Tool definitions for the LLM — includes atomic_capture + custom tools.
+            # None for providers without tool-call support.
+            tool_definitions = self._all_tool_definitions(model)
 
-            start = time.time()
-            raw = _llm.call_llm(
-                model=model,
-                system_prompt=system_prompt,
-                messages=messages,
-                max_tokens=max_tokens or self.config.max_output_tokens,
-                temperature=temperature if temperature is not None else 0.6,
-                cache_control_breakpoints=[len(system_prompt)],
-                tools=tool_definitions,
-            )
-            latency_ms = int((time.time() - start) * 1000)
+            # Accumulators across multi-turn loop iterations
+            all_tool_call_results: list[ToolCallResult] = []
+            all_captures: list[Capture] = []
+            all_parse_failures: list = []
+            total_input_tokens = 0
+            total_output_tokens = 0
+            total_cache_hit_tokens = 0
+            total_cache_miss_tokens = 0
+            total_cost = 0.0
+            cost_fallback = False
+            tool_iterations_maxed = False
+            iteration_count = 0
+            last_raw = None
 
-            cost, cost_fallback = _costs.calc_cost(
-                model, raw.input_tokens, raw.output_tokens, raw.cache_hit_tokens
-            )
+            # ── Multi-turn tool loop ──────────────────────────────
+            start_total = time.time()
+            while True:
+                iteration_count += 1
 
-            # Extract captures from BOTH text (Path 2) and tool_use blocks (Path 1)
-            captures, parse_failures = _capture.extract_all_captures(
-                raw.text, tool_uses=raw.tool_uses,
-            )
+                # Pre-check cost cap before each iteration (except first, already checked)
+                if iteration_count > 1:
+                    iter_check = self._check_cost_guardrails(critical=critical)
+                    if not iter_check.allow:
+                        # Cap hit mid-loop — return what we have with skipped=True
+                        latency_ms = int((time.time() - start_total) * 1000)
+                        skip_reason = f"cost cap hit at iteration {iteration_count}: {iter_check.reason}"
+                        response = Response(
+                            text=last_raw.text if last_raw else "",
+                            model=model,
+                            input_tokens=total_input_tokens,
+                            output_tokens=total_output_tokens,
+                            cache_hit_tokens=total_cache_hit_tokens,
+                            cache_miss_tokens=total_cache_miss_tokens,
+                            cost_usd=total_cost,
+                            cost_estimated_via_fallback=cost_fallback,
+                            latency_ms=latency_ms,
+                            summary=self._derive_summary(work_item),
+                            raw=last_raw.raw or {} if last_raw else {},
+                            captures=all_captures,
+                            skipped=True,
+                            skip_reason=skip_reason,
+                            tool_calls=all_tool_call_results,
+                            tool_iterations=iteration_count - 1,
+                        )
+                        self._log({
+                            "trigger": self.trigger,
+                            "model": model,
+                            "input_tokens": total_input_tokens,
+                            "output_tokens": total_output_tokens,
+                            "cost_usd": total_cost,
+                            "latency_ms": latency_ms,
+                            "status": "skipped",
+                            "summary": skip_reason,
+                            "run_id": self.run_id,
+                        })
+                        return response
 
-            # Write captures if enabled
-            written_captures = []
-            if write_captures and captures:
-                for c in captures:
+                iter_start = time.time()
+                raw = _llm.call_llm(
+                    model=model,
+                    system_prompt=system_prompt,
+                    messages=messages,
+                    max_tokens=max_tokens or self.config.max_output_tokens,
+                    temperature=temperature if temperature is not None else 0.6,
+                    cache_control_breakpoints=[len(system_prompt)] if iteration_count == 1 else None,
+                    tools=tool_definitions,
+                )
+                iter_latency_ms = int((time.time() - iter_start) * 1000)
+                last_raw = raw
+
+                iter_cost, iter_cost_fallback = _costs.calc_cost(
+                    model, raw.input_tokens, raw.output_tokens, raw.cache_hit_tokens
+                )
+                total_input_tokens += raw.input_tokens
+                total_output_tokens += raw.output_tokens
+                total_cache_hit_tokens += raw.cache_hit_tokens
+                total_cache_miss_tokens += raw.cache_miss_tokens
+                total_cost += iter_cost
+                if iter_cost_fallback:
+                    cost_fallback = True
+
+                # Extract captures from this iteration (Path 1 + Path 2)
+                iter_captures, iter_failures = _capture.extract_all_captures(
+                    raw.text, tool_uses=raw.tool_uses,
+                )
+                all_captures.extend(iter_captures)
+                all_parse_failures.extend(iter_failures)
+
+                # Partition tool_uses: atomic_capture (handled above) vs custom tools
+                custom_tool_uses = [
+                    tu for tu in raw.tool_uses
+                    if tu.get("name") != "atomic_capture"
+                    and self.tool_registry.get(tu.get("name", "")) is not None
+                ]
+                unknown_tool_uses = [
+                    tu for tu in raw.tool_uses
+                    if tu.get("name") != "atomic_capture"
+                    and self.tool_registry.get(tu.get("name", "")) is None
+                    and tu.get("name", "")  # non-empty name
+                ]
+
+                # Log any tool calls to unknown tools (model hallucinated a tool name)
+                for tu in unknown_tool_uses:
+                    _logger.warning(
+                        "agent %r: LLM called unknown tool %r (not in registry)",
+                        self.name, tu.get("name", ""),
+                    )
+                    self._log({
+                        "trigger": "tool_call",
+                        "parent_run_id": self.run_id,
+                        "tool_name": tu.get("name", ""),
+                        "latency_ms": 0,
+                        "error": "ToolNotRegistered",
+                    })
+
+                # Execute custom tools
+                iter_tool_results: list[ToolCallResult] = []
+                for tu in custom_tool_uses:
+                    tool_result = self.tool_registry.execute(tu)
+                    all_tool_call_results.append(tool_result)
+                    iter_tool_results.append(tool_result)
+                    # Per-tool JSONL log line
+                    self._log({
+                        "trigger": "tool_call",
+                        "parent_run_id": self.run_id,
+                        "tool_name": tool_result.tool_name,
+                        "latency_ms": tool_result.latency_ms,
+                        "error": tool_result.error,
+                    })
+
+                # If no custom tools were called, the loop is done
+                if not custom_tool_uses:
+                    break
+
+                # Check if we've hit the iteration cap
+                if iteration_count >= self.max_tool_iterations:
+                    tool_iterations_maxed = True
+                    break
+
+                # Build follow-up messages with tool_result blocks so the LLM
+                # can incorporate results in the next turn.
+                # We build the assistant's tool_use blocks + the tool_result blocks
+                # and append them to the running messages list.
+                messages = self._build_tool_loop_messages(
+                    messages, raw, iter_tool_results, model
+                )
+
+            # ── End of multi-turn loop ────────────────────────────
+            latency_ms = int((time.time() - start_total) * 1000)
+
+            # Write captures if enabled (dedupe across all iterations already done
+            # by extract_all_captures, which uses a seen-set per call. But we
+            # accumulated across iterations so need to dedupe manually.)
+            written_captures: list[Capture] = []
+            seen_capture_keys: set[tuple] = set()
+            if write_captures:
+                for c in all_captures:
+                    key = (c.type, c.name, hash(c.body))
+                    if key in seen_capture_keys:
+                        continue
+                    seen_capture_keys.add(key)
                     try:
-                        path = _capture.write_atomic_note(
+                        _capture.write_atomic_note(
                             self.agent_root, c, self.config.write_paths
                         )
                         written_captures.append(c)
                     except Exception as e:
-                        # Log capture write failure but don't fail the whole call
                         self._log({
                             "trigger": "capture_write_error",
                             "parent_run_id": self.run_id,
@@ -473,29 +660,32 @@ class AtomicAgent:
 
             # Build response
             response = Response(
-                text=raw.text,
+                text=last_raw.text if last_raw else "",
                 model=model,
-                input_tokens=raw.input_tokens,
-                output_tokens=raw.output_tokens,
-                cache_hit_tokens=raw.cache_hit_tokens,
-                cache_miss_tokens=raw.cache_miss_tokens,
-                cost_usd=cost,
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
+                cache_hit_tokens=total_cache_hit_tokens,
+                cache_miss_tokens=total_cache_miss_tokens,
+                cost_usd=total_cost,
                 cost_estimated_via_fallback=cost_fallback,
                 latency_ms=latency_ms,
                 summary=self._derive_summary(work_item),
-                raw=raw.raw or {},
+                raw=last_raw.raw or {} if last_raw else {},
                 captures=written_captures,
+                tool_calls=all_tool_call_results,
+                tool_iterations=iteration_count,
+                tool_iterations_maxed=tool_iterations_maxed,
             )
 
-            # Log
+            # Log run record
             log_record: dict = {
                 "trigger": self.trigger,
                 "model": model,
-                "input_tokens": raw.input_tokens,
-                "output_tokens": raw.output_tokens,
-                "cache_hit_tokens": raw.cache_hit_tokens,
-                "cache_miss_tokens": raw.cache_miss_tokens,
-                "cost_usd": cost,
+                "input_tokens": total_input_tokens,
+                "output_tokens": total_output_tokens,
+                "cache_hit_tokens": total_cache_hit_tokens,
+                "cache_miss_tokens": total_cache_miss_tokens,
+                "cost_usd": total_cost,
                 "latency_ms": latency_ms,
                 "status": "ok",
                 "summary": response.summary,
@@ -508,8 +698,8 @@ class AtomicAgent:
                 log_record["cost_estimated_via_fallback"] = True
             if critical:
                 log_record["critical"] = True
-            if parse_failures:
-                log_record["capture_parse_failures"] = len(parse_failures)
+            if all_parse_failures:
+                log_record["capture_parse_failures"] = len(all_parse_failures)
             if self._helpers_this_run:
                 # Spec/13 Layer 3 — research log: roll up helper provenance
                 # into the parent run record so an audit can trace every fact
@@ -517,12 +707,95 @@ class AtomicAgent:
                 log_record["helper_provenance"] = list(self._helpers_this_run)
             if self._delegations_this_run:
                 log_record["delegations"] = list(self._delegations_this_run)
+            if all_tool_call_results:
+                log_record["tool_calls"] = [
+                    {
+                        "tool_name": r.tool_name,
+                        "tool_use_id": r.tool_use_id,
+                        "latency_ms": r.latency_ms,
+                        "error": r.error,
+                    }
+                    for r in all_tool_call_results
+                ]
+            if iteration_count > 1:
+                log_record["tool_iterations"] = iteration_count
+            if tool_iterations_maxed:
+                log_record["tool_iterations_maxed"] = True
             self._log(log_record)
 
             return response
 
         finally:
             lock.release()
+
+    def _build_tool_loop_messages(
+        self,
+        prior_messages: list[dict],
+        raw: Any,
+        tool_results: list[ToolCallResult],
+        model: str,
+    ) -> list[dict]:
+        """Build the updated messages list for the next iteration of the tool loop.
+
+        Appends the assistant's response (with tool_use blocks) and the
+        tool_result blocks so the LLM can incorporate results in its next turn.
+
+        Provider-specific:
+        - Anthropic: assistant message with tool_use content blocks + user
+          message with tool_result content blocks.
+        - OpenAI/Moonshot: assistant message with tool_calls + role=tool messages.
+        """
+        messages = list(prior_messages)
+
+        if model.startswith("claude-"):
+            # Build Anthropic-style assistant message with tool_use blocks
+            assistant_content: list[dict] = []
+            if raw.text:
+                assistant_content.append({"type": "text", "text": raw.text})
+            for tu in raw.tool_uses:
+                # Only include the custom tool_uses (not atomic_capture) in the
+                # follow-up — atomic_capture was handled by the capture path.
+                if tu.get("name") != "atomic_capture":
+                    assistant_content.append({
+                        "type": "tool_use",
+                        "id": tu["id"],
+                        "name": tu["name"],
+                        "input": tu.get("input", {}),
+                    })
+            if assistant_content:
+                messages.append({"role": "assistant", "content": assistant_content})
+
+            # User message with tool_result blocks
+            result_blocks = build_tool_result_blocks_anthropic(tool_results)
+            if result_blocks:
+                messages.append({"role": "user", "content": result_blocks})
+
+        else:
+            # OpenAI / Moonshot path
+            # Build tool_calls list for the assistant message
+            tool_calls_payload = [
+                {
+                    "id": tu["id"],
+                    "type": "function",
+                    "function": {
+                        "name": tu["name"],
+                        "arguments": json.dumps(tu.get("input", {})),
+                    },
+                }
+                for tu in raw.tool_uses
+                if tu.get("name") != "atomic_capture"
+            ]
+            if tool_calls_payload:
+                messages.append({
+                    "role": "assistant",
+                    "content": raw.text or None,
+                    "tool_calls": tool_calls_payload,
+                })
+            # Append tool result messages
+            result_messages = build_tool_result_blocks_openai(raw.tool_uses, tool_results)
+            messages.extend(result_messages)
+
+        return messages
 
     # ────────────────────────────────────────────────────────────
     # Helpers (Patterns A + B per spec/10)
