@@ -24,7 +24,7 @@ from typing import Any
 
 import frontmatter
 
-from . import _capture, _cascade, _costs, _llm, _model, _tools
+from . import _capture, _cascade, _costs, _llm, _model, _roster, _tools
 from ._io import atomic_append_jsonl, atomic_write
 from ._locks import AgentLock
 from ._platform import get_agents_root
@@ -35,6 +35,8 @@ from .exceptions import (
     AtomicAgentsError,
     CostGuardrailBlocked,
     HelperBatchPartialFailure,
+    NotInRoster,
+    SelfDelegationError,
 )
 from .types import (
     AgentConfig,
@@ -88,6 +90,11 @@ class AtomicAgent:
         # start of each call(); appended to by helper_call(). Empty list
         # means either no helpers ran or the call started outside call().
         self._helpers_this_run: list[dict] = []
+
+        # Per-call delegation rollup. Reset at the start of each call();
+        # appended to by delegate(). Embedded in the parent's run log record
+        # as `delegations: [...]` when non-empty.
+        self._delegations_this_run: list[dict] = []
 
         # Loaded later via load() — populated in __init__ for clarity
         self._persona_text: str = ""
@@ -147,6 +154,9 @@ class AtomicAgent:
             model_data = _model.parse_model_md(self.agent_root / "model.md")
             tools_data = _tools.parse_tools_md(self.agent_root / "tools.md")
 
+        # roster.md lives at the instance root (same for cascaded + single-agent layouts)
+        roster = _roster.parse_roster_md(self.agent_root / "roster.md")
+
         return AgentConfig(
             default_model=model_data["default_model"],
             fallback_model=model_data["fallback_model"],
@@ -163,6 +173,7 @@ class AtomicAgent:
             write_paths=tools_data["write_paths"],
             external_apis=tools_data["external_apis"],
             hard_nos=tools_data["hard_nos"],
+            roster=roster,
         )
 
     # ────────────────────────────────────────────────────────────
@@ -388,6 +399,8 @@ class AtomicAgent:
         try:
             # Reset helper-provenance rollup for this run (spec/13 Layer 3)
             self._helpers_this_run = []
+            # Reset delegation rollup for this run
+            self._delegations_this_run = []
             # Cost guardrails check
             check = self._check_cost_guardrails(critical=critical)
             if not check.allow:
@@ -502,6 +515,8 @@ class AtomicAgent:
                 # into the parent run record so an audit can trace every fact
                 # back to the helper invocation that produced it.
                 log_record["helper_provenance"] = list(self._helpers_this_run)
+            if self._delegations_this_run:
+                log_record["delegations"] = list(self._delegations_this_run)
             self._log(log_record)
 
             return response
@@ -710,6 +725,248 @@ class AtomicAgent:
             "status": "ok",
             "summary": (
                 f"batch complete: actual ${actual_usd:.6f} vs "
+                f"reserved ${reserved_usd:.6f}"
+            ),
+        })
+
+        return results  # type: ignore
+
+    # ────────────────────────────────────────────────────────────
+    # Delegation (runtime agent-to-agent, per spec/15)
+
+    def _resolve_delegated_agent_path(self, target_name: str) -> Path:
+        """Resolve the filesystem path for a target agent.
+
+        In a cascaded layout (<system>/projects/<project>/agents/<role>/),
+        the target resolves as a peer under the same project:
+            <system>/projects/<project>/agents/<target>/
+
+        In a single-agent layout (<agents_root>/<role>/), the target resolves
+        as a top-level sibling:
+            <agents_root>/<target>/
+        """
+        if self.cascade:
+            return self.cascade.instance_root.parent / target_name
+        return self.agents_root / target_name
+
+    def _enforce_roster_membership(self, target: str) -> None:
+        """Raise NotInRoster if target is not in this coordinator's roster."""
+        if target not in self.config.roster:
+            raise NotInRoster(
+                f"target '{target}' not in coordinator's roster: {self.config.roster}"
+            )
+
+    def delegate(
+        self,
+        target_agent_name: str,
+        work_item: str,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        critical: bool = False,
+        summary: str = "",
+    ) -> Response:
+        """Synchronously dispatch a work item to another agent in the roster.
+
+        Loads <target_agent_name> as a fresh AtomicAgent instance with its own
+        persona, memory, wiki, journal, and config. Calls it with the work_item.
+        Returns its Response.
+
+        The coordinator's cost guardrails apply to the total call tree — a
+        pre-check runs before the delegate call, and the delegation is refused
+        if the cap is hit (unless critical=True).
+
+        Each delegate call also writes a JSONL log line with trigger=delegate,
+        parent_agent, delegated_agent, parent_run_id, and delegated_run_id.
+        The Response captures (if any) are written to the target's memory, not
+        the coordinator's.
+
+        Raises:
+            NotInRoster: target_agent_name is not in self.config.roster.
+            SelfDelegationError: target_agent_name == self.name (one-level only).
+            CostGuardrailBlocked: parent's cost cap is hit and critical=False.
+        """
+        self._enforce_roster_membership(target_agent_name)
+        if target_agent_name == self.name:
+            raise SelfDelegationError(
+                f"agent '{self.name}' cannot delegate to itself — one-level delegation only"
+            )
+
+        check = self._check_cost_guardrails(critical=critical)
+        if not check.allow:
+            raise CostGuardrailBlocked(
+                f"Delegation to '{target_agent_name}' blocked: {check.reason}"
+            )
+
+        target_path = self._resolve_delegated_agent_path(target_agent_name)
+        # Build the target agent; it inherits no state from the coordinator
+        target_agent = AtomicAgent(
+            name=target_agent_name,
+            trigger="delegate",
+            agents_root=target_path.parent,
+            run_id=None,  # generates its own fresh run_id
+        )
+
+        start = time.time()
+        response = target_agent.call(
+            work_item=work_item,
+            max_tokens=max_tokens,
+            temperature=temperature if temperature is not None else None,
+            critical=critical,
+        )
+        latency_ms = int((time.time() - start) * 1000)
+
+        # Log the delegation in the COORDINATOR's log
+        log_record: dict = {
+            "trigger": "delegate",
+            "parent_agent": self.name,
+            "delegated_agent": target_agent_name,
+            "parent_run_id": self.run_id,
+            "model": response.model,
+            "input_tokens": response.input_tokens,
+            "output_tokens": response.output_tokens,
+            "cost_usd": response.cost_usd,
+            "latency_ms": latency_ms,
+            "status": "ok" if not response.skipped else "skipped",
+            "summary": summary or f"delegate to {target_agent_name}",
+            "delegate_run_id": target_agent.run_id,
+        }
+        if critical:
+            log_record["critical"] = True
+        self._log(log_record)
+
+        # Append to per-run delegation rollup
+        rollup_entry = {
+            "target": target_agent_name,
+            "summary": summary or f"delegate to {target_agent_name}",
+            "cost_usd": response.cost_usd,
+            "latency_ms": latency_ms,
+            "delegated_run_id": target_agent.run_id,
+            "captures_count": len(response.captures),
+        }
+        self._delegations_this_run.append(rollup_entry)
+
+        return response
+
+    def delegate_parallel(
+        self,
+        calls: list[tuple[str, str]],
+        max_concurrent: int = 5,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        summary_template: str = "delegate {idx} of {total}: {target}",
+    ) -> list[Response]:
+        """Parallel fan-out to multiple agents.
+
+        Pre-reserves worst-case batch cost against parent headroom (mirrors
+        helper_call_parallel pattern). Concurrency capped at 25 (matching
+        Anthropic's thread limit). Calls are executed in parallel via
+        ThreadPoolExecutor with max_concurrent workers (default 5, hard cap 25).
+        Returns Responses in the same order as `calls`.
+
+        All same refusal conditions apply per-call (in-roster, no self).
+
+        Args:
+            calls: list of (target_agent_name, work_item) tuples.
+            max_concurrent: thread pool size. Clamped to [1, 25].
+            max_tokens: output token cap forwarded to each delegate call.
+            temperature: temperature forwarded to each delegate call.
+            summary_template: template for per-call summaries; supports
+                {idx} (1-based), {total}, {target}.
+
+        Raises:
+            ValueError: max_concurrent is 0 or > 25.
+            NotInRoster / SelfDelegationError: any call fails roster check.
+            CostGuardrailBlocked: batch reservation exceeds headroom.
+        """
+        if max_concurrent < 1 or max_concurrent > 25:
+            raise ValueError(
+                f"max_concurrent must be between 1 and 25 inclusive; got {max_concurrent}"
+            )
+
+        # Validate all targets before reserving cost or spawning threads
+        for target, _ in calls:
+            self._enforce_roster_membership(target)
+            if target == self.name:
+                raise SelfDelegationError(
+                    f"agent '{self.name}' cannot delegate to itself — one-level delegation only"
+                )
+
+        check = self._check_cost_guardrails(critical=False)
+        if not check.allow:
+            raise CostGuardrailBlocked(
+                f"Parallel delegation batch blocked: {check.reason}"
+            )
+
+        total = len(calls)
+
+        # Worst-case reservation: each target's max_output_tokens × its output rate.
+        # We use the coordinator's default model rate as a conservative proxy
+        # (target models may differ, but we don't load targets just for pricing).
+        reserved_usd = self._estimate_batch_cost(
+            self.config.default_model,
+            max_tokens or self.config.max_output_tokens,
+            total,
+        )
+        self._check_batch_reservation(reserved_usd)
+
+        self._log({
+            "trigger": "delegate_batch_reservation",
+            "parent_agent": self.name,
+            "parent_run_id": self.run_id,
+            "model": self.config.default_model,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "reserved_usd": reserved_usd,
+            "batch_size": total,
+            "status": "ok",
+            "summary": f"reserved worst-case ${reserved_usd:.6f} for {total}-delegate batch",
+        })
+
+        results: list[Any] = [None] * total
+
+        def call_one(idx: int, target: str, work_item: str):
+            summ = summary_template.format(idx=idx + 1, total=total, target=target)
+            return idx, self.delegate(
+                target_agent_name=target,
+                work_item=work_item,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                summary=summ,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent) as pool:
+            futures = {
+                pool.submit(call_one, i, target, work_item): i
+                for i, (target, work_item) in enumerate(calls)
+            }
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    idx, response = future.result()
+                    results[idx] = response
+                except Exception as e:
+                    idx = futures[future]
+                    results[idx] = e
+
+        failures = [(i, r) for i, r in enumerate(results) if isinstance(r, Exception)]
+        if failures:
+            raise HelperBatchPartialFailure(failures, results)
+
+        actual_usd = sum(
+            r.cost_usd for r in results if isinstance(r, Response)
+        )
+        self._log({
+            "trigger": "delegate_batch_release",
+            "parent_agent": self.name,
+            "parent_run_id": self.run_id,
+            "model": self.config.default_model,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "reserved_usd": reserved_usd,
+            "actual_usd": actual_usd,
+            "batch_size": total,
+            "status": "ok",
+            "summary": (
+                f"delegate batch complete: actual ${actual_usd:.6f} vs "
                 f"reserved ${reserved_usd:.6f}"
             ),
         })
