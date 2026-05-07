@@ -4,7 +4,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .tools import ToolCallResult
 
 
 @dataclass
@@ -79,6 +82,10 @@ class Response:
     captures: list[Capture] = field(default_factory=list)
     skipped: bool = False              # True if cost guardrail blocked the call
     skip_reason: str = ""
+    # Custom tools fields (spec/17) — populated when tool_registry has tools
+    tool_calls: list["ToolCallResult"] = field(default_factory=list)
+    tool_iterations: int = 1           # 1 = no tools used, 2+ = multi-turn loop
+    tool_iterations_maxed: bool = False  # True when max_iterations cap was hit
 
     @classmethod
     def skipped_response(cls, reason: str, model: str) -> "Response":

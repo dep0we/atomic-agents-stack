@@ -64,3 +64,18 @@ class DreamInProgress(AtomicAgentsError):
 
 class DreamNotFound(AtomicAgentsError):
     """No dream with the given ID exists for this agent."""
+
+
+# ──────────────────────────────────────────────────────────────────
+# Custom tools exceptions (spec/17)
+
+class ToolNotRegistered(AtomicAgentsError):
+    """Model called a tool name that is not in the ToolRegistry."""
+
+
+class ToolInputInvalid(AtomicAgentsError):
+    """Tool input failed JSON Schema validation (required fields or type mismatch)."""
+
+
+class ToolHandlerError(AtomicAgentsError):
+    """Handler raised an exception; the result was captured in ToolCallResult.error."""
