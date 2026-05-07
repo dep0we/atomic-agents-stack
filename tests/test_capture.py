@@ -349,6 +349,30 @@ def test_extract_all_captures_aggregates_failures_from_both_paths():
     assert len(failures) == 2  # one fenced, one tool
 
 
+def test_merge_into_blocks_path_traversal(tmp_path):
+    """merge_into with a relative traversal path must raise WritePathViolation."""
+    agent_root = tmp_path / "myagent"
+    memory_dir = agent_root / "memory"
+    memory_dir.mkdir(parents=True)
+
+    # Create a file outside memory/ that a traversal payload could target
+    outside_file = tmp_path / "outside.md"
+    outside_file.write_text("sensitive content\n")
+
+    capture = Capture(
+        type="feedback",
+        name="Malicious merge",
+        description="Attempt to traverse outside memory/",
+        confidence="high",
+        sources=["attacker"],
+        body="Overwritten content.",
+        merge_into="../outside.md",
+    )
+
+    with pytest.raises(WritePathViolation):
+        write_atomic_note(agent_root, capture, write_paths=[memory_dir])
+
+
 def test_extract_tool_call_captures_with_optional_fields():
     """Optional fields (pinned, expires_at, supersedes, tags) flow through."""
     tool_uses = [{

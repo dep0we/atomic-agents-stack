@@ -266,6 +266,7 @@ def write_atomic_note(
     if capture.merge_into:
         # Merge: update an existing note's last_seen + sources rather than create new
         target = memory_dir / capture.merge_into
+        enforce_write_path(target.resolve(), write_paths)
         if not target.exists():
             raise SchemaValidationError(
                 f"merge_into target {capture.merge_into} doesn't exist"
