@@ -237,6 +237,7 @@ Then in any Claude Code session you can ask things like *"run scout against this
 - **Tune over time.** After you've got eval history, the tuning analyzer (`python -m atomic_agents.tuning <agent>`) detects patterns and proposes edits. See [`spec/11-tuning.md`](spec/11-tuning.md).
 - **Build a goal-driven agent.** For agents that pursue a multi-step persistent goal across many sessions, see [`spec/12-goals-and-intent.md`](spec/12-goals-and-intent.md).
 - **Multi-agent projects.** For Muse-style setups where multiple roles share a project context, see [`spec/06-multi-agent-projects.md`](spec/06-multi-agent-projects.md).
+- **For autonomous deployment:** read [GOVERNANCE.md](GOVERNANCE.md) — pre-deploy checklist, naming conventions, audit practices for solo + small-team operators.
 
 ## Troubleshooting
 
