@@ -459,10 +459,15 @@ class EvalRunner:
     # Internals
 
     def _build_judge_prompt(self, test: EvalTest, agent_response: str) -> str:
-        """Render the judge.md template with this test's content."""
-        # The judge template uses {placeholder} substitutions
+        """Render the judge.md template with this test's content.
+
+        When the test declares ``expected_facts`` (per spec/13 Layer 2), an
+        additional "Factual accuracy check" section is appended to the prompt
+        instructing the judge to verify each fact and emit a ``factual_checks``
+        array in its JSON response.
+        """
         try:
-            return self.judge_template.format(
+            base = self.judge_template.format(
                 rubric=self.rubric_body,
                 test_input=test.input,
                 expected_behavior=test.expected_behavior,
@@ -470,10 +475,8 @@ class EvalRunner:
                 agent_response=agent_response,
                 trajectory="(trajectory capture not implemented in v0.2)",
             )
-        except KeyError as e:
-            # Template has a placeholder we don't provide — just return the
-            # template + appended content so the judge has something to work with
-            return (
+        except KeyError:
+            base = (
                 f"{self.judge_template}\n\n"
                 f"---\n\n## Rubric\n\n{self.rubric_body}\n\n"
                 f"## Test input\n\n{test.input}\n\n"
@@ -481,6 +484,53 @@ class EvalRunner:
                 f"## Pass criteria\n\n{test.pass_criteria}\n\n"
                 f"## Agent's response\n\n{agent_response}"
             )
+        if test.expected_facts:
+            base = base + "\n\n" + self._render_factual_check_section(test.expected_facts)
+        return base
+
+    @staticmethod
+    def _render_factual_check_section(expected_facts: list[dict]) -> str:
+        """Build the spec/13 Layer-2 'Factual accuracy check' addendum.
+
+        Instructs the judge to emit a ``factual_checks: [...]`` array
+        alongside its rubric scores, with per-fact verdicts on whether
+        the agent stated the claim, used the correct value, and cited
+        a source.
+        """
+        bullets = []
+        for f in expected_facts:
+            claim = f.get("claim", "")
+            source = f.get("source", "")
+            expected = f.get("expected_value", "")
+            bullets.append(
+                f'- claim: "{claim}"\n'
+                f'  source: {source}\n'
+                f'  expected_value: "{expected}"'
+            )
+        bullet_text = "\n".join(bullets)
+        return (
+            "## Factual accuracy check\n\n"
+            "In addition to scoring rubric dimensions, verify these facts in the\n"
+            "agent's response. For each expected_fact:\n\n"
+            "1. Did the agent state this claim?\n"
+            "2. If yes, did the agent's value match expected_value?\n"
+            "3. If yes, did the agent cite a source?\n\n"
+            "Add a `factual_checks` array to your JSON response with one entry\n"
+            "per expected_fact:\n\n"
+            "```json\n"
+            '"factual_checks": [\n'
+            "  {\n"
+            '    "claim": "<claim text>",\n'
+            '    "stated_in_response": true|false,\n'
+            '    "value_correct": true|false|null,\n'
+            '    "cited": true|false|null\n'
+            "  }\n"
+            "]\n"
+            "```\n\n"
+            "Use `null` for value_correct/cited when stated_in_response is false.\n\n"
+            "Expected facts:\n\n"
+            f"{bullet_text}"
+        )
 
     @staticmethod
     def _parse_judge_response(text: str) -> dict:
@@ -496,7 +546,29 @@ class EvalRunner:
         return json.loads(text)
 
     def _compute_weighted_score(self, scores_dict: dict) -> float:
-        """Apply rubric weights to the judge's per-dimension scores."""
+        """Apply rubric weights to the judge's per-dimension scores.
+
+        Per spec/13 Layer 2: when the rubric declares ``factual_accuracy`` as
+        a weighted dimension and the judge returned ``factual_checks``, the
+        runner derives the dimension's score from the checks (proportion of
+        verified facts × 5, on the same 1–5 scale as other dimensions). If
+        the judge already returned a numeric score for ``factual_accuracy``,
+        the judge's score takes priority (the LLM may apply nuance the bare
+        proportion misses).
+        """
+        # Inject a derived factual_accuracy score if the rubric expects one
+        # but the judge didn't return a numeric score for it.
+        if "factual_accuracy" in self.weights:
+            existing = scores_dict.get("factual_accuracy")
+            if not (isinstance(existing, dict) and "score" in existing):
+                checks = scores_dict.get("factual_checks", [])
+                derived = compute_factual_accuracy_from_checks(checks)
+                if derived is not None:
+                    scores_dict["factual_accuracy"] = {
+                        "score": derived,
+                        "justification": "derived from factual_checks proportion",
+                    }
+
         total = 0.0
         weight_sum = 0.0
         for dim, weight_pct in self.weights.items():
@@ -549,6 +621,38 @@ class EvalRunner:
         if result.error:
             line["error"] = result.error
         atomic_append_jsonl(log_path, json.dumps(line))
+
+
+# ──────────────────────────────────────────────────────────────────
+# Layer-2 factual accuracy helper (module-level for testability)
+
+
+def compute_factual_accuracy_from_checks(checks: list[dict]) -> float | None:
+    """Compute a 1-5 dimension score from a list of ``factual_checks`` entries.
+
+    Per spec/13 Layer 2:
+    - A check is "verified" iff stated_in_response AND value_correct AND cited.
+    - The dimension score is ``round(5 * verified / total)`` clamped to 1.
+    - Returns ``None`` when ``checks`` is empty (no signal to score from).
+
+    A claim that's correctly stated but uncited counts as half-verified
+    (we still want some signal — the value is right, but it's not auditable).
+    """
+    if not checks:
+        return None
+    total = len(checks)
+    verified = 0.0
+    for c in checks:
+        stated = bool(c.get("stated_in_response"))
+        value_ok = bool(c.get("value_correct"))
+        cited = bool(c.get("cited"))
+        if stated and value_ok and cited:
+            verified += 1.0
+        elif stated and value_ok:
+            verified += 0.5  # right value, uncited — partial credit
+    proportion = verified / total
+    score = round(5 * proportion)
+    return max(1, min(5, int(score)))
 
 
 # ──────────────────────────────────────────────────────────────────

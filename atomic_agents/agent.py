@@ -83,6 +83,11 @@ class AtomicAgent:
         # populated for paths shaped <system>/projects/<project>/agents/<role>/.
         self.cascade: _cascade.CascadePaths | None = _cascade.detect_cascade(self.agent_root)
 
+        # Per-call helper-provenance rollup (spec/13 Layer 3). Reset at the
+        # start of each call(); appended to by helper_call(). Empty list
+        # means either no helpers ran or the call started outside call().
+        self._helpers_this_run: list[dict] = []
+
         # Loaded later via load() — populated in __init__ for clarity
         self._persona_text: str = ""
         self._tools_text: str = ""
@@ -353,6 +358,8 @@ class AtomicAgent:
             raise
 
         try:
+            # Reset helper-provenance rollup for this run (spec/13 Layer 3)
+            self._helpers_this_run = []
             # Cost guardrails check
             check = self._check_cost_guardrails(critical=critical)
             if not check.allow:
@@ -458,6 +465,11 @@ class AtomicAgent:
                 log_record["critical"] = True
             if parse_failures:
                 log_record["capture_parse_failures"] = len(parse_failures)
+            if self._helpers_this_run:
+                # Spec/13 Layer 3 — research log: roll up helper provenance
+                # into the parent run record so an audit can trace every fact
+                # back to the helper invocation that produced it.
+                log_record["helper_provenance"] = list(self._helpers_this_run)
             self._log(log_record)
 
             return response
@@ -533,6 +545,19 @@ class AtomicAgent:
             log_record["sources"] = sources_list
             log_record["provenance_preserved"] = provenance_preserved
         self._log(log_record)
+
+        # Append to the in-memory rollup for spec/13 Layer 3 (research log).
+        # The parent run's log record will include this list at end-of-call.
+        rollup_entry = {
+            "model": actual_model,
+            "summary": summary or "helper call",
+            "cost_usd": cost,
+            "latency_ms": latency_ms,
+        }
+        if sources_list:
+            rollup_entry["sources_summarized"] = sources_list
+            rollup_entry["provenance_preserved"] = provenance_preserved
+        self._helpers_this_run.append(rollup_entry)
 
         return HelperResult(
             text=raw.text,
