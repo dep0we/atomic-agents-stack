@@ -41,15 +41,19 @@ HARD RULES (per spec/12):
 """
 
 from __future__ import annotations
+import json
 import re
 from dataclasses import dataclass, field, asdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .outcome import OutcomeResult
 
 import frontmatter
 
-from ._io import atomic_write
+from ._io import atomic_write, atomic_append_jsonl
 from ._platform import get_agents_root
 from .exceptions import (
     AtomicAgentsError,
@@ -81,6 +85,8 @@ class SubGoal:
     blocked_by: str | None = None       # id of another sub_goal
     completed: str | None = None        # YYYY-MM-DD when status=complete
     output: str | None = None           # path to artifact this sub_goal produced
+    body: str | None = None             # optional longer description / narrative
+    acceptance_criteria: list[str] = field(default_factory=list)  # optional per-sub-goal criteria
 
 
 @dataclass
@@ -273,6 +279,8 @@ class GoalManager:
                 blocked_by=sg.get("blocked_by"),
                 completed=str(sg["completed"]) if sg.get("completed") else None,
                 output=sg.get("output"),
+                body=sg.get("body"),
+                acceptance_criteria=list(sg.get("acceptance_criteria") or []),
             )
             for sg in meta.get("sub_goals", [])
         ]
@@ -343,6 +351,10 @@ class GoalManager:
             d["completed"] = sg.completed
         if sg.output:
             d["output"] = sg.output
+        if sg.body:
+            d["body"] = sg.body
+        if sg.acceptance_criteria:
+            d["acceptance_criteria"] = sg.acceptance_criteria
         return d
 
     # ────────────────────────────────────────────────────────────
@@ -726,6 +738,157 @@ class GoalManager:
         return "\n".join(lines)
 
     # ────────────────────────────────────────────────────────────
+    # Goal-outcome composition
+
+    def dispatch_as_outcome(
+        self,
+        sub_goal_id: str,
+        rubric: "str | Path",
+        max_iterations: int = 3,
+        extra_context: str | None = None,
+        judge_model: str | None = None,
+    ) -> "tuple[OutcomeResult, SubGoal]":
+        """Dispatch a sub-goal as an outcome and update sub-goal status from result.
+
+        Behavior:
+        - Refuses if sub-goal is not ``pending`` or ``in_progress`` (raises GoalCorrupted).
+        - Refuses if sub-goal has unresolved blocked_by dependencies (raises GoalCorrupted).
+        - Marks sub-goal ``in_progress`` before dispatch (idempotent if already in_progress).
+        - Builds outcome ``description`` from the sub-goal's label + body + acceptance criteria.
+        - Calls OutcomeRunner(agents_root, agent_name).run(description, rubric,
+          max_iterations, extra_context, judge_model).
+        - Maps terminal state to sub-goal status:
+            - satisfied              → complete
+            - max_iterations_reached → blocked (reason cites run_id)
+            - failed                 → blocked (reason cites judge explanation)
+            - interrupted            → stays in_progress (caller decides whether to retry)
+        - Records a dedicated ``sub_goal_outcome_dispatched`` event in goal_history.jsonl.
+        - Returns (OutcomeResult, updated SubGoal).
+        """
+        # Lazy import to avoid circular imports
+        from .outcome import OutcomeRunner  # noqa: PLC0415
+
+        if self._goal is None:
+            self.load()
+
+        sg = self._require_sub_goal(sub_goal_id)
+
+        # Refuse degenerate states
+        if sg.status not in ("pending", "in_progress"):
+            raise GoalCorrupted(
+                f"sub_goal '{sub_goal_id}' is '{sg.status}'; "
+                f"dispatch_as_outcome only accepts pending or in_progress sub-goals"
+            )
+
+        # Refuse if blocked_by is unresolved
+        if sg.blocked_by:
+            blocker = self.find_sub_goal(sg.blocked_by)
+            if blocker is None:
+                raise GoalCorrupted(
+                    f"sub_goal '{sub_goal_id}' blocked_by '{sg.blocked_by}' which does not exist; "
+                    f"goal graph is inconsistent — operator must repair goal.md"
+                )
+            if blocker.status != "complete":
+                raise GoalCorrupted(
+                    f"sub_goal '{sub_goal_id}' has unresolved blocked_by dependency "
+                    f"'{sg.blocked_by}' (status: {blocker.status}); "
+                    f"resolve the blocker before dispatching as outcome"
+                )
+
+        # Mark in_progress before running so observers see the dispatch in-flight
+        if sg.status == "pending":
+            sg.status = "in_progress"
+            self._append_history(f"sub_goal `{sub_goal_id}` → in_progress (outcome dispatch)")
+
+        # Build the outcome description from the sub-goal
+        description = self._build_outcome_description_from_sub_goal(sg)
+
+        # Run the outcome
+        runner = OutcomeRunner(
+            agents_root=self.agents_root,
+            agent_name=self.agent_name,
+            judge_model=judge_model,
+        )
+        result = runner.run(
+            description=description,
+            rubric=rubric,
+            max_iterations=max_iterations,
+            extra_context=extra_context,
+        )
+
+        # Map terminal state to sub-goal status
+        applied_status: str
+        if result.status == "satisfied":
+            sg.status = "complete"
+            sg.completed = self.today.isoformat()
+            applied_status = "complete"
+            self._append_history(
+                f"sub_goal `{sub_goal_id}` → complete "
+                f"(outcome {result.run_id} satisfied)"
+            )
+        elif result.status == "max_iterations_reached":
+            sg.status = "blocked"
+            sg.blocked_by = None  # no sub-goal blocker — narrative in history
+            applied_status = "blocked"
+            self._append_history(
+                f"sub_goal `{sub_goal_id}` → blocked "
+                f"(max_iterations_reached on outcome {result.run_id})"
+            )
+        elif result.status == "failed":
+            sg.status = "blocked"
+            sg.blocked_by = None
+            applied_status = "blocked"
+            explanation_short = (result.explanation or "")[:200]
+            self._append_history(
+                f"sub_goal `{sub_goal_id}` → blocked "
+                f"(outcome failed — {explanation_short})"
+            )
+        else:
+            # interrupted — leave in_progress; caller decides whether to retry
+            applied_status = "in_progress"
+            self._append_history(
+                f"sub_goal `{sub_goal_id}` stays in_progress "
+                f"(outcome {result.run_id} interrupted)"
+            )
+
+        # Record dedicated JSONL history entry
+        self._append_goal_history_jsonl({
+            "ts": datetime.now().astimezone().isoformat(),
+            "event": "sub_goal_outcome_dispatched",
+            "sub_goal_id": sub_goal_id,
+            "outcome_run_id": result.run_id,
+            "terminal_state": result.status,
+            "applied_status": applied_status,
+            "iterations": len(result.iterations),
+            "total_cost_usd": result.total_cost_usd,
+        })
+
+        return result, sg
+
+    def _build_outcome_description_from_sub_goal(self, sg: SubGoal) -> str:
+        """Build a clear outcome description from sub-goal fields.
+
+        Pattern:
+            <sg.label>
+
+            <sg.body if present>
+
+            Acceptance criteria for this sub-goal:
+              - <criterion>
+              ...
+        """
+        parts: list[str] = [sg.label]
+
+        if sg.body and sg.body.strip():
+            parts.append(sg.body.strip())
+
+        if sg.acceptance_criteria:
+            criteria_lines = "\n".join(f"  - {c}" for c in sg.acceptance_criteria)
+            parts.append(f"Acceptance criteria for this sub-goal:\n{criteria_lines}")
+
+        return "\n\n".join(parts)
+
+    # ────────────────────────────────────────────────────────────
     # Internals
 
     def _would_cycle(self, sub_goal_id: str, new_blocker_id: str) -> bool:
@@ -772,6 +935,11 @@ class GoalManager:
             self._goal.body = self._goal.body.rstrip() + f"\n\n{history_marker} (auto-appended)\n"
         self._goal.body = self._goal.body.rstrip() + f"\n- {self.today.isoformat()} — {entry}"
 
+    def _append_goal_history_jsonl(self, entry: dict) -> None:
+        """Append a structured event to goal_history.jsonl in the agent root."""
+        history_path = self.agent_root / "goal_history.jsonl"
+        atomic_append_jsonl(history_path, json.dumps(entry))
+
 
 # ──────────────────────────────────────────────────────────────────
 # CLI
@@ -812,6 +980,25 @@ def main(argv: list[str] | None = None) -> int:
 
     p_report = sub.add_parser("report", help="Periodic progress report (suitable for journal)")
     p_report.add_argument("agent")
+
+    p_dispatch_outcome = sub.add_parser(
+        "dispatch-outcome",
+        help="Run a sub-goal as an outcome loop and machine-decide completion",
+    )
+    p_dispatch_outcome.add_argument("agent")
+    p_dispatch_outcome.add_argument("sub_goal_id")
+    p_dispatch_outcome.add_argument(
+        "--rubric", required=True,
+        help="path to rubric file, or 'inline:<text>'",
+    )
+    p_dispatch_outcome.add_argument(
+        "--max-iterations", type=int, default=3,
+        help="max iterations for the outcome loop (default 3)",
+    )
+    p_dispatch_outcome.add_argument(
+        "--judge-model", default=None,
+        help="override the judge model",
+    )
 
     args = parser.parse_args(argv)
 
@@ -881,6 +1068,51 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "report":
         print(gm.progress_report())
         return 0
+
+    if args.cmd == "dispatch-outcome":
+        import sys as _sys
+        gm.load()
+
+        # Resolve rubric arg
+        rubric: "str | Path"
+        if args.rubric.startswith("inline:"):
+            rubric = args.rubric[len("inline:"):]
+        else:
+            rubric = Path(args.rubric)
+
+        try:
+            result, sg = gm.dispatch_as_outcome(
+                sub_goal_id=args.sub_goal_id,
+                rubric=rubric,
+                max_iterations=args.max_iterations,
+                judge_model=args.judge_model,
+            )
+        except GoalCorrupted as e:
+            print(f"Error: {e}", file=_sys.stderr)
+            return 1
+
+        gm.save()
+
+        status_labels = {
+            "satisfied": "SATISFIED",
+            "max_iterations_reached": "MAX ITERATIONS REACHED",
+            "failed": "FAILED",
+            "interrupted": "INTERRUPTED",
+        }
+        outcome_label = status_labels.get(result.status, result.status.upper())
+        print(f"\n=== Outcome: {outcome_label} ===")
+        print(f"Run ID:              {result.run_id}")
+        print(f"Iterations:          {len(result.iterations)} / {result.max_iterations}")
+        print(f"Total cost:          ${result.total_cost_usd:.4f}")
+        print(f"Explanation:         {result.explanation}")
+        print(f"Sub-goal '{sg.id}' → {sg.status}")
+        print()
+
+        if result.status == "satisfied":
+            return 0
+        if result.status == "interrupted":
+            return 2
+        return 1
 
     return 1
 

@@ -475,6 +475,60 @@ The runtime distinguishes by trigger source:
 
 ---
 
+## Dispatching a sub-goal as an outcome
+
+Instead of operator-marking a sub-goal complete, you can let an iterate-to-rubric loop machine-decide it:
+
+```python
+from atomic_agents.goal import GoalManager
+from pathlib import Path
+
+gm = GoalManager(agents_root, "muse-director")
+gm.load()
+
+result, sg = gm.dispatch_as_outcome(
+    sub_goal_id="ch_5_draft",
+    rubric=Path("evals/chapter_draft_rubric.md"),   # or inline text
+    max_iterations=3,
+    judge_model=None,    # auto-select cross-family
+)
+gm.save()
+print(result.status)    # satisfied | max_iterations_reached | failed | interrupted
+print(sg.status)        # complete | blocked | in_progress
+```
+
+**Terminal-state mapping:**
+
+| Outcome status | Sub-goal status | Reason |
+|---|---|---|
+| `satisfied` | `complete` | Judge confirmed every rubric criterion met |
+| `max_iterations_reached` | `blocked` | Hit the iteration cap; reason cites the outcome run_id |
+| `failed` | `blocked` | Rubric/description contradiction or judge crash; reason cites judge explanation |
+| `interrupted` | stays `in_progress` | Cost guardrail fired; caller decides whether to retry |
+
+**Dispatch guards** — `dispatch_as_outcome` refuses and raises `GoalCorrupted` when:
+- Sub-goal is already `complete`, `blocked`, or `abandoned` (only `pending` / `in_progress` allowed)
+- Sub-goal has an unresolved `blocked_by` dependency (blocker not yet `complete`)
+
+The method marks the sub-goal `in_progress` **before** running the outcome loop so any observer polling `goal.md` can see the dispatch in-flight.
+
+After each run, a `sub_goal_outcome_dispatched` entry is appended to `goal_history.jsonl` with the outcome `run_id`, `terminal_state`, `applied_status`, iteration count, and cost — creating a full audit trail from machine-decided sub-goal completion back to the outcome that decided it.
+
+**CLI:**
+
+```sh
+python -m atomic_agents.goal dispatch-outcome muse-director ch_5_draft \
+    --rubric evals/chapter_draft_rubric.md \
+    --max-iterations 3 \
+    --judge-model gpt-5
+```
+
+Exit codes: 0 = satisfied, 1 = failed/max_iterations_reached, 2 = interrupted.
+
+*See [14-outcomes.md](14-outcomes.md) for the OutcomeRunner primitive this composes with.*
+
+---
+
 ## What's NOT in v1
 
 - **Multi-goal scheduling** — sequential only; one active goal at a time
