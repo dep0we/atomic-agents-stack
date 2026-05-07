@@ -498,6 +498,180 @@ def test_run_suite_no_tests_returns_empty(agent_vault):
 # ──────────────────────────────────────────────────────────────────
 # Provider availability
 
+# ──────────────────────────────────────────────────────────────────
+# Setup-applied regression tests (P1 fix)
+
+def test_run_test_applies_setup_to_work_item(agent_vault, monkeypatch):
+    """When test.setup is non-empty, the agent must receive setup text in its work item.
+
+    This is the P1 regression guard: before the fix, test.setup was parsed into
+    EvalTest.setup but run_test() discarded it and called agent.call(work_item=test.input)
+    directly.  The fix prepends setup with a clear separator so tests are
+    reproducible regardless of live vault state.
+    """
+    agents_root, agent_name = agent_vault
+
+    # Write a test that has a non-empty Setup section
+    evals_dir = agents_root / agent_name / "evals"
+    golden = evals_dir / "golden" / "happy"
+    setup_test = """---
+schema_version: 1
+agent: testagent
+category: happy
+test_id: 002_setup_test
+created: 2026-05-07
+---
+
+# Test with setup
+
+## Setup
+
+Vault contains note_foo.md with content "foo bar".
+
+## Input
+
+Summarise the note.
+
+## Expected behavior
+
+Should reference foo bar.
+
+## Pass criteria
+
+- output_quality ≥ 4
+"""
+    (golden / "002_setup_test.md").write_text(setup_test)
+
+    runner = EvalRunner(agents_root, agent_name)
+
+    captured_work_items: list[str] = []
+
+    agent_response_mock = MagicMock()
+    agent_response_mock.text = "foo bar summary"
+    agent_response_mock.model = "claude-sonnet-4-6-20260101"
+    agent_response_mock.input_tokens = 100
+    agent_response_mock.output_tokens = 10
+    agent_response_mock.cost_usd = 0.001
+    agent_response_mock.skipped = False
+
+    judge_response_mock = MagicMock()
+    judge_response_mock.text = json.dumps({
+        "persona_fidelity": {"score": 5, "justification": "good"},
+        "output_quality": {"score": 5, "justification": "correct"},
+        "hard_fails": [],
+        "overall": {"justification": "pass"},
+    })
+    judge_response_mock.input_tokens = 200
+    judge_response_mock.output_tokens = 50
+
+    def make_mock_agent(*args, **kwargs):
+        instance = MagicMock()
+        instance.config.default_model = "claude-sonnet-4-6-20260101"
+        def capture_call(**kw):
+            captured_work_items.append(kw.get("work_item", ""))
+            return agent_response_mock
+        instance.call.side_effect = capture_call
+        return instance
+
+    with patch("atomic_agents.eval.AtomicAgent", side_effect=make_mock_agent):
+        with patch("atomic_agents.eval._llm.call_llm", return_value=judge_response_mock):
+            with patch("atomic_agents.eval._provider_available", return_value=True):
+                result = runner.run_test("002_setup_test")
+
+    assert len(captured_work_items) == 1
+    work_item = captured_work_items[0]
+    # Setup text must appear before the actual input
+    assert "Vault contains note_foo.md" in work_item
+    assert "Summarise the note" in work_item
+    assert work_item.index("Vault contains note_foo.md") < work_item.index("Summarise the note")
+    # A separator must be present so the agent can distinguish setup from input
+    assert "---" in work_item
+    # The result must record that setup was applied
+    assert result.setup_applied is True
+
+
+def test_run_test_no_setup_unchanged_behavior(agent_vault):
+    """When test.setup is empty, the agent receives test.input verbatim.
+
+    Ensures the P1 fix is a no-op for tests that have no Setup section, so
+    existing golden tests without setup are unaffected.
+    """
+    agents_root, agent_name = agent_vault
+
+    # Write a test with no Setup section
+    evals_dir = agents_root / agent_name / "evals"
+    golden = evals_dir / "golden" / "happy"
+    no_setup_test = """---
+schema_version: 1
+agent: testagent
+category: happy
+test_id: 003_no_setup_test
+created: 2026-05-07
+---
+
+# Test without setup
+
+## Input
+
+What is 3+3?
+
+## Expected behavior
+
+Should answer 6.
+
+## Pass criteria
+
+- output_quality ≥ 4
+"""
+    (golden / "003_no_setup_test.md").write_text(no_setup_test)
+
+    runner = EvalRunner(agents_root, agent_name)
+
+    captured_work_items: list[str] = []
+
+    agent_response_mock = MagicMock()
+    agent_response_mock.text = "6"
+    agent_response_mock.model = "claude-sonnet-4-6-20260101"
+    agent_response_mock.input_tokens = 50
+    agent_response_mock.output_tokens = 5
+    agent_response_mock.cost_usd = 0.0005
+    agent_response_mock.skipped = False
+
+    judge_response_mock = MagicMock()
+    judge_response_mock.text = json.dumps({
+        "persona_fidelity": {"score": 5, "justification": "good"},
+        "output_quality": {"score": 5, "justification": "correct"},
+        "hard_fails": [],
+        "overall": {"justification": "pass"},
+    })
+    judge_response_mock.input_tokens = 200
+    judge_response_mock.output_tokens = 50
+
+    def make_mock_agent(*args, **kwargs):
+        instance = MagicMock()
+        instance.config.default_model = "claude-sonnet-4-6-20260101"
+        def capture_call(**kw):
+            captured_work_items.append(kw.get("work_item", ""))
+            return agent_response_mock
+        instance.call.side_effect = capture_call
+        return instance
+
+    with patch("atomic_agents.eval.AtomicAgent", side_effect=make_mock_agent):
+        with patch("atomic_agents.eval._llm.call_llm", return_value=judge_response_mock):
+            with patch("atomic_agents.eval._provider_available", return_value=True):
+                result = runner.run_test("003_no_setup_test")
+
+    assert len(captured_work_items) == 1
+    work_item = captured_work_items[0]
+    # Work item should be exactly the input — no setup preamble
+    assert work_item.strip() == "What is 3+3?"
+    # setup_applied must be False
+    assert result.setup_applied is False
+
+
+# ──────────────────────────────────────────────────────────────────
+# Provider availability
+
 def test_provider_available_env_var(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
     assert _provider_available("claude-opus-4-7-20260101") is True
