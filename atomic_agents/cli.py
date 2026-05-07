@@ -2,8 +2,10 @@
 
 Usage:
     atomic-agents run <agent> [options]
+    atomic-agents version <agent> <note-filename>
+    atomic-agents restore <agent> <note-filename> <version-name>
 
-For now, just supports the `run` subcommand. Future: `eval`, `tune`, `dashboard`, `goal`.
+Supports: run, info, version, restore subcommands.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ from pathlib import Path
 
 from .agent import AtomicAgent
 from ._platform import get_agents_root
+from ._versioning import list_versions, restore_version
 from .exceptions import AtomicAgentsError
 
 
@@ -35,6 +38,17 @@ def main(argv: list[str] | None = None) -> int:
     info.add_argument("agent")
     info.add_argument("--agents-root", default=None)
 
+    version_cmd = sub.add_parser("version", help="List versions for a memory note")
+    version_cmd.add_argument("agent", help="agent name (folder under agents-root)")
+    version_cmd.add_argument("note_filename", help="bare filename, e.g. feedback_comm_style.md")
+    version_cmd.add_argument("--agents-root", default=None)
+
+    restore_cmd = sub.add_parser("restore", help="Restore a memory note from a snapshot")
+    restore_cmd.add_argument("agent", help="agent name (folder under agents-root)")
+    restore_cmd.add_argument("note_filename", help="bare filename, e.g. feedback_comm_style.md")
+    restore_cmd.add_argument("version_name", help="version filename to restore from")
+    restore_cmd.add_argument("--agents-root", default=None)
+
     args = parser.parse_args(argv)
 
     agents_root = Path(args.agents_root).expanduser().resolve() if args.agents_root else get_agents_root()
@@ -44,6 +58,10 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_run(args, agents_root)
         elif args.cmd == "info":
             return _cmd_info(args, agents_root)
+        elif args.cmd == "version":
+            return _cmd_version(args, agents_root)
+        elif args.cmd == "restore":
+            return _cmd_restore(args, agents_root)
     except AtomicAgentsError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
@@ -91,14 +109,52 @@ def _cmd_info(args, agents_root: Path) -> int:
         print(f"  Daily cap:   ${cfg.daily_cap_usd}  → action: {cfg.daily_cap_action}")
         print(f"  Monthly cap: ${cfg.monthly_cap_usd} → action: {cfg.monthly_cap_action}")
         print(f"  Warning thresholds: {cfg.warning_thresholds}")
-    print(f"Read paths:   {len(cfg.read_paths)}")
+    print(f"Read paths:       {len(cfg.read_paths)}")
     for p in cfg.read_paths:
         print(f"  • {p}")
-    print(f"Write paths:  {len(cfg.write_paths)}")
+    print(f"Write paths:      {len(cfg.write_paths)}")
     for p in cfg.write_paths:
+        print(f"  • {p}")
+    print(f"Read-only paths:  {len(cfg.read_only_paths)}")
+    for p in cfg.read_only_paths:
         print(f"  • {p}")
     print(f"External APIs: {cfg.external_apis}")
     print(f"Hard NOs:      {len(cfg.hard_nos)} entries")
+    return 0
+
+
+def _cmd_version(args, agents_root: Path) -> int:
+    """List all snapshot versions for a memory note, newest first."""
+    agent_root = agents_root / args.agent
+    memory_dir = agent_root / "memory"
+    if not memory_dir.exists():
+        print(f"No memory/ directory found at {memory_dir}", file=sys.stderr)
+        return 1
+    versions = list_versions(memory_dir, args.note_filename)
+    if not versions:
+        print(f"No versions found for {args.note_filename}")
+        return 0
+    for v in versions:
+        print(v.name)
+    return 0
+
+
+def _cmd_restore(args, agents_root: Path) -> int:
+    """Restore a memory note from a named snapshot."""
+    agent_root = agents_root / args.agent
+    memory_dir = agent_root / "memory"
+    if not memory_dir.exists():
+        print(f"No memory/ directory found at {memory_dir}", file=sys.stderr)
+        return 1
+    from pathlib import Path as _Path
+    stem = _Path(args.note_filename).stem
+    version_path = memory_dir / ".versions" / stem / args.version_name
+    if not version_path.exists():
+        print(f"Version not found: {version_path}", file=sys.stderr)
+        return 1
+    restored = restore_version(memory_dir, args.note_filename, version_path)
+    print(f"Restored {args.note_filename} from {args.version_name}")
+    print(f"  live note: {restored}")
     return 0
 
 

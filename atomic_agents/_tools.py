@@ -18,6 +18,7 @@ from ._platform import expand
 SECTION_PATTERNS = {
     "read_paths": re.compile(r"^##\s+Read paths?\b", re.IGNORECASE),
     "write_paths": re.compile(r"^##\s+Write paths?\b", re.IGNORECASE),
+    "read_only_paths": re.compile(r"^##\s+Read[\s-]only paths?\b", re.IGNORECASE),
     "external_apis": re.compile(r"^##\s+External APIs?\b", re.IGNORECASE),
     "hard_nos": re.compile(r"^##\s+Hard NOs?\b", re.IGNORECASE),
 }
@@ -69,7 +70,7 @@ def parse_tools_md_text(text: str) -> dict:
             continue
         item = bullet_match.group(1).strip()
 
-        if current_section in ("read_paths", "write_paths"):
+        if current_section in ("read_paths", "write_paths", "read_only_paths"):
             # Strip backticks and trailing comments
             item = re.sub(r"`", "", item)
             # Take everything up to a comma, paren, or em-dash divider

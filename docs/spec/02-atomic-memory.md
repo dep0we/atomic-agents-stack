@@ -457,4 +457,158 @@ If you've read Karpathy's pattern, the wiki layer here will look familiar. The n
 
 ---
 
+---
+
+## Versioning, concurrency, and read-only mounts
+
+Three Anthropic memory-model parity features added in PR #46.
+
+### Memory versioning
+
+Every overwrite or merge of an existing memory note creates an immutable snapshot before the mutation. Fresh writes (creating a note for the first time) do not snapshot — there is no prior content to preserve.
+
+**Storage layout:**
+
+```
+<agent>/memory/
+├── feedback_communication_style.md    ← live note
+└── .versions/
+    └── feedback_communication_style/
+        ├── 20260507T143012Z_a3f8c1b2.md   ← oldest snapshot
+        └── 20260507T161455Z_d92e4f77.md   ← newest snapshot
+```
+
+- `.versions/` is a hidden directory at the same level as the live memory notes.
+- One subdirectory per note, named by the note's stem (without `.md`).
+- One file per version, named `<ISO-ts>_<8-char-sha256>.md`. The ISO timestamp is UTC in `YYYYMMDDTHHMMSSZ` format (sortable, filesystem-safe). The 8-char hash disambiguates near-simultaneous writes.
+- `INDEX.md` is excluded from versioning — it is mechanical scaffolding, not semantic content.
+- Version files contain the **full old content** (frontmatter + body), not a diff.
+
+**When versions are created:**
+
+| Event | Snapshot? |
+|---|---|
+| `write_atomic_note` on a new note (first write) | No — no prior content |
+| `write_atomic_note` overwrite (orphan-recovery path) | Yes — snapshots old content first |
+| `write_atomic_note` with `merge_into` on an existing note | Yes — snapshots old content first |
+| `restore_version` — restoring a snapshot | Yes — snapshots current live state before overwriting |
+| `redact_version` — replacing a snapshot's body | No — snapshot of a snapshot would be circular |
+
+**Versioning API** (`atomic_agents._versioning`):
+
+```python
+from atomic_agents._versioning import (
+    snapshot_memory_version,
+    list_versions,
+    read_version,
+    restore_version,
+    redact_version,
+)
+
+# Internal: called automatically by write_atomic_note before any overwrite
+version_path = snapshot_memory_version(live_note_path)  # → Path | None
+
+# List all snapshots for a note, newest first
+versions = list_versions(memory_dir, "feedback_comm_style.md")  # → list[Path]
+
+# Read a snapshot's content
+fm_dict, body_text = read_version(versions[0])  # → (dict, str)
+
+# Restore live note to a snapshot (reversible — snapshots current state first)
+live = restore_version(memory_dir, "feedback_comm_style.md", versions[0])
+
+# Redact a snapshot's body (compliance — preserves frontmatter audit trail)
+redact_version(versions[0], replacement="[REDACTED — PII removed]")
+```
+
+**Logging:** each versioning event appends a JSONL line to the agent's per-day log:
+
+| Event | `trigger` value |
+|---|---|
+| Snapshot created | `memory_version_created` |
+| Snapshot restored to live | `memory_version_restored` |
+| Snapshot body redacted | `memory_version_redacted` |
+
+**Retention:** versions persist indefinitely — no auto-expiry. Operators can prune the `.versions/` directory freely; the live notes are the source of truth.
+
+---
+
+### Optimistic concurrency
+
+`write_atomic_note` accepts an optional `expected_content_sha256` precondition to prevent clobbering concurrent writes.
+
+```python
+import hashlib
+
+# Read the current note and compute its sha256
+current = (memory_dir / "feedback_comm_style.md").read_text()
+sha = hashlib.sha256(current.encode()).hexdigest()
+
+# Later: write only if the note hasn't changed since we read it
+write_atomic_note(
+    agent_root, capture, write_paths,
+    expected_content_sha256=sha,
+)
+```
+
+**Behavior:**
+
+| Condition | Result |
+|---|---|
+| `expected_content_sha256` omitted | Always proceeds (existing behavior) |
+| Note exists, sha256 matches | Proceeds normally |
+| Note exists, sha256 mismatch | Raises `MemoryPreconditionFailed` with `actual_sha256` attribute |
+| Note doesn't exist, precondition provided | Raises `MemoryPreconditionFailed(actual_sha256=None)` |
+
+On `MemoryPreconditionFailed`, the caller re-reads the note with `read_version` (or direct file read), merges its changes, and retries with the fresh sha256. The `actual_sha256` field in the exception carries the current on-disk sha so the caller can compute the diff without a second file read.
+
+---
+
+### Read-only path declaration
+
+Sessions can attach memory directories as read-only, so agents can reference shared material without risk of accidentally writing to it — even when their write paths are broadly scoped.
+
+**Declare in `tools.md`:**
+
+```markdown
+## Read paths
+- ~/agents/shared/wiki/
+
+## Write paths
+- ~/agents/myagent/memory/
+
+## Read-only paths
+- ~/agents/shared/reference/
+```
+
+Paths listed under `## Read-only paths` (or `## Read only paths` — both accepted) are enforced as write-blocked by `enforce_write_path`, which is called on every `write_atomic_note`. The read-only constraint wins even if the same path appears under `## Write paths`.
+
+**Use cases:**
+
+- Shared reference libraries read by multiple agents — mount as read-only so no agent corrupts the corpus.
+- Ingest-only corpora (raw documents waiting for wiki distillation) — agents can read but shouldn't overwrite.
+- Audit-critical decision logs — protect from casual merge/overwrite.
+
+The `AgentConfig.read_only_paths` field carries the parsed paths; they flow through `agent.call()` into every capture write automatically.
+
+---
+
+### Comparison to Anthropic's memory_version model
+
+| Feature | Anthropic managed | Atomic Agents |
+|---|---|---|
+| Per-mutation immutable versions | Yes (API-managed) | Yes (filesystem `.versions/`) |
+| Snapshot storage | Anthropic servers, opaque | Local markdown files, human-readable |
+| Retention / expiry | 30-day auto-expiry | Indefinite, operator-prunable |
+| Concurrency guard | `content_sha256` precondition | `expected_content_sha256` precondition |
+| Read-only mount | Session-level `include_memory` flag | `## Read-only paths` in tools.md |
+| Multiple stores per agent | Up to 8 stores per session | Single `memory/` per agent (multi-store deferred to follow-up PR) |
+| Query / list API | REST/SDK | Python API + `atomic-agents version` CLI |
+| Compliance redact | Not specified | `redact_version()` — replaces body, preserves frontmatter |
+| Cross-machine sync | Automatic | Via Obsidian Sync or rsync (operator-managed) |
+
+The core design difference: Anthropic's model is API-first (server holds state, client queries it); Atomic Agents is filesystem-first (markdown is canonical, APIs are helpers built on top). The filesystem-first model gives you human-readable audit trails, vault-native portability, and no vendor dependency — at the cost of managing your own retention and sync.
+
+---
+
 *Next: [03-file-formats](03-file-formats.md) — exact frontmatter schemas and naming conventions.*
