@@ -24,17 +24,25 @@ SECTION_PATTERNS = {
 
 
 def parse_tools_md(path: Path) -> dict:
-    """Parse tools.md into a dict of section -> list of items.
+    """Parse tools.md from disk. Thin wrapper around parse_tools_md_text."""
+    if not path.exists():
+        return parse_tools_md_text("")
+    return parse_tools_md_text(path.read_text(encoding="utf-8"))
+
+
+def parse_tools_md_text(text: str) -> dict:
+    """Parse tools.md content into a dict of section -> list of items.
 
     Items are stripped bullet-point text. Paths are expanded (~/, etc.).
     Sections we don't recognize (e.g., "## Read budget", "## Helpers") are
     skipped — current_section resets when we hit any unrecognized H2.
-    """
-    if not path.exists():
-        return {"read_paths": [], "write_paths": [], "external_apis": [], "hard_nos": []}
 
-    text = path.read_text(encoding="utf-8")
+    Use this when the source is cascade-merged content (role + instance
+    override) rather than a single file on disk.
+    """
     sections = {key: [] for key in SECTION_PATTERNS}
+    if not text:
+        return sections
 
     current_section = None
     for line in text.splitlines():

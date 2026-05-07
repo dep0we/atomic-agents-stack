@@ -15,8 +15,19 @@ from pathlib import Path
 import yaml
 
 
-def parse_model_md(path: Path) -> dict:
-    """Parse model.md into a dict.
+def parse_model_md(path: Path | None) -> dict:
+    """Parse model.md from disk. Thin wrapper around parse_model_md_text.
+
+    Accepts None (meaning "neither cascade layer has model.md") and returns
+    pure defaults.
+    """
+    if path is None or not path.exists():
+        return parse_model_md_text("")
+    return parse_model_md_text(path.read_text(encoding="utf-8"))
+
+
+def parse_model_md_text(text: str) -> dict:
+    """Parse model.md content into a config dict.
 
     Returns:
         {
@@ -32,6 +43,8 @@ def parse_model_md(path: Path) -> dict:
           "warning_thresholds": list[float],
           "alert_channel": str,
         }
+
+    Empty input returns pure defaults.
     """
     defaults = {
         "default_model": "claude-sonnet-4-6-20260101",
@@ -47,10 +60,8 @@ def parse_model_md(path: Path) -> dict:
         "alert_channel": "log_only",
     }
 
-    if not path.exists():
+    if not text:
         return defaults
-
-    text = path.read_text(encoding="utf-8")
 
     # Find "## Default model" section — accepts `**\`model-id\`**`, `**model-id**`,
     # `\`model-id\``, or bare model-id on its own line
