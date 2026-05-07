@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 import concurrent.futures
 import json
+import re
 import time
 from dataclasses import asdict
 from datetime import date, datetime
@@ -467,6 +468,14 @@ class AtomicAgent:
     # ────────────────────────────────────────────────────────────
     # Helpers (Patterns A + B per spec/10)
 
+    HELPER_PROVENANCE_PROMPT = (
+        "When summarizing or extracting facts from a source document, cite the "
+        "location (section, page, or paragraph) of each fact. If you can't "
+        "pinpoint a location, say so explicitly. Do not return facts without "
+        "provenance — the calling agent depends on traceability for citation in "
+        "its response."
+    )
+
     def helper_call(
         self,
         prompt: str,
@@ -474,24 +483,31 @@ class AtomicAgent:
         max_tokens: int = 1024,
         temperature: float = 0.3,
         summary: str = "",
+        sources: list[str] | None = None,
     ) -> HelperResult:
         """One sequential helper call. Bound by parent's cost guardrails.
 
-        Returns HelperResult with text + cost + token counts.
+        When ``sources`` is passed (per spec/10 Wave 8 helper provenance),
+        the helper system prompt includes citation instructions and the
+        source list. The result echoes ``sources`` and sets
+        ``provenance_preserved=False`` if the output appears to lack
+        citation-like markers, so the parent can decide whether to trust
+        the helper output as citable facts or treat it as uncited prose.
+
+        Returns HelperResult with text + cost + token counts + provenance.
         """
-        # Inherit parent's guardrails — block if cap hit
         check = self._check_cost_guardrails(critical=False)
         if not check.allow:
-            raise CostGuardrailBlocked(
-                f"Helper call blocked: {check.reason}"
-            )
+            raise CostGuardrailBlocked(f"Helper call blocked: {check.reason}")
 
         actual_model = check.fallback_model if check.action == "fallback" else model
+        sources_list = list(sources) if sources else []
+        system_prompt = self._build_helper_system_prompt(sources_list)
 
         start = time.time()
         raw = _llm.call_llm(
             model=actual_model,
-            system_prompt="",  # helpers don't load full persona
+            system_prompt=system_prompt,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=max_tokens,
             temperature=temperature,
@@ -499,7 +515,9 @@ class AtomicAgent:
         latency_ms = int((time.time() - start) * 1000)
         cost = _costs.calc_cost(actual_model, raw.input_tokens, raw.output_tokens)
 
-        self._log({
+        provenance_preserved = self._detect_provenance(raw.text, sources_list)
+
+        log_record: dict = {
             "trigger": "helper",
             "parent_agent": self.name,
             "parent_run_id": self.run_id,
@@ -510,7 +528,11 @@ class AtomicAgent:
             "latency_ms": latency_ms,
             "status": "ok",
             "summary": summary or "helper call",
-        })
+        }
+        if sources_list:
+            log_record["sources"] = sources_list
+            log_record["provenance_preserved"] = provenance_preserved
+        self._log(log_record)
 
         return HelperResult(
             text=raw.text,
@@ -519,6 +541,8 @@ class AtomicAgent:
             output_tokens=raw.output_tokens,
             cost_usd=cost,
             latency_ms=latency_ms,
+            sources=sources_list,
+            provenance_preserved=provenance_preserved,
         )
 
     def helper_call_parallel(
@@ -529,8 +553,31 @@ class AtomicAgent:
         temperature: float = 0.3,
         max_concurrent: int = 5,
         summary_template: str = "helper call {idx} of {total}",
+        sources_per_prompt: list[list[str]] | None = None,
+        sources: list[str] | None = None,
     ) -> list[HelperResult]:
-        """Parallel helper calls. Pre-checks guardrails ONCE; if cap hit, refuses the batch."""
+        """Parallel helper calls. Pre-checks guardrails ONCE; if cap hit, refuses the batch.
+
+        Provenance options (mutually exclusive — passing both raises ValueError):
+
+        - ``sources``: same source list applied to every prompt (e.g., one
+          source document being analyzed N different ways).
+        - ``sources_per_prompt``: list of source lists, aligned 1:1 with
+          ``prompts`` (e.g., each prompt is a different document).
+
+        Either way, each result's ``sources`` and ``provenance_preserved``
+        fields are populated as in ``helper_call``.
+        """
+        if sources is not None and sources_per_prompt is not None:
+            raise ValueError(
+                "pass either `sources` (shared) or `sources_per_prompt` (per-prompt), not both"
+            )
+        if sources_per_prompt is not None and len(sources_per_prompt) != len(prompts):
+            raise ValueError(
+                f"sources_per_prompt has {len(sources_per_prompt)} entries; "
+                f"expected {len(prompts)} (one per prompt)"
+            )
+
         check = self._check_cost_guardrails(critical=False)
         if not check.allow:
             raise CostGuardrailBlocked(
@@ -540,6 +587,11 @@ class AtomicAgent:
         total = len(prompts)
         results: list[Any] = [None] * total  # list[HelperResult | Exception]
 
+        def sources_for(idx: int) -> list[str] | None:
+            if sources_per_prompt is not None:
+                return sources_per_prompt[idx]
+            return sources
+
         def call_one(idx: int, prompt: str):
             return idx, self.helper_call(
                 prompt=prompt,
@@ -547,6 +599,7 @@ class AtomicAgent:
                 max_tokens=max_tokens,
                 temperature=temperature,
                 summary=summary_template.format(idx=idx + 1, total=total),
+                sources=sources_for(idx),
             )
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent) as pool:
@@ -564,6 +617,57 @@ class AtomicAgent:
             raise HelperBatchPartialFailure(failures, results)
 
         return results  # type: ignore
+
+    def _build_helper_system_prompt(self, sources: list[str]) -> str:
+        """Build the helper's system prompt. Empty when no sources are passed."""
+        if not sources:
+            return ""
+        bullet_list = "\n".join(f"- {s}" for s in sources)
+        return f"{self.HELPER_PROVENANCE_PROMPT}\n\nSources you are working from:\n{bullet_list}"
+
+    @staticmethod
+    def _detect_provenance(text: str, sources: list[str]) -> bool:
+        """Heuristic: did the helper preserve attribution back to the sources?
+
+        Returns True when no sources were passed (nothing to preserve) or when
+        the output contains attribution-shaped signals — bracketed citations
+        ([§2, p3], [section 4], [memo §1]), explicit attribution phrases
+        ("according to", "per memo", "§3"), or a verbatim mention of any
+        source's basename.
+
+        Conservative: prefers a False-positive over a False-negative — we'd
+        rather rare flag something as preserved when it wasn't than miss real
+        provenance loss.
+        """
+        if not sources:
+            return True
+        if not text or not text.strip():
+            return False
+
+        # Bracketed-citation check: at least one [...] containing common citation
+        # markers (section symbol, "p<digit>", "section", "page", "paragraph").
+        bracket_pattern = re.compile(
+            r"\[[^\]]*(?:§|sect|page|p\.|p\s*\d|para|para\.)[^\]]*\]",
+            re.IGNORECASE,
+        )
+        if bracket_pattern.search(text):
+            return True
+
+        # Inline attribution phrases.
+        inline_pattern = re.compile(
+            r"(?:\baccording to\b|\bper\s+\w|\bcited in\b|§\s*\d|\(p\.?\s*\d)",
+            re.IGNORECASE,
+        )
+        if inline_pattern.search(text):
+            return True
+
+        # Verbatim source basename mention (last path component, stem).
+        for src in sources:
+            stem = src.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+            if stem and len(stem) >= 3 and stem.lower() in text.lower():
+                return True
+
+        return False
 
     # ────────────────────────────────────────────────────────────
     # Cost guardrails
