@@ -36,7 +36,9 @@ into structured config still happens in ``_tools.py`` / ``_model.py``.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -210,8 +212,14 @@ class QueueItem:
     """One claimed work item from the project queue.
 
     The on-disk file lives at ``project_root/queue/claimed/<lease_token>/<original_name>``.
+    A sidecar ``<original_name>.lease.json`` lives alongside the work file and
+    records explicit lease metadata so ``recover_stale_claims`` can use
+    ``lease_expires_at`` rather than file mtime.
+
     Callers should pass ``self.path.read_text()`` as the work_item content,
     then call ``release_claim()`` or ``move_to_dead_letter()`` when done.
+    For long-running work, call ``renew_lease()`` periodically to extend the
+    lease before it expires.
     """
 
     path: Path
@@ -221,14 +229,42 @@ class QueueItem:
     claimed_at: float
 
 
+def _sidecar_path(work_file: Path) -> Path:
+    """Return the path of the lease sidecar for a given work file."""
+    return work_file.parent / (work_file.name + ".lease.json")
+
+
+def _write_sidecar(work_file: Path, lease_token: str, lease_seconds: int) -> None:
+    """Write a lease sidecar alongside *work_file*."""
+    now = datetime.now(tz=timezone.utc)
+    expires_at = datetime.fromtimestamp(
+        now.timestamp() + lease_seconds, tz=timezone.utc
+    )
+    sidecar = {
+        "lease_token": lease_token,
+        "claimed_at": now.isoformat(),
+        "lease_expires_at": expires_at.isoformat(),
+        "lease_seconds": lease_seconds,
+    }
+    _sidecar_path(work_file).write_text(json.dumps(sidecar), encoding="utf-8")
+
+
 def claim_next_queued(
-    project_root: Path, role: str, lease_token: str,
+    project_root: Path,
+    role: str,
+    lease_token: str,
+    lease_seconds: int = 3600,
 ) -> QueueItem | None:
     """Atomically claim the next item from ``project_root/queue/queued/<role>/``.
 
     Atomicity: uses ``Path.rename`` (POSIX atomic move) to take ownership of
     a file. If two workers race, only one rename succeeds for any given file;
     the loser ``FileNotFoundError``s and tries the next one.
+
+    After a successful rename, a sidecar ``<file>.lease.json`` is written next
+    to the claimed file.  The sidecar records ``lease_expires_at`` (an explicit
+    ISO-8601 timestamp) so ``recover_stale_claims`` can detect expiry without
+    relying on filesystem mtime.
 
     Returns ``None`` when the queue is empty or no items remain after races.
     """
@@ -250,6 +286,7 @@ def claim_next_queued(
         except FileNotFoundError:
             # Another worker raced us to this file. Try the next.
             continue
+        _write_sidecar(dst, lease_token=lease_token, lease_seconds=lease_seconds)
         return QueueItem(
             path=dst,
             original_name=src.name,
@@ -261,25 +298,42 @@ def claim_next_queued(
 
 
 def release_claim(item: QueueItem, project_root: Path) -> None:
-    """Mark a claimed item as completed by moving it to ``queue/done/``."""
-    done_dir = project_root / "queue" / "done"
+    """Mark a claimed item as completed by moving it to ``queue/done/<lease_token>/``.
+
+    The destination is namespaced by ``lease_token`` so two leases with
+    identically-named files do not overwrite each other.  The lease sidecar is
+    removed on arrival (the item is done; the lease is no longer relevant).
+    """
+    done_dir = project_root / "queue" / "done" / item.lease_token
     done_dir.mkdir(parents=True, exist_ok=True)
     item.path.rename(done_dir / item.original_name)
+    # Remove sidecar if it still exists in the original claimed location.
+    sc = _sidecar_path(item.path)
+    if sc.exists():
+        sc.unlink(missing_ok=True)
 
 
 def move_to_dead_letter(
     item: QueueItem, project_root: Path, reason: str = "",
 ) -> None:
-    """Move a claimed item to ``queue/dead-letter/`` after exhausting retries.
+    """Move a claimed item to ``queue/dead-letter/<lease_token>/`` after exhausting retries.
 
-    A sibling ``.reason.txt`` is written with ``reason`` for debugging.
+    The destination is namespaced by ``lease_token`` so two leases with
+    identically-named files do not overwrite each other.
+
+    A sibling ``.reason.txt`` is written alongside the item when *reason* is
+    provided.  The lease sidecar is removed (dead-letter is a terminal state).
     """
-    dl_dir = project_root / "queue" / "dead-letter"
+    dl_dir = project_root / "queue" / "dead-letter" / item.lease_token
     dl_dir.mkdir(parents=True, exist_ok=True)
     target = dl_dir / item.original_name
     item.path.rename(target)
     if reason:
         (dl_dir / (item.original_name + ".reason.txt")).write_text(reason, encoding="utf-8")
+    # Remove sidecar from the (now-moved) claimed location.
+    sc = _sidecar_path(item.path)
+    if sc.exists():
+        sc.unlink(missing_ok=True)
 
 
 def recover_stale_claims(
@@ -287,13 +341,19 @@ def recover_stale_claims(
 ) -> list[Path]:
     """Find claimed items whose lease has expired and move them back to ``queued``.
 
-    A claim is stale if its file mtime is older than ``lease_seconds`` seconds
-    ago. Returns the list of recovered file paths (now in their queued home).
+    **Lease detection order** (for each work file in ``queue/claimed/<token>/``):
 
-    The recovery target is ``queue/queued/<role>/`` based on the claim's
-    parent role layout — but spec/06 keeps role inside the file naming. As a
-    safe default, this implementation puts recovered files into
-    ``queue/queued/_recovered/`` so an operator can re-route them.
+    1. If a sidecar ``<file>.lease.json`` exists, read ``lease_expires_at`` and
+       compare to *now*.  Recover only if the lease has expired.
+    2. If no sidecar exists (legacy claim written before this fix), fall back to
+       comparing file mtime against ``lease_seconds``.
+
+    Recovered files are moved to
+    ``queue/queued/_recovered/<lease_token>/<filename>`` so an operator can
+    identify which lease they came from. Sidecar files are deleted on recovery
+    (the recovered item starts fresh; a new sidecar is written on reclaim).
+
+    Returns the list of recovered work-file paths (now in their queued home).
     """
     import time
 
@@ -302,28 +362,59 @@ def recover_stale_claims(
         return []
 
     now = time.time()
+    now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
     recovered: list[Path] = []
-    recovered_dir = project_root / "queue" / "queued" / "_recovered"
-    recovered_dir.mkdir(parents=True, exist_ok=True)
 
     for lease_dir in claimed_root.iterdir():
         if not lease_dir.is_dir():
             continue
+        lease_token = lease_dir.name
         for path in lease_dir.iterdir():
             if not path.is_file():
                 continue
-            try:
-                age = now - path.stat().st_mtime
-            except FileNotFoundError:
+            # Skip sidecars — they are handled alongside their work file.
+            if path.name.endswith(".lease.json"):
                 continue
-            if age >= lease_seconds:
+            sidecar = _sidecar_path(path)
+            is_stale = False
+            if sidecar.is_file():
+                # Explicit sidecar — use lease_expires_at.
+                try:
+                    data = json.loads(sidecar.read_text(encoding="utf-8"))
+                    expires_at = datetime.fromisoformat(data["lease_expires_at"])
+                    if expires_at.tzinfo is None:
+                        expires_at = expires_at.replace(tzinfo=timezone.utc)
+                    is_stale = expires_at < now_dt
+                except (KeyError, ValueError, OSError):
+                    # Malformed sidecar — fall back to mtime.
+                    try:
+                        is_stale = (now - path.stat().st_mtime) >= lease_seconds
+                    except FileNotFoundError:
+                        continue
+            else:
+                # Legacy claim (no sidecar) — use mtime.
+                try:
+                    is_stale = (now - path.stat().st_mtime) >= lease_seconds
+                except FileNotFoundError:
+                    continue
+
+            if is_stale:
+                recovered_dir = (
+                    project_root / "queue" / "queued" / "_recovered" / lease_token
+                )
+                recovered_dir.mkdir(parents=True, exist_ok=True)
                 target = recovered_dir / path.name
                 try:
                     path.rename(target)
+                    # Remove stale sidecar — the recovered item gets a fresh
+                    # sidecar if/when it is reclaimed.
+                    if sidecar.exists():
+                        sidecar.unlink(missing_ok=True)
                     recovered.append(target)
                 except FileNotFoundError:
                     pass
-        # Clean up empty lease dirs
+
+        # Clean up empty lease dirs.
         try:
             next(lease_dir.iterdir())
         except StopIteration:
@@ -332,3 +423,42 @@ def recover_stale_claims(
             pass
 
     return recovered
+
+
+def renew_lease(item: QueueItem, additional_seconds: int = None) -> None:
+    """Extend the lease for an actively-worked item.
+
+    Updates ``lease_expires_at`` in the sidecar to
+    ``now + additional_seconds``.  If *additional_seconds* is ``None``, the
+    original ``lease_seconds`` from the sidecar is reused (i.e., the lease is
+    reset to full duration from now).
+
+    If no sidecar exists (legacy claim), a new one is written using
+    *additional_seconds* (or a default of 3600 if that is also ``None``).
+
+    Long-running workers should call this periodically — recommended cadence is
+    every ``lease_seconds / 3`` seconds — to prevent ``recover_stale_claims``
+    from reclaiming an actively-worked item.
+    """
+    sidecar = _sidecar_path(item.path)
+    if sidecar.is_file():
+        try:
+            data = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            data = {}
+    else:
+        data = {}
+
+    lease_secs = additional_seconds
+    if lease_secs is None:
+        lease_secs = data.get("lease_seconds", 3600)
+
+    now = datetime.now(tz=timezone.utc)
+    data["lease_expires_at"] = datetime.fromtimestamp(
+        now.timestamp() + lease_secs, tz=timezone.utc
+    ).isoformat()
+    data.setdefault("lease_token", item.lease_token)
+    data.setdefault("claimed_at", now.isoformat())
+    data["lease_seconds"] = lease_secs
+
+    sidecar.write_text(json.dumps(data), encoding="utf-8")
