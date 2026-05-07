@@ -1,11 +1,18 @@
 """Capture marker parsing + atomic write of new atomic notes per spec/05.
 
 Two parser pathways supported (per Wave 5 spec):
-- Path 1: tool calls (handled by the LLM SDK; not parsed from text)
-- Path 2: fenced ```atomic_capture``` JSON blocks in response text
 
-This module implements Path 2. Path 1 is handled in _llm.py when tool calls
-are returned by the SDK.
+- **Path 1: tool calls** (preferred) — agent emits a structured tool call via
+  the SDK. SDK validates inputs against schema before they reach the helper.
+  Implemented via CAPTURE_TOOL_SCHEMA + the provider-formatter helpers
+  (anthropic_tool_definition / openai_tool_definition) and
+  extract_tool_call_captures.
+- **Path 2: fenced JSON blocks** (fallback) — agent emits a ```atomic_capture
+  JSON``` fenced markdown block in its response text. Parsed via regex.
+
+Both paths work; agents can use either or both. extract_all_captures parses
+both and dedupes by (type, name, body hash). Tool-call captures take priority
+when the same observation is emitted via both paths.
 """
 
 from __future__ import annotations
@@ -31,6 +38,160 @@ CAPTURE_BLOCK_PATTERN = re.compile(
     r"^(`{3,4})atomic_capture\s*\n(.*?)\n\1\s*$",
     re.MULTILINE | re.DOTALL,
 )
+
+
+# ──────────────────────────────────────────────────────────────────
+# Path 1: tool-call schema
+
+# JSON Schema for the atomic_capture tool. Used by both Anthropic
+# (input_schema) and OpenAI (function.parameters) providers — the schema is
+# identical; only the format wrapper differs per provider.
+CAPTURE_TOOL_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "type": {
+            "type": "string",
+            "enum": ["user", "feedback", "project", "decision", "reference"],
+            "description": "Atomic note type from the locked taxonomy.",
+        },
+        "name": {
+            "type": "string",
+            "maxLength": 80,
+            "description": "Human-readable title for the memory note.",
+        },
+        "description": {
+            "type": "string",
+            "maxLength": 200,
+            "description": "One-line hook explaining when this memory matters.",
+        },
+        "confidence": {
+            "type": "string",
+            "enum": ["high", "medium", "low"],
+            "description": "high = locked, medium = strong, low = tentative.",
+        },
+        "sources": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "description": "Source pointers (conversation IDs, doc paths). Must be non-empty.",
+        },
+        "body": {
+            "type": "string",
+            "description": "Full markdown body of the memory note.",
+        },
+        "supersedes": {
+            "type": ["string", "null"],
+            "description": "Filename of an older memory this one replaces (null if none).",
+        },
+        "merge_into": {
+            "type": ["string", "null"],
+            "description": "Filename of an existing note to merge into instead of creating new.",
+        },
+        "pinned": {
+            "type": "boolean",
+            "description": "If true, always loaded into context (use sparingly).",
+        },
+        "expires_at": {
+            "type": ["string", "null"],
+            "description": "YYYY-MM-DD when this memory becomes archive-candidate (null if none).",
+        },
+        "tags": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Free-form tags for grouping (optional).",
+        },
+    },
+    "required": ["type", "name", "description", "confidence", "sources", "body"],
+    "additionalProperties": False,
+}
+
+CAPTURE_TOOL_DESCRIPTION = (
+    "Capture a durable observation as an atomic memory note. Use when the user "
+    "explicitly asks you to remember, when they correct your behavior, when they "
+    "lock a decision, or when you learn something durable about them. Do NOT use "
+    "for ephemeral conversation context, routine task outputs, or anything already "
+    "in your persona/memory files (per spec/05 capture rules)."
+)
+
+
+def anthropic_tool_definition() -> dict:
+    """Return the atomic_capture tool definition formatted for Anthropic Messages API."""
+    return {
+        "name": "atomic_capture",
+        "description": CAPTURE_TOOL_DESCRIPTION,
+        "input_schema": CAPTURE_TOOL_SCHEMA,
+    }
+
+
+def openai_tool_definition() -> dict:
+    """Return the atomic_capture tool definition formatted for OpenAI function-calling."""
+    return {
+        "type": "function",
+        "function": {
+            "name": "atomic_capture",
+            "description": CAPTURE_TOOL_DESCRIPTION,
+            "parameters": CAPTURE_TOOL_SCHEMA,
+        },
+    }
+
+
+def extract_tool_call_captures(
+    tool_uses: list[dict],
+) -> tuple[list[Capture], list[tuple[dict, str]]]:
+    """Parse a list of tool_use blocks from an LLM response into Captures.
+
+    `tool_uses` is the normalized list returned by `_llm.call_llm()` when the
+    response contains tool_use blocks. Each entry is shaped:
+
+        {"name": "atomic_capture", "input": {...typed args...}, "id": "..."}
+
+    Only entries with name="atomic_capture" are processed; other tools are
+    ignored (they belong to other tool definitions the agent may have).
+
+    Returns (captures, parse_failures). parse_failures is a list of
+    (raw_input_dict, error_message) tuples for entries that failed validation.
+    """
+    captures: list[Capture] = []
+    failures: list[tuple[dict, str]] = []
+    for tool_use in tool_uses:
+        if tool_use.get("name") != "atomic_capture":
+            continue
+        raw_input = tool_use.get("input", {}) or {}
+        try:
+            validate_capture(raw_input)
+            captures.append(_dict_to_capture(raw_input))
+        except (SchemaValidationError, TypeError, ValueError, KeyError) as e:
+            failures.append((raw_input, str(e)))
+    return captures, failures
+
+
+def extract_all_captures(
+    response_text: str, tool_uses: list[dict] | None = None,
+) -> tuple[list[Capture], list[tuple[Any, str]]]:
+    """Extract captures from BOTH text (Path 2) and tool_use blocks (Path 1).
+
+    Dedupes by (type, name, body hash). Tool-call captures take priority over
+    text-fenced ones when content matches (Path 1 is more reliable per spec/05).
+
+    Returns (captures, all_failures).
+    """
+    fenced_captures, fenced_failures = extract_captures(response_text)
+    tool_captures: list[Capture] = []
+    tool_failures: list[tuple[Any, str]] = []
+    if tool_uses:
+        tool_captures, t_fail = extract_tool_call_captures(tool_uses)
+        tool_failures = list(t_fail)
+
+    seen: dict[tuple, Capture] = {}
+    for c in tool_captures:
+        seen[(c.type, c.name, hash(c.body))] = c
+    for c in fenced_captures:
+        key = (c.type, c.name, hash(c.body))
+        if key not in seen:
+            seen[key] = c
+
+    all_failures: list[tuple[Any, str]] = list(fenced_failures) + tool_failures
+    return list(seen.values()), all_failures
 
 
 def extract_captures(response_text: str) -> tuple[list[Capture], list[tuple[str, str]]]:

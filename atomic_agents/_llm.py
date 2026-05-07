@@ -26,6 +26,14 @@ class _RawLLMResponse:
     cache_hit_tokens: int = 0
     cache_miss_tokens: int = 0
     raw: dict[str, Any] | None = None
+    # Normalized tool_use blocks across providers — each entry:
+    #   {"name": "<tool_name>", "input": {...}, "id": "<call_id>"}
+    # Empty list when no tools are passed or the model didn't call any.
+    tool_uses: list[dict] = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.tool_uses is None:
+            self.tool_uses = []
 
 
 def call_llm(
@@ -35,20 +43,27 @@ def call_llm(
     max_tokens: int = 4096,
     temperature: float = 0.6,
     cache_control_breakpoints: list[int] | None = None,
+    tools: list[dict] | None = None,
 ) -> _RawLLMResponse:
     """Dispatch to the right provider based on model id prefix.
 
-    Returns _RawLLMResponse normalized across providers.
+    `tools` is a list of provider-formatted tool definitions. For Anthropic, use
+    atomic_agents._capture.anthropic_tool_definition(); for OpenAI/Moonshot, use
+    openai_tool_definition(). The agent layer picks the right formatter via
+    AtomicAgent._capture_tool_definitions(model).
+
+    Returns _RawLLMResponse normalized across providers, with tool_use blocks
+    normalized to {"name": ..., "input": ..., "id": ...} regardless of provider.
     """
     if model.startswith("claude-"):
         return _call_anthropic(
             model, system_prompt, messages, max_tokens, temperature,
-            cache_control_breakpoints,
+            cache_control_breakpoints, tools,
         )
     if model.startswith("gpt-"):
-        return _call_openai(model, system_prompt, messages, max_tokens, temperature)
+        return _call_openai(model, system_prompt, messages, max_tokens, temperature, tools)
     if model.startswith("moonshot/"):
-        return _call_moonshot(model, system_prompt, messages, max_tokens, temperature)
+        return _call_moonshot(model, system_prompt, messages, max_tokens, temperature, tools)
     raise ValueError(f"no provider routing for model: {model}")
 
 
@@ -59,6 +74,7 @@ def _call_anthropic(
     max_tokens: int,
     temperature: float,
     cache_breakpoints: list[int] | None = None,
+    tools: list[dict] | None = None,
 ) -> _RawLLMResponse:
     """Call Anthropic's Messages API."""
     try:
@@ -87,19 +103,31 @@ def _call_anthropic(
     else:
         system_blocks = [{"type": "text", "text": system_prompt}]
 
-    response = client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        system=system_blocks,
-        messages=messages,
-    )
+    create_kwargs: dict[str, Any] = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "system": system_blocks,
+        "messages": messages,
+    }
+    if tools:
+        create_kwargs["tools"] = tools
 
-    # Extract text — concatenate text blocks
-    text_parts = []
+    response = client.messages.create(**create_kwargs)
+
+    # Extract text + tool_use blocks
+    text_parts: list[str] = []
+    tool_uses: list[dict] = []
     for block in response.content:
-        if hasattr(block, "text"):
-            text_parts.append(block.text)
+        block_type = getattr(block, "type", None)
+        if block_type == "tool_use":
+            tool_uses.append({
+                "id": getattr(block, "id", ""),
+                "name": getattr(block, "name", ""),
+                "input": getattr(block, "input", {}) or {},
+            })
+        elif block_type == "text" or hasattr(block, "text"):
+            text_parts.append(getattr(block, "text", ""))
     text = "".join(text_parts)
 
     # Token usage — Anthropic returns input_tokens, output_tokens, cache_*_tokens
@@ -116,12 +144,13 @@ def _call_anthropic(
         cache_hit_tokens=cache_hit,
         cache_miss_tokens=cache_miss,
         raw=response.model_dump() if hasattr(response, "model_dump") else None,
+        tool_uses=tool_uses,
     )
 
 
 def _call_openai(
     model: str, system_prompt: str, messages: list[dict],
-    max_tokens: int, temperature: float,
+    max_tokens: int, temperature: float, tools: list[dict] | None = None,
 ) -> _RawLLMResponse:
     try:
         import openai
@@ -134,24 +163,33 @@ def _call_openai(
     client = openai.OpenAI(api_key=api_key)
 
     chat_messages = [{"role": "system", "content": system_prompt}] + messages
-    response = client.chat.completions.create(
-        model=model,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        messages=chat_messages,
-    )
-    text = response.choices[0].message.content or ""
+    create_kwargs: dict[str, Any] = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "messages": chat_messages,
+    }
+    if tools:
+        create_kwargs["tools"] = tools
+
+    response = client.chat.completions.create(**create_kwargs)
+    msg = response.choices[0].message
+    text = msg.content or ""
     usage = response.usage
+
+    tool_uses = _extract_openai_tool_calls(msg)
+
     return _RawLLMResponse(
         text=text,
         input_tokens=usage.prompt_tokens,
         output_tokens=usage.completion_tokens,
+        tool_uses=tool_uses,
     )
 
 
 def _call_moonshot(
     model: str, system_prompt: str, messages: list[dict],
-    max_tokens: int, temperature: float,
+    max_tokens: int, temperature: float, tools: list[dict] | None = None,
 ) -> _RawLLMResponse:
     """Moonshot Kimi API — uses an OpenAI-compatible interface."""
     try:
@@ -166,19 +204,56 @@ def _call_moonshot(
     actual_model = model.replace("moonshot/", "")
 
     chat_messages = [{"role": "system", "content": system_prompt}] + messages
-    response = client.chat.completions.create(
-        model=actual_model,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        messages=chat_messages,
-    )
-    text = response.choices[0].message.content or ""
+    create_kwargs: dict[str, Any] = {
+        "model": actual_model,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "messages": chat_messages,
+    }
+    if tools:
+        create_kwargs["tools"] = tools
+
+    response = client.chat.completions.create(**create_kwargs)
+    msg = response.choices[0].message
+    text = msg.content or ""
     usage = response.usage
+
+    tool_uses = _extract_openai_tool_calls(msg)
+
     return _RawLLMResponse(
         text=text,
         input_tokens=usage.prompt_tokens,
         output_tokens=usage.completion_tokens,
+        tool_uses=tool_uses,
     )
+
+
+def _extract_openai_tool_calls(msg: Any) -> list[dict]:
+    """Convert OpenAI/Moonshot ChatCompletion message tool_calls into normalized dicts.
+
+    OpenAI returns msg.tool_calls = list of objects with id + function {name, arguments}.
+    arguments is a JSON string; we parse it.
+    """
+    tool_calls = getattr(msg, "tool_calls", None)
+    if not tool_calls:
+        return []
+    import json as _json
+    out: list[dict] = []
+    for tc in tool_calls:
+        fn = getattr(tc, "function", None)
+        if fn is None:
+            continue
+        raw_args = getattr(fn, "arguments", "") or ""
+        try:
+            args = _json.loads(raw_args) if raw_args else {}
+        except _json.JSONDecodeError:
+            args = {}
+        out.append({
+            "id": getattr(tc, "id", ""),
+            "name": getattr(fn, "name", ""),
+            "input": args,
+        })
+    return out
 
 
 def _get_anthropic_key() -> str:
