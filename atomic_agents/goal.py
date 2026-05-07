@@ -161,6 +161,10 @@ def validate_goal(goal_dict: dict[str, Any]) -> None:
         bb = sub.get("blocked_by")
         if bb is not None and not isinstance(bb, str):
             raise SchemaValidationError(f"sub_goal[{sub['id']}] blocked_by must be string or null")
+        if bb is not None and bb not in seen_ids:
+            raise SchemaValidationError(
+                f"sub_goal[{sub['id']}] blocked_by references unknown id '{bb}'"
+            )
 
 
 def validate_agent_mode(mode: str) -> None:
@@ -353,7 +357,12 @@ class GoalManager:
         return None
 
     def next_sub_goal(self) -> SubGoal | None:
-        """Find the next pending, unblocked sub_goal."""
+        """Find the next pending, unblocked sub_goal.
+
+        Raises GoalCorrupted if a sub_goal's blocked_by references an id that
+        doesn't exist — that inconsistency means the goal graph is untrustworthy
+        and dispatching would violate operator intent.
+        """
         if self._goal is None:
             self.load()
         for sg in self._goal.sub_goals:
@@ -361,24 +370,40 @@ class GoalManager:
                 continue
             if sg.blocked_by:
                 blocker = self.find_sub_goal(sg.blocked_by)
-                if blocker and blocker.status != "complete":
+                if blocker is None:
+                    raise GoalCorrupted(
+                        f"sub_goal '{sg.id}' blocked_by '{sg.blocked_by}' which does not exist; "
+                        f"goal graph is inconsistent — operator must repair goal.md"
+                    )
+                if blocker.status != "complete":
                     continue
             return sg
         return None
 
     def mark_in_progress(self, sub_goal_id: str, assigned: str | None = None) -> SubGoal:
-        """Transition sub_goal to in_progress. Optionally update assigned."""
+        """Transition sub_goal to in_progress. Optionally update assigned.
+
+        When transitioning from blocked → in_progress, blocked_by is automatically
+        cleared and the previous blocker is recorded in the history so the state
+        remains consistent (in_progress must not carry a blocked_by).
+        """
         sg = self._require_sub_goal(sub_goal_id)
         if sg.status not in ("pending", "blocked"):
             raise AtomicAgentsError(
                 f"sub_goal {sub_goal_id} is {sg.status}; can only transition to "
                 f"in_progress from pending or blocked"
             )
+        previous_blocked_by = sg.blocked_by
         sg.status = "in_progress"
+        sg.blocked_by = None
         if assigned is not None:
             sg.assigned = assigned
-        self._append_history(f"sub_goal `{sub_goal_id}` → in_progress" +
-                              (f" (assigned: {assigned})" if assigned else ""))
+        history_msg = f"sub_goal `{sub_goal_id}` → in_progress"
+        if assigned:
+            history_msg += f" (assigned: {assigned})"
+        if previous_blocked_by:
+            history_msg += f" (unblocked; previous_blocked_by: {previous_blocked_by})"
+        self._append_history(history_msg)
         return sg
 
     def mark_complete(self, sub_goal_id: str, output: str | None = None) -> SubGoal:
@@ -400,12 +425,26 @@ class GoalManager:
         return sg
 
     def mark_blocked(self, sub_goal_id: str, blocked_by: str) -> SubGoal:
-        """Mark sub_goal as blocked by another sub_goal."""
+        """Mark sub_goal as blocked by another sub_goal.
+
+        Raises AtomicAgentsError if:
+        - blocked_by references an unknown sub_goal
+        - sub_goal_id == blocked_by (self-block)
+        - the operation would introduce a cycle in the blocked_by graph
+        """
         sg = self._require_sub_goal(sub_goal_id)
         # Validate the blocker exists
         if not self.find_sub_goal(blocked_by):
             raise AtomicAgentsError(
                 f"blocked_by references unknown sub_goal: {blocked_by}"
+            )
+        if sub_goal_id == blocked_by:
+            raise AtomicAgentsError(
+                f"sub_goal '{sub_goal_id}' cannot block itself"
+            )
+        if self._would_cycle(sub_goal_id, blocked_by):
+            raise AtomicAgentsError(
+                f"marking '{sub_goal_id}' blocked by '{blocked_by}' would create a cycle"
             )
         sg.status = "blocked"
         sg.blocked_by = blocked_by
@@ -435,6 +474,22 @@ class GoalManager:
             self.load()
         if self.find_sub_goal(id):
             raise AtomicAgentsError(f"sub_goal {id} already exists")
+        if blocked_by is not None:
+            if blocked_by == id:
+                raise AtomicAgentsError(
+                    f"sub_goal {id} cannot block itself"
+                )
+            if not self.find_sub_goal(blocked_by):
+                raise AtomicAgentsError(
+                    f"sub_goal {id} blocked_by references unknown id '{blocked_by}'"
+                )
+            # Check that adding this sub_goal with the given blocked_by won't
+            # create a cycle (the new node can't already be a transitive
+            # dependency of blocked_by, since it doesn't exist yet, so only
+            # a self-reference is possible — already handled above).
+            # If blocked_by itself would form a cycle through the new id
+            # this can only happen if the graph already contains a path from
+            # id to blocked_by.  Since id is new, no such path can exist.
         sg = SubGoal(
             id=id, label=label, status="pending",
             assigned=assigned, deadline=deadline, blocked_by=blocked_by,
@@ -498,6 +553,19 @@ class GoalManager:
         """Archive the current goal — move goal.md to goal_archive/.
 
         Used for both successful completion and operator-initiated abandonment.
+
+        Collision safety: if <date>_<slug>.md already exists (same day, same intent
+        slug), a numeric suffix is appended (_1, _2, …) until a free path is found.
+        This prevents overwriting a previous archive.
+
+        Write ordering: the archive file is written first; goal.md is unlinked only
+        after the archive has been successfully committed to disk.  A failure between
+        the two steps leaves both files present (recoverable state) rather than
+        losing data.
+
+        Idempotent: if goal.md is already absent when this is called, a second call
+        via has_goal() guard will raise AtomicAgentsError rather than silently
+        double-archiving.
         """
         if self._goal is None:
             self.load()
@@ -506,13 +574,20 @@ class GoalManager:
 
         self.archive_dir.mkdir(parents=True, exist_ok=True)
         intent_slug = re.sub(r"[^a-z0-9]+", "_", self._goal.intent.lower()).strip("_")[:60]
-        archive_path = self.archive_dir / f"{self.today.isoformat()}_{intent_slug}.md"
+        base_name = f"{self.today.isoformat()}_{intent_slug}"
+        archive_path = self.archive_dir / f"{base_name}.md"
+
+        # Increment suffix until a free path is found (collision safety)
+        counter = 0
+        while archive_path.exists():
+            counter += 1
+            archive_path = self.archive_dir / f"{base_name}_{counter}.md"
 
         # Mark inactive + record reason in history before saving to archive
         self._goal.active = False
         self._append_history(f"goal archived ({reason})")
 
-        # Write the inactive goal to the archive path
+        # Write archive first — unlink goal.md only after successful write
         post = frontmatter.Post(self._goal.body, **{
             "schema_version": self._goal.schema_version,
             "active": False,
@@ -527,7 +602,7 @@ class GoalManager:
         })
         atomic_write(archive_path, frontmatter.dumps(post) + "\n")
 
-        # Remove the active goal.md
+        # Remove the active goal.md only after archive is safely written
         self.goal_path.unlink()
         self._goal = None
         return archive_path
@@ -652,6 +727,41 @@ class GoalManager:
 
     # ────────────────────────────────────────────────────────────
     # Internals
+
+    def _would_cycle(self, sub_goal_id: str, new_blocker_id: str) -> bool:
+        """Return True if adding blocked_by=new_blocker_id to sub_goal_id would
+        create a cycle in the blocked_by dependency graph.
+
+        We check whether sub_goal_id is reachable from new_blocker_id by
+        following blocked_by edges.  If it is, then adding the edge
+        sub_goal_id → new_blocker_id would close a cycle.
+
+        Also handles the trivial self-block case (sub_goal_id == new_blocker_id).
+        """
+        if self._goal is None:
+            return False
+        # Build an adjacency map: id → blocked_by (or None)
+        # We also speculatively include the would-be new edge.
+        blocked_by_map: dict[str, str | None] = {}
+        for sg in self._goal.sub_goals:
+            blocked_by_map[sg.id] = sg.blocked_by
+        # Temporarily add the proposed edge
+        blocked_by_map[sub_goal_id] = new_blocker_id
+
+        # DFS from new_blocker_id; if we reach sub_goal_id, there's a cycle.
+        visited: set[str] = set()
+        stack = [new_blocker_id]
+        while stack:
+            current = stack.pop()
+            if current == sub_goal_id:
+                return True
+            if current in visited:
+                continue
+            visited.add(current)
+            blocker = blocked_by_map.get(current)
+            if blocker is not None:
+                stack.append(blocker)
+        return False
 
     def _append_history(self, entry: str) -> None:
         """Append a timestamped line to the goal's body history section."""
