@@ -73,11 +73,14 @@ print(f"Captures: {len(response.captures)}")
 | Schema migration runner — `atomic_agents.migrate` | ✅ v0.5 |
 | Tool-call captures (Path 1) | ✅ v0.6 |
 | Multi-agent project cascade loader — `atomic_agents._cascade` | ✅ v0.7 |
-| Helper provenance enforcement | ⏳ planned |
-| Research integrity layers 2+3 | ⏳ planned |
-| Claude Code skill wrappers | ⏳ planned |
+| Helper provenance preservation | ✅ v0.8 |
+| Research integrity layers 2+3 | ✅ v0.9 |
+| Claude Code skill wrappers — `extras/claude-code-skills/` | ✅ v0.9 |
+| Spec docs in repo — `docs/` | ✅ v0.9 |
+| CI (Python 3.11 + 3.12 matrix) | ✅ v0.9 |
+| First non-Bishop Atomic Agent built end-to-end | ⏳ next |
 
-The spec is finalized; the Python implementation lands incrementally. See [CHANGELOG.md](CHANGELOG.md) for per-version detail.
+The spec is feature-complete relative to the v1 lock. See [CHANGELOG.md](CHANGELOG.md) for per-version detail.
 
 ---
 
