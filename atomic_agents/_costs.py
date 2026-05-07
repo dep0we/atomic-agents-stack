@@ -5,8 +5,11 @@ Pricing table is hardcoded; update when Anthropic/OpenAI/Moonshot change rates.
 
 from __future__ import annotations
 import json
+import logging
 from datetime import date
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # USD per 1M tokens — input / output
 PRICING: dict[str, dict[str, float]] = {
@@ -28,23 +31,55 @@ PRICING: dict[str, dict[str, float]] = {
 # Cache hit pricing — Anthropic charges 10% of input rate for cache hits
 CACHE_HIT_DISCOUNT = 0.10
 
+# Module-level set of model ids for which we've already emitted a warning,
+# so operators see the message exactly once per process lifetime.
+_unknown_model_warned: set[str] = set()
+
+
+def _fallback_pricing() -> dict[str, float]:
+    """Return the most expensive (conservative-pessimistic) rates from PRICING.
+
+    Used when a model id is not in the table so that unknown models are
+    over-counted rather than silently treated as free.
+    """
+    max_input = max(p["input"] for p in PRICING.values())
+    max_output = max(p["output"] for p in PRICING.values())
+    return {"input": max_input, "output": max_output}
+
 
 def calc_cost(model: str, input_tokens: int, output_tokens: int,
-              cache_hit_tokens: int = 0) -> float:
+              cache_hit_tokens: int = 0) -> tuple[float, bool]:
     """Compute USD cost for one LLM call.
+
+    Returns (cost_usd, cost_estimated_via_fallback).
+
+    cost_estimated_via_fallback is True when `model` was not found in the
+    PRICING table — the cost is then computed with the highest known rates
+    so guardrails and dashboards remain conservative-pessimistic rather than
+    zero. A one-time WARNING is logged per unseen model id.
 
     cache_hit_tokens is the portion of input tokens served from prompt cache;
     they cost 1/10 of the normal input rate. Remainder is normal input price.
     """
+    fallback = False
     if model not in PRICING:
-        # Unknown model — return 0 rather than crashing. Logged elsewhere.
-        return 0.0
-    p = PRICING[model]
+        fallback = True
+        if model not in _unknown_model_warned:
+            _unknown_model_warned.add(model)
+            logger.warning(
+                "unknown model %r has no pricing entry — cost estimated via "
+                "fallback (highest known rates). Add it to PRICING to silence "
+                "this warning and get an accurate cost.",
+                model,
+            )
+        p = _fallback_pricing()
+    else:
+        p = PRICING[model]
     cache_miss_tokens = max(0, input_tokens - cache_hit_tokens)
     cost_cached = cache_hit_tokens * p["input"] * CACHE_HIT_DISCOUNT / 1_000_000
     cost_uncached = cache_miss_tokens * p["input"] / 1_000_000
     cost_output = output_tokens * p["output"] / 1_000_000
-    return round(cost_cached + cost_uncached + cost_output, 6)
+    return round(cost_cached + cost_uncached + cost_output, 6), fallback
 
 
 def sum_cost_for_period(log_dir: Path, period: str, today: date | None = None) -> float:

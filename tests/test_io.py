@@ -1,7 +1,9 @@
 """Tests for atomic_agents._io."""
 
 import json
+import os
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -9,6 +11,7 @@ from atomic_agents._io import (
     atomic_write,
     atomic_append_jsonl,
     cleanup_stale_tempfiles,
+    _fsync_dir,
 )
 
 
@@ -31,7 +34,6 @@ def test_atomic_write_no_partial_file_on_failure(tmp_path, monkeypatch):
     atomic_write(target, "original")
 
     # Patch os.replace to raise — simulates a rename failure
-    import os
     original_replace = os.replace
 
     def failing_replace(src, dst):
@@ -77,3 +79,48 @@ def test_cleanup_stale_tempfiles(tmp_path):
     assert not (tmp_path / ".real.md.abc.tmp").exists()
     assert not (tmp_path / "subdir" / ".other.md.xyz.tmp").exists()
     assert (tmp_path / "real.md").exists()
+
+
+# --- P2 regression test: directory fsync after os.replace ---
+
+
+def test_atomic_write_fsync_directory_after_replace(tmp_path):
+    """atomic_write must call os.fsync on the parent directory fd after rename."""
+    target = tmp_path / "output.md"
+
+    fsync_calls = []
+
+    original_open = os.open
+    original_fsync = os.fsync
+    original_close = os.close
+
+    dir_fd_seen = []
+
+    def tracking_open(path, flags, *args, **kwargs):
+        fd = original_open(path, flags, *args, **kwargs)
+        # Record the fd if it corresponds to our parent directory.
+        if str(path) == str(tmp_path):
+            dir_fd_seen.append(fd)
+        return fd
+
+    def tracking_fsync(fd):
+        fsync_calls.append(fd)
+        return original_fsync(fd)
+
+    with mock.patch("os.open", side_effect=tracking_open), \
+         mock.patch("os.fsync", side_effect=tracking_fsync):
+        atomic_write(target, "content")
+
+    assert target.read_text() == "content"
+    # The parent directory fd must appear in the fsync calls.
+    assert dir_fd_seen, "os.open was never called on the parent directory"
+    assert any(fd in fsync_calls for fd in dir_fd_seen), (
+        "os.fsync was never called on the parent directory fd"
+    )
+
+
+def test_fsync_dir_swallows_oserror(tmp_path):
+    """_fsync_dir must not propagate OSError (Windows-style)."""
+    with mock.patch("os.fsync", side_effect=OSError("cannot fsync dir on Windows")):
+        # Should complete without raising.
+        _fsync_dir(tmp_path)

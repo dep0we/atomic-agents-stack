@@ -428,7 +428,7 @@ class AtomicAgent:
             )
             latency_ms = int((time.time() - start) * 1000)
 
-            cost = _costs.calc_cost(
+            cost, cost_fallback = _costs.calc_cost(
                 model, raw.input_tokens, raw.output_tokens, raw.cache_hit_tokens
             )
 
@@ -467,6 +467,7 @@ class AtomicAgent:
                 cache_hit_tokens=raw.cache_hit_tokens,
                 cache_miss_tokens=raw.cache_miss_tokens,
                 cost_usd=cost,
+                cost_estimated_via_fallback=cost_fallback,
                 latency_ms=latency_ms,
                 summary=self._derive_summary(work_item),
                 raw=raw.raw or {},
@@ -490,6 +491,8 @@ class AtomicAgent:
             }
             if check.action == "fallback":
                 log_record["fallback"] = True
+            if cost_fallback:
+                log_record["cost_estimated_via_fallback"] = True
             if critical:
                 log_record["critical"] = True
             if parse_failures:
@@ -554,7 +557,7 @@ class AtomicAgent:
             temperature=temperature,
         )
         latency_ms = int((time.time() - start) * 1000)
-        cost = _costs.calc_cost(actual_model, raw.input_tokens, raw.output_tokens)
+        cost, _cost_fallback = _costs.calc_cost(actual_model, raw.input_tokens, raw.output_tokens)
 
         provenance_preserved = self._detect_provenance(raw.text, sources_list)
 
