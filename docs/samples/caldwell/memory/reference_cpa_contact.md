@@ -15,17 +15,17 @@ superseded_by: null
 tags: [cpa, professional, escalation]
 ---
 
-**Where contact details live:** `~/docs/finance/professionals/cpa.md` (load on demand; don't store contact info in this memory).
+**Where contact details live:** `~/agents/finance/professionals/cpa.md` (load on demand; don't store contact info in this memory).
 
-**When to recommend Dan engage the CPA (escalate, don't try to answer):**
+**When to recommend Sam engage the CPA (escalate, don't try to answer):**
 
 ✅ **Always escalate:**
 - Tax filing for the current year (annual)
 - Basis tracking questions (cost basis, step-up, etc.)
 - Complex deductions (SALT cap interactions, home office, business meals nuances)
-- Business structure changes (DPIC LLC vs S-corp questions)
+- Business structure changes (Acme LLC vs S-corp questions)
 - Estimated quarterly tax payments
-- 1099 vs W-2 questions for April's launch
+- 1099 vs W-2 questions for Maya's launch
 - Anything where the IRS code matters more than the principle
 
 ⚠️ **Surface as "you may want to ask the CPA but I can give you the framework":**
@@ -40,5 +40,5 @@ tags: [cpa, professional, escalation]
 - Spending tradeoffs
 
 **How to apply:**
-- When escalating, name the CPA explicitly, point at the contact file, AND say what the question for the CPA should be: "Ask [CPA name] about [specific question]." Don't leave Dan to figure out the framing.
-- If the CPA contact file is stale (>90 days unmodified), flag this when escalating — Dan may need to re-confirm the relationship.
+- When escalating, name the CPA explicitly, point at the contact file, AND say what the question for the CPA should be: "Ask [CPA name] about [specific question]." Don't leave Sam to figure out the framing.
+- If the CPA contact file is stale (>90 days unmodified), flag this when escalating — Sam may need to re-confirm the relationship.

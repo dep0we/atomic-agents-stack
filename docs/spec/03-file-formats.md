@@ -26,7 +26,7 @@ Codex review (finding #28) and operator practice surfaced this: **time-bounded c
 | Memory type | Time-bounded? | Date in filename? |
 |---|---|---|
 | `feedback_*` | usually no — behavioral preferences are persistent | NO |
-| `user_*` | usually no — facts about Dan are persistent | NO |
+| `user_*` | usually no — facts about Sam are persistent | NO |
 | `reference_*` | usually no — pointers to systems persist | NO |
 | `decision_*` | OFTEN yes — locked choices have validity windows | YES if validity scope is clear (Q3 2026, 2026, etc.) |
 | `project_*` | OFTEN yes — projects have deadlines and success criteria | YES if the project is bounded by year/quarter |
@@ -34,7 +34,7 @@ Codex review (finding #28) and operator practice surfaced this: **time-bounded c
 
 The rationale: `decision_q3_income_target.md` is ambiguous when Q3 2027 rolls around with a new Q3 target. `decision_2026-q3_income_target.md` makes the validity scope explicit in the filename, allowing both files to coexist without confusion.
 
-Same logic for projects: `project_april_consulting_launch.md` becomes ambiguous if April launches a second venture later. `project_2026_april_consulting_launch.md` is clearly the 2026 launch specifically.
+Same logic for projects: `project_maya_consulting_launch.md` becomes ambiguous if Maya launches a second venture later. `project_2026_april_consulting_launch.md` is clearly the 2026 launch specifically.
 
 ### Migration for existing files
 
@@ -47,7 +47,7 @@ The schema migration framework (per [../spec/03-file-formats#schema-migration](.
 
 ### Evergreen content stays undated
 
-To be clear: `feedback_debt_priority_order.md` should NOT become `feedback_2026_debt_priority_order.md`. The behavioral preference doesn't have a 2026 validity window — it's how Dan thinks about debt, period. Date suffixes only apply when the *content's validity* is genuinely time-bounded.
+To be clear: `feedback_debt_priority_order.md` should NOT become `feedback_2026_debt_priority_order.md`. The behavioral preference doesn't have a 2026 validity window — it's how Sam thinks about debt, period. Date suffixes only apply when the *content's validity* is genuinely time-bounded.
 
 **Topic naming**: lowercase, snake_case. Be specific enough to be unique without context — `feedback_debt_priority_order` not `feedback_debt`. Topic should be 2-5 words; longer than that, restructure into sub-notes with a parent index entry.
 
@@ -87,7 +87,7 @@ One-line hook explaining when this memory matters. Will appear in INDEX. ~150 ch
 
 **`type`** *(required, enum)*
 Locked taxonomy:
-- `user` — about Dan (his preferences, role, context)
+- `user` — about Sam (his preferences, role, context)
 - `feedback` — corrections + validated approaches (how to behave)
 - `project` — active work state (in-flight initiatives, blockers)
 - `decision` — locked architectural / strategic choices
@@ -201,7 +201,7 @@ Plain markdown with sections. Loadable as-is into context.
 - Hook is the file's `description` field (or a manually-edited shorter version)
 - Stay under ~150 lines total before splitting into sub-indexes
 
-**Hand-edits welcome.** The INDEX is the agent's view of its memory. Curation by Dan is encouraged.
+**Hand-edits welcome.** The INDEX is the agent's view of its memory. Curation by Sam is encouraged.
 
 ---
 
@@ -249,14 +249,14 @@ Persona files are *not* frontmatter-tagged the same way memories are. They're fr
 ## Evolution discipline
 <bullets — meta-rules about how SOUL itself grows>
 
-## Things I've learned about how to advise / serve Dan
+## Things I've learned about how to advise / serve Sam
 <accumulating list — this is the section that evolves over time>
 ```
 
 ### USER.md skeleton
 
 ```markdown
-# USER — Dan Powers
+# USER — Sam
 
 ## Role and context
 <bullets>
@@ -398,7 +398,7 @@ When the agent or a tool writes a new atomic unit, it should validate:
 5. ✅ Filename matches `{type}_{topic}.md` pattern
 6. ✅ INDEX.md has been updated to reference the new file
 
-A simple Python validator lives in [../implementation/shared-helper](../implementation/shared-helper.md). Failed validations should block the write; surface to Dan with the specific field that failed.
+A simple Python validator lives in [../implementation/shared-helper](../implementation/shared-helper.md). Failed validations should block the write; surface to Sam with the specific field that failed.
 
 ---
 
@@ -582,7 +582,7 @@ Snapshots are kept indefinitely (they're cheap — markdown compresses well). Pe
 
 ### Multi-agent migration considerations
 
-When `<agents_root>` has multiple agents, the migration is atomic across all of them. Half-migrated state (Caldwell on v2, Bishop on v1) is forbidden — the helper would refuse some writes and accept others, leading to inconsistency.
+When `<agents_root>` has multiple agents, the migration is atomic across all of them. Half-migrated state (Caldwell on v2, another agent on v1) is forbidden — the helper would refuse some writes and accept others, leading to inconsistency.
 
 The migration runner walks the entire `<agents_root>` in one pass. If migration fails for one agent's files (e.g., a broken file), the entire migration rolls back. All-or-nothing.
 

@@ -13,7 +13,7 @@ Chosen for: financial reasoning depth, judgment under uncertainty, ability to ho
 Fires when:
 - Opus errors (rate limit, transient failure)
 - Daily Opus token cap reached (see below)
-- Dan explicitly requests "fast mode"
+- Sam explicitly requests "fast mode"
 
 Sonnet handles most Caldwell work fine. The Opus default is for the hard tradeoffs.
 
@@ -28,8 +28,8 @@ Sonnet handles most Caldwell work fine. The Opus default is for the hard tradeof
 
 If the Opus cap is reached:
 - Cron runs that day: SKIP the Opus call, log skip reason, retry next day
-- Skill invocations that day: AUTO-FALLBACK to Sonnet, surface to Dan that fallback engaged
-- Critical-flag invocations: override the cap (Dan tags manually if a question can't wait)
+- Skill invocations that day: AUTO-FALLBACK to Sonnet, surface to Sam that fallback engaged
+- Critical-flag invocations: override the cap (Sam tags manually if a question can't wait)
 
 ## Prompt caching strategy
 
@@ -93,7 +93,7 @@ research_integrity:
     log_uncited_claims: true      # surface when Caldwell admits an uncited claim
 ```
 
-When Caldwell calls a helper to summarize a CPA memo or extract balance-sheet diffs, the helper output must include per-fact citations back to the source document. Caldwell then cites the source in his response to Dan. The log JSONL captures the chain.
+When Caldwell calls a helper to summarize a CPA memo or extract balance-sheet diffs, the helper output must include per-fact citations back to the source document. Caldwell then cites the source in his response to Sam. The log JSONL captures the chain.
 
 The factual_accuracy rubric dimension (20% of Caldwell's eval score) and HF8 (confident false factual claim) enforce this.
 
@@ -106,6 +106,6 @@ For a typical Caldwell day (1-3 cron runs + 0-5 skill invocations), expected dai
 ## Notes
 
 - **Embedding model**: not used. Caldwell is INDEX-driven, not vector-search-driven. If we add vector search to the wiki layer later, document the model choice here.
-- **Streaming**: enabled for skill invocations (Dan reads as it streams). Disabled for cron (output written whole to journal/log).
+- **Streaming**: enabled for skill invocations (Sam reads as it streams). Disabled for cron (output written whole to journal/log).
 - **Temperature**: 0.6 for analysis tasks, 0.3 for tactical recommendations. Per-call override allowed.
 - **Tool use**: enabled for `Read` (vault files) only. No external API tools beyond Tavily; no shell.

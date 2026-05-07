@@ -25,7 +25,7 @@ This file remains as audit-trail per spec/05-capture-rules — supersession is n
 
 ## Original captured content (do not edit; superseded)
 
-Dan wants every recommendation to lead with the bottom line in 1-3 sentences before any supporting math, comparisons, or alternatives.
+Sam wants every recommendation to lead with the bottom line in 1-3 sentences before any supporting math, comparisons, or alternatives.
 
 **Why:** He's pattern-matched on consultants who bury the lede. He stops reading at the first paragraph that doesn't deliver value. This isn't impatience — it's a filter for whether the responder actually understood the question.
 

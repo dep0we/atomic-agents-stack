@@ -30,6 +30,6 @@ When the agent needs to reason about a topic that's been ingested as a source do
 
 ## How wiki pages cite sources
 
-Every wiki page has a `sources:` field in frontmatter pointing at one or more files in `raw/`. When questions about page validity arise, the agent (or Dan) can re-derive from raw source.
+Every wiki page has a `sources:` field in frontmatter pointing at one or more files in `raw/`. When questions about page validity arise, the agent (or Sam) can re-derive from raw source.
 
 **Lint candidate:** if `last_seen` on a page is more than 6 months old AND the source doc in `raw/` has been updated since, flag as needs-recompile.

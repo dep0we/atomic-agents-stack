@@ -23,7 +23,7 @@ print(f"Cost: ${response.cost_usd:.4f}")
 print(f"Captures: {len(response.captures)}")
 ```
 
-The agent reads everything it needs from `~/docs/agents/caldwell/`:
+The agent reads everything it needs from `~/agents/caldwell/`:
 - `persona/IDENTITY.md`, `SOUL.md`, `USER.md`
 - `tools.md` (read/write paths, hard NOs)
 - `model.md` (default model, cost guardrails)

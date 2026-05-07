@@ -7,7 +7,7 @@ Original source material that's been ingested for distillation into `wiki/` page
 - CPA memos and meeting notes
 - Financial planning books (chapters or summaries)
 - Tax planning documents
-- Anything Dan hands the agent as "read this and summarize for future reference"
+- Anything Sam hands the agent as "read this and summarize for future reference"
 
 ## Naming convention
 

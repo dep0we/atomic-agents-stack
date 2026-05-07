@@ -472,7 +472,7 @@ Patterns detected: 3
 Proposals generated: 3 (2 high-confidence, 1 medium)
 
 Report written to:
-  ~/docs/agents/caldwell/evals/tuning_reports/2026-05-08_proposal.md
+  ~/agents/caldwell/evals/tuning_reports/2026-05-08_proposal.md
 
 Review the report. To apply approved proposals:
   python -m atomic_agents.tune caldwell --apply 2026-05-08_proposal.md
@@ -507,7 +507,7 @@ When invoked:
     - Number of proposals
     - For each: target_file, edit_type, confidence, one-sentence summary
     - Rendered diff (the actual proposed change)
-6. Ask Dan whether to mark proposals accepted/rejected interactively
+6. Ask Sam whether to mark proposals accepted/rejected interactively
 7. If yes, edit the frontmatter on each proposal as decided
 8. Run apply step:
     python -m atomic_agents.tune $AGENT --apply $REPORT_FILE
@@ -595,7 +595,7 @@ After a few months, prune detectors that have <30% acceptance rate.
 
 - **Auto-apply mode** — every change is operator-approved. No `--auto-apply` flag exists.
 - **Rubric tuning** — the rubric is what tuning targets; tuning doesn't tune itself.
-- **Cross-agent learning** — tuning analyzes one agent at a time. Dan's setup is small enough that cross-agent pattern transfer (e.g., "Caldwell got better with X; try X on Harper") would be over-engineering. v2 if needed.
+- **Cross-agent learning** — tuning analyzes one agent at a time. Sam's setup is small enough that cross-agent pattern transfer (e.g., "Caldwell got better with X; try X on Harper") would be over-engineering. v2 if needed.
 - **Real-time tuning** — tuning runs after evals (post-hoc). It doesn't observe and tune mid-conversation.
 
 ---

@@ -9,7 +9,7 @@ This is **purely an aggregation + render layer.** No LLM calls. No external serv
 ## What ships in this implementation
 
 ```
-~/Projects/automations/
+~/projects/automations/
 ├── lib/
 │   └── atomic_agents/
 │       ├── costs.py                 ← aggregation logic
@@ -22,10 +22,10 @@ This is **purely an aggregation + render layer.** No LLM calls. No external serv
 ├── jobs/
 │   └── atomic_agents_dashboard.py   ← nightly cron entry
 └── launchd/
-    └── ai.gizmo.atomic-agents-dashboard.plist
+    └── ai.your-server.atomic-agents-dashboard.plist
 ```
 
-The dashboard *output* lands in the vault at `<agents_root>/_dashboard/` so Dan can browse it from Obsidian Mobile or any browser.
+The dashboard *output* lands in the vault at `<agents_root>/_dashboard/` so Sam can browse it from Obsidian Mobile or any browser.
 
 ---
 
@@ -497,7 +497,7 @@ When the server isn't running:
 
 ## Performance
 
-For Dan's scale (5-10 agents, ~50-200 runs each per month), nightly aggregation runs in **~5-30 seconds**. Reading 12 months of JSONL across all agents is at most a few thousand records.
+For Sam's scale (5-10 agents, ~50-200 runs each per month), nightly aggregation runs in **~5-30 seconds**. Reading 12 months of JSONL across all agents is at most a few thousand records.
 
 If an agent's logs grow past ~10K records/month, switch to a streaming aggregator (the current `load_runs` reads everything into memory). Not a concern for v1.
 
@@ -510,7 +510,7 @@ If an agent's logs grow past ~10K records/month, switch to a streaming aggregato
 - **Agent folder with no log/ subdir** — discover_agents skips it.
 - **Mid-month new agent** — appears with partial data; delta vs. last month shows "—".
 - **Agent renamed** — old folder data attributed to old name; new folder appears separately. Manual merge if needed.
-- **Clock skew across machines** (cron on gizmo, skill on MacBook, both writing logs) — sort by `ts` regardless of which machine wrote the record.
+- **Clock skew across machines** (cron on your-server, skill on MacBook, both writing logs) — sort by `ts` regardless of which machine wrote the record.
 
 ---
 

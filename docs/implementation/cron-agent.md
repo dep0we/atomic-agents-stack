@@ -10,11 +10,11 @@ This is one of two runtime forms an Atomic Agent takes. The other is the [claude
 
 ✅ The agent has scheduled, recurring work (daily morning brief, weekly retrospective, quarterly review)
 
-✅ The agent processes a queue (work items written by Dan or another agent)
+✅ The agent processes a queue (work items written by Sam or another agent)
 
 ✅ The agent watches for triggers (file changes, calendar events, external API webhooks)
 
-❌ The agent is purely reactive to Dan's chat — that's the skill version
+❌ The agent is purely reactive to Sam's chat — that's the skill version
 
 ❌ The agent runs more frequently than every ~5 minutes — at that cadence, run a long-lived service instead
 
@@ -22,10 +22,10 @@ This is one of two runtime forms an Atomic Agent takes. The other is the [claude
 
 ## Where the code lives
 
-In Dan's `automations` repo on GitHub (`dep0we/automations`), under:
+In Sam's `automations` repo on GitHub (`user/automations`), under:
 
 ```
-~/Projects/automations/                        ← MacBook dev workspace
+~/projects/automations/                        ← MacBook dev workspace
 └── jobs/
     └── agents/
         ├── caldwell_daily_brief.py
@@ -33,13 +33,13 @@ In Dan's `automations` repo on GitHub (`dep0we/automations`), under:
         └── ...
 ```
 
-Deployed to gizmo at `/Users/gizmo/automations/` via the existing `ai.gizmo.automations-deploy` LaunchAgent (auto-pulls every 5 min).
+Deployed to your-server at `/path/to/your-server/automations/` via the existing `ai.your-server.automations-deploy` LaunchAgent (auto-pulls every 5 min).
 
 LaunchAgent plists live in:
 
 ```
-~/Projects/automations/launchd/
-├── ai.gizmo.caldwell-daily-brief.plist
+~/projects/automations/launchd/
+├── ai.your-server.caldwell-daily-brief.plist
 └── ...
 ```
 
@@ -63,9 +63,9 @@ Calls atomic_agents to:
   7. Write journal entry
   8. Write log record
        ↓
-Outputs persist in ~/docs/agents/caldwell/
+Outputs persist in ~/agents/caldwell/
        ↓
-Bishop or another agent or Dan reads outputs as needed
+another agent or another agent or Sam reads outputs as needed
 ```
 
 ---
@@ -77,7 +77,7 @@ Bishop or another agent or Dan reads outputs as needed
 """
 Caldwell daily brief — runs every morning at 06:30 CT.
 Reviews yesterday's financial activity, surfaces anything that needs attention,
-writes the brief to journal/ and a summary to ~/docs/automations/output/caldwell/.
+writes the brief to journal/ and a summary to ~/agents/automations/output/caldwell/.
 """
 
 from pathlib import Path
@@ -104,10 +104,10 @@ def main():
     # 2. Build the work item for cron
     work_item = """
     Daily brief for today.
-    Read ~/docs/finance/balance_sheet.md and the last 3 days of activity.
+    Read ~/agents/finance/balance_sheet.md and the last 3 days of activity.
     Surface: anything notable, anything off-track from the Q3 income target,
-    anything that needs Dan's attention.
-    Format: bottom-line first per Dan's preference. Aim for 5-10 sentences.
+    anything that needs Sam's attention.
+    Format: bottom-line first per Sam's preference. Aim for 5-10 sentences.
     """
 
     # 3. Call the model
@@ -141,7 +141,7 @@ def main():
     })
 
     # 7. Optional: write a published artifact to the agent's output/ folder
-    #    for downstream consumption (Bishop, Dan, other agents)
+    #    for downstream consumption (another agent, Sam, other agents)
     output_path = VAULT_ROOT / "agents" / AGENT_NAME / "output" / f"{response.date}.md"
     agent.write_output(output_path, response.text)  # helper enforces tools.md write paths
 
@@ -193,7 +193,7 @@ The agent emits captures in this format inside its response:
 <atomic_capture>
 type: feedback
 name: Bottom-line-first communication preference
-description: Dan wants the recommendation in 1-3 sentences before any working
+description: Sam wants the recommendation in 1-3 sentences before any working
 confidence: high
 sources: [conversation_2026-05-06]
 body: |
@@ -206,7 +206,7 @@ The `extract_captures()` method finds these blocks, validates the frontmatter ag
 If a capture fails validation:
 - Don't write the file
 - Log the failure
-- Surface to Dan via Telegram alert (the runner's `lib.logger.run()` handles this)
+- Surface to Sam via Telegram alert (the runner's `lib.logger.run()` handles this)
 
 ---
 
@@ -218,12 +218,12 @@ If a capture fails validation:
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>ai.gizmo.caldwell-daily-brief</string>
+    <string>ai.your-server.caldwell-daily-brief</string>
 
     <key>ProgramArguments</key>
     <array>
         <string>/opt/homebrew/bin/python3.11</string>
-        <string>/Users/gizmo/automations/jobs/agents/caldwell_daily_brief.py</string>
+        <string>/path/to/your-server/automations/jobs/agents/caldwell_daily_brief.py</string>
     </array>
 
     <key>StartCalendarInterval</key>
@@ -248,18 +248,18 @@ If a capture fails validation:
     </dict>
 
     <key>StandardOutPath</key>
-    <string>/Users/gizmo/automations/log/caldwell-daily-brief-stdout.log</string>
+    <string>/path/to/your-server/automations/log/caldwell-daily-brief-stdout.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/gizmo/automations/log/caldwell-daily-brief-stderr.log</string>
+    <string>/path/to/your-server/automations/log/caldwell-daily-brief-stderr.log</string>
 
     <key>WorkingDirectory</key>
-    <string>/Users/gizmo/automations</string>
+    <string>/path/to/your-server/automations</string>
 </dict>
 </plist>
 ```
 
-Bootstrap with: `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.gizmo.caldwell-daily-brief.plist`
+Bootstrap with: `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.your-server.caldwell-daily-brief.plist`
 
 ---
 
@@ -340,7 +340,7 @@ Script loads it via `python-dotenv` or similar. Same security profile as Option 
 |---|---|---|
 | API rate limit | `lib.atomic_agents` catches 429, writes `status: error` to log | Retry with exponential backoff up to 3x; on persistent fail, write log + Telegram alert |
 | Model unavailable | API returns model error | Fall back to model from `model.md` `Fallback` field; log fallback usage |
-| Vault file missing | Loader raises FileNotFoundError | Log error, surface to Dan, don't run this cycle (skip rather than corrupt) |
+| Vault file missing | Loader raises FileNotFoundError | Log error, surface to Sam, don't run this cycle (skip rather than corrupt) |
 | Capture validation fails | `extract_captures` raises ValidationError | Don't write the bad capture; log details; continue with other captures |
 | Daily token cap hit | `lib.atomic_agents` checks log before call | Skip the run; log skip reason; retry tomorrow |
 | Out-of-scope write attempt | Helper enforces `tools.md` write paths | Block the write; log violation; do NOT silently route around it |
@@ -373,7 +373,7 @@ def total_cost_last_7_days():
     return total
 ```
 
-Surface the weekly cost to Dan via Telegram or as a journal entry.
+Surface the weekly cost to Sam via Telegram or as a journal entry.
 
 ---
 
@@ -391,13 +391,13 @@ Don't schedule a new agent without seeing at least 3 manual runs that produced q
 
 ---
 
-## Bishop is special (preview)
+## another agent is special (preview)
 
-Bishop runs inside openclaw, not as a cron Python script. The cron pattern in this doc is for non-openclaw agents (Caldwell, Harper, Paul, Muse-roles).
+another agent runs inside openclaw, not as a cron Python script. The cron pattern in this doc is for non-openclaw agents (Caldwell, Harper, Paul, Muse-roles).
 
-When we adapt the Atomic Agents spec to Bishop, we'll write a separate adaptation doc covering:
+When we adapt the Atomic Agents spec to another agent, we'll write a separate adaptation doc covering:
 - How openclaw's memory-core + memory-wiki plugins map to Atomic Notes + Atomic Wiki
-- How `~/.openclaw/workspace/` files (IDENTITY/SOUL/USER) map to `~/docs/agents/bishop/persona/`
+- How `~/.openclaw/workspace/` files (IDENTITY/SOUL/USER) map to `~/agents/bishop/persona/`
 - The sync layer between vault-source-of-truth and openclaw-runtime-paths
 
 For now, the cron pattern is the canonical implementation reference.

@@ -29,7 +29,7 @@ Without it, the eval framework produces this loop:
 Run evals → see scores → ??? → repeat
 ```
 
-The `???` is "operator reads judge justifications, infers patterns across runs, mentally synthesizes what to change, opens persona files, edits, re-runs evals." That works for an engineer with three hours. It doesn't work for Dan, and it doesn't scale to 5+ agents.
+The `???` is "operator reads judge justifications, infers patterns across runs, mentally synthesizes what to change, opens persona files, edits, re-runs evals." That works for an engineer with three hours. It doesn't work for Sam, and it doesn't scale to 5+ agents.
 
 With tuning:
 
@@ -90,7 +90,7 @@ The analyzer scans for these. Each pattern has a corresponding edit-proposal cla
 
 | Pattern | Suggests editing |
 |---|---|
-| `scope_discipline` low when specific domain mentioned (e.g., Highland comp) | Add explicit redirect to IDENTITY.md "Out of scope" + escalation map |
+| `scope_discipline` low when specific domain mentioned (e.g., Acme comp) | Add explicit redirect to IDENTITY.md "Out of scope" + escalation map |
 | Tools.md "hard NO" almost-violated multiple times | Tighten the rule wording; consider adding example |
 
 ### Tool / runtime patterns
@@ -308,12 +308,12 @@ So: tuning is essentially free. The expensive step is the **eval run** that prod
 
 1. **Mon**: weekly eval cron runs full Caldwell suite. 5 tests pass; 2 score below 4.0 on persona_fidelity. Result lands in `evals/runs/2026-05-04.jsonl`.
 2. **Mon (later)**: tuning cron runs. Reads runs from past 4 weeks, finds `persona_fidelity` averaging 3.4 with recurring judge phrase "hedge openers." Generates 1 proposal: edit SOUL.md voice section. Writes report to `evals/tuning_reports/2026-05-04_proposal.md`. Surfaces via Telegram alert: "Tuning report ready: 1 proposal."
-3. **Tue**: Dan opens the report in Obsidian. Reads the rationale. Agrees. Edits frontmatter `operator_decision: accepted`.
-4. **Tue (later)**: Dan runs `python -m atomic_agents.tune caldwell --apply 2026-05-04_proposal.md`. Diff applied to SOUL.md. Journal entry written.
+3. **Tue**: Sam opens the report in Obsidian. Reads the rationale. Agrees. Edits frontmatter `operator_decision: accepted`.
+4. **Tue (later)**: Sam runs `python -m atomic_agents.tune caldwell --apply 2026-05-04_proposal.md`. Diff applied to SOUL.md. Journal entry written.
 5. **Wed**: next scheduled eval run. Same 5 tests. Now 5/5 pass; persona_fidelity at 4.6 average. Improvement attributed to the SOUL.md edit. Tuning history updated.
 6. **Future runs**: pattern doesn't recur (the rule worked). Tuning generates no new proposals on this dimension.
 
-The whole loop took ~10 minutes of Dan's time across two days. Without tuning, it would have been hours of reading judge transcripts and figuring out what to change.
+The whole loop took ~10 minutes of Sam's time across two days. Without tuning, it would have been hours of reading judge transcripts and figuring out what to change.
 
 ---
 

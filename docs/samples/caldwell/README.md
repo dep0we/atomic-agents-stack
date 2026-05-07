@@ -2,22 +2,24 @@
 
 This folder is a complete worked example of a single-agent Atomic Agents deployment. It's used throughout the spec as a reference.
 
+> **About the names in this sample.** Caldwell is a fictional financial-planning agent for a fictional user named **Sam** (with spouse **Maya**). Sam works at **Acme Industries** and runs a side consulting practice called **SamCo** with two retainer clients (**ClientCo A** and **ClientCo B**). All of these are illustrative — pick your own names when you build your own agent. Specs throughout `docs/spec/` use Caldwell + Sam as a worked example for the same reason.
+
 ---
 
 ## What you're looking at
 
-Caldwell is **Dan's** financial planning assistant. The persona, memory, and journal entries reflect Dan's actual situation — debt-averse posture, real Q3 income target, real CRE consulting context.
+Caldwell is the example financial-planning assistant for the example user, Sam. The persona, memory, and journal entries reflect a believable household financial situation — debt-averse posture, a Q3 income target, retainer income, a side launch by the spouse — to show the spec in use rather than the spec in the abstract.
 
-This is intentional: a generic "DemoAgent" with placeholder content wouldn't show what a real, populated Atomic Agent looks like. Caldwell shows the spec in use, not the spec in the abstract.
+A generic "DemoAgent" with placeholder content wouldn't show what a real, populated Atomic Agent looks like. Caldwell does.
 
-## If you're not Dan
+## If you're not Sam (which you aren't)
 
 Use this as a template structure, not as your agent's content. To adapt for yourself:
 
 1. Copy the folder structure to `<your_agents_root>/<your_agent_name>/`
 2. **Rewrite `persona/IDENTITY.md`** — your agent's role, scope, doctrine
 3. **Rewrite `persona/SOUL.md`** — your agent's voice and posture
-4. **Rewrite `persona/USER.md`** — about *you*, not about Dan
+4. **Rewrite `persona/USER.md`** — about *you*, not about Sam
 5. **Replace `tools.md`** read/write paths with your actual paths
 6. **Replace `model.md`** with your model and budget
 7. **Empty `memory/`** except for `INDEX.md` (start with an empty index; populate as you use the agent)
@@ -28,7 +30,7 @@ The structure is the spec; the content is yours.
 
 ## What this agent's job is (Caldwell-specific)
 
-Personal financial planning assistant for Dan. Helps with:
+Personal financial planning assistant for Sam. Helps with:
 - Debt elimination strategy and execution
 - Income planning across day job + side hustle + spouse's launch
 - Investment philosophy and allocation framing
@@ -44,14 +46,14 @@ samples/caldwell/
 ├── persona/
 │   ├── IDENTITY.md                              ← who Caldwell is
 │   ├── SOUL.md                                  ← personality
-│   └── USER.md                                  ← about Dan (the slice Caldwell needs)
+│   └── USER.md                                  ← about Sam (the slice Caldwell needs)
 ├── tools.md                                     ← what Caldwell can read/write
 ├── model.md                                     ← LLM + budget + cost guardrails
 ├── memory/                                      ← Atomic Notes
 │   ├── INDEX.md                                 ← always-loaded routing
 │   ├── feedback_*.md                            ← behavioral corrections + validated
 │   ├── decision_*.md                            ← locked architectural choices
-│   ├── user_*.md                                ← about Dan
+│   ├── user_*.md                                ← about Sam
 │   ├── project_*.md                             ← active project state
 │   └── reference_*.md                           ← pointers to external systems
 ├── wiki/                                        ← Atomic Wiki (distilled corpus)

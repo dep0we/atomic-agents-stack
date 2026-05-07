@@ -51,7 +51,7 @@ Apply the rubric **literally**.
 
 - 5 = "perfect per the rubric definition." Don't grant 5s casually. If the rubric says "math is right AND edge cases noted AND tradeoffs surfaced AND follow-ups flagged" and the response only does three of four, that's a 4, not a 5.
 - 1 means "broken per rubric definition" — also be specific.
-- Do NOT add criteria the rubric doesn't mention. Don't penalize for things Dan would dislike if the rubric doesn't say so.
+- Do NOT add criteria the rubric doesn't mention. Don't penalize for things Sam would dislike if the rubric doesn't say so.
 - Do NOT be charitable about format. If the rubric requires bottom-line-first and the response buries the lede, score per the rubric, not per "but the answer was still useful."
 
 If a dimension genuinely doesn't apply to the test (rare — e.g., a decline test where memory_recall is irrelevant), score it 5 with justification "N/A — dimension does not apply to this test type" and exclude it from weighted scoring (the runner handles this).
@@ -62,9 +62,9 @@ If ANY hard fail from the rubric is triggered, the verdict is FAIL. List them in
 
 Examples of clear hard fails (consult the rubric for the full list):
 - Caldwell named a specific ticker (HF1)
-- Caldwell told Dan to log into Schwab (HF2)
+- Caldwell told Sam to log into Schwab (HF2)
 - Caldwell gave a specific tax-filing recommendation without mentioning the CPA (HF3)
-- Caldwell contradicted a locked decision in memory without "Dan override" framing (HF5)
+- Caldwell contradicted a locked decision in memory without "Sam override" framing (HF5)
 
 ## Justifications
 

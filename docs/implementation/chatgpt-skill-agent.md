@@ -6,7 +6,7 @@ This is the third runtime form an Atomic Agent can take. The other two are [cron
 
 ---
 
-## What changed (April 2026)
+## What changed (Maya 2026)
 
 OpenAI adopted the **Agent Skills open standard** that Anthropic published in October 2025. Skills are now natively supported in multiple runtimes — but with different levels of integration. Be honest about which is verified working today vs. which is documented but unverified.
 
@@ -23,12 +23,12 @@ These were confirmed live by direct search at the time of writing:
 | **OpenClaw** | Uses SKILL.md as its core plugin format | Documented in OpenClaw's plugin docs |
 
 [^1]: OpenAI Codex Skills Guide — accessed 2026-05-06 via Tavily search. Confirms `~/.codex/skills/` location, `$skill-name` invocation, and Markdown frontmatter format.
-[^2]: OpenAI Help Center — confirms ChatGPT Skills are in beta on Business/Enterprise/Edu/Teachers/Healthcare plans only as of April 2026; Plus and free users do not have access.
+[^2]: OpenAI Help Center — confirms ChatGPT Skills are in beta on Business/Enterprise/Edu/Teachers/Healthcare plans only as of Maya 2026; Plus and free users do not have access.
 [^3]: OpenAI Cookbook — describes the API skills endpoint, including the bundle/zip upload flow.
 
 ### Documented but NOT independently verified
 
-- **Conformance to the open standard across all five runtimes** — the spec claim that "the same SKILL.md works in all five" is *mostly* true based on the docs, but real cross-platform testing has not been done by Dan or anyone working on this spec. Treat as a future verification target, not a current guarantee. If you're betting infrastructure on it, write a small test agent and deploy it to each runtime first.
+- **Conformance to the open standard across all five runtimes** — the spec claim that "the same SKILL.md works in all five" is *mostly* true based on the docs, but real cross-platform testing has not been done by Sam or anyone working on this spec. Treat as a future verification target, not a current guarantee. If you're betting infrastructure on it, write a small test agent and deploy it to each runtime first.
 - **`POST /v1/skills` writeback semantics** — the API supports uploading skills, but how (or whether) the API-skill model can persist captures back to the operator's vault has not been verified end-to-end. Bundle-snapshot mode is the safe assumption.
 - **OpenClaw's MCP-bridge to ChatGPT** — referenced as "a path forward" but no working bridge exists today.
 
@@ -46,7 +46,7 @@ Three places you can deploy a ChatGPT-side Atomic Agent skill:
 
 ### 1. Codex CLI (recommended for Atomic Agents)
 
-✅ **Best fit.** Runs locally, has filesystem access, can read `~/docs/agents/caldwell/` directly the same way Claude Code skills can.
+✅ **Best fit.** Runs locally, has filesystem access, can read `~/agents/caldwell/` directly the same way Claude Code skills can.
 
 ✅ Same loading pattern as the Claude version. The agent reads persona, INDEX, atomic notes from disk on demand.
 
@@ -56,22 +56,22 @@ Three places you can deploy a ChatGPT-side Atomic Agent skill:
 
 ### 2. ChatGPT (web/desktop app)
 
-⚠️ **Limited.** ChatGPT web can't read local files. The Atomic Agent's vault lives on gizmo (or MacBook); ChatGPT can't reach it.
+⚠️ **Limited.** ChatGPT web can't read local files. The Atomic Agent's vault lives on your-server (or MacBook); ChatGPT can't reach it.
 
 Options to bridge the gap:
 - **Bundle persona + INDEX + key notes** into the skill itself (uploaded as `resources/`). Loses the "vault is source of truth, runtime just reads it" property — the bundle becomes a frozen snapshot.
-- **MCP server** to gizmo. ChatGPT Connectors can talk to MCP. You'd run a small MCP server on gizmo exposing read access to `~/docs/agents/{name}/`. Then ChatGPT web has live vault access. (This is the path forward for serious ChatGPT-web Atomic Agents — it's not free work but it's real.)
-- **Accept staleness.** Re-upload the bundle weekly. Atomic notes captured during a ChatGPT-web session can't write back to the vault — they'd have to be transcribed by Dan after the session.
+- **MCP server** to your-server. ChatGPT Connectors can talk to MCP. You'd run a small MCP server on your-server exposing read access to `~/agents/{name}/`. Then ChatGPT web has live vault access. (This is the path forward for serious ChatGPT-web Atomic Agents — it's not free work but it's real.)
+- **Accept staleness.** Re-upload the bundle weekly. Atomic notes captured during a ChatGPT-web session can't write back to the vault — they'd have to be transcribed by Sam after the session.
 
 ❌ Not recommended for primary use. Codex CLI does what ChatGPT-web tries to do, but with vault access.
 
-✅ Useful as a **mobile/away-from-laptop fallback**. If Dan needs to chat with Caldwell from his phone via ChatGPT app, a stripped-down skill works — bundle the persona + INDEX, accept that he won't capture new memories from this surface.
+✅ Useful as a **mobile/away-from-laptop fallback**. If Sam needs to chat with Caldwell from his phone via ChatGPT app, a stripped-down skill works — bundle the persona + INDEX, accept that he won't capture new memories from this surface.
 
 ### 3. OpenAI API (programmatic)
 
 For automation: same shape as the cron version, just calling OpenAI's API instead of Anthropic's. The skill is uploaded via `POST /v1/skills` and attached to chat completions. This is interchangeable with the cron pattern in [cron-agent](cron-agent.md) — just swap which API the Python client points at.
 
-Useful when Dan wants:
+Useful when Sam wants:
 - Cost optimization on certain workloads (GPT models for tasks where they're cheaper)
 - Multi-model routing (Caldwell uses Claude, but a workflow inside Caldwell could call GPT for a specific subtask)
 - Resilience against single-vendor outage
@@ -85,7 +85,7 @@ The format is identical across Claude Code, Codex CLI, and ChatGPT:
 ```yaml
 ---
 name: caldwell
-description: Caldwell — Dan's personal financial advisor. Loads the agent's vault folder
+description: Caldwell — Sam's personal financial advisor. Loads the agent's vault folder
   and provides direct, calm financial counsel on debt strategy, income planning, and
   spending decisions.
 ---
@@ -152,9 +152,9 @@ The agent's *behavior* is identical. Only the loader differs. The Atomic Agents 
 ```yaml
 ---
 name: caldwell
-description: Caldwell — Dan Powers' personal financial advisor. Loads the agent's vault
+description: Caldwell — Sam' personal financial advisor. Loads the agent's vault
   folder and provides direct, calm financial counsel on debt strategy, income planning,
-  spending decisions, and money tradeoffs. Use when Dan asks money questions, wants
+  spending decisions, and money tradeoffs. Use when Sam asks money questions, wants
   to think through a financial decision, or needs help allocating cash.
 ---
 
@@ -166,27 +166,27 @@ You are Caldwell. Read the agent's persona and memory files from the vault befor
 
 Use the shell tool to read these files in parallel:
 
-- ~/docs/agents/caldwell/persona/IDENTITY.md
-- ~/docs/agents/caldwell/persona/SOUL.md
-- ~/docs/agents/caldwell/persona/USER.md
-- ~/docs/agents/caldwell/tools.md
-- ~/docs/agents/caldwell/memory/INDEX.md
-- ~/docs/agents/caldwell/wiki/INDEX.md
+- ~/agents/caldwell/persona/IDENTITY.md
+- ~/agents/caldwell/persona/SOUL.md
+- ~/agents/caldwell/persona/USER.md
+- ~/agents/caldwell/tools.md
+- ~/agents/caldwell/memory/INDEX.md
+- ~/agents/caldwell/wiki/INDEX.md
 
 After reading, you embody Caldwell.
 
 ## Recall pattern
 
-When Dan asks a question:
+When Sam asks a question:
 1. Identify relevant atomic notes from memory/INDEX.md
 2. Read those specific files
 3. Read relevant wiki pages from wiki/INDEX.md (if any)
-4. If specific dollar amounts needed, read ~/docs/finance/balance_sheet.md and relevant accounts/
+4. If specific dollar amounts needed, read ~/agents/finance/balance_sheet.md and relevant accounts/
 5. Reason and respond per Caldwell's persona
 
 ## Capture pattern
 
-If Dan says something durable, emit a capture marker in your response:
+If Sam says something durable, emit a capture marker in your response:
 
 <atomic_capture>
 type: feedback
@@ -198,25 +198,25 @@ body: |
   <body content>
 </atomic_capture>
 
-After the response, write the file to ~/docs/agents/caldwell/memory/{type}_{topic}.md
+After the response, write the file to ~/agents/caldwell/memory/{type}_{topic}.md
 and update memory/INDEX.md.
 
-Apply capture rules from ~/docs/Atomic Agents/spec/05-capture-rules.md.
+Apply capture rules from ~/agents/Atomic Agents/spec/05-capture-rules.md.
 
 ## End of session
 
-Append to ~/docs/agents/caldwell/journal/YYYY-MM/YYYY-MM-DD.md:
+Append to ~/agents/caldwell/journal/YYYY-MM/YYYY-MM-DD.md:
 - What was discussed
 - Captures made
 - Open questions
 
 ## Hard rules
 
-- Never write outside ~/docs/agents/caldwell/ (see tools.md)
+- Never write outside ~/agents/caldwell/ (see tools.md)
 - Never recommend specific securities by ticker
 - Never take external actions
 - Bottom line first
-- Match Dan's communication preferences (per persona/USER.md)
+- Match Sam's communication preferences (per persona/USER.md)
 ```
 
 ### Running it
@@ -278,7 +278,7 @@ curl -X POST https://api.openai.com/v1/skills \
 ```yaml
 ---
 name: caldwell
-description: Caldwell — Dan Powers' personal financial advisor. Calm, direct, no judgment.
+description: Caldwell — Sam' personal financial advisor. Calm, direct, no judgment.
   Bundled persona and memory snapshot. Note: this version has limited vault access; use
   Codex CLI for full Atomic Agents experience.
 ---
@@ -298,22 +298,22 @@ Read these resource files in order:
 - resources/memory_INDEX.md
 - resources/recent_atomic_notes.md
 
-These are snapshots from Dan's vault as of the upload date. They may be stale — note
-this if Dan asks about anything time-sensitive.
+These are snapshots from Sam's vault as of the upload date. They may be stale — note
+this if Sam asks about anything time-sensitive.
 
 ## Limitations on this surface
 
 - I cannot read live balance sheet data. If a recommendation requires current numbers,
-  ask Dan to share the relevant figures in chat.
+  ask Sam to share the relevant figures in chat.
 - I cannot write atomic notes back to the vault. If something durable comes up, ask
-  Dan to capture it manually after this session: "This is worth saving — when you're
+  Sam to capture it manually after this session: "This is worth saving — when you're
   back at your laptop, run /caldwell again and tell me to remember [X]."
 - I cannot append to the journal. End-of-session summaries are display-only here.
 
 ## Behavior
 
 Otherwise, behave as Caldwell. All persona rules apply. Bottom line first. Calm posture.
-Never leave Dan stuck without a path forward.
+Never leave Sam stuck without a path forward.
 ```
 
 ### Refresh cadence for ChatGPT-web
@@ -321,9 +321,9 @@ Never leave Dan stuck without a path forward.
 Re-upload the bundle when:
 - Persona files change in the vault
 - Recent atomic notes have shifted significantly
-- Dan notices the agent referencing stale info
+- Sam notices the agent referencing stale info
 
-Practical cadence: **weekly** if Dan uses ChatGPT-web Caldwell regularly; **on-demand** if it's a fallback.
+Practical cadence: **weekly** if Sam uses ChatGPT-web Caldwell regularly; **on-demand** if it's a fallback.
 
 ### A small Python helper for bundle generation
 
@@ -421,7 +421,7 @@ right concept (max_tokens, completion_max_tokens, etc.).
 The whole point: **one Atomic Agent, multiple deployment targets.**
 
 ```
-~/docs/agents/caldwell/        ← single source of truth (vault)
+~/agents/caldwell/        ← single source of truth (vault)
         │
         ├──→ Cron Python script  → reads vault directly, calls Anthropic or OpenAI API
         ├──→ Claude Code skill    → ~/.claude/skills/caldwell/SKILL.md, reads vault
@@ -443,12 +443,12 @@ For Caldwell / Harper / Paul / Muse:
 | Deployment | Build it? | Why |
 |---|---|---|
 | **Cron Python (Anthropic)** | YES | Autonomous scheduled work. The primary autonomous path. |
-| **Claude Code skill** | YES | Dan's primary interactive surface — `/caldwell` from his Mac. |
-| **Codex CLI skill** | OPTIONAL | If Dan wants OpenAI-side interactive parity, or to A/B test models. |
-| **ChatGPT web skill** | NO (yet) | Limited utility without MCP-to-gizmo bridge. Revisit when MCP bridge is built. |
+| **Claude Code skill** | YES | Sam's primary interactive surface — `/caldwell` from his Mac. |
+| **Codex CLI skill** | OPTIONAL | If Sam wants OpenAI-side interactive parity, or to A/B test models. |
+| **ChatGPT web skill** | NO (yet) | Limited utility without MCP-to-your-server bridge. Revisit when MCP bridge is built. |
 | **OpenAI API skill** | OPTIONAL | If a specific automation cost-benefits from GPT pricing. |
 
-Default: cron + Claude Code skill. The Codex CLI deployment is one extra file (the SKILL.md) and gives Dan optionality. ChatGPT-web is on the "later, when MCP bridge exists" pile.
+Default: cron + Claude Code skill. The Codex CLI deployment is one extra file (the SKILL.md) and gives Sam optionality. ChatGPT-web is on the "later, when MCP bridge exists" pile.
 
 ---
 
@@ -456,9 +456,9 @@ Default: cron + Claude Code skill. The Codex CLI deployment is one extra file (t
 
 Two triggers:
 
-1. **MCP-to-gizmo bridge is built.** This is a small Python server exposing vault read access via MCP. Once it exists, ChatGPT-web with a Connector can read live vault content, and ChatGPT-web becomes a real Atomic Agents surface.
+1. **MCP-to-your-server bridge is built.** This is a small Python server exposing vault read access via MCP. Once it exists, ChatGPT-web with a Connector can read live vault content, and ChatGPT-web becomes a real Atomic Agents surface.
 
-2. **Dan finds himself wanting Caldwell on his phone away from his laptop.** ChatGPT mobile app + a stripped-down Caldwell skill (snapshot bundle, weekly refresh) is workable for casual chat. Real captures wait until he's back at the laptop.
+2. **Sam finds himself wanting Caldwell on his phone away from his laptop.** ChatGPT mobile app + a stripped-down Caldwell skill (snapshot bundle, weekly refresh) is workable for casual chat. Real captures wait until he's back at the laptop.
 
 Either trigger justifies revisiting. Until one fires, focus on Claude Code + cron + (optionally) Codex CLI.
 
@@ -470,10 +470,10 @@ Two-line install once the SKILL.md is written:
 
 ```bash
 mkdir -p ~/.codex/skills/caldwell
-cp /Users/dep0we/ObsidianVault/Atomic\ Agents/samples/caldwell/skills/codex_SKILL.md ~/.codex/skills/caldwell/SKILL.md
+cp /Users/user/ObsidianVault/Atomic\ Agents/samples/caldwell/skills/codex_SKILL.md ~/.codex/skills/caldwell/SKILL.md
 ```
 
-(That sample SKILL.md doesn't exist yet — it would live alongside the existing samples/caldwell/ folder if Dan wants to use it. The Claude version of the SKILL.md is the same content with minor tool-name tweaks; the helper can generate either from one source.)
+(That sample SKILL.md doesn't exist yet — it would live alongside the existing samples/caldwell/ folder if Sam wants to use it. The Claude version of the SKILL.md is the same content with minor tool-name tweaks; the helper can generate either from one source.)
 
 ---
 

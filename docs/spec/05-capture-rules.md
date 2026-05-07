@@ -69,19 +69,19 @@ Steps 4-6 are atomic — an orphan memory file (no INDEX entry) is a bug. The ag
 
 ### Capturing factual claims (cite the source)
 
-When a memory captures a factual claim about Dan's data or external sources, the capture **must cite the source file**. Per [13-research-integrity](13-research-integrity.md), this is the floor for capture quality on facts.
+When a memory captures a factual claim about Sam's data or external sources, the capture **must cite the source file**. Per [13-research-integrity](13-research-integrity.md), this is the floor for capture quality on facts.
 
 In the `body` of the captured note, include the citation inline:
 
 ```markdown
-Dan's highest-rate credit card APR is 24.99% as of 2026-05-04 [per ~/docs/finance/balance_sheet.md].
+Sam's highest-rate credit card APR is 24.99% as of 2026-05-04 [per ~/agents/finance/balance_sheet.md].
 ```
 
 In the `sources` frontmatter field, include the file path AND the conversation reference:
 
 ```yaml
 sources:
-  - ~/docs/finance/balance_sheet.md
+  - ~/agents/finance/balance_sheet.md
   - conversation_2026-05-08
 ```
 
@@ -99,7 +99,7 @@ Captures that include factual claims without source citations should be rejected
 **`feedback`** — lead with the rule, then `**Why:**`, then `**How to apply:**`
 
 ```markdown
-Dan prefers the bottom line before supporting math.
+Sam prefers the bottom line before supporting math.
 
 **Why:** He's pattern-matched on consultants who bury the lede. Specific enough that
 a one-paragraph executive summary up front is ALWAYS expected.
@@ -115,39 +115,39 @@ working. Math, charts, comparisons go below the fold.
 
 **Considered:** Snowball (psychology), mortgage prepay (math says equal-ish at current rates).
 
-**Won because:** Dan's specific anxiety pattern weights "balance reaching zero" heavily.
-Mortgage prepay only wins by basis points and Dan accepts that tradeoff.
+**Won because:** Sam's specific anxiety pattern weights "balance reaching zero" heavily.
+Mortgage prepay only wins by basis points and Sam accepts that tradeoff.
 
-**Confirmed by:** Dan, in conversation 2026-04-15.
+**Confirmed by:** Sam, in conversation 2026-04-15.
 ```
 
-**`user`** — concise factual content about Dan
+**`user`** — concise factual content about Sam
 
 ```markdown
-Dan's risk tolerance is moderate, debt-averse. He has explicitly said "I do not want to
+Sam's risk tolerance is moderate, debt-averse. He has explicitly said "I do not want to
 optimize for gains; I want to extinguish liabilities." Reference frame: 2026 financial reset.
 ```
 
 **`project`** — current state, who's doing what, when, blockers
 
 ```markdown
-**April's consulting launch** — status: planning phase, no clients yet.
+**Maya's consulting launch** — status: planning phase, no clients yet.
 
-**Goal:** Add $X/mo gross revenue from April's side hustle by Q3 2026.
+**Goal:** Add $X/mo gross revenue from Maya's side hustle by Q3 2026.
 
 **Blockers:** No website yet, pricing undecided, target client profile not locked.
 
-**Last update:** 2026-05-01 — Dan and April had alignment conversation, decided to pursue
+**Last update:** 2026-05-01 — Sam and Maya had alignment conversation, decided to pursue
 B2B service offerings rather than e-commerce.
 ```
 
 **`reference`** — pointer + when to use it
 
 ```markdown
-**Financial vault:** ~/docs/finance/ on gizmo
+**Financial vault:** ~/agents/finance/ on your-server
 
 Contains current balance sheets, income statements, all account snapshots. Updated weekly
-by Dan. Reference this BEFORE recommending any specific dollar amount or strategy —
+by Sam. Reference this BEFORE recommending any specific dollar amount or strategy —
 recommendations should be grounded in current numbers, not assumed.
 ```
 
@@ -162,14 +162,14 @@ Some atomic notes mature. They get confirmed enough times, applied across enough
 A memory is **promotion-eligible** when ANY of:
 
 1. **Reference count**: referenced in 5+ sessions over 30+ days without contradiction
-2. **Confirmation count**: confirmed at 3+ distinct moments by Dan
+2. **Confirmation count**: confirmed at 3+ distinct moments by Sam
 3. **Foundational nature**: type=decision with confidence=high and impact spans multiple agent functions
 4. **User declares**: "this should always be in mind" or equivalent
 
 ### Promotion process
 
 1. **Agent flags the candidate** at end-of-session: "this memory is promotion-eligible — recommend moving to persona/USER.md section X"
-2. **Dan reviews** the proposed promotion. May edit the wording.
+2. **Sam reviews** the proposed promotion. May edit the wording.
 3. **Promote** — the content moves into the appropriate persona file (IDENTITY / SOUL / USER) under the right section
 4. **Mark original** — set `superseded_by: persona/USER.md#section_anchor` on the source atomic note. Don't delete; the supersession chain is the audit trail.
 5. **Update INDEX** — add an entry under `## Recently Promoted to Persona` for visibility
@@ -178,7 +178,7 @@ A memory is **promotion-eligible** when ANY of:
 
 | Source memory type | Promotes to |
 |---|---|
-| `user` (about Dan) | `USER.md` |
+| `user` (about Sam) | `USER.md` |
 | `feedback` (how to behave) | `SOUL.md` (if about voice/posture) or `IDENTITY.md` (if about doctrine) |
 | `decision` (locked choice with broad scope) | `IDENTITY.md` operating doctrine section |
 | `reference` (foundational tool/system) | Usually NOT promoted — references stay as references |
@@ -186,7 +186,7 @@ A memory is **promotion-eligible** when ANY of:
 
 ### Don't auto-promote
 
-Promotion is high-stakes. Auto-promoting without review risks corrupting the persona files. The agent flags candidates; Dan approves. Keep the trust gradient.
+Promotion is high-stakes. Auto-promoting without review risks corrupting the persona files. The agent flags candidates; Sam approves. Keep the trust gradient.
 
 ---
 
@@ -196,7 +196,7 @@ The reverse loop: persona content that no longer holds gets demoted, and atomic 
 
 ### Demotion (rare)
 
-If an IDENTITY/SOUL/USER section becomes wrong (e.g., Dan's role changes, scope shifts):
+If an IDENTITY/SOUL/USER section becomes wrong (e.g., Sam's role changes, scope shifts):
 
 1. **Don't delete** — move the section into a `feedback` atomic note with `superseded_by` pointing at the new content
 2. **Edit the persona file** with the new truth
@@ -236,7 +236,7 @@ Run periodically (daily for active agents, weekly otherwise) to surface memory q
 
 ### Lint outputs
 
-A markdown report at `~/docs/agents/{name}/log/lint_YYYY-MM-DD.md`:
+A markdown report at `~/agents/{name}/log/lint_YYYY-MM-DD.md`:
 
 ```markdown
 # Lint report — Caldwell — 2026-05-06
@@ -251,7 +251,7 @@ A markdown report at `~/docs/agents/{name}/log/lint_YYYY-MM-DD.md`:
   - Resolve: which is current?
 
 ## Stale (4)
-- project_april_consulting_launch.md (last_seen 2026-02-10, 86 days)
+- project_maya_consulting_launch.md (last_seen 2026-02-10, 86 days)
 - ...
 
 ## Schema drift (0)
@@ -259,7 +259,7 @@ A markdown report at `~/docs/agents/{name}/log/lint_YYYY-MM-DD.md`:
 ## Orphans (0)
 ```
 
-Dan reviews. Fixes by editing files (or asking the agent to fix specific items). Lint is a *signal*, not an automatic action.
+Sam reviews. Fixes by editing files (or asking the agent to fix specific items). Lint is a *signal*, not an automatic action.
 
 ---
 
@@ -274,7 +274,7 @@ When two memories disagree:
 - Both files persist. The chain is the history.
 - Loader respects `superseded_by` and skips outdated entries by default.
 
-### Surface to Dan when
+### Surface to Sam when
 
 - Older has `confidence: high` AND newer has `confidence: low` (suspicious)
 - Newer's source is `observation` only, older's source is direct user statement
@@ -349,12 +349,12 @@ For runtimes that don't support tool calls (some streaming flows, ad-hoc API int
 {
   "type": "feedback",
   "name": "Bottom-line-first communication preference",
-  "description": "Dan wants the recommendation before the supporting math",
+  "description": "Sam wants the recommendation before the supporting math",
   "confidence": "high",
   "sources": ["conversation_2026-05-06"],
   "supersedes": null,
   "merge_into": null,
-  "body": "Dan prefers the bottom line before supporting math.\n\n**Why:** Pattern-matched on consultants who bury the lede.\n\n**How to apply:** Open every analysis with 1-3 sentences of 'what to do' before working."
+  "body": "Sam prefers the bottom line before supporting math.\n\n**Why:** Pattern-matched on consultants who bury the lede.\n\n**How to apply:** Open every analysis with 1-3 sentences of 'what to do' before working."
 }
 ```
 ````
@@ -382,7 +382,7 @@ If the model legitimately needs to put triple backticks inside the JSON body str
 `````markdown
 ````atomic_capture
 {
-  "body": "Dan asked me to remember this code pattern:\n\n```python\nlambda x: x.lower()\n```\n\nIt's the avalanche-classifier pattern from the work session."
+  "body": "Sam asked me to remember this code pattern:\n\n```python\nlambda x: x.lower()\n```\n\nIt's the avalanche-classifier pattern from the work session."
 }
 ````
 `````

@@ -298,7 +298,7 @@ Hard fails:  0
 Total cost:  $1.24 (agent $0.91 + judge $0.33)
 Duration:    47s
 
-Results saved: ~/docs/agents/caldwell/evals/runs/2026-05-06.jsonl
+Results saved: ~/agents/caldwell/evals/runs/2026-05-06.jsonl
 ```
 
 ---
@@ -334,7 +334,7 @@ When user types `/eval`:
 python -m atomic_agents.eval $AGENT $SCOPE_FLAGS --summary-only
 ```
 
-5. After completion, read `~/docs/agents/$AGENT/evals/runs/$(date +%Y-%m-%d).jsonl`
+5. After completion, read `~/agents/$AGENT/evals/runs/$(date +%Y-%m-%d).jsonl`
    and present the structured results
 
 ## What to surface

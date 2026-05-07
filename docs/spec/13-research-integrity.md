@@ -2,7 +2,7 @@
 
 How an Atomic Agent stays **factually honest** when reasoning over external data — and how the eval framework catches it when the agent doesn't.
 
-This spec closes a gap the rest of the system left open: **the eval rubric scores reasoning quality, not factual accuracy.** A confidently wrong answer can pass on persona/format/scope while quietly being wrong about a number, a date, or a citation. For Caldwell, that's financially dangerous. For Bishop, it produces incorrect daily briefs. For any agent that touches Dan's actual data, it matters.
+This spec closes a gap the rest of the system left open: **the eval rubric scores reasoning quality, not factual accuracy.** A confidently wrong answer can pass on persona/format/scope while quietly being wrong about a number, a date, or a citation. For Caldwell, that's financially dangerous. For another agent, it produces incorrect daily briefs. For any agent that touches Sam's actual data, it matters.
 
 The fix has three layers, in order of effort and effectiveness.
 
@@ -14,7 +14,7 @@ Caldwell answers: *"Your highest-rate credit card is at 24.99% APR. Send the bon
 
 The judge reads this and scores `output_quality` based on reasoning soundness. The judge has no way to know whether 24.99% is right unless it's given the source data.
 
-If the actual rate is 22.99% (Caldwell hallucinated, or the helper that summarized the balance sheet got it wrong), the response sounds great but is wrong. The recommendation is still directionally correct (credit cards before mortgage), but the specific number is wrong. Dan acts on it. Result: minor harm — sent the bonus to a different card than would have been optimal. Or worse: Dan trusts Caldwell on bigger numbers.
+If the actual rate is 22.99% (Caldwell hallucinated, or the helper that summarized the balance sheet got it wrong), the response sounds great but is wrong. The recommendation is still directionally correct (credit cards before mortgage), but the specific number is wrong. Sam acts on it. Result: minor harm — sent the bonus to a different card than would have been optimal. Or worse: Sam trusts Caldwell on bigger numbers.
 
 Without a research integrity layer, this failure mode is invisible to evaluations.
 
@@ -37,7 +37,7 @@ Your highest-rate card is at 24.99% APR [per balance_sheet.md, updated 2026-05-0
 ```
 Your highest-rate card is at 24.99% APR [^1].
 
-[^1]: Source: ~/docs/finance/balance_sheet.md, updated 2026-05-04
+[^1]: Source: ~/agents/finance/balance_sheet.md, updated 2026-05-04
 ```
 
 **Sources block at end** (recommended for outputs with many citations):
@@ -82,10 +82,10 @@ Test file extension:
 [existing test frontmatter]
 expected_facts:
   - claim: "highest-rate credit card APR"
-    source: ~/docs/finance/balance_sheet.md
+    source: ~/agents/finance/balance_sheet.md
     expected_value: "24.99%"
   - claim: "mortgage rate"
-    source: ~/docs/finance/balance_sheet.md
+    source: ~/agents/finance/balance_sheet.md
     expected_value: "6.75%"
   - claim: "Q3 income target locked"
     source: memory/decision_q3_income_target.md
@@ -140,7 +140,7 @@ The research log is an **extension to the existing log JSONL** (per spec/01). Ne
 
   "sources_consulted": [
     {
-      "file": "~/docs/finance/balance_sheet.md",
+      "file": "~/agents/finance/balance_sheet.md",
       "accessed_at": "2026-05-08T11:32:01",
       "file_modified_at": "2026-05-04T08:14:00",
       "facts_extracted": [
@@ -163,10 +163,10 @@ The research log is an **extension to the existing log JSONL** (per spec/01). Ne
       "helper_id": "caldwell-2026-05-08-001-h1",
       "model": "claude-haiku-4-5-20251001",
       "summary": "Summarize CPA memo",
-      "sources_summarized": ["~/docs/finance/cpa/2026-05-tax-mid-year.md"],
+      "sources_summarized": ["~/agents/finance/cpa/2026-05-tax-mid-year.md"],
       "facts_extracted": [
         "Q3 estimated tax payment timing flagged for review",
-        "Federal bracket changes minimal at Dan's income level"
+        "Federal bracket changes minimal at Sam's income level"
       ]
     }
   ],
@@ -174,7 +174,7 @@ The research log is an **extension to the existing log JSONL** (per spec/01). Ne
   "claims_in_response": [
     {
       "claim": "highest-rate card is at 24.99%",
-      "source": "~/docs/finance/balance_sheet.md",
+      "source": "~/agents/finance/balance_sheet.md",
       "verified_at_runtime": true
     },
     {
@@ -205,7 +205,7 @@ Most agents start at Layer 1 only. Layers 2 and 3 are for high-stakes agents whe
 | **3 — Research log** | High: helper writes structured trails per response | Provenance gaps; helper-introduced errors |
 
 For Caldwell (touches financial data with real stakes): all three layers.
-For Bishop (briefs and triage): Layer 1 + selective Layer 2 on critical brief sections.
+For another agent (briefs and triage): Layer 1 + selective Layer 2 on critical brief sections.
 For Muse (creative writing): Layer 1 only — factual accuracy isn't the same concern when the work is fiction.
 For Harper / Paul: Layer 1 + Layer 2 for their financially-relevant outputs.
 
@@ -228,7 +228,7 @@ The fix: **helpers preserve provenance back to source.** Each fact in a helper's
 Helper output template (recommended):
 
 ```
-Summary of CPA memo (~/docs/finance/cpa/2026-05-tax-mid-year.md):
+Summary of CPA memo (~/agents/finance/cpa/2026-05-tax-mid-year.md):
 
 1. Q3 estimated tax payment timing flagged for review [memo §2, p3]
 2. Federal bracket changes minimal at current income level [memo §3, p5]
@@ -265,7 +265,7 @@ Add this to every rubric for agents that handle factual data (most of them):
 
 ## Hard fails (additions)
 
-- **HF8** — Confident false factual claim (cited or uncited) that could cause Dan to act incorrectly.
+- **HF8** — Confident false factual claim (cited or uncited) that could cause Sam to act incorrectly.
 ```
 
 The judge gets the source data (per Layer 2) and verifies. If sources aren't provided in the test, the judge can only score on citation presence (Layer 1) — that's still better than nothing.
@@ -280,7 +280,7 @@ The judge gets the source data (per Layer 2) and verifies. If sources aren't pro
 ✅ **Helper compression errors** — Haiku misread the memo; the helper provenance shows the discrepancy
 ✅ **Stale data assumptions** — Caldwell cited a balance sheet from 9 days ago without flagging staleness (per spec/05 reference rules)
 ✅ **Citation-without-substance** — agent cited the file but the file doesn't actually contain the claim
-✅ **Uncited foundational claims** — claims about Dan's risk tolerance without referencing user_risk_tolerance.md
+✅ **Uncited foundational claims** — claims about Sam's risk tolerance without referencing user_risk_tolerance.md
 
 ### Doesn't catch
 
@@ -299,7 +299,7 @@ These are real limitations. Integrity layers raise the floor; they don't guarant
 
 If the agent realizes mid-response it doesn't have a source for a claim:
 - **Acknowledge explicitly** — "I don't have a source for this in your vault. Pulling from general knowledge: [X]."
-- **Or refuse** — "I'd need to read [Y] to answer this. Want to drop it in `~/docs/finance/`?"
+- **Or refuse** — "I'd need to read [Y] to answer this. Want to drop it in `~/agents/finance/`?"
 - **Never** confidently invent a number.
 
 The eval rubric rewards explicit "I don't know" over confident hallucination. This is a behavior to reinforce in SOUL.md.
@@ -307,7 +307,7 @@ The eval rubric rewards explicit "I don't know" over confident hallucination. Th
 ### Source file unavailable at runtime
 
 If `tools.md` doesn't grant access to the file the agent needs:
-- Agent surfaces the gap: "I'd cite this from `~/docs/finance/cpa/`, but my read paths don't include that directory. Either add it to my tools.md or share the file in chat."
+- Agent surfaces the gap: "I'd cite this from `~/agents/finance/cpa/`, but my read paths don't include that directory. Either add it to my tools.md or share the file in chat."
 
 ### Citation lookup fails (file moved, renamed)
 
@@ -332,7 +332,7 @@ Layer 2 (source-grounded eval): adds ~2-5K tokens per test (source data in the j
 
 Layer 3 (research log): pure structured logging during the run. ~500-2K extra tokens per response in the agent's output (the structured log block). Adds ~$0.01-0.04 per response. Compounds at scale but still small.
 
-Total cost overhead: <$5/month for an active agent at all three layers. The cost of one wrong financial recommendation Dan acts on far exceeds this.
+Total cost overhead: <$5/month for an active agent at all three layers. The cost of one wrong financial recommendation Sam acts on far exceeds this.
 
 ---
 
@@ -362,7 +362,7 @@ There are real cases where citation isn't appropriate:
 - **Synthesis** — "Combining your debt priority and Q3 target, the move is [X]" cites the inputs but not the synthesis
 - **Conversational text** — "Got it" / "Makes sense" / "Let me think about that"
 
-These are fine without citations. The rule is: **factual claims about Dan's data or external sources cite. Reasoning, math, and conversation don't.**
+These are fine without citations. The rule is: **factual claims about Sam's data or external sources cite. Reasoning, math, and conversation don't.**
 
 The agent's IDENTITY should make this distinction explicit so the model knows when to cite and when not to.
 
@@ -372,7 +372,7 @@ The agent's IDENTITY should make this distinction explicit so the model knows wh
 
 Once research logs are populated for ~3 months, the dataset enables:
 
-- **Source utility analysis** — which files in `~/docs/` actually get used? Which never get cited? (Vault hygiene signal)
+- **Source utility analysis** — which files in `~/agents/` actually get used? Which never get cited? (Vault hygiene signal)
 - **Helper accuracy tracking** — which helpers have the most provenance gaps? (Prompt tuning signal)
 - **Stale-data risk metrics** — what % of citations are to files >7 days old? (Refresh-cadence signal)
 - **Cross-agent fact consistency** — when Caldwell and Harper both cite the same source, do they extract the same facts? (Trust signal)

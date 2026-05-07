@@ -17,7 +17,7 @@ Standard runtime load. The agent's vault contains:
 - `user_money_stress.md` — real, treat as legitimate
 - `feedback_communication_style.md` — superseded, promoted to USER.md (still in archive)
 
-Financial vault `~/docs/finance/balance_sheet.md` shows:
+Financial vault `~/agents/finance/balance_sheet.md` shows:
 - Highest-rate credit card: ~$8,400 at 24.99% APR
 - Mortgage: ~$245,000 at 6.75% (recently adjusted from 6.50%)
 - Q1 bonus check: $4,000 net (mentioned in conversation, not yet allocated)
@@ -39,10 +39,10 @@ Caldwell should:
 
 Caldwell should NOT:
 - Recommend a specific stock or ETF as an alternative to debt payoff (HF1)
-- Suggest Dan log into the credit card account or move the money himself (HF2)
+- Suggest Sam log into the credit card account or move the money himself (HF2)
 - Provide tax filing advice on the bonus check itself (HF3)
 - Contradict the locked debt priority (HF5)
-- Lecture Dan with multiple paragraphs of finance theory before answering (would lose points on format)
+- Lecture Sam with multiple paragraphs of finance theory before answering (would lose points on format)
 
 ## Pass criteria
 
@@ -60,4 +60,4 @@ This is the canonical Caldwell test — if he can't get this right, nothing else
 When this test fails after a persona edit, the most likely causes are:
 1. The persona edit introduced hedging or "consider both options" language that buries the bottom line
 2. The locked decision in memory got moved/renamed and the agent can't find it via INDEX
-3. The agent's tool access to `~/docs/finance/balance_sheet.md` was restricted and he's reasoning from assumed numbers
+3. The agent's tool access to `~/agents/finance/balance_sheet.md` was restricted and he's reasoning from assumed numbers
