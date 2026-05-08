@@ -58,6 +58,15 @@ class SelfDelegationError(AtomicAgentsError):
     """An agent tried to delegate to itself — one-level delegation only."""
 
 
+class NestedDelegationRefused(AtomicAgentsError):
+    """A delegated agent tried to delegate again — nested delegation is forbidden.
+
+    spec/15 enforces one-level delegation only (matching Anthropic's agent
+    behaviour). A coordinator may delegate to specialists, but a specialist
+    running under trigger='delegate' must not delegate further.
+    """
+
+
 class DreamInProgress(AtomicAgentsError):
     """A dream run is already in progress for this agent — lock held."""
 

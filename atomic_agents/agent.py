@@ -15,12 +15,15 @@ Usage:
 from __future__ import annotations
 import concurrent.futures
 import json
+import logging
 import re
 import time
 from dataclasses import asdict
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
+
+_logger = logging.getLogger(__name__)
 
 import frontmatter
 
@@ -35,6 +38,7 @@ from .exceptions import (
     AtomicAgentsError,
     CostGuardrailBlocked,
     HelperBatchPartialFailure,
+    NestedDelegationRefused,
     NotInRoster,
     SelfDelegationError,
     ToolNotRegistered,
@@ -122,6 +126,12 @@ class AtomicAgent:
         # appended to by delegate(). Embedded in the parent's run log record
         # as `delegations: [...]` when non-empty.
         self._delegations_this_run: list[dict] = []
+
+        # Cumulative cost of all delegate() calls made during the current run.
+        # Reset at the start of each call(). Passed as extra_in_flight_cost_usd
+        # to _check_cost_guardrails before each delegation so sequential
+        # delegations correctly see prior delegated spend. (fix R2-A2)
+        self._delegated_cost_this_run: float = 0.0
 
         # Loaded later via load() — populated in __init__ for clarity
         self._persona_text: str = ""
@@ -519,11 +529,16 @@ class AtomicAgent:
         max_tokens: int | None = None,
         temperature: float | None = None,
         write_captures: bool = True,
+        parent_remaining_headroom_usd: float | None = None,
     ) -> Response:
         """Make the LLM call. Returns a Response with captures populated.
 
         critical=True bypasses cost guardrails (still logged with critical: true).
         write_captures=False extracts but doesn't persist captures (dry-run mode).
+
+        parent_remaining_headroom_usd: when set (by a coordinator's delegate()),
+        this call's own cap is clamped to min(own remaining, parent headroom).
+        This enforces the coordinator's cap as a true tree-cap (spec/15).
 
         When self.tool_registry has registered tools, call() runs a multi-turn
         loop (up to self.max_tool_iterations iterations):
@@ -562,8 +577,13 @@ class AtomicAgent:
             self._helpers_this_run = []
             # Reset delegation rollup for this run
             self._delegations_this_run = []
+            # Reset cumulative delegated cost for this run (fix R2-A2)
+            self._delegated_cost_this_run = 0.0
             # Cost guardrails check
-            check = self._check_cost_guardrails(critical=critical)
+            check = self._check_cost_guardrails(
+                critical=critical,
+                parent_remaining_headroom_usd=parent_remaining_headroom_usd,
+            )
             if not check.allow:
                 self._log({
                     "trigger": self.trigger,
@@ -602,15 +622,26 @@ class AtomicAgent:
             tool_iterations_maxed = False
             iteration_count = 0
             last_raw = None
+            # In-flight cost accumulator — tracks spend from current loop iterations
+            # that hasn't landed in the persisted log yet. Passed to
+            # _check_cost_guardrails so mid-loop cap checks see the true running
+            # total, not just the pre-call on-disk snapshot. (fix R2-A1)
+            accumulated_loop_cost_usd: float = 0.0
 
             # ── Multi-turn tool loop ──────────────────────────────
             start_total = time.time()
             while True:
                 iteration_count += 1
 
-                # Pre-check cost cap before each iteration (except first, already checked)
+                # Pre-check cost cap before each iteration (except first, already checked).
+                # Pass the in-flight accumulator so the guardrail sees spend that
+                # has not yet been persisted to the log file. (fix R2-A1)
                 if iteration_count > 1:
-                    iter_check = self._check_cost_guardrails(critical=critical)
+                    iter_check = self._check_cost_guardrails(
+                        critical=critical,
+                        extra_in_flight_cost_usd=accumulated_loop_cost_usd,
+                        parent_remaining_headroom_usd=parent_remaining_headroom_usd,
+                    )
                     if not iter_check.allow:
                         # Cap hit mid-loop — return what we have with skipped=True
                         latency_ms = int((time.time() - start_total) * 1000)
@@ -667,6 +698,9 @@ class AtomicAgent:
                 total_cache_hit_tokens += raw.cache_hit_tokens
                 total_cache_miss_tokens += raw.cache_miss_tokens
                 total_cost += iter_cost
+                # Track in-flight spend so mid-loop cap checks see the running
+                # total before the parent log line is written. (fix R2-A1)
+                accumulated_loop_cost_usd += iter_cost
                 if iter_cost_fallback:
                     cost_fallback = True
 
@@ -1165,19 +1199,63 @@ class AtomicAgent:
         Raises:
             NotInRoster: target_agent_name is not in self.config.roster.
             SelfDelegationError: target_agent_name == self.name (one-level only).
+            NestedDelegationRefused: self.trigger == 'delegate' (nested delegation
+                forbidden — spec/15 enforces one-level only).
             CostGuardrailBlocked: parent's cost cap is hit and critical=False.
         """
+        # Nested delegation guard — spec/15 one-level limit. (fix R2-A3)
+        if self.trigger == "delegate":
+            raise NestedDelegationRefused(
+                f"agent '{self.name}' is already running as a delegated agent "
+                f"(trigger='delegate') and cannot delegate further — "
+                f"nested delegation refused per spec/15 (one-level only)"
+            )
+
         self._enforce_roster_membership(target_agent_name)
         if target_agent_name == self.name:
             raise SelfDelegationError(
                 f"agent '{self.name}' cannot delegate to itself — one-level delegation only"
             )
 
-        check = self._check_cost_guardrails(critical=critical)
+        # Pass prior delegated cost as extra_in_flight so the guardrail sees
+        # tree-spend that landed in the target's log dir, not the coordinator's.
+        # (fix R2-A2)
+        check = self._check_cost_guardrails(
+            critical=critical,
+            extra_in_flight_cost_usd=self._delegated_cost_this_run,
+        )
         if not check.allow:
             raise CostGuardrailBlocked(
                 f"Delegation to '{target_agent_name}' blocked: {check.reason}"
             )
+
+        # Compute coordinator's remaining headroom to pass to the delegate.
+        # This enforces the coordinator cap as a true tree-cap. (fix R2-A2)
+        # Include already-delegated spend so the headroom accounts for it.
+        remaining_headroom: float | None = None
+        if self.config.cost_guardrails_enabled and not critical:
+            log_dir = self.agent_root / "log"
+            today_cost = (
+                _costs.sum_cost_for_period(log_dir, "today")
+                + self._delegated_cost_this_run
+            )
+            month_cost = (
+                _costs.sum_cost_for_period(log_dir, "this_month")
+                + self._delegated_cost_this_run
+            )
+            daily_remaining = (
+                self.config.daily_cap_usd - today_cost
+                if self.config.daily_cap_usd > 0
+                else float("inf")
+            )
+            monthly_remaining = (
+                self.config.monthly_cap_usd - month_cost
+                if self.config.monthly_cap_usd > 0
+                else float("inf")
+            )
+            headroom = min(daily_remaining, monthly_remaining)
+            if headroom < float("inf"):
+                remaining_headroom = headroom
 
         target_path = self._resolve_delegated_agent_path(target_agent_name)
         # Build the target agent; it inherits no state from the coordinator
@@ -1194,8 +1272,13 @@ class AtomicAgent:
             max_tokens=max_tokens,
             temperature=temperature if temperature is not None else None,
             critical=critical,
+            parent_remaining_headroom_usd=remaining_headroom,
         )
         latency_ms = int((time.time() - start) * 1000)
+
+        # Add delegated cost to coordinator's accumulator so subsequent
+        # delegate() calls see the true tree-spend. (fix R2-A2)
+        self._delegated_cost_this_run += response.cost_usd
 
         # Log the delegation in the COORDINATOR's log
         log_record: dict = {
@@ -1260,6 +1343,14 @@ class AtomicAgent:
             NotInRoster / SelfDelegationError: any call fails roster check.
             CostGuardrailBlocked: batch reservation exceeds headroom.
         """
+        # Nested delegation guard — spec/15 one-level limit. (fix R2-A3)
+        if self.trigger == "delegate":
+            raise NestedDelegationRefused(
+                f"agent '{self.name}' is already running as a delegated agent "
+                f"(trigger='delegate') and cannot delegate further — "
+                f"nested delegation refused per spec/15 (one-level only)"
+            )
+
         if max_concurrent < 1 or max_concurrent > 25:
             raise ValueError(
                 f"max_concurrent must be between 1 and 25 inclusive; got {max_concurrent}"
@@ -1462,8 +1553,23 @@ class AtomicAgent:
     # ────────────────────────────────────────────────────────────
     # Cost guardrails
 
-    def _check_cost_guardrails(self, critical: bool = False) -> CostCheckResult:
-        """Run before each LLM call. Returns CostCheckResult."""
+    def _check_cost_guardrails(
+        self,
+        critical: bool = False,
+        extra_in_flight_cost_usd: float = 0.0,
+        parent_remaining_headroom_usd: float | None = None,
+    ) -> CostCheckResult:
+        """Run before each LLM call. Returns CostCheckResult.
+
+        extra_in_flight_cost_usd: accumulated spend from the current tool loop
+            that has not yet been persisted to the log file. Added to the
+            disk-read total before cap comparison so mid-loop iterations see
+            the true running spend. (fix R2-A1)
+
+        parent_remaining_headroom_usd: when set by a delegating coordinator,
+            this call's effective cap is clamped to min(own remaining, parent
+            headroom), enforcing the coordinator's cap as a tree-cap. (fix R2-A2)
+        """
         if not self.config.cost_guardrails_enabled:
             return CostCheckResult(allow=True)
 
@@ -1471,8 +1577,8 @@ class AtomicAgent:
             return CostCheckResult(allow=True, reason="critical_override")
 
         log_dir = self.agent_root / "log"
-        today_cost = _costs.sum_cost_for_period(log_dir, "today")
-        month_cost = _costs.sum_cost_for_period(log_dir, "this_month")
+        today_cost = _costs.sum_cost_for_period(log_dir, "today") + extra_in_flight_cost_usd
+        month_cost = _costs.sum_cost_for_period(log_dir, "this_month") + extra_in_flight_cost_usd
 
         daily_pct = (today_cost / self.config.daily_cap_usd) if self.config.daily_cap_usd > 0 else 0
         monthly_pct = (month_cost / self.config.monthly_cap_usd) if self.config.monthly_cap_usd > 0 else 0
@@ -1491,6 +1597,31 @@ class AtomicAgent:
                 self.config.monthly_cap_action,
                 f"monthly cap hit (${month_cost:.2f}/${self.config.monthly_cap_usd:.2f})",
             )
+
+        # Parent headroom check: coordinator's remaining budget caps the delegate.
+        # (fix R2-A2) — clamp to min(own remaining, parent headroom)
+        if parent_remaining_headroom_usd is not None:
+            daily_remaining = (
+                self.config.daily_cap_usd - today_cost
+                if self.config.daily_cap_usd > 0
+                else float("inf")
+            )
+            monthly_remaining = (
+                self.config.monthly_cap_usd - month_cost
+                if self.config.monthly_cap_usd > 0
+                else float("inf")
+            )
+            own_remaining = min(daily_remaining, monthly_remaining)
+            effective_remaining = min(own_remaining, parent_remaining_headroom_usd)
+            if effective_remaining <= 0:
+                return CostCheckResult(
+                    allow=False,
+                    action="skip",
+                    reason=(
+                        f"parent coordinator headroom exhausted "
+                        f"(${parent_remaining_headroom_usd:.6f} remaining)"
+                    ),
+                )
 
         return CostCheckResult(allow=True)
 
