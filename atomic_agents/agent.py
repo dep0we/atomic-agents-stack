@@ -29,6 +29,7 @@ import frontmatter
 
 from . import _capture, _cascade, _costs, _llm, _model, _roster, _tools
 from ._io import atomic_append_jsonl, atomic_write, safe_resolve_under
+from .mcp import MCPClientPool, parse_mcp_md
 from ._locks import AgentLock
 from ._platform import get_agents_root
 from ._schema import validate_atomic_note_frontmatter
@@ -133,6 +134,11 @@ class AtomicAgent:
         # to _check_cost_guardrails before each delegation so sequential
         # delegations correctly see prior delegated spend. (fix R2-A2)
         self._delegated_cost_this_run: float = 0.0
+
+        # MCP client pool (spec/19). Lazy-initialized on first call() when
+        # mcp_servers are declared. Torn down in call()'s finally block.
+        # None means either no MCP servers declared or pool not yet initialized.
+        self.mcp_pool: MCPClientPool | None = None
 
         # Loaded later via load() — populated in __init__ for clarity
         self._persona_text: str = ""
@@ -301,6 +307,10 @@ class AtomicAgent:
         # roster.md lives at the instance root (same for cascaded + single-agent layouts)
         roster = _roster.parse_roster_md(self.agent_root / "roster.md")
 
+        # mcp.md lives at the instance root (same for cascaded + single-agent layouts).
+        # Empty list when no mcp.md exists — that's fine.
+        mcp_servers = parse_mcp_md(self.agent_root / "mcp.md")
+
         return AgentConfig(
             default_model=model_data["default_model"],
             fallback_model=model_data["fallback_model"],
@@ -319,6 +329,7 @@ class AtomicAgent:
             external_apis=tools_data["external_apis"],
             hard_nos=tools_data["hard_nos"],
             roster=roster,
+            mcp_servers=mcp_servers,
         )
 
     # ────────────────────────────────────────────────────────────
@@ -580,6 +591,25 @@ class AtomicAgent:
             self._delegations_this_run = []
             # Reset cumulative delegated cost for this run (fix R2-A2)
             self._delegated_cost_this_run = 0.0
+
+            # MCP client pool — lazy init (spec/19).
+            # Only spin up when mcp.md declares servers and pool not yet live.
+            # Discover tools and register them into the tool registry before
+            # the first LLM call so the model sees the full tool list.
+            if self.config.mcp_servers and self.mcp_pool is None:
+                self.mcp_pool = MCPClientPool(
+                    server_specs=self.config.mcp_servers,
+                    agents_root=self.agents_root,
+                )
+                self.mcp_pool.connect_all()
+                mcp_tool_defs = self.mcp_pool.discover_tools()
+                for td in mcp_tool_defs:
+                    self.tool_registry.register(td)
+                _logger.debug(
+                    "agent %r: MCP pool ready — %d tools from %d server(s)",
+                    self.name, len(mcp_tool_defs), len(self.config.mcp_servers),
+                )
+
             # Cost guardrails check
             check = self._check_cost_guardrails(
                 critical=critical,
@@ -870,6 +900,12 @@ class AtomicAgent:
             return response
 
         finally:
+            # Tear down MCP pool after each call so subprocesses don't linger.
+            # disconnect_all() is idempotent — safe to call even if connect_all()
+            # was never reached (e.g. if an exception occurred before it).
+            if self.mcp_pool is not None:
+                self.mcp_pool.disconnect_all()
+                self.mcp_pool = None
             lock.release()
 
     def _build_tool_loop_messages(

@@ -138,3 +138,33 @@ class PathTraversalError(AtomicAgentsError):
         self.child = child
         self.root = root
         super().__init__(message)
+
+
+# ──────────────────────────────────────────────────────────────────
+# MCP exceptions (spec/19)
+
+class MCPServerConnectFailed(AtomicAgentsError):
+    """An MCP server failed to connect or initialize.
+
+    Raised (and caught/logged) by MCPClientPool.connect_all(). Does not
+    block other servers from connecting — the agent runs with whatever
+    servers connected successfully. Also raised at parse time when an env
+    var reference in mcp.md cannot be resolved.
+    """
+
+
+class MCPServerNotConfigured(AtomicAgentsError):
+    """Operator referenced an MCP server name that is not in mcp.md.
+
+    Raised when code tries to route a call to a server that was not declared
+    in the agent's mcp.md configuration.
+    """
+
+
+class MCPToolDispatchFailed(AtomicAgentsError):
+    """A runtime failure occurred while routing a tool call to an MCP server.
+
+    Raised by the tool handler when the MCP server returns an error or the
+    async call fails. Caught by ToolRegistry.execute() and recorded in
+    ToolCallResult.error — does not propagate up to the agent's call() loop.
+    """

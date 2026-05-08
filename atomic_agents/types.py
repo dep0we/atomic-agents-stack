@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .tools import ToolCallResult
+    from .mcp import MCPServerSpec
 
 
 @dataclass
@@ -40,6 +41,10 @@ class AgentConfig:
     # From roster.md (parsed) — agent names this coordinator may delegate to.
     # Empty list = no delegation allowed.
     roster: list[str] = field(default_factory=list)
+
+    # From mcp.md (parsed) — MCP servers this agent may connect to.
+    # Empty list = no MCP servers declared (that's fine; pool not created).
+    mcp_servers: list["MCPServerSpec"] = field(default_factory=list)
 
 
 @dataclass
