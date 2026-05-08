@@ -16,19 +16,16 @@ when the same observation is emitted via both paths.
 """
 
 from __future__ import annotations
-import contextlib
-import hashlib
 import json
-import os
 import re
-import sys
-from datetime import date, datetime
+import warnings
+from datetime import date
 from pathlib import Path
 from typing import Any
 
 import frontmatter
 
-from ._io import atomic_write, atomic_append_jsonl
+from ._io import atomic_append_jsonl
 from ._schema import (
     derive_filename,
     validate_capture,
@@ -42,6 +39,18 @@ from .exceptions import (
     WritePathViolation,
 )
 from .types import Capture
+
+# Re-export internal helpers from filesystem.py so existing importers
+# (dream.py, tests) continue to find them here.
+from .memory.filesystem import (
+    _render_note,
+    _update_index,
+    _section_for_type,
+    _per_file_lock,
+    _check_precondition,
+    _is_same_capture_content,
+    _merge_into_existing,
+)
 
 # Match ```atomic_capture or ````atomic_capture (3+ backticks) blocks
 CAPTURE_BLOCK_PATTERN = re.compile(
@@ -262,155 +271,73 @@ def write_atomic_note(
 ) -> Path:
     """Write a captured atomic note to memory/, then update memory/INDEX.md.
 
-    Atomic write order per spec/04:
-    1. Snapshot old content (versioning) — before any overwrite or merge
-    2. Write the note file (temp + fsync + rename)
-    3. Update INDEX.md (temp + fsync + rename)
+    .. deprecated::
+        Use ``FilesystemBackend.write_note()`` (via ``agent.memory.write_note()``)
+        instead. This function will emit a DeprecationWarning in v1.0.
 
-    If step 3 fails, the result is an orphan note (lint catches it).
-    Step 2 failing leaves nothing behind.
+    Delegates to FilesystemBackend.write_note(). The ``today`` parameter is
+    kept for signature compatibility but unused (the backend always uses
+    date.today()). ``log_target``, if provided, receives a JSONL event when a
+    version snapshot is created (for backward compat with tests/callers).
 
-    Returns the path of the written note. Raises WritePathViolation if the
-    target is outside any of `write_paths` or inside a read-only path.
-
-    Args:
-        agent_root: Path to the agent's root directory.
-        capture: The Capture to write.
-        write_paths: Directories the agent is allowed to write to.
-        today: Override for today's date (used in tests).
-        expected_content_sha256: Optional precondition. When provided:
-            - For new notes (target doesn't exist): raises MemoryPreconditionFailed
-              (caller expected an existing note).
-            - For overwrite/merge: reads current content, hashes it, compares.
-              Mismatch raises MemoryPreconditionFailed. Match proceeds normally.
-        read_only_paths: Paths that must not be written to even if under write_paths.
-        log_target: Optional JSONL log file path for versioning events.
+    Returns the path of the written note.
     """
-    today = today or date.today()
+    warnings.warn(
+        "write_atomic_note() is deprecated; use agent.memory.write_note() instead.",
+        DeprecationWarning, stacklevel=2,
+    )
+    from .memory.filesystem import FilesystemBackend, _snapshot
+    from .memory.backend import WritePolicy
+
     memory_dir = agent_root / "memory"
-    enforce_write_path(memory_dir, write_paths, read_only_paths=read_only_paths)
+    backend = FilesystemBackend(agent_root, "memory")
+    policy = WritePolicy(
+        write_paths=write_paths,
+        read_only_paths=read_only_paths or [],
+    )
 
-    if capture.merge_into:
-        # Merge: update an existing note's last_seen + sources rather than create new
-        target = memory_dir / capture.merge_into
-        enforce_write_path(target.resolve(), write_paths, read_only_paths=read_only_paths)
-        if not target.exists():
-            raise SchemaValidationError(
-                f"merge_into target {capture.merge_into} doesn't exist"
-            )
-        # Wrap precondition + snapshot + write in a per-file lock to close
-        # the TOCTOU window between sha256 check and write (codex R2-D4).
-        with _per_file_lock(target):
-            # Optimistic concurrency check (for merge target)
-            if expected_content_sha256 is not None:
-                _check_precondition(target, expected_content_sha256)
-            # Snapshot before merge
-            version_path = snapshot_memory_version(target)
-            if version_path is not None and log_target is not None:
-                _log_version_created(log_target, target.name, version_path, agent_root)
-            _merge_into_existing(target, capture, today)
-        # INDEX entry already exists for the existing note; nothing to add
-        return target
+    # For log_target compat: detect whether the operation will snapshot,
+    # and if so capture the version path to log it after the write.
+    version_path: Path | None = None
+    if log_target is not None and capture.merge_into:
+        # Merge path will snapshot the target — pre-emptively capture it
+        target_for_snap = memory_dir / capture.merge_into
+        if target_for_snap.exists():
+            # We'll snapshot AFTER write_note to get the actual path
+            pass
 
-    # New note path
-    filename = derive_filename(capture.type, capture.name)
-    target = memory_dir / filename
+    ref = backend.write_note(capture, policy, expected_content_sha256)
+    note_path = agent_root / "memory" / ref.name
 
-    if target.exists():
-        # Same-name file already exists. Check if it's an INDEX orphan (the note
-        # was written but INDEX update failed on a previous run). If the content
-        # matches the incoming capture, repair the INDEX and return — don't refuse.
-        # If the content differs, this is a real name conflict; raise as before.
-        if _is_same_capture_content(target, capture):
-            # Orphan-recovery path: re-run INDEX update idempotently.
-            # Snapshot before overwriting (orphan repair is still a mutation)
-            with _per_file_lock(target):
-                if expected_content_sha256 is not None:
-                    _check_precondition(target, expected_content_sha256)
-                version_path = snapshot_memory_version(target)
-                if version_path is not None and log_target is not None:
-                    _log_version_created(log_target, target.name, version_path, agent_root)
-                _update_index(memory_dir / "INDEX.md", capture, filename)
-            return target
-        raise SchemaValidationError(
-            f"atomic note {filename} already exists; use merge_into to update"
-        )
+    # If log_target was provided, check whether a snapshot was created
+    # during this write and log it.
+    if log_target is not None:
+        note_name = ref.name
+        stem = note_path.stem
+        versions_dir = memory_dir / ".versions" / stem
+        if versions_dir.exists():
+            versions = sorted(versions_dir.glob("*.md"), reverse=True)
+            if versions:
+                version_path = versions[0]
+                _log_version_created(log_target, note_name, version_path, agent_root)
 
-    # Fresh write — target does not exist
-    if expected_content_sha256 is not None:
-        # Caller supplied a precondition but the note doesn't exist yet.
-        raise MemoryPreconditionFailed(
-            f"expected_content_sha256 was provided but {filename} doesn't exist",
-            actual_sha256=None,
-        )
-
-    # Phase 1 — write the note (no snapshot: no prior version exists)
-    note_content = _render_note(capture, today)
-    atomic_write(target, note_content)
-
-    # Phase 2 — update INDEX
-    _update_index(memory_dir / "INDEX.md", capture, filename)
-
-    return target
+    return note_path
 
 
-@contextlib.contextmanager
-def _per_file_lock(target: Path):
-    """Acquire an exclusive POSIX flock on ``<target>.lock``.
-
-    This serializes the precondition-check + snapshot + write sequence so two
-    concurrent writers cannot both pass the sha256 check and then race on the
-    write — closing the TOCTOU window described in codex finding R2-D4.
-
-    The lock file is ``<target>.lock`` (a sidecar next to the note).  It is
-    created automatically and never removed (removal would introduce a new race
-    between unlink and re-open).
-
-    **Platform note:** ``fcntl`` is POSIX-only.  On Windows the lock is a
-    no-op (best-effort precondition, not atomic).  This is documented behaviour
-    per spec/04: full atomicity is guaranteed only on POSIX systems.
-    """
-    if sys.platform == "win32" or not hasattr(os, "O_RDWR"):
-        # Windows / non-POSIX: yield without locking — best-effort only.
-        yield
-        return
-
-    import fcntl as _fcntl
-
-    lock_path = target.parent / (target.name + ".lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
-    try:
-        # Blocking exclusive lock — waits until any concurrent holder releases.
-        _fcntl.flock(fd, _fcntl.LOCK_EX)
-        yield
-    finally:
-        try:
-            _fcntl.flock(fd, _fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
-
-
-def _check_precondition(target: Path, expected_sha256: str) -> None:
-    """Raise MemoryPreconditionFailed if target content sha256 != expected_sha256.
-
-    Must be called while holding the per-file lock (``_per_file_lock``) so that
-    the check and the subsequent write are serialized against concurrent writers.
-    """
-    current_content = target.read_text(encoding="utf-8")
-    actual = hashlib.sha256(current_content.encode("utf-8")).hexdigest()
-    if actual != expected_sha256:
-        raise MemoryPreconditionFailed(
-            f"content of {target.name} has changed (expected {expected_sha256[:16]}..., "
-            f"actual {actual[:16]}...); re-read and retry",
-            actual_sha256=actual,
-        )
+# The private helper functions (_render_note, _update_index, _section_for_type,
+# _per_file_lock, _check_precondition, _is_same_capture_content, _merge_into_existing)
+# have moved to atomic_agents.memory.filesystem and are re-exported above.
+# They remain importable from this module for backward compatibility.
 
 
 def _log_version_created(
     log_target: Path, note_name: str, version_path: Path, agent_root: Path
 ) -> None:
-    """Append a memory_version_created event to the agent log."""
+    """Append a memory_version_created event to the agent log.
+
+    Kept here for any code that still calls it directly. The new path
+    goes through FilesystemBackend which handles snapshotting internally.
+    """
     try:
         rel = version_path.relative_to(agent_root)
     except ValueError:
@@ -420,123 +347,6 @@ def _log_version_created(
         "note": note_name,
         "version_path": str(rel),
     }))
-
-
-def _is_same_capture_content(existing_path: Path, capture: Capture) -> bool:
-    """Return True if the existing note on disk matches the incoming capture.
-
-    Compares the fields most likely to identify a duplicate vs a conflict:
-    type, name, description, and body. Sources and metadata are intentionally
-    excluded — the orphan-recovery path should tolerate minor metadata drift
-    (e.g., a different run_id in sources) while still repairing the index.
-
-    If the file cannot be read or parsed, returns False (safe default — refuse
-    rather than silently repair something we can't verify).
-    """
-    try:
-        parsed = frontmatter.load(existing_path)
-    except Exception:
-        return False
-    return (
-        parsed.metadata.get("type") == capture.type
-        and parsed.metadata.get("name") == capture.name
-        and parsed.metadata.get("description") == capture.description
-        and parsed.content.strip() == capture.body.strip()
-    )
-
-
-def _render_note(capture: Capture, captured_date: date) -> str:
-    """Build the markdown content for a new atomic note."""
-    fm: dict[str, Any] = {
-        "schema_version": CURRENT_SCHEMA_VERSION,
-        "name": capture.name,
-        "description": capture.description,
-        "type": capture.type,
-        "captured": captured_date.isoformat(),
-        "last_seen": captured_date.isoformat(),
-        "sources": capture.sources,
-        "confidence": capture.confidence,
-    }
-    if capture.pinned:
-        fm["pinned"] = True
-    if capture.expires_at:
-        fm["expires_at"] = capture.expires_at
-    if capture.supersedes:
-        fm["supersedes"] = capture.supersedes
-    if capture.tags:
-        fm["tags"] = capture.tags
-
-    post = frontmatter.Post(capture.body, **fm)
-    return frontmatter.dumps(post) + "\n"
-
-
-def _merge_into_existing(target: Path, capture: Capture, today: date) -> None:
-    """Update an existing note's last_seen and sources without changing the body.
-
-    Used when a capture has merge_into set — the agent saw the same observation
-    again and wants to refresh recency + add a new source reference, not create
-    a duplicate note.
-    """
-    parsed = frontmatter.load(target)
-    parsed.metadata["last_seen"] = today.isoformat()
-    existing_sources = list(parsed.metadata.get("sources", []))
-    for src in capture.sources:
-        if src not in existing_sources:
-            existing_sources.append(src)
-    parsed.metadata["sources"] = existing_sources
-    atomic_write(target, frontmatter.dumps(parsed) + "\n")
-
-
-def _update_index(index_path: Path, capture: Capture, filename: str) -> None:
-    """Add an entry to memory/INDEX.md under the right type section.
-
-    Idempotent — if an entry for this filename already exists, replace its line.
-    """
-    if not index_path.exists():
-        # Create a minimal INDEX
-        initial = "# Memory Index\n\n## " + _section_for_type(capture.type) + "\n"
-        atomic_write(index_path, initial)
-
-    text = index_path.read_text(encoding="utf-8")
-    section_header = "## " + _section_for_type(capture.type)
-    new_line = f"- [{capture.name}]({filename}) — {capture.description}"
-
-    # Remove any existing line referencing this filename (idempotent)
-    pattern = re.compile(
-        rf"^- \[.*?\]\({re.escape(filename)}\).*?$",
-        re.MULTILINE,
-    )
-    text = pattern.sub("", text)
-
-    # Find the section; create if missing
-    if section_header not in text:
-        text = text.rstrip() + f"\n\n{section_header}\n{new_line}\n"
-    else:
-        # Insert under the section header
-        lines = text.splitlines()
-        out_lines = []
-        inserted = False
-        for i, line in enumerate(lines):
-            out_lines.append(line)
-            if line.strip() == section_header and not inserted:
-                out_lines.append(new_line)
-                inserted = True
-        text = "\n".join(out_lines) + "\n"
-
-    # Clean up empty lines from removed entries
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    atomic_write(index_path, text)
-
-
-def _section_for_type(type_str: str) -> str:
-    """Map atomic-note type to its INDEX.md section header."""
-    return {
-        "user": "User Profile",
-        "feedback": "Critical Feedback",
-        "project": "Active Projects",
-        "decision": "Locked Decisions",
-        "reference": "Reference",
-    }[type_str]
 
 
 def enforce_write_path(

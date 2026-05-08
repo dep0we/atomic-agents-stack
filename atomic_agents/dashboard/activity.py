@@ -25,6 +25,7 @@ from ._shared import (
     status_pill,
 )
 from .._io import atomic_write
+from ..memory.filesystem import FilesystemBackend
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -217,24 +218,38 @@ def _scan_recent_captures(
     agent_names: list[str],
     limit: int = 50,
 ) -> list[dict]:
-    """Return last N memory/*.md files sorted by mtime, newest first."""
+    """Return last N memory/*.md files sorted by last-mutation timestamp, newest first.
+
+    Uses FilesystemBackend.last_mutation_at() (falls back to file mtime when no
+    version history exists) — codex P2 #7 fix for TOCTOU-unreliable mtime sorting.
+    """
     files: list[tuple[float, dict]] = []
     for agent in agent_names:
-        memory_dir = agents_root / agent / "memory"
-        if not memory_dir.exists():
+        agent_root = agents_root / agent
+        if not (agent_root / "memory").exists():
             continue
-        for md_path in memory_dir.glob("*.md"):
-            if md_path.name == "INDEX.md":
-                continue
+        backend = FilesystemBackend(agent_root, "memory")
+        # Use backend.list_notes() so future non-filesystem backends are supported.
+        for ref in backend.list_notes(include_archived=True, include_superseded=True):
             try:
-                mtime = md_path.stat().st_mtime
+                # Prefer last_mutation_at (version-aware); fall back to ref.last_seen
+                mutation_dt = backend.last_mutation_at(ref.name)
+                if mutation_dt is None and ref.last_seen is not None:
+                    mutation_dt = datetime.combine(
+                        ref.last_seen,
+                        datetime.min.time(),
+                        tzinfo=timezone.utc,
+                    )
+                if mutation_dt is None:
+                    continue
+                sort_key = mutation_dt.timestamp()
             except OSError:
                 continue
-            files.append((mtime, {
+            files.append((sort_key, {
                 "agent": agent,
-                "filename": md_path.name,
-                "mtime": mtime,
-                "mtime_dt": datetime.fromtimestamp(mtime, tz=timezone.utc),
+                "filename": ref.name,
+                "mtime": sort_key,
+                "mtime_dt": mutation_dt,
             }))
     files.sort(key=lambda x: x[0], reverse=True)
     return [d for _, d in files[:limit]]

@@ -215,43 +215,32 @@ class StaleNoteRecurring(PatternDetector):
 
     def detect(self, ctx):
         findings = []
-        cutoff = ctx.today - timedelta(days=self.stale_threshold_days)
-        for filename, info in ctx.memory_notes.items():
-            meta = info.get("meta", {})
-            if meta.get("pinned"):
-                continue
-            if meta.get("archived"):
-                continue
-            if meta.get("superseded_by"):
-                continue
-            last_seen = meta.get("last_seen")
-            if not last_seen:
-                continue
-            try:
-                last_seen_date = (
-                    datetime.fromisoformat(str(last_seen)).date()
-                    if "T" in str(last_seen)
-                    else date.fromisoformat(str(last_seen))
-                )
-            except (ValueError, TypeError):
-                continue
-            if last_seen_date < cutoff:
-                age_days = (ctx.today - last_seen_date).days
+        # Use backend.list_stale() when available (P2.6 migration), fall back to
+        # manual ctx.memory_notes scan for backward compat in tests.
+        backend = getattr(ctx, "memory_backend", None)
+        if backend is not None:
+            stale_refs = backend.list_stale(
+                threshold_days=self.stale_threshold_days, exclude_pinned=True
+            )
+            for ref in stale_refs:
+                if ref.last_seen is None:
+                    continue
+                age_days = (ctx.today - ref.last_seen).days
                 findings.append(PatternFinding(
-                    detector_id=f"{self.detector_id}_{filename}",
+                    detector_id=f"{self.detector_id}_{ref.name}",
                     severity="medium",
                     confidence="high",
                     summary=(
-                        f"`{filename}` last seen {age_days} days ago "
+                        f"`{ref.name}` last seen {age_days} days ago "
                         f"(threshold: {self.stale_threshold_days}d). "
                         f"Either pin it (still relevant) or archive it (no longer used)."
                     ),
                     evidence=[{
-                        "note_path": filename,
-                        "last_seen": str(last_seen),
+                        "note_path": ref.name,
+                        "last_seen": ref.last_seen.isoformat(),
                         "age_days": age_days,
                     }],
-                    suggested_target_file=f"memory/{filename}",
+                    suggested_target_file=f"memory/{ref.name}",
                     suggested_section="frontmatter",
                     suggested_edit_type="modification",
                 ))
@@ -1097,20 +1086,33 @@ class TuningRunner:
                     except json.JSONDecodeError:
                         continue
 
-        # Memory notes
-        memory_dir = self.agent_root / "memory"
-        if memory_dir.exists():
-            for path in memory_dir.glob("*.md"):
-                if path.name == "INDEX.md":
-                    continue
-                try:
-                    parsed = frontmatter.load(path)
-                    ctx.memory_notes[path.name] = {
-                        "meta": dict(parsed.metadata),
-                        "body": parsed.content,
-                    }
-                except Exception:
-                    continue
+        # Memory notes — loaded via FilesystemBackend for consistency.
+        # The backend is stored on ctx so detectors (StaleNoteRecurring) can use
+        # backend methods (list_stale) instead of re-filtering locally.
+        from .memory.filesystem import FilesystemBackend
+        memory_backend = FilesystemBackend(self.agent_root, "memory")
+        ctx.memory_backend = memory_backend
+        for ref in memory_backend.list_notes(include_archived=True, include_superseded=True):
+            note = memory_backend.read_note(ref.name)
+            if note is not None:
+                ctx.memory_notes[ref.name] = {
+                    "meta": {
+                        "type": note.type,
+                        "name": note.name,
+                        "description": note.description,
+                        "confidence": note.confidence,
+                        "sources": note.sources,
+                        "captured": note.captured.isoformat() if note.captured else None,
+                        "last_seen": note.last_seen.isoformat() if note.last_seen else None,
+                        "pinned": note.pinned,
+                        "archived": note.archived,
+                        "superseded_by": note.superseded_by,
+                        "expires_at": note.expires_at,
+                        "tags": note.tags,
+                        **note.extra_frontmatter,
+                    },
+                    "body": note.body,
+                }
 
         # Tuning history
         history_path = self.agent_root / "evals" / "tuning_history.jsonl"

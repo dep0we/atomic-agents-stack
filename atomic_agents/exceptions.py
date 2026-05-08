@@ -177,3 +177,30 @@ class MCPToolDispatchFailed(AtomicAgentsError):
     async call fails. Caught by ToolRegistry.execute() and recorded in
     ToolCallResult.error — does not propagate up to the agent's call() loop.
     """
+
+
+# ──────────────────────────────────────────────────────────────────
+# MemoryBackend exceptions (spec/20)
+
+class BackendNotRegistered(AtomicAgentsError):
+    """Operator declared a backend that isn't registered.
+
+    Future-facing: only triggered when memory.md config selects a backend
+    that was not registered via register_backend().
+    """
+
+
+class VersionNotFound(AtomicAgentsError):
+    """Version token resolution failed.
+
+    Raised by resolve_version_token() when the supplied token does not
+    correspond to any known version for the named note.
+    """
+
+
+class StagingNotApplied(AtomicAgentsError):
+    """Operation on a staging area that has already been applied or discarded.
+
+    Raised when a caller tries to write to or apply a StagedMemory after
+    apply_staging() or discard_staging() has already been called.
+    """

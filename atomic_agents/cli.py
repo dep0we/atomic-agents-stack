@@ -22,8 +22,9 @@ from pathlib import Path
 
 from .agent import AtomicAgent
 from ._platform import get_agents_root
-from ._versioning import list_versions, restore_version
-from .exceptions import AtomicAgentsError
+from .memory.filesystem import FilesystemBackend
+from .memory.backend import WritePolicy
+from .exceptions import AtomicAgentsError, VersionNotFound
 from .skills import discover_skills, validate_skill_manifest
 
 
@@ -198,12 +199,13 @@ def _cmd_version(args, agents_root: Path) -> int:
     if not memory_dir.exists():
         print(f"No memory/ directory found at {memory_dir}", file=sys.stderr)
         return 1
-    versions = list_versions(memory_dir, args.note_filename)
-    if not versions:
+    backend = FilesystemBackend(agent_root, "memory")
+    version_refs = backend.list_versions(args.note_filename)
+    if not version_refs:
         print(f"No versions found for {args.note_filename}")
         return 0
-    for v in versions:
-        print(v.name)
+    for vref in version_refs:
+        print(str(vref))
     return 0
 
 
@@ -214,15 +216,17 @@ def _cmd_restore(args, agents_root: Path) -> int:
     if not memory_dir.exists():
         print(f"No memory/ directory found at {memory_dir}", file=sys.stderr)
         return 1
-    from pathlib import Path as _Path
-    stem = _Path(args.note_filename).stem
-    version_path = memory_dir / ".versions" / stem / args.version_name
-    if not version_path.exists():
-        print(f"Version not found: {version_path}", file=sys.stderr)
+    backend = FilesystemBackend(agent_root, "memory")
+    try:
+        vref = backend.resolve_version_token(args.note_filename, args.version_name)
+    except VersionNotFound as e:
+        print(f"Error: {e}", file=sys.stderr)
         return 1
-    restored = restore_version(memory_dir, args.note_filename, version_path)
+    # Build a permissive policy for CLI restore (whole agent root is writable)
+    policy = WritePolicy(write_paths=[agent_root])
+    ref = backend.restore_version(args.note_filename, vref, policy)
     print(f"Restored {args.note_filename} from {args.version_name}")
-    print(f"  live note: {restored}")
+    print(f"  live note: {memory_dir / ref.name}")
     return 0
 
 

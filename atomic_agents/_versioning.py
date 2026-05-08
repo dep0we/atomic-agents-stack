@@ -14,12 +14,18 @@ Public API:
   read_version             — (frontmatter_dict, body_text) of a snapshot
   restore_version          — atomically replace live note from snapshot
   redact_version           — replace body with [REDACTED], preserve frontmatter
+
+.. deprecated::
+    All public functions here are compatibility wrappers that will emit
+    DeprecationWarning in v1.0. Use ``agent.memory`` (MemoryBackend) instead.
+    The actual implementations have moved to ``memory.filesystem.FilesystemBackend``.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -43,17 +49,7 @@ def _sha256_hex(content: str) -> str:
 
 
 def _version_filename(content: str) -> str:
-    """Return a version filename: <ISO-ts>_<8-char-hash>.md.
-
-    ISO timestamp is UTC, formatted as YYYYMMDDTHHMMSSffffffZ (microsecond
-    precision) to keep it sortable and filesystem-safe (no colons).
-
-    Microsecond precision means two snapshots of identical content taken in the
-    same wall-clock second produce distinct filenames, preserving the
-    immutable-per-mutation invariant (spec/02).  Second-precision timestamps
-    plus content hashing is NOT sufficient because two writes of the same
-    content in the same second would collide.
-    """
+    """Return a version filename: <ISO-ts>_<8-char-hash>.md."""
     ts = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     short_hash = _sha256_hex(content)[:8]
     return f"{ts}_{short_hash}.md"
@@ -63,55 +59,59 @@ def snapshot_memory_version(target: Path) -> Path | None:
     """Snapshot the current on-disk content of `target` into .versions/.
 
     Returns the path of the version file written, or None if `target`
-    doesn't exist (first-time write — no prior content to snapshot).
+    doesn't exist or is INDEX.md.
 
-    INDEX.md is excluded: returns None without reading the file.
+    .. deprecated:: Use FilesystemBackend internally (via agent.memory).
     """
-    if target.name in _EXCLUDED_FILES:
-        return None
-    if not target.exists():
-        return None
-
-    content = target.read_text(encoding="utf-8")
-    stem = target.stem
-    versions_dir = _versions_dir(target.parent, stem)
-    versions_dir.mkdir(parents=True, exist_ok=True)
-
-    version_name = _version_filename(content)
-    version_path = versions_dir / version_name
-    # Use atomic_write so the snapshot itself is crash-safe.
-    atomic_write(version_path, content)
-    return version_path
+    # Delegate to filesystem implementation
+    from .memory.filesystem import _snapshot
+    return _snapshot(target)
 
 
 def list_versions(memory_dir: Path, note_filename: str) -> list[Path]:
     """Return version paths for a note, newest first.
 
     `note_filename` is the bare filename (e.g., ``feedback_comm_style.md``).
-    Returns an empty list if no versions directory exists.
 
-    Raises PathTraversalError if note_filename resolves outside memory_dir
-    (guards against CLI args like ``../../persona/IDENTITY.md``).
+    .. deprecated:: Use ``agent.memory.list_versions(name)`` instead.
     """
-    # Validate that the note_filename stays inside memory_dir.
+    warnings.warn(
+        "list_versions() is deprecated; use agent.memory.list_versions() instead.",
+        DeprecationWarning, stacklevel=2,
+    )
+    from .memory.filesystem import FilesystemBackend
+
+    # Validate path traversal guard (same as before)
     safe_resolve_under(note_filename, memory_dir)
 
+    # Derive agent_root from memory_dir (parent)
+    agent_root = memory_dir.parent
+    backend = FilesystemBackend(agent_root, memory_dir.name)
+    refs = backend.list_versions(note_filename)
+    # Return as Path objects for backward compat.
+    # backend_id is now "<stem>/<version_filename>" — extract just the filename.
     stem = Path(note_filename).stem
-    versions_dir = _versions_dir(memory_dir, stem)
-    if not versions_dir.exists():
-        return []
-    # Filenames sort lexicographically newest-first because they start with
-    # the ISO timestamp YYYYMMDDTHHMMSSZ.
-    paths = sorted(versions_dir.glob("*.md"), reverse=True)
-    return paths
+    result = []
+    for ref in refs:
+        bid = ref.backend_id
+        # backend_id encodes stem/filename; extract the filename portion
+        if "/" in bid:
+            version_filename = bid.split("/", 1)[1]
+        else:
+            version_filename = bid
+        result.append(memory_dir / ".versions" / stem / version_filename)
+    return result
 
 
 def read_version(version_path: Path) -> tuple[dict, str]:
     """Return (frontmatter_dict, body_text) from a snapshot file.
 
-    Parses the snapshot as a python-frontmatter Post. If the file has no
-    frontmatter at all, frontmatter_dict will be empty.
+    .. deprecated:: Use ``agent.memory.read_version(version_ref)`` instead.
     """
+    warnings.warn(
+        "read_version() is deprecated; use agent.memory.read_version() instead.",
+        DeprecationWarning, stacklevel=2,
+    )
     parsed = frontmatter.load(version_path)
     return dict(parsed.metadata), parsed.content
 
@@ -124,17 +124,12 @@ def restore_version(
 ) -> Path:
     """Atomically replace the live note with a snapshot's content.
 
-    Process:
-    1. Snapshot the current live state first (so the restore is reversible).
-    2. Atomically write the version's content to the live note path.
-    3. Log the restoration event if log_target is provided.
-
-    Returns the path of the restored (live) note.
-
-    Raises PathTraversalError if:
-    - note_filename resolves outside memory_dir (guards live note write target).
-    - version_path resolves outside memory_dir/.versions/ (guards snapshot source).
+    .. deprecated:: Use ``agent.memory.restore_version()`` instead.
     """
+    warnings.warn(
+        "restore_version() is deprecated; use agent.memory.restore_version() instead.",
+        DeprecationWarning, stacklevel=2,
+    )
     # Guard the live-note write target.
     live_note = safe_resolve_under(note_filename, memory_dir)
 
@@ -142,14 +137,14 @@ def restore_version(
     versions_root = memory_dir / ".versions"
     safe_resolve_under(version_path, versions_root)
 
-    # Step 1: snapshot current live state so restore is reversible.
+    # Snapshot current live state so restore is reversible.
     snapshot_memory_version(live_note)
 
-    # Step 2: write version content to live note.
+    # Write version content to live note.
     version_content = version_path.read_text(encoding="utf-8")
     atomic_write(live_note, version_content)
 
-    # Step 3: optional logging.
+    # Optional logging.
     if log_target is not None:
         _append_log(log_target, {
             "trigger": "memory_version_restored",
@@ -167,12 +162,13 @@ def redact_version(
 ) -> None:
     """Replace a snapshot's body content with a redaction marker.
 
-    Frontmatter is preserved so the audit trail (who wrote what, when) remains
-    intact. Only the body (potentially containing PII or secrets) is removed.
-    Used for compliance — never for normal memory operations.
+    .. deprecated:: Use ``agent.memory.redact_version()`` instead.
     """
+    warnings.warn(
+        "redact_version() is deprecated; use agent.memory.redact_version() instead.",
+        DeprecationWarning, stacklevel=2,
+    )
     parsed = frontmatter.load(version_path)
-    # Build a new Post with same frontmatter but redacted body.
     redacted_post = frontmatter.Post(replacement, **parsed.metadata)
     atomic_write(version_path, frontmatter.dumps(redacted_post) + "\n")
 
