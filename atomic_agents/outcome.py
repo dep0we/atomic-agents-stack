@@ -143,7 +143,8 @@ class OutcomeRunner:
                 starting with a known path). Inline rubric starts with '#' or
                 contains newlines. A string with no newlines that looks like a
                 file path is treated as a path.
-            max_iterations: How many times to iterate. Clamped to [1, 20].
+            max_iterations: How many times to iterate. Must be in [1, 20];
+                raises ValueError if outside that range.
             output_dir: Where the agent should write files. Defaults to
                 <agent_root>/outcomes/runs/<run_id>/.
             extra_context: Optional additional context for the agent (e.g.
@@ -283,7 +284,16 @@ class OutcomeRunner:
                 iteration=i,
             )
 
-            # ── Step 6: Call judge ────────────────────────────────────────
+            # ── Step 6: Cost guardrail check before judge ─────────────────
+            judge_check = agent._check_cost_guardrails(critical=False)
+            if not judge_check.allow:
+                result.status = "interrupted"
+                result.explanation = (
+                    f"cost guardrail hit before judge call at iteration {i}: {judge_check.reason}"
+                )
+                break
+
+            # ── Step 7: Call judge ────────────────────────────────────────
             try:
                 judge_raw = _llm.call_llm(
                     model=judge_model,
@@ -307,7 +317,7 @@ class OutcomeRunner:
                 judge_model, judge_raw.input_tokens, judge_raw.output_tokens
             )
 
-            # ── Step 7: Parse verdict ─────────────────────────────────────
+            # ── Step 8: Parse verdict ─────────────────────────────────────
             try:
                 verdict = EvalRunner._parse_judge_response(judge_raw.text)
             except Exception:
@@ -355,7 +365,7 @@ class OutcomeRunner:
                     )
                     break
 
-            # ── Step 8: Build iteration record ────────────────────────────
+            # ── Step 9: Build iteration record ────────────────────────────
             iter_record = IterationRecord(
                 iteration=i,
                 agent_response=agent_response.text,
@@ -374,7 +384,7 @@ class OutcomeRunner:
             result.iterations.append(iter_record)
             self._append_iteration_log(agent, run_id, iter_record, verdict.get("satisfied", False))
 
-            # ── Step 9: Decide next ───────────────────────────────────────
+            # ── Step 10: Decide next ──────────────────────────────────────
             satisfied = bool(verdict.get("satisfied", False))
             contradicts = bool(verdict.get("rubric_contradicts_description", False))
 
@@ -730,7 +740,7 @@ def _print_result(result: OutcomeResult) -> None:
     icon = status_icons.get(result.status, result.status.upper())
     print(f"\n=== Outcome: {icon} ===")
     print(f"Run ID:      {result.run_id}")
-    print(f"Agent:       {result.rubric_source}")
+    print(f"Rubric:      {result.rubric_source}")
     print(f"Iterations:  {len(result.iterations)} / {result.max_iterations}")
     print(f"Total cost:  ${result.total_cost_usd:.4f}")
     print(f"Explanation: {result.explanation}")
