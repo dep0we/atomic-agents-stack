@@ -609,11 +609,19 @@ def test_conformance_20_discard_staging_preserves_live(tmp_path):
 # 21. Concurrent writes: two threads with preconditions → only one succeeds
 
 def test_conformance_21_concurrent_writes_precondition(tmp_path):
-    """Concurrent writes with sha256 preconditions — only one wins."""
+    """Concurrent writes with sha256 preconditions — exactly one wins, one raises.
+
+    Two threads race to merge-write the same note with the SAME precondition sha256.
+    The per-file lock serializes them. After the first write mutates the file, the
+    second thread reads the new content which no longer matches the precondition →
+    MemoryPreconditionFailed. Exactly one success and one MemoryPreconditionFailed
+    must be observed.
+    """
     backend, policy = _make_backend(tmp_path)
 
-    # Write initial note
-    capture = _make_capture(name="Concurrent target", body="Initial body.", sources=["src_0"])
+    # Write initial note with NO sources so the first merge can add one and
+    # guarantee a content change (which shifts the sha256 for the second thread).
+    capture = _make_capture(name="Concurrent target", body="Initial body.", sources=["initial_src"])
     ref = backend.write_note(capture, policy)
 
     # Get the sha256 of the current content
@@ -621,22 +629,28 @@ def test_conformance_21_concurrent_writes_precondition(tmp_path):
     content = note_path.read_text(encoding="utf-8")
     correct_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
 
-    successes = []
-    failures = []
+    successes: list[int] = []
+    precondition_failures: list[int] = []
+    other_failures: list[tuple[int, Exception]] = []
     barrier = threading.Barrier(2)
 
     def attempt_merge(thread_id: int):
         try:
-            barrier.wait()  # Synchronize start
+            barrier.wait()  # Synchronize start for maximum concurrency
+            # Each thread uses a unique source not already in the note;
+            # this guarantees the first merge actually changes the file content
+            # (adds the new source), so the second thread's sha256 check fails.
             merge_cap = _make_capture(
                 name="Concurrent target",
                 merge_into=ref.name,
-                sources=[f"src_{thread_id}"],
+                sources=[f"new_src_{thread_id}"],
             )
             backend.write_note(merge_cap, policy, expected_content_sha256=correct_sha256)
             successes.append(thread_id)
-        except Exception:
-            failures.append(thread_id)
+        except MemoryPreconditionFailed:
+            precondition_failures.append(thread_id)
+        except Exception as exc:
+            other_failures.append((thread_id, exc))
 
     threads = [threading.Thread(target=attempt_merge, args=(i,)) for i in range(2)]
     for t in threads:
@@ -644,10 +658,19 @@ def test_conformance_21_concurrent_writes_precondition(tmp_path):
     for t in threads:
         t.join()
 
-    # At least one should succeed; this test verifies locking doesn't deadlock
-    # and the system handles concurrent access gracefully
-    total = len(successes) + len(failures)
-    assert total == 2, "Both threads should complete"
+    # Both threads must complete without unexpected exceptions
+    assert not other_failures, (
+        f"Unexpected exceptions: {other_failures}"
+    )
+    total = len(successes) + len(precondition_failures)
+    assert total == 2, f"Both threads must complete: successes={successes}, failures={precondition_failures}"
+    # Exactly one success and one precondition failure (the loser sees a changed sha256)
+    assert len(successes) == 1, (
+        f"Exactly one thread should succeed — got {len(successes)}: {successes}"
+    )
+    assert len(precondition_failures) == 1, (
+        f"Exactly one MemoryPreconditionFailed expected — got {len(precondition_failures)}"
+    )
 
 
 # ──────────────────────────────────────────────────────────────────

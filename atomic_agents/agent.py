@@ -413,33 +413,27 @@ class AtomicAgent:
             self._wiki_index_text = wiki_index.read_text(encoding="utf-8")
 
     def _load_pinned_notes(self) -> None:
-        memory_dir = self.agent_root / "memory"
-        if not memory_dir.exists():
+        if not (self.agent_root / "memory").exists():
             return
         pinned_refs = self.memory.list_pinned()
         pinned = []
         for ref in pinned_refs[:PINNED_MAX]:
-            path = memory_dir / ref.name
-            try:
-                parsed = frontmatter.load(path)
-                pinned.append(self._render_note_for_context(path, parsed))
-            except Exception:
+            note = self.memory.read_note(ref.name)
+            if note is None:
                 continue
+            pinned.append(self._render_note_from_model(ref.name, note))
         self._pinned_notes = pinned
 
     def _load_recent_notes(self, n: int = RECENT_NOTES_DEFAULT) -> None:
-        memory_dir = self.agent_root / "memory"
-        if not memory_dir.exists():
+        if not (self.agent_root / "memory").exists():
             return
         recent_refs = self.memory.list_recent(n=n, exclude_pinned=True)
         self._recent_notes = []
         for ref in recent_refs:
-            path = memory_dir / ref.name
-            try:
-                parsed = frontmatter.load(path)
-                self._recent_notes.append(self._render_note_for_context(path, parsed))
-            except Exception:
+            note = self.memory.read_note(ref.name)
+            if note is None:
                 continue
+            self._recent_notes.append(self._render_note_from_model(ref.name, note))
 
     def _load_recent_journal(self, n: int = RECENT_JOURNAL_DEFAULT) -> None:
         journal_dir = self.agent_root / "journal"
@@ -461,6 +455,22 @@ class AtomicAgent:
             f"last_seen: {parsed.metadata.get('last_seen', '?')}"
         )
         return f"# {path.name}\n\n{meta_summary}\n\n{parsed.content}"
+
+    @staticmethod
+    def _render_note_from_model(filename: str, note: "Any") -> str:
+        """Format a Note model for inclusion in the system prompt.
+
+        Mirrors _render_note_for_context but reads from a Note dataclass instead
+        of a raw frontmatter.Post. Called by _load_pinned_notes and
+        _load_recent_notes after the P2.1 migration to agent.memory.read_note().
+        """
+        meta_summary = (
+            f"name: {note.name}\n"
+            f"type: {note.type}\n"
+            f"confidence: {note.confidence}\n"
+            f"last_seen: {note.last_seen}"
+        )
+        return f"# {filename}\n\n{meta_summary}\n\n{note.body}"
 
     # ────────────────────────────────────────────────────────────
     # System prompt assembly

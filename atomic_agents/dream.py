@@ -241,6 +241,39 @@ def _read_memory_notes(agent_root: Path) -> list[dict]:
     return notes
 
 
+def _read_memory_notes_via_backend(backend: "FilesystemBackend") -> list[dict]:
+    """Return list of parsed notes from memory/ via MemoryBackend protocol.
+
+    Replaces the direct filesystem glob in _read_memory_notes() when a backend
+    is available. Returns the same dict format ({filename, meta, body}).
+    """
+    notes = []
+    for ref in backend.list_notes(include_archived=True, include_superseded=True):
+        note = backend.read_note(ref.name)
+        if note is None:
+            continue
+        notes.append({
+            "filename": ref.name,
+            "meta": {
+                "type": note.type,
+                "name": note.name,
+                "description": note.description,
+                "confidence": note.confidence,
+                "sources": note.sources,
+                "captured": note.captured.isoformat() if note.captured else None,
+                "last_seen": note.last_seen.isoformat() if note.last_seen else None,
+                "pinned": note.pinned,
+                "archived": note.archived,
+                "superseded_by": note.superseded_by,
+                "expires_at": note.expires_at,
+                "tags": note.tags,
+                **note.extra_frontmatter,
+            },
+            "body": note.body,
+        })
+    return notes
+
+
 def _read_journal_entries(agent_root: Path, lookback_days: int) -> list[dict]:
     """Return journal entry dicts within lookback window."""
     journal_dir = agent_root / "journal"
@@ -647,7 +680,11 @@ def _run_pipeline(
     total_cost = 0.0
 
     # Phase 3: Read inputs
-    notes = _read_memory_notes(agent_root)
+    # Route memory reads through the backend protocol when available.
+    if backend is not None:
+        notes = _read_memory_notes_via_backend(backend)
+    else:
+        notes = _read_memory_notes(agent_root)
     journal_entries = _read_journal_entries(agent_root, journal_lookback_days)
     log_lines = _read_log_lines(agent_root, log_lookback_days)
 

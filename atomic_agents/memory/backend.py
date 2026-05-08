@@ -12,6 +12,7 @@ See docs/spec/20-memory-backend.md for the full specification.
 
 from __future__ import annotations
 
+import abc
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
@@ -80,7 +81,16 @@ class VersionRef:
     backend_id: str          # backend internals only
 
     def __str__(self) -> str:
-        """Display token for CLI / dashboard. Backend decides format."""
+        """Display token for CLI / dashboard.
+
+        For FilesystemBackend, backend_id is ``<stem>/<version_filename>``.
+        Display returns just the version filename (the part after the last '/'),
+        preserving the operator-visible token format from before the P2.7 fix.
+        """
+        # If the backend_id uses the encoded stem/filename format, return only
+        # the filename portion for display; otherwise return backend_id verbatim.
+        if "/" in self.backend_id:
+            return self.backend_id.split("/", 1)[1]
         return self.backend_id
 
 
@@ -110,15 +120,34 @@ class MemoryStats:
     most_churned: list[tuple[str, int]]   # [(note_name, version_count), ...] top 20
 
 
-@dataclass
-class StagedMemory:
-    """A staged write area for bulk operations (e.g., dream).
+class StagedMemory(abc.ABC):
+    """Abstract base for staged write areas used by bulk operations (e.g., dream).
 
     Created by backend.create_staging(). Callers write notes via
     write_note(), then either apply_staging() (atomic swap) or
     discard_staging() (abandon). Never construct directly.
+
+    Per scope §3, subclasses MUST implement write_note(), render_index_summary(),
+    and stats(). The backend_id field identifies this staging area.
     """
-    backend_id: str
+
+    def __init__(self, backend_id: str) -> None:
+        self.backend_id = backend_id
+
+    @abc.abstractmethod
+    def write_note(self, capture: "Capture", policy: "WritePolicy") -> "NoteRef":
+        """Write a capture to the staging area, enforcing policy."""
+        ...
+
+    @abc.abstractmethod
+    def render_index_summary(self) -> str:
+        """Return the INDEX.md-equivalent text for this staging area."""
+        ...
+
+    @abc.abstractmethod
+    def stats(self) -> "MemoryStats":
+        """Return aggregate statistics for the staged memory area."""
+        ...
 
 
 # ──────────────────────────────────────────────────────────────────

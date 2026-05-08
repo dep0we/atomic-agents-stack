@@ -178,15 +178,11 @@ def aggregate_memory(
 
         # Version churn via backend.stats().most_churned
         for note_name, snapshot_count in stats.most_churned:
-            # Derive last_mutated from newest snapshot filename
-            stem = note_name.replace(".md", "")
-            versions_dir_path = memory_dir / ".versions" / stem
+            # Use backend.last_mutation_at() instead of reaching into .versions/ directly
             last_mutated = ""
-            if versions_dir_path.exists():
-                snaps = sorted(versions_dir_path.glob("*.md"))
-                if snaps:
-                    last_snap = snaps[-1].name
-                    last_mutated = last_snap[:15] if len(last_snap) >= 15 else last_snap
+            mutation_dt = backend.last_mutation_at(note_name)
+            if mutation_dt is not None:
+                last_mutated = mutation_dt.strftime("%Y%m%dT%H%M%S")
             all_churn.append(VersionChurnEntry(
                 agent=agent,
                 note=note_name,

@@ -226,25 +226,28 @@ def _scan_recent_captures(
     files: list[tuple[float, dict]] = []
     for agent in agent_names:
         agent_root = agents_root / agent
-        memory_dir = agent_root / "memory"
-        if not memory_dir.exists():
+        if not (agent_root / "memory").exists():
             continue
         backend = FilesystemBackend(agent_root, "memory")
-        for md_path in memory_dir.glob("*.md"):
-            if md_path.name == "INDEX.md":
-                continue
+        # Use backend.list_notes() so future non-filesystem backends are supported.
+        for ref in backend.list_notes(include_archived=True, include_superseded=True):
             try:
-                # Prefer last_mutation_at (version-aware); fall back to mtime
-                mutation_dt = backend.last_mutation_at(md_path.name)
+                # Prefer last_mutation_at (version-aware); fall back to ref.last_seen
+                mutation_dt = backend.last_mutation_at(ref.name)
+                if mutation_dt is None and ref.last_seen is not None:
+                    mutation_dt = datetime.combine(
+                        ref.last_seen,
+                        datetime.min.time(),
+                        tzinfo=timezone.utc,
+                    )
                 if mutation_dt is None:
-                    mtime = md_path.stat().st_mtime
-                    mutation_dt = datetime.fromtimestamp(mtime, tz=timezone.utc)
+                    continue
                 sort_key = mutation_dt.timestamp()
             except OSError:
                 continue
             files.append((sort_key, {
                 "agent": agent,
-                "filename": md_path.name,
+                "filename": ref.name,
                 "mtime": sort_key,
                 "mtime_dt": mutation_dt,
             }))

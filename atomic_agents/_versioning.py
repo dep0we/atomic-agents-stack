@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -74,10 +75,10 @@ def list_versions(memory_dir: Path, note_filename: str) -> list[Path]:
 
     .. deprecated:: Use ``agent.memory.list_versions(name)`` instead.
     """
-    # warnings.warn(
-    #     "list_versions() is deprecated; use agent.memory.list_versions() instead.",
-    #     DeprecationWarning, stacklevel=2,
-    # )
+    warnings.warn(
+        "list_versions() is deprecated; use agent.memory.list_versions() instead.",
+        DeprecationWarning, stacklevel=2,
+    )
     from .memory.filesystem import FilesystemBackend
 
     # Validate path traversal guard (same as before)
@@ -87,9 +88,19 @@ def list_versions(memory_dir: Path, note_filename: str) -> list[Path]:
     agent_root = memory_dir.parent
     backend = FilesystemBackend(agent_root, memory_dir.name)
     refs = backend.list_versions(note_filename)
-    # Return as Path objects for backward compat
+    # Return as Path objects for backward compat.
+    # backend_id is now "<stem>/<version_filename>" — extract just the filename.
     stem = Path(note_filename).stem
-    return [memory_dir / ".versions" / stem / ref.backend_id for ref in refs]
+    result = []
+    for ref in refs:
+        bid = ref.backend_id
+        # backend_id encodes stem/filename; extract the filename portion
+        if "/" in bid:
+            version_filename = bid.split("/", 1)[1]
+        else:
+            version_filename = bid
+        result.append(memory_dir / ".versions" / stem / version_filename)
+    return result
 
 
 def read_version(version_path: Path) -> tuple[dict, str]:
@@ -97,10 +108,10 @@ def read_version(version_path: Path) -> tuple[dict, str]:
 
     .. deprecated:: Use ``agent.memory.read_version(version_ref)`` instead.
     """
-    # warnings.warn(
-    #     "read_version() is deprecated; use agent.memory.read_version() instead.",
-    #     DeprecationWarning, stacklevel=2,
-    # )
+    warnings.warn(
+        "read_version() is deprecated; use agent.memory.read_version() instead.",
+        DeprecationWarning, stacklevel=2,
+    )
     parsed = frontmatter.load(version_path)
     return dict(parsed.metadata), parsed.content
 
@@ -115,10 +126,10 @@ def restore_version(
 
     .. deprecated:: Use ``agent.memory.restore_version()`` instead.
     """
-    # warnings.warn(
-    #     "restore_version() is deprecated; use agent.memory.restore_version() instead.",
-    #     DeprecationWarning, stacklevel=2,
-    # )
+    warnings.warn(
+        "restore_version() is deprecated; use agent.memory.restore_version() instead.",
+        DeprecationWarning, stacklevel=2,
+    )
     # Guard the live-note write target.
     live_note = safe_resolve_under(note_filename, memory_dir)
 
@@ -153,10 +164,10 @@ def redact_version(
 
     .. deprecated:: Use ``agent.memory.redact_version()`` instead.
     """
-    # warnings.warn(
-    #     "redact_version() is deprecated; use agent.memory.redact_version() instead.",
-    #     DeprecationWarning, stacklevel=2,
-    # )
+    warnings.warn(
+        "redact_version() is deprecated; use agent.memory.redact_version() instead.",
+        DeprecationWarning, stacklevel=2,
+    )
     parsed = frontmatter.load(version_path)
     redacted_post = frontmatter.Post(replacement, **parsed.metadata)
     atomic_write(version_path, frontmatter.dumps(redacted_post) + "\n")

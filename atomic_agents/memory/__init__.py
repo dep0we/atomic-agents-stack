@@ -59,6 +59,54 @@ def _register_defaults() -> None:
 _register_defaults()
 
 __all__ = [
+    # Registry
     "register_backend",
     "get_backend",
+    # Protocol + dataclasses
+    "MemoryBackend",
+    "Note",
+    "NoteRef",
+    "VersionRef",
+    "WritePolicy",
+    "MemoryStats",
+    "StagedMemory",
+    # Exceptions
+    "BackendNotRegistered",
+    "VersionNotFound",
+    "StagingNotApplied",
 ]
+
+# Lazy imports to avoid circular dependency at module load time.
+# Callers that import from atomic_agents.memory will trigger these.
+def __getattr__(name: str):
+    """Lazy attribute resolution for public types and exceptions."""
+    _protocol_types = {
+        "MemoryBackend", "Note", "NoteRef", "VersionRef",
+        "WritePolicy", "MemoryStats", "StagedMemory",
+    }
+    _exception_names = {"BackendNotRegistered", "VersionNotFound", "StagingNotApplied"}
+
+    if name in _protocol_types:
+        from .backend import (
+            MemoryBackend, Note, NoteRef, VersionRef,
+            WritePolicy, MemoryStats, StagedMemory,
+        )
+        _locals = {
+            "MemoryBackend": MemoryBackend, "Note": Note, "NoteRef": NoteRef,
+            "VersionRef": VersionRef, "WritePolicy": WritePolicy,
+            "MemoryStats": MemoryStats, "StagedMemory": StagedMemory,
+        }
+        return _locals[name]
+
+    if name in _exception_names:
+        from ..exceptions import (
+            BackendNotRegistered, VersionNotFound, StagingNotApplied,
+        )
+        _locals = {
+            "BackendNotRegistered": BackendNotRegistered,
+            "VersionNotFound": VersionNotFound,
+            "StagingNotApplied": StagingNotApplied,
+        }
+        return _locals[name]
+
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

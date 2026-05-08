@@ -28,7 +28,6 @@ import shutil
 import sys
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
@@ -75,12 +74,14 @@ _TYPE_TO_SECTION = {
 # ──────────────────────────────────────────────────────────────────
 # FilesystemStagedMemory
 
-@dataclass
 class FilesystemStagedMemory(StagedMemory):
     """Filesystem-specific staging area for dream-style bulk operations."""
-    staging_dir: Path    # <agent_root>/dreams/.staging-<uuid>/memory/
-    _applied: bool = False
-    _discarded: bool = False
+
+    def __init__(self, backend_id: str, staging_dir: Path) -> None:
+        super().__init__(backend_id)
+        self.staging_dir: Path = staging_dir
+        self._applied: bool = False
+        self._discarded: bool = False
 
     def _check_active(self) -> None:
         if self._applied or self._discarded:
@@ -91,10 +92,24 @@ class FilesystemStagedMemory(StagedMemory):
             )
 
     def write_note(self, capture: "Capture", policy: WritePolicy) -> NoteRef:
-        """Write a note to the staging area (no policy enforcement on staging dir itself)."""
+        """Write a note to the staging area, enforcing policy on the logical live target.
+
+        Policy is enforced against the *logical* live destination (the filename
+        resolved under the first write_path), not the temporary staging path.
+        This prevents dream from staging a note that would violate write policy
+        at apply time. If policy.write_paths is empty we skip the live-path check
+        and fall back to allowing the write (staging is always inside agent_root).
+        """
         self._check_active()
         self.staging_dir.mkdir(parents=True, exist_ok=True)
         filename = derive_filename(capture.type, capture.name)
+        # Enforce policy against the logical live target (where note lands after apply).
+        # Use the first write_path as the live memory directory for the check.
+        if policy.write_paths:
+            logical_live_target = policy.write_paths[0] / filename
+            _enforce_write_path(
+                logical_live_target.resolve(), policy.write_paths, policy.read_only_paths
+            )
         target = self.staging_dir / filename
         today = date.today()
         content = _render_note(capture, today)
@@ -328,15 +343,6 @@ class FilesystemBackend:
 
     # ───── Versioning ────────────────────────────────────────────────
 
-    def list_versions(self, name: str) -> list[VersionRef]:
-        safe_resolve_under(name, self._memory_dir)
-        stem = Path(name).stem
-        vdir = self._versions_dir / stem
-        if not vdir.exists():
-            return []
-        paths = sorted(vdir.glob("*.md"), reverse=True)
-        return [VersionRef(backend_id=p.name) for p in paths]
-
     def read_version(self, version_ref: VersionRef) -> Note:
         vpath = self._resolve_version_ref(version_ref)
         return _path_to_note(vpath)
@@ -371,6 +377,10 @@ class FilesystemBackend:
     def resolve_version_token(self, name: str, token: str) -> VersionRef:
         """Convert a CLI token (version filename) to an opaque VersionRef.
 
+        The returned VersionRef.backend_id encodes both the note stem and the
+        version filename as ``<stem>/<version_filename>`` so _resolve_version_ref
+        can validate the full path without ambiguous glob-search.
+
         Raises VersionNotFound if the token doesn't match any version.
         """
         safe_resolve_under(name, self._memory_dir)
@@ -391,19 +401,62 @@ class FilesystemBackend:
             raise VersionNotFound(
                 f"Version {token!r} not found for note {name!r}"
             )
-        return VersionRef(backend_id=token)
+        # Encode stem + filename in backend_id to avoid ambiguous resolution
+        return VersionRef(backend_id=f"{stem}/{token}")
+
+    def list_versions(self, name: str) -> list[VersionRef]:
+        safe_resolve_under(name, self._memory_dir)
+        stem = Path(name).stem
+        vdir = self._versions_dir / stem
+        if not vdir.exists():
+            return []
+        paths = sorted(vdir.glob("*.md"), reverse=True)
+        # Encode stem/filename in backend_id for safe resolution
+        return [VersionRef(backend_id=f"{stem}/{p.name}") for p in paths]
 
     def _resolve_version_ref(self, version_ref: VersionRef) -> Path:
-        """Resolve a VersionRef to an absolute path. Raises VersionNotFound if gone."""
-        token = version_ref.backend_id
-        # token is a version filename; find it under any note stem
-        for stem_dir in self._versions_dir.iterdir() if self._versions_dir.exists() else []:
-            if not stem_dir.is_dir():
-                continue
-            candidate = stem_dir / token
-            if candidate.exists():
-                return candidate
-        raise VersionNotFound(f"Version {token!r} not found in {self._versions_dir}")
+        """Resolve a VersionRef to an absolute path. Raises VersionNotFound if gone.
+
+        backend_id must be in the form ``<note_stem>/<version_filename>``.
+        Both components are validated with safe_resolve_under so neither can
+        escape the .versions/ root.
+        """
+        backend_id = version_ref.backend_id
+        # Parse the opaque id: expect exactly one '/' separator
+        if "/" not in backend_id:
+            raise VersionNotFound(
+                f"Malformed VersionRef backend_id {backend_id!r}: "
+                "expected '<stem>/<version_filename>' format"
+            )
+        stem, version_filename = backend_id.split("/", 1)
+
+        if not stem or not version_filename:
+            raise VersionNotFound(
+                f"Malformed VersionRef backend_id {backend_id!r}: empty stem or filename"
+            )
+
+        # Validate stem against versions_root (no traversal)
+        try:
+            stem_dir = safe_resolve_under(stem, self._versions_dir)
+        except PathTraversalError:
+            raise VersionNotFound(
+                f"VersionRef stem {stem!r} resolves outside .versions/ directory"
+            )
+
+        # Validate version_filename against the stem dir (no traversal)
+        try:
+            vpath = safe_resolve_under(version_filename, stem_dir)
+        except PathTraversalError:
+            raise VersionNotFound(
+                f"VersionRef filename {version_filename!r} resolves outside "
+                f".versions/{stem}/ directory"
+            )
+
+        if not vpath.is_file():
+            raise VersionNotFound(
+                f"Version file {version_filename!r} not found under .versions/{stem}/"
+            )
+        return vpath
 
     # ───── Bulk staging ─────────────────────────────────────────────
 
@@ -427,9 +480,27 @@ class FilesystemBackend:
                 f"Staged memory directory {staged_memory} doesn't exist"
             )
 
+        # Enforce policy against every note that would land in live memory.
+        # Walk staging area and check each .md file against write_paths/read_only_paths.
+        for staged_file in staged_memory.glob("*.md"):
+            if staged_file.name in _EXCLUDED_FILES:
+                continue
+            # The logical live target is self._memory_dir / filename
+            logical_target = self._memory_dir / staged_file.name
+            try:
+                _enforce_write_path(
+                    logical_target.resolve(), policy.write_paths, policy.read_only_paths
+                )
+            except WritePathViolation:
+                raise WritePathViolation(
+                    f"apply_staging: staged note {staged_file.name!r} targets a "
+                    f"path that violates write policy — staging discarded"
+                )
+
         current_memory = self._memory_dir
-        ts = datetime.now().strftime("%Y%m%dT%H%M%S")
-        archived = self._agent_root / f"memory.archived-{ts}"
+        ts = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%S_%f")
+        ts_unique = f"{ts}_{uuid.uuid4().hex[:8]}"
+        archived = self._agent_root / f"memory.archived-{ts_unique}"
 
         # Acquire the per-agent lock to serialize against in-flight agent.call() writes.
         agent_lock = AgentLock(self._agent_root, wait_seconds=30)
@@ -437,7 +508,13 @@ class FilesystemBackend:
         try:
             if current_memory.exists():
                 os.rename(str(current_memory), str(archived))
-            os.rename(str(staged_memory), str(current_memory))
+            try:
+                os.rename(str(staged_memory), str(current_memory))
+            except Exception:
+                # Rollback: restore archived dir back to memory/ to leave agent intact
+                if archived.exists() and not current_memory.exists():
+                    os.rename(str(archived), str(current_memory))
+                raise
             staging._applied = True
         finally:
             agent_lock.release()

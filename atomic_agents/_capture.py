@@ -18,6 +18,7 @@ when the same observation is emitted via both paths.
 from __future__ import annotations
 import json
 import re
+import warnings
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -281,10 +282,10 @@ def write_atomic_note(
 
     Returns the path of the written note.
     """
-    # warnings.warn(
-    #     "write_atomic_note() is deprecated; use agent.memory.write_note() instead.",
-    #     DeprecationWarning, stacklevel=2,
-    # )
+    warnings.warn(
+        "write_atomic_note() is deprecated; use agent.memory.write_note() instead.",
+        DeprecationWarning, stacklevel=2,
+    )
     from .memory.filesystem import FilesystemBackend, _snapshot
     from .memory.backend import WritePolicy
 
