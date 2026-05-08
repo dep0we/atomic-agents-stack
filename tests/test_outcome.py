@@ -535,3 +535,122 @@ def test_outcome_artifact_glob_picks_up_new_files(agent_vault, rubric_text, sati
     # Also verify the iteration record has the artifact_path
     assert result.iterations[0].artifact_path is not None
     assert Path(result.iterations[0].artifact_path).name == "summary.txt"
+
+
+# ──────────────────────────────────────────────────────────────────
+# Test 11: judge call respects cost cap (R2-C1)
+
+
+def test_outcome_judge_call_respects_cost_cap(agent_vault, rubric_text):
+    """Agent call succeeds, but guardrail refuses before judge call → interrupted, judge never called."""
+    runner = _make_runner(agent_vault)
+
+    agent_resp = _make_agent_response()
+    call_count = {"guardrail": 0, "judge": 0}
+
+    def guardrail_side_effect(critical=False):
+        call_count["guardrail"] += 1
+        # First check (pre-agent): allow. Second check (pre-judge): deny.
+        if call_count["guardrail"] <= 1:
+            return CostCheckResult(allow=True)
+        return CostCheckResult(allow=False, action="skip", reason="daily cap hit ($0.10/$0.10)")
+
+    def judge_side_effect(*args, **kwargs):
+        call_count["judge"] += 1
+        return MagicMock()
+
+    with patch("atomic_agents.outcome.AtomicAgent") as MockAgent:
+        mock_instance = MagicMock()
+        mock_instance.call.return_value = agent_resp
+        mock_instance.config.default_model = "claude-sonnet-4-6-20260101"
+        mock_instance._check_cost_guardrails.side_effect = guardrail_side_effect
+        MockAgent.return_value = mock_instance
+
+        with patch("atomic_agents.outcome._llm.call_llm", side_effect=judge_side_effect) as mock_llm:
+            result = runner.run(
+                description="Cost cap judge test",
+                rubric=rubric_text,
+                max_iterations=3,
+            )
+
+    assert result.status == "interrupted"
+    assert "cost guardrail" in result.explanation
+    assert "judge" in result.explanation
+    # Judge should not have been called at all
+    assert call_count["judge"] == 0
+    # Only 1 iteration was attempted (aborted before judge), so no completed iterations
+    assert len(result.iterations) == 0
+
+
+# ──────────────────────────────────────────────────────────────────
+# Tests 12-14: max_iterations validation raises ValueError (R2-C2)
+
+
+def test_outcome_max_iterations_zero_raises(agent_vault):
+    """max_iterations=0 raises ValueError (operator mistake should be loud)."""
+    agents_root, agent_name = agent_vault
+    runner = OutcomeRunner(agents_root=agents_root, agent_name=agent_name, judge_model="gpt-5")
+
+    with pytest.raises(ValueError, match="max_iterations"):
+        runner.run("desc", "rubric text\n# criteria", max_iterations=0)
+
+
+def test_outcome_max_iterations_twentyone_raises(agent_vault):
+    """max_iterations=21 raises ValueError (above allowed cap)."""
+    agents_root, agent_name = agent_vault
+    runner = OutcomeRunner(agents_root=agents_root, agent_name=agent_name, judge_model="gpt-5")
+
+    with pytest.raises(ValueError, match="max_iterations"):
+        runner.run("desc", "rubric text\n# criteria", max_iterations=21)
+
+
+def test_outcome_max_iterations_in_range_unchanged(agent_vault, satisfied_verdict):
+    """max_iterations=5 is accepted unchanged and stored in the result."""
+    runner = _make_runner(agent_vault)
+
+    agent_resp = _make_agent_response()
+    judge_resp = _make_judge_response(satisfied_verdict)
+
+    with patch("atomic_agents.outcome.AtomicAgent") as MockAgent:
+        mock_instance = MagicMock()
+        mock_instance.call.return_value = agent_resp
+        mock_instance.config.default_model = "claude-sonnet-4-6-20260101"
+        mock_instance._check_cost_guardrails.return_value = CostCheckResult(allow=True)
+        MockAgent.return_value = mock_instance
+
+        with patch("atomic_agents.outcome._llm.call_llm", return_value=judge_resp):
+            result = runner.run(
+                description="In-range max_iterations test",
+                rubric="rubric\n# criteria",
+                max_iterations=5,
+            )
+
+    assert result.max_iterations == 5
+
+
+# ──────────────────────────────────────────────────────────────────
+# Test 15: CLI summary labels rubric_source correctly (R2-C3)
+
+
+def test_outcome_cli_summary_labels_correctly(agent_vault, satisfied_verdict, capsys):
+    """CLI _print_result prints 'Rubric:' not 'Agent:' for rubric_source."""
+    from atomic_agents.outcome import _print_result
+
+    result = OutcomeResult(
+        run_id="outcome-test-12345678",
+        description="CLI label test",
+        rubric_source="testagent/evals/rubric.md",
+        max_iterations=3,
+        status="satisfied",
+        explanation="All criteria met.",
+        started_at="2026-05-07T10:00:00+00:00",
+        ended_at="2026-05-07T10:00:05+00:00",
+        total_cost_usd=0.0012,
+    )
+
+    _print_result(result)
+    captured = capsys.readouterr()
+
+    assert "Rubric:" in captured.out
+    assert "Agent:" not in captured.out
+    assert "testagent/evals/rubric.md" in captured.out

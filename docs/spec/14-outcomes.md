@@ -10,7 +10,7 @@ An **outcome** is an in-flight generation loop. You give the runner:
 
 1. A **description** — what to build.
 2. A **rubric** — the criteria the artifact must meet (same format as spec/08).
-3. A **max_iterations** cap (default 3, max 20).
+3. A **max_iterations** cap (default 3, must be in [1, 20]; raises `ValueError` outside that range).
 
 The runner then:
 
@@ -80,7 +80,7 @@ You can also point the runner at your agent's existing `evals/rubric.md` — the
 
 For each iteration `i` in `range(max_iterations + 1)`:
 
-1. **Cost guardrail check.** Uses the parent agent's `_check_cost_guardrails`. If the cap is hit → `interrupted`.
+1. **Cost guardrail check (pre-agent).** Uses the parent agent's `_check_cost_guardrails`. If the cap is hit → `interrupted`.
 
 2. **Build agent prompt.** Iteration 0: description + rubric + output dir + optional extra context. Iteration N>0: adds the previous judge's gap feedback so the agent knows exactly what to revise.
 
@@ -89,6 +89,8 @@ For each iteration `i` in `range(max_iterations + 1)`:
 4. **Detect artifact.** Glob the run output dir for new files. If the agent wrote a file, that file is graded. If not, the agent's text response is graded.
 
 5. **Build judge prompt.** Description + rubric + artifact text + per-criterion JSON schema. Fresh context — judge has no memory of prior iterations.
+
+5b. **Cost guardrail check (pre-judge).** Second `_check_cost_guardrails` call to ensure the agent call didn't exhaust remaining headroom before the judge fires. If the cap is hit → `interrupted`.
 
 6. **Call judge.** `_llm.call_llm` directly — no agent loading, no captures, no tools. Cross-family model (or explicit override). Strict temperature (0.2).
 
@@ -125,7 +127,7 @@ The judge outputs a JSON object:
 
 ## Cost guardrails
 
-The runner inherits the parent agent's cost guardrails. Before each iteration, `_check_cost_guardrails` runs. If the daily or monthly cap is hit, the run ends with `status=interrupted`.
+The runner inherits the parent agent's cost guardrails. Each iteration runs `_check_cost_guardrails` **twice** — once before the agent draft call and once before the judge call. If the cap is hit at either point, the run ends with `status=interrupted`. This means a single iteration cannot overspend by completing the agent call and then letting the judge fire unchecked.
 
 Costs from all iterations are aggregated in `OutcomeResult.total_cost_usd`.
 
