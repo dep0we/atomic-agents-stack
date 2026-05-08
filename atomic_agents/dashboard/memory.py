@@ -18,6 +18,7 @@ from typing import Any
 from .costs import discover_agents
 from ._shared import page_shell, truncate
 from .._io import atomic_write
+from ..memory.filesystem import FilesystemBackend
 
 # Try to import python-frontmatter; if not available, use a simple fallback.
 try:
@@ -134,87 +135,68 @@ def aggregate_memory(
         if not memory_dir.exists():
             continue
 
+        # Use FilesystemBackend for all memory reads (protocol-compliant)
+        backend = FilesystemBackend(agent_root, "memory")
+        stats = backend.stats()
+
         # Note counts by type
         counts = NoteTypeCount(agent=agent)
-        notes_in_memory: list[str] = []
-        stale_notes: list[StalenessCandidate] = []
-
-        for md_path in memory_dir.glob("*.md"):
-            if md_path.name == "INDEX.md":
-                continue
-            notes_in_memory.append(md_path.name)
-            fm = _read_frontmatter(md_path)
-            note_type = (fm.get("type") or "").lower()
-            if note_type == "user":
-                counts.user += 1
-            elif note_type == "feedback":
-                counts.feedback += 1
-            elif note_type == "project":
-                counts.project += 1
-            elif note_type == "decision":
-                counts.decision += 1
-            elif note_type == "reference":
-                counts.reference += 1
-            else:
-                counts.other += 1
-
-            # Staleness check
-            pinned = bool(fm.get("pinned", False))
-            last_seen_str = fm.get("last_seen") or fm.get("last_updated")
-            days_since: int | None = None
-            if last_seen_str:
-                try:
-                    last_seen_d = date.fromisoformat(str(last_seen_str)[:10])
-                    days_since = (today - last_seen_d).days
-                except (ValueError, TypeError):
-                    pass
-
-            if not pinned and days_since is not None and days_since >= staleness_threshold_days:
-                stale_notes.append(StalenessCandidate(
-                    agent=agent,
-                    note=md_path.name,
-                    last_seen=str(last_seen_str),
-                    days_since=days_since,
-                    pinned=False,
-                ))
+        counts.user = stats.by_type.get("user", 0)
+        counts.feedback = stats.by_type.get("feedback", 0)
+        counts.project = stats.by_type.get("project", 0)
+        counts.decision = stats.by_type.get("decision", 0)
+        counts.reference = stats.by_type.get("reference", 0)
+        # Any type not in the known set goes to "other"
+        counts.other = sum(
+            v for k, v in stats.by_type.items()
+            if k not in _KNOWN_TYPES
+        )
 
         if counts.total > 0:
             note_counts.append(counts)
+
+        # Staleness via backend.list_stale()
+        stale_refs = backend.list_stale(staleness_threshold_days, exclude_pinned=True)
+        stale_notes: list[StalenessCandidate] = []
+        for ref in stale_refs:
+            days_since: int | None = None
+            if ref.last_seen is not None:
+                days_since = (today - ref.last_seen).days
+            stale_notes.append(StalenessCandidate(
+                agent=agent,
+                note=ref.name,
+                last_seen=ref.last_seen.isoformat() if ref.last_seen else None,
+                days_since=days_since,
+                pinned=ref.pinned,
+            ))
         all_stale.extend(sorted(stale_notes, key=lambda x: x.days_since or 0, reverse=True))
 
-        # Orphan check: in memory/ but missing from INDEX.md
-        index_path = memory_dir / "INDEX.md"
-        if index_path.exists():
-            try:
-                index_text = index_path.read_text(encoding="utf-8")
-            except OSError:
-                index_text = ""
-            for note_name in notes_in_memory:
-                stem = note_name.replace(".md", "")
-                # INDEX.md might reference by stem or full filename
-                if note_name not in index_text and stem not in index_text:
-                    all_orphans.append(OrphanNote(agent=agent, note=note_name))
+        # Orphans via backend.list_orphans()
+        orphan_refs = backend.list_orphans()
+        for ref in orphan_refs:
+            all_orphans.append(OrphanNote(agent=agent, note=ref.name))
 
-        # Version churn
-        versions_dir = memory_dir / ".versions"
-        if versions_dir.exists():
-            for stem_dir in sorted(versions_dir.iterdir()):
-                if not stem_dir.is_dir():
-                    continue
-                snapshots = sorted(stem_dir.glob("*.md"))
-                if not snapshots:
-                    continue
-                last_snap = snapshots[-1].name  # newest (highest ts prefix)
-                all_churn.append(VersionChurnEntry(
-                    agent=agent,
-                    note=f"{stem_dir.name}.md",
-                    snapshot_count=len(snapshots),
-                    last_mutated=last_snap[:15] if len(last_snap) >= 15 else last_snap,
-                ))
+        # Version churn via backend.stats().most_churned
+        for note_name, snapshot_count in stats.most_churned:
+            # Derive last_mutated from newest snapshot filename
+            stem = note_name.replace(".md", "")
+            versions_dir_path = memory_dir / ".versions" / stem
+            last_mutated = ""
+            if versions_dir_path.exists():
+                snaps = sorted(versions_dir_path.glob("*.md"))
+                if snaps:
+                    last_snap = snaps[-1].name
+                    last_mutated = last_snap[:15] if len(last_snap) >= 15 else last_snap
+            all_churn.append(VersionChurnEntry(
+                agent=agent,
+                note=note_name,
+                snapshot_count=snapshot_count,
+                last_mutated=last_mutated,
+            ))
 
-        # Memory size
-        live_bytes = _dir_size(memory_dir, exclude_subdirs=True)
-        versions_bytes = _dir_size(versions_dir) if versions_dir.exists() else 0
+        # Memory size via backend.stats()
+        live_bytes = stats.live_bytes
+        versions_bytes = stats.version_history_bytes
         ratio = versions_bytes / live_bytes if live_bytes > 0 else 0.0
         memory_sizes.append(AgentMemorySize(
             agent=agent,
@@ -223,7 +205,7 @@ def aggregate_memory(
             ratio=round(ratio, 2),
         ))
 
-        # Dream history
+        # Dream history (no backend method — direct manifest scan)
         dreams_dir = agent_root / "dreams"
         if dreams_dir.exists():
             for dream_dir in sorted(dreams_dir.iterdir()):

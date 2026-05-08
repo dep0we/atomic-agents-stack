@@ -29,6 +29,8 @@ import frontmatter
 
 from . import _capture, _cascade, _costs, _llm, _model, _roster, _tools
 from ._io import atomic_append_jsonl, atomic_write, safe_resolve_under
+from .memory.filesystem import FilesystemBackend
+from .memory.backend import WritePolicy
 from .mcp import MCPClientPool, parse_mcp_md
 from ._locks import AgentLock
 from ._platform import get_agents_root
@@ -165,6 +167,12 @@ class AtomicAgent:
 
         # Parse config files
         self.config = self._load_config()
+
+        # Memory backend (spec/20 — routes all memory I/O through the protocol)
+        self.memory: FilesystemBackend = FilesystemBackend(
+            agent_root=self.agent_root,
+            memory_subdir="memory",
+        )
 
     def _register_skill_tools(self) -> None:
         """Register load_skill and load_skill_file as built-in tools in the registry.
@@ -397,9 +405,9 @@ class AtomicAgent:
             self._tools_text = ""
 
     def _load_indexes(self) -> None:
-        memory_index = self.agent_root / "memory" / "INDEX.md"
-        if memory_index.exists():
-            self._memory_index_text = memory_index.read_text(encoding="utf-8")
+        summary = self.memory.render_index_summary()
+        if summary and summary.strip() != "# Memory Index\n":
+            self._memory_index_text = summary
         wiki_index = self.agent_root / "wiki" / "INDEX.md"
         if wiki_index.exists():
             self._wiki_index_text = wiki_index.read_text(encoding="utf-8")
@@ -408,44 +416,30 @@ class AtomicAgent:
         memory_dir = self.agent_root / "memory"
         if not memory_dir.exists():
             return
+        pinned_refs = self.memory.list_pinned()
         pinned = []
-        for path in sorted(memory_dir.glob("*.md")):
-            if path.name == "INDEX.md":
-                continue
+        for ref in pinned_refs[:PINNED_MAX]:
+            path = memory_dir / ref.name
             try:
                 parsed = frontmatter.load(path)
-                if parsed.metadata.get("pinned") is True:
-                    pinned.append(self._render_note_for_context(path, parsed))
+                pinned.append(self._render_note_for_context(path, parsed))
             except Exception:
                 continue
-        self._pinned_notes = pinned[:PINNED_MAX]
+        self._pinned_notes = pinned
 
     def _load_recent_notes(self, n: int = RECENT_NOTES_DEFAULT) -> None:
         memory_dir = self.agent_root / "memory"
         if not memory_dir.exists():
             return
-        notes_with_dates = []
-        for path in memory_dir.glob("*.md"):
-            if path.name == "INDEX.md":
-                continue
+        recent_refs = self.memory.list_recent(n=n, exclude_pinned=True)
+        self._recent_notes = []
+        for ref in recent_refs:
+            path = memory_dir / ref.name
             try:
                 parsed = frontmatter.load(path)
-                # Skip pinned (already loaded) and archived
-                if parsed.metadata.get("pinned"):
-                    continue
-                if parsed.metadata.get("archived"):
-                    continue
-                if parsed.metadata.get("superseded_by"):
-                    continue
-                last_seen = parsed.metadata.get("last_seen", "0000-00-00")
-                notes_with_dates.append((str(last_seen), path, parsed))
+                self._recent_notes.append(self._render_note_for_context(path, parsed))
             except Exception:
                 continue
-        notes_with_dates.sort(reverse=True)
-        self._recent_notes = [
-            self._render_note_for_context(path, parsed)
-            for _, path, parsed in notes_with_dates[:n]
-        ]
 
     def _load_recent_journal(self, n: int = RECENT_JOURNAL_DEFAULT) -> None:
         journal_dir = self.agent_root / "journal"
@@ -821,16 +815,17 @@ class AtomicAgent:
             written_captures: list[Capture] = []
             seen_capture_keys: set[tuple] = set()
             if write_captures:
+                policy = WritePolicy(
+                    write_paths=self.config.write_paths,
+                    read_only_paths=self.config.read_only_paths,
+                )
                 for c in all_captures:
                     key = (c.type, c.name, hash(c.body))
                     if key in seen_capture_keys:
                         continue
                     seen_capture_keys.add(key)
                     try:
-                        _capture.write_atomic_note(
-                            self.agent_root, c, self.config.write_paths,
-                            read_only_paths=self.config.read_only_paths,
-                        )
+                        self.memory.write_note(c, policy)
                         written_captures.append(c)
                     except Exception as e:
                         self._log({

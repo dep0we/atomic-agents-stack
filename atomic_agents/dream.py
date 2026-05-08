@@ -61,6 +61,8 @@ from ._io import atomic_write
 from ._locks import AgentLock
 from ._platform import get_agents_root
 from .exceptions import AtomicAgentsError, DreamInProgress, DreamNotFound
+from .memory.backend import WritePolicy
+from .memory.filesystem import FilesystemBackend, FilesystemStagedMemory
 from .types import Capture
 
 # Regex for valid dream_id: only the drm_<YYYY-MM-DDTHHMMSS>_<6hex> shape or
@@ -637,6 +639,7 @@ def _run_pipeline(
     instructions: str,
     model: str,
     critical: bool,
+    backend: FilesystemBackend | None = None,
 ) -> DreamResult:
     """Execute the full dream pipeline. Mutates and returns result."""
     total_input_tokens = 0
@@ -750,9 +753,15 @@ def _run_pipeline(
     # Parse synthesis output
     synthesis_data = _parse_helper_text(synthesis_result.text)
 
-    # Phase 6: Write outputs
-    output_dir = dream_dir / "memory"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Phase 6: Write outputs via staging (protocol-compliant bulk write area)
+    if backend is not None:
+        staging = backend.create_staging()
+        output_dir = staging.staging_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        staging = None
+        output_dir = dream_dir / "memory"
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     written_notes: list[str] = []
     stale_filenames = {s.note for s in stale_markings}
@@ -845,6 +854,16 @@ def _run_pipeline(
     unchanged_count = len(notes) - len(consolidated_superseded) - len(notes_to_consolidate)
     report_content = _build_report(final_consolidated, final_promoted, stale_markings, unchanged_count)
     atomic_write(dream_dir / "report.md", report_content)
+
+    # 6f: Move staging area to dream_dir/memory/ for operator review.
+    # When backend staging was used, output_dir is inside dreams/.staging-<uuid>/memory/.
+    # Rename it to dreams/<id>/memory/ so the operator can review and apply later.
+    if staging is not None:
+        dream_memory = dream_dir / "memory"
+        if not dream_memory.exists():
+            os.rename(str(output_dir), str(dream_memory))
+        # Mark staging as consumed (it was moved, not applied via backend)
+        staging._discarded = True
 
     # Finalise result
     result.consolidated = final_consolidated
@@ -982,6 +1001,9 @@ class DreamRunner:
                 f"Set ATOMIC_AGENTS_ROOT or create the agent."
             )
 
+        # Memory backend — shared across start/apply/discard calls
+        self._backend = FilesystemBackend(self.agent_root, "memory")
+
         # Resolve model: explicit > agent's model.md default
         if model:
             self._model = model
@@ -1052,6 +1074,7 @@ class DreamRunner:
                 instructions=instructions,
                 model=self._model,
                 critical=critical,
+                backend=self._backend,
             )
             _write_manifest(dream_dir, result)
         except Exception as exc:
@@ -1120,31 +1143,41 @@ class DreamRunner:
                 f"Dreamed memory/ dir not found at {dreamed_memory} — dream output is incomplete"
             )
 
-        current_memory = self.agent_root / "memory"
-        ts = datetime.now().strftime("%Y%m%dT%H%M%S")
-        archived = self.agent_root / f"memory.archived-{ts}"
+        # Build a permissive write policy allowing the agent's memory dir.
+        # apply_staging() handles the AgentLock + atomic rename internally.
+        memory_dir = self.agent_root / "memory"
+        policy = WritePolicy(write_paths=[memory_dir, self.agent_root])
 
-        # Acquire the per-agent lock (same lock used by AtomicAgent.call()) so
-        # the rename pair is serialized against any in-flight agent.call() that
-        # may be writing captures.  Wait up to 30 s then raise AgentLockBusy.
-        agent_lock = AgentLock(self.agent_root, wait_seconds=30)
-        agent_lock.acquire()
-        try:
-            # Step 3: archive current memory (if exists)
-            if current_memory.exists():
-                os.rename(str(current_memory), str(archived))
+        # Wrap the dream output dir as a FilesystemStagedMemory so apply_staging
+        # can do the lock-aware atomic swap through the backend protocol.
+        staged = FilesystemStagedMemory(
+            backend_id=dream_id,
+            staging_dir=dreamed_memory,
+        )
 
-            # Step 4: promote dreamed memory
-            os.rename(str(dreamed_memory), str(current_memory))
+        # apply_staging archives current memory to memory.archived-<ts>, promotes
+        # dreamed_memory to memory/, acquires AgentLock internally.
+        self._backend.apply_staging(staged, policy)
 
-            # Step 5: update manifest
-            result.applied_at = datetime.now().astimezone().isoformat()
-            result.archived_path = str(archived)
-            _write_manifest(dream_dir, result)
-        finally:
-            agent_lock.release()
+        # Retrieve the archived path from disk (apply_staging uses its own ts)
+        # by scanning for the newest memory.archived-* dir.
+        archived = self._find_archived_memory()
+
+        # Step 5: update manifest
+        result.applied_at = datetime.now().astimezone().isoformat()
+        result.archived_path = str(archived) if archived else None
+        _write_manifest(dream_dir, result)
 
         return archived
+
+    def _find_archived_memory(self) -> Path | None:
+        """Return the most recently created memory.archived-* directory, or None."""
+        candidates = sorted(
+            self.agent_root.glob("memory.archived-*"),
+            key=lambda p: p.name,
+            reverse=True,
+        )
+        return candidates[0] if candidates else None
 
     def discard(self, dream_id: str) -> None:
         """Remove the dreamed output dir. Refuses if already applied."""

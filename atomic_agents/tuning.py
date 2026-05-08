@@ -1097,20 +1097,30 @@ class TuningRunner:
                     except json.JSONDecodeError:
                         continue
 
-        # Memory notes
-        memory_dir = self.agent_root / "memory"
-        if memory_dir.exists():
-            for path in memory_dir.glob("*.md"):
-                if path.name == "INDEX.md":
-                    continue
-                try:
-                    parsed = frontmatter.load(path)
-                    ctx.memory_notes[path.name] = {
-                        "meta": dict(parsed.metadata),
-                        "body": parsed.content,
-                    }
-                except Exception:
-                    continue
+        # Memory notes — loaded via FilesystemBackend for consistency
+        from .memory.filesystem import FilesystemBackend
+        memory_backend = FilesystemBackend(self.agent_root, "memory")
+        for ref in memory_backend.list_notes(include_archived=True, include_superseded=True):
+            note = memory_backend.read_note(ref.name)
+            if note is not None:
+                ctx.memory_notes[ref.name] = {
+                    "meta": {
+                        "type": note.type,
+                        "name": note.name,
+                        "description": note.description,
+                        "confidence": note.confidence,
+                        "sources": note.sources,
+                        "captured": note.captured.isoformat() if note.captured else None,
+                        "last_seen": note.last_seen.isoformat() if note.last_seen else None,
+                        "pinned": note.pinned,
+                        "archived": note.archived,
+                        "superseded_by": note.superseded_by,
+                        "expires_at": note.expires_at,
+                        "tags": note.tags,
+                        **note.extra_frontmatter,
+                    },
+                    "body": note.body,
+                }
 
         # Tuning history
         history_path = self.agent_root / "evals" / "tuning_history.jsonl"
