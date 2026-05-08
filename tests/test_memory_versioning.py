@@ -520,3 +520,123 @@ def test_redaction_logged(tmp_path):
     redact_events = [l for l in lines if l.get("trigger") == "memory_version_redacted"]
     assert len(redact_events) == 1
     assert "version_path" in redact_events[0]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Codex R2 regression tests
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_snapshot_two_in_same_second_have_distinct_paths(tmp_path):
+    """Two snapshots of identical content taken in the same second must NOT collide.
+
+    With second-only timestamp precision two writes of the same content produce
+    the same <timestamp>_<hash>.md filename — a silent overwrite that violates
+    the immutable-per-mutation history invariant (codex R2-D3).
+
+    Fix: microsecond precision in the timestamp ensures distinct filenames even
+    within the same second.
+    """
+    note = _write_note(tmp_path, content="identical content\n")
+    memory_dir = note.parent
+
+    # Take two snapshots as fast as possible — both will happen in the same second
+    # (and likely the same microsecond epoch, but %f gives 6 digits so they diverge)
+    v1 = snapshot_memory_version(note)
+
+    # Reset the file so snapshot_memory_version doesn't skip (file must exist)
+    # and take a second snapshot immediately
+    v2 = snapshot_memory_version(note)
+
+    assert v1 is not None
+    assert v2 is not None
+    # The two version paths must be distinct (no collision)
+    assert v1 != v2, (
+        f"Two snapshots produced the same path: {v1.name}. "
+        "Timestamp precision is likely too coarse (second-level)."
+    )
+    # Both version files must exist (no overwrite)
+    assert v1.exists(), f"v1 snapshot file was overwritten or missing: {v1}"
+    assert v2.exists(), f"v2 snapshot file was overwritten or missing: {v2}"
+
+
+def test_snapshot_filename_has_microsecond_precision(tmp_path):
+    """Version filename must include microseconds (%f) — 6 extra digits after seconds."""
+    from atomic_agents._versioning import _version_filename
+    name = _version_filename("some content")
+    # Expected format: YYYYMMDDTHHMMSSffffffZ_<hash>.md
+    # The timestamp portion before the underscore should be 22 chars:
+    # 8 date + T + 6 time + 6 microseconds + Z = 22 chars
+    stem = name.replace(".md", "")
+    ts_part = stem.split("_")[0]
+    # Must be 22 characters: YYYYMMDDTHHMMSS + ffffff + Z
+    assert len(ts_part) == 22, (
+        f"Expected 22-char timestamp (with microseconds), got {len(ts_part)!r}: {ts_part!r}"
+    )
+    # Must end with Z
+    assert ts_part.endswith("Z"), f"Timestamp should end with Z: {ts_part!r}"
+
+
+def test_capture_concurrent_write_blocked_by_file_lock(tmp_path):
+    """Two threads attempting concurrent write_atomic_note with preconditions.
+
+    Thread A holds the per-file lock and writes slowly.  Thread B attempts to
+    write with a precondition concurrently.  Thread B must either:
+    - Succeed after Thread A releases (if precondition still matches), or
+    - Raise MemoryPreconditionFailed (if Thread A's write invalidated it).
+
+    In this test Thread A changes the content, so Thread B's stale sha should
+    result in MemoryPreconditionFailed, not a silent bad write.
+    """
+    import threading
+
+    agent_root = tmp_path / "agent"
+    memory_dir = agent_root / "memory"
+    memory_dir.mkdir(parents=True)
+
+    # Write the initial note
+    capture_init = _make_capture()
+    write_atomic_note(agent_root, capture_init, write_paths=[memory_dir])
+    note_path = memory_dir / "feedback_comm_style.md"
+
+    # Thread B will use the sha from before Thread A writes
+    content_before = note_path.read_text()
+    sha_before = _sha(content_before)
+
+    # Barrier to coordinate the threads
+    barrier = threading.Barrier(2)
+    results = {}
+
+    def thread_a():
+        """Merges first — changes the file content."""
+        barrier.wait()  # sync start
+        merge_a = _make_capture(merge_into="feedback_comm_style.md", sources=["agent_a"])
+        write_atomic_note(agent_root, merge_a, write_paths=[memory_dir])
+        results["a"] = "done"
+
+    def thread_b():
+        """Tries to merge with stale sha — should fail after Thread A writes."""
+        barrier.wait()  # sync start
+        try:
+            merge_b = _make_capture(merge_into="feedback_comm_style.md", sources=["agent_b"])
+            write_atomic_note(
+                agent_root, merge_b, write_paths=[memory_dir],
+                expected_content_sha256=sha_before,
+            )
+            results["b"] = "ok"
+        except Exception as e:
+            results["b"] = type(e).__name__
+
+    ta = threading.Thread(target=thread_a)
+    tb = threading.Thread(target=thread_b)
+    ta.start(); tb.start()
+    ta.join(); tb.join()
+
+    assert results.get("a") == "done"
+    # Thread B must have either succeeded (if it got the lock first and a matched)
+    # or raised MemoryPreconditionFailed (if Thread A went first and changed content).
+    # Either outcome is correct — what we're checking is that NO silent corruption
+    # occurred (i.e., we don't get a generic Exception or crash).
+    assert results.get("b") in ("ok", "MemoryPreconditionFailed"), (
+        f"Thread B had unexpected outcome: {results.get('b')!r}"
+    )

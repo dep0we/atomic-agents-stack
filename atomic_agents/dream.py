@@ -58,9 +58,16 @@ import frontmatter
 from . import _costs, _llm, _model
 from ._capture import _render_note, _update_index
 from ._io import atomic_write
+from ._locks import AgentLock
 from ._platform import get_agents_root
 from .exceptions import AtomicAgentsError, DreamInProgress, DreamNotFound
 from .types import Capture
+
+# Regex for valid dream_id: only the drm_<YYYY-MM-DDTHHMMSS>_<6hex> shape or
+# any sequence of alphanumeric + underscore + hyphen with no path separators.
+# This prevents path traversal via dream_id such as "../../persona".
+import re as _re
+_VALID_DREAM_ID_RE = _re.compile(r'^[a-zA-Z0-9_-]+$')
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -1117,23 +1124,46 @@ class DreamRunner:
         ts = datetime.now().strftime("%Y%m%dT%H%M%S")
         archived = self.agent_root / f"memory.archived-{ts}"
 
-        # Step 3: archive current memory (if exists)
-        if current_memory.exists():
-            os.rename(str(current_memory), str(archived))
+        # Acquire the per-agent lock (same lock used by AtomicAgent.call()) so
+        # the rename pair is serialized against any in-flight agent.call() that
+        # may be writing captures.  Wait up to 30 s then raise AgentLockBusy.
+        agent_lock = AgentLock(self.agent_root, wait_seconds=30)
+        agent_lock.acquire()
+        try:
+            # Step 3: archive current memory (if exists)
+            if current_memory.exists():
+                os.rename(str(current_memory), str(archived))
 
-        # Step 4: promote dreamed memory
-        os.rename(str(dreamed_memory), str(current_memory))
+            # Step 4: promote dreamed memory
+            os.rename(str(dreamed_memory), str(current_memory))
 
-        # Step 5: update manifest
-        result.applied_at = datetime.now().astimezone().isoformat()
-        result.archived_path = str(archived)
-        _write_manifest(dream_dir, result)
+            # Step 5: update manifest
+            result.applied_at = datetime.now().astimezone().isoformat()
+            result.archived_path = str(archived)
+            _write_manifest(dream_dir, result)
+        finally:
+            agent_lock.release()
 
         return archived
 
     def discard(self, dream_id: str) -> None:
         """Remove the dreamed output dir. Refuses if already applied."""
+        # Validate dream_id before constructing a path from it.
+        # dream_id must contain only alphanumerics, underscores, and hyphens —
+        # no path separators.  This prevents "../../persona" style traversal.
+        if not _VALID_DREAM_ID_RE.match(dream_id):
+            raise DreamNotFound(
+                f"Invalid dream_id {dream_id!r}: must contain only alphanumeric "
+                "characters, underscores, and hyphens"
+            )
         dream_dir = self.dreams_dir / dream_id
+        # Belt-and-suspenders: also verify the resolved path is inside dreams_dir
+        try:
+            dream_dir.resolve().relative_to(self.dreams_dir.resolve())
+        except ValueError:
+            raise DreamNotFound(
+                f"Dream path for {dream_id!r} resolves outside the dreams directory"
+            )
         if not dream_dir.exists():
             raise DreamNotFound(f"Dream {dream_id!r} not found")
 

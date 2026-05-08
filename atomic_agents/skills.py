@@ -301,8 +301,12 @@ def load_skill_referenced_file(skill_manifest: SkillManifest, relative_path: str
         SkillFileTraversal: If the path attempts directory traversal.
         FileNotFoundError: If the referenced file does not exist.
     """
-    # Block explicit traversal markers
-    if ".." in relative_path.replace("\\", "/").split("/"):
+    # Normalise path separators for cross-platform comparison
+    normalised = relative_path.replace("\\", "/")
+    parts = [p for p in normalised.split("/") if p]
+
+    # Block explicit traversal markers (.. in any component)
+    if ".." in parts:
         raise SkillFileTraversal(
             f"Path traversal detected in skill {skill_manifest.name!r}: "
             f"{relative_path!r} contains '..'"
@@ -313,6 +317,17 @@ def load_skill_referenced_file(skill_manifest: SkillManifest, relative_path: str
         raise SkillFileTraversal(
             f"Path traversal detected in skill {skill_manifest.name!r}: "
             f"{relative_path!r} contains '..'"
+        )
+
+    # Enforce one-level-deep limit: relative_path must be a bare filename
+    # with no subdirectory component (spec/18 §37).  More than one path
+    # component means the caller is referencing a subdirectory, which is not
+    # supported and could be used to reference files in hidden subdirs.
+    if len(parts) > 1:
+        raise SkillFileTraversal(
+            f"Skill {skill_manifest.name!r}: referenced file {relative_path!r} "
+            "is more than one level deep. Only bare filenames (no subdirectory "
+            "components) are supported by load_skill_file."
         )
 
     target = (skill_manifest.skill_dir / relative_path).resolve()
