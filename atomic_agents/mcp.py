@@ -40,8 +40,42 @@ from .tools import ToolDefinition
 
 _logger = logging.getLogger(__name__)
 
-# Regex to detect path-shaped args: starts with /, ~, or contains /
-_PATH_SHAPED = re.compile(r"^[/~]|/")
+# Detect path-shaped args. A path-shaped arg is one that:
+#   - starts with /  (absolute POSIX path)
+#   - starts with ~  (home-relative path)
+#   - starts with ./ or ../  (relative path from current dir or parent)
+#   - contains ..  (path traversal — always suspicious regardless of prefix)
+#   - matches C:\ or C:/ style (absolute Windows path)
+#
+# Explicitly NOT path-shaped:
+#   - npm scoped packages like @scope/package  (@ prefix, no leading ./ or /)
+#   - plain flags like -y, --verbose, --option=value
+#   - bare strings like "some-string", "module_name"
+#
+# Using discrete checks rather than a single regex for clarity and correctness.
+def _is_path_shaped(arg: str) -> bool:
+    """Return True if ``arg`` looks like a filesystem path that should be validated."""
+    if not arg:
+        return False
+    # Absolute POSIX path
+    if arg.startswith("/"):
+        return True
+    # Home-relative
+    if arg.startswith("~"):
+        return True
+    # Relative paths (./ or ../)
+    if arg.startswith("./") or arg.startswith("../"):
+        return True
+    # Bare .. (just the traversal token, no prefix)
+    if arg == "..":
+        return True
+    # Contains .. anywhere — path traversal attempt
+    if ".." in arg:
+        return True
+    # Absolute Windows path (e.g. C:\ or C:/)
+    if len(arg) >= 3 and arg[1] == ":" and arg[2] in ("/", "\\"):
+        return True
+    return False
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -248,10 +282,14 @@ async def _async_connect_and_list(spec: MCPServerSpec) -> list:
     from mcp.client.stdio import stdio_client, StdioServerParameters
     from mcp.client.session import ClientSession
 
+    # Merge spec.env ON TOP OF the parent environment so the child inherits
+    # PATH, HOME, etc. Passing only spec.env drops those, breaking commands
+    # like "npx" that rely on PATH being set. spec.env wins on conflicts.
+    merged_env = {**os.environ, **spec.env} if spec.env else None
     params = StdioServerParameters(
         command=spec.command,
         args=spec.args,
-        env=spec.env if spec.env else None,
+        env=merged_env,
     )
 
     async with stdio_client(params) as (read_stream, write_stream):
@@ -301,10 +339,12 @@ async def _async_call_tool(spec: MCPServerSpec, tool_name: str, arguments: dict)
     from mcp.client.stdio import stdio_client, StdioServerParameters
     from mcp.client.session import ClientSession
 
+    # Same env-merge logic as _async_connect_and_list: parent env + spec.env overlay.
+    merged_env = {**os.environ, **spec.env} if spec.env else None
     params = StdioServerParameters(
         command=spec.command,
         args=spec.args,
-        env=spec.env if spec.env else None,
+        env=merged_env,
     )
 
     async with stdio_client(params) as (read_stream, write_stream):
@@ -366,17 +406,29 @@ def _extract_content_value(content: list) -> Any:
 # ──────────────────────────────────────────────────────────────────
 # mcp.md parser
 
-def parse_mcp_md(path: Path) -> list[MCPServerSpec]:
+def parse_mcp_md(path: Path, read_paths: list | None = None) -> list[MCPServerSpec]:
     """Parse <agent>/mcp.md into a list of MCPServerSpec.
 
     Empty list if file doesn't exist (agent has no MCP servers — that's fine).
+
+    read_paths: if provided, path-shaped args are validated against these roots
+        via validate_mcp_server_args(). PathTraversalError is raised if any arg
+        resolves outside all declared read_paths.
     """
     if not path.exists():
         return []
-    return parse_mcp_md_text(path.read_text(encoding="utf-8"), mcp_md_path=path)
+    return parse_mcp_md_text(
+        path.read_text(encoding="utf-8"),
+        mcp_md_path=path,
+        read_paths=read_paths,
+    )
 
 
-def parse_mcp_md_text(text: str, mcp_md_path: Path | None = None) -> list[MCPServerSpec]:
+def parse_mcp_md_text(
+    text: str,
+    mcp_md_path: Path | None = None,
+    read_paths: list | None = None,
+) -> list[MCPServerSpec]:
     """Parse mcp.md content into a list of MCPServerSpec.
 
     Format::
@@ -403,9 +455,10 @@ def parse_mcp_md_text(text: str, mcp_md_path: Path | None = None) -> list[MCPSer
 
     Raises MCPServerConnectFailed when an env var reference cannot be resolved.
 
-    Path-shaped args (starting with /, ~, or containing /) are validated
-    against the agent's read_paths via safe_resolve_under when mcp_md_path
-    is provided. This provides best-effort path-traversal protection.
+    read_paths: if provided, each parsed spec is immediately passed to
+        validate_mcp_server_args(). Path-shaped args (starting with /, ~, ./, ../,
+        or containing ..) that resolve outside all declared read_paths raise
+        PathTraversalError, named with the offending server and arg.
     """
     if not text or not text.strip():
         return []
@@ -451,6 +504,25 @@ def parse_mcp_md_text(text: str, mcp_md_path: Path | None = None) -> list[MCPSer
             current_fields.setdefault(key, []).append(value)
 
     _flush()
+
+    # Validate path-shaped args against read_paths for every parsed spec.
+    # This ensures the validator is always invoked via the live parse path,
+    # not just when calling validate_mcp_server_args() directly.
+    if read_paths is not None:
+        for spec in specs:
+            try:
+                validate_mcp_server_args(spec, read_paths)
+            except Exception as exc:
+                # Re-raise with server name context for clarity
+                from .exceptions import PathTraversalError
+                if isinstance(exc, PathTraversalError):
+                    raise PathTraversalError(
+                        f"mcp.md server '{spec.name}': {exc}",
+                        child=exc.child,
+                        root=exc.root,
+                    ) from exc
+                raise
+
     return specs
 
 
@@ -519,11 +591,13 @@ def validate_mcp_server_args(
 ) -> None:
     """Best-effort path-traversal check on MCP server args.
 
-    For each arg that looks path-shaped (starts with /, ~, or contains /),
-    resolve it and verify it stays under one of the agent's declared read_paths.
+    For each arg that looks path-shaped (starts with /, ~, ./, ../, or contains
+    ..), resolve it and verify it stays under one of the agent's declared
+    read_paths.
 
     Raises PathTraversalError if a path-shaped arg resolves outside all
-    declared read_paths. Non-path-shaped args are not validated.
+    declared read_paths. Non-path-shaped args (flags like -y, npm scoped names
+    like @scope/pkg, plain strings) are not validated.
 
     This is best-effort — we can't know what every MCP server treats as a path.
     The obvious path-shaped cases get caught here.
@@ -535,7 +609,7 @@ def validate_mcp_server_args(
         return  # no read_paths declared — can't validate
 
     for arg in spec.args:
-        if not _PATH_SHAPED.search(arg):
+        if not _is_path_shaped(arg):
             continue  # not path-shaped, skip
 
         # Expand ~

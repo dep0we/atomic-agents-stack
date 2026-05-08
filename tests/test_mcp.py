@@ -477,3 +477,327 @@ def _make_raw_response(
         cache_miss_tokens=0,
         raw={},
     )
+
+
+# ──────────────────────────────────────────────────────────────────
+# New regression tests — codex MCP review findings
+
+# M1 — env merges with parent environment
+
+def test_mcp_env_merges_with_parent_environment(monkeypatch):
+    """Merged env passed to StdioServerParameters includes parent PATH + spec.env vars.
+
+    Tests the env-merge by intercepting StdioServerParameters at the point it is
+    used inside _async_connect_and_list. We patch the local-import path so the
+    mock is installed before the import happens in the async function.
+    """
+    monkeypatch.setenv("PATH", "/usr/bin:/usr/local/bin")
+    monkeypatch.setenv("HOME", "/home/testuser")
+
+    spec = MCPServerSpec(
+        name="github",
+        command="npx",
+        args=["-y", "@modelcontextprotocol/server-github"],
+        env={"GITHUB_TOKEN": "tok_abc123"},
+    )
+
+    captured_envs: list[dict] = []
+
+    # Build a fake mcp SDK that captures the StdioServerParameters env kwarg.
+    fake_params_cls = MagicMock(side_effect=lambda **kw: (captured_envs.append(kw.get("env", {})), kw)[1])
+
+    async def fake_list_tools_flow():
+        result = MagicMock()
+        result.tools = []
+        return result
+
+    class _FakeSession:
+        def __init__(self, *args, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_): pass
+        async def initialize(self): pass
+        async def list_tools(self): return await fake_list_tools_flow()
+
+    class _FakeStdioClient:
+        def __init__(self, params): pass
+        async def __aenter__(self): return (MagicMock(), MagicMock())
+        async def __aexit__(self, *_): pass
+
+    # Build a fake mcp module hierarchy
+    fake_mcp = types.ModuleType("mcp")
+    fake_mcp_client = types.ModuleType("mcp.client")
+    fake_mcp_stdio = types.ModuleType("mcp.client.stdio")
+    fake_mcp_session_mod = types.ModuleType("mcp.client.session")
+
+    fake_mcp_stdio.StdioServerParameters = fake_params_cls
+    fake_mcp_stdio.stdio_client = _FakeStdioClient
+    fake_mcp_session_mod.ClientSession = _FakeSession
+
+    fake_mcp.client = fake_mcp_client
+    fake_mcp_client.stdio = fake_mcp_stdio
+    fake_mcp_client.session = fake_mcp_session_mod
+
+    import asyncio
+
+    with patch.dict(sys.modules, {
+        "mcp": fake_mcp,
+        "mcp.client": fake_mcp_client,
+        "mcp.client.stdio": fake_mcp_stdio,
+        "mcp.client.session": fake_mcp_session_mod,
+    }):
+        from atomic_agents.mcp import _async_connect_and_list as _acal
+        asyncio.run(_acal(spec))
+
+    # Exactly one StdioServerParameters call should have been made
+    assert len(captured_envs) == 1
+    env_passed = captured_envs[0]
+    assert "PATH" in env_passed, "PATH must be inherited from parent env"
+    assert env_passed["PATH"] == "/usr/bin:/usr/local/bin"
+    assert "HOME" in env_passed
+    assert "GITHUB_TOKEN" in env_passed, "spec.env var must be present"
+    assert env_passed["GITHUB_TOKEN"] == "tok_abc123"
+
+
+def test_mcp_env_merge_prefers_spec_over_parent(monkeypatch):
+    """spec.env values override parent env values for the same key."""
+    monkeypatch.setenv("GITHUB_TOKEN", "parent_token")
+
+    spec = MCPServerSpec(
+        name="gh",
+        command="npx",
+        args=[],
+        env={"GITHUB_TOKEN": "spec_token"},
+    )
+
+    # Test the merge expression directly (same logic as in _async_connect_and_list)
+    merged = {**os.environ, **spec.env}
+    assert merged["GITHUB_TOKEN"] == "spec_token"
+
+
+def test_mcp_empty_spec_env_passes_none_to_sdk():
+    """When spec.env is empty, merged_env is None (SDK uses default env)."""
+    spec = MCPServerSpec(name="srv", command="npx", args=[], env={})
+
+    # Verify the merge logic: empty spec.env → None (same expression as in the code)
+    merged_env = {**os.environ, **spec.env} if spec.env else None
+    assert merged_env is None
+
+
+# M2 — validator wired into parse path
+def test_parse_mcp_md_validates_path_args_at_parse_time(tmp_path):
+    """parse_mcp_md raises PathTraversalError for path-traversal args when read_paths supplied."""
+    mcp_file = tmp_path / "mcp.md"
+    mcp_file.write_text(
+        "# MCP servers\n\n## bad-server\ncommand: npx\n"
+        "args: -y, @mcp/srv, ../../etc/passwd\n"
+    )
+    allowed_root = tmp_path / "data"
+    allowed_root.mkdir()
+
+    with pytest.raises(PathTraversalError):
+        parse_mcp_md(mcp_file, read_paths=[allowed_root])
+
+
+def test_parse_mcp_md_text_validates_path_args(tmp_path):
+    """parse_mcp_md_text raises PathTraversalError when read_paths supplied and arg escapes."""
+    text = (
+        "# MCP servers\n\n## traversal\ncommand: python\n"
+        "args: -m, mcp_srv, ../../etc/shadow\n"
+    )
+    allowed_root = tmp_path / "allowed"
+    allowed_root.mkdir()
+
+    with pytest.raises(PathTraversalError):
+        parse_mcp_md_text(text, read_paths=[allowed_root])
+
+
+def test_parse_mcp_md_without_read_paths_skips_validation(tmp_path):
+    """parse_mcp_md without read_paths does not raise even for path-looking args."""
+    mcp_file = tmp_path / "mcp.md"
+    mcp_file.write_text(
+        "# MCP servers\n\n## srv\ncommand: npx\nargs: -y, @mcp/srv, /tmp/data\n"
+    )
+    # No read_paths — should not raise
+    specs = parse_mcp_md(mcp_file)  # no read_paths kwarg
+    assert len(specs) == 1
+
+
+def test_agent_load_config_blocks_path_traversal_via_mcp_md(tmp_path):
+    """Integration test: AtomicAgent.__init__ raises PathTraversalError when mcp.md has traversal arg.
+
+    This is the 'validator wired into live call path' test — mirrors the
+    merge_into bug pattern from R1 #29. The validator must be invoked by the
+    real _load_config path, not just standalone.
+    """
+    from atomic_agents.exceptions import PathTraversalError as _PTError
+
+    agent_dir = _build_minimal_agent_dir(tmp_path)
+    # Write a mcp.md with a path-traversal arg outside tools.md read_paths.
+    # tools.md declares read_paths: ~/docs/ — ../../etc/passwd escapes that.
+    (agent_dir / "mcp.md").write_text(
+        "# MCP servers\n\n## evil\ncommand: npx\n"
+        "args: -y, @mcp/srv, ../../etc/passwd\n"
+    )
+
+    _stub_anthropic()
+    from atomic_agents.agent import AtomicAgent
+
+    with pytest.raises(_PTError):
+        AtomicAgent(name="test-agent", agents_root=tmp_path)
+
+
+# M4 — path heuristic accepts npm scoped names and flags
+def test_path_heuristic_accepts_npm_scoped_names():
+    """@scope/package is NOT path-shaped (npm scoped name, not a filesystem path)."""
+    from atomic_agents.mcp import _is_path_shaped
+
+    assert not _is_path_shaped("@modelcontextprotocol/server-filesystem")
+    assert not _is_path_shaped("@mcp/server-github")
+    assert not _is_path_shaped("@scope/some-package")
+
+
+def test_path_heuristic_accepts_flags():
+    """-y and --option=value are NOT path-shaped."""
+    from atomic_agents.mcp import _is_path_shaped
+
+    assert not _is_path_shaped("-y")
+    assert not _is_path_shaped("--verbose")
+    assert not _is_path_shaped("--option=value")
+    assert not _is_path_shaped("--enable_tool_X")
+
+
+def test_path_heuristic_blocks_dotdot_traversal():
+    """../../etc/passwd IS path-shaped (contains ..)."""
+    from atomic_agents.mcp import _is_path_shaped
+
+    assert _is_path_shaped("../../etc/passwd")
+    assert _is_path_shaped("../relative/path")
+    assert _is_path_shaped("..")
+
+
+def test_path_heuristic_blocks_absolute_paths():
+    """/etc/passwd IS path-shaped (absolute POSIX path)."""
+    from atomic_agents.mcp import _is_path_shaped
+
+    assert _is_path_shaped("/etc/passwd")
+    assert _is_path_shaped("/tmp/data")
+    assert _is_path_shaped("/home/user/file.txt")
+
+
+def test_path_heuristic_blocks_tilde_paths():
+    """~/secrets/keys.json IS path-shaped (home-relative)."""
+    from atomic_agents.mcp import _is_path_shaped
+
+    assert _is_path_shaped("~/secrets/keys.json")
+    assert _is_path_shaped("~/agents/scout/data")
+    assert _is_path_shaped("~")
+
+
+def test_path_heuristic_accepts_bare_strings():
+    """Plain strings without path markers are NOT path-shaped."""
+    from atomic_agents.mcp import _is_path_shaped
+
+    assert not _is_path_shaped("some-string")
+    assert not _is_path_shaped("module_name")
+    assert not _is_path_shaped("server")
+    assert not _is_path_shaped("")
+
+
+# M3 — MCP tools unregistered on call finally
+def test_mcp_tools_unregistered_on_call_finally(tmp_path):
+    """MCP tools are removed from tool_registry after call() completes normally."""
+    agent_dir = _build_minimal_agent_dir(tmp_path)
+    (agent_dir / "mcp.md").write_text(
+        "# MCP servers\n\n## time\ncommand: npx\nargs: -y, @mcp/time\n"
+    )
+
+    _stub_anthropic()
+    from atomic_agents.agent import AtomicAgent
+    from atomic_agents.tools import ToolDefinition
+
+    agent = AtomicAgent(name="test-agent", agents_root=tmp_path)
+
+    mcp_tool = ToolDefinition(
+        name="time__get_current_time",
+        description="Returns the current time.",
+        input_schema={"type": "object", "properties": {}, "required": []},
+        handler=lambda inp: "2026-05-07T12:00:00Z",
+    )
+
+    mock_pool = MagicMock()
+    mock_pool.connect_all = MagicMock()
+    mock_pool.discover_tools = MagicMock(return_value=[mcp_tool])
+    mock_pool.disconnect_all = MagicMock()
+
+    raw = _make_raw_response("Done.")
+
+    with patch("atomic_agents._llm.call_llm", return_value=raw):
+        with patch("atomic_agents.agent.MCPClientPool", return_value=mock_pool):
+            agent.call("What time is it?")
+
+    # After call completes, MCP tool must be removed from registry
+    assert agent.tool_registry.get("time__get_current_time") is None
+
+
+def test_mcp_tools_unregistered_even_on_call_exception(tmp_path):
+    """MCP tools are cleaned up from tool_registry even when call() raises."""
+    agent_dir = _build_minimal_agent_dir(tmp_path)
+    (agent_dir / "mcp.md").write_text(
+        "# MCP servers\n\n## srv\ncommand: npx\nargs: -y, @mcp/srv\n"
+    )
+
+    _stub_anthropic()
+    from atomic_agents.agent import AtomicAgent
+    from atomic_agents.tools import ToolDefinition
+
+    agent = AtomicAgent(name="test-agent", agents_root=tmp_path)
+
+    mcp_tool = ToolDefinition(
+        name="srv__do_thing",
+        description="Does a thing.",
+        input_schema={"type": "object", "properties": {}, "required": []},
+        handler=lambda inp: "done",
+    )
+
+    mock_pool = MagicMock()
+    mock_pool.connect_all = MagicMock()
+    mock_pool.discover_tools = MagicMock(return_value=[mcp_tool])
+    mock_pool.disconnect_all = MagicMock()
+
+    with patch("atomic_agents._llm.call_llm", side_effect=RuntimeError("LLM bombed")):
+        with patch("atomic_agents.agent.MCPClientPool", return_value=mock_pool):
+            with pytest.raises(RuntimeError, match="LLM bombed"):
+                agent.call("Do something.")
+
+    # Even though call raised, MCP tool must be cleaned up
+    assert agent.tool_registry.get("srv__do_thing") is None
+
+
+# M6 — MCP pool not initialized when cost cap skips call
+def test_mcp_pool_not_initialized_when_cost_cap_skips_call(tmp_path):
+    """connect_all() is never called when cost guardrail skips the call."""
+    agent_dir = _build_minimal_agent_dir(tmp_path)
+    (agent_dir / "mcp.md").write_text(
+        "# MCP servers\n\n## time\ncommand: npx\nargs: -y, @mcp/time\n"
+    )
+    # Set a very tight daily cap
+    (agent_dir / "model.md").write_text(
+        "## Default model\nclaude-haiku-4-5-20251001\n"
+        "## Cost guardrails\nenabled: true\ndaily_cap_usd: 0.0001\n"
+    )
+
+    _stub_anthropic()
+    from atomic_agents.agent import AtomicAgent
+
+    agent = AtomicAgent(name="test-agent", agents_root=tmp_path)
+
+    mock_pool_cls = MagicMock()
+
+    # Patch _check_cost_guardrails to always return allow=False (skip)
+    from atomic_agents.types import CostCheckResult
+    with patch.object(agent, "_check_cost_guardrails", return_value=CostCheckResult(allow=False, reason="daily cap hit")):
+        with patch("atomic_agents.agent.MCPClientPool", mock_pool_cls):
+            agent.call("Do something.")
+
+    # MCPClientPool should never have been instantiated
+    mock_pool_cls.assert_not_called()

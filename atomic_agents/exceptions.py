@@ -82,6 +82,15 @@ class ToolNotRegistered(AtomicAgentsError):
     """Model called a tool name that is not in the ToolRegistry."""
 
 
+class ToolNameCollision(AtomicAgentsError):
+    """Attempted to register a tool name already in the registry without allow_overwrite=True.
+
+    Raised by ToolRegistry.register() when a duplicate name is detected.
+    MCP registration uses default (refuse-to-overwrite) so namespace collisions
+    surface loudly during development instead of silently winning.
+    """
+
+
 class ToolInputInvalid(AtomicAgentsError):
     """Tool input failed JSON Schema validation (required fields or type mismatch)."""
 
