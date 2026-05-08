@@ -32,7 +32,7 @@ from atomic_agents._versioning import (
     restore_version,
     snapshot_memory_version,
 )
-from atomic_agents.exceptions import MemoryPreconditionFailed, WritePathViolation
+from atomic_agents.exceptions import MemoryPreconditionFailed, PathTraversalError, WritePathViolation
 from atomic_agents.types import Capture
 
 
@@ -640,3 +640,36 @@ def test_capture_concurrent_write_blocked_by_file_lock(tmp_path):
     assert results.get("b") in ("ok", "MemoryPreconditionFailed"), (
         f"Thread B had unexpected outcome: {results.get('b')!r}"
     )
+
+
+# Path-traversal guard — versioning API (codex R2-B regression tests)
+
+
+def test_restore_version_refuses_dotdot_note_filename(tmp_path):
+    """restore_version raises PathTraversalError for dotdot note_filename."""
+    note = _write_note(tmp_path, content="original\n")
+    memory_dir = note.parent
+    v1 = snapshot_memory_version(note)
+
+    with pytest.raises(PathTraversalError, match="resolves outside"):
+        restore_version(memory_dir, "../../persona/IDENTITY.md", v1)
+
+
+def test_restore_version_refuses_dotdot_version_name(tmp_path):
+    """restore_version raises PathTraversalError when version_path escapes .versions/."""
+    note = _write_note(tmp_path, content="original\n")
+    memory_dir = note.parent
+    # Craft a version_path that resolves outside memory_dir/.versions/
+    evil_version_path = memory_dir / ".versions" / ".." / ".." / "persona" / "IDENTITY.md"
+
+    with pytest.raises(PathTraversalError, match="resolves outside"):
+        restore_version(memory_dir, "feedback_comm_style.md", evil_version_path)
+
+
+def test_list_versions_refuses_dotdot_note_filename(tmp_path):
+    """list_versions raises PathTraversalError for dotdot note_filename."""
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+
+    with pytest.raises(PathTraversalError, match="resolves outside"):
+        list_versions(memory_dir, "../../persona/IDENTITY.md")

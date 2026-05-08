@@ -120,3 +120,21 @@ class SkillFileTraversal(AtomicAgentsError):
     Security parity with the capture path-traversal fix. load_skill_referenced_file
     raises this when a relative_path contains '..' or resolves outside the skill_dir.
     """
+
+
+class PathTraversalError(AtomicAgentsError):
+    """Resolved path escapes the expected root directory.
+
+    Raised by safe_resolve_under() when user/operator-controlled input (roster
+    names, CLI filenames, version names) resolves outside the intended root after
+    joining with Path / and calling .resolve().
+
+    Attributes:
+        child: the raw input value that triggered the violation.
+        root: the root directory the resolved path was expected to stay under.
+    """
+
+    def __init__(self, message: str, child: str = "", root: str = ""):
+        self.child = child
+        self.root = root
+        super().__init__(message)

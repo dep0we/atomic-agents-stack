@@ -25,7 +25,8 @@ from pathlib import Path
 
 import frontmatter
 
-from ._io import atomic_write, atomic_append_jsonl
+from ._io import atomic_write, atomic_append_jsonl, safe_resolve_under
+from .exceptions import PathTraversalError
 
 
 # Files that must never be versioned.
@@ -88,7 +89,13 @@ def list_versions(memory_dir: Path, note_filename: str) -> list[Path]:
 
     `note_filename` is the bare filename (e.g., ``feedback_comm_style.md``).
     Returns an empty list if no versions directory exists.
+
+    Raises PathTraversalError if note_filename resolves outside memory_dir
+    (guards against CLI args like ``../../persona/IDENTITY.md``).
     """
+    # Validate that the note_filename stays inside memory_dir.
+    safe_resolve_under(note_filename, memory_dir)
+
     stem = Path(note_filename).stem
     versions_dir = _versions_dir(memory_dir, stem)
     if not versions_dir.exists():
@@ -123,8 +130,17 @@ def restore_version(
     3. Log the restoration event if log_target is provided.
 
     Returns the path of the restored (live) note.
+
+    Raises PathTraversalError if:
+    - note_filename resolves outside memory_dir (guards live note write target).
+    - version_path resolves outside memory_dir/.versions/ (guards snapshot source).
     """
-    live_note = memory_dir / note_filename
+    # Guard the live-note write target.
+    live_note = safe_resolve_under(note_filename, memory_dir)
+
+    # Guard the version source — must stay inside .versions/.
+    versions_root = memory_dir / ".versions"
+    safe_resolve_under(version_path, versions_root)
 
     # Step 1: snapshot current live state so restore is reversible.
     snapshot_memory_version(live_note)

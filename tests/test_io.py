@@ -11,8 +11,10 @@ from atomic_agents._io import (
     atomic_write,
     atomic_append_jsonl,
     cleanup_stale_tempfiles,
+    safe_resolve_under,
     _fsync_dir,
 )
+from atomic_agents.exceptions import PathTraversalError
 
 
 def test_atomic_write_creates_file(tmp_path):
@@ -124,3 +126,50 @@ def test_fsync_dir_swallows_oserror(tmp_path):
     with mock.patch("os.fsync", side_effect=OSError("cannot fsync dir on Windows")):
         # Should complete without raising.
         _fsync_dir(tmp_path)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# safe_resolve_under — path-traversal guard (codex R2-B regression tests)
+
+
+def test_safe_resolve_under_blocks_dotdot(tmp_path):
+    """safe_resolve_under raises PathTraversalError for ../ escapes."""
+    root = tmp_path / "agents"
+    root.mkdir()
+    with pytest.raises(PathTraversalError, match="resolves outside"):
+        safe_resolve_under("../escape", root)
+
+
+def test_safe_resolve_under_blocks_absolute_path(tmp_path):
+    """safe_resolve_under raises PathTraversalError for absolute paths that escape root."""
+    root = tmp_path / "agents"
+    root.mkdir()
+    with pytest.raises(PathTraversalError, match="resolves outside"):
+        safe_resolve_under("/etc/passwd", root)
+
+
+def test_safe_resolve_under_allows_normal(tmp_path):
+    """safe_resolve_under returns the resolved path for a normal child name."""
+    root = tmp_path / "agents"
+    root.mkdir()
+    result = safe_resolve_under("editor", root)
+    assert result == (root / "editor").resolve()
+    assert str(result).startswith(str(root.resolve()))
+
+
+def test_safe_resolve_under_allows_nested(tmp_path):
+    """safe_resolve_under allows sub-paths that stay inside root."""
+    root = tmp_path / "memory"
+    root.mkdir()
+    result = safe_resolve_under("subdir/note.md", root)
+    assert result == (root / "subdir" / "note.md").resolve()
+
+
+def test_safe_resolve_under_error_carries_child_and_root(tmp_path):
+    """PathTraversalError exposes child and root attributes."""
+    root = tmp_path / "agents"
+    root.mkdir()
+    with pytest.raises(PathTraversalError) as exc_info:
+        safe_resolve_under("../bad", root)
+    assert exc_info.value.child == "../bad"
+    assert str(root.resolve()) in exc_info.value.root
