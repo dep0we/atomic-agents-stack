@@ -309,7 +309,11 @@ class AtomicAgent:
 
         # mcp.md lives at the instance root (same for cascaded + single-agent layouts).
         # Empty list when no mcp.md exists — that's fine.
-        mcp_servers = parse_mcp_md(self.agent_root / "mcp.md")
+        # Pass read_paths so path-shaped args are validated at parse time (spec/19).
+        mcp_servers = parse_mcp_md(
+            self.agent_root / "mcp.md",
+            read_paths=tools_data["read_paths"],
+        )
 
         return AgentConfig(
             default_model=model_data["default_model"],
@@ -584,6 +588,10 @@ class AtomicAgent:
             })
             raise
 
+        # Track MCP tool names registered this call so we can clean them up in
+        # finally even if an exception occurs mid-call (spec/19 fix M3).
+        _mcp_registered_names: list[str] = []
+
         try:
             # Reset helper-provenance rollup for this run (spec/13 Layer 3)
             self._helpers_this_run = []
@@ -592,25 +600,9 @@ class AtomicAgent:
             # Reset cumulative delegated cost for this run (fix R2-A2)
             self._delegated_cost_this_run = 0.0
 
-            # MCP client pool — lazy init (spec/19).
-            # Only spin up when mcp.md declares servers and pool not yet live.
-            # Discover tools and register them into the tool registry before
-            # the first LLM call so the model sees the full tool list.
-            if self.config.mcp_servers and self.mcp_pool is None:
-                self.mcp_pool = MCPClientPool(
-                    server_specs=self.config.mcp_servers,
-                    agents_root=self.agents_root,
-                )
-                self.mcp_pool.connect_all()
-                mcp_tool_defs = self.mcp_pool.discover_tools()
-                for td in mcp_tool_defs:
-                    self.tool_registry.register(td)
-                _logger.debug(
-                    "agent %r: MCP pool ready — %d tools from %d server(s)",
-                    self.name, len(mcp_tool_defs), len(self.config.mcp_servers),
-                )
-
-            # Cost guardrails check
+            # Cost guardrails check FIRST — before spinning up MCP subprocesses.
+            # A call that will be skipped due to cost cap should not pay the
+            # subprocess startup cost. (spec/19 fix M6)
             check = self._check_cost_guardrails(
                 critical=critical,
                 parent_remaining_headroom_usd=parent_remaining_headroom_usd,
@@ -625,6 +617,25 @@ class AtomicAgent:
                     "summary": f"Skipped: {check.reason}",
                 })
                 return Response.skipped_response(check.reason, self.config.default_model)
+
+            # MCP client pool — lazy init (spec/19).
+            # Only spin up when mcp.md declares servers and pool not yet live.
+            # Discover tools and register them into the tool registry before
+            # the first LLM call so the model sees the full tool list.
+            if self.config.mcp_servers and self.mcp_pool is None:
+                self.mcp_pool = MCPClientPool(
+                    server_specs=self.config.mcp_servers,
+                    agents_root=self.agents_root,
+                )
+                self.mcp_pool.connect_all()
+                mcp_tool_defs = self.mcp_pool.discover_tools()
+                for td in mcp_tool_defs:
+                    self.tool_registry.register(td, allow_overwrite=True)
+                    _mcp_registered_names.append(td.name)
+                _logger.debug(
+                    "agent %r: MCP pool ready — %d tools from %d server(s)",
+                    self.name, len(mcp_tool_defs), len(self.config.mcp_servers),
+                )
 
             # Pick model — fallback if guardrail says so, else override, else default
             if check.action == "fallback" and check.fallback_model:
@@ -906,6 +917,11 @@ class AtomicAgent:
             if self.mcp_pool is not None:
                 self.mcp_pool.disconnect_all()
                 self.mcp_pool = None
+            # Unregister MCP tools that were registered for this call (spec/19 fix M3).
+            # Prevents stale tools from accumulating in the long-lived tool_registry
+            # when a later call's server fails to reconnect.
+            for _mcp_name in _mcp_registered_names:
+                self.tool_registry.unregister(_mcp_name)
             lock.release()
 
     def _build_tool_loop_messages(

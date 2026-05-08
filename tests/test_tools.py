@@ -145,15 +145,15 @@ def test_tool_registry_register_and_get():
     assert bool(registry) is True
 
 
-def test_tool_registry_register_overwrites_same_name():
-    """Re-registering with the same name replaces the old definition."""
+def test_tool_registry_register_overwrites_same_name_with_allow_overwrite():
+    """Re-registering with allow_overwrite=True replaces the old definition."""
     registry = ToolRegistry()
     registry.register(ToolDefinition(
         name="tool_x", description="v1", input_schema={}, handler=lambda _: "v1"
     ))
     registry.register(ToolDefinition(
         name="tool_x", description="v2", input_schema={}, handler=lambda _: "v2"
-    ))
+    ), allow_overwrite=True)
     assert registry.get("tool_x").description == "v2"
     assert len(registry) == 1
 
@@ -646,3 +646,65 @@ def test_max_tool_iterations_clamped(tmp_path):
 
     agent_high = _build_minimal_agent(tmp_path, "high-agent", max_tool_iterations=9999)
     assert agent_high.max_tool_iterations == MAX_TOOL_ITERATIONS
+
+
+# ──────────────────────────────────────────────────────────────────
+# New regression tests — codex MCP review findings (M3, M5)
+
+# M5 — collision detection
+def test_tool_registry_register_raises_on_collision():
+    """Registering the same tool name twice raises ToolNameCollision by default."""
+    from atomic_agents.exceptions import ToolNameCollision
+
+    registry = ToolRegistry()
+    registry.register(ToolDefinition(
+        name="foo_tool", description="v1", input_schema={}, handler=lambda _: "v1"
+    ))
+    with pytest.raises(ToolNameCollision, match="foo_tool"):
+        registry.register(ToolDefinition(
+            name="foo_tool", description="v2", input_schema={}, handler=lambda _: "v2"
+        ))
+    # Original registration should still be intact
+    assert registry.get("foo_tool").description == "v1"
+
+
+def test_tool_registry_register_allow_overwrite_replaces():
+    """allow_overwrite=True silently replaces the existing registration."""
+    registry = ToolRegistry()
+    registry.register(ToolDefinition(
+        name="foo_tool", description="v1", input_schema={}, handler=lambda _: "v1"
+    ))
+    registry.register(ToolDefinition(
+        name="foo_tool", description="v2", input_schema={}, handler=lambda _: "v2"
+    ), allow_overwrite=True)
+    assert registry.get("foo_tool").description == "v2"
+    assert len(registry) == 1
+
+
+# M3 — ToolRegistry.unregister
+def test_tool_registry_unregister_removes_tool():
+    """unregister() removes a registered tool and returns True."""
+    registry = ToolRegistry()
+    registry.register(_make_simple_tool("my_tool"))
+    assert registry.get("my_tool") is not None
+
+    result = registry.unregister("my_tool")
+    assert result is True
+    assert registry.get("my_tool") is None
+    assert "my_tool" not in registry.list_names()
+
+
+def test_tool_registry_unregister_missing_returns_false():
+    """unregister() on a non-existent tool returns False (idempotent)."""
+    registry = ToolRegistry()
+    result = registry.unregister("nonexistent")
+    assert result is False
+
+
+def test_tool_registry_unregister_twice_is_idempotent():
+    """Calling unregister() twice on the same name does not raise."""
+    registry = ToolRegistry()
+    registry.register(_make_simple_tool("tool_to_remove"))
+    registry.unregister("tool_to_remove")
+    result = registry.unregister("tool_to_remove")  # second call
+    assert result is False

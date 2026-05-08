@@ -66,7 +66,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .exceptions import ToolHandlerError, ToolInputInvalid, ToolNotRegistered
+from .exceptions import ToolHandlerError, ToolInputInvalid, ToolNameCollision, ToolNotRegistered
 
 _logger = logging.getLogger(__name__)
 
@@ -142,10 +142,41 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, ToolDefinition] = {}
 
-    def register(self, tool: ToolDefinition) -> None:
-        """Register a tool. Overwrites any prior registration with the same name."""
+    def register(self, tool: ToolDefinition, *, allow_overwrite: bool = False) -> None:
+        """Register a tool.
+
+        By default, raises ToolNameCollision if a tool with the same name is
+        already registered. Pass ``allow_overwrite=True`` to replace silently.
+
+        MCP registration uses the default (refuse-to-overwrite) so namespace
+        collisions — e.g. a custom tool named ``foo__bar`` clashing with an MCP
+        server named ``foo`` whose tool is named ``bar`` — surface loudly at
+        startup rather than silently winning.
+
+        Raises:
+            ToolNameCollision: tool name already in registry and allow_overwrite
+                is False.
+        """
+        if not allow_overwrite and tool.name in self._tools:
+            raise ToolNameCollision(
+                f"Tool '{tool.name}' is already registered. "
+                f"Pass allow_overwrite=True to replace it, or use a unique name."
+            )
         self._tools[tool.name] = tool
         _logger.debug("registered tool %r", tool.name)
+
+    def unregister(self, name: str) -> bool:
+        """Remove a tool from the registry by name.
+
+        Returns True if the tool was present and removed, False if it was not
+        in the registry (idempotent — safe to call even if the tool was never
+        registered or was already removed).
+        """
+        if name in self._tools:
+            del self._tools[name]
+            _logger.debug("unregistered tool %r", name)
+            return True
+        return False
 
     def get(self, name: str) -> ToolDefinition | None:
         """Return the ToolDefinition for ``name``, or None if not registered."""
