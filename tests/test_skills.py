@@ -848,3 +848,72 @@ def test_skill_load_appears_in_run_log_tool_calls_rollup(tmp_path):
     tool_names = [t["tool_name"] for t in run_rec["tool_calls"]]
     assert "load_skill" in tool_names
     assert run_rec["tool_iterations"] == 2
+
+
+# ──────────────────────────────────────────────────────────────────
+# Codex R2 regression tests — one-level-deep file limit (spec/18 §37)
+# ──────────────────────────────────────────────────────────────────
+
+
+def _make_skill_manifest(skill_dir: Path, name: str = "test-skill") -> SkillManifest:
+    """Build a SkillManifest pointing at skill_dir (doesn't need to exist for unit tests)."""
+    return SkillManifest(
+        name=name,
+        description="A test skill.",
+        when_to_use=None,
+        skill_dir=skill_dir,
+        skill_md_path=skill_dir / "SKILL.md",
+        body_lines=1,
+    )
+
+
+def test_skill_referenced_file_refuses_subdir(tmp_path):
+    """load_skill_referenced_file refuses 'subdir/file.md' — one level limit (spec/18 §37).
+
+    The traversal block alone was NOT enforcing this: 'subdir/file.md' has no
+    '..' so it passed through.  This regression test verifies the new depth
+    check rejects any path with a directory component.
+    """
+    skill_dir = tmp_path / "skills" / "depth-test"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: depth-test\ndescription: Depth test skill.\n---\n\nBody.\n"
+    )
+    # Create the nested file so the check doesn't fail on FileNotFoundError first
+    subdir = skill_dir / "subdir"
+    subdir.mkdir()
+    (subdir / "file.md").write_text("Should not be accessible.")
+
+    manifest = _make_skill_manifest(skill_dir, name="depth-test")
+    with pytest.raises(SkillFileTraversal, match="one level"):
+        load_skill_referenced_file(manifest, "subdir/file.md")
+
+
+def test_skill_referenced_file_refuses_multi_level_subdir(tmp_path):
+    """Multi-level paths like 'a/b/file.md' are also refused."""
+    skill_dir = tmp_path / "skills" / "depth-test2"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: depth-test2\ndescription: Multi-level depth test.\n---\n\nBody.\n"
+    )
+    nested = skill_dir / "a" / "b"
+    nested.mkdir(parents=True)
+    (nested / "file.md").write_text("Should not be accessible.")
+
+    manifest = _make_skill_manifest(skill_dir, name="depth-test2")
+    with pytest.raises(SkillFileTraversal, match="one level"):
+        load_skill_referenced_file(manifest, "a/b/file.md")
+
+
+def test_skill_referenced_file_allows_bare_filename(tmp_path):
+    """A bare filename with no directory component succeeds (one-level-deep limit allows it)."""
+    skill_dir = tmp_path / "skills" / "ok-depth"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: ok-depth\ndescription: Ok depth skill.\n---\n\nBody.\n"
+    )
+    (skill_dir / "examples.md").write_text("# Examples\n\nHere.")
+
+    manifest = _make_skill_manifest(skill_dir, name="ok-depth")
+    content = load_skill_referenced_file(manifest, "examples.md")
+    assert "Examples" in content

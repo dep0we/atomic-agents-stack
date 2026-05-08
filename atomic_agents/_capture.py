@@ -16,9 +16,12 @@ when the same observation is emitted via both paths.
 """
 
 from __future__ import annotations
+import contextlib
 import hashlib
 import json
+import os
 import re
+import sys
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -295,14 +298,17 @@ def write_atomic_note(
             raise SchemaValidationError(
                 f"merge_into target {capture.merge_into} doesn't exist"
             )
-        # Optimistic concurrency check (for merge target)
-        if expected_content_sha256 is not None:
-            _check_precondition(target, expected_content_sha256)
-        # Snapshot before merge
-        version_path = snapshot_memory_version(target)
-        if version_path is not None and log_target is not None:
-            _log_version_created(log_target, target.name, version_path, agent_root)
-        _merge_into_existing(target, capture, today)
+        # Wrap precondition + snapshot + write in a per-file lock to close
+        # the TOCTOU window between sha256 check and write (codex R2-D4).
+        with _per_file_lock(target):
+            # Optimistic concurrency check (for merge target)
+            if expected_content_sha256 is not None:
+                _check_precondition(target, expected_content_sha256)
+            # Snapshot before merge
+            version_path = snapshot_memory_version(target)
+            if version_path is not None and log_target is not None:
+                _log_version_created(log_target, target.name, version_path, agent_root)
+            _merge_into_existing(target, capture, today)
         # INDEX entry already exists for the existing note; nothing to add
         return target
 
@@ -318,12 +324,13 @@ def write_atomic_note(
         if _is_same_capture_content(target, capture):
             # Orphan-recovery path: re-run INDEX update idempotently.
             # Snapshot before overwriting (orphan repair is still a mutation)
-            if expected_content_sha256 is not None:
-                _check_precondition(target, expected_content_sha256)
-            version_path = snapshot_memory_version(target)
-            if version_path is not None and log_target is not None:
-                _log_version_created(log_target, target.name, version_path, agent_root)
-            _update_index(memory_dir / "INDEX.md", capture, filename)
+            with _per_file_lock(target):
+                if expected_content_sha256 is not None:
+                    _check_precondition(target, expected_content_sha256)
+                version_path = snapshot_memory_version(target)
+                if version_path is not None and log_target is not None:
+                    _log_version_created(log_target, target.name, version_path, agent_root)
+                _update_index(memory_dir / "INDEX.md", capture, filename)
             return target
         raise SchemaValidationError(
             f"atomic note {filename} already exists; use merge_into to update"
@@ -347,8 +354,49 @@ def write_atomic_note(
     return target
 
 
+@contextlib.contextmanager
+def _per_file_lock(target: Path):
+    """Acquire an exclusive POSIX flock on ``<target>.lock``.
+
+    This serializes the precondition-check + snapshot + write sequence so two
+    concurrent writers cannot both pass the sha256 check and then race on the
+    write — closing the TOCTOU window described in codex finding R2-D4.
+
+    The lock file is ``<target>.lock`` (a sidecar next to the note).  It is
+    created automatically and never removed (removal would introduce a new race
+    between unlink and re-open).
+
+    **Platform note:** ``fcntl`` is POSIX-only.  On Windows the lock is a
+    no-op (best-effort precondition, not atomic).  This is documented behaviour
+    per spec/04: full atomicity is guaranteed only on POSIX systems.
+    """
+    if sys.platform == "win32" or not hasattr(os, "O_RDWR"):
+        # Windows / non-POSIX: yield without locking — best-effort only.
+        yield
+        return
+
+    import fcntl as _fcntl
+
+    lock_path = target.parent / (target.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        # Blocking exclusive lock — waits until any concurrent holder releases.
+        _fcntl.flock(fd, _fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            _fcntl.flock(fd, _fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 def _check_precondition(target: Path, expected_sha256: str) -> None:
-    """Raise MemoryPreconditionFailed if target content sha256 != expected_sha256."""
+    """Raise MemoryPreconditionFailed if target content sha256 != expected_sha256.
+
+    Must be called while holding the per-file lock (``_per_file_lock``) so that
+    the check and the subsequent write are serialized against concurrent writers.
+    """
     current_content = target.read_text(encoding="utf-8")
     actual = hashlib.sha256(current_content.encode("utf-8")).hexdigest()
     if actual != expected_sha256:

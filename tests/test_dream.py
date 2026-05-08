@@ -30,6 +30,7 @@ from atomic_agents.dream import (
 )
 from atomic_agents.exceptions import (
     AtomicAgentsError,
+    AgentLockBusy,
     DreamInProgress,
     DreamNotFound,
 )
@@ -473,3 +474,68 @@ def test_dream_empty_vault_completes_with_zero_changes(agents_root, monkeypatch)
     assert len(result.consolidated) == 0
     assert len(result.promoted) == 0
     assert result.output_memory_count == 0
+
+
+# ──────────────────────────────────────────────────────────────────
+# Codex R2 regression tests
+# ──────────────────────────────────────────────────────────────────
+
+def test_dream_apply_takes_agent_lock(agents_root, monkeypatch):
+    """apply() must acquire the AgentLock and wait/fail if held by another process.
+
+    We simulate an in-flight agent.call() by acquiring the AgentLock directly
+    before calling apply().  With wait_seconds=0 apply() should raise AgentLockBusy
+    quickly rather than hanging.  We patch the lock in apply() to use wait_seconds=0
+    so the test doesn't take 30 s.
+    """
+    from atomic_agents._locks import AgentLock
+    agent_dir = agents_root / "dreamer"
+    _write_note(agent_dir, "feedback_test.md", "feedback", "Test",
+                "Test body", "2026-03-01")
+
+    with patch("atomic_agents.dream._llm.call_llm") as mock_llm:
+        mock_llm.return_value = _no_op_response()
+        runner = DreamRunner(agents_root, "dreamer")
+        result = runner.start()
+
+    # Manually set status to completed with a dreamed memory dir
+    # (already done by start())
+    assert result.status == "completed"
+
+    # Acquire the agent lock directly, simulating an in-flight call()
+    held_lock = AgentLock(agent_dir, wait_seconds=0)
+    held_lock.acquire()
+    try:
+        # Patch AgentLock in dream.py to use wait_seconds=0 so apply() fails fast
+        original_agent_lock = __import__("atomic_agents.dream", fromlist=["AgentLock"]).AgentLock
+
+        def fast_failing_lock(agent_root, wait_seconds=30):
+            return original_agent_lock(agent_root, wait_seconds=0)
+
+        with patch("atomic_agents.dream.AgentLock", side_effect=fast_failing_lock):
+            with pytest.raises(AgentLockBusy):
+                runner.apply(result.dream_id)
+    finally:
+        held_lock.release()
+
+
+def test_dream_discard_refuses_dotdot_dream_id(agents_root):
+    """--discard ../../persona must raise DreamNotFound (invalid format), not rmtree."""
+    runner = DreamRunner(agents_root, "dreamer")
+    with pytest.raises(DreamNotFound, match="Invalid dream_id"):
+        runner.discard("../../persona")
+
+
+def test_dream_discard_refuses_absolute_path_as_dream_id(agents_root):
+    """An absolute-path-style dream_id must be rejected before path construction."""
+    runner = DreamRunner(agents_root, "dreamer")
+    # Slashes are forbidden characters per the validation regex
+    with pytest.raises(DreamNotFound, match="Invalid dream_id"):
+        runner.discard("/etc/passwd")
+
+
+def test_dream_discard_refuses_dream_id_with_slash(agents_root):
+    """A dream_id containing a slash must be rejected (path separator not allowed)."""
+    runner = DreamRunner(agents_root, "dreamer")
+    with pytest.raises(DreamNotFound, match="Invalid dream_id"):
+        runner.discard("some/nested/path")

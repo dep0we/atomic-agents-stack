@@ -44,10 +44,16 @@ def _sha256_hex(content: str) -> str:
 def _version_filename(content: str) -> str:
     """Return a version filename: <ISO-ts>_<8-char-hash>.md.
 
-    ISO timestamp is UTC, formatted as YYYYMMDDTHHMMSSZ to keep it sortable
-    and filesystem-safe (no colons).
+    ISO timestamp is UTC, formatted as YYYYMMDDTHHMMSSffffffZ (microsecond
+    precision) to keep it sortable and filesystem-safe (no colons).
+
+    Microsecond precision means two snapshots of identical content taken in the
+    same wall-clock second produce distinct filenames, preserving the
+    immutable-per-mutation invariant (spec/02).  Second-precision timestamps
+    plus content hashing is NOT sufficient because two writes of the same
+    content in the same second would collide.
     """
-    ts = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    ts = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     short_hash = _sha256_hex(content)[:8]
     return f"{ts}_{short_hash}.md"
 
