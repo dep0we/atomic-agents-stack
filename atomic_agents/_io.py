@@ -3,12 +3,17 @@
 Used by every write in the package. Never write directly with `path.write_text` from
 agent code; always go through `atomic_write` so partial-write states are impossible
 on POSIX.
+
+Also exports safe_resolve_under() — the canonical path-traversal guard used wherever
+user/operator-controlled input becomes a path component.
 """
 
 from __future__ import annotations
 import os
 import tempfile
 from pathlib import Path
+
+from .exceptions import PathTraversalError
 
 
 def _fsync_dir(directory: Path) -> None:
@@ -86,6 +91,33 @@ def atomic_append_jsonl(target: Path, line: str) -> None:
         f.write(line)
         f.flush()
         os.fsync(f.fileno())
+
+
+def safe_resolve_under(child: "Path | str", root: Path) -> Path:
+    """Resolve `child` under `root` and verify the result stays inside `root`.
+
+    `child` may be a string supplied by a user or operator (roster names, CLI
+    filenames, version names).  A value like ``../other`` or ``/etc/passwd``
+    would normally escape the intended root after ``root / child``.  This
+    helper resolves both sides and enforces containment.
+
+    Returns the resolved absolute Path on success.
+    Raises PathTraversalError if the resolved child is not under root.
+
+    Use this anywhere external input becomes a path component.  Examples:
+    roster agent names (delegate target), CLI note_filename / version_name.
+    """
+    resolved = (root / child).resolve()
+    root_resolved = root.resolve()
+    try:
+        resolved.relative_to(root_resolved)
+    except ValueError:
+        raise PathTraversalError(
+            f"path {child!r} resolves outside {root_resolved}",
+            child=str(child),
+            root=str(root_resolved),
+        )
+    return resolved
 
 
 def cleanup_stale_tempfiles(directory: Path) -> list[Path]:

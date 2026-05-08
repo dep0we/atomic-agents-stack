@@ -635,3 +635,30 @@ def test_roster_md_parser_blank_lines_and_extra_whitespace():
 """
     names = parse_roster_md_text(text)
     assert names == ["editor", "writer"]
+
+
+# ──────────────────────────────────────────────────────────────────
+# 17. Path-traversal guard on delegate target (codex R2-B regression)
+
+
+def test_delegate_refuses_dotdot_target_in_roster(tmp_agents):
+    """A roster entry like '../other' triggers NotInRoster (path traversal guard)."""
+    # The name passes the roster membership check but should fail path traversal.
+    # We put the dotdot name directly in the roster so _enforce_roster_membership
+    # passes, then _resolve_delegated_agent_path should catch the traversal.
+    roster = "# Roster\n\n## Delegate to\n\n- ../other\n"
+    _build_minimal_agent(tmp_agents, "coord", roster_text=roster)
+    coordinator = AtomicAgent(name="coord", agents_root=tmp_agents)
+
+    with pytest.raises(NotInRoster, match="traversal|resolves outside"):
+        coordinator.delegate(target_agent_name="../other", work_item="anything")
+
+
+def test_delegate_refuses_absolute_path_in_roster(tmp_agents):
+    """A roster entry that is an absolute path triggers NotInRoster."""
+    roster = "# Roster\n\n## Delegate to\n\n- /tmp/evil\n"
+    _build_minimal_agent(tmp_agents, "coord", roster_text=roster)
+    coordinator = AtomicAgent(name="coord", agents_root=tmp_agents)
+
+    with pytest.raises(NotInRoster, match="traversal|resolves outside"):
+        coordinator.delegate(target_agent_name="/tmp/evil", work_item="anything")

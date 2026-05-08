@@ -28,7 +28,7 @@ _logger = logging.getLogger(__name__)
 import frontmatter
 
 from . import _capture, _cascade, _costs, _llm, _model, _roster, _tools
-from ._io import atomic_append_jsonl, atomic_write
+from ._io import atomic_append_jsonl, atomic_write, safe_resolve_under
 from ._locks import AgentLock
 from ._platform import get_agents_root
 from ._schema import validate_atomic_note_frontmatter
@@ -40,6 +40,7 @@ from .exceptions import (
     HelperBatchPartialFailure,
     NestedDelegationRefused,
     NotInRoster,
+    PathTraversalError,
     SelfDelegationError,
     ToolNotRegistered,
 )
@@ -1160,10 +1161,22 @@ class AtomicAgent:
         In a single-agent layout (<agents_root>/<role>/), the target resolves
         as a top-level sibling:
             <agents_root>/<target>/
+
+        Raises NotInRoster (mapped from PathTraversalError) if target_name
+        contains path-traversal sequences (e.g. ``../other``) that would
+        resolve outside the agents root.
         """
         if self.cascade:
-            return self.cascade.instance_root.parent / target_name
-        return self.agents_root / target_name
+            agents_dir = self.cascade.instance_root.parent
+        else:
+            agents_dir = self.agents_root
+        try:
+            return safe_resolve_under(target_name, agents_dir)
+        except PathTraversalError as exc:
+            raise NotInRoster(
+                f"target '{target_name}' resolves outside agents root "
+                f"({agents_dir}) — path traversal refused"
+            ) from exc
 
     def _enforce_roster_membership(self, target: str) -> None:
         """Raise NotInRoster if target is not in this coordinator's roster."""
