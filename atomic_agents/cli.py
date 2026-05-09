@@ -6,6 +6,7 @@ Usage:
     atomic-agents skills <agent> [options]
     atomic-agents version <agent> <note-filename>
     atomic-agents restore <agent> <note-filename> <version-name>
+    atomic-agents doctor [--agent <name>] [--json] [--no-mcp]
 
 Subcommands:
     run     — Run an agent against a work item
@@ -13,6 +14,7 @@ Subcommands:
     skills  — List all skills for an agent with metadata and warnings
     version — List memory note version snapshots
     restore — Restore a memory note from a snapshot
+    doctor  — Preflight checks before scheduling an agent run
 """
 
 from __future__ import annotations
@@ -66,9 +68,35 @@ def main(argv: list[str] | None = None) -> int:
     restore_cmd.add_argument("version_name", help="version filename to restore from")
     restore_cmd.add_argument("--agents-root", default=None)
 
+    doctor_cmd = sub.add_parser(
+        "doctor",
+        help="Run preflight checks (env, vault, keys, model, mcp, locks, write-paths)",
+    )
+    doctor_cmd.add_argument(
+        "--agent",
+        default=None,
+        help="check this agent specifically (omit to run host-only checks)",
+    )
+    doctor_cmd.add_argument(
+        "--agents-root", default=None,
+        help="override ATOMIC_AGENTS_ROOT for this run",
+    )
+    doctor_cmd.add_argument(
+        "--json", action="store_true",
+        help="emit machine-readable JSON instead of the human report",
+    )
+    doctor_cmd.add_argument(
+        "--no-mcp", action="store_true",
+        help="skip MCP server handshake (faster; useful when servers are remote)",
+    )
+
     args = parser.parse_args(argv)
 
     agents_root = Path(args.agents_root).expanduser().resolve() if args.agents_root else get_agents_root()
+
+    # Doctor has its own exit-code semantics (0/1/2) and must never raise to the user.
+    if args.cmd == "doctor":
+        return _cmd_doctor(args)
 
     try:
         if args.cmd == "run":
@@ -228,6 +256,37 @@ def _cmd_restore(args, agents_root: Path) -> int:
     print(f"Restored {args.note_filename} from {args.version_name}")
     print(f"  live note: {memory_dir / ref.name}")
     return 0
+
+
+def _cmd_doctor(args) -> int:
+    """Run preflight checks and report to stdout.
+
+    Exit codes:
+        0 — every check passed (skips ok)
+        1 — one or more failed
+        2 — doctor itself crashed (unexpected exception in our own code)
+    """
+    from . import doctor as doctor_module
+
+    agents_root_override = (
+        Path(args.agents_root).expanduser().resolve() if args.agents_root else None
+    )
+    try:
+        results = doctor_module.run_doctor(
+            agent_name=args.agent,
+            agents_root=agents_root_override,
+            skip_mcp=args.no_mcp,
+        )
+    except Exception as e:  # noqa: BLE001 — exit-2 catch-all by design
+        print(f"doctor crashed: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        sys.stdout.write(doctor_module.render_json(results))
+    else:
+        sys.stdout.write(doctor_module.render_human(results))
+
+    return doctor_module.overall_exit_code(results)
 
 
 if __name__ == "__main__":
