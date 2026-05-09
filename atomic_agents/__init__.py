@@ -47,7 +47,7 @@ from .dream import (
     StaleMarking,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.10.0"
 
 __all__ = [
     "AtomicAgent",
