@@ -2,30 +2,79 @@
 
 All notable changes to this project will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+See [`docs/deployment/versioning.md`](docs/deployment/versioning.md) for the full
+SemVer policy and what counts as a Major / Minor / Patch change for this project.
+
+## Conventions
+
+Each released version uses `## [MAJOR.MINOR.PATCH] - YYYY-MM-DD`. Within a
+release, entries are grouped under these section headings (Keep a Changelog
+v1.1.0, in this canonical order):
+
+- **Added** — new user-visible features, modules, or CLI surfaces.
+- **Changed** — non-breaking changes to existing behaviour or wording.
+- **Deprecated** — APIs slated for removal in a future Major; still functional.
+- **Removed** — APIs deleted in this version. Always paired with a Major bump
+  unless pre-1.0 (see versioning.md §Pre-1.0 caveat).
+- **Fixed** — bug fixes that don't change documented behaviour.
+- **Security** — vulnerabilities fixed; reference CVE / advisory if any.
+
+### Marking breaking changes
+
+Any change that would force operators to do work to upgrade — schema rename,
+CLI flag removal, default-value flip, default-backend swap, frontmatter
+contract change — gets a `### BREAKING` callout under the version's section.
+The callout names the symptom an operator would observe, the migration
+path (typically a `python -m atomic_agents.migrate --to vN` invocation),
+and a one-line rationale. Example:
+
+```
+## [0.2.0] - 2026-06-01
+
+### BREAKING
+
+- **Memory schema bumped 2 → 3.** Frontmatter `confidence` field is now an
+  enum (`high`/`medium`/`low`) rather than a freeform string.
+  Migrate: copy `docs/migrations/v2_to_v3.py` into `<vault>/_migrations/`,
+  then run `python -m atomic_agents.migrate --to v3`.
+  Why: enables typed conformance tests in the eval runner.
+```
+
+The pre-merge expectation is: if a PR's diff would trigger a `### BREAKING`
+callout, the PR title starts with `feat!:` / `refactor!:` and the PR body
+includes the callout text verbatim, ready to paste into the next release's
+CHANGELOG entry.
 
 ## [Unreleased]
 
 ### Added
 
-**`atomic-agents doctor` preflight CLI** (issue #66)
+**`atomic-agents doctor` preflight CLI** (issue #66, PR #75)
 
 - New CLI subcommand: `atomic-agents doctor [--agent <name>] [--agents-root <path>] [--json] [--no-mcp]`. Runs nine independent checks (env, python, vault, provider-keys, model, mcp, locks, memory-backend, write-paths) and reports each as `pass` / `fail` / `skip`.
 - Each failing check emits a `fix_hint` containing the literal command needed to resolve it (e.g. `security add-generic-password ... -s atomic-agents-anthropic -w '<key>'` for a missing Keychain entry).
 - Provider-keys check reuses the production lookup chain (`_llm._get_key()`) so doctor's verdict can never disagree with runtime behaviour. Provider inference follows `_costs.PRICING` keys: `claude-*` → anthropic, `gpt-*` → openai, `moonshot/*` → moonshot. Also verifies the optional provider SDK is importable — `gpt-*` and `moonshot/*` selections require the `openai` extra; doctor fails fast instead of letting the runtime hit `ImportError` on first call.
-- MCP check exercises the real stdio handshake (`session.initialize` + `list_tools`) per declared server, threading `tools.md` `read_paths` through `parse_mcp_md` so the same `PathTraversalError` that runtime would raise surfaces at install time. Skipped via `--no-mcp` or when `mcp.md` is absent.
+- MCP check exercises the real stdio handshake (`session.initialize` + `list_tools`) per declared server, threading `tools.md` `read_paths` through `parse_mcp_md` so the same `PathTraversalError` that runtime would raise surfaces at install time. Bounded by a 10-second default wall-clock timeout — a server that starts but never replies fails the check instead of hanging the CLI. Skipped via `--no-mcp` or when `mcp.md` is absent.
 - Cascade-aware: when the agent path matches `<system>/projects/<project>/agents/<role>` (spec/06), `model.md` and `tools.md` are resolved via `_cascade.resolve_*` so role-level config satisfies the vault check and downstream parsers see the same config the runtime would.
 - Locks check uses `flock(LOCK_NB)` to distinguish a lingering lock file (normal) from an actively-held lock (problem); flags stale when held + mtime > 300s.
-- Write-paths check verifies the agent's `memory/` directory falls inside at least one `write_path` and is NOT shadowed by a `read_only_path` — `FilesystemBackend.write_note()` enforces both at runtime, so a misalignment would otherwise fail after the agent has already spent tokens.
+- Write-paths check verifies the agent's `memory/` directory falls inside at least one `write_path`, is NOT shadowed by a `read_only_path`, and is itself `os.W_OK` writable on disk — `FilesystemBackend.write_note()` enforces all three at runtime, so a misalignment would otherwise fail after the agent has already spent tokens.
 - Malformed config (bad YAML in `model.md`, etc.) is reported as a FAIL CheckResult, not as an exit-2 doctor crash. Exit-2 is reserved for genuine bugs in doctor itself.
 - Output formats: human-readable aligned table by default, machine-readable JSON via `--json` (intended for Cloud Run liveness probes / launchd preflight).
 - Exit codes: `0` all-pass, `1` any-fail, `2` doctor itself crashed.
-- Spec: `docs/spec/27-doctor.md`. Getting-started gains a "Verify your install" step (`§9`).
-- MCP handshake is bounded by a 10-second default wall-clock timeout (`DEFAULT_MCP_HANDSHAKE_TIMEOUT_SECONDS`); a server that starts but never replies fails the check instead of hanging the CLI — critical for the `--json` liveness-probe use case.
-- Memory dir writability is verified with `os.access(memory_dir, os.W_OK)` directly, not only via parent-write_path containment. Catches the case where `write_paths` lists a broad parent that's writable but `memory/` itself is `chmod 0500`.
-- Codex review across three pre-merge passes: 5 P2 findings on round 1 (cascade, parse containment, optional SDK, MCP read_paths, memory-in-write_paths), 2 P2 findings on round 2 (YAML-syntax detection, empty-write_paths-in-agent-scope FAIL), 2 P2 findings on round 3 (MCP timeout, direct memory-dir writability) — all 9 closed before merge.
+- Spec: `docs/spec/27-doctor.md`. Getting-started gains a "Verify your install" step (§9).
+- Codex review across three pre-merge rounds: 9 P2 findings closed (cascade resolution, parse-error containment, optional SDK detection, MCP read_paths enforcement, memory-in-write_paths verification, YAML-syntax detection, empty-write_paths-in-agent-scope FAIL, MCP handshake timeout, direct memory-dir `os.W_OK`).
 - 54 new tests in `tests/test_doctor.py` covering each check's PASS + FAIL paths, every codex-fix scenario, and CLI integration (exit codes, JSON shape, crash → exit 2).
+
+**SemVer policy + upgrade runbook** (issue #68, PR #76)
+
+- New: [`docs/deployment/versioning.md`](docs/deployment/versioning.md) — full SemVer policy with project-specific Major/Minor/Patch definitions (schema break vs new feature vs bug fix), pre-1.0 caveat, and the release-cutting procedure (extract CHANGELOG section via awk, tag with annotation, create GitHub Release with `--notes-file`).
+- New: [`docs/deployment/upgrading.md`](docs/deployment/upgrading.md) — operator runbook: read release notes → pull → copy migration script(s) into `<vault>/_migrations/` → `python -m atomic_agents.migrate --status` → `--to vN --dry-run` → `--to vN` → verify (`atomic-agents doctor` in v0.10.0+; pre-v0.10 falls back to `info` + `run` smoke check) → restart LaunchAgents.
+- Updated: [`README.md`](README.md) gains a "Versioning & upgrades" section linking both docs.
+- Updated: `CHANGELOG.md` header now documents Keep-a-Changelog section conventions (Added / Changed / Deprecated / Removed / Fixed / Security) and the `### BREAKING` callout convention for any change that forces operator work to upgrade.
+- Tagged historical releases v0.1.0 and v0.9.0 retroactively at the commits where their CHANGELOG entries landed, so `git tag -l` and the GitHub Releases page now match the CHANGELOG history.
+- Codex review across five pre-merge rounds: 11 P2 findings closed (pre-1.0 bump-rule consistency, migrate `--to vN` requirement, migration scripts location (`<vault>/_migrations/`), GitHub Release notes from CHANGELOG (not `--notes-from-tag`), doctor reference gating to v0.10.0+, no-op migrate behavior, rollback semantics, single-snapshot-per-`--to`, `CURRENT_SCHEMA_VERSION` lives in the package not the vault).
 
 **MCP (Model Context Protocol) client support** (PR #55, follow-up #56)
 
