@@ -49,6 +49,14 @@ CHANGELOG entry.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-05-09
+
+First Minor release after the spec-completion v0.9.0. Adds the MCP client, the
+MemoryBackend protocol (the watershed for the protocol-pattern scaling
+roadmap), the `atomic-agents doctor` preflight CLI, and the SemVer/upgrade
+documentation that turns "what version are you running" into an answerable
+question. No `### BREAKING` changes — drop-in upgrade from v0.9.0.
+
 ### Added
 
 **`atomic-agents doctor` preflight CLI** (issue #66, PR #75)
