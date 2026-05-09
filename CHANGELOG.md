@@ -49,6 +49,10 @@ CHANGELOG entry.
 
 ## [Unreleased]
 
+### Fixed
+
+- README "What's shipped" table refreshed to add v0.10.0 rows (MCP client, MemoryBackend, doctor, deployment docs) and consolidate the inflated `v0.2`–`v0.8` labels — those modules all actually shipped in v0.9.0, the leading-zero `v0.X` labels were aspirational milestone numbers from the build sequence. Versions in the table are now real release tags.
+
 ## [0.10.0] - 2026-05-09
 
 First Minor release after the spec-completion v0.9.0. Adds the MCP client, the
