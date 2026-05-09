@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+**`atomic-agents doctor` preflight CLI** (issue #66)
+
+- New CLI subcommand: `atomic-agents doctor [--agent <name>] [--agents-root <path>] [--json] [--no-mcp]`. Runs nine independent checks (env, python, vault, provider-keys, model, mcp, locks, memory-backend, write-paths) and reports each as `pass` / `fail` / `skip`.
+- Each failing check emits a `fix_hint` containing the literal command needed to resolve it (e.g. `security add-generic-password ... -s atomic-agents-anthropic -w '<key>'` for a missing Keychain entry).
+- Provider-keys check reuses the production lookup chain (`_llm._get_key()`) so doctor's verdict can never disagree with runtime behaviour. Provider inference follows `_costs.PRICING` keys: `claude-*` → anthropic, `gpt-*` → openai, `moonshot/*` → moonshot. Also verifies the optional provider SDK is importable — `gpt-*` and `moonshot/*` selections require the `openai` extra; doctor fails fast instead of letting the runtime hit `ImportError` on first call.
+- MCP check exercises the real stdio handshake (`session.initialize` + `list_tools`) per declared server, threading `tools.md` `read_paths` through `parse_mcp_md` so the same `PathTraversalError` that runtime would raise surfaces at install time. Skipped via `--no-mcp` or when `mcp.md` is absent.
+- Cascade-aware: when the agent path matches `<system>/projects/<project>/agents/<role>` (spec/06), `model.md` and `tools.md` are resolved via `_cascade.resolve_*` so role-level config satisfies the vault check and downstream parsers see the same config the runtime would.
+- Locks check uses `flock(LOCK_NB)` to distinguish a lingering lock file (normal) from an actively-held lock (problem); flags stale when held + mtime > 300s.
+- Write-paths check verifies the agent's `memory/` directory falls inside at least one `write_path` and is NOT shadowed by a `read_only_path` — `FilesystemBackend.write_note()` enforces both at runtime, so a misalignment would otherwise fail after the agent has already spent tokens.
+- Malformed config (bad YAML in `model.md`, etc.) is reported as a FAIL CheckResult, not as an exit-2 doctor crash. Exit-2 is reserved for genuine bugs in doctor itself.
+- Output formats: human-readable aligned table by default, machine-readable JSON via `--json` (intended for Cloud Run liveness probes / launchd preflight).
+- Exit codes: `0` all-pass, `1` any-fail, `2` doctor itself crashed.
+- Spec: `docs/spec/27-doctor.md`. Getting-started gains a "Verify your install" step (`§9`).
+- MCP handshake is bounded by a 10-second default wall-clock timeout (`DEFAULT_MCP_HANDSHAKE_TIMEOUT_SECONDS`); a server that starts but never replies fails the check instead of hanging the CLI — critical for the `--json` liveness-probe use case.
+- Memory dir writability is verified with `os.access(memory_dir, os.W_OK)` directly, not only via parent-write_path containment. Catches the case where `write_paths` lists a broad parent that's writable but `memory/` itself is `chmod 0500`.
+- Codex review across three pre-merge passes: 5 P2 findings on round 1 (cascade, parse containment, optional SDK, MCP read_paths, memory-in-write_paths), 2 P2 findings on round 2 (YAML-syntax detection, empty-write_paths-in-agent-scope FAIL), 2 P2 findings on round 3 (MCP timeout, direct memory-dir writability) — all 9 closed before merge.
+- 54 new tests in `tests/test_doctor.py` covering each check's PASS + FAIL paths, every codex-fix scenario, and CLI integration (exit codes, JSON shape, crash → exit 2).
+
 **MCP (Model Context Protocol) client support** (PR #55, follow-up #56)
 
 - New module `atomic_agents/mcp/` enables agents to consume tools from external MCP servers (stdio transport).
