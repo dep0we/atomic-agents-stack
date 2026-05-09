@@ -1,0 +1,976 @@
+"""Preflight checks for an atomic-agents installation.
+
+`atomic-agents doctor` runs every check below and reports the results so an
+operator can verify the install before scheduling a run. Each check is
+independent: one failure does not abort the others. The CLI surface is in
+``cli.py``; this module is the pure-logic core (so callers can also import it,
+e.g. as a Cloud Run liveness probe).
+
+Checks (one CheckResult per check unless noted):
+
+    env             ATOMIC_AGENTS_ROOT (or default ~/docs/agents) resolves
+                    to a directory that exists.
+    python          sys.version_info satisfies pyproject's requires-python.
+    vault           Required files exist under <agents_root>/<agent>/
+                    (persona/IDENTITY.md, tools.md, model.md, memory/INDEX.md).
+                    Skipped when no agent name is given.
+    provider-keys   For each provider referenced by model.md (default + fallback),
+                    a key resolves via env / Keychain / ~/.config keys.json.
+                    One CheckResult per provider.
+    model           model.md's default_model is in the pricing table; if cost
+                    guardrails are enabled, daily/monthly caps are non-zero.
+    mcp             Each server in mcp.md responds to a stdio handshake.
+                    Skipped with --no-mcp or when mcp.md is absent.
+                    One CheckResult per declared server.
+    locks           Agent's .lock file is not currently held by another
+                    process. (flock releases on death; lingering files are
+                    normal — only an actively-held lock is suspicious.)
+    memory-backend  FilesystemBackend resolves and stats() returns.
+    write-paths     Each tools.md write_paths entry exists and is writable.
+
+Exit code mapping (set by the CLI, not this module):
+
+    0  every check passed (skips ok)
+    1  one or more failed
+    2  doctor itself crashed
+
+Doctor never raises for a "check failed" condition — it returns a fail
+CheckResult. It only crashes when the doctor logic itself is broken (a
+genuine exit-2 condition).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+from . import _cascade, _model, _tools
+from ._costs import PRICING
+from ._platform import get_agents_root
+
+
+PASS = "pass"
+FAIL = "fail"
+SKIP = "skip"
+
+# Minimum supported Python version. Mirror pyproject.toml's requires-python.
+MIN_PYTHON = (3, 11)
+
+# Provider name → (keychain entry, env var list, config-file key, sdk_module).
+# sdk_module is the import name doctor must verify is installed; None means
+# the provider's SDK is a hard dependency and import never fails.
+_PROVIDER_KEYS = {
+    "anthropic": (
+        "atomic-agents-anthropic",
+        ["ATOMIC_AGENTS_ANTHROPIC_KEY", "ANTHROPIC_API_KEY"],
+        "anthropic",
+        None,  # anthropic is a hard dep in pyproject.toml
+    ),
+    "openai": (
+        "atomic-agents-openai",
+        ["ATOMIC_AGENTS_OPENAI_KEY", "OPENAI_API_KEY"],
+        "openai",
+        "openai",  # optional extra; needed for both openai and moonshot
+    ),
+    "moonshot": (
+        "atomic-agents-moonshot",
+        ["ATOMIC_AGENTS_MOONSHOT_KEY", "MOONSHOT_API_KEY"],
+        "moonshot",
+        "openai",  # _llm._call_moonshot reuses the openai SDK with a base_url
+    ),
+}
+
+
+@dataclass
+class CheckResult:
+    """One check's outcome.
+
+    name      identifier matching the docstring above (e.g. "env", "python")
+    status    PASS | FAIL | SKIP
+    message   one-line summary suitable for the terminal
+    fix_hint  what the operator should run/edit to fix it (empty on PASS/SKIP)
+    detail    optional extra info; surfaces in --json
+    """
+
+    name: str
+    status: str
+    message: str
+    fix_hint: str = ""
+    detail: dict = field(default_factory=dict)
+
+    @property
+    def passed(self) -> bool:
+        return self.status == PASS
+
+    @property
+    def failed(self) -> bool:
+        return self.status == FAIL
+
+
+# ──────────────────────────────────────────────────────────────────
+# Entry point
+
+
+def run_doctor(
+    agent_name: str | None = None,
+    agents_root: Path | None = None,
+    *,
+    skip_mcp: bool = False,
+) -> list[CheckResult]:
+    """Run every check and return the list of CheckResult.
+
+    agent_name=None runs only the host-level checks (env, python). The vault,
+    model, provider-keys, mcp, locks, memory-backend, and write-paths checks
+    require a target agent and are emitted as SKIP results when no agent is
+    given.
+    """
+    results: list[CheckResult] = []
+
+    results.append(check_env(agents_root))
+    results.append(check_python())
+
+    # Resolve agents_root for downstream checks. We tolerate a missing path
+    # because check_env will already have flagged it; downstream checks
+    # then short-circuit to SKIP.
+    resolved_root: Path = (
+        Path(agents_root).expanduser().resolve()
+        if agents_root is not None
+        else get_agents_root()
+    )
+
+    if agent_name is None:
+        for n in ("vault", "provider-keys", "model", "mcp", "locks",
+                  "memory-backend", "write-paths"):
+            results.append(CheckResult(
+                name=n, status=SKIP,
+                message="no --agent supplied; skipped",
+            ))
+        return results
+
+    agent_root = resolved_root / agent_name
+
+    # Detect cascade so vault/model/tools resolution mirrors the runtime.
+    # detect_cascade returns None for single-agent layouts.
+    cascade = _cascade.detect_cascade(agent_root)
+
+    results.append(check_vault(agent_root, cascade=cascade))
+
+    # Parse model.md / tools.md once for the downstream checks. We resolve
+    # via cascade when applicable so doctor sees the same config the runtime
+    # would. Parse errors (malformed YAML, bad caps) are reported as FAIL
+    # results, not crashes — operators should not see "doctor crashed" for
+    # a config mistake.
+    model_data, model_parse_fail = _safe_parse_model(agent_root, cascade)
+    tools_data, tools_parse_fail = _safe_parse_tools(agent_root, cascade)
+
+    if model_parse_fail is not None:
+        results.append(model_parse_fail)
+    if tools_parse_fail is not None:
+        results.append(tools_parse_fail)
+
+    results.extend(check_provider_keys(model_data))
+    results.append(check_model(model_data))
+
+    if skip_mcp:
+        results.append(CheckResult(
+            name="mcp", status=SKIP,
+            message="--no-mcp specified; skipped",
+        ))
+    else:
+        results.extend(check_mcp(agent_root, read_paths=tools_data.get("read_paths", [])))
+
+    results.append(check_locks(agent_root))
+    results.append(check_memory_backend(agent_root))
+    results.append(check_write_paths(tools_data, agent_root=agent_root))
+
+    return results
+
+
+def _safe_parse_model(agent_root: Path, cascade) -> tuple[dict, CheckResult | None]:
+    """Parse model.md, returning (data, parse_failure_check_or_None).
+
+    On parse failure, returns the parser defaults plus a FAIL CheckResult so
+    downstream checks still run with sane defaults instead of crashing the
+    whole doctor run.
+
+    Two failure paths are detected:
+
+    1. The parser itself raises (e.g. ``float("not-a-number")`` on a bad cap
+       value). The exception is caught here.
+    2. The parser silently swallows malformed YAML — ``parse_model_md_text``
+       catches ``yaml.YAMLError`` and falls back to defaults. We re-parse the
+       embedded YAML fences directly so this case still surfaces as a FAIL.
+    """
+    try:
+        if cascade is not None:
+            model_path = _cascade.resolve_model_md(cascade)
+            data = _model.parse_model_md(model_path)
+            text = model_path.read_text(encoding="utf-8") if model_path else ""
+        else:
+            mp = agent_root / "model.md"
+            data = _model.parse_model_md(mp if mp.exists() else None)
+            text = mp.read_text(encoding="utf-8") if mp.exists() else ""
+    except Exception as e:  # noqa: BLE001 — operator config issue, not a doctor bug
+        return _model.parse_model_md_text(""), CheckResult(
+            name="config-parse[model.md]", status=FAIL,
+            message=f"could not parse model.md: {type(e).__name__}: {e}",
+            fix_hint=(
+                "Check model.md syntax — see docs/spec/04-runtime-assembly.md "
+                "and docs/samples/caldwell/model.md for a reference. "
+                "Common causes: malformed YAML in cost_guardrails block, "
+                "non-numeric cap values."
+            ),
+            detail={"error_type": type(e).__name__},
+        )
+
+    # Belt-and-braces: surface YAML errors that parse_model_md_text swallows.
+    yaml_failure = _detect_yaml_fence_errors(text)
+    if yaml_failure is not None:
+        return data, CheckResult(
+            name="config-parse[model.md]", status=FAIL,
+            message=f"model.md contains invalid YAML: {yaml_failure}",
+            fix_hint=(
+                "Check the ```yaml fenced block(s) in model.md. Run "
+                "`python -c \"import yaml; yaml.safe_load(open('model.md').read())\"` "
+                "for a more precise error location, or see "
+                "docs/samples/caldwell/model.md for a reference."
+            ),
+        )
+    return data, None
+
+
+def _detect_yaml_fence_errors(text: str) -> str | None:
+    """Return a one-line description of the first YAML-fence error, or None.
+
+    parse_model_md_text catches yaml.YAMLError and silently falls back to
+    defaults — perfectly fine for runtime, but doctor's job is to surface
+    operator config errors. Re-parse here directly.
+    """
+    if not text:
+        return None
+    import re
+    import yaml  # type: ignore[import-untyped]
+    blocks = re.findall(r"```yaml\s*\n(.*?)```", text, re.DOTALL)
+    for block in blocks:
+        try:
+            yaml.safe_load(block)
+        except yaml.YAMLError as e:
+            # The exception's str() includes line/column when available.
+            return str(e).splitlines()[0]
+    return None
+
+
+def _safe_parse_tools(agent_root: Path, cascade) -> tuple[dict, CheckResult | None]:
+    """Parse tools.md, returning (data, parse_failure_check_or_None)."""
+    try:
+        if cascade is not None:
+            _, tools_text = _cascade.resolve_tools_md(cascade)
+            data = _tools.parse_tools_md_text(tools_text)
+        else:
+            tp = agent_root / "tools.md"
+            data = _tools.parse_tools_md(tp) if tp.exists() else {}
+        return data, None
+    except Exception as e:  # noqa: BLE001 — operator config issue, not a doctor bug
+        return {}, CheckResult(
+            name="config-parse[tools.md]", status=FAIL,
+            message=f"could not parse tools.md: {type(e).__name__}: {e}",
+            fix_hint=(
+                "Check tools.md syntax — see docs/spec/01-anatomy.md for the "
+                "section format. Common cause: stray content under a path "
+                "section that isn't a bullet."
+            ),
+            detail={"error_type": type(e).__name__},
+        )
+
+
+# ──────────────────────────────────────────────────────────────────
+# Individual checks
+
+
+def check_env(agents_root_override: Path | None) -> CheckResult:
+    """ATOMIC_AGENTS_ROOT or default resolves to an existing directory."""
+    if agents_root_override is not None:
+        path = Path(agents_root_override).expanduser().resolve()
+        source = f"--agents-root {agents_root_override}"
+    else:
+        env_val = os.environ.get("ATOMIC_AGENTS_ROOT")
+        if env_val:
+            path = Path(env_val).expanduser().resolve()
+            source = f"ATOMIC_AGENTS_ROOT={env_val}"
+        else:
+            path = get_agents_root()
+            source = "default ~/docs/agents (ATOMIC_AGENTS_ROOT unset)"
+
+    if not path.exists():
+        return CheckResult(
+            name="env", status=FAIL,
+            message=f"agents-root does not exist: {path} ({source})",
+            fix_hint=(
+                f"Create it: mkdir -p {path}\n"
+                f"  Or set ATOMIC_AGENTS_ROOT to an existing directory."
+            ),
+            detail={"path": str(path), "source": source},
+        )
+    if not path.is_dir():
+        return CheckResult(
+            name="env", status=FAIL,
+            message=f"agents-root is not a directory: {path}",
+            fix_hint=f"Remove the file at {path} and recreate it as a directory.",
+            detail={"path": str(path), "source": source},
+        )
+    return CheckResult(
+        name="env", status=PASS,
+        message=f"agents-root resolves to {path} ({source})",
+        detail={"path": str(path), "source": source},
+    )
+
+
+def check_python() -> CheckResult:
+    """Interpreter satisfies the minimum supported version."""
+    cur = sys.version_info[:2]
+    cur_str = f"{cur[0]}.{cur[1]}.{sys.version_info.micro}"
+    if cur >= MIN_PYTHON:
+        return CheckResult(
+            name="python", status=PASS,
+            message=f"Python {cur_str} (>= {MIN_PYTHON[0]}.{MIN_PYTHON[1]} required)",
+            detail={"version": cur_str},
+        )
+    return CheckResult(
+        name="python", status=FAIL,
+        message=f"Python {cur_str} is too old; need >= {MIN_PYTHON[0]}.{MIN_PYTHON[1]}",
+        fix_hint=(
+            f"Install Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ and re-run via that "
+            "interpreter (e.g. `uv run --python 3.12 atomic-agents doctor`)."
+        ),
+        detail={"version": cur_str},
+    )
+
+
+def check_vault(agent_root: Path, *, cascade=None) -> CheckResult:
+    """Required files exist for this agent layout.
+
+    Single-agent layout: persona/IDENTITY.md, tools.md, model.md, memory/INDEX.md
+    must all exist under <agent_root> per spec/04.
+
+    Cascaded layout (spec/06): persona/IDENTITY.md and memory/INDEX.md are
+    instance-only. tools.md and model.md may live at the role layer; either
+    role-level or instance-level satisfies the requirement.
+
+    Pass ``cascade=_cascade.detect_cascade(agent_root)`` to opt into the
+    cascade-aware variant; the default behaviour (cascade=None) is the
+    single-agent rule.
+    """
+    if not agent_root.exists():
+        return CheckResult(
+            name="vault", status=FAIL,
+            message=f"agent folder does not exist: {agent_root}",
+            fix_hint=(
+                f"Create it (or copy a sample): "
+                f"cp -r docs/samples/caldwell {agent_root}"
+            ),
+            detail={"agent_root": str(agent_root)},
+        )
+
+    # Always-required, instance-level files.
+    instance_required = [
+        "persona/IDENTITY.md",
+        "memory/INDEX.md",
+    ]
+    missing = [r for r in instance_required if not (agent_root / r).exists()]
+
+    # tools.md / model.md: either instance-level (always for single-agent) or
+    # role-level (cascade-only fallback).
+    for filename in ("tools.md", "model.md"):
+        instance_path = agent_root / filename
+        if instance_path.exists():
+            continue
+        if cascade is not None:
+            role_path = cascade.role_root / filename
+            if role_path.exists():
+                continue
+        missing.append(filename)
+
+    if missing:
+        return CheckResult(
+            name="vault", status=FAIL,
+            message=f"required files missing: {', '.join(missing)}",
+            fix_hint=(
+                "Create the missing files. See docs/spec/01-anatomy.md for the "
+                "canonical layout (or docs/spec/06-multi-agent-projects.md "
+                "for cascade layouts). docs/samples/caldwell/ is a working "
+                "example."
+            ),
+            detail={
+                "missing": missing,
+                "agent_root": str(agent_root),
+                "cascaded": cascade is not None,
+            },
+        )
+    return CheckResult(
+        name="vault", status=PASS,
+        message=(
+            f"all required files present under {agent_root}"
+            + (" (cascaded)" if cascade is not None else "")
+        ),
+        detail={"agent_root": str(agent_root), "cascaded": cascade is not None},
+    )
+
+
+def _provider_for_model(model_id: str) -> str | None:
+    """Map a model id to its provider name.
+
+    Convention follows _costs.PRICING keys:
+        claude-*       → anthropic
+        gpt-*          → openai
+        moonshot/*     → moonshot
+
+    Returns None for ids that don't match any known provider prefix.
+    """
+    if not model_id:
+        return None
+    if model_id.startswith("claude-"):
+        return "anthropic"
+    if model_id.startswith("gpt-"):
+        return "openai"
+    if model_id.startswith("moonshot/"):
+        return "moonshot"
+    return None
+
+
+def check_provider_keys(model_data: dict) -> list[CheckResult]:
+    """For each provider used by default + fallback, verify a key resolves."""
+    providers: list[str] = []
+    seen: set[str] = set()
+    for key in ("default_model", "fallback_model"):
+        mid = model_data.get(key)
+        if not mid:
+            continue
+        prov = _provider_for_model(mid)
+        if prov and prov not in seen:
+            providers.append(prov)
+            seen.add(prov)
+
+    if not providers:
+        return [CheckResult(
+            name="provider-keys", status=SKIP,
+            message="no recognised provider in model.md (default/fallback)",
+        )]
+
+    return [_check_one_provider_key(p) for p in providers]
+
+
+def _check_one_provider_key(provider: str) -> CheckResult:
+    """Resolve a key for a single provider via the production lookup chain.
+
+    Also verifies that the optional SDK module the runtime would import is
+    available — without this, the key check passes but the first agent run
+    fails with an ImportError after spending nothing on tokens but plenty on
+    operator confusion.
+    """
+    if provider not in _PROVIDER_KEYS:
+        return CheckResult(
+            name=f"provider-keys[{provider}]", status=SKIP,
+            message=f"no key-resolution chain registered for {provider!r}",
+        )
+    keychain_name, env_vars, config_key, sdk_module = _PROVIDER_KEYS[provider]
+
+    # Optional-SDK check first — a missing import is more fundamental than a
+    # missing key and the fix is different (extras vs creds).
+    if sdk_module is not None:
+        try:
+            __import__(sdk_module)
+        except ImportError as e:
+            extra = "openai" if sdk_module == "openai" else sdk_module
+            return CheckResult(
+                name=f"provider-keys[{provider}]", status=FAIL,
+                message=f"{provider} requires the {sdk_module!r} package, which is not installed",
+                fix_hint=(
+                    f"Install the optional extra: uv add 'atomic-agents-stack[{extra}]'\n"
+                    f"  Or: pip install {sdk_module}"
+                ),
+                detail={
+                    "provider": provider,
+                    "missing_sdk": sdk_module,
+                    "underlying_error": str(e),
+                },
+            )
+
+    # Reuse the production resolver so the doctor verdict and runtime
+    # behaviour can never disagree on key resolution.
+    from ._llm import _get_key
+    from .exceptions import AtomicAgentsError
+    try:
+        _get_key(env_vars=env_vars, keychain_name=keychain_name, config_key=config_key)
+    except AtomicAgentsError as e:
+        return CheckResult(
+            name=f"provider-keys[{provider}]", status=FAIL,
+            message=f"{provider} API key not found",
+            fix_hint=(
+                f"Choose one:\n"
+                f"  - export {env_vars[0]}='<key>'\n"
+                f"  - security add-generic-password -a $USER -s {keychain_name} -w '<key>' "
+                f"(macOS Keychain)\n"
+                f"  - add {{\"{config_key}\": \"<key>\"}} to ~/.config/atomic_agents/keys.json"
+            ),
+            detail={
+                "provider": provider,
+                "keychain": keychain_name,
+                "env_vars": env_vars,
+                "underlying_error": str(e),
+            },
+        )
+    return CheckResult(
+        name=f"provider-keys[{provider}]", status=PASS,
+        message=f"{provider} API key resolves",
+        detail={"provider": provider},
+    )
+
+
+def check_model(model_data: dict) -> CheckResult:
+    """default_model is in PRICING; if guardrails enabled, caps are non-zero."""
+    default_model = model_data.get("default_model", "")
+    if not default_model:
+        return CheckResult(
+            name="model", status=FAIL,
+            message="model.md has no default_model",
+            fix_hint=(
+                "Add a `## Default model` section to model.md with the model id "
+                "on the next line. See docs/samples/caldwell/model.md."
+            ),
+        )
+    if default_model not in PRICING:
+        return CheckResult(
+            name="model", status=FAIL,
+            message=f"default_model {default_model!r} is not in the pricing table",
+            fix_hint=(
+                f"Use one of {sorted(PRICING.keys())}, or add {default_model!r} "
+                "to atomic_agents/_costs.py PRICING with current rates."
+            ),
+            detail={"default_model": default_model},
+        )
+
+    # If guardrails enabled, caps must be non-zero (zero = unlimited; the issue
+    # treats that as a misconfiguration since it disables the feature silently).
+    if model_data.get("cost_guardrails_enabled"):
+        daily = float(model_data.get("daily_cap_usd", 0.0))
+        monthly = float(model_data.get("monthly_cap_usd", 0.0))
+        if daily <= 0 or monthly <= 0:
+            return CheckResult(
+                name="model", status=FAIL,
+                message=(
+                    "cost_guardrails enabled but daily_cap_usd or monthly_cap_usd "
+                    f"is 0 (daily={daily}, monthly={monthly})"
+                ),
+                fix_hint=(
+                    "Set both daily_cap_usd and monthly_cap_usd to non-zero "
+                    "values in model.md's cost_guardrails block, or set "
+                    "enabled: false to opt out."
+                ),
+                detail={"daily_cap_usd": daily, "monthly_cap_usd": monthly},
+            )
+
+    return CheckResult(
+        name="model", status=PASS,
+        message=f"default_model {default_model!r} priced; guardrails ok",
+        detail={
+            "default_model": default_model,
+            "cost_guardrails_enabled": model_data.get("cost_guardrails_enabled", False),
+        },
+    )
+
+
+def check_mcp(agent_root: Path, *, read_paths: list | None = None) -> list[CheckResult]:
+    """Each server in mcp.md responds to a stdio handshake.
+
+    Returns one CheckResult per declared server. Returns a single SKIP result
+    when mcp.md is absent (the common case for agents that don't use MCP).
+
+    ``read_paths`` should be the parsed tools.md read_paths so doctor enforces
+    the same path-traversal protection the runtime does. When omitted, doctor
+    accepts any args — but the agent itself will reject the same config at
+    runtime, so this argument should always be supplied by ``run_doctor``.
+    """
+    mcp_path = agent_root / "mcp.md"
+    if not mcp_path.exists():
+        return [CheckResult(
+            name="mcp", status=SKIP,
+            message="no mcp.md (agent does not use MCP)",
+        )]
+
+    # Lazy import — keeps the doctor command's startup cost low for agents
+    # that don't use MCP (which is the majority).
+    from . import mcp as mcp_module
+
+    try:
+        specs = mcp_module.parse_mcp_md(mcp_path, read_paths=read_paths)
+    except Exception as e:
+        return [CheckResult(
+            name="mcp", status=FAIL,
+            message=f"could not parse mcp.md: {type(e).__name__}: {e}",
+            fix_hint=(
+                "Check mcp.md syntax — see docs/spec/19-mcp.md for the format. "
+                "Common causes: unresolved env-var reference, malformed YAML, "
+                "or path-shaped server args that fall outside tools.md "
+                "read_paths (PathTraversalError)."
+            ),
+        )]
+
+    if not specs:
+        return [CheckResult(
+            name="mcp", status=SKIP,
+            message="mcp.md present but declares no servers",
+        )]
+
+    results: list[CheckResult] = []
+    for spec in specs:
+        cr = _check_one_mcp_server(spec, mcp_module)
+        results.append(cr)
+    return results
+
+
+DEFAULT_MCP_HANDSHAKE_TIMEOUT_SECONDS = 10.0
+
+
+def _check_one_mcp_server(spec, mcp_module,
+                           timeout_seconds: float = DEFAULT_MCP_HANDSHAKE_TIMEOUT_SECONDS) -> CheckResult:
+    """Run one server's stdio handshake with a bounded timeout.
+
+    The MCP SDK's ClientSession has no default read timeout. Without a bound
+    here, a server that starts but never responds to ``initialize`` /
+    ``list_tools`` would hang doctor forever — fatal for the documented
+    --json liveness-probe use case.
+    """
+    from .exceptions import MCPServerConnectFailed
+    if spec.transport != "stdio":
+        return CheckResult(
+            name=f"mcp[{spec.name}]", status=SKIP,
+            message=f"transport {spec.transport!r} not supported in v1 (stdio only)",
+        )
+    try:
+        conn = _connect_sync_with_timeout(spec, mcp_module, timeout_seconds)
+    except TimeoutError:
+        return CheckResult(
+            name=f"mcp[{spec.name}]", status=FAIL,
+            message=(
+                f"server {spec.name!r} did not respond within {timeout_seconds:.0f}s "
+                f"(stdio handshake)"
+            ),
+            fix_hint=(
+                f"Run the command manually and confirm it prints MCP traffic: "
+                f"{spec.command} {' '.join(spec.args)}\n"
+                f"  If it hangs, the server has a startup/auth/network bug. "
+                f"If it works manually, raise the timeout via doctor's "
+                f"DEFAULT_MCP_HANDSHAKE_TIMEOUT_SECONDS or use --no-mcp."
+            ),
+            detail={"server": spec.name, "timeout_seconds": timeout_seconds},
+        )
+    except MCPServerConnectFailed as e:
+        return CheckResult(
+            name=f"mcp[{spec.name}]", status=FAIL,
+            message=f"server {spec.name!r} failed to connect",
+            fix_hint=(
+                f"Verify the command is on PATH and the server is reachable: "
+                f"{spec.command} {' '.join(spec.args)}\n"
+                f"  Underlying error: {e}"
+            ),
+            detail={"server": spec.name, "command": spec.command, "args": spec.args},
+        )
+    except Exception as e:
+        return CheckResult(
+            name=f"mcp[{spec.name}]", status=FAIL,
+            message=f"server {spec.name!r} unexpected error: {type(e).__name__}: {e}",
+            fix_hint=f"Manually run: {spec.command} {' '.join(spec.args)}",
+        )
+    return CheckResult(
+        name=f"mcp[{spec.name}]", status=PASS,
+        message=f"server {spec.name!r} responded ({len(conn.tools)} tools)",
+        detail={"server": spec.name, "tool_count": len(conn.tools)},
+    )
+
+
+def _connect_sync_with_timeout(spec, mcp_module, timeout_seconds: float):
+    """Run mcp's async handshake with a hard wall-clock bound.
+
+    Wraps `_async_connect_and_list` (used by mcp._connect_sync) in
+    asyncio.wait_for so an unresponsive server fails the check after
+    timeout_seconds instead of blocking the whole CLI.
+    """
+    import asyncio
+
+    async def bounded():
+        return await asyncio.wait_for(
+            mcp_module._async_connect_and_list(spec),
+            timeout=timeout_seconds,
+        )
+
+    try:
+        tools = asyncio.run(bounded())
+    except asyncio.TimeoutError as e:
+        raise TimeoutError(str(e)) from e
+    except Exception as e:
+        # Re-raise into the MCPServerConnectFailed shape that the production
+        # _connect_sync would have produced, so the caller's exception
+        # taxonomy stays the same.
+        from .exceptions import MCPServerConnectFailed
+        raise MCPServerConnectFailed(
+            f"MCP server '{spec.name}' failed to connect: {type(e).__name__}: {e}"
+        ) from e
+
+    return mcp_module._ServerConnection(spec=spec, tools=tools)
+
+
+def check_locks(agent_root: Path, *, stale_seconds: float = 300.0) -> CheckResult:
+    """Agent's .lock file is not currently held by another process.
+
+    A .lock file lingering on disk is normal — POSIX flock() releases on
+    process death and Python doesn't unlink the file on exit. The only
+    problematic state is "file currently held": doctor tests that with a
+    non-blocking flock attempt. If the file is held AND its mtime is older
+    than ``stale_seconds``, the holder is likely stuck.
+    """
+    lock_path = agent_root / ".lock"
+    if not lock_path.exists():
+        return CheckResult(
+            name="locks", status=PASS,
+            message="no lock file (agent has not run yet, or last run released cleanly)",
+        )
+
+    import errno
+    import fcntl
+    import time
+
+    try:
+        fd = os.open(lock_path, os.O_RDWR)
+    except OSError as e:
+        return CheckResult(
+            name="locks", status=FAIL,
+            message=f"could not open {lock_path}: {e}",
+            fix_hint=f"Check filesystem permissions on {lock_path}.",
+        )
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            # BlockingIOError (EWOULDBLOCK / EAGAIN) means the lock is held.
+            # Any other OSError is a genuine problem with the file or fd.
+            if not isinstance(e, BlockingIOError) and e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                raise
+            # Lock is held. Read the recorded PID for diagnostics.
+            try:
+                contents = lock_path.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                contents = ""
+            mtime = lock_path.stat().st_mtime
+            age = time.time() - mtime
+            stale = age > stale_seconds
+            return CheckResult(
+                name="locks", status=FAIL,
+                message=(
+                    f"agent lock at {lock_path} is held"
+                    + (f" (stale: age {age:.0f}s > {stale_seconds:.0f}s threshold)" if stale else "")
+                    + (f"; recorded {contents}" if contents else "")
+                ),
+                fix_hint=(
+                    "If the holder process is alive, wait for it to finish or kill it. "
+                    f"If the holder is dead, remove the file: rm {lock_path}"
+                ),
+                detail={"path": str(lock_path), "age_seconds": age, "contents": contents, "stale": stale},
+            )
+        # Acquired — release immediately.
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+    return CheckResult(
+        name="locks", status=PASS,
+        message="lock file present but not held (clean)",
+    )
+
+
+def check_memory_backend(agent_root: Path) -> CheckResult:
+    """FilesystemBackend resolves and stats() returns successfully."""
+    memory_dir = agent_root / "memory"
+    if not memory_dir.exists():
+        return CheckResult(
+            name="memory-backend", status=FAIL,
+            message=f"memory/ directory missing at {memory_dir}",
+            fix_hint=f"Create it: mkdir -p {memory_dir} && touch {memory_dir}/INDEX.md",
+        )
+    try:
+        from .memory.filesystem import FilesystemBackend
+        backend = FilesystemBackend(agent_root, "memory")
+        stats = backend.stats()
+    except Exception as e:
+        return CheckResult(
+            name="memory-backend", status=FAIL,
+            message=f"backend stats() raised {type(e).__name__}: {e}",
+            fix_hint=(
+                "Check that memory/ is readable and INDEX.md is well-formed. "
+                "See docs/spec/02-atomic-memory.md."
+            ),
+        )
+    return CheckResult(
+        name="memory-backend", status=PASS,
+        message=f"FilesystemBackend ok ({stats.total_notes} notes)",
+        detail={
+            "total_notes": stats.total_notes,
+            "by_type": stats.by_type,
+            "live_bytes": stats.live_bytes,
+        },
+    )
+
+
+def check_write_paths(tools_data: dict, *, agent_root: Path | None = None) -> CheckResult:
+    """Each tools.md write_paths entry exists and is writable.
+
+    Also verifies that the agent's memory directory falls inside at least
+    one write_path and not inside any read_only_path. FilesystemBackend
+    enforces both at write_note() time, so a captures write would otherwise
+    fail at runtime after the agent has already spent tokens on the response.
+
+    A non-existent or unwritable write_path will fail the first time the
+    agent tries to write a capture there. Better to fail at install time.
+    """
+    paths = tools_data.get("write_paths", [])
+    read_only = tools_data.get("read_only_paths", [])
+    if not paths:
+        # No write_paths is a hard fail for an agent-scoped check —
+        # FilesystemBackend.write_note() raises WritePathViolation on every
+        # capture write when the policy's write_paths list is empty. For
+        # tools-only callers (no agent_root), empty == "n/a" and we skip.
+        if agent_root is None:
+            return CheckResult(
+                name="write-paths", status=SKIP,
+                message="tools.md declares no write_paths",
+            )
+        return CheckResult(
+            name="write-paths", status=FAIL,
+            message="tools.md declares no write_paths; every capture write would be rejected",
+            fix_hint=(
+                "Add a `## Write paths` section to tools.md listing at least "
+                "the agent's memory/ directory. See docs/spec/01-anatomy.md "
+                "for the format."
+            ),
+        )
+
+    failures: list[tuple[str, str]] = []
+    for raw in paths:
+        p = Path(str(raw)).expanduser()
+        if not p.exists():
+            failures.append((str(p), "does not exist"))
+            continue
+        if not os.access(p, os.W_OK):
+            failures.append((str(p), "not writable"))
+
+    # Memory-target check: agent_root/memory must (1) be inside a write_path,
+    # (2) not be inside a read_only_path, AND (3) actually be writable on
+    # disk. The third condition catches the case where write_paths contains
+    # a broad parent that's writable but memory/ itself is chmodded read-only.
+    # We compare resolved paths so .. and symlinks don't sneak past.
+    if agent_root is not None:
+        memory_dir = (agent_root / "memory").resolve()
+        write_resolved = [Path(str(p)).expanduser().resolve() for p in paths]
+        readonly_resolved = [Path(str(p)).expanduser().resolve() for p in read_only]
+
+        if not any(_is_relative_to(memory_dir, w) for w in write_resolved):
+            failures.append((
+                str(memory_dir),
+                "agent memory dir is not inside any write_path "
+                "(captures would fail at runtime)",
+            ))
+        elif any(_is_relative_to(memory_dir, ro) for ro in readonly_resolved):
+            failures.append((
+                str(memory_dir),
+                "agent memory dir is inside a read_only_path "
+                "(captures would be rejected)",
+            ))
+        elif memory_dir.exists() and not os.access(memory_dir, os.W_OK):
+            failures.append((
+                str(memory_dir),
+                "agent memory dir exists but is not writable "
+                "(captures would fail with PermissionError)",
+            ))
+
+    if failures:
+        rendered = "; ".join(f"{p} ({why})" for p, why in failures)
+        return CheckResult(
+            name="write-paths", status=FAIL,
+            message=f"write_paths invalid: {rendered}",
+            fix_hint=(
+                "Create the missing directories or fix permissions. "
+                "Every path in tools.md write_paths must exist and be "
+                "writable, and the agent's memory/ directory must be "
+                "covered by a write_path and not by a read_only_path."
+            ),
+            detail={"failures": [{"path": p, "reason": w} for p, w in failures]},
+        )
+    return CheckResult(
+        name="write-paths", status=PASS,
+        message=f"all {len(paths)} write_paths exist and are writable",
+        detail={"count": len(paths)},
+    )
+
+
+def _is_relative_to(child: Path, parent: Path) -> bool:
+    """Path.is_relative_to landed in 3.9; Python 3.11+ has it. Wrapper for clarity."""
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+# ──────────────────────────────────────────────────────────────────
+# Output rendering
+
+
+def render_human(results: list[CheckResult]) -> str:
+    """Aligned text output suitable for terminal display."""
+    if not results:
+        return "(no checks run)\n"
+
+    name_width = max(len(r.name) for r in results)
+    badge = {PASS: "[ OK ]", FAIL: "[FAIL]", SKIP: "[skip]"}
+
+    lines: list[str] = []
+    for r in results:
+        lines.append(f"{badge[r.status]}  {r.name.ljust(name_width)}  {r.message}")
+        if r.fix_hint and r.status == FAIL:
+            for hint_line in r.fix_hint.splitlines():
+                lines.append(f"           {hint_line}")
+
+    summary = _summarise(results)
+    lines.append("")
+    lines.append(summary)
+    return "\n".join(lines) + "\n"
+
+
+def render_json(results: list[CheckResult]) -> str:
+    """JSON output for scripting / liveness probes."""
+    payload = {
+        "results": [asdict(r) for r in results],
+        "summary": {
+            "passed": sum(1 for r in results if r.status == PASS),
+            "failed": sum(1 for r in results if r.status == FAIL),
+            "skipped": sum(1 for r in results if r.status == SKIP),
+            "all_ok": not any(r.failed for r in results),
+        },
+    }
+    return json.dumps(payload, indent=2, default=str) + "\n"
+
+
+def _summarise(results: list[CheckResult]) -> str:
+    passed = sum(1 for r in results if r.status == PASS)
+    failed = sum(1 for r in results if r.status == FAIL)
+    skipped = sum(1 for r in results if r.status == SKIP)
+    if failed:
+        return f"FAIL — {failed} failed, {passed} passed, {skipped} skipped"
+    return f"OK — {passed} passed, {skipped} skipped"
+
+
+def overall_exit_code(results: list[CheckResult]) -> int:
+    """0 if no failures, 1 otherwise."""
+    return 1 if any(r.failed for r in results) else 0

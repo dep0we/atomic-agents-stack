@@ -220,7 +220,24 @@ chmod +x ~/bin/run-atomic-agent.sh
 crontab -e   # add an entry from extras/cron/crontab.example
 ```
 
-## 9. (Optional) Wire into Claude Code
+## 9. Verify your install with `doctor`
+
+Before scheduling a recurring run, make sure every preflight check passes:
+
+```bash
+atomic-agents doctor --agent <name>
+```
+
+That validates env, Python, vault layout, provider keys, model + cost
+guardrails, MCP servers, lock state, memory backend, and write paths in one
+shot. Each failing check prints the exact command needed to fix it. Add
+`--no-mcp` to skip MCP handshakes if your servers are remote, or `--json`
+for liveness-probe output. See [`spec/27-doctor.md`](spec/27-doctor.md) for
+the full check catalogue.
+
+Make this the last step of every deploy: doctor exits 0 ⇒ ready to schedule.
+
+## 10. (Optional) Wire into Claude Code
 
 [`extras/claude-code-skills/`](../extras/claude-code-skills/) has SKILL.md wrappers for every CLI surface. Copy the ones you want:
 
