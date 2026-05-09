@@ -150,14 +150,19 @@ atomic_agents/                  # the Python package
     ├── serve.py                # optional local web server
     └── __main__.py             # python -m atomic_agents.dashboard ...
 
-tests/                          # 257 tests, all passing on Python 3.11+
+tests/                          # 720+ tests, all passing on Python 3.11+
 docs/                           # spec + implementation guides
 ├── README.md                   # spec entry point
 ├── architecture.md             # 30-second mental model + design rationale
-├── spec/                       # 13 locked spec docs (anatomy → research integrity)
+├── getting-started.md          # 15-minute clone-to-running-agent walk-through
+├── spec/                       # 21 locked spec docs (anatomy → memory backend → doctor)
 ├── implementation/             # build guides per runtime (cron, Claude skill, dashboard, ...)
+├── deployment/                 # SemVer policy + operator upgrade runbook
 ├── samples/caldwell/           # complete worked single-agent example
 ├── appendix/portability.md     # using Atomic Agents without Obsidian / on any OS
+├── GOVERNANCE.md               # solo / small-team operator guide
+├── TENSIONS.md                 # architectural tensions to protect when changing the code
+├── methodology.md              # working-methods retrospective (how this codebase ships)
 └── package-readme.md           # this package's PyPI/distribution readme
 
 extras/                         # operational templates (skills, schedulers)
@@ -224,6 +229,12 @@ uv run pytest
 uv run pytest tests/test_capture.py -v
 ```
 
+Before opening a PR, read [`CLAUDE.md`](CLAUDE.md) (project design ethos +
+working-methods), [`docs/TENSIONS.md`](docs/TENSIONS.md) (architectural tensions
+to protect when changing code), and [`docs/methodology.md`](docs/methodology.md)
+(the practices that produced this codebase's quality — codex review in rounds,
+verify-before-claim, bisectable commits).
+
 ---
 
 ## License
@@ -234,4 +245,4 @@ MIT — see [LICENSE](LICENSE).
 
 ## Status
 
-**v0.1, alpha.** Core runtime is stable and tested. Subsequent versions add eval, tuning, goals, and other modules per the spec. Currently developed by a single user (Sam); reference implementation that anyone can use, fork, or extend.
+**v0.10, alpha.** Core runtime stable, 720+ tests passing on Python 3.11/3.12. MemoryBackend protocol shipped (PR #57); MCP client support shipped (PRs #55 + #56); `atomic-agents doctor` preflight + SemVer policy + upgrade runbook shipped in v0.10.0. Currently developed by a single maintainer; reference implementation that anyone can use, fork, or extend.

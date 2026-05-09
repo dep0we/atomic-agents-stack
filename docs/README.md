@@ -49,6 +49,9 @@ Two layers per agent: human-curated persona on top, agent-curated memory below. 
 | **Get an agent running in 15 minutes** | [getting-started](getting-started.md) |
 | **Deploy an agent autonomously (pre-deploy checklist, naming, audit)** | [GOVERNANCE.md](GOVERNANCE.md) |
 | Understand the architecture at a glance | [architecture](architecture.md) |
+| **Contribute or change framework code (design ethos + taste rules)** | [../CLAUDE.md](../CLAUDE.md) |
+| **Architectural tensions to protect when changing code** | [TENSIONS.md](TENSIONS.md) |
+| **Working methods that produced this codebase's quality** | [methodology.md](methodology.md) |
 | Build a new agent from zero (per-runtime) | [implementation/cron-agent](implementation/cron-agent.md), [implementation/claude-skill-agent](implementation/claude-skill-agent.md), or [implementation/chatgpt-skill-agent](implementation/chatgpt-skill-agent.md) |
 | Look at a complete worked example (single-agent) | [samples/caldwell](samples/caldwell/README.md) |
 | Understand a specific design choice | [spec/01-anatomy](spec/01-anatomy.md) through [spec/09-cost-observability](spec/09-cost-observability.md) |
