@@ -56,32 +56,36 @@ print(f"Captures: {len(response.captures)}")
 
 ## What's shipped
 
-| Component | Status |
+| Component | Shipped |
 |---|---|
-| `AtomicAgent` runtime | ✅ v0.1 |
-| Persona loading (IDENTITY, SOUL, USER) | ✅ v0.1 |
-| `memory/` + `wiki/` INDEX-driven recall | ✅ v0.1 |
-| Helper-mediated atomic captures (fenced JSON) | ✅ v0.1 |
-| Multi-tier cost guardrails (50%/80%/100%) | ✅ v0.1 |
-| Helper calls — sequential + parallel | ✅ v0.1 |
-| Anthropic / OpenAI / Moonshot Kimi routing | ✅ v0.1 |
-| File locking with stale-lock recovery | ✅ v0.1 |
-| Schema validation incl. date-suffix filenames | ✅ v0.1 |
-| Cost dashboard (HTML, global + per-agent) | ✅ v0.1 |
-| Optional local dashboard server | ✅ v0.1 |
-| Eval runner — `atomic_agents.eval` | ✅ v0.2 |
-| Tuning analyzer — `atomic_agents.tuning` | ✅ v0.3 |
-| Goal manager — `atomic_agents.goal` | ✅ v0.4 |
-| Schema migration runner — `atomic_agents.migrate` | ✅ v0.5 |
-| Tool-call captures (Path 1) | ✅ v0.6 |
-| Multi-agent project cascade loader — `atomic_agents._cascade` | ✅ v0.7 |
-| Helper provenance preservation | ✅ v0.8 |
-| Research integrity layers 2+3 | ✅ v0.9 |
-| Claude Code skill wrappers — `extras/claude-code-skills/` | ✅ v0.9 |
-| Spec docs in repo — `docs/` | ✅ v0.9 |
-| CI (Python 3.11 + 3.12 matrix) | ✅ v0.9 |
+| `AtomicAgent` runtime | ✅ v0.1.0 |
+| Persona loading (IDENTITY, SOUL, USER) | ✅ v0.1.0 |
+| `memory/` + `wiki/` INDEX-driven recall | ✅ v0.1.0 |
+| Helper-mediated atomic captures (fenced JSON) | ✅ v0.1.0 |
+| Multi-tier cost guardrails (50% / 80% / 100%) | ✅ v0.1.0 |
+| Helper calls — sequential + parallel | ✅ v0.1.0 |
+| Anthropic / OpenAI / Moonshot Kimi routing | ✅ v0.1.0 |
+| File locking with stale-lock recovery | ✅ v0.1.0 |
+| Schema validation incl. date-suffix filenames | ✅ v0.1.0 |
+| Cost dashboard (HTML, global + per-agent) | ✅ v0.1.0 |
+| Optional local dashboard server | ✅ v0.1.0 |
+| Eval runner — `atomic_agents.eval` | ✅ v0.9.0 |
+| Tuning analyzer — `atomic_agents.tuning` | ✅ v0.9.0 |
+| Goal manager — `atomic_agents.goal` | ✅ v0.9.0 |
+| Schema migration runner — `atomic_agents.migrate` | ✅ v0.9.0 |
+| Tool-call captures (Path 1) | ✅ v0.9.0 |
+| Multi-agent project cascade loader — `atomic_agents._cascade` | ✅ v0.9.0 |
+| Helper provenance preservation | ✅ v0.9.0 |
+| Research integrity layers 2 + 3 | ✅ v0.9.0 |
+| Claude Code skill wrappers — `extras/claude-code-skills/` | ✅ v0.9.0 |
+| Spec docs in repo — `docs/` | ✅ v0.9.0 |
+| CI (Python 3.11 + 3.12 matrix) | ✅ v0.9.0 |
+| MCP (Model Context Protocol) client — `atomic_agents.mcp` | ✅ v0.10.0 |
+| MemoryBackend protocol + FilesystemBackend default — `atomic_agents.memory` | ✅ v0.10.0 |
+| `atomic-agents doctor` preflight CLI — `atomic_agents.doctor` | ✅ v0.10.0 |
+| SemVer policy + upgrade runbook — `docs/deployment/` | ✅ v0.10.0 |
 
-The spec is feature-complete relative to the v1 lock. See [CHANGELOG.md](CHANGELOG.md) for per-version detail.
+See [CHANGELOG.md](CHANGELOG.md) for per-version detail and [`docs/deployment/versioning.md`](docs/deployment/versioning.md) for what counts as a Major / Minor / Patch change.
 
 ---
 
