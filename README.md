@@ -85,6 +85,26 @@ The spec is feature-complete relative to the v1 lock. See [CHANGELOG.md](CHANGEL
 
 ---
 
+## Versioning & upgrades
+
+`atomic-agents-stack` follows [SemVer](https://semver.org) with project-specific
+rules for what counts as a Major / Minor / Patch change (schema break vs new
+feature vs bug fix). **Pre-1.0, Minor releases may contain breaking changes** —
+always read the release notes before upgrading.
+
+- [`docs/deployment/versioning.md`](docs/deployment/versioning.md) — full SemVer
+  policy, the meaning of each digit, the pre-1.0 caveat, and how releases are cut.
+- [`docs/deployment/upgrading.md`](docs/deployment/upgrading.md) — operator
+  runbook: read release notes → pull → `python -m atomic_agents.migrate
+  --to vN` → verify (`atomic-agents doctor` once that lands in v0.10.0+,
+  otherwise an `info` + `run` smoke check) → restart LaunchAgents.
+
+Every release lands as a `vX.Y.Z` git tag plus a GitHub Release with the
+CHANGELOG entry verbatim. Breaking changes get a `### BREAKING` callout in
+that entry.
+
+---
+
 ## How it works at runtime
 
 When an agent is invoked, the framework:
