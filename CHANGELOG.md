@@ -49,6 +49,12 @@ CHANGELOG entry.
 
 ## [Unreleased]
 
+### Added
+
+- **`CLAUDE.md`** — project-level design ethos that loads in every Claude Code session. Captures the throughline (a home user with one agent and an org with a fleet experience the same framework), 14 design taste rules (vault-as-truth, protocols-not-subclassing, layers-don't-merge, cost-first-class, audit-trail-structural, progressive-disclosure, markdown-as-config, atomic-and-idempotent, one-level-constraints, spec-is-the-product, codex-rounds-not-passes, verify-before-claim, docs-match-reality, backward-compat-by-default), the Apple-flavor aesthetic vocabulary, the working-methods section centered on `/ship` end-to-end (Step 18 = `/document-release` subagent) + bisectable commits + CHANGELOG-as-single-source-of-truth + self-dogfood + intentional handoff, and "what this method does not optimize for" so future sessions don't quietly drop discipline to ship faster.
+- **`docs/TENSIONS.md`** — architectural-tension doc capturing 14 tensions across 3 severity tiers (today, at-scale, aesthetic), each with one-sentence description, why it's load-bearing, file/line refs, when it bites, what to watch for, and related issue / ROADMAP entries. Companion to `methodology.md` — methodology captures *how we build*, tensions capture *what to protect when changing the code*.
+- **`docs/methodology.md`** — working-methods retrospective from v0.10.0. Names the practices that produced the codebase's quality — codex review in rounds (3-5 per non-trivial PR; each round catches different things because the diff changes), verify-before-claim (reproduce findings, don't accept by plausibility), scope discipline (file inline as separate issue, never accumulate "we should track that" debt), reversible-vs-irreversible gates, docs-match-reality, self-dogfood as you ship, bisectable commits, CHANGELOG-as-single-source-of-truth, intentional handoffs. Closes with explicit "what this method does NOT optimize for" so future sessions name the trade-off before silently dropping it.
+
 ### Fixed
 
 - README "What's shipped" table refreshed to add v0.10.0 rows (MCP client, MemoryBackend, doctor, deployment docs) and consolidate the inflated `v0.2`–`v0.8` labels — those modules all actually shipped in v0.9.0, the leading-zero `v0.X` labels were aspirational milestone numbers from the build sequence. Versions in the table are now real release tags.
