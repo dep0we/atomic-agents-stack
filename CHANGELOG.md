@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+**MCP (Model Context Protocol) client support** (PR #55, follow-up #56)
+
+- New module `atomic_agents/mcp/` enables agents to consume tools from external MCP servers (stdio transport).
+- Server registry parsed from `<agent>/mcp.md`; tool collision detection across MCP + custom tools (`ToolNameCollision`).
+- Validator integration end-to-end so server-side schema rejections surface as `MCPValidationError` to the agent.
+- Env merge semantics: agent-level + per-server env vars compose without leaking parent process env.
+- Codex review (6 findings) closed before merge; covers env merge, validator wiring, collision detection, server lifecycle.
+
+**MemoryBackend protocol + FilesystemBackend default** (PR #57, follow-up #58/#59)
+
+- New `atomic_agents.memory` package with `MemoryBackend` Protocol, `Note`/`NoteRef`/`VersionRef`/`WritePolicy`/`StagedMemory`/`MemoryStats` dataclasses, and `FilesystemBackend` as the default registered backend.
+- Boil-the-lake refactor of the memory layer: 9 call sites (agent.py, dream.py, tuning.py, both dashboards, cli.py, _capture.py, _versioning.py) route through `agent.memory` instead of direct filesystem operations.
+- `WritePolicy` enforced at `write_note`, `apply_staging`, and inside staged writes — security-equivalent to the prior write-path enforcement, now backend-pluggable.
+- Atomic dir-swap in `apply_staging` is rollback-safe (microsecond-precision archive name + restore-on-failure).
+- New exceptions: `BackendNotRegistered`, `VersionNotFound`, `StagingNotApplied`.
+- Spec doc: `docs/spec/20-memory-backend.md`.
+- Test count: 626 → 668 (35 conformance tests in `test_memory_protocol_conformance.py` + 10 fs-specific in `test_memory_filesystem_backend.py` + 4 live-agent integration in `test_memory_integration.py`).
+- Two scoped follow-ups deferred to issues #58 (dream → `staging.write_note(capture, policy)`) and #59 (CLI → `agent.memory` instead of direct backend).
+- Codex reviewed the scope (10 findings → rev 2) and the implementation diff (4 P1 + 7 P2 + 3 P3 → all closed in fix commit).
+
+### Issue tracking convention
+
+All scoped follow-ups, codex-deferred items, and future enhancements now go to GitHub Issues at dep0we/atomic-agents-stack with label conventions: `enhancement`, `documentation`, `infrastructure`, `polish`, `backend` (new — protocol abstractions), `deployment` (new — install / upgrade / runbooks), `spec`, `bug`. Title prefix `[scope]` (e.g. `[backend]`, `[deployment]`, `[v0.X]`, `[polish]`).
+
+### Roadmap as live backlog
+
+- 6 backend-protocol scaling issues filed (#60–#65): LockBackend (urgent — multi-process cliff), LogBackend, PersonaBackend, AgentProfileBackend, ToolRegistryBackend, CorpusBackend.
+- 8 deployment-readiness issues filed (#66–#73): doctor CLI, Obsidian guide, SemVer + release pipeline, programmatic API docs, cost alert webhook, launchd template stamper, recovery runbook, cost guardrail sizing.
+- Filter via `gh issue list --label backend` or `gh issue list --label deployment`.
+
 ## [0.9.0] - 2026-05-07
 
 Spec-completion release. The full v0.x build sequence is landed: every deferred spec module from v0.1 plus operational extras and an in-repo copy of the spec.
