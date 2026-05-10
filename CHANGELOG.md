@@ -49,6 +49,10 @@ CHANGELOG entry.
 
 ## [Unreleased]
 
+### Planned (issue filed, implementation pending)
+
+- **`[backend] LLMBackend Protocol + canonical types + native reference implementations`** ([#87](https://github.com/dep0we/atomic-agents-stack/issues/87)) — establishing the LLM provider abstraction layer in the protocol-pattern series alongside #60–#65 / #82–#84. Currently `_llm.py` uses procedural dispatch (if/elif by model-id prefix); this work introduces a `SyncLLMBackend` Protocol + canonical `LLMToolDefinition`/`LLMToolUse`/`LLMToolResult`/`CacheDirective`/`LLMCapabilities`/`PricingInfo` types so third-party backends (Gemini, Bedrock, Ollama, etc.) can plug in without forking core. The plan rejects LiteLLM-in-core under a conformance-boundary framing — opt-in `atomic-agents-litellm` adapter welcome as a third-party package. Codex-reviewed pre-filing (1 P1 + 5 P2 + 4 P3 findings, all addressed in the issue body). Cross-references issue #81 (LLM client resilience), which composes via a future `RetryingLLMBackend` wrapper. Implementation pending in a separate session; will land as part of v0.11.0 (additive Minor; no `### BREAKING` callout).
+
 ### Added
 
 - **`CLAUDE.md`** — project-level design ethos that loads in every Claude Code session. Captures the throughline (a home user with one agent and an org with a fleet experience the same framework), 14 design taste rules (vault-as-truth, protocols-not-subclassing, layers-don't-merge, cost-first-class, audit-trail-structural, progressive-disclosure, markdown-as-config, atomic-and-idempotent, one-level-constraints, spec-is-the-product, codex-rounds-not-passes, verify-before-claim, docs-match-reality, backward-compat-by-default), the Apple-flavor aesthetic vocabulary, the working-methods section centered on `/ship` end-to-end (Step 18 = `/document-release` subagent) + bisectable commits + CHANGELOG-as-single-source-of-truth + self-dogfood + intentional handoff, and "what this method does not optimize for" so future sessions don't quietly drop discipline to ship faster.
