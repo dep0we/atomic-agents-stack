@@ -185,7 +185,7 @@ atomic-agents restore <agent> <note-filename.md> <YYYYMMDDT...md>
 
 ### Special case: crash during memory migration
 
-The schema migration runner (`python -m atomic_agents.migrate`) snapshots
+The schema migration runner — `python -m atomic_agents.migrate` — snapshots
 the entire vault to `<vault>/_migrations/snapshots/<...>.tar.gz` before
 applying any change, validates after every script, and rolls back the
 tarball if validation fails. **A crash mid-migration leaves a snapshot
