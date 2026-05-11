@@ -84,6 +84,10 @@ print(f"Captures: {len(response.captures)}")
 | MemoryBackend protocol + FilesystemBackend default — `atomic_agents.memory` | ✅ v0.10.0 |
 | `atomic-agents doctor` preflight CLI — `atomic_agents.doctor` | ✅ v0.10.0 |
 | SemVer policy + upgrade runbook — `docs/deployment/` | ✅ v0.10.0 |
+| Obsidian-backed deployment guide — `docs/deployment/obsidian.md` | ✅ Unreleased |
+| Programmatic invocation guide + public exception table — `docs/deployment/programmatic.md` | ✅ Unreleased |
+| Disaster recovery runbook — `docs/deployment/disaster-recovery.md` | ✅ Unreleased |
+| Cost guardrail sizing guidance — `docs/deployment/cost-guardrail-sizing.md` | ✅ Unreleased |
 
 See [CHANGELOG.md](CHANGELOG.md) for per-version detail and [`docs/deployment/versioning.md`](docs/deployment/versioning.md) for what counts as a Major / Minor / Patch change.
 
@@ -157,7 +161,7 @@ docs/                           # spec + implementation guides
 ├── getting-started.md          # 15-minute clone-to-running-agent walk-through
 ├── spec/                       # 21 locked spec docs (anatomy → memory backend → doctor)
 ├── implementation/             # build guides per runtime (cron, Claude skill, dashboard, ...)
-├── deployment/                 # SemVer policy + operator upgrade runbook
+├── deployment/                 # SemVer policy, upgrade runbook, Obsidian guide, programmatic API, disaster recovery, cost guardrail sizing
 ├── samples/caldwell/           # complete worked single-agent example
 ├── appendix/portability.md     # using Atomic Agents without Obsidian / on any OS
 ├── GOVERNANCE.md               # solo / small-team operator guide
