@@ -61,7 +61,7 @@ Equity Value = EV - Net Debt + Cash
 Price per Share = Equity Value / Diluted Shares Outstanding
 ```
 
-**Caldwell context:** Dan's CRE deals typically use an **unlevered DCF** at the
+**Caldwell context:** CRE deals typically use an **unlevered DCF** at the
 property level, then layer in the capital stack separately. Always confirm which
 cash flow stream is being discounted.
 

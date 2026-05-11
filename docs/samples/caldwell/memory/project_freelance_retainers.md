@@ -1,6 +1,6 @@
 ---
 schema_version: 1
-name: SamCo retainers — two example clients stable through 2026
+name: Freelance editing retainers — two clients stable through 2026
 description: Two retainer clients; treat as stable income through year-end
 type: project
 captured: 2026-04-22
@@ -24,7 +24,7 @@ tags: [income, retainer, stable]
 **For income planning purposes:**
 - Treat the combined retainer revenue as a fixed, predictable component of household income through Dec 31, 2026
 - Reference the actual dollar amount in `~/agents/finance/income/` (do not state amount in this memory; load it live)
-- Do NOT factor in SamCo new-client wins — those are opportunistic upside, not baseline
+- Do NOT factor in freelance new-client wins — those are opportunistic upside, not baseline (see `project_freelance_editing_growth.md`)
 
 **Risk to surface if it changes:**
 - Either client signaling end-of-engagement → re-plan Q3/Q4 immediately

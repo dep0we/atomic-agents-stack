@@ -1,7 +1,7 @@
 ---
 schema_version: 1
 name: Q3 2026 income target — $X gross by Sept 30, household combined
-description: Locked household income target combining Acme salary, SamCo retainers, Maya's launch
+description: Locked household income target combining Atlas Logistics salary and freelance editing retainers
 type: decision
 captured: 2026-04-22
 last_seen: 2026-05-06
@@ -19,17 +19,17 @@ tags: [income, target, q3, household]
 **Decided 2026-04-22:** Household combined gross income target of $X by Sept 30, 2026.
 
 **Composition:**
-- Acme salary (stable baseline) — fixed component
-- SamCo retainers (ClientCo A + Marcus, stable through 2026) — confirmed component
-- Maya's consulting launch (variable, Q3 ramp) — needs ~$Y/mo by Sept to hit target
-- Any SamCo new-client wins (variable, opportunistic) — buffer/upside
+- Atlas Logistics salary (stable baseline) — fixed component
+- Existing freelance editing retainers (ClientCo A + ClientCo B, stable through 2026) — confirmed component
+- Freelance editing growth (one prospect queued, Q3 ramp) — needs ~$Y/mo by Sept to hit target
+- Any additional freelance pickups (variable, opportunistic) — buffer/upside
 
 **Considered alternatives:**
 - Lower target ($X-15%): rejected — insufficient to accelerate debt timeline
-- Higher target ($X+20%): rejected — requires Acme scaling Sam can't commit time to
+- Higher target ($X+20%): rejected — requires day-job overtime Sam can't commit to without hurting evening freelance capacity
 - Different timing (Dec instead of Sept): rejected — pushes debt-free date into 2027
 
-**Won because:** Hits the debt-free runway by Q1 2027 if maintained, while not requiring Acme-job-quitting moves Sam isn't ready to make. Aligns Acme + Maya + Acme without forcing tradeoffs that make any of them suffer.
+**Won because:** Hits the debt-free runway by Q1 2027 if maintained, while not requiring day-job moves Sam isn't ready to make. Aligns day-job + freelance growth without forcing tradeoffs that make either suffer.
 
 **How to apply:**
 - All cash-allocation recommendations should track against this Q3 target.

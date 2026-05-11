@@ -507,7 +507,7 @@ When invoked:
     - Number of proposals
     - For each: target_file, edit_type, confidence, one-sentence summary
     - Rendered diff (the actual proposed change)
-6. Ask Sam whether to mark proposals accepted/rejected interactively
+6. Ask the operator whether to mark proposals accepted/rejected interactively
 7. If yes, edit the frontmatter on each proposal as decided
 8. Run apply step:
     python -m atomic_agents.tuning $AGENT --apply $REPORT_FILE
@@ -595,7 +595,7 @@ After a few months, prune detectors that have <30% acceptance rate.
 
 - **Auto-apply mode** — every change is operator-approved. No `--auto-apply` flag exists.
 - **Rubric tuning** — the rubric is what tuning targets; tuning doesn't tune itself.
-- **Cross-agent learning** — tuning analyzes one agent at a time. Sam's setup is small enough that cross-agent pattern transfer (e.g., "Caldwell got better with X; try X on Harper") would be over-engineering. v2 if needed.
+- **Cross-agent learning** — tuning analyzes one agent at a time. A personal-scale setup is small enough that cross-agent pattern transfer (e.g., "Caldwell got better with X; try X on agent-a") would be over-engineering. v2 if needed.
 - **Real-time tuning** — tuning runs after evals (post-hoc). It doesn't observe and tune mid-conversation.
 
 ---

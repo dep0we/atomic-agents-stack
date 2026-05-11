@@ -26,10 +26,10 @@ The mechanic in one sentence: **always load INDEX + persona + a few atomic units
 What the agent has *learned* during interactions. Primary observations.
 
 **Examples**:
-- "Sam prefers debt elimination over investment optimization, confirmed 2026-04-15"
+- "The user prefers debt elimination over investment optimization, confirmed 2026-04-15"
 - "Locked decision: Q3 2026 income target = $X by Sept 30"
-- "Caldwell should not name Jorge in financial discussions (per Sam, 2026-03-22)"
-- "Sam's risk tolerance is moderate, debt-averse"
+- "Caldwell should not reference the user's former business partner in financial discussions (per the user, 2026-03-22)"
+- "The user's risk tolerance is moderate, debt-averse"
 
 **Where**: `memory/`, one file per note, named `{type}_{topic}.md`.
 
@@ -59,7 +59,7 @@ They differ in three ways that matter:
 | **Decay** | Stays relevant until superseded | Stays relevant until source doc supersedes |
 | **Trust** | "Caldwell observed this" | "This is what the document says" |
 
-If you collapse them into one pool, the agent can't tell the difference between "I learned this from Sam" and "I read this in a book." That distinction matters at advice-time.
+If you collapse them into one pool, the agent can't tell the difference between "I learned this from the user" and "I read this in a book." That distinction matters at advice-time.
 
 ---
 
@@ -81,12 +81,12 @@ Example `memory/INDEX.md`:
 - `Investment philosophy` — index funds, not active picks
 
 ## User Profile
-- `Sam's risk tolerance` — moderate, debt-averse
+- `User risk tolerance` — moderate, debt-averse
 - `Money stress reality` — real, treat as legitimate
 
 ## Active Projects
-- `Maya's consulting launch` — income side, status: planning
-- `Acme client retention` — affects household income
+- `Spouse consulting launch` — income side, status: planning
+- `Day-job client retention` — affects household income
 
 ## Reference
 - `Financial vault path` — ~/agents/finance/
@@ -119,7 +119,7 @@ Every atomic note is a markdown file with frontmatter + body.
 ---
 schema_version: 1
 name: Debt priority order — credit cards before mortgage prepay
-description: Sam locked debt elimination order — extinguish high-rate credit before mortgage extra payments
+description: User locked debt elimination order — extinguish high-rate credit before mortgage extra payments
 type: feedback
 captured: 2026-04-15
 last_seen: 2026-05-04
@@ -132,11 +132,11 @@ supersedes: null
 superseded_by: null
 ---
 
-Sam confirmed 2026-04-15 that he wants the credit card balances cleared before any extra mortgage prepayment, even though the math says mortgage-first is slightly better long-term.
+The user confirmed 2026-04-15 that they want the credit card balances cleared before any extra mortgage prepayment, even though the math says mortgage-first is slightly better long-term.
 
 **Why:** psychological weight. The credit card balances feel oppressive even at modest dollar amounts. Reducing them to zero matters more than basis-point optimization.
 
-**How to apply:** When recommending debt strategy, default to avalanche-on-credit-cards-only. Only suggest mortgage-prepay if every credit balance is at zero AND Sam asks about it.
+**How to apply:** When recommending debt strategy, default to avalanche-on-credit-cards-only. Only suggest mortgage-prepay if every credit balance is at zero AND the user asks about it.
 ```
 
 **Frontmatter fields** (full schema in [03-file-formats](03-file-formats.md)):
@@ -200,7 +200,7 @@ Pay minimums on all debts. Pour every extra dollar into the smallest balance unt
 
 ## Sources
 - `Financial Freedom, Ch 7` — the avalanche/snowball framing
-- `CPA meeting 2026-04-15` — Sam's CPA endorses avalanche for his rates
+- `CPA meeting 2026-04-15` — the user's CPA endorses avalanche for their rates
 ```
 
 **Differences from Atomic Notes**:
@@ -244,7 +244,7 @@ Some memories are so consistently confirmed that they should move into IDENTITY.
 
 **Process**:
 1. Agent flags the candidate at end-of-session: "this user-memory has matured; consider promoting to USER.md"
-2. Sam reviews, edits if needed
+2. The operator reviews, edits if needed
 3. Promote into the right persona file
 4. Mark the original Atomic Note as superseded with `superseded_by: persona/USER.md#section`
 
@@ -264,12 +264,12 @@ When two memories disagree, the agent doesn't know which is true.
 2. Find note pairs with the same `type` and overlapping `sources` but different content — possible contradiction
 3. Find notes whose `expires_at` has passed — archive candidates
 4. Find notes with `last_seen` older than 90 days and not pinned — staleness candidates
-5. Surface findings to Sam as a list — Sam resolves by editing or merging
+5. Surface findings to the operator as a list — the operator resolves by editing or merging
 
 **Conflict resolution** when contradictions found:
 
 - Newer wins by default — the older note gets `superseded_by: newer.md`, both stay readable
-- BUT: if `confidence: high` on the older AND `confidence: low` on the newer, surface the conflict to Sam
+- BUT: if `confidence: high` on the older AND `confidence: low` on the newer, surface the conflict to the operator
 - Never auto-delete — supersession is non-destructive, deletion is final
 
 This pattern is borrowed from Memori and the analyticsvidhya cognitive-architectures piece. Memory drift is real; without explicit conflict resolution, agents end up holding both contradictory facts and behaving inconsistently.
@@ -334,7 +334,7 @@ But **scale eventually matters**. Once an agent's `memory/` has thousands of not
 
 - "Show me every memory with `confidence: high` from the last 30 days" — requires walking every file
 - Lint passes that compare every note to every other note — quadratic in note count
-- Cross-agent queries ("any agent see Sam mention X this month?") — even more files to walk
+- Cross-agent queries ("did any agent see the user mention X this month?") — even more files to walk
 - INDEX.md regeneration after large bulk changes — full directory scan
 
 When that scale arrives, the spec's answer is **derived caches**: SQLite (or DuckDB) sidecars built from the markdown, used for fast queries, regeneratable from the markdown at any time.
@@ -359,7 +359,7 @@ Add a derived cache when at least one of these is true:
 - Operator-initiated queries ("which atomic notes mention X?") take > 1 second
 - Multi-agent project queue has > 100 active items needing concurrent reads
 
-For Sam's scale today (5-10 agents, ~50-200 notes per agent), no cache is needed. Document the threshold; don't pre-build.
+For a personal-scale deployment today (5-10 agents, ~50-200 notes per agent), no cache is needed. Document the threshold; don't pre-build.
 
 ### Cache layout
 

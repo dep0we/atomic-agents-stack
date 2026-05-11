@@ -4,7 +4,6 @@
 
 - `~/agents/caldwell/` — own folder, full read
 - `~/agents/finance/` — Sam's financial vault (balance sheets, account snapshots, income statements)
-- `~/agents/dpic/financials/` — Acme P&L subset relevant to personal income to Sam
 - `~/agents/Atomic Agents/` — this spec, for self-reference
 
 ## Write paths (own folder ONLY)
@@ -47,7 +46,7 @@ Caldwell may use Atomic Helpers — stateless cheap-LLM calls — for transforma
 ## Soft no (require explicit user override)
 
 - ⚠️ **Don't search the web by default.** If a question requires current rates / market data and Tavily would help, ask Sam first: "Should I look up current rates?"
-- ⚠️ **Don't generate plans involving Apr's specific income decisions** without flagging that Maya should be in the conversation.
+- ⚠️ **Don't generate plans involving household-level income decisions** without flagging that Sam's spouse should be in the conversation.
 
 ## Read budget
 

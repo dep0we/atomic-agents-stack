@@ -10,7 +10,7 @@ A specification + reference design for building consistent, self-improving AI ag
 
 ## What this is
 
-A complete answer to: *"How do I build an AI agent (Caldwell, Harper, Paul, Muse, another agent, future ones) that:*
+A complete answer to: *"How do I build an AI agent (Caldwell, agent-a, agent-b, Muse, another agent, future ones) that:*
 
 - *has a stable, evolvable identity?*
 - *remembers what it learns across sessions and across years?*
@@ -72,7 +72,7 @@ The spec docs are numbered for reading order. The samples are populated with rea
 ## Key terms (locked vocabulary)
 
 - **Atomic Agents** — the system / convention / family
-- **Atomic Agent** — one specific agent (Caldwell, Harper, another agent, etc.)
+- **Atomic Agent** — one specific agent (Caldwell, agent-a, another agent, etc.)
 - **Atomic Memory** — recall subsystem (Notes + Wiki + INDEX)
 - **Atomic Notes** — agent-state observations (semantic memory)
 - **Atomic Wiki** — distilled corpus pages from ingested source material
@@ -90,7 +90,7 @@ The spec docs are numbered for reading order. The samples are populated with rea
 | Spec v1 written | ✅ this folder |
 | Sample agent (Caldwell) populated | ✅ samples/caldwell/ |
 | Implementation guides | ✅ implementation/ (cron, Claude skill, ChatGPT skill, shared helper, cost dashboard) |
-| Portability appendix (non-Sam setups) | ✅ appendix/portability.md |
+| Portability appendix (non-default setups) | ✅ appendix/portability.md |
 | Cost & observability spec | ✅ spec/09-cost-observability.md |
 | Cost dashboard implementation guide | ✅ implementation/cost-dashboard.md |
 | Sample log JSONL data (Caldwell) | ✅ samples/caldwell/log/2026-05/ |
@@ -122,9 +122,9 @@ The spec docs are numbered for reading order. The samples are populated with rea
 
 ## Portability note
 
-The docs use `~/agents/` as the example path because that's where Sam keeps his vault. Throughout the spec, **substitute your own `<agents_root>` directory**. Nothing depends on this specific path — see [appendix/portability](appendix/portability.md) for what's actually required vs. just Sam's setup.
+The docs use `~/agents/` as the example path. Throughout the spec, **substitute your own `<agents_root>` directory**. Nothing depends on this specific path — see [appendix/portability](appendix/portability.md) for what's actually required vs. just the example setup.
 
-Same goes for Obsidian Sync, your-server (always-on home server), Telegram, and every other Sam-specific name — they're examples. The spec works on any OS, with any markdown editor, any sync mechanism (or none), and any LLM provider.
+Same goes for Obsidian Sync, your-server (always-on home server), Telegram, and every other tool referenced by name — they're examples. The spec works on any OS, with any markdown editor, any sync mechanism (or none), and any LLM provider.
 
 ---
 

@@ -222,11 +222,11 @@ that's arriving.**
    lose the consistency check.
 
 2. **The substring search for personal references undersells the problem.**
-   Direct mentions of "Dan" were ~5 hits across the repo. The bigger problem
-   was `Sam` used as a real persona in spec docs (the Caldwell sample
-   correctly frames Sam as fictional, but the spec docs use Sam as if
-   defined elsewhere). The framing is more subtle than the literal string
-   match. (See issue #77.)
+   Direct mentions of the maintainer's name were ~5 hits across the repo. The bigger problem
+   was the sample's persona name used as a real persona in spec docs (the
+   Caldwell sample correctly framed its user as fictional, but the spec docs
+   referenced that name as if defined elsewhere). The framing is more subtle
+   than the literal string match. (See issue #77.)
 
 3. **CHANGELOG-driven release notes is not a small win.** Every PR going
    forward writes its own release-notes content as part of the diff. There
@@ -236,9 +236,9 @@ that's arriving.**
 
 4. **Issue #77 (personal-references sweep) is a precondition for #10
    (public flip).** Nothing in the deployment-readiness backlog
-   (#69–#73) helps if a public reader sees Sam's situation in the Caldwell
-   sample and thinks they're meant to copy a real person's life. #77 is
-   gating.
+   (#69–#73) helps if a public reader sees the sample persona's situation in
+   the Caldwell sample and thinks they're meant to copy a real person's
+   life. #77 is gating.
 
 5. **The "agent-as-package" goal (strategic roadmap #3) means `atomic-agents
    doctor` will also be the install verifier for `pip install atomic-<agent>`.**

@@ -4,7 +4,7 @@ How to build agents that pursue a **persistent goal across many sessions** — n
 
 This spec adds a layer the rest of the spec deliberately deferred: **goal-driven agents** like Muse's Director, who hold a goal ("complete this novel's first draft") across hundreds of runs and generate the work that gets dispatched to other agents.
 
-Most agents don't need this. Caldwell, another agent, Harper, Paul are all **reactive** — given a question, they answer; given a queue item, they handle it; each invocation is a discrete transaction. They don't need a goal layer because the operator decides what's next.
+Most agents don't need this. Caldwell, another agent, agent-a, agent-b are all **reactive** — given a question, they answer; given a queue item, they handle it; each invocation is a discrete transaction. They don't need a goal layer because the operator decides what's next.
 
 Goal-driven agents are different. They decide what's next themselves, against a target the operator set.
 
@@ -16,7 +16,7 @@ Every Atomic Agent declares its operating mode in IDENTITY.md. Three options:
 
 | Mode | What it does | Examples | Has goal.md? |
 |---|---|---|---|
-| **Reactive** | Handles each request as a discrete transaction. The operator (or another agent) supplies the work item; the agent reasons and responds. | Caldwell, another agent, Harper, Paul | NO |
+| **Reactive** | Handles each request as a discrete transaction. The operator (or another agent) supplies the work item; the agent reasons and responds. | Caldwell, another agent, agent-a, agent-b | NO |
 | **Goal-driven** | Maintains an active goal across runs. Decomposes the goal into sub-goals and queue items. Generates work for itself or other agents until the goal's success criteria are met. | Muse Director, future research-pursuit agents, ops-automation agents | YES (one per active goal) |
 | **Hybrid** | Reactive most of the time. Becomes goal-driven when an active goal.md exists. Falls back to reactive when no goals are active. | Muse Director (reactive for ad-hoc queries; goal-driven during a project) | OPTIONAL (active when goals exist) |
 
@@ -400,7 +400,7 @@ The loop continues. Each agent does its job. The goal anchors what work happens 
 
 ## Anti-patterns
 
-❌ **Putting reactive work in goal.md.** "Answer Sam's question about X" is a reactive request; it doesn't belong as a sub_goal. Goals are persistent objectives, not single-turn tasks.
+❌ **Putting reactive work in goal.md.** "Answer the operator's question about X" is a reactive request; it doesn't belong as a sub_goal. Goals are persistent objectives, not single-turn tasks.
 
 ❌ **Vague success criteria.** "Make the novel good" can't be evaluated. "All 24 chapters drafted; style guide lint passes; structural review done" can.
 
@@ -453,7 +453,7 @@ For a Director that runs hundreds of times per day, the cost adds up. Consider t
 ## Hybrid agents — the realistic case
 
 Most goal-driven agents are actually hybrid. Muse Director:
-- Most of the time: reactive ("Sam, what's the chapter 5 status?")
+- Most of the time: reactive ("Operator, what's the chapter 5 status?")
 - Sometimes: goal-driven (cron run at 9am dispatches the next sub_goal)
 
 The IDENTITY.md declares this:

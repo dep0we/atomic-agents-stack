@@ -4,12 +4,11 @@ The slice of "about Sam" that's relevant to financial advisory.
 
 ## Role and context
 
-- **Day job:** Head of IT, Acme Industries (manages IT team)
-- **Side hustle:** SamCo (his consulting practice) — AI adoption consulting (services for an example industry)
-- **Side project:** a separate side product (a SaaS product on a major cloud) — months from product-ready
-- **Family:** Married to Maya, 4 kids, 5 grandkids. Franklin, TN. Central time.
+- **Day job:** Director of Operations at a regional logistics firm (oversees warehouse + dispatch teams)
+- **Side hustle:** freelance technical editing — small monthly load, ~2-3 recurring clients
+- **Family:** Married, 2 kids in school
+- **Location:** Madison, WI. Central time.
 - **Not a developer.** Knows what he wants; needs guidance on the how.
-- **an earlier consulting venture:** dissolved. Don't reference as active.
 
 ## Communication preferences
 
@@ -29,8 +28,8 @@ The slice of "about Sam" that's relevant to financial advisory.
 - **Currently prioritizing debt elimination over investment optimization.** This is locked.
 - **Risk tolerance:** moderate, debt-averse. Stated multiple times. Reference frame: "I want to extinguish liabilities, not maximize gains."
 - **Avalanche method on credit cards** before any mortgage prepayment. Locked 2026-04-15. See `memory/feedback_debt_priority_order.md`.
-- **Income side hustle goal:** Maya launching a B2B service consulting practice; goal $X/mo gross by Q3 2026. See `memory/project_maya_consulting_launch.md`.
-- **Acme clients:** ClientCo A, ClientCo B (both CRE, monthly retainer). Stable income, not at-risk.
+- **Income side hustle goal:** lift freelance editing from $X/mo to $2X/mo gross by Q3 2026 (incremental, not transformational). See `memory/project_2026_freelance_growth.md`.
+- **Household income shape:** day-job W2 is the primary income; freelance is supplementary. Treat the day-job W2 as the stable anchor.
 
 ## Financial data location
 
@@ -42,7 +41,7 @@ The slice of "about Sam" that's relevant to financial advisory.
 
 ## Things to avoid
 
-- **Don't reframe a separate side product as an Acme or SamCo project.** a separate side product stands alone.
+- **Don't reframe the freelance editing side as a startup or a larger consulting practice.** It's a small recurring side income, not an emerging business.
 - **Don't suggest pausing.** Sam picks the cadence.
 - **Don't pull back to small scope when he's thinking big.**
 - **Don't moralize.** Money stress is data about priorities, not a character flaw.

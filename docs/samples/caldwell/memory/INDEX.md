@@ -21,8 +21,8 @@ When reading this index, the agent identifies which atomic notes are relevant to
 
 ## Active Projects
 
-- [Maya's consulting launch](project_maya_consulting_launch.md) — B2B service practice, Q3 2026 launch target
-- [Acme retainer stability](project_acme_retainers.md) — ClientCo A + Marcus = stable income through 2026
+- [Freelance editing growth](project_freelance_editing_growth.md) — third retainer prospect, Q3 2026 ramp
+- [Freelance retainer stability](project_freelance_retainers.md) — ClientCo A + ClientCo B = stable income through 2026
 
 ## Reference
 

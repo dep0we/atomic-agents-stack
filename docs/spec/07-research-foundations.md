@@ -8,7 +8,7 @@ We're not inventing memory architecture from scratch. The field has done a lot o
 
 ## Karpathy's LLM Wiki Pattern
 
-Andrej Karpathy proposed (Maya 2026) that an LLM can maintain a structured plain-text wiki — `raw/` for source documents, `wiki/` for distilled pages, `index.md` as the master routing layer. Claude reads index → follows links → answers selectively. Reported 95% token reduction vs. naive RAG.
+Andrej Karpathy proposed (May 2026) that an LLM can maintain a structured plain-text wiki — `raw/` for source documents, `wiki/` for distilled pages, `index.md` as the master routing layer. Claude reads index → follows links → answers selectively. Reported 95% token reduction vs. naive RAG.
 
 **What we borrow**: the entire `raw/` + `wiki/` distillation layer. Atomic Wiki *is* Karpathy's pattern, applied per-agent.
 
@@ -104,9 +104,9 @@ After initially arguing against multi-agent systems ("Don't Build Multi-Agents")
 
 ---
 
-## Muse (Sam's own work)
+## Muse (the maintainer's prior work)
 
-Sam's Muse system — multi-role narrative-fiction agent stack — already had a working `prompt.md` / `tools.md` / `model.md` / `soul.md` split per role, plus `policy/` for locked decisions. Tested at scale, productive.
+The maintainer's Muse system — a multi-role narrative-fiction agent stack — already had a working `prompt.md` / `tools.md` / `model.md` / `soul.md` split per role, plus `policy/` for locked decisions. Tested at scale, productive.
 
 **What we borrow**: the operational file split (`tools.md` and `model.md` as first-class files), the `policy/` flat directory, the explicit runtime assembly order.
 

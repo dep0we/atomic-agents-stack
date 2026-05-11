@@ -35,7 +35,7 @@ This order is **mandatory**. Every runtime must follow it. The order is what giv
 |---|---|---|---|
 | 1 | IDENTITY.md | Who, mission, scope, doctrine | ~500-1500 tokens |
 | 2 | SOUL.md | Personality, voice, evolution discipline | ~500-1000 tokens |
-| 3 | USER.md | About Sam (relevant slice) | ~500-1000 tokens |
+| 3 | USER.md | About the operator (relevant slice) | ~500-1000 tokens |
 | 4 | tools.md | Capability boundaries | ~200-500 tokens |
 | 5 | (model.md) | (informational, not always loaded) | 0-200 tokens |
 | 6 | memory/INDEX.md | Atomic Notes routing layer | ~500-2000 tokens |
@@ -85,7 +85,7 @@ The system prompt only loads INDEXes + recent + pinned. Everything else is selec
 The agent is instructed to use a tool / convention to load specific atomic units when reasoning needs them:
 
 ```
-The agent thinks: "Sam asked about debt strategy. The INDEX shows
+The agent thinks: "The operator asked about debt strategy. The INDEX shows
 `Debt priority order` is relevant.
 I'll read that file before responding."
 ```
@@ -209,7 +209,7 @@ The canonical order extends with three layers — role-shared, project-shared, a
 [1]  ROLE      roles/<role>/PROMPT.md           ← who I am as a Writer in general
 [2]  INSTANCE  agents/<role>/persona/IDENTITY   ← who I am as Writer ON THIS PROJECT
 [3]  INSTANCE  agents/<role>/persona/SOUL       ← my voice on this project
-[4]  INSTANCE  agents/<role>/persona/USER       ← about Sam
+[4]  INSTANCE  agents/<role>/persona/USER       ← about the operator
 [5]  ROLE      roles/<role>/tools.md            ← role-level tools (override at instance if needed)
 [5b] INSTANCE  agents/<role>/tools.md           ← OPTIONAL — overrides 5 if file exists
 [6]  ROLE      roles/<role>/model.md
