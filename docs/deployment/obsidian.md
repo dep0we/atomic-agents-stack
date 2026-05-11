@@ -778,6 +778,19 @@ A short list of things that catch operators in the first week:
 
 ## Going further
 
+- [`programmatic.md`](programmatic.md) — embedding the framework in
+  Python, the complete public exception table, and `AgentLockBusy`
+  semantics referenced in the lock-race section above.
+- [`disaster-recovery.md`](disaster-recovery.md) — symptom-organized
+  runbook for stale locks, mid-run crashes, corrupted INDEX,
+  Obsidian-Sync-specific conflict recovery, and `.versions/`
+  snapshot management.
+- [`cost-guardrail-sizing.md`](cost-guardrail-sizing.md) — picking
+  daily / monthly caps when an Obsidian-backed agent runs on a
+  multi-device sync layout.
+- [`versioning.md`](versioning.md) and
+  [`upgrading.md`](upgrading.md) — SemVer policy and operator
+  upgrade runbook.
 - [`../appendix/portability.md`](../appendix/portability.md) — the
   framing for "you don't need Obsidian; this is just one shape."
 - [`../spec/01-anatomy.md`](../spec/01-anatomy.md) — the canonical
