@@ -84,10 +84,10 @@ print(f"Captures: {len(response.captures)}")
 | MemoryBackend protocol + FilesystemBackend default — `atomic_agents.memory` | ✅ v0.10.0 |
 | `atomic-agents doctor` preflight CLI — `atomic_agents.doctor` | ✅ v0.10.0 |
 | SemVer policy + upgrade runbook — `docs/deployment/` | ✅ v0.10.0 |
-| Obsidian-backed deployment guide — `docs/deployment/obsidian.md` | ✅ Unreleased |
-| Programmatic invocation guide + public exception table — `docs/deployment/programmatic.md` | ✅ Unreleased |
-| Disaster recovery runbook — `docs/deployment/disaster-recovery.md` | ✅ Unreleased |
-| Cost guardrail sizing guidance — `docs/deployment/cost-guardrail-sizing.md` | ✅ Unreleased |
+| Obsidian-backed deployment guide — `docs/deployment/obsidian.md` | ✅ v0.11.0 |
+| Programmatic invocation guide + public exception table — `docs/deployment/programmatic.md` | ✅ v0.11.0 |
+| Disaster recovery runbook — `docs/deployment/disaster-recovery.md` | ✅ v0.11.0 |
+| Cost guardrail sizing guidance — `docs/deployment/cost-guardrail-sizing.md` | ✅ v0.11.0 |
 
 See [CHANGELOG.md](CHANGELOG.md) for per-version detail and [`docs/deployment/versioning.md`](docs/deployment/versioning.md) for what counts as a Major / Minor / Patch change.
 
