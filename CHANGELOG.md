@@ -49,6 +49,21 @@ CHANGELOG entry.
 
 ## [Unreleased]
 
+### Changed
+
+- **README rewritten for the public flip.** Framework-first positioning replaces the prior feature-list opener. New tagline lands as the hero (*"AI agents that live in your folder, not someone else's database"* / *"Vault-native, MIT-licensed, runs anywhere markdown does"*). New comparison matrix names Letta / Mem0, hosted-agent harnesses, LangChain / LangGraph, and direct-SDK as honest contrast points (where they win, where Atomic Agents wins). Backend-protocol scaling roadmap surfaced as its own section. 6 deployment runbooks linked. Spec count corrected (13 → 21). Caldwell appears only as one sample among future samples, not as the headline.
+- **README badge URLs corrected** from `github.com/user/*` (broken) to `github.com/dep0we/*`. Version badge added.
+- **README default `ATOMIC_AGENTS_ROOT` corrected** from `~/agents/agents` (duplicated path, typo) to `~/docs/agents` per `atomic_agents/_platform.py:DEFAULT_AGENTS_ROOT`.
+- **Status section** updated v0.10 → v0.11.0; protocol-pattern v1.0 expectation named.
+
+### Added
+
+- **`CONTRIBUTING.md`** — reading order before opening a PR (CLAUDE.md / TENSIONS.md / methodology.md), branch + commit shape, test expectations, review-in-rounds practice, what lands cleanly vs what needs an issue first.
+- **`CODE_OF_CONDUCT.md`** — condensed Contributor-Covenant-shaped policy with the project's actual maintainer contact and an enforcement table; not vendored boilerplate.
+- **`SECURITY.md`** — 90-day disclosure window, in-scope vs documented-honest-limitations (best-effort path-traversal check in MCP args, advisory-only cost guardrails without the shared helper, plain-markdown-no-encryption-at-rest), operator hygiene checklist.
+- **`.github/ISSUE_TEMPLATE/{bug,feature,question}.md`** — structured templates matching the project's existing issue conventions (title prefixes, env/repro/scope sections).
+- **`.github/pull_request_template.md`** — mirrors the project's existing PR shape (Summary / Why / Test plan / Design alignment self-check against the 14 CLAUDE.md design rules).
+
 ### Planned (issue filed, implementation pending)
 
 - **`[backend] LLMBackend Protocol + canonical types + native reference implementations`** ([#87](https://github.com/dep0we/atomic-agents-stack/issues/87)) — establishing the LLM provider abstraction layer in the protocol-pattern series alongside #60–#65 / #82–#84. Currently `_llm.py` uses procedural dispatch (if/elif by model-id prefix); this work introduces a `SyncLLMBackend` Protocol + canonical `LLMToolDefinition`/`LLMToolUse`/`LLMToolResult`/`CacheDirective`/`LLMCapabilities`/`PricingInfo` types so third-party backends (Gemini, Bedrock, Ollama, etc.) can plug in without forking core. The plan rejects LiteLLM-in-core under a conformance-boundary framing — opt-in `atomic-agents-litellm` adapter welcome as a third-party package. Codex-reviewed pre-filing (1 P1 + 5 P2 + 4 P3 findings, all addressed in the issue body). Cross-references issue #81 (LLM client resilience), which composes via a future `RetryingLLMBackend` wrapper. Implementation pending in a separate session; will land in a future Minor release (additive; no `### BREAKING` callout).
