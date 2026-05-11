@@ -734,6 +734,15 @@ to match.
 
 ## See also
 
+- [`obsidian.md`](obsidian.md) — Obsidian-backed deployment shape;
+  names the `AgentLockBusy` race window and the conflict-recovery
+  flow when a synced device writes mid-call.
+- [`disaster-recovery.md`](disaster-recovery.md) — symptom-organized
+  runbook covering every exception in the table above plus the
+  specific recovery commands when one fires.
+- [`cost-guardrail-sizing.md`](cost-guardrail-sizing.md) — picking
+  the `cost_guardrails` numbers that show up in `CostGuardrailBlocked`
+  exceptions; role archetypes for sizing.
 - [`versioning.md`](versioning.md) — SemVer rules that cover the public
   surface above.
 - [`upgrading.md`](upgrading.md) — operator runbook for moving between

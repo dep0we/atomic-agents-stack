@@ -496,6 +496,14 @@ Other deferred items per
 
 ## See also
 
+- [`obsidian.md`](obsidian.md) — Obsidian-backed deployment shape;
+  cost-guardrail thresholds behave identically across sync mechanisms.
+- [`programmatic.md`](programmatic.md) — embedding the framework in
+  Python; how to read / override `cost_guardrails` at the call site
+  and catch `CostGuardrailBlocked` programmatically.
+- [`disaster-recovery.md`](disaster-recovery.md) — recovery flow when
+  a guardrail trip cascades into other symptoms (e.g., cron skipped
+  for a week, journal gaps, log churn).
 - [`../spec/09-cost-observability.md`](../spec/09-cost-observability.md)
   — authoritative spec for cost guardrails and the dashboard.
 - [`../spec/15-delegation.md`](../spec/15-delegation.md) — the

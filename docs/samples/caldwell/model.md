@@ -52,28 +52,28 @@ For cron (once-daily runs), cache hits are unlikely. Don't optimize for cache; o
 
 ## Cost guardrails
 
-Defaults to **disabled** for new agents. Run for 1-2 weeks observe-only, then check the per-agent dashboard for suggested caps based on actual usage.
+Values below match the **personal financial advisor archetype** (Archetype A) recommended in [`../../../deployment/cost-guardrail-sizing.md`](../../../deployment/cost-guardrail-sizing.md): daily Opus reasoning over personal numbers, ~5-10 calls/day, ~5-10K tokens per call. New operators copying this sample can also follow the observe-then-apply pattern from spec/09 — leave `enabled: false`, run for 14 days, then apply the dashboard's suggested caps.
 
 ```yaml
 cost_guardrails:
-  enabled: false                    # OFF until 14 days of usage data exists
-  daily_cap_usd: 5.00               # placeholder — dashboard will suggest a real value
-  monthly_cap_usd: 100.00           # placeholder
-  daily_cap_action: skip            # cron should skip rather than blow budget
+  enabled: true                     # archetype-A defaults; flip to false for observe-only
+  daily_cap_usd: 0.50               # Archetype A starting cap for a personal advisor agent
+  monthly_cap_usd: 7.00             # ~3x the typical monthly run pattern, leaves headroom
+  daily_cap_action: fallback        # interactive: swap to Sonnet for the rest of the day
   monthly_cap_action: alert         # monthly is informational; alert and proceed
   warning_thresholds: [0.50, 0.80]  # warn at 50% and 80% before action fires
   alert_channel: telegram           # see implementation/cron-agent for setup
 ```
 
 Once `enabled: true`:
-- Cron runs that hit the daily cap → SKIP (run skipped, log entry written, retry tomorrow)
-- Skill invocations that hit the cap → fall back to Sonnet for the rest of the day
+- Skill invocations that hit the daily cap → fall back to Sonnet for the rest of the day (`daily_cap_action: fallback`)
+- Cron runs that hit the daily cap → also fall back (cron + skill share the same daily envelope on this agent; flip to `skip` if you want cron to skip and skill to fall back)
 - 50% warning → INFO logged + dashboard banner
 - 80% warning → ALERT via configured channel + dashboard banner
 - 100% (cap hit) → cap action fires (skip / fallback / alert)
 - Critical-flag invocations bypass the cap (mark `critical: true` in the log)
 
-See `../../../spec/09-cost-observability` for the full guardrail spec.
+See [`../../../spec/09-cost-observability.md`](../../../spec/09-cost-observability.md) for the full guardrail spec and [`../../../deployment/cost-guardrail-sizing.md`](../../../deployment/cost-guardrail-sizing.md) for how to pick numbers if you're tuning these for a different role archetype.
 
 ## Research integrity (per spec/13)
 

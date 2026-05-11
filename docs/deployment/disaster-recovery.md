@@ -723,9 +723,19 @@ a restored copy while the original is investigated.
   enforcement, and `list_orphans()` / `list_versions()` /
   `restore_version()` API surface.
 
-Two further runbooks are planned in this same directory and will be
-linked here when they land: an Obsidian-Sync-specific conflict runbook
-(`obsidian.md`) and a programmatic-usage reference that catalogues every
-exception class and the recovery shape per class (`programmatic.md`).
-Until then, the exception names live in
-[`atomic_agents/exceptions.py`](../../atomic_agents/exceptions.py).
+- [`obsidian.md`](obsidian.md) — Obsidian-Sync-specific conflict
+  recovery (`~conflict~`, `.trash/`, soft-deleted notes coming back
+  via Sync) plus the lock-race interaction when a synced device
+  writes mid-call. Pairs with the stale-lock scenario above.
+- [`programmatic.md`](programmatic.md) — the complete public exception
+  table. Every exception named in the doctor failure-mode table above
+  has its raise site, recovery class, and catchable-mid-call rule
+  documented there. Authoritative reference for "what exception is
+  this and what do I do."
+- [`cost-guardrail-sizing.md`](cost-guardrail-sizing.md) — when
+  `CostGuardrailBlocked` is the symptom, this is the doc for picking
+  caps that prevent the recurrence rather than just recovering from it.
+
+The exception names also live in
+[`atomic_agents/exceptions.py`](../../atomic_agents/exceptions.py)
+for a quick code-level reference.
