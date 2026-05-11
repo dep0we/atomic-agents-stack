@@ -174,7 +174,7 @@ agents/*/**/.*.tmp
 | Path | Why excluded |
 |---|---|
 | `agents/*/log/` | Every `agent.call()` appends a JSONL record. Multiple devices sharing a vault sync log entries from every host they pass through, generating a constant stream of small writes that pollute sync diffs and confuse rollups. Logs are write-only audit trail — they don't need cross-device consistency. |
-| `agents/*/memory/.versions/` | `_versioning.py` writes a full-file snapshot to `memory/.versions/<stem>/<timestamp>.md` before any update to an existing memory note. The current note is already synced. The snapshot pile grows monotonically; on a multi-host setup with frequent edits the snapshot directory dwarfs the live memory directory within weeks. |
+| `agents/*/memory/.versions/` | `_versioning.py` writes a full-file snapshot to `memory/.versions/<stem>/<timestamp>.md` before any update to an existing memory note. The current note is already synced. The snapshot pile grows monotonically; on a multi-host setup with frequent edits the snapshot directory dwarfs the live memory directory within weeks. **Trade-off to know:** excluding `.versions/` means `agent.memory.restore_version()` works only on the host that wrote the snapshot. If you want to call `restore_version` from a device that wasn't the writer (e.g., review old versions from your phone), DO sync `.versions/` and accept the size cost. The default recommendation (exclude) fits operators who run the framework on one host and edit content on others; the override fits operators who run AND restore from multiple hosts. |
 | `agents/*/.lock` | `atomic_agents/_locks.py` uses `fcntl.flock` for in-process exclusion. The lock file records `pid=<PID> acquired=<epoch>` for debugging. Syncing it pushes the local PID to other hosts, where the PID either doesn't exist or refers to an unrelated process. The flock itself is in-kernel and never crosses hosts; only the on-disk debug content moves, and it moves misleadingly. |
 | `agents/*/.staging-*/`, `agents/*/.dream-staging/` | Transient. Multi-step pipelines (dream batches, cascade lease claims) stage intermediate state under dot-prefixed dirs that get torn down on completion. A crashed run leaves a recoverable staging area; the framework cleans it up on next start. Syncing transient state across hosts creates phantom resumability that doesn't exist. |
 | `agents/*/_dashboard/` | The dashboard HTML is rendered from logs + outcomes by `atomic_agents/dashboard/render.py`. It's self-contained (inline CSS, no JS dependencies, no external assets — see [§ Dashboard self-containment](#_dashboardindexhtml-self-containment) below). Rendered on the host that runs the framework; readable on any device that has the file. If you want phone-readable dashboards, render on the host then serve via Obsidian Sync — but only if exactly one host renders. Two hosts rendering with sync turned on will overwrite each other constantly. |
@@ -714,22 +714,31 @@ encode host-local paths:
   binaries (`~/dev/my-mcp/bin/server`). If your Mac mini path
   differs from your laptop path, the file can't be both.
 - **`tools.md`** — usually fine; the paths inside `tools.md` are
-  resolved relative to the agent root or via `$HOME`, which expands
-  per-host.
+  resolved via `Path.expanduser()` (the framework's `expand()` helper
+  in `atomic_agents/_platform.py`), which expands a leading `~` to the
+  user's home directory. **`$HOME` and other environment-variable
+  references in tools.md paths are NOT expanded** — only the literal
+  `~` prefix.
 - **`model.md`** — fully portable. No host-specific content.
 
 If `mcp.md` paths really do differ per host, two options:
 
-1. **Use `$HOME`-relative paths in `mcp.md`** — the framework expands
-   `~` and `$HOME` at load time. If your username is the same on both
-   hosts (`/Users/operator` and `/home/operator` are not the same), use
-   `$HOME` to keep paths portable.
+1. **Use `~`-prefixed paths in `mcp.md` arg lists** — the framework
+   expands `~` via `Path.expanduser()` in `atomic_agents/mcp.py`. If
+   the operator account name is the same on both hosts (e.g.,
+   `/Users/operator` on macOS and `/Users/operator` on the laptop),
+   `~/dev/my-mcp/bin/server` resolves correctly on each. **`$HOME` is
+   NOT expanded inside `mcp.md` arg paths**; use `~` instead. The
+   `env:` section IS different — values starting with `$` (e.g.,
+   `KEY=$ANTHROPIC_API_KEY`) are resolved against `os.environ` at load
+   time, so secrets-via-env work as expected.
 2. **Maintain `mcp.<host>.md` and symlink** — keep `mcp.macbook.md`
    and `mcp.macmini.md` in the synced vault; each host has a local
    symlink `mcp.md → mcp.<hostname>.md`. The framework reads `mcp.md`;
    the symlink is host-local and doesn't sync (Obsidian Sync doesn't
    sync symlinks). This is the escape hatch when paths genuinely
-   diverge.
+   diverge (different OSes, different account names, different binary
+   install locations).
 
 The first option is simpler. Reach for the second only when the
 first doesn't fit.
