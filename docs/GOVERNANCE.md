@@ -208,7 +208,7 @@ Last updated: YYYY-MM-DD
 
 **Purpose:** Personal financial advisor — tracks household finances, debt payoff
 progress, and spending patterns. Runs a daily digest at 07:00 CT.
-**Owner:** Sam
+**Owner:** &lt;your-name&gt;
 **Last reviewed:** 2026-05-07 — confirmed debt payoff order is still correct.
 **Triggers:**
 - Cron: `0 7 * * *` daily via `com.atomic-agents.run.financial-advisor.plist`

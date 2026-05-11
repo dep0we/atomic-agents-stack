@@ -9,7 +9,7 @@ How to compose multiple Atomic Agents under a project umbrella when one agent is
 - **Agent scope** — persona, atomic memory, journal, tools, model. The Atomic Agent spec.
 - **Project scope** — shared canon, style guide, policy, work queue. Sits *above* multiple agents.
 
-Most agents are single-agent (another agent, Caldwell, Harper, Paul). They use only agent scope; project scope is collapsed.
+Most agents are single-agent (another agent, Caldwell, agent-a, agent-b). They use only agent scope; project scope is collapsed.
 
 A few systems are multi-agent (Muse on The Unfinished, future systems). Multiple Atomic Agents share a project layer above them.
 
@@ -30,7 +30,7 @@ Use multi-agent only when ALL of:
 If the workflow is "one agent does everything," stay single-agent. Multi-agent adds coordination overhead; only adopt it when the specialization wins back the cost.
 
 **Don't go multi-agent for**:
-- ❌ "Different topics" — Caldwell handles money, Harper handles Acme. They don't share a world. Each is its own single-agent.
+- ❌ "Different topics" — Caldwell handles money, agent-a handles a different domain. They don't share a world. Each is its own single-agent.
 - ❌ "Pipeline of steps" — if agents don't really need separate identities, just write a Python script with multiple LLM calls.
 
 ---
@@ -98,7 +98,7 @@ The fix: a **three-layer cascade** with shared role templates.
             │   ├── persona/
             │   │   ├── IDENTITY.md ← THIS director ON THIS project
             │   │   ├── SOUL.md     ← personality evolves per-project
-            │   │   └── USER.md     ← Sam slice (or symlink to global)
+            │   │   └── USER.md     ← operator slice (or symlink to global)
             │   ├── memory/
             │   ├── wiki/
             │   ├── journal/
@@ -140,7 +140,7 @@ A Writer on a noir thriller project has different SOUL.md than a Writer on a sci
 [1]  ROLE      roles/<role>/PROMPT.md          ← who I am as a Writer in general
 [2]  INSTANCE  agents/<role>/persona/IDENTITY  ← who I am as Writer ON THIS PROJECT
 [3]  INSTANCE  agents/<role>/persona/SOUL      ← my voice on this project
-[4]  INSTANCE  agents/<role>/persona/USER      ← about Sam
+[4]  INSTANCE  agents/<role>/persona/USER      ← about the operator
 [5]  ROLE      roles/<role>/tools.md           ← what my role can touch (general)
 [5b] INSTANCE  agents/<role>/tools.md          ← OPTIONAL override (if file exists, replaces 5)
 [6]  ROLE      roles/<role>/model.md           ← model selection
@@ -176,7 +176,7 @@ For role's `PROMPT.md`:
 
 | Situation | Cascade? |
 |---|---|
-| Single-agent system (Caldwell, Harper, Paul, another agent) | NO — flat per-agent layout from [01-anatomy](01-anatomy.md) |
+| Single-agent system (Caldwell, agent-a, agent-b, another agent) | NO — flat per-agent layout from [01-anatomy](01-anatomy.md) |
 | Multi-agent, single project, no #2 expected | OPTIONAL — flat is fine; cascade pays off only if #2 lands |
 | Multi-agent, single project, #2 likely | YES — set up cascade now; one extra dir indirection, zero duplication later |
 | Multi-agent, multiple existing projects | YES — duplication pain is real, this is what cascade solves |
@@ -197,7 +197,7 @@ Test by running each existing role on the original project; output should be ide
 
 ### Symlinks vs copy-on-cascade
 
-If instance USER.md is identical across projects (Sam is the same Sam), use a symlink:
+If instance USER.md is identical across projects (the operator is the same operator), use a symlink:
 
 ```bash
 ln -s ../../../USER.md ~/agents/muse/projects/the-unfinished/agents/writer/persona/USER.md
@@ -312,7 +312,7 @@ By default, **roles read everything in their project**, including peer roles' fo
 | Read | Write |
 |---|---|
 | Own folder (full) | Own folder ONLY |
-| Project canon, style, policy | (no — those are Sam-owned) |
+| Project canon, style, policy | (no — those are operator-owned) |
 | Project queue (pending → in_progress → completed) | Own work items only |
 | Other roles' wiki/ and journal/ | Never |
 | Other roles' memory/ | Never (except via shared canon distillation if needed) |

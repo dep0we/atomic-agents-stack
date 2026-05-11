@@ -138,7 +138,7 @@ Each fact carries a citation back to the section/page in the source. This lets t
 
 Helper system prompts should include the provenance instruction:
 
-> When summarizing or extracting facts from a source document, cite the location (section, page, or paragraph) of each fact. If you can't pinpoint a location, say so explicitly. Do not return facts without provenance — the calling agent depends on traceability for citation in its response to Sam.
+> When summarizing or extracting facts from a source document, cite the location (section, page, or paragraph) of each fact. If you can't pinpoint a location, say so explicitly. Do not return facts without provenance — the calling agent depends on traceability for citation in its response to the operator.
 
 When a helper returns text without provenance (older prompts, model formatting drift), the parent agent treats the helper output as **uncited prose**, not citable facts. The parent then either re-verifies the source directly or marks claims as uncited per spec/13's rules.
 
@@ -238,7 +238,7 @@ When you find yourself wanting any of these for a helper, stop. You're describin
 
 Heuristic: **does this helper need to learn?**
 
-If yes (it should remember Sam prefers 5-bullet summaries, or it should remember which financial terms Sam finds confusing) → graduate to Agent. Get a folder under `<agents_root>/`, get a SOUL.md, get a memory layer.
+If yes (it should remember the operator prefers 5-bullet summaries, or it should remember which financial terms the operator finds confusing) → graduate to Agent. Get a folder under `<agents_root>/`, get a SOUL.md, get a memory layer.
 
 If no (it's a transformation that should be the same every time) → stays a Helper.
 
@@ -257,7 +257,7 @@ Reserved for when a Helper genuinely needs persistence. Layout would be:
 │   │   ├── persona/
 │   │   │   ├── IDENTITY.md     (lightweight: "you summarize text")
 │   │   │   └── SOUL.md         (preferences accumulated over time)
-│   │   ├── memory/             (typed atomic notes about how Sam likes summaries)
+│   │   ├── memory/             (typed atomic notes about how the operator likes summaries)
 │   │   ├── tools.md            (read-only by default; no vault writes)
 │   │   └── model.md            (cheap default)
 │   └── translator/
@@ -279,7 +279,7 @@ Helper Agents would get the full evolution loop — capture, promotion, lint —
 ```python
 # Daily brief flow
 def caldwell_daily_brief(self):
-    # Load Sam's latest CPA memo if dropped in vault recently
+    # Load the operator's latest CPA memo if dropped in vault recently
     new_docs = self.scan_for_new_documents("~/agents/finance/cpa/")
     if new_docs:
         summaries = self.helper_call_parallel(

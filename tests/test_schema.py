@@ -15,7 +15,7 @@ def _valid_note_meta():
     return {
         "schema_version": 1,
         "name": "Bottom-line-first communication",
-        "description": "Dan wants the recommendation in 1-3 sentences before any working",
+        "description": "the user wants the recommendation in 1-3 sentences before any working",
         "type": "feedback",
         "captured": "2026-04-12",
         "last_seen": "2026-05-04",
@@ -90,7 +90,7 @@ def test_validate_capture_valid():
     capture = {
         "type": "feedback",
         "name": "Q1 bonus reaffirmation",
-        "description": "Dan reaffirmed bonuses route to credit-cards-first",
+        "description": "the user reaffirmed bonuses route to credit-cards-first",
         "confidence": "high",
         "sources": ["conversation_2026-05-06"],
         "body": "Body content here.",

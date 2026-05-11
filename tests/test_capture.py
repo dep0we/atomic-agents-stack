@@ -108,7 +108,7 @@ def test_write_atomic_note(tmp_path):
     capture = Capture(
         type="feedback",
         name="Bottom-line first",
-        description="Dan wants the recommendation in 1-3 sentences",
+        description="the user wants the recommendation in 1-3 sentences",
         confidence="high",
         sources=["conversation_2026-05-08"],
         body="Body content here.",

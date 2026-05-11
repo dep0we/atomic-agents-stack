@@ -20,7 +20,7 @@ tags: [vault, source_of_truth, balance_sheet]
 **Contents:**
 - `balance_sheet.md` — current assets, liabilities, net worth (updated weekly by Sam)
 - `accounts/` — per-account snapshots (checking, savings, credit cards, mortgage, retirement, brokerage)
-- `income/` — monthly income breakdown by source (Acme, Acme, Maya when launched)
+- `income/` — monthly income breakdown by source (Atlas Logistics W2, freelance editing retainers)
 - `expenses/` — monthly expense categorization
 - `goals.md` — long-horizon goals (debt-free date, retirement timing, kids' education funding state)
 - `journal.md` — Sam's free-form financial journal

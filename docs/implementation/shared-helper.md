@@ -268,7 +268,7 @@ def _acquire_lock(self):
     except BlockingIOError:
         # Lock held by another process. Either wait or fail.
         # For cron: fail fast and skip — try again next cycle.
-        # For skill: wait up to 30 seconds, then surface to Sam.
+        # For skill: wait up to 30 seconds, then surface to the operator.
         raise AgentLockBusy(f"Agent {self.name} is locked by another process")
 
 def _release_lock(self):
@@ -288,7 +288,7 @@ def _release_lock(self):
 |---|---|---|
 | Cron job | Another cron job | Skip this run. Log skip. Try again next cycle. |
 | Cron job | Skill session | Skip. Don't compete with interactive session. |
-| Skill session | Cron job | Wait up to 30 seconds; cron is fast. If still locked, surface to Sam. |
+| Skill session | Cron job | Wait up to 30 seconds; cron is fast. If still locked, surface to the operator. |
 | Skill session | Another skill session | Wait up to 30 seconds. Probably stale state from a crashed prior session. |
 
 **Obsidian Sync considerations:**
@@ -297,7 +297,7 @@ Obsidian Sync writes can land mid-operation. The atomic rename pattern protects 
 
 - Obsidian Sync detects local changes and queues them; brief writes from the helper land cleanly
 - Run cron jobs at low-activity times (e.g., 3am) to minimize collision
-- Lint pass detects content divergence (e.g., frontmatter inconsistency) and flags it for Sam
+- Lint pass detects content divergence (e.g., frontmatter inconsistency) and flags it for the operator
 - Long-term fix: a small Sync-aware wrapper that quiesces sync briefly during writes (deferred to v2)
 
 ### Write-path enforcement

@@ -182,7 +182,7 @@ When a change makes one of these worse, push back on it — even if it adds a fe
 
 All work tracked in **GitHub Issues at dep0we/atomic-agents-stack**. Title prefixes: `[backend]`, `[deployment]`, `[polish]`, `[v0.X]`. Labels: `enhancement`, `documentation`, `infrastructure`, `polish`, `backend`, `deployment`, `spec`, `bug`. **Don't track atomic-agents work in Todoist.**
 
-When scope creep / follow-up / future enhancement appears mid-task, **file the issue inline as part of completing the parent task**. Don't ask Dan to file it. The pattern from PR #57: "I noticed X; filed #58 to track it; continuing on parent scope."
+When scope creep / follow-up / future enhancement appears mid-task, **file the issue inline as part of completing the parent task**. Don't ask the maintainer to file it. The pattern from PR #57: "I noticed X; filed #58 to track it; continuing on parent scope."
 
 ROADMAP.md (in vault) is the strategic narrative; GitHub Issues are the executable backlog. The two stay in sync via the ROADMAP's "Live issue backlog" table.
 

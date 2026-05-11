@@ -7,9 +7,9 @@ last_review: 2026-05-09
 
 # Tensions — Atomic Agents
 
-**Companion doc to `ROADMAP.md`.** Where ROADMAP captures *what we want to build*, this captures *the architectural tensions in what's already built* — places the elegance bends, where current decisions create future cost, and what to watch as the framework scales from "Dan's home agent" to "an organization running an army."
+**Companion doc to `ROADMAP.md`.** Where ROADMAP captures *what we want to build*, this captures *the architectural tensions in what's already built* — places the elegance bends, where current decisions create future cost, and what to watch as the framework scales from "a single operator's home agent" to "an organization running an army."
 
-These aren't bugs. They're design tensions, often with no obviously-better answer today. Most resolve themselves naturally as the backend-protocol pattern lands. Some require an explicit decision later. The point of writing them down is so that *future-Dan* and *future-Claude* aren't surprised when one of them starts mattering.
+These aren't bugs. They're design tensions, often with no obviously-better answer today. Most resolve themselves naturally as the backend-protocol pattern lands. Some require an explicit decision later. The point of writing them down is so that *future maintainers* and *future contributors* aren't surprised when one of them starts mattering.
 
 > **Living doc — update freely.** When a tension resolves, move it to the "Resolved" section with a date + how it resolved. When a new one appears, add it. When severity changes, update the tier.
 

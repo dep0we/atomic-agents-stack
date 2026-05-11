@@ -1,6 +1,6 @@
-# Portability — using Atomic Agents without Obsidian, your-server, or Sam's setup
+# Portability — using Atomic Agents without Obsidian, your-server, or the reference setup
 
-The spec is **platform-agnostic**. Every runtime, vault, and sync mechanism in the docs is one example among many. This page explains what's actually required vs. what's just Sam's particular setup.
+The spec is **platform-agnostic**. Every runtime, vault, and sync mechanism in the docs is one example among many. This page explains what's actually required vs. what's just the reference setup.
 
 ---
 
@@ -17,15 +17,15 @@ Nothing else is mandatory.
 
 ---
 
-## What's Sam-specific (and how to substitute)
+## What's example-specific (and how to substitute)
 
-The docs use Sam's setup as a worked example. Here's what to substitute when you're not Sam:
+The docs use a reference setup as a worked example. Here's what to substitute for your own setup:
 
 | Docs say | Substitute with |
 |---|---|
 | `~/agents/` | `<your_agents_root>` — anywhere you want. `~/agents/`, `~/Documents/agents/`, `D:\agents\`, `/srv/atomic-agents/`, all valid. |
 | `your-server` (always-on home server hostname) | Your hostname, or just "the machine where the cron runs." |
-| another agent, Caldwell, Harper, Paul, Muse | Your own agent names. Pick whatever makes sense. |
+| another agent, Caldwell, agent-a, agent-b, Muse | Your own agent names. Pick whatever makes sense. |
 | Obsidian Sync | Any sync mechanism (git, Dropbox, iCloud, Syncthing, none). |
 | Telegram bot for alerts | Any channel — email, Slack, Discord, log file, none. |
 | `~/agents/finance/` (Caldwell example) | Whatever folder holds your operational data. |
@@ -92,7 +92,7 @@ Pick whichever match your tools. The vault folder is the same; only the loader d
 
 Tested patterns:
 
-- **macOS** (primary, Sam's setup) — Keychain for secrets, launchd for cron, Obsidian for the editor
+- **macOS** (primary, reference setup) — Keychain for secrets, launchd for cron, Obsidian for the editor
 - **Linux** — systemd timers for cron, gnome-keyring or pass for secrets, any markdown editor
 - **Windows** — Task Scheduler for cron, Windows Credential Manager or 1Password CLI for secrets, VS Code for editing
 
@@ -107,7 +107,7 @@ If someone hands you this spec and you want to set it up from scratch:
 1. **Pick `<agents_root>`** — any folder. `mkdir ~/agents`.
 2. **Pick a runtime** — start with cron Python if you want autonomous; Claude Code or Codex CLI if you want interactive.
 3. **Install the helper** — `pip install atomic-agents` (when published; today: clone the repo).
-4. **Create your first agent** — copy `samples/caldwell/` into `<agents_root>/myagent/`. Strip Sam-specific content from `persona/USER.md`. Replace with your own.
+4. **Create your first agent** — copy `samples/caldwell/` into `<agents_root>/myagent/`. Strip example-specific content from `persona/USER.md`. Replace with your own.
 5. **Add an API key** — Keychain, `.env`, or `~/.config/atomic_agents/keys.json` (chmod 600). See [../implementation/cron-agent#secrets-handling](../implementation/cron-agent.md#secrets-handling).
 6. **Run it** — `atomic-agents run myagent` (console script) or `python -m atomic_agents.cli run myagent`, or invoke the skill.
 7. **Verify** — check the journal entry got written, check the log JSONL, check the INDEX wasn't corrupted.
@@ -123,23 +123,23 @@ To be explicit, none of these are required:
 - ❌ Obsidian Sync (the service)
 - ❌ always-on home server (your-server)
 - ❌ macOS specifically (cross-platform)
-- ❌ Tailscale (Sam's network setup)
+- ❌ Tailscale (one example network setup)
 - ❌ Telegram (just one notification channel)
 - ❌ Anthropic specifically (works with OpenAI, local models, anything)
 - ❌ Claude Code specifically (one of several runtimes)
-- ❌ Anything in `~/projects/automations/` (Sam's specific repo)
+- ❌ Anything in `~/projects/automations/` (one operator-specific repo)
 
-If you read something in the spec that *seems* to depend on these and isn't called out as Sam-specific, it's a documentation bug. File it.
+If you read something in the spec that *seems* to depend on these and isn't called out as example-specific, it's a documentation bug. File it.
 
 ---
 
-## Sam's actual deployment (for reference)
+## Reference deployment (for context)
 
-If you're curious what Sam's running:
+One reference operator's setup:
 
-- **Vault location**: `/path/to/your-server/docs/agents/` on his always-on home server (also synced to MacBook + iOS via Obsidian Sync)
+- **Vault location**: `/path/to/your-server/docs/agents/` on an always-on home server (also synced to a laptop + iOS via Obsidian Sync)
 - **another agent**: runs inside openclaw on your-server (the special case — see [../spec/06-multi-agent-projects](../spec/06-multi-agent-projects.md) for how openclaw maps to the spec)
-- **Caldwell, Harper, Paul, Muse**: cron Python jobs on your-server + Claude Code skills on his MacBook
+- **Caldwell, agent-a, agent-b, Muse**: cron Python jobs on your-server + Claude Code skills on a laptop
 - **Sync**: Obsidian Sync (paid)
 - **Editor**: Obsidian primarily; VS Code for the implementation code in the automations repo
 - **Secrets**: macOS Keychain on your-server

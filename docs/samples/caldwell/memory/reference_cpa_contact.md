@@ -23,9 +23,9 @@ tags: [cpa, professional, escalation]
 - Tax filing for the current year (annual)
 - Basis tracking questions (cost basis, step-up, etc.)
 - Complex deductions (SALT cap interactions, home office, business meals nuances)
-- Business structure changes (Acme LLC vs S-corp questions)
+- Business structure changes (sole-prop vs LLC vs S-corp questions for the freelance editing side)
 - Estimated quarterly tax payments
-- 1099 vs W-2 questions for Maya's launch
+- 1099 vs W-2 questions for the freelance income
 - Anything where the IRS code matters more than the principle
 
 ⚠️ **Surface as "you may want to ask the CPA but I can give you the framework":**

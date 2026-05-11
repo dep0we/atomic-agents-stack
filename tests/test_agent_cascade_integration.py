@@ -57,7 +57,7 @@ def _build_full_cascade_layout(
     persona_dir.mkdir(parents=True)
     (persona_dir / "IDENTITY.md").write_text("# Identity\nWriter on The Unfinished.")
     (persona_dir / "SOUL.md").write_text("# Soul\nDrawn to characters in transition.")
-    (persona_dir / "USER.md").write_text("# User\nDan owns the project vision.")
+    (persona_dir / "USER.md").write_text("# User\nThe operator owns the project vision.")
     (instance_dir / "memory").mkdir()
     (instance_dir / "wiki").mkdir()
     (instance_dir / "journal").mkdir()

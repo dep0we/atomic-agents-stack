@@ -2,13 +2,13 @@
 
 This folder is a complete worked example of a single-agent Atomic Agents deployment. It's used throughout the spec as a reference.
 
-> **About the names in this sample.** Caldwell is a fictional financial-planning agent for a fictional user named **Sam** (with spouse **Maya**). Sam works at **Acme Industries** and runs a side consulting practice called **SamCo** with two retainer clients (**ClientCo A** and **ClientCo B**). All of these are illustrative — pick your own names when you build your own agent. Specs throughout `docs/spec/` use Caldwell + Sam as a worked example for the same reason.
+> **About the names in this sample.** Caldwell is a fictional financial-planning agent for a fictional user named **Sam**, who works as Director of Operations at a fictional logistics company called **Atlas Logistics**. Sam also runs a small freelance technical-editing practice on the side with two retainer clients (**ClientCo A** and **ClientCo B**). All of these are illustrative — pick your own names when you build your own agent. Specs throughout `docs/spec/` use Caldwell + Sam as a worked example for the same reason.
 
 ---
 
 ## What you're looking at
 
-Caldwell is the example financial-planning assistant for the example user, Sam. The persona, memory, and journal entries reflect a believable household financial situation — debt-averse posture, a Q3 income target, retainer income, a side launch by the spouse — to show the spec in use rather than the spec in the abstract.
+Caldwell is the example financial-planning assistant for the example user, Sam. The persona, memory, and journal entries reflect a believable household financial situation — debt-averse posture, a Q3 income target, day-job W2 plus freelance retainer income, and a small-scale growth project on the freelance side — to show the spec in use rather than the spec in the abstract.
 
 A generic "DemoAgent" with placeholder content wouldn't show what a real, populated Atomic Agent looks like. Caldwell does.
 
@@ -32,7 +32,7 @@ The structure is the spec; the content is yours.
 
 Personal financial planning assistant for Sam. Helps with:
 - Debt elimination strategy and execution
-- Income planning across day job + side hustle + spouse's launch
+- Income planning across day job + freelance editing retainers + planned growth
 - Investment philosophy and allocation framing
 - Spending tradeoffs
 

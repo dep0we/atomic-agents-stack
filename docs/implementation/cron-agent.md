@@ -10,11 +10,11 @@ This is one of two runtime forms an Atomic Agent takes. The other is the [claude
 
 ✅ The agent has scheduled, recurring work (daily morning brief, weekly retrospective, quarterly review)
 
-✅ The agent processes a queue (work items written by Sam or another agent)
+✅ The agent processes a queue (work items written by the operator or another agent)
 
 ✅ The agent watches for triggers (file changes, calendar events, external API webhooks)
 
-❌ The agent is purely reactive to Sam's chat — that's the skill version
+❌ The agent is purely reactive to the operator's chat — that's the skill version
 
 ❌ The agent runs more frequently than every ~5 minutes — at that cadence, run a long-lived service instead
 
@@ -22,7 +22,7 @@ This is one of two runtime forms an Atomic Agent takes. The other is the [claude
 
 ## Where the code lives
 
-In Sam's `automations` repo on GitHub (`user/automations`), under:
+In an `automations` repo on GitHub (`user/automations`), under:
 
 ```
 ~/projects/automations/                        ← MacBook dev workspace
@@ -65,7 +65,7 @@ Calls atomic_agents to:
        ↓
 Outputs persist in ~/agents/caldwell/
        ↓
-another agent or another agent or Sam reads outputs as needed
+another agent or the operator reads outputs as needed
 ```
 
 ---
@@ -106,8 +106,8 @@ def main():
     Daily brief for today.
     Read ~/agents/finance/balance_sheet.md and the last 3 days of activity.
     Surface: anything notable, anything off-track from the Q3 income target,
-    anything that needs Sam's attention.
-    Format: bottom-line first per Sam's preference. Aim for 5-10 sentences.
+    anything that needs the operator's attention.
+    Format: bottom-line first per the operator's stated preference. Aim for 5-10 sentences.
     """
 
     # 3. Call the model
@@ -141,7 +141,7 @@ def main():
     })
 
     # 7. Optional: write a published artifact to the agent's output/ folder
-    #    for downstream consumption (another agent, Sam, other agents)
+    #    for downstream consumption (another agent, the operator, other agents)
     output_path = VAULT_ROOT / "agents" / AGENT_NAME / "output" / f"{response.date}.md"
     agent.write_output(output_path, response.text)  # helper enforces tools.md write paths
 
@@ -193,7 +193,7 @@ The agent emits captures in this format inside its response:
 <atomic_capture>
 type: feedback
 name: Bottom-line-first communication preference
-description: Sam wants the recommendation in 1-3 sentences before any working
+description: the operator wants the recommendation in 1-3 sentences before any working
 confidence: high
 sources: [conversation_2026-05-06]
 body: |
@@ -206,7 +206,7 @@ The `extract_captures()` method finds these blocks, validates the frontmatter ag
 If a capture fails validation:
 - Don't write the file
 - Log the failure
-- Surface to Sam via Telegram alert (the runner's `lib.logger.run()` handles this)
+- Surface to the operator via Telegram alert (the runner's `lib.logger.run()` handles this)
 
 ---
 
@@ -340,7 +340,7 @@ Script loads it via `python-dotenv` or similar. Same security profile as Option 
 |---|---|---|
 | API rate limit | `lib.atomic_agents` catches 429, writes `status: error` to log | Retry with exponential backoff up to 3x; on persistent fail, write log + Telegram alert |
 | Model unavailable | API returns model error | Fall back to model from `model.md` `Fallback` field; log fallback usage |
-| Vault file missing | Loader raises FileNotFoundError | Log error, surface to Sam, don't run this cycle (skip rather than corrupt) |
+| Vault file missing | Loader raises FileNotFoundError | Log error, surface to the operator, don't run this cycle (skip rather than corrupt) |
 | Capture validation fails | `extract_captures` raises ValidationError | Don't write the bad capture; log details; continue with other captures |
 | Daily token cap hit | `lib.atomic_agents` checks log before call | Skip the run; log skip reason; retry tomorrow |
 | Out-of-scope write attempt | Helper enforces `tools.md` write paths | Block the write; log violation; do NOT silently route around it |
@@ -373,7 +373,7 @@ def total_cost_last_7_days():
     return total
 ```
 
-Surface the weekly cost to Sam via Telegram or as a journal entry.
+Surface the weekly cost to the operator via Telegram or as a journal entry.
 
 ---
 
@@ -393,7 +393,7 @@ Don't schedule a new agent without seeing at least 3 manual runs that produced q
 
 ## another agent is special (preview)
 
-another agent runs inside openclaw, not as a cron Python script. The cron pattern in this doc is for non-openclaw agents (Caldwell, Harper, Paul, Muse-roles).
+another agent runs inside openclaw, not as a cron Python script. The cron pattern in this doc is for non-openclaw agents (Caldwell, agent-a, agent-b, Muse-roles).
 
 When we adapt the Atomic Agents spec to another agent, we'll write a separate adaptation doc covering:
 - How openclaw's memory-core + memory-wiki plugins map to Atomic Notes + Atomic Wiki

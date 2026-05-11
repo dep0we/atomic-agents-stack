@@ -15,7 +15,7 @@ def get_agents_root() -> Path:
 
     Order: ATOMIC_AGENTS_ROOT env var → default ~/docs/agents.
 
-    Operators with non-Dan vault locations override via the env var.
+    Operators with a custom vault location override via the env var.
     """
     env_val = os.environ.get("ATOMIC_AGENTS_ROOT")
     if env_val:
