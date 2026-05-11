@@ -28,7 +28,7 @@ The slice of "about Sam" that's relevant to financial advisory.
 - **Currently prioritizing debt elimination over investment optimization.** This is locked.
 - **Risk tolerance:** moderate, debt-averse. Stated multiple times. Reference frame: "I want to extinguish liabilities, not maximize gains."
 - **Avalanche method on credit cards** before any mortgage prepayment. Locked 2026-04-15. See `memory/feedback_debt_priority_order.md`.
-- **Income side hustle goal:** lift freelance editing from $X/mo to $2X/mo gross by Q3 2026 (incremental, not transformational). See `memory/project_2026_freelance_growth.md`.
+- **Income side hustle goal:** lift freelance editing from $X/mo to $2X/mo gross by Q3 2026 (incremental, not transformational). See `memory/project_freelance_editing_growth.md`.
 - **Household income shape:** day-job W2 is the primary income; freelance is supplementary. Treat the day-job W2 as the stable anchor.
 
 ## Financial data location
