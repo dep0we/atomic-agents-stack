@@ -58,6 +58,27 @@ If the file doesn't declare a mode, default is **reactive**.
 
 ---
 
+## Graduated autonomy
+
+Atomic Agents treats autonomy as a **gradient**, not a binary. The framework's design rejects both extremes — fully-autonomous agents that take any action without check, and fully-supervised agents that pause for human approval on every decision. Neither shape survives contact with real operator workloads at any scale beyond a single agent doing trivial work.
+
+**The principle**: agents act freely where risk is low, ask for revision where risk is moderate, and prepare evidence for humans where risk is high. The structural mechanism that encodes this is the **action classification + judge layer** combination from `spec/17` (tools.md) and `spec/28` (judge layer):
+
+| Action class | Default judge policy | What this means in practice |
+|---|---|---|
+| `read_only` (read_file, search_notes, list_directory) | Bypass judge | Agent acts freely — no authorization check on reads |
+| `reversible_write` (draft creation, staged memory writes) | Judge optional; default-allow with audit | Agent acts; audit captures the action; operator can review post-hoc |
+| `external_side_effect` (send_email, create_pr, post_message) | Judge required; judge-decides | Per-action validation before execution; judge may revise, block, or escalate |
+| `high_risk` (delete_files, force_push, production_deploy) | Judge required; default-escalate | Human review for every instance; agent prepares evidence; never auto-executes |
+
+The four-outcome judge model (`allow / block / revise / escalate` per spec/28) is the mechanical encoding of graduated autonomy. **Revise** in particular is what makes the gradient real — it lets the system correct an action without losing the actor's intent (\"send the email but remove the attachment\" / \"open the PR as draft, not for merge\" / \"lower the spend limit before proceeding\").
+
+Operators tune the gradient per-agent via `judges.md` class policy and via `mandates.md` (`spec/29`) for durable scoped authority that crosses many runs. The autonomy ladder declared in `IDENTITY.md` (see below in this spec, in the IDENTITY template) is the persona-level statement of intent; tools.md / judges.md / mandates.md are the operator-managed *enforcement surfaces* that make the ladder real at runtime.
+
+The graduated-autonomy property is what distinguishes Atomic Agents from frameworks that assume agents either (a) operate against fully-supervised checklists or (b) operate with unrestricted tool access modulated only by post-hoc evals. Both extremes leave operators unable to scale agent deployment to real workloads without taking on either an approval-bottleneck cost or an unbounded-blast-radius cost. The framework's commitment is that **the same agent definition runs at every scale — the gradient is configured by the operator's `tools.md` / `judges.md` / `mandates.md`, not by re-shaping the agent itself.**
+
+---
+
 ## persona/IDENTITY.md
 
 **Purpose**: Who the agent is. Mission, role, scope, doctrine. The stable role definition.

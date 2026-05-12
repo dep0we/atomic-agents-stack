@@ -29,6 +29,8 @@ The **judge layer** is a pre-action validation surface. Before any side-effectfu
 
 The judge raises `tools.md` from advisory-in-some-runtimes to **gated-at-runtime when the judge is enabled**. In runtimes without the helper or with `judges.md` absent, `tools.md` remains advisory exactly as today (per `spec/01` §"Policy vs enforcement"). The judge does not change the runtime story for runtimes the framework cannot reach.
 
+The judge layer is the structural encoding of **graduated autonomy** — the framework's commitment to treating agent autonomy as a gradient (free where risk is low, revised where risk is moderate, escalated where risk is high) rather than a binary. See `spec/01-anatomy.md` §"Graduated autonomy" for the principle; this spec is the mechanism.
+
 ## Why this exists
 
 Atomic Agents today has:
