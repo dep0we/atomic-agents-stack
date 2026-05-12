@@ -17,7 +17,7 @@ Most agent state ends up somewhere you don't fully control — an app database, 
 
 There's another shape: **your agents live in your folder.** Plain markdown files. INDEX.md routing. Persona in `IDENTITY.md` / `SOUL.md` / `USER.md`. Typed atomic notes you can `cat`. Audit trail as JSONL you can grep. Cost guardrails in markdown config. Crash-safe writes — every mutation goes through `temp file + fsync + rename + parent-dir fsync`, so a power loss never leaves a half-written note. Schema migrations are scripts you read before running. If you switch laptops, you copy a folder. If you want a new runtime — cron, Claude Code skill, ChatGPT skill, your own HTTP service — you point the runtime at the folder.
 
-That's the shape `atomic-agents-stack` defines, in 21 spec docs (locked when implementation matches), with a Python reference implementation, 720+ tests, and a Caldwell sample that includes 5 days of real JSONL run logs, a rendered cost dashboard, evals across happy / edge / adversarial / decline categories, and a helper-pattern day showing ~76% cost savings vs. all-Opus.
+That's the shape `atomic-agents-stack` defines, in 21 locked spec docs + 1 RFC (locked when implementation matches), with a Python reference implementation, 720+ tests, and a Caldwell sample that includes 5 days of real JSONL run logs, a rendered cost dashboard, evals across happy / edge / adversarial / decline categories, and a helper-pattern day showing ~76% cost savings vs. all-Opus.
 
 A home user with one agent and an org with a fleet experience the same framework — graceful, coherent, self-explanatory at every scale.
 
@@ -138,7 +138,7 @@ This is the slot in the AI-agent-tooling landscape `atomic-agents-stack` occupie
 
 `atomic-agents-stack` is a **spec** for vault-native AI agents, plus one **reference implementation** in Python. The spec is the central artifact; anyone can build agents to the spec without using this code.
 
-Start at [`docs/README.md`](docs/README.md) for the spec entry point. The 21 spec docs in [`docs/spec/`](docs/spec/) cover:
+Start at [`docs/README.md`](docs/README.md) for the spec entry point. The 21 locked spec docs (plus 1 RFC) in [`docs/spec/`](docs/spec/) cover:
 
 - [01 — Anatomy](docs/spec/01-anatomy.md) — file layout, persona, memory, wiki, journal, log
 - [02 — Atomic Memory](docs/spec/02-atomic-memory.md) — Notes + Wiki + INDEX-driven recall
