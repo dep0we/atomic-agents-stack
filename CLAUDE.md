@@ -326,6 +326,7 @@ From `ROADMAP.md` §"What I'd NOT pursue", repeated here so future-Claude doesn'
 - **TypeScript port.** One ecosystem at a time. Port later if community demand justifies.
 - **Domain-specific agents shipped officially** (e.g., "atomic-finance-advisor" as a first-party package). Marketplace's job, not ours.
 - **Multi-modal capture by us** (voice, image). MCP servers provide this. We'd duplicate the ecosystem.
+- **Graphify-style knowledge-graph integration** ([graphify.net](https://graphify.net/)'s territory). INDEX-driven recall is the load-bearing memory pattern (spec/02 + spec/04); "visualize the whole graph" is the opposite aesthetic. Wrong substrate too — graphify's strength is code semantics (Tree-sitter + LLM extraction), not YAML + JSONL. Three lightweight in-framework dashboard improvements are filed as alternatives (#138 goal timeline, #139 delegation cost treemap, #140 spec cross-reference Mermaid diagram).
 
 These are not forbidden forever — they're explicitly deferred with rationale. If someone proposes one, the burden of proof is "what changed since the rationale was written."
 

@@ -49,6 +49,10 @@ CHANGELOG entry.
 
 ## [Unreleased]
 
+### Changed
+
+- **`CLAUDE.md` §"What we're explicitly NOT building"** — added Graphify-style knowledge-graph integration to the list of explicitly-deferred ideas, with rationale (INDEX-driven recall is the load-bearing memory pattern per spec/02 + spec/04; graphify's "visualize the whole graph" aesthetic is the opposite; substrate mismatch — graphify's strength is code semantics, not YAML + JSONL). Mirrors the canonical entry in `~/ObsidianVault/Atomic Agents/ROADMAP.md` §"What I'd NOT pursue". Three lightweight in-framework alternatives filed as separate issues ([#138](https://github.com/dep0we/atomic-agents-stack/issues/138) goal timeline, [#139](https://github.com/dep0we/atomic-agents-stack/issues/139) delegation cost treemap, [#140](https://github.com/dep0we/atomic-agents-stack/issues/140) spec cross-reference Mermaid diagram).
+
 ### Added
 
 - **README hero diagram** — at-a-glance SVG at the top of the README showing the three core value claims (agent-as-folder, stateless cost-capped runtime, grepable JSONL audit trail) and the four shipped runtime shapes (`cron` · `launchd` · Claude Code skill · embedded Python). Light + dark variants wired via `<picture>` element so each viewer's system color scheme is matched. Source SVGs at `docs/assets/atomic-agents-hero.svg` and `docs/assets/atomic-agents-hero-dark.svg`. Every in-diagram claim — `Response` field names, JSONL top-level log shape, the runtime list — verified against shipped code (`atomic_agents/types.py` for the dataclass surface, `docs/samples/caldwell/log/` for real log shape, `extras/` for the runtime ports) per CLAUDE.md taste rules #12 + #13; an Opus subagent stood in for the rate-limited Codex round and caught four drift claims (invented `run_id`/`captures` JSONL fields, mistyped `Response(text, cost, run_id)`, aspirational `MCP server`/`HTTP service` runtime chips, drifted "21 locked spec docs" count) before commit.
