@@ -1,0 +1,165 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 720" role="img" aria-labelledby="title desc">
+  <title id="title">Atomic Agents — vault-native AI agents</title>
+  <desc id="desc">Three panels showing an agent as a folder of markdown files, a stateless runtime wrapped in cost guardrails, and a grepable audit trail. Bottom strip lists portable runtimes: cron, Claude Code skill, MCP server, HTTP service, embedded Python.</desc>
+
+  <defs>
+    <style>
+      .h1 { font: 600 22px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; fill: #f0f6fc; }
+      .sub { font: 400 13px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; fill: #8b949e; }
+      .eyebrow { font: 600 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; fill: #fb923c; letter-spacing: 2.4px; }
+      .panel-title { font: 600 18px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; fill: #f0f6fc; }
+      .caption { font: 400 12.5px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; fill: #c9d1d9; }
+      .mono { font: 12.5px ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; fill: #e6edf3; }
+      .mono-dim { font: 12.5px ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; fill: #6e7681; }
+      .mono-accent { font: 12.5px ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; fill: #fb923c; }
+      .mono-sm { font: 11.5px ui-monospace, "SF Mono", Menlo, Consolas, monospace; fill: #e6edf3; }
+      .mono-sm-dim { font: 11.5px ui-monospace, "SF Mono", Menlo, Consolas, monospace; fill: #6e7681; }
+      .tag { font: 600 10.5px -apple-system, BlinkMacSystemFont, sans-serif; fill: #fb923c; letter-spacing: 0.8px; }
+      .strip { font: 500 13px -apple-system, BlinkMacSystemFont, sans-serif; fill: #c9d1d9; }
+      .strip-dim { font: 400 13px -apple-system, BlinkMacSystemFont, sans-serif; fill: #6e7681; }
+      .chip { font: 600 12px ui-monospace, "SF Mono", Menlo, Consolas, monospace; fill: #f0f6fc; }
+    </style>
+    <marker id="arrowhead" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#484f58"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1200" height="720" fill="#0d1117"/>
+
+  <!-- Title block -->
+  <text x="600" y="50" text-anchor="middle" class="h1">Your agent is a folder. The runtime is stateless. The audit trail is text.</text>
+  <text x="600" y="76" text-anchor="middle" class="sub">Atomic Agents — vault-native AI agents in plain Markdown</text>
+
+  <!-- ============== PANEL 1 : THE AGENT (folder tree) ============== -->
+  <rect x="60" y="110" width="340" height="480" rx="10" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+  <text x="84" y="142" class="eyebrow">01 · THE AGENT</text>
+  <text x="84" y="170" class="panel-title">A folder you own</text>
+  <line x1="84" y1="186" x2="376" y2="186" stroke="#30363d" stroke-width="1"/>
+
+  <!-- Folder tree -->
+  <g>
+    <text x="84"  y="218" class="mono">myagent/</text>
+    <text x="84"  y="240" class="mono">├── persona/</text>
+    <text x="84"  y="262" class="mono">│   ├── IDENTITY.md   <tspan class="mono-dim">who I am</tspan></text>
+    <text x="84"  y="284" class="mono">│   ├── SOUL.md       <tspan class="mono-dim">how I evolve</tspan></text>
+    <text x="84"  y="306" class="mono">│   └── USER.md       <tspan class="mono-dim">who I serve</tspan></text>
+    <text x="84"  y="328" class="mono">├── tools.md          <tspan class="mono-dim">what I can do</tspan></text>
+    <text x="84"  y="350" class="mono">├── model.md          <tspan class="mono-dim">cost guardrails</tspan></text>
+    <text x="84"  y="372" class="mono">├── memory/           <tspan class="mono-dim">atomic notes</tspan></text>
+    <text x="84"  y="394" class="mono">│   ├── INDEX.md      <tspan class="mono-dim">routing layer</tspan></text>
+    <text x="84"  y="416" class="mono">│   └── *.md          <tspan class="mono-dim">typed captures</tspan></text>
+    <text x="84"  y="438" class="mono">├── wiki/             <tspan class="mono-dim">distilled corpus</tspan></text>
+    <text x="84"  y="460" class="mono">├── journal/          <tspan class="mono-dim">episodic log</tspan></text>
+    <text x="84"  y="482" class="mono">└── log/              <tspan class="mono-dim">JSONL audit</tspan></text>
+  </g>
+
+  <!-- Caption -->
+  <text x="84" y="540" class="caption">Plain markdown. Editable in any text editor</text>
+  <text x="84" y="558" class="caption">or Obsidian. The vault is the source of truth.</text>
+
+  <!-- Arrow 1 → 2 -->
+  <line x1="408" y1="350" x2="424" y2="350" stroke="#484f58" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+
+  <!-- ============== PANEL 2 : THE RUNTIME ============== -->
+  <rect x="430" y="110" width="340" height="480" rx="10" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+  <text x="454" y="142" class="eyebrow">02 · THE RUNTIME</text>
+  <text x="454" y="170" class="panel-title">Stateless. Cost-capped.</text>
+  <line x1="454" y1="186" x2="746" y2="186" stroke="#30363d" stroke-width="1"/>
+
+  <!-- agent.call() invocation -->
+  <text x="454" y="218" class="mono"><tspan fill="#fb923c">agent</tspan>.call(work_item=<tspan fill="#56d364">"..."</tspan>)</text>
+
+  <!-- Cost guardrail wrapper -->
+  <rect x="454" y="238" width="292" height="248" rx="8" fill="#1f1a14" stroke="#d29922" stroke-width="1" stroke-dasharray="4 3"/>
+  <text x="600" y="255" text-anchor="middle" class="tag">COST GUARDRAILS · TREE-CAP</text>
+
+  <!-- Flow steps inside the wrapper -->
+  <g>
+    <!-- Step 1 -->
+    <rect x="476" y="270" width="248" height="30" rx="6" fill="#21262d" stroke="#30363d"/>
+    <text x="600" y="289" text-anchor="middle" class="mono-sm">load persona · tools · memory</text>
+
+    <text x="600" y="312" text-anchor="middle" class="mono-sm-dim">▼</text>
+
+    <!-- Step 2 -->
+    <rect x="476" y="318" width="248" height="30" rx="6" fill="#21262d" stroke="#30363d"/>
+    <text x="600" y="337" text-anchor="middle" class="mono-sm">call LLM (Anthropic · OpenAI · …)</text>
+
+    <text x="600" y="360" text-anchor="middle" class="mono-sm-dim">▼</text>
+
+    <!-- Step 3 -->
+    <rect x="476" y="366" width="248" height="30" rx="6" fill="#21262d" stroke="#30363d"/>
+    <text x="600" y="385" text-anchor="middle" class="mono-sm">extract captures · helpers · tools</text>
+
+    <text x="600" y="408" text-anchor="middle" class="mono-sm-dim">▼</text>
+
+    <!-- Step 4 -->
+    <rect x="476" y="414" width="248" height="30" rx="6" fill="#21262d" stroke="#30363d"/>
+    <text x="600" y="433" text-anchor="middle" class="mono-sm">atomic write: memory · journal · log</text>
+
+    <text x="600" y="458" text-anchor="middle" class="mono-sm-dim">▼</text>
+
+    <!-- Return -->
+    <text x="600" y="478" text-anchor="middle" class="mono-sm">return Response(text, cost_usd, captures, …)</text>
+  </g>
+
+  <!-- Caption -->
+  <text x="454" y="540" class="caption">Crash-safe writes. Cost-checked before each LLM</text>
+  <text x="454" y="558" class="caption">call. Same call() from cron, launchd, Claude, Python.</text>
+
+  <!-- Arrow 2 → 3 -->
+  <line x1="778" y1="350" x2="794" y2="350" stroke="#484f58" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+
+  <!-- ============== PANEL 3 : THE AUDIT TRAIL ============== -->
+  <rect x="800" y="110" width="340" height="480" rx="10" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+  <text x="824" y="142" class="eyebrow">03 · THE AUDIT TRAIL</text>
+  <text x="824" y="170" class="panel-title">Grepable. Atomic.</text>
+  <line x1="824" y1="186" x2="1116" y2="186" stroke="#30363d" stroke-width="1"/>
+
+  <!-- Artifact 1: memory note -->
+  <rect x="824" y="206" width="292" height="92" rx="6" fill="#21262d" stroke="#30363d"/>
+  <text x="838" y="226" class="mono-sm-dim">memory/project_focus.md</text>
+  <text x="1102" y="226" text-anchor="end" class="tag">+ NEW</text>
+  <line x1="838" y1="232" x2="1102" y2="232" stroke="#30363d"/>
+  <text x="838" y="250" class="mono-sm"><tspan fill="#6e7681">---</tspan></text>
+  <text x="838" y="266" class="mono-sm"><tspan fill="#e6edf3">type: </tspan><tspan fill="#56d364">project</tspan></text>
+  <text x="838" y="282" class="mono-sm"><tspan fill="#e6edf3">name: </tspan><tspan fill="#56d364">focus-shift</tspan></text>
+
+  <!-- Artifact 2: journal entry -->
+  <rect x="824" y="312" width="292" height="76" rx="6" fill="#21262d" stroke="#30363d"/>
+  <text x="838" y="332" class="mono-sm-dim">journal/2026-05/2026-05-12.md</text>
+  <text x="1102" y="332" text-anchor="end" class="tag">+ APPENDED</text>
+  <line x1="838" y1="338" x2="1102" y2="338" stroke="#30363d"/>
+  <text x="838" y="358" class="mono-sm">14:32 — Reviewed Q2 priorities;</text>
+  <text x="838" y="374" class="mono-sm">captured one project note.</text>
+
+  <!-- Artifact 3: JSONL log line -->
+  <rect x="824" y="402" width="292" height="90" rx="6" fill="#21262d" stroke="#30363d"/>
+  <text x="838" y="422" class="mono-sm-dim">log/2026-05/2026-05-12.jsonl</text>
+  <text x="1102" y="422" text-anchor="end" class="tag">+ LOGGED</text>
+  <line x1="838" y1="428" x2="1102" y2="428" stroke="#30363d"/>
+  <text x="838" y="448" class="mono-sm"><tspan fill="#6e7681">{</tspan><tspan fill="#e6edf3">"ts":</tspan><tspan fill="#56d364">"2026-05-12T14:32-05:00"</tspan>,</text>
+  <text x="838" y="464" class="mono-sm"> <tspan fill="#e6edf3">"trigger":</tspan><tspan fill="#56d364">"cron"</tspan>, <tspan fill="#e6edf3">"cost_usd":</tspan><tspan fill="#56d364">0.0421</tspan>,</text>
+  <text x="838" y="480" class="mono-sm"> <tspan fill="#e6edf3">"model":</tspan><tspan fill="#56d364">"opus-4-7"</tspan>, <tspan fill="#e6edf3">"status":</tspan><tspan fill="#56d364">"ok"</tspan><tspan fill="#6e7681">}</tspan></text>
+
+  <!-- Caption -->
+  <text x="824" y="540" class="caption">Every run a JSONL line. Every capture a typed</text>
+  <text x="824" y="558" class="caption">note. No hidden state in a database.</text>
+
+  <!-- ============== BOTTOM PORTABILITY STRIP ============== -->
+  <line x1="60" y1="620" x2="1140" y2="620" stroke="#30363d" stroke-width="1"/>
+
+  <text x="600" y="654" text-anchor="middle" class="strip">
+    <tspan class="strip-dim">Same agent definition — run from:  </tspan>
+    <tspan class="chip">cron</tspan>
+    <tspan class="strip-dim">  ·  </tspan>
+    <tspan class="chip">launchd</tspan>
+    <tspan class="strip-dim">  ·  </tspan>
+    <tspan class="chip">Claude Code skill</tspan>
+    <tspan class="strip-dim">  ·  </tspan>
+    <tspan class="chip">embedded Python</tspan>
+  </text>
+
+  <text x="600" y="688" text-anchor="middle" class="sub">MIT · 720+ tests · Python 3.11+ · github.com/dep0we/atomic-agents-stack</text>
+</svg>
