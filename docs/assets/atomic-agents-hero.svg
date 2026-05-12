@@ -101,7 +101,7 @@
     <text x="600" y="458" text-anchor="middle" class="mono-sm-dim">▼</text>
 
     <!-- Return -->
-    <text x="600" y="478" text-anchor="middle" class="mono-sm">return Response(text, cost_usd, captures, …)</text>
+    <text x="600" y="478" text-anchor="middle" class="mono-sm">→ Response(text, cost_usd, captures, …)</text>
   </g>
 
   <!-- Caption -->
