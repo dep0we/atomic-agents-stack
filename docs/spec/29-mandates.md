@@ -101,8 +101,9 @@ class MandateConstraints:
 
     # External cost budgets — real-money cost reported by tool handlers
     # (Stripe charges, vendor invoices, API fees outside the LLM call, etc.)
-    # Tool handlers report this via the new ToolResult.external_cost_usd field;
-    # tools that don't report default to $0.
+    # Tool handlers report this via ToolCallResult.external_cost_usd
+    # (a new field added by the impl PR — see "ToolCallResult schema extension"
+    # below); tools that don't report default to $0.
     daily_external_usd: float | None = None
     monthly_external_usd: float | None = None
     cumulative_external_usd: float | None = None    # lifetime real-money cap
@@ -119,9 +120,36 @@ class MandateConstraints:
     # Time-of-day enforcement
     time_window: TimeWindow | None = None
 
+    # Scope-only opt-out (rare; trust the prose; requires justification)
+    # When True, MandateCheck skips structured constraint checks and ALLOWs
+    # any cite to the mandate. The check_mandate_unconstrained doctor check
+    # surfaces these to the operator. justification is REQUIRED whenever
+    # unconstrained: True.
+    unconstrained: bool = False
+    unconstrained_justification: str | None = None
+
     # Operator-extensible (custom constraints; framework ignores; specialist
     # judges or operator tooling may consume)
     extra: dict[str, Any] = field(default_factory=dict)
+```
+
+### `ToolCallResult` schema extension (impl PR)
+
+The current framework's `ToolCallResult` (per `atomic_agents/tools.py`) is structured around `output` + `error` only. The mandate primitive extends it with optional external-cost reporting fields the implementation PR adds:
+
+```python
+@dataclass
+class ToolCallResult:
+    # existing fields preserved
+    output: Any
+    error: str | None
+    # new fields (defaulted; backward-compatible)
+    external_cost_usd: float | None = None
+    external_cost_currency: str = "USD"
+    external_cost_reversibility: str | None = None    # informational
+```
+
+Tool handlers that don't populate the new fields continue to work unchanged. Operators who want mandate external-cost tracking add the fields to their tool handlers' returns. The implementation PR documents the migration path for existing tool handlers in the impl-PR runbook.
 
 
 @dataclass(frozen=True)
@@ -260,7 +288,8 @@ This makes the *honest* enforcement story unmissable: scope is documentation; co
 
 ### Parser rules
 
-- Each `## <mandate-id>` section is one mandate. `mandate-id` is the dataclass `Mandate.id`.
+- **Reserved section name `_meta`**: a section heading `## _meta` is parsed as the file's metadata block, not as a mandate. Only project-root `mandates.md` honors `_meta` (defines `per_agent_mandate_policy` and `allowed_per_agent_ids` per the resolution section below). Per-agent `mandates.md` files with a `## _meta` section: the section is ignored with a doctor warning (`check_mandate_meta_misplaced`). The `_meta` reservation is processed BEFORE mandate-section parsing so the ID-validity rule (`[a-z0-9][a-z0-9-]*`) doesn't refuse `_meta` as a malformed mandate.
+- Each `## <mandate-id>` section other than `_meta` is one mandate. `mandate-id` is the dataclass `Mandate.id`.
 - Section body is parsed as YAML (matching the embedded-YAML convention from `model.md` and `judges.md`).
 - **Required fields**: `granted_by`, `granted_at`, `scope`, `revocation_state`. Missing required field → `MandateInvalid` at load time (the framework refuses to honor any cite against the invalid mandate; the doctor surfaces the file error).
 - **Recommended fields**: `expires_at`. A mandate without `expires_at` is honored but the doctor emits `check_mandate_no_expiry` warnings; long-lived mandates without expiry are an accumulating attack surface.
@@ -325,10 +354,22 @@ class MandateCheck:
 2. **Source hash**: re-read `mandates.md`, recompute `source_hash` of the cited mandate's section, compare against the value bound at proposal time. Mismatch indicates the mandate file changed between proposal and judgment — `BLOCK` with reason `mandate_state_inconsistent`, with the reason field naming "re-author the proposal against the current mandate state." The framework re-reads first (rather than checking state first) because state-from-stale-bytes is misleading; if the operator just revoked the mandate, the hash check catches it before the state check would.
 3. **State**: mandate's `revocation_state == ACTIVE` and current time < `expires_at` (if `expires_at` set). Revoked → `BLOCK` with reason `mandate_revoked`. Expired → `BLOCK` with reason `mandate_expired`.
 4. **Tool allowlist**: if `constraints.allowed_tools` is set, `proposal.tool_name` MUST be in it. Otherwise → `BLOCK` with reason `mandate_tool_not_allowed`.
-5. **Target allowlist**: if `constraints.allowed_targets` is set, the proposal's `target_canonical` (extracted by the framework per tool kind — see Target extraction below) MUST match at least one pattern. No match → `BLOCK` with reason `mandate_target_not_allowed`. If `constraints.blocked_targets` is set, the proposal's `target_canonical` MUST NOT match any pattern. Match → `BLOCK` with reason `mandate_target_blocked`. If target extraction fails (no kind-handler for the proposal's tool, no target in tool args) → `BLOCK` with reason `mandate_target_unextractable`.
+5. **Target allowlist**: if `constraints.allowed_targets` is set, the proposal's `target_canonical` (extracted by the framework per tool kind — see Target extraction below) MUST match at least one pattern. No match → `BLOCK` with reason `mandate_target_not_allowed`. If `constraints.blocked_targets` is set, the proposal's `target_canonical` MUST NOT match any pattern. Match → `BLOCK` with reason `mandate_target_blocked`. If target extraction fails (no kind-handler for the proposal's tool, no target in tool args), the action depends on `judges.md`'s `## Mandates / unextractable_target_action`:
+   - `block` (default): `BLOCK` with reason `mandate_target_unextractable`
+   - `escalate`: `ESCALATE` with reason `mandate_target_unextractable`
+
+   Operators may configure either at the `judges.md` level. The default is fail-closed (block).
 6. **Time window**: if `constraints.time_window` is set, current time MUST fall within it. Outside → `BLOCK` with reason `mandate_outside_time_window` (or `ESCALATE` if the action class is `high_risk`).
-7. **Token budget**: if any `*_token_usd` cap is set, framework sums prior `actor`-source cost events tagged with this `mandate_id` (see Cost integration) and projects the action's cost. Exceeds cap (lifetime / daily / monthly) → see budget-breach action below.
-8. **External budget**: if any `*_external_usd` cap is set, framework sums prior tool-reported external cost tagged with this `mandate_id` and projects the action's external cost from the tool definition's `expected_external_cost_usd` field (if set) or the proposal's `proposed_external_cost_usd` declaration (if the actor supplied one). Exceeds cap → see budget-breach action below.
+7. **Token budget**: if any `*_token_usd` cap is set, framework sums prior `actor`-source cost events tagged with this `mandate_id` (see Cost integration) and projects the *upcoming turn's* token cost.
+
+   **Token-cost projection for the upcoming turn**: token cost in spec/09 is logged per LLM turn (`agent.call()` iteration), not per tool call. A single turn can emit multiple tool calls, potentially citing different mandates. The framework projects the upcoming turn's token cost by:
+   - Reading the actor's last-turn token cost (from the most recent `actor`-source cost event for this run_id) and using it as the projection baseline. For the first turn (no prior cost event), the framework uses the `model.md` `expected_cost_per_call_usd` field if set, else a conservative default (`$0.10`).
+   - Apportioning the projected turn cost across the tool calls in the turn proportional to each call's argument-token count. Each mandate's projection is the apportioned share, not the full turn cost. Apportioning to N tool calls means each tool call's projection is approximately `turn_cost / N` adjusted by relative argument-token count.
+
+   This is approximate — the actual token cost is known only after the turn completes. The reservation pattern reserves the projection; the `_committed` event corrects to the actual when the cost event lands. Token-budget mandates are therefore *eventually accurate* per turn, not pre-turn exact. For mandates where token-cost precision matters more than approval throughput, operators omit token budgets and rely on the actor's overall cost guardrail instead.
+
+   Exceeds cap (lifetime / daily / monthly) → see budget-breach action below.
+8. **External budget**: if any `*_external_usd` cap is set, framework sums prior tool-reported external cost tagged with this `mandate_id` and projects the action's external cost from a **framework-owned source** — the tool definition's `expected_external_cost_usd` field (a static estimate operators register at tool-declaration time) or, for tools that compute cost dynamically, a `cost_estimator: Callable[[dict], float]` callback also registered on the tool definition. The framework calls the estimator with the proposal's `tool_arguments` to get a projection. **The actor never supplies the projected external cost.** When a mandate's `allowed_tools` includes a tool with neither `expected_external_cost_usd` nor `cost_estimator` registered, the framework treats projected external cost as `+∞` and `MandateCheck` returns `BLOCK` with reason `mandate_external_cost_unprojectable`. Fail-closed by design — the same discipline as target extraction. Operators add a static or computed estimator to the tool definition to unblock; alternatively, they remove `*_external_usd` caps from the mandate (operator choice). Exceeds cap → see budget-breach action below.
 9. **Escalation thresholds**: if `constraints.requires_escalation_above_token_usd` or `requires_escalation_above_external_usd` is set and the corresponding projected cost exceeds it → `ESCALATE` with reason `mandate_escalation_threshold_hit_<token|external>`.
 
 **Budget-breach action (steps 7 + 8)**: behavior depends on action class —
@@ -364,7 +405,22 @@ For tools without a registered extractor, the framework falls back to a set of w
 
 If extraction returns `None` and the mandate's `constraints.allowed_targets` is set → `BLOCK` with reason `mandate_target_unextractable`. The fallback is intentionally fail-closed: a mandate that says "only send to these vendors" + a tool the framework can't extract a target from = the framework refuses. Operators who want a tool to be mandate-target-aware must register an `target_extractor` on the tool definition (small impl cost) or omit `allowed_targets` from the mandate (operator decision).
 
-The extracted `target_canonical` is recorded in the proposal binding and in the JSONL judgment event, so post-hoc audit can verify the target the framework *actually saw* matches the target the operator intended to constrain.
+The extracted `target_canonical` is recorded in the proposal at assembly time (per the ActionProposal field below) and surfaces in the JSONL judgment event under `mandate_cite.target_canonical`, so post-hoc audit can verify the target the framework *actually saw* matches the target the operator intended to constrain.
+
+### `ActionProposal` field extension (spec/28 RFC extension)
+
+This spec extends spec/28's `ActionProposal` dataclass with one new optional field, presented as an RFC extension (spec/28 is locked-after-merge per `spec/28` RFC convention; spec/29's extension is acknowledged here and will be reflected in the spec/28 source-of-truth once both specs are jointly re-locked by the implementation PR):
+
+```python
+# spec/28 ActionProposal gains:
+target_canonical: str | None = None    # framework-extracted at assembly time
+                                       # nullable; not all tools have extractable targets
+                                       # not part of the proposal_binding hash
+                                       # (the framework re-extracts at execution time;
+                                       # the proposal records what was seen)
+```
+
+This is a clean additive field with a `None` default, backward-compatible for the existing spec/28 positional and keyword shapes. `ProposalAmendment` (the judge-amendable subset per spec/28 §"Revise") does NOT include `target_canonical` — the field is framework-owned end-to-end.
 
 ## Per-agent vs project-root resolution
 
@@ -396,7 +452,13 @@ Per spec/15, delegation is one-level (coordinator → delegate; delegate does no
 
 - A delegate's MandateCheck reads both `<project>/mandates.md` (the project-root file) and `<delegate>/mandates.md`. The project-root file is the cross-agent authorization layer.
 - Coordinator-*local* mandates (entries in `<coordinator>/mandates.md` but not `<project>/mandates.md`) do **not** flow to the delegate. If the coordinator wants the delegate to be able to cite a mandate, the operator places it in the project-root file. This is the same discipline tool-permission non-inheritance follows in spec/15.
-- The delegate's MandateCheck logs `mandate_used` events into the delegate's own JSONL audit log. The cumulative budget computation reads from the delegate's log only — the coordinator's budget usage is independent of the delegate's. (For shared budgets across coordinator + delegate, operators use a project-root mandate that both agents cite; the per-mandate cumulative budget is computed across all agents that cite the same ID, by aggregating across all run logs in the project.)
+- The delegate's MandateCheck logs `mandate_used` events into the delegate's own JSONL audit log. **Budget computation rule** (resolves the per-agent vs project-level question consistently): cumulative budget for a *project-root* mandate is computed by aggregating `mandate_used` + outstanding `mandate_reservation` events across **all agents in the project**, by reading each agent's JSONL log. The aggregation is **eventually consistent** — at any instant, an agent's read of the cross-agent sum may lag another agent's just-written event. Cumulative budget for an *agent-local* mandate is computed from that agent's own log only, no aggregation.
+- **Cross-agent reservation race** (known limitation): the TTL reservation pattern provides atomicity *within* a single agent's process. Across agents that share a project-root mandate, two agents can race past a budget cap because each agent's reservation isn't visible to the other in real time. Mitigations available to operators:
+    - **Set `requires_escalation_above_*` thresholds well below the cap.** Two racing agents both ESCALATE rather than both ALLOW; operator review serializes the decision.
+    - **Use class `high_risk` for shared-budget actions.** High-risk class uses a project-level filesystem lock (see "High-risk lock specification" below) that synchronizes across all agents in the project.
+    - **Accept eventual consistency.** For low-stakes mandates where occasional minor overruns are tolerable, the eventual-consistency model is sufficient. Doctor surfaces sustained over-cap conditions via `check_mandate_overrun`.
+
+The framework does not provide a built-in distributed lock for cross-agent token / external budget reservations beyond the high-risk filesystem lock. Operators who need stricter cross-agent atomicity should reach for the high-risk class or external orchestration. This is an honest limitation; the alternative (a per-mandate distributed lock for every reservation) would impose unbounded latency on the common case to defend a rare one.
 
 ## Cost integration (`spec/09` and `spec/28`)
 
@@ -461,7 +523,18 @@ This conservatism is the load-bearing trade. The framework cannot, in general, d
 
 ### Action class-aware reservation discipline
 
-For `high_risk` action classes, the framework adds a synchronous filesystem lock (per the `.lock` pattern from spec/01) around the reserve-judge-execute-commit sequence. This eliminates the TTL race entirely at the cost of serializing high-risk actions across concurrent agent processes. Trade-off is intentional: high-risk actions are rare and the cost of a brief serialization is dominated by the cost of a budget breach. `reversible_write` and `external_side_effect` classes use the TTL-only reservation pattern (faster, with the crash-recovery story above).
+For `high_risk` action classes, the framework adds a synchronous filesystem lock around the reserve-judge-execute-commit sequence. This eliminates the TTL race entirely at the cost of serializing high-risk actions across concurrent agent processes.
+
+#### High-risk lock specification
+
+Lock granularity depends on mandate scope:
+
+- **Agent-local mandate** (`<agent>/mandates.md`): lock file at `<agent>/.locks/mandate-<id>.lock`. Only the owning agent's processes contend; isolated from other agents.
+- **Project-root mandate** (`<project>/mandates.md`): lock file at `<project>/.locks/mandate-<id>.lock`. ALL agents in the project share this lock; high-risk actions citing the same project-root mandate serialize across the fleet. This is the structural cross-agent serialization that closes the cross-agent reservation race for high-risk classes.
+
+The lock uses the existing `.lock` pattern from spec/01 — atomic create-or-fail; holder writes pid + start_ts; lock acquisition timeout configurable (default 30 seconds) via `judges.md` `## Mandates / high_risk_lock_timeout_s`; timeout returns `BLOCK` with reason `mandate_high_risk_lock_timeout`. Lock is released on successful commit, rollback, or process exit.
+
+`reversible_write` and `external_side_effect` classes use the TTL-only reservation pattern (faster, with the crash-recovery story above; eventual consistency for cross-agent project-root mandates).
 
 ## Mandate lifecycle events
 
@@ -480,10 +553,18 @@ Every mandate state transition writes a JSONL event tied to the agent's run log 
 
 ### Lifecycle event deduplication (state file)
 
-To prevent re-emitting `mandate_granted` / `mandate_revoked` / `mandate_expired` events on every load, the framework maintains `~/.atomic-agents/.judge-state/mandates.json` (path may be configured via `XDG_STATE_HOME`; framework-internal, atomic-write per rule #8):
+To prevent re-emitting `mandate_granted` / `mandate_revoked` / `mandate_expired` events on every load, the framework maintains per-scope state files. Mandate IDs can repeat across unrelated agents and projects (`procurement-q2-2026` is a common-enough mandate name that two unrelated projects will collide); keying state by ID alone would cause cross-scope event suppression. State files are therefore scoped:
+
+- **Agent-local mandates** → `<agent>/.judge-state/mandates.json`
+- **Project-root mandates** → `<project>/.judge-state/mandates.json`
+
+Each is independent. An agent computing dedup for a project-root mandate cite reads `<project>/.judge-state/mandates.json`; for an agent-local mandate it reads `<agent>/.judge-state/mandates.json`. Cross-scope collision is impossible because the IDs live in different files.
+
+State file shape (per file):
 
 ```json
 {
+  "scope": "agent:<name>" | "project:<name>",
   "mandates": {
     "procurement-q2-2026": {
       "last_seen_state": "active",
@@ -526,13 +607,20 @@ Absent section → all defaults applied per the table above.
 
 ## Doctor integration (`spec/27`)
 
-New checks:
+New checks (full consolidated list):
 
 - `check_mandate_health` — surfaces mandates with high reservation-expiry rate (suggests TTL too low or actions failing post-reservation), high cap-breach-block rate (suggests cap is too tight for actual usage), or no `mandate_used` events in the last 90 days (suggests revocation candidate)
 - `check_mandate_no_expiry` — warns on mandates with `expires_at: null`
-- `check_mandate_id_collisions` — surfaces project-root vs per-agent ID collisions
-- `check_mandate_relaxation_violations` — surfaces per-agent mandates that relax project-root constraints (these refuse to load; doctor explains why)
+- `check_mandate_id_collisions` — surfaces project-root vs per-agent ID collisions (per-agent entry refused)
 - `check_mandate_source_hash_drift` — surfaces mandates whose `source_hash` has changed since the agent last cited them (informational; common if the operator routinely edits)
+- `check_mandate_unconstrained` — surfaces mandates that loaded with `constraints.unconstrained: true` (scope-only enforcement; lists each with its `unconstrained_justification`)
+- `check_mandate_unverified_external_reservations` — surfaces orphan `mandate_reservation_external_unverified` events from crash recovery; lists each with the reconciliation CLI command operator can run
+- `check_mandate_overrun` — surfaces sustained over-cap conditions on project-root mandates (cross-agent reservation race; operator should consider tightening `requires_escalation_above_*` or moving the mandate's actions to high_risk class)
+- `check_mandate_meta_misplaced` — warns when `## _meta` section appears in a per-agent `mandates.md` (silently ignored; operator likely intended project-root)
+- `check_mandate_state_inconsistent_followed_by_revoked` — annotates audit-reader pairs of `mandate_state_inconsistent` + subsequent `mandate_revoked` events on the same mandate as a single compound revocation surfacing (per the two-turn surfacing convention)
+- `check_mandate_external_cost_unprojectable` — surfaces tools that mandates cite via `allowed_tools` but lack an `expected_external_cost_usd` or `cost_estimator` registration (mandates with `*_external_usd` caps block on these tools)
+
+(`check_mandate_relaxation_violations` from the v1 spec draft is **removed** — the disjoint-ID resolution model no longer has a relaxation concept; per-agent same-ID entries are refused at load via `check_mandate_id_collisions`.)
 
 ## Audit shape
 
@@ -563,19 +651,32 @@ Beyond the lifecycle events above, mandate-aware judgment events carry an additi
 
 `mandate_cite` is `null` for judgments on proposals that don't cite a mandate (preserves spec/28's existing JSONL shape for non-mandate flows). The `mandate_source_hash` field in `binding` extends spec/28's TOCTOU defense — execution-time binding can re-verify the mandate state is consistent with what the judge approved, and a hash mismatch at execution triggers re-judgment, mirroring the spec/28 pattern for `tool_definition_hash` mismatch.
 
+#### `target_canonical` placement clarification
+
+The framework-extracted `target_canonical` value is stored in **`mandate_cite.target_canonical`** in the JSONL judgment event (and in `ActionProposal.target_canonical` at proposal-assembly time per the spec/28 field extension above). It is **not** part of `binding`. `binding` is reserved for content-hash defenses (the hashes are stable identifiers of what was approved); `target_canonical` is a content value the operator actually wants to read in audits. Placing it under `mandate_cite` keeps `binding` minimal and `mandate_cite` informative.
+
+#### JudgmentEvent.binding schema extension (spec/28 RFC extension)
+
+The `mandate_source_hash` field is added to spec/28's `ProposalBinding`-equivalent shape as a defaulted nullable field — backward-compatible at the data level. Legacy `JudgmentEvent` records without `mandate_source_hash` continue to parse correctly (default `null`). New emissions populate the field when a mandate is cited and leave it `null` when not. The spec/28 source-of-truth shape will be updated alongside the implementation PR; no JudgmentEvent schema bump is required.
+
+### Source-hash-before-state ordering (tradeoff documentation)
+
+`MandateCheck`'s validation order (step 2 = source hash; step 3 = state) means that when an operator revokes a mandate AND the file changes in the same edit pass, the first action-after-revoke surfaces as `mandate_state_inconsistent` (hash drift), not `mandate_revoked` (state). On the actor's next turn (after the inconsistent block, the actor re-authors with a fresh proposal binding against the new mandate state), the state-based block surfaces as `mandate_revoked` properly. This is a deliberate two-turn surfacing for the compound-failure case: the framework refuses to render a state-based block on stale bytes, because state-from-stale-bytes is misleading. Operators reading audit logs see both events — the inconsistent block on the first turn and the revoked block on the second. The doctor's `check_mandate_state_inconsistent_followed_by_revoked` flags this sequence so audit readers know it's the same operator action, not two separate events.
+
 ## Operator CLI
 
-Three new subcommands ship with the impl:
+Four new subcommands ship with the impl:
 
 ```
 atomic-agents mandate list [--agent NAME] [--include-revoked] [--include-expired]
 atomic-agents mandate show <mandate-id> [--agent NAME]
 atomic-agents mandate usage <mandate-id> [--since DATE] [--until DATE]
+atomic-agents mandate reconcile <reservation-id> --action {committed|rolled_back} [--reason TEXT]
 ```
 
-`mandate list` summarizes active mandates with cumulative-vs-cap percentages. `mandate show` prints the mandate's full state plus recent usage. `mandate usage` produces a time-series cost report for the mandate, source = JSONL audit log.
+`mandate list` summarizes active mandates with cumulative-vs-cap percentages. `mandate show` prints the mandate's full state plus recent usage. `mandate usage` produces a time-series cost report for the mandate, source = JSONL audit log. `mandate reconcile` resolves an orphaned `mandate_reservation_external_unverified` event from crash recovery — the operator verifies (e.g., checks Stripe / vendor / wherever) whether the external action actually completed and runs `reconcile` with the appropriate `--action`. The command writes a `mandate_reservation_reconciled` event with the operator's decision attached; doctor's `check_mandate_unverified_external_reservations` drops the entry on next run.
 
-Operators **grant** mandates by editing `mandates.md` directly (no `mandate grant` subcommand — the file IS the operator's grant; the framework cannot grant on the operator's behalf). Operators **revoke** mandates by editing `mandates.md` to set `revocation_state: revoked` (no `mandate revoke` subcommand for the same reason). The CLI is read-only by design; it reports on operator-authored state.
+Operators **grant** mandates by editing `mandates.md` directly (no `mandate grant` subcommand — the file IS the operator's grant; the framework cannot grant on the operator's behalf). Operators **revoke** mandates by editing `mandates.md` to set `revocation_state: revoked` (no `mandate revoke` subcommand for the same reason). The CLI is read-only with respect to mandates themselves; `reconcile` writes to the JSONL audit log, not to `mandates.md`.
 
 ## Only operators grant mandates
 
@@ -597,9 +698,15 @@ When an operator adds `mandates.md` and actors begin citing mandate IDs:
 
 - The judge layer registers the cite via the new `mandate_id` field
 - `MandateCheck` runs as a built-in specialist; no `judges.md` change required to enable it
-- Cost events for mandate-citing actions carry `cost_source: "mandate:<id>"` instead of `actor`; legacy cost-event consumers without source filtering may need updates if they assume `actor` is the only producer outside the judge ledger
+- Cost events for mandate-citing actions keep `cost_source: "actor"` (preserving spec/28's actor budget accounting unchanged) and additionally carry a `mandate_id` field. Actor cost guardrails continue to count these events normally. Legacy cost-event consumers that ignore unknown fields continue to work without changes.
 
 The framework will not auto-create or auto-edit `mandates.md`. Operators write mandates by hand.
+
+### Structural write protection for `mandates.md`
+
+The framework enforces write-path safety for operator-authored config (per `spec/20` MemoryBackend's WritePolicy + spec/17 tools.md write paths). The default WritePolicy for any agent excludes the operator-authored config surfaces — `tools.md`, `judges.md`, `mandates.md`, `model.md`, `persona/IDENTITY.md`, `persona/SOUL.md`, `persona/USER.md`. A custom tool, MCP tool, helper, or delegate that attempts to write to any of these paths is refused at the WritePolicy enforcement layer — *before* the mandate layer even sees the attempt. This is the same structural protection that prevents tools from rewriting `tools.md` to grant themselves new permissions. It is NOT a mandate-specific check; it is the framework's general WritePolicy discipline applied to mandates as one of several operator-authored files.
+
+This means: even a malicious actor with a write-capable tool cannot edit `mandates.md` to grant itself authority. The WritePolicy is the authoritative protection. The `## Only operators grant mandates` section above describes the *behavioral* discipline (the actor doesn't get to grant mandates via skills / dreams / captures / helpers / MCP results); the WritePolicy is the *structural* enforcement that backs that discipline.
 
 ## Out of scope
 
