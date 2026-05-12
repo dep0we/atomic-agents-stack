@@ -7,17 +7,17 @@
 
 > **AI agents that live in your folder, not someone else's database.**
 
-Vault-native, MIT-licensed, runs anywhere markdown does.
+Vault-native, MIT-licensed, Markdown-source-of-truth.
 
 ---
 
 ## Why this exists
 
-Most AI-agent tooling today lives in someone else's database. Letta hosts your memory. Mem0 hosts your memory. Hosted-agent frameworks like OpenClaw run the harness on their hardware. You get the ergonomics, they get the data and the lock-in.
+Most agent state ends up somewhere you don't fully control — an app database, a vector store, a hosted trace system, or bespoke glue code rebuilt per project. Some popular tools offer self-hosted modes (Letta has a Docker path; Mem0 has an OSS distribution); even so, the operator usually doesn't end up owning the durable shape of their agents.
 
-There's another shape: **your agents live in your folder.** Plain markdown files. INDEX.md routing. Persona in `IDENTITY.md` / `SOUL.md` / `USER.md`. Memory as typed atomic notes you can `cat`. Audit trail as JSONL you can grep. Cost guardrails in markdown config. Migrations are scripts you can read. If you stop paying anyone, the agent still works. If you switch laptops, you copy a folder. If you want a new runtime — cron, Claude Code skill, ChatGPT skill, your own HTTP service — you point the runtime at the folder.
+There's another shape: **your agents live in your folder.** Plain markdown files. INDEX.md routing. Persona in `IDENTITY.md` / `SOUL.md` / `USER.md`. Typed atomic notes you can `cat`. Audit trail as JSONL you can grep. Cost guardrails in markdown config. Crash-safe writes — every mutation goes through `temp file + fsync + rename + parent-dir fsync`, so a power loss never leaves a half-written note. Schema migrations are scripts you read before running. If you switch laptops, you copy a folder. If you want a new runtime — cron, Claude Code skill, ChatGPT skill, your own HTTP service — you point the runtime at the folder.
 
-That's the shape `atomic-agents-stack` defines, in 21 locked spec docs, with a Python reference implementation, 720+ tests, and a complete worked sample.
+That's the shape `atomic-agents-stack` defines, in 21 spec docs (locked when implementation matches), with a Python reference implementation, 720+ tests, and a Caldwell sample that includes 5 days of real JSONL run logs, a rendered cost dashboard, evals across happy / edge / adversarial / decline categories, and a helper-pattern day showing ~76% cost savings vs. all-Opus.
 
 A home user with one agent and an org with a fleet experience the same framework — graceful, coherent, self-explanatory at every scale.
 
@@ -37,7 +37,7 @@ export ATOMIC_AGENTS_ROOT=~/agents
 # Verify everything's wired up
 uv run atomic-agents doctor
 
-# Run an agent (assuming you've created one — see "Your first agent" below)
+# Run an agent (assuming you've created one — see docs/getting-started.md)
 uv run atomic-agents run myagent --work-item "What should I focus on today?"
 
 # See the cost dashboard
@@ -88,26 +88,49 @@ For a complete worked example with real persona, memory, journal, evals, and a s
 
 ---
 
+## Current limits
+
+Honest about what isn't shipped or fully tested:
+
+- **Alpha, single maintainer.** Pre-1.0 means Minor releases may contain breaking changes; read release notes before upgrading.
+- **macOS / Linux primary; Windows under-tested.** `atomic_agents/_locks.py` uses POSIX `fcntl`. iOS can't run the runtime at all (Markdown vault files sync there fine — see [`docs/deployment/obsidian.md`](docs/deployment/obsidian.md)).
+- **Only `MemoryBackend` is shipped from the protocol roadmap.** `Lock` / `Log` / `Persona` / `AgentProfile` / `ToolRegistry` / `Corpus` / `LLM` / `Policy` backends are all filesystem-default-only today; the protocol contracts come later. Org-scale deployments today still run filesystem-everything.
+- **Cost guardrail `alert` action is log-backed today.** The `alert_channel` field is parsed, but external dispatch (Telegram / email / webhook) is not wired up yet. Today's alerts go to the run log; the dashboard surfaces them visually. See [`#70`](https://github.com/dep0we/atomic-agents-stack/issues/70).
+- **Cross-host locking is operator-managed.** The flock is in-kernel and per-host; running the same agent on two hosts simultaneously is on you. A `LockBackend` ([`#60`](https://github.com/dep0we/atomic-agents-stack/issues/60)) will eventually generalize this.
+- **`__all__` lags behind raised exceptions.** A few public-facing exceptions are raised inside the package but not in `atomic_agents.__all__` yet ([`#99`](https://github.com/dep0we/atomic-agents-stack/issues/99)); documented in `docs/deployment/programmatic.md`.
+
+---
+
 ## How it compares to alternatives
 
-The framework occupies a specific slot in the AI-agent-tooling landscape. Honest comparison:
+This is the slot in the AI-agent-tooling landscape `atomic-agents-stack` occupies, in narrow defensible claims rather than competitive sniping:
 
-| | Atomic Agents | Letta / Mem0 | Hosted-agent harnesses<br>(OpenClaw-shaped) | LangChain / LangGraph | Direct SDK + your scripts |
+| | Atomic Agents | Letta | Mem0 | LangGraph + LangSmith | Direct SDK + your scripts |
 |---|---|---|---|---|---|
-| **Vault portability** | Plain folders, copy anywhere | Hosted database | Hosted runtime | Whatever you build | Whatever you build |
-| **License** | MIT | Mostly hosted-service ToS | Vendor-specific | MIT (LangChain), MIT (LangGraph) | Whatever |
-| **Memory layer** | Typed atomic notes + INDEX + wiki, all markdown | Their primary feature | Their memory service | Vector store you wire in | Build it |
-| **Persona layer** | IDENTITY/SOUL/USER spec | None — strings in prompt | Vendor-shaped | Strings in prompts | Strings in prompts |
-| **Audit trail** | JSONL with `parent_run_id` rollups | Vendor dashboards | Vendor dashboards | None built in | Build it |
-| **Cost guardrails** | First-class — daily / monthly caps, fallback, alert, critical-flag override | Per their pricing | Per their pricing | None built in | Build it |
-| **Multi-agent coordination** | Spec-defined role × project cascade | None | Vendor-shaped | LangGraph: yes (graph-based) | Build it |
-| **Self-hosting** | Yes (it's just a folder + Python) | Hosted-only or their server | Their server | Yes | Yes |
-| **Spec-defined** | 21 numbered spec docs | No public spec | No public spec | API reference | None |
-| **The bet** | Operators want to own their agents | Operators want managed memory | Operators want zero ops | Operators want flexibility | Operators want full control |
+| **Source of truth for agent state** | Markdown files in a folder you own | Postgres-backed memory blocks (cloud or self-hosted Docker) | Vector / structured memory store (cloud or OSS) | Checkpointer + long-term store you wire in | Whatever you build |
+| **Persona layer** | Spec-defined `IDENTITY.md` / `SOUL.md` / `USER.md` files; promotion loop from memory | `persona` / `human` memory blocks | Operator-defined memory | Prompts + state schemas | Prompts |
+| **License (core)** | MIT | Apache-2.0 (OSS); managed Letta Cloud also offered | Apache-2.0 (OSS); managed Mem0 also offered | MIT (LangGraph OSS); LangSmith is hosted | Whatever |
+| **Required server / DB** | None (just files + Python) | Postgres recommended for production | Vector store backend | None for OSS; Postgres-style for `langgraph-checkpoint-postgres` | None |
+| **Audit trail** | JSONL per run with `parent_run_id` rollups; helper + delegate + tool + capture lines all link back | Dashboards in Letta UI / cloud | Mem0 dashboards | LangSmith (hosted) | Build it |
+| **Cost guardrails** | First-class — daily / monthly caps, threshold warnings, fallback action, `critical=True` override, tree-cap across delegates | Per their pricing model | Per their pricing model | Not built into core OSS | Build it |
+| **Multi-agent coordination** | Role × project cascade defined in spec/06 | Multi-agent shared memory blocks | Agent-shared memory pools | LangGraph: graph-based orchestration (more flexible) | Build it |
+| **Numbered, locked spec** | 21 docs in `docs/spec/` | API + concept docs | API + concept docs | API reference + concept docs | None |
+| **Reference runtime** | Python, macOS / Linux primary | Python (server) + multi-language clients | Python (OSS) + multi-language clients | Python + JavaScript | Whatever |
 
-**Where the alternatives win:** Letta has the polished hosted-service UX. LangGraph has more flexible graph-based orchestration. Hosted harnesses give you zero-ops. If those properties matter more than ownership, pick those tools.
+**Where the alternatives win:**
 
-**Where Atomic Agents wins:** the framework feels like one thing across scales. The same agent definitions run as a cron job on your laptop, a Claude Code skill, a Codex CLI skill, a ChatGPT skill, or an HTTP service. Different backends register at import time. The audit trail is structural, not bolted on. The cost story is first-class. Your data stays where you put it.
+- **Letta** has the polished hosted-service UX, multi-language clients, and a more mature multi-agent shared-memory primitive.
+- **Mem0** has stronger memory-retrieval optimization (embeddings + retrieval research is their core focus); if memory quality is the bottleneck, evaluate them directly.
+- **LangGraph** has more flexible graph-based orchestration and the **LangSmith** observability stack is broader than any single project's audit trail can replicate.
+- **Direct SDK** wins when your problem is so domain-specific that any framework's structure is overhead.
+
+**Where Atomic Agents wins:**
+
+- **Markdown-source-of-truth, human-editable.** Operators can edit persona / tools / memory from any text editor or Obsidian without a vendor app.
+- **No required server.** The framework is "files + Python." A complete agent runs on a laptop with zero infrastructure.
+- **Spec-level file layout.** 21 numbered docs lock the contract; conformance is testable; alternate implementations are possible.
+- **Crash-safe writes by default.** `temp file + fsync + rename + parent-dir fsync` for every mutation; an interrupted run leaves recoverable artifacts, not corruption.
+- **Cost story is structural, not bolted on.** Daily / monthly caps + tree-cap for delegations + per-call cost reservation for helper batches + a `critical=True` override that's part of the API, not a per-vendor workaround.
 
 ---
 
@@ -134,7 +157,7 @@ Start at [`docs/README.md`](docs/README.md) for the spec entry point. The 21 spe
 - [20 — Memory backend protocol](docs/spec/20-memory-backend.md) — the protocol-pattern moat
 - [27 — Doctor](docs/spec/27-doctor.md) — preflight verification
 
-Each spec doc is locked when the implementation matches and tests pass. Spec changes that imply implementation changes get filed as GitHub issues. **Spec docs are not aspirational; they describe what's true today.**
+Each spec doc is locked when the implementation matches and tests pass. Spec changes that imply implementation changes get filed as GitHub issues. **Spec docs separate shipped behavior from explicit future / deferred boundaries** — sections that describe behavior not yet implemented are explicitly marked as such, not silently aspirational.
 
 ---
 
@@ -154,7 +177,7 @@ The framework is moving toward swappable backends layer by layer. The shape: a P
 | `LLMBackend` | Planned | [`#87`](https://github.com/dep0we/atomic-agents-stack/issues/87) |
 | `PolicyBackend` | Planned | [`#89`](https://github.com/dep0we/atomic-agents-stack/issues/89) |
 
-A home user runs filesystem-everything. An organization runs the same agents over Postgres, behind an HTTP service, with a fleet of orchestrated roles. **Same agents. Different backends.** See [`docs/architecture.md`](docs/architecture.md) for the mental model.
+**v1 direction:** a home user runs filesystem-everything (today). An organization runs the same agent definitions over Postgres, behind an HTTP service, with a fleet of orchestrated roles — *once the remaining backend protocols ship*. Today, only `MemoryBackend` has a non-filesystem-default-ready protocol; the others are roadmap. See [`docs/architecture.md`](docs/architecture.md) for the mental model and [`docs/TENSIONS.md`](docs/TENSIONS.md) for the architectural tensions this scaling story has to survive.
 
 ---
 
