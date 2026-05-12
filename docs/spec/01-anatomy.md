@@ -16,6 +16,7 @@ What files an Atomic Agent is made of, and what each one does.
 ├── model.md                   ← required
 ├── judges.md                  ← OPTIONAL (only when judge layer is enabled — see spec/28)
 ├── mandates.md                ← OPTIONAL (only when mandate-citing actions are used — see spec/29)
+├── audits.md                  ← OPTIONAL (only when responsibility audit is configured — see spec/30)
 ├── memory/
 │   ├── INDEX.md               ← required (auto-generated, hand-edited as needed)
 │   └── *.md                   ← any number, frontmatter-tagged
@@ -28,6 +29,9 @@ What files an Atomic Agent is made of, and what each one does.
 ├── log/                       ← required for cron-version agents
 │   └── YYYY-MM/YYYY-MM-DD.jsonl
 ├── goal.md                    ← OPTIONAL (only for goal-driven / hybrid agents — see spec/12)
+├── dreams/                    ← OPTIONAL — produced by the dream pipeline (see spec/16)
+├── outcomes/                  ← OPTIONAL — produced by the outcome pipeline (see spec/14)
+├── audits/                    ← OPTIONAL — produced by the responsibility audit (see spec/30)
 └── evals/                     ← OPTIONAL but recommended (see spec/08)
     ├── rubric.md
     ├── judge.md
