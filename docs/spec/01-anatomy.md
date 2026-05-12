@@ -14,6 +14,8 @@ What files an Atomic Agent is made of, and what each one does.
 │   └── USER.md                ← required (unless agent doesn't have a primary user)
 ├── tools.md                   ← required
 ├── model.md                   ← required
+├── judges.md                  ← OPTIONAL (only when judge layer is enabled — see spec/28)
+├── mandates.md                ← OPTIONAL (only when mandate-citing actions are used — see spec/29)
 ├── memory/
 │   ├── INDEX.md               ← required (auto-generated, hand-edited as needed)
 │   └── *.md                   ← any number, frontmatter-tagged
@@ -73,7 +75,9 @@ Atomic Agents treats autonomy as a **gradient**, not a binary. The framework's d
 
 The four-outcome judge model (`allow / block / revise / escalate` per spec/28) is the mechanical encoding of graduated autonomy. **Revise** in particular is what makes the gradient real — it lets the system correct an action without losing the actor's intent (\"send the email but remove the attachment\" / \"open the PR as draft, not for merge\" / \"lower the spend limit before proceeding\").
 
-Operators tune the gradient per-agent via `judges.md` class policy and via `mandates.md` (`spec/29`) for durable scoped authority that crosses many runs. The autonomy ladder declared in `IDENTITY.md` (see below in this spec, in the IDENTITY template) is the persona-level statement of intent; tools.md / judges.md / mandates.md are the operator-managed *enforcement surfaces* that make the ladder real at runtime.
+Operators tune the gradient per-agent via `judges.md` class policy and via `mandates.md` (`spec/29`) for durable scoped authority that crosses many runs. The autonomy ladder declared in `IDENTITY.md` (see below in this spec, in the IDENTITY template) is the persona-level *statement of intent*; tools.md / judges.md / mandates.md are the operator-managed *enforcement surfaces* that make the ladder real at runtime.
+
+**When the ladder and the enforcement surfaces disagree, the enforcement surfaces win.** An IDENTITY autonomy ladder that says "I can send emails autonomously" combined with a `judges.md` that puts `external_side_effect: escalate` results in emails being escalated — the persona statement does not override the judge policy. This is intentional: persona files are *what the agent believes about itself*; enforcement files are *what the operator commits to*; the operator's commitment wins. The doctor surfaces ladder/enforcement mismatches via `check_autonomy_ladder_consistency` so operators can resolve drift before it becomes confusion at runtime.
 
 The graduated-autonomy property is what distinguishes Atomic Agents from frameworks that assume agents either (a) operate against fully-supervised checklists or (b) operate with unrestricted tool access modulated only by post-hoc evals. Both extremes leave operators unable to scale agent deployment to real workloads without taking on either an approval-bottleneck cost or an unbounded-blast-radius cost. The framework's commitment is that **the same agent definition runs at every scale — the gradient is configured by the operator's `tools.md` / `judges.md` / `mandates.md`, not by re-shaping the agent itself.**
 
