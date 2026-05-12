@@ -9,6 +9,13 @@
 
 Vault-native, MIT-licensed, Markdown-source-of-truth.
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/atomic-agents-hero-dark.svg">
+    <img src="docs/assets/atomic-agents-hero.svg" alt="Atomic Agents at a glance: an agent is a folder of Markdown files (persona, tools, memory, wiki, journal, log); the runtime is stateless and wrapped in cost guardrails; every run writes a JSONL audit line, a typed memory note, and a journal entry. Same agent definition runs from cron, launchd, a Claude Code skill, or embedded in Python." width="100%">
+  </picture>
+</p>
+
 ---
 
 ## Why this exists
