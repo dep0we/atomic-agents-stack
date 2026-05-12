@@ -30,9 +30,9 @@ Without a consolidating audit, drift between these surfaces accumulates invisibl
 
 The framework already has the *shape* for this kind of offline-reflection primitive: dreams + evals are exactly the pattern (markdown output, vault-resident, cron-friendly, structured artifact). The responsibility audit reuses that pattern at a different boundary.
 
-## The seven rows (generalized from commerce)
+## The seven questions (generalized from commerce)
 
-For each action class an agent uses (`read_only` / `reversible_write` / `external_side_effect` / `high_risk` — per `spec/28`), the audit asks seven questions per row:
+For each tool the agent has used (rows of the coverage table) across the four action classes (`read_only` / `reversible_write` / `external_side_effect` / `high_risk` — per `spec/28`), the audit asks seven questions per tool — one question per column:
 
 1. **Discovery** — Where does this action's input come from? (Conversation? Memory note? Helper output? Skill? Prior tool result? MCP server discovery?)
 2. **Authorization** — Who said the agent could take this action? (Operator-in-conversation? Cited mandate? Persona-implied? Class-default policy? Nothing-explicit?)
@@ -74,7 +74,7 @@ Operator runs CLI (or cron fires)
                 │
                 ▼
    audit synthesizes:
-     coverage table (6 rows × N action classes used in window)
+     coverage table (7 columns × N tools × M action classes used in window)
      gap list       (rows scoring weak/missing)
      mandate usage  (last_used per mandate; revocation candidates)
      escalation drift per class (approval rate signals)
@@ -97,6 +97,20 @@ Operator runs CLI (or cron fires)
 
 To set expectations honestly, the audit's *inputs* (the authorization surfaces it inspects) are explicitly listed. The list separates **covered** surfaces (v1 reads these) from **deferred** surfaces (the audit doesn't read these yet; impact noted).
 
+### Phantom MCP tools
+
+MCP servers may be removed from `mcp.md` after producing JSONL events. The audit treats such tool calls as "orphaned MCP cite — server removed" and:
+
+- Lists them in the coverage table with `[orphaned MCP cite]` annotation in the `Action execution` column
+- Surfaces them as a discrete row in the gaps section: "agent used MCP server `<name>` X times in window; server is no longer registered in `mcp.md` (removed at unknown date). If these tool calls were legitimate, restore the registration with appropriate classification; if not, no action needed."
+- Does NOT default to `external_side_effect` for orphaned tools — there's no current registration to defer to, so the classification cell renders as `unknown (server removed)` rather than a defaulted value. This avoids implying a class that may not match what the operator originally intended.
+
+### Doctor snapshot staleness during long-running audits
+
+Project-level audits can run for 60+ seconds (the project-agent-status threshold for `running`). The audit's `doctor_snapshot_at` pins the read time, but doctor findings may resolve or surface during the audit window. The audit's "Doctor findings cross-reference" section annotates each cited finding with `(as of <doctor_snapshot_at>)` so readers know whether to re-check.
+
+A finding written into the audit at minute 0 may be "doctor reported X" which is no longer true at minute 1. This is an honest snapshot — the audit does not re-poll the doctor mid-run. Operators reading the audit see the snapshot timestamp and can verify against the live doctor surface if the cited finding is decision-load-bearing.
+
 ### Covered in v1
 
 - `<agent>/tools.md` — declared tools + classifications
@@ -106,7 +120,7 @@ To set expectations honestly, the audit's *inputs* (the authorization surfaces i
 - `<agent>/model.md` — cost guardrails + critical-action declarations
 - `<agent>/persona/IDENTITY.md` — for the autonomy ladder cross-reference (spec/01 graduated-autonomy property)
 - `<agent>/log/*.jsonl` — agent runs, tool calls, judgment events, mandate events, escalations, cost events
-- `<agent>/escalations/` — pending + resolved escalation files
+- Escalation files at the path declared in `judges.md`'s `## Escalation queue / destination` (per spec/28). Default: `<agent>/escalations/`. Layout: `<destination>/<class>/<proposal_id>.md` (class-subdirectoried per spec/28's escalation file format). The audit honors operator-configured `destination` paths; reading hardcoded paths would miss escalations for operators who relocate the queue.
 - `<agent>/.judge-state/` — framework state (mandate dedup, etc.)
 - `<project>/tools.md|judges.md|mandates.md` (project-level audit only)
 
@@ -228,26 +242,26 @@ not exercised in the window.
 
 ### `read_only` class (used 891 times by 14 tools)
 
-| Tool | Discovery | Authorization | Evidence | Reversibility | Escalation | Score |
-|---|---|---|---|---|---|---|
-| `read_file` | conversation | class-default (read_only: bypass) | JSONL | reversible (no-op) | not applicable | ★★★ |
-| `search_notes` | conversation | class-default | JSONL | reversible | not applicable | ★★★ |
-| ... | ... | ... | ... | ... | ... | ... |
+| Tool | Discovery | Authorization | Effective constraint | Action execution | Evidence | Reversibility | Escalation | Score |
+|---|---|---|---|---|---|---|---|---|
+| `read_file` | conversation | class-default (read_only: bypass) | tools.md write_paths (read scope) | declared read_only in tools.md | JSONL | reversible (no-op) | not applicable | ★★★ |
+| `search_notes` | conversation | class-default | tools.md read_paths | declared read_only in tools.md | JSONL | reversible | not applicable | ★★★ |
+| ... | ... | ... | ... | ... | ... | ... | ... | ... |
 
 ### `reversible_write` class (used 47 times by 3 tools)
 
-| Tool | Discovery | Authorization | Evidence | Reversibility | Escalation | Score |
-|---|---|---|---|---|---|---|
-| `write_note(staged)` | atomic_capture | spec/05 capture rules | JSONL + memory version | reversible (via restore_version) | not configured | ★★ |
-| ... | ... | ... | ... | ... | ... | ... |
+| Tool | Discovery | Authorization | Effective constraint | Action execution | Evidence | Reversibility | Escalation | Score |
+|---|---|---|---|---|---|---|---|---|
+| `write_note(staged)` | atomic_capture | spec/05 capture rules | tools.md write_paths | declared reversible_write in tools.md | JSONL + memory version | reversible (via restore_version) | not configured | ★★ |
+| ... | ... | ... | ... | ... | ... | ... | ... | ... |
 
 ### `external_side_effect` class (used 23 times by 4 tools)
 
-| Tool | Discovery | Authorization | Evidence | Reversibility | Escalation | Score |
-|---|---|---|---|---|---|---|
-| `send_email` | conversation | `mandate:procurement-q2-2026` | JudgmentEvent + mandate_used | irreversible | judges.md class-default | ★★ |
-| `create_pr` | conversation | judges.md (judge-decides) | JudgmentEvent | reversible (close PR) | judge-decides | ★★ |
-| `mcp.github.create_pull_request` | conversation | judges.md (judge-decides) | JudgmentEvent | reversible | **NOT DECLARED in mcp.md** | ★ |
+| Tool | Discovery | Authorization | Effective constraint | Action execution | Evidence | Reversibility | Escalation | Score |
+|---|---|---|---|---|---|---|---|---|
+| `send_email` | conversation | `mandate:procurement-q2-2026` | **mandate has no allowed_targets — practically unconstrained** | declared external_side_effect in tools.md | JudgmentEvent + mandate_used | irreversible | judges.md class-default | ★ |
+| `create_pr` | conversation | judges.md (judge-decides) | judges.md class policy only | declared external_side_effect in tools.md | JudgmentEvent | reversible (close PR) | judge-decides | ★★ |
+| `mcp.github.create_pull_request` | conversation | judges.md (judge-decides) | judges.md class policy only | **defaulted external_side_effect — NOT DECLARED in mcp.md** | JudgmentEvent | reversible | judge-decides | ★ |
 
 ### `high_risk` class (used 0 times by 1 declared tool)
 
@@ -384,13 +398,109 @@ class ResponsibilityAuditFrontmatter:
     coverage_legacy_unknown_pct: float   # 0.0–1.0; gives a quick health signal
     doctor_snapshot_at: str | None       # ISO-8601 timestamp of the doctor output the
                                          # audit read; null when audit didn't read doctor
-    project_agent_status: dict[str, str] | None  # set when scope == "project";
-                                         # maps agent_name to "fresh"|"stale"|"missing"|
-                                         # "incompatible"|"running"
+    project_agent_status: dict[str, ProjectAgentStatus] | None  # set when scope ==
+                                         # "project"; ProjectAgentStatus is a StrEnum
+                                         # (defined in the body-dataclasses section
+                                         # below)
     schema_version: int                  # currently 1
 ```
 
 **Honest enrichment frontmatter (P2 #8 from RFC review)**: `enrichment_requested` vs `enrichment_actual` are separate fields. An audit operator who runs with `--enrich` but blows the budget gets `enrichment_requested: "llm"` + `enrichment_actual: "rule-engine"` + `enrichment_dropped_reason: "budget_exhausted"`. Downstream readers (dashboards, doctor) see the honest signal: the operator wanted enrichment; it didn't happen.
+
+### Audit body dataclasses
+
+The audit's report body (coverage table rows, gap list, mandate usage report, escalation drift, stale policy) maps to a set of dataclasses so dashboards, doctor consumers, and impl tests can import stable types rather than re-parsing markdown:
+
+```python
+class ProjectAgentStatus(StrEnum):
+    FRESH = "fresh"
+    STALE = "stale"
+    MISSING = "missing"
+    INCOMPATIBLE = "incompatible"
+    RUNNING = "running"
+
+
+@dataclass(frozen=True)
+class CoverageRow:
+    """One row of the coverage table — per tool per action class."""
+    tool_name: str
+    action_class: ActionClass                # from spec/28
+    discovery: str | None                    # may be "unknown (legacy)" in v1 legacy mode
+    authorization: str | None
+    effective_constraint: str | None
+    action_execution: str
+    evidence: str | None
+    reversibility: str | None
+    escalation: str | None
+    score: int                               # 1-3 stars (1=★, 2=★★, 3=★★★)
+    legacy_unknown_fields: list[str]         # field names that rendered as "unknown (legacy)"
+
+
+@dataclass(frozen=True)
+class Gap:
+    id: str                                  # "G1", "G2", ...
+    headline: str                            # short summary
+    what: str                                # what the audit observed
+    why: str                                 # why it matters
+    recommended_action: str                  # operator-facing recommendation
+    affected_tools: list[str]                # tool names this gap touches
+    affected_action_class: ActionClass | None
+
+
+@dataclass(frozen=True)
+class MandateUsageRow:
+    mandate_id: str
+    granted_at: str
+    expires_at: str | None
+    last_used_at: str | None
+    cumulative_token_usd: float
+    cumulative_token_cap_usd: float | None
+    cumulative_external_usd: float
+    cumulative_external_cap_usd: float | None
+    status_emoji: str                        # "★★★ Active, healthy" | "★★ Used once, expired" | etc.
+    revocation_candidate: bool
+
+
+@dataclass(frozen=True)
+class EscalationDriftRow:
+    action_class: ActionClass
+    total_escalations: int
+    operator_approved_count: int
+    operator_denied_count: int
+    operator_revised_count: int
+    approval_rate: float | None              # None if total_escalations == 0
+    drift_signal: str                        # "healthy" | "high (>95%)" | "low (<60%)" | "unexercised"
+
+
+@dataclass(frozen=True)
+class StalePolicyRow:
+    file_path: Path
+    last_edited_at: str                      # ISO-8601; from filesystem mtime in v1
+    days_since_edit: int
+    recommended_cadence_days: int
+    status: str                              # "fresh" | "stale" | "advisory"
+    detection_basis: str                     # "mtime" in v1; "reviewed_at" in future
+
+
+@dataclass(frozen=True)
+class AuditReport:
+    """Programmatic representation of the audit's full body. The markdown file
+    is the canonical artifact; AuditReport is what impl-side consumers
+    construct and serialize. Round-trip: AuditReport → markdown → re-parse
+    → AuditReport produces the same instance (modulo nondeterministic
+    envelope fields)."""
+    frontmatter: ResponsibilityAuditFrontmatter
+    executive_summary: str                   # 1-paragraph prose
+    coverage_rows: list[CoverageRow]
+    gaps: list[Gap]
+    mandate_usage: list[MandateUsageRow]
+    escalation_drift: list[EscalationDriftRow]
+    stale_policy: list[StalePolicyRow]
+    doctor_findings_referenced: list[str]    # IDs of doctor findings cross-referenced
+    audit_notes: str                         # closing notes about audit mode + next recommended audit
+```
+
+Impl PR ships `AuditReport.to_markdown()` and `AuditReport.from_markdown(path)` for the round-trip. Dashboard readers consume `AuditReport` directly; the markdown is the operator-facing artifact + the canonical source of truth on disk.
 
 ## Rule-engine vs LLM enrichment
 
@@ -418,7 +528,7 @@ The split is intentional: rule-engine detection is the load-bearing part. Operat
 Per rule #4, every code path that calls an LLM has a cost gate. The audit is no exception.
 
 - Rule-engine audits cost nothing beyond filesystem reads and JSONL parsing.
-- LLM-enriched audits flow through `LLMBackend` and emit cost events with **a new `cost_source` value: `"audit"`** (a third value alongside `actor` and `judge` from `spec/28`).
+- LLM-enriched audits flow through `LLMBackend` and emit cost events with **a new `cost_source` value: `"audit"`** (a third value alongside `actor` and `judge` from `spec/28`). The audit self-event filter rule is precise: when reading the agent's JSONL log to populate the coverage table, the audit excludes events matching **either** `cost_source == "audit"` (audit's own LLM-cost events) **or** `event in {"audit_started", "audit_completed", "audit_failed", "audit_budget_exhausted"}` (audit lifecycle events). Both kinds are framework-generated by prior audit runs and would pollute the action-coverage analysis if counted. Pass `--include-audit-spend` to override the cost-event side of the filter (lifecycle events remain excluded; they aren't actor actions).
 - Audit-config lives in a new operator-managed `audits.md` file (per the "Audit config file" section below — this resolves the open question from RFC #116).
 - Audit cost exhaustion → audit completes in rule-engine-only mode, emits an `audit_budget_exhausted` event the doctor surfaces. The audit file is still produced (rule-engine coverage table without LLM recommendations).
 
@@ -438,6 +548,18 @@ This is **load-bearing migration discipline**, not just a new enum value. The im
 4. **Dashboard + doctor consumers updated** to surface audit spend as a separate column / metric. The dashboard's existing cost panel adds a third row for audit spend.
 
 Legacy cost events without `cost_source` continue to default to `actor` per spec/29's backward-compat rule. Existing actor/judge consumers continue to filter by their respective sources and are not polluted by audit events *after the migration step lands*. The migration is part of the audit's implementation PR; merging the spec doesn't change any existing cost arithmetic.
+
+### Implementation-PR dependency ordering
+
+Three specs propose changes to the same `_costs.sum_cost_for_period()` consumer:
+
+- **spec/28 impl PR** introduces the `source: Literal["actor","judge"] | None = None` filter parameter (the actor/judge ledger split)
+- **spec/29 impl PR** adds the `mandate_id: str | None = None` filter parameter (mandate ledger queries)
+- **spec/30 impl PR** (this spec) extends the `source` literal to `Literal["actor","judge","audit"]` (adds the audit ledger value)
+
+The audit's impl PR **depends on spec/28's impl PR landing first** — without spec/28's source filter, this spec's `source="audit"` filter has no parameter to extend. The audit's impl PR explicitly declares this dependency; the impl-issue tracking surface lists `depends on: <spec/28 impl PR>` so the order can't slip.
+
+Spec/29's `mandate_id` filter is orthogonal — it can land before or after the audit's impl PR without conflict, because it adds a new parameter rather than extending the literal type. The same `_costs.sum_cost_for_period()` consumer ends up with two independent filter parameters: `source` (three-valued literal) and `mandate_id` (string or None).
 
 ## Audit config file (`audits.md`)
 
@@ -480,13 +602,47 @@ The audit's gap analysis is calibrated by profile. An agent without `mandates.md
 
 | Profile | Means | Mandate-related gaps surfaced |
 |---|---|---|
-| `auto` (default) | Framework detects based on presence of judges.md, mandates.md, and recent action class distribution | Based on detection |
+| `auto` (default) | Framework detects via the deterministic algorithm below | Resolved to one of the named profiles |
 | `no-judge` | Agent has no judges.md (advisory tools.md only) | Mandate gaps not surfaced; tools.md gaps are |
 | `judge-only` | judges.md present, mandates.md not used | Mandate gaps not surfaced |
 | `mandate-aware` | judges.md + mandates.md both present | All gap types surfaced |
-| `external-action-heavy` | mandate-aware + tools have `expected_external_cost_usd` registrations | All gap types + external-cost coverage analysis |
+| `external-action-heavy` | mandate-aware + tools have `expected_external_cost_usd` registrations | All gap types + external-cost coverage analysis (see below) |
 
-A non-mandate agent gets a per-class judges.md coverage report without nagging about missing mandates. An mandate-aware agent gets the full report including mandate-usage and target-allowlist gaps.
+#### `auto` detection algorithm
+
+The framework resolves `auto` to a named profile via this deterministic precedence (config-shaped, not usage-shaped — operators reading their `audits.md` know which profile applies before any runs happen):
+
+```
+if any tool definition has expected_external_cost_usd OR cost_estimator registered:
+    → external-action-heavy
+elif mandates.md is present (with ≥1 mandate, including project-root mandates the agent inherits):
+    → mandate-aware
+elif judges.md is present:
+    → judge-only
+else:
+    → no-judge
+```
+
+This is **config-shaped**: profile reflects what the operator has configured, not what the agent happens to have run recently. An agent with `mandates.md` but only `read_only` runs in the window is still `mandate-aware` — the operator's intent is mandate-aware. The audit will note "no external_side_effect runs in this window" as a usage observation, but profile-gated gap analysis remains mandate-aware.
+
+The resolved profile is written into the audit's frontmatter `profile:` field so readers see exactly which gap-rules ran.
+
+#### Per-profile gap-analysis differences
+
+Profiles differ in **what gaps are surfaced**, not just "mandate visibility":
+
+| Gap type | `no-judge` | `judge-only` | `mandate-aware` | `external-action-heavy` |
+|---|---|---|---|---|
+| Missing class declaration in tools.md/mcp.md | ✅ surfaced | ✅ | ✅ | ✅ |
+| Missing per-class judge policy | — | ✅ | ✅ | ✅ |
+| Escalation drift signals (approval rate outside 60-95%) | — | ✅ | ✅ | ✅ |
+| Unused mandate (last_used > 30d) | — | — | ✅ | ✅ |
+| Mandate without allowed_targets but action target varies | — | — | ✅ | ✅ |
+| Mandate without budget caps | — | — | ✅ | ✅ |
+| Tool used in mandate's `allowed_tools` without `expected_external_cost_usd` registration | — | — | — | ✅ |
+| Action external cost > 50% of remaining mandate budget at decision time | — | — | — | ✅ |
+
+This makes profile-driven behavior auditable: an operator reviewing the audit's frontmatter `profile: mandate-aware` knows mandate gaps will surface; an operator with `profile: no-judge` knows the audit isn't going to complain about missing judge policy.
 
 ### `enabled: false` semantics
 
@@ -518,7 +674,7 @@ The audit run itself emits structured events (recursive but useful — the audit
 | `audit_failed` | `audit_id`, `reason`, `partial_output_path` if any |
 | `audit_budget_exhausted` | `audit_id`, `enrichment_dropped: true`, fell back to rule-engine output |
 
-These are written to the agent's standard JSONL log with `cost_source: "audit"` for any LLM cost. Project-level audit events are written to `<project>/audits/audit.jsonl` (a project-scoped log file separate from per-agent logs, because the audit operates over the whole project).
+These are written to the agent's standard JSONL log with `cost_source: "audit"` for any LLM cost. Project-level audit events have their own placement — see the "Project audit log placement" subsection below the design-rules table.
 
 ## Composition with eval framework (`spec/08`)
 
@@ -586,11 +742,24 @@ Future: PolicyBackend will define org-level policy templates and approval workfl
 
 ### Project audit log placement
 
-The spec earlier mentioned `<project>/audits/audit.jsonl` for project-level events. Refined per rule #5 discipline — events should extend the right audit shape, not invent parallel logs. Updated placement:
+Refined per rule #5 discipline — events extend the right audit shape, not invent parallel logs. Project-level audit events live alongside per-agent logs in the conventional `log/` path, just project-scoped:
 
 - Project-level audit emits the same `audit_started` / `audit_completed` / etc. event shapes as per-agent audits.
-- Project audit events live in `<project>/.judge-state/audit-events.jsonl` (framework-managed path; matches the convention for cross-agent framework state from spec/29's `.judge-state/mandates.json`). Dashboard readers and `LogBackend` (#61) consume these events through the same protocol as per-agent JSONL logs.
+- Project audit events live in `<project>/log/YYYY-MM/YYYY-MM-DD.jsonl` — mirroring the per-agent log shape (`<agent>/log/YYYY-MM/YYYY-MM-DD.jsonl`) at the project scope. This is symmetric with how per-agent audits emit events to per-agent logs. Dashboard readers and `LogBackend` (#61) consume both paths through the same protocol.
+- `.judge-state/` is reserved for *framework-managed lifecycle dedup state* (per spec/29's mandate state file) — small JSON snapshots, not append-only audit logs. Audit events are append-only by nature; they belong in `log/`, not `.judge-state/`.
+- Project-root path itself (`<project>/log/`) is created on first project audit run if it doesn't exist (mirrors how `<agent>/log/` is created on first agent run).
 - The future `LogBackend` (#61) abstracts both per-agent JSONL and project-level JSONL behind a single protocol; operators using a non-filesystem LogBackend get the same audit events through the same surface.
+
+### Project-root path discovery
+
+When invoked with `--project`, the audit discovers the project root via a precedence walk:
+
+1. `--project-root PATH` flag value if explicitly passed (highest precedence)
+2. `ATOMIC_AGENTS_PROJECT_ROOT` environment variable if set
+3. Walk up from current working directory until finding either `<dir>/.atomic-agents-project` sentinel file OR `<dir>/agents/` subdirectory (typical project layout per spec/06)
+4. If no project root found: refuse with an error explaining how to set `--project-root` or create a `.atomic-agents-project` sentinel
+
+The sentinel file's presence is the operator's explicit declaration "this is a project root." Walking up indefinitely without a clear signal would be too magic. The `.atomic-agents-project` sentinel is added as a new optional file in spec/06's project-anatomy section (filed as a follow-up doc-update issue, not bundled in this PR).
 
 ## Doctor integration (`spec/27`)
 
@@ -605,11 +774,35 @@ New checks added by this primitive:
 - `check_audit_legacy_unknown_high` — warns when an audit's `coverage_legacy_unknown_pct > 0.5` (more than half the coverage cells are "unknown (legacy)" — suggests the operator should schedule the framework's schema-extension upgrade)
 - `check_audit_disabled_with_external_actions` — fires ONLY when `audits.md` has `enabled: false` AND the agent has used external_side_effect or high_risk class actions in recent runs (informational: "you've turned off audits but your agent is taking actions where audit would help")
 
-### Stale-policy detection — `reviewed_at` over filesystem mtime
+### Stale-policy detection — mtime-with-caveat for v1
 
-`tools.md`, `judges.md`, and `mandates.md` may carry an optional top-of-file `reviewed_at: <ISO-8601>` frontmatter field that operators update when they intentionally review the file (even without editing it). The audit prefers `reviewed_at` over filesystem mtime when present.
+Filesystem mtime is unreliable across git checkout, file copy, sync (Obsidian / iCloud), and future non-filesystem backends — using it for staleness causes false alarms after every clone. **v1 of the audit uses mtime and explicitly annotates all stale-policy findings as `(mtime-based; advisory only)`.** Operators reading the audit see that staleness is a soft signal.
 
-Filesystem mtime is unreliable across git checkout, file copy, sync (Obsidian / iCloud), and future non-filesystem backends — using it alone for staleness causes false alarms after every clone. When `reviewed_at` is absent, the audit uses mtime but annotates the finding as `(mtime-based; consider adding reviewed_at frontmatter for accuracy)`.
+A future spec/03 extension to add an optional `reviewed_at: <ISO-8601>` frontmatter field to `tools.md` / `judges.md` / `mandates.md` is filed as a follow-up tracking issue alongside this spec's implementation issues. The audit's impl PR does **not** unilaterally extend other specs' file formats; instead, the impl PR ships mtime-only stale detection, and the `reviewed_at` enhancement lands as a separate spec/03 + spec/17 + spec/28 + spec/29 update once design coherence is reviewed at the file-formats level.
+
+This honest scope keeps the audit's impl PR self-contained: it touches only `audits.md` (new), audit output files, doctor checks, and the cost-event filter. It does NOT silently extend sibling specs.
+
+## Audit output file protection
+
+Audit output files at `<agent>/audits/responsibility-<date>.md` are **framework-authored** (the audit runtime writes them), not operator-authored. The WritePolicy default protection from spec/29 covers operator-authored config — it does not cover framework-authored artifacts.
+
+The audit's impl PR adds explicit protection for audit outputs:
+
+- `<agent>/audits/*.md` is on the WritePolicy denylist for custom tools, MCP tools, helpers, and delegates. A tool that attempts to write to this path is refused at the WritePolicy layer, same protection that operator-authored config files get.
+- The audit runtime itself bypasses this protection (it has special framework privilege to write under `audits/`).
+- **Re-running the audit on the same date**: the framework refuses to overwrite an existing `responsibility-<YYYY-MM-DD>.md`. If the operator wants a second audit on the same date, they pass `--output <path>` to write to a different filename (e.g., `responsibility-<date>-rerun.md`). This makes audit history append-only at the date granularity; operators can't lose a prior audit by accident.
+- Older audit files retain their original `generated_at` frontmatter; the most-recent-audit query uses the latest `generated_at` value, not the latest filename mtime.
+
+## Concurrent agent run + audit semantics
+
+An operator may run the audit DURING an agent run (the agent is mid-`call()`). This is supported but requires explicit semantics:
+
+- **Reading mid-write JSONL lines**: the audit's JSONL reader treats any trailing partial line (a line not terminated by `\n`) as "no content yet" and stops reading at that point. The agent's atomic-append-jsonl (per current `atomic_agents/agent.py`) guarantees per-line atomicity, so the audit either sees a complete line or no line — it never sees a half-written line as a parse error.
+- **Reading mid-cycle mandate reservations**: the audit may read a `mandate_reservation` event with no matching `_committed` / `_rolled_back` event because the action is still in flight. The audit's cumulative-budget computation treats outstanding-reservations-with-TTL-not-yet-expired as "uncommitted; projected" rather than "missing data." This matches the live MandateCheck reservation pattern from spec/29.
+- **Reading mid-cycle judgment events**: a judgment event is emitted *atomically* per spec/28; the audit either sees the event or doesn't. No partial-judgment reads.
+- **Eventual consistency**: cumulative figures reported by an audit run during an active agent run are accurate-as-of the audit's read time, plus or minus the in-flight reservations. Operators reading "in-flight: 2 reservations totaling $47.23" understand they're seeing a live snapshot.
+
+The audit does **not** acquire any locks on the agent's state files or logs. The reader is read-only; no write contention occurs. The audit's own output is the only write path, and it writes to its own date-named file.
 
 ## Backward compatibility
 
@@ -637,11 +830,10 @@ This spec describes the **what** and the **where**. It does not pin:
 
 These are below the threshold of needing resolution before implementation begins. Tentative answers captured here; the impl PR may revise either way.
 
-1. **Does audit config live in `judges.md`'s new `## Audit budget` section, or in a separate `audits.md` file?** Tentative: in `judges.md` for v1 (simpler; audit is conceptually coupled to the judge layer's data). If operators want richer audit config (per-class gap thresholds, custom recommendations, etc.) it can graduate to a separate file in a future minor.
-2. **Should the audit's first run produce a baseline gap list that subsequent audits compare against?** Tentative: yes, but not in v1. The "audit-over-time delta" feature is a separate enhancement; v1 produces standalone reports.
-3. **Should the audit attempt to detect agents that have been *active but never audited*?** Tentative: yes, via `check_responsibility_audit_age` in the doctor. The doctor warns when an active agent has no recent audit.
-4. **How should the audit handle agents whose tools have been removed from `tools.md` mid-window?** Tentative: include them in the historical coverage table for the window in which they were active; mark them with a `[removed]` annotation in the table.
-5. **Should the audit cross-reference `evals/` results?** Tentative: yes, lightly — if evals have run in the window, the audit notes their existence + most recent verdict. Not part of the gap analysis itself (eval failures are spec/08's surface; audit is authorization-coverage).
+1. **Should the audit's first run produce a baseline gap list that subsequent audits compare against?** Tentative: yes, but not in v1. The "audit-over-time delta" feature is a separate enhancement; v1 produces standalone reports.
+2. **Should the audit attempt to detect agents that have been *active but never audited*?** Tentative: yes, via `check_responsibility_audit_age` in the doctor. The doctor warns when an active agent has no recent audit.
+3. **How should the audit handle agents whose tools have been removed from `tools.md` mid-window?** Tentative: include them in the historical coverage table for the window in which they were active; mark them with a `[removed]` annotation in the table.
+4. **Should the audit cross-reference `evals/` results?** Tentative: yes, lightly — if evals have run in the window, the audit notes their existence + most recent verdict. Not part of the gap analysis itself (eval failures are spec/08's surface; audit is authorization-coverage; eval verdicts do not enter `gap_count` per §"Composition with eval framework").
 
 ## References
 
