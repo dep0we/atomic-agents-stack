@@ -65,11 +65,13 @@ Actor (LLM)                Framework            Judge (LLM | rules)            T
    │                                                                          
    │                          │◀── block(reason) ─────│   (no execution)
    │                                                                          
-   │                          │◀── revise(amended) ───│                          │
-   │                          │── re-validates amended:                          │
-   │                          │   schema, write paths,                           │
-   │                          │   class non-escalation,                          │
-   │                          │   second judgment ──────▶│                       │
+   │                          │◀── revise(amendment) ─│                          │
+   │                          │── applies amendment;                             │
+   │                          │   recomputes class +                             │
+   │                          │   hashes from new tool;                          │
+   │                          │   schema + write paths;                          │
+   │                          │   second judgment (same                          │
+   │                          │   ensemble) ──────────▶│                       │
    │                          │◀── allow (or block) ──│                          │
    │                          │── executes amended ───────────────────────────▶│
    │                                                                          
@@ -111,20 +113,72 @@ class ActionProposal:
     mcp_server: str | None                  # mcp server name if tool came from MCP, else None
 
     # Actor-supplied (via side-channel marker bound to this tool_call_id;
-    # required for side-effectful classes)
-    side_channel_for_tool_call_id: str      # MUST equal tool_call_id; binds the marker
-                                            # to a specific tool_use in the turn
-    reason: str                             # why the actor is proposing this
-    evidence: list[Evidence]                # supporting memory/conversation refs
-    authorization: Authorization            # who granted it, scope
-    expected_consequence: str               # plain language
-    reversibility: Reversibility            # reversible | reversible_with_artifact | irreversible
+    # required for side-effectful classes, optional for read-only)
+    side_channel_for_tool_call_id: str | None  # MUST equal tool_call_id if present
+    reason: str | None                      # why the actor is proposing this
+    evidence: list[Evidence]                # supporting memory/conversation refs (may be empty)
+    authorization: Authorization | None     # who granted it, scope
+    expected_consequence: str | None        # plain language
+    reversibility: Reversibility | None     # reversible | reversible_with_artifact | irreversible
     rollback_path: str | None               # how to undo, if reversible
     target_audience: str | None             # "internal" | "external:<surface>" — for privacy judges
 
     # Framework-set after assembly
     proposal_id: str                        # unique id; primary key for judgment events
     proposal_ts: str                        # ISO-8601
+
+
+@dataclass(frozen=True)
+class ProposalAmendment:
+    """What a judge returns on REVISE. Contains ONLY the fields the judge is
+    allowed to amend. The framework applies the amendment to the original
+    proposal and produces a new bound ActionProposal with framework-recomputed
+    classification + hashes + proposal_id + proposal_ts. The judge cannot
+    forge framework-managed fields."""
+    tool_name: str | None                   # may change tool (e.g., revise create_pr → create_draft_pr)
+    tool_arguments: dict[str, Any] | None   # may amend args (e.g., strip attachment)
+    target_audience: str | None             # may narrow audience
+    expected_consequence: str | None        # may refine description
+    reversibility: Reversibility | None     # may adjust reversibility claim
+    rollback_path: str | None               # may add rollback path
+    appended_evidence: list[Evidence]       # may add evidence; cannot replace
+    judge_note: str                         # why the amendment
+
+
+@dataclass(frozen=True)
+class JudgmentEvent:
+    """The audit-shape dataclass written to JSONL per judgment. NOT what the
+    judge returns (Judgment is). The framework wraps Judgment with the
+    runtime-only fields below (raw_outcome, enforcement_action, cost_source,
+    binding) before serializing."""
+    event: str                              # always "judgment"
+    run_id: str
+    parent_run_id: str
+    proposal_id: str
+    agent: str
+    judge_id: str
+    policy_version: str
+    proposal: ActionProposal
+    judgment: Judgment
+    raw_outcome: JudgmentOutcome            # what judge returned
+    enforcement_action: str                 # what framework did:
+                                            # "audit_bypass" | "block_executed" |
+                                            # "allow_executed" | "revise_executed" |
+                                            # "escalate_pending"
+    binding: ProposalBinding                # tool_call_id, tool_definition_hash, arguments_hash
+    latency_ms: int
+    cost_usd: float | None
+    cost_source: str                        # "judge"
+    ts: str
+```
+
+Field-presence rules for `ActionProposal`:
+
+| Classification | read_audit_mode | side-channel fields | Behavior on missing |
+|---|---|---|---|
+| `read_only` | `false` | Not required | Proposal not built; judge bypassed |
+| `read_only` | `true` | Not required | Minimal proposal built (introspected only); judge invoked for audit; outcome ignored for enforcement |
+| `reversible_write` / `external_side_effect` / `high_risk` | any | **Required** | Missing side-channel marker, mismatched `side_channel_for_tool_call_id`, or duplicate marker for same `tool_call_id` → `JudgeProposalInvalid` (failure_policy resolves; default `BLOCK`) |
 
 
 @dataclass(frozen=True)
@@ -149,12 +203,7 @@ class SkillRef:
     file_hash: str                          # sha256 of the skill file at load time
 ```
 
-For `read_only` actions, actor-supplied fields are not required:
-
-- When `read_audit_mode: false` (default): the framework bypasses the judge entirely for read-only actions; no proposal is assembled.
-- When `read_audit_mode: true`: the framework assembles a *minimal* proposal containing only the introspected fields (no actor side-channel) and invokes the judge for audit. The judge's outcome is recorded in the JSONL event with `enforcement_action: "audit_bypass"`; the read executes regardless of the judge's verdict.
-
-For all other classes, missing side-channel fields, side-channel markers whose `side_channel_for_tool_call_id` does not match an emitted `tool_use.id`, duplicate side-channel markers for the same tool_call_id, or side-channels reused across multiple tool calls all default the judgment to `BLOCK` with reason `proposal_incomplete` or `side_channel_mismatch` — the actor must declare intent **per tool call**.
+Field-presence rules are summarized in the table above. The narrative: for `read_only` actions, actor-supplied fields are optional (set to `None`). For all other classes, the actor must declare intent **per tool call** via a side-channel marker; missing or misbound markers raise `JudgeProposalInvalid`.
 
 ### Proposal binding (TOCTOU defense)
 
@@ -193,7 +242,7 @@ class JudgmentOutcome(StrEnum):
 class Judgment:
     outcome: JudgmentOutcome
     reason: str
-    amended_proposal: ActionProposal | None  # set on REVISE; must satisfy revise constraints
+    amendment: ProposalAmendment | None      # set on REVISE; framework applies it
     escalation_queue_id: str | None          # set on ESCALATE
     judge_id: str
     policy_version: str                      # sha256 of tools.md + judges.md at decision time
@@ -201,6 +250,8 @@ class Judgment:
     latency_ms: int
     cost_usd: float | None
 ```
+
+Note: `Judgment` is what the **backend returns**. The framework wraps it in a `JudgmentEvent` (defined above) for audit. `enforcement_action`, `raw_outcome`, `cost_source`, and `binding` are framework-set fields on `JudgmentEvent`, not on `Judgment` — the judge does not get to influence how its decision was enforced.
 
 ### Allow
 
@@ -214,13 +265,13 @@ Refuse the action. The actor receives the reason via tool_result; the multi-turn
 
 ### Revise
 
-The judge returns an amended proposal (the `tool_name`, `tool_arguments`, `target_audience`, `expected_consequence`, `rollback_path`, and `reversibility` fields may differ from the original; **`classification` is never set by the judge** — see below). The amended proposal **must** satisfy:
+The judge returns a `ProposalAmendment` (the small dataclass defined above containing only judge-amendable fields). The framework applies the amendment to the original proposal:
 
-1. **Framework-recomputed classification**: the framework recomputes `classification` for the amended proposal from the amended `tool_name` + `tools.md` / `mcp.md`. The judge cannot downgrade `classification` to escape stricter per-class policy. If the recomputed class is *higher* than the original (e.g., revising a `reversible_write` into a tool registered as `high_risk`), the amended proposal must also satisfy the stricter class's policy.
-2. **Schema validation**: amended `tool_arguments` validates against the (possibly new) tool's registered JSON schema.
-3. **Policy re-check**: amended args still pass `tools.md` write-path enforcement and any rule-engine specialist judges.
-4. **Preserved actor fields**: `reason`, `evidence`, `authorization` are preserved from the original; the judge may *append* to evidence but not rewrite or replace the actor's reason and authorization.
-5. **Second judgment**: the amended proposal passes through a fresh judgment cycle (typically the same backend, possibly a different specialist) before execution. The second judgment must return `ALLOW`; `REVISE` on a revised proposal returns `BLOCK` with reason `revise_loop_exhausted` (no infinite revise loops). `max_revise_iterations` is bounded at 1 by spec.
+1. **Framework recomputation**: framework constructs a new `ActionProposal` by merging the original with the amendment. `tool_name`, `tool_arguments`, `target_audience`, `expected_consequence`, `reversibility`, `rollback_path` come from the amendment (when present) or the original (when amendment fields are `None`). `evidence` is the original's `evidence + amendment.appended_evidence`. `reason` and `authorization` are taken **from the original** — the judge cannot rewrite them. `classification` is recomputed by the framework from the new `tool_name` against `tools.md` / `mcp.md`. New `tool_definition_hash`, `arguments_hash`, `proposal_id`, and `proposal_ts` are framework-set.
+2. **Class non-downgrade by exploit**: because the framework recomputes classification from the (potentially new) tool, the judge cannot bypass class policy by editing the classification field — it doesn't have access to that field. If the new tool is registered at a higher class, the stricter class's policy applies to the second judgment.
+3. **Schema validation**: amended `tool_arguments` validates against the (possibly new) tool's registered JSON schema.
+4. **Policy re-check**: amended args still pass `tools.md` write-path enforcement.
+5. **Second judgment — deterministic ensemble selection**: the amended proposal passes through a fresh judgment cycle using the **identical ensemble configuration** as the original proposal — same backends in the same order, same `JudgePolicyContext` (except for the amended-proposal-derived fields), against the framework-recomputed amended proposal. This makes revise paths reproducible: given the same original proposal and the same amendment, the second judgment is deterministic. The second judgment must return `ALLOW`; if it returns `REVISE` again, the framework returns `BLOCK` with reason `revise_loop_exhausted` (no infinite revise loops). `max_revise_iterations` is bounded at 1 by spec.
 
 The framework records both the original and the amended proposal in the judgment event. Operators can audit what the judge changed.
 
@@ -233,6 +284,62 @@ Revise is the empirically most-useful outcome for production failure modes that 
 ### Escalate
 
 Pause the action. The framework writes a **PENDING** escalation record to `vault/escalations/<class>/<proposal_id>.md` containing the full proposal and the judge's reason. The actor's run returns with `Response.deferred=True` and the escalation_queue_id. Subsequent operator resolution writes a **RESOLVED** event linked to the PENDING record (escalation is modeled as a state machine, not a single verdict).
+
+#### Escalation file format
+
+```markdown
+---
+type: escalation
+state: pending | resolved | redacted
+proposal_id: proposal_20260512T143052_xyz98765
+parent_run_id: agent_20260512T143050_def67890
+agent: caldwell
+action_class: high_risk
+judge_id: default-llm
+escalated_at: 2026-05-12T14:30:52Z
+policy_version: tools.md@sha256:...+judges.md@sha256:...
+schema_version: 1
+---
+
+## Proposal
+
+<JudgmentEvent.proposal serialized as a fenced ```yaml block>
+
+## Judge's reason for escalating
+
+<Judgment.reason — free prose>
+
+## Resolution
+
+<Empty when state=pending. Operator writes one of the resolution blocks below.>
+
+### Approved by <operator>
+resolved_at: <ISO-8601>
+re_judged: false
+note: <free prose>
+
+### Denied by <operator>
+resolved_at: <ISO-8601>
+note: <free prose>
+
+### Revised by <operator>
+resolved_at: <ISO-8601>
+re_judged: <true | false — true for high_risk, false otherwise>
+amendment: <ProposalAmendment serialized as fenced ```yaml block>
+note: <free prose>
+
+### Redacted by <operator>
+redacted_at: <ISO-8601>
+redaction_reason: <free prose>
+```
+
+#### Resolution conflict rule
+
+The framework writes PENDING; the operator (or an authorized service) writes a resolution block by editing the file. The framework reads files in `vault/escalations/<class>/` once per resolution-poll cycle (configurable; default 60s) and emits RESOLVED events for any file whose `state` field transitioned from `pending` to one of `resolved` / `redacted`.
+
+If two resolution blocks are present, the *first* one (top-down in file order) wins; the file's `state` field is the authoritative state. Operators editing concurrently are responsible for not stomping each other; the framework does not attempt to merge conflicting resolutions. The doctor (`spec/27`) gains `check_escalation_conflicts` to surface files with multiple resolution blocks.
+
+Redacted files keep their frontmatter but the body is replaced with the `redaction_reason`. The RESOLVED event records the redaction; the original proposal is preserved in the JSONL audit trail.
 
 Resolution paths:
 
@@ -336,7 +443,7 @@ read_file: read_only
 create_pull_request: high_risk
 ```
 
-The judge's `JudgmentContext` includes `mcp_server`, so MCP-aware specialist judges can apply server-specific policies (e.g., GitHub PRs to `main` always escalate, regardless of class).
+The proposal's `mcp_server` field (visible to the judge via `ActionProposal`, mirrored into `JudgePolicyContext` if specialist judges need fast access) lets MCP-aware specialist judges apply server-specific policies (e.g., GitHub PRs to `main` always escalate, regardless of class).
 
 Read-only MCP tools (`search`, `read_*`, `list_*`) are the common case where defaulting to `external_side_effect` creates noise. The expected operator workflow: run with the default once, observe which MCP tools triggered the judge, declare overrides in `mcp.md` to mark them `read_only`. The doctor (`spec/27`) gains a `check_mcp_tool_classification` check that flags tools without explicit classification after first use.
 
@@ -519,7 +626,7 @@ class LLMJudgeBackend:
         llm: LLMBackend,
         policy_source: Path,                # path to judges.md
         tools_source: Path,                 # path to tools.md
-        model_id: str = "gpt-5-haiku",      # OpenAI by default; see "Default judge model" below
+        model_id: str = "gpt-5-nano",       # OpenAI by default; see "Default judge model" below
         timeout_ms: int = 5000,
         max_revise_iterations: int = 1,
     ): ...
@@ -529,7 +636,7 @@ class LLMJudgeBackend:
 
 ### Default judge model
 
-The framework's default *actor* is Anthropic (Sonnet 4.6 in `atomic_agents/_model.py`). The correlated-judgment mitigation requires the default *judge* to be a different model family to avoid actor and judge sharing biases. So the default judge backend pairs with an **OpenAI** model (cheapest tier that maintains judge quality in the eval suite — `gpt-5-haiku` at time of writing).
+The framework's default *actor* is Anthropic (Sonnet 4.6 in `atomic_agents/_model.py`). The correlated-judgment mitigation requires the default *judge* to be a different model family to avoid actor and judge sharing biases. So the default judge backend pairs with an **OpenAI** model. The cheapest tier currently in the cost table at `atomic_agents/_costs.py` is `gpt-5-nano`, used as the default here. The implementation PR validates the choice against eval-suite quality before locking; if a smaller / cheaper tier is added to the pricing table later, the default may move.
 
 Operators in Claude-only deployments (no OPENAI_API_KEY configured) can:
 
@@ -682,14 +789,31 @@ read_audit_mode: false
 ### Parser rules
 
 - Section headings (`## <name>`) are recognized as listed. Unknown headings are skipped with a `doctor` warning.
-- Required sections: `Default judge`, `Class policy`. Missing required section → `JudgePolicyInvalid`.
+- Required sections: `Default judge`. **`Class policy`** is *recommended* but not strictly required — when absent or partial, the framework fills missing keys from the per-class default table below (the table in the Action classification section above). When present, only listed keys are honored; unlisted keys still get default-fill.
+- **`Class policy` default-fill**: `read_only: bypass`, `reversible_write: allow_with_audit`, `external_side_effect: judge_required`, `high_risk: escalate`. These defaults are conservative — partial `judges.md` does not over-block and does not silently allow.
 - Values within sections are parsed as YAML. Invalid YAML → `JudgePolicyInvalid`.
 - Class policy values are an enum: `bypass | allow_with_audit | judge_required | escalate`. Unknown value → `JudgePolicyInvalid`.
-- Specialist composition is optional. Absent section → default catch-all LLM judge.
-- Failure policy section is optional. Absent → all exceptions default to `block` (fail-closed).
+- Specialist composition is optional. Absent section → composition is implicit `[PolicyJudge, LLMCatchAll]` (PolicyJudge always-on baseline + the LLM catch-all configured under `## Default judge`). The catch-all is not "alone" — PolicyJudge always runs first.
+- Failure policy section is optional. **`Failure policy` default-fill**: any unlisted exception type defaults to `block` (fail-closed). Partial coverage is allowed; missing keys get the safe default.
 - Per-tool overrides (rare, advanced) live in `tools.md`'s per-tool sections, not in `judges.md`.
 
 Pure-YAML config files are refused per rule #7. Embedded YAML inside markdown is acceptable for structured fields. Markdown sections carry the same aesthetic as `tools.md` and `model.md`.
+
+### `ClassPolicySnapshot`
+
+The parsed-and-defaulted class policy is exposed to the judge as `ClassPolicySnapshot` in `JudgePolicyContext`:
+
+```python
+@dataclass(frozen=True)
+class ClassPolicySnapshot:
+    read_only: ClassPolicyValue            # bypass | allow_with_audit | judge_required | escalate
+    reversible_write: ClassPolicyValue
+    external_side_effect: ClassPolicyValue
+    high_risk: ClassPolicyValue
+    source: dict[str, str]                 # per-class: "judges.md" | "project_floor" | "default"
+```
+
+The `source` field tells the judge which policy layer set each class — useful for explaining decisions in `Judgment.reason` ("blocked because high_risk → escalate, inherited from project floor").
 
 ## Cost treatment
 
@@ -697,6 +821,7 @@ Per rule #4, every code path that calls an LLM has a cost gate. The judge is no 
 
 - Judge calls flow through `_check_cost_guardrails` like any other LLM call, but against a **separate ledger**.
 - Each cost event written to the JSONL log carries `cost_source: "actor" | "judge"`. The existing `_costs.sum_cost_for_period()` is updated by the implementation PR to take a `source` filter so the actor budget cap and the judge budget cap are summed independently. This is the load-bearing change that makes "judge spend not subtracted from actor budget" actually true — without it, judge cost events would pollute the actor cost stream silently.
+- **Legacy cost events (records without `cost_source`) count as `actor`.** Existing deployments upgraded to a judge-aware framework see no change in actor-budget arithmetic. Only judgment events emitted by the new code carry `cost_source: "judge"`. The implementation PR adds the field to the cost-event dataclass with `Literal["actor", "judge"] = "actor"` as the default for safe backward-compatible parsing.
 - `judges.md` declares the judge budget (`daily_usd`, `monthly_usd`) — judge spend is summed against this ledger only.
 - **`critical=True` does not bypass the judge.** Critical actions are eligible for `ALLOW` from the judge but the judge **always runs**. The audit trail is the point, and critical actions are exactly the ones that most need recording. This resolves the cost/critical tension explicitly: cost cap on the *actor* may be overridden by `critical=True`; cost cap on the *judge* cannot — it raises `JudgeBudgetExhausted` which the `failure_policy` resolves (default block).
 - Specialist composition multiplies cost — operators see the multiplication in the dashboard before opting in.
@@ -705,7 +830,7 @@ The discipline: judgment is expensive; the cost is the price of the safety prope
 
 ## Audit shape
 
-Each judgment writes a JSONL line to the run log, carrying `parent_run_id` linking back to the actor's run. The current filesystem behavior:
+Each judgment writes a JSONL line to the run log, carrying `parent_run_id` linking back to the actor's run. The JSONL shape is the `JudgmentEvent` dataclass defined above, serialized via the framework's existing JSONL writer. Filesystem-default behavior proposed by this spec:
 
 ```json
 {
@@ -841,7 +966,7 @@ These are *genuinely* below the threshold of needing resolution before implement
 - `docs/spec/17-tools.md` (tools.md policy; action classification source)
 - `docs/spec/19-mcp.md` (mcp.md; `default_action_class` field; MCP tool classification)
 - `docs/spec/20-memory-backend.md` (Protocol pattern template; mirrored for JudgeBackend)
-- `docs/spec/27-doctor.md` (extends with `check_judge_health`, `check_judge_policy_sync`, `check_mcp_tool_classification`)
+- `docs/spec/27-doctor.md` (extends with `check_judge_health`, `check_judge_policy_sync`, `check_judge_policy_floor`, `check_mcp_tool_classification`, `check_escalation_conflicts`, and the `vault_synced_judge_captures_off` warning)
 - #87 LLMBackend (judge calls flow through this)
 - #89 PolicyBackend (org-scale policy; composes with judges)
 - #61 LogBackend (judgment events; same protocol)
