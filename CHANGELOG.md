@@ -51,9 +51,10 @@ CHANGELOG entry.
 
 ### Changed
 
-- **README rewritten for the public flip.** Framework-first positioning replaces the prior feature-list opener. New tagline lands as the hero (*"AI agents that live in your folder, not someone else's database"* / *"Vault-native, MIT-licensed, runs anywhere markdown does"*). New comparison matrix names Letta / Mem0, hosted-agent harnesses, LangChain / LangGraph, and direct-SDK as honest contrast points (where they win, where Atomic Agents wins). Backend-protocol scaling roadmap surfaced as its own section. 6 deployment runbooks linked. Spec count corrected (13 → 21). Caldwell appears only as one sample among future samples, not as the headline.
+- **README rewritten for the public flip.** Framework-first positioning replaces the prior feature-list opener. New tagline lands as the hero — *"AI agents that live in your folder, not someone else's database"* with subtitle *"Vault-native, MIT-licensed, Markdown-source-of-truth."* New `Why this exists` opener names "agent state ends up in app databases / vector stores / hosted trace systems / bespoke glue code" as the precise enemy rather than naming specific competitors as universally hosted. New `Current limits` section makes the alpha / single-maintainer / macOS-Linux-primary / only-MemoryBackend-shipped / log-only-alerts state explicit before the comparison matrix. New honest comparison matrix names Letta, Mem0, LangGraph + LangSmith, and direct-SDK with narrower defensible claims (Markdown-source-of-truth, no required server, spec-level file layout) — and a `Where the alternatives win` paragraph names where each does better than Atomic Agents. Backend-protocol scaling section now labels org-scale-over-Postgres as `v1 direction` rather than implying shipped today. 6 deployment runbooks linked. Spec count corrected (13 → 21). Caldwell description sharpened to surface the 5 days of real JSONL logs, the helper-pattern day with ~76% cost savings, and the evals across happy/edge/adversarial/decline categories. Caldwell appears as one sample among future samples, not as the headline.
 - **README badge URLs corrected** from `github.com/user/*` (broken) to `github.com/dep0we/*`. Version badge added.
 - **README default `ATOMIC_AGENTS_ROOT` corrected** from `~/agents/agents` (duplicated path, typo) to `~/docs/agents` per `atomic_agents/_platform.py:DEFAULT_AGENTS_ROOT`.
+- **README "spec docs are not aspirational" softened** to "spec docs separate shipped behavior from explicit future/deferred boundaries" — closer to ground truth (some spec sections mark future work explicitly).
 - **Status section** updated v0.10 → v0.11.0; protocol-pattern v1.0 expectation named.
 
 ### Added
@@ -63,6 +64,14 @@ CHANGELOG entry.
 - **`SECURITY.md`** — 90-day disclosure window, in-scope vs documented-honest-limitations (best-effort path-traversal check in MCP args, advisory-only cost guardrails without the shared helper, plain-markdown-no-encryption-at-rest), operator hygiene checklist.
 - **`.github/ISSUE_TEMPLATE/{bug,feature,question}.md`** — structured templates matching the project's existing issue conventions (title prefixes, env/repro/scope sections).
 - **`.github/pull_request_template.md`** — mirrors the project's existing PR shape (Summary / Why / Test plan / Design alignment self-check against the 14 CLAUDE.md design rules).
+
+### Fixed
+
+- **`LICENSE` copyright line** flipped from `Copyright (c) 2026 Dan Powers` to `Copyright (c) 2026 atomic-agents-stack contributors`. Matches the `pyproject.toml` author field from the personal-references scrub (issue #77 / PR #92). The Codex adversarial review of the launch README flagged the inconsistency between LICENSE and `pyproject.toml` as small but visible drift — the only place the maintainer name still surfaced after the scrub.
+
+### Process notes (operator-visible context, not behavior changes)
+
+- **Codex adversarial review run against the launch README before the public flip** (see [`feedback_codex_reviews_mandatory.md`](https://github.com/dep0we/atomic-agents-stack/issues) operator memory). Six findings caught and applied: factual errors in the comparison matrix (Letta has self-hosted Docker; Mem0 OSS exists; LangGraph has filesystem-backed memory via Deep Agents and LangSmith for observability — original matrix overclaimed all four), `runs anywhere markdown does` softened to `Markdown-source-of-truth` because `atomic_agents/_locks.py` imports POSIX `fcntl` unconditionally, `spec docs are not aspirational` softened to `separate shipped behavior from explicit future/deferred boundaries`, dangling "Your first agent below" reference removed, and the LICENSE consistency fix above. Recommendation: Revise before public flip — adopted.
 
 ### Planned (issue filed, implementation pending)
 
