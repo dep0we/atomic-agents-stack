@@ -110,7 +110,10 @@ class ActionProposal:
     loaded_skills: list[SkillRef]           # skills active when the proposal was made
     mcp_server: str | None                  # mcp server name if tool came from MCP, else None
 
-    # Actor-supplied (via side-channel marker; required for side-effectful classes)
+    # Actor-supplied (via side-channel marker bound to this tool_call_id;
+    # required for side-effectful classes)
+    side_channel_for_tool_call_id: str      # MUST equal tool_call_id; binds the marker
+                                            # to a specific tool_use in the turn
     reason: str                             # why the actor is proposing this
     evidence: list[Evidence]                # supporting memory/conversation refs
     authorization: Authorization            # who granted it, scope
@@ -146,11 +149,33 @@ class SkillRef:
     file_hash: str                          # sha256 of the skill file at load time
 ```
 
-For `read_only` actions, actor-supplied fields are not required (the judge bypasses by default; see Action classification). For all other classes, missing side-channel fields default the judgment to `BLOCK` with reason `proposal_incomplete` — the actor must declare intent to act.
+For `read_only` actions, actor-supplied fields are not required:
+
+- When `read_audit_mode: false` (default): the framework bypasses the judge entirely for read-only actions; no proposal is assembled.
+- When `read_audit_mode: true`: the framework assembles a *minimal* proposal containing only the introspected fields (no actor side-channel) and invokes the judge for audit. The judge's outcome is recorded in the JSONL event with `enforcement_action: "audit_bypass"`; the read executes regardless of the judge's verdict.
+
+For all other classes, missing side-channel fields, side-channel markers whose `side_channel_for_tool_call_id` does not match an emitted `tool_use.id`, duplicate side-channel markers for the same tool_call_id, or side-channels reused across multiple tool calls all default the judgment to `BLOCK` with reason `proposal_incomplete` or `side_channel_mismatch` — the actor must declare intent **per tool call**.
 
 ### Proposal binding (TOCTOU defense)
 
 The framework binds the proposal to the exact tool call via `tool_call_id`, `tool_definition_hash`, and `arguments_hash`. When the judge returns `ALLOW`, the framework executes the **bound** arguments — not arguments the actor might emit in a follow-up turn, not arguments mutated by another handler. If the tool definition has changed between proposal and execution (rare, but possible during hot-reload), the framework re-runs the judge against the new definition.
+
+#### What the hashes cover
+
+The current framework does **not** have a canonical-JSON hasher. The implementation PR adds a small `atomic_agents/_canonical.py` helper used uniformly across the judge layer.
+
+**`arguments_hash`** = `sha256(canonical_json(parsed_tool_arguments))`, where:
+
+- `parsed_tool_arguments` is the result of provider-specific argument parsing (Anthropic: `ToolUseBlock.input` dict directly; OpenAI: `json.loads(tool_call.function.arguments)` with the existing malformed-JSON-→-{} fallback per `_llm.py`)
+- `canonical_json` uses `json.dumps(..., sort_keys=True, separators=(",", ":"), ensure_ascii=False)`
+- If parsing fails, the framework raises `JudgeProposalInvalid` *before* invoking the judge — no judgment is rendered on an unparseable proposal
+
+**`tool_definition_hash`** = `sha256(canonical_json({...}))`, where the canonical payload is:
+
+- For custom tools: `{"kind": "custom", "name": tool_name, "input_schema": <schema>, "handler_module": <module_path>, "handler_qualname": <qualname>}` — the handler's module + qualname names *who* will execute, not the bytecode (handler updates are framework-version events, recorded by `tool_definition_hash` change at the registry layer)
+- For MCP tools: `{"kind": "mcp", "server": mcp_server, "name": tool_name, "input_schema": <schema>, "server_version": <version_string_if_advertised>}`
+
+Hashes are stable across framework restarts on the same code revision and change deterministically when the relevant inputs change. The conformance suite asserts this for both shapes.
 
 This closes the proposal/execution mismatch failure mode: judge approves args X, runtime executes args Y. The hashes are recorded in the judgment event for audit.
 
@@ -189,13 +214,13 @@ Refuse the action. The actor receives the reason via tool_result; the multi-turn
 
 ### Revise
 
-The judge returns an amended proposal. The amended proposal **must** satisfy:
+The judge returns an amended proposal (the `tool_name`, `tool_arguments`, `target_audience`, `expected_consequence`, `rollback_path`, and `reversibility` fields may differ from the original; **`classification` is never set by the judge** — see below). The amended proposal **must** satisfy:
 
-1. **Schema validation**: amended `tool_arguments` validates against the tool's registered JSON schema.
-2. **Policy re-check**: amended args still pass `tools.md` write-path enforcement and any rule-engine specialist judges.
-3. **Class non-escalation**: amended `classification` is `<=` the original (an `external_side_effect` proposal cannot be revised into a `high_risk` action).
-4. **Preserved actor fields**: `reason`, `evidence`, `authorization` are preserved from the original; the judge may add to them but not rewrite.
-5. **Second judgment**: the amended proposal passes through a fresh judgment cycle (typically the same backend, possibly a different specialist) before execution. The second judgment must return `ALLOW`; `REVISE` on a revised proposal returns `BLOCK` (no infinite revise loops).
+1. **Framework-recomputed classification**: the framework recomputes `classification` for the amended proposal from the amended `tool_name` + `tools.md` / `mcp.md`. The judge cannot downgrade `classification` to escape stricter per-class policy. If the recomputed class is *higher* than the original (e.g., revising a `reversible_write` into a tool registered as `high_risk`), the amended proposal must also satisfy the stricter class's policy.
+2. **Schema validation**: amended `tool_arguments` validates against the (possibly new) tool's registered JSON schema.
+3. **Policy re-check**: amended args still pass `tools.md` write-path enforcement and any rule-engine specialist judges.
+4. **Preserved actor fields**: `reason`, `evidence`, `authorization` are preserved from the original; the judge may *append* to evidence but not rewrite or replace the actor's reason and authorization.
+5. **Second judgment**: the amended proposal passes through a fresh judgment cycle (typically the same backend, possibly a different specialist) before execution. The second judgment must return `ALLOW`; `REVISE` on a revised proposal returns `BLOCK` with reason `revise_loop_exhausted` (no infinite revise loops). `max_revise_iterations` is bounded at 1 by spec.
 
 The framework records both the original and the amended proposal in the judgment event. Operators can audit what the judge changed.
 
@@ -213,7 +238,7 @@ Resolution paths:
 
 - **Operator approves** → framework executes the bound action; RESOLVED event records `approved` outcome
 - **Operator blocks** → no execution; RESOLVED event records `denied` outcome
-- **Operator revises** → operator supplies amended proposal; framework executes amended; RESOLVED event records `revised` outcome
+- **Operator revises** → operator supplies amended proposal; framework **always re-validates** the amended proposal (schema, policy, classification recompute, write-path enforcement). For `high_risk` actions, framework also **re-judges** the amended proposal through a fresh judgment cycle (operator revisions on high-risk actions are not a judge override; they are an operator hint that gets validated). For non-`high_risk` actions, schema/policy validation alone is sufficient. RESOLVED event records `revised` outcome with `re_judged: true | false` field.
 - **Auto-decide timeout** → after `auto_decide_after` (per `judges.md`), framework applies the `fallback` policy (default `block` for `high_risk`, configurable per class)
 
 The escalation queue is append-only at the framework level. Operators may resolve a PENDING by writing a RESOLVED event; they cannot delete a PENDING record without leaving a `redacted` marker (mirrors `spec/03` version redaction semantics).
@@ -254,18 +279,38 @@ agent.call() multi-turn loop:
 
 Default: the judge does **not** gate `atomic_capture`. Memory writes remain governed by existing capture rules (`spec/05`) and write-path enforcement.
 
-Opt-in: operators may set `judge_captures: true` in `judges.md` to route `atomic_capture` markers through the judge. This is intended for privacy-sensitive vaults where the operator wants pre-write validation that the captured content does not include credentials, PII, or content sourced from `read_only` paths that should not propagate to memory. The proposal classification for captures is always `reversible_write` (the memory layer supports `restore_version`); the proposal's `tool_name` is `atomic_capture` and `tool_arguments` is the capture marker payload.
+**Synced-vault caveat**: a vault synchronized across hosts (Obsidian Sync, iCloud, syncthing) turns memory writes into a *cross-runtime* surface — what one agent writes locally propagates to other devices and may become instruction input for other agents reading the same vault. This blurs the "internal-only" boundary.
+
+For synced vaults, the recommendation is **`judge_captures: true`** even though the default is false. The framework cannot reliably detect "is this vault synced?" — Obsidian Sync state lives in Obsidian, iCloud sync lives in macOS, etc. — so it doesn't flip the default automatically. Instead:
+
+- The doctor (`spec/27`) checks for common sync indicators (`.obsidian-sync/`, iCloud path prefix, `.stignore` for syncthing) and emits a `vault_synced_judge_captures_off` warning when judge is enabled, sync is detected, and `judge_captures: false`.
+- The configuration wizard (#94, planned) defaults `judge_captures: true` when it detects a synced vault during operator setup.
+
+Opt-in: operators set `judge_captures: true` in `judges.md` to route `atomic_capture` markers through the judge. The proposal classification for captures is always `reversible_write` (the memory layer supports `restore_version`); the proposal's `tool_name` is `atomic_capture` and `tool_arguments` is the capture marker payload.
 
 ## Delegation interaction (`spec/15`)
 
-Atomic Agents delegation is one-level (coordinator → specialist; specialists do not delegate further). The judge layer respects this boundary:
+Atomic Agents delegation is one-level (coordinator → specialist; specialists do not delegate further). The judge layer respects this boundary while closing the "delegate without `judges.md` escapes coordinator policy" hole that strict tool non-inheritance would otherwise leave open.
 
-- **Each agent has its own `judges.md`**. A coordinator's judge does not implicitly run against a delegate's actions. This matches the one-level principle and the `tools.md` non-inheritance rule from `spec/15`.
-- **`delegate_chain` is recorded** in every proposal. The coordinator's run_id appears in the delegate's proposal `delegate_chain` field; the judge can read it to make policy decisions ("delegate of coordinator X is allowed to send emails; delegate of coordinator Y is not").
-- **Authorization can flow**. A delegate's `authorization.granted_by` may be `"delegated_from:<coordinator_agent>"` with `scope` describing what the coordinator authorized. The delegate's judge inspects authorization shape as it would for any source.
+### Policy resolution
+
+A delegate's effective policy is the **union** of:
+
+1. **Project-root floor** (`<project>/judges.md` at the multi-agent project root per `spec/06`, if present) — sets minimum class policy and required failure_policy. The project floor **cannot be relaxed** by a delegate's own `judges.md`; per-class policies in the delegate's file may only be *stricter* (`escalate` is stricter than `judge_required`; `judge_required` is stricter than `allow_with_audit`; etc.). Attempts to relax → `JudgePolicyInvalid` at load time.
+2. **Delegate's own `judges.md`** — may add stricter class policy, add specialist composition, narrow the budget, change destination, override per-class fallbacks (but only toward stricter).
+3. **Coordinator-imposed scope** carried via `authorization.granted_by = "delegated_from:<coordinator>"` — the delegate's judge sees this and may apply additional constraints derived from the coordinator's intent.
+
+If neither a project-root `judges.md` nor a delegate `judges.md` is present, the delegate's judge layer is **bypassed** (judges.md is opt-in per rule #14). A coordinator that needs to enforce policy on delegates must drop a `judges.md` at the project root.
+
+The framework's load-time validation checks that no delegate's `judges.md` relaxes the project floor and raises `JudgePolicyInvalid` (which the failure_policy resolves — default block at first call) if it does. The doctor (`spec/27`) gains `check_judge_policy_floor` to surface drift before runtime.
+
+### Other delegation rules
+
+- **`delegate_chain` is recorded** in every proposal. The coordinator's run_id appears in the delegate's proposal `delegate_chain` field; the judge can read it to make policy decisions.
+- **Authorization flows by reference, not transitively**. A delegate's `authorization.granted_by` may be `"delegated_from:<coordinator>"`; the delegate's judge inspects shape and scope as it would for any authorization.
 - **Escalations bubble**. A PENDING escalation in a delegate's vault triggers an `escalation_propagated` event in the coordinator's run record so coordinator-level dashboards see fleet-wide pending escalations.
 
-Operators who want a single judge policy across coordinator + delegates can put a shared `judges.md` in the project root and symlink (per `spec/06` multi-agent project patterns). The framework reads `judges.md` from the agent's own directory; symlinks resolve normally.
+The framework reads `judges.md` from the agent's own directory first, then walks upward to find a project-root `judges.md`. Symlinks resolve normally.
 
 ## MCP tool classification (`spec/19`)
 
@@ -334,28 +379,70 @@ class JudgeBackend(Protocol):
     def close(self) -> None: ...
 ```
 
-`JudgmentContext` is a runtime-assembly digest (per `spec/04`) scoped to the judge:
+`JudgmentContext` is a runtime-assembly digest (per `spec/04`) scoped to the judge. Crucially it is split into **policy-context** (what the judge is allowed to see and prompt against) and **runtime-config** (what the framework uses for enforcement; never shown to the judge):
 
 ```python
 @dataclass(frozen=True)
-class JudgmentContext:
+class JudgePolicyContext:
+    """What the judge sees. Includes only policy + agent context, not
+    operational config about the judge itself."""
     agent_name: str
     persona_digest: PersonaDigest         # IDENTITY + SOUL + USER excerpt
     tools_md_entry: ToolPolicyEntry        # the tool's tools.md section
-    judges_md: JudgesConfig                # parsed judges.md
+    class_policy: ClassPolicySnapshot      # the per-class rules from judges.md
+    specialist_axis: str | None            # which axis this judge is responsible for (if specialist)
     recent_runs: list[RunSummary]          # last N runs of this agent
     cited_notes: list[Note]                # the evidence the actor cited
     delegate_chain: list[str]              # mirror of proposal.delegate_chain
     loaded_skills: list[SkillRef]          # mirror of proposal.loaded_skills
+
+
+@dataclass(frozen=True)
+class JudgeRuntimeConfig:
+    """What the framework uses to manage the judge. NEVER passed into
+    the judge's prompt or visible to the LLM judge. Splitting prevents
+    conflict-of-interest (the LLM judge cannot see / modify its own
+    failure_policy, budget, escalation fallback, or backend selection)."""
+    backend_name: str                      # which JudgeBackend
+    model_id: str | None
+    timeout_ms: int
+    budget: BudgetConfig
+    failure_policy: dict[str, JudgmentOutcome]
+    escalation_config: EscalationConfig
+    read_audit_mode: bool
+    judge_captures: bool
+
+
+@dataclass(frozen=True)
+class JudgmentContext:
+    policy: JudgePolicyContext
+    runtime: JudgeRuntimeConfig            # framework-only; judges that
+                                           # reference this field outside
+                                           # of conformance-allowed reads
+                                           # fail conformance
 ```
 
-The context is what the judge sees; the proposal is what the judge decides on. Splitting them keeps `evaluate` deterministic given the same (proposal, context) pair — important for the conformance suite.
+The judge backend reads `JudgePolicyContext` to build its prompt or its rule input. `JudgeRuntimeConfig` is used by the framework to manage retries, budgets, and escalations — the LLM judge does not see its own knobs. Splitting them keeps `evaluate` deterministic given the same (proposal, policy_context) pair — important for the conformance suite.
 
 ### Capability advertisement
 
-- `supported_outcomes()` — set of outcomes this backend can return. Pure rule engines may return only `{ALLOW, BLOCK}`. LLM judges typically return `{ALLOW, BLOCK, REVISE, ESCALATE}`. The runtime falls back from unsupported outcomes (e.g., if a judge that doesn't support `REVISE` would have revised, it `BLOCK`s with a reason instead).
+- `supported_outcomes()` — set of outcomes this backend can return. Pure rule engines may return only `{ALLOW, BLOCK}`. LLM judges typically return `{ALLOW, BLOCK, REVISE, ESCALATE}`.
 - `supports_read_audit()` — whether the backend can be invoked on read-only actions for audit (without blocking).
 - `supports_specialist_composition()` — whether multiple instances of this backend can compose in an `EnsembleJudge`.
+
+#### Outcome-fallback contract
+
+Each backend is responsible for **self-mapping** its internal intent to a supported outcome before returning. A backend that internally "wants to revise" but does not advertise `REVISE` must return `BLOCK` with reason `revise_intent_not_supported`. The runtime does not second-guess the backend's mapping.
+
+The runtime *does* validate that the returned outcome appears in `supported_outcomes()`. Outcomes not in the advertised set are rejected as `JudgePolicyInvalid` (the backend lied about its capabilities; failure_policy resolves — default block). This split keeps the runtime fallback narrow (only illegal returns) and pushes intent-translation responsibility to the backend that knows its own capabilities.
+
+| Backend returns | Backend advertised | Runtime behavior |
+|---|---|---|
+| Outcome in advertised set | — | Pass to enforcement |
+| Outcome NOT in advertised set | — | Reject as `JudgePolicyInvalid`; failure_policy resolves |
+| `REVISE` with no `amended_proposal` | `REVISE` supported | Reject as `JudgePolicyInvalid` |
+| `ESCALATE` with no `escalation_queue_id` | `ESCALATE` supported | Framework assigns one; warn |
+| Amended proposal fails re-validation | — | `JudgeAmendedProposalRejected`; failure_policy resolves |
 
 ### Exception taxonomy
 
@@ -383,22 +470,26 @@ Operators may override per-exception-type per-class. Default is fail-closed (blo
 
 ### Conformance suite
 
-Mirrors `spec/20`'s suite shape. ~25 tests covering:
+Mirrors `spec/20`'s suite shape. ~30 tests covering:
 
 - `evaluate` returns a valid `Judgment` for each outcome in `supported_outcomes()`
-- `evaluate` does not mutate the proposal (idempotency)
+- `evaluate` does not mutate the proposal or `JudgePolicyContext` (idempotency)
 - Latency bounded by configurable timeout; timeout → `JudgeUnavailable`
-- Concurrent `evaluate` calls do not corrupt state
-- `policy_version` changes when policy source changes
-- `JudgmentContext` mutation does not affect prior judgments
+- Concurrent `evaluate` calls do not corrupt named state: (a) policy cache (b) LLM client connection (c) judge budget counter (d) ensemble vote buffer (e) JSONL writer position (f) escalation queue file (g) backend registry. Each is a named invariant the conformance test verifies independently
+- `policy_version` changes when policy source changes; `policy_version` is computed via atomic snapshot (read whole file in one read, validate, hash; partial-read or invalid-utf-8 → `JudgePolicyInvalid` not a silently-wrong hash)
+- Framework recomputes `classification` for amended proposals; judge cannot influence classification
 - Schema-invalid amended proposal → `JudgeAmendedProposalRejected`
-- Class non-escalation enforced (revise cannot promote to `high_risk`)
-- Second judgment on revised proposal cannot itself revise (no infinite loops)
+- Stricter class policy applies when amended class is higher than original
+- Second judgment on revised proposal cannot itself revise (no infinite loops; reason `revise_loop_exhausted`)
 - Exception taxonomy maps to outcomes per `failure_policy`
-- Audit JSONL includes `tool_definition_hash`, `arguments_hash`, `tool_call_id`
-- Read-audit mode bypasses block but still writes judgment event
-- Escalation writes PENDING file with full proposal
-- Resolution writes RESOLVED event linked by `proposal_id`
+- Side-channel with mismatched/missing/duplicate `side_channel_for_tool_call_id` → `proposal_incomplete` or `side_channel_mismatch`
+- Audit JSONL includes `tool_definition_hash`, `arguments_hash`, `tool_call_id`, `raw_outcome`, `enforcement_action`, `cost_source`
+- Read-audit mode bypasses block but still writes judgment event with `enforcement_action = "audit_bypass"`
+- Escalation writes PENDING file with full proposal; resolution writes RESOLVED event linked by `proposal_id`; redacted PENDING leaves a `redacted` marker
+- Hash determinism: identical (parsed args, tool def) inputs produce identical hashes across processes
+- Hash sensitivity: changes in handler module/qualname or schema produce different `tool_definition_hash`
+- Project-floor `judges.md` cannot be relaxed by delegate-level `judges.md` → `JudgePolicyInvalid` at load time
+- `JudgeRuntimeConfig` fields never appear in the LLM judge's prompt (a conformance assertion that the backend's prompt-construction does not read from `runtime`)
 - `close()` is idempotent
 
 Per-backend tests cover backend-specific behavior (LLM prompt formatting, rule-engine matching, ensemble voting).
@@ -428,13 +519,25 @@ class LLMJudgeBackend:
         llm: LLMBackend,
         policy_source: Path,                # path to judges.md
         tools_source: Path,                 # path to tools.md
-        model_id: str = "claude-haiku-4-5",
+        model_id: str = "gpt-5-haiku",      # OpenAI by default; see "Default judge model" below
         timeout_ms: int = 5000,
         max_revise_iterations: int = 1,
     ): ...
 ```
 
-Default model is the cheapest model that maintains judge quality in the eval suite. Operators override per-agent or per-action-class. `max_revise_iterations` is bounded at 1 by spec to enforce the "no infinite revise" rule.
+`max_revise_iterations` is bounded at 1 by spec to enforce the "no infinite revise" rule.
+
+### Default judge model
+
+The framework's default *actor* is Anthropic (Sonnet 4.6 in `atomic_agents/_model.py`). The correlated-judgment mitigation requires the default *judge* to be a different model family to avoid actor and judge sharing biases. So the default judge backend pairs with an **OpenAI** model (cheapest tier that maintains judge quality in the eval suite — `gpt-5-haiku` at time of writing).
+
+Operators in Claude-only deployments (no OPENAI_API_KEY configured) can:
+
+- Configure an Anthropic judge model explicitly in `judges.md` (acknowledging the correlation risk)
+- Use rule-engine specialists only (deterministic; no model-family correlation)
+- Run an ensemble of two Anthropic models (different sizes; partial mitigation)
+
+The doctor (`spec/27`) warns when the configured judge model family matches the configured actor model family.
 
 ### Why LLM-default, not rule-engine-default
 
@@ -475,7 +578,15 @@ majority_revise     → if majority revises (with consistent amendments), ensemb
 default             → allow
 ```
 
-The default reference implementation ships with **PolicyJudge** (rule-engine, deterministic) + a single LLM-backed catch-all judge for the other axes. Full specialist composition is opt-in.
+### Default composition: PolicyJudge always-on, LLM catch-all, others opt-in
+
+The default reference implementation ships with:
+
+- **`PolicyJudge`** (rule-engine, deterministic, ~microseconds, **always-on** when the judge is enabled) — runs first; matches `tools.md` write paths, allowlists, deny rules, and class-policy enforcement. If it blocks, the ensemble blocks (no LLM cost incurred).
+- **LLM catch-all judge** — runs after PolicyJudge if PolicyJudge allowed. Single LLM call covering authorization, privacy, reversibility, quality, and security axes together.
+- **Specialist composition** (per-axis split into AuthorizationJudge / PrivacyJudge / etc.) — opt-in via the `## Specialist composition` section of `judges.md`. When the section is omitted, the catch-all runs alone.
+
+So absent a `## Specialist composition` section, the runtime composition is `[PolicyJudge, LLMCatchAll]` — not just the catch-all alone. The `Default judge` section in `judges.md` sets the LLM catch-all's backend; PolicyJudge is implicit and always-on.
 
 ## Memory provenance integration
 
@@ -584,12 +695,13 @@ Pure-YAML config files are refused per rule #7. Embedded YAML inside markdown is
 
 Per rule #4, every code path that calls an LLM has a cost gate. The judge is no exception.
 
-- Judge calls flow through `_check_cost_guardrails` like any other LLM call
-- `judges.md` declares a separate budget (`daily_usd`, `monthly_usd`) — judge spend is not subtracted from the agent's actor budget by default
-- **`critical=True` does not bypass the judge.** Critical actions are eligible for `ALLOW` from the judge but the judge **always runs**. The audit trail is the point, and critical actions are exactly the ones that most need recording. This resolves the cost/critical tension explicitly: cost cap on the *actor* may be overridden by `critical=True`; cost cap on the *judge* cannot — it raises `JudgeBudgetExhausted` which the `failure_policy` resolves (default block)
-- Specialist composition multiplies cost — operators see the multiplication in the dashboard before opting in
+- Judge calls flow through `_check_cost_guardrails` like any other LLM call, but against a **separate ledger**.
+- Each cost event written to the JSONL log carries `cost_source: "actor" | "judge"`. The existing `_costs.sum_cost_for_period()` is updated by the implementation PR to take a `source` filter so the actor budget cap and the judge budget cap are summed independently. This is the load-bearing change that makes "judge spend not subtracted from actor budget" actually true — without it, judge cost events would pollute the actor cost stream silently.
+- `judges.md` declares the judge budget (`daily_usd`, `monthly_usd`) — judge spend is summed against this ledger only.
+- **`critical=True` does not bypass the judge.** Critical actions are eligible for `ALLOW` from the judge but the judge **always runs**. The audit trail is the point, and critical actions are exactly the ones that most need recording. This resolves the cost/critical tension explicitly: cost cap on the *actor* may be overridden by `critical=True`; cost cap on the *judge* cannot — it raises `JudgeBudgetExhausted` which the `failure_policy` resolves (default block).
+- Specialist composition multiplies cost — operators see the multiplication in the dashboard before opting in.
 
-The discipline: judgment is expensive; the cost is the price of the safety property; operators decide how much they want to pay.
+The discipline: judgment is expensive; the cost is the price of the safety property; operators decide how much they want to pay. The ledger split is non-negotiable — without it the "separate budget" promise is unfalsifiable.
 
 ## Audit shape
 
@@ -606,6 +718,8 @@ Each judgment writes a JSONL line to the run log, carrying `parent_run_id` linki
   "policy_version": "tools.md@sha256:...+judges.md@sha256:...",
   "proposal": { ... ActionProposal ... },
   "judgment": { ... Judgment ... },
+  "raw_outcome": "block",
+  "enforcement_action": "audit_bypass | block_executed | allow_executed | revise_executed | escalate_pending",
   "binding": {
     "tool_call_id": "...",
     "tool_definition_hash": "sha256:...",
@@ -613,9 +727,12 @@ Each judgment writes a JSONL line to the run log, carrying `parent_run_id` linki
   },
   "latency_ms": 412,
   "cost_usd": 0.00073,
+  "cost_source": "judge",
   "ts": "2026-05-12T14:30:52Z"
 }
 ```
+
+`raw_outcome` is what the judge returned. `enforcement_action` is what the framework did with that outcome — they differ on `read_audit_mode` (judge can return BLOCK but framework executes), on operator escalation overrides, and on failure_policy resolutions. This lets the dashboard count "judge would have blocked but read-audit bypassed" distinctly from "judge allowed and we executed" — which Round 2 caught as indistinguishable in the v1 audit shape.
 
 The parent run record rolls up judgments inline (same shape as `helper_provenance`, `delegations`, `tool_calls`), so a single read of the agent's run record shows everything the actor and judge did, together.
 
