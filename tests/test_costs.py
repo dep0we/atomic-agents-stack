@@ -124,3 +124,188 @@ def test_pricing_table_includes_known_models():
     assert "claude-opus-4-7-20260101" in PRICING
     assert "claude-sonnet-4-6-20260101" in PRICING
     assert "claude-haiku-4-5-20251001" in PRICING
+
+
+# ──────────────────────────────────────────────────────────────────
+# #122 — cost_source + mandate_id filters on sum_cost_for_period
+# Spec/28 (judge layer) + spec/29 (mandates) + spec/30 (audit) all
+# require the ledger to filter by origin and authorizing mandate.
+
+
+def _write_day(log_dir: Path, day: date, records: list[dict]) -> Path:
+    """Test helper — write `records` as JSONL into <log_dir>/<YYYY-MM>/<YYYY-MM-DD>.jsonl."""
+    month_dir = log_dir / day.strftime("%Y-%m")
+    month_dir.mkdir(parents=True, exist_ok=True)
+    log_path = month_dir / f"{day.isoformat()}.jsonl"
+    log_path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+    return log_path
+
+
+def test_sum_cost_source_filter_actor_only(tmp_path):
+    today = date.today()
+    _write_day(tmp_path, today, [
+        {"cost_usd": 0.10, "cost_source": "actor"},
+        {"cost_usd": 0.05, "cost_source": "judge"},
+        {"cost_usd": 0.03, "cost_source": "audit"},
+    ])
+    total = sum_cost_for_period(tmp_path, "today", today, source="actor")
+    assert abs(total - 0.10) < 1e-6
+
+
+def test_sum_cost_source_filter_judge_only(tmp_path):
+    today = date.today()
+    _write_day(tmp_path, today, [
+        {"cost_usd": 0.10, "cost_source": "actor"},
+        {"cost_usd": 0.05, "cost_source": "judge"},
+        {"cost_usd": 0.03, "cost_source": "audit"},
+    ])
+    total = sum_cost_for_period(tmp_path, "today", today, source="judge")
+    assert abs(total - 0.05) < 1e-6
+
+
+def test_sum_cost_source_filter_audit_only(tmp_path):
+    today = date.today()
+    _write_day(tmp_path, today, [
+        {"cost_usd": 0.10, "cost_source": "actor"},
+        {"cost_usd": 0.05, "cost_source": "judge"},
+        {"cost_usd": 0.03, "cost_source": "audit"},
+    ])
+    total = sum_cost_for_period(tmp_path, "today", today, source="audit")
+    assert abs(total - 0.03) < 1e-6
+
+
+def test_sum_cost_source_none_sums_everything(tmp_path):
+    """source=None preserves legacy behavior — sum every cost record."""
+    today = date.today()
+    _write_day(tmp_path, today, [
+        {"cost_usd": 0.10, "cost_source": "actor"},
+        {"cost_usd": 0.05, "cost_source": "judge"},
+        {"cost_usd": 0.03, "cost_source": "audit"},
+    ])
+    total = sum_cost_for_period(tmp_path, "today", today)
+    assert abs(total - 0.18) < 1e-6
+
+
+def test_sum_cost_legacy_record_counts_as_actor(tmp_path):
+    """Records without a cost_source field are pre-#122 actor spend."""
+    today = date.today()
+    _write_day(tmp_path, today, [
+        {"cost_usd": 0.10},  # legacy — no cost_source
+        {"cost_usd": 0.05, "cost_source": "judge"},
+    ])
+    total = sum_cost_for_period(tmp_path, "today", today, source="actor")
+    assert abs(total - 0.10) < 1e-6
+
+
+def test_sum_cost_legacy_record_not_counted_for_judge(tmp_path):
+    """Legacy records (no cost_source) must NOT contribute to judge totals."""
+    today = date.today()
+    _write_day(tmp_path, today, [
+        {"cost_usd": 0.10},  # legacy
+        {"cost_usd": 0.05, "cost_source": "judge"},
+    ])
+    total = sum_cost_for_period(tmp_path, "today", today, source="judge")
+    assert abs(total - 0.05) < 1e-6
+
+
+def test_sum_cost_mandate_id_filter(tmp_path):
+    today = date.today()
+    _write_day(tmp_path, today, [
+        {"cost_usd": 0.10, "cost_source": "actor", "mandate_id": "research-2026"},
+        {"cost_usd": 0.05, "cost_source": "actor", "mandate_id": "research-2026"},
+        {"cost_usd": 0.20, "cost_source": "actor", "mandate_id": "marketing"},
+        {"cost_usd": 0.07, "cost_source": "actor"},  # no mandate
+    ])
+    total = sum_cost_for_period(tmp_path, "today", today, mandate_id="research-2026")
+    assert abs(total - 0.15) < 1e-6
+
+
+def test_sum_cost_mandate_id_none_does_not_filter(tmp_path):
+    """mandate_id=None means 'no mandate filter', not 'only records lacking a mandate'."""
+    today = date.today()
+    _write_day(tmp_path, today, [
+        {"cost_usd": 0.10, "cost_source": "actor", "mandate_id": "research-2026"},
+        {"cost_usd": 0.07, "cost_source": "actor"},  # no mandate
+    ])
+    total = sum_cost_for_period(tmp_path, "today", today)
+    assert abs(total - 0.17) < 1e-6
+
+
+def test_sum_cost_source_and_mandate_combined_and(tmp_path):
+    """source + mandate_id together AND — both filters must match."""
+    today = date.today()
+    _write_day(tmp_path, today, [
+        {"cost_usd": 0.10, "cost_source": "actor", "mandate_id": "M1"},
+        {"cost_usd": 0.05, "cost_source": "judge", "mandate_id": "M1"},
+        {"cost_usd": 0.20, "cost_source": "actor", "mandate_id": "M2"},
+    ])
+    total = sum_cost_for_period(
+        tmp_path, "today", today, source="actor", mandate_id="M1"
+    )
+    assert abs(total - 0.10) < 1e-6
+
+
+def test_sum_cost_this_month_with_filter(tmp_path):
+    """Multi-day this_month aggregation respects the filter."""
+    today = date(2026, 5, 12)
+    yesterday = date(2026, 5, 11)
+    _write_day(tmp_path, yesterday, [
+        {"cost_usd": 0.10, "cost_source": "actor"},
+        {"cost_usd": 0.04, "cost_source": "judge"},
+    ])
+    _write_day(tmp_path, today, [
+        {"cost_usd": 0.20, "cost_source": "actor"},
+        {"cost_usd": 0.06, "cost_source": "judge"},
+    ])
+    actor_total = sum_cost_for_period(tmp_path, "this_month", today, source="actor")
+    judge_total = sum_cost_for_period(tmp_path, "this_month", today, source="judge")
+    assert abs(actor_total - 0.30) < 1e-6
+    assert abs(judge_total - 0.10) < 1e-6
+
+
+def test_sum_cost_filter_on_empty_log_dir_returns_zero(tmp_path):
+    """Non-existent log dir with filters set still returns 0.0 (no crash)."""
+    today = date.today()
+    total = sum_cost_for_period(
+        tmp_path / "nonexistent", "today", today, source="judge", mandate_id="M1"
+    )
+    assert total == 0.0
+
+
+def test_sum_cost_unknown_cost_source_value_drops_from_strict_filters(tmp_path):
+    """Records with unrecognized cost_source (e.g., typo, casing drift) silently
+    drop from every strict-source filter but are still summed by source=None.
+
+    This pins current behavior — a future change to warn-or-reject unknown
+    sources would update this test deliberately. See #122 review Finding 2.
+    """
+    today = date.today()
+    _write_day(tmp_path, today, [
+        {"cost_usd": 0.10, "cost_source": "actor"},
+        {"cost_usd": 0.20, "cost_source": "ACTOR"},   # casing drift
+        {"cost_usd": 0.30, "cost_source": "actorr"},  # typo
+        {"cost_usd": 0.40, "cost_source": "invented"},
+    ])
+    # Strict filters match only the canonical lowercase value
+    assert abs(sum_cost_for_period(tmp_path, "today", today, source="actor") - 0.10) < 1e-6
+    assert sum_cost_for_period(tmp_path, "today", today, source="judge") == 0.0
+    assert sum_cost_for_period(tmp_path, "today", today, source="audit") == 0.0
+    # source=None still sums everything (no filter applied)
+    assert abs(sum_cost_for_period(tmp_path, "today", today) - 1.00) < 1e-6
+
+
+def test_sum_cost_mixed_sources_in_one_file(tmp_path):
+    """A single day's log can carry all three sources; each filter isolates its slice."""
+    today = date.today()
+    _write_day(tmp_path, today, [
+        {"cost_usd": 1.00, "cost_source": "actor"},
+        {"cost_usd": 0.50, "cost_source": "actor"},
+        {"cost_usd": 0.20, "cost_source": "judge"},
+        {"cost_usd": 0.30, "cost_source": "judge"},
+        {"cost_usd": 0.10, "cost_source": "audit"},
+        {"cost_usd": 0.05},  # legacy — counts as actor
+    ])
+    assert abs(sum_cost_for_period(tmp_path, "today", today, source="actor") - 1.55) < 1e-6
+    assert abs(sum_cost_for_period(tmp_path, "today", today, source="judge") - 0.50) < 1e-6
+    assert abs(sum_cost_for_period(tmp_path, "today", today, source="audit") - 0.10) < 1e-6
+    assert abs(sum_cost_for_period(tmp_path, "today", today) - 2.15) < 1e-6
