@@ -49,6 +49,31 @@ same code thoroughly enough to ship.
 The wrong version of this practice is "ask Claude to imagine being a
 reviewer." That's prompting; this is verification.
 
+### Reviewer roster (when to reach for which)
+
+Three reviewers cover the cross-family slot today. They are *not*
+interchangeable — pick the one whose blind spots are opposite to the
+author's.
+
+| Reviewer | Family | When to use | Caveats |
+|---|---|---|---|
+| `codex exec` / `codex review` | OpenAI (GPT) | **Default** for any non-trivial diff. Pulls git diff itself; reads files; runs commands; produces structured findings with high signal. | Has hung on multiple occasions during round 2-3 of large spec docs (PR #117 + #118); has session-level rate limits. When Codex is unavailable, fall back per below. |
+| Opus subagent + verify-against-code prompt | Anthropic (Claude) | Codex unavailable. Use as a same-family fallback with the verify-discipline system prompt that mirrors Codex's structured-findings shape. | Same model family as the author — catches less than a true cross-family reviewer would. Use as partial coverage, not substitute. Precedent: PR #118 audit-spec round 2. |
+| `atomic-agents review --backend kimi` | Moonshot | Codex unavailable AND you want genuine cross-family coverage. Calls Moonshot via the project's `_llm.py` client with the same verify-against-code system prompt. | Today's default model is `moonshot/moonshot-v1-128k` (non-thinking). In one empirical test (PR #145 cost-source filter) it caught 0 of 3 findings Opus caught and produced several hallucinated ones; use it as a *third* opinion alongside Opus, not as a primary reviewer. The Kimi K2.x thinking models are stronger reviewers but their output lives in a separate `reasoning_content` field not extracted by `_llm._call_moonshot` yet — tracked as a follow-up to ship with the LLMBackend protocol (#87). |
+
+**Decision rule.** Always run Codex first. If Codex hangs / rate-limits /
+errors twice in a row, run Opus subagent (catches more issues per call than
+Kimi today) AND Kimi (cross-family coverage even at lower quality). Two
+weaker reviewers in parallel still beat one strong reviewer alone for
+finding blind-spot misses.
+
+**Setup notes for Kimi.** Reads `MOONSHOT_API_KEY` (or
+`ATOMIC_AGENTS_MOONSHOT_KEY`) from env, or `atomic-agents-moonshot` from
+macOS Keychain, or `moonshot` from `~/.config/atomic_agents/keys.json`.
+International (api.moonshot.ai) operators must set
+`MOONSHOT_BASE_URL=https://api.moonshot.ai/v1` until the LLMBackend
+protocol (#87) lands proper per-region routing.
+
 ---
 
 ## Verify before claim — empirically
