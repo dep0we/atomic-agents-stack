@@ -8,8 +8,13 @@ import json
 import logging
 from datetime import date
 from pathlib import Path
+from typing import Literal
 
 logger = logging.getLogger(__name__)
+
+# Cost-event source categories (spec/28 actor/judge split + spec/30 audit).
+# Legacy records (no cost_source field) are treated as "actor" on read.
+CostSource = Literal["actor", "judge", "audit"]
 
 # USD per 1M tokens — input / output
 PRICING: dict[str, dict[str, float]] = {
@@ -82,10 +87,30 @@ def calc_cost(model: str, input_tokens: int, output_tokens: int,
     return round(cost_cached + cost_uncached + cost_output, 6), fallback
 
 
-def sum_cost_for_period(log_dir: Path, period: str, today: date | None = None) -> float:
+def sum_cost_for_period(
+    log_dir: Path,
+    period: str,
+    today: date | None = None,
+    *,
+    source: CostSource | None = None,
+    mandate_id: str | None = None,
+) -> float:
     """Sum cost_usd across log JSONL for the given period.
 
     period: 'today' or 'this_month'.
+
+    source: optional filter on cost-event origin (spec/28 + spec/30):
+        - None (default): sum every cost record (legacy behavior).
+        - "actor": match records with cost_source == "actor" OR missing
+          (legacy records pre-date the field and represent actor spend).
+        - "judge" / "audit": strict match on cost_source.
+
+    mandate_id: optional filter on mandate authorization (spec/29). When set,
+        only records with cost.mandate_id == mandate_id contribute. When None,
+        mandate_id is not consulted.
+
+    Filters AND together. Backward-compatible: omitting both kwargs preserves
+    the pre-#122 behavior verbatim.
     """
     today = today or date.today()
     total = 0.0
@@ -109,8 +134,23 @@ def sum_cost_for_period(log_dir: Path, period: str, today: date | None = None) -
                 continue
             try:
                 rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if source is not None:
+                rec_source = rec.get("cost_source", "actor")
+                if source == "actor":
+                    # legacy records (no cost_source) count as actor
+                    if rec_source != "actor":
+                        continue
+                else:
+                    if rec_source != source:
+                        continue
+            if mandate_id is not None:
+                if rec.get("mandate_id") != mandate_id:
+                    continue
+            try:
                 total += float(rec.get("cost_usd", 0.0))
-            except (json.JSONDecodeError, ValueError):
+            except (TypeError, ValueError):
                 continue
     return total
 
