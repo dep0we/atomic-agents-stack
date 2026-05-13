@@ -56,7 +56,6 @@ from .tools import (
     ToolCallResult,
     ToolDefinition,
     ToolRegistry,
-    build_tool_result_blocks_openai,
 )
 from .skills import SkillManifest, discover_skills, load_skill_body, load_skill_referenced_file
 from .types import (
@@ -368,6 +367,7 @@ class AtomicAgent:
         return AgentConfig(
             default_model=model_data["default_model"],
             fallback_model=model_data["fallback_model"],
+            provider=model_data.get("provider"),
             max_input_tokens=model_data["max_input_tokens"],
             max_output_tokens=model_data["max_output_tokens"],
             cost_guardrails_enabled=model_data["cost_guardrails_enabled"],
@@ -775,6 +775,7 @@ class AtomicAgent:
                     temperature=temperature if temperature is not None else 0.6,
                     cache_control_breakpoints=[len(system_prompt)] if iteration_count == 1 else None,
                     tools=tool_definitions,
+                    preferred_provider=self.config.provider,
                 )
                 iter_latency_ms = int((time.time() - iter_start) * 1000)
                 last_raw = raw
@@ -983,57 +984,36 @@ class AtomicAgent:
         """Build the updated messages list for the next iteration of the tool loop.
 
         Appends the assistant's response (with tool_use blocks) and the
-        tool_result blocks so the LLM can incorporate results in its next turn.
+        tool_result messages so the LLM can incorporate results in its
+        next turn.
 
-        Provider-specific:
-        - Anthropic: assistant message with tool_use content blocks + user
-          message with tool_result content blocks.
-        - OpenAI/Moonshot: assistant message with tool_calls + role=tool messages.
+        Post-#87 PR 3: every supported provider routes through the
+        registry. The backend's ``format_tool_results`` translates
+        canonical types to whatever message shape that provider's API
+        requires (Anthropic gets an assistant message with tool_use
+        blocks + a user message with tool_result blocks; OpenAI/Moonshot
+        get an assistant message with ``tool_calls`` + N tool-role
+        messages). The agent layer no longer branches by provider.
         """
+        from .llm import find_backend_for_model
+
         messages = list(prior_messages)
-
-        if model.startswith("claude-"):
-            # Route through AnthropicLLMBackend.format_tool_results (#87 PR
-            # 2.5). The backend builds the assistant-echo turn + the user
-            # tool_result turn from canonical types — replaces the
-            # provider-shaped inline construction that was here pre-#87.
-            from .llm import find_backend_for_model
-
-            canonical_tool_uses, canonical_tool_results = _canonicalize_tool_loop(
-                raw.tool_uses, tool_results,
-            )
-            backend = find_backend_for_model(model)
-            messages.extend(backend.format_tool_results(
-                tool_uses=canonical_tool_uses,
-                tool_results=canonical_tool_results,
-                assistant_text=raw.text or "",
-            ))
-
-        else:
-            # OpenAI / Moonshot path
-            # Build tool_calls list for the assistant message
-            tool_calls_payload = [
-                {
-                    "id": tu["id"],
-                    "type": "function",
-                    "function": {
-                        "name": tu["name"],
-                        "arguments": json.dumps(tu.get("input", {})),
-                    },
-                }
-                for tu in raw.tool_uses
-                if tu.get("name") != "atomic_capture"
-            ]
-            if tool_calls_payload:
-                messages.append({
-                    "role": "assistant",
-                    "content": raw.text or None,
-                    "tool_calls": tool_calls_payload,
-                })
-            # Append tool result messages
-            result_messages = build_tool_result_blocks_openai(raw.tool_uses, tool_results)
-            messages.extend(result_messages)
-
+        canonical_tool_uses, canonical_tool_results = _canonicalize_tool_loop(
+            raw.tool_uses, tool_results,
+        )
+        # Thread the agent's ``model.md provider:`` preference (#87 PR 3)
+        # so a multi-iteration tool loop on an ambiguously-claimed model
+        # id resolves consistently across all iterations. Without this,
+        # iteration 1's call resolves correctly via call_llm but
+        # iteration 2's format_tool_results crashes mid-loop with
+        # AmbiguousBackendError. Bug caught by Opus subagent review of
+        # this PR (Finding 1); regression test in test_codex_r2_agent.py.
+        backend = find_backend_for_model(model, preferred_provider=self.config.provider)
+        messages.extend(backend.format_tool_results(
+            tool_uses=canonical_tool_uses,
+            tool_results=canonical_tool_results,
+            assistant_text=raw.text or "",
+        ))
         return messages
 
     # ────────────────────────────────────────────────────────────
@@ -1082,6 +1062,7 @@ class AtomicAgent:
             messages=[{"role": "user", "content": prompt}],
             max_tokens=max_tokens,
             temperature=temperature,
+            preferred_provider=self.config.provider,
         )
         latency_ms = int((time.time() - start) * 1000)
         cost, _cost_fallback = _costs.calc_cost(actual_model, raw.input_tokens, raw.output_tokens)

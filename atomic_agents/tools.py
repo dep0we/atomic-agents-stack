@@ -396,43 +396,11 @@ def _validate_input(input_data: dict, schema: dict, tool_name: str) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────
-# Helpers for agent.py multi-turn loop
-#
-# The Anthropic-format builder (build_tool_result_blocks_anthropic) was
-# removed in #87 PR 2.5 — Anthropic tool-loop continuation now flows
-# through AnthropicLLMBackend.format_tool_results from canonical types.
-# The OpenAI-format helper below remains until #87 PR 3 introduces
-# OpenAICompatibleLLMBackend and takes ownership.
-
-
-def build_tool_result_blocks_openai(
-    tool_uses: list[dict],
-    results: list[ToolCallResult],
-) -> list[dict]:
-    """Build OpenAI-format tool result messages from a list of results.
-
-    OpenAI expects one assistant message with tool_calls, then one
-    ``role: tool`` message per result.
-
-    Returns a flat list of message dicts to append to the messages list::
-
-        [
-            {"role": "tool", "tool_call_id": "...", "content": "..."},
-            ...
-        ]
-    """
-    messages = []
-    for result in results:
-        if result.error is not None:
-            content = f"[tool error] {result.error}"
-        else:
-            try:
-                content = json.dumps(result.output)
-            except (TypeError, ValueError):
-                content = str(result.output)
-        messages.append({
-            "role": "tool",
-            "tool_call_id": result.tool_use_id,
-            "content": content,
-        })
-    return messages
+# Both provider-format tool-result builders were removed across #87:
+# - build_tool_result_blocks_anthropic deleted in PR 2.5 — Anthropic
+#   tool-loop continuation flows through AnthropicLLMBackend.format_tool_results
+#   from canonical types.
+# - build_tool_result_blocks_openai deleted in PR 3 — OpenAI / Moonshot
+#   tool-loop continuation flows through OpenAICompatibleLLMBackend.format_tool_results.
+# Both backends own provider translation entirely; the agent layer no
+# longer constructs provider-shaped messages.

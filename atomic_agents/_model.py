@@ -33,6 +33,7 @@ def parse_model_md_text(text: str) -> dict:
         {
           "default_model": str,
           "fallback_model": str | None,
+          "provider": str | None,          # #87: optional LLMBackend disambiguator
           "max_input_tokens": int,
           "max_output_tokens": int,
           "cost_guardrails_enabled": bool,
@@ -49,6 +50,7 @@ def parse_model_md_text(text: str) -> dict:
     defaults = {
         "default_model": "claude-sonnet-4-6-20260101",
         "fallback_model": None,
+        "provider": None,
         "max_input_tokens": 12_000,
         "max_output_tokens": 4_000,
         "cost_guardrails_enabled": False,
@@ -78,6 +80,26 @@ def parse_model_md_text(text: str) -> dict:
     )
     if m:
         defaults["fallback_model"] = m.group(1).strip("`* ")
+
+    # Optional ``provider:`` line — disambiguates when multiple LLMBackends
+    # claim the same model id (e.g., openai + azure-openai both claim gpt-5).
+    # See ``atomic_agents.llm.find_backend_for_model(preferred_provider=...)``
+    # and the ``AmbiguousBackendError`` it raises when this field is missing
+    # under ambiguity.
+    #
+    # Strip fenced YAML blocks before searching — operator config blocks
+    # (cost_guardrails, etc.) may have ``provider:`` nested under another
+    # key, which is unrelated and must not hoist into the framework's
+    # provider setting. Caught by Opus subagent review of #87 PR 3
+    # (Finding 2).
+    text_outside_yaml = re.sub(r"```yaml\s*\n.*?```", "", text, flags=re.DOTALL)
+    m = re.search(
+        r"^\s*provider\s*:\s*([a-zA-Z0-9._-]+)\s*$",
+        text_outside_yaml,
+        re.MULTILINE,
+    )
+    if m:
+        defaults["provider"] = m.group(1).strip()
 
     # Find any embedded YAML block
     yaml_blocks = re.findall(r"```yaml\s*\n(.*?)```", text, re.DOTALL)
