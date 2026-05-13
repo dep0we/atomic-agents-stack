@@ -203,7 +203,15 @@ def _call_moonshot(
         ) from e
 
     api_key = _get_moonshot_key()
-    client = openai.OpenAI(api_key=api_key, base_url="https://api.moonshot.cn/v1")
+    # Default base_url targets the China endpoint; operators with keys issued
+    # via the international portal (api.moonshot.ai) override via env. Proper
+    # per-region handling lands with the LLMBackend protocol (#87).
+    base_url = (
+        os.environ.get("ATOMIC_AGENTS_MOONSHOT_BASE_URL")
+        or os.environ.get("MOONSHOT_BASE_URL")
+        or "https://api.moonshot.cn/v1"
+    )
+    client = openai.OpenAI(api_key=api_key, base_url=base_url)
     actual_model = model.replace("moonshot/", "")
 
     chat_messages = [{"role": "system", "content": system_prompt}] + messages
