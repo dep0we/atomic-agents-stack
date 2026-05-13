@@ -356,8 +356,10 @@ def test_agent_passes_custom_tools_to_llm(tmp_path):
 
     tools_passed = captured_kwargs.get("tools", [])
     assert tools_passed is not None
-    # Should include atomic_capture + query_db
-    tool_names = {t["name"] for t in tools_passed}
+    # Post-#87 PR 2.5: agent.py passes canonical LLMToolDefinition lists
+    # to _llm.call_llm rather than provider-shaped dicts. The backend
+    # (or transitional glue in _llm) translates at the dispatch boundary.
+    tool_names = {t.name for t in tools_passed}
     assert "atomic_capture" in tool_names
     assert "query_db" in tool_names
 
@@ -416,6 +418,32 @@ def test_agent_executes_tool_and_loops(tmp_path):
     assert tc.tool_name == "echo"
     assert tc.output == "echo: hello"
     assert tc.error is None
+
+    # Second-iteration messages payload — verify the tool-loop continuation
+    # builds the right shape AFTER #87 PR 2.5's refactor routed through
+    # AnthropicLLMBackend.format_tool_results. Pre-#87 the inline
+    # construction in agent.py produced this same shape; the regression
+    # surface this test protects is wire-byte parity (#87 PR 2.5 review
+    # caught a string-not-json-encoded gap that this test now pins).
+    call_args_list = fake_anthropic.Anthropic.return_value.messages.create.call_args_list
+    second_call_kwargs = call_args_list[1].kwargs
+    msgs = second_call_kwargs["messages"]
+    # Original user prompt + assistant turn echoing the tool_use + user turn with tool_result
+    assert msgs[0]["role"] == "user"  # original prompt
+    assert msgs[1]["role"] == "assistant"
+    assistant_content = msgs[1]["content"]
+    tool_use_blocks = [b for b in assistant_content if b.get("type") == "tool_use"]
+    assert len(tool_use_blocks) == 1
+    assert tool_use_blocks[0]["name"] == "echo"
+    assert tool_use_blocks[0]["id"] == "tu_001"
+    assert tool_use_blocks[0]["input"] == {"msg": "hello"}
+    # User turn with tool_result
+    assert msgs[2]["role"] == "user"
+    result_blocks = [b for b in msgs[2]["content"] if b.get("type") == "tool_result"]
+    assert len(result_blocks) == 1
+    assert result_blocks[0]["tool_use_id"] == "tu_001"
+    # Wire bytes — string output is json-encoded (matches pre-#87)
+    assert result_blocks[0]["content"] == '"echo: hello"'
 
 
 def test_agent_max_iterations_caps_loop(tmp_path):

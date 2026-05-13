@@ -324,10 +324,26 @@ class AnthropicLLMBackend:
         if assistant_content:
             out.append({"role": "assistant", "content": assistant_content})
 
-        # User turn with tool_result blocks
+        # User turn with tool_result blocks. Serialization rules preserve
+        # pre-#87 wire bytes exactly so operator eval harnesses comparing
+        # JSONL transcripts before/after the migration see no diff:
+        #
+        # - Error strings: passed through (already prefixed "[tool error]").
+        # - Everything else (str, dict, list, dataclass, datetime, ...):
+        #   json.dumps the content. JSON strings get quoted (matches the
+        #   pre-#87 `tools.build_tool_result_blocks_anthropic` behavior),
+        #   dicts get encoded, and anything not JSON-serializable falls
+        #   back to ``str()`` so a single bad tool return doesn't crash
+        #   the loop.
         result_blocks: list[dict] = []
         for r in tool_results:
-            content = r.content if isinstance(r.content, str) else json.dumps(r.content)
+            if r.is_error and isinstance(r.content, str):
+                content = r.content  # error message already a string
+            else:
+                try:
+                    content = json.dumps(r.content)
+                except (TypeError, ValueError):
+                    content = str(r.content)
             block: dict[str, Any] = {
                 "type": "tool_result",
                 "tool_use_id": r.tool_use_id,

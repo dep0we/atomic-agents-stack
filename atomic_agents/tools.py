@@ -397,33 +397,12 @@ def _validate_input(input_data: dict, schema: dict, tool_name: str) -> None:
 
 # ──────────────────────────────────────────────────────────────────
 # Helpers for agent.py multi-turn loop
-
-def build_tool_result_blocks_anthropic(results: list[ToolCallResult]) -> list[dict]:
-    """Build Anthropic-format tool_result content blocks from a list of results.
-
-    Each block::
-
-        {
-            "type": "tool_result",
-            "tool_use_id": "...",
-            "content": "<json-serialized output or error message>"
-        }
-    """
-    blocks = []
-    for result in results:
-        if result.error is not None:
-            content = f"[tool error] {result.error}"
-        else:
-            try:
-                content = json.dumps(result.output)
-            except (TypeError, ValueError):
-                content = str(result.output)
-        blocks.append({
-            "type": "tool_result",
-            "tool_use_id": result.tool_use_id,
-            "content": content,
-        })
-    return blocks
+#
+# The Anthropic-format builder (build_tool_result_blocks_anthropic) was
+# removed in #87 PR 2.5 — Anthropic tool-loop continuation now flows
+# through AnthropicLLMBackend.format_tool_results from canonical types.
+# The OpenAI-format helper below remains until #87 PR 3 introduces
+# OpenAICompatibleLLMBackend and takes ownership.
 
 
 def build_tool_result_blocks_openai(

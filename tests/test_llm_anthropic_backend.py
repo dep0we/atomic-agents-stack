@@ -409,10 +409,15 @@ def test_format_tool_results_builds_assistant_echo_and_user_results():
     assert asst["content"][1] == {
         "type": "tool_use", "id": "tu_1", "name": "search", "input": {"q": "atomic"},
     }
-    # User turn — tool_result blocks
+    # User turn — tool_result blocks. String content is json-encoded
+    # (so the wire content is the quoted form `"..."`), matching
+    # pre-#87 byte-for-byte behavior so operator JSONL transcripts don't
+    # diff across the migration. See the docstring of format_tool_results
+    # for the serialization rules.
     assert usr["role"] == "user"
     assert usr["content"][0] == {
-        "type": "tool_result", "tool_use_id": "tu_1", "content": "search results here",
+        "type": "tool_result", "tool_use_id": "tu_1",
+        "content": '"search results here"',
     }
 
 
@@ -463,6 +468,57 @@ def test_format_tool_results_marks_is_error_block():
     )
     usr = out[1]
     block = usr["content"][0]
+    assert block["is_error"] is True
+
+
+def test_format_tool_results_string_content_is_json_encoded_for_wire_parity():
+    """Pre-#87 ``tools.build_tool_result_blocks_anthropic`` always
+    json.dumps'd the output, producing wire content like ``'"hello"'``
+    (with quotes) for string outputs. PR 2.5's backend preserves that
+    behavior so operator eval harnesses comparing JSONL transcripts
+    before/after the migration see no diff.
+    """
+    b = AnthropicLLMBackend()
+    out = b.format_tool_results(
+        tool_uses=[LLMToolUse(id="tu_1", name="echo", input={})],
+        tool_results=[LLMToolResult(tool_use_id="tu_1", content="echo: hello")],
+    )
+    block = out[1]["content"][0]
+    assert block["content"] == '"echo: hello"'  # json-encoded string
+
+
+def test_format_tool_results_non_json_serializable_content_falls_back_to_str():
+    """A tool handler that returns a non-JSON-serializable object (e.g.,
+    ``datetime``) must not crash the loop. The pre-#87 helper had a
+    ``try: json.dumps except: str()`` fallback; the backend preserves it.
+    """
+    import datetime as _dt
+    b = AnthropicLLMBackend()
+    t = _dt.datetime(2026, 1, 2, 3, 4, 5)
+    out = b.format_tool_results(
+        tool_uses=[LLMToolUse(id="tu_1", name="clock", input={})],
+        tool_results=[LLMToolResult(tool_use_id="tu_1", content=t)],
+    )
+    block = out[1]["content"][0]
+    # Whatever str() produces is fine — the property is "didn't crash"
+    assert block["content"] == str(t)
+
+
+def test_format_tool_results_error_string_passes_through():
+    """Error content (already a string prefixed ``[tool error]``) is
+    passed through verbatim — NOT json-encoded. Pre-#87 didn't quote
+    error strings either (the error branch of the old helper assigned
+    ``content = f"[tool error] {...}"`` and skipped json.dumps).
+    """
+    b = AnthropicLLMBackend()
+    out = b.format_tool_results(
+        tool_uses=[LLMToolUse(id="tu_1", name="search", input={})],
+        tool_results=[LLMToolResult(
+            tool_use_id="tu_1", content="[tool error] boom", is_error=True,
+        )],
+    )
+    block = out[1]["content"][0]
+    assert block["content"] == "[tool error] boom"  # raw, no quotes
     assert block["is_error"] is True
 
 
