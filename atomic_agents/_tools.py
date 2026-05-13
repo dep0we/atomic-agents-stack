@@ -24,6 +24,28 @@ SECTION_PATTERNS = {
 }
 
 
+# Judge-layer per-tool action-class section header (spec/28 + #112 PR 2a).
+# Kept separate from SECTION_PATTERNS because the bullet format is
+# ``tool_name: action_class`` rather than the path/text shape the other
+# sections use — and the resulting parse is a dict, not a list. Used by
+# parse_tool_classifications_text() only.
+_TOOL_CLASSIFICATION_HEADER = re.compile(
+    r"^##\s+Tool classifications?\b", re.IGNORECASE
+)
+
+
+# Valid ActionClass enum values from atomic_agents/judge/types.py.
+# Kept as a literal here to keep _tools.py free of judge-module imports
+# (would otherwise force tools.py → judge → memory load order at parse
+# time). The judge layer asserts parity in its conformance suite.
+_VALID_ACTION_CLASSES: frozenset[str] = frozenset({
+    "read_only",
+    "reversible_write",
+    "external_side_effect",
+    "high_risk",
+})
+
+
 def parse_tools_md(path: Path) -> dict:
     """Parse tools.md from disk. Thin wrapper around parse_tools_md_text."""
     if not path.exists():
@@ -81,3 +103,86 @@ def parse_tools_md_text(text: str) -> dict:
             sections[current_section].append(item)
 
     return sections
+
+
+def parse_tool_classifications(path: Path) -> dict[str, str]:
+    """Parse ``tools.md``'s ``## Tool classification`` section into a
+    ``{tool_name: action_class}`` map.
+
+    Per spec/28 + #112 PR 2a: the judge layer needs a per-tool
+    ``ActionClass`` to build ``ActionProposal.classification``. Two
+    sources can supply the value:
+
+    1. ``ToolDefinition.classification`` (set when the tool is
+       registered in code).
+    2. This ``## Tool classification`` section in ``tools.md`` (operator
+       can override or supply a class for tools whose registration
+       didn't set one).
+
+    Bullet shape::
+
+        - tool_name: external_side_effect
+        - send_email: external_side_effect — outward-facing, irreversible
+        - read_calendar: read_only
+
+    Action-class values must be one of the four ``ActionClass`` enum
+    strings (``read_only``, ``reversible_write``,
+    ``external_side_effect``, ``high_risk``). Invalid values are
+    silently skipped — the framework defaults unmapped tools to
+    ``external_side_effect`` per spec/28's safe default. PR 4's
+    conformance suite asserts the parser produces the same map as the
+    operator wrote, so silent-skip is acceptable here without a logger
+    surface (operators learn the mapping via doctor checks, not
+    parser warnings).
+    """
+    if not path.exists():
+        return parse_tool_classifications_text("")
+    return parse_tool_classifications_text(path.read_text(encoding="utf-8"))
+
+
+def parse_tool_classifications_text(text: str) -> dict[str, str]:
+    """Parse a ``## Tool classification`` section from in-memory text.
+
+    Same behavior as ``parse_tool_classifications`` but for
+    cascade-merged content (role + instance override). Returns an
+    empty dict when the section is absent.
+    """
+    result: dict[str, str] = {}
+    if not text:
+        return result
+
+    in_section = False
+    for line in text.splitlines():
+        stripped = line.rstrip()
+        if stripped.startswith("## "):
+            in_section = bool(_TOOL_CLASSIFICATION_HEADER.match(stripped))
+            continue
+        if not in_section:
+            continue
+        if stripped.startswith("#") or not stripped.strip():
+            continue
+
+        bullet_match = re.match(r"^\s*[-*]\s+(.+?)$", stripped)
+        if not bullet_match:
+            continue
+        item = bullet_match.group(1).strip()
+        # ``tool_name: action_class [— optional trailing comment]``
+        if ":" not in item:
+            continue
+        name_part, rest = item.split(":", 1)
+        tool_name = name_part.strip().strip("`")
+        # Take everything up to a comma, em-dash, or paren divider.
+        cls_value = (
+            re.split(r"\s+(?:—|--|\(|,)\s*", rest.strip(), maxsplit=1)[0]
+            .strip()
+            .strip("`")
+            # Normalize case so operators writing
+            # ``Send_Email: External_Side_Effect`` map cleanly — the
+            # silent-skip on capitalized values was operator-hostile
+            # per the round-2 review.
+            .lower()
+        )
+        if not tool_name or cls_value not in _VALID_ACTION_CLASSES:
+            continue
+        result[tool_name] = cls_value
+    return result
