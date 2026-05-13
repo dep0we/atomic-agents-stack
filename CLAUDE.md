@@ -289,6 +289,7 @@ If the project ever needs to optimize differently, `docs/methodology.md` is the 
 | `docs/spec/01-...31-llm-backend.md` | Locked spec (22 docs today, plus 3 RFCs at 28/29/30). The product. |
 | `docs/implementation/` | Build guides per runtime (cron, Claude skill, dashboard) |
 | `docs/deployment/versioning.md`, `upgrading.md` | SemVer + operator runbook |
+| `docs/deployment/release-runbook.md` | Maintainer `/ship` runbook: two-mode workflow + manual surface check |
 | `docs/methodology.md` | Working-methods retrospective; the methods that produced this codebase |
 | `docs/TENSIONS.md` | Architectural tensions; protect against silent drift |
 | `docs/GOVERNANCE.md` | Solo / small-team operator guide |

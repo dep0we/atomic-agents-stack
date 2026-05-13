@@ -190,7 +190,7 @@ The framework is moving toward swappable backends layer by layer. The shape: a P
 
 ## Deployment shapes
 
-Six operator runbooks for the common deployment paths. Pick the one that matches what you're doing:
+Seven operator runbooks for the common deployment paths. Pick the one that matches what you're doing:
 
 - [`docs/deployment/obsidian.md`](docs/deployment/obsidian.md) — running the framework against an Obsidian-synced vault: ignore patterns, `.versions/` trade-offs, sync race conditions, conflict copy recovery
 - [`docs/deployment/programmatic.md`](docs/deployment/programmatic.md) — embedding in Python: the `Agent` + `call()` public surface, the complete public exception table, three worked examples
@@ -198,6 +198,7 @@ Six operator runbooks for the common deployment paths. Pick the one that matches
 - [`docs/deployment/cost-guardrail-sizing.md`](docs/deployment/cost-guardrail-sizing.md) — picking daily/monthly caps + cap action; seven role archetypes with recommended starting values
 - [`docs/deployment/versioning.md`](docs/deployment/versioning.md) — SemVer policy; what counts as Major / Minor / Patch
 - [`docs/deployment/upgrading.md`](docs/deployment/upgrading.md) — operator upgrade runbook + migration runner usage
+- [`docs/deployment/release-runbook.md`](docs/deployment/release-runbook.md) — maintainer-facing `/ship` runbook: two-mode workflow (PR-level vs. release cut), local gstack patch, operator manual surface check
 
 ---
 
