@@ -155,16 +155,17 @@ class PolicyJudge:
             )
 
         if cls_policy == ClassPolicyValue.ESCALATE:
-            # PR 2a deferral. PR 3 widens supported_outcomes once polling
-            # ships.
-            return self._block(
+            # PR 3b widens supported_outcomes to include ESCALATE.
+            # PolicyJudge returning ESCALATE means the operator's
+            # class_policy=escalate fires here as the rule-engine
+            # answer (no LLM needed); the framework writes a PENDING
+            # file + defers the actor's run.
+            return self._escalate(
                 proposal,
                 reason=(
-                    "class policy is escalate but operator-resolution "
-                    "polling is not yet implemented (escalate_pending_"
-                    "polling_unimplemented). Action blocked to avoid "
-                    "orphan PENDING files. Widens to ESCALATE in PR 3 "
-                    "of #112 once judges.md + polling loop ship."
+                    f"class policy is escalate for "
+                    f"{proposal.classification.value} — "
+                    "operator-configured pre-action gate"
                 ),
             )
 
@@ -176,8 +177,13 @@ class PolicyJudge:
         return self._allow(proposal, reason="all rule-engine checks passed")
 
     def supported_outcomes(self) -> set[JudgmentOutcome]:
-        # PR 2a ships ALLOW + BLOCK only. PR 3 adds ESCALATE.
-        return {JudgmentOutcome.ALLOW, JudgmentOutcome.BLOCK}
+        # PR 3b widens to include ESCALATE for class_policy=escalate
+        # paths. REVISE remains out of scope (PR 3c ships it).
+        return {
+            JudgmentOutcome.ALLOW,
+            JudgmentOutcome.BLOCK,
+            JudgmentOutcome.ESCALATE,
+        }
 
     def supports_read_audit(self) -> bool:
         # Rule engine is deterministic and free — supports audit mode.
@@ -280,6 +286,19 @@ class PolicyJudge:
     def _block(self, proposal: ActionProposal, *, reason: str) -> Judgment:
         return Judgment(
             outcome=JudgmentOutcome.BLOCK,
+            reason=reason,
+            judge_id=self._judge_id,
+            policy_version=self._policy_version,
+            latency_ms=0,
+            cost_usd=0.0,
+        )
+
+    def _escalate(self, proposal: ActionProposal, *, reason: str) -> Judgment:
+        # PR 3b: PolicyJudge returns ESCALATE for class_policy=escalate.
+        # The framework writes the PENDING file + mints the queue_id
+        # at dispatch time; PolicyJudge itself does no I/O.
+        return Judgment(
+            outcome=JudgmentOutcome.ESCALATE,
             reason=reason,
             judge_id=self._judge_id,
             policy_version=self._policy_version,
