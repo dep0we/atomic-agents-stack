@@ -97,6 +97,15 @@ class Response:
     tool_calls: list["ToolCallResult"] = field(default_factory=list)
     tool_iterations: int = 1           # 1 = no tools used, 2+ = multi-turn loop
     tool_iterations_maxed: bool = False  # True when max_iterations cap was hit
+    # Judge-layer ESCALATE (spec/28). When any tool_use in the actor's
+    # turn produces an ESCALATE judgment, the framework writes a PENDING
+    # file and returns deferred=True with the proposal_ids of every
+    # escalated action. ALLOWed tool_uses in the same turn still execute
+    # and their results land in ``tool_calls``; the multi-turn loop
+    # terminates immediately rather than running one more iteration.
+    # See spec/28 §"Escalate" and the ESCALATE state machine docs.
+    deferred: bool = False
+    escalation_queue_ids: list[str] = field(default_factory=list)
 
     @classmethod
     def skipped_response(cls, reason: str, model: str) -> "Response":
