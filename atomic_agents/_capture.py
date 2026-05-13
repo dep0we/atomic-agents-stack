@@ -154,6 +154,22 @@ def openai_tool_definition() -> dict:
     }
 
 
+def canonical_tool_definition():
+    """Return the atomic_capture tool definition as a canonical ``LLMToolDefinition``.
+
+    Used by ``agent.py`` to hand the capture tool to any backend (the
+    backend translates to its provider format inside ``call()``). Import
+    happens at function-call time to avoid the circular import
+    ``_capture → llm.types → _llm → _capture``.
+    """
+    from .llm.types import LLMToolDefinition
+    return LLMToolDefinition(
+        name="atomic_capture",
+        description=CAPTURE_TOOL_DESCRIPTION,
+        input_schema=CAPTURE_TOOL_SCHEMA,
+    )
+
+
 def extract_tool_call_captures(
     tool_uses: list[dict],
 ) -> tuple[list[Capture], list[tuple[dict, str]]]:

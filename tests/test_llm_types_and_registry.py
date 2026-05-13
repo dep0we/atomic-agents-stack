@@ -73,7 +73,7 @@ class _FakeBackend:
              tools=None, cache_directives=None) -> _RawLLMResponse:
         return _RawLLMResponse(text="fake", input_tokens=10, output_tokens=5)
 
-    def format_tool_results(self, tool_results):
+    def format_tool_results(self, tool_uses, tool_results, assistant_text=""):
         return [{"role": "tool", "content": str(r.content)} for r in tool_results]
 
 
@@ -84,13 +84,23 @@ def _clean_registry():
     Necessary because the registry is process-local module state. Without
     cleanup, test ordering would matter and a leftover backend from one
     test would corrupt the next test's expected match set.
+
+    Also pins ``_DEFAULTS_REGISTERED`` to True for the duration of each
+    test so the lazy default-backend registration doesn't fire and
+    re-populate the cleared registry. The flag + registry are both
+    restored to their pre-test values at teardown — so tests that
+    indirectly trigger ``find_backend_for_model`` from outside this
+    module continue to see the lazy-init contract.
     """
-    from atomic_agents.llm import _registry
-    saved = dict(_registry)
-    _registry.clear()
+    from atomic_agents import llm as _llm_pkg
+    saved_registry = dict(_llm_pkg._registry)
+    saved_flag = _llm_pkg._DEFAULTS_REGISTERED
+    _llm_pkg._registry.clear()
+    _llm_pkg._DEFAULTS_REGISTERED = True  # suppress lazy re-registration
     yield
-    _registry.clear()
-    _registry.update(saved)
+    _llm_pkg._registry.clear()
+    _llm_pkg._registry.update(saved_registry)
+    _llm_pkg._DEFAULTS_REGISTERED = saved_flag
 
 
 # ──────────────────────────────────────────────────────────────────

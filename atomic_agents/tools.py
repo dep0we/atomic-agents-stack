@@ -186,6 +186,26 @@ class ToolRegistry:
         """Return a sorted list of all registered tool names."""
         return sorted(self._tools.keys())
 
+    def to_canonical_definitions(self):
+        """Format all tools as canonical ``LLMToolDefinition`` instances.
+
+        Used by ``agent.py`` to hand the registry's tools to any backend
+        (the backend translates to its provider format inside ``call()``).
+        Replaces the per-provider helpers (``to_anthropic_definitions``,
+        ``to_openai_definitions``) at agent-runtime call sites; those
+        helpers stay around for tests + any external code that pinned to
+        them.
+        """
+        from .llm.types import LLMToolDefinition
+        return [
+            LLMToolDefinition(
+                name=t.name,
+                description=t.description,
+                input_schema=t.input_schema,
+            )
+            for t in self._tools.values()
+        ]
+
     def to_anthropic_definitions(self) -> list[dict]:
         """Format all tools for the Anthropic Messages API.
 

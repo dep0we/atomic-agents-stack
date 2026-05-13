@@ -65,7 +65,17 @@ def test_anthropic_call_returns_empty_tool_uses_when_no_tools():
 
 
 def test_anthropic_call_forwards_tools_parameter():
-    """When tools=[...] is passed, it lands in messages.create kwargs."""
+    """When tools=[...] is passed, the tool data lands in messages.create kwargs.
+
+    Pre-#87 PR 2 this test asserted object identity (``is tools``) — the
+    dispatcher passed the operator's list through to the SDK by reference.
+    Post-routing, the LLMBackend Protocol's ``call()`` accepts canonical
+    ``LLMToolDefinition`` instances, so ``_llm.call_llm`` converts the
+    legacy dict-shape list at entry and the backend translates back to
+    Anthropic's tools schema before the SDK call. The objects passed to
+    the SDK are therefore semantically equal but not identity-equal —
+    the contract is data preservation, not pointer preservation.
+    """
     response = _make_anthropic_response([
         _make_anthropic_block("text", text=""),
     ])
@@ -84,7 +94,8 @@ def test_anthropic_call_forwards_tools_parameter():
         )
 
     _, call_kwargs = fake_client.messages.create.call_args
-    assert call_kwargs["tools"] is tools
+    # Data preserved through the canonical-types roundtrip
+    assert call_kwargs["tools"] == tools
 
 
 def test_anthropic_call_extracts_tool_use_blocks():

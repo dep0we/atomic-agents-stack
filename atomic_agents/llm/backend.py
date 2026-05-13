@@ -226,20 +226,41 @@ class SyncLLMBackend(Protocol):
         """
         ...
 
-    def format_tool_results(self, tool_results: list[LLMToolResult]) -> list[dict]:
-        """Translate canonical tool_result list → provider-shaped messages.
+    def format_tool_results(
+        self,
+        tool_uses: list[LLMToolUse],
+        tool_results: list[LLMToolResult],
+        assistant_text: str = "",
+    ) -> list[dict]:
+        """Build the next-iteration message list for the provider's tool loop.
 
-        After a tool loop iteration executes the model's requested tools,
-        ``agent.py`` produces a ``list[LLMToolResult]`` and calls this
-        method to get the next provider-shaped message list to pass to
-        ``call()``. Codex P1: the line ``agent.py:953`` previously did
-        this dispatch via ``model.startswith()``; the Protocol moves it
-        into each backend so third-party backends fully participate.
+        Different providers want different shapes for "the model called
+        tools; here are their results — continue":
+
+        * Anthropic — echo the prior assistant turn (text + tool_use
+          blocks) followed by a user turn with tool_result blocks.
+        * OpenAI — assistant turn with ``tool_calls`` field followed by
+          N tool-role messages, one per result.
+
+        The Protocol takes all three pieces so the backend can build
+        whichever provider shape it needs:
+
+        * ``tool_uses`` — the model's tool_use blocks from the prior call
+          (the response's ``tool_uses`` field).
+        * ``tool_results`` — what came back when the agent executed each
+          tool. Pairs with ``tool_uses`` by ``tool_use_id``.
+        * ``assistant_text`` — the model's prior text content (the
+          response's ``text`` field). Some providers want this echoed
+          back, others don't; backend's call.
 
         Returns a list of dicts ready to append to the ``messages``
-        argument of the next ``call()`` invocation. The exact shape is
-        provider-specific (Anthropic returns user-role messages with
-        ``tool_result`` content blocks; OpenAI returns tool-role messages
-        with ``tool_call_id``).
+        argument of the next ``call()`` invocation. Empty
+        ``tool_results`` → empty list.
+
+        Signature note: PR 1 of #87 landed a single-arg version of this
+        method; PR 2 extended it after AnthropicLLMBackend's
+        implementation needed all three pieces to build the
+        assistant-echo turn. No third-party consumers existed at the
+        time of the change.
         """
         ...
