@@ -53,7 +53,18 @@ from __future__ import annotations
 import logging
 
 from ..exceptions import UnknownJudgeBackendError
+from .atomic_action import (
+    canonical_tool_definition as atomic_action_tool_definition,
+    extract_atomic_action_markers,
+)
 from .backend import JudgeBackend, Judgment, JudgmentOutcome
+from .proposal import (
+    assemble_proposal,
+    compute_arguments_hash,
+    compute_tool_definition_hash,
+    is_framework_managed_tool,
+)
+from .rules import PolicyJudge, make_default_policy_judge
 from .types import (
     ActionClass,
     ActionProposal,
@@ -121,6 +132,17 @@ __all__ = [
     "list_backends",
     "unregister_backend",
     "unregister_judge_backend",
+    # Side-channel marker (#112 PR 2a)
+    "atomic_action_tool_definition",
+    "extract_atomic_action_markers",
+    # Proposal assembly (#112 PR 2a)
+    "assemble_proposal",
+    "compute_arguments_hash",
+    "compute_tool_definition_hash",
+    "is_framework_managed_tool",
+    # Reference impl (#112 PR 2a)
+    "PolicyJudge",
+    "make_default_policy_judge",
 ]
 
 
