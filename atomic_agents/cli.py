@@ -7,6 +7,7 @@ Usage:
     atomic-agents version <agent> <note-filename>
     atomic-agents restore <agent> <note-filename> <version-name>
     atomic-agents doctor [--agent <name>] [--json] [--no-mcp]
+    atomic-agents review --backend <kimi> [options]
 
 Subcommands:
     run     — Run an agent against a work item
@@ -15,6 +16,7 @@ Subcommands:
     version — List memory note version snapshots
     restore — Restore a memory note from a snapshot
     doctor  — Preflight checks before scheduling an agent run
+    review  — Cross-family adversarial code review (CLAUDE.md rule #11)
 """
 
 from __future__ import annotations
@@ -90,7 +92,75 @@ def main(argv: list[str] | None = None) -> int:
         help="skip MCP server handshake (faster; useful when servers are remote)",
     )
 
+    review_cmd = sub.add_parser(
+        "review",
+        help="Run a cross-family adversarial code review against a target file",
+        description=(
+            "Cross-family adversarial review via a non-author model. Per "
+            "CLAUDE.md rule #11 (review in rounds) + rule #12 (verify before "
+            "claim). Output goes to stdout (markdown); cost summary to stderr."
+        ),
+    )
+    review_cmd.add_argument(
+        "--backend",
+        required=True,
+        choices=["kimi"],
+        help="reviewer model family (kimi = Moonshot Kimi 2.6)",
+    )
+    review_prompt_group = review_cmd.add_mutually_exclusive_group(required=True)
+    review_prompt_group.add_argument(
+        "--prompt",
+        help="adversarial review prompt as inline text",
+    )
+    review_prompt_group.add_argument(
+        "--prompt-file",
+        help="path to a markdown file containing the review prompt",
+    )
+    review_cmd.add_argument(
+        "--target",
+        default=None,
+        help="primary file under review (read first by the reviewer)",
+    )
+    review_cmd.add_argument(
+        "--read-files",
+        default="",
+        help=(
+            "comma-separated list of files for grounding context "
+            "(e.g. 'CLAUDE.md,docs/spec/28-judge-layer.md')"
+        ),
+    )
+    review_cmd.add_argument(
+        "--working-dir",
+        default=None,
+        help="working directory for resolving --target and --read-files (default: cwd)",
+    )
+    review_cmd.add_argument(
+        "--model",
+        default=None,
+        help="override the default model id for the chosen backend",
+    )
+    review_cmd.add_argument(
+        "--max-tokens",
+        type=int,
+        default=16000,
+        help=(
+            "max output tokens for the reviewer (default: 16000 — reasoning "
+            "models like Kimi K2.6 use a large slice of this for internal "
+            "reasoning_content before producing the visible review)"
+        ),
+    )
+
     args = parser.parse_args(argv)
+
+    # `review` is a host-only subcommand — no agents-root needed (operates on
+    # arbitrary files, not agent folders). All other subcommands resolve
+    # agents_root either from --agents-root or the ATOMIC_AGENTS_ROOT env var.
+    if args.cmd == "review":
+        try:
+            return _cmd_review(args)
+        except AtomicAgentsError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
 
     agents_root = Path(args.agents_root).expanduser().resolve() if args.agents_root else get_agents_root()
 
@@ -112,6 +182,54 @@ def main(argv: list[str] | None = None) -> int:
     except AtomicAgentsError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
+    return 0
+
+
+def _cmd_review(args) -> int:
+    """Run a cross-family adversarial review and stream the output to stdout.
+
+    Reads --prompt or --prompt-file, optionally pulls in --target +
+    --read-files for grounding, dispatches to the chosen backend's LLM,
+    prints the review to stdout, and prints a cost summary to stderr.
+    """
+    from . import review as review_mod
+
+    if args.prompt is not None:
+        prompt_text = args.prompt
+    else:
+        prompt_path = Path(args.prompt_file).expanduser()
+        if not prompt_path.exists():
+            print(f"Error: --prompt-file not found: {prompt_path}", file=sys.stderr)
+            return 1
+        prompt_text = prompt_path.read_text(encoding="utf-8")
+
+    working_dir = (
+        Path(args.working_dir).expanduser().resolve()
+        if args.working_dir
+        else Path.cwd()
+    )
+
+    read_files: list[Path] = []
+    if args.read_files:
+        for entry in args.read_files.split(","):
+            entry = entry.strip()
+            if entry:
+                read_files.append(Path(entry))
+
+    target = Path(args.target) if args.target else None
+
+    request = review_mod.ReviewRequest(
+        backend=args.backend,
+        prompt=prompt_text,
+        read_files=read_files,
+        target=target,
+        working_dir=working_dir,
+        model=args.model,
+        max_tokens=args.max_tokens,
+    )
+    result = review_mod.run_review(request)
+    print(result.text)
+    review_mod.print_cost_summary(result)
     return 0
 
 
