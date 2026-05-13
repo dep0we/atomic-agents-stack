@@ -22,13 +22,13 @@ operator-visible resolution path (spec/28:340 polling cycle).
 
 from __future__ import annotations
 
-import hashlib
 import re
 from pathlib import Path
 
 from .._capture import enforce_write_path
 from ..exceptions import WritePathViolation
 from .backend import Judgment, JudgmentOutcome
+from .proposal import compute_policy_version
 from .types import (
     ActionClass,
     ClassPolicyValue,
@@ -92,13 +92,13 @@ class PolicyJudge:
         self._allowed_write_paths: list[Path] = list(allowed_write_paths or [])
         self._read_only_paths: list[Path] = list(read_only_paths or [])
         self._judge_id = judge_id
-        # policy_version per spec/28:302 — keep the prefix shape so audit-log
-        # readers can split tools.md vs judges.md halves. judges.md is
-        # `absent` in PR 2a (parser lands in PR 3).
-        self._policy_version = (
-            f"tools.md@sha256:{hashlib.sha256(tools_md_text.encode('utf-8')).hexdigest()}"
-            f"+judges.md@sha256:absent"
-        )
+        # policy_version computation is centralized in
+        # ``judge.proposal.compute_policy_version`` so every JudgeBackend
+        # producing this string for the same (tools.md, judges.md)
+        # snapshot agrees byte-for-byte. judges.md text stays None in
+        # PR 2a/2b (parser lands in PR 3); ``compute_policy_version``
+        # writes ``judges.md@sha256:absent`` in that case.
+        self._policy_version = compute_policy_version(tools_md_text, None)
 
     # ── JudgeBackend Protocol surface ──────────────────────────────
 
