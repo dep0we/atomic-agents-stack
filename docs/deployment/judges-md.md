@@ -11,13 +11,15 @@ this page is the *how-to-author-it* guide that pairs with the shipped
 parser.
 
 > **Status:** The judge layer ships in pieces across `#112` PR 1 → 4.
-> PR 3a (this doc's subject) shipped the `judges.md` parser, cascade-aware
-> project floor, and per-class policy short-circuits in dispatch. ESCALATE
-> state-machine polling, full conformance suite, and the spec lock-in
-> land in subsequent PRs. The fields documented here are the parser's
-> contract as of PR 3a — adding `judges.md` to your agent today opts
-> you into PolicyJudge (always-on rule engine) and, when an OpenAI key
-> resolves, `LLMJudgeBackend` (the second-line LLM judge from PR 2b).
+> PR 3a shipped the `judges.md` parser, cascade-aware project floor, and
+> per-class policy short-circuits in dispatch. **PR 3b (current) ships
+> the ESCALATE state machine** — PENDING file writes, operator
+> resolution polling, auto-decide timeout, and inline execution of
+> Approved escalations. The full conformance suite and the spec/28
+> lock-in land in PR 4. REVISE (judge-driven amendment + operator
+> `### Revised by <op>`) is deferred to PR 3c — a Revised block in
+> PR 3b is logged as a warning and treated as Denied so the action does
+> not execute against an unvalidated amendment.
 
 ---
 
@@ -28,7 +30,7 @@ parser.
 | `tools.md` write paths to be advisory exactly as today (no judge invocation).      | **No `judges.md`.** The opt-in gate stays off. |
 | Every side-effectful tool call to write an audit-only judgment event.              | `judges.md` with `class_policy: allow_with_audit` per class. |
 | Every side-effectful tool call to be evaluated by a judge before execution.        | `judges.md` with `class_policy: judge_required` per class. |
-| `delete_files`-class actions to pause for operator approval.                       | `judges.md` with `high_risk: escalate`. (ESCALATE wiring lands in PR 3b.) |
+| `delete_files`-class actions to pause for operator approval.                       | `judges.md` with `high_risk: escalate`. See [Escalation queue](#escalation-queue) below. |
 | A multi-agent project to enforce a minimum policy across every delegate.           | Drop a `judges.md` at the **project root** — it becomes the non-relaxable floor. |
 
 The judge layer is fully opt-in. Existing deployments see no judge
@@ -141,7 +143,7 @@ into one of four action classes. The `class_policy` block in
 | `bypass`            | Skip the judge entirely. No proposal built, no judgment event written, no audit trail line. The class behaves pre-#112.       | `read_only` actions where the operator trusts the actor's read pattern and doesn't want judgment cost on every read. |
 | `allow_with_audit`  | Run the judge, **always allow**, but write the full judgment event to the audit trail. Surface for "I want to see what the judge would say without it gating." | Production rollouts where you want visibility into the judge's calibration before letting it block actions.          |
 | `judge_required`    | Run the judge; **its outcome is enforced**. BLOCK refuses; ALLOW executes; REVISE/ESCALATE follow spec/28 semantics.            | The default for `reversible_write` and `external_side_effect` actions once the judge is calibrated.                  |
-| `escalate`          | Always escalate to operator approval before execution. The judge runs (audit trail captures its opinion) but the action waits for operator sign-off. (ESCALATE polling ships in PR 3b — until then, ESCALATE self-maps to BLOCK with `escalate_pending_polling_unimplemented` to avoid orphan PENDING files.) | `high_risk` actions (`delete_files`, `force_push`, `production_deploy`) and anything else the operator wants eyes-on. |
+| `escalate`          | Pause for operator approval before execution. Framework writes a PENDING file to `vault/escalations/<class>/<proposal_id>.md`; `agent.call()` returns `Response(deferred=True, escalation_queue_ids=[...])`. On a later `call()` (or explicit `agent.poll_escalations()`), the framework reads the operator's resolution block and either executes (Approved), refuses (Denied), or auto-decides on timeout. See [Escalation queue](#escalation-queue) below. | `high_risk` actions (`delete_files`, `force_push`, `production_deploy`) and anything else the operator wants eyes-on. |
 
 Strictness ordering: `bypass < allow_with_audit < judge_required < escalate`.
 A delegate's `judges.md` may *strengthen* a class's policy but cannot
@@ -286,6 +288,216 @@ Only these names are valid in `failure_policy`. Typos raise
 
 ---
 
+## Escalation queue
+
+When the judge ensemble returns ESCALATE — or when
+`class_policy.<X>=escalate` synthesizes the outcome at the framework
+layer — the action is paused and queued for operator approval. The
+queue is a directory of plain markdown files; operators resolve a
+PENDING by editing the file in any text editor (Obsidian, vim, VS Code)
+and writing a resolution block at the bottom. There is no separate
+inbox UI in PR 3b — the vault IS the queue.
+
+### Lifecycle
+
+1. **Framework writes PENDING.** On ESCALATE, the framework atomically
+   writes `<agent_root>/vault/escalations/<action_class>/<proposal_id>.md`
+   with frontmatter (state, agent, action_class, judge_id,
+   `escalated_at`, `policy_version`, `schema_version`) plus a `## Proposal`
+   block carrying the full `ActionProposal` serialized as fenced YAML
+   and a `## Judge's reason for escalating` block carrying the judge's
+   prose. `agent.call()` returns `Response(deferred=True, escalation_queue_ids=[id1, ...])`.
+2. **Operator opens the file** and writes exactly ONE resolution block at
+   the bottom (under the existing `## Resolution` heading). See the
+   [Resolution block grammar](#resolution-block-grammar) below.
+3. **Framework polls** — at the top of any subsequent `agent.call()` (or
+   when an operator runs `agent.poll_escalations()` directly), the
+   framework scans the queue subject to the
+   `resolution_poll_cycle_seconds` throttle. The poller is
+   crash-recoverable and de-duplicated: concurrent pollers race a
+   `.<proposal_id>.resolved-emitted` sidecar via `O_CREAT|O_EXCL`, so
+   exactly one emits the RESOLVED audit event.
+4. **Framework acts on the resolution.**
+   - **Approved** → re-verify `tool_definition_hash` against the
+     current tool registry (refuses if the tool's schema or handler
+     changed since PENDING — audited as `approved_stale_tool_definition`),
+     then execute the bound action inline. `cost_source="actor"` keeps
+     the spend on the original actor's ledger.
+   - **Denied** → no execution; audit records refusal.
+   - **Redacted** → no execution; audit records redaction. The body is
+     replaced with the operator's redaction reason; frontmatter is
+     preserved.
+   - **Auto-decided by framework** → when `auto_decide_after_seconds`
+     elapses without an operator block, the framework writes its own
+     `### Auto-decided by framework` block applying
+     `fallback_on_timeout` (default `block`). The auto-decide path uses
+     a sha256 compare-and-swap before writing, so an operator who
+     edits the file in the same poll cycle wins (framework defers to
+     the next cycle).
+
+### Resolution block grammar
+
+Operators write exactly ONE block at the bottom of the PENDING file.
+Headers MUST match this grammar exactly:
+
+```
+### <Verb> by <operator>
+```
+
+Where:
+
+- `###` is an h3 prefix (not h2, not h4).
+- `<Verb>` is one of `Approved`, `Denied`, `Redacted`,
+  `Auto-decided`, `Revised` — **exact case** (capital A/D/R, lowercase
+  rest, hyphen in `Auto-decided`).
+- The literal word `by` separates the verb and the operator name.
+- `<operator>` is a non-empty string (your name, your handle, a service
+  account ID — whatever you want on the audit trail).
+
+Typos surface as **doctor warnings**, not silent denials. A malformed
+header (`### approved by alice`, `### Approved By alice`, `#### Approved by alice`)
+makes the file UNPARSEABLE — the framework leaves it as-is, does NOT
+claim the de-dup sidecar, and surfaces the bad file on the next
+`atomic-agents doctor` run. Fix the typo and the next poll picks it
+up.
+
+**First block wins.** If two resolution blocks appear in the same
+file, the framework processes the *first* one (top-down). The
+file's `state:` frontmatter field is the authoritative state. Two
+operators editing concurrently are responsible for not stomping each
+other; the framework does not attempt to merge.
+
+**Revised → treated as Denied in PR 3b.** REVISE (operator supplies
+an amended proposal that the framework re-validates and, for
+`high_risk`, re-judges) ships in PR 3c. A `### Revised by <op>` block
+in PR 3b is logged as a warning and treated as Denied so the action
+does not execute against an unvalidated amendment.
+
+### Block bodies
+
+Each block carries free-prose context that flows to the audit trail.
+The framework parses the header for the decision and surfaces the
+body to the JSONL audit event verbatim.
+
+Approved (the most common):
+
+```
+### Approved by alice
+resolved_at: 2026-05-13T09:14:22Z
+note: Reviewed the proposal — sender list is correct, attachment is the public report.
+```
+
+Denied:
+
+```
+### Denied by alice
+resolved_at: 2026-05-13T09:14:22Z
+note: Wrong distribution list. Have the agent re-author against the customer list, not the prospect list.
+```
+
+Redacted (use when the PENDING contains sensitive details that
+shouldn't persist in the queue history):
+
+```
+### Redacted by alice
+redacted_at: 2026-05-13T09:14:22Z
+redaction_reason: PENDING body contained customer PII not appropriate for retention.
+```
+
+`resolved_at` / `redacted_at` is operator-supplied prose; the framework
+also stamps its own `resolved_at` ISO-8601 timestamp on the RESOLVED
+audit event.
+
+### Auto-decide behavior
+
+When `escalation.auto_decide_after_seconds` is set and the PENDING
+file's `escalated_at` is past the timeout, the framework writes a
+synthetic resolution block on the next poll cycle:
+
+```
+### Auto-decided by framework
+resolved_at: 2026-05-13T13:30:00Z
+reason: auto_decide_after_seconds=86400 elapsed; fallback_on_timeout=block
+```
+
+The framework flips the file's `state:` frontmatter to `resolved`,
+emits a RESOLVED audit event with `enforcement_action="auto_decided_block"`
+(or `"auto_decided_allow"` if `fallback_on_timeout: allow`), and
+does NOT execute the action when fallback is `block`.
+
+**Race safety**: the auto-decide write is gated on a sha256
+compare-and-swap. If an operator edits the file between the poller's
+initial read and the framework's atomic_write, the framework aborts
+the auto-decide and defers to the operator's edit (which the next
+poll cycle picks up as a normal Approved/Denied/Redacted block). The
+auto-decide is idempotent — the timeout has still passed, so retrying
+on the next cycle is safe.
+
+### Body integrity
+
+On every operator resolution, the framework recomputes
+`arguments_hash` from the `## Proposal` block's `tool_arguments` field
+and compares against the embedded `arguments_hash` value. Mismatch →
+`enforcement_action="proposal_body_tampered"`, **no execution**.
+
+**Scope of the check**: this catches accidental edits (operator
+mis-pastes the proposal, fixes a typo in the args) and lazy tamper
+(operator changes the args without recomputing the embedded hash). A
+sophisticated operator can recompute the hash to match — the
+embedded hash is in the same file. Operator approval is itself the
+trust anchor; the body-integrity check is a guard against careless
+edits, not against a hostile operator. Operators with vault write
+access can also write a fresh PENDING file from scratch with any
+arguments they want.
+
+### Audit shape
+
+Every resolution emits a JSONL `JudgmentEvent` line to the agent's
+run log. The relevant fields:
+
+- `enforcement_action` distinguishes the exact action the framework
+  took: `approved_executed`, `approved_stale_tool_definition`,
+  `denied`, `redacted`, `auto_decided_block`, `auto_decided_allow`,
+  `proposal_body_tampered`.
+- `synthesis_source` (only set when the framework — not a real judge
+  — produced the ESCALATE) tells you why the PENDING was written:
+  `"class_policy"` (operator's `class_policy.<X>=escalate` fired
+  without invoking the judge ensemble) or `"failure_policy"` (a
+  judge raised an exception mapped to `escalate` via
+  `failure_policy`). `null` (or omitted) means a real judge in the
+  ensemble returned ESCALATE.
+- `triggered_by` (populated only for `failure_policy` synthesis)
+  names the exception class: `"failure_policy:JudgeUnavailable"`,
+  etc. Operators auditing a stall caused by a backend outage see
+  exactly which exception drove the escalate.
+- `escalation_queue_id` equals the `proposal_id` — the framework
+  does not mint a separate queue ID.
+- For the original actor's run, the deferred tool_use is recorded
+  with `trigger: "tool_call_deferred"` and a synthesized
+  `ToolCallResult(deferred=True, error="judge_deferred: ESCALATE — see escalation_queue_id=...")`.
+  Consumers iterating `response.tool_calls` distinguish deferred
+  from genuine handler errors via the `deferred: bool` field, not by
+  string-matching `error`.
+
+The PENDING file is preserved in the audit trail across its full
+lifecycle (PENDING → resolved | redacted), so a fleet auditor can
+reconstruct the operator decision from the file itself.
+
+### Standalone-invocation caveat
+
+`agent.poll_escalations()` is public and operators may call it
+directly (e.g., from a future `atomic-agents poll-escalations` CLI).
+When invoked standalone (NOT via `agent.call()`), the MCP client pool
+is NOT initialized — `call()` is what wires it up after the cost
+gate. If an Approved escalation's tool is an MCP tool, the tool
+registry lookup returns `None` and the resolution is recorded as
+`approved_stale_tool_definition` — safe (fail-closed) but misleading
+(the tool isn't stale; the framework just hasn't loaded MCP yet).
+Wire MCP init into a standalone CLI before relying on Approved
+MCP-tool execution; tracked in [#166](https://github.com/dep0we/atomic-agents-stack/issues/166).
+
+---
+
 ## Other knobs
 
 ### `backend`, `model`, `timeout_ms`
@@ -320,15 +532,23 @@ All three fields are optional. Caps are non-negative; negatives raise
 
 ### `escalation`
 
-ESCALATE state-machine polling lands in PR 3b; PR 3a parses these
-fields so PR 3b can consume them without re-parsing.
+Controls where PENDING files are written, how long the framework waits
+for the operator before auto-deciding, the fallback verdict on timeout,
+and how often the resolution poller scans the queue.
 
 ```yaml
 escalation:
-  destination: vault                    # "vault" | future: "linear" | "slack" | ...
-  auto_decide_after_seconds: 86400      # Wait at most 24h for operator decision. None = wait indefinitely.
-  fallback_on_timeout: block            # What to do when auto_decide_after expires. allow/block/revise/escalate.
+  destination: vault/escalations/         # Vault-relative directory. Default "vault/escalations/". Legacy "vault" is accepted as an alias and normalized.
+  auto_decide_after_seconds: 86400        # Wait at most 24h for operator decision. None / omitted = wait indefinitely.
+  fallback_on_timeout: block              # What to do when auto_decide_after expires. allow | block | revise | escalate. Default block.
+  resolution_poll_cycle_seconds: 60       # Throttle: at most one queue scan per N seconds inside agent.call(). Default 60.
 ```
+
+The poller is opportunistic — it runs at the top of `agent.call()`
+whenever the throttle window has elapsed since the last scan (the
+`.last-poll` marker lives in the destination directory). Operators who
+want a clock-driven poll independent of agent traffic can call
+`agent.poll_escalations()` directly from a cron / launchd job.
 
 ### `judge_captures`, `read_audit_mode`
 

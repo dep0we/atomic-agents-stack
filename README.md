@@ -176,7 +176,7 @@ The framework is moving toward swappable backends layer by layer. The shape: a P
 |---|---|---|
 | `MemoryBackend` | ✅ Shipped (v0.10.0) | [`spec/20-memory-backend.md`](docs/spec/20-memory-backend.md) |
 | `LLMBackend` | ✅ Shipped (v0.13.0) | [`spec/31-llm-backend.md`](docs/spec/31-llm-backend.md) |
-| `JudgeBackend` | 🟡 In progress — Protocol + types scaffolding ([#112](https://github.com/dep0we/atomic-agents-stack/issues/112) PR 1) + opt-in dispatch wiring + `PolicyJudge` rule-engine + `atomic_action` proposal marker (PR 2a) + `LLMJudgeBackend` reference impl + two-judge ensemble dispatch + per-judge audit events (PR 2b) shipped; `judges.md` parser, ESCALATE polling, and the conformance suite land in PRs 3-4 | [`spec/28-judge-layer.md`](docs/spec/28-judge-layer.md) (RFC) |
+| `JudgeBackend` | 🟡 In progress — Protocol + types scaffolding ([#112](https://github.com/dep0we/atomic-agents-stack/issues/112) PR 1) + opt-in dispatch wiring + `PolicyJudge` rule-engine + `atomic_action` proposal marker (PR 2a) + `LLMJudgeBackend` reference impl + two-judge ensemble dispatch + per-judge audit events (PR 2b) + `judges.md` operator config parser + cascade-aware project floor (PR 3a) + ESCALATE state machine (PENDING-file writer + operator resolution polling + auto-decide timeout + inline Approved execution) (PR 3b) shipped; REVISE flow lands in PR 3c, the full conformance suite + spec/28 lock-in in PR 4 | [`spec/28-judge-layer.md`](docs/spec/28-judge-layer.md) (RFC) |
 | `LockBackend` | Planned | [`#60`](https://github.com/dep0we/atomic-agents-stack/issues/60) |
 | `LogBackend` | Planned | [`#61`](https://github.com/dep0we/atomic-agents-stack/issues/61) |
 | `PersonaBackend` | Planned | [`#62`](https://github.com/dep0we/atomic-agents-stack/issues/62) |
@@ -221,7 +221,7 @@ Every tool call is classified into one of four action classes per `tools.md`. Th
 | `bypass`            | Skip the judge entirely. No proposal, no judgment event, no audit line.                                                                          |
 | `allow_with_audit`  | Run the judge; **always allow**; write the full judgment event to the audit trail. Surface for "I want to see the judge's opinion without it gating actions yet." |
 | `judge_required`    | Run the judge; its outcome is enforced. BLOCK refuses; ALLOW executes; REVISE/ESCALATE follow spec/28 semantics.                                 |
-| `escalate`          | Always pause for operator approval. The judge still runs (audit captures its opinion); the action waits for operator sign-off. (ESCALATE polling ships in PR 3b — until then ESCALATE self-maps to BLOCK with `escalate_pending_polling_unimplemented` to avoid orphan PENDING files.) |
+| `escalate`          | Pause for operator approval. Framework writes a PENDING file to `vault/escalations/<class>/<proposal_id>.md`; `agent.call()` returns `Response(deferred=True, escalation_queue_ids=[...])`; operator writes a resolution block; the next `call()` (or an explicit `agent.poll_escalations()`) reads the decision and executes Approved actions inline. See [Escalation queue](#escalation-queue) below. |
 
 Strictness ordering: `bypass < allow_with_audit < judge_required < escalate`. Unspecified classes default-fill to safe values (`read_only: bypass`, everything else `judge_required` or `escalate` for `high_risk`).
 
@@ -254,6 +254,22 @@ failure_policy:
 ```
 
 The parser auto-detects the shape — top-level keys are either exception names (flat) or action class names (nested). Mixing shapes raises `JudgePolicyInvalid`.
+
+### Escalation queue
+
+When the judge ensemble returns ESCALATE — or when `class_policy.<X>=escalate` synthesizes the outcome at the framework layer, or when a judge exception is mapped to `escalate` via `failure_policy` — the action is paused for operator review. The framework writes a PENDING file to `<agent_root>/vault/escalations/<action_class>/<proposal_id>.md` (atomic, frontmatter + full `ActionProposal` serialized as fenced YAML + the judge's reason), and `agent.call()` returns `Response(deferred=True, escalation_queue_ids=[id1, id2, ...])`. The actor's run terminates immediately — ALLOWed tool_uses in the same turn still execute and their results land in `Response.tool_calls`, but the multi-turn loop does not continue.
+
+The operator resolves a PENDING by editing the file in any text editor (Obsidian, vim, VS Code) and writing exactly one resolution block at the bottom. Header grammar is **strict** — h3 + exact-case verb + the literal word `by` + a non-empty operator name:
+
+```
+### Approved by alice
+resolved_at: 2026-05-13T09:14:22Z
+note: Reviewed — sender list is correct, attachment is the public report.
+```
+
+The four resolution verbs are `Approved`, `Denied`, `Redacted`, and `Auto-decided` (the framework writes the auto-decide block itself when `escalation.auto_decide_after_seconds` elapses). `Revised` is reserved for PR 3c; a Revised block in PR 3b is treated as Denied so the action does not execute against an unvalidated amendment. Header typos surface as doctor warnings rather than silent denials.
+
+On the next `agent.call()` (or when an operator runs `agent.poll_escalations()` directly), the framework throttle-checks (`escalation.resolution_poll_cycle_seconds`, default 60s), scans the queue, re-verifies the proposal body's `arguments_hash` (mismatch → `proposal_body_tampered`, refuses execution), and for Approved resolutions re-verifies `tool_definition_hash` against the current tool registry before executing the bound action inline. Concurrent pollers race a `.<proposal_id>.resolved-emitted` sidecar via `O_CREAT|O_EXCL` for exactly-once audit emit; auto-decide writes use a sha256 compare-and-swap so an operator edit-in-progress always wins. See [`docs/deployment/judges-md.md`](docs/deployment/judges-md.md#escalation-queue) for the full grammar, audit shape (`enforcement_action`, `synthesis_source`, `triggered_by`), and the `approved_stale_tool_definition` refusal path.
 
 ### See also
 
@@ -419,4 +435,4 @@ Before opening a PR, read [`CLAUDE.md`](CLAUDE.md) (the project's design ethos a
 
 ## Status
 
-**v0.13.0, alpha.** Core runtime stable. 1193 tests passing on Python 3.11 / 3.12. Two backend protocols shipped (Memory + LLM); `JudgeBackend` Protocol + canonical types ([#112](https://github.com/dep0we/atomic-agents-stack/issues/112) PR 1) plus opt-in judge dispatch wiring, the `PolicyJudge` rule-engine reference impl, and the `atomic_action` proposal marker (PR 2a) plus the `LLMJudgeBackend` reference impl, two-judge ensemble dispatch, and per-judge audit events (PR 2b) shipped on branch — opt in via `judges.md` in the agent root or `AGENT_JUDGE_ENABLED=1`; the `judges.md` parser, ESCALATE polling, and the conformance suite land in PRs 3-4. The remaining protocol-pattern roadmap (`LockBackend` / `LogBackend` / `PersonaBackend` / etc.) is what v1.0 closes; the surface stabilizes there. Pre-1.0 — Minor releases may contain breaking changes (see [`docs/deployment/versioning.md`](docs/deployment/versioning.md)). Single-maintainer project; reference implementation that anyone can use, fork, or extend.
+**v0.13.0, alpha.** Core runtime stable. 1193 tests passing on Python 3.11 / 3.12. Two backend protocols shipped (Memory + LLM); `JudgeBackend` Protocol + canonical types ([#112](https://github.com/dep0we/atomic-agents-stack/issues/112) PR 1) plus opt-in judge dispatch wiring, the `PolicyJudge` rule-engine reference impl, and the `atomic_action` proposal marker (PR 2a) plus the `LLMJudgeBackend` reference impl, two-judge ensemble dispatch, and per-judge audit events (PR 2b) plus the `judges.md` operator config parser and cascade-aware project floor (PR 3a) plus the ESCALATE state machine — PENDING-file writer, operator resolution polling, auto-decide timeout, inline Approved execution (PR 3b) — shipped on branch. Opt in via `judges.md` in the agent root or `AGENT_JUDGE_ENABLED=1`; REVISE flow lands in PR 3c, the full conformance suite + spec/28 lock-in in PR 4. The remaining protocol-pattern roadmap (`LockBackend` / `LogBackend` / `PersonaBackend` / etc.) is what v1.0 closes; the surface stabilizes there. Pre-1.0 — Minor releases may contain breaking changes (see [`docs/deployment/versioning.md`](docs/deployment/versioning.md)). Single-maintainer project; reference implementation that anyone can use, fork, or extend.
