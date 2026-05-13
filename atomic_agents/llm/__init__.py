@@ -66,6 +66,8 @@ __all__ = [
 ]
 
 
+
+
 # Process-local registry. Keyed by ``provider_id`` to enforce the
 # uniqueness invariant — two backends with the same id make no sense.
 # A model id may legitimately be claimed by multiple ``provider_id``s
@@ -161,6 +163,8 @@ def find_backend_for_model(
        candidate ``provider_id`` values, hinting at the ``model.md``
        fix.
     """
+    _ensure_default_backends()
+
     # Treat empty / whitespace as "no preference" — a model.md parser
     # encountering a bare `provider:` line shouldn't make resolution
     # fail with the misleading "no backend registered with provider_id
@@ -188,3 +192,46 @@ def find_backend_for_model(
             model, sorted(b.provider_id for b in matches)
         )
     return matches[0]
+
+
+_DEFAULTS_REGISTERED = False
+
+
+def _ensure_default_backends() -> None:
+    """Lazily register the reference backends on first registry use.
+
+    Each backend's instantiation may raise ``AtomicAgentsError`` when its
+    optional SDK isn't installed (e.g., anthropic, openai). The framework
+    treats missing SDKs as "this backend isn't available in this
+    deployment" — log at DEBUG and continue. The cost gates and doctor
+    surface the actual missing-key / missing-SDK condition when an
+    operator tries to use the affected provider.
+
+    Called by ``find_backend_for_model`` on every lookup; idempotent via
+    the ``_DEFAULTS_REGISTERED`` guard. Lazy registration keeps
+    ``import atomic_agents`` fast — pulling in anthropic at module-import
+    time slows every subprocess spawn (e.g., ``multiprocessing.Process``
+    in tests) by ~300ms and broke a timing-sensitive lock acquisition
+    test on the introducing PR.
+
+    PR 2 of #87 registers AnthropicLLMBackend here. PR 3 will add
+    OpenAICompatibleLLMBackend + MoonshotLLMBackend factories.
+    """
+    from ..exceptions import AtomicAgentsError as _AAE
+    global _DEFAULTS_REGISTERED
+    if _DEFAULTS_REGISTERED:
+        return
+    _DEFAULTS_REGISTERED = True
+    try:
+        from .anthropic import AnthropicLLMBackend
+        register_llm_backend(AnthropicLLMBackend())
+        _logger.debug("registered AnthropicLLMBackend")
+    except (ImportError, _AAE) as e:
+        # Documented expected misses: missing SDK or framework-specific
+        # init failure (e.g., key not configured at backend init time —
+        # though current backends defer key lookup to first call). Logged
+        # at WARNING so operators see it without enabling DEBUG.
+        _logger.warning("AnthropicLLMBackend not registered: %s", e)
+    # Any other exception type propagates → real code bugs surface as
+    # tracebacks at first lookup rather than masquerading as
+    # UnknownModelError with no backend registered.

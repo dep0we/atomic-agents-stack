@@ -266,9 +266,16 @@ class AtomicAgent:
         Returns None for providers without tool-call support — the agent then
         falls back to Path 2 fenced-block parsing only.
 
-        This is the static, registry-unaware version used by existing tests and
-        callers that only need the built-in capture definition. See
-        _all_tool_definitions() for the full list including custom tools.
+        Format-static: returns provider-shaped dicts (Anthropic or OpenAI),
+        not canonical ``LLMToolDefinition``. See _all_tool_definitions()
+        for the full list including custom tools.
+
+        Note: #87 PR 2 introduced an LLMBackend Protocol whose tool definition
+        type is canonical (``LLMToolDefinition``) rather than provider-shaped.
+        ``_llm.call_llm`` converts at the boundary today so this method can
+        keep returning provider dicts. PR 3 / PR 4 of the LLMBackend arc
+        will refactor this method to return canonical lists; the existing
+        dict-shape callers and tests stay unchanged in PR 2.
         """
         if model.startswith("claude-"):
             return [_capture.anthropic_tool_definition()]

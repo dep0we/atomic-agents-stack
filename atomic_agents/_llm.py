@@ -34,109 +34,134 @@ def call_llm(
     max_tokens: int = 4096,
     temperature: float = 0.6,
     cache_control_breakpoints: list[int] | None = None,
-    tools: list[dict] | None = None,
+    tools: list | None = None,
 ) -> _RawLLMResponse:
     """Dispatch to the right provider based on model id prefix.
 
-    `tools` is a list of provider-formatted tool definitions. For Anthropic, use
-    atomic_agents._capture.anthropic_tool_definition(); for OpenAI/Moonshot, use
-    openai_tool_definition(). The agent layer picks the right formatter via
-    AtomicAgent._capture_tool_definitions(model).
+    ``tools`` accepts either:
 
-    Returns _RawLLMResponse normalized across providers, with tool_use blocks
-    normalized to {"name": ..., "input": ..., "id": ...} regardless of provider.
+    - ``list[LLMToolDefinition]`` (canonical, the post-#87 shape) — passed
+      through to backends that have registered (Anthropic today; OpenAI /
+      Moonshot once PR 3 of #87 lands).
+    - ``list[dict]`` (legacy Anthropic-shape or OpenAI-shape) — accepted
+      for backward compatibility with any external code that pinned to the
+      pre-#87 API. Converted to canonical at the entry point. PR 3 / PR 4
+      of the LLMBackend arc removes this acceptance once every internal
+      caller produces canonical.
+
+    Returns ``_RawLLMResponse`` normalized across providers, with tool_use
+    blocks normalized to ``{"name": ..., "input": ..., "id": ...}``
+    regardless of provider.
     """
     if model.startswith("claude-"):
-        return _call_anthropic(
-            model, system_prompt, messages, max_tokens, temperature,
-            cache_control_breakpoints, tools,
+        # Route Anthropic through the registry (#87 PR 2). The backend
+        # accepts canonical types and translates internally; legacy dict
+        # tools are converted at this entry boundary so call sites that
+        # haven't migrated keep working.
+        from .llm import find_backend_for_model
+        from .llm.types import CacheDirective
+
+        canonical_tools = _to_canonical_tool_defs(tools)
+        cache_directives = (
+            [CacheDirective(breakpoint_id=f"breakpoint_{i}") for i in cache_control_breakpoints]
+            if cache_control_breakpoints
+            else None
+        )
+        backend = find_backend_for_model(model)
+        return backend.call(
+            model=model,
+            system_prompt=system_prompt,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            tools=canonical_tools,
+            cache_directives=cache_directives,
         )
     if model.startswith("gpt-"):
-        return _call_openai(model, system_prompt, messages, max_tokens, temperature, tools)
+        # Legacy procedural path — PR 3 of #87 introduces
+        # OpenAICompatibleLLMBackend which subsumes this branch.
+        openai_tools = _to_openai_tool_dicts(tools)
+        return _call_openai(model, system_prompt, messages, max_tokens, temperature, openai_tools)
     if model.startswith("moonshot/"):
-        return _call_moonshot(model, system_prompt, messages, max_tokens, temperature, tools)
+        openai_tools = _to_openai_tool_dicts(tools)
+        return _call_moonshot(model, system_prompt, messages, max_tokens, temperature, openai_tools)
     raise ValueError(f"no provider routing for model: {model}")
 
 
-def _call_anthropic(
-    model: str,
-    system_prompt: str,
-    messages: list[dict],
-    max_tokens: int,
-    temperature: float,
-    cache_breakpoints: list[int] | None = None,
-    tools: list[dict] | None = None,
-) -> _RawLLMResponse:
-    """Call Anthropic's Messages API."""
-    try:
-        import anthropic
-    except ImportError as e:
-        raise AtomicAgentsError(
-            "anthropic SDK not installed; pip install anthropic"
-        ) from e
+def _to_canonical_tool_defs(tools):
+    """Accept either canonical ``LLMToolDefinition`` list or legacy dict list.
 
-    api_key = _get_anthropic_key()
-    client = anthropic.Anthropic(api_key=api_key)
+    Conversion is one-way (dict → canonical) for the Anthropic dispatch
+    path. PR 3 / PR 4 of #87 removes this once every internal caller
+    produces canonical. Until then the wrapper keeps external pinned
+    callers (and the existing `tests/test_llm_tool_uses.py` fixtures)
+    working unchanged.
 
-    # System prompt as a list with cache_control on the long-cached portion
-    system_blocks: list[dict[str, Any]]
-    if cache_breakpoints:
-        # Multiple system blocks with cache_control on stable ones
-        # (For v1, just put one ephemeral cache_control on the whole system prompt
-        #  if any breakpoints are requested — refine later)
-        system_blocks = [
-            {
-                "type": "text",
-                "text": system_prompt,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ]
-    else:
-        system_blocks = [{"type": "text", "text": system_prompt}]
+    The legacy dict shape is Anthropic's ``{name, description, input_schema}``
+    — that's what ``_capture.anthropic_tool_definition()`` produced and
+    what every existing Anthropic-targeted call site passes.
 
-    create_kwargs: dict[str, Any] = {
-        "model": model,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "system": system_blocks,
-        "messages": messages,
-    }
-    if tools:
-        create_kwargs["tools"] = tools
+    Per-element shape check (not just ``tools[0]``): a future caller that
+    mixes canonical and legacy items in the same list shouldn't slip past
+    the entry guard and crash deep inside the backend. Each item is
+    converted independently.
 
-    response = client.messages.create(**create_kwargs)
+    Caveat: legacy dict items must carry exactly ``name`` / ``description``
+    / ``input_schema``. Extra keys (e.g., Anthropic's per-tool
+    ``cache_control``) are dropped during conversion. Per-tool caching
+    support lands with the canonical-type extension tracked in the
+    PR-2 follow-up issue.
+    """
+    if not tools:
+        return None
+    from .llm.types import LLMToolDefinition
+    return [
+        t if isinstance(t, LLMToolDefinition)
+        else LLMToolDefinition(
+            name=t["name"],
+            description=t["description"],
+            input_schema=t["input_schema"],
+        )
+        for t in tools
+    ]
 
-    # Extract text + tool_use blocks
-    text_parts: list[str] = []
-    tool_uses: list[dict] = []
-    for block in response.content:
-        block_type = getattr(block, "type", None)
-        if block_type == "tool_use":
-            tool_uses.append({
-                "id": getattr(block, "id", ""),
-                "name": getattr(block, "name", ""),
-                "input": getattr(block, "input", {}) or {},
-            })
-        elif block_type == "text" or hasattr(block, "text"):
-            text_parts.append(getattr(block, "text", ""))
-    text = "".join(text_parts)
 
-    # Token usage — Anthropic returns input_tokens, output_tokens, cache_*_tokens
-    usage = response.usage
-    cache_hit = getattr(usage, "cache_read_input_tokens", 0) or 0
-    cache_creation = getattr(usage, "cache_creation_input_tokens", 0) or 0
-    input_tokens = usage.input_tokens + cache_hit + cache_creation
-    cache_miss = input_tokens - cache_hit
+def _to_openai_tool_dicts(tools):
+    """Accept either canonical ``LLMToolDefinition`` list or legacy openai-shape dicts.
 
-    return _RawLLMResponse(
-        text=text,
-        input_tokens=input_tokens,
-        output_tokens=usage.output_tokens,
-        cache_hit_tokens=cache_hit,
-        cache_miss_tokens=cache_miss,
-        raw=response.model_dump() if hasattr(response, "model_dump") else None,
-        tool_uses=tool_uses,
-    )
+    Reverse of ``_to_canonical_tool_defs``: agent.py refactor in PR 2.5
+    will produce canonical even for OpenAI / Moonshot models, but
+    ``_call_openai`` / ``_call_moonshot`` still expect OpenAI's
+    ``{"type": "function", "function": {...}}`` wrapper. Translates
+    canonical → openai dict here as transitional glue.
+
+    Per-element shape check so a mixed list (canonical + legacy) doesn't
+    crash a downstream consumer that assumes one shape.
+
+    PR 3 of #87 introduces ``OpenAICompatibleLLMBackend.call()`` which
+    owns this translation internally; this helper deletes when that PR
+    lands and every OpenAI / Moonshot call goes through the registry.
+    """
+    if not tools:
+        return None
+    from .llm.types import LLMToolDefinition
+    # Fast path: when every item is already a dict, return the input list
+    # by reference. Preserves object identity for legacy callers + tests
+    # that pre-date the canonical-types refactor and assert `is` equality.
+    if all(isinstance(t, dict) for t in tools):
+        return tools
+    return [
+        t if isinstance(t, dict)
+        else {
+            "type": "function",
+            "function": {
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.input_schema,
+            },
+        }
+        for t in tools
+    ]
 
 
 def _call_openai(
