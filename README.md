@@ -101,7 +101,7 @@ Honest about what isn't shipped or fully tested:
 
 - **Alpha, single maintainer.** Pre-1.0 means Minor releases may contain breaking changes; read release notes before upgrading.
 - **macOS / Linux primary; Windows under-tested.** `atomic_agents/_locks.py` uses POSIX `fcntl`. iOS can't run the runtime at all (Markdown vault files sync there fine — see [`docs/deployment/obsidian.md`](docs/deployment/obsidian.md)).
-- **Only `MemoryBackend` is shipped from the protocol roadmap.** `Lock` / `Log` / `Persona` / `AgentProfile` / `ToolRegistry` / `Corpus` / `LLM` / `Policy` backends are all filesystem-default-only today; the protocol contracts come later. Org-scale deployments today still run filesystem-everything.
+- **`MemoryBackend` + `LLMBackend` are shipped from the protocol roadmap.** Three reference LLM backends (Anthropic, OpenAI direct via `OpenAICompatibleLLMBackend`, Moonshot via the same factory class) all register at framework import; third-party Gemini / Bedrock / Vertex / vLLM-local backends can register without forking core. `Lock` / `Log` / `Persona` / `AgentProfile` / `ToolRegistry` / `Corpus` / `Policy` backends are still filesystem-default-only today; their protocol contracts come later. Org-scale deployments today still run filesystem-everything for those layers.
 - **Cost guardrail `alert` action is log-backed today.** The `alert_channel` field is parsed, but external dispatch (Telegram / email / webhook) is not wired up yet. Today's alerts go to the run log; the dashboard surfaces them visually. See [`#70`](https://github.com/dep0we/atomic-agents-stack/issues/70).
 - **Cross-host locking is operator-managed.** The flock is in-kernel and per-host; running the same agent on two hosts simultaneously is on you. A `LockBackend` ([`#60`](https://github.com/dep0we/atomic-agents-stack/issues/60)) will eventually generalize this.
 - **`__all__` lags behind raised exceptions.** A few public-facing exceptions are raised inside the package but not in `atomic_agents.__all__` yet ([`#99`](https://github.com/dep0we/atomic-agents-stack/issues/99)); documented in `docs/deployment/programmatic.md`.
@@ -175,13 +175,13 @@ The framework is moving toward swappable backends layer by layer. The shape: a P
 | Backend | Status | Spec |
 |---|---|---|
 | `MemoryBackend` | ✅ Shipped (v0.10.0) | [`spec/20-memory-backend.md`](docs/spec/20-memory-backend.md) |
+| `LLMBackend` | ✅ Shipped (v0.13 era) | [`spec/31-llm-backend.md`](docs/spec/31-llm-backend.md) |
 | `LockBackend` | Planned | [`#60`](https://github.com/dep0we/atomic-agents-stack/issues/60) |
 | `LogBackend` | Planned | [`#61`](https://github.com/dep0we/atomic-agents-stack/issues/61) |
 | `PersonaBackend` | Planned | [`#62`](https://github.com/dep0we/atomic-agents-stack/issues/62) |
 | `AgentProfileBackend` | Planned | [`#63`](https://github.com/dep0we/atomic-agents-stack/issues/63) |
 | `ToolRegistryBackend` | Planned | [`#64`](https://github.com/dep0we/atomic-agents-stack/issues/64) |
 | `CorpusBackend` | Planned | [`#65`](https://github.com/dep0we/atomic-agents-stack/issues/65) |
-| `LLMBackend` | Planned | [`#87`](https://github.com/dep0we/atomic-agents-stack/issues/87) |
 | `PolicyBackend` | Planned | [`#89`](https://github.com/dep0we/atomic-agents-stack/issues/89) |
 
 **v1 direction:** a home user runs filesystem-everything (today). An organization runs the same agent definitions over Postgres, behind an HTTP service, with a fleet of orchestrated roles — *once the remaining backend protocols ship*. Today, only `MemoryBackend` has a non-filesystem-default-ready protocol; the others are roadmap. See [`docs/architecture.md`](docs/architecture.md) for the mental model and [`docs/TENSIONS.md`](docs/TENSIONS.md) for the architectural tensions this scaling story has to survive.
@@ -235,6 +235,7 @@ Six operator runbooks for the common deployment paths. Pick the one that matches
 | Programmatic invocation guide + public exception table — `docs/deployment/programmatic.md` | ✅ v0.11.0 |
 | Disaster recovery runbook — `docs/deployment/disaster-recovery.md` | ✅ v0.11.0 |
 | Cost guardrail sizing guidance — `docs/deployment/cost-guardrail-sizing.md` | ✅ v0.11.0 |
+| LLMBackend protocol + Anthropic/OpenAI/Moonshot reference impls — `atomic_agents.llm` | ✅ v0.13 era |
 
 See [CHANGELOG.md](CHANGELOG.md) for per-version detail.
 
