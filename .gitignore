@@ -60,3 +60,6 @@ _dashboard/
 **/journal/**/*.md
 **/.cost-warnings.json
 **/.lock
+
+# Operator-private working files — not committed
+temp/

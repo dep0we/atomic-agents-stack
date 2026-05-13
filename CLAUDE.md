@@ -12,7 +12,7 @@ For broader context, read these in order on a fresh session:
 
 ## What this is
 
-Atomic Agents is a vault-native AI agent framework: agents live as plain markdown files, the runtime is stateless, and storage is moving toward swappable protocols layer by layer (MemoryBackend ships today; Lock / Log / Persona / AgentProfile / ToolRegistry / Corpus protocols are next per ROADMAP). A person at home runs filesystem-everything with one agent. An organization runs the same agents over Postgres, behind an HTTP service, with a fleet of orchestrated roles. **Same agent definitions, same call() flow, same audit trail. Different backends.**
+Atomic Agents is a vault-native AI agent framework: agents live as plain markdown files, the runtime is stateless, and storage is moving toward swappable protocols layer by layer (MemoryBackend ships today; LLMBackend ships as of #87 with three reference impls — Anthropic, OpenAI, Moonshot; Lock / Log / Persona / AgentProfile / ToolRegistry / Corpus protocols are next per ROADMAP). A person at home runs filesystem-everything with one agent. An organization runs the same agents over Postgres, behind an HTTP service, with a fleet of orchestrated roles. **Same agent definitions, same call() flow, same audit trail. Different backends.**
 
 The spec is the central artifact. The Python package is one conforming reference implementation. Anyone can build agents to the spec without using this code — and eventually, alternate implementations will.
 
@@ -42,7 +42,7 @@ When you can't tell whether a design move helps both — stop, name the tradeoff
                             Helpers (cheap parallel)
                                 │
                   Backend Protocols (the moat)
-                  Memory ✅  Lock 🟡  Log 🟡  Persona 🟡
+                  Memory ✅  LLM ✅  Lock 🟡  Log 🟡  Persona 🟡
                   AgentProfile 🟡  ToolRegistry 🟡  Corpus 🟡
                                 │
                   Storage substrate — swappable
@@ -334,6 +334,6 @@ These are not forbidden forever — they're explicitly deferred with rationale. 
 
 ## Status
 
-**v0.10, alpha.** Core runtime stable, 720+ tests passing on Python 3.11/3.12. MemoryBackend protocol shipped (PR #57); MCP client support shipped (PRs #55 + #56). 14 issues in active backlog covering protocol-pattern scaling and deployment readiness. Single-developer project; reference implementation that anyone can use, fork, or extend.
+**v0.13 era, alpha, PUBLIC.** Core runtime stable, 925+ tests passing on Python 3.11/3.12. Two backend protocols shipped: MemoryBackend (PR #57) and LLMBackend (#87 — Anthropic + OpenAI + Moonshot reference impls registered at framework import). MCP client support shipped (PRs #55 + #56). Active backlog covers the remaining protocols (Lock/Log/Persona/AgentProfile/ToolRegistry/Corpus/Policy) + spec-impl follow-ups for the three-spec stack (judge/mandates/responsibility audit). Single-developer project; reference implementation that anyone can use, fork, or extend.
 
 Going forward: **the elegance is the product.** Protect it.
