@@ -18,6 +18,11 @@ class AgentConfig:
     # From model.md
     default_model: str
     fallback_model: str | None
+    # Optional LLMBackend disambiguator (#87): when multiple registered
+    # backends claim the same model id (e.g., openai + azure-openai both
+    # match ``gpt-5``), this names which one wins. None → registry uses
+    # the unambiguous match or raises ``AmbiguousBackendError``.
+    provider: str | None = None
     max_input_tokens: int = 12_000
     max_output_tokens: int = 4_000
     temperature: float = 0.6

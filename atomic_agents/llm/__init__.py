@@ -222,16 +222,27 @@ def _ensure_default_backends() -> None:
     if _DEFAULTS_REGISTERED:
         return
     _DEFAULTS_REGISTERED = True
+    # Each backend's instantiation may raise ``ImportError`` (missing
+    # optional SDK) or ``AtomicAgentsError`` (framework-specific init
+    # failure). Those are documented expected misses — log at WARNING
+    # and continue with the remaining backends. Any other exception
+    # propagates so real code bugs surface as tracebacks at first
+    # lookup, not as silent ``UnknownModelError``.
     try:
         from .anthropic import AnthropicLLMBackend
         register_llm_backend(AnthropicLLMBackend())
         _logger.debug("registered AnthropicLLMBackend")
     except (ImportError, _AAE) as e:
-        # Documented expected misses: missing SDK or framework-specific
-        # init failure (e.g., key not configured at backend init time —
-        # though current backends defer key lookup to first call). Logged
-        # at WARNING so operators see it without enabling DEBUG.
         _logger.warning("AnthropicLLMBackend not registered: %s", e)
-    # Any other exception type propagates → real code bugs surface as
-    # tracebacks at first lookup rather than masquerading as
-    # UnknownModelError with no backend registered.
+    try:
+        from .openai_compat import make_openai_backend
+        register_llm_backend(make_openai_backend())
+        _logger.debug("registered OpenAILLMBackend")
+    except (ImportError, _AAE) as e:
+        _logger.warning("OpenAILLMBackend not registered: %s", e)
+    try:
+        from .moonshot import make_moonshot_backend
+        register_llm_backend(make_moonshot_backend())
+        _logger.debug("registered MoonshotLLMBackend")
+    except (ImportError, _AAE) as e:
+        _logger.warning("MoonshotLLMBackend not registered: %s", e)

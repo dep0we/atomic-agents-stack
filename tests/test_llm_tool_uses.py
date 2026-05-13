@@ -224,7 +224,13 @@ def test_openai_call_forwards_tools_parameter():
         )
 
     _, call_kwargs = fake_client.chat.completions.create.call_args
-    assert call_kwargs["tools"] is tools
+    # Post-#87 PR 3 the OpenAI dispatch routes through
+    # OpenAICompatibleLLMBackend, which translates canonical
+    # LLMToolDefinition → OpenAI's tools schema at the SDK boundary.
+    # _llm.call_llm converts legacy openai-shape dicts → canonical at
+    # entry. The resulting wire dict is value-equal to the operator's
+    # input but a fresh object — assert == rather than is.
+    assert call_kwargs["tools"] == tools
 
 
 def test_openai_call_extracts_tool_calls():
