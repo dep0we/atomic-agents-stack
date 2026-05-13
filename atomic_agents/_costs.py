@@ -24,13 +24,18 @@ PRICING: dict[str, dict[str, float]] = {
     "gpt-5":                         {"input": 5.0,  "output": 20.0},
     "gpt-5-mini":                    {"input": 0.50, "output": 2.0},
     "gpt-5-nano":                    {"input": 0.10, "output": 0.50},
-    # Moonshot (placeholder rates — verify against current Moonshot pricing)
+    # Moonshot (placeholder rates — verify against current Moonshot pricing).
+    # Both the api.moonshot.ai (dot-style) and api.moonshot.cn (dash-date-style)
+    # endpoints expose distinct model identifiers; cost lookup needs entries
+    # for whichever an operator selects via `--model`.
     "moonshot/moonshot-v1-128k":     {"input": 0.30, "output": 1.20},
     "moonshot/moonshot-v1-32k":      {"input": 0.30, "output": 1.20},
     "moonshot/moonshot-v1-8k":       {"input": 0.30, "output": 1.20},
-    "moonshot/kimi-k2.6":            {"input": 0.30, "output": 1.20},  # thinking model
-    "moonshot/kimi-k2.5":            {"input": 0.30, "output": 1.20},  # thinking model
-    "moonshot/kimi-2.6":             {"input": 0.30, "output": 1.20},  # legacy alias
+    "moonshot/kimi-k2.6":            {"input": 0.30, "output": 1.20},  # thinking; .ai
+    "moonshot/kimi-k2.5":            {"input": 0.30, "output": 1.20},  # thinking; .ai
+    "moonshot/kimi-k2-0905-preview": {"input": 0.30, "output": 1.20},  # thinking; .cn
+    "moonshot/kimi-k2-0711-preview": {"input": 0.30, "output": 1.20},  # thinking; .cn
+    "moonshot/kimi-2.6":             {"input": 0.30, "output": 1.20},
 }
 
 # Cache hit pricing — Anthropic charges 10% of input rate for cache hits

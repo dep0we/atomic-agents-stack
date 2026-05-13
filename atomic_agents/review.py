@@ -36,7 +36,8 @@ from pathlib import Path
 from typing import Literal
 
 from . import _costs, _llm
-from .exceptions import AtomicAgentsError
+from ._io import safe_resolve_under
+from .exceptions import AtomicAgentsError, PathTraversalError
 
 _logger = logging.getLogger(__name__)
 
@@ -174,18 +175,25 @@ def _assemble_user_prompt(request: ReviewRequest) -> str:
 
     Layout favors the reviewer reading the target first (primary focus),
     then context (grounding), then the operator's adversarial prompt.
+
+    Every operator-supplied path is resolved through `safe_resolve_under`
+    against `working_dir` per the framework's canonical path-traversal
+    guard. `..` segments and absolute paths that escape the working dir
+    raise `PathTraversalError`. Operators legitimately needing to grep
+    across multiple repos should raise `--working-dir` to the common
+    parent rather than expect the wrapper to silently traverse.
     """
     parts: list[str] = []
 
     if request.target is not None:
-        resolved = (request.working_dir / request.target).resolve()
+        resolved = safe_resolve_under(request.target, request.working_dir)
         content = _read_text_safe(resolved)
         parts.append(_format_file_block("Review target", request.target, content))
 
     if request.read_files:
         parts.append("## Context files\n")
         for f in request.read_files:
-            resolved = (request.working_dir / f).resolve()
+            resolved = safe_resolve_under(f, request.working_dir)
             content = _read_text_safe(resolved)
             parts.append(_format_file_block("Context", f, content))
 
@@ -247,12 +255,26 @@ def print_cost_summary(result: ReviewResult, stream=None) -> None:
     tool, or a PR comment. Per CLAUDE.md rule #4, every LLM-touching code path
     surfaces its cost.
 
+    When the result has empty visible content (likely a Kimi K2.x thinking
+    model that consumed its budget on `reasoning_content` — see #146), an
+    additional WARNING line precedes the cost summary so operators don't
+    silently pay for blank reviews.
+
     `stream` defaults to the current `sys.stderr` resolved at call time (not
     import time) so test harnesses like pytest's capsys can redirect output
     correctly.
     """
     if stream is None:
         stream = sys.stderr
+    if not result.text.strip():
+        print(
+            f"WARNING: reviewer returned empty content "
+            f"(model={result.model}, output_tokens={result.output_tokens}) — "
+            f"likely a thinking-style model whose visible content was crowded "
+            f"out by reasoning_content. Bump --max-tokens or use a non-thinking "
+            f"model (e.g. moonshot/moonshot-v1-128k). See issue #146.",
+            file=stream,
+        )
     fallback_marker = " (fallback pricing)" if result.cost_estimated_via_fallback else ""
     print(
         f"--- review: {result.model} | {result.input_tokens} in / "

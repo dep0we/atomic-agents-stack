@@ -203,6 +203,13 @@ def _cmd_review(args) -> int:
             return 1
         prompt_text = prompt_path.read_text(encoding="utf-8")
 
+    # Refuse empty / whitespace-only prompts. The LLM call would still bill
+    # for the system-prompt input tokens, return empty output, and exit 0 —
+    # a silent no-op that wastes spend and hides operator misconfiguration.
+    if not prompt_text.strip():
+        print("Error: prompt is empty", file=sys.stderr)
+        return 1
+
     working_dir = (
         Path(args.working_dir).expanduser().resolve()
         if args.working_dir
