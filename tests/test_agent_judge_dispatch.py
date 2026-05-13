@@ -210,7 +210,7 @@ class TestJudgeDispatchAllow:
                 "reason": "scheduled send per operator instruction",
             }
         }
-        allow, events = agent._dispatch_with_judge(tu, markers)
+        allow, events, _queue_id = agent._dispatch_with_judge(tu, markers)
         assert allow is True
         # PR 2b: ensemble may include LLMJudge after PolicyJudge if
         # registered; tests run without an OpenAI key so the LLM
@@ -236,7 +236,7 @@ class TestJudgeDispatchAllow:
         markers = {
             "tc_1": {"for_tool_call_id": "tc_1", "reason": "ok"}
         }
-        _, events = agent._dispatch_with_judge(tu, markers)
+        _, events, _queue_id = agent._dispatch_with_judge(tu, markers)
         event = events[0]
         # Per spec/28 §"Audit shape" — these MUST be present.
         for key in (
@@ -279,7 +279,7 @@ class TestJudgeDispatchFailureModes:
         )
         tu = {"name": "send_email", "input": {"to": "x@y"}, "id": "tc_1"}
         # No marker bound to tc_1.
-        allow, events = agent._dispatch_with_judge(tu, {})
+        allow, events, _queue_id = agent._dispatch_with_judge(tu, {})
         assert allow is False
         # Proposal-assembly failure → single framework-synthesized
         # BLOCK event (no ensemble judges ran).
@@ -303,7 +303,7 @@ class TestJudgeDispatchFailureModes:
             )
         )
         tu = {"name": "send_email", "input": {}, "id": "tc_1"}
-        _, events = agent._dispatch_with_judge(tu, {})
+        _, events, _queue_id = agent._dispatch_with_judge(tu, {})
         event = events[0]
         assert event["binding"]["tool_call_id"] == "tc_1"
         assert event["binding"]["tool_definition_hash"]
@@ -333,7 +333,7 @@ class TestReadOnlyNoMarkerNeeded:
         # No marker — but classification is read_only so this should be fine.
         # With default class_policy=JUDGE_REQUIRED, PolicyJudge still runs
         # but finds nothing to BLOCK on; returns ALLOW.
-        allow, events = agent._dispatch_with_judge(tu, {})
+        allow, events, _queue_id = agent._dispatch_with_judge(tu, {})
         assert allow is True
         assert events[0]["raw_outcome"] == "allow"
 
@@ -371,7 +371,7 @@ class TestTildePathExpansion:
         markers = {
             "tc_1": {"for_tool_call_id": "tc_1", "reason": "memory write"}
         }
-        allow, events = agent._dispatch_with_judge(tu, markers)
+        allow, events, _queue_id = agent._dispatch_with_judge(tu, markers)
         # MUST be ALLOW — the path is genuinely under the allowed
         # write_paths once both sides are expanded.
         assert allow is True, (
@@ -432,7 +432,7 @@ class TestEnsembleEnforcementAction:
 
         tu = {"name": "send_email", "input": {"to": "x@y"}, "id": "tc_1"}
         markers = {"tc_1": {"for_tool_call_id": "tc_1", "reason": "ok"}}
-        allow, events = agent._dispatch_with_judge(tu, markers)
+        allow, events, _queue_id = agent._dispatch_with_judge(tu, markers)
 
         assert allow is False
         assert len(events) == 2, f"expected 2 events (one per judge), got {len(events)}"
@@ -464,7 +464,7 @@ class TestEnsembleEnforcementAction:
         # The lone event should be ``allow_executed``.
         tu = {"name": "send_email", "input": {"to": "x@y"}, "id": "tc_1"}
         markers = {"tc_1": {"for_tool_call_id": "tc_1", "reason": "ok"}}
-        allow, events = agent._dispatch_with_judge(tu, markers)
+        allow, events, _queue_id = agent._dispatch_with_judge(tu, markers)
         assert allow is True
         assert len(events) == 1
         assert events[0]["enforcement_action"] == "allow_executed"
@@ -524,8 +524,8 @@ class TestMultiToolPartialExecute:
             "tc_clean": {"for_tool_call_id": "tc_clean", "reason": "ok"},
             "tc_dirty": {"for_tool_call_id": "tc_dirty", "reason": "bad path"},
         }
-        clean_allow, _clean_events = agent._dispatch_with_judge(tu_clean, markers)
-        dirty_allow, dirty_events = agent._dispatch_with_judge(tu_dirty, markers)
+        clean_allow, _clean_events, _queue_id = agent._dispatch_with_judge(tu_clean, markers)
+        dirty_allow, dirty_events, _queue_id = agent._dispatch_with_judge(tu_dirty, markers)
         assert clean_allow is True
         assert dirty_allow is False
         assert "write-path violation" in dirty_events[-1]["judgment_reason"].lower()
@@ -572,7 +572,7 @@ class TestJudgeErrorFailClosed:
         agent._policy_judge = _RaisingJudge()
         tu = {"name": "send_email", "input": {"to": "x@y"}, "id": "tc_1"}
         markers = {"tc_1": {"for_tool_call_id": "tc_1", "reason": "ok"}}
-        allow, events = agent._dispatch_with_judge(tu, markers)
+        allow, events, _queue_id = agent._dispatch_with_judge(tu, markers)
         assert allow is False
         assert len(events) == 1
         event = events[0]
@@ -770,12 +770,18 @@ class TestJudgesMdIntegration:
         )
         tu = {"name": "send_email", "input": {"to": "x@y"}, "id": "tc_1"}
         markers = {"tc_1": {"for_tool_call_id": "tc_1", "reason": "test"}}
-        allow, events = a._dispatch_with_judge(tu, markers)
-        # PR 3a: ESCALATE class-policy → PolicyJudge self-maps to BLOCK
-        # with escalate_pending_polling_unimplemented reason. PR 3b
-        # replaces the self-map with real ESCALATE emission.
+        allow, events, queue_id = a._dispatch_with_judge(tu, markers)
+        # PR 3b: ESCALATE class-policy synthesizes ESCALATE outcome at
+        # the framework layer (before the ensemble runs), writes the
+        # PENDING file, and returns a deferred signal. PolicyJudge
+        # never sees the proposal because the short-circuit fires
+        # first. The queue_id round-trips back to the caller so
+        # agent.call() can populate Response.escalation_queue_ids.
         assert allow is False
-        assert "escalate_pending_polling_unimplemented" in events[-1]["judgment_reason"]
+        assert queue_id is not None
+        assert events[-1]["enforcement_action"] == "escalate_pending"
+        assert events[-1]["judgment_outcome"] == "escalate"
+        assert events[-1]["synthesis_source"] == "class_policy"
 
     def test_malformed_judges_md_fails_load_loud(self, tmp_path, monkeypatch):
         # Malformed YAML in judges.md fails load with JudgePolicyInvalid
@@ -874,7 +880,7 @@ class TestJudgesMdCodexRound2Fixes:
         )
         tu = {"name": "read_cal", "input": {}, "id": "tc_1"}
         # read_only doesn't require a marker.
-        allow, events = a._dispatch_with_judge(tu, {})
+        allow, events, _queue_id = a._dispatch_with_judge(tu, {})
         assert allow is True
         assert len(events) == 1  # single bypass event, no ensemble
         assert events[0]["judge_id"] == "framework"
@@ -932,7 +938,7 @@ class TestJudgesMdCodexRound2Fixes:
 
         tu = {"name": "send_email", "input": {"to": "x@y"}, "id": "tc_1"}
         markers = {"tc_1": {"for_tool_call_id": "tc_1", "reason": "test"}}
-        allow, events = a._dispatch_with_judge(tu, markers)
+        allow, events, _queue_id = a._dispatch_with_judge(tu, markers)
         # Audit mode: BLOCKs are recorded but action proceeds.
         assert allow is True
         # Both events emitted (PolicyJudge ALLOW + stub BLOCK).
@@ -985,7 +991,7 @@ class TestJudgesMdCodexRound2Fixes:
         a._policy_judge = _RaisingJudge()
         tu = {"name": "send_email", "input": {"to": "x@y"}, "id": "tc_1"}
         markers = {"tc_1": {"for_tool_call_id": "tc_1", "reason": "test"}}
-        allow, events = a._dispatch_with_judge(tu, markers)
+        allow, events, _queue_id = a._dispatch_with_judge(tu, markers)
         # failure_policy says allow — action proceeds despite the
         # judge being unavailable.
         assert allow is True

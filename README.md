@@ -24,7 +24,7 @@ Most agent state ends up somewhere you don't fully control — an app database, 
 
 There's another shape: **your agents live in your folder.** Plain markdown files. INDEX.md routing. Persona in `IDENTITY.md` / `SOUL.md` / `USER.md`. Typed atomic notes you can `cat`. Audit trail as JSONL you can grep. Cost guardrails in markdown config. Crash-safe writes — every mutation goes through `temp file + fsync + rename + parent-dir fsync`, so a power loss never leaves a half-written note. Schema migrations are scripts you read before running. If you switch laptops, you copy a folder. If you want a new runtime — cron, Claude Code skill, ChatGPT skill, your own HTTP service — you point the runtime at the folder.
 
-That's the shape `atomic-agents-stack` defines, in 22 locked spec docs + 3 RFCs (locked when implementation matches), with a Python reference implementation, 1153 tests, and a Caldwell sample that includes 5 days of real JSONL run logs, a rendered cost dashboard, evals across happy / edge / adversarial / decline categories, and a helper-pattern day showing ~76% cost savings vs. all-Opus.
+That's the shape `atomic-agents-stack` defines, in 22 locked spec docs + 3 RFCs (locked when implementation matches), with a Python reference implementation, 1193 tests, and a Caldwell sample that includes 5 days of real JSONL run logs, a rendered cost dashboard, evals across happy / edge / adversarial / decline categories, and a helper-pattern day showing ~76% cost savings vs. all-Opus.
 
 A home user with one agent and an org with a fleet experience the same framework — graceful, coherent, self-explanatory at every scale.
 
@@ -371,7 +371,7 @@ atomic_agents/                  # the Python package
 ├── _locks.py                   # per-agent flock with stale-lock recovery
 └── _io.py                      # atomic file writes (temp + fsync + rename)
 
-tests/                          # 1153 tests, all passing on Python 3.11 + 3.12
+tests/                          # 1193 tests, all passing on Python 3.11 + 3.12
 
 docs/
 ├── README.md                   # spec entry point
@@ -419,4 +419,4 @@ Before opening a PR, read [`CLAUDE.md`](CLAUDE.md) (the project's design ethos a
 
 ## Status
 
-**v0.13.0, alpha.** Core runtime stable. 1153 tests passing on Python 3.11 / 3.12. Two backend protocols shipped (Memory + LLM); `JudgeBackend` Protocol + canonical types ([#112](https://github.com/dep0we/atomic-agents-stack/issues/112) PR 1) plus opt-in judge dispatch wiring, the `PolicyJudge` rule-engine reference impl, and the `atomic_action` proposal marker (PR 2a) plus the `LLMJudgeBackend` reference impl, two-judge ensemble dispatch, and per-judge audit events (PR 2b) shipped on branch — opt in via `judges.md` in the agent root or `AGENT_JUDGE_ENABLED=1`; the `judges.md` parser, ESCALATE polling, and the conformance suite land in PRs 3-4. The remaining protocol-pattern roadmap (`LockBackend` / `LogBackend` / `PersonaBackend` / etc.) is what v1.0 closes; the surface stabilizes there. Pre-1.0 — Minor releases may contain breaking changes (see [`docs/deployment/versioning.md`](docs/deployment/versioning.md)). Single-maintainer project; reference implementation that anyone can use, fork, or extend.
+**v0.13.0, alpha.** Core runtime stable. 1193 tests passing on Python 3.11 / 3.12. Two backend protocols shipped (Memory + LLM); `JudgeBackend` Protocol + canonical types ([#112](https://github.com/dep0we/atomic-agents-stack/issues/112) PR 1) plus opt-in judge dispatch wiring, the `PolicyJudge` rule-engine reference impl, and the `atomic_action` proposal marker (PR 2a) plus the `LLMJudgeBackend` reference impl, two-judge ensemble dispatch, and per-judge audit events (PR 2b) shipped on branch — opt in via `judges.md` in the agent root or `AGENT_JUDGE_ENABLED=1`; the `judges.md` parser, ESCALATE polling, and the conformance suite land in PRs 3-4. The remaining protocol-pattern roadmap (`LockBackend` / `LogBackend` / `PersonaBackend` / etc.) is what v1.0 closes; the surface stabilizes there. Pre-1.0 — Minor releases may contain breaking changes (see [`docs/deployment/versioning.md`](docs/deployment/versioning.md)). Single-maintainer project; reference implementation that anyone can use, fork, or extend.
