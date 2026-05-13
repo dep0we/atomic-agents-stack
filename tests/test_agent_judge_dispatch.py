@@ -210,8 +210,13 @@ class TestJudgeDispatchAllow:
                 "reason": "scheduled send per operator instruction",
             }
         }
-        allow, judgment, event = agent._dispatch_with_judge(tu, markers)
+        allow, events = agent._dispatch_with_judge(tu, markers)
         assert allow is True
+        # PR 2b: ensemble may include LLMJudge after PolicyJudge if
+        # registered; tests run without an OpenAI key so the LLM
+        # judge is None and only PolicyJudge's event is emitted.
+        assert len(events) >= 1
+        event = events[0]
         assert event["raw_outcome"] == "allow"
         assert event["enforcement_action"] == "allow_executed"
         assert event["cost_source"] == "judge"
@@ -231,7 +236,8 @@ class TestJudgeDispatchAllow:
         markers = {
             "tc_1": {"for_tool_call_id": "tc_1", "reason": "ok"}
         }
-        _, _, event = agent._dispatch_with_judge(tu, markers)
+        _, events = agent._dispatch_with_judge(tu, markers)
+        event = events[0]
         # Per spec/28 §"Audit shape" — these MUST be present.
         for key in (
             "trigger",
@@ -273,8 +279,12 @@ class TestJudgeDispatchFailureModes:
         )
         tu = {"name": "send_email", "input": {"to": "x@y"}, "id": "tc_1"}
         # No marker bound to tc_1.
-        allow, judgment, event = agent._dispatch_with_judge(tu, {})
+        allow, events = agent._dispatch_with_judge(tu, {})
         assert allow is False
+        # Proposal-assembly failure → single framework-synthesized
+        # BLOCK event (no ensemble judges ran).
+        assert len(events) == 1
+        event = events[0]
         assert event["raw_outcome"] == "block"
         assert event["enforcement_action"] == "block_executed"
         assert "JudgeProposalInvalid" in event["judgment_reason"]
@@ -293,7 +303,8 @@ class TestJudgeDispatchFailureModes:
             )
         )
         tu = {"name": "send_email", "input": {}, "id": "tc_1"}
-        _, _, event = agent._dispatch_with_judge(tu, {})
+        _, events = agent._dispatch_with_judge(tu, {})
+        event = events[0]
         assert event["binding"]["tool_call_id"] == "tc_1"
         assert event["binding"]["tool_definition_hash"]
         # arguments_hash is empty when proposal-assembly failed —
@@ -322,9 +333,9 @@ class TestReadOnlyNoMarkerNeeded:
         # No marker — but classification is read_only so this should be fine.
         # With default class_policy=JUDGE_REQUIRED, PolicyJudge still runs
         # but finds nothing to BLOCK on; returns ALLOW.
-        allow, judgment, event = agent._dispatch_with_judge(tu, {})
+        allow, events = agent._dispatch_with_judge(tu, {})
         assert allow is True
-        assert event["raw_outcome"] == "allow"
+        assert events[0]["raw_outcome"] == "allow"
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -360,16 +371,103 @@ class TestTildePathExpansion:
         markers = {
             "tc_1": {"for_tool_call_id": "tc_1", "reason": "memory write"}
         }
-        allow, judgment, event = agent._dispatch_with_judge(tu, markers)
+        allow, events = agent._dispatch_with_judge(tu, markers)
         # MUST be ALLOW — the path is genuinely under the allowed
         # write_paths once both sides are expanded.
         assert allow is True, (
-            f"~/... path falsely BLOCKed: {judgment.reason}"
+            f"~/... path falsely BLOCKed: {events[0]['judgment_reason']}"
         )
 
 
 # ──────────────────────────────────────────────────────────────────
 # Multi-tool partial-execute (round-2 P2: first ALLOW, second BLOCK)
+
+
+class TestEnsembleEnforcementAction:
+    """Codex round-2 P2: ensemble intermediate-allow events must NOT
+    carry ``allow_executed`` when a later judge BLOCKs. Pin the audit
+    invariant — the tool is only marked executed when the ENSEMBLE as
+    a whole allows."""
+
+    def test_intermediate_allow_marked_pending_when_later_judge_blocks(
+        self, agent, monkeypatch
+    ):
+        monkeypatch.setenv("AGENT_JUDGE_ENABLED", "1")
+        agent.tool_registry.register(
+            ToolDefinition(
+                name="send_email",
+                description="send email",
+                input_schema={"type": "object"},
+                handler=lambda inp: None,
+                classification="external_side_effect",
+            )
+        )
+        # Force a two-judge ensemble: PolicyJudge ALLOW + injected
+        # second judge that BLOCKs. We use the agent's _llm_judge slot
+        # directly with a stub since the real LLM judge needs an
+        # OpenAI key.
+        from atomic_agents.judge.backend import Judgment, JudgmentOutcome
+
+        class _AlwaysBlock:
+            judge_id = "test-blocker"
+            policy_version = "unimplemented"
+            def evaluate(self, proposal, context):
+                return Judgment(
+                    outcome=JudgmentOutcome.BLOCK,
+                    reason="injected block",
+                    judge_id=self.judge_id,
+                    policy_version=self.policy_version,
+                )
+            def supported_outcomes(self):
+                return {JudgmentOutcome.ALLOW, JudgmentOutcome.BLOCK}
+            def supports_read_audit(self):
+                return False
+            def supports_specialist_composition(self):
+                return True
+            def close(self):
+                pass
+
+        agent._llm_judge = _AlwaysBlock()
+        agent._llm_judge_constructed = True
+
+        tu = {"name": "send_email", "input": {"to": "x@y"}, "id": "tc_1"}
+        markers = {"tc_1": {"for_tool_call_id": "tc_1", "reason": "ok"}}
+        allow, events = agent._dispatch_with_judge(tu, markers)
+
+        assert allow is False
+        assert len(events) == 2, f"expected 2 events (one per judge), got {len(events)}"
+        # First event: PolicyJudge ALLOW with intermediate enforcement.
+        assert events[0]["raw_outcome"] == "allow"
+        assert events[0]["enforcement_action"] == "allow_pending_next_judge", (
+            f"PolicyJudge's intermediate ALLOW must NOT be marked "
+            f"`allow_executed` — got {events[0]['enforcement_action']!r}. "
+            f"The tool was never actually executed."
+        )
+        # Second event: the BLOCK that short-circuited.
+        assert events[1]["raw_outcome"] == "block"
+        assert events[1]["enforcement_action"] == "block_executed"
+
+    def test_final_allow_promotes_last_event_to_allow_executed(
+        self, agent, monkeypatch
+    ):
+        monkeypatch.setenv("AGENT_JUDGE_ENABLED", "1")
+        agent.tool_registry.register(
+            ToolDefinition(
+                name="send_email",
+                description="send email",
+                input_schema={"type": "object"},
+                handler=lambda inp: None,
+                classification="external_side_effect",
+            )
+        )
+        # PolicyJudge ALLOWs; no LLM judge → single-judge ensemble.
+        # The lone event should be ``allow_executed``.
+        tu = {"name": "send_email", "input": {"to": "x@y"}, "id": "tc_1"}
+        markers = {"tc_1": {"for_tool_call_id": "tc_1", "reason": "ok"}}
+        allow, events = agent._dispatch_with_judge(tu, markers)
+        assert allow is True
+        assert len(events) == 1
+        assert events[0]["enforcement_action"] == "allow_executed"
 
 
 class TestMultiToolPartialExecute:
@@ -426,11 +524,11 @@ class TestMultiToolPartialExecute:
             "tc_clean": {"for_tool_call_id": "tc_clean", "reason": "ok"},
             "tc_dirty": {"for_tool_call_id": "tc_dirty", "reason": "bad path"},
         }
-        clean_allow, _, _ = agent._dispatch_with_judge(tu_clean, markers)
-        dirty_allow, dirty_j, _ = agent._dispatch_with_judge(tu_dirty, markers)
+        clean_allow, _clean_events = agent._dispatch_with_judge(tu_clean, markers)
+        dirty_allow, dirty_events = agent._dispatch_with_judge(tu_dirty, markers)
         assert clean_allow is True
         assert dirty_allow is False
-        assert "write-path violation" in dirty_j.reason.lower()
+        assert "write-path violation" in dirty_events[-1]["judgment_reason"].lower()
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -474,9 +572,11 @@ class TestJudgeErrorFailClosed:
         agent._policy_judge = _RaisingJudge()
         tu = {"name": "send_email", "input": {"to": "x@y"}, "id": "tc_1"}
         markers = {"tc_1": {"for_tool_call_id": "tc_1", "reason": "ok"}}
-        allow, judgment, event = agent._dispatch_with_judge(tu, markers)
+        allow, events = agent._dispatch_with_judge(tu, markers)
         assert allow is False
-        assert "JudgeUnavailable" in judgment.reason
+        assert len(events) == 1
+        event = events[0]
+        assert "JudgeUnavailable" in event["judgment_reason"]
         assert event["enforcement_action"] == "block_executed"
 
     def test_non_judge_exception_also_fail_closes(self, agent, monkeypatch):
