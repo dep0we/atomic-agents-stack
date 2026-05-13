@@ -182,7 +182,7 @@ class AtomicAgent:
         # None means either no MCP servers declared or pool not yet initialized.
         self.mcp_pool: MCPClientPool | None = None
 
-        # Judge layer (#112 PR 2a + 2b). PolicyJudge + LLMJudgeBackend
+        # Judge layer (#112 PR 2a + 2b + 3a). PolicyJudge + LLMJudgeBackend
         # instances are lazy-built on first dispatch — cached per-agent
         # so policy_version is stable within a run. ``_llm_judge`` may
         # remain ``None`` when no LLM key is configured for the default
@@ -191,10 +191,18 @@ class AtomicAgent:
         # from tools.md ``## Tool classification`` section; empty dict
         # otherwise (everything defaults to external_side_effect in
         # ``_resolve_classification``).
+        #
+        # ``self.judges_config`` is the parsed ``judges.md`` operator
+        # config (PR 3a). ``None`` when judges.md is absent — the
+        # judge dispatch falls back to ``_default_class_policy_snapshot``
+        # (PR 2a/2b's hardcoded JUDGE_REQUIRED defaults). When present,
+        # ``_dispatch_with_judge`` uses parsed class_policy +
+        # per-class failure_policy + timeout + budget configuration.
         self._policy_judge = None
         self._llm_judge = None  # type: ignore[assignment]
         self._llm_judge_constructed = False  # distinct from None-cache
         self._tool_classifications: dict[str, str] = {}
+        self.judges_config = None  # type: ignore[assignment]
 
         # Loaded later via load() — populated in __init__ for clarity
         self._persona_text: str = ""
@@ -387,6 +395,13 @@ class AtomicAgent:
         ):
             return True
         if (self.agent_root / "judges.md").exists():
+            return True
+        # Inherited project-floor judges.md counts as opt-in (Codex
+        # round-2 P1) — without this check, a cascade project floor
+        # would parse but the gate would keep dispatch off, leaving
+        # the floor unenforced unless every delegate also authors its
+        # own judges.md.
+        if getattr(self, "judges_config", None) is not None:
             return True
         return False
 
@@ -606,7 +621,41 @@ class AtomicAgent:
             return False, [event]
 
         # Build the JudgmentContext once; both judges see the same
-        # context per spec/28 idempotency invariants.
+        # context per spec/28 idempotency invariants. When judges.md
+        # was parsed at load time (PR 3a), use its values; otherwise
+        # fall back to the PR 2a hardcoded defaults so existing
+        # deployments without judges.md keep working.
+        if self.judges_config is not None:
+            class_policy = self.judges_config.class_policy
+            timeout_ms = self.judges_config.timeout_ms
+            judge_budget = self.judges_config.budget
+            escalation_cfg = self.judges_config.escalation
+            # JudgeRuntimeConfig.failure_policy stays a flat
+            # ``dict[str, str]`` per its existing Protocol-side
+            # consumer; per-class lookups happen on
+            # ``JudgesConfig.failure_policy_for`` separately. For the
+            # context payload, expose the external_side_effect
+            # bucket (most-common class) so any backend reading the
+            # flat field gets a reasonable default. Per-class
+            # enforcement lives in agent.py post-judge.
+            flat_failure_policy = dict(
+                self.judges_config.failure_policy[ActionClass.EXTERNAL_SIDE_EFFECT]
+            )
+            backend_name = self.judges_config.default_backend
+        else:
+            class_policy = self._default_class_policy_snapshot()
+            timeout_ms = 5000
+            judge_budget = BudgetConfig()
+            escalation_cfg = EscalationConfig()
+            flat_failure_policy = {
+                "JudgeUnavailable": "block",
+                "JudgePolicyInvalid": "block",
+                "JudgeBudgetExhausted": "block",
+                "JudgeProposalInvalid": "block",
+                "JudgeAmendedProposalRejected": "block",
+            }
+            backend_name = "ensemble"
+
         policy_ctx = JudgePolicyContext(
             agent_name=self.name,
             persona_digest=PersonaDigest(agent_name=self.name),
@@ -615,20 +664,14 @@ class AtomicAgent:
                 classification=classification,
                 write_paths=list(self.config.write_paths or []),
             ),
-            class_policy=self._default_class_policy_snapshot(),
+            class_policy=class_policy,
         )
         runtime_cfg = JudgeRuntimeConfig(
-            backend_name="ensemble",
-            timeout_ms=5000,
-            budget=BudgetConfig(),
-            escalation_config=EscalationConfig(),
-            failure_policy={
-                "JudgeUnavailable": "block",
-                "JudgePolicyInvalid": "block",
-                "JudgeBudgetExhausted": "block",
-                "JudgeProposalInvalid": "block",
-                "JudgeAmendedProposalRejected": "block",
-            },
+            backend_name=backend_name,
+            timeout_ms=timeout_ms,
+            budget=judge_budget,
+            escalation_config=escalation_cfg,
+            failure_policy=flat_failure_policy,
         )
         context = JudgmentContext(policy=policy_ctx, runtime=runtime_cfg)
 
@@ -638,14 +681,72 @@ class AtomicAgent:
             arguments_hash=proposal_obj.arguments_hash,
         )
 
+        # Class-policy short-circuits (PR 3a — Codex round-2 P2 fix).
+        # Operators who set class_policy.<X>: bypass don't want the
+        # ensemble to run at all (LLM judge would incur cost for a
+        # class the operator declared safe). Operators who set
+        # allow_with_audit want every judge's decision recorded but
+        # never enforced. Both short-circuit BEFORE building the
+        # ensemble loop.
+        from .judge.types import ClassPolicyValue as _CPV
+        effective_class_policy = {
+            ActionClass.READ_ONLY: class_policy.read_only,
+            ActionClass.REVERSIBLE_WRITE: class_policy.reversible_write,
+            ActionClass.EXTERNAL_SIDE_EFFECT: class_policy.external_side_effect,
+            ActionClass.HIGH_RISK: class_policy.high_risk,
+        }[classification]
+
+        if effective_class_policy == _CPV.BYPASS:
+            # Synthesize a single bypass-recording event. No judge
+            # ensemble runs. Tool executes immediately.
+            from .judge.backend import Judgment
+            bypass_judgment = Judgment(
+                outcome=JudgmentOutcome.ALLOW,
+                reason=(
+                    f"class_policy.{classification.value} = bypass — "
+                    "judge ensemble not invoked"
+                ),
+                judge_id="framework",
+                policy_version=(
+                    self.judges_config.judges_md_hash
+                    if self.judges_config is not None
+                    else "unimplemented"
+                ),
+            )
+            bypass_event = self._build_judgment_event_dict(
+                proposal=proposal_obj,
+                tool_use=tu,
+                judgment=bypass_judgment,
+                enforcement_action="allow_executed",
+                binding=binding,
+            )
+            return True, [bypass_event]
+
         # Build the judge ensemble. PR 2b: PolicyJudge first
         # (microsecond latency, free), then LLMJudgeBackend if
         # available. First BLOCK short-circuits remaining judges per
-        # spec/28:694.
+        # spec/28:694. ``allow_with_audit`` mode runs the ensemble
+        # but does not let BLOCKs gate execution (audit-only).
+        audit_mode = effective_class_policy == _CPV.ALLOW_WITH_AUDIT
         judges = [self._ensure_policy_judge()]
         llm_judge = self._ensure_llm_judge()
         if llm_judge is not None:
             judges.append(llm_judge)
+
+        # Helper for failure_policy lookup. When judges.md was parsed,
+        # consult its per-class-per-exception map; otherwise fall back
+        # to the spec/28 default ("block" for every exception). Codex
+        # round-2 P2: unconditional BLOCK on JudgeError ignored
+        # operator failure_policy configuration entirely.
+        def _outcome_for_failure(exception_name: str) -> JudgmentOutcome:
+            if self.judges_config is not None:
+                raw = self.judges_config.failure_policy_for(classification, exception_name)
+            else:
+                raw = "block"
+            try:
+                return JudgmentOutcome(raw)
+            except ValueError:
+                return JudgmentOutcome.BLOCK
 
         events: list[dict] = []
         final_allow = True
@@ -654,27 +755,37 @@ class AtomicAgent:
             try:
                 judgment = judge.evaluate(proposal_obj, context)
             except JudgeError as exc:
-                # Map exception to BLOCK per failure_policy default.
+                # Map exception via per-class failure_policy. Operator
+                # may configure "allow" / "block" / "escalate" per-class
+                # per-exception. Until PR 3b's real ESCALATE outcome,
+                # "escalate" still self-maps to BLOCK so PR 3a doesn't
+                # leak the half-implemented ESCALATE.
                 from .judge.backend import Judgment
+                outcome = _outcome_for_failure(type(exc).__name__)
+                if outcome == JudgmentOutcome.ESCALATE:
+                    outcome = JudgmentOutcome.BLOCK
+                    reason_suffix = " (escalate_pending_polling_unimplemented)"
+                else:
+                    reason_suffix = ""
                 judgment = Judgment(
-                    outcome=JudgmentOutcome.BLOCK,
-                    reason=f"{type(exc).__name__}: {exc}",
+                    outcome=outcome,
+                    reason=f"{type(exc).__name__}: {exc}{reason_suffix}",
                     judge_id=judge.judge_id,
                     policy_version=judge.policy_version,
                     latency_ms=int((time.time() - start) * 1000),
                 )
 
             judge_allow = judgment.outcome == JudgmentOutcome.ALLOW
-            # Provisional enforcement_action — intermediate ALLOWs in
-            # an ensemble haven't actually been executed yet; the tool
-            # only runs after the whole ensemble allows. Set the value
-            # provisionally here; rewrite after the loop based on the
-            # final ensemble outcome. (Codex round-2 finding: marking
-            # intermediate allows as ``allow_executed`` corrupts the
-            # audit trail's "tool ran" count.)
-            enforcement = (
-                "allow_pending_next_judge" if judge_allow else "block_executed"
-            )
+            # audit_mode (class_policy=allow_with_audit): every event
+            # is recorded with ``audit_bypass`` enforcement and the
+            # action ALWAYS proceeds, regardless of judge outcome.
+            # Otherwise the standard ensemble logic applies.
+            if audit_mode:
+                enforcement = "audit_bypass"
+            else:
+                enforcement = (
+                    "allow_pending_next_judge" if judge_allow else "block_executed"
+                )
             event = self._build_judgment_event_dict(
                 proposal=proposal_obj,
                 tool_use=tu,
@@ -684,7 +795,7 @@ class AtomicAgent:
             )
             events.append(event)
 
-            if not judge_allow:
+            if not judge_allow and not audit_mode:
                 # First BLOCK wins; skip remaining judges (no
                 # cost incurred for downstream judges). All prior
                 # events keep their ``allow_pending_next_judge``
@@ -692,6 +803,12 @@ class AtomicAgent:
                 # the ensemble blocked.
                 final_allow = False
                 break
+
+        # audit_mode: ensemble result is always ALLOW regardless of
+        # individual judges' outcomes — the BLOCKs were recorded for
+        # forensics but do not gate the action.
+        if audit_mode:
+            return True, events
 
         # Ensemble-final fixup: when the whole ensemble allowed, the
         # LAST event represents the action that actually runs — promote
@@ -766,6 +883,23 @@ class AtomicAgent:
             self._tool_classifications = _tools.parse_tool_classifications(
                 self.agent_root / "tools.md"
             )
+            tools_text = ""
+            tools_md_path = self.agent_root / "tools.md"
+            if tools_md_path.exists():
+                tools_text = tools_md_path.read_text(encoding="utf-8")
+
+        # judges.md operator config (#112 PR 3a). Cascade-aware: own
+        # judges.md + project-floor judges.md (when cascade); the
+        # floor is non-relaxable per spec/28:408. ``None`` when no
+        # judges.md exists — PR 2a/2b's hardcoded defaults run.
+        # ``JudgePolicyInvalid`` at parse time stops _load_config
+        # with a clear diagnostic per spec/28 fail-loud discipline.
+        from . import judges_md as _judges_md_mod
+        self.judges_config = _judges_md_mod.load_judges_config(
+            agent_root=self.agent_root,
+            cascade=self.cascade,
+            tools_md_text=tools_text,
+        )
 
         # roster.md lives at the instance root (same for cascaded + single-agent layouts)
         roster = _roster.parse_roster_md(self.agent_root / "roster.md")
