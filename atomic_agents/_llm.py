@@ -13,30 +13,18 @@ from __future__ import annotations
 import logging
 import os
 import time
-from dataclasses import dataclass
 from typing import Any
 
 from .exceptions import AtomicAgentsError
 
+# Canonical home for the normalized LLM response shape is now
+# atomic_agents.llm.backend — see #87 PR 1 (canonical types + Protocol).
+# Re-exported here so existing imports (`from atomic_agents._llm import
+# _RawLLMResponse`) continue to work unchanged for the duration of the
+# #87 arc and for any third-party operator who pinned against this path.
+from .llm.backend import _RawLLMResponse  # noqa: F401 — public re-export
+
 _logger = logging.getLogger(__name__)
-
-
-@dataclass
-class _RawLLMResponse:
-    text: str
-    input_tokens: int
-    output_tokens: int
-    cache_hit_tokens: int = 0
-    cache_miss_tokens: int = 0
-    raw: dict[str, Any] | None = None
-    # Normalized tool_use blocks across providers — each entry:
-    #   {"name": "<tool_name>", "input": {...}, "id": "<call_id>"}
-    # Empty list when no tools are passed or the model didn't call any.
-    tool_uses: list[dict] = None  # type: ignore[assignment]
-
-    def __post_init__(self):
-        if self.tool_uses is None:
-            self.tool_uses = []
 
 
 def call_llm(
