@@ -497,7 +497,7 @@ def test_agent_cost_cap_breaks_tool_loop(tmp_path):
     # by patching _costs.sum_cost_for_period
     call_seq = [0]
 
-    def fake_sum_cost(log_dir, period):
+    def fake_sum_cost(log_dir, period, *args, **kwargs):
         call_seq[0] += 1
         # Return over-cap after the first guardrail check (which is the pre-check
         # for iteration 2)

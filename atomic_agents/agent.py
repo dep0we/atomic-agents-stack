@@ -716,6 +716,7 @@ class AtomicAgent:
                             "input_tokens": total_input_tokens,
                             "output_tokens": total_output_tokens,
                             "cost_usd": total_cost,
+                            "cost_source": "actor",
                             "latency_ms": latency_ms,
                             "status": "skipped",
                             "summary": skip_reason,
@@ -876,6 +877,7 @@ class AtomicAgent:
                 "cache_hit_tokens": total_cache_hit_tokens,
                 "cache_miss_tokens": total_cache_miss_tokens,
                 "cost_usd": total_cost,
+                "cost_source": "actor",
                 "latency_ms": latency_ms,
                 "status": "ok",
                 "summary": response.summary,
@@ -1058,6 +1060,7 @@ class AtomicAgent:
             "input_tokens": raw.input_tokens,
             "output_tokens": raw.output_tokens,
             "cost_usd": cost,
+            "cost_source": "actor",
             "latency_ms": latency_ms,
             "status": "ok",
             "summary": summary or "helper call",
@@ -1306,11 +1309,11 @@ class AtomicAgent:
         if self.config.cost_guardrails_enabled and not critical:
             log_dir = self.agent_root / "log"
             today_cost = (
-                _costs.sum_cost_for_period(log_dir, "today")
+                _costs.sum_cost_for_period(log_dir, "today", source="actor")
                 + self._delegated_cost_this_run
             )
             month_cost = (
-                _costs.sum_cost_for_period(log_dir, "this_month")
+                _costs.sum_cost_for_period(log_dir, "this_month", source="actor")
                 + self._delegated_cost_this_run
             )
             daily_remaining = (
@@ -1360,6 +1363,7 @@ class AtomicAgent:
             "input_tokens": response.input_tokens,
             "output_tokens": response.output_tokens,
             "cost_usd": response.cost_usd,
+            "cost_source": "actor",
             "latency_ms": latency_ms,
             "status": "ok" if not response.skipped else "skipped",
             "summary": summary or f"delegate to {target_agent_name}",
@@ -1537,8 +1541,8 @@ class AtomicAgent:
         if not self.config.cost_guardrails_enabled or reserved_usd <= 0:
             return
         log_dir = self.agent_root / "log"
-        today_cost = _costs.sum_cost_for_period(log_dir, "today")
-        month_cost = _costs.sum_cost_for_period(log_dir, "this_month")
+        today_cost = _costs.sum_cost_for_period(log_dir, "today", source="actor")
+        month_cost = _costs.sum_cost_for_period(log_dir, "this_month", source="actor")
         daily_remaining = (
             self.config.daily_cap_usd - today_cost
             if self.config.daily_cap_usd > 0
@@ -1647,8 +1651,8 @@ class AtomicAgent:
             return CostCheckResult(allow=True, reason="critical_override")
 
         log_dir = self.agent_root / "log"
-        today_cost = _costs.sum_cost_for_period(log_dir, "today") + extra_in_flight_cost_usd
-        month_cost = _costs.sum_cost_for_period(log_dir, "this_month") + extra_in_flight_cost_usd
+        today_cost = _costs.sum_cost_for_period(log_dir, "today", source="actor") + extra_in_flight_cost_usd
+        month_cost = _costs.sum_cost_for_period(log_dir, "this_month", source="actor") + extra_in_flight_cost_usd
 
         daily_pct = (today_cost / self.config.daily_cap_usd) if self.config.daily_cap_usd > 0 else 0
         monthly_pct = (month_cost / self.config.monthly_cap_usd) if self.config.monthly_cap_usd > 0 else 0

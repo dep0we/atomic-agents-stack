@@ -642,8 +642,8 @@ def _check_cap(agent_root: Path, model: str, reserved: float, critical: bool) ->
     if critical or reserved <= 0:
         return
     log_dir = agent_root / "log"
-    today_cost = _costs.sum_cost_for_period(log_dir, "today")
-    month_cost = _costs.sum_cost_for_period(log_dir, "this_month")
+    today_cost = _costs.sum_cost_for_period(log_dir, "today", source="actor")
+    month_cost = _costs.sum_cost_for_period(log_dir, "this_month", source="actor")
     # Load caps from model.md
     model_data = _model.parse_model_md(agent_root / "model.md")
     if not model_data.get("cost_guardrails_enabled"):
