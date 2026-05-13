@@ -629,7 +629,10 @@ def _parse_escalation(raw: Any) -> EscalationConfig:
             f"judges.md ``escalation`` must be a mapping; got "
             f"{type(raw).__name__}"
         )
-    destination = str(raw.get("destination", "vault"))
+    # Default ``vault/escalations/`` matches spec/28:288. Operators
+    # who set destination=vault explicitly get normalized at write
+    # time (see escalation.py).
+    destination = str(raw.get("destination", "vault/escalations/"))
     auto_decide = raw.get("auto_decide_after_seconds")
     if auto_decide is not None:
         auto_decide = _coerce_int(
@@ -648,10 +651,22 @@ def _parse_escalation(raw: Any) -> EscalationConfig:
             f"valid outcome: {fallback!r}. Allowed: "
             f"['allow', 'block', 'revise', 'escalate']"
         )
+    poll_cycle_raw = raw.get("resolution_poll_cycle_seconds", 60)
+    poll_cycle = _coerce_int(
+        poll_cycle_raw,
+        default=60,
+        field_label="escalation.resolution_poll_cycle_seconds",
+    )
+    if poll_cycle < 0:
+        raise JudgePolicyInvalid(
+            f"judges.md ``escalation.resolution_poll_cycle_seconds`` "
+            f"must be >= 0; got {poll_cycle}"
+        )
     return EscalationConfig(
         destination=destination,
         auto_decide_after_seconds=auto_decide,
         fallback_on_timeout=fallback,
+        resolution_poll_cycle_seconds=poll_cycle,
     )
 
 

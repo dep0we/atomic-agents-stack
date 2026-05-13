@@ -392,13 +392,24 @@ class EscalationConfig:
     """Escalation destination + timeout behavior, parsed from
     ``judges.md``.
 
-    PR 3's parser fleshes out the load semantics; PR 1 just defines the
-    shape so ``JudgeRuntimeConfig`` can carry it.
+    PR 3a's parser fleshes out the load semantics; PR 3b wires it into
+    the actual write-side + poll-side state machine.
+
+    ``destination`` is the vault-relative directory where PENDING files
+    are written, per spec/28:288. Default ``vault/escalations/`` matches
+    the spec. Legacy ``"vault"`` is accepted by ``write_pending_escalation``
+    as an alias and normalized internally (back-compat for early adopters).
+
+    ``resolution_poll_cycle_seconds`` (spec/28:340) caps how often the
+    framework scans the escalation queue. Default 60s. PR 3b uses this
+    as the throttle window for the opportunistic on-call poll inside
+    ``agent.call()``; a clock-driven CLI / cron path is a follow-up.
     """
 
-    destination: str = "vault"  # "vault" | future: "linear" | "slack" | ...
+    destination: str = "vault/escalations/"
     auto_decide_after_seconds: int | None = None  # None = wait indefinitely
     fallback_on_timeout: str = "block"  # JudgmentOutcome value string
+    resolution_poll_cycle_seconds: int = 60
 
 
 @dataclass(frozen=True)
@@ -479,3 +490,10 @@ class JudgmentEvent:
     cost_usd: float | None
     cost_source: str  # "judge" for JudgmentEvent; legacy records default to "actor"
     ts: str  # ISO-8601 UTC
+    # PR 3b additions for ESCALATE state machine. ``synthesis_source`` is
+    # set when the framework, not a real judge, produces the ESCALATE
+    # outcome — either because operator class_policy=escalate fired, or
+    # because failure_policy mapped an exception to escalate. Real-judge
+    # ESCALATE leaves it None. Spec/28 lock-in (PR 4) will canonicalize.
+    synthesis_source: str | None = None  # "class_policy" | "failure_policy" | None
+    triggered_by: str | None = None  # "failure_policy:<ExceptionName>" when applicable

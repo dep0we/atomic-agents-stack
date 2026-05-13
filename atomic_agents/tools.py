@@ -138,6 +138,12 @@ class ToolCallResult:
     output: Any                    # whatever the handler returned (json-serialized)
     error: str | None = None       # set when handler raised or validation failed
     latency_ms: int = 0
+    # Judge layer (spec/28 PR 3b). True when the tool_use was deferred
+    # by an ESCALATE judgment — handler did NOT run; the framework
+    # wrote a PENDING file and ``Response.deferred=True``. Consumers
+    # iterating ``response.tool_calls`` distinguish this from genuine
+    # handler errors via the field, not by string-matching ``error``.
+    deferred: bool = False
 
 
 class ToolRegistry:

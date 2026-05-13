@@ -297,10 +297,12 @@ proposal_id: proposal_20260512T143052_xyz98765
 parent_run_id: agent_20260512T143050_def67890
 agent: caldwell
 action_class: high_risk
-judge_id: default-llm
+judge_id: default-llm | framework
 escalated_at: 2026-05-12T14:30:52Z
 policy_version: tools.md@sha256:...+judges.md@sha256:...
 schema_version: 1
+triggered_by: failure_policy:JudgeUnavailable      # optional; framework-synthesized only
+synthesis_source: class_policy | failure_policy    # optional; framework-synthesized only
 ---
 
 ## Proposal
@@ -340,6 +342,14 @@ redaction_reason: <free prose>
 The framework writes PENDING; the operator (or an authorized service) writes a resolution block by editing the file. The framework reads files in `vault/escalations/<class>/` once per resolution-poll cycle (configurable; default 60s) and emits RESOLVED events for any file whose `state` field transitioned from `pending` to one of `resolved` / `redacted`.
 
 If two resolution blocks are present, the *first* one (top-down in file order) wins; the file's `state` field is the authoritative state. Operators editing concurrently are responsible for not stomping each other; the framework does not attempt to merge conflicting resolutions. The doctor (`spec/27`) gains `check_escalation_conflicts` to surface files with multiple resolution blocks.
+
+**Strict resolution-block parser** (PR 3b lock-in). Resolution headers MUST match exactly: `### <Verb> by <operator>` — h3 prefix, verb in `{Approved, Denied, Redacted, Revised, Auto-decided}` with exact case, the literal word `by`, and a non-empty operator string. Typos (lowercase verb, h4 prefix, missing `by`) make the file UNPARSEABLE — the framework leaves the file as-is, does NOT claim the de-dup sidecar, and surfaces a doctor warning on the next health check. This lets operators fix the typo and re-trigger without state-machine debt.
+
+**Body integrity** (PR 3b lock-in). On every operator resolution, the framework recomputes `arguments_hash` from the `## Proposal` block's `tool_arguments` field and compares against the embedded `arguments_hash` value. Mismatch → `enforcement_action="proposal_body_tampered"`, no execution. **Defense scope**: this catches accidental edits and lazy tamper (operator changes `tool_arguments` without also updating the embedded `arguments_hash`). A sophisticated operator can recompute the hash to match — the embedded hash IS in the same file. Operator approval is itself the trust anchor; the check is a guard against careless edits, not against hostile operators. Operators with vault write access can also write a fresh PENDING file from scratch with any arguments they want.
+
+**De-dup sidecar** (PR 3b lock-in). The framework claims a `.<proposal_id>.resolved-emitted` sidecar file via `O_CREAT|O_EXCL` next to the PENDING file before emitting the RESOLVED audit event. Concurrent pollers race the sidecar create; exactly one wins. The sidecar is a vault-internal dotfile (taste rule #1: vault as source of truth — no in-memory de-dup state). The throttle marker `<destination>/.last-poll` follows the same convention; `spec/27`'s doctor should ignore both.
+
+**Auto-decide CAS race** (PR 3b lock-in). The auto-decide-timeout path re-snapshots the PENDING file just before its atomic_write and aborts if the sha256 changed since the initial read — operator-edit-during-write defers to the next poll cycle. The auto-decide is idempotent (timeout has still passed), so retry is safe.
 
 Redacted files keep their frontmatter but the body is replaced with the `redaction_reason`. The RESOLVED event records the redaction; the original proposal is preserved in the JSONL audit trail.
 
@@ -771,8 +781,9 @@ aggregation: any_block_blocks
 
 destination: vault/escalations/
 operator_notification: email | webhook | none
-auto_decide_after: 24h
-fallback: block
+auto_decide_after_seconds: 86400
+fallback_on_timeout: block
+resolution_poll_cycle_seconds: 60
 
 ## Failure policy
 
@@ -797,6 +808,7 @@ read_audit_mode: false
 - Class policy values are an enum: `bypass | allow_with_audit | judge_required | escalate`. Unknown value → `JudgePolicyInvalid`.
 - Specialist composition is optional. Absent section → composition is implicit `[PolicyJudge, LLMCatchAll]` (PolicyJudge always-on baseline + the LLM catch-all configured under `## Default judge`). The catch-all is not "alone" — PolicyJudge always runs first.
 - Failure policy section is optional. **`Failure policy` default-fill**: any unlisted exception type defaults to `block` (fail-closed). Partial coverage is allowed; missing keys get the safe default.
+- **`Escalation queue` parser rules** (PR 3b lock-in): duration values are integer seconds (e.g., `auto_decide_after_seconds: 86400`), not duration strings. The framework reads `destination` as a vault-relative directory; the operator-typed value `vault` is normalized to `vault/escalations/` per spec/28:288. `resolution_poll_cycle_seconds` (default 60) caps how often the framework scans the escalation directory for state transitions; `0` disables throttling. The `fallback` key was renamed to `fallback_on_timeout` to match the parsed field name; the old name is not accepted.
 - Per-tool overrides (rare, advanced) live in `tools.md`'s per-tool sections, not in `judges.md`.
 
 Pure-YAML config files are refused per rule #7. Embedded YAML inside markdown is acceptable for structured fields. Markdown sections carry the same aesthetic as `tools.md` and `model.md`.
@@ -846,7 +858,10 @@ Each judgment writes a JSONL line to the run log, carrying `parent_run_id` linki
   "proposal": { ... ActionProposal ... },
   "judgment": { ... Judgment ... },
   "raw_outcome": "block",
-  "enforcement_action": "audit_bypass | block_executed | allow_executed | revise_executed | escalate_pending",
+  "enforcement_action": "audit_bypass | block_executed | allow_executed | allow_pending_next_judge | revise_executed | escalate_pending | approved_executed | approved_stale_tool_definition | denied | redacted | auto_decided_block | auto_decided_allow | proposal_body_tampered",
+  "synthesis_source": "class_policy | failure_policy | null",
+  "triggered_by": "failure_policy:<ExceptionName> | null",
+  "escalation_queue_id": "proposal_20260512T143052_xyz98765 | null",
   "binding": {
     "tool_call_id": "...",
     "tool_definition_hash": "sha256:...",
@@ -860,6 +875,24 @@ Each judgment writes a JSONL line to the run log, carrying `parent_run_id` linki
 ```
 
 `raw_outcome` is what the judge returned. `enforcement_action` is what the framework did with that outcome — they differ on `read_audit_mode` (judge can return BLOCK but framework executes), on operator escalation overrides, and on failure_policy resolutions. This lets the dashboard count "judge would have blocked but read-audit bypassed" distinctly from "judge allowed and we executed" — which Round 2 caught as indistinguishable in the v1 audit shape.
+
+**Enforcement-action enum (PR 3b lock-in).** The v1 spec listed five values (`audit_bypass`, `block_executed`, `allow_executed`, `revise_executed`, `escalate_pending`). Reference-implementation work since extended the enum:
+
+- `allow_pending_next_judge` (PR 2b ensemble) — a judge in a multi-judge ensemble ALLOWed, but subsequent judges have not yet voted. Promoted to `allow_executed` on the LAST event when the ensemble's overall verdict is ALLOW. Intermediate ALLOWs stay `allow_pending_next_judge`.
+- `approved_executed` (PR 3b) — operator wrote `### Approved by <op>` to a PENDING file; framework re-verified `tool_definition_hash`; executed the bound action.
+- `approved_stale_tool_definition` (PR 3b) — operator wrote Approved but the tool's `input_schema` / handler changed since PENDING-write. Refused execution; PENDING file preserved.
+- `denied` (PR 3b) — operator wrote `### Denied by <op>` to a PENDING file. No execution.
+- `redacted` (PR 3b) — operator wrote `### Redacted by <op>` to a PENDING file (body redacted, frontmatter preserved). No execution.
+- `auto_decided_block` / `auto_decided_allow` (PR 3b) — `auto_decide_after_seconds` elapsed; framework applied `fallback_on_timeout` policy from `judges.md`. The CAS write detects operator-edit races and defers to the operator on conflict.
+- `proposal_body_tampered` (PR 3b) — operator edited the `## Proposal` body of a PENDING file between write and resolution. Framework recomputes `arguments_hash` from the body's tool_arguments and refuses execution on mismatch. Action is treated as denied; PENDING file preserved in audit trail.
+
+**`synthesis_source`** (PR 3b) — set when the framework, not a real judge, produced the ESCALATE outcome. Values: `"class_policy"` (operator's `class_policy.<X>=escalate` fired without ensemble), `"failure_policy"` (a judge raised an exception mapped to escalate via `failure_policy`), `null` (a real judge returned ESCALATE). This lets dashboards distinguish judge-driven escalations from framework-synthesized ones.
+
+**`triggered_by`** (PR 3b) — populated for failure_policy synthesis only. Value: `"failure_policy:<ExceptionName>"`. Operators auditing a stall caused by `JudgeUnavailable: backend timeout` see exactly which exception class drove the escalate.
+
+**`escalation_queue_id`** (PR 3b) — populated when the event's outcome is `escalate` or when a resolution event links back to a PENDING file. Equals the `proposal_id` (which doubles as the queue key — the framework does not mint a separate ID).
+
+**`Response.deferred` semantics** (PR 3b). `agent.call()` returns `Response(deferred=True, escalation_queue_ids=[id1, id2, ...])` when any tool_use in the actor's assistant turn produces an ESCALATE outcome. The list (not a singular id) accommodates the case where one turn proposes multiple actions, of which two or more escalate. ALLOWed tool_uses in the same turn still execute and their results land in `Response.tool_calls`; the multi-turn loop terminates immediately after the iteration (no follow-up LLM call to close out the partial state). Operator resolution of the PENDING file does NOT replay the result to the original actor — execution is terminal, with `cost_source="actor"` keeping the spend on the proposing run's ledger.
 
 The parent run record rolls up judgments inline (same shape as `helper_provenance`, `delegations`, `tool_calls`), so a single read of the agent's run record shows everything the actor and judge did, together.
 

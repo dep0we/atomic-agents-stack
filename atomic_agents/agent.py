@@ -518,6 +518,208 @@ class AtomicAgent:
         )
         return self._llm_judge
 
+    # ────────────────────────────────────────────────────────────
+    # Escalation polling (#112 PR 3b)
+
+    def poll_escalations(self) -> list:
+        """Scan the escalation queue for operator resolutions and
+        execute / audit them.
+
+        Called from the top of ``agent.call()`` once per iteration (the
+        first iteration if the throttle window has elapsed). Returns
+        the list of ``ResolutionEvent``s that fired this poll cycle
+        (mostly useful for tests; production callers ignore the value).
+
+        **Standalone-invocation caveat (Codex round-1 P2-1).** This
+        method is public and operators may call it directly (e.g., from
+        a future ``atomic-agents poll-escalations`` CLI). When invoked
+        standalone (NOT via ``agent.call()``), the MCP client pool is
+        NOT initialized: ``call()`` is what wires it up after the cost
+        gate. If an Approved escalation's tool is an MCP tool, the
+        tool registry lookup returns None and the resolution is
+        recorded as ``approved_stale_tool_definition`` — safe (fail
+        closed) but misleading (the tool isn't stale; the framework
+        just hasn't loaded MCP yet). Wire MCP init into a standalone
+        CLI before relying on Approved MCP-tool execution; see #166.
+
+        Behavior:
+        - Throttled by ``judges_config.escalation.resolution_poll_cycle_seconds``
+          (default 60s). The .last-poll mtime marker lives in the
+          escalation destination directory.
+        - For Approved resolutions: re-verifies the tool_definition_hash
+          against the current tool registry, refuses execution on
+          mismatch (``approved_stale_tool_definition``), then executes
+          the bound action via the loaded tool registry. Result charged
+          to the actor's original ``parent_run_id`` (cost_source="actor").
+        - For Denied / Redacted resolutions: audits without executing.
+        - For Auto-decided resolutions: applies the operator's
+          fallback_on_timeout policy.
+        - For Body-tampered files: refuses execution; emits
+          ``proposal_body_tampered`` audit.
+        - For Revised resolutions: PR 3b treats as Denied (REVISE flow
+          ships in PR 3c). The audit event records the operator's
+          intent so PR 3c can surface stale-deferred revisions.
+        """
+        from .judge import escalation as _esc
+        from .judge.backend import Judgment, JudgmentOutcome
+
+        if self.judges_config is None:
+            return []
+        cfg = self.judges_config.escalation
+        # Throttle: skip if recent poll happened within cycle window.
+        if _esc.is_within_throttle(
+            agent_root=self.agent_root,
+            judges_config_escalation=cfg,
+        ):
+            return []
+        try:
+            events = _esc.poll_resolutions(
+                agent_root=self.agent_root,
+                judges_config_escalation=cfg,
+                log_warning=lambda msg: _logger.warning(
+                    "agent %r poll_escalations: %s", self.name, msg
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            _logger.exception(
+                "agent %r: poll_escalations raised; skipping cycle: %s",
+                self.name, exc,
+            )
+            # Do NOT touch_last_poll on error (Codex round-1 P1-5).
+            # Persistent failures (e.g., disk full) should not silently
+            # throttle subsequent retries.
+            return []
+        # Only update throttle marker after a successful scan. Errors
+        # leave .last-poll untouched so the next call() retries.
+        _esc.touch_last_poll(
+            agent_root=self.agent_root,
+            judges_config_escalation=cfg,
+        )
+
+        for event in events:
+            self._process_resolution_event(event)
+        return events
+
+    def _process_resolution_event(self, event) -> None:
+        """Handle one ResolutionEvent: emit JSONL audit + execute if
+        Approved + tool_definition_hash matches the current registry.
+        """
+        from .judge import escalation as _esc
+        from .judge.proposal import compute_tool_definition_hash
+
+        decision = event.decision
+        proposal = event.proposal
+        fm = event.frontmatter
+        enforcement = event.enforcement_action
+
+        # Re-verify tool_definition_hash for Approved cases. The
+        # current tool registry may have evolved since the PENDING was
+        # written (tool dropped, schema changed). Mismatch → refuse,
+        # promote enforcement to approved_stale_tool_definition.
+        if decision is _esc.ResolutionDecision.APPROVED:
+            registered = self.tool_registry.get(proposal.tool_name)
+            if registered is None:
+                enforcement = "approved_stale_tool_definition"
+                stale_reason = (
+                    f"tool {proposal.tool_name!r} no longer registered "
+                    "at execution time"
+                )
+            else:
+                current_hash = compute_tool_definition_hash(
+                    proposal.tool_name,
+                    registered.input_schema,
+                    registered.handler,
+                )
+                if current_hash != proposal.tool_definition_hash:
+                    enforcement = "approved_stale_tool_definition"
+                    stale_reason = (
+                        "tool_definition_hash mismatch: PENDING="
+                        f"{proposal.tool_definition_hash[:12]}..., "
+                        f"current={current_hash[:12]}..."
+                    )
+                else:
+                    stale_reason = None
+        else:
+            stale_reason = None
+
+        # Build the RESOLVED audit record. We synthesize a Judgment
+        # so the JSONL line has the standard judge-event shape.
+        from .judge.backend import Judgment, JudgmentOutcome
+        from .judge.types import ProposalBinding
+
+        judgment = Judgment(
+            outcome=(
+                JudgmentOutcome.ALLOW
+                if decision is _esc.ResolutionDecision.APPROVED
+                and stale_reason is None
+                else JudgmentOutcome.BLOCK
+            ),
+            reason=(stale_reason or event.reason or decision.value),
+            judge_id=event.operator,
+            policy_version=fm.policy_version,
+        )
+        binding = ProposalBinding(
+            tool_call_id=proposal.tool_call_id,
+            tool_definition_hash=proposal.tool_definition_hash,
+            arguments_hash=proposal.arguments_hash,
+        )
+        # Pseudo tool_use payload for the event builder.
+        tool_use_stub = {"name": proposal.tool_name, "id": proposal.tool_call_id}
+        record = self._build_judgment_event_dict(
+            proposal=proposal,
+            tool_use=tool_use_stub,
+            judgment=judgment,
+            enforcement_action=enforcement,
+            binding=binding,
+        )
+        record["resolved_at"] = event.resolved_at
+        record["resolution_operator"] = event.operator
+        record["escalation_file"] = str(event.file_path)
+        record["escalation_queue_id"] = fm.proposal_id
+        record["trigger"] = "escalation_resolved"
+        self._log(record)
+
+        # Execute the bound action for Approved + fresh tool. The
+        # ToolCallResult is appended to a deferred_execution JSONL
+        # line; no actor-loop replay happens (the original run is
+        # closed). cost_source="actor" keeps the spend on the
+        # proposing actor's ledger per the operator-approval-as-consent
+        # discipline.
+        if (
+            decision is _esc.ResolutionDecision.APPROVED
+            and stale_reason is None
+        ):
+            try:
+                tool_use_payload = {
+                    "name": proposal.tool_name,
+                    "id": proposal.tool_call_id,
+                    "input": proposal.tool_arguments,
+                }
+                tool_result = self.tool_registry.execute(tool_use_payload)
+                self._log({
+                    "trigger": "escalation_deferred_execution",
+                    "parent_run_id": fm.parent_run_id,
+                    "escalation_queue_id": fm.proposal_id,
+                    "tool_name": tool_result.tool_name,
+                    "latency_ms": tool_result.latency_ms,
+                    "error": tool_result.error,
+                    "cost_source": "actor",
+                })
+            except Exception as exc:  # noqa: BLE001
+                _logger.exception(
+                    "agent %r: escalation_deferred_execution failed for "
+                    "proposal_id=%r: %s",
+                    self.name, proposal.proposal_id, exc,
+                )
+                self._log({
+                    "trigger": "escalation_deferred_execution",
+                    "parent_run_id": fm.parent_run_id,
+                    "escalation_queue_id": fm.proposal_id,
+                    "tool_name": proposal.tool_name,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "cost_source": "actor",
+                })
+
     def _dispatch_with_judge(
         self,
         tu: dict,
@@ -618,7 +820,7 @@ class AtomicAgent:
                     arguments_hash="",
                 ),
             )
-            return False, [event]
+            return False, [event], None
 
         # Build the JudgmentContext once; both judges see the same
         # context per spec/28 idempotency invariants. When judges.md
@@ -696,6 +898,53 @@ class AtomicAgent:
             ActionClass.HIGH_RISK: class_policy.high_risk,
         }[classification]
 
+        if effective_class_policy == _CPV.ESCALATE:
+            # PR 3b: synthesize ESCALATE from operator class_policy.
+            # No judge ensemble runs — the operator's class_policy is
+            # itself the decision. Write PENDING + signal defer.
+            from .judge.backend import Judgment
+            from .judge import escalation as _esc
+            escalate_judgment = Judgment(
+                outcome=JudgmentOutcome.ESCALATE,
+                reason=(
+                    f"class_policy.{classification.value} = escalate — "
+                    "operator-configured pre-action gate"
+                ),
+                judge_id="framework",
+                policy_version=(
+                    self.judges_config.judges_md_hash
+                    if self.judges_config is not None
+                    else "unimplemented"
+                ),
+            )
+            _pending_path, queue_id = _esc.write_pending_escalation(
+                proposal=proposal_obj,
+                judgment_reason=escalate_judgment.reason,
+                judge_id="framework",
+                agent_root=self.agent_root,
+                agent_name=self.name,
+                parent_run_id=self.run_id,
+                policy_version=escalate_judgment.policy_version,
+                judges_config_escalation=escalation_cfg,
+                synthesis_source="class_policy",
+            )
+            escalate_judgment = Judgment(
+                outcome=JudgmentOutcome.ESCALATE,
+                reason=escalate_judgment.reason,
+                judge_id="framework",
+                policy_version=escalate_judgment.policy_version,
+                escalation_queue_id=queue_id,
+            )
+            event = self._build_judgment_event_dict(
+                proposal=proposal_obj,
+                tool_use=tu,
+                judgment=escalate_judgment,
+                enforcement_action="escalate_pending",
+                binding=binding,
+                synthesis_source="class_policy",
+            )
+            return False, [event], queue_id
+
         if effective_class_policy == _CPV.BYPASS:
             # Synthesize a single bypass-recording event. No judge
             # ensemble runs. Tool executes immediately.
@@ -720,7 +969,7 @@ class AtomicAgent:
                 enforcement_action="allow_executed",
                 binding=binding,
             )
-            return True, [bypass_event]
+            return True, [bypass_event], None
 
         # Build the judge ensemble. PR 2b: PolicyJudge first
         # (microsecond latency, free), then LLMJudgeBackend if
@@ -750,30 +999,71 @@ class AtomicAgent:
 
         events: list[dict] = []
         final_allow = True
+        escalation_queue_id: str | None = None
         for judge in judges:
             start = time.time()
+            failure_synthesis: str | None = None
+            triggered_by_failure: str | None = None
             try:
                 judgment = judge.evaluate(proposal_obj, context)
             except JudgeError as exc:
                 # Map exception via per-class failure_policy. Operator
                 # may configure "allow" / "block" / "escalate" per-class
-                # per-exception. Until PR 3b's real ESCALATE outcome,
-                # "escalate" still self-maps to BLOCK so PR 3a doesn't
-                # leak the half-implemented ESCALATE.
+                # per-exception. PR 3b: "escalate" outcome now produces
+                # a real PENDING file + deferred Response.
                 from .judge.backend import Judgment
                 outcome = _outcome_for_failure(type(exc).__name__)
                 if outcome == JudgmentOutcome.ESCALATE:
-                    outcome = JudgmentOutcome.BLOCK
-                    reason_suffix = " (escalate_pending_polling_unimplemented)"
-                else:
-                    reason_suffix = ""
+                    failure_synthesis = "failure_policy"
+                    triggered_by_failure = f"failure_policy:{type(exc).__name__}"
                 judgment = Judgment(
                     outcome=outcome,
-                    reason=f"{type(exc).__name__}: {exc}{reason_suffix}",
+                    reason=f"{type(exc).__name__}: {exc}",
                     judge_id=judge.judge_id,
                     policy_version=judge.policy_version,
                     latency_ms=int((time.time() - start) * 1000),
                 )
+
+            # ESCALATE handling: a real judge (or failure_policy
+            # synthesis) returned ESCALATE. Write PENDING + emit one
+            # audit event with enforcement_action=escalate_pending.
+            # Ensemble short-circuits — downstream judges do not run.
+            if judgment.outcome == JudgmentOutcome.ESCALATE and not audit_mode:
+                from .judge import escalation as _esc
+                _pending_path, queue_id = _esc.write_pending_escalation(
+                    proposal=proposal_obj,
+                    judgment_reason=judgment.reason,
+                    judge_id=judgment.judge_id,
+                    agent_root=self.agent_root,
+                    agent_name=self.name,
+                    parent_run_id=self.run_id,
+                    policy_version=judgment.policy_version,
+                    judges_config_escalation=escalation_cfg,
+                    synthesis_source=failure_synthesis,
+                    triggered_by=triggered_by_failure,
+                )
+                # Update judgment with the queue_id we just minted.
+                judgment = Judgment(
+                    outcome=JudgmentOutcome.ESCALATE,
+                    reason=judgment.reason,
+                    judge_id=judgment.judge_id,
+                    policy_version=judgment.policy_version,
+                    latency_ms=judgment.latency_ms,
+                    escalation_queue_id=queue_id,
+                )
+                event = self._build_judgment_event_dict(
+                    proposal=proposal_obj,
+                    tool_use=tu,
+                    judgment=judgment,
+                    enforcement_action="escalate_pending",
+                    binding=binding,
+                    synthesis_source=failure_synthesis,
+                    triggered_by=triggered_by_failure,
+                )
+                events.append(event)
+                final_allow = False
+                escalation_queue_id = queue_id
+                break
 
             judge_allow = judgment.outcome == JudgmentOutcome.ALLOW
             # audit_mode (class_policy=allow_with_audit): every event
@@ -808,7 +1098,7 @@ class AtomicAgent:
         # individual judges' outcomes — the BLOCKs were recorded for
         # forensics but do not gate the action.
         if audit_mode:
-            return True, events
+            return True, events, None
 
         # Ensemble-final fixup: when the whole ensemble allowed, the
         # LAST event represents the action that actually runs — promote
@@ -822,7 +1112,7 @@ class AtomicAgent:
         if final_allow and events:
             events[-1]["enforcement_action"] = "allow_executed"
 
-        return final_allow, events
+        return final_allow, events, escalation_queue_id
 
     def _build_judgment_event_dict(
         self,
@@ -832,16 +1122,24 @@ class AtomicAgent:
         judgment,
         enforcement_action: str,
         binding,
+        synthesis_source: str | None = None,
+        triggered_by: str | None = None,
     ) -> dict:
         """Construct the JSONL-shaped JudgmentEvent record for the
         audit trail. Mirrors spec/28's audit shape (line 833).
 
-        Stored inline in the agent's run log via ``self._log({...})``.
+        ``synthesis_source`` distinguishes framework-synthesized ESCALATE
+        from real-judge ESCALATE: ``"class_policy"`` for operator-set
+        class_policy=escalate, ``"failure_policy"`` for exception-mapped
+        escalate, ``None`` for actual ensemble verdicts. ``triggered_by``
+        carries the exception class name for failure_policy synthesis.
+        Both are PR 3b extensions to the audit shape (spec/28 lock-in
+        in PR 4). Stored inline via ``self._log({...})``.
         """
         proposal_dict = None
         if proposal is not None:
             proposal_dict = asdict(proposal)
-        return {
+        record = {
             "trigger": "judgment",
             "event": "judgment",
             "parent_run_id": self.run_id,
@@ -860,6 +1158,16 @@ class AtomicAgent:
             "cost_source": "judge",
             "tool_name": tool_use.get("name", ""),
         }
+        if synthesis_source is not None:
+            record["synthesis_source"] = synthesis_source
+        if triggered_by is not None:
+            record["triggered_by"] = triggered_by
+        # Carry the escalation_queue_id through when populated so
+        # operators auditing the trail see the PENDING file linkage.
+        queue_id = getattr(judgment, "escalation_queue_id", None)
+        if queue_id is not None:
+            record["escalation_queue_id"] = queue_id
+        return record
 
     # ────────────────────────────────────────────────────────────
     # Config loading
@@ -1231,6 +1539,18 @@ class AtomicAgent:
                     self.name, len(mcp_tool_defs), len(self.config.mcp_servers),
                 )
 
+            # PR 3b ESCALATE: opportunistic throttled poll of the
+            # escalation queue. Operators (and the auto-decide-timeout
+            # branch) resolve PENDING files asynchronously; on each
+            # call() we check whether any are ready, emit RESOLVED audit
+            # events, and execute Approved actions inline. Throttle
+            # caps disk I/O at one scan per
+            # judges_config.escalation.resolution_poll_cycle_seconds
+            # (default 60s) per agent. Standalone CLI / cron poller
+            # is tracked as a follow-up issue.
+            if self._judge_enabled():
+                self.poll_escalations()
+
             # Pick model — fallback if guardrail says so, else override, else default
             if check.action == "fallback" and check.fallback_model:
                 model = check.fallback_model
@@ -1263,6 +1583,11 @@ class AtomicAgent:
             # _check_cost_guardrails so mid-loop cap checks see the true running
             # total, not just the pre-call on-disk snapshot. (fix R2-A1)
             accumulated_loop_cost_usd: float = 0.0
+            # PR 3b ESCALATE: accumulate queue_ids across iterations
+            # (a single tool-loop iteration can produce multiple
+            # deferred tool_uses; the loop terminates immediately, but
+            # Response.escalation_queue_ids reflects all of them).
+            accumulated_escalation_queue_ids: list[str] = []
 
             # ── Multi-turn tool loop ──────────────────────────────
             start_total = time.time()
@@ -1386,6 +1711,10 @@ class AtomicAgent:
                 # (no judges.md, no AGENT_JUDGE_ENABLED env var) the dispatch
                 # is skipped entirely and today's pre-#112 behavior runs.
                 judge_blocked: dict[str, str] = {}  # tool_call_id -> block reason
+                # PR 3b ESCALATE: tool_call_id -> escalation_queue_id.
+                # Deferred tool_uses don't execute this turn; the actor's
+                # call() returns deferred=True after the iteration.
+                judge_deferred: dict[str, str] = {}
                 if self._judge_enabled() and custom_tool_uses:
                     from .judge.atomic_action import extract_atomic_action_markers
                     from .exceptions import JudgeProposalInvalid
@@ -1408,7 +1737,7 @@ class AtomicAgent:
                     if not judge_blocked:
                         for tu in custom_tool_uses:
                             try:
-                                allow, events = self._dispatch_with_judge(
+                                allow, events, queue_id = self._dispatch_with_judge(
                                     tu, markers,
                                 )
                             except Exception as exc:  # noqa: BLE001
@@ -1432,7 +1761,14 @@ class AtomicAgent:
                             # judge that actually ran.
                             for event in events:
                                 self._log(event)
-                            if not allow:
+                            if queue_id is not None:
+                                # PR 3b ESCALATE: PENDING file already
+                                # written by _dispatch_with_judge. Mark
+                                # this tool_use as deferred so it does
+                                # not execute this turn; the actor's
+                                # call() returns with deferred=True.
+                                judge_deferred[tu.get("id", "")] = queue_id
+                            elif not allow:
                                 # The LAST event in the list is the BLOCKing
                                 # judge — the others ALLOWed. Its reason is
                                 # what flows back to the actor.
@@ -1468,6 +1804,42 @@ class AtomicAgent:
                             "error": blocked_result.error,
                         })
                         continue
+                    if tcid in judge_deferred:
+                        # PR 3b ESCALATE: PENDING file already written.
+                        # Synthesize a "deferred" tool_result for the
+                        # audit trail but do NOT execute the handler.
+                        # The actor's call() returns deferred=True after
+                        # this iteration; no further multi-turn loop.
+                        # ``deferred=True`` is the structural signal
+                        # consumers iterate on (Codex round-1 P2-4 fix);
+                        # ``error`` carries the same info as prose for
+                        # humans reading the JSONL log. Distinct trigger
+                        # ``tool_call_deferred`` keeps dashboard failure
+                        # counts honest (P2-5 fix).
+                        from .tools import ToolCallResult as _TCR
+                        deferred_result = _TCR(
+                            tool_name=tu.get("name", ""),
+                            tool_use_id=tcid,
+                            input=tu.get("input", {}) or {},
+                            output=None,
+                            error=(
+                                f"judge_deferred: ESCALATE — see "
+                                f"escalation_queue_id={judge_deferred[tcid]}"
+                            ),
+                            latency_ms=0,
+                            deferred=True,
+                        )
+                        all_tool_call_results.append(deferred_result)
+                        iter_tool_results.append(deferred_result)
+                        self._log({
+                            "trigger": "tool_call_deferred",
+                            "parent_run_id": self.run_id,
+                            "tool_name": deferred_result.tool_name,
+                            "latency_ms": 0,
+                            "error": deferred_result.error,
+                            "escalation_queue_id": judge_deferred[tcid],
+                        })
+                        continue
                     tool_result = self.tool_registry.execute(tu)
                     all_tool_call_results.append(tool_result)
                     iter_tool_results.append(tool_result)
@@ -1482,6 +1854,16 @@ class AtomicAgent:
 
                 # If no custom tools were called, the loop is done
                 if not custom_tool_uses:
+                    break
+
+                # PR 3b ESCALATE: any deferred tool_use breaks the
+                # multi-turn loop. ALLOWed tool_results stay in
+                # all_tool_call_results, deferred ones already recorded
+                # an audit-only error result. Actor's call() returns
+                # with deferred=True so the caller (operator harness,
+                # parent agent, CLI) sees the run paused.
+                if judge_deferred:
+                    accumulated_escalation_queue_ids.extend(judge_deferred.values())
                     break
 
                 # Check if we've hit the iteration cap
@@ -1546,6 +1928,8 @@ class AtomicAgent:
                 tool_calls=all_tool_call_results,
                 tool_iterations=iteration_count,
                 tool_iterations_maxed=tool_iterations_maxed,
+                deferred=bool(accumulated_escalation_queue_ids),
+                escalation_queue_ids=accumulated_escalation_queue_ids,
             )
 
             # Log run record

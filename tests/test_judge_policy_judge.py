@@ -115,12 +115,14 @@ class TestProtocolSurface:
         judge = PolicyJudge()
         assert isinstance(judge, JudgeBackend)
 
-    def test_supported_outcomes_pr2a_set(self):
-        # PR 2a ships ALLOW + BLOCK only. ESCALATE adds in PR 3.
+    def test_supported_outcomes_pr3b_set(self):
+        # PR 3b widens to include ESCALATE for class_policy=escalate.
+        # REVISE ships in PR 3c.
         judge = PolicyJudge()
         assert judge.supported_outcomes() == {
             JudgmentOutcome.ALLOW,
             JudgmentOutcome.BLOCK,
+            JudgmentOutcome.ESCALATE,
         }
 
     def test_supports_read_audit(self):
@@ -162,18 +164,18 @@ class TestClassPolicyDispatch:
         assert judgment.outcome == JudgmentOutcome.ALLOW
         assert "audit" in judgment.reason.lower()
 
-    def test_escalate_becomes_block_in_pr2a(self):
-        # Per the PR 2a deferral — class-policy ESCALATE self-maps to
-        # BLOCK with the escalate_pending_polling_unimplemented reason
-        # to avoid orphan PENDING files.
+    def test_escalate_returns_escalate_pr3b(self):
+        # PR 3b: class-policy ESCALATE returns a real ESCALATE
+        # judgment. The framework (in agent.py) writes the PENDING
+        # file + mints the queue_id; PolicyJudge itself does no I/O.
         judge = PolicyJudge()
         proposal = _proposal_for({"to": "x@y"})
         judgment = judge.evaluate(
             proposal,
             _ctx_with(ClassPolicyValue.ESCALATE),
         )
-        assert judgment.outcome == JudgmentOutcome.BLOCK
-        assert "escalate_pending_polling_unimplemented" in judgment.reason
+        assert judgment.outcome == JudgmentOutcome.ESCALATE
+        assert "escalate" in judgment.reason.lower()
 
     def test_judge_required_with_no_violations_returns_allow(self):
         judge = PolicyJudge()  # no write paths configured
