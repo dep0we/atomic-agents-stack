@@ -21,7 +21,10 @@ import time
 from dataclasses import asdict
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .llm.types import LLMToolDefinition  # noqa: F401 — used in str type hints
 
 _logger = logging.getLogger(__name__)
 
@@ -53,7 +56,6 @@ from .tools import (
     ToolCallResult,
     ToolDefinition,
     ToolRegistry,
-    build_tool_result_blocks_anthropic,
     build_tool_result_blocks_openai,
 )
 from .skills import SkillManifest, discover_skills, load_skill_body, load_skill_referenced_file
@@ -69,6 +71,44 @@ from .types import (
 PINNED_MAX = 5
 RECENT_NOTES_DEFAULT = 5
 RECENT_JOURNAL_DEFAULT = 1
+
+
+def _canonicalize_tool_loop(raw_tool_uses, tool_results):
+    """Translate provider-shape ``raw.tool_uses`` + framework ``ToolCallResult``
+    list into canonical ``LLMToolUse`` + ``LLMToolResult`` lists.
+
+    Lifted out of ``_build_tool_loop_messages`` (#87 PR 2.5 review Finding 8)
+    so PR 3 can reuse it when ``OpenAICompatibleLLMBackend.format_tool_results``
+    takes ownership of the OpenAI/Moonshot branch — the same translation
+    happens before either backend's call.
+
+    Content normalization: ``LLMToolResult.content`` is set to ``tr.output``
+    verbatim for success cases and to a ``"[tool error] ..."`` string for
+    errors. The backend's ``format_tool_results`` does any provider-
+    specific serialization (json.dumps with str() fallback) so wire bytes
+    stay byte-equivalent to the pre-#87 ``build_tool_result_blocks_*``
+    helpers — a PR 2.5 review caught the gap empirically.
+    """
+    from .llm.types import LLMToolResult, LLMToolUse
+    canonical_tool_uses = [
+        LLMToolUse(id=tu["id"], name=tu["name"], input=tu.get("input", {}))
+        for tu in raw_tool_uses
+    ]
+    canonical_tool_results = []
+    for tr in tool_results:
+        if tr.error is not None:
+            canonical_tool_results.append(LLMToolResult(
+                tool_use_id=tr.tool_use_id,
+                content=f"[tool error] {tr.error}",
+                is_error=True,
+            ))
+        else:
+            canonical_tool_results.append(LLMToolResult(
+                tool_use_id=tr.tool_use_id,
+                content=tr.output,
+                is_error=False,
+            ))
+    return canonical_tool_uses, canonical_tool_results
 
 
 class AtomicAgent:
@@ -260,47 +300,42 @@ class AtomicAgent:
         return f"run-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
 
     @staticmethod
-    def _capture_tool_definitions(model: str) -> list[dict] | None:
-        """Return the atomic_capture tool definition formatted for the agent's provider.
+    def _capture_tool_definitions(model: str) -> "list[LLMToolDefinition] | None":
+        """Return the atomic_capture tool definition as canonical ``LLMToolDefinition``.
 
         Returns None for providers without tool-call support — the agent then
-        falls back to Path 2 fenced-block parsing only.
+        falls back to Path 2 fenced-block parsing only. Today every supported
+        provider (Anthropic, OpenAI, Moonshot) has tool calls, so the only
+        None path is for unrecognized model prefixes.
 
-        Format-static: returns provider-shaped dicts (Anthropic or OpenAI),
-        not canonical ``LLMToolDefinition``. See _all_tool_definitions()
-        for the full list including custom tools.
-
-        Note: #87 PR 2 introduced an LLMBackend Protocol whose tool definition
-        type is canonical (``LLMToolDefinition``) rather than provider-shaped.
-        ``_llm.call_llm`` converts at the boundary today so this method can
-        keep returning provider dicts. PR 3 / PR 4 of the LLMBackend arc
-        will refactor this method to return canonical lists; the existing
-        dict-shape callers and tests stay unchanged in PR 2.
+        Returns a single-element ``list[LLMToolDefinition]``. Backends
+        translate canonical → provider format inside their ``call()`` —
+        the agent layer no longer branches on ``model.startswith`` (the
+        codex P1 fix from the #87 LLMBackend plan, landed in PR 2.5).
         """
-        if model.startswith("claude-"):
-            return [_capture.anthropic_tool_definition()]
-        if model.startswith("gpt-") or model.startswith("moonshot/"):
-            return [_capture.openai_tool_definition()]
+        if (model.startswith("claude-")
+                or model.startswith("gpt-")
+                or model.startswith("moonshot/")):
+            return [_capture.canonical_tool_definition()]
         return None
 
-    def _all_tool_definitions(self, model: str) -> list[dict] | None:
-        """Return all tool definitions (atomic_capture + custom tools) for the provider.
+    def _all_tool_definitions(self, model: str) -> "list[LLMToolDefinition] | None":
+        """Return all tool definitions (atomic_capture + custom tools) as canonical.
 
         Includes:
         - atomic_capture (built-in, always included for supported providers)
         - All tools registered in self.tool_registry (operator-supplied)
 
-        Returns None for providers without tool-call support — the agent then
-        falls back to Path 2 fenced-block parsing only (atomic_capture only;
-        custom tools are unavailable for unsupported providers).
+        Returns ``list[LLMToolDefinition]`` ready to hand to any backend's
+        ``call()`` (the backend translates to provider format internally).
+        Returns None for providers without tool-call support — the agent
+        then falls back to Path 2 fenced-block parsing only.
         """
-        if model.startswith("claude-"):
-            defs: list[dict] = [_capture.anthropic_tool_definition()]
-            defs.extend(self.tool_registry.to_anthropic_definitions())
-            return defs
-        if model.startswith("gpt-") or model.startswith("moonshot/"):
-            defs = [_capture.openai_tool_definition()]
-            defs.extend(self.tool_registry.to_openai_definitions())
+        if (model.startswith("claude-")
+                or model.startswith("gpt-")
+                or model.startswith("moonshot/")):
+            defs = [_capture.canonical_tool_definition()]
+            defs.extend(self.tool_registry.to_canonical_definitions())
             return defs
         return None
 
@@ -958,27 +993,21 @@ class AtomicAgent:
         messages = list(prior_messages)
 
         if model.startswith("claude-"):
-            # Build Anthropic-style assistant message with tool_use blocks
-            assistant_content: list[dict] = []
-            if raw.text:
-                assistant_content.append({"type": "text", "text": raw.text})
-            for tu in raw.tool_uses:
-                # Only include the custom tool_uses (not atomic_capture) in the
-                # follow-up — atomic_capture was handled by the capture path.
-                if tu.get("name") != "atomic_capture":
-                    assistant_content.append({
-                        "type": "tool_use",
-                        "id": tu["id"],
-                        "name": tu["name"],
-                        "input": tu.get("input", {}),
-                    })
-            if assistant_content:
-                messages.append({"role": "assistant", "content": assistant_content})
+            # Route through AnthropicLLMBackend.format_tool_results (#87 PR
+            # 2.5). The backend builds the assistant-echo turn + the user
+            # tool_result turn from canonical types — replaces the
+            # provider-shaped inline construction that was here pre-#87.
+            from .llm import find_backend_for_model
 
-            # User message with tool_result blocks
-            result_blocks = build_tool_result_blocks_anthropic(tool_results)
-            if result_blocks:
-                messages.append({"role": "user", "content": result_blocks})
+            canonical_tool_uses, canonical_tool_results = _canonicalize_tool_loop(
+                raw.tool_uses, tool_results,
+            )
+            backend = find_backend_for_model(model)
+            messages.extend(backend.format_tool_results(
+                tool_uses=canonical_tool_uses,
+                tool_results=canonical_tool_results,
+                assistant_text=raw.text or "",
+            ))
 
         else:
             # OpenAI / Moonshot path
