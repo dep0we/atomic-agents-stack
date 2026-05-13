@@ -204,3 +204,50 @@ class StagingNotApplied(AtomicAgentsError):
     Raised when a caller tries to write to or apply a StagedMemory after
     apply_staging() or discard_staging() has already been called.
     """
+
+
+# LLMBackend exceptions (spec/31 — PR #87 PR-1)
+
+class UnknownModelError(AtomicAgentsError):
+    """No registered LLMBackend claims the requested model id.
+
+    Raised by ``find_backend_for_model(model_id)`` when zero backends'
+    ``supports_model(model_id)`` returned True. Operators should either
+    register a backend that handles the model or pick a model id that
+    a registered backend handles.
+    """
+
+
+class AmbiguousBackendError(AtomicAgentsError):
+    """Multiple registered LLMBackends claim the same model id.
+
+    Raised by ``find_backend_for_model(model_id)`` when more than one
+    backend's ``supports_model(model_id)`` returned True and the caller
+    did not specify ``preferred_provider`` to disambiguate. The
+    ``candidates`` attribute lists the conflicting ``provider_id``
+    values so the operator can pick one.
+
+    Once ``model.md``'s ``provider:`` field is parsed (lands with the
+    AnthropicLLMBackend follow-up to PR 1 of issue #87), operators can
+    resolve the ambiguity by adding a ``provider: <id>`` line. Until
+    then, callers must pass ``preferred_provider`` explicitly.
+    """
+
+    def __init__(self, model: str, candidates: list[str]):
+        self.model = model
+        self.candidates = candidates
+        super().__init__(
+            f"multiple backends claim model {model!r}: "
+            f"{candidates}. Pass `preferred_provider=<id>` to "
+            f"find_backend_for_model() to disambiguate (parsing the "
+            f"`provider:` field of model.md lands with the "
+            f"AnthropicLLMBackend impl — issue #87)."
+        )
+
+    def __reduce__(self):
+        # Default exception __reduce__ returns (cls, (args[0],)) — the
+        # formatted message — which then crashes when pickle.loads calls
+        # __init__(message). Restore the full constructor args so this
+        # exception can cross process boundaries (multiprocessing pools,
+        # concurrent.futures workers).
+        return (type(self), (self.model, self.candidates))
