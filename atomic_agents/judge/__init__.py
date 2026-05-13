@@ -58,9 +58,19 @@ from .atomic_action import (
     extract_atomic_action_markers,
 )
 from .backend import JudgeBackend, Judgment, JudgmentOutcome
+from .llm import (
+    JUDGMENT_TOOL_NAME,
+    JUDGMENT_TOOL_SCHEMA,
+    LLMJudgeBackend,
+    build_judge_system_prompt,
+    build_judge_user_payload,
+    make_default_llm_judge,
+    parse_judgment_tool_use,
+)
 from .proposal import (
     assemble_proposal,
     compute_arguments_hash,
+    compute_policy_version,
     compute_tool_definition_hash,
     is_framework_managed_tool,
 )
@@ -138,11 +148,20 @@ __all__ = [
     # Proposal assembly (#112 PR 2a)
     "assemble_proposal",
     "compute_arguments_hash",
+    "compute_policy_version",
     "compute_tool_definition_hash",
     "is_framework_managed_tool",
     # Reference impl (#112 PR 2a)
     "PolicyJudge",
     "make_default_policy_judge",
+    # LLM-backed reference impl (#112 PR 2b)
+    "LLMJudgeBackend",
+    "make_default_llm_judge",
+    "build_judge_system_prompt",
+    "build_judge_user_payload",
+    "parse_judgment_tool_use",
+    "JUDGMENT_TOOL_NAME",
+    "JUDGMENT_TOOL_SCHEMA",
 ]
 
 
