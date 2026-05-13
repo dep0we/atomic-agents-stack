@@ -74,6 +74,12 @@ International (api.moonshot.ai) operators must set
 `MOONSHOT_BASE_URL=https://api.moonshot.ai/v1` until the LLMBackend
 protocol (#87) lands proper per-region routing.
 
+**Security caveat for `MOONSHOT_BASE_URL`.** This env var determines where
+the operator's Moonshot API key AND the full review prompt (including any
+`--read-files` contents) are sent. Don't set it to a host you don't trust.
+Anthropic and OpenAI clients in `_llm.py` don't expose the same per-call
+endpoint override, so this is a new affordance the wrapper introduces.
+
 ---
 
 ## Verify before claim — empirically

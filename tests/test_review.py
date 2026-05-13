@@ -11,7 +11,7 @@ from unittest.mock import patch
 import pytest
 
 from atomic_agents import review
-from atomic_agents.exceptions import AtomicAgentsError
+from atomic_agents.exceptions import AtomicAgentsError, PathTraversalError
 from atomic_agents._costs import PRICING
 
 
@@ -113,6 +113,62 @@ def test_assemble_user_prompt_no_target_no_context(tmp_path):
     assert "Review prompt" in body
     assert "Review target" not in body
     assert "Context files" not in body
+
+
+def test_assemble_user_prompt_refuses_dotdot_in_read_files(tmp_path):
+    """Operator-supplied paths must not escape --working-dir via `..` segments.
+
+    Matches the framework's canonical path-traversal guard convention used
+    by memory/restore/version CLI surfaces (test_memory_versioning.py).
+    """
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    # Create a file outside the sandbox that the operator might try to leak
+    secret = tmp_path / "secret.txt"
+    secret.write_text("api-key-xyz")
+
+    req = review.ReviewRequest(
+        backend="kimi",
+        prompt="x",
+        read_files=[Path("../secret.txt")],
+        working_dir=sandbox,
+    )
+    with pytest.raises(PathTraversalError):
+        review._assemble_user_prompt(req)
+
+
+def test_assemble_user_prompt_refuses_dotdot_in_target(tmp_path):
+    """Same path-traversal guard applies to --target."""
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    secret = tmp_path / "secret.txt"
+    secret.write_text("not-for-review")
+
+    req = review.ReviewRequest(
+        backend="kimi",
+        prompt="x",
+        target=Path("../secret.txt"),
+        working_dir=sandbox,
+    )
+    with pytest.raises(PathTraversalError):
+        review._assemble_user_prompt(req)
+
+
+def test_assemble_user_prompt_refuses_absolute_path_outside_working_dir(tmp_path):
+    """An absolute path outside --working-dir also escapes; refuse it."""
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("x")
+
+    req = review.ReviewRequest(
+        backend="kimi",
+        prompt="x",
+        read_files=[Path(str(outside.resolve()))],
+        working_dir=sandbox,
+    )
+    with pytest.raises(PathTraversalError):
+        review._assemble_user_prompt(req)
 
 
 def test_assemble_user_prompt_resolves_paths_against_working_dir(tmp_path):
@@ -226,6 +282,47 @@ def test_print_cost_summary_goes_to_stderr_not_stdout():
     assert out.getvalue() == ""
 
 
+def test_print_cost_summary_warns_when_review_text_is_empty():
+    """Empty visible content from a thinking model is the documented K2.6
+    failure mode (#146). Cost summary must flag this so operators don't
+    silently pay for blank reviews.
+    """
+    result = review.ReviewResult(
+        text="",  # thinking model consumed budget on reasoning_content
+        input_tokens=12000,
+        output_tokens=16000,
+        cost_usd=0.022,
+        cost_estimated_via_fallback=False,
+        model="moonshot/kimi-k2.6",
+        latency_ms=60000,
+    )
+    err = io.StringIO()
+    review.print_cost_summary(result, stream=err)
+    out = err.getvalue()
+    assert "WARNING" in out
+    assert "empty content" in out.lower()
+    assert "moonshot/kimi-k2.6" in out
+    assert "#146" in out  # operators can grep to the follow-up issue
+    # Cost summary still prints after the warning
+    assert "$0.0220" in out
+
+
+def test_print_cost_summary_no_warning_when_text_present():
+    """Don't pollute the cost summary with the warning on normal calls."""
+    result = review.ReviewResult(
+        text="Finding 1 — P2 — ...",
+        input_tokens=100,
+        output_tokens=200,
+        cost_usd=0.0001,
+        cost_estimated_via_fallback=False,
+        model="moonshot/moonshot-v1-128k",
+        latency_ms=1000,
+    )
+    err = io.StringIO()
+    review.print_cost_summary(result, stream=err)
+    assert "WARNING" not in err.getvalue()
+
+
 def test_print_cost_summary_marks_fallback_pricing():
     """Operators must see when cost is conservative-pessimistic, not actual."""
     result = review.ReviewResult(
@@ -311,6 +408,42 @@ def test_cli_review_missing_prompt_file_returns_nonzero(monkeypatch, tmp_path, c
     assert rc == 1
     _, err = capsys.readouterr()
     assert "not found" in err
+
+
+def test_cli_review_rejects_empty_prompt_file(monkeypatch, tmp_path, capsys):
+    """Empty prompt-file must exit 1 without making an LLM call — otherwise
+    operator pays for system-prompt input tokens and gets blank output back.
+    """
+    monkeypatch.setenv("ATOMIC_AGENTS_MOONSHOT_KEY", "fake-key")
+    empty_prompt = tmp_path / "empty.md"
+    empty_prompt.write_text("   \n\n  \t\n")  # whitespace only
+    from atomic_agents.cli import main as cli_main
+
+    with patch("atomic_agents.review.run_review") as mock_run:
+        rc = cli_main([
+            "review", "--backend", "kimi",
+            "--prompt-file", str(empty_prompt),
+        ])
+    assert rc == 1
+    _, err = capsys.readouterr()
+    assert "prompt is empty" in err
+    # Critically: no LLM call was made
+    mock_run.assert_not_called()
+
+
+def test_cli_review_rejects_empty_inline_prompt(monkeypatch, capsys):
+    """Same guard for inline --prompt; whitespace-only is empty for our purposes."""
+    monkeypatch.setenv("ATOMIC_AGENTS_MOONSHOT_KEY", "fake-key")
+    from atomic_agents.cli import main as cli_main
+
+    with patch("atomic_agents.review.run_review") as mock_run:
+        rc = cli_main([
+            "review", "--backend", "kimi", "--prompt", "   ",
+        ])
+    assert rc == 1
+    _, err = capsys.readouterr()
+    assert "prompt is empty" in err
+    mock_run.assert_not_called()
 
 
 def test_cli_review_parses_read_files_csv(monkeypatch, tmp_path):
