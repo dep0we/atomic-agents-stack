@@ -60,6 +60,33 @@ from .llm import (
     iter_registered_backends,
     find_backend_for_model,
 )
+from .judge import (
+    # Protocol contract + outcome model
+    JudgeBackend,
+    JudgmentOutcome,
+    Judgment,
+    JudgmentContext,
+    # Canonical proposal types
+    ActionProposal,
+    ProposalAmendment,
+    # Enums most commonly consumed at top-level
+    ActionClass,
+    # Aliased registry primitives (avoid top-level name collisions
+    # with ``atomic_agents.llm.get_backend`` and a hypothetical
+    # ``atomic_agents.memory.register_backend``)
+    register_judge_backend,
+    get_judge_backend,
+    unregister_judge_backend,
+)
+from .exceptions import (
+    JudgeError,
+    JudgeUnavailable,
+    JudgePolicyInvalid,
+    JudgeBudgetExhausted,
+    JudgeProposalInvalid,
+    JudgeAmendedProposalRejected,
+    UnknownJudgeBackendError,
+)
 
 __version__ = "0.13.0"
 
@@ -113,4 +140,23 @@ __all__ = [
     "get_backend",
     "iter_registered_backends",
     "find_backend_for_model",
+    # JudgeBackend Protocol surface (spec/28 — #112 PR 1 scaffolding;
+    # reference implementations + agent.call() wiring land in PR 2)
+    "JudgeBackend",
+    "JudgmentOutcome",
+    "Judgment",
+    "JudgmentContext",
+    "ActionProposal",
+    "ProposalAmendment",
+    "ActionClass",
+    "register_judge_backend",
+    "get_judge_backend",
+    "unregister_judge_backend",
+    "JudgeError",
+    "JudgeUnavailable",
+    "JudgePolicyInvalid",
+    "JudgeBudgetExhausted",
+    "JudgeProposalInvalid",
+    "JudgeAmendedProposalRejected",
+    "UnknownJudgeBackendError",
 ]

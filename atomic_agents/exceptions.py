@@ -251,3 +251,56 @@ class AmbiguousBackendError(AtomicAgentsError):
         # exception can cross process boundaries (multiprocessing pools,
         # concurrent.futures workers).
         return (type(self), (self.model, self.candidates))
+
+
+# ──────────────────────────────────────────────────────────────────
+# JudgeBackend exceptions (spec/28 — issue #112 PR 1 of 4)
+#
+# Distinct from ``NoJudgeAvailable`` above — that exception belongs to the
+# existing eval-framework judge (``atomic_agents.eval``). The exceptions
+# below are for the runtime *judge layer* per spec/28: a pre-action
+# validation surface that runs between LLM tool_use emission and tool
+# handler dispatch. Both judges coexist; they cover different surfaces.
+
+class JudgeError(AtomicAgentsError):
+    """Base for all spec/28 judge-layer exceptions.
+
+    Each subclass maps to a configurable default judgment outcome via
+    ``judges.md``'s ``failure_policy`` block (default: ``block`` for all,
+    i.e. fail-closed). Operators may override per-exception-type per-class.
+    """
+
+
+class JudgeUnavailable(JudgeError):
+    """Backend cannot respond (timeout, network, provider outage)."""
+
+
+class JudgePolicyInvalid(JudgeError):
+    """``judges.md`` or ``tools.md`` cannot be parsed, or a project-floor
+    relax violation was detected at policy-source load time."""
+
+
+class JudgeBudgetExhausted(JudgeError):
+    """Per-action or per-period judge cost cap was hit."""
+
+
+class JudgeProposalInvalid(JudgeError):
+    """Proposal is missing fields required for its action class — e.g.,
+    a side-effectful tool_use arrived without the actor's side-channel
+    marker, or ``side_channel_for_tool_call_id`` did not match the
+    bound ``tool_call_id``."""
+
+
+class JudgeAmendedProposalRejected(JudgeError):
+    """A ``REVISE`` outcome's amended proposal failed framework
+    re-validation (schema, policy, classification recompute, or
+    write-path enforcement) before the second judgment cycle."""
+
+
+class UnknownJudgeBackendError(JudgeError):
+    """Operator referenced a judge backend name that is not registered.
+
+    Raised by ``atomic_agents.judge.get_backend(name)`` when the name
+    has not been ``register_backend()``-ed. Distinct from
+    ``BackendNotRegistered`` which covers the memory-backend registry.
+    """
