@@ -214,6 +214,37 @@ def _proposal_ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def compute_policy_version(
+    tools_md_text: str,
+    judges_md_text: str | None = None,
+) -> str:
+    """Compute the canonical ``policy_version`` string per spec/28:302.
+
+    Centralized here so every ``JudgeBackend`` implementation produces
+    the same policy_version for the same ``(tools.md, judges.md)``
+    snapshot. Without centralization, audit lines from the same
+    proposal but different judges (PolicyJudge + LLMJudgeBackend in
+    PR 2b's ensemble) would carry different policy snapshots even
+    when both judges read the same files — confusing for operators
+    reconciling decisions.
+
+    Format: ``tools.md@sha256:<64hex>+judges.md@sha256:<64hex|absent>``.
+
+    ``judges.md_text`` is ``None`` until PR 3's parser lands; the
+    "absent" sentinel signals "no judges.md content was hashed" — a
+    real sha256 hex cannot equal "absent" (sha256 is 64 lowercase hex
+    chars, not the literal word). Audit-log readers can reliably split
+    on ``+`` to recover both halves.
+    """
+    import hashlib
+    tools_hash = hashlib.sha256(tools_md_text.encode("utf-8")).hexdigest()
+    if judges_md_text is None:
+        judges_part = "absent"
+    else:
+        judges_part = hashlib.sha256(judges_md_text.encode("utf-8")).hexdigest()
+    return f"tools.md@sha256:{tools_hash}+judges.md@sha256:{judges_part}"
+
+
 def is_framework_managed_tool(tool_name: str) -> bool:
     """Return True if the tool is framework-managed (capture or action
     marker) and should bypass judge dispatch entirely.
