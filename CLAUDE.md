@@ -12,7 +12,7 @@ For broader context, read these in order on a fresh session:
 
 ## What this is
 
-Atomic Agents is a vault-native AI agent framework: agents live as plain markdown files, the runtime is stateless, and storage is moving toward swappable protocols layer by layer (MemoryBackend ships today; LLMBackend ships as of #87 with three reference impls — Anthropic, OpenAI, Moonshot; Lock / Log / Persona / AgentProfile / ToolRegistry / Corpus protocols are next per ROADMAP). A person at home runs filesystem-everything with one agent. An organization runs the same agents over Postgres, behind an HTTP service, with a fleet of orchestrated roles. **Same agent definitions, same call() flow, same audit trail. Different backends.**
+Atomic Agents is a vault-native AI agent framework: agents live as plain markdown files, the runtime is stateless, and storage is moving toward swappable protocols layer by layer (MemoryBackend ships today; LLMBackend ships as of #87 with three reference impls — Anthropic, OpenAI, Moonshot; JudgeBackend Protocol + canonical types + registry scaffolding ships as of #112 PR 1 of 4, with reference impls + `agent.call()` wiring landing in PRs 2-4; Lock / Log / Persona / AgentProfile / ToolRegistry / Corpus protocols are next per ROADMAP). A person at home runs filesystem-everything with one agent. An organization runs the same agents over Postgres, behind an HTTP service, with a fleet of orchestrated roles. **Same agent definitions, same call() flow, same audit trail. Different backends.**
 
 The spec is the central artifact. The Python package is one conforming reference implementation. Anyone can build agents to the spec without using this code — and eventually, alternate implementations will.
 
@@ -42,7 +42,8 @@ When you can't tell whether a design move helps both — stop, name the tradeoff
                             Helpers (cheap parallel)
                                 │
                   Backend Protocols (the moat)
-                  Memory ✅  LLM ✅  Lock 🟡  Log 🟡  Persona 🟡
+                  Memory ✅  LLM ✅  Judge 🟡 (scaffolding shipped, #112)
+                  Lock 🟡  Log 🟡  Persona 🟡
                   AgentProfile 🟡  ToolRegistry 🟡  Corpus 🟡
                                 │
                   Storage substrate — swappable
@@ -335,6 +336,6 @@ These are not forbidden forever — they're explicitly deferred with rationale. 
 
 ## Status
 
-**v0.13.0, alpha, PUBLIC.** Core runtime stable, 974 tests passing on Python 3.11/3.12. Two backend protocols shipped: MemoryBackend (PR #57) and LLMBackend (#87 — Anthropic + OpenAI + Moonshot reference impls registered at framework import). MCP client support shipped (PRs #55 + #56). Active backlog covers the remaining protocols (Lock/Log/Persona/AgentProfile/ToolRegistry/Corpus/Policy) + spec-impl follow-ups for the three-spec stack (judge/mandates/responsibility audit). Single-developer project; reference implementation that anyone can use, fork, or extend.
+**v0.13.0, alpha, PUBLIC.** Core runtime stable, 974 tests passing on Python 3.11/3.12. Two backend protocols shipped: MemoryBackend (PR #57) and LLMBackend (#87 — Anthropic + OpenAI + Moonshot reference impls registered at framework import). JudgeBackend Protocol scaffolding shipped as #112 PR 1 of 4 — Protocol contract, canonical proposal/judgment types, exception taxonomy, and registry primitives live under `atomic_agents.judge`; reference implementations (`PolicyJudge`, `LLMJudgeBackend`), `judges.md` parser, and `agent.call()` wiring follow in PRs 2-4 (no behavior change until then). MCP client support shipped (PRs #55 + #56). Active backlog covers the remaining protocols (Lock/Log/Persona/AgentProfile/ToolRegistry/Corpus/Policy) + spec-impl follow-ups for the three-spec stack (judge/mandates/responsibility audit). Single-developer project; reference implementation that anyone can use, fork, or extend.
 
 Going forward: **the elegance is the product.** Protect it.
