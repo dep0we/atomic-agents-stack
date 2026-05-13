@@ -175,7 +175,7 @@ The framework is moving toward swappable backends layer by layer. The shape: a P
 | Backend | Status | Spec |
 |---|---|---|
 | `MemoryBackend` | ✅ Shipped (v0.10.0) | [`spec/20-memory-backend.md`](docs/spec/20-memory-backend.md) |
-| `LLMBackend` | ✅ Shipped (v0.13 era) | [`spec/31-llm-backend.md`](docs/spec/31-llm-backend.md) |
+| `LLMBackend` | ✅ Shipped (v0.13.0) | [`spec/31-llm-backend.md`](docs/spec/31-llm-backend.md) |
 | `LockBackend` | Planned | [`#60`](https://github.com/dep0we/atomic-agents-stack/issues/60) |
 | `LogBackend` | Planned | [`#61`](https://github.com/dep0we/atomic-agents-stack/issues/61) |
 | `PersonaBackend` | Planned | [`#62`](https://github.com/dep0we/atomic-agents-stack/issues/62) |
@@ -235,7 +235,7 @@ Six operator runbooks for the common deployment paths. Pick the one that matches
 | Programmatic invocation guide + public exception table — `docs/deployment/programmatic.md` | ✅ v0.11.0 |
 | Disaster recovery runbook — `docs/deployment/disaster-recovery.md` | ✅ v0.11.0 |
 | Cost guardrail sizing guidance — `docs/deployment/cost-guardrail-sizing.md` | ✅ v0.11.0 |
-| LLMBackend protocol + Anthropic/OpenAI/Moonshot reference impls — `atomic_agents.llm` | ✅ v0.13 era |
+| LLMBackend protocol + Anthropic/OpenAI/Moonshot reference impls — `atomic_agents.llm` | ✅ v0.13.0 |
 
 See [CHANGELOG.md](CHANGELOG.md) for per-version detail.
 
