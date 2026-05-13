@@ -176,6 +176,7 @@ The framework is moving toward swappable backends layer by layer. The shape: a P
 |---|---|---|
 | `MemoryBackend` | ✅ Shipped (v0.10.0) | [`spec/20-memory-backend.md`](docs/spec/20-memory-backend.md) |
 | `LLMBackend` | ✅ Shipped (v0.13.0) | [`spec/31-llm-backend.md`](docs/spec/31-llm-backend.md) |
+| `JudgeBackend` | 🟡 In progress — Protocol + types scaffolding shipped ([#112](https://github.com/dep0we/atomic-agents-stack/issues/112) PR 1 of 4); reference impls + `agent.call()` wiring land in PRs 2-4 | [`spec/28-judge-layer.md`](docs/spec/28-judge-layer.md) (RFC) |
 | `LockBackend` | Planned | [`#60`](https://github.com/dep0we/atomic-agents-stack/issues/60) |
 | `LogBackend` | Planned | [`#61`](https://github.com/dep0we/atomic-agents-stack/issues/61) |
 | `PersonaBackend` | Planned | [`#62`](https://github.com/dep0we/atomic-agents-stack/issues/62) |
@@ -344,4 +345,4 @@ Before opening a PR, read [`CLAUDE.md`](CLAUDE.md) (the project's design ethos a
 
 ## Status
 
-**v0.13.0, alpha.** Core runtime stable. 974 tests passing on Python 3.11 / 3.12. Two backend protocols shipped (Memory + LLM); the remaining protocol-pattern roadmap (`LockBackend` / `LogBackend` / `PersonaBackend` / etc.) is what v1.0 closes; the surface stabilizes there. Pre-1.0 — Minor releases may contain breaking changes (see [`docs/deployment/versioning.md`](docs/deployment/versioning.md)). Single-maintainer project; reference implementation that anyone can use, fork, or extend.
+**v0.13.0, alpha.** Core runtime stable. 974 tests passing on Python 3.11 / 3.12. Two backend protocols shipped (Memory + LLM); `JudgeBackend` Protocol + canonical types scaffolding shipped on branch as [#112](https://github.com/dep0we/atomic-agents-stack/issues/112) PR 1 of 4 (reference impls + `agent.call()` wiring land in PRs 2-4); the remaining protocol-pattern roadmap (`LockBackend` / `LogBackend` / `PersonaBackend` / etc.) is what v1.0 closes; the surface stabilizes there. Pre-1.0 — Minor releases may contain breaking changes (see [`docs/deployment/versioning.md`](docs/deployment/versioning.md)). Single-maintainer project; reference implementation that anyone can use, fork, or extend.
