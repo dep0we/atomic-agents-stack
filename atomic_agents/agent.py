@@ -182,12 +182,18 @@ class AtomicAgent:
         # None means either no MCP servers declared or pool not yet initialized.
         self.mcp_pool: MCPClientPool | None = None
 
-        # Judge layer (#112 PR 2a). PolicyJudge instance lazy-built on
-        # first dispatch — cached per-agent so policy_version is stable
-        # within a run. tool_classifications parsed from tools.md if
-        # the section exists; empty dict otherwise (everything defaults
-        # to external_side_effect per spec/28 in _resolve_classification).
+        # Judge layer (#112 PR 2a + 2b). PolicyJudge + LLMJudgeBackend
+        # instances are lazy-built on first dispatch — cached per-agent
+        # so policy_version is stable within a run. ``_llm_judge`` may
+        # remain ``None`` when no LLM key is configured for the default
+        # judge model (PR 2b: ``gpt-5-nano``); the ensemble runs
+        # PolicyJudge only in that case. ``tool_classifications`` parsed
+        # from tools.md ``## Tool classification`` section; empty dict
+        # otherwise (everything defaults to external_side_effect in
+        # ``_resolve_classification``).
         self._policy_judge = None
+        self._llm_judge = None  # type: ignore[assignment]
+        self._llm_judge_constructed = False  # distinct from None-cache
         self._tool_classifications: dict[str, str] = {}
 
         # Loaded later via load() — populated in __init__ for clarity
@@ -461,20 +467,60 @@ class AtomicAgent:
         )
         return self._policy_judge
 
+    def _ensure_llm_judge(self):
+        """Lazy-construct and cache the default ``LLMJudgeBackend`` for
+        this agent (#112 PR 2b). Returns the cached instance or ``None``
+        when the LLM backend isn't reachable (no key for the default
+        judge model).
+
+        Per spec/28's correlated-judgment mitigation, the default model
+        is ``gpt-5-nano`` (OpenAI) so the judge family differs from the
+        default Anthropic actor. Operators in Claude-only deployments
+        get ``None`` here — the ensemble runs PolicyJudge only.
+
+        Distinct from ``_ensure_policy_judge`` because ``None`` is a
+        legitimate cached result (no key configured). Tracks
+        construction state via ``_llm_judge_constructed`` so a
+        ``None`` cache doesn't re-attempt on every dispatch.
+        """
+        if self._llm_judge_constructed:
+            return self._llm_judge
+        self._llm_judge_constructed = True
+        from .judge.llm import make_default_llm_judge
+        # Read tools.md text for policy_version derivation (cascade-aware).
+        tools_md_text = ""
+        if self.cascade:
+            _, tools_md_text = _cascade.resolve_tools_md(self.cascade)
+        else:
+            tools_md_path = self.agent_root / "tools.md"
+            if tools_md_path.exists():
+                tools_md_text = tools_md_path.read_text(encoding="utf-8")
+        # judges.md text is None in PR 2b (parser lands in PR 3) —
+        # compute_policy_version writes ``judges.md@sha256:absent``.
+        self._llm_judge = make_default_llm_judge(
+            tools_md_text=tools_md_text,
+            judges_md_text=None,
+        )
+        return self._llm_judge
+
     def _dispatch_with_judge(
         self,
         tu: dict,
         atomic_action_markers: dict[str, dict],
     ):
         """Run the judge ensemble against one tool_use. Returns
-        ``(allow: bool, judgment, judgment_event_dict)``.
+        ``(allow: bool, events: list[dict])`` — one JudgmentEvent
+        record per invoked judge (the caller logs each verbatim per
+        spec/28 §"Audit shape").
 
         Spec/28 §"Where the judge sits in agent.call()" places this
         between LLM tool_use parsing and tool handler dispatch.
 
-        PR 2a ensemble is hardcoded to ``[PolicyJudge]``. PR 2b adds
-        LLMJudgeBackend layered after. PR 3 reads ordering from
-        ``judges.md``.
+        PR 2b ensemble: ``PolicyJudge`` (rule engine) first; if
+        ALLOW, then ``LLMJudgeBackend`` if registered. First BLOCK in
+        the ensemble short-circuits remaining judges (spec/28:694
+        "If it blocks, the ensemble blocks — no LLM cost incurred").
+        PR 3 reads ordering from ``judges.md``.
         """
         from .judge import proposal as _proposal_mod
         from .judge.backend import JudgmentOutcome
@@ -529,6 +575,8 @@ class AtomicAgent:
         except JudgeProposalInvalid as exc:
             # Fail-closed per spec/28. Synthesize a BLOCK judgment and
             # a JudgmentEvent so the audit trail records the refusal.
+            # Single-event return — proposal-assembly failure means no
+            # ensemble judges ran.
             from .judge.backend import Judgment
             judgment = Judgment(
                 outcome=JudgmentOutcome.BLOCK,
@@ -555,9 +603,10 @@ class AtomicAgent:
                     arguments_hash="",
                 ),
             )
-            return False, judgment, event
+            return False, [event]
 
-        # Build the JudgmentContext for the judge to consult.
+        # Build the JudgmentContext once; both judges see the same
+        # context per spec/28 idempotency invariants.
         policy_ctx = JudgePolicyContext(
             agent_name=self.name,
             persona_digest=PersonaDigest(agent_name=self.name),
@@ -569,8 +618,8 @@ class AtomicAgent:
             class_policy=self._default_class_policy_snapshot(),
         )
         runtime_cfg = JudgeRuntimeConfig(
-            backend_name="rules",
-            timeout_ms=1000,
+            backend_name="ensemble",
+            timeout_ms=5000,
             budget=BudgetConfig(),
             escalation_config=EscalationConfig(),
             failure_policy={
@@ -583,45 +632,80 @@ class AtomicAgent:
         )
         context = JudgmentContext(policy=policy_ctx, runtime=runtime_cfg)
 
-        # Invoke the ensemble (PR 2a: PolicyJudge only).
-        judge = self._ensure_policy_judge()
-        start = time.time()
-        try:
-            judgment = judge.evaluate(proposal_obj, context)
-        except JudgeError as exc:
-            # Map exception to BLOCK per failure_policy default.
-            from .judge.backend import Judgment
-            judgment = Judgment(
-                outcome=JudgmentOutcome.BLOCK,
-                reason=f"{type(exc).__name__}: {exc}",
-                judge_id=judge.judge_id,
-                policy_version=judge.policy_version,
-                latency_ms=int((time.time() - start) * 1000),
-            )
-
-        # PR 2a: PolicyJudge only returns ALLOW or BLOCK. REVISE and
-        # ESCALATE shouldn't appear from PolicyJudge (per its
-        # supported_outcomes). Defensively treat unsupported outcomes
-        # as BLOCK so PR 2b's LLMJudgeBackend or future regressions
-        # don't accidentally execute an action.
-        allow = judgment.outcome == JudgmentOutcome.ALLOW
-        enforcement = (
-            "allow_executed" if allow else "block_executed"
-        )
-
         binding = ProposalBinding(
             tool_call_id=tool_call_id,
             tool_definition_hash=tdef_hash,
             arguments_hash=proposal_obj.arguments_hash,
         )
-        event = self._build_judgment_event_dict(
-            proposal=proposal_obj,
-            tool_use=tu,
-            judgment=judgment,
-            enforcement_action=enforcement,
-            binding=binding,
-        )
-        return allow, judgment, event
+
+        # Build the judge ensemble. PR 2b: PolicyJudge first
+        # (microsecond latency, free), then LLMJudgeBackend if
+        # available. First BLOCK short-circuits remaining judges per
+        # spec/28:694.
+        judges = [self._ensure_policy_judge()]
+        llm_judge = self._ensure_llm_judge()
+        if llm_judge is not None:
+            judges.append(llm_judge)
+
+        events: list[dict] = []
+        final_allow = True
+        for judge in judges:
+            start = time.time()
+            try:
+                judgment = judge.evaluate(proposal_obj, context)
+            except JudgeError as exc:
+                # Map exception to BLOCK per failure_policy default.
+                from .judge.backend import Judgment
+                judgment = Judgment(
+                    outcome=JudgmentOutcome.BLOCK,
+                    reason=f"{type(exc).__name__}: {exc}",
+                    judge_id=judge.judge_id,
+                    policy_version=judge.policy_version,
+                    latency_ms=int((time.time() - start) * 1000),
+                )
+
+            judge_allow = judgment.outcome == JudgmentOutcome.ALLOW
+            # Provisional enforcement_action — intermediate ALLOWs in
+            # an ensemble haven't actually been executed yet; the tool
+            # only runs after the whole ensemble allows. Set the value
+            # provisionally here; rewrite after the loop based on the
+            # final ensemble outcome. (Codex round-2 finding: marking
+            # intermediate allows as ``allow_executed`` corrupts the
+            # audit trail's "tool ran" count.)
+            enforcement = (
+                "allow_pending_next_judge" if judge_allow else "block_executed"
+            )
+            event = self._build_judgment_event_dict(
+                proposal=proposal_obj,
+                tool_use=tu,
+                judgment=judgment,
+                enforcement_action=enforcement,
+                binding=binding,
+            )
+            events.append(event)
+
+            if not judge_allow:
+                # First BLOCK wins; skip remaining judges (no
+                # cost incurred for downstream judges). All prior
+                # events keep their ``allow_pending_next_judge``
+                # enforcement — they were ALLOWed by their judge but
+                # the ensemble blocked.
+                final_allow = False
+                break
+
+        # Ensemble-final fixup: when the whole ensemble allowed, the
+        # LAST event represents the action that actually runs — promote
+        # its enforcement from ``allow_pending_next_judge`` to
+        # ``allow_executed``. Intermediate ALLOWs stay
+        # ``allow_pending_next_judge`` (they were judged but did not
+        # gate the action). Spec/28's enforcement_action enum currently
+        # documents ``allow_executed`` for the single-judge case;
+        # ``allow_pending_next_judge`` is a PR 2b ensemble extension
+        # tracked in #161 for PR 4's spec lock-in.
+        if final_allow and events:
+            events[-1]["enforcement_action"] = "allow_executed"
+
+        return final_allow, events
 
     def _build_judgment_event_dict(
         self,
@@ -1190,7 +1274,7 @@ class AtomicAgent:
                     if not judge_blocked:
                         for tu in custom_tool_uses:
                             try:
-                                allow, judgment, event = self._dispatch_with_judge(
+                                allow, events = self._dispatch_with_judge(
                                     tu, markers,
                                 )
                             except Exception as exc:  # noqa: BLE001
@@ -1208,9 +1292,19 @@ class AtomicAgent:
                                     f"{type(exc).__name__}: {exc}"
                                 )
                                 continue
-                            self._log(event)
+                            # Per-judge audit lines (#112 PR 2b ensemble).
+                            # First BLOCK in the ensemble short-circuits
+                            # remaining judges; this loop records every
+                            # judge that actually ran.
+                            for event in events:
+                                self._log(event)
                             if not allow:
-                                judge_blocked[tu.get("id", "")] = judgment.reason
+                                # The LAST event in the list is the BLOCKing
+                                # judge — the others ALLOWed. Its reason is
+                                # what flows back to the actor.
+                                judge_blocked[tu.get("id", "")] = (
+                                    events[-1].get("judgment_reason", "judge_blocked")
+                                )
 
                 # Execute custom tools
                 iter_tool_results: list[ToolCallResult] = []
