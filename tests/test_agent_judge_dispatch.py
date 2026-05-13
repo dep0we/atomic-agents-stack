@@ -696,6 +696,303 @@ class TestToolsClassificationOnDisk:
 # Tool registration validation (round-2 P3)
 
 
+class TestJudgesMdIntegration:
+    """PR 3a integration tests — agent.py uses parsed ``judges.md``
+    config when present, falls back to PR 2a/2b hardcoded defaults
+    when absent (opt-in gate from PR 2a still applies)."""
+
+    def test_judges_config_none_when_no_judges_md(self, agent):
+        # No judges.md in agent fixture → judges_config is None.
+        assert agent.judges_config is None
+
+    def test_judges_config_populated_when_judges_md_present(self, tmp_path, monkeypatch):
+        # Build an agent with a judges.md file.
+        monkeypatch.setenv("ATOMIC_AGENTS_ANTHROPIC_KEY", "fake-key")
+        agents_root = tmp_path / "agents"
+        agent_dir = agents_root / "tester"
+        (agent_dir / "persona").mkdir(parents=True)
+        (agent_dir / "persona" / "IDENTITY.md").write_text("# I")
+        (agent_dir / "tools.md").write_text("## Read paths\n- ~/docs/\n")
+        (agent_dir / "model.md").write_text("## Default model\nclaude-haiku-4-5-20251001\n")
+        (agent_dir / "judges.md").write_text(
+            "```yaml\n"
+            "backend: rules\n"
+            "timeout_ms: 3000\n"
+            "class_policy:\n"
+            "  read_only: bypass\n"
+            "  reversible_write: judge_required\n"
+            "  external_side_effect: escalate\n"
+            "  high_risk: escalate\n"
+            "```\n"
+        )
+        (agent_dir / "memory").mkdir()
+        (agent_dir / "log").mkdir()
+        a = AtomicAgent(name="tester", agents_root=agents_root)
+        a.load()
+        cfg = a.judges_config
+        assert cfg is not None
+        assert cfg.default_backend == "rules"
+        assert cfg.timeout_ms == 3000
+
+    def test_parsed_class_policy_flows_into_dispatch_context(self, tmp_path, monkeypatch):
+        # When judges.md sets external_side_effect: escalate, the
+        # dispatch context uses that value instead of the PR 2a
+        # hardcoded JUDGE_REQUIRED default. PolicyJudge then self-maps
+        # ESCALATE → BLOCK with the PR 2a deferred-polling reason
+        # (the actual ESCALATE outcome lands in PR 3b).
+        monkeypatch.setenv("ATOMIC_AGENTS_ANTHROPIC_KEY", "fake-key")
+        monkeypatch.setenv("AGENT_JUDGE_ENABLED", "1")
+        agents_root = tmp_path / "agents"
+        agent_dir = agents_root / "tester"
+        (agent_dir / "persona").mkdir(parents=True)
+        (agent_dir / "persona" / "IDENTITY.md").write_text("# I")
+        (agent_dir / "tools.md").write_text("## Read paths\n- ~/docs/\n")
+        (agent_dir / "model.md").write_text("## Default model\nclaude-haiku-4-5-20251001\n")
+        (agent_dir / "judges.md").write_text(
+            "```yaml\n"
+            "class_policy:\n"
+            "  external_side_effect: escalate\n"
+            "```\n"
+        )
+        (agent_dir / "memory").mkdir()
+        (agent_dir / "log").mkdir()
+        a = AtomicAgent(name="tester", agents_root=agents_root)
+        a.load()
+
+        a.tool_registry.register(
+            ToolDefinition(
+                name="send_email",
+                description="...",
+                input_schema={"type": "object"},
+                handler=lambda i: None,
+                classification="external_side_effect",
+            )
+        )
+        tu = {"name": "send_email", "input": {"to": "x@y"}, "id": "tc_1"}
+        markers = {"tc_1": {"for_tool_call_id": "tc_1", "reason": "test"}}
+        allow, events = a._dispatch_with_judge(tu, markers)
+        # PR 3a: ESCALATE class-policy → PolicyJudge self-maps to BLOCK
+        # with escalate_pending_polling_unimplemented reason. PR 3b
+        # replaces the self-map with real ESCALATE emission.
+        assert allow is False
+        assert "escalate_pending_polling_unimplemented" in events[-1]["judgment_reason"]
+
+    def test_malformed_judges_md_fails_load_loud(self, tmp_path, monkeypatch):
+        # Malformed YAML in judges.md fails load with JudgePolicyInvalid
+        # at AtomicAgent construction (where _load_config runs).
+        # Operator typos surface immediately, not via fail-closed BLOCK
+        # on every action at runtime. Codex round-1 P3 acknowledged
+        # this is acceptable so long as the error is actionable (it
+        # is — names the field, the offending value, and the
+        # allowed set).
+        from atomic_agents.exceptions import JudgePolicyInvalid
+
+        monkeypatch.setenv("ATOMIC_AGENTS_ANTHROPIC_KEY", "fake-key")
+        agents_root = tmp_path / "agents"
+        agent_dir = agents_root / "tester"
+        (agent_dir / "persona").mkdir(parents=True)
+        (agent_dir / "persona" / "IDENTITY.md").write_text("# I")
+        (agent_dir / "tools.md").write_text("## Read paths\n- ~/docs/\n")
+        (agent_dir / "model.md").write_text("## Default model\nclaude-haiku-4-5-20251001\n")
+        (agent_dir / "judges.md").write_text(
+            "```yaml\n"
+            "class_policy:\n"
+            "  high_risk: not_a_real_value\n"
+            "```\n"
+        )
+        (agent_dir / "memory").mkdir()
+        (agent_dir / "log").mkdir()
+        with pytest.raises(JudgePolicyInvalid, match="not a valid value"):
+            AtomicAgent(name="tester", agents_root=agents_root)
+
+
+class TestJudgesMdCodexRound2Fixes:
+    """Codex round-2 P1 + P2 regressions on PR 3a's wiring."""
+
+    def _make_agent_with_judges_md(self, tmp_path, monkeypatch, judges_md_text):
+        monkeypatch.setenv("ATOMIC_AGENTS_ANTHROPIC_KEY", "fake-key")
+        agents_root = tmp_path / "agents"
+        agent_dir = agents_root / "tester"
+        (agent_dir / "persona").mkdir(parents=True)
+        (agent_dir / "persona" / "IDENTITY.md").write_text("# I")
+        (agent_dir / "tools.md").write_text("## Read paths\n- ~/docs/\n")
+        (agent_dir / "model.md").write_text("## Default model\nclaude-haiku-4-5-20251001\n")
+        (agent_dir / "judges.md").write_text(judges_md_text)
+        (agent_dir / "memory").mkdir()
+        (agent_dir / "log").mkdir()
+        a = AtomicAgent(name="tester", agents_root=agents_root)
+        a.load()
+        return a
+
+    def test_project_floor_without_delegate_enables_dispatch(self, tmp_path, monkeypatch):
+        # Codex round-2 P1: a cascade project floor with no
+        # delegate-level judges.md was being parsed (judges_config
+        # set) but _judge_enabled() returned False because it only
+        # checked the env var and the delegate's own file. Fix:
+        # _judge_enabled returns True whenever judges_config is
+        # populated.
+        monkeypatch.setenv("ATOMIC_AGENTS_ANTHROPIC_KEY", "fake-key")
+        monkeypatch.delenv("AGENT_JUDGE_ENABLED", raising=False)
+        # Hand-construct a minimal agent and inject judges_config.
+        agents_root = tmp_path / "agents"
+        agent_dir = agents_root / "tester"
+        (agent_dir / "persona").mkdir(parents=True)
+        (agent_dir / "persona" / "IDENTITY.md").write_text("# I")
+        (agent_dir / "tools.md").write_text("## Read paths\n- ~/docs/\n")
+        (agent_dir / "model.md").write_text("## Default model\nclaude-haiku-4-5-20251001\n")
+        (agent_dir / "memory").mkdir()
+        (agent_dir / "log").mkdir()
+        # No judges.md in agent_root — but simulate cascade-floor parse
+        # by setting judges_config directly.
+        a = AtomicAgent(name="tester", agents_root=agents_root)
+        a.load()
+        assert a._judge_enabled() is False  # baseline: no signal
+        # Now inject a parsed config — as if a project-floor load found
+        # judges.md elsewhere.
+        from atomic_agents.judges_md import parse_judges_md_text
+        a.judges_config = parse_judges_md_text("```yaml\nbackend: rules\n```\n")
+        assert a._judge_enabled() is True
+
+    def test_class_policy_bypass_short_circuits_ensemble(self, tmp_path, monkeypatch):
+        # Codex round-2 P2: class_policy.<X>: bypass should skip the
+        # judge ensemble entirely. No LLM cost for "this class is safe."
+        a = self._make_agent_with_judges_md(
+            tmp_path, monkeypatch,
+            "```yaml\n"
+            "class_policy:\n"
+            "  read_only: bypass\n"  # bypass for read_only class
+            "```\n"
+        )
+        a.tool_registry.register(
+            ToolDefinition(
+                name="read_cal",
+                description="...",
+                input_schema={"type": "object"},
+                handler=lambda i: None,
+                classification="read_only",
+            )
+        )
+        tu = {"name": "read_cal", "input": {}, "id": "tc_1"}
+        # read_only doesn't require a marker.
+        allow, events = a._dispatch_with_judge(tu, {})
+        assert allow is True
+        assert len(events) == 1  # single bypass event, no ensemble
+        assert events[0]["judge_id"] == "framework"
+        assert "bypass" in events[0]["judgment_reason"].lower()
+        assert events[0]["enforcement_action"] == "allow_executed"
+
+    def test_class_policy_allow_with_audit_records_but_does_not_block(
+        self, tmp_path, monkeypatch
+    ):
+        # Codex round-2 P2: allow_with_audit runs the ensemble (every
+        # judge records its decision) but does not let BLOCK gate
+        # execution. enforcement_action on every event is
+        # audit_bypass.
+        a = self._make_agent_with_judges_md(
+            tmp_path, monkeypatch,
+            "```yaml\n"
+            "class_policy:\n"
+            "  external_side_effect: allow_with_audit\n"
+            "```\n"
+        )
+        a.tool_registry.register(
+            ToolDefinition(
+                name="send_email",
+                description="...",
+                input_schema={"type": "object"},
+                handler=lambda i: None,
+                classification="external_side_effect",
+            )
+        )
+        # Inject a stub second judge that BLOCKs — proving audit_mode
+        # ignores BLOCK outcomes.
+        from atomic_agents.judge.backend import Judgment, JudgmentOutcome
+
+        class _AlwaysBlock:
+            judge_id = "blocker"
+            policy_version = "x"
+            def evaluate(self, p, c):
+                return Judgment(
+                    outcome=JudgmentOutcome.BLOCK,
+                    reason="injected block",
+                    judge_id=self.judge_id,
+                    policy_version=self.policy_version,
+                )
+            def supported_outcomes(self):
+                return {JudgmentOutcome.ALLOW, JudgmentOutcome.BLOCK}
+            def supports_read_audit(self):
+                return False
+            def supports_specialist_composition(self):
+                return True
+            def close(self):
+                pass
+
+        a._llm_judge = _AlwaysBlock()
+        a._llm_judge_constructed = True
+
+        tu = {"name": "send_email", "input": {"to": "x@y"}, "id": "tc_1"}
+        markers = {"tc_1": {"for_tool_call_id": "tc_1", "reason": "test"}}
+        allow, events = a._dispatch_with_judge(tu, markers)
+        # Audit mode: BLOCKs are recorded but action proceeds.
+        assert allow is True
+        # Both events emitted (PolicyJudge ALLOW + stub BLOCK).
+        assert len(events) == 2
+        # Every event tagged audit_bypass.
+        for event in events:
+            assert event["enforcement_action"] == "audit_bypass"
+
+    def test_failure_policy_allow_applied_to_judge_error(self, tmp_path, monkeypatch):
+        # Codex round-2 P2: judges.md failure_policy: JudgeUnavailable: allow
+        # must produce an ALLOW outcome on JudgeError, not the
+        # unconditional BLOCK PR 2b/2a synthesized.
+        a = self._make_agent_with_judges_md(
+            tmp_path, monkeypatch,
+            "```yaml\n"
+            "class_policy:\n"
+            "  external_side_effect: judge_required\n"
+            "failure_policy:\n"
+            "  JudgeUnavailable: allow\n"
+            "```\n"
+        )
+        a.tool_registry.register(
+            ToolDefinition(
+                name="send_email",
+                description="...",
+                input_schema={"type": "object"},
+                handler=lambda i: None,
+                classification="external_side_effect",
+            )
+        )
+
+        # Inject a PolicyJudge that raises JudgeUnavailable.
+        from atomic_agents.exceptions import JudgeUnavailable
+        from atomic_agents.judge.backend import JudgmentOutcome
+
+        class _RaisingJudge:
+            judge_id = "raiser"
+            policy_version = "x"
+            def evaluate(self, p, c):
+                raise JudgeUnavailable("network down")
+            def supported_outcomes(self):
+                return {JudgmentOutcome.ALLOW, JudgmentOutcome.BLOCK}
+            def supports_read_audit(self):
+                return False
+            def supports_specialist_composition(self):
+                return True
+            def close(self):
+                pass
+
+        a._policy_judge = _RaisingJudge()
+        tu = {"name": "send_email", "input": {"to": "x@y"}, "id": "tc_1"}
+        markers = {"tc_1": {"for_tool_call_id": "tc_1", "reason": "test"}}
+        allow, events = a._dispatch_with_judge(tu, markers)
+        # failure_policy says allow — action proceeds despite the
+        # judge being unavailable.
+        assert allow is True
+        assert events[0]["raw_outcome"] == "allow"
+        assert "JudgeUnavailable" in events[0]["judgment_reason"]
+
+
 class TestToolDefinitionValidation:
     def test_register_rejects_invalid_classification(self, agent):
         # Fail-fast at registration so typos surface before runtime.

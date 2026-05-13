@@ -24,7 +24,7 @@ Most agent state ends up somewhere you don't fully control — an app database, 
 
 There's another shape: **your agents live in your folder.** Plain markdown files. INDEX.md routing. Persona in `IDENTITY.md` / `SOUL.md` / `USER.md`. Typed atomic notes you can `cat`. Audit trail as JSONL you can grep. Cost guardrails in markdown config. Crash-safe writes — every mutation goes through `temp file + fsync + rename + parent-dir fsync`, so a power loss never leaves a half-written note. Schema migrations are scripts you read before running. If you switch laptops, you copy a folder. If you want a new runtime — cron, Claude Code skill, ChatGPT skill, your own HTTP service — you point the runtime at the folder.
 
-That's the shape `atomic-agents-stack` defines, in 22 locked spec docs + 3 RFCs (locked when implementation matches), with a Python reference implementation, 1104 tests, and a Caldwell sample that includes 5 days of real JSONL run logs, a rendered cost dashboard, evals across happy / edge / adversarial / decline categories, and a helper-pattern day showing ~76% cost savings vs. all-Opus.
+That's the shape `atomic-agents-stack` defines, in 22 locked spec docs + 3 RFCs (locked when implementation matches), with a Python reference implementation, 1153 tests, and a Caldwell sample that includes 5 days of real JSONL run logs, a rendered cost dashboard, evals across happy / edge / adversarial / decline categories, and a helper-pattern day showing ~76% cost savings vs. all-Opus.
 
 A home user with one agent and an org with a fleet experience the same framework — graceful, coherent, self-explanatory at every scale.
 
@@ -189,14 +189,88 @@ The framework is moving toward swappable backends layer by layer. The shape: a P
 
 ---
 
+## Judge layer (opt-in)
+
+The **judge layer** is a pre-action validation surface. Before any side-effectful tool call executes, a separate `JudgeBackend` inspects a structured action proposal — built from the LLM's `tool_use` block plus an `atomic_action` side-channel marker the actor emits in the same turn — and returns ALLOW / BLOCK / REVISE / ESCALATE. Every judgment writes a JSONL audit event carrying the proposal hashes, the outcome, the policy version, and the judge's reason. The full design is in [`docs/spec/28-judge-layer.md`](docs/spec/28-judge-layer.md); this README section is the orientation.
+
+The layer is **fully opt-in**. Existing deployments see no judge invocation until they drop a `judges.md` file in the agent root (or set `AGENT_JUDGE_ENABLED=1` for the hardcoded defaults).
+
+### Minimum-viable `judges.md`
+
+```markdown
+# Judges — <agent>
+
+```yaml
+backend: rules
+class_policy:
+  read_only: bypass
+  reversible_write: allow_with_audit
+  external_side_effect: judge_required
+  high_risk: escalate
+```
+```
+
+That single file opts the agent into the two-judge ensemble: `PolicyJudge` (rule-engine, microseconds, always-on) then `LLMJudgeBackend` (OpenAI `gpt-5-nano` by default, lazy-skipped if no `OPENAI_API_KEY` resolves so Claude-only deployments aren't blocked).
+
+### The four class policies
+
+Every tool call is classified into one of four action classes per `tools.md`. The `class_policy` block in `judges.md` says what the framework does with each class:
+
+| Policy              | What it means                                                                                                                                   |
+|---------------------|-------------------------------------------------------------------------------------------------------------------------------------------------|
+| `bypass`            | Skip the judge entirely. No proposal, no judgment event, no audit line.                                                                          |
+| `allow_with_audit`  | Run the judge; **always allow**; write the full judgment event to the audit trail. Surface for "I want to see the judge's opinion without it gating actions yet." |
+| `judge_required`    | Run the judge; its outcome is enforced. BLOCK refuses; ALLOW executes; REVISE/ESCALATE follow spec/28 semantics.                                 |
+| `escalate`          | Always pause for operator approval. The judge still runs (audit captures its opinion); the action waits for operator sign-off. (ESCALATE polling ships in PR 3b — until then ESCALATE self-maps to BLOCK with `escalate_pending_polling_unimplemented` to avoid orphan PENDING files.) |
+
+Strictness ordering: `bypass < allow_with_audit < judge_required < escalate`. Unspecified classes default-fill to safe values (`read_only: bypass`, everything else `judge_required` or `escalate` for `high_risk`).
+
+### Cascade-aware project floor
+
+In multi-agent project layouts, `<project>/judges.md` is the **non-relaxable floor** per spec/28 §408. A delegate's own `<agent>/judges.md` may strengthen per-class policy but cannot weaken it below the floor; attempts raise `JudgePolicyInvalid` at load. Classes the delegate didn't override inherit the floor's value (visible in `ClassPolicySnapshot.source` as `"floor"` vs `"judges.md"` vs `"default"`).
+
+This pattern lets a project lead drop one `judges.md` at the project root that guarantees a minimum-policy floor across every agent in the project, with each agent free to strengthen further.
+
+### `failure_policy` — fail-closed by default
+
+When a judge errors (timeout, budget exhausted, malformed proposal), the framework consults `failure_policy` to decide the enforcement outcome. **Default is `block` for every exception type** — operators must explicitly opt into looser behavior.
+
+Two shapes are accepted. **Flat** (one fallback for every class):
+
+```yaml
+failure_policy:
+  JudgeUnavailable: block
+  JudgeBudgetExhausted: block
+```
+
+**Nested per-class** (different fallback per `(action_class, exception)` pair):
+
+```yaml
+failure_policy:
+  read_only:
+    JudgeUnavailable: allow      # read_only actions tolerate judge outages
+  high_risk:
+    JudgeUnavailable: escalate   # high_risk actions escalate to operator
+```
+
+The parser auto-detects the shape — top-level keys are either exception names (flat) or action class names (nested). Mixing shapes raises `JudgePolicyInvalid`.
+
+### See also
+
+- [`docs/deployment/judges-md.md`](docs/deployment/judges-md.md) — the full operator runbook for `judges.md` (every field, every error message, examples).
+- [`docs/spec/28-judge-layer.md`](docs/spec/28-judge-layer.md) — the RFC: ESCALATE state machine, audit-event schema, specialist composition, failure-mode catalog.
+
+---
+
 ## Deployment shapes
 
-Seven operator runbooks for the common deployment paths. Pick the one that matches what you're doing:
+Eight operator runbooks for the common deployment paths. Pick the one that matches what you're doing:
 
 - [`docs/deployment/obsidian.md`](docs/deployment/obsidian.md) — running the framework against an Obsidian-synced vault: ignore patterns, `.versions/` trade-offs, sync race conditions, conflict copy recovery
 - [`docs/deployment/programmatic.md`](docs/deployment/programmatic.md) — embedding in Python: the `Agent` + `call()` public surface, the complete public exception table, three worked examples
 - [`docs/deployment/disaster-recovery.md`](docs/deployment/disaster-recovery.md) — symptom-organized runbook: stale locks, mid-run crashes, corrupted INDEX, migration rollback, memory write races
 - [`docs/deployment/cost-guardrail-sizing.md`](docs/deployment/cost-guardrail-sizing.md) — picking daily/monthly caps + cap action; seven role archetypes with recommended starting values
+- [`docs/deployment/judges-md.md`](docs/deployment/judges-md.md) — authoring `judges.md` to configure the judge layer: class policy, cascade-aware project floor, `failure_policy` shapes
 - [`docs/deployment/versioning.md`](docs/deployment/versioning.md) — SemVer policy; what counts as Major / Minor / Patch
 - [`docs/deployment/upgrading.md`](docs/deployment/upgrading.md) — operator upgrade runbook + migration runner usage
 - [`docs/deployment/release-runbook.md`](docs/deployment/release-runbook.md) — maintainer-facing `/ship` runbook: two-mode workflow (PR-level vs. release cut), local gstack patch, operator manual surface check
@@ -297,7 +371,7 @@ atomic_agents/                  # the Python package
 ├── _locks.py                   # per-agent flock with stale-lock recovery
 └── _io.py                      # atomic file writes (temp + fsync + rename)
 
-tests/                          # 1104 tests, all passing on Python 3.11 + 3.12
+tests/                          # 1153 tests, all passing on Python 3.11 + 3.12
 
 docs/
 ├── README.md                   # spec entry point
@@ -305,7 +379,7 @@ docs/
 ├── getting-started.md          # 15-minute clone-to-running-agent walk-through
 ├── spec/                       # 22 locked spec docs + 3 RFCs
 ├── implementation/             # build guides per runtime
-├── deployment/                 # 6 operator runbooks
+├── deployment/                 # 8 operator runbooks (Obsidian, programmatic, disaster-recovery, cost-guardrail-sizing, judges-md, versioning, upgrading, release-runbook)
 ├── samples/caldwell/           # complete worked single-agent example
 ├── appendix/portability.md     # using Atomic Agents without Obsidian / on any OS
 ├── GOVERNANCE.md               # solo / small-team operator guide
@@ -345,4 +419,4 @@ Before opening a PR, read [`CLAUDE.md`](CLAUDE.md) (the project's design ethos a
 
 ## Status
 
-**v0.13.0, alpha.** Core runtime stable. 1104 tests passing on Python 3.11 / 3.12. Two backend protocols shipped (Memory + LLM); `JudgeBackend` Protocol + canonical types ([#112](https://github.com/dep0we/atomic-agents-stack/issues/112) PR 1) plus opt-in judge dispatch wiring, the `PolicyJudge` rule-engine reference impl, and the `atomic_action` proposal marker (PR 2a) plus the `LLMJudgeBackend` reference impl, two-judge ensemble dispatch, and per-judge audit events (PR 2b) shipped on branch — opt in via `judges.md` in the agent root or `AGENT_JUDGE_ENABLED=1`; the `judges.md` parser, ESCALATE polling, and the conformance suite land in PRs 3-4. The remaining protocol-pattern roadmap (`LockBackend` / `LogBackend` / `PersonaBackend` / etc.) is what v1.0 closes; the surface stabilizes there. Pre-1.0 — Minor releases may contain breaking changes (see [`docs/deployment/versioning.md`](docs/deployment/versioning.md)). Single-maintainer project; reference implementation that anyone can use, fork, or extend.
+**v0.13.0, alpha.** Core runtime stable. 1153 tests passing on Python 3.11 / 3.12. Two backend protocols shipped (Memory + LLM); `JudgeBackend` Protocol + canonical types ([#112](https://github.com/dep0we/atomic-agents-stack/issues/112) PR 1) plus opt-in judge dispatch wiring, the `PolicyJudge` rule-engine reference impl, and the `atomic_action` proposal marker (PR 2a) plus the `LLMJudgeBackend` reference impl, two-judge ensemble dispatch, and per-judge audit events (PR 2b) shipped on branch — opt in via `judges.md` in the agent root or `AGENT_JUDGE_ENABLED=1`; the `judges.md` parser, ESCALATE polling, and the conformance suite land in PRs 3-4. The remaining protocol-pattern roadmap (`LockBackend` / `LogBackend` / `PersonaBackend` / etc.) is what v1.0 closes; the surface stabilizes there. Pre-1.0 — Minor releases may contain breaking changes (see [`docs/deployment/versioning.md`](docs/deployment/versioning.md)). Single-maintainer project; reference implementation that anyone can use, fork, or extend.
