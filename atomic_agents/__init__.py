@@ -46,8 +46,22 @@ from .dream import (
     PromotedNote,
     StaleMarking,
 )
+from .llm import (
+    SyncLLMBackend,
+    LLMToolDefinition,
+    LLMToolUse,
+    LLMToolResult,
+    CacheDirective,
+    LLMCapabilities,
+    PricingInfo,
+    register_llm_backend,
+    unregister_llm_backend,
+    get_backend,
+    iter_registered_backends,
+    find_backend_for_model,
+)
 
-__version__ = "0.10.0"
+__version__ = "0.13.0"
 
 __all__ = [
     "AtomicAgent",
@@ -86,4 +100,17 @@ __all__ = [
     "ConsolidatedNote",
     "PromotedNote",
     "StaleMarking",
+    # LLMBackend Protocol surface (spec/31, shipped v0.13.0)
+    "SyncLLMBackend",
+    "LLMToolDefinition",
+    "LLMToolUse",
+    "LLMToolResult",
+    "CacheDirective",
+    "LLMCapabilities",
+    "PricingInfo",
+    "register_llm_backend",
+    "unregister_llm_backend",
+    "get_backend",
+    "iter_registered_backends",
+    "find_backend_for_model",
 ]
