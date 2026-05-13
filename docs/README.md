@@ -63,6 +63,7 @@ Two layers per agent: human-curated persona on top, agent-curated memory below. 
 | **Build agents that pursue persistent goals (Muse Director-style)** | [spec/12-goals-and-intent](spec/12-goals-and-intent.md) |
 | **Keep factual claims cited + verifiable (no hallucinated numbers)** | [spec/13-research-integrity](spec/13-research-integrity.md) |
 | **Use Atomic Agents without Obsidian / on a different OS / hand off to a teammate** | [appendix/portability](appendix/portability.md) |
+| **Configure the judge layer (judges.md authoring, class policy, cascade floor, failure_policy)** | [deployment/judges-md](deployment/judges-md.md) + [spec/28-judge-layer](spec/28-judge-layer.md) |
 | Adapt this for another agent (post-spec-lock) | (TBD — separate doc once the spec is settled) |
 
 The spec docs are numbered for reading order. The samples are populated with realistic example content, not lorem ipsum.
