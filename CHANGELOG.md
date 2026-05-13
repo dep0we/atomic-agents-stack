@@ -49,6 +49,10 @@ CHANGELOG entry.
 
 ## [Unreleased]
 
+### Added
+
+- **Project-local `/ship` adaptation** — `.claude/skills/review/checklist.md` (atomic-agents-shaped Pre-Landing Review checklist drawn from the 14 taste rules in `CLAUDE.md`) + `docs/deployment/release-runbook.md` (release runbook, two-mode workflow PR-level vs. release cut, operator manual surface check to cover what `/document-release` misses, gstack patch reapply procedure). Pairs with a local-only gstack template patch (`fix/ship-no-version-fallback` branch in `~/.claude/skills/gstack/`) that adds a `NO_VERSION_FILE` mode to `/ship` Step 12 and a missing-checklist fallback to Step 9. Closes [#155](https://github.com/dep0we/atomic-agents-stack/issues/155).
+
 ## [0.13.0] - 2026-05-13
 
 This release closes the LLMBackend Protocol arc ([#87](https://github.com/dep0we/atomic-agents-stack/issues/87)) — the framework now has two backend protocols in production (Memory + LLM) and three reference LLM backends (Anthropic, OpenAI direct, Moonshot) registered at framework import. Drop-in upgrade: existing agents and `model.md` configs keep working unchanged; ambiguous registrations get a new `provider:` field for disambiguation.
