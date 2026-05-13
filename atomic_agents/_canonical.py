@@ -48,6 +48,13 @@ def canonical_json(obj: Any) -> str:
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
+        # Refuse non-finite floats (NaN / Infinity / -Infinity) rather
+        # than emitting the non-standard ``NaN`` / ``Infinity`` tokens
+        # via json.dumps' default ``allow_nan=True``. Round-1 reviewer
+        # P3: a future strict JSON conformance impl would diverge on
+        # these tokens; raising ValueError now keeps cross-impl hashes
+        # honest.
+        allow_nan=False,
     )
 
 

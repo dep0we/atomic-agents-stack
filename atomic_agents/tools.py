@@ -104,12 +104,24 @@ class ToolDefinition:
             json-serializes it before feeding it back to the LLM.
             Runs synchronously in the agent's call thread.
             Exceptions are caught and wrapped in ToolCallResult.error.
+        classification: Optional per-tool action class for the judge
+            layer (spec/28 + #112 PR 2a). Valid values are the
+            ``ActionClass`` enum strings: ``"read_only"``,
+            ``"reversible_write"``, ``"external_side_effect"``, or
+            ``"high_risk"``. Stored as a string to keep ``tools.py``
+            independent of ``atomic_agents/judge`` (the judge module
+            does the typed conversion at dispatch time). When ``None``
+            (default), the framework consults ``tools.md``'s
+            ``## Tool classification`` section; if no entry there
+            either, the proposal-assembly path defaults to
+            ``external_side_effect`` per spec/28's safe default.
     """
 
     name: str
     description: str
     input_schema: dict
     handler: Callable[[dict], Any]
+    classification: str | None = None
 
 
 @dataclass
@@ -161,6 +173,21 @@ class ToolRegistry:
             raise ToolNameCollision(
                 f"Tool '{tool.name}' is already registered. "
                 f"Pass allow_overwrite=True to replace it, or use a unique name."
+            )
+        # Fail-fast classification validation (#112 PR 2a). Silent
+        # default-mapping at dispatch time was operator-hostile per the
+        # round-2 review — registering a tool with an invalid class is
+        # always a typo / version mismatch, not a runtime concern.
+        if tool.classification is not None and tool.classification not in {
+            "read_only",
+            "reversible_write",
+            "external_side_effect",
+            "high_risk",
+        }:
+            raise ValueError(
+                f"Tool {tool.name!r} has invalid classification "
+                f"{tool.classification!r}. Must be one of: "
+                f"read_only, reversible_write, external_side_effect, high_risk."
             )
         self._tools[tool.name] = tool
         _logger.debug("registered tool %r", tool.name)
