@@ -202,7 +202,7 @@ uv run pytest                            # full suite
 uv run pytest tests/test_<module>.py -v  # one module
 ```
 
-1067 tests today. New backend protocols add ~25 conformance + ~10 impl-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol — the conformance suite is what keeps the protocol honest.
+1104 tests today. New backend protocols add ~25 conformance + ~10 impl-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol — the conformance suite is what keeps the protocol honest.
 
 ### Releases + SemVer
 
@@ -214,7 +214,7 @@ Every release: `vX.Y.Z` git tag + GitHub Release with CHANGELOG entry verbatim. 
 
 ## Working methods
 
-These are the methods that have produced this codebase's quality (4 published tags through v0.13.0, ~55 merged PRs, ~1067 tests, no production rollback events). Captured here to survive the session that produced them. Full retrospective in `docs/methodology.md`.
+These are the methods that have produced this codebase's quality (4 published tags through v0.13.0, ~55 merged PRs, ~1104 tests, no production rollback events). Captured here to survive the session that produced them. Full retrospective in `docs/methodology.md`.
 
 ### Always run `/ship` end-to-end — never bypass
 
@@ -336,6 +336,6 @@ These are not forbidden forever — they're explicitly deferred with rationale. 
 
 ## Status
 
-**v0.13.0, alpha, PUBLIC.** Core runtime stable, 1067 tests passing on Python 3.11/3.12. Two backend protocols shipped: MemoryBackend (PR #57) and LLMBackend (#87 — Anthropic + OpenAI + Moonshot reference impls registered at framework import). JudgeBackend Protocol scaffolding shipped as #112 PR 1 (Protocol contract, canonical proposal/judgment types, exception taxonomy, and registry primitives under `atomic_agents.judge`); #112 PR 2a adds opt-in judge dispatch wiring inside `agent.call()`, the `PolicyJudge` rule-engine reference implementation, the `atomic_action` side-channel marker tool, framework-side proposal assembly with TOCTOU-defense hashes, and a per-tool `classification` field with a `tools.md` parser — dispatch is opt-in via `judges.md` in the agent root or `AGENT_JUDGE_ENABLED=1`, so existing deployments see no judge invocation by default. `LLMJudgeBackend`, the `judges.md` parser, ESCALATE polling, and the conformance suite land in PRs 2b-4. MCP client support shipped (PRs #55 + #56). Active backlog covers the remaining protocols (Lock/Log/Persona/AgentProfile/ToolRegistry/Corpus/Policy) + spec-impl follow-ups for the three-spec stack (judge/mandates/responsibility audit). Single-developer project; reference implementation that anyone can use, fork, or extend.
+**v0.13.0, alpha, PUBLIC.** Core runtime stable, 1104 tests passing on Python 3.11/3.12. Two backend protocols shipped: MemoryBackend (PR #57) and LLMBackend (#87 — Anthropic + OpenAI + Moonshot reference impls registered at framework import). JudgeBackend Protocol scaffolding shipped as #112 PR 1 (Protocol contract, canonical proposal/judgment types, exception taxonomy, and registry primitives under `atomic_agents.judge`); #112 PR 2a adds opt-in judge dispatch wiring inside `agent.call()`, the `PolicyJudge` rule-engine reference implementation, the `atomic_action` side-channel marker tool, framework-side proposal assembly with TOCTOU-defense hashes, and a per-tool `classification` field with a `tools.md` parser — dispatch is opt-in via `judges.md` in the agent root or `AGENT_JUDGE_ENABLED=1`, so existing deployments see no judge invocation by default. `LLMJudgeBackend`, the `judges.md` parser, ESCALATE polling, and the conformance suite land in PRs 2b-4. MCP client support shipped (PRs #55 + #56). Active backlog covers the remaining protocols (Lock/Log/Persona/AgentProfile/ToolRegistry/Corpus/Policy) + spec-impl follow-ups for the three-spec stack (judge/mandates/responsibility audit). Single-developer project; reference implementation that anyone can use, fork, or extend.
 
 Going forward: **the elegance is the product.** Protect it.
