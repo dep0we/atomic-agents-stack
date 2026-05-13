@@ -201,7 +201,7 @@ uv run pytest                            # full suite
 uv run pytest tests/test_<module>.py -v  # one module
 ```
 
-720+ tests today. New backend protocols add ~25 conformance + ~10 impl-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol — the conformance suite is what keeps the protocol honest.
+928 tests today. New backend protocols add ~25 conformance + ~10 impl-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol — the conformance suite is what keeps the protocol honest.
 
 ### Releases + SemVer
 
@@ -213,7 +213,7 @@ Every release: `vX.Y.Z` git tag + GitHub Release with CHANGELOG entry verbatim. 
 
 ## Working methods
 
-These are the methods that have produced this codebase's quality (3 published tags, 47 merged PRs, ~720 tests, no production rollback events as of v0.10.0). Captured here to survive the session that produced them. Full retrospective in `docs/methodology.md`.
+These are the methods that have produced this codebase's quality (4 published tags through v0.13.0, ~55 merged PRs, ~928 tests, no production rollback events). Captured here to survive the session that produced them. Full retrospective in `docs/methodology.md`.
 
 ### Always run `/ship` end-to-end — never bypass
 
@@ -286,7 +286,7 @@ If the project ever needs to optimize differently, `docs/methodology.md` is the 
 | Doc | Purpose |
 |-----|---------|
 | `docs/architecture.md` | Mental model in diagrams. Read first. |
-| `docs/spec/01-...27-doctor.md` | Locked spec (21 docs today). The product. |
+| `docs/spec/01-...31-llm-backend.md` | Locked spec (22 docs today, plus 3 RFCs at 28/29/30). The product. |
 | `docs/implementation/` | Build guides per runtime (cron, Claude skill, dashboard) |
 | `docs/deployment/versioning.md`, `upgrading.md` | SemVer + operator runbook |
 | `docs/methodology.md` | Working-methods retrospective; the methods that produced this codebase |

@@ -3,7 +3,7 @@
 [![Tests](https://github.com/dep0we/atomic-agents-stack/actions/workflows/test.yml/badge.svg)](https://github.com/dep0we/atomic-agents-stack/actions/workflows/test.yml)
 [![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.12.0-orange)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.13.0-orange)](CHANGELOG.md)
 
 > **AI agents that live in your folder, not someone else's database.**
 
@@ -24,7 +24,7 @@ Most agent state ends up somewhere you don't fully control — an app database, 
 
 There's another shape: **your agents live in your folder.** Plain markdown files. INDEX.md routing. Persona in `IDENTITY.md` / `SOUL.md` / `USER.md`. Typed atomic notes you can `cat`. Audit trail as JSONL you can grep. Cost guardrails in markdown config. Crash-safe writes — every mutation goes through `temp file + fsync + rename + parent-dir fsync`, so a power loss never leaves a half-written note. Schema migrations are scripts you read before running. If you switch laptops, you copy a folder. If you want a new runtime — cron, Claude Code skill, ChatGPT skill, your own HTTP service — you point the runtime at the folder.
 
-That's the shape `atomic-agents-stack` defines, in 21 locked spec docs + 1 RFC (locked when implementation matches), with a Python reference implementation, 720+ tests, and a Caldwell sample that includes 5 days of real JSONL run logs, a rendered cost dashboard, evals across happy / edge / adversarial / decline categories, and a helper-pattern day showing ~76% cost savings vs. all-Opus.
+That's the shape `atomic-agents-stack` defines, in 22 locked spec docs + 3 RFCs (locked when implementation matches), with a Python reference implementation, 928 tests, and a Caldwell sample that includes 5 days of real JSONL run logs, a rendered cost dashboard, evals across happy / edge / adversarial / decline categories, and a helper-pattern day showing ~76% cost savings vs. all-Opus.
 
 A home user with one agent and an org with a fleet experience the same framework — graceful, coherent, self-explanatory at every scale.
 
@@ -121,7 +121,7 @@ This is the slot in the AI-agent-tooling landscape `atomic-agents-stack` occupie
 | **Audit trail** | JSONL per run with `parent_run_id` rollups; helper + delegate + tool + capture lines all link back | Dashboards in Letta UI / cloud | Mem0 dashboards | LangSmith (hosted) | Build it |
 | **Cost guardrails** | First-class — daily / monthly caps, threshold warnings, fallback action, `critical=True` override, tree-cap across delegates | Per their pricing model | Per their pricing model | Not built into core OSS | Build it |
 | **Multi-agent coordination** | Role × project cascade defined in spec/06 | Multi-agent shared memory blocks | Agent-shared memory pools | LangGraph: graph-based orchestration (more flexible) | Build it |
-| **Numbered, locked spec** | 21 docs in `docs/spec/` | API + concept docs | API + concept docs | API reference + concept docs | None |
+| **Numbered, locked spec** | 22 docs in `docs/spec/` (+ 3 RFCs) | API + concept docs | API + concept docs | API reference + concept docs | None |
 | **Reference runtime** | Python, macOS / Linux primary | Python (server) + multi-language clients | Python (OSS) + multi-language clients | Python + JavaScript | Whatever |
 
 **Where the alternatives win:**
@@ -135,7 +135,7 @@ This is the slot in the AI-agent-tooling landscape `atomic-agents-stack` occupie
 
 - **Markdown-source-of-truth, human-editable.** Operators can edit persona / tools / memory from any text editor or Obsidian without a vendor app.
 - **No required server.** The framework is "files + Python." A complete agent runs on a laptop with zero infrastructure.
-- **Spec-level file layout.** 21 numbered docs lock the contract; conformance is testable; alternate implementations are possible.
+- **Spec-level file layout.** 22 numbered docs lock the contract (plus 3 RFCs in progress); conformance is testable; alternate implementations are possible.
 - **Crash-safe writes by default.** `temp file + fsync + rename + parent-dir fsync` for every mutation; an interrupted run leaves recoverable artifacts, not corruption.
 - **Cost story is structural, not bolted on.** Daily / monthly caps + tree-cap for delegations + per-call cost reservation for helper batches + a `critical=True` override that's part of the API, not a per-vendor workaround.
 
@@ -145,7 +145,7 @@ This is the slot in the AI-agent-tooling landscape `atomic-agents-stack` occupie
 
 `atomic-agents-stack` is a **spec** for vault-native AI agents, plus one **reference implementation** in Python. The spec is the central artifact; anyone can build agents to the spec without using this code.
 
-Start at [`docs/README.md`](docs/README.md) for the spec entry point. The 21 locked spec docs (plus 1 RFC) in [`docs/spec/`](docs/spec/) cover:
+Start at [`docs/README.md`](docs/README.md) for the spec entry point. The 22 locked spec docs (plus 3 RFCs) in [`docs/spec/`](docs/spec/) cover:
 
 - [01 — Anatomy](docs/spec/01-anatomy.md) — file layout, persona, memory, wiki, journal, log
 - [02 — Atomic Memory](docs/spec/02-atomic-memory.md) — Notes + Wiki + INDEX-driven recall
@@ -295,13 +295,13 @@ atomic_agents/                  # the Python package
 ├── _locks.py                   # per-agent flock with stale-lock recovery
 └── _io.py                      # atomic file writes (temp + fsync + rename)
 
-tests/                          # 720+ tests, all passing on Python 3.11 + 3.12
+tests/                          # 928 tests, all passing on Python 3.11 + 3.12
 
 docs/
 ├── README.md                   # spec entry point
 ├── architecture.md             # mental model + design rationale
 ├── getting-started.md          # 15-minute clone-to-running-agent walk-through
-├── spec/                       # 21 locked spec docs
+├── spec/                       # 22 locked spec docs + 3 RFCs
 ├── implementation/             # build guides per runtime
 ├── deployment/                 # 6 operator runbooks
 ├── samples/caldwell/           # complete worked single-agent example
@@ -343,4 +343,4 @@ Before opening a PR, read [`CLAUDE.md`](CLAUDE.md) (the project's design ethos a
 
 ## Status
 
-**v0.12.0, alpha.** Core runtime stable. 720+ tests passing on Python 3.11 / 3.12. Pre-1.0 — Minor releases may contain breaking changes (see [`docs/deployment/versioning.md`](docs/deployment/versioning.md)). Single-maintainer project; reference implementation that anyone can use, fork, or extend. The protocol-pattern roadmap (`LockBackend` / `LogBackend` / `PersonaBackend` / etc.) is what v1.0 closes; the surface stabilizes there.
+**v0.13.0, alpha.** Core runtime stable. 928 tests passing on Python 3.11 / 3.12. Two backend protocols shipped (Memory + LLM); the remaining protocol-pattern roadmap (`LockBackend` / `LogBackend` / `PersonaBackend` / etc.) is what v1.0 closes; the surface stabilizes there. Pre-1.0 — Minor releases may contain breaking changes (see [`docs/deployment/versioning.md`](docs/deployment/versioning.md)). Single-maintainer project; reference implementation that anyone can use, fork, or extend.
