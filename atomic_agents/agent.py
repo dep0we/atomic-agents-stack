@@ -16,6 +16,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import asdict
@@ -181,6 +182,14 @@ class AtomicAgent:
         # None means either no MCP servers declared or pool not yet initialized.
         self.mcp_pool: MCPClientPool | None = None
 
+        # Judge layer (#112 PR 2a). PolicyJudge instance lazy-built on
+        # first dispatch — cached per-agent so policy_version is stable
+        # within a run. tool_classifications parsed from tools.md if
+        # the section exists; empty dict otherwise (everything defaults
+        # to external_side_effect per spec/28 in _resolve_classification).
+        self._policy_judge = None
+        self._tool_classifications: dict[str, str] = {}
+
         # Loaded later via load() — populated in __init__ for clarity
         self._persona_text: str = ""
         self._tools_text: str = ""
@@ -335,8 +344,321 @@ class AtomicAgent:
                 or model.startswith("moonshot/")):
             defs = [_capture.canonical_tool_definition()]
             defs.extend(self.tool_registry.to_canonical_definitions())
+            # Judge layer side-channel marker (spec/28 + #112 PR 2a).
+            # Always included alongside atomic_capture for supported
+            # providers. The actor emits atomic_action in the same turn
+            # as any side-effectful tool call to justify it; if the
+            # judge layer is disabled (no judges.md, no env var) the
+            # markers are silently ignored at proposal-assembly time.
+            from .judge.atomic_action import canonical_tool_definition as _action_def
+            defs.append(_action_def())
             return defs
         return None
+
+    # ────────────────────────────────────────────────────────────
+    # Judge layer (#112 PR 2a — opt-in dispatch)
+
+    def _judge_enabled(self) -> bool:
+        """Return True when the judge layer should run for this agent.
+
+        Per CLAUDE.md rule #14 (backward compatibility by default), the
+        judge dispatch is opt-in. Existing v0.13.0 deployments that
+        pip-upgrade to this version see today's behavior unchanged
+        unless either signal below is set.
+
+        Two signals enable dispatch:
+
+        1. ``judges.md`` exists in ``agent_root``. PR 2a treats mere
+           presence as opt-in; PR 3's parser layers on operator
+           configuration. Operators authoring the file in PR 2a get
+           PolicyJudge coverage with framework defaults.
+        2. ``AGENT_JUDGE_ENABLED`` environment variable is truthy.
+           Escape hatch for experiments / smoke tests before
+           authoring a judges.md.
+        """
+        if os.environ.get("AGENT_JUDGE_ENABLED", "").strip().lower() in (
+            "1", "true", "yes", "on",
+        ):
+            return True
+        if (self.agent_root / "judges.md").exists():
+            return True
+        return False
+
+    def _resolve_classification(self, tool_name: str) -> tuple[str, str]:
+        """Look up the per-tool ``ActionClass`` value for proposal
+        assembly. Returns ``(class_value, classification_source)``.
+
+        Lookup order:
+
+        1. ``ToolDefinition.classification`` on the registered tool
+           (set in code when the tool was registered). Source =
+           ``"tools.py"``.
+        2. ``self._tool_classifications`` from
+           ``tools.md ## Tool classification`` section. Source =
+           ``"tools.md"``.
+        3. Default to ``"external_side_effect"`` per spec/28's safe
+           default. Source = ``"default_unknown"``.
+
+        Returns the string value (not a typed enum) so the caller —
+        which is in agent.py — doesn't introduce a runtime dependency
+        on the judge module beyond what it already has.
+        """
+        registered = self.tool_registry.get(tool_name)
+        if registered is not None and registered.classification:
+            return registered.classification, "tools.py"
+        mapped = self._tool_classifications.get(tool_name)
+        if mapped is not None:
+            return mapped, "tools.md"
+        return "external_side_effect", "default_unknown"
+
+    def _default_class_policy_snapshot(self):
+        """Return the default ``ClassPolicySnapshot`` used by PR 2a
+        when no ``judges.md`` parser is available.
+
+        Every class defaults to ``JUDGE_REQUIRED`` — judge runs and
+        enforces. PR 3's ``judges.md`` parser reads operator overrides
+        per class.
+        """
+        from .judge.types import ClassPolicySnapshot, ClassPolicyValue
+        return ClassPolicySnapshot(
+            read_only=ClassPolicyValue.JUDGE_REQUIRED,
+            reversible_write=ClassPolicyValue.JUDGE_REQUIRED,
+            external_side_effect=ClassPolicyValue.JUDGE_REQUIRED,
+            high_risk=ClassPolicyValue.JUDGE_REQUIRED,
+            source={
+                "read_only": "default",
+                "reversible_write": "default",
+                "external_side_effect": "default",
+                "high_risk": "default",
+            },
+        )
+
+    def _ensure_policy_judge(self):
+        """Lazy-construct and cache the default ``PolicyJudge`` for
+        this agent. Returns the cached instance on subsequent calls.
+
+        PolicyJudge is registered against this agent's tools.md
+        (write paths + read-only paths + the raw text for
+        policy_version computation).
+        """
+        if self._policy_judge is not None:
+            return self._policy_judge
+        from .judge.rules import make_default_policy_judge
+        # Read the tools.md content for policy_version derivation.
+        # Use the resolved tools.md (cascade-aware) when available; fall
+        # back to the agent_root file otherwise.
+        tools_md_text = ""
+        if self.cascade:
+            _, tools_md_text = _cascade.resolve_tools_md(self.cascade)
+        else:
+            tools_md_path = self.agent_root / "tools.md"
+            if tools_md_path.exists():
+                tools_md_text = tools_md_path.read_text(encoding="utf-8")
+        self._policy_judge = make_default_policy_judge(
+            tools_md_text=tools_md_text,
+            allowed_write_paths=[Path(p) for p in (self.config.write_paths or [])],
+            read_only_paths=[Path(p) for p in (self.config.read_only_paths or [])],
+        )
+        return self._policy_judge
+
+    def _dispatch_with_judge(
+        self,
+        tu: dict,
+        atomic_action_markers: dict[str, dict],
+    ):
+        """Run the judge ensemble against one tool_use. Returns
+        ``(allow: bool, judgment, judgment_event_dict)``.
+
+        Spec/28 §"Where the judge sits in agent.call()" places this
+        between LLM tool_use parsing and tool handler dispatch.
+
+        PR 2a ensemble is hardcoded to ``[PolicyJudge]``. PR 2b adds
+        LLMJudgeBackend layered after. PR 3 reads ordering from
+        ``judges.md``.
+        """
+        from .judge import proposal as _proposal_mod
+        from .judge.backend import JudgmentOutcome
+        from .judge.types import (
+            ActionClass,
+            JudgmentContext,
+            JudgePolicyContext,
+            JudgeRuntimeConfig,
+            BudgetConfig,
+            EscalationConfig,
+            PersonaDigest,
+            ProposalBinding,
+            ToolPolicyEntry,
+        )
+        from .exceptions import JudgeError, JudgeProposalInvalid
+
+        tool_name = tu.get("name", "")
+        tool_call_id = tu.get("id", "")
+        cls_str, cls_source = self._resolve_classification(tool_name)
+        try:
+            classification = ActionClass(cls_str)
+        except ValueError:
+            classification = ActionClass.EXTERNAL_SIDE_EFFECT
+            cls_source = "default_unknown"
+
+        # Resolve the side-channel marker, if any.
+        marker = atomic_action_markers.get(tool_call_id)
+
+        # Resolve handler / tool_definition_hash inputs.
+        registered = self.tool_registry.get(tool_name)
+        input_schema = registered.input_schema if registered else {}
+        handler = registered.handler if registered else None
+        tdef_hash = _proposal_mod.compute_tool_definition_hash(
+            tool_name,
+            input_schema,
+            handler,
+        )
+
+        # Build the proposal. JudgeProposalInvalid bubbles to BLOCK via
+        # the failure-policy default (spec/28:567).
+        try:
+            proposal_obj = _proposal_mod.assemble_proposal(
+                tu,
+                marker,
+                classification=classification,
+                classification_source=cls_source,
+                tool_definition_hash=tdef_hash,
+                actor_agent=self.name,
+                actor_run_id=self.run_id,
+                actor_model_id=getattr(self.config, "model", None),
+            )
+        except JudgeProposalInvalid as exc:
+            # Fail-closed per spec/28. Synthesize a BLOCK judgment and
+            # a JudgmentEvent so the audit trail records the refusal.
+            from .judge.backend import Judgment
+            judgment = Judgment(
+                outcome=JudgmentOutcome.BLOCK,
+                reason=f"JudgeProposalInvalid: {exc}",
+                judge_id="framework",
+                policy_version="unimplemented",
+            )
+            event = self._build_judgment_event_dict(
+                proposal=None,
+                tool_use=tu,
+                judgment=judgment,
+                enforcement_action="block_executed",
+                binding=ProposalBinding(
+                    tool_call_id=tool_call_id,
+                    tool_definition_hash=tdef_hash,
+                    # Empty sentinel — proposal-assembly failed so no
+                    # canonical args hash exists. ProposalBinding's
+                    # str-typed field carries an empty string rather
+                    # than a non-hex string per round-2 review (the
+                    # "proposal_assembly_failed" string violated the
+                    # implicit sha256-hex contract that audit-log
+                    # tooling relies on). Failure reason lives in
+                    # ``judgment.reason`` and on ``event["judgment_reason"]``.
+                    arguments_hash="",
+                ),
+            )
+            return False, judgment, event
+
+        # Build the JudgmentContext for the judge to consult.
+        policy_ctx = JudgePolicyContext(
+            agent_name=self.name,
+            persona_digest=PersonaDigest(agent_name=self.name),
+            tools_md_entry=ToolPolicyEntry(
+                tool_name=tool_name,
+                classification=classification,
+                write_paths=list(self.config.write_paths or []),
+            ),
+            class_policy=self._default_class_policy_snapshot(),
+        )
+        runtime_cfg = JudgeRuntimeConfig(
+            backend_name="rules",
+            timeout_ms=1000,
+            budget=BudgetConfig(),
+            escalation_config=EscalationConfig(),
+            failure_policy={
+                "JudgeUnavailable": "block",
+                "JudgePolicyInvalid": "block",
+                "JudgeBudgetExhausted": "block",
+                "JudgeProposalInvalid": "block",
+                "JudgeAmendedProposalRejected": "block",
+            },
+        )
+        context = JudgmentContext(policy=policy_ctx, runtime=runtime_cfg)
+
+        # Invoke the ensemble (PR 2a: PolicyJudge only).
+        judge = self._ensure_policy_judge()
+        start = time.time()
+        try:
+            judgment = judge.evaluate(proposal_obj, context)
+        except JudgeError as exc:
+            # Map exception to BLOCK per failure_policy default.
+            from .judge.backend import Judgment
+            judgment = Judgment(
+                outcome=JudgmentOutcome.BLOCK,
+                reason=f"{type(exc).__name__}: {exc}",
+                judge_id=judge.judge_id,
+                policy_version=judge.policy_version,
+                latency_ms=int((time.time() - start) * 1000),
+            )
+
+        # PR 2a: PolicyJudge only returns ALLOW or BLOCK. REVISE and
+        # ESCALATE shouldn't appear from PolicyJudge (per its
+        # supported_outcomes). Defensively treat unsupported outcomes
+        # as BLOCK so PR 2b's LLMJudgeBackend or future regressions
+        # don't accidentally execute an action.
+        allow = judgment.outcome == JudgmentOutcome.ALLOW
+        enforcement = (
+            "allow_executed" if allow else "block_executed"
+        )
+
+        binding = ProposalBinding(
+            tool_call_id=tool_call_id,
+            tool_definition_hash=tdef_hash,
+            arguments_hash=proposal_obj.arguments_hash,
+        )
+        event = self._build_judgment_event_dict(
+            proposal=proposal_obj,
+            tool_use=tu,
+            judgment=judgment,
+            enforcement_action=enforcement,
+            binding=binding,
+        )
+        return allow, judgment, event
+
+    def _build_judgment_event_dict(
+        self,
+        *,
+        proposal,
+        tool_use: dict,
+        judgment,
+        enforcement_action: str,
+        binding,
+    ) -> dict:
+        """Construct the JSONL-shaped JudgmentEvent record for the
+        audit trail. Mirrors spec/28's audit shape (line 833).
+
+        Stored inline in the agent's run log via ``self._log({...})``.
+        """
+        proposal_dict = None
+        if proposal is not None:
+            proposal_dict = asdict(proposal)
+        return {
+            "trigger": "judgment",
+            "event": "judgment",
+            "parent_run_id": self.run_id,
+            "proposal_id": getattr(proposal, "proposal_id", None),
+            "agent": self.name,
+            "judge_id": judgment.judge_id,
+            "policy_version": judgment.policy_version,
+            "proposal": proposal_dict,
+            "judgment_outcome": judgment.outcome.value,
+            "judgment_reason": judgment.reason,
+            "raw_outcome": judgment.outcome.value,
+            "enforcement_action": enforcement_action,
+            "binding": asdict(binding),
+            "latency_ms": judgment.latency_ms,
+            "cost_usd": judgment.cost_usd,
+            "cost_source": "judge",
+            "tool_name": tool_use.get("name", ""),
+        }
 
     # ────────────────────────────────────────────────────────────
     # Config loading
@@ -349,9 +671,17 @@ class AtomicAgent:
             # tools.md: instance .override.md merges with role; instance tools.md replaces role
             _, tools_text = _cascade.resolve_tools_md(self.cascade)
             tools_data = _tools.parse_tools_md_text(tools_text)
+            # Judge-layer per-tool classifications from tools.md (#112 PR 2a).
+            # Lookup at proposal-assembly time via _resolve_classification.
+            self._tool_classifications = _tools.parse_tool_classifications_text(
+                tools_text
+            )
         else:
             model_data = _model.parse_model_md(self.agent_root / "model.md")
             tools_data = _tools.parse_tools_md(self.agent_root / "tools.md")
+            self._tool_classifications = _tools.parse_tool_classifications(
+                self.agent_root / "tools.md"
+            )
 
         # roster.md lives at the instance root (same for cascaded + single-agent layouts)
         roster = _roster.parse_roster_md(self.agent_root / "roster.md")
@@ -801,15 +1131,18 @@ class AtomicAgent:
                 all_captures.extend(iter_captures)
                 all_parse_failures.extend(iter_failures)
 
-                # Partition tool_uses: atomic_capture (handled above) vs custom tools
+                # Partition tool_uses: framework-managed (atomic_capture,
+                # atomic_action) handled above / by judge dispatch, vs
+                # custom tools the operator registered.
+                from .judge.proposal import is_framework_managed_tool
                 custom_tool_uses = [
                     tu for tu in raw.tool_uses
-                    if tu.get("name") != "atomic_capture"
+                    if not is_framework_managed_tool(tu.get("name", ""))
                     and self.tool_registry.get(tu.get("name", "")) is not None
                 ]
                 unknown_tool_uses = [
                     tu for tu in raw.tool_uses
-                    if tu.get("name") != "atomic_capture"
+                    if not is_framework_managed_tool(tu.get("name", ""))
                     and self.tool_registry.get(tu.get("name", "")) is None
                     and tu.get("name", "")  # non-empty name
                 ]
@@ -828,9 +1161,85 @@ class AtomicAgent:
                         "error": "ToolNotRegistered",
                     })
 
+                # Judge layer (#112 PR 2a). Extract atomic_action markers and
+                # dispatch the judge ensemble for each side-effectful tool_use
+                # BEFORE handler execution. Spec/28 §"Where the judge sits in
+                # agent.call()". Opt-in per _judge_enabled() — when disabled
+                # (no judges.md, no AGENT_JUDGE_ENABLED env var) the dispatch
+                # is skipped entirely and today's pre-#112 behavior runs.
+                judge_blocked: dict[str, str] = {}  # tool_call_id -> block reason
+                if self._judge_enabled() and custom_tool_uses:
+                    from .judge.atomic_action import extract_atomic_action_markers
+                    from .exceptions import JudgeProposalInvalid
+                    try:
+                        markers = extract_atomic_action_markers(raw.tool_uses)
+                    except JudgeProposalInvalid as exc:
+                        # Marker-level malformation (duplicate / missing
+                        # for_tool_call_id). Per failure_policy default,
+                        # block ALL side-effectful tool_uses this iteration.
+                        _logger.warning(
+                            "agent %r: judge layer marker extraction failed: %s",
+                            self.name, exc,
+                        )
+                        markers = {}
+                        for tu in custom_tool_uses:
+                            tcid = tu.get("id", "")
+                            judge_blocked[tcid] = (
+                                f"JudgeProposalInvalid (marker extraction): {exc}"
+                            )
+                    if not judge_blocked:
+                        for tu in custom_tool_uses:
+                            try:
+                                allow, judgment, event = self._dispatch_with_judge(
+                                    tu, markers,
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                # Defensive: any uncaught judge-path error
+                                # fail-closes per spec/28's failure_policy
+                                # default. Better to block than silently let
+                                # the action run with no audit record.
+                                _logger.exception(
+                                    "agent %r: judge dispatch raised; "
+                                    "fail-closing to BLOCK for tool_call_id=%r",
+                                    self.name, tu.get("id", ""),
+                                )
+                                judge_blocked[tu.get("id", "")] = (
+                                    f"judge dispatch error: "
+                                    f"{type(exc).__name__}: {exc}"
+                                )
+                                continue
+                            self._log(event)
+                            if not allow:
+                                judge_blocked[tu.get("id", "")] = judgment.reason
+
                 # Execute custom tools
                 iter_tool_results: list[ToolCallResult] = []
                 for tu in custom_tool_uses:
+                    tcid = tu.get("id", "")
+                    if tcid in judge_blocked:
+                        # Judge BLOCKed — synthesize an error tool_result so
+                        # the LLM sees the refusal on the next turn, without
+                        # running the handler. The reason flows back to the
+                        # actor verbatim per spec/28 §"Block".
+                        from .tools import ToolCallResult as _TCR
+                        blocked_result = _TCR(
+                            tool_name=tu.get("name", ""),
+                            tool_use_id=tcid,
+                            input=tu.get("input", {}) or {},
+                            output=None,
+                            error=f"judge_blocked: {judge_blocked[tcid]}",
+                            latency_ms=0,
+                        )
+                        all_tool_call_results.append(blocked_result)
+                        iter_tool_results.append(blocked_result)
+                        self._log({
+                            "trigger": "tool_call",
+                            "parent_run_id": self.run_id,
+                            "tool_name": blocked_result.tool_name,
+                            "latency_ms": 0,
+                            "error": blocked_result.error,
+                        })
+                        continue
                     tool_result = self.tool_registry.execute(tu)
                     all_tool_call_results.append(tool_result)
                     iter_tool_results.append(tool_result)
