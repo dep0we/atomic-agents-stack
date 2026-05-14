@@ -1525,10 +1525,8 @@ class AtomicAgent:
         # its enforcement from ``allow_pending_next_judge`` to
         # ``allow_executed``. Intermediate ALLOWs stay
         # ``allow_pending_next_judge`` (they were judged but did not
-        # gate the action). Spec/28's enforcement_action enum currently
-        # documents ``allow_executed`` for the single-judge case;
-        # ``allow_pending_next_judge`` is a PR 2b ensemble extension
-        # tracked in #161 for PR 4's spec lock-in.
+        # gate the action). Both values are canonical in spec/28's
+        # enforcement_action enum (PR 4 lock).
         if final_allow and events:
             events[-1]["enforcement_action"] = "allow_executed"
 
@@ -1553,8 +1551,8 @@ class AtomicAgent:
         class_policy=escalate, ``"failure_policy"`` for exception-mapped
         escalate, ``None`` for actual ensemble verdicts. ``triggered_by``
         carries the exception class name for failure_policy synthesis.
-        Both are PR 3b extensions to the audit shape (spec/28 lock-in
-        in PR 4). Stored inline via ``self._log({...})``.
+        Both fields are canonical in spec/28's audit shape (PR 4 lock).
+        Stored inline via ``self._log({...})``.
         """
         proposal_dict = None
         if proposal is not None:

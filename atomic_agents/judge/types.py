@@ -17,23 +17,15 @@ etc.) are NOT hashable, by design: tool input schemas and evidence
 collections are naturally nested-mutable. Consumers that need a set/dict
 key should derive one (e.g., ``proposal.proposal_id``).
 
-Spec drift flagged for PR 4's spec lock-in update:
+Layout notes (folded into spec/28's locked text):
 
-- spec/28 §"Module layout" puts all dataclasses in ``backend.py``. We
-  split into ``types.py`` + ``backend.py`` per #87 PR 1's landed
-  convention (``LLMBackend`` Protocol scaffolding shipped 2026-05-13).
-- spec/28 references ``ClassPolicyValue`` (line 811) without defining
-  it. Adding here.
-- spec/28 references ``Provenance`` (line 191) without defining it.
-  Adding here.
-- spec/28's ``JudgePolicyContext.cited_notes: list[Note]`` violates
-  CLAUDE.md rule #6 (progressive disclosure — load metadata, not
-  bodies). Using ``list[NoteRef]`` (existing in ``memory/backend.py``)
-  instead. PR 2's proposal assembly may layer in an evidence-body
-  helper if judges demonstrably need it.
-- spec/28's audit shape uses ``enforcement_action: str`` with five
-  literal values; we keep that as ``str`` rather than introducing an
-  enum here (spec authoritative on this surface).
+- Dataclasses live in ``types.py``; the Protocol contract + Judgment
+  live in ``backend.py``. Mirrors #87's LLMBackend split.
+- ``ClassPolicyValue`` + ``Provenance`` are defined here (spec/28
+  references both).
+- ``JudgePolicyContext.cited_notes: list[NoteRef]`` (progressive
+  disclosure per CLAUDE.md rule #6 — metadata only, not bodies).
+- ``enforcement_action: str`` (not enum) per spec/28's audit shape.
 """
 
 from __future__ import annotations
@@ -137,14 +129,12 @@ class Provenance(StrEnum):
 class SkillRef:
     """Reference to a skill that was loaded when a proposal was made.
 
-    spec/28:203-205 declares ``name: str`` + ``file_hash: str`` (sha256
-    of the skill file at load time, as the integrity property). PR 1
-    scaffolding keeps ``file_hash`` optional with a ``None`` default
-    because no caller computes the hash yet — proposal assembly lands
-    in PR 2 and will populate. PR 4 spec lock-in either restores the
-    required-field shape (preferred — the integrity property is
-    load-bearing for tamper-detection) or formally accepts the
-    optional default. Tracked in #161.
+    spec/28:203-205 declares ``name: str`` + ``file_hash: str``. The
+    field stays optional with a ``None`` default — proposal assembly
+    today (PR 2a) doesn't compute the hash, so requiring it would
+    break every existing caller. Restoring the required shape is a
+    future-strengthening that tracks with #161; field-order is a
+    documentation property, not a contract.
     """
 
     name: str
@@ -160,14 +150,10 @@ class Evidence:
     ``ProposalAmendment.appended_evidence`` but cannot replace or remove
     existing entries.
 
-    Field-order drift from spec/28:187-191 (spec order:
-    ``source, source_hash, claim, provenance``). Python forbids
-    required fields after fields with defaults; since ``source_hash``
-    is ``Optional`` with a ``None`` default, it must follow the
-    required fields ``claim`` + ``provenance``. PR 4 spec lock-in
-    either accepts the reorder (preferred — field order is a
-    documentation property, not a contract) or migrates Evidence to
-    ``@dataclass(kw_only=True)``. Tracked in #161.
+    Field-order vs spec/28:187-191: Python forbids required fields
+    after defaulted fields; ``source_hash`` (Optional, None default)
+    follows ``claim`` + ``provenance``. Field order is a documentation
+    property, not a contract — operators construct via keyword args.
     """
 
     source: str  # note name, conversation ref, skill name

@@ -24,7 +24,7 @@ Most agent state ends up somewhere you don't fully control — an app database, 
 
 There's another shape: **your agents live in your folder.** Plain markdown files. INDEX.md routing. Persona in `IDENTITY.md` / `SOUL.md` / `USER.md`. Typed atomic notes you can `cat`. Audit trail as JSONL you can grep. Cost guardrails in markdown config. Crash-safe writes — every mutation goes through `temp file + fsync + rename + parent-dir fsync`, so a power loss never leaves a half-written note. Schema migrations are scripts you read before running. If you switch laptops, you copy a folder. If you want a new runtime — cron, Claude Code skill, ChatGPT skill, your own HTTP service — you point the runtime at the folder.
 
-That's the shape `atomic-agents-stack` defines, in 22 locked spec docs + 3 RFCs (locked when implementation matches), with a Python reference implementation, 1222 tests, and a Caldwell sample that includes 5 days of real JSONL run logs, a rendered cost dashboard, evals across happy / edge / adversarial / decline categories, and a helper-pattern day showing ~76% cost savings vs. all-Opus.
+That's the shape `atomic-agents-stack` defines, in 23 locked spec docs + 2 RFCs (locked when implementation matches), with a Python reference implementation, 1261 tests, and a Caldwell sample that includes 5 days of real JSONL run logs, a rendered cost dashboard, evals across happy / edge / adversarial / decline categories, and a helper-pattern day showing ~76% cost savings vs. all-Opus.
 
 A home user with one agent and an org with a fleet experience the same framework — graceful, coherent, self-explanatory at every scale.
 
@@ -121,7 +121,7 @@ This is the slot in the AI-agent-tooling landscape `atomic-agents-stack` occupie
 | **Audit trail** | JSONL per run with `parent_run_id` rollups; helper + delegate + tool + capture lines all link back | Dashboards in Letta UI / cloud | Mem0 dashboards | LangSmith (hosted) | Build it |
 | **Cost guardrails** | First-class — daily / monthly caps, threshold warnings, fallback action, `critical=True` override, tree-cap across delegates | Per their pricing model | Per their pricing model | Not built into core OSS | Build it |
 | **Multi-agent coordination** | Role × project cascade defined in spec/06 | Multi-agent shared memory blocks | Agent-shared memory pools | LangGraph: graph-based orchestration (more flexible) | Build it |
-| **Numbered, locked spec** | 22 docs in `docs/spec/` (+ 3 RFCs) | API + concept docs | API + concept docs | API reference + concept docs | None |
+| **Numbered, locked spec** | 23 docs in `docs/spec/` (+ 2 RFCs) | API + concept docs | API + concept docs | API reference + concept docs | None |
 | **Reference runtime** | Python, macOS / Linux primary | Python (server) + multi-language clients | Python (OSS) + multi-language clients | Python + JavaScript | Whatever |
 
 **Where the alternatives win:**
@@ -135,7 +135,7 @@ This is the slot in the AI-agent-tooling landscape `atomic-agents-stack` occupie
 
 - **Markdown-source-of-truth, human-editable.** Operators can edit persona / tools / memory from any text editor or Obsidian without a vendor app.
 - **No required server.** The framework is "files + Python." A complete agent runs on a laptop with zero infrastructure.
-- **Spec-level file layout.** 22 numbered docs lock the contract (plus 3 RFCs in progress); conformance is testable; alternate implementations are possible.
+- **Spec-level file layout.** 23 numbered docs lock the contract (plus 2 RFCs in progress); conformance is testable; alternate implementations are possible.
 - **Crash-safe writes by default.** `temp file + fsync + rename + parent-dir fsync` for every mutation; an interrupted run leaves recoverable artifacts, not corruption.
 - **Cost story is structural, not bolted on.** Daily / monthly caps + tree-cap for delegations + per-call cost reservation for helper batches + a `critical=True` override that's part of the API, not a per-vendor workaround.
 
@@ -145,7 +145,7 @@ This is the slot in the AI-agent-tooling landscape `atomic-agents-stack` occupie
 
 `atomic-agents-stack` is a **spec** for vault-native AI agents, plus one **reference implementation** in Python. The spec is the central artifact; anyone can build agents to the spec without using this code.
 
-Start at [`docs/README.md`](docs/README.md) for the spec entry point. The 22 locked spec docs (plus 3 RFCs) in [`docs/spec/`](docs/spec/) cover:
+Start at [`docs/README.md`](docs/README.md) for the spec entry point. The 23 locked spec docs (plus 2 RFCs) in [`docs/spec/`](docs/spec/) cover:
 
 - [01 — Anatomy](docs/spec/01-anatomy.md) — file layout, persona, memory, wiki, journal, log
 - [02 — Atomic Memory](docs/spec/02-atomic-memory.md) — Notes + Wiki + INDEX-driven recall
@@ -176,7 +176,7 @@ The framework is moving toward swappable backends layer by layer. The shape: a P
 |---|---|---|
 | `MemoryBackend` | ✅ Shipped (v0.10.0) | [`spec/20-memory-backend.md`](docs/spec/20-memory-backend.md) |
 | `LLMBackend` | ✅ Shipped (v0.13.0) | [`spec/31-llm-backend.md`](docs/spec/31-llm-backend.md) |
-| `JudgeBackend` | 🟡 In progress — Protocol + types scaffolding ([#112](https://github.com/dep0we/atomic-agents-stack/issues/112) PR 1) + opt-in dispatch wiring + `PolicyJudge` rule-engine + `atomic_action` proposal marker (PR 2a) + `LLMJudgeBackend` reference impl + two-judge ensemble dispatch + per-judge audit events (PR 2b) + `judges.md` operator config parser + cascade-aware project floor (PR 3a) + ESCALATE state machine (PENDING-file writer + operator resolution polling + auto-decide timeout + inline Approved execution) (PR 3b) + REVISE state machine (judge-driven amendment + second-judgment cycle + operator `### Revised by <op>` with embedded amendment YAML + class-upgrade re-judge gate) (PR 3c) shipped; the full conformance suite + spec/28 lock-in lands in PR 4 | [`spec/28-judge-layer.md`](docs/spec/28-judge-layer.md) (RFC) |
+| `JudgeBackend` | ✅ Locked at [#112](https://github.com/dep0we/atomic-agents-stack/issues/112) PR 4. `PolicyJudge` + `LLMJudgeBackend` reference impls; opt-in dispatch + `atomic_action` proposal marker; two-judge ensemble + per-judge audit events; `judges.md` operator config + cascade-aware project floor; ESCALATE state machine (PENDING-file writer + operator resolution polling + auto-decide timeout + inline Approved execution); REVISE state machine (judge-driven amendment + second-judgment cycle + operator `### Revised by <op>` with embedded amendment YAML + class-upgrade re-judge gate). Conformance suite (`tests/test_judge_protocol_conformance.py`) gates the spec lock | [`spec/28-judge-layer.md`](docs/spec/28-judge-layer.md) |
 | `LockBackend` | Planned | [`#60`](https://github.com/dep0we/atomic-agents-stack/issues/60) |
 | `LogBackend` | Planned | [`#61`](https://github.com/dep0we/atomic-agents-stack/issues/61) |
 | `PersonaBackend` | Planned | [`#62`](https://github.com/dep0we/atomic-agents-stack/issues/62) |
@@ -284,7 +284,7 @@ PR 3c does NOT run full JSON-Schema validation against amended `tool_arguments` 
 ### See also
 
 - [`docs/deployment/judges-md.md`](docs/deployment/judges-md.md) — the full operator runbook for `judges.md` (every field, every error message, examples).
-- [`docs/spec/28-judge-layer.md`](docs/spec/28-judge-layer.md) — the RFC: ESCALATE state machine, audit-event schema, specialist composition, failure-mode catalog.
+- [`docs/spec/28-judge-layer.md`](docs/spec/28-judge-layer.md) — locked at #112 PR 4: ESCALATE + REVISE state machines, audit-event schema, specialist composition, failure-mode catalog, conformance suite reference.
 
 ---
 
@@ -397,13 +397,13 @@ atomic_agents/                  # the Python package
 ├── _locks.py                   # per-agent flock with stale-lock recovery
 └── _io.py                      # atomic file writes (temp + fsync + rename)
 
-tests/                          # 1222 tests, all passing on Python 3.11 + 3.12
+tests/                          # 1261 tests, all passing on Python 3.11 + 3.12
 
 docs/
 ├── README.md                   # spec entry point
 ├── architecture.md             # mental model + design rationale
 ├── getting-started.md          # 15-minute clone-to-running-agent walk-through
-├── spec/                       # 22 locked spec docs + 3 RFCs
+├── spec/                       # 23 locked spec docs + 2 RFCs
 ├── implementation/             # build guides per runtime
 ├── deployment/                 # 8 operator runbooks (Obsidian, programmatic, disaster-recovery, cost-guardrail-sizing, judges-md, versioning, upgrading, release-runbook)
 ├── samples/caldwell/           # complete worked single-agent example
@@ -445,4 +445,4 @@ Before opening a PR, read [`CLAUDE.md`](CLAUDE.md) (the project's design ethos a
 
 ## Status
 
-**v0.13.0, alpha.** Core runtime stable. 1222 tests passing on Python 3.11 / 3.12. Two backend protocols shipped (Memory + LLM); `JudgeBackend` Protocol + canonical types ([#112](https://github.com/dep0we/atomic-agents-stack/issues/112) PR 1) plus opt-in judge dispatch wiring, the `PolicyJudge` rule-engine reference impl, and the `atomic_action` proposal marker (PR 2a) plus the `LLMJudgeBackend` reference impl, two-judge ensemble dispatch, and per-judge audit events (PR 2b) plus the `judges.md` operator config parser and cascade-aware project floor (PR 3a) plus the ESCALATE state machine — PENDING-file writer, operator resolution polling, auto-decide timeout, inline Approved execution (PR 3b) plus the REVISE state machine — judge-driven amendment + second-judgment cycle, operator `### Revised by <op>` with embedded `amendment:` YAML, class-upgrade re-judge gate keyed on recomputed classification (PR 3c) — shipped on branch. Opt in via `judges.md` in the agent root or `AGENT_JUDGE_ENABLED=1`; the full conformance suite + spec/28 lock-in lands in PR 4. The remaining protocol-pattern roadmap (`LockBackend` / `LogBackend` / `PersonaBackend` / etc.) is what v1.0 closes; the surface stabilizes there. Pre-1.0 — Minor releases may contain breaking changes (see [`docs/deployment/versioning.md`](docs/deployment/versioning.md)). Single-maintainer project; reference implementation that anyone can use, fork, or extend.
+**v0.13.0, alpha.** Core runtime stable. 1261 tests passing on Python 3.11 / 3.12. **Three backend protocols shipped**: `MemoryBackend`, `LLMBackend`, and `JudgeBackend` (locked at [#112](https://github.com/dep0we/atomic-agents-stack/issues/112) PR 4 with `tests/test_judge_protocol_conformance.py` parametrized over `PolicyJudge` + `LLMJudgeBackend`). The judge layer is opt-in — existing deployments see no judge invocation unless `judges.md` is in the agent root or `AGENT_JUDGE_ENABLED=1` is set. The remaining protocol-pattern roadmap (`LockBackend` / `LogBackend` / `PersonaBackend` / `AgentProfileBackend` / `ToolRegistryBackend` / `CorpusBackend`) is what v1.0 closes; the surface stabilizes there. Pre-1.0 — Minor releases may contain breaking changes (see [`docs/deployment/versioning.md`](docs/deployment/versioning.md)). Single-maintainer project; reference implementation that anyone can use, fork, or extend.

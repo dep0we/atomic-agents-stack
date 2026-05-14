@@ -7,28 +7,24 @@ rule-engine ``PolicyJudge``, an LLM-backed ``LLMJudgeBackend`` (composing
 ``LLMBackend`` from #87), and operator-authored specialists — but the
 framework's runtime sees only this Protocol.
 
-This module is **scaffolding only** in PR 1 of #112. Reference
-implementations land in PR 2; ``agent.call()`` wiring lands in PR 2;
-the ``judges.md`` parser lands in PR 3; conformance suite + spec
-lock-in land in PR 4.
+The ``JudgeBackend`` Protocol contract (spec/28). Reference impls:
+``PolicyJudge`` (rule engine) + ``LLMJudgeBackend`` (LLM-backed).
+Third-party backends register via ``atomic_agents.judge.register_backend``.
 
-Spec drift flagged for PR 4's spec lock-in update:
+Conformance is asserted by ``tests/test_judge_protocol_conformance.py``
+against every shipped backend; the canonical invariants live in
+spec/28 §"Conformance suite".
 
-- spec/28 §"Module layout" lists ``JudgeError`` subclasses in
-  ``judge/backend.py``. We placed them in ``atomic_agents/exceptions.py``
-  next to ``UnknownModelError`` from #87 PR 1 (consistent placement
-  for backend exceptions). Spec doc updated in PR 4.
-- spec/28's Protocol surface declares ``judge_id`` and
-  ``policy_version`` as ``@property`` decorators. We mirror that here.
+Placement notes:
+
+- ``JudgeError`` subclasses live in ``atomic_agents/exceptions.py``
+  alongside ``UnknownModelError`` from #87 PR 1 (consistent placement
+  for backend exceptions across protocols).
+- ``judge_id`` and ``policy_version`` are ``@property`` decorators.
   The ``@runtime_checkable`` + ``@property`` interaction is verified
-  in ``tests/test_judge_types_and_registry.py`` with a
-  ``MagicMock(spec=JudgeBackend)`` regression test (the same gotcha
-  that #87 PR 1 had).
-
-PR 1 stubs MUST return the literal sentinel ``"unimplemented"`` from
-``policy_version`` until PR 3's ``judges.md`` parser lands. PR 4's
-conformance suite asserts production backends never return that
-sentinel.
+  in ``tests/test_judge_types_and_registry.py``.
+- Production backends MUST NOT return ``"unimplemented"`` from
+  ``policy_version``; the conformance suite asserts this.
 """
 
 from __future__ import annotations
