@@ -801,7 +801,7 @@ Configure `failure_policy[JudgePolicyInvalid]` (default `block`) to control what
 
 **Cascade-floor strictness.** A delegate's `judges.md` may strengthen `validation` (e.g., floor=`weakened`, delegate=`strict`) but cannot relax it. Relax attempts raise `JudgePolicyInvalid` at agent-load. A delegate that omits the field inherits the floor's value without tripping a false-positive relax violation.
 
-**Reserved namespaces.** `validation: audit` (validate + JSONL warn without BLOCK; tracked at [#176](https://github.com/dep0we/atomic-agents-stack/issues/176)) and `validation: paranoid` ([#178](https://github.com/dep0we/atomic-agents-stack/issues/178)) are reserved but not yet implemented. The parser rejects both with "not yet implemented" messages pointing at the tracking issue, distinct from a generic operator-typo rejection.
+**Reserved namespaces.** `validation: audit` (validate + JSONL warn without BLOCK; tracked at [#176](https://github.com/dep0we/atomic-agents-stack/issues/176)) and `validation: paranoid` ([#179](https://github.com/dep0we/atomic-agents-stack/issues/179)) are reserved but not yet implemented. The parser rejects both with "not yet implemented" messages pointing at the tracking issue, distinct from a generic operator-typo rejection.
 
 **Migration aid.** Operators flipping `validation: strict` on a production agent may discover that amendments which previously passed weakened validation now BLOCK. Before the flip, audit your registered tools' `input_schema` values — the `check_tool_schemas_for_amendment_validation` doctor check (tracked at [#175](https://github.com/dep0we/atomic-agents-stack/issues/175)) will surface tools whose schemas are missing or trivially permissive.
 

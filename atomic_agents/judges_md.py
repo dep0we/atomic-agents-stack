@@ -96,7 +96,7 @@ _RESERVED_VALIDATION_VALUES: dict[str, str] = {
     ),
     "paranoid": (
         "validation: paranoid is not yet implemented; tracked at "
-        "https://github.com/dep0we/atomic-agents-stack/issues/178"
+        "https://github.com/dep0we/atomic-agents-stack/issues/179"
     ),
 }
 
@@ -938,7 +938,7 @@ def _parse_validation(raw: Any) -> tuple[str, str]:
     Rejects:
 
     - ``audit`` with "not yet implemented; tracked at #176".
-    - ``paranoid`` with "not yet implemented; tracked at #178" (the
+    - ``paranoid`` with "not yet implemented; tracked at #179" (the
       reserved-but-not-yet-implemented namespace is distinct from a
       generic operator typo per CLAUDE.md taste rule).
     - Any other unknown value with "validation must be one of

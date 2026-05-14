@@ -872,8 +872,8 @@ class TestValidationField:
             parse_judges_md_text("```yaml\nvalidation: audit\n```\n")
 
     def test_paranoid_rejected_with_namespace_pointer(self):
-        # Reserved namespace symmetric with audit. (#178 tracks the work.)
-        with pytest.raises(JudgePolicyInvalid, match="issues/178"):
+        # Reserved namespace symmetric with audit. (#179 tracks the work.)
+        with pytest.raises(JudgePolicyInvalid, match="issues/179"):
             parse_judges_md_text("```yaml\nvalidation: paranoid\n```\n")
 
     def test_unknown_value_rejected_with_allowed_set(self):
