@@ -212,9 +212,11 @@ class TestResolutionParser:
         sidecar = pending.with_name(f".{pending.name}.resolved-emitted")
         assert not sidecar.exists()
 
-    def test_revised_block_pr3b_treated_as_denied(self, tmp_path):
-        # Operator authored ### Revised by op — PR 3b doesn't support
-        # REVISE yet. Resolved with denied enforcement, doctor warning.
+    def test_revised_block_without_amendment_invalid(self, tmp_path):
+        # PR 3c: Revised block with no embedded ``amendment:`` YAML
+        # block is operator_revise_invalid_amendment — the sidecar IS
+        # claimed (operator's intent recorded), but enforcement
+        # promotes to the invalid value so no execution happens.
         proposal = _make_proposal()
         pending = _write_pending(tmp_path, proposal)
         _append_resolution_and_resolve(
@@ -224,10 +226,38 @@ class TestResolutionParser:
             agent_root=tmp_path, judges_config_escalation=EscalationConfig()
         )
         assert len(events) == 1
-        # Decision is REVISED_DEFERRED but enforcement maps to denied
-        # so the action does NOT execute against an unvalidated amendment.
-        assert events[0].decision is _esc.ResolutionDecision.REVISED_DEFERRED
-        assert events[0].enforcement_action == "denied"
+        assert events[0].decision is _esc.ResolutionDecision.OPERATOR_REVISED
+        assert events[0].enforcement_action == "operator_revise_invalid_amendment"
+        assert events[0].amendment is None
+
+    def test_revised_block_with_amendment_parses(self, tmp_path):
+        # PR 3c happy path: operator authored ### Revised by op with an
+        # embedded amendment YAML. The framework parses the amendment
+        # into a ProposalAmendment dataclass and the agent executes
+        # the revised action via _process_operator_revise.
+        proposal = _make_proposal()
+        pending = _write_pending(tmp_path, proposal)
+        _append_resolution_and_resolve(
+            pending,
+            "### Revised by alice\n"
+            "resolved_at: 2026-05-13T12:06:00+00:00\n"
+            "note: stripping attachment per policy\n"
+            "amendment:\n"
+            "  ```yaml\n"
+            "  judge_note: operator stripped attachment\n"
+            "  tool_arguments:\n"
+            "    to: x@y\n"
+            "    body: hi\n"
+            "  ```\n",
+        )
+        events = _esc.poll_resolutions(
+            agent_root=tmp_path, judges_config_escalation=EscalationConfig()
+        )
+        assert len(events) == 1
+        assert events[0].decision is _esc.ResolutionDecision.OPERATOR_REVISED
+        assert events[0].enforcement_action == "operator_revise_executed"
+        assert events[0].amendment is not None
+        assert events[0].amendment.tool_arguments == {"to": "x@y", "body": "hi"}
 
 
 class TestBodyIntegrity:
