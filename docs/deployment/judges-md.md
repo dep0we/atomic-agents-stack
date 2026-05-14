@@ -21,8 +21,10 @@ parser.
 > with embedded `amendment:` YAML + class-upgrade re-judge gate), and
 > a 38-test conformance suite parametrized over both shipped backends.
 > PR 5a ships the per-class `fallback_on_timeout` map (see
-> [`escalation`](#escalation) below). Full JSON-Schema validation of
-> amended args via an opt-in `[validation]` extra ships in PR 5b.
+> [`escalation`](#escalation) below). PR 5b ships full JSON-Schema
+> validation of amended `tool_arguments` via an opt-in `[validation]`
+> extra and a new `validation:` field — see
+> [Validation](#validation) below.
 
 ---
 
@@ -754,6 +756,55 @@ strictness (as `class_policy` does) or by inheriting unset escalation
 sections from the floor is tracked at
 [#173](https://github.com/dep0we/atomic-agents-stack/issues/173).
 
+### Validation
+
+The `validation:` top-level field controls how amended `tool_arguments` get validated on REVISE before the framework executes the bound action.
+
+```yaml
+validation: strict   # "weakened" (default) | "strict". Default: weakened.
+```
+
+`weakened` (the default) matches pre-PR-5b behavior: tool registered + dict-shaped args + canonical `arguments_hash` recompute. A one-shot per-agent log warning fires the first time amendment validation runs, pointing at the upgrade path.
+
+`strict` adds `jsonschema.validate(args, registered.input_schema)` after the weakened checks. Empty or missing schemas are no-ops (no constraint). Errors are surfaced with field-path detail so operators reading the audit trail know exactly which key failed.
+
+**Install order.** The `[validation]` extra must be installed BEFORE setting `validation: strict` in `judges.md`. The parser probes `import jsonschema` at agent-load when strict is configured and fails LOUD with `JudgePolicyInvalid` if the package is not importable. Install:
+
+```bash
+pip install 'atomic-agents-stack[validation]'
+# or for uv-managed projects:
+uv sync --extra validation
+```
+
+Then flip the config:
+
+```yaml
+# judges.md
+validation: strict
+
+class_policy:
+  external_side_effect: judge_required
+  high_risk: escalate
+```
+
+**Why an explicit gate (and not transitive import availability).** Operators commonly pull `jsonschema` in via unrelated dependencies (FastAPI, openapi-core, jsonschema-rs adapters). If strict validation activated whenever `jsonschema` happened to be importable, those operators would see validation change behavior on a `pip install` of an unrelated library. The `validation: strict` opt-in is the explicit operator intent — the framework respects it and only it.
+
+**Exception taxonomy under strict mode.** Different shapes of failure map to different exception types so `failure_policy` can route them differently:
+
+| What broke                                  | Re-raised as                       |
+|---------------------------------------------|------------------------------------|
+| Amendment doesn't match the schema          | `JudgeAmendedProposalRejected`     |
+| Tool's own schema is malformed (operator authoring bug, broken `$ref`) | `JudgePolicyInvalid`               |
+| Runtime jsonschema API surprise             | `JudgeAmendedProposalRejected`     |
+
+Configure `failure_policy[JudgePolicyInvalid]` (default `block`) to control what happens when a registered tool ships with a broken schema.
+
+**Cascade-floor strictness.** A delegate's `judges.md` may strengthen `validation` (e.g., floor=`weakened`, delegate=`strict`) but cannot relax it. Relax attempts raise `JudgePolicyInvalid` at agent-load. A delegate that omits the field inherits the floor's value without tripping a false-positive relax violation.
+
+**Reserved namespaces.** `validation: audit` (validate + JSONL warn without BLOCK; tracked at [#176](https://github.com/dep0we/atomic-agents-stack/issues/176)) and `validation: paranoid` ([#178](https://github.com/dep0we/atomic-agents-stack/issues/178)) are reserved but not yet implemented. The parser rejects both with "not yet implemented" messages pointing at the tracking issue, distinct from a generic operator-typo rejection.
+
+**Migration aid.** Operators flipping `validation: strict` on a production agent may discover that amendments which previously passed weakened validation now BLOCK. Before the flip, audit your registered tools' `input_schema` values — the `check_tool_schemas_for_amendment_validation` doctor check (tracked at [#175](https://github.com/dep0we/atomic-agents-stack/issues/175)) will surface tools whose schemas are missing or trivially permissive.
+
 ### `judge_captures`, `read_audit_mode`
 
 ```yaml
@@ -810,6 +861,9 @@ message for any of:
 - Non-numeric or negative budget caps.
 - File that isn't valid UTF-8.
 - Delegate's class policy that relaxes a project floor.
+- `validation` values outside `{weakened, strict}` (see [Validation](#validation)). `audit` and `paranoid` are reserved namespaces and produce distinct "not yet implemented" rejections pointing at their tracking issues; any other unknown value produces the generic "must be one of" rejection.
+- `validation: strict` set in `judges.md` while the `[validation]` extra is not installed — the parser probes `import jsonschema` at agent-load time.
+- Delegate's `validation` value that relaxes a project floor's `validation` (e.g., floor=`strict`, delegate=`weakened`).
 
 The discipline: operator typos surface at agent-load, not at the first
 side-effectful tool call. A `judges.md` that loads cleanly is a
