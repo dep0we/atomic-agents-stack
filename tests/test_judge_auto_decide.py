@@ -447,3 +447,46 @@ class TestPerClassFallbackOnTimeout:
         # The recovery parser still maps Auto-decided + fallback=allow
         # → AUTO_DECIDED_ALLOW.
         assert events[0].decision is _esc.ResolutionDecision.AUTO_DECIDED_ALLOW
+
+
+class TestFallbackMapInvariant:
+    """Pin the ``assert "default" in fallback_map`` guard in
+    ``_apply_auto_decide``. Normally unreachable through the parser
+    (which enforces the ``"default"`` key) but a caller that
+    programmatically constructs an ``EscalationConfig`` with a bad dict
+    would hit it — and without this test, a future refactor could
+    accidentally move the assert into the swallowing ``except Exception``
+    in ``poll_resolutions``, making the invariant violation invisible.
+    Calling ``_apply_auto_decide`` directly keeps the path exercised.
+    """
+
+    def test_fallback_map_missing_default_raises_assertion(self, tmp_path):
+        import hashlib
+        from datetime import datetime, timezone
+
+        # Build a minimal PENDING file so _apply_auto_decide can read it.
+        proposal = _make_proposal(proposal_id="proposal_assert_test")
+        pending = _write_pending(tmp_path, proposal)
+        # Back-date so the timeout would normally apply.
+        _backdate_escalated_at(pending, seconds_ago=9999)
+        text = pending.read_text(encoding="utf-8")
+        pre_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        fm_dict, body = _esc._split_frontmatter(text)
+        fm = _esc._frontmatter_from_dict(fm_dict)
+        now_dt = datetime.now(tz=timezone.utc)
+
+        # A fallback_map WITHOUT the required "default" key must raise
+        # AssertionError at policy-application time, not fail silently.
+        bad_map: dict = {"high_risk": "block"}  # missing "default"
+        with pytest.raises(AssertionError, match="default"):
+            _esc._apply_auto_decide(
+                pending_path=pending,
+                pre_sha=pre_sha,
+                fm=fm,
+                text=text,
+                body=body,
+                timeout_seconds=60,
+                fallback_map=bad_map,
+                now_dt=now_dt,
+                log_warning=None,
+            )

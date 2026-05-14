@@ -502,6 +502,77 @@ class TestPerClassFallbackOnTimeout:
         with pytest.raises(JudgePolicyInvalid, match="must be a string"):
             parse_judges_md_text(text)
 
+    def test_dict_shape_non_string_key_raises(self):
+        # PR 5a gap: the ``if not isinstance(key, str)`` branch in
+        # ``_parse_fallback_on_timeout``. YAML always coerces mapping
+        # keys to strings, so this branch is unreachable through
+        # ``parse_judges_md_text``. Call the internal function directly
+        # to pin it — protects against future callers (programmatic
+        # construction, JSON5 parsers) that hand raw dicts to the function.
+        from atomic_agents.judges_md import _parse_fallback_on_timeout
+
+        with pytest.raises(JudgePolicyInvalid, match="keys must be strings"):
+            _parse_fallback_on_timeout({42: "block", "default": "block"})
+
+    def test_legacy_string_allow_normalizes_correctly(self):
+        # ``"allow"`` is a valid legacy string outcome. Only ``"block"`` was
+        # tested in the existing suite; pin all other valid outcomes too
+        # (this test covers ``allow``; ``revise`` and ``escalate`` are covered
+        # in ``test_all_valid_legacy_string_outcomes`` below).
+        text = (
+            "```yaml\n"
+            "escalation:\n"
+            "  fallback_on_timeout: allow\n"
+            "```\n"
+        )
+        cfg = parse_judges_md_text(text)
+        assert cfg.escalation.fallback_on_timeout == {"default": "allow"}
+
+    def test_all_valid_legacy_string_outcomes(self):
+        # Every JudgmentOutcome value must be accepted as a legacy string.
+        # Exercises all four branches of the ``normalized in _VALID_OUTCOMES``
+        # check — ``"block"`` was already pinned; this pins ``"revise"``
+        # and ``"escalate"`` which are less obvious but valid operator
+        # choices (e.g. "escalate timeout → escalate again" is unusual but
+        # spec-legal).
+        for outcome in ("allow", "block", "revise", "escalate"):
+            text = (
+                "```yaml\n"
+                "escalation:\n"
+                f"  fallback_on_timeout: {outcome}\n"
+                "```\n"
+            )
+            cfg = parse_judges_md_text(text)
+            assert cfg.escalation.fallback_on_timeout == {"default": outcome}, (
+                f"Expected {{'default': {outcome!r}}} for outcome={outcome!r}"
+            )
+
+    def test_dict_shape_all_four_action_classes_as_keys(self):
+        # All four ActionClass values are valid per-class keys in the dict
+        # shape. ``test_dict_shape_with_explicit_default`` only exercised
+        # ``high_risk`` + ``reversible_write``. Pin ``read_only`` +
+        # ``external_side_effect`` too so a future ActionClass rename
+        # regresses loud here.
+        text = (
+            "```yaml\n"
+            "escalation:\n"
+            "  fallback_on_timeout:\n"
+            "    default: block\n"
+            "    read_only: allow\n"
+            "    reversible_write: block\n"
+            "    external_side_effect: escalate\n"
+            "    high_risk: block\n"
+            "```\n"
+        )
+        cfg = parse_judges_md_text(text)
+        assert cfg.escalation.fallback_on_timeout == {
+            "default": "block",
+            "read_only": "allow",
+            "reversible_write": "block",
+            "external_side_effect": "escalate",
+            "high_risk": "block",
+        }
+
 
 # ──────────────────────────────────────────────────────────────────
 # Project-floor strictness (Codex round-1 P1 #2)
