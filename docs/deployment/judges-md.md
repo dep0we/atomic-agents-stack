@@ -286,7 +286,7 @@ Only these names are valid in `failure_policy`. Typos raise
 | Exception                       | Raised when…                                                              |
 |---------------------------------|---------------------------------------------------------------------------|
 | `JudgeUnavailable`              | Backend cannot respond (timeout, network, provider outage).               |
-| `JudgePolicyInvalid`            | `judges.md` or `tools.md` cannot be parsed at agent-load time.            |
+| `JudgePolicyInvalid`            | `judges.md` or `tools.md` cannot be parsed at agent-load time. Also raised at REVISE time under `validation: strict` when a registered tool's `input_schema` is malformed or has broken `$ref`s. |
 | `JudgeBudgetExhausted`          | Judge cost cap hit (separate ledger from actor budget).                    |
 | `JudgeProposalInvalid`          | Proposal missing required fields for its class.                            |
 | `JudgeAmendedProposalRejected`  | REVISE's amended proposal failed re-validation.                            |

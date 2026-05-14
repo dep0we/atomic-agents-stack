@@ -304,8 +304,18 @@ def _run_strict_jsonschema_validation(
     """
     registered = tool_registry.get(amended.tool_name)
     # Empty / None schema → no constraint, no validation work.
+    #
+    # Be precise about what counts as "no schema": ``None`` and ``{}``
+    # both mean "the tool doesn't declare a schema." Per /ship Step 11
+    # adversarial review (PR 5b), ``not schema`` truthiness would ALSO
+    # short-circuit on ``False`` (a legitimate JSON-Schema construct
+    # meaning "reject all instances") and ``[]`` (malformed shape that
+    # SHOULD trigger ``SchemaError → JudgePolicyInvalid``). Use
+    # explicit identity / equality checks so those cases reach
+    # ``jsonschema.validate`` and route through the correct exception
+    # branch below.
     schema = registered.input_schema if registered is not None else None
-    if not schema:
+    if schema is None or schema == {}:
         return
 
     try:

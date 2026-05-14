@@ -617,7 +617,25 @@ class AtomicAgent:
         )
 
         for event in events:
-            self._process_resolution_event(event)
+            # /ship Step 11 adversarial P1 (PR 5b): exception isolation
+            # per-event. Pre-fix, one event raising an uncaught
+            # exception (OSError, KeyError on malformed frontmatter,
+            # JudgeError class the per-path handlers don't yet catch)
+            # silently swallowed every subsequent event in the same
+            # poll cycle. PR 5b's strict-mode validation widens the
+            # raise surface (JudgePolicyInvalid in particular), making
+            # the poison-pill failure mode load-bearing to fix here.
+            try:
+                self._process_resolution_event(event)
+            except Exception as exc:  # noqa: BLE001
+                _logger.exception(
+                    "agent %r: resolution event for proposal_id=%r "
+                    "raised %s; continuing to next event",
+                    self.name,
+                    getattr(event.frontmatter, "proposal_id", "<unknown>"),
+                    type(exc).__name__,
+                )
+                continue
         return events
 
     def _process_resolution_event(self, event) -> None:
@@ -1485,6 +1503,15 @@ class AtomicAgent:
                         judgment=synth_judgment,
                         enforcement_action="revise_invalid_amendment",
                         binding=binding,
+                        # /ship Step 11 adversarial P2: BLOCK/ALLOW
+                        # branches need the same synthesis_source +
+                        # triggered_by labels the ESCALATE branch
+                        # above already set, so audit consumers
+                        # filtering by these structured fields don't
+                        # miss failure_policy-synthesized
+                        # block/allow events.
+                        synthesis_source="failure_policy",
+                        triggered_by="failure_policy:JudgePolicyInvalid",
                     )
                     event["original_proposal_id"] = (
                         original_proposal.proposal_id
@@ -1494,14 +1521,22 @@ class AtomicAgent:
                     event["revise_iteration"] = revise_iteration
                     events.append(event)
                     if outcome == JudgmentOutcome.ALLOW:
-                        # Honor failure_policy=allow: the amended
-                        # action is NOT executed (the amendment failed
-                        # validation), but the audit records the
-                        # operator's stated tolerance. No final_allow
-                        # promotion — the amendment never executes;
-                        # the original action is also blocked because
-                        # the judge wanted REVISE in the first place.
-                        final_allow = False
+                        # /ship Step 11 adversarial P1: honor
+                        # failure_policy[JudgePolicyInvalid]=allow as
+                        # "tolerate the failure" — execute the
+                        # ORIGINAL pre-amendment action, mirroring
+                        # the JudgeUnavailable:allow / JudgeBudget
+                        # Exhausted:allow shape elsewhere. The judge
+                        # wanted REVISE because it thought the
+                        # original was risky; the operator explicitly
+                        # opted into "tolerate the failure" via the
+                        # ``allow`` policy. The amendment can't run
+                        # (it failed validation), so the original is
+                        # the only meaningful "let it through"
+                        # interpretation. Pre-fix this silently set
+                        # final_allow=False — audit said ALLOW while
+                        # the action was actually blocked.
+                        final_allow = True
                     else:
                         final_allow = False
                     break

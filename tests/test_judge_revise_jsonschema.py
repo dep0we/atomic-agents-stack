@@ -205,6 +205,58 @@ class TestStrictPolicyInvalid:
             )
 
 
+class TestStrictSchemaShapeEdgeCases:
+    """/ship Step 11 adversarial P2: the strict-mode short-circuit
+    must distinguish "no schema" (None or {}) from special-but-valid
+    JSON-Schema shapes that the parser previously swallowed via
+    truthy-falsy comparison.
+    """
+
+    def test_false_schema_rejects_every_amendment(self):
+        # JSON-Schema spec: a schema value of ``False`` means "reject
+        # all instances." Strict mode must surface this as a per-
+        # amendment rejection (ValidationError → JudgeAmendedProposal
+        # Rejected), NOT silently treat it as "no schema, skip".
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="send_email",
+                description="forbidden tool",
+                input_schema=False,
+                handler=lambda i: None,
+                classification="external_side_effect",
+            )
+        )
+        amended = _make_proposal(tool_arguments={"to": "x@y", "body": "hi"})
+        with pytest.raises(JudgeAmendedProposalRejected):
+            _revise.validate_amended_args(
+                amended, registry,
+                agent_name="t", validation_mode="strict",
+            )
+
+    def test_list_schema_treated_as_policy_invalid(self):
+        # ``[]`` is not a valid JSON-Schema; jsonschema.validate raises
+        # SchemaError. Strict mode must route this through
+        # JudgePolicyInvalid (operator authoring bug — the schema
+        # itself is malformed), NOT silently bypass via truthy-falsy.
+        registry = ToolRegistry()
+        registry.register(
+            ToolDefinition(
+                name="send_email",
+                description="malformed",
+                input_schema=[],
+                handler=lambda i: None,
+                classification="external_side_effect",
+            )
+        )
+        amended = _make_proposal(tool_arguments={"to": "x@y", "body": "hi"})
+        with pytest.raises(JudgePolicyInvalid, match="malformed"):
+            _revise.validate_amended_args(
+                amended, registry,
+                agent_name="t", validation_mode="strict",
+            )
+
+
 class TestStrictDefensiveBranches:
     """/ship Step 9.1 specialist coverage gap-fills: the three
     defensive except branches in ``_run_strict_jsonschema_validation``
