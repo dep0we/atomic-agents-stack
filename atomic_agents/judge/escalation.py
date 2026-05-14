@@ -360,7 +360,7 @@ def poll_resolutions(
 
     now_dt = (now or _now_dt)()
     timeout_seconds = judges_config_escalation.auto_decide_after_seconds
-    fallback = judges_config_escalation.fallback_on_timeout
+    fallback_map = judges_config_escalation.fallback_on_timeout
 
     events: list[ResolutionEvent] = []
     for class_dir in sorted(root.iterdir()):
@@ -372,7 +372,7 @@ def poll_resolutions(
                     pending_path=pending_path,
                     now_dt=now_dt,
                     timeout_seconds=timeout_seconds,
-                    fallback=fallback,
+                    fallback_map=fallback_map,
                     log_warning=log_warning,
                 )
             except Exception as exc:
@@ -395,7 +395,7 @@ def _process_pending_file(
     pending_path: Path,
     now_dt: datetime,
     timeout_seconds: int | None,
-    fallback: str,
+    fallback_map: dict[str, str],
     log_warning: Callable[[str], None] | None,
 ) -> ResolutionEvent | None:
     """Process one PENDING file. Returns a ResolutionEvent if a state
@@ -450,7 +450,11 @@ def _process_pending_file(
             escalated_dt = escalated_dt.replace(tzinfo=timezone.utc)
         if (now_dt - escalated_dt).total_seconds() < timeout_seconds:
             return None
-        # Past timeout: apply fallback via CAS write.
+        # Past timeout: apply fallback via CAS write. Per-class
+        # resolution keys on the PENDING file's frontmatter
+        # ``action_class`` (the authoritative classification recorded
+        # at write time) — not on the on-disk directory name, which
+        # is just a filesystem layout artifact an operator could typo.
         return _apply_auto_decide(
             pending_path=pending_path,
             pre_sha=pre_sha,
@@ -458,7 +462,7 @@ def _process_pending_file(
             text=text,
             body=body,
             timeout_seconds=timeout_seconds,
-            fallback=fallback,
+            fallback_map=fallback_map,
             now_dt=now_dt,
             log_warning=log_warning,
         )
@@ -489,7 +493,7 @@ def _apply_auto_decide(
     text: str,
     body: str,
     timeout_seconds: int,
-    fallback: str,
+    fallback_map: dict[str, str],
     now_dt: datetime,
     log_warning: Callable[[str], None] | None,
 ) -> ResolutionEvent | None:
@@ -499,7 +503,26 @@ def _apply_auto_decide(
     changed since ``pre_sha``, an operator beat us — abort + retry on
     the next poll cycle. The auto-decide is idempotent (timeout has
     still passed) so re-attempt is safe.
+
+    Per-class resolution: ``fallback_map`` is the full
+    ``EscalationConfig.fallback_on_timeout`` dict (always carries a
+    ``"default"`` key after parser normalization). The auto-decide
+    looks up the policy for this proposal's class via
+    ``fm.action_class`` — the frontmatter is the authoritative source.
+    Falls back to the dict's ``"default"`` for any class the operator
+    didn't list explicitly.
     """
+    # Invariant: every ``EscalationConfig.fallback_on_timeout`` value
+    # comes from ``_parse_fallback_on_timeout`` (which enforces ``default``)
+    # or the dataclass default_factory (which seeds ``{"default": "block"}``).
+    # Assert loud here so violations fail at policy-application — not
+    # silently get swallowed by the outer ``except Exception`` in
+    # ``poll_resolutions`` and wedge the file every poll cycle.
+    assert "default" in fallback_map, (
+        "EscalationConfig.fallback_on_timeout must contain a 'default' key; "
+        "construct via _parse_fallback_on_timeout or the dataclass default."
+    )
+    fallback = fallback_map.get(fm.action_class, fallback_map["default"])
     sidecar_path = _sidecar_path(pending_path)
     # Re-snapshot to detect operator-edit race.
     current_bytes = pending_path.read_bytes()
@@ -521,7 +544,8 @@ def _apply_auto_decide(
         f"### {decision_verb} by framework\n"
         f"resolved_at: {resolved_at}\n"
         f"reason: auto_decide_after_seconds={timeout_seconds} elapsed; "
-        f"fallback_on_timeout={fallback}\n"
+        f"fallback_on_timeout={fallback} "
+        f"(resolved for action_class={fm.action_class})\n"
     )
     # Resolution section already exists in the body; append the block.
     new_text = _flip_state_and_append_resolution(text, "resolved", block)
@@ -568,7 +592,8 @@ def _apply_auto_decide(
         operator="framework",
         resolved_at=resolved_at,
         reason=f"auto_decide_after_seconds={timeout_seconds} elapsed; "
-        f"fallback_on_timeout={fallback}",
+        f"fallback_on_timeout={fallback} "
+        f"(resolved for action_class={fm.action_class})",
         enforcement_action=_DECISION_TO_ENFORCEMENT[decision],
     )
 

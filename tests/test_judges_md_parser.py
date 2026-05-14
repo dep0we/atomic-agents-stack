@@ -113,7 +113,8 @@ class TestHappyPaths:
         assert cfg.class_policy.high_risk == ClassPolicyValue.ESCALATE
         assert cfg.escalation.destination == "vault"
         assert cfg.escalation.auto_decide_after_seconds == 86400
-        assert cfg.escalation.fallback_on_timeout == "block"
+        # PR 5a: legacy string normalizes to {"default": "block"}.
+        assert cfg.escalation.fallback_on_timeout == {"default": "block"}
         assert cfg.judge_captures is True
         assert cfg.specialist_axes == ["security", "mandate_check"]
 
@@ -357,6 +358,148 @@ class TestMalformationPaths:
             "```\n"
         )
         with pytest.raises(JudgePolicyInvalid, match="must be strings"):
+            parse_judges_md_text(text)
+
+
+# ──────────────────────────────────────────────────────────────────
+# Per-class fallback_on_timeout (PR 5a of #112)
+
+
+class TestPerClassFallbackOnTimeout:
+    """``escalation.fallback_on_timeout`` accepts a legacy string OR a
+    per-class dict. The dict form requires an explicit ``default`` key —
+    there is no implicit fall-through. Per-class keys must be valid
+    ``ActionClass.value`` strings; values must be valid outcomes.
+    """
+
+    def test_legacy_string_normalizes_to_default_dict(self):
+        text = (
+            "```yaml\n"
+            "escalation:\n"
+            "  fallback_on_timeout: block\n"
+            "```\n"
+        )
+        cfg = parse_judges_md_text(text)
+        assert cfg.escalation.fallback_on_timeout == {"default": "block"}
+
+    def test_legacy_string_uppercase_normalized(self):
+        # Backward-compat with the pre-PR-5a parser's case-insensitive
+        # behavior. Value is lowercased on the way in.
+        text = (
+            "```yaml\n"
+            "escalation:\n"
+            "  fallback_on_timeout: BLOCK\n"
+            "```\n"
+        )
+        cfg = parse_judges_md_text(text)
+        assert cfg.escalation.fallback_on_timeout == {"default": "block"}
+
+    def test_dict_shape_with_explicit_default(self):
+        text = (
+            "```yaml\n"
+            "escalation:\n"
+            "  fallback_on_timeout:\n"
+            "    default: block\n"
+            "    high_risk: block\n"
+            "    reversible_write: allow\n"
+            "```\n"
+        )
+        cfg = parse_judges_md_text(text)
+        assert cfg.escalation.fallback_on_timeout == {
+            "default": "block",
+            "high_risk": "block",
+            "reversible_write": "allow",
+        }
+
+    def test_dict_shape_default_only_equivalent_to_legacy_string(self):
+        # Operators who want every class to share a policy may still
+        # spell the dict form explicitly — the parser doesn't collapse
+        # it back to a string; both shapes produce the canonical dict.
+        text = (
+            "```yaml\n"
+            "escalation:\n"
+            "  fallback_on_timeout:\n"
+            "    default: block\n"
+            "```\n"
+        )
+        cfg = parse_judges_md_text(text)
+        assert cfg.escalation.fallback_on_timeout == {"default": "block"}
+
+    def test_dict_shape_missing_default_raises(self):
+        # P1 finding from PR 5a plan review (§3 of plan review):
+        # ``default`` is mandatory in the dict form. No implicit
+        # fall-through to "block" — operators always opt into a
+        # default explicitly.
+        text = (
+            "```yaml\n"
+            "escalation:\n"
+            "  fallback_on_timeout:\n"
+            "    high_risk: escalate\n"
+            "    reversible_write: allow\n"
+            "```\n"
+        )
+        with pytest.raises(JudgePolicyInvalid, match="missing required ``default:``"):
+            parse_judges_md_text(text)
+
+    def test_dict_shape_unknown_class_key_raises(self):
+        # P0 finding from PR 5a plan review (§2): operator typo on
+        # a class name fails LOUD at parse time rather than silently
+        # falling through to default at auto-decide time. Names the
+        # offending key.
+        text = (
+            "```yaml\n"
+            "escalation:\n"
+            "  fallback_on_timeout:\n"
+            "    default: block\n"
+            "    high_risc: escalate\n"  # operator typo
+            "```\n"
+        )
+        with pytest.raises(JudgePolicyInvalid, match="high_risc.*not a recognised ActionClass"):
+            parse_judges_md_text(text)
+
+    def test_dict_shape_invalid_outcome_raises(self):
+        text = (
+            "```yaml\n"
+            "escalation:\n"
+            "  fallback_on_timeout:\n"
+            "    default: block\n"
+            "    high_risk: not_a_real_outcome\n"
+            "```\n"
+        )
+        with pytest.raises(JudgePolicyInvalid, match="high_risk.*not a valid outcome"):
+            parse_judges_md_text(text)
+
+    def test_dict_shape_invalid_default_outcome_raises(self):
+        text = (
+            "```yaml\n"
+            "escalation:\n"
+            "  fallback_on_timeout:\n"
+            "    default: nonsense\n"
+            "```\n"
+        )
+        with pytest.raises(JudgePolicyInvalid, match="default.*not a valid outcome"):
+            parse_judges_md_text(text)
+
+    def test_non_string_non_dict_raises(self):
+        text = (
+            "```yaml\n"
+            "escalation:\n"
+            "  fallback_on_timeout: 42\n"
+            "```\n"
+        )
+        with pytest.raises(JudgePolicyInvalid, match="must be a string or a mapping"):
+            parse_judges_md_text(text)
+
+    def test_dict_shape_non_string_value_raises(self):
+        text = (
+            "```yaml\n"
+            "escalation:\n"
+            "  fallback_on_timeout:\n"
+            "    default: block\n"
+            "    high_risk: true\n"  # YAML bool, not a string
+            "```\n"
+        )
+        with pytest.raises(JudgePolicyInvalid, match="must be a string"):
             parse_judges_md_text(text)
 
 

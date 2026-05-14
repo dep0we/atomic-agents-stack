@@ -42,6 +42,7 @@ from typing import Any
 import yaml
 
 from .exceptions import JudgePolicyInvalid
+from .judge.backend import JudgmentOutcome
 from .judge.types import (
     ActionClass,
     BudgetConfig,
@@ -339,6 +340,15 @@ def apply_project_floor(
         budget=own.budget,  # delegate's budget takes precedence
         class_policy=new_class_policy,
         failure_policy=_merge_failure_policy(own.failure_policy, floor.failure_policy),
+        # Cascade-floor scope (spec/28:408): class_policy is the
+        # non-relaxable floor. ``escalation.fallback_on_timeout`` is NOT
+        # floor-protected today — a delegate's ``judges.md`` may set its
+        # own per-class fallback shape, which silently overrides the
+        # project floor's. Pre-PR-5a this gap was acceptable because
+        # ``fallback_on_timeout`` was a single string (operator-level
+        # "do something safe on timeout"), but PR 5a made the field
+        # per-class-configurable and therefore security-relevant.
+        # Tracked: https://github.com/dep0we/atomic-agents-stack/issues/173
         escalation=own.escalation,
         judge_captures=own.judge_captures or floor.judge_captures,
         read_audit_mode=own.read_audit_mode or floor.read_audit_mode,
@@ -621,6 +631,91 @@ def _parse_failure_policy(raw: Any) -> dict[ActionClass, dict[str, str]]:
     return out
 
 
+# Derived from JudgmentOutcome rather than hardcoded so the spec/28
+# four-outcome model stays the single source of truth — if a fifth
+# outcome ever ships, this parser auto-extends.
+_VALID_OUTCOMES: tuple[str, ...] = tuple(o.value for o in JudgmentOutcome)
+
+
+def _parse_fallback_on_timeout(raw: Any) -> dict[str, str]:
+    """Parse the ``escalation.fallback_on_timeout`` field.
+
+    Accepts two shapes, both normalize to a ``dict[str, str]`` keyed by
+    ``ActionClass.value`` strings with a mandatory ``"default"`` key:
+
+    1. **Legacy string** (PR 3a shape — still accepted):
+       ``fallback_on_timeout: block`` → ``{"default": "block"}``.
+    2. **Per-class mapping** (PR 5a of #112):
+
+           fallback_on_timeout:
+             default: block
+             high_risk: block
+             reversible_write: allow
+
+       ``default`` is REQUIRED in the dict form — there is no implicit
+       fall-through. Operators who want every class to share a policy
+       use the legacy string shape; operators who want differentiated
+       policies use the dict shape with an explicit ``default``.
+
+    Per-class keys must be one of the four ``ActionClass.value`` strings.
+    Values must be one of ``{allow, block, revise, escalate}``. Any
+    violation raises ``JudgePolicyInvalid`` naming the offending key
+    or value — fail loud at parse time, never silently downgrade.
+    """
+    if isinstance(raw, str):
+        normalized = raw.lower().strip()
+        if normalized not in _VALID_OUTCOMES:
+            raise JudgePolicyInvalid(
+                f"judges.md ``escalation.fallback_on_timeout`` is not a "
+                f"valid outcome: {normalized!r}. Allowed: "
+                f"{list(_VALID_OUTCOMES)}"
+            )
+        return {"default": normalized}
+
+    if not isinstance(raw, dict):
+        raise JudgePolicyInvalid(
+            f"judges.md ``escalation.fallback_on_timeout`` must be a "
+            f"string or a mapping; got {type(raw).__name__}"
+        )
+
+    if "default" not in raw:
+        raise JudgePolicyInvalid(
+            "judges.md ``escalation.fallback_on_timeout`` mapping is "
+            "missing required ``default:`` key. Either spell out a "
+            "default outcome (e.g. ``default: block``) or use the "
+            "legacy string shape (``fallback_on_timeout: block``)."
+        )
+
+    allowed_keys = {"default"} | {c.value for c in ActionClass}
+    parsed: dict[str, str] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str):
+            raise JudgePolicyInvalid(
+                f"judges.md ``escalation.fallback_on_timeout`` keys "
+                f"must be strings; got {type(key).__name__}={key!r}"
+            )
+        if key not in allowed_keys:
+            raise JudgePolicyInvalid(
+                f"judges.md ``escalation.fallback_on_timeout`` key "
+                f"{key!r} is not a recognised ActionClass. Allowed: "
+                f"{sorted(allowed_keys)}"
+            )
+        if not isinstance(value, str):
+            raise JudgePolicyInvalid(
+                f"judges.md ``escalation.fallback_on_timeout[{key!r}]`` "
+                f"must be a string; got {type(value).__name__}"
+            )
+        normalized_value = value.lower().strip()
+        if normalized_value not in _VALID_OUTCOMES:
+            raise JudgePolicyInvalid(
+                f"judges.md ``escalation.fallback_on_timeout[{key!r}]`` "
+                f"is not a valid outcome: {normalized_value!r}. "
+                f"Allowed: {list(_VALID_OUTCOMES)}"
+            )
+        parsed[key] = normalized_value
+    return parsed
+
+
 def _parse_escalation(raw: Any) -> EscalationConfig:
     if raw is None:
         return EscalationConfig()
@@ -639,18 +734,7 @@ def _parse_escalation(raw: Any) -> EscalationConfig:
             auto_decide, default=0, field_label="escalation.auto_decide_after_seconds"
         )
     fallback_raw = raw.get("fallback_on_timeout", "block")
-    if not isinstance(fallback_raw, str):
-        raise JudgePolicyInvalid(
-            f"judges.md ``escalation.fallback_on_timeout`` must be a "
-            f"string; got {type(fallback_raw).__name__}"
-        )
-    fallback = fallback_raw.lower().strip()
-    if fallback not in {"allow", "block", "revise", "escalate"}:
-        raise JudgePolicyInvalid(
-            f"judges.md ``escalation.fallback_on_timeout`` is not a "
-            f"valid outcome: {fallback!r}. Allowed: "
-            f"['allow', 'block', 'revise', 'escalate']"
-        )
+    fallback = _parse_fallback_on_timeout(fallback_raw)
     poll_cycle_raw = raw.get("resolution_poll_cycle_seconds", 60)
     poll_cycle = _coerce_int(
         poll_cycle_raw,

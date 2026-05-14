@@ -195,7 +195,7 @@ def _make_canary_context() -> tuple[JudgmentContext, dict[str, str]]:
         ),
         escalation_config=EscalationConfig(
             destination=canaries["escalation_destination"],
-            fallback_on_timeout=canaries["escalation_fallback"],
+            fallback_on_timeout={"default": canaries["escalation_fallback"]},
         ),
         failure_policy={
             "JudgeUnavailable": canaries["failure_policy_judge_unavailable"],

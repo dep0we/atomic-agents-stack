@@ -394,8 +394,22 @@ class EscalationConfig:
 
     destination: str = "vault/escalations/"
     auto_decide_after_seconds: int | None = None  # None = wait indefinitely
-    fallback_on_timeout: str = "block"  # JudgmentOutcome value string
+    fallback_on_timeout: dict[str, str] = field(
+        default_factory=lambda: {"default": "block"}
+    )
     resolution_poll_cycle_seconds: int = 60
+
+    # ``fallback_on_timeout`` canonical shape (PR 5a of #112): a mapping
+    # keyed by ``ActionClass.value`` strings plus a mandatory ``"default"``
+    # key applied when an action class is not explicitly listed. The
+    # ``judges.md`` parser accepts a legacy YAML string (e.g.
+    # ``fallback_on_timeout: block``) and normalizes it to
+    # ``{"default": "block"}`` at parse time so existing operator configs
+    # continue to work unchanged. The auto-decide path resolves the
+    # per-class policy from the PENDING file's frontmatter
+    # ``action_class`` (NOT the on-disk directory name) so an operator
+    # who hand-creates a typo'd directory still gets the authoritative
+    # classification's timeout policy. See spec/28 §"Escalation queue".
 
 
 @dataclass(frozen=True)
