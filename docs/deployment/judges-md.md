@@ -12,14 +12,17 @@ parser.
 
 > **Status:** The judge layer ships in pieces across `#112` PR 1 → 4.
 > PR 3a shipped the `judges.md` parser, cascade-aware project floor, and
-> per-class policy short-circuits in dispatch. **PR 3b (current) ships
-> the ESCALATE state machine** — PENDING file writes, operator
-> resolution polling, auto-decide timeout, and inline execution of
-> Approved escalations. The full conformance suite and the spec/28
-> lock-in land in PR 4. REVISE (judge-driven amendment + operator
-> `### Revised by <op>`) is deferred to PR 3c — a Revised block in
-> PR 3b is logged as a warning and treated as Denied so the action does
-> not execute against an unvalidated amendment.
+> per-class policy short-circuits in dispatch. PR 3b shipped the
+> ESCALATE state machine — PENDING file writes, operator resolution
+> polling, auto-decide timeout, and inline execution of Approved
+> escalations. **PR 3c (current) ships the REVISE state machine** —
+> both judge-driven (ensemble returns `Judgment(outcome=REVISE,
+> amendment=...)` → framework amends + re-judges, bounded at
+> `max_revise_iterations=1`) and operator-driven (operator writes
+> `### Revised by <op>` with an embedded `amendment:` YAML block → for
+> `high_risk` the framework re-judges via a fresh ensemble; for other
+> classes schema/policy validation alone is sufficient). The full
+> conformance suite and the spec/28 lock-in land in PR 4.
 
 ---
 
@@ -367,11 +370,15 @@ file's `state:` frontmatter field is the authoritative state. Two
 operators editing concurrently are responsible for not stomping each
 other; the framework does not attempt to merge.
 
-**Revised → treated as Denied in PR 3b.** REVISE (operator supplies
-an amended proposal that the framework re-validates and, for
-`high_risk`, re-judges) ships in PR 3c. A `### Revised by <op>` block
-in PR 3b is logged as a warning and treated as Denied so the action
-does not execute against an unvalidated amendment.
+**Revised (PR 3c)** ships the operator-amendment path — see
+[Operator-revise resolution](#operator-revise-resolution) below for the
+full grammar, the embedded `amendment:` YAML block, the class-upgrade
+gate, and what `re_judged` means in the audit trail. PR 3c also ships
+the judge-driven REVISE cycle (an ensemble judge returns
+`Judgment(outcome=REVISE, amendment=ProposalAmendment(...))` and the
+framework recurses against the amended proposal); operators see that
+path as a sequence of `revise_pending_second_judgment` →
+`revise_executed` audit events, no PENDING file written.
 
 ### Block bodies
 
@@ -407,6 +414,125 @@ redaction_reason: PENDING body contained customer PII not appropriate for retent
 `resolved_at` / `redacted_at` is operator-supplied prose; the framework
 also stamps its own `resolved_at` ISO-8601 timestamp on the RESOLVED
 audit event.
+
+### Operator-revise resolution
+
+When the proposal is *directionally right but unsafe as written* —
+strip an attachment, lower a spend limit, swap to a draft-PR variant —
+the operator writes `### Revised by <op>` with an embedded
+`amendment:` YAML block. The framework parses the amendment, applies
+it to the PENDING file's `ActionProposal`, re-validates, gates on the
+**recomputed** class, and executes the amended bound action (re-judging
+first when the amended class is `high_risk`).
+
+#### Block format
+
+```
+### Revised by alice
+resolved_at: 2026-05-13T09:14:22Z
+note: Stripping attachment per security review; the body is the public summary only.
+amendment:
+  ```yaml
+  judge_note: "operator stripped attachment per security review"
+  tool_arguments:
+    to: "stakeholders@example.com"
+    subject: "Q1 summary"
+    body: "Summary follows in-line; attachment removed."
+  ```
+```
+
+The outer block is the markdown resolution block (h3 header, same grammar
+as Approved / Denied / Redacted). The inner ```` ```yaml ```` fence
+under `amendment:` carries the amendment payload. Operators authoring
+in Obsidian or VS Code: indent the YAML under `amendment:` so the
+markdown renderer keeps it visually nested — the parser dedents before
+loading.
+
+#### Amendment fields
+
+The amendment carries **only** judge-amendable fields per spec/28 §"Revise".
+`reason` and `authorization` come from the original proposal and cannot
+be rewritten by an amendment.
+
+| Field                  | Type                                                          | Purpose                                                                                                                          |
+|------------------------|---------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------|
+| `judge_note`           | string (optional — defaults to `"operator amendment"`)         | Free prose explaining the amendment. Flows into the second-judgment context and the audit trail.                                  |
+| `tool_name`            | string (optional — defaults to original)                       | Swap the tool. Triggers framework recomputation of `classification` from `tools.md` / `mcp.md` — see [class-upgrade gate](#class-upgrade-gate-recomputed-classification-not-original) below. |
+| `tool_arguments`       | mapping (optional — defaults to original)                      | Amended args. Must be a dict; non-canonicalizable values (sets, custom classes) raise `JudgeAmendedProposalRejected`.              |
+| `target_audience`      | string (optional)                                              | Override the original's target_audience.                                                                                          |
+| `expected_consequence` | string (optional)                                              | Override the original's expected_consequence.                                                                                     |
+| `reversibility`        | enum: `reversible` \| `partial` \| `irreversible` (optional)   | Override the original's reversibility. Unknown values raise `JudgeAmendedProposalRejected`.                                       |
+| `rollback_path`        | string (optional)                                              | Override the original's rollback_path.                                                                                            |
+| `appended_evidence`    | list of `Evidence` mappings (optional)                          | Appended to the original's evidence list. Each item must be a mapping that constructs an `Evidence` dataclass; malformed → refuse. |
+
+Unknown fields raise `JudgeAmendedProposalRejected` at parse time —
+typos in the amendment surface loud, not silent.
+
+#### Class-upgrade gate (recomputed classification, not original)
+
+When the operator swaps `tool_name`, the framework **recomputes** the
+amended proposal's classification from the new tool. The high-risk
+re-judge gate keys on the **recomputed** class, NOT the PENDING file's
+original `action_class`. This means an operator who phrases an
+amendment as `reversible_write` → `delete_files` (or anything else
+registered at `high_risk`) cannot skip the second-judgment eyes:
+
+- **Amended class == `high_risk`** → fresh ensemble runs against the
+  amended proposal. Only executes on ALLOW. BLOCK refuses; the audit
+  records the re-judge chain plus the refusal. Audit field
+  `re_judged: true`.
+- **Amended class != `high_risk`** → schema/policy validation alone is
+  sufficient (tool registered, args dict-shaped, `arguments_hash`
+  recomputes, write-path enforcement re-runs). Executes on success.
+  Audit field `re_judged: false`.
+
+The `re_judged` field is **framework-set, not operator-supplied**.
+Operators express intent via the amendment; the framework decides
+whether re-judge fires based on the amended classification. Specifying
+`re_judged:` in the block body is ignored (and may be rejected as an
+unknown field in a future PR).
+
+#### Audit shape
+
+Successful operator-revise emits one JSONL line to the agent's run log:
+
+```json
+{
+  "trigger": "escalation_operator_revise_executed",
+  "parent_run_id": "<original actor's run_id>",
+  "escalation_queue_id": "<original proposal_id>",
+  "original_proposal_id": "<original proposal_id>",
+  "amended_proposal_id": "<freshly-minted amended proposal_id>",
+  "tool_name": "<amended tool_name>",
+  "re_judged": true | false,
+  "cost_source": "actor"
+}
+```
+
+When `re_judged: true`, the re-judge ensemble's `JudgmentEvent` lines
+are also emitted (one per invoked judge) with
+`trigger: "escalation_operator_revise_re_judge"` and
+`original_proposal_id` linking back to the actor's original proposal.
+`parent_run_id` on the re-judge events points at the **original
+actor's** `run_id`, not whatever agent.call() happened to fire the poll
+— forensic chains stay walkable from amended back to actor-original.
+
+Invalid amendments (missing YAML block, malformed YAML, unknown
+fields, unknown tool, non-dict `tool_arguments`, args_hash recompute
+failure, write-path violation) emit
+`enforcement_action="operator_revise_invalid_amendment"` and refuse
+execution. The PENDING file is preserved.
+
+#### Validation deferred to PR 4
+
+PR 3c does NOT run full JSON-Schema validation against the amended
+`tool_arguments` (spec/28:274 calls for it; deferred to PR 4 with the
+`jsonschema` dep). The framework checks: (1) `tool_name` resolves to a
+registered handler in the tool_registry, (2) `tool_arguments` is a dict
+(not None, not a list, not a scalar), (3) `arguments_hash` recomputes
+successfully via `canonical_sha256`. The framework emits a one-shot
+warning per agent the first time operator-revise validation runs
+without full JSON-Schema — operators see the gap in agent logs.
 
 ### Auto-decide behavior
 
@@ -458,7 +584,12 @@ run log. The relevant fields:
 - `enforcement_action` distinguishes the exact action the framework
   took: `approved_executed`, `approved_stale_tool_definition`,
   `denied`, `redacted`, `auto_decided_block`, `auto_decided_allow`,
-  `proposal_body_tampered`.
+  `proposal_body_tampered`, `operator_revise_executed`,
+  `operator_revise_invalid_amendment` (PR 3c — operator-revise paths).
+  Judge-driven REVISE in the same ensemble emits
+  `revise_pending_second_judgment` on the first judgment and
+  `revise_executed` / `revise_invalid_amendment` /
+  `revise_loop_exhausted_blocked` on the recursion.
 - `synthesis_source` (only set when the framework — not a real judge
   — produced the ESCALATE) tells you why the PENDING was written:
   `"class_policy"` (operator's `class_policy.<X>=escalate` fired
@@ -472,6 +603,21 @@ run log. The relevant fields:
   exactly which exception drove the escalate.
 - `escalation_queue_id` equals the `proposal_id` — the framework
   does not mint a separate queue ID.
+- `revise_iteration` (PR 3c — judge-driven REVISE only) is `0` on the
+  first judgment, `1` on the second. `max_revise_iterations=1` is
+  bounded by spec/28:276; a second judgment returning REVISE produces
+  `revise_loop_exhausted_blocked`.
+- `original_proposal_id` (PR 3c) links a second-judgment or
+  operator-revise audit event back to the original
+  pre-amendment `proposal_id`. Forensic chains stay walkable from
+  amended back to actor-original. `re_judged: bool` on the executed
+  event reports whether the ensemble re-ran (operator-revise high_risk
+  → true; lower classes → false; judge-driven REVISE second-judgment
+  events → always true).
+- `revised_from_proposal_id` (PR 3c) appears in PENDING-file
+  frontmatter when an ESCALATE fires inside a judge-driven REVISE's
+  second judgment — the new PENDING carries the original `proposal_id`
+  so operators reviewing the queue can chain back.
 - For the original actor's run, the deferred tool_use is recorded
   with `trigger: "tool_call_deferred"` and a synthesized
   `ToolCallResult(deferred=True, error="judge_deferred: ESCALATE — see escalation_queue_id=...")`.
