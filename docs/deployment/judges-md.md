@@ -10,19 +10,18 @@ lives in the canonical spec at [`docs/spec/28-judge-layer.md`](../spec/28-judge-
 this page is the *how-to-author-it* guide that pairs with the shipped
 parser.
 
-> **Status:** The judge layer ships in pieces across `#112` PR 1 → 4.
-> PR 3a shipped the `judges.md` parser, cascade-aware project floor, and
-> per-class policy short-circuits in dispatch. PR 3b shipped the
-> ESCALATE state machine — PENDING file writes, operator resolution
-> polling, auto-decide timeout, and inline execution of Approved
-> escalations. **PR 3c (current) ships the REVISE state machine** —
-> both judge-driven (ensemble returns `Judgment(outcome=REVISE,
-> amendment=...)` → framework amends + re-judges, bounded at
-> `max_revise_iterations=1`) and operator-driven (operator writes
-> `### Revised by <op>` with an embedded `amendment:` YAML block → for
-> `high_risk` the framework re-judges via a fresh ensemble; for other
-> classes schema/policy validation alone is sufficient). The full
-> conformance suite and the spec/28 lock-in land in PR 4.
+> **Status:** The judge layer is **locked** as of `#112` PR 4
+> (2026-05-14). Shipped + locked: Protocol contract, two reference
+> impls (`PolicyJudge` rule engine + `LLMJudgeBackend` LLM-backed),
+> the `judges.md` parser, cascade-aware project floor, ESCALATE state
+> machine (PENDING file writer + operator resolution polling +
+> auto-decide timeout + inline Approved execution), REVISE state
+> machine (judge-driven amendment + second-judgment cycle bounded at
+> `max_revise_iterations=1`, operator `### Revised by <op>` resolution
+> with embedded `amendment:` YAML + class-upgrade re-judge gate), and
+> a 38-test conformance suite parametrized over both shipped backends.
+> Deferred to PR 5: full JSON-Schema validation of amended args (via
+> optional `jsonschema` extra) + per-class `fallback_on_timeout` map.
 
 ---
 

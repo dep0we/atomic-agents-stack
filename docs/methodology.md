@@ -5,9 +5,11 @@ captured at v0.10.0 (2026-05-09). This is not a contributor guide; it is a
 description of practices that have shipped recognisable correctness and
 velocity, written down so they survive the session that produced them.
 
-The shape of the project so far: 3 published tags (v0.1.0 retroactive,
-v0.9.0 retroactive, v0.10.0 cut today), 47 merged PRs, ~720 tests,
-no production rollback events.
+The shape of the project so far: 4 published tags (v0.1.0 retroactive,
+v0.9.0 retroactive, v0.10.0, v0.13.0), ~70 merged PRs, ~1261 tests,
+no production rollback events. Three backend protocols shipped
+(MemoryBackend, LLMBackend, JudgeBackend) with parametrized
+conformance suites.
 
 ---
 
