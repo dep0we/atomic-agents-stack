@@ -328,8 +328,17 @@ note: <free prose>
 
 ### Revised by <operator>
 resolved_at: <ISO-8601>
-re_judged: <true | false — true for high_risk, false otherwise>
-amendment: <ProposalAmendment serialized as fenced ```yaml block>
+amendment:
+  ```yaml
+  judge_note: <operator note explaining the amendment>
+  tool_name: <optional — swap tool>
+  tool_arguments: <optional — amended args dict>
+  target_audience: <optional>
+  expected_consequence: <optional>
+  reversibility: <optional>
+  rollback_path: <optional>
+  appended_evidence: <optional list>
+  ```
 note: <free prose>
 
 ### Redacted by <operator>
@@ -342,6 +351,10 @@ redaction_reason: <free prose>
 The framework writes PENDING; the operator (or an authorized service) writes a resolution block by editing the file. The framework reads files in `vault/escalations/<class>/` once per resolution-poll cycle (configurable; default 60s) and emits RESOLVED events for any file whose `state` field transitioned from `pending` to one of `resolved` / `redacted`.
 
 If two resolution blocks are present, the *first* one (top-down in file order) wins; the file's `state` field is the authoritative state. Operators editing concurrently are responsible for not stomping each other; the framework does not attempt to merge conflicting resolutions. The doctor (`spec/27`) gains `check_escalation_conflicts` to surface files with multiple resolution blocks.
+
+**Operator-revise semantics (PR 3c).** When the operator writes `### Revised by <op>`, the framework parses the embedded `amendment:` YAML block into a `ProposalAmendment`, applies it to the PENDING file's `ActionProposal`, re-validates (tool registered, args dict-shaped, args_hash recomputes, write-path enforcement), and **gates on the recomputed classification** (NOT the original). For `high_risk` actions the framework runs a fresh judgment cycle through the ensemble before executing. For non-`high_risk` actions, schema/policy validation alone is sufficient. The `re_judged: bool` audit field on the executed event reports whether the ensemble re-ran. **`re_judged` is framework-set, not operator-supplied** — operators express intent via the amendment; the framework decides whether re-judge is needed based on the AMENDED class. This means an operator who swaps `tool_name` to upgrade `reversible_write` → `high_risk` (or `delete_files` etc.) cannot skip the re-judge by phrasing the original proposal as a lower class.
+
+If the framework's re-judge returns BLOCK, the action is refused; the audit record carries `enforcement_action="operator_revise_executed"` with `re_judged: true` on the re-judge event chain but **no `escalation_operator_revise_executed` audit line** for the action itself (refusal is the outcome). Invalid amendments (missing YAML block, malformed YAML, unknown fields, tool not registered) emit `enforcement_action="operator_revise_invalid_amendment"` and refuse execution.
 
 **Strict resolution-block parser** (PR 3b lock-in). Resolution headers MUST match exactly: `### <Verb> by <operator>` — h3 prefix, verb in `{Approved, Denied, Redacted, Revised, Auto-decided}` with exact case, the literal word `by`, and a non-empty operator string. Typos (lowercase verb, h4 prefix, missing `by`) make the file UNPARSEABLE — the framework leaves the file as-is, does NOT claim the de-dup sidecar, and surfaces a doctor warning on the next health check. This lets operators fix the typo and re-trigger without state-machine debt.
 
@@ -858,7 +871,7 @@ Each judgment writes a JSONL line to the run log, carrying `parent_run_id` linki
   "proposal": { ... ActionProposal ... },
   "judgment": { ... Judgment ... },
   "raw_outcome": "block",
-  "enforcement_action": "audit_bypass | block_executed | allow_executed | allow_pending_next_judge | revise_executed | escalate_pending | approved_executed | approved_stale_tool_definition | denied | redacted | auto_decided_block | auto_decided_allow | proposal_body_tampered",
+  "enforcement_action": "audit_bypass | block_executed | allow_executed | allow_pending_next_judge | revise_pending_second_judgment | revise_executed | revise_invalid_amendment | revise_loop_exhausted_blocked | escalate_pending | approved_executed | approved_stale_tool_definition | denied | redacted | auto_decided_block | auto_decided_allow | proposal_body_tampered | operator_revise_executed | operator_revise_invalid_amendment",
   "synthesis_source": "class_policy | failure_policy | null",
   "triggered_by": "failure_policy:<ExceptionName> | null",
   "escalation_queue_id": "proposal_20260512T143052_xyz98765 | null",
@@ -885,6 +898,11 @@ Each judgment writes a JSONL line to the run log, carrying `parent_run_id` linki
 - `redacted` (PR 3b) — operator wrote `### Redacted by <op>` to a PENDING file (body redacted, frontmatter preserved). No execution.
 - `auto_decided_block` / `auto_decided_allow` (PR 3b) — `auto_decide_after_seconds` elapsed; framework applied `fallback_on_timeout` policy from `judges.md`. The CAS write detects operator-edit races and defers to the operator on conflict.
 - `proposal_body_tampered` (PR 3b) — operator edited the `## Proposal` body of a PENDING file between write and resolution. Framework recomputes `arguments_hash` from the body's tool_arguments and refuses execution on mismatch. Action is treated as denied; PENDING file preserved in audit trail.
+- `revise_pending_second_judgment` (PR 3c) — a judge in the ensemble returned `Judgment(outcome=REVISE, amendment=...)`; the framework has built the amended proposal and is about to recurse with `revise_iteration=1`. This event records the FIRST judgment's REVISE intent. The second-judgment event chain follows and replaces this with `revise_executed` (action ran) or `revise_loop_exhausted_blocked` (second judgment also REVISEd).
+- `revise_invalid_amendment` (PR 3c) — judge advertised REVISE but the amendment failed validation (no `amendment` payload, unknown tool, args not a dict, args_hash recompute failed, write-path violation). Action refused; second judgment NOT run.
+- `revise_loop_exhausted_blocked` (PR 3c) — the second judgment returned REVISE again. Per spec/28:276, `max_revise_iterations=1`. Action refused; reason carries `revise_loop_exhausted`.
+- `operator_revise_executed` (PR 3c) — operator wrote `### Revised by <op>` to a PENDING file with an embedded amendment YAML. Framework parsed + validated + (for high_risk) re-judged → executed. Audit field `re_judged: bool` records whether the re-judge ran (true on high_risk, false on lower classes).
+- `operator_revise_invalid_amendment` (PR 3c) — operator's Revised block had no embedded amendment YAML, malformed YAML, unknown fields, or the amendment failed validation. Action refused.
 
 **`synthesis_source`** (PR 3b) — set when the framework, not a real judge, produced the ESCALATE outcome. Values: `"class_policy"` (operator's `class_policy.<X>=escalate` fired without ensemble), `"failure_policy"` (a judge raised an exception mapped to escalate via `failure_policy`), `null` (a real judge returned ESCALATE). This lets dashboards distinguish judge-driven escalations from framework-synthesized ones.
 

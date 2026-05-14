@@ -81,7 +81,7 @@ class ResolutionDecision(StrEnum):
     AUTO_DECIDED_BLOCK = "auto_decided_block"
     AUTO_DECIDED_ALLOW = "auto_decided_allow"
     BODY_TAMPERED = "body_tampered"
-    REVISED_DEFERRED = "revised_deferred"  # PR 3c — treated as Denied in 3b
+    OPERATOR_REVISED = "operator_revised"  # PR 3c — real REVISE handling
     UNPARSEABLE = "unparseable"  # Strict-parser surface; framework leaves PENDING as-is
 
 
@@ -119,6 +119,13 @@ class ResolutionEvent:
     resolved_at: str  # ISO-8601 UTC
     reason: str  # free-prose; empty on parse failure
     enforcement_action: str  # spec/28 enforcement_action enum string
+    # PR 3c: operator-supplied ProposalAmendment when decision is
+    # OPERATOR_REVISED. Set by ``_claim_operator_resolution`` after
+    # parsing the embedded ``amendment:`` YAML block. None for any
+    # other decision (or when no amendment block is present, which
+    # the framework treats as invalid → enforcement promoted to
+    # operator_revise_invalid_amendment).
+    amendment: Any | None = None  # ProposalAmendment — avoiding circular type
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -142,7 +149,7 @@ _VERB_TO_DECISION: dict[str, ResolutionDecision] = {
     "Denied": ResolutionDecision.DENIED,
     "Redacted": ResolutionDecision.REDACTED,
     "Auto-decided": ResolutionDecision.AUTO_DECIDED_BLOCK,
-    "Revised": ResolutionDecision.REVISED_DEFERRED,
+    "Revised": ResolutionDecision.OPERATOR_REVISED,
 }
 
 _DECISION_TO_ENFORCEMENT: dict[ResolutionDecision, str] = {
@@ -152,7 +159,7 @@ _DECISION_TO_ENFORCEMENT: dict[ResolutionDecision, str] = {
     ResolutionDecision.AUTO_DECIDED_BLOCK: "auto_decided_block",
     ResolutionDecision.AUTO_DECIDED_ALLOW: "auto_decided_allow",
     ResolutionDecision.BODY_TAMPERED: "proposal_body_tampered",
-    ResolutionDecision.REVISED_DEFERRED: "denied",
+    ResolutionDecision.OPERATOR_REVISED: "operator_revise_executed",
     ResolutionDecision.UNPARSEABLE: "denied",
 }
 
@@ -198,6 +205,7 @@ def write_pending_escalation(
     judges_config_escalation: EscalationConfig,
     synthesis_source: str | None = None,
     triggered_by: str | None = None,
+    revised_from_proposal_id: str | None = None,
 ) -> tuple[Path, str]:
     """Write the PENDING escalation file atomically.
 
@@ -228,7 +236,10 @@ def write_pending_escalation(
         schema_version=SCHEMA_VERSION,
         triggered_by=triggered_by,
     )
-    content = _render_pending_file(fm, proposal, judgment_reason, synthesis_source)
+    content = _render_pending_file(
+        fm, proposal, judgment_reason, synthesis_source,
+        revised_from_proposal_id=revised_from_proposal_id,
+    )
     atomic_write(pending_path, content)
     return pending_path, proposal_id
 
@@ -238,6 +249,8 @@ def _render_pending_file(
     proposal: ActionProposal,
     judgment_reason: str,
     synthesis_source: str | None,
+    *,
+    revised_from_proposal_id: str | None = None,
 ) -> str:
     """Render the PENDING file as YAML-frontmatter + markdown body.
 
@@ -263,6 +276,13 @@ def _render_pending_file(
         fm_lines.append(f"triggered_by: {fm.triggered_by}")
     if synthesis_source is not None:
         fm_lines.append(f"synthesis_source: {synthesis_source}")
+    if revised_from_proposal_id is not None:
+        # P1 #3 (PR 3c): when this PENDING was written from a
+        # second-judgment ESCALATE inside a judge-driven REVISE, the
+        # original proposal_id appears here so operators can chain
+        # back through the audit trail. Forensic linkage; no
+        # behavior change.
+        fm_lines.append(f"revised_from_proposal_id: {revised_from_proposal_id}")
     fm_lines.append("---")
 
     proposal_yaml = _serialize_proposal(proposal)
@@ -604,6 +624,35 @@ def _claim_operator_resolution(
                 "Action refused; original PENDING preserved in audit trail."
             )
 
+    # PR 3c operator-revise: parse the embedded amendment YAML so the
+    # agent's resolution handler can run amend_proposal + re-judge.
+    # Invalid YAML promotes enforcement to operator_revise_invalid_amendment
+    # but the sidecar stays claimed (operator's intent recorded; framework
+    # refuses to act on a malformed amendment).
+    amendment = None
+    enforcement = _DECISION_TO_ENFORCEMENT[decision]
+    if decision is ResolutionDecision.OPERATOR_REVISED:
+        block_body = _extract_first_block_body(body)
+        from . import _revise as _rv
+
+        try:
+            amendment = _rv.parse_operator_amendment(block_body)
+        except Exception as exc:  # noqa: BLE001
+            amendment = None
+            enforcement = "operator_revise_invalid_amendment"
+            if log_warning is not None:
+                log_warning(
+                    f"poll_resolutions: {pending_path.name} operator amendment "
+                    f"parse failed: {type(exc).__name__}: {exc}"
+                )
+        if amendment is None and enforcement != "operator_revise_invalid_amendment":
+            enforcement = "operator_revise_invalid_amendment"
+            if log_warning is not None:
+                log_warning(
+                    f"poll_resolutions: {pending_path.name} Revised block "
+                    "has no embedded amendment YAML; refusing execution."
+                )
+
     return ResolutionEvent(
         file_path=pending_path,
         sidecar_path=sidecar_path,
@@ -613,8 +662,25 @@ def _claim_operator_resolution(
         operator=operator,
         resolved_at=resolved_at,
         reason=reason,
-        enforcement_action=_DECISION_TO_ENFORCEMENT[decision],
+        enforcement_action=enforcement,
+        amendment=amendment,
     )
+
+
+def _extract_first_block_body(body: str) -> str:
+    """Return the body text of the FIRST resolution block (between
+    its header line and the next h3 header or EOF).
+
+    Used by ``_claim_operator_resolution`` to feed the operator's
+    amendment YAML into ``_revise.parse_operator_amendment``.
+    """
+    matches = list(_RESOLUTION_HEADER_RE.finditer(body))
+    if not matches:
+        return ""
+    first = matches[0]
+    start = first.end()
+    end = matches[1].start() if len(matches) > 1 else len(body)
+    return body[start:end]
 
 
 def _claim_sidecar(sidecar_path: Path) -> None:
