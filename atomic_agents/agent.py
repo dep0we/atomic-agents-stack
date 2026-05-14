@@ -775,7 +775,14 @@ class AtomicAgent:
                 tool_classifications=self._tool_classifications,
             )
             _rv.validate_amended_args(
-                amended, self.tool_registry, agent_name=self.name
+                amended,
+                self.tool_registry,
+                agent_name=self.name,
+                validation_mode=(
+                    self.judges_config.validation
+                    if self.judges_config is not None
+                    else "weakened"
+                ),
             )
             _rv.enforce_amended_write_paths(
                 amended,
@@ -1358,7 +1365,14 @@ class AtomicAgent:
                         tool_classifications=self._tool_classifications,
                     )
                     _rv.validate_amended_args(
-                        amended, self.tool_registry, agent_name=self.name
+                        amended,
+                        self.tool_registry,
+                        agent_name=self.name,
+                        validation_mode=(
+                            self.judges_config.validation
+                            if self.judges_config is not None
+                            else "weakened"
+                        ),
                     )
                     _rv.enforce_amended_write_paths(
                         amended,
