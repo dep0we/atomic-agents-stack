@@ -202,7 +202,7 @@ uv run pytest                            # full suite
 uv run pytest tests/test_<module>.py -v  # one module
 ```
 
-1261 tests today. New backend protocols add ~25 conformance + ~10 impl-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol — the conformance suite is what keeps the protocol honest.
+1279 tests today. New backend protocols add ~25 conformance + ~10 impl-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol — the conformance suite is what keeps the protocol honest.
 
 ### Releases + SemVer
 
@@ -214,7 +214,7 @@ Every release: `vX.Y.Z` git tag + GitHub Release with CHANGELOG entry verbatim. 
 
 ## Working methods
 
-These are the methods that have produced this codebase's quality (4 published tags through v0.13.0, ~55 merged PRs, ~1261 tests, no production rollback events). Captured here to survive the session that produced them. Full retrospective in `docs/methodology.md`.
+These are the methods that have produced this codebase's quality (4 published tags through v0.13.0, ~55 merged PRs, ~1279 tests, no production rollback events). Captured here to survive the session that produced them. Full retrospective in `docs/methodology.md`.
 
 ### Always run `/ship` end-to-end — never bypass
 
@@ -336,11 +336,11 @@ These are not forbidden forever — they're explicitly deferred with rationale. 
 
 ## Status
 
-**v0.13.0, alpha, PUBLIC.** Core runtime stable, 1261 tests passing (+ 2 LLM-only conformance skips on PolicyJudge) on Python 3.11/3.12. Three backend protocols shipped:
+**v0.13.0, alpha, PUBLIC.** Core runtime stable, 1279 tests passing (+ 2 LLM-only conformance skips on PolicyJudge) on Python 3.11/3.12. Three backend protocols shipped:
 
 - **MemoryBackend** (PR #57) — filesystem reference impl + conformance suite.
 - **LLMBackend** (#87) — Anthropic + OpenAI + Moonshot reference impls, registered at framework import; conformance suite parametrizes across all three.
-- **JudgeBackend Protocol** (#112, **locked at PR 4** with `tests/test_judge_protocol_conformance.py`) — PolicyJudge (rule engine) + LLMJudgeBackend reference impls; ESCALATE + REVISE state machines; `judges.md` operator config with cascade-aware project floor; operator-driven resolution flow (Approved / Denied / Redacted / Revised / Auto-decided); body-integrity check + O_EXCL sidecar de-dup + CAS-safe auto-decide. Dispatch opt-in via `judges.md` in the agent root or `AGENT_JUDGE_ENABLED=1` — existing deployments see no judge invocation by default.
+- **JudgeBackend Protocol** (#112, **locked at PR 4** with `tests/test_judge_protocol_conformance.py`) — PolicyJudge (rule engine) + LLMJudgeBackend reference impls; ESCALATE + REVISE state machines; `judges.md` operator config with cascade-aware project floor; operator-driven resolution flow (Approved / Denied / Redacted / Revised / Auto-decided); body-integrity check + O_EXCL sidecar de-dup + CAS-safe auto-decide. **PR 5a (unreleased):** `escalation.fallback_on_timeout` widens to per-class dict form; auto-decide resolves policy from PENDING frontmatter `action_class`. Dispatch opt-in via `judges.md` in the agent root or `AGENT_JUDGE_ENABLED=1` — existing deployments see no judge invocation by default.
 
 MCP client support shipped (PRs #55 + #56). Active backlog covers the remaining protocols (Lock / Log / Persona / AgentProfile / ToolRegistry / Corpus / Policy). Single-developer project; reference implementation that anyone can use, fork, or extend.
 
