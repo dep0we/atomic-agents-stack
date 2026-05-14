@@ -12,7 +12,7 @@ For broader context, read these in order on a fresh session:
 
 ## What this is
 
-Atomic Agents is a vault-native AI agent framework: agents live as plain markdown files, the runtime is stateless, and storage is moving toward swappable protocols layer by layer (MemoryBackend ships today; LLMBackend ships as of #87 with three reference impls — Anthropic, OpenAI, Moonshot; the JudgeBackend Protocol + canonical types + registry scaffolding ships as of #112 PR 1, with opt-in judge dispatch wiring, the `PolicyJudge` rule-engine reference impl, and the `atomic_action` proposal marker shipping as of PR 2a, and the `LLMJudgeBackend` reference impl + two-judge ensemble dispatch + per-judge audit events shipping as of PR 2b — the `judges.md` parser, ESCALATE polling, and the conformance suite land in PRs 3-4; Lock / Log / Persona / AgentProfile / ToolRegistry / Corpus protocols are next per ROADMAP). A person at home runs filesystem-everything with one agent. An organization runs the same agents over Postgres, behind an HTTP service, with a fleet of orchestrated roles. **Same agent definitions, same call() flow, same audit trail. Different backends.**
+Atomic Agents is a vault-native AI agent framework: agents live as plain markdown files, the runtime is stateless, and storage is moving toward swappable protocols layer by layer. **Shipped backend protocols**: MemoryBackend (PR #57); LLMBackend (#87 — Anthropic + OpenAI + Moonshot reference impls); JudgeBackend Protocol (#112 — locked at PR 4 with conformance suite, PolicyJudge + LLMJudgeBackend reference impls, ESCALATE + REVISE state machines, `judges.md` operator config + cascade-aware project floor, operator-driven resolution flow). **Next per ROADMAP**: Lock / Log / Persona / AgentProfile / ToolRegistry / Corpus protocols. A person at home runs filesystem-everything with one agent. An organization runs the same agents over Postgres, behind an HTTP service, with a fleet of orchestrated roles. **Same agent definitions, same call() flow, same audit trail. Different backends.**
 
 The spec is the central artifact. The Python package is one conforming reference implementation. Anyone can build agents to the spec without using this code — and eventually, alternate implementations will.
 
@@ -42,7 +42,7 @@ When you can't tell whether a design move helps both — stop, name the tradeoff
                             Helpers (cheap parallel)
                                 │
                   Backend Protocols (the moat)
-                  Memory ✅  LLM ✅  Judge 🟡 (scaffolding shipped, #112)
+                  Memory ✅  LLM ✅  Judge ✅ (locked at #112 PR 4)
                   Lock 🟡  Log 🟡  Persona 🟡
                   AgentProfile 🟡  ToolRegistry 🟡  Corpus 🟡
                                 │
@@ -202,7 +202,7 @@ uv run pytest                            # full suite
 uv run pytest tests/test_<module>.py -v  # one module
 ```
 
-1222 tests today. New backend protocols add ~25 conformance + ~10 impl-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol — the conformance suite is what keeps the protocol honest.
+1261 tests today. New backend protocols add ~25 conformance + ~10 impl-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol — the conformance suite is what keeps the protocol honest.
 
 ### Releases + SemVer
 
@@ -214,7 +214,7 @@ Every release: `vX.Y.Z` git tag + GitHub Release with CHANGELOG entry verbatim. 
 
 ## Working methods
 
-These are the methods that have produced this codebase's quality (4 published tags through v0.13.0, ~55 merged PRs, ~1222 tests, no production rollback events). Captured here to survive the session that produced them. Full retrospective in `docs/methodology.md`.
+These are the methods that have produced this codebase's quality (4 published tags through v0.13.0, ~55 merged PRs, ~1261 tests, no production rollback events). Captured here to survive the session that produced them. Full retrospective in `docs/methodology.md`.
 
 ### Always run `/ship` end-to-end — never bypass
 
@@ -287,7 +287,7 @@ If the project ever needs to optimize differently, `docs/methodology.md` is the 
 | Doc | Purpose |
 |-----|---------|
 | `docs/architecture.md` | Mental model in diagrams. Read first. |
-| `docs/spec/01-...31-llm-backend.md` | Locked spec (22 docs today, plus 3 RFCs at 28/29/30). The product. |
+| `docs/spec/01-...31-llm-backend.md` | Locked spec (23 docs today, plus 2 RFCs at 29/30). The product. |
 | `docs/implementation/` | Build guides per runtime (cron, Claude skill, dashboard) |
 | `docs/deployment/versioning.md`, `upgrading.md` | SemVer + operator runbook |
 | `docs/deployment/release-runbook.md` | Maintainer `/ship` runbook: two-mode workflow + manual surface check |
@@ -336,6 +336,12 @@ These are not forbidden forever — they're explicitly deferred with rationale. 
 
 ## Status
 
-**v0.13.0, alpha, PUBLIC.** Core runtime stable, 1222 tests passing on Python 3.11/3.12. Two backend protocols shipped: MemoryBackend (PR #57) and LLMBackend (#87 — Anthropic + OpenAI + Moonshot reference impls registered at framework import). JudgeBackend Protocol scaffolding shipped as #112 PR 1 (Protocol contract, canonical proposal/judgment types, exception taxonomy, and registry primitives under `atomic_agents.judge`); #112 PR 2a adds opt-in judge dispatch wiring inside `agent.call()`, the `PolicyJudge` rule-engine reference implementation, the `atomic_action` side-channel marker tool, framework-side proposal assembly with TOCTOU-defense hashes, and a per-tool `classification` field with a `tools.md` parser — dispatch is opt-in via `judges.md` in the agent root or `AGENT_JUDGE_ENABLED=1`, so existing deployments see no judge invocation by default. #112 PR 2b adds the `LLMJudgeBackend` reference implementation (composes the `LLMBackend` Protocol via composition; default model `gpt-5-nano` for correlated-judgment mitigation against the default Anthropic actor; system prompt assembled from `JudgePolicyContext` only so runtime config cannot reach the prompt by construction), a two-judge ensemble inside `_dispatch_with_judge` (`PolicyJudge` first then `LLMJudgeBackend` if the OpenAI key resolves, first BLOCK short-circuits), per-judge JSONL `JudgmentEvent` audit lines, a framework-side timeout wrapper (default 5s), `temperature=0` determinism, and a new `allow_pending_next_judge` enforcement_action audit value (ensemble extension to spec/28's enforcement_action enum; PR 4 will lock spec/28 with this) — and `make_default_llm_judge` returns `None` when no OpenAI key is resolvable so Claude-only deployments see PolicyJudge only with no spurious `JudgeUnavailable` blocks. The `judges.md` parser, ESCALATE polling, and the conformance suite land in PRs 3-4. MCP client support shipped (PRs #55 + #56). Active backlog covers the remaining protocols (Lock/Log/Persona/AgentProfile/ToolRegistry/Corpus/Policy) + spec-impl follow-ups for the three-spec stack (judge/mandates/responsibility audit). Single-developer project; reference implementation that anyone can use, fork, or extend.
+**v0.13.0, alpha, PUBLIC.** Core runtime stable, 1261 tests passing (+ 2 LLM-only conformance skips on PolicyJudge) on Python 3.11/3.12. Three backend protocols shipped:
+
+- **MemoryBackend** (PR #57) — filesystem reference impl + conformance suite.
+- **LLMBackend** (#87) — Anthropic + OpenAI + Moonshot reference impls, registered at framework import; conformance suite parametrizes across all three.
+- **JudgeBackend Protocol** (#112, **locked at PR 4** with `tests/test_judge_protocol_conformance.py`) — PolicyJudge (rule engine) + LLMJudgeBackend reference impls; ESCALATE + REVISE state machines; `judges.md` operator config with cascade-aware project floor; operator-driven resolution flow (Approved / Denied / Redacted / Revised / Auto-decided); body-integrity check + O_EXCL sidecar de-dup + CAS-safe auto-decide. Dispatch opt-in via `judges.md` in the agent root or `AGENT_JUDGE_ENABLED=1` — existing deployments see no judge invocation by default.
+
+MCP client support shipped (PRs #55 + #56). Active backlog covers the remaining protocols (Lock / Log / Persona / AgentProfile / ToolRegistry / Corpus / Policy). Single-developer project; reference implementation that anyone can use, fork, or extend.
 
 Going forward: **the elegance is the product.** Protect it.
