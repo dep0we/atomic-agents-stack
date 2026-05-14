@@ -647,6 +647,15 @@ class AtomicAgent:
         from .judge.backend import Judgment, JudgmentOutcome
         from .judge.types import ProposalBinding
 
+        # P1 #1: OPERATOR_REVISED's "resolved" line is intent-recorded,
+        # not execution-recorded. _process_operator_revise emits the
+        # actual operator_revise_executed line AFTER the handler runs.
+        # Promote enforcement to operator_revise_pending here so the
+        # resolved-event line doesn't claim execution-already-happened.
+        if decision is _esc.ResolutionDecision.OPERATOR_REVISED and (
+            enforcement == "operator_revise_executed"
+        ):
+            enforcement = "operator_revise_pending"
         judgment = Judgment(
             outcome=(
                 JudgmentOutcome.ALLOW
@@ -719,6 +728,194 @@ class AtomicAgent:
                     "error": f"{type(exc).__name__}: {exc}",
                     "cost_source": "actor",
                 })
+
+        # PR 3c: operator-revise execution path.
+        if decision is _esc.ResolutionDecision.OPERATOR_REVISED:
+            self._process_operator_revise(event)
+
+    def _process_operator_revise(self, event) -> None:
+        """Execute an operator's Revised resolution.
+
+        Flow:
+        1. amend_proposal with the operator's amendment (already
+           parsed in escalation._claim_operator_resolution).
+        2. validate_amended_args + enforce_amended_write_paths.
+        3. Gate on **amended.classification** (Codex round-1 P1-4 —
+           NOT original.classification — otherwise the operator can
+           swap tool_name to upgrade reversible_write → delete_files
+           and skip re-judge):
+           - amended.classification == high_risk → re-judge through
+             a fresh ensemble; only execute if ALLOW.
+           - other classes → schema/policy validation alone is
+             sufficient; execute on success.
+        4. Execute via tool_registry; emit deferred_execution audit
+           line with cost_source="actor".
+        5. Invalid amendment → enforcement promoted to
+           operator_revise_invalid_amendment via escalation.py; this
+           method skips execution but still emits the audit record
+           (already emitted above in the synthesized Judgment flow).
+        """
+        from .judge import _revise as _rv
+        from .judge.types import ActionClass
+        from .exceptions import JudgeAmendedProposalRejected
+
+        amendment = event.amendment
+        fm = event.frontmatter
+        original = event.proposal
+
+        if amendment is None:
+            # operator_revise_invalid_amendment — audit already emitted.
+            return
+
+        try:
+            amended = _rv.amend_proposal(
+                original=original,
+                amendment=amendment,
+                tool_registry=self.tool_registry,
+                tool_classifications=self._tool_classifications,
+            )
+            _rv.validate_amended_args(
+                amended, self.tool_registry, agent_name=self.name
+            )
+            _rv.enforce_amended_write_paths(
+                amended,
+                write_paths=list(self.config.write_paths or []),
+                read_only_paths=list(self.config.read_only_paths or []),
+            )
+        except JudgeAmendedProposalRejected as exc:
+            _logger.warning(
+                "agent %r: operator_revise validation failed for "
+                "proposal_id=%r: %s",
+                self.name, fm.proposal_id, exc,
+            )
+            self._log({
+                "trigger": "escalation_operator_revise_invalid_amendment",
+                "parent_run_id": fm.parent_run_id,
+                "escalation_queue_id": fm.proposal_id,
+                "tool_name": original.tool_name,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+            return
+
+        # Gate on AMENDED classification (Codex round-1 P1-4 fix).
+        re_judged = amended.classification == ActionClass.HIGH_RISK
+        if re_judged:
+            # Build the same config the agent uses at first-dispatch
+            # time. Reuses _dispatch_with_judge's config-resolution
+            # logic by constructing a synthetic tu/markers, but we
+            # skip atomic_action marker validation since the operator
+            # is the trust anchor here.
+            if self.judges_config is not None:
+                class_policy = self.judges_config.class_policy
+                timeout_ms = self.judges_config.timeout_ms
+                judge_budget = self.judges_config.budget
+                escalation_cfg = self.judges_config.escalation
+                flat_failure_policy = dict(
+                    self.judges_config.failure_policy[
+                        ActionClass.EXTERNAL_SIDE_EFFECT
+                    ]
+                )
+                backend_name = self.judges_config.default_backend
+            else:
+                class_policy = self._default_class_policy_snapshot()
+                from .judge.types import EscalationConfig as _EC
+                from .judge.types import BudgetConfig as _BC
+                timeout_ms = 5000
+                judge_budget = _BC()
+                escalation_cfg = _EC()
+                flat_failure_policy = {
+                    "JudgeUnavailable": "block",
+                    "JudgePolicyInvalid": "block",
+                    "JudgeBudgetExhausted": "block",
+                    "JudgeProposalInvalid": "block",
+                    "JudgeAmendedProposalRejected": "block",
+                }
+                backend_name = "ensemble"
+
+            from .judge.types import ProposalBinding
+
+            binding = ProposalBinding(
+                tool_call_id=amended.tool_call_id,
+                tool_definition_hash=amended.tool_definition_hash,
+                arguments_hash=amended.arguments_hash,
+            )
+            tu_stub = {
+                "name": amended.tool_name,
+                "id": amended.tool_call_id,
+                "input": amended.tool_arguments,
+            }
+            allow, events, queue_id = self._run_ensemble(
+                proposal_obj=amended,
+                tu=tu_stub,
+                binding=binding,
+                class_policy=class_policy,
+                timeout_ms=timeout_ms,
+                judge_budget=judge_budget,
+                escalation_cfg=escalation_cfg,
+                flat_failure_policy=flat_failure_policy,
+                backend_name=backend_name,
+                revise_iteration=0,
+                original_proposal=original,
+            )
+            for ev in events:
+                ev["trigger"] = "escalation_operator_revise_re_judge"
+                ev["escalation_queue_id"] = fm.proposal_id
+                ev["original_proposal_id"] = original.proposal_id
+                ev["re_judged"] = True
+                # P1 #2: re-judge audit events must link to the
+                # ORIGINAL actor's run, not the poller's. cost_source
+                # discipline + forensic chains break if these get
+                # bound to whichever agent.call() happened to fire
+                # the poll.
+                ev["parent_run_id"] = fm.parent_run_id
+                self._log(ev)
+            if not allow:
+                _logger.info(
+                    "agent %r: operator_revise high_risk re-judge BLOCKed "
+                    "for proposal_id=%r (queue_id=%r); refusing execution",
+                    self.name, original.proposal_id, fm.proposal_id,
+                )
+                return
+        else:
+            re_judged = False
+
+        # Execute the amended bound action.
+        try:
+            tool_use_payload = {
+                "name": amended.tool_name,
+                "id": amended.tool_call_id,
+                "input": amended.tool_arguments,
+            }
+            tool_result = self.tool_registry.execute(tool_use_payload)
+            self._log({
+                "trigger": "escalation_operator_revise_executed",
+                "parent_run_id": fm.parent_run_id,
+                "escalation_queue_id": fm.proposal_id,
+                "original_proposal_id": original.proposal_id,
+                "amended_proposal_id": amended.proposal_id,
+                "tool_name": tool_result.tool_name,
+                "latency_ms": tool_result.latency_ms,
+                "error": tool_result.error,
+                "re_judged": re_judged,
+                "cost_source": "actor",
+            })
+        except Exception as exc:  # noqa: BLE001
+            _logger.exception(
+                "agent %r: operator_revise execution failed for "
+                "proposal_id=%r: %s",
+                self.name, original.proposal_id, exc,
+            )
+            self._log({
+                "trigger": "escalation_operator_revise_executed",
+                "parent_run_id": fm.parent_run_id,
+                "escalation_queue_id": fm.proposal_id,
+                "original_proposal_id": original.proposal_id,
+                "amended_proposal_id": amended.proposal_id,
+                "tool_name": amended.tool_name,
+                "error": f"{type(exc).__name__}: {exc}",
+                "re_judged": re_judged,
+                "cost_source": "actor",
+            })
 
     def _dispatch_with_judge(
         self,
@@ -858,6 +1055,82 @@ class AtomicAgent:
             }
             backend_name = "ensemble"
 
+        # Build the initial JudgmentContext + Binding. PR 3c factors
+        # the ensemble loop into ``_run_ensemble`` so REVISE outcomes
+        # can recurse against the amended proposal with a fresh
+        # context derived from the amended classification / tool name.
+        binding = ProposalBinding(
+            tool_call_id=tool_call_id,
+            tool_definition_hash=tdef_hash,
+            arguments_hash=proposal_obj.arguments_hash,
+        )
+
+        return self._run_ensemble(
+            proposal_obj=proposal_obj,
+            tu=tu,
+            binding=binding,
+            class_policy=class_policy,
+            timeout_ms=timeout_ms,
+            judge_budget=judge_budget,
+            escalation_cfg=escalation_cfg,
+            flat_failure_policy=flat_failure_policy,
+            backend_name=backend_name,
+            revise_iteration=0,
+            original_proposal=None,
+        )
+
+    def _run_ensemble(
+        self,
+        *,
+        proposal_obj,
+        tu: dict,
+        binding,
+        class_policy,
+        timeout_ms: int,
+        judge_budget,
+        escalation_cfg,
+        flat_failure_policy: dict,
+        backend_name: str,
+        revise_iteration: int = 0,
+        original_proposal=None,
+    ):
+        """Run the judge ensemble against one ``ActionProposal``.
+
+        Factored out of ``_dispatch_with_judge`` in PR 3c so the REVISE
+        branch can recurse against an amended proposal with a fresh
+        context (CLASS NON-DOWNGRADE BY EXPLOIT defense — the second
+        judgment's effective_class_policy is computed from the AMENDED
+        classification, not the original).
+
+        ``revise_iteration`` is the spec/28:276 ``max_revise_iterations``
+        bound: 0 for the first judgment, 1 for the second. The third
+        judgment is impossible by construction — when iteration ≥ 1
+        and a judge returns REVISE, the framework BLOCKs with reason
+        ``revise_loop_exhausted_blocked``.
+
+        ``original_proposal`` is non-None on the second judgment.
+        Carried into audit events as ``original_proposal`` for
+        forensic linkage; the audit consumer sees both proposals
+        inline plus the amendment yields.
+        """
+        from .judge import proposal as _proposal_mod  # noqa: F401
+        from .judge.backend import JudgmentOutcome, Judgment
+        from .judge.types import (
+            ActionClass,
+            JudgmentContext,
+            JudgePolicyContext,
+            JudgeRuntimeConfig,
+            PersonaDigest,
+            ProposalBinding,
+            ToolPolicyEntry,
+        )
+        from .exceptions import JudgeError, JudgeAmendedProposalRejected
+        from .judge.types import ClassPolicyValue as _CPV
+
+        tool_name = proposal_obj.tool_name
+        tool_call_id = proposal_obj.tool_call_id
+        classification = proposal_obj.classification
+
         policy_ctx = JudgePolicyContext(
             agent_name=self.name,
             persona_digest=PersonaDigest(agent_name=self.name),
@@ -876,12 +1149,6 @@ class AtomicAgent:
             failure_policy=flat_failure_policy,
         )
         context = JudgmentContext(policy=policy_ctx, runtime=runtime_cfg)
-
-        binding = ProposalBinding(
-            tool_call_id=tool_call_id,
-            tool_definition_hash=tdef_hash,
-            arguments_hash=proposal_obj.arguments_hash,
-        )
 
         # Class-policy short-circuits (PR 3a — Codex round-2 P2 fix).
         # Operators who set class_policy.<X>: bypass don't want the
@@ -1024,6 +1291,149 @@ class AtomicAgent:
                     latency_ms=int((time.time() - start) * 1000),
                 )
 
+            # REVISE handling (PR 3c). The judge proposes an amendment;
+            # the framework builds an amended proposal, re-validates,
+            # and re-runs the ensemble (max_revise_iterations=1 per
+            # spec/28:276). Audit_mode skips REVISE — operators in
+            # audit-only mode see the judge's intent but no execution
+            # path takes effect.
+            if judgment.outcome == JudgmentOutcome.REVISE and not audit_mode:
+                if revise_iteration >= 1:
+                    # Spec/28:276 — second judgment must return ALLOW;
+                    # REVISE again is the loop-exhausted case.
+                    block_judgment = Judgment(
+                        outcome=JudgmentOutcome.BLOCK,
+                        reason="revise_loop_exhausted: second judgment "
+                        "returned REVISE; max_revise_iterations=1",
+                        judge_id=judgment.judge_id,
+                        policy_version=judgment.policy_version,
+                        latency_ms=judgment.latency_ms,
+                    )
+                    event = self._build_judgment_event_dict(
+                        proposal=proposal_obj,
+                        tool_use=tu,
+                        judgment=block_judgment,
+                        enforcement_action="revise_loop_exhausted_blocked",
+                        binding=binding,
+                    )
+                    event["original_proposal_id"] = (
+                        original_proposal.proposal_id
+                        if original_proposal is not None
+                        else None
+                    )
+                    event["revise_iteration"] = revise_iteration
+                    events.append(event)
+                    final_allow = False
+                    break
+                # First REVISE — build amended proposal + recurse.
+                from .judge import _revise as _rv
+
+                amendment = judgment.amendment
+                if amendment is None:
+                    # Judge advertised REVISE outcome but returned no
+                    # amendment payload. Treat as invalid_amendment.
+                    block_judgment = Judgment(
+                        outcome=JudgmentOutcome.BLOCK,
+                        reason="revise_invalid_amendment: judge returned "
+                        "REVISE but Judgment.amendment is None",
+                        judge_id=judgment.judge_id,
+                        policy_version=judgment.policy_version,
+                        latency_ms=judgment.latency_ms,
+                    )
+                    event = self._build_judgment_event_dict(
+                        proposal=proposal_obj,
+                        tool_use=tu,
+                        judgment=block_judgment,
+                        enforcement_action="revise_invalid_amendment",
+                        binding=binding,
+                    )
+                    events.append(event)
+                    final_allow = False
+                    break
+                try:
+                    amended = _rv.amend_proposal(
+                        original=proposal_obj,
+                        amendment=amendment,
+                        tool_registry=self.tool_registry,
+                        tool_classifications=self._tool_classifications,
+                    )
+                    _rv.validate_amended_args(
+                        amended, self.tool_registry, agent_name=self.name
+                    )
+                    _rv.enforce_amended_write_paths(
+                        amended,
+                        write_paths=list(self.config.write_paths or []),
+                        read_only_paths=list(self.config.read_only_paths or []),
+                    )
+                except JudgeAmendedProposalRejected as exc:
+                    block_judgment = Judgment(
+                        outcome=JudgmentOutcome.BLOCK,
+                        reason=f"revise_invalid_amendment: {exc}",
+                        judge_id=judgment.judge_id,
+                        policy_version=judgment.policy_version,
+                        latency_ms=judgment.latency_ms,
+                    )
+                    event = self._build_judgment_event_dict(
+                        proposal=proposal_obj,
+                        tool_use=tu,
+                        judgment=block_judgment,
+                        enforcement_action="revise_invalid_amendment",
+                        binding=binding,
+                    )
+                    events.append(event)
+                    final_allow = False
+                    break
+                # Audit the first-judgment REVISE outcome before
+                # recursing. Enforcement = revise_pending_second_judgment
+                # so the audit shape distinguishes "judge wanted to
+                # revise" from "framework executed the revision".
+                first_event = self._build_judgment_event_dict(
+                    proposal=proposal_obj,
+                    tool_use=tu,
+                    judgment=judgment,
+                    enforcement_action="revise_pending_second_judgment",
+                    binding=binding,
+                )
+                first_event["revise_iteration"] = revise_iteration
+                first_event["amendment"] = {
+                    "judge_note": amendment.judge_note,
+                    "tool_name": amendment.tool_name,
+                    "tool_arguments": amendment.tool_arguments,
+                }
+                events.append(first_event)
+                # Recurse against the amended proposal. Fresh binding
+                # reflects amended hashes; class-policy + ensemble
+                # re-evaluate from amended classification.
+                amended_binding = ProposalBinding(
+                    tool_call_id=amended.tool_call_id,
+                    tool_definition_hash=amended.tool_definition_hash,
+                    arguments_hash=amended.arguments_hash,
+                )
+                allow2, events2, queue2 = self._run_ensemble(
+                    proposal_obj=amended,
+                    tu=tu,
+                    binding=amended_binding,
+                    class_policy=class_policy,
+                    timeout_ms=timeout_ms,
+                    judge_budget=judge_budget,
+                    escalation_cfg=escalation_cfg,
+                    flat_failure_policy=flat_failure_policy,
+                    backend_name=backend_name,
+                    revise_iteration=1,
+                    original_proposal=proposal_obj,
+                )
+                # Tag every second-judgment event with the linkage.
+                for ev in events2:
+                    ev["revise_iteration"] = 1
+                    ev["original_proposal_id"] = proposal_obj.proposal_id
+                # Promote the last event to revise_executed when the
+                # second judgment ALLOWed (the action that actually
+                # ran is the amended one).
+                if allow2 and events2:
+                    events2[-1]["enforcement_action"] = "revise_executed"
+                events.extend(events2)
+                return allow2, events, queue2
+
             # ESCALATE handling: a real judge (or failure_policy
             # synthesis) returned ESCALATE. Write PENDING + emit one
             # audit event with enforcement_action=escalate_pending.
@@ -1041,6 +1451,16 @@ class AtomicAgent:
                     judges_config_escalation=escalation_cfg,
                     synthesis_source=failure_synthesis,
                     triggered_by=triggered_by_failure,
+                    # P1 #3 (PR 3c): if this ESCALATE fires during a
+                    # second judgment (revise_iteration >= 1), thread
+                    # the original proposal_id into the new PENDING so
+                    # forensic chains stay walkable from amended
+                    # back to actor-original.
+                    revised_from_proposal_id=(
+                        original_proposal.proposal_id
+                        if original_proposal is not None
+                        else None
+                    ),
                 )
                 # Update judgment with the queue_id we just minted.
                 judgment = Judgment(
