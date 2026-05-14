@@ -689,7 +689,7 @@ and how often the resolution poller scans the queue.
 escalation:
   destination: vault/escalations/         # Vault-relative directory. Default "vault/escalations/". Legacy "vault" is accepted as an alias and normalized.
   auto_decide_after_seconds: 86400        # Wait at most 24h for operator decision. None / omitted = wait indefinitely.
-  fallback_on_timeout: block              # What to do when auto_decide_after expires. allow | block | revise | escalate. Default block.
+  fallback_on_timeout: block              # What to do when auto_decide_after expires. allow | block. Default block. (revise/escalate are judge-driven outcomes and have no semantics in the no-judge-responded path; the parser rejects them at load time.)
   resolution_poll_cycle_seconds: 60       # Throttle: at most one queue scan per N seconds inside agent.call(). Default 60.
 ```
 
@@ -723,8 +723,12 @@ fall-through. Operators who want every class to share a single policy
 should use the legacy string shape (`fallback_on_timeout: block`).
 Class keys must be one of `read_only | reversible_write |
 external_side_effect | high_risk`; values must be one of `allow |
-block | revise | escalate`. Any typo on either side fails LOUD at
-parse time with `JudgePolicyInvalid` naming the offending key or value.
+block`. (`revise` and `escalate` are judge-driven outcomes that
+require a live judge to interpret — they have no meaning in the
+auto-decide-when-no-judge-responded path, so the parser rejects them
+at load time rather than silently coercing them to block at runtime.)
+Any typo on either side fails LOUD at parse time with
+`JudgePolicyInvalid` naming the offending key or value.
 
 **Authoritative-via-frontmatter.** At auto-decide time the framework
 resolves per-class policy from the PENDING file's frontmatter
@@ -800,6 +804,8 @@ message for any of:
 - Unknown exception names in `failure_policy`.
 - Class-policy values outside `{bypass, allow_with_audit, judge_required, escalate}`.
 - Failure-policy outcomes outside `{allow, block, revise, escalate}`.
+- `escalation.fallback_on_timeout` outcomes outside `{allow, block}` (judge-driven `revise`/`escalate` have no meaning in the no-judge-responded path).
+- `escalation.fallback_on_timeout` dict form missing the mandatory `default:` key.
 - Non-integer or negative `timeout_ms`, `auto_decide_after_seconds`.
 - Non-numeric or negative budget caps.
 - File that isn't valid UTF-8.

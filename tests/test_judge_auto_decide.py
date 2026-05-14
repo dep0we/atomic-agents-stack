@@ -449,44 +449,53 @@ class TestPerClassFallbackOnTimeout:
         assert events[0].decision is _esc.ResolutionDecision.AUTO_DECIDED_ALLOW
 
 
-class TestFallbackMapInvariant:
-    """Pin the ``assert "default" in fallback_map`` guard in
-    ``_apply_auto_decide``. Normally unreachable through the parser
-    (which enforces the ``"default"`` key) but a caller that
-    programmatically constructs an ``EscalationConfig`` with a bad dict
-    would hit it — and without this test, a future refactor could
-    accidentally move the assert into the swallowing ``except Exception``
-    in ``poll_resolutions``, making the invariant violation invisible.
-    Calling ``_apply_auto_decide`` directly keeps the path exercised.
+class TestEscalationConfigInvariant:
+    """Pin the ``"default" in fallback_on_timeout`` invariant at the
+    ``EscalationConfig`` dataclass __post_init__ level.
+
+    /ship Step 9.1 review (cross-confirmed by 4 specialists: maintainability,
+    security, adversarial, testing) flagged that PR 5a's first-pass
+    runtime ``assert "default" in fallback_map`` guard in
+    ``_apply_auto_decide`` was double-broken: (a) ``python -O`` strips
+    asserts at bytecode level, and (b) ``AssertionError`` IS-A
+    ``Exception``, so the outer ``except Exception`` in
+    ``poll_resolutions`` would swallow it and wedge the PENDING file
+    silently every poll cycle — exactly the opposite of the docstring's
+    stated intent.
+
+    The fix moves the invariant to ``EscalationConfig.__post_init__``
+    so violations fail loud at config-load (parser + direct dataclass
+    construction both surface here) and the runtime path is
+    safe-by-construction.
     """
 
-    def test_fallback_map_missing_default_raises_assertion(self, tmp_path):
-        import hashlib
-        from datetime import datetime, timezone
+    def test_missing_default_key_raises_at_construction(self):
+        # Direct dataclass construction without the "default" key must
+        # fail at __post_init__ — not at runtime, not silently swallowed.
+        with pytest.raises(ValueError, match="must contain a 'default' key"):
+            EscalationConfig(fallback_on_timeout={"high_risk": "block"})
 
-        # Build a minimal PENDING file so _apply_auto_decide can read it.
-        proposal = _make_proposal(proposal_id="proposal_assert_test")
-        pending = _write_pending(tmp_path, proposal)
-        # Back-date so the timeout would normally apply.
-        _backdate_escalated_at(pending, seconds_ago=9999)
-        text = pending.read_text(encoding="utf-8")
-        pre_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        fm_dict, body = _esc._split_frontmatter(text)
-        fm = _esc._frontmatter_from_dict(fm_dict)
-        now_dt = datetime.now(tz=timezone.utc)
+    def test_empty_dict_raises_at_construction(self):
+        with pytest.raises(ValueError, match="must contain a 'default' key"):
+            EscalationConfig(fallback_on_timeout={})
 
-        # A fallback_map WITHOUT the required "default" key must raise
-        # AssertionError at policy-application time, not fail silently.
-        bad_map: dict = {"high_risk": "block"}  # missing "default"
-        with pytest.raises(AssertionError, match="default"):
-            _esc._apply_auto_decide(
-                pending_path=pending,
-                pre_sha=pre_sha,
-                fm=fm,
-                text=text,
-                body=body,
-                timeout_seconds=60,
-                fallback_map=bad_map,
-                now_dt=now_dt,
-                log_warning=None,
-            )
+    def test_non_dict_raises_at_construction(self):
+        # The dataclass field is annotated ``dict[str, str]`` but Python
+        # doesn't enforce annotations at runtime. ``__post_init__``
+        # explicitly checks the type so a caller that programmatically
+        # passes a string (or anything non-dict) fails LOUD rather than
+        # corrupting later code that expects dict semantics.
+        with pytest.raises(ValueError, match="must be a dict"):
+            EscalationConfig(fallback_on_timeout="block")  # type: ignore[arg-type]
+
+    def test_valid_dict_constructs(self):
+        # Negative-space test: the happy path must still work.
+        cfg = EscalationConfig(
+            fallback_on_timeout={"default": "block", "high_risk": "block"}
+        )
+        assert cfg.fallback_on_timeout == {"default": "block", "high_risk": "block"}
+
+    def test_default_factory_satisfies_invariant(self):
+        # The dataclass default_factory seeds ``{"default": "block"}``.
+        cfg = EscalationConfig()
+        assert cfg.fallback_on_timeout == {"default": "block"}

@@ -42,7 +42,6 @@ from typing import Any
 import yaml
 
 from .exceptions import JudgePolicyInvalid
-from .judge.backend import JudgmentOutcome
 from .judge.types import (
     ActionClass,
     BudgetConfig,
@@ -631,10 +630,20 @@ def _parse_failure_policy(raw: Any) -> dict[ActionClass, dict[str, str]]:
     return out
 
 
-# Derived from JudgmentOutcome rather than hardcoded so the spec/28
-# four-outcome model stays the single source of truth — if a fifth
-# outcome ever ships, this parser auto-extends.
-_VALID_OUTCOMES: tuple[str, ...] = tuple(o.value for o in JudgmentOutcome)
+# Outcomes the auto-decide path can actually enforce. /ship Step 9.1
+# adversarial review (PR 5a) flagged a silent-coercion gap: the parser
+# previously accepted all four ``JudgmentOutcome`` values
+# (``allow|block|revise|escalate``) but ``_apply_auto_decide`` only
+# branches on ``allow`` — every other value silently collapsed to
+# ``AUTO_DECIDED_BLOCK`` with no warning, producing audit text that
+# contradicted the operator's stated intent. Narrowing the accepted
+# set here makes the operator-intent / framework-behavior mismatch
+# fail LOUD at parse time instead. ``revise`` and ``escalate`` are
+# judge-driven outcomes that require a live judge; they have no
+# meaningful semantics in the auto-decide-when-no-judge-responded
+# scenario. Wiring them to real machinery (e.g. re-enqueueing as a
+# fresh ESCALATE proposal) is tracked separately.
+_VALID_FALLBACK_OUTCOMES: tuple[str, ...] = ("allow", "block")
 
 
 def _parse_fallback_on_timeout(raw: Any) -> dict[str, str]:
@@ -664,11 +673,11 @@ def _parse_fallback_on_timeout(raw: Any) -> dict[str, str]:
     """
     if isinstance(raw, str):
         normalized = raw.lower().strip()
-        if normalized not in _VALID_OUTCOMES:
+        if normalized not in _VALID_FALLBACK_OUTCOMES:
             raise JudgePolicyInvalid(
                 f"judges.md ``escalation.fallback_on_timeout`` is not a "
                 f"valid outcome: {normalized!r}. Allowed: "
-                f"{list(_VALID_OUTCOMES)}"
+                f"{list(_VALID_FALLBACK_OUTCOMES)}"
             )
         return {"default": normalized}
 
@@ -706,11 +715,11 @@ def _parse_fallback_on_timeout(raw: Any) -> dict[str, str]:
                 f"must be a string; got {type(value).__name__}"
             )
         normalized_value = value.lower().strip()
-        if normalized_value not in _VALID_OUTCOMES:
+        if normalized_value not in _VALID_FALLBACK_OUTCOMES:
             raise JudgePolicyInvalid(
                 f"judges.md ``escalation.fallback_on_timeout[{key!r}]`` "
                 f"is not a valid outcome: {normalized_value!r}. "
-                f"Allowed: {list(_VALID_OUTCOMES)}"
+                f"Allowed: {list(_VALID_FALLBACK_OUTCOMES)}"
             )
         parsed[key] = normalized_value
     return parsed

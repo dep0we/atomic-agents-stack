@@ -480,6 +480,55 @@ class TestPerClassFallbackOnTimeout:
         with pytest.raises(JudgePolicyInvalid, match="default.*not a valid outcome"):
             parse_judges_md_text(text)
 
+    def test_legacy_string_revise_rejected(self):
+        # /ship Step 9.1 adversarial finding (cross-confirmed by 3
+        # specialists): the parser used to accept all four JudgmentOutcome
+        # values, but ``_apply_auto_decide`` only branches on ``allow``
+        # — ``revise``/``escalate`` silently collapsed to BLOCK at runtime
+        # with audit text contradicting operator intent. Narrowed
+        # acceptance to {allow, block} surfaces the gap at parse time.
+        text = (
+            "```yaml\n"
+            "escalation:\n"
+            "  fallback_on_timeout: revise\n"
+            "```\n"
+        )
+        with pytest.raises(JudgePolicyInvalid, match="not a valid outcome"):
+            parse_judges_md_text(text)
+
+    def test_legacy_string_escalate_rejected(self):
+        text = (
+            "```yaml\n"
+            "escalation:\n"
+            "  fallback_on_timeout: escalate\n"
+            "```\n"
+        )
+        with pytest.raises(JudgePolicyInvalid, match="not a valid outcome"):
+            parse_judges_md_text(text)
+
+    def test_dict_shape_revise_per_class_rejected(self):
+        text = (
+            "```yaml\n"
+            "escalation:\n"
+            "  fallback_on_timeout:\n"
+            "    default: block\n"
+            "    high_risk: revise\n"
+            "```\n"
+        )
+        with pytest.raises(JudgePolicyInvalid, match="high_risk.*not a valid outcome"):
+            parse_judges_md_text(text)
+
+    def test_dict_shape_escalate_per_class_rejected(self):
+        text = (
+            "```yaml\n"
+            "escalation:\n"
+            "  fallback_on_timeout:\n"
+            "    default: escalate\n"
+            "```\n"
+        )
+        with pytest.raises(JudgePolicyInvalid, match="default.*not a valid outcome"):
+            parse_judges_md_text(text)
+
     def test_non_string_non_dict_raises(self):
         text = (
             "```yaml\n"
@@ -515,10 +564,12 @@ class TestPerClassFallbackOnTimeout:
             _parse_fallback_on_timeout({42: "block", "default": "block"})
 
     def test_legacy_string_allow_normalizes_correctly(self):
-        # ``"allow"`` is a valid legacy string outcome. Only ``"block"`` was
-        # tested in the existing suite; pin all other valid outcomes too
-        # (this test covers ``allow``; ``revise`` and ``escalate`` are covered
-        # in ``test_all_valid_legacy_string_outcomes`` below).
+        # ``"allow"`` is a valid legacy string outcome. Only ``"block"``
+        # was tested in the existing suite. ``"revise"`` and
+        # ``"escalate"`` are NOT valid for ``fallback_on_timeout`` per
+        # the /ship Step 9.1 adversarial finding (the auto-decide path
+        # only branches on ``allow``; the parser narrows to {allow,
+        # block} to surface the gap at parse time).
         text = (
             "```yaml\n"
             "escalation:\n"
@@ -528,30 +579,11 @@ class TestPerClassFallbackOnTimeout:
         cfg = parse_judges_md_text(text)
         assert cfg.escalation.fallback_on_timeout == {"default": "allow"}
 
-    def test_all_valid_legacy_string_outcomes(self):
-        # Every JudgmentOutcome value must be accepted as a legacy string.
-        # Exercises all four branches of the ``normalized in _VALID_OUTCOMES``
-        # check — ``"block"`` was already pinned; this pins ``"revise"``
-        # and ``"escalate"`` which are less obvious but valid operator
-        # choices (e.g. "escalate timeout → escalate again" is unusual but
-        # spec-legal).
-        for outcome in ("allow", "block", "revise", "escalate"):
-            text = (
-                "```yaml\n"
-                "escalation:\n"
-                f"  fallback_on_timeout: {outcome}\n"
-                "```\n"
-            )
-            cfg = parse_judges_md_text(text)
-            assert cfg.escalation.fallback_on_timeout == {"default": outcome}, (
-                f"Expected {{'default': {outcome!r}}} for outcome={outcome!r}"
-            )
-
     def test_dict_shape_all_four_action_classes_as_keys(self):
-        # All four ActionClass values are valid per-class keys in the dict
-        # shape. ``test_dict_shape_with_explicit_default`` only exercised
-        # ``high_risk`` + ``reversible_write``. Pin ``read_only`` +
-        # ``external_side_effect`` too so a future ActionClass rename
+        # All four ActionClass values are valid per-class keys in the
+        # dict shape. ``test_dict_shape_with_explicit_default`` only
+        # exercised ``high_risk`` + ``reversible_write``. Pin ``read_only``
+        # + ``external_side_effect`` too so a future ActionClass rename
         # regresses loud here.
         text = (
             "```yaml\n"
@@ -560,7 +592,7 @@ class TestPerClassFallbackOnTimeout:
             "    default: block\n"
             "    read_only: allow\n"
             "    reversible_write: block\n"
-            "    external_side_effect: escalate\n"
+            "    external_side_effect: block\n"
             "    high_risk: block\n"
             "```\n"
         )
@@ -569,7 +601,7 @@ class TestPerClassFallbackOnTimeout:
             "default": "block",
             "read_only": "allow",
             "reversible_write": "block",
-            "external_side_effect": "escalate",
+            "external_side_effect": "block",
             "high_risk": "block",
         }
 

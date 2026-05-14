@@ -512,16 +512,13 @@ def _apply_auto_decide(
     Falls back to the dict's ``"default"`` for any class the operator
     didn't list explicitly.
     """
-    # Invariant: every ``EscalationConfig.fallback_on_timeout`` value
-    # comes from ``_parse_fallback_on_timeout`` (which enforces ``default``)
-    # or the dataclass default_factory (which seeds ``{"default": "block"}``).
-    # Assert loud here so violations fail at policy-application — not
-    # silently get swallowed by the outer ``except Exception`` in
-    # ``poll_resolutions`` and wedge the file every poll cycle.
-    assert "default" in fallback_map, (
-        "EscalationConfig.fallback_on_timeout must contain a 'default' key; "
-        "construct via _parse_fallback_on_timeout or the dataclass default."
-    )
+    # ``"default"`` key invariant is enforced by
+    # ``EscalationConfig.__post_init__`` so every config that reaches this
+    # site already satisfies it (parser + direct dataclass construction
+    # both surface there). The runtime path is safe-by-construction —
+    # no defensive check needed here (and a defensive ``assert`` would
+    # be stripped by ``python -O`` and swallowed by the outer
+    # ``except Exception`` in ``poll_resolutions``).
     fallback = fallback_map.get(fm.action_class, fallback_map["default"])
     sidecar_path = _sidecar_path(pending_path)
     # Re-snapshot to detect operator-edit race.
