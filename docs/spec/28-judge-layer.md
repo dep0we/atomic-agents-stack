@@ -788,7 +788,17 @@ aggregation: any_block_blocks
 destination: vault/escalations/
 operator_notification: email | webhook | none
 auto_decide_after_seconds: 86400
+
+# Single-policy form (applied to every ActionClass):
 fallback_on_timeout: block
+
+# OR per-class form (PR 5a of #112) — ``default`` is REQUIRED:
+# fallback_on_timeout:
+#   default: block
+#   high_risk: block
+#   reversible_write: allow
+#   external_side_effect: block
+
 resolution_poll_cycle_seconds: 60
 
 ## Failure policy
@@ -814,7 +824,7 @@ read_audit_mode: false
 - Class policy values are an enum: `bypass | allow_with_audit | judge_required | escalate`. Unknown value → `JudgePolicyInvalid`.
 - Specialist composition is optional. Absent section → composition is implicit `[PolicyJudge, LLMCatchAll]` (PolicyJudge always-on baseline + the LLM catch-all configured under `## Default judge`). The catch-all is not "alone" — PolicyJudge always runs first.
 - Failure policy section is optional. **`Failure policy` default-fill**: any unlisted exception type defaults to `block` (fail-closed). Partial coverage is allowed; missing keys get the safe default.
-- **`Escalation queue` parser rules**: duration values are integer seconds (e.g., `auto_decide_after_seconds: 86400`), not duration strings. The framework reads `destination` as a vault-relative directory; the operator-typed value `vault` is normalized to `vault/escalations/` per spec/28:288. `resolution_poll_cycle_seconds` (default 60) caps how often the framework scans the escalation directory for state transitions; `0` disables throttling. The `fallback` key was renamed to `fallback_on_timeout` to match the parsed field name; the old name is not accepted.
+- **`Escalation queue` parser rules**: duration values are integer seconds (e.g., `auto_decide_after_seconds: 86400`), not duration strings. The framework reads `destination` as a vault-relative directory; the operator-typed value `vault` is normalized to `vault/escalations/` per spec/28:288. `resolution_poll_cycle_seconds` (default 60) caps how often the framework scans the escalation directory for state transitions; `0` disables throttling. The `fallback` key was renamed to `fallback_on_timeout` to match the parsed field name; the old name is not accepted. `fallback_on_timeout` accepts either a string (applied to every `ActionClass`) OR a mapping keyed by `ActionClass.value` strings with a mandatory `default:` key — there is no implicit fall-through when the dict form is used. Per-class resolution at auto-decide time keys on the PENDING file's frontmatter `action_class` field (the authoritative classification recorded at write time), NOT on the on-disk directory name, so an operator who hand-renames or typos a class directory still gets the correct timeout policy.
 - Per-tool overrides (rare, advanced) live in `tools.md`'s per-tool sections, not in `judges.md`.
 
 Pure-YAML config files are refused per rule #7. Embedded YAML inside markdown is acceptable for structured fields. Markdown sections carry the same aesthetic as `tools.md` and `model.md`.
