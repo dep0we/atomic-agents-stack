@@ -20,8 +20,9 @@ parser.
 > `max_revise_iterations=1`, operator `### Revised by <op>` resolution
 > with embedded `amendment:` YAML + class-upgrade re-judge gate), and
 > a 38-test conformance suite parametrized over both shipped backends.
-> Deferred to PR 5: full JSON-Schema validation of amended args (via
-> optional `jsonschema` extra) + per-class `fallback_on_timeout` map.
+> PR 5a ships the per-class `fallback_on_timeout` map (see
+> [`escalation`](#escalation) below). Full JSON-Schema validation of
+> amended args via an opt-in `[validation]` extra ships in PR 5b.
 
 ---
 
@@ -542,13 +543,16 @@ synthetic resolution block on the next poll cycle:
 ```
 ### Auto-decided by framework
 resolved_at: 2026-05-13T13:30:00Z
-reason: auto_decide_after_seconds=86400 elapsed; fallback_on_timeout=block
+reason: auto_decide_after_seconds=86400 elapsed; fallback_on_timeout=block (resolved for action_class=external_side_effect)
 ```
 
 The framework flips the file's `state:` frontmatter to `resolved`,
 emits a RESOLVED audit event with `enforcement_action="auto_decided_block"`
-(or `"auto_decided_allow"` if `fallback_on_timeout: allow`), and
-does NOT execute the action when fallback is `block`.
+(or `"auto_decided_allow"` if the resolved policy is `allow`), and
+does NOT execute the action when fallback is `block`. The
+parenthetical records the `action_class` the framework keyed on when
+resolving per-class policy — see *Per-class `fallback_on_timeout`*
+under [`escalation`](#escalation).
 
 **Race safety**: the auto-decide write is gated on a sha256
 compare-and-swap. If an operator edits the file between the poller's
@@ -685,7 +689,7 @@ and how often the resolution poller scans the queue.
 escalation:
   destination: vault/escalations/         # Vault-relative directory. Default "vault/escalations/". Legacy "vault" is accepted as an alias and normalized.
   auto_decide_after_seconds: 86400        # Wait at most 24h for operator decision. None / omitted = wait indefinitely.
-  fallback_on_timeout: block              # What to do when auto_decide_after expires. allow | block | revise | escalate. Default block.
+  fallback_on_timeout: block              # What to do when auto_decide_after expires. allow | block. Default block. (revise/escalate are judge-driven outcomes and have no semantics in the no-judge-responded path; the parser rejects them at load time.)
   resolution_poll_cycle_seconds: 60       # Throttle: at most one queue scan per N seconds inside agent.call(). Default 60.
 ```
 
@@ -694,6 +698,61 @@ whenever the throttle window has elapsed since the last scan (the
 `.last-poll` marker lives in the destination directory). Operators who
 want a clock-driven poll independent of agent traffic can call
 `agent.poll_escalations()` directly from a cron / launchd job.
+
+#### Per-class `fallback_on_timeout` (PR 5a of #112)
+
+`fallback_on_timeout` accepts either a single string (applied to every
+`ActionClass`) or a mapping keyed by `ActionClass.value` strings with a
+mandatory `default:` key. Use the dict form when different classes
+deserve different timeout policy — e.g. `high_risk` should never
+silently allow, while `reversible_write` is safe to auto-approve when
+the operator is on vacation:
+
+```yaml
+escalation:
+  auto_decide_after_seconds: 86400
+  fallback_on_timeout:
+    default: block                 # REQUIRED. Applied to any class not listed below.
+    high_risk: block               # Explicit; same as default here. Documenting intent for ops review.
+    reversible_write: allow        # Vacation-friendly for write actions that can be rolled back.
+    external_side_effect: block    # Refuse outbound-effect actions on timeout.
+```
+
+The `default:` key is mandatory in the dict form — there is no implicit
+fall-through. Operators who want every class to share a single policy
+should use the legacy string shape (`fallback_on_timeout: block`).
+Class keys must be one of `read_only | reversible_write |
+external_side_effect | high_risk`; values must be one of `allow |
+block`. (`revise` and `escalate` are judge-driven outcomes that
+require a live judge to interpret — they have no meaning in the
+auto-decide-when-no-judge-responded path, so the parser rejects them
+at load time rather than silently coercing them to block at runtime.)
+Any typo on either side fails LOUD at parse time with
+`JudgePolicyInvalid` naming the offending key or value.
+
+**Authoritative-via-frontmatter.** At auto-decide time the framework
+resolves per-class policy from the PENDING file's frontmatter
+`action_class` field — the classification recorded at write time — NOT
+from the on-disk directory name. So an operator who hand-moves a
+PENDING file into a typo'd or renamed class directory still gets the
+correct timeout policy for the *real* classification of that action.
+The on-disk `### Auto-decided by framework` block's `reason:` line
+records the resolved class (e.g. `fallback_on_timeout=block (resolved
+for action_class=high_risk)`) for audit clarity.
+
+**Cascade-floor scope.** Per spec/28:408 the project's
+`<project>/judges.md` is the non-relaxable floor for **`class_policy`**
+— a delegate may strengthen, never relax. The same protection does
+*not* extend to `escalation.fallback_on_timeout` today: the delegate's
+parsed `escalation` config wins wholesale (even when the delegate
+omits the `escalation:` section, the parser materializes the
+spec/28 default config — the floor's escalation is NOT inherited).
+If your project sets `high_risk: block` at the floor and you want
+every delegate bound by it, duplicate the `escalation:` block at
+each delegate's `judges.md`. Whether to close this gap by enforcing
+strictness (as `class_policy` does) or by inheriting unset escalation
+sections from the floor is tracked at
+[#173](https://github.com/dep0we/atomic-agents-stack/issues/173).
 
 ### `judge_captures`, `read_audit_mode`
 
@@ -745,6 +804,8 @@ message for any of:
 - Unknown exception names in `failure_policy`.
 - Class-policy values outside `{bypass, allow_with_audit, judge_required, escalate}`.
 - Failure-policy outcomes outside `{allow, block, revise, escalate}`.
+- `escalation.fallback_on_timeout` outcomes outside `{allow, block}` (judge-driven `revise`/`escalate` have no meaning in the no-judge-responded path).
+- `escalation.fallback_on_timeout` dict form missing the mandatory `default:` key.
 - Non-integer or negative `timeout_ms`, `auto_decide_after_seconds`.
 - Non-numeric or negative budget caps.
 - File that isn't valid UTF-8.

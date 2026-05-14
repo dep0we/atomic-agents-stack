@@ -83,7 +83,7 @@ class TestAutoDecideTimeout:
         _backdate_escalated_at(pending, seconds_ago=120)
         cfg = EscalationConfig(
             auto_decide_after_seconds=60,
-            fallback_on_timeout="block",
+            fallback_on_timeout={"default": "block"},
         )
         events = _esc.poll_resolutions(
             agent_root=tmp_path, judges_config_escalation=cfg
@@ -104,7 +104,7 @@ class TestAutoDecideTimeout:
         # Backdate 10s — within 60s window.
         _backdate_escalated_at(pending, seconds_ago=10)
         cfg = EscalationConfig(
-            auto_decide_after_seconds=60, fallback_on_timeout="block"
+            auto_decide_after_seconds=60, fallback_on_timeout={"default": "block"}
         )
         events = _esc.poll_resolutions(
             agent_root=tmp_path, judges_config_escalation=cfg
@@ -140,7 +140,7 @@ class TestAutoDecideTimeout:
         )
         pending.write_text(text, encoding="utf-8")
         cfg = EscalationConfig(
-            auto_decide_after_seconds=60, fallback_on_timeout="block"
+            auto_decide_after_seconds=60, fallback_on_timeout={"default": "block"}
         )
         events = _esc.poll_resolutions(
             agent_root=tmp_path, judges_config_escalation=cfg
@@ -160,7 +160,7 @@ class TestAutoDecideTimeout:
         pending = _write_pending(tmp_path, proposal)
         _backdate_escalated_at(pending, seconds_ago=120)
         cfg = EscalationConfig(
-            auto_decide_after_seconds=60, fallback_on_timeout="block"
+            auto_decide_after_seconds=60, fallback_on_timeout={"default": "block"}
         )
         # First poll auto-decides AND claims the sidecar.
         events1 = _esc.poll_resolutions(
@@ -180,3 +180,322 @@ class TestAutoDecideTimeout:
         # de-dup state. Sidecar persistence is the contract.
         assert len(events2) == 1
         assert events2[0].decision is _esc.ResolutionDecision.AUTO_DECIDED_BLOCK
+
+
+# ──────────────────────────────────────────────────────────────────
+# Per-class fallback_on_timeout (PR 5a of #112)
+
+
+class TestPerClassFallbackOnTimeout:
+    """``EscalationConfig.fallback_on_timeout`` is a dict keyed by
+    ``ActionClass.value`` with a mandatory ``"default"``. The auto-decide
+    path resolves the policy for a PENDING file using its frontmatter
+    ``action_class`` (NOT the on-disk directory name) so the
+    authoritative classification recorded at write time drives the
+    decision — operator typos on the directory layout don't silently
+    fall through to the default policy.
+    """
+
+    def _make_proposal_with_class(
+        self, *, action_class: ActionClass, proposal_id: str
+    ) -> ActionProposal:
+        from atomic_agents.judge.proposal import compute_arguments_hash
+
+        args = {"to": "x@y", "body": "hi"}
+        return ActionProposal(
+            tool_name="send_email",
+            tool_arguments=args,
+            tool_call_id="tc_1",
+            tool_definition_hash="sha256:" + "a" * 64,
+            arguments_hash=compute_arguments_hash(args),
+            classification=action_class,
+            classification_source="tools.md",
+            actor_agent="caldwell",
+            actor_run_id="agent_run_1",
+            proposal_id=proposal_id,
+            proposal_ts="2026-05-13T12:00:00+00:00",
+        )
+
+    def test_high_risk_uses_per_class_override_default_used_for_other(
+        self, tmp_path
+    ):
+        # high_risk → block (per-class), external_side_effect → allow
+        # (the default). Two pending files; one resolves to block,
+        # the other to allow.
+        p_high = self._make_proposal_with_class(
+            action_class=ActionClass.HIGH_RISK,
+            proposal_id="proposal_high",
+        )
+        p_ext = self._make_proposal_with_class(
+            action_class=ActionClass.EXTERNAL_SIDE_EFFECT,
+            proposal_id="proposal_ext",
+        )
+        pending_high = _write_pending(tmp_path, p_high)
+        pending_ext = _write_pending(tmp_path, p_ext)
+        _backdate_escalated_at(pending_high, seconds_ago=120)
+        _backdate_escalated_at(pending_ext, seconds_ago=120)
+
+        cfg = EscalationConfig(
+            auto_decide_after_seconds=60,
+            fallback_on_timeout={
+                "default": "allow",
+                "high_risk": "block",
+            },
+        )
+        events = _esc.poll_resolutions(
+            agent_root=tmp_path, judges_config_escalation=cfg
+        )
+        assert len(events) == 2
+        by_id = {e.frontmatter.proposal_id: e for e in events}
+        assert by_id["proposal_high"].decision is _esc.ResolutionDecision.AUTO_DECIDED_BLOCK
+        assert by_id["proposal_ext"].decision is _esc.ResolutionDecision.AUTO_DECIDED_ALLOW
+        # Reason line records the action_class so operators reading a
+        # stale PENDING file know which policy applied.
+        assert "action_class=high_risk" in by_id["proposal_high"].reason
+        assert "action_class=external_side_effect" in by_id["proposal_ext"].reason
+
+    def test_class_not_in_per_class_falls_back_to_default(self, tmp_path):
+        # reversible_write is NOT listed; default = escalate.
+        proposal = self._make_proposal_with_class(
+            action_class=ActionClass.REVERSIBLE_WRITE,
+            proposal_id="proposal_rev",
+        )
+        pending = _write_pending(tmp_path, proposal)
+        _backdate_escalated_at(pending, seconds_ago=120)
+        cfg = EscalationConfig(
+            auto_decide_after_seconds=60,
+            fallback_on_timeout={
+                "default": "block",
+                "high_risk": "allow",  # listed but irrelevant for this proposal
+            },
+        )
+        events = _esc.poll_resolutions(
+            agent_root=tmp_path, judges_config_escalation=cfg
+        )
+        assert len(events) == 1
+        # Default applied — block.
+        assert events[0].decision is _esc.ResolutionDecision.AUTO_DECIDED_BLOCK
+
+    def test_authoritative_class_from_frontmatter_not_directory(
+        self, tmp_path
+    ):
+        # P0 finding from plan review (§2): per-class resolution must
+        # key on the PENDING file's frontmatter ``action_class``, NOT
+        # the on-disk directory name. An operator could hand-move a
+        # PENDING file into a wrong-named directory (or rename a
+        # directory). The framework's auto-decide must still apply
+        # the policy for the authoritative class recorded in the file.
+        proposal = self._make_proposal_with_class(
+            action_class=ActionClass.HIGH_RISK,
+            proposal_id="proposal_misfiled",
+        )
+        # Normal write goes to vault/escalations/high_risk/...
+        pending = _write_pending(tmp_path, proposal)
+        # Simulate operator moving the file to a typo'd directory.
+        typo_dir = pending.parent.parent / "hi_risk"
+        typo_dir.mkdir()
+        new_path = typo_dir / pending.name
+        pending.rename(new_path)
+        _backdate_escalated_at(new_path, seconds_ago=120)
+        # Per-class config: high_risk → block, default → allow. If the
+        # framework resolved per-class via the directory name (the bug
+        # this test pins), it would not find "hi_risk" in the per-class
+        # map and fall through to default=allow — silently relaxing the
+        # high_risk policy. Authoritative-via-frontmatter means we get
+        # high_risk → block, the correct policy.
+        cfg = EscalationConfig(
+            auto_decide_after_seconds=60,
+            fallback_on_timeout={
+                "default": "allow",
+                "high_risk": "block",
+            },
+        )
+        events = _esc.poll_resolutions(
+            agent_root=tmp_path, judges_config_escalation=cfg
+        )
+        assert len(events) == 1
+        assert events[0].decision is _esc.ResolutionDecision.AUTO_DECIDED_BLOCK
+        assert "action_class=high_risk" in events[0].reason
+
+    def test_unknown_frontmatter_class_falls_back_to_default(self, tmp_path):
+        # Diff-review Finding 2: symmetric to the typo'd-directory case
+        # but in the AUTHORITATIVE source itself. An operator (or a
+        # future framework with a different ``ActionClass`` enum)
+        # hand-edits the PENDING frontmatter ``action_class`` to a
+        # string outside the spec/28 four-class set. The framework
+        # falls through to ``default`` rather than raising —
+        # ``fallback_map.get(fm.action_class, fallback_map["default"])``
+        # is the contract. Pin the silent-fall-through so a future
+        # refactor (e.g. someone writes
+        # ``fallback_map[fm.action_class]`` thinking the parser
+        # validates frontmatter contents) regresses LOUD instead of
+        # quietly raising KeyError every poll cycle.
+        import re
+
+        proposal = self._make_proposal_with_class(
+            action_class=ActionClass.HIGH_RISK,
+            proposal_id="proposal_unknown_class",
+        )
+        pending = _write_pending(tmp_path, proposal)
+        text = pending.read_text(encoding="utf-8")
+        text = re.sub(
+            r"action_class: [^\n]+",
+            "action_class: hi_risk",
+            text,
+        )
+        pending.write_text(text, encoding="utf-8")
+        _backdate_escalated_at(pending, seconds_ago=120)
+        cfg = EscalationConfig(
+            auto_decide_after_seconds=60,
+            fallback_on_timeout={
+                "default": "allow",
+                "high_risk": "block",  # would apply if frontmatter said high_risk
+            },
+        )
+        events = _esc.poll_resolutions(
+            agent_root=tmp_path, judges_config_escalation=cfg
+        )
+        assert len(events) == 1
+        # ``hi_risk`` is not in the per-class map → ``default`` (allow).
+        assert events[0].decision is _esc.ResolutionDecision.AUTO_DECIDED_ALLOW
+        assert "action_class=hi_risk" in events[0].reason
+
+    def test_two_files_same_directory_resolve_per_frontmatter(self, tmp_path):
+        # Diff-review Finding 3: opposite direction from the typo'd-
+        # directory test. Two PENDING files in the SAME class directory
+        # but with DIFFERENT frontmatter ``action_class``. Each must
+        # resolve via its OWN frontmatter — pinning the
+        # "frontmatter is authoritative, directory is layout" claim
+        # symmetrically.
+        import re
+
+        p_a = self._make_proposal_with_class(
+            action_class=ActionClass.HIGH_RISK,
+            proposal_id="proposal_misfile_1",
+        )
+        p_b = self._make_proposal_with_class(
+            action_class=ActionClass.HIGH_RISK,
+            proposal_id="proposal_misfile_2",
+        )
+        pending_a = _write_pending(tmp_path, p_a)
+        pending_b = _write_pending(tmp_path, p_b)
+        # Hand-edit pending_b's frontmatter to claim external_side_effect
+        # while leaving the file in vault/escalations/high_risk/ —
+        # operator-misfile scenario.
+        text = pending_b.read_text(encoding="utf-8")
+        text = re.sub(
+            r"action_class: high_risk",
+            "action_class: external_side_effect",
+            text,
+            count=1,
+        )
+        pending_b.write_text(text, encoding="utf-8")
+        assert pending_a.parent.name == "high_risk"
+        assert pending_b.parent.name == "high_risk"
+
+        _backdate_escalated_at(pending_a, seconds_ago=120)
+        _backdate_escalated_at(pending_b, seconds_ago=120)
+
+        cfg = EscalationConfig(
+            auto_decide_after_seconds=60,
+            fallback_on_timeout={
+                "default": "block",
+                "high_risk": "block",
+                "external_side_effect": "allow",
+            },
+        )
+        events = _esc.poll_resolutions(
+            agent_root=tmp_path, judges_config_escalation=cfg
+        )
+        assert len(events) == 2
+        by_id = {e.frontmatter.proposal_id: e for e in events}
+        # pending_a: frontmatter high_risk → high_risk policy → block.
+        assert (
+            by_id["proposal_misfile_1"].decision
+            is _esc.ResolutionDecision.AUTO_DECIDED_BLOCK
+        )
+        # pending_b: frontmatter external_side_effect → external_side_effect
+        # policy → allow. Directory neighbor is irrelevant.
+        assert (
+            by_id["proposal_misfile_2"].decision
+            is _esc.ResolutionDecision.AUTO_DECIDED_ALLOW
+        )
+
+    def test_reason_line_records_resolved_class(self, tmp_path):
+        # PR 5a P2 from plan review (§10): the on-disk Auto-decided
+        # block embeds the resolved action_class in its reason line so
+        # an operator reading a 6-month-old PENDING file can see WHICH
+        # policy applied. The recovery regex still parses the policy.
+        proposal = self._make_proposal_with_class(
+            action_class=ActionClass.HIGH_RISK,
+            proposal_id="proposal_reason_line",
+        )
+        pending = _write_pending(tmp_path, proposal)
+        _backdate_escalated_at(pending, seconds_ago=120)
+        cfg = EscalationConfig(
+            auto_decide_after_seconds=60,
+            fallback_on_timeout={"default": "block", "high_risk": "allow"},
+        )
+        events = _esc.poll_resolutions(
+            agent_root=tmp_path, judges_config_escalation=cfg
+        )
+        assert len(events) == 1
+        # On-disk text carries the resolved class.
+        text = pending.read_text(encoding="utf-8")
+        assert "fallback_on_timeout=allow" in text
+        assert "action_class=high_risk" in text
+        # The recovery parser still maps Auto-decided + fallback=allow
+        # → AUTO_DECIDED_ALLOW.
+        assert events[0].decision is _esc.ResolutionDecision.AUTO_DECIDED_ALLOW
+
+
+class TestEscalationConfigInvariant:
+    """Pin the ``"default" in fallback_on_timeout`` invariant at the
+    ``EscalationConfig`` dataclass __post_init__ level.
+
+    /ship Step 9.1 review (cross-confirmed by 4 specialists: maintainability,
+    security, adversarial, testing) flagged that PR 5a's first-pass
+    runtime ``assert "default" in fallback_map`` guard in
+    ``_apply_auto_decide`` was double-broken: (a) ``python -O`` strips
+    asserts at bytecode level, and (b) ``AssertionError`` IS-A
+    ``Exception``, so the outer ``except Exception`` in
+    ``poll_resolutions`` would swallow it and wedge the PENDING file
+    silently every poll cycle — exactly the opposite of the docstring's
+    stated intent.
+
+    The fix moves the invariant to ``EscalationConfig.__post_init__``
+    so violations fail loud at config-load (parser + direct dataclass
+    construction both surface here) and the runtime path is
+    safe-by-construction.
+    """
+
+    def test_missing_default_key_raises_at_construction(self):
+        # Direct dataclass construction without the "default" key must
+        # fail at __post_init__ — not at runtime, not silently swallowed.
+        with pytest.raises(ValueError, match="must contain a 'default' key"):
+            EscalationConfig(fallback_on_timeout={"high_risk": "block"})
+
+    def test_empty_dict_raises_at_construction(self):
+        with pytest.raises(ValueError, match="must contain a 'default' key"):
+            EscalationConfig(fallback_on_timeout={})
+
+    def test_non_dict_raises_at_construction(self):
+        # The dataclass field is annotated ``dict[str, str]`` but Python
+        # doesn't enforce annotations at runtime. ``__post_init__``
+        # explicitly checks the type so a caller that programmatically
+        # passes a string (or anything non-dict) fails LOUD rather than
+        # corrupting later code that expects dict semantics.
+        with pytest.raises(ValueError, match="must be a dict"):
+            EscalationConfig(fallback_on_timeout="block")  # type: ignore[arg-type]
+
+    def test_valid_dict_constructs(self):
+        # Negative-space test: the happy path must still work.
+        cfg = EscalationConfig(
+            fallback_on_timeout={"default": "block", "high_risk": "block"}
+        )
+        assert cfg.fallback_on_timeout == {"default": "block", "high_risk": "block"}
+
+    def test_default_factory_satisfies_invariant(self):
+        # The dataclass default_factory seeds ``{"default": "block"}``.
+        cfg = EscalationConfig()
+        assert cfg.fallback_on_timeout == {"default": "block"}
