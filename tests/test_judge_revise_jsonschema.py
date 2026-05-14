@@ -205,6 +205,89 @@ class TestStrictPolicyInvalid:
             )
 
 
+class TestStrictDefensiveBranches:
+    """/ship Step 9.1 specialist coverage gap-fills: the three
+    defensive except branches in ``_run_strict_jsonschema_validation``
+    each get a dedicated test so regressions on the descriptive error
+    messages don't ship silently.
+    """
+
+    def test_runtime_typeerror_translated_to_rejection(self, monkeypatch):
+        # Defensive branch: jsonschema.validate raises TypeError
+        # post-load (e.g., future API rename of arguments). Framework
+        # surfaces JudgeAmendedProposalRejected with descriptive text.
+        import jsonschema
+
+        def _boom(*args, **kwargs):
+            raise TypeError("unexpected keyword argument 'whatever'")
+
+        monkeypatch.setattr(jsonschema, "validate", _boom)
+        amended = _make_proposal(tool_arguments={"to": "x@y", "body": "hi"})
+        with pytest.raises(
+            JudgeAmendedProposalRejected,
+            match="unexpected runtime error.*TypeError",
+        ):
+            _revise.validate_amended_args(
+                amended, _make_registry(),
+                agent_name="t", validation_mode="strict",
+            )
+
+    def test_runtime_attributeerror_translated_to_rejection(self, monkeypatch):
+        # Same defensive branch for AttributeError.
+        import jsonschema
+
+        def _boom(*args, **kwargs):
+            raise AttributeError("'Validator' object has no attribute 'iter_errors'")
+
+        monkeypatch.setattr(jsonschema, "validate", _boom)
+        amended = _make_proposal(tool_arguments={"to": "x@y", "body": "hi"})
+        with pytest.raises(
+            JudgeAmendedProposalRejected,
+            match="unexpected runtime error.*AttributeError",
+        ):
+            _revise.validate_amended_args(
+                amended, _make_registry(),
+                agent_name="t", validation_mode="strict",
+            )
+
+    def test_runtime_import_unavailable_translated_to_rejection(self, monkeypatch):
+        # Outer defensive try: ``import jsonschema`` succeeded at
+        # agent-load but the runtime call discovers the module is
+        # broken (e.g., a hot-swap removed it from sys.modules).
+        # Surfaces JudgeAmendedProposalRejected with the
+        # "runtime surface unavailable" message.
+        import sys
+
+        # Stash any cached imports so we can restore them.
+        saved = {}
+        for mod_name in ("jsonschema", "jsonschema.exceptions"):
+            if mod_name in sys.modules:
+                saved[mod_name] = sys.modules.pop(mod_name)
+        # Block re-import via a finder that raises ImportError.
+        class _BlockImport:
+            def find_spec(self, name, *args, **kwargs):
+                if name == "jsonschema":
+                    raise ImportError("simulated post-load jsonschema removal")
+                return None
+
+        blocker = _BlockImport()
+        sys.meta_path.insert(0, blocker)
+        try:
+            amended = _make_proposal(tool_arguments={"to": "x@y", "body": "hi"})
+            with pytest.raises(
+                JudgeAmendedProposalRejected,
+                match="runtime surface unavailable.*ImportError",
+            ):
+                _revise.validate_amended_args(
+                    amended, _make_registry(),
+                    agent_name="t", validation_mode="strict",
+                )
+        finally:
+            sys.meta_path.remove(blocker)
+            for mod_name, mod in saved.items():
+                sys.modules[mod_name] = mod
+
+
 class TestWeakenedMode:
     def test_weakened_passes_when_strict_would_reject(self):
         # Same input that strict rejects — weakened mode must accept

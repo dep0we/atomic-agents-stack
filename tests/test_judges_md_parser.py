@@ -945,3 +945,28 @@ class TestValidationFloor:
         )
         merged = apply_project_floor(delegate, floor)
         assert merged.validation == "strict"
+
+    def test_floor_strict_delegate_explicit_strict_source_is_delegate(self):
+        # /ship Step 9.1 maintainability gap-fill: post-merge
+        # validation_source should be "delegate" when the delegate
+        # explicitly set strict. Regression guard for cascade-chain
+        # checks that key on validation_source.
+        floor = parse_judges_md_text(
+            "```yaml\nvalidation: strict\n```\n"
+        )
+        delegate = parse_judges_md_text(
+            "```yaml\nvalidation: strict\n```\n"
+        )
+        merged = apply_project_floor(delegate, floor)
+        assert merged.validation_source == "delegate"
+
+    def test_floor_strict_delegate_omits_source_is_floor(self):
+        # Symmetric gap-fill: when the delegate omits and inherits the
+        # floor, post-merge validation_source should be "floor"
+        # (because the floor explicitly set it).
+        floor = parse_judges_md_text(
+            "```yaml\nvalidation: strict\n```\n"
+        )
+        delegate = parse_judges_md_text("```yaml\nbackend: rules\n```\n")
+        merged = apply_project_floor(delegate, floor)
+        assert merged.validation_source == "floor"

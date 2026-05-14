@@ -385,6 +385,104 @@ class TestValidationModeWiring:
         with pytest.raises(JudgePolicyInvalid, match="not importable"):
             AtomicAgent(name="tester_no_extra", agents_root=agents_root)
 
+    def test_strict_malformed_schema_routes_through_failure_policy(self, tmp_path, monkeypatch):
+        """/ship Step 9.1 specialist-army cross-confirmed P0 (testing +
+        security): under ``validation: strict``, a tool with a malformed
+        ``input_schema`` raises ``JudgePolicyInvalid`` inside
+        ``validate_amended_args``. Pre-fix this propagated out of
+        ``_run_ensemble`` and got caught by the generic ``except
+        Exception`` at the dispatch site, producing a generic
+        "judge dispatch error" audit and a hard BLOCK regardless of
+        ``failure_policy[JudgePolicyInvalid]``. Docs at
+        ``docs/deployment/judges-md.md`` claim the failure_policy
+        decides this case — pre-fix impl diverged from docs (CLAUDE.md
+        rule #13). This regression pins the fix.
+        """
+        from atomic_agents.agent import AtomicAgent
+        from atomic_agents.judge.backend import Judgment, JudgmentOutcome
+
+        monkeypatch.setenv("ATOMIC_AGENTS_ANTHROPIC_KEY", "fake-key")
+        monkeypatch.setenv("AGENT_JUDGE_ENABLED", "1")
+        agents_root = tmp_path / "agents"
+        agent_dir = agents_root / "tester_malformed_schema"
+        (agent_dir / "persona").mkdir(parents=True)
+        (agent_dir / "persona" / "IDENTITY.md").write_text("# I")
+        (agent_dir / "tools.md").write_text("## Read paths\n- ~/docs/\n")
+        (agent_dir / "model.md").write_text(
+            "## Default model\nclaude-haiku-4-5-20251001\n"
+        )
+        # failure_policy.JudgePolicyInvalid = escalate — operator
+        # wants a malformed-schema event surfaced for review, NOT a
+        # silent BLOCK with a generic "judge dispatch error" reason.
+        (agent_dir / "judges.md").write_text(
+            "```yaml\n"
+            "validation: strict\n"
+            "class_policy:\n"
+            "  external_side_effect: judge_required\n"
+            "failure_policy:\n"
+            "  JudgePolicyInvalid: escalate\n"
+            "```\n"
+        )
+        (agent_dir / "memory").mkdir()
+        (agent_dir / "log").mkdir()
+        agent = AtomicAgent(name="tester_malformed_schema", agents_root=agents_root)
+        agent.load()
+        # Register a tool with a deliberately malformed input_schema —
+        # `required: "not_a_list"` triggers SchemaError at validate.
+        agent.tool_registry.register(
+            ToolDefinition(
+                name="send_email",
+                description="...",
+                input_schema={"type": "object", "required": "not_a_list"},
+                handler=lambda i: None,
+                classification="external_side_effect",
+            )
+        )
+
+        amendment = ProposalAmendment(
+            judge_note="amend args",
+            tool_arguments={"to": "x@y", "body": "hi"},
+        )
+        real_id = agent._ensure_policy_judge().judge_id
+        real_pv = agent._ensure_policy_judge().policy_version
+
+        def evaluate(proposal, context):
+            return Judgment(
+                outcome=JudgmentOutcome.REVISE,
+                reason="amend args",
+                judge_id=real_id,
+                policy_version=real_pv,
+                amendment=amendment,
+            )
+
+        monkeypatch.setattr(agent._ensure_policy_judge(), "evaluate", evaluate)
+        tu = {
+            "name": "send_email",
+            "input": {"to": "x@y", "body": "hi"},
+            "id": "tc_malformed_1",
+        }
+        markers = {"tc_malformed_1": {"for_tool_call_id": "tc_malformed_1", "reason": "send"}}
+        # Pre-fix this would have produced an uncaught JudgePolicyInvalid
+        # bubbling out of _run_ensemble; the test asserts the dispatch
+        # completes cleanly and the failure_policy-mapped outcome
+        # (escalate) is honored.
+        allow, events, queue_id = agent._dispatch_with_judge(tu, markers)
+        assert allow is False
+        # failure_policy[JudgePolicyInvalid]=escalate must route to
+        # an ESCALATE outcome — operator gets a PENDING file for review
+        # instead of a silent BLOCK.
+        assert queue_id is not None, (
+            "failure_policy[JudgePolicyInvalid]=escalate should have "
+            "produced an escalation_queue_id; got None — fix did not "
+            "route through failure_policy"
+        )
+        invalid_event = events[-1]
+        assert invalid_event["enforcement_action"] == "revise_invalid_amendment"
+        # The audit reason should name JudgePolicyInvalid so operators
+        # know the root cause is a malformed schema (not an amendment
+        # rejection).
+        assert "JudgePolicyInvalid" in invalid_event["judgment_reason"]
+
     def test_legacy_no_validation_key_uses_weakened(self, revise_agent, monkeypatch):
         # The ``revise_agent`` fixture's judges.md doesn't set
         # ``validation:`` — config defaults to weakened. End-to-end

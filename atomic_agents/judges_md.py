@@ -37,7 +37,7 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 
@@ -78,6 +78,15 @@ _POLICY_STRICTNESS: dict[ClassPolicyValue, int] = {
 # rejects them with "not yet implemented" pointing at their tracking
 # issue, so operator typos surface differently from operators reaching
 # for a future feature.
+#
+# Indices start at 1 (not 0) to leave headroom for a future weaker
+# tier — e.g. a hypothetical ``validation: off`` (no weakened-mode
+# checks at all) would land at 0 without renumbering existing entries
+# or rebasing the integer-pinning regression tests in
+# ``tests/test_judges_md_parser.py::TestValidationFloor``. Mirrors the
+# 0-based ``_POLICY_STRICTNESS`` precedent above where ``bypass`` is
+# the floor at 0; we just don't have a "bypass" equivalent for
+# ``validation`` shipped today.
 _VALID_VALIDATION_VALUES: tuple[str, ...] = ("weakened", "strict")
 _VALIDATION_STRICTNESS: dict[str, int] = {"weakened": 1, "strict": 2}
 _RESERVED_VALIDATION_VALUES: dict[str, str] = {
@@ -166,13 +175,24 @@ class JudgesConfig:
     # the ``[validation]`` extra BEFORE setting ``validation: strict``;
     # the parser fails LOUD at agent-load otherwise.
     #
-    # ``validation_source`` mirrors ``class_policy.source`` — the
-    # cascade-floor strictness check only fires when the delegate
-    # EXPLICITLY set ``validation`` (source=="judges.md"). A delegate
-    # that omits the field default-fills to "weakened" with
-    # source=="default" and inherits the floor without tripping a
-    # false-positive relax violation.
-    validation: str = "weakened"
+    # ``validation_source`` mirrors ``class_policy.source`` and takes
+    # one of four values across the parse → cascade-merge pipeline:
+    #
+    # - ``"default"``   — operator omitted the ``validation:`` field;
+    #                     parser default-filled to ``weakened``.
+    #                     Pre-merge state for delegate configs the
+    #                     cascade-floor check treats as "inherit the
+    #                     floor" rather than "explicit relax-attempt".
+    # - ``"judges.md"`` — operator explicitly set the value in
+    #                     the agent's own ``judges.md``. Pre-merge.
+    #                     The cascade-floor strictness check fires
+    #                     against this state.
+    # - ``"delegate"``  — post-``apply_project_floor`` resolved value
+    #                     came from the delegate's explicit setting.
+    # - ``"floor"``     — post-``apply_project_floor`` resolved value
+    #                     came from the project floor (delegate
+    #                     omitted; inherits the floor's value).
+    validation: Literal["weakened", "strict"] = "weakened"
     validation_source: str = "default"
 
     # Specialist composition axes — parsed-but-unused in PR 3a.
