@@ -33,22 +33,24 @@ sourced from the live agent context (see CLAUDE.md taste rule #1:
 vault is source of truth, but the runtime that consults the vault still
 needs the agent's loaded config).
 
-Spec divergences flagged for PR 4 spec lock-in:
+Canonical implementations (spec/28 locked at PR 4):
 
-- spec/28:849 enforcement_action enum is extended by PR 3b to include
-  ``auto_decided_block``, ``approved_executed``,
-  ``approved_stale_tool_definition``, ``denied``, ``redacted``,
-  ``proposal_body_tampered``. PR 2b already extended with
-  ``allow_pending_next_judge``; PR 4 locks the full list.
-- spec/28 says ``Response.deferred=True and the escalation_queue_id``
-  (singular). PR 3b uses ``escalation_queue_ids: list[str]`` for the
-  multi-tool_use case where one assistant turn produces N ESCALATEs.
-- spec/28's ``judges.md`` example shows ``auto_decide_after: 24h``;
-  this implementation uses ``auto_decide_after_seconds: <int>`` per
-  the PR 3a-shipped parser. PR 4 patches spec/28 to match.
-- Spec/28's resolution block parser is unspecified. PR 3b documents
-  STRICT parsing: header MUST be h3 + exact case + ``by `` + non-empty
-  operator string. Typos surface as doctor warnings (spec/27 follow-up).
+- ``enforcement_action`` enum: 18 values documented in spec/28 §"Audit
+  event schema" — ``audit_bypass``, ``block_executed``, ``allow_executed``,
+  ``allow_pending_next_judge``, ``revise_pending_second_judgment``,
+  ``revise_executed``, ``revise_invalid_amendment``,
+  ``revise_loop_exhausted_blocked``, ``escalate_pending``,
+  ``approved_executed``, ``approved_stale_tool_definition``,
+  ``denied``, ``redacted``, ``auto_decided_block``,
+  ``auto_decided_allow``, ``proposal_body_tampered``,
+  ``operator_revise_executed``, ``operator_revise_invalid_amendment``.
+- ``Response.escalation_queue_ids: list[str]`` — multi-tool_use turns
+  can defer N actions simultaneously.
+- Duration values are integer seconds (``auto_decide_after_seconds``,
+  ``resolution_poll_cycle_seconds``); duration-string parsing not
+  shipped.
+- Strict resolution-block parser: header MUST match
+  ``### <Verb> by <op>`` exactly. Typos surface as doctor warnings.
 """
 
 from __future__ import annotations

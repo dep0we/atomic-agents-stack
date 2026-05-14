@@ -20,22 +20,17 @@ module:
    otherwise an operator-revise can upgrade `reversible_write` →
    `delete_files` and skip judge eyes).
 
-Spec divergences flagged for PR 4 lock-in:
+Validation scope: PR 3c ships **weakened** validation — tool registered
++ args dict-shaped + arguments_hash recomputes. Full JSON-Schema
+validation against the registered ``input_schema`` lands in PR 5 with
+the ``jsonschema`` dep (see #112 PR 5). Operators see a one-shot
+per-agent log warning the first time amendment validation runs without
+the full validator (per CLAUDE.md rule #13: docs match reality).
 
-- spec/28:274 says "amended args validate against the tool's
-  registered JSON schema." This implementation does NOT run full
-  JSON-Schema validation (would require adding ``jsonschema`` as a
-  dep). Instead the validator runs: (1) tool_name resolves to a
-  registered handler in tool_registry; (2) args is a dict (not
-  None/list/scalar); (3) arguments_hash recomputes successfully.
-  Operators are warned once per agent at startup when the gap is
-  active (see ``_warn_jsonschema_gap_once``). Doctor follow-up
-  filed via PR 3c's CHANGELOG entry.
-- spec/28:329-333 shows the operator-revise resolution-block format
-  (Revised by <op>, resolved_at, re_judged, amendment, note). PR 3c
-  implements this; the ``re_judged`` field is **framework-set, not
-  operator-supplied** (operator's intent is the amendment; framework
-  decides if re-judge fires based on amended.classification).
+The ``re_judged: bool`` field on the audit record is framework-set,
+not operator-supplied: operators express intent via the amendment;
+the framework decides whether re-judge fires based on the AMENDED
+classification (Codex round-1 P1-4 — gate on amended, not original).
 """
 
 from __future__ import annotations
