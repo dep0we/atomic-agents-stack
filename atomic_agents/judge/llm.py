@@ -38,14 +38,13 @@ Structural defenses against the documented failure modes:
 - **Timeout**: framework-side ``concurrent.futures`` wrapper enforces
   the configured ``timeout_ms``. Timeout → ``JudgeUnavailable``.
 
-PR 2b ``supported_outcomes()`` advertises ``{ALLOW, BLOCK}`` only.
-The tool schema accepts all four outcome values (``allow|block|revise|
-escalate``) so the LLM can SIGNAL revise/escalate intent in audit
-logs — backend code maps ``revise``/``escalate`` to BLOCK with
-``revise_intent_not_supported`` / ``escalate_intent_not_supported``
-reasons before returning ``Judgment``. PR 3 widens
-``supported_outcomes`` once the second-judgment cycle (revise) and
-operator-resolution polling loop (escalate) ship.
+``supported_outcomes()`` returns all four spec/28 values (PR 4 lock):
+``{ALLOW, BLOCK, REVISE, ESCALATE}``. The tool schema's ``amendment``
+sub-object is required when ``outcome=revise`` (enforced at parse
+time via ``parse_judgment_tool_use``; missing or malformed →
+``JudgeUnavailable`` per spec/28's fail-closed contract). ESCALATE
+returns a Judgment directly; the framework writes the PENDING file
+and the actor's run returns ``Response.deferred=True``.
 """
 
 from __future__ import annotations
@@ -61,12 +60,12 @@ from .proposal import compute_policy_version
 from .types import ActionProposal, JudgePolicyContext
 
 
-# JSON Schema for the ``judgment`` tool. The outcome enum includes all
-# four spec/28 values so the LLM can signal revise/escalate intent
-# even though ``supported_outcomes()`` advertises ``{ALLOW, BLOCK}``
-# only in PR 2b. ``revise``/``escalate`` map to BLOCK with the
-# documented reasons after parsing — operators see the LLM's intent
-# in audit logs.
+# JSON Schema for the ``judgment`` tool. The outcome enum covers all
+# four spec/28 values; ``supported_outcomes()`` returns all four at
+# PR 4 lock. The ``amendment`` sub-object is required when
+# ``outcome=revise`` (enforced at parse time, not in the schema
+# itself — JSON-Schema's ``dependentRequired`` is uneven across
+# provider tool-use validators).
 JUDGMENT_TOOL_SCHEMA: dict = {
     "type": "object",
     "properties": {
@@ -74,12 +73,14 @@ JUDGMENT_TOOL_SCHEMA: dict = {
             "type": "string",
             "enum": ["allow", "block", "revise", "escalate"],
             "description": (
-                "Your decision on the proposal. 'allow' — proceed with "
-                "the bound action. 'block' — refuse with reason. "
-                "'revise' — propose an amendment (PR 2b: signal only; "
-                "self-maps to block until PR 3's second-judgment cycle "
-                "lands). 'escalate' — defer to operator (PR 2b: signal "
-                "only; self-maps to block until PR 3's polling loop)."
+                "Your decision on the proposal. "
+                "'allow' — proceed with the bound action. "
+                "'block' — refuse with reason. "
+                "'revise' — propose an amendment via the ``amendment`` "
+                "field; the framework re-validates + re-judges. Bounded "
+                "at max_revise_iterations=1. "
+                "'escalate' — defer to operator; the framework writes a "
+                "PENDING file and the actor's run returns deferred=True."
             ),
         },
         "reason": {
@@ -89,6 +90,41 @@ JUDGMENT_TOOL_SCHEMA: dict = {
                 "actor sees this verbatim on tool_result when BLOCK; "
                 "operators see it in audit logs always."
             ),
+        },
+        "amendment": {
+            "type": "object",
+            "description": (
+                "REQUIRED when outcome='revise'; ignored otherwise. The "
+                "framework applies these fields to the original proposal "
+                "(unchanged fields carry over verbatim). ``reason`` and "
+                "``authorization`` are NOT amendable — explain your "
+                "revision via ``judge_note`` instead."
+            ),
+            "properties": {
+                "judge_note": {
+                    "type": "string",
+                    "description": "Why you're proposing this amendment.",
+                },
+                "tool_name": {
+                    "type": "string",
+                    "description": (
+                        "Optional: swap to a different tool (e.g., "
+                        "create_pr → create_draft_pr)."
+                    ),
+                },
+                "tool_arguments": {
+                    "type": "object",
+                    "description": "Optional: amended args dict.",
+                },
+                "target_audience": {"type": "string"},
+                "expected_consequence": {"type": "string"},
+                "reversibility": {
+                    "type": "string",
+                    "enum": ["reversible", "partially_reversible", "irreversible"],
+                },
+                "rollback_path": {"type": "string"},
+            },
+            "required": ["judge_note"],
         },
     },
     "required": ["outcome", "reason"],
@@ -103,13 +139,12 @@ JUDGMENT_TOOL_DESCRIPTION = (
 )
 
 
-# Sentinel — recorded on Judgment.reason when the LLM signals a
-# revise/escalate intent that PR 2b cannot enforce. Operators searching
-# audit logs for the literal strings can identify "judge wanted to
-# revise/escalate but the framework didn't have support yet" — useful
-# early signal for PR 3's prioritization.
-REVISE_INTENT_REASON = "revise_intent_not_supported"
-ESCALATE_INTENT_REASON = "escalate_intent_not_supported"
+# PR 4 lock: PR 2b's self-map sentinels (``revise_intent_not_supported`` /
+# ``escalate_intent_not_supported``) are removed. The LLM judge now
+# returns real REVISE / ESCALATE outcomes — REVISE with a parsed
+# ``ProposalAmendment`` payload; ESCALATE flows directly to the
+# framework's PENDING-file writer. Audit logs from pre-PR-4 runs still
+# contain the old sentinel strings (audit history is preserved).
 
 
 def build_judge_system_prompt(policy: JudgePolicyContext) -> str:
@@ -196,10 +231,15 @@ def build_judge_system_prompt(policy: JudgePolicyContext) -> str:
         "free-form text. The four outcome values are:",
         "- allow — proceed (action runs verbatim)",
         "- block — refuse with reason (actor sees the reason)",
-        "- revise — signal that the proposal needs amendment "
-        "(framework records the intent; PR 2b enforces as block)",
-        "- escalate — signal that operator review is needed "
-        "(framework records the intent; PR 2b enforces as block)",
+        "- revise — propose an amendment via the `amendment` field; "
+        "the framework re-validates and re-judges. Bounded at one "
+        "revise iteration. Use this when the proposal is directionally "
+        "right but needs a specific fix (lower a spend cap, strip an "
+        "attachment, switch to a draft variant of the tool).",
+        "- escalate — defer to operator. The framework writes a "
+        "PENDING file under vault/escalations/ and the actor's run "
+        "returns deferred=True. Use this when the action genuinely "
+        "requires human eyes before execution.",
     ]
 
     return "\n".join(lines)
@@ -277,30 +317,36 @@ def parse_judgment_tool_use(
             "(or empty string). Fail-closed."
         )
 
-    # Self-map revise/escalate → BLOCK per spec/28 §"Outcome-fallback
-    # contract" (line 544). PR 2b advertises {ALLOW, BLOCK} only via
-    # supported_outcomes(); revise/escalate intent surfaces in
-    # Judgment.reason for operator visibility but the action is
-    # blocked.
+    # PR 4 (spec lock-in): widened to honor REVISE / ESCALATE outcomes
+    # from the LLM. PR 2b shipped a self-map to BLOCK because the
+    # framework couldn't act on either outcome yet; PR 3b/3c shipped
+    # the state machines, and PR 4 makes the LLM judge first-class
+    # within them. Parse the amendment payload on REVISE; pass ESCALATE
+    # through unchanged (framework writes the PENDING file).
     if outcome_raw == "revise":
+        amendment_raw = payload.get("amendment")
+        if not isinstance(amendment_raw, dict):
+            raise JudgeUnavailable(
+                "LLM judge returned outcome='revise' without a valid "
+                "`amendment` object on the `judgment` tool_use input. "
+                "Fail-closed per spec/28 §'Outcome-fallback contract'."
+            )
+        try:
+            amendment = _amendment_from_dict(amendment_raw)
+        except (TypeError, ValueError) as exc:
+            raise JudgeUnavailable(
+                f"LLM judge's `amendment` payload is malformed: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
         return Judgment(
-            outcome=JudgmentOutcome.BLOCK,
-            reason=f"{REVISE_INTENT_REASON}: {reason_raw}",
+            outcome=JudgmentOutcome.REVISE,
+            reason=reason_raw,
             judge_id=judge_id,
             policy_version=policy_version,
             latency_ms=latency_ms,
             cost_usd=cost_usd,
             model_id=model_id,
-        )
-    if outcome_raw == "escalate":
-        return Judgment(
-            outcome=JudgmentOutcome.BLOCK,
-            reason=f"{ESCALATE_INTENT_REASON}: {reason_raw}",
-            judge_id=judge_id,
-            policy_version=policy_version,
-            latency_ms=latency_ms,
-            cost_usd=cost_usd,
-            model_id=model_id,
+            amendment=amendment,
         )
 
     return Judgment(
@@ -311,6 +357,49 @@ def parse_judgment_tool_use(
         latency_ms=latency_ms,
         cost_usd=cost_usd,
         model_id=model_id,
+    )
+
+
+def _amendment_from_dict(data: dict) -> "ProposalAmendment":
+    """Coerce the LLM-emitted amendment dict into a typed
+    ``ProposalAmendment``. Mirrors the operator-revise YAML parser in
+    ``_revise.parse_operator_amendment``: validate shape strictly,
+    raise ``ValueError`` on every deviation so the caller's catch
+    converts to ``JudgeUnavailable`` per the spec/28 fail-closed
+    contract (Codex round-1 P1 #2 — empty-amendment KeyError
+    previously escaped the catch tuple in ``parse_judgment_tool_use``).
+    """
+    from .types import ProposalAmendment, Reversibility
+
+    judge_note = data.get("judge_note")
+    if not isinstance(judge_note, str) or not judge_note.strip():
+        raise ValueError(
+            "amendment.judge_note is required and must be a non-empty string"
+        )
+    tool_arguments = data.get("tool_arguments")
+    if tool_arguments is not None and not isinstance(tool_arguments, dict):
+        raise ValueError(
+            f"amendment.tool_arguments must be a mapping or omitted; got "
+            f"{type(tool_arguments).__name__}"
+        )
+    rev_raw = data.get("reversibility")
+    reversibility = None
+    if rev_raw is not None:
+        try:
+            reversibility = Reversibility(rev_raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"amendment.reversibility not a valid Reversibility value: "
+                f"{rev_raw!r}"
+            ) from exc
+    return ProposalAmendment(
+        judge_note=judge_note,
+        tool_name=data.get("tool_name"),
+        tool_arguments=tool_arguments,
+        target_audience=data.get("target_audience"),
+        expected_consequence=data.get("expected_consequence"),
+        reversibility=reversibility,
+        rollback_path=data.get("rollback_path"),
     )
 
 
@@ -496,9 +585,17 @@ class LLMJudgeBackend:
         )
 
     def supported_outcomes(self) -> set[JudgmentOutcome]:
-        # PR 2b ships ALLOW + BLOCK only. PR 3 widens to REVISE
-        # (second-judgment cycle) and ESCALATE (polling loop).
-        return {JudgmentOutcome.ALLOW, JudgmentOutcome.BLOCK}
+        # PR 4 widens to all four outcomes. PR 3b shipped ESCALATE
+        # state machine; PR 3c shipped REVISE state machine. PR 4's
+        # spec lock-in makes the default LLM judge first-class within
+        # both — _parse_judgment_response now parses amendment payloads
+        # and returns REVISE/ESCALATE Judgment instances unchanged.
+        return {
+            JudgmentOutcome.ALLOW,
+            JudgmentOutcome.BLOCK,
+            JudgmentOutcome.REVISE,
+            JudgmentOutcome.ESCALATE,
+        }
 
     def supports_read_audit(self) -> bool:
         # LLM judge in audit mode costs real money per call; default

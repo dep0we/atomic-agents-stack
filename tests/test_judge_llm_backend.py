@@ -11,9 +11,12 @@ Covers:
   exception messages).
 - **Tool-use parsing**: happy path, no tool_use, multiple tool_uses,
   malformed input dict, missing outcome/reason, invalid enum value.
-- **Self-map**: model returns ``revise``/``escalate`` → BLOCK with the
-  spec-required ``revise_intent_not_supported`` /
-  ``escalate_intent_not_supported`` reason prefixes.
+- **REVISE outcome**: model returns ``outcome=revise`` with a parsed
+  ``amendment`` payload → ``Judgment(outcome=REVISE, amendment=...)``;
+  missing-amendment → ``JudgeUnavailable`` (PR 4 fail-closed).
+- **ESCALATE outcome**: model returns ``outcome=escalate`` →
+  ``Judgment(outcome=ESCALATE)`` passed through; framework writes the
+  PENDING file and the actor's run returns ``deferred=True``.
 - **Determinism**: ``temperature=0`` passed to wrapped backend;
   conformance tests use a deterministic fake backend.
 - **Timeout**: framework-side wrapper converts to ``JudgeUnavailable``.
@@ -38,11 +41,9 @@ from atomic_agents.exceptions import JudgeUnavailable
 from atomic_agents.judge import JudgeBackend
 from atomic_agents.judge.backend import JudgmentOutcome
 from atomic_agents.judge.llm import (
-    ESCALATE_INTENT_REASON,
     JUDGMENT_TOOL_NAME,
     JUDGMENT_TOOL_SCHEMA,
     LLMJudgeBackend,
-    REVISE_INTENT_REASON,
     build_judge_system_prompt,
     build_judge_user_payload,
     make_default_llm_judge,
@@ -241,10 +242,15 @@ class TestProtocolSurface:
         judge = LLMJudgeBackend(llm=fake)
         assert isinstance(judge, JudgeBackend)
 
-    def test_supported_outcomes_pr2b_set(self):
-        # PR 2b advertises {ALLOW, BLOCK}. PR 3 widens.
+    def test_supported_outcomes_pr4_set(self):
+        # PR 4 widens to all four outcomes. PR 2b shipped {ALLOW, BLOCK}
+        # only; PR 3b/3c shipped the state machines; PR 4 makes the LLM
+        # judge first-class within both.
         assert LLMJudgeBackend(llm=_FakeLLMBackend()).supported_outcomes() == {
-            JudgmentOutcome.ALLOW, JudgmentOutcome.BLOCK,
+            JudgmentOutcome.ALLOW,
+            JudgmentOutcome.BLOCK,
+            JudgmentOutcome.REVISE,
+            JudgmentOutcome.ESCALATE,
         }
 
     def test_supports_read_audit_false(self):
@@ -350,26 +356,93 @@ class TestParseJudgmentToolUse:
         j = parse_judgment_tool_use(tool_uses, **self._kwargs())
         assert j.outcome == JudgmentOutcome.BLOCK
 
-    def test_revise_self_maps_to_block(self):
+    def test_revise_with_amendment_returns_revise(self):
+        # PR 4 spec lock-in: LLM judge returns real REVISE outcomes with
+        # parsed amendment payloads (replaces PR 2b's self-map to BLOCK).
         tool_uses = [
-            {"name": "judgment",
-             "input": {"outcome": "revise", "reason": "lower the limit"},
-             "id": "j1"}
+            {
+                "name": "judgment",
+                "input": {
+                    "outcome": "revise",
+                    "reason": "lower the limit",
+                    "amendment": {
+                        "judge_note": "reduce spend cap",
+                        "tool_arguments": {"limit": 100},
+                    },
+                },
+                "id": "j1",
+            }
         ]
         j = parse_judgment_tool_use(tool_uses, **self._kwargs())
-        assert j.outcome == JudgmentOutcome.BLOCK
-        assert REVISE_INTENT_REASON in j.reason
-        assert "lower the limit" in j.reason
+        assert j.outcome == JudgmentOutcome.REVISE
+        assert j.amendment is not None
+        assert j.amendment.judge_note == "reduce spend cap"
+        assert j.amendment.tool_arguments == {"limit": 100}
 
-    def test_escalate_self_maps_to_block(self):
+    def test_revise_without_amendment_fails_closed(self):
+        # PR 4: LLM that signals revise but omits amendment field —
+        # framework raises JudgeUnavailable per spec/28 fail-closed.
+        tool_uses = [
+            {
+                "name": "judgment",
+                "input": {"outcome": "revise", "reason": "no amendment"},
+                "id": "j1",
+            }
+        ]
+        with pytest.raises(JudgeUnavailable, match="amendment"):
+            parse_judgment_tool_use(tool_uses, **self._kwargs())
+
+    def test_revise_with_empty_amendment_fails_closed(self):
+        # Codex round-1 P1 #2 regression: amendment={} previously
+        # raised KeyError that escaped the (TypeError, ValueError)
+        # catch tuple in parse_judgment_tool_use. PR 4 fix: every
+        # parser failure → JudgeUnavailable.
+        tool_uses = [
+            {
+                "name": "judgment",
+                "input": {
+                    "outcome": "revise",
+                    "reason": "tried to revise",
+                    "amendment": {},  # missing required judge_note
+                },
+                "id": "j1",
+            }
+        ]
+        with pytest.raises(JudgeUnavailable, match="malformed|amendment"):
+            parse_judgment_tool_use(tool_uses, **self._kwargs())
+
+    def test_revise_with_non_dict_tool_arguments_fails_closed(self):
+        # Codex round-1 P2 #2 regression: amendment.tool_arguments
+        # must be a dict (or omitted). Non-dict shapes raise
+        # JudgeUnavailable at parse time, not at the downstream
+        # ProposalAmendment construction.
+        tool_uses = [
+            {
+                "name": "judgment",
+                "input": {
+                    "outcome": "revise",
+                    "reason": "args wrong type",
+                    "amendment": {
+                        "judge_note": "ok",
+                        "tool_arguments": "not a dict",
+                    },
+                },
+                "id": "j1",
+            }
+        ]
+        with pytest.raises(JudgeUnavailable, match="tool_arguments|malformed"):
+            parse_judgment_tool_use(tool_uses, **self._kwargs())
+
+    def test_escalate_returns_escalate(self):
+        # PR 4: LLM judge returns real ESCALATE; framework writes PENDING.
         tool_uses = [
             {"name": "judgment",
              "input": {"outcome": "escalate", "reason": "operator review"},
              "id": "j1"}
         ]
         j = parse_judgment_tool_use(tool_uses, **self._kwargs())
-        assert j.outcome == JudgmentOutcome.BLOCK
-        assert ESCALATE_INTENT_REASON in j.reason
+        assert j.outcome == JudgmentOutcome.ESCALATE
+        assert j.reason == "operator review"
 
     def test_no_tool_use_raises_judge_unavailable(self):
         with pytest.raises(JudgeUnavailable, match="no `judgment` tool_use"):
