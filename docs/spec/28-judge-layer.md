@@ -1,27 +1,20 @@
 # spec/28 — Judge Layer
 
-> Status: **RFC** (origin: #110). This spec describes a planned surface, not current
-> behavior. It is the design hypothesis the maintainer is committing to before
-> implementation. Sections will be revised based on adversarial review. The
-> spec locks (drops the RFC marker) when the first reference implementation
-> ships and the conformance suite passes.
+> Status: **locked** as of #112 PR 4. Reference implementation: `atomic_agents/judge/` (PolicyJudge + LLMJudgeBackend + escalation + revise state machines). Conformance suite: `tests/test_judge_protocol_conformance.py`.
 >
 > Cross-links: spec/01 (anatomy), spec/03 (file formats), spec/04 (runtime assembly), spec/05 (capture rules), spec/08 (evaluation), spec/13 (research integrity), spec/15 (delegation), spec/17 (tools), spec/19 (MCP), spec/20 (memory backend — protocol pattern template)
 >
 > Related backends: PolicyBackend (#89), LLMBackend (#87), LogBackend (#61)
 
-## RFC vs locked spec — what this convention means
+## Lock criterion (PR 4)
 
-The framework's normal spec discipline (rule #10) is *spec describes what is true today*. This document is an exception: it is the agreed-on design for a surface that does not exist yet. Treating it as a locked spec would be dishonest (the implementation is not in the codebase to verify against); skipping the spec entirely would be worse (the design has too many load-bearing decisions to defer to commit time).
+Per CLAUDE.md rule #10 ("the spec is the product"), spec/28 locks when:
 
-Convention for RFC specs:
+1. A reference implementation ships in the codebase (`atomic_agents/judge/`).
+2. A conformance suite asserts the documented invariants (`tests/test_judge_protocol_conformance.py`, ~37 tests covering the invariants enumerated in §"Conformance suite" below).
+3. Drift between spec and shipped behavior is folded into the canonical text (PR 4 stripped the per-PR-lock-in markers PR 3a/3b/3c accumulated).
 
-- The `Status: **RFC**` marker above is required at the top.
-- Each non-trivial decision states the **decided** answer in the body, not in a deferred "open question." Open questions are reserved for things genuinely below the threshold of needing resolution before implementation begins.
-- The spec is revised in rounds (cross-model adversarial review) before merge. Revisions are captured in the spec itself, not in spec-shaped issue comments.
-- When the first reference implementation ships, the doctor (`spec/27`) verifies the spec matches the code, the `Status` marker drops to `implemented`, and any drift between spec and code becomes a follow-up issue per rule #10.
-
-This convention applies only to *new framework surfaces large enough to require design before code*. Most spec docs continue to describe shipped behavior.
+The original RFC convention (`Status: **RFC**` banner + "RFC vs locked spec" preface) is removed at lock. Drift from the locked spec is a follow-up issue per rule #10, not a spec edit.
 
 ## Overview
 
@@ -285,7 +278,7 @@ Revise is the empirically most-useful outcome for production failure modes that 
 
 ### Escalate
 
-Pause the action. The framework writes a **PENDING** escalation record to `vault/escalations/<class>/<proposal_id>.md` containing the full proposal and the judge's reason. The actor's run returns with `Response.deferred=True` and the escalation_queue_id. Subsequent operator resolution writes a **RESOLVED** event linked to the PENDING record (escalation is modeled as a state machine, not a single verdict).
+Pause the action. The framework writes a **PENDING** escalation record to `vault/escalations/<class>/<proposal_id>.md` containing the full proposal and the judge's reason. The actor's run returns with `Response.deferred=True` and `Response.escalation_queue_ids: list[str]` (one id per ESCALATEd tool_use in the assistant turn — multi-tool-use turns can produce multiple deferrals). Subsequent operator resolution writes a **RESOLVED** event linked to the PENDING record (escalation is modeled as a state machine, not a single verdict). ALLOWed tool_uses in the same turn still execute and their results land in `Response.tool_calls`; the multi-turn loop terminates immediately after the iteration (no follow-up LLM call).
 
 #### Escalation file format
 
@@ -356,13 +349,13 @@ If two resolution blocks are present, the *first* one (top-down in file order) w
 
 If the framework's re-judge returns BLOCK, the action is refused; the audit record carries `enforcement_action="operator_revise_executed"` with `re_judged: true` on the re-judge event chain but **no `escalation_operator_revise_executed` audit line** for the action itself (refusal is the outcome). Invalid amendments (missing YAML block, malformed YAML, unknown fields, tool not registered) emit `enforcement_action="operator_revise_invalid_amendment"` and refuse execution.
 
-**Strict resolution-block parser** (PR 3b lock-in). Resolution headers MUST match exactly: `### <Verb> by <operator>` — h3 prefix, verb in `{Approved, Denied, Redacted, Revised, Auto-decided}` with exact case, the literal word `by`, and a non-empty operator string. Typos (lowercase verb, h4 prefix, missing `by`) make the file UNPARSEABLE — the framework leaves the file as-is, does NOT claim the de-dup sidecar, and surfaces a doctor warning on the next health check. This lets operators fix the typo and re-trigger without state-machine debt.
+**Strict resolution-block parser**. Resolution headers MUST match exactly: `### <Verb> by <operator>` — h3 prefix, verb in `{Approved, Denied, Redacted, Revised, Auto-decided}` with exact case, the literal word `by`, and a non-empty operator string. Typos (lowercase verb, h4 prefix, missing `by`) make the file UNPARSEABLE — the framework leaves the file as-is, does NOT claim the de-dup sidecar, and surfaces a doctor warning on the next health check. This lets operators fix the typo and re-trigger without state-machine debt.
 
-**Body integrity** (PR 3b lock-in). On every operator resolution, the framework recomputes `arguments_hash` from the `## Proposal` block's `tool_arguments` field and compares against the embedded `arguments_hash` value. Mismatch → `enforcement_action="proposal_body_tampered"`, no execution. **Defense scope**: this catches accidental edits and lazy tamper (operator changes `tool_arguments` without also updating the embedded `arguments_hash`). A sophisticated operator can recompute the hash to match — the embedded hash IS in the same file. Operator approval is itself the trust anchor; the check is a guard against careless edits, not against hostile operators. Operators with vault write access can also write a fresh PENDING file from scratch with any arguments they want.
+**Body integrity**. On every operator resolution, the framework recomputes `arguments_hash` from the `## Proposal` block's `tool_arguments` field and compares against the embedded `arguments_hash` value. Mismatch → `enforcement_action="proposal_body_tampered"`, no execution. **Defense scope**: this catches accidental edits and lazy tamper (operator changes `tool_arguments` without also updating the embedded `arguments_hash`). A sophisticated operator can recompute the hash to match — the embedded hash IS in the same file. Operator approval is itself the trust anchor; the check is a guard against careless edits, not against hostile operators. Operators with vault write access can also write a fresh PENDING file from scratch with any arguments they want.
 
-**De-dup sidecar** (PR 3b lock-in). The framework claims a `.<proposal_id>.resolved-emitted` sidecar file via `O_CREAT|O_EXCL` next to the PENDING file before emitting the RESOLVED audit event. Concurrent pollers race the sidecar create; exactly one wins. The sidecar is a vault-internal dotfile (taste rule #1: vault as source of truth — no in-memory de-dup state). The throttle marker `<destination>/.last-poll` follows the same convention; `spec/27`'s doctor should ignore both.
+**De-dup sidecar**. The framework claims a `.<proposal_id>.resolved-emitted` sidecar file via `O_CREAT|O_EXCL` next to the PENDING file before emitting the RESOLVED audit event. Concurrent pollers race the sidecar create; exactly one wins. The sidecar is a vault-internal dotfile (taste rule #1: vault as source of truth — no in-memory de-dup state). The throttle marker `<destination>/.last-poll` follows the same convention; `spec/27`'s doctor should ignore both.
 
-**Auto-decide CAS race** (PR 3b lock-in). The auto-decide-timeout path re-snapshots the PENDING file just before its atomic_write and aborts if the sha256 changed since the initial read — operator-edit-during-write defers to the next poll cycle. The auto-decide is idempotent (timeout has still passed), so retry is safe.
+**Auto-decide CAS race**. The auto-decide-timeout path re-snapshots the PENDING file just before its atomic_write and aborts if the sha256 changed since the initial read — operator-edit-during-write defers to the next poll cycle. The auto-decide is idempotent (timeout has still passed), so retry is safe.
 
 Redacted files keep their frontmatter but the body is replaced with the `redaction_reason`. The RESOLVED event records the redaction; the original proposal is preserved in the JSONL audit trail.
 
@@ -821,7 +814,7 @@ read_audit_mode: false
 - Class policy values are an enum: `bypass | allow_with_audit | judge_required | escalate`. Unknown value → `JudgePolicyInvalid`.
 - Specialist composition is optional. Absent section → composition is implicit `[PolicyJudge, LLMCatchAll]` (PolicyJudge always-on baseline + the LLM catch-all configured under `## Default judge`). The catch-all is not "alone" — PolicyJudge always runs first.
 - Failure policy section is optional. **`Failure policy` default-fill**: any unlisted exception type defaults to `block` (fail-closed). Partial coverage is allowed; missing keys get the safe default.
-- **`Escalation queue` parser rules** (PR 3b lock-in): duration values are integer seconds (e.g., `auto_decide_after_seconds: 86400`), not duration strings. The framework reads `destination` as a vault-relative directory; the operator-typed value `vault` is normalized to `vault/escalations/` per spec/28:288. `resolution_poll_cycle_seconds` (default 60) caps how often the framework scans the escalation directory for state transitions; `0` disables throttling. The `fallback` key was renamed to `fallback_on_timeout` to match the parsed field name; the old name is not accepted.
+- **`Escalation queue` parser rules**: duration values are integer seconds (e.g., `auto_decide_after_seconds: 86400`), not duration strings. The framework reads `destination` as a vault-relative directory; the operator-typed value `vault` is normalized to `vault/escalations/` per spec/28:288. `resolution_poll_cycle_seconds` (default 60) caps how often the framework scans the escalation directory for state transitions; `0` disables throttling. The `fallback` key was renamed to `fallback_on_timeout` to match the parsed field name; the old name is not accepted.
 - Per-tool overrides (rare, advanced) live in `tools.md`'s per-tool sections, not in `judges.md`.
 
 Pure-YAML config files are refused per rule #7. Embedded YAML inside markdown is acceptable for structured fields. Markdown sections carry the same aesthetic as `tools.md` and `model.md`.
@@ -889,7 +882,7 @@ Each judgment writes a JSONL line to the run log, carrying `parent_run_id` linki
 
 `raw_outcome` is what the judge returned. `enforcement_action` is what the framework did with that outcome — they differ on `read_audit_mode` (judge can return BLOCK but framework executes), on operator escalation overrides, and on failure_policy resolutions. This lets the dashboard count "judge would have blocked but read-audit bypassed" distinctly from "judge allowed and we executed" — which Round 2 caught as indistinguishable in the v1 audit shape.
 
-**Enforcement-action enum (PR 3b lock-in).** The v1 spec listed five values (`audit_bypass`, `block_executed`, `allow_executed`, `revise_executed`, `escalate_pending`). Reference-implementation work since extended the enum:
+**Enforcement-action enum.** The v1 spec listed five values (`audit_bypass`, `block_executed`, `allow_executed`, `revise_executed`, `escalate_pending`). Reference-implementation work since extended the enum:
 
 - `allow_pending_next_judge` (PR 2b ensemble) — a judge in a multi-judge ensemble ALLOWed, but subsequent judges have not yet voted. Promoted to `allow_executed` on the LAST event when the ensemble's overall verdict is ALLOW. Intermediate ALLOWs stay `allow_pending_next_judge`.
 - `approved_executed` (PR 3b) — operator wrote `### Approved by <op>` to a PENDING file; framework re-verified `tool_definition_hash`; executed the bound action.
@@ -1005,6 +998,22 @@ These are *genuinely* below the threshold of needing resolution before implement
 
 1. **Should there be a per-tool budget override?** Today `judges.md` declares an agent-level budget. Operators may want a per-class budget (`high_risk` gets $X/month; everything else shares $Y). **Tentative**: per-class budgets in `judges.md` v2.
 2. **How does the judge interact with the dream pipeline?** Dreams run outside `agent.call()` and may produce capture markers without the runtime's tool-use loop. **Tentative**: dream pipeline reuses the same `judge_captures` switch from `judges.md`; the dream runner respects it identically to the live runtime.
+
+## Conformance status (PR 4)
+
+`tests/test_judge_protocol_conformance.py` ships ~37 tests covering the invariants enumerated in §"Conformance suite" above plus the PR 3a/3b/3c state-machine additions. The suite parametrizes over the two shipped JudgeBackends:
+
+- `PolicyJudge` (rule engine; offline; runs every invariant except the LLM-only canary).
+- `LLMJudgeBackend` wired to a deterministic `_StubLLMBackend` (offline; runs every invariant including the UUID-canary serialization assertion for `JudgeRuntimeConfig` non-leakage).
+
+Coverage map:
+
+- **Framework-side** (run once): hash determinism + sensitivity, project-floor non-relaxable, atomic-snapshot semantics, ESCALATE state machine (O_EXCL sidecar, body integrity, strict resolution-block parser, auto-decide CAS), REVISE state machine (`amend_proposal` recomputes classification, `JudgeAmendedProposalRejected` on schema-invalid).
+- **Per-backend** (parametrized): Protocol surface (`isinstance`), `evaluate` idempotency, `policy_version` changes on policy change, `policy_version` is non-sentinel, `judge_id` stable, `close()` idempotent, `supports_read_audit` + `supports_specialist_composition` return bools, `supported_outcomes` returns the canonical set.
+- **LLM-only**: latency-bounded timeout → `JudgeUnavailable`; concurrent-call connection-state integrity; UUID-canary assertion that `JudgeRuntimeConfig` fields never appear in the serialized LLM prompt.
+- **Deferred** (filed as follow-up issues): judge_budget_counter live state (not implemented), schema-shape JSON-Schema validation (jsonschema dep — see PR 5).
+
+The conformance suite is reusable by third-party `JudgeBackend` implementations: importing the fixtures + invariant tests into a downstream package exercises any registered backend.
 
 ## References
 
