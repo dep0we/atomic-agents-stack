@@ -46,6 +46,7 @@ import os
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
 
 from . import _cascade, _model, _tools
 from ._costs import PRICING
@@ -1075,12 +1076,30 @@ def check_log_backend(agent_root: Path) -> CheckResult:
     # In PR 2, the only non-filesystem id is ``sqlite`` (forward-
     # declared) which PR 3 will register; for now ``get_default_log_
     # backend`` raises ``BackendNotRegistered`` for it.
+    #
+    # Credential safety: any exception from ``get_default_log_backend``
+    # may include a URL with embedded credentials. We redact via the
+    # same urlparse-based pattern ``check_lock_backend`` uses (security
+    # parity — Step 9.1 security CRITICAL #3 on PR 2).
+    url = os.environ.get("ATOMIC_AGENTS_LOG_BACKEND_URL")
+    safe_url: str | None = None
+    if url:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        if parsed.password:
+            netloc = parsed.hostname or ""
+            if parsed.port:
+                netloc = f"{netloc}:{parsed.port}"
+            safe_url = parsed._replace(netloc=netloc).geturl()
+        else:
+            safe_url = url
+
     try:
         get_default_log_backend(agent_root)
     except BackendNotRegistered as exc:
         return CheckResult(
             name="log-backend", status=FAIL,
-            message=f"log backend {backend_id!r} not yet registered: {exc}",
+            message=f"log backend {backend_id!r} not yet registered",
             fix_hint=(
                 f"The {backend_id!r} backend is reserved but not shipped in "
                 "this version. Unset ATOMIC_AGENTS_LOG_BACKEND to use the "
@@ -1088,19 +1107,29 @@ def check_log_backend(agent_root: Path) -> CheckResult:
             ),
         )
     except Exception as exc:
+        # Sanitize the exception message — connection errors from
+        # backend constructors commonly embed the full URL including
+        # credentials. Drop the exception class name and rely on
+        # fix_hint to guide the operator. The full exception is
+        # available in the LOG level above DEBUG (not echoed via
+        # CheckResult) for the operator who has logging access.
         return CheckResult(
             name="log-backend", status=FAIL,
-            message=f"log backend construction failed: {exc}",
+            message=f"log backend {backend_id!r} construction failed",
             fix_hint=(
                 "Check ATOMIC_AGENTS_LOG_BACKEND and "
-                "ATOMIC_AGENTS_LOG_BACKEND_URL for typos."
+                "ATOMIC_AGENTS_LOG_BACKEND_URL for typos. Run with "
+                "DEBUG logging to see the full exception."
             ),
         )
 
+    detail: dict[str, Any] = {"backend_id": backend_id}
+    if safe_url is not None:
+        detail["url"] = safe_url
     return CheckResult(
         name="log-backend", status=PASS,
         message=f"{backend_id} backend constructed",
-        detail={"backend_id": backend_id},
+        detail=detail,
     )
 
 

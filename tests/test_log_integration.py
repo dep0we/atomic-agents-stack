@@ -447,3 +447,146 @@ def test_doctor_check_log_backend_sqlite_forward_pointer_fail(tmp_path, monkeypa
     assert result.status == "fail"
     assert "sqlite" in result.message
     assert "not yet registered" in result.message
+
+
+# ──────────────────────────────────────────────────────────────────
+# Step 11 adversarial follow-ups — gaps the Sonnet review surfaced.
+
+
+def test_count_provenance_wiring_handles_legacy_records(tmp_path, monkeypatch):
+    """`_count_provenance` (PR 2 wiring) reads helper records without
+    primitive set — pre-PR-2 records had only trigger='helper'. Step 11
+    P0 #2: the original LogQuery(primitive='helper') would exclude these
+    because RunRecord.from_dict defaults missing primitive to 'other',
+    and the backend's predicate evaluator runs BEFORE the belt-and-
+    suspenders check in the function body. Fix removes the primitive
+    filter from LogQuery and filters in-Python."""
+    from atomic_agents.dashboard.quality import _count_provenance
+
+    today = date.today()
+    log_dir = tmp_path / "alice" / "log" / today.strftime("%Y-%m")
+    log_dir.mkdir(parents=True)
+    ts = datetime.now().astimezone().isoformat()
+    # Legacy record: has trigger="helper" but NO primitive field.
+    log_dir.joinpath(f"{today.isoformat()}.jsonl").write_text(
+        json.dumps({
+            "ts": ts, "trigger": "helper", "model": "claude-haiku",
+            "input_tokens": 100, "output_tokens": 50, "status": "ok",
+            "summary": "legacy helper", "provenance_preserved": True,
+        }) + "\n"
+        + json.dumps({
+            "ts": ts, "trigger": "helper", "model": "claude-haiku",
+            "input_tokens": 100, "output_tokens": 50, "status": "ok",
+            "summary": "legacy helper unpreserved",
+        }) + "\n"
+    )
+    preserved, total = _count_provenance(tmp_path, "alice", today, today)
+    assert total == 2, "Legacy helper records must be counted via trigger fallback"
+    assert preserved == 1
+
+
+def test_outcome_runner_kwarg_threaded_to_internal_agent(tmp_path, monkeypatch):
+    """OutcomeRunner accepts ``log_backend=`` kwarg and threads it to the
+    internal AtomicAgent constructed at ``run()`` — Step 11 P0 #3
+    (DreamRunner-kwarg-drop trap mitigation at OutcomeRunner)."""
+    from atomic_agents.outcome import OutcomeRunner
+
+    _build_minimal_agent_dir(tmp_path, "alice")
+    monkeypatch.setenv("ATOMIC_AGENTS_ROOT", str(tmp_path))
+
+    custom = _CapturingLogBackend()
+    runner = OutcomeRunner(
+        agents_root=tmp_path,
+        agent_name="alice",
+        log_backend=custom,
+    )
+    assert runner._log_backend is custom, \
+        "OutcomeRunner MUST honor log_backend= kwarg"
+
+
+def test_sum_cost_with_real_filesystem_backend(tmp_path):
+    """End-to-end: sum_cost_for_period(backend=FilesystemLogBackend(...))
+    correctly sums today's records. Step 11 specialist gap: the
+    integration test for the backend path used _CapturingLogBackend
+    which ignores filters; this pins the real filesystem semantic."""
+    from atomic_agents import _costs
+    from atomic_agents.logs import FilesystemLogBackend, RunRecord
+
+    today = date.today()
+    log_dir = tmp_path / "alice" / "log"
+    backend = FilesystemLogBackend(tmp_path / "alice")
+    backend.append(RunRecord(
+        ts=datetime.now().astimezone().isoformat(),
+        run_id="r1", primitive="agent_call", status="ok",
+        summary="t", model="m", input_tokens=10, output_tokens=5,
+        cost_usd=0.25, cost_source="actor",
+    ))
+    backend.append(RunRecord(
+        ts=datetime.now().astimezone().isoformat(),
+        run_id="r2", primitive="agent_call", status="ok",
+        summary="t", model="m", input_tokens=10, output_tokens=5,
+        cost_usd=0.50, cost_source="actor",
+    ))
+    backend.append(RunRecord(
+        ts=datetime.now().astimezone().isoformat(),
+        run_id="r3", primitive="judgment", status="ok",
+        summary="t", model="m", input_tokens=10, output_tokens=5,
+        cost_usd=0.10, cost_source="judge",
+    ))
+    # Filesystem backend preserves legacy walk semantic (Step 11 P0
+    # #4 mitigation) — sums by file location, filters by cost_source.
+    total_actor = _costs.sum_cost_for_period(
+        log_dir, "today", source="actor", backend=backend,
+    )
+    assert total_actor == pytest.approx(0.75)
+    total_judge = _costs.sum_cost_for_period(
+        log_dir, "today", source="judge", backend=backend,
+    )
+    assert total_judge == pytest.approx(0.10)
+
+
+def test_sum_cost_filesystem_tolerates_malformed_ts_record(tmp_path):
+    """Step 11 P0 #4: filesystem backend MUST count records with
+    malformed ts because the legacy file-walk semantic was the
+    safety-load-bearing contract for cost guardrails. Records with
+    ``ts="x"`` land in the day file's filename-derived date even
+    though their ts content is unparseable."""
+    from atomic_agents import _costs
+    from atomic_agents.logs import FilesystemLogBackend
+
+    today = date.today()
+    log_dir = tmp_path / "alice" / "log"
+    day_file = log_dir / today.strftime("%Y-%m") / f"{today.isoformat()}.jsonl"
+    day_file.parent.mkdir(parents=True, exist_ok=True)
+    # Direct disk write with malformed ts — simulates legacy on-disk
+    # records or rotated/corrupted writes.
+    day_file.write_text(
+        json.dumps({"cost_usd": 0.42, "cost_source": "actor", "ts": "x"}) + "\n"
+    )
+    backend = FilesystemLogBackend(tmp_path / "alice")
+    total = _costs.sum_cost_for_period(
+        log_dir, "today", source="actor", backend=backend,
+    )
+    # Legacy semantic preserved — the malformed-ts record counts.
+    assert total == pytest.approx(0.42)
+
+
+def test_doctor_check_log_backend_redacts_url_credential(tmp_path, monkeypatch):
+    """check_log_backend's error message MUST NOT echo URL credentials.
+    Step 9.1 security CRITICAL #3 (PR 2). Parity with check_lock_backend."""
+    from atomic_agents.doctor import check_log_backend
+
+    agent_root = _build_minimal_agent_dir(tmp_path, "alice")
+    monkeypatch.setenv("ATOMIC_AGENTS_LOG_BACKEND", "sqlite")
+    monkeypatch.setenv(
+        "ATOMIC_AGENTS_LOG_BACKEND_URL",
+        "sqlite://super-secret-token@host/db",
+    )
+
+    result = check_log_backend(agent_root)
+    # Should FAIL (sqlite not yet registered) — the message MUST NOT
+    # leak the credential, regardless of which backend code path runs.
+    assert result.status == "fail"
+    assert "super-secret-token" not in result.message
+    if "url" in (result.detail or {}):
+        assert "super-secret-token" not in result.detail["url"]

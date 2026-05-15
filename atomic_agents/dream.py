@@ -301,8 +301,12 @@ def _read_log_lines(
         since_dt = datetime.combine(cutoff, dt_time.min).astimezone()
         records = []
         for rec in log_backend.query(LogQuery(since=since_dt)):
-            # filter out helper runs — too noisy
-            if rec.trigger == "helper":
+            # filter out helper runs — too noisy. Belt-and-suspenders:
+            # check BOTH primitive (post-PR-2 records) AND trigger
+            # (legacy pre-PR-2 records that don't have primitive set).
+            # Matches dashboard/quality._count_provenance pattern —
+            # Step 9.1 maintainability + Step 11 P0 #2 mitigation.
+            if rec.primitive == "helper" or rec.trigger == "helper":
                 continue
             records.append(rec.to_dict())
         return records

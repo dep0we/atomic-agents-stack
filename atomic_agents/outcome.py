@@ -37,12 +37,15 @@ import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, date
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .logs import LogBackend
 
 _log = logging.getLogger(__name__)
 
 from . import _llm, _costs
-from ._io import atomic_write, atomic_append_jsonl
+from ._io import atomic_write
 from ._platform import get_agents_root
 from .agent import AtomicAgent
 from .eval import EvalRunner, _provider_available
@@ -112,11 +115,23 @@ class OutcomeRunner:
         agents_root: Path | str | None = None,
         agent_name: str = "",
         judge_model: str | None = None,
+        *,
+        log_backend: "LogBackend | None" = None,
     ):
         self.agents_root = Path(agents_root) if agents_root else get_agents_root()
         self.agent_name = agent_name
         self.agent_root = self.agents_root / agent_name
         self._explicit_judge_model = judge_model
+        # #61 PR 2 — LogBackend forwarding. Operators pass a custom
+        # backend via the kwarg; the internal ``AtomicAgent`` constructed
+        # inside ``run()`` inherits it. Without this threading, the
+        # operator-pinned backend would be silently dropped at the
+        # agent-construction boundary — the DreamRunner-kwarg-drop trap
+        # shape the lock arc PR 3 Step 11 caught. Step 11 of THIS arc
+        # (PR 2) caught the equivalent at OutcomeRunner; fixed here.
+        # ``None`` means: defer to the agent's own ``get_default_log_
+        # backend`` resolution (env var → filesystem default).
+        self._log_backend = log_backend
 
         if not self.agent_root.exists():
             raise AtomicAgentsError(
@@ -183,12 +198,15 @@ class OutcomeRunner:
             started_at=started_at,
         )
 
-        # Initialize the agent (lazy-loads on first call)
+        # Initialize the agent (lazy-loads on first call).
+        # Thread ``self._log_backend`` through so operator-pinned
+        # backends survive the runner→agent construction boundary.
         agent = AtomicAgent(
             name=self.agent_name,
             trigger="outcome",
             agents_root=self.agents_root,
             run_id=run_id,
+            log_backend=self._log_backend,
         )
 
         # Resolve judge model: explicit > cross-family via eval config > pick_judge_model fallback

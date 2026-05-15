@@ -195,6 +195,13 @@ class AtomicAgent:
     # rather than narrowing to the filesystem default. Step 9.1
     # maintainability specialist CRITICAL.
     lock_backend: LockBackend
+    # Same class-level annotation rationale for ``log_backend`` (#61
+    # PR 2). Without this, static analysis would narrow ``agent.log_
+    # backend`` to the concrete ``FilesystemLogBackend`` default rather
+    # than treating it as any ``LogBackend`` Protocol implementer —
+    # breaking the operator-pinned-SQLite/Postgres/Datadog case PR 3
+    # forward.
+    log_backend: LogBackend
     """The main agent runtime.
 
     Responsible for:

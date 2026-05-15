@@ -139,7 +139,6 @@ def load_runs(
     preserve the existing dashboard's reader contract.
     """
     from datetime import datetime, time as dt_time
-    from .._platform import get_agents_root
     from ..logs import LogQuery, get_default_log_backend
 
     until = until or date.today()

@@ -295,6 +295,16 @@ def _count_provenance(
     in ``record.extra`` (primitive-specific key); we read it via
     ``RunRecord.extra.get`` rather than parsing raw JSONL.
 
+    Helper-record discrimination is done IN-MEMORY (not via
+    ``LogQuery(primitive="helper")``) because legacy on-disk records
+    written before PR 2 do not have a ``primitive`` field — they would
+    be re-materialized via ``RunRecord.from_dict`` with the default
+    ``PRIMITIVE_OTHER`` and silently filtered out by the backend's
+    predicate evaluator BEFORE the in-method belt-and-suspenders check
+    could run. Step 11 adversarial P0 #2 caught this. Querying the
+    full window and filtering in-Python preserves backward compat for
+    every legacy helper record.
+
     Returns (preserved_count, total_count).
     """
     from datetime import datetime, time as dt_time
@@ -306,11 +316,10 @@ def _count_provenance(
 
     preserved = 0
     total = 0
-    for rec in backend.query(LogQuery(
-        since=since_dt, until=until_dt, primitive="helper",
-    )):
-        # Legacy records may still use trigger="helper" without
-        # primitive set. Belt-and-suspenders check.
+    # NO primitive filter in the LogQuery — see docstring rationale.
+    for rec in backend.query(LogQuery(since=since_dt, until=until_dt)):
+        # Helper records are identified by EITHER primitive (post-PR-2)
+        # OR trigger (legacy, pre-PR-2). Belt-and-suspenders.
         if rec.primitive != "helper" and rec.trigger != "helper":
             continue
         total += 1

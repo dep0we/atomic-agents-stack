@@ -139,10 +139,26 @@ def sum_cost_for_period(
     """
     today = today or date.today()
 
+    # When the backend is the filesystem reference impl, prefer the
+    # legacy file-walk semantic (file location implies date, ts content
+    # ignored). This preserves the safety-load-bearing cost guardrail
+    # behavior for records with malformed or missing ts — which
+    # production records shouldn't have, but legacy on-disk records
+    # might. SQL/Datadog backends in PR 3+ route through query() where
+    # records have indexed ts and the malformed-ts case doesn't apply.
+    #
+    # Step 11 adversarial P0 #4 caught this: a record with ``ts="x"``
+    # in today's JSONL file was counted by legacy sum_cost_for_period
+    # but silently dropped by the backend.query() path — a silent
+    # loosening of the cost cap. The fix preserves legacy semantic
+    # for filesystem while still threading the backend through (so
+    # the operator surface is consistent across all backend types).
     if backend is not None:
-        return _sum_via_backend(
-            backend, today, period, source, mandate_id
-        )
+        from .logs.filesystem import FilesystemLogBackend
+        if not isinstance(backend, FilesystemLogBackend):
+            return _sum_via_backend(
+                backend, today, period, source, mandate_id
+            )
 
     total = 0.0
     if period == "today":
@@ -220,12 +236,10 @@ def _sum_via_backend(
     else:
         raise ValueError(f"unknown period: {period}")
 
-    cost_source_filter: str | None = source if source is not None else None
-
     records = backend.query(LogQuery(
         since=since_dt,
         until=until_dt,
-        cost_source=cost_source_filter,
+        cost_source=source,
         mandate_id=mandate_id,
     ))
 
