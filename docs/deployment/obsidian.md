@@ -407,12 +407,15 @@ that defeats the point of an Obsidian deployment.
 The pragmatic recommendation: **run agents on one host at a time**.
 The agent vault is the source of truth; reads from other devices
 (your phone, your laptop) are fine. Concurrent *writes* from
-multiple devices is where the rough edges live. If you do need
-multi-host runs, lengthen the cron interval enough that two
-invocations rarely overlap, and consider migrating to a coordinated
-backend (`LockBackend` on Postgres or Redis is on the roadmap — see
-`spec/20-memory-backend.md` for the protocol pattern that future
-`LockBackend` will follow).
+multiple devices is where the rough edges live. For real multi-host
+runs, atomic-agents now ships `RedisLockBackend` (#60, shipped
+2026-05-15) — set `ATOMIC_AGENTS_LOCK_BACKEND=redis` +
+`ATOMIC_AGENTS_LOCK_BACKEND_URL=redis://...` and concurrent
+`agent.call()` across hosts coordinates via Redis advisory locks
+instead of POSIX `fcntl.flock`. See `spec/21-lock-backend.md` for
+the full operator surface (env vars, constructor kwarg,
+`doctor.check_lock_backend` coherence check). Filesystem-default
+(single-host) deployments are unchanged.
 
 ### Lock recovery
 
