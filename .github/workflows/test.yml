@@ -45,58 +45,24 @@ jobs:
       - name: Run tests
         run: uv run --python ${{ matrix.python-version }} pytest -v --tb=short
 
-  test-load-time-gate-without-jsonschema:
-    # NEGATIVE-PATH JOB (PR 5b of #112). Installs WITHOUT the
-    # [validation] extra, then exercises the parser's load-time gate
-    # against a real Python interpreter — NOT a monkeypatched probe.
-    # An agent built around a judges.md with validation: strict MUST
-    # refuse to construct when jsonschema is not installed. This is
-    # the operational guarantee operators rely on; the test job pins
-    # it.
-    name: load-time gate raises without jsonschema (Python 3.12)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v3
-        with:
-          enable-cache: true
-          cache-dependency-glob: pyproject.toml
-
-      - name: Set up Python 3.12
-        run: uv python install 3.12
-
-      - name: Install dependencies WITHOUT [validation] extra
-        run: uv sync --extra dev --extra openai --python 3.12
-
-      - name: Confirm jsonschema is not importable
-        run: |
-          set -e
-          if uv run --python 3.12 python -c "import jsonschema" 2>/dev/null; then
-            echo "ERROR: jsonschema is importable but the negative-path job requires it absent."
-            exit 1
-          fi
-          echo "OK: jsonschema is not importable as required."
-
-      - name: Assert validation:strict + missing extra raises JudgePolicyInvalid
-        run: |
-          uv run --python 3.12 python - <<'PY'
-          import sys
-          from atomic_agents.judges_md import parse_judges_md_text
-          from atomic_agents.exceptions import JudgePolicyInvalid
-
-          text = "```yaml\nvalidation: strict\n```\n"
-          try:
-              parse_judges_md_text(text)
-          except JudgePolicyInvalid as exc:
-              msg = str(exc)
-              if "not importable" not in msg:
-                  print(f"UNEXPECTED MESSAGE: {msg}", file=sys.stderr)
-                  sys.exit(2)
-              print(f"OK: parser raised JudgePolicyInvalid as required: {msg}")
-              sys.exit(0)
-          print("ERROR: parser accepted validation:strict without [validation] extra", file=sys.stderr)
-          sys.exit(1)
-          PY
+  # NOTE on the load-time fail-loud gate (PR 5b of #112):
+  #
+  # An earlier draft of this workflow included a third job that ran
+  # WITHOUT ``--extra validation`` against a real Python interpreter
+  # and asserted ``parse_judges_md_text("validation: strict")`` raised
+  # ``JudgePolicyInvalid`` with "not importable" in the message — i.e.,
+  # pinning the load-time fail-loud guarantee operationally instead of
+  # under a monkeypatched probe. That job is intentionally absent.
+  #
+  # Why: ``jsonschema`` is a transitive dependency of ``mcp>=1.0.0``
+  # (which ``atomic_agents`` requires unconditionally), so the
+  # "operator without jsonschema" scenario is unreachable in this
+  # dependency tree. Uninstalling jsonschema would break ``mcp``
+  # imports, which would crash the test script before it reached the
+  # parser at all. Coverage of the gate's behavior lives in
+  # ``tests/test_judges_md_parser.py::TestValidationField::test_strict_raises_when_jsonschema_missing``,
+  # which monkeypatches ``_check_jsonschema_importable`` to simulate
+  # the missing-import path — the realistic shape of the gate in this
+  # ecosystem. If a future change drops the ``mcp`` requirement or
+  # ``mcp`` drops its jsonschema dep, the real-interpreter negative-
+  # path job can be re-added here.
