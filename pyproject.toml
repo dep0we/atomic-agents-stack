@@ -31,6 +31,7 @@ dependencies = [
 [project.optional-dependencies]
 openai = ["openai>=1.30"]
 validation = ["jsonschema>=4.0"]
+redis = ["redis>=5.0,<7.0"]
 dev = [
     "pytest>=8.0",
 ]
@@ -66,4 +67,8 @@ filterwarnings = [
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",
+    # fakeredis for in-memory Redis simulation in the lock conformance
+    # + integration tests (#60 PR 3). Dev-only — no production import
+    # path depends on it.
+    "fakeredis[lua]>=2.0",
 ]

@@ -176,3 +176,34 @@ class LockBackend(Protocol):
         backends rather than discovering the mismatch mid-operation.
         """
         ...
+
+    def scope(self, sub_path: str) -> "LockBackend":
+        """Return a new LockBackend rooted at a sub-scope of this one.
+
+        Lets the framework re-scope an operator-provided backend
+        without the operator having to construct multiple instances.
+        For ``FilesystemLockBackend``, ``scope("dreams")`` returns a
+        new backend rooted at ``<scope_root>/dreams``. For
+        ``RedisLockBackend``, it returns a new backend with the
+        ``key_prefix`` extended by ``"dreams:"``. Operators pass ONE
+        backend to ``AtomicAgent``; the agent calls ``scope("dreams")``
+        internally to produce the dream-lock backend.
+
+        The sub-scope MUST be a backend of the same type with the same
+        ``backend_id`` and equivalent ``capabilities()`` — sub-scoping
+        cannot change capability claims (a filesystem backend doesn't
+        suddenly become distributed by being sub-scoped). The
+        conformance suite asserts this invariant.
+
+        ``sub_path`` is a single semantic identifier (e.g., ``"dreams"``,
+        ``"staging"``). Backends interpret it: filesystem joins as a
+        directory; Redis prepends as a key-prefix segment. Empty string
+        is invalid — sub-scoping to "the same scope" is always a caller
+        error. **Backends MUST raise ``ValueError`` with a message
+        explaining the requirement.** The reference impls (filesystem,
+        Redis) do this; the conformance suite asserts the contract;
+        third-party backends MUST honor it so ``DreamRunner``'s
+        ``scope("dreams")`` call always produces a distinct namespace
+        from the parent's empty-name root.
+        """
+        ...

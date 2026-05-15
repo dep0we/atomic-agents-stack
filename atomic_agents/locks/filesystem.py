@@ -226,6 +226,24 @@ class FilesystemLockBackend:
             supports_lease=False,
         )
 
+    def scope(self, sub_path: str) -> "FilesystemLockBackend":
+        """Return a new FilesystemLockBackend rooted at ``<scope_root>/<sub_path>``.
+
+        Used by ``DreamRunner`` to derive its dream-lock backend
+        (``agent.lock_backend.scope("dreams")``) from the agent's
+        operator-provided lock backend. Preserves the configured
+        ``poll_interval``.
+        """
+        if not sub_path:
+            raise ValueError(
+                "FilesystemLockBackend.scope(sub_path) requires a non-empty "
+                "sub_path; use the existing backend for the same scope."
+            )
+        return FilesystemLockBackend(
+            self._scope_root / sub_path,
+            poll_interval=self._poll_interval,
+        )
+
     # ──────────────────────────────────────────────────────────────────
     # Internal helpers
 

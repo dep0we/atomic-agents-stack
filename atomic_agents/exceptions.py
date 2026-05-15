@@ -19,8 +19,8 @@ class LockBusy(AtomicAgentsError):
     Raised by ``atomic_agents.locks.LockBackend.acquire()`` when the
     deadline elapses without the lock being granted. Backend-agnostic:
     a ``FilesystemLockBackend`` raises it when another process holds the
-    advisory ``flock``; a future ``RedisLockBackend`` raises it when the
-    Redis SET NX call returns nil within the wait window.
+    advisory ``flock``; a ``RedisLockBackend`` raises it when the
+    Redis ``SET NX EX`` call returns nil within the wait window.
 
     Held lock identity is in the message text for human inspection;
     consumers branching on identity should query
@@ -32,6 +32,27 @@ class LockBusy(AtomicAgentsError):
 # at the package top level. Existing ``except AgentLockBusy`` code paths
 # keep working unchanged because the class identity is preserved.
 AgentLockBusy = LockBusy
+
+
+class LockLost(AtomicAgentsError):
+    """A previously-held lease-backed lock expired mid-critical-section.
+
+    Distinct from ``LockBusy`` (couldn't acquire) — ``LockLost`` means
+    the caller HAD the lock and lost it because the lease expired before
+    a renewal could land. Surfaces from heartbeat threads on
+    lease-backed backends (``RedisLockBackend`` etc) and is checked by
+    long-running call sites between iterations of their work loops so
+    they can abort safely instead of writing under a lock another holder
+    now owns.
+
+    Deliberately NOT a subclass of ``LockBusy`` — code paths catching
+    ``LockBusy`` for "couldn't start work" semantics should NOT
+    accidentally swallow ``LockLost`` which signals "in-flight work
+    must abort." Both share ``AtomicAgentsError`` as the common ancestor.
+
+    Filesystem backends with ``supports_lease=False`` never raise this;
+    operators using the filesystem default will not see it.
+    """
 
 
 class CostGuardrailBlocked(AtomicAgentsError):

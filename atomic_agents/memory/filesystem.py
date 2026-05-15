@@ -43,7 +43,7 @@ from .backend import (
     WritePolicy,
 )
 from .._io import atomic_write, safe_resolve_under
-from ..locks import get_lock_backend
+from ..locks import LockBackend, get_default_lock_backend
 from .._schema import CURRENT_SCHEMA_VERSION, derive_filename
 from ..exceptions import (
     MemoryPreconditionFailed,
@@ -148,6 +148,7 @@ class FilesystemBackend:
         memory_subdir: str = "memory",
         *,
         apply_staging_lock_timeout: float = 30.0,
+        lock_backend: LockBackend | None = None,
     ):
         self._agent_root = agent_root
         self._memory_dir = agent_root / memory_subdir
@@ -165,11 +166,16 @@ class FilesystemBackend:
         # tradeoff (CLAUDE.md rule #2 — Protocols stay clean); the
         # constructor kwarg lives on the concrete reference impl only.
         self._apply_staging_lock_timeout = apply_staging_lock_timeout
-        # Cached LockBackend scoped to ``agent_root`` so that
-        # ``apply_staging`` serializes against ``agent.call()`` (both
-        # acquire ``<agent_root>/.lock`` via empty-name). Routed through
-        # the registry (default ``"filesystem"``) for PR 3 forward-compat.
-        self._lock_backend = get_lock_backend("filesystem")(agent_root)
+        # LockBackend scoped to ``agent_root`` so that ``apply_staging``
+        # serializes against ``agent.call()`` (both acquire the agent's
+        # main lock via empty-name). Operator override flows in via the
+        # ``lock_backend`` kwarg (programmatic) OR
+        # ``ATOMIC_AGENTS_LOCK_BACKEND`` env var (deployment). See
+        # spec/21 §"Operator override surface".
+        if lock_backend is None:
+            self._lock_backend = get_default_lock_backend(agent_root)
+        else:
+            self._lock_backend = lock_backend
 
     # ───── Internal helpers ─────────────────────────────────────────
 
@@ -532,7 +538,18 @@ class FilesystemBackend:
         # acquires), so the kernel flock serializes the two paths
         # cross-process. Context-manager release is idempotent per
         # spec/21 §"release(handle)".
-        with self._lock_backend.acquire("", timeout=self._apply_staging_lock_timeout):
+        from ..locks import check_lock_lost
+
+        with self._lock_backend.acquire(
+            "", timeout=self._apply_staging_lock_timeout
+        ) as handle:
+            # Lease-backed backends (Redis): check that the heartbeat
+            # didn't detect lease expiry between acquire and the first
+            # rename. Step 11 adversarial P1-3 — the rename window is
+            # small but real under load (NFS, large staging tree); a
+            # lost lease here means another holder could be writing to
+            # memory/ concurrently. No-op for filesystem.
+            check_lock_lost(handle)
             if current_memory.exists():
                 os.rename(str(current_memory), str(archived))
             try:
