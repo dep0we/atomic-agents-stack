@@ -46,6 +46,7 @@ import os
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
 
 from . import _cascade, _model, _tools
 from ._costs import PRICING
@@ -189,6 +190,7 @@ def run_doctor(
 
     results.append(check_lock_backend(agent_root))
     results.append(check_locks(agent_root))
+    results.append(check_log_backend(agent_root))
     results.append(check_memory_backend(agent_root))
     results.append(check_write_paths(tools_data, agent_root=agent_root))
 
@@ -992,6 +994,142 @@ def check_lock_backend(agent_root: Path) -> CheckResult:
         name="lock-backend", status=PASS,
         message=f"{backend_id} backend reachable at {safe_url}",
         detail={"backend_id": backend_id, "url": safe_url},
+    )
+
+
+def check_log_backend(agent_root: Path) -> CheckResult:
+    """Operator-config coherence check for the log backend (#61 PR 2).
+
+    Validates that ``ATOMIC_AGENTS_LOG_BACKEND`` (plus
+    ``ATOMIC_AGENTS_LOG_BACKEND_URL`` when non-filesystem) is correctly
+    configured:
+
+    * unset / ``filesystem`` → PASS (today's deployment shape — writes
+      JSONL to ``<agent>/log/YYYY-MM/YYYY-MM-DD.jsonl`` as the
+      pre-#61 code did)
+    * ``sqlite`` (forward-pointer for #61 PR 3) → FAIL with the
+      installation hint until PR 3 ships
+    * unknown backend_id (typo) → FAIL with the known-id list, which
+      includes the lazy ``sqlite`` forward-pointer so operator typos
+      see the same hint they'd get from
+      ``get_default_log_backend`` itself
+
+    Mirrors ``check_lock_backend`` shape — both checks reuse the
+    framework's ``get_default_log_backend`` factory internally so
+    doctor's verdict and the runtime's behavior cannot diverge.
+    """
+    from .exceptions import BackendNotRegistered
+    from .logs import get_default_log_backend, list_log_backends
+
+    backend_id = os.environ.get(
+        "ATOMIC_AGENTS_LOG_BACKEND", "filesystem"
+    ).strip().lower()
+
+    if backend_id == "filesystem":
+        try:
+            backend = get_default_log_backend(agent_root)
+            stats = backend.stats()
+        except Exception as exc:
+            return CheckResult(
+                name="log-backend", status=FAIL,
+                message=f"filesystem log backend stats() raised {type(exc).__name__}: {exc}",
+                fix_hint=(
+                    f"Check that {agent_root}/log is readable. The default "
+                    "FilesystemLogBackend constructs itself at agent_root "
+                    "and reads <agent>/log/YYYY-MM/YYYY-MM-DD.jsonl."
+                ),
+            )
+        return CheckResult(
+            name="log-backend", status=PASS,
+            message=(
+                f"filesystem backend ok ({stats.total_records} records, "
+                f"{stats.records_this_month} this month)"
+            ),
+            detail={
+                "backend_id": "filesystem",
+                "total_records": stats.total_records,
+                "records_today": stats.records_today,
+                "records_this_month": stats.records_this_month,
+                "size_bytes": stats.size_bytes,
+            },
+        )
+
+    # ``sqlite`` is the forward-pointer name — PR 3 will register it.
+    # Treat it as a known id alongside the eagerly-registered backends
+    # so doctor's known-id list matches ``get_default_log_backend``'s
+    # error message (same Step-11-adversarial-P0-3 mitigation).
+    known_ids = set(list_log_backends()) | {"sqlite"}
+    if backend_id not in known_ids:
+        return CheckResult(
+            name="log-backend", status=FAIL,
+            message=(
+                f"ATOMIC_AGENTS_LOG_BACKEND={backend_id!r} is not "
+                f"a known backend. Known: {sorted(known_ids)}"
+            ),
+            fix_hint=(
+                "Set ATOMIC_AGENTS_LOG_BACKEND to one of the known "
+                "ids, or unset to use the filesystem default."
+            ),
+        )
+
+    # Non-filesystem id selected — try to construct via the factory.
+    # In PR 2, the only non-filesystem id is ``sqlite`` (forward-
+    # declared) which PR 3 will register; for now ``get_default_log_
+    # backend`` raises ``BackendNotRegistered`` for it.
+    #
+    # Credential safety: any exception from ``get_default_log_backend``
+    # may include a URL with embedded credentials. We redact via the
+    # same urlparse-based pattern ``check_lock_backend`` uses (security
+    # parity — Step 9.1 security CRITICAL #3 on PR 2).
+    url = os.environ.get("ATOMIC_AGENTS_LOG_BACKEND_URL")
+    safe_url: str | None = None
+    if url:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        if parsed.password:
+            netloc = parsed.hostname or ""
+            if parsed.port:
+                netloc = f"{netloc}:{parsed.port}"
+            safe_url = parsed._replace(netloc=netloc).geturl()
+        else:
+            safe_url = url
+
+    try:
+        get_default_log_backend(agent_root)
+    except BackendNotRegistered as exc:
+        return CheckResult(
+            name="log-backend", status=FAIL,
+            message=f"log backend {backend_id!r} not yet registered",
+            fix_hint=(
+                f"The {backend_id!r} backend is reserved but not shipped in "
+                "this version. Unset ATOMIC_AGENTS_LOG_BACKEND to use the "
+                "filesystem default."
+            ),
+        )
+    except Exception as exc:
+        # Sanitize the exception message — connection errors from
+        # backend constructors commonly embed the full URL including
+        # credentials. Drop the exception class name and rely on
+        # fix_hint to guide the operator. The full exception is
+        # available in the LOG level above DEBUG (not echoed via
+        # CheckResult) for the operator who has logging access.
+        return CheckResult(
+            name="log-backend", status=FAIL,
+            message=f"log backend {backend_id!r} construction failed",
+            fix_hint=(
+                "Check ATOMIC_AGENTS_LOG_BACKEND and "
+                "ATOMIC_AGENTS_LOG_BACKEND_URL for typos. Run with "
+                "DEBUG logging to see the full exception."
+            ),
+        )
+
+    detail: dict[str, Any] = {"backend_id": backend_id}
+    if safe_url is not None:
+        detail["url"] = safe_url
+    return CheckResult(
+        name="log-backend", status=PASS,
+        message=f"{backend_id} backend constructed",
+        detail=detail,
     )
 
 

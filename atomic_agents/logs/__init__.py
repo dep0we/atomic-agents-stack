@@ -184,31 +184,52 @@ register_log_backend("filesystem", FilesystemLogBackend)
 
 
 # ────────────────────────────────────────────────────────────────────
-# PR 2 wiring contract — runners + readers MUST acquire the backend
-# from the agent instance, NOT construct their own.
+# PR 2 wiring contract — post-PR-2 state (this block describes what
+# IS wired today, not what's planned).
 #
-# The lock arc PR 3 Step 11 adversarial caught DreamRunner silently
-# dropping the operator's ``lock_backend`` kwarg by constructing its
-# own lock backend instance. The log arc has the same trap surface:
-# ``OutcomeRunner`` (outcome.py:187) constructs an ``AtomicAgent`` for
-# its iteration runs; ``EvalRunner`` (eval.py) does similar; ``Dream``
-# (dream.py:281-286, 621-623) walks ``<agent_root>/log/`` directly for
-# cost rollups; ``_costs.sum_cost_for_period`` (_costs.py:100) and
-# ``dashboard/costs.py:load_runs`` (dashboard/costs.py:120) walk the
-# month dirs without an agent reference. Each is a future PR 2 wiring
-# site where a "construct my own FilesystemLogBackend" shortcut would
-# silently bypass the operator's ``log_backend`` kwarg, producing a
-# multi-backend split-brain when PR 3 ships ``SQLiteLogBackend``.
+# Background — the trap shape: the lock arc PR 3 Step 11 adversarial
+# caught ``DreamRunner`` silently dropping the operator's
+# ``lock_backend`` kwarg by constructing its own lock backend
+# instance. The log arc has the same trap surface across multiple
+# runners and readers.
 #
-# PR 2 wires by:
-#   1. ``agent._log()`` becomes a thin wrapper that builds a RunRecord
-#      from the dict literal and calls ``self.log_backend.append(...)``.
+# Wired by #61 PR 2:
+#   1. ``agent._log()`` is a thin wrapper that builds a RunRecord
+#      (deriving ``primitive`` from the legacy ``trigger``, defaulting
+#      ``run_id`` to ``self.run_id``) and calls
+#      ``self.log_backend.append(...)``.
 #   2. ``OutcomeRunner._append_iteration_log`` routes through
 #      ``agent.log_backend.append(...)`` — never constructs its own.
-#   3. ``EvalRunner._write_run_log`` routes through the agent's backend.
-#   4. Dashboard / cost readers route through ``self.log_backend.query()``.
-#   5. ``AtomicAgent.__init__`` accepts ``log_backend: LogBackend | None``;
-#      if not set, calls ``get_default_log_backend(self.agent_root)``.
+#      OutcomeRunner accepts ``log_backend=`` kwarg (mirrors AtomicAgent
+#      pattern), threaded to the internal AtomicAgent at ``run()``.
+#   3. ``DreamRunner`` accepts ``log_backend=`` kwarg; threaded through
+#      to ``_read_log_lines`` and ``_check_cap`` via ``_run_pipeline``.
+#   4. ``_costs.sum_cost_for_period`` accepts ``backend=`` kwarg —
+#      every call site in ``agent.py`` and ``dream.py`` passes
+#      ``self.log_backend``. The filesystem backend specifically
+#      preserves the legacy file-walk semantic (date-from-file-path,
+#      not record.ts) to keep cost guardrails safe against malformed
+#      legacy records — Step 11 adversarial P0 #4. SQL/Datadog
+#      backends (PR 3+) use the indexed ``query()`` path.
+#   5. ``dashboard/costs.load_runs`` + ``dashboard/quality._count_
+#      provenance`` route through ``get_default_log_backend(agents_
+#      root / agent).query(LogQuery(...))`` — env-var-resolved
+#      backend matches the runtime's choice.
+#   6. ``AtomicAgent.__init__`` accepts ``log_backend: LogBackend |
+#      None``; if unset, calls ``get_default_log_backend(self.agent_
+#      root)``. Public ``self.log_backend`` mirrors ``self.lock_
+#      backend`` / ``self.memory``.
+#   7. ``doctor.check_log_backend`` validates operator config and
+#      reports backend stats; URL-credential-redacted error messages.
+#
+# DEFERRED (intentional):
+#   - ``EvalRunner._write_run_log`` writes to ``evals/runs/<date>
+#     .jsonl`` — a SEPARATE artifact from the agent's daily log dir.
+#     Cross-primitive routing through ``agent.log_backend`` with a
+#     ``primitive="eval"`` taxonomy entry is PR 3 scope per spec/22
+#     §"Cross-primitive run records".
+#   - ``dream.py`` manifest writes go to ``dreams/runs/<date>.jsonl``
+#     — also separate; same PR-3 reroute story as evals.
 
 
 def get_default_log_backend(scope_root: Path) -> LogBackend:

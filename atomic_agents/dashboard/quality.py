@@ -290,55 +290,41 @@ def _count_provenance(
 ) -> tuple[int, int]:
     """Count helper runs with provenance_preserved=True vs. total helper runs.
 
+    Per #61 PR 2: routes through ``LogBackend.query()`` instead of
+    walking the filesystem directly. ``provenance_preserved`` lives
+    in ``record.extra`` (primitive-specific key); we read it via
+    ``RunRecord.extra.get`` rather than parsing raw JSONL.
+
+    Helper-record discrimination is done IN-MEMORY (not via
+    ``LogQuery(primitive="helper")``) because legacy on-disk records
+    written before PR 2 do not have a ``primitive`` field — they would
+    be re-materialized via ``RunRecord.from_dict`` with the default
+    ``PRIMITIVE_OTHER`` and silently filtered out by the backend's
+    predicate evaluator BEFORE the in-method belt-and-suspenders check
+    could run. Step 11 adversarial P0 #2 caught this. Querying the
+    full window and filtering in-Python preserves backward compat for
+    every legacy helper record.
+
     Returns (preserved_count, total_count).
-    Reads raw JSONL to access the provenance_preserved field not in RunRecord.
     """
-    log_dir = agents_root / agent / "log"
-    if not log_dir.exists():
-        return 0, 0
+    from datetime import datetime, time as dt_time
+    from ..logs import LogQuery, get_default_log_backend
+
+    backend = get_default_log_backend(agents_root / agent)
+    since_dt = datetime.combine(since, dt_time.min).astimezone()
+    until_dt = datetime.combine(until, dt_time.max).astimezone()
+
     preserved = 0
     total = 0
-    for month_dir in sorted(log_dir.iterdir()):
-        if not month_dir.is_dir():
+    # NO primitive filter in the LogQuery — see docstring rationale.
+    for rec in backend.query(LogQuery(since=since_dt, until=until_dt)):
+        # Helper records are identified by EITHER primitive (post-PR-2)
+        # OR trigger (legacy, pre-PR-2). Belt-and-suspenders.
+        if rec.primitive != "helper" and rec.trigger != "helper":
             continue
-        try:
-            year, month = map(int, month_dir.name.split("-"))
-        except ValueError:
-            continue
-        month_start = date(year, month, 1)
-        from datetime import timedelta as _td
-        month_end = (
-            date(year + 1, 1, 1) - _td(days=1)
-            if month == 12
-            else date(year, month + 1, 1) - _td(days=1)
-        )
-        if month_end < since or month_start > until:
-            continue
-        for path in sorted(month_dir.glob("*.jsonl")):
-            try:
-                text = path.read_text(encoding="utf-8")
-            except OSError:
-                continue
-            for line in text.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if rec.get("trigger") != "helper":
-                    continue
-                ts_str = rec.get("ts", "")
-                try:
-                    rec_date = date.fromisoformat(ts_str[:10])
-                except (ValueError, TypeError):
-                    continue
-                if not (since <= rec_date <= until):
-                    continue
-                total += 1
-                if rec.get("provenance_preserved"):
-                    preserved += 1
+        total += 1
+        if rec.extra.get("provenance_preserved"):
+            preserved += 1
     return preserved, total
 
 

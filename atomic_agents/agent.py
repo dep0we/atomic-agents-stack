@@ -43,6 +43,25 @@ from .locks import (
     check_lock_lost,
     get_default_lock_backend,
 )
+from .logs import (
+    LogBackend,
+    RunRecord,
+    get_default_log_backend,
+)
+from .logs.types import (
+    PRIMITIVE_AGENT_CALL,
+    PRIMITIVE_CAPTURE,
+    PRIMITIVE_COST_WARNING,
+    PRIMITIVE_DELEGATE,
+    PRIMITIVE_DREAM,
+    PRIMITIVE_ESCALATION,
+    PRIMITIVE_EVAL,
+    PRIMITIVE_HELPER,
+    PRIMITIVE_JUDGMENT,
+    PRIMITIVE_OTHER,
+    PRIMITIVE_OUTCOME_ITERATION,
+    PRIMITIVE_TOOL,
+)
 from ._platform import get_agents_root
 from ._schema import validate_atomic_note_frontmatter
 from .goal import parse_agent_mode
@@ -77,6 +96,57 @@ from .types import (
 PINNED_MAX = 5
 RECENT_NOTES_DEFAULT = 5
 RECENT_JOURNAL_DEFAULT = 1
+
+
+# ────────────────────────────────────────────────────────────────────
+# #61 PR 2 — primitive derivation from the legacy ``trigger`` string.
+#
+# Today's ``self._log({"trigger": "..."})`` call sites use a free-form
+# dispatch string. spec/22's ``RunRecord.primitive`` is the canonical
+# taxonomy. This mapping derives ``primitive`` from ``trigger`` for
+# every existing call site; new code paths SHOULD set ``primitive``
+# explicitly via ``RunRecord(..., primitive=PRIMITIVE_X)`` rather than
+# relying on the derivation.
+#
+# Triggers that share a primitive bucket (``helper_batch_reservation``
+# + ``helper_batch_release`` + ``helper``) are folded together. The
+# fallback bucket is ``PRIMITIVE_OTHER`` — backends MUST accept it
+# (spec/22 §"Canonical primitive taxonomy" — the closed set is
+# documentation, not enforcement).
+
+_PRIMITIVE_BY_TRIGGER: dict[str, str] = {
+    "agent_call": PRIMITIVE_AGENT_CALL,
+    "outcome_iteration": PRIMITIVE_OUTCOME_ITERATION,
+    "dream": PRIMITIVE_DREAM,
+    "eval": PRIMITIVE_EVAL,
+    "helper": PRIMITIVE_HELPER,
+    "helper_batch_reservation": PRIMITIVE_HELPER,
+    "helper_batch_release": PRIMITIVE_HELPER,
+    "delegate": PRIMITIVE_DELEGATE,
+    "delegate_batch_reservation": PRIMITIVE_DELEGATE,
+    "delegate_batch_release": PRIMITIVE_DELEGATE,
+    "tool_call": PRIMITIVE_TOOL,
+    "tool_call_deferred": PRIMITIVE_TOOL,
+    "cost_warning": PRIMITIVE_COST_WARNING,
+    "capture_write_error": PRIMITIVE_CAPTURE,
+    "judgment": PRIMITIVE_JUDGMENT,
+    "escalation_deferred_execution": PRIMITIVE_ESCALATION,
+    "escalation_operator_revise_executed": PRIMITIVE_ESCALATION,
+    "escalation_operator_revise_invalid_amendment": PRIMITIVE_ESCALATION,
+    "escalation_resolved": PRIMITIVE_ESCALATION,
+}
+
+
+def _derive_primitive_from_trigger(trigger: str | None) -> str:
+    """Map the legacy ``trigger`` string to spec/22 ``primitive`` taxonomy.
+
+    Returns ``PRIMITIVE_OTHER`` for ``None`` or unknown triggers — the
+    open vocabulary fallback. Future code paths emitting new triggers
+    SHOULD register the mapping here or set ``primitive`` explicitly.
+    """
+    if trigger is None:
+        return PRIMITIVE_OTHER
+    return _PRIMITIVE_BY_TRIGGER.get(trigger, PRIMITIVE_OTHER)
 
 
 def _canonicalize_tool_loop(raw_tool_uses, tool_results):
@@ -125,6 +195,13 @@ class AtomicAgent:
     # rather than narrowing to the filesystem default. Step 9.1
     # maintainability specialist CRITICAL.
     lock_backend: LockBackend
+    # Same class-level annotation rationale for ``log_backend`` (#61
+    # PR 2). Without this, static analysis would narrow ``agent.log_
+    # backend`` to the concrete ``FilesystemLogBackend`` default rather
+    # than treating it as any ``LogBackend`` Protocol implementer —
+    # breaking the operator-pinned-SQLite/Postgres/Datadog case PR 3
+    # forward.
+    log_backend: LogBackend
     """The main agent runtime.
 
     Responsible for:
@@ -145,6 +222,7 @@ class AtomicAgent:
         max_tool_iterations: int = DEFAULT_MAX_TOOL_ITERATIONS,
         *,
         lock_backend: LockBackend | None = None,
+        log_backend: LogBackend | None = None,
     ):
         self.name = name
         self.trigger = trigger
@@ -176,6 +254,22 @@ class AtomicAgent:
             self.lock_backend = get_default_lock_backend(self.agent_root)
         else:
             self.lock_backend = lock_backend
+
+        # LogBackend instance bound to this agent's root (#61 PR 2).
+        # Operators may pin a backend via the ``log_backend=...``
+        # constructor kwarg (programmatic path) OR via
+        # ``ATOMIC_AGENTS_LOG_BACKEND`` (deployment path — same env-var
+        # idiom as locks). Default (both unset) is the filesystem
+        # backend scoped to this agent's root — matches pre-#61 PR 2
+        # behavior byte-for-byte (the JSONL append path at
+        # ``log/YYYY-MM/YYYY-MM-DD.jsonl`` is preserved). ``log_backend``
+        # is public — mirrors ``self.memory`` / ``self.lock_backend``
+        # and lets diagnostic code (``atomic-agents doctor``) reuse
+        # the same backend instance.
+        if log_backend is None:
+            self.log_backend = get_default_log_backend(self.agent_root)
+        else:
+            self.log_backend = log_backend
 
         # Cascade detection — None for single-agent layouts (load behaves as before),
         # populated for paths shaped <system>/projects/<project>/agents/<role>/.
@@ -2993,11 +3087,11 @@ class AtomicAgent:
         if self.config.cost_guardrails_enabled and not critical:
             log_dir = self.agent_root / "log"
             today_cost = (
-                _costs.sum_cost_for_period(log_dir, "today", source="actor")
+                _costs.sum_cost_for_period(log_dir, "today", source="actor", backend=self.log_backend)
                 + self._delegated_cost_this_run
             )
             month_cost = (
-                _costs.sum_cost_for_period(log_dir, "this_month", source="actor")
+                _costs.sum_cost_for_period(log_dir, "this_month", source="actor", backend=self.log_backend)
                 + self._delegated_cost_this_run
             )
             daily_remaining = (
@@ -3225,8 +3319,8 @@ class AtomicAgent:
         if not self.config.cost_guardrails_enabled or reserved_usd <= 0:
             return
         log_dir = self.agent_root / "log"
-        today_cost = _costs.sum_cost_for_period(log_dir, "today", source="actor")
-        month_cost = _costs.sum_cost_for_period(log_dir, "this_month", source="actor")
+        today_cost = _costs.sum_cost_for_period(log_dir, "today", source="actor", backend=self.log_backend)
+        month_cost = _costs.sum_cost_for_period(log_dir, "this_month", source="actor", backend=self.log_backend)
         daily_remaining = (
             self.config.daily_cap_usd - today_cost
             if self.config.daily_cap_usd > 0
@@ -3335,8 +3429,8 @@ class AtomicAgent:
             return CostCheckResult(allow=True, reason="critical_override")
 
         log_dir = self.agent_root / "log"
-        today_cost = _costs.sum_cost_for_period(log_dir, "today", source="actor") + extra_in_flight_cost_usd
-        month_cost = _costs.sum_cost_for_period(log_dir, "this_month", source="actor") + extra_in_flight_cost_usd
+        today_cost = _costs.sum_cost_for_period(log_dir, "today", source="actor", backend=self.log_backend) + extra_in_flight_cost_usd
+        month_cost = _costs.sum_cost_for_period(log_dir, "this_month", source="actor", backend=self.log_backend) + extra_in_flight_cost_usd
 
         daily_pct = (today_cost / self.config.daily_cap_usd) if self.config.daily_cap_usd > 0 else 0
         monthly_pct = (month_cost / self.config.monthly_cap_usd) if self.config.monthly_cap_usd > 0 else 0
@@ -3421,11 +3515,34 @@ class AtomicAgent:
     # Logging
 
     def _log(self, record: dict) -> None:
-        """Append one JSONL line to log/YYYY-MM/YYYY-MM-DD.jsonl."""
+        """Append one log line via ``self.log_backend.append(...)``.
+
+        Thin wrapper that builds a ``RunRecord`` from the legacy dict
+        literal (every existing ``self._log({"trigger": "...", ...})``
+        site keeps its dict shape verbatim) and routes through the
+        operator-pinned ``LogBackend``. Default ``FilesystemLogBackend``
+        preserves the legacy on-disk shape byte-for-byte (writes to
+        ``<agent_root>/log/YYYY-MM/YYYY-MM-DD.jsonl`` via
+        ``_io.atomic_append_jsonl`` — same path as the pre-PR-2 code).
+
+        Pre-population matches the legacy idiom:
+        - ``ts`` set to local-tz ISO-8601 if absent (so
+          ``record.ts.date() == date.today()`` in local time —
+          preserves the day-file landing semantic the dashboard
+          readers / dream walker depend on)
+        - ``run_id`` defaulted to ``self.run_id`` so child-record
+          ``parent_run_id`` rollups link to the parent run
+        - ``primitive`` derived from the legacy ``trigger`` string
+          via ``_derive_primitive_from_trigger`` with ``"other"`` as
+          the fallback bucket
+        """
         record = {"ts": datetime.now().astimezone().isoformat(), **record}
-        today = date.today()
-        log_path = self.agent_root / "log" / today.strftime("%Y-%m") / f"{today.isoformat()}.jsonl"
-        atomic_append_jsonl(log_path, json.dumps(record))
+        record.setdefault("run_id", self.run_id)
+        record.setdefault(
+            "primitive",
+            _derive_primitive_from_trigger(record.get("trigger")),
+        )
+        self.log_backend.append(RunRecord.from_dict(record))
 
     def _derive_summary(self, work_item: str) -> str:
         """Short summary of the work item for log records."""

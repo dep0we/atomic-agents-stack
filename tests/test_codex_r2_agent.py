@@ -235,7 +235,11 @@ def test_delegate_inherits_coordinator_remaining_headroom(tmp_path):
 
     coord = AtomicAgent(name="coordinator", agents_root=agents_root)
 
-    # Pre-fill coordinator's log to consume all headroom
+    # Pre-fill coordinator's log to consume all headroom.
+    # Per #61 PR 2: sum_cost_for_period now routes through LogBackend.query()
+    # which filters records by ts — placeholder "x" gets filtered out, so
+    # a real ISO-8601 ts in today's tz window is required.
+    from datetime import datetime as _dt
     today = date.today()
     log_path = (
         coord.agent_root / "log"
@@ -243,7 +247,9 @@ def test_delegate_inherits_coordinator_remaining_headroom(tmp_path):
     )
     log_path.parent.mkdir(parents=True, exist_ok=True)
     # Coordinator has spent $0.0001 — its entire daily cap
-    log_path.write_text(json.dumps({"cost_usd": 0.0001, "ts": "x"}) + "\n")
+    log_path.write_text(
+        json.dumps({"cost_usd": 0.0001, "ts": _dt.now().astimezone().isoformat()}) + "\n"
+    )
 
     fake_client = MagicMock()
     fake_anthropic = types.SimpleNamespace(Anthropic=lambda api_key: fake_client)
