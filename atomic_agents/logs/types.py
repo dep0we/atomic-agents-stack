@@ -419,14 +419,26 @@ class LogAggregate:
 
     Fields:
         group_by: tuple of ``RunRecord`` field names to group by. The
-            backend looks up each field via ``getattr(record, name)`` —
-            including fields nested in ``extra`` (filesystem walks
-            ``record.extra.get(name)`` for unknown names). Empty tuple
-            ``()`` means "no grouping; return a single value keyed by
-            the empty tuple".
+            backend looks up each field via ``getattr(record, name)``,
+            falling through to ``record.extra.get(name)`` for fields
+            not on the canonical ``RunRecord`` dataclass (matches the
+            Protocol contract — see ``LogBackend.aggregate``). Empty
+            tuple ``()`` means "no grouping; return a single value
+            keyed by the empty tuple".
         metric: one of the ``METRIC_*`` constants. Backends MUST raise
             ``ValueError`` for unknown metrics (the conformance suite
             pins this — see ``test_aggregate_unknown_metric_raises``).
+
+    SECURITY NOTE — multi-tenant deployments: ``group_by`` fields that
+    resolve through ``record.extra`` (e.g., per-tenant identifiers like
+    ``api_key``, ``user_id``, ``billing_account`` stashed in extra by
+    a primitive) let any caller enumerate all distinct values in the
+    backend via the result dict keys. Callers in multi-tenant systems
+    MUST validate ``group_by`` field names against an allowlist of
+    known-safe canonical fields before passing to ``aggregate()`` —
+    or restrict access to ``aggregate`` to operators only. The
+    Protocol does not enforce this at the API boundary; PR 2's
+    dashboard wiring is the right layer to gate.
     """
 
     group_by: tuple[str, ...]
@@ -516,11 +528,18 @@ class LogCapabilities:
 
 
 def _coerce_optional_str(v: Any) -> str | None:
-    """Return a string when ``v`` is non-None and non-empty, else None."""
+    """Return a string when ``v`` is non-None, else None.
+
+    Empty strings ARE preserved (returned as ``""``, not converted to
+    ``None``) so the ``to_dict → JSON → from_dict`` round-trip is
+    byte-identical for records that legitimately carry empty-string
+    optional fields. Treating ``""`` as missing would silently destroy
+    data in the round-trip — exactly the failure mode the Step 11
+    adversarial review caught.
+    """
     if v is None:
         return None
-    s = str(v)
-    return s if s else None
+    return str(v)
 
 
 def _coerce_optional_int(v: Any) -> int | None:

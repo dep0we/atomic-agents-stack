@@ -37,7 +37,6 @@ partial-cutoff day file via ``_io.atomic_write``.
 from __future__ import annotations
 
 import json
-import os
 import re
 from collections import defaultdict
 from datetime import date, datetime
@@ -132,6 +131,20 @@ class FilesystemLogBackend:
         derives from that timestamp. Falling back to ``date.today()``
         on parse failure preserves the legacy "today's file" landing
         for malformed records rather than dropping them.
+
+        **PR 2 wiring contract.** Today's ``agent.py:3425-3427`` shape
+        sets both ``ts = datetime.now().astimezone().isoformat()`` AND
+        computes the file path from ``date.today()`` — both local-tz.
+        Because they're computed in the same call, ``ts.date() ==
+        date.today()`` holds for the legacy path. PR 2's ``_log()``
+        wrapper MUST preserve this invariant when building the
+        ``RunRecord``: set ``ts`` via the same ``datetime.now()
+        .astimezone().isoformat()`` idiom so the backend-derived date
+        matches what ``date.today()`` would have produced. A wrapper
+        that uses UTC ts (e.g., ``datetime.now(timezone.utc)``) on a
+        non-UTC host will land records in a UTC-date file whereas the
+        legacy path landed them in a local-date file — diverging the
+        on-disk shape across the wiring transition.
         """
         day = _record_date(record)
         target = (
@@ -317,7 +330,19 @@ class FilesystemLogBackend:
         Counts deleted records. Idempotent — calling again with the
         same threshold returns 0 because the prior call removed the
         candidates. Empty month dirs are cleaned at the end.
+
+        Raises ``ValueError`` for naive datetimes (per the LogBackend
+        contract). Silent local-vs-UTC conversion is the failure shape
+        that produces off-by-one-day retention errors near midnight;
+        operators MUST pass a tz-aware threshold.
         """
+        if threshold.tzinfo is None:
+            raise ValueError(
+                "delete_older_than(threshold) requires a tz-aware "
+                "datetime; naive datetime would silently convert "
+                "local-vs-UTC and corrupt retention near midnight"
+            )
+
         log_dir = self._log_dir
         if not log_dir.exists():
             return 0

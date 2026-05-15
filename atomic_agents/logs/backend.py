@@ -89,12 +89,21 @@ class LogBackend(Protocol):
 
         Semantics:
 
-        * MUST be atomic. A crash mid-``append`` MUST NOT corrupt the
-          backend — partial records MUST NOT be readable via ``query``.
-          Filesystem backends inherit this via ``_io.atomic_append_jsonl``;
-          SQL backends use ``INSERT`` inside a single transaction;
-          remote backends serialize via the network primitive's
-          atomicity guarantee.
+        * **Atomic for records ≤ ``PIPE_BUF``** (POSIX, typically 4096
+          bytes); SHOULD be atomic for larger records via backend-native
+          serialization (SQL transaction, lease-token-checked Lua,
+          single-request HTTP). The reference ``FilesystemLogBackend``
+          inherits its bound from ``_io.atomic_append_jsonl`` which is
+          atomic only for sub-``PIPE_BUF`` writes; records carrying
+          rollup arrays (``helper_provenance``, ``delegations``,
+          ``tool_calls``) routinely exceed this on the top-level
+          ``agent.call()`` write. Operators with deployments that
+          generate >4 KB records on shared NFS / multi-process hosts
+          SHOULD select a transaction-backed backend (``SQLiteLogBackend``
+          in PR 3, future Postgres/Datadog impls). Filesystem-default
+          deployments on a single host accept the bound; the failure mode
+          is silent partial-line append observable only via downstream
+          ``json.JSONDecodeError`` skips in ``query()``.
         * MUST persist before returning. A crash immediately after
           ``append()`` returns MUST NOT lose the record. Filesystem
           backends fsync; SQL backends ack the commit; remote backends
@@ -179,7 +188,12 @@ class LogBackend(Protocol):
         * Negative ``n`` raises ``ValueError`` (no implicit conversion).
 
         Performance: ``FilesystemLogBackend`` reverse-walks month dirs
-        and day files to avoid materializing the full history;
+        and day files to BOUND the scan to the most recent files;
+        WITHIN a single day file the implementation reads the full
+        content into memory (``reversed(f.readlines())``). For
+        deployments where individual day files exceed ~10 MB,
+        ``tail()`` materializes the latest day fully — prefer
+        ``SQLiteLogBackend`` (PR 3) for sub-millisecond tail at scale.
         SQL backends use ``ORDER BY ts DESC LIMIT n`` then reverse
         client-side.
 
@@ -219,6 +233,17 @@ class LogBackend(Protocol):
           push the aggregation to native primitives. The reference
           ``FilesystemLogBackend`` aggregates in-memory after
           ``query()``.
+        * **``group_by`` field names MUST resolve first against
+          canonical ``RunRecord`` attributes, then fall through to
+          ``record.extra`` for primitive-specific keys** (e.g.,
+          ``"iteration"`` for outcome iteration records,
+          ``"proposal_id"`` for judge records). Backends advertising
+          ``supports_aggregation_pushdown=True`` MAY raise
+          ``NotImplementedError`` for ``group_by`` fields that resolve
+          only through ``extra`` (SQL ``GROUP BY`` over a JSON column
+          requires native JSON extraction; not every backend supports
+          this — operators wanting ``extra``-field group_bys with
+          pushdown SHOULD use a backend with SQL JSON1 / equivalent).
 
         Metric semantics:
 
@@ -262,10 +287,11 @@ class LogBackend(Protocol):
           log-retention policy is configured at the org level).
 
         Args:
-            threshold: tz-aware ``datetime``. Naive datetimes are
-                treated as UTC for the purpose of comparison;
-                backends MAY raise ``ValueError`` on naive datetimes
-                to push the choice back on the caller.
+            threshold: tz-aware ``datetime``. **Backends MUST raise
+                ``ValueError`` on naive datetimes** — silent
+                local-vs-UTC conversion is the failure shape that
+                produces off-by-one-day retention errors near midnight.
+                The conformance suite pins this contract.
 
         Returns:
             Count of records deleted.
@@ -282,8 +308,15 @@ class LogBackend(Protocol):
         ``query()`` with ``limit`` for that).
 
         Used by ``atomic-agents doctor`` and the dashboard's home tab
-        to surface "how much history is here?" without paying a full
-        scan cost.
+        to surface "how much history is here?". Backends MAY return
+        coarse estimates (e.g., line counts rounded to nearest 1000)
+        as long as the value is monotonic with appends.
+
+        Performance note: the reference ``FilesystemLogBackend.stats()``
+        opens every day file and counts lines — O(records). PR 2 wires
+        this into the dashboard home tab; on agents with year-long
+        history this is O(all-history) per page load. SQL backends
+        push to ``COUNT(*)`` (O(1) with an index).
 
         Returns:
             ``LogStats`` with totals, date-range bounds, and (for

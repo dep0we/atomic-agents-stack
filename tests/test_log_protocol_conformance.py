@@ -253,6 +253,56 @@ def test_query_filters_by_status(backend):
     assert out[0].status == "error"
 
 
+def test_query_filters_by_model(backend):
+    """LogQuery.model is a Protocol-documented filter — pin it.
+
+    The maintainability specialist surfaced that model was only
+    tested as a group_by dimension in aggregate; a SQLite backend with
+    a broken model WHERE clause would pass all conformance tests
+    without this.
+    """
+    backend.append(_make_record(
+        model="claude-opus-4-7", ts=_ts_at(2026, 5, 15, 10), run_id="opus",
+    ))
+    backend.append(_make_record(
+        model="claude-haiku-4-5", ts=_ts_at(2026, 5, 15, 11), run_id="haiku",
+    ))
+    out = backend.query(LogQuery(model="claude-opus-4-7"))
+    assert len(out) == 1
+    assert out[0].run_id == "opus"
+
+
+def test_query_until_is_inclusive(backend):
+    """LogQuery.until is documented inclusive — pin the boundary.
+
+    A SQLite backend that naively translates this to `WHERE ts <
+    :until` (exclusive) would pass the broader since/until window test
+    without this boundary check. Mirror for since lower bound.
+    """
+    ts_exact = _ts_at(2026, 5, 15, 12)
+    ts_after = _ts_at(2026, 5, 15, 13)
+    backend.append(_make_record(ts=ts_exact, run_id="at_boundary"))
+    backend.append(_make_record(ts=ts_after, run_id="after_boundary"))
+    out = backend.query(
+        LogQuery(until=datetime(2026, 5, 15, 12, tzinfo=timezone.utc))
+    )
+    assert len(out) == 1
+    assert out[0].run_id == "at_boundary"
+
+
+def test_query_since_is_inclusive(backend):
+    """LogQuery.since is documented inclusive — pin the boundary."""
+    ts_before = _ts_at(2026, 5, 15, 11)
+    ts_exact = _ts_at(2026, 5, 15, 12)
+    backend.append(_make_record(ts=ts_before, run_id="before_boundary"))
+    backend.append(_make_record(ts=ts_exact, run_id="at_boundary"))
+    out = backend.query(
+        LogQuery(since=datetime(2026, 5, 15, 12, tzinfo=timezone.utc))
+    )
+    assert len(out) == 1
+    assert out[0].run_id == "at_boundary"
+
+
 def test_query_filters_by_since_until_window(backend):
     backend.append(_make_record(ts=_ts_at(2026, 1, 1, 12), run_id="jan"))
     backend.append(_make_record(ts=_ts_at(2026, 5, 15, 12), run_id="may"))
@@ -265,6 +315,25 @@ def test_query_filters_by_since_until_window(backend):
     )
     assert len(out) == 1
     assert out[0].run_id == "may"
+
+
+def test_query_filter_sub_second_precision(backend):
+    """since/until comparison must hold at sub-second precision.
+
+    A backend that truncates ts to date or to seconds would mis-filter
+    rapid-fire records (multiple appends within one second). This
+    pins full ISO-8601 precision.
+    """
+    base = datetime(2026, 5, 15, 12, 0, 0, tzinfo=timezone.utc)
+    backend.append(_make_record(
+        ts=(base.replace(microsecond=100_000)).isoformat(), run_id="early",
+    ))
+    backend.append(_make_record(
+        ts=(base.replace(microsecond=900_000)).isoformat(), run_id="late",
+    ))
+    out = backend.query(LogQuery(since=base.replace(microsecond=500_000)))
+    assert len(out) == 1
+    assert out[0].run_id == "late"
 
 
 def test_query_filters_by_cost_source(backend):
@@ -340,6 +409,12 @@ def test_tail_more_than_total_returns_all(backend):
 def test_tail_negative_raises_value_error(backend):
     with pytest.raises(ValueError):
         backend.tail(-1)
+
+
+def test_tail_empty_backend_returns_empty_list(backend):
+    """tail(n>0) against an empty backend MUST return [] without raising."""
+    assert backend.tail(5) == []
+    assert backend.tail(1) == []
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -435,6 +510,43 @@ def test_delete_older_than_idempotent(backend):
     assert second == 0
 
 
+def test_delete_older_than_strictly_before(backend):
+    """Records with ts == threshold MUST survive (strict-before semantic).
+
+    The spec MUST language pins this; a backend that implements `<=`
+    instead of `<` would pass the broader idempotency test without
+    this boundary check.
+    """
+    boundary = _ts_at(2026, 5, 15, 12)
+    backend.append(_make_record(ts=boundary, run_id="at_boundary"))
+    backend.append(_make_record(ts=_ts_at(2026, 1, 1), run_id="before"))
+    deleted = backend.delete_older_than(
+        datetime(2026, 5, 15, 12, tzinfo=timezone.utc)
+    )
+    assert deleted == 1
+    remaining = backend.query(LogQuery())
+    assert {r.run_id for r in remaining} == {"at_boundary"}
+
+
+def test_delete_older_than_empty_backend_returns_zero(backend):
+    """delete on empty backend MUST return 0 without raising."""
+    deleted = backend.delete_older_than(
+        datetime(2026, 1, 1, tzinfo=timezone.utc)
+    )
+    assert deleted == 0
+
+
+def test_delete_older_than_rejects_naive_datetime(backend):
+    """Naive datetime threshold MUST raise ValueError.
+
+    Silent local-vs-UTC conversion is the failure shape that produces
+    off-by-one-day retention errors near midnight. Pins the spec MUST.
+    """
+    backend.append(_make_record())
+    with pytest.raises(ValueError):
+        backend.delete_older_than(datetime(2026, 5, 15, 12))  # naive
+
+
 # ──────────────────────────────────────────────────────────────────
 # Stats
 
@@ -449,6 +561,67 @@ def test_stats_reflects_appended_records(backend):
     assert s.oldest_ts < s.newest_ts
 
 
+def test_stats_empty_backend(backend):
+    """stats() on an empty backend MUST return zero/None per the spec."""
+    s = backend.stats()
+    assert s.total_records == 0
+    assert s.oldest_ts is None
+    assert s.newest_ts is None
+    assert s.records_today == 0
+    assert s.records_this_month == 0
+
+
+# ──────────────────────────────────────────────────────────────────
+# Append — open primitive vocabulary
+
+
+def test_append_accepts_arbitrary_primitive(backend):
+    """Spec: 'Backends MUST accept arbitrary strings — the closed set
+    is documentation, not enforcement.' Pins that a backend validating
+    primitive against PRIMITIVE_* constants would fail conformance."""
+    backend.append(_make_record(
+        primitive="my_custom_primitive",
+        ts=_ts_at(2026, 5, 15, 10),
+    ))
+    out = backend.tail(1)
+    assert out[0].primitive == "my_custom_primitive"
+
+
+# ──────────────────────────────────────────────────────────────────
+# Aggregate — token sums
+
+
+def test_aggregate_sum_input_tokens_returns_int(backend):
+    """sum_input_tokens MUST return int (not float)."""
+    backend.append(_make_record(
+        input_tokens=100, ts=_ts_at(2026, 5, 15, 10),
+    ))
+    backend.append(_make_record(
+        input_tokens=200, ts=_ts_at(2026, 5, 15, 11),
+    ))
+    result = backend.aggregate(
+        LogQuery(),
+        LogAggregate(group_by=(), metric="sum_input_tokens"),
+    )
+    assert result[()] == 300
+    assert isinstance(result[()], int)
+
+
+def test_aggregate_sum_output_tokens_returns_int(backend):
+    backend.append(_make_record(
+        output_tokens=50, ts=_ts_at(2026, 5, 15, 10),
+    ))
+    backend.append(_make_record(
+        output_tokens=75, ts=_ts_at(2026, 5, 15, 11),
+    ))
+    result = backend.aggregate(
+        LogQuery(),
+        LogAggregate(group_by=(), metric="sum_output_tokens"),
+    )
+    assert result[()] == 125
+    assert isinstance(result[()], int)
+
+
 # ──────────────────────────────────────────────────────────────────
 # Capabilities
 
@@ -460,3 +633,40 @@ def test_capabilities_returns_logcapabilities(backend):
     assert isinstance(caps.supports_streaming, bool)
     assert isinstance(caps.supports_retention, bool)
     assert isinstance(caps.durable, bool)
+
+
+def test_capabilities_retention_claim_matches_behavior(backend):
+    """Spec: 'Conformance tests assert claim-vs-behavior parity.'
+
+    A backend that claims supports_retention=True MUST implement
+    delete_older_than without raising NotImplementedError.
+    """
+    caps = backend.capabilities()
+    if caps.supports_retention:
+        backend.append(_make_record(ts=_ts_at(2026, 5, 15, 10)))
+        # MUST NOT raise NotImplementedError when the claim is True.
+        backend.delete_older_than(
+            datetime(2026, 1, 1, tzinfo=timezone.utc)
+        )
+
+
+# ──────────────────────────────────────────────────────────────────
+# Append/round-trip empty-string preservation
+
+
+def test_append_preserves_empty_string_optional_fields(backend):
+    """Empty-string optional fields MUST round-trip preserved.
+
+    Round-tripping ``RunRecord(trigger="")`` through to_dict → JSON →
+    from_dict MUST return a RunRecord with trigger=="" (not None).
+    Treating empty string as missing was the silent-data-loss failure
+    mode the Step 11 adversarial review caught.
+    """
+    backend.append(_make_record(
+        trigger="",
+        agent_name="",
+        ts=_ts_at(2026, 5, 15, 10),
+    ))
+    out = backend.tail(1)
+    assert out[0].trigger == ""
+    assert out[0].agent_name == ""

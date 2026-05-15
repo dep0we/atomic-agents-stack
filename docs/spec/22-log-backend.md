@@ -249,12 +249,22 @@ class LogBackend(Protocol):
 
 A backend implementing ``append`` MUST:
 
-1. **Be atomic.** A crash mid-``append`` MUST NOT corrupt the backend;
-   partial records MUST NOT be readable via ``query``. Filesystem
-   backends inherit this via ``_io.atomic_append_jsonl`` (single POSIX
-   append for typical <1KB lines); SQL backends use ``INSERT`` inside
-   a single transaction; remote backends serialize via the network
-   primitive's atomicity guarantee.
+1. **Be atomic for records ≤ ``PIPE_BUF``** (POSIX, typically 4096
+   bytes). SHOULD be atomic for larger records via backend-native
+   serialization (SQL transaction, lease-token-checked Lua,
+   single-request HTTP). A crash mid-``append`` MUST NOT leave a
+   readable partial record in ``query`` output for records within the
+   atomicity bound. The reference ``FilesystemLogBackend`` inherits
+   ``_io.atomic_append_jsonl``'s ``PIPE_BUF`` bound; records carrying
+   rollup arrays (``helper_provenance``, ``delegations``,
+   ``tool_calls``) on the top-level ``agent.call()`` write routinely
+   exceed 4 KB. Operators with deployments that generate >4 KB records
+   on shared NFS or with multiple processes appending to the same day
+   file SHOULD select a transaction-backed backend (``SQLiteLogBackend``
+   in PR 3, future Postgres/Datadog impls). Filesystem-default
+   deployments on a single host accept the bound; the failure mode is
+   silent partial-line append observable as ``json.JSONDecodeError``
+   skips in ``query()``.
 
 2. **Persist before returning.** A crash immediately after ``append()``
    returns MUST NOT lose the record. Filesystem backends fsync; SQL
@@ -300,6 +310,11 @@ callers see the cost transparently.
 3. Be atomic at the record level: a crash mid-deletion MUST NOT leave
    a half-deleted record. Filesystem backends rewrite the partial-day
    file via ``_io.atomic_write``.
+4. **Raise ``ValueError`` on naive datetimes**. Silent local-vs-UTC
+   conversion is the failure shape that produces off-by-one-day
+   retention errors near midnight; operators MUST pass a tz-aware
+   threshold. The conformance suite pins this via
+   ``test_delete_older_than_rejects_naive_threshold``.
 
 Backends MAY raise ``NotImplementedError`` from ``delete_older_than``
 when ``capabilities().supports_retention=False``. This is the escape
@@ -410,8 +425,21 @@ LockBackend operator surface in spec/21 §"Operator surface — NOT a
      ``filesystem``). PR 1 supports ``filesystem``; PR 3 adds
      ``sqlite``.
    - ``ATOMIC_AGENTS_LOG_BACKEND_URL`` — connection / path string for
-     non-filesystem backends (e.g., ``sqlite:///path/to/logs.db``,
-     ``datadog://api-key-from-secrets``).
+     non-filesystem backends. The concrete URL format is settled by
+     each backend at its PR (PR 3 commits ``SQLiteLogBackend``'s
+     format; future Datadog / Loki impls settle theirs). PR 1
+     reserves the env var name but does NOT pin any URL schema —
+     operators on Cloud Run who set the var ahead of PR 3 SHOULD
+     consult the backend's spec section for the exact format before
+     deploying.
+
+   Credential safety: ``get_default_log_backend`` sanitizes the
+   ``ATOMIC_AGENTS_LOG_BACKEND`` value before echoing it in error
+   messages — strips anything following ``://`` and truncates at 32
+   chars — so an operator who accidentally pastes a URL credential
+   into ``ATOMIC_AGENTS_LOG_BACKEND`` (instead of
+   ``ATOMIC_AGENTS_LOG_BACKEND_URL``) does not see the credential
+   echoed in the resulting ``BackendNotRegistered`` exception text.
 
 The env var name ``ATOMIC_AGENTS_LOG_BACKEND_URL`` is intentionally
 generic (not ``_SQLITE_PATH``) so future Datadog / Loki / Postgres

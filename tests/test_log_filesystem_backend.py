@@ -405,3 +405,36 @@ def test_get_default_log_backend_unknown_id_includes_sqlite_in_hint(
     assert "bogus_typo" in msg
     assert "sqlite" in msg
     assert "filesystem" in msg
+
+
+def test_get_log_backend_unknown_id_includes_sqlite_in_hint():
+    """get_log_backend's error message must match get_default_log_backend's
+    forward-pointer shape — Step 9.1 maintainability specialist surfaced
+    the two raise sites had different error-message policies."""
+    with pytest.raises(BackendNotRegistered) as excinfo:
+        get_log_backend("not_a_real_backend")
+    msg = str(excinfo.value)
+    assert "not_a_real_backend" in msg
+    assert "sqlite" in msg
+    assert "filesystem" in msg
+
+
+def test_get_default_log_backend_redacts_url_credential_in_error(
+    tmp_path, monkeypatch
+):
+    """An operator who accidentally pastes a URL into
+    ATOMIC_AGENTS_LOG_BACKEND (instead of _URL) MUST NOT see the
+    credential echoed in the BackendNotRegistered exception message.
+    Same credential-leak failure mode as the locks arc PR 3 fix."""
+    monkeypatch.setenv(
+        "ATOMIC_AGENTS_LOG_BACKEND",
+        "datadog://super-secret-api-key-do-not-leak@ingest.host",
+    )
+    with pytest.raises(BackendNotRegistered) as excinfo:
+        get_default_log_backend(tmp_path)
+    msg = str(excinfo.value)
+    # The credential MUST NOT appear in the message.
+    assert "super-secret-api-key" not in msg
+    assert "ingest.host" not in msg
+    # The scheme should still appear so the operator can debug.
+    assert "datadog" in msg
