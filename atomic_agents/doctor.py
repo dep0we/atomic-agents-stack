@@ -1058,7 +1058,9 @@ def check_log_backend(agent_root: Path) -> CheckResult:
     # Treat it as a known id alongside the eagerly-registered backends
     # so doctor's known-id list matches ``get_default_log_backend``'s
     # error message (same Step-11-adversarial-P0-3 mitigation).
-    known_ids = set(list_log_backends()) | {"sqlite"}
+    # ``sqlite`` is eagerly registered as of #61 PR 3; the registry's
+    # own list is authoritative.
+    known_ids = set(list_log_backends())
     if backend_id not in known_ids:
         return CheckResult(
             name="log-backend", status=FAIL,

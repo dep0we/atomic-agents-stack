@@ -108,6 +108,7 @@ def sum_cost_for_period(
     source: CostSource | None = None,
     mandate_id: str | None = None,
     backend: "LogBackend | None" = None,
+    agent_name: str | None = None,
 ) -> float:
     """Sum cost_usd across log records for the given period.
 
@@ -157,7 +158,7 @@ def sum_cost_for_period(
         from .logs.filesystem import FilesystemLogBackend
         if not isinstance(backend, FilesystemLogBackend):
             return _sum_via_backend(
-                backend, today, period, source, mandate_id
+                backend, today, period, source, mandate_id, agent_name
             )
 
     total = 0.0
@@ -208,6 +209,7 @@ def _sum_via_backend(
     period: str,
     source: CostSource | None,
     mandate_id: str | None,
+    agent_name: str | None = None,
 ) -> float:
     """Sum cost_usd via LogBackend.query (PR 2 backend-routed path).
 
@@ -215,6 +217,12 @@ def _sum_via_backend(
     backends with index pushdown (SQLite PR 3 forward) translate this
     to ``WHERE ts >= :since AND ts < :until`` natively. Filesystem
     backend walks month dirs as before.
+
+    ``agent_name`` filter is critical for shared-backend deployments
+    (#61 PR 3 review-pass Step 11 P0 #1) — without it, alice's cost
+    guardrails sum bob's records too. The filesystem path's
+    one-dir-per-agent shape provides this naturally; shared backends
+    require the explicit filter.
     """
     from .logs import LogQuery
 
@@ -241,6 +249,7 @@ def _sum_via_backend(
         until=until_dt,
         cost_source=source,
         mandate_id=mandate_id,
+        agent_name=agent_name,
     ))
 
     total = 0.0

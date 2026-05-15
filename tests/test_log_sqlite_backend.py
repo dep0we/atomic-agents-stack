@@ -354,6 +354,98 @@ def test_concurrent_appends_from_threads(tmp_path):
     assert stats.total_records == 40
 
 
+def test_cold_start_race_idempotent_schema_init(tmp_path):
+    """Simulating two backends initializing a fresh db concurrently must
+    NOT raise UNIQUE-constraint on schema_version (Step 11 P0 #2).
+
+    The previous SELECT-then-INSERT pattern would fail on the second
+    process. INSERT OR IGNORE makes it idempotent — losing the race
+    is a no-op, both processes converge to a working backend.
+    """
+    db = tmp_path / "shared.db"
+    # Open two backends pointing at the same fresh db file. The
+    # second instance's _ensure_schema must not raise.
+    backend_a = SQLiteLogBackend(db)
+    backend_b = SQLiteLogBackend(db)
+    backend_a.append(_make_record(run_id="from_a"))
+    backend_b.append(_make_record(run_id="from_b"))
+    # Both writes land in the same db (verify via a third connection).
+    backend_c = SQLiteLogBackend(db)
+    out = backend_c.query(LogQuery())
+    assert {r.run_id for r in out} == {"from_a", "from_b"}
+
+
+def test_reopen_existing_populated_db(tmp_path):
+    """A second SQLiteLogBackend instance reads records written by the
+    first. The load-bearing multi-process / multi-instance property."""
+    db = tmp_path / "logs.db"
+    backend1 = SQLiteLogBackend(db)
+    for i in range(3):
+        backend1.append(_make_record(run_id=f"r{i}"))
+    # Reopen — fresh backend instance against the same file.
+    backend2 = SQLiteLogBackend(db)
+    out = backend2.tail(10)
+    assert {r.run_id for r in out} == {"r0", "r1", "r2"}
+
+
+def test_url_rejects_netloc(tmp_path):
+    """Step 11 P2: ``sqlite://host/path`` is ambiguous; must raise."""
+    with pytest.raises(ValueError, match="ambiguous"):
+        make_sqlite_backend_from_url("sqlite://host/path")
+
+
+def test_url_in_memory_three_slash_form(tmp_path):
+    """SQLAlchemy-convention ``sqlite:///:memory:`` works alongside ``sqlite::memory:``."""
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        backend = make_sqlite_backend_from_url("sqlite:///:memory:")
+    backend.append(_make_record())
+    assert len(backend.tail(1)) == 1
+
+
+def test_in_memory_construction_warns(tmp_path):
+    """Step 11 security #4: :memory: emits a data-loss warning."""
+    import warnings
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        make_sqlite_backend_from_url("sqlite::memory:")
+    assert any(
+        "non-persistent" in str(w.message) for w in caught
+    ), "Expected RuntimeWarning about in-memory non-persistence"
+
+
+def test_canonical_columns_derived_from_run_record(tmp_path):
+    """`_CANONICAL_COLUMNS` MUST stay in sync with `RunRecord.__dataclass_fields__`.
+
+    Step 11 P2 mitigation: the manual frozenset was a drift hazard;
+    derive-from-dataclass eliminates it. Pin via assertion that a new
+    field on RunRecord would surface in _CANONICAL_COLUMNS.
+    """
+    from atomic_agents.logs.sqlite import _CANONICAL_COLUMNS
+    expected = frozenset(
+        name for name in RunRecord.__dataclass_fields__ if name != "extra"
+    )
+    assert _CANONICAL_COLUMNS == expected
+
+
+def test_row_to_record_preserves_empty_required_strings(tmp_path):
+    """`_row_to_record` MUST NOT clobber empty-string required fields
+    via the `or DEFAULT` idiom (Step 11 P2). Round-trips `model=""`
+    as `model=""`, not `model="n/a"`."""
+    db = tmp_path / "logs.db"
+    backend = SQLiteLogBackend(db)
+    backend.append(_make_record(
+        model="",  # empty string; not None
+        summary="",
+        run_id="empty_strings",
+    ))
+    out = backend.tail(1)
+    assert out[0].model == ""
+    assert out[0].summary == ""
+    assert out[0].run_id == "empty_strings"
+
+
 # ──────────────────────────────────────────────────────────────────
 # URL parsing
 

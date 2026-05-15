@@ -284,6 +284,7 @@ def _read_log_lines(
     lookback_days: int,
     *,
     log_backend: "LogBackend | None" = None,
+    agent_name: str | None = None,
 ) -> list[dict]:
     """Return non-helper log records within lookback window.
 
@@ -300,7 +301,7 @@ def _read_log_lines(
         from .logs import LogQuery
         since_dt = datetime.combine(cutoff, dt_time.min).astimezone()
         records = []
-        for rec in log_backend.query(LogQuery(since=since_dt)):
+        for rec in log_backend.query(LogQuery(since=since_dt, agent_name=agent_name)):
             # filter out helper runs — too noisy. Belt-and-suspenders:
             # check BOTH primitive (post-PR-2 records) AND trigger
             # (legacy pre-PR-2 records that don't have primitive set).
@@ -653,6 +654,7 @@ def _check_cap(
     critical: bool,
     *,
     log_backend: "LogBackend | None" = None,
+    agent_name: str | None = None,
 ) -> None:
     """Raise ValueError if reserved cost exceeds remaining headroom (unless critical).
 
@@ -664,8 +666,8 @@ def _check_cap(
     if critical or reserved <= 0:
         return
     log_dir = agent_root / "log"
-    today_cost = _costs.sum_cost_for_period(log_dir, "today", source="actor", backend=log_backend)
-    month_cost = _costs.sum_cost_for_period(log_dir, "this_month", source="actor", backend=log_backend)
+    today_cost = _costs.sum_cost_for_period(log_dir, "today", source="actor", backend=log_backend, agent_name=agent_name)
+    month_cost = _costs.sum_cost_for_period(log_dir, "this_month", source="actor", backend=log_backend, agent_name=agent_name)
     # Load caps from model.md
     model_data = _model.parse_model_md(agent_root / "model.md")
     if not model_data.get("cost_guardrails_enabled"):
@@ -710,7 +712,8 @@ def _run_pipeline(
         notes = _read_memory_notes(agent_root)
     journal_entries = _read_journal_entries(agent_root, journal_lookback_days)
     log_lines = _read_log_lines(
-        agent_root, log_lookback_days, log_backend=log_backend
+        agent_root, log_lookback_days,
+        log_backend=log_backend, agent_name=agent_root.name,
     )
 
     # Update manifest inputs
@@ -1141,12 +1144,14 @@ class DreamRunner:
         notes = _read_memory_notes(self.agent_root)
         journal_entries = _read_journal_entries(self.agent_root, journal_lookback_days)
         log_lines = _read_log_lines(
-            self.agent_root, log_lookback_days, log_backend=self._log_backend
+            self.agent_root, log_lookback_days,
+            log_backend=self._log_backend, agent_name=self.agent_name,
         )
         estimated_cost = _estimate_dream_cost(self._model, notes, journal_entries, log_lines)
         _check_cap(
             self.agent_root, self._model, estimated_cost, critical,
             log_backend=self._log_backend,
+            agent_name=self.agent_name,
         )
 
         # Initialise manifest

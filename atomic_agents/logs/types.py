@@ -381,6 +381,16 @@ class LogQuery:
     cost_source: str | None = None
     mandate_id: str | None = None
     parent_run_id: str | None = None
+    # ``agent_name`` filter (#61 PR 3 review-pass — Step 11 P0 #1).
+    # Load-bearing for shared-backend deployments where multiple agents
+    # write to the same SQLite/Postgres/Datadog instance. Without this
+    # filter, cost-guardrail sums and dashboard reads mix records
+    # across agents — alice's daily cap warning fires when the fleet
+    # hits her cap, dashboard "alice's spend" shows fleet spend
+    # stamped with alice. The filesystem-backend default's
+    # one-dir-per-agent shape happens to provide this isolation
+    # naturally; shared backends require an explicit filter.
+    agent_name: str | None = None
     since: datetime | None = None
     until: datetime | None = None
     limit: int | None = None

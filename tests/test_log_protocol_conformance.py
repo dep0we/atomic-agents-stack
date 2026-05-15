@@ -371,6 +371,53 @@ def test_query_filters_by_parent_run_id(backend):
     assert {r.run_id for r in out} == {"child-1", "child-2"}
 
 
+def test_query_filters_by_agent_name_isolates_explicit_agent_records(backend):
+    """Records with explicit agent_name are isolated by the filter.
+
+    Step 11 P0 #1 pin: shared-backend deployments (single SQLite/
+    Postgres file across agents) MUST isolate cross-agent records.
+    Alice's reads MUST NOT include bob's explicitly-stamped records.
+    """
+    backend.append(_make_record(
+        agent_name="alice", run_id="a1", ts=_ts_at(2026, 5, 15, 10),
+    ))
+    backend.append(_make_record(
+        agent_name="bob", run_id="b1", ts=_ts_at(2026, 5, 15, 11),
+    ))
+    backend.append(_make_record(
+        agent_name="alice", run_id="a2", ts=_ts_at(2026, 5, 15, 12),
+    ))
+    out = backend.query(LogQuery(agent_name="alice"))
+    assert {r.run_id for r in out} == {"a1", "a2"}
+    out_bob = backend.query(LogQuery(agent_name="bob"))
+    assert {r.run_id for r in out_bob} == {"b1"}
+
+
+def test_query_filters_by_agent_name_lenient_on_missing(backend):
+    """Records WITHOUT agent_name match the filter (legacy compat).
+
+    Pre-PR-2 records on disk don't carry agent_name. Under filesystem's
+    per-agent-dir scoping, every record in the dir IS the named
+    agent's — strict filtering would break dashboard reads of legacy
+    data. Lenient matching (column == filter OR column IS NULL)
+    preserves backward compat without weakening cross-agent isolation
+    for explicitly-stamped records.
+    """
+    backend.append(_make_record(
+        agent_name=None, run_id="legacy", ts=_ts_at(2026, 5, 15, 10),
+    ))
+    backend.append(_make_record(
+        agent_name="alice", run_id="explicit_alice", ts=_ts_at(2026, 5, 15, 11),
+    ))
+    backend.append(_make_record(
+        agent_name="bob", run_id="explicit_bob", ts=_ts_at(2026, 5, 15, 12),
+    ))
+    out = backend.query(LogQuery(agent_name="alice"))
+    # Legacy record matches (no agent_name) AND alice's explicit
+    # records match. Bob's explicit records are excluded.
+    assert {r.run_id for r in out} == {"legacy", "explicit_alice"}
+
+
 def test_query_respects_limit(backend):
     for i in range(5):
         backend.append(_make_record(ts=_ts_at(2026, 5, 15, i), run_id=f"r{i}"))

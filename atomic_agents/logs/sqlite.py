@@ -35,11 +35,29 @@ across threads by default. ``check_same_thread=False`` would allow
 sharing but with locking that serializes all writes; per-thread
 connections plus WAL journaling is the standard pattern.
 
-Concurrent multi-process append: WAL mode supports it. Multiple
-``SQLiteLogBackend`` instances pointing at the same db file from
-different processes will see consistent reads + serialized writes.
-This is the load-bearing property for the "operator pins SQLite on
-Cloud Run with N replicas" deployment shape that motivates #61.
+Concurrent multi-process append: WAL mode supports it on **local
+filesystems**. Multiple ``SQLiteLogBackend`` instances pointing at
+the same db file from different processes on the SAME host will see
+consistent reads + serialized writes. This is the load-bearing
+property for the "operator pins SQLite on Cloud Run with N replicas
+sharing a local-disk volume" deployment shape that motivates #61.
+
+**Network-mounted filesystems (NFS, SMB, CIFS) are NOT supported.**
+SQLite WAL on NFS is documented-broken by upstream — file-level
+locks don't propagate across NFS clients reliably, producing
+corruption under concurrent writes. Operators with shared-storage
+deployments needing log durability across multiple hosts should
+use a Postgres backend (future PR) or accept the operator-pinned
+SQLite-on-local-disk per-replica deployment shape.
+
+Cross-agent isolation: when an operator pins ``ATOMIC_AGENTS_LOG_
+BACKEND_URL=sqlite:///shared.db`` to share a single db across
+multiple agents, every record carries an ``agent_name`` field stamped
+by ``agent.py:_log()`` and every reader (``_costs.sum_cost_for_
+period``, ``dashboard.costs.load_runs``, ``dashboard.quality._count_
+provenance``) filters by it via ``LogQuery.agent_name=...``. Without
+this filter, alice's cost guardrails would sum bob's records too.
+Step 11 P0 #1 — fixed PR 3 review-pass.
 """
 
 from __future__ import annotations
@@ -47,7 +65,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from datetime import datetime
+import warnings
+from datetime import date, datetime, time as dt_time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -135,6 +154,18 @@ _INSERT_COLUMNS = (
     "latency_ms", "cache_hit_tokens", "cache_miss_tokens",
     "mandate_id", "parent_run_id", "parent_agent", "trigger",
     "agent_name", "fallback", "critical", "extra",
+)
+
+# Precomputed INSERT statement — built once at module load instead of
+# every ``append()`` call. Step 11 P3: 27+ ``_log()`` calls per
+# ``agent.call()`` → previously 54 string joins per call producing
+# throwaway strings. Now zero per call.
+_INSERT_SQL = (
+    "INSERT INTO run_records ("
+    + ", ".join(_INSERT_COLUMNS)
+    + ") VALUES ("
+    + ", ".join("?" * len(_INSERT_COLUMNS))
+    + ")"
 )
 
 
@@ -225,32 +256,56 @@ class SQLiteLogBackend:
         return conn
 
     def _ensure_schema(self, conn: sqlite3.Connection) -> None:
-        """Create tables + indexes if missing; assert schema version."""
+        """Create tables + indexes if missing; assert schema version.
+
+        Cold-start multi-process race mitigation (Step 11 P0 #2): the
+        ``schema_version`` row goes in via ``INSERT OR IGNORE`` so two
+        processes initializing a fresh db simultaneously don't race
+        each other into a UNIQUE-constraint failure. Either process
+        wins the insert; the loser sees the row already exists and
+        moves on. Then both validate the existing row matches the
+        expected version.
+
+        Schema migration ladder (#61 PR 3): the current behavior is
+        "raise RuntimeError on mismatch." When a future PR bumps
+        ``_SCHEMA_VERSION`` to 2, insert the migration here BEFORE the
+        validation read:
+          # if existing == 1: conn.execute("ALTER TABLE run_records ADD COLUMN ...")
+          # conn.execute("UPDATE meta SET value=? WHERE key='schema_version'", ("2",))
+        Document the migration in CHANGELOG under ### BREAKING and
+        cross-link to spec/22 §"Schema migration ladder".
+        """
         conn.execute(_CREATE_RUN_RECORDS)
         conn.execute(_CREATE_META)
         for stmt in _CREATE_INDEXES:
             conn.execute(stmt)
-        # Schema version: insert-if-missing, validate-if-present.
+        # Idempotent insert — losing the cold-start race is a no-op.
+        conn.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)",
+            ("schema_version", str(_SCHEMA_VERSION)),
+        )
         cur = conn.execute(
             "SELECT value FROM meta WHERE key = 'schema_version'"
         )
         row = cur.fetchone()
+        # Row MUST exist after INSERT OR IGNORE — either we inserted
+        # or another process did. Defensive check for the impossible
+        # "INSERT failed AND no other process inserted" case.
         if row is None:
-            conn.execute(
-                "INSERT INTO meta (key, value) VALUES (?, ?)",
-                ("schema_version", str(_SCHEMA_VERSION)),
+            raise RuntimeError(
+                "SQLiteLogBackend: schema_version row missing after "
+                "INSERT OR IGNORE — db corruption suspected."
             )
-        else:
-            existing = int(row[0])
-            if existing != _SCHEMA_VERSION:
-                raise RuntimeError(
-                    f"SQLiteLogBackend schema version mismatch: file has "
-                    f"v{existing}, code expects v{_SCHEMA_VERSION}. "
-                    f"A backward-incompatible schema bump shipped without "
-                    f"a migration. Open an issue at "
-                    f"https://github.com/dep0we/atomic-agents-stack/issues "
-                    f"with this error."
-                )
+        existing = int(row[0])
+        if existing != _SCHEMA_VERSION:
+            raise RuntimeError(
+                f"SQLiteLogBackend schema version mismatch: file has "
+                f"v{existing}, code expects v{_SCHEMA_VERSION}. "
+                f"A backward-incompatible schema bump shipped without "
+                f"a migration. Open an issue at "
+                f"https://github.com/dep0we/atomic-agents-stack/issues "
+                f"with this error."
+            )
         conn.commit()
 
     # ────────────────────────────────────────────────────────────
@@ -288,12 +343,7 @@ class SQLiteLogBackend:
             None if record.critical is None else int(record.critical),
             json.dumps(record.extra) if record.extra else "{}",
         )
-        placeholders = ", ".join("?" * len(values))
-        columns = ", ".join(_INSERT_COLUMNS)
-        conn.execute(
-            f"INSERT INTO run_records ({columns}) VALUES ({placeholders})",
-            values,
-        )
+        conn.execute(_INSERT_SQL, values)
         conn.commit()
 
     # ────────────────────────────────────────────────────────────
@@ -444,34 +494,50 @@ class SQLiteLogBackend:
     # Stats
 
     def stats(self) -> LogStats:
-        """COUNT(*) + MIN/MAX(ts) — O(1) with the ts index."""
-        conn = self._get_conn()
-        row = conn.execute(
-            "SELECT COUNT(*) AS total, MIN(ts) AS oldest, MAX(ts) AS newest "
-            "FROM run_records"
-        ).fetchone()
-        total = int(row["total"] or 0)
-        oldest_ts = row["oldest"]
-        newest_ts = row["newest"]
+        """Single-query stats — one covering-index scan instead of three.
 
-        # records_today / records_this_month — local-tz day window.
-        # Compute the window in Python and pass as parameters; SQLite
-        # can use the ts index for the range.
-        from datetime import date, time as dt_time
+        Performance characteristics:
+        - ``COUNT(*) FROM run_records`` is **O(N)** (SQLite has no
+          row-count metadata shortcut like InnoDB's page-directory),
+          but I/O-cheap because the planner uses a covering index
+          (``idx_ts``) rather than touching the table heap.
+        - ``MIN(ts)`` / ``MAX(ts)`` are true **O(1)** index-edge
+          lookups via ``idx_ts``.
+        - ``records_today`` / ``records_this_month`` use conditional
+          aggregation in the same statement — no extra scan.
+
+        Total cost: one O(N) covering-index scan per call (was 3
+        scans before this consolidation — Step 11 perf #2). The
+        dashboard home tab calls this on every render; the saving
+        scales linearly with history size.
+        """
+        conn = self._get_conn()
+
+        # Compute the local-tz day + month window in Python; the
+        # backend can use the ts index for the conditional aggregates.
         today = date.today()
         today_start = datetime.combine(today, dt_time.min).astimezone().isoformat()
         today_end = datetime.combine(today, dt_time.max).astimezone().isoformat()
         first_of_month = today.replace(day=1)
         month_start = datetime.combine(first_of_month, dt_time.min).astimezone().isoformat()
 
-        records_today = int(conn.execute(
-            "SELECT COUNT(*) FROM run_records WHERE ts >= ? AND ts <= ?",
-            (today_start, today_end),
-        ).fetchone()[0] or 0)
-        records_this_month = int(conn.execute(
-            "SELECT COUNT(*) FROM run_records WHERE ts >= ? AND ts <= ?",
-            (month_start, today_end),
-        ).fetchone()[0] or 0)
+        row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                MIN(ts) AS oldest,
+                MAX(ts) AS newest,
+                COUNT(CASE WHEN ts >= ? AND ts <= ? THEN 1 END) AS today,
+                COUNT(CASE WHEN ts >= ? AND ts <= ? THEN 1 END) AS month
+            FROM run_records
+            """,
+            (today_start, today_end, month_start, today_end),
+        ).fetchone()
+        total = int(row["total"] or 0)
+        oldest_ts = row["oldest"]
+        newest_ts = row["newest"]
+        records_today = int(row["today"] or 0)
+        records_this_month = int(row["month"] or 0)
 
         size_bytes: int | None
         if self._in_memory:
@@ -553,6 +619,13 @@ class SQLiteLogBackend:
         if filter.parent_run_id is not None:
             clauses.append("parent_run_id = ?")
             params.append(filter.parent_run_id)
+        if filter.agent_name is not None:
+            # Lenient: match when column = filter OR column IS NULL.
+            # Pre-PR-2 records (if any imported into a SQL backend
+            # from a legacy filesystem export) don't carry agent_name.
+            # Matches filesystem backend's lenient _matches behavior.
+            clauses.append("(agent_name = ? OR agent_name IS NULL)")
+            params.append(filter.agent_name)
         if filter.since is not None:
             clauses.append("ts >= ?")
             params.append(filter.since.isoformat())
@@ -574,21 +647,32 @@ class SQLiteLogBackend:
         return sql, params
 
     def _row_to_record(self, row: sqlite3.Row) -> RunRecord:
-        """Convert a SQLite ``Row`` to a ``RunRecord``."""
-        extra_text = row["extra"] or "{}"
+        """Convert a SQLite ``Row`` to a ``RunRecord``.
+
+        Empty-string preservation: required string fields use
+        ``... if not None else DEFAULT`` rather than ``... or DEFAULT``.
+        Python's ``or`` treats empty strings as falsy — without the
+        explicit None check, ``RunRecord(model="", ...)`` would
+        round-trip as ``model="n/a"``. Step 11 P2 divergence with
+        FilesystemLogBackend (which uses ``d.get(key, fallback)``
+        that only fires when key is missing — empty strings preserved).
+        """
+        extra_text = row["extra"]
+        if extra_text is None:
+            extra_text = "{}"
         try:
             extra = json.loads(extra_text)
         except json.JSONDecodeError:
             extra = {}
         return RunRecord(
-            ts=row["ts"] or "",
-            run_id=row["run_id"] or "",
-            primitive=row["primitive"] or "other",
-            status=row["status"] or "",
-            summary=row["summary"] or "",
-            model=row["model"] or "n/a",
-            input_tokens=int(row["input_tokens"] or 0),
-            output_tokens=int(row["output_tokens"] or 0),
+            ts=row["ts"] if row["ts"] is not None else "",
+            run_id=row["run_id"] if row["run_id"] is not None else "",
+            primitive=row["primitive"] if row["primitive"] is not None else "other",
+            status=row["status"] if row["status"] is not None else "",
+            summary=row["summary"] if row["summary"] is not None else "",
+            model=row["model"] if row["model"] is not None else "n/a",
+            input_tokens=int(row["input_tokens"]) if row["input_tokens"] is not None else 0,
+            output_tokens=int(row["output_tokens"]) if row["output_tokens"] is not None else 0,
             cost_usd=row["cost_usd"],
             cost_source=row["cost_source"],
             latency_ms=row["latency_ms"],
@@ -605,16 +689,16 @@ class SQLiteLogBackend:
         )
 
 
-# Canonical RunRecord field names available as SQL columns. Used by
-# ``aggregate()`` to decide whether ``group_by`` field resolves to a
-# direct column or to a JSON1 extraction.
-_CANONICAL_COLUMNS = frozenset({
-    "ts", "run_id", "primitive", "status", "summary", "model",
-    "input_tokens", "output_tokens", "cost_usd", "cost_source",
-    "latency_ms", "cache_hit_tokens", "cache_miss_tokens",
-    "mandate_id", "parent_run_id", "parent_agent", "trigger",
-    "agent_name", "fallback", "critical",
-})
+# Canonical RunRecord field names available as SQL columns. Derived
+# from ``RunRecord.__dataclass_fields__`` minus ``extra`` so a new
+# field added to RunRecord automatically becomes available as a SQL
+# column once the schema is migrated. Step 11 P2: previously this
+# was a hand-maintained frozenset that could drift out of sync with
+# RunRecord — silent group_by routing through json_extract for new
+# fields was the failure shape.
+_CANONICAL_COLUMNS = frozenset(
+    name for name in RunRecord.__dataclass_fields__ if name != "extra"
+)
 
 
 def _metric_to_sql(metric: str) -> str:
@@ -656,24 +740,33 @@ def make_sqlite_backend_from_url(url: str) -> SQLiteLogBackend:
         ValueError: malformed URL.
     """
     if url == "sqlite::memory:" or url == "sqlite:///:memory:":
+        warnings.warn(
+            "SQLiteLogBackend(:memory:) is non-persistent — all records "
+            "are lost on process exit. Use sqlite:///absolute/path/to/db "
+            "for durable logging in production.",
+            RuntimeWarning, stacklevel=2,
+        )
         return SQLiteLogBackend(":memory:")
     parsed = urlparse(url)
     if parsed.scheme != "sqlite":
         raise ValueError(
             f"SQLite URL must start with 'sqlite://'; got {url!r}"
         )
-    # ``sqlite:///path`` → ``parsed.path == '/path'``; strip the
-    # leading slash for the absolute path. ``sqlite://relative/path``
-    # would have parsed.netloc='relative' and parsed.path='/path' —
-    # not the conventional shape, but tolerate it as best-effort.
+    # Reject netloc-bearing URLs explicitly — ``sqlite://host/path``
+    # is ambiguous (was it a typo for sqlite:///path? sqlite://host:
+    # path?). Operators who mistype three slashes as two get a clear
+    # ValueError instead of a silent relative-path landing. Step 11
+    # P2: silent-data-loss via misconfiguration is exactly the
+    # failure mode this guard prevents.
     if parsed.netloc:
-        # Relative path embedded as netloc segment
-        path_str = parsed.netloc + parsed.path
-    else:
-        # ``sqlite:///path`` → parsed.path == ``/path``; preserve the
-        # leading slash for absolute POSIX paths. ``sqlite:////path``
-        # (four slashes) still works — the absolute path stays.
-        path_str = parsed.path
+        raise ValueError(
+            f"SQLite URL with host component is ambiguous: {url!r}. "
+            f"Use sqlite:///absolute/path (three slashes) for absolute "
+            f"paths; use sqlite::memory: for in-memory transient state."
+        )
+    # ``sqlite:///path`` → parsed.path == ``/path``; preserve the
+    # leading slash for absolute POSIX paths.
+    path_str = parsed.path
     # Reject empty or root-only paths — ``sqlite:///`` parses to
     # parsed.path == "/", which is not a usable db file path.
     if not path_str or path_str == "/":
