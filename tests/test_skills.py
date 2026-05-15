@@ -711,9 +711,9 @@ def test_load_skill_tool_returns_body_for_known_skill(tmp_path):
     ]
 
     with patch.dict(sys.modules, {"anthropic": fake_anthropic}):
-        with patch("atomic_agents.agent.AgentLock") as mock_lock:
-            mock_lock.return_value.acquire.return_value = None
-            mock_lock.return_value.release.return_value = None
+        with patch.object(agent, "lock_backend") as mock_lock:
+            mock_lock.acquire.return_value = MagicMock()  # fake LockHandle (#60 PR 2)
+            mock_lock.release.return_value = None
             response = agent.call("Use the test skill to help me.")
 
     # Two LLM turns: one for tool call, one for final response
@@ -748,9 +748,9 @@ def test_load_skill_tool_handler_error_for_unknown_skill(tmp_path):
     ]
 
     with patch.dict(sys.modules, {"anthropic": fake_anthropic}):
-        with patch("atomic_agents.agent.AgentLock") as mock_lock:
-            mock_lock.return_value.acquire.return_value = None
-            mock_lock.return_value.release.return_value = None
+        with patch.object(agent, "lock_backend") as mock_lock:
+            mock_lock.acquire.return_value = MagicMock()  # fake LockHandle (#60 PR 2)
+            mock_lock.release.return_value = None
             response = agent.call("Load a nonexistent skill.")
 
     assert len(response.tool_calls) == 1
@@ -795,9 +795,9 @@ def test_load_skill_file_tool_for_referenced_files(tmp_path):
     ]
 
     with patch.dict(sys.modules, {"anthropic": fake_anthropic}):
-        with patch("atomic_agents.agent.AgentLock") as mock_lock:
-            mock_lock.return_value.acquire.return_value = None
-            mock_lock.return_value.release.return_value = None
+        with patch.object(agent, "lock_backend") as mock_lock:
+            mock_lock.acquire.return_value = MagicMock()  # fake LockHandle (#60 PR 2)
+            mock_lock.release.return_value = None
             response = agent.call("Read the reference file from ref-skill.")
 
     assert len(response.tool_calls) == 1
@@ -828,9 +828,9 @@ def test_skill_load_appears_in_run_log_tool_calls_rollup(tmp_path):
     ]
 
     with patch.dict(sys.modules, {"anthropic": fake_anthropic}):
-        with patch("atomic_agents.agent.AgentLock") as mock_lock:
-            mock_lock.return_value.acquire.return_value = None
-            mock_lock.return_value.release.return_value = None
+        with patch.object(agent, "lock_backend") as mock_lock:
+            mock_lock.acquire.return_value = MagicMock()  # fake LockHandle (#60 PR 2)
+            mock_lock.release.return_value = None
             response = agent.call("Load and use the skill.")
 
     # Read the log file

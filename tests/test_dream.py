@@ -26,7 +26,6 @@ from atomic_agents.dream import (
     _new_dream_id,
     _read_manifest,
     _write_manifest,
-    _DreamLock,
 )
 from atomic_agents.exceptions import (
     AtomicAgentsError,
@@ -345,24 +344,55 @@ def test_dream_list_returns_newest_first(agents_root, monkeypatch):
     assert dreams[1].dream_id == r1.dream_id
 
 
+def _hold_dream_lock_for_test(dreams_dir_str: str, hold_seconds: float, ready_path: str) -> None:
+    """Module-level helper for multiprocessing spawn (must be pickle-able)."""
+    import time as _time
+    from atomic_agents.locks import FilesystemLockBackend
+    backend = FilesystemLockBackend(Path(dreams_dir_str))
+    handle = backend.acquire("", timeout=0)
+    Path(ready_path).write_text("ready")
+    _time.sleep(hold_seconds)
+    backend.release(handle)
+
+
 def test_dream_concurrent_run_blocked_by_lock(agents_root, monkeypatch):
-    """Second dream while first holds the lock raises DreamInProgress."""
+    """Second dream while first holds the lock raises DreamInProgress via DreamRunner.start().
+
+    Post-#60 PR 2: exercises the PRODUCTION callsite in ``dream.start()``
+    rather than an inline reimplementation of the wrap. A child process
+    holds the dream lock; the parent's ``start()`` call hits the kernel
+    flock collision, raises LockBusy internally, and ``start()`` wraps
+    it in DreamInProgress with PEP-3134 chaining.
+    """
+    import multiprocessing
+    import time as _time
+    from atomic_agents.exceptions import LockBusy
+
     agent_dir = agents_root / "dreamer"
     dreams_dir = agent_dir / "dreams"
     dreams_dir.mkdir(parents=True, exist_ok=True)
 
-    # Acquire the lock directly
-    lock = _DreamLock(dreams_dir, wait_seconds=0)
-    lock.acquire()
-
+    ready = agents_root / ".dream-concurrent-ready"
+    child = multiprocessing.Process(
+        target=_hold_dream_lock_for_test, args=(str(dreams_dir), 2.0, str(ready))
+    )
+    child.start()
     try:
-        runner = DreamRunner(agents_root, "dreamer")
-        with pytest.raises(DreamInProgress):
-            # zero wait means fail immediately if lock is busy
-            inner_lock = _DreamLock(dreams_dir, wait_seconds=0)
-            inner_lock.acquire()
+        deadline = _time.monotonic() + 10.0
+        while not ready.exists():
+            if _time.monotonic() >= deadline:
+                raise AssertionError("child never wrote sentinel")
+            _time.sleep(0.02)
+        with patch("atomic_agents.dream._llm.call_llm") as mock_llm:
+            mock_llm.return_value = _no_op_response()
+            # dream_lock_timeout=0 forces fail-fast against the held lock.
+            runner = DreamRunner(agents_root, "dreamer", dream_lock_timeout=0.0)
+            with pytest.raises(DreamInProgress) as exc_info:
+                runner.start()
+        assert isinstance(exc_info.value.__cause__, LockBusy)
     finally:
-        lock.release()
+        child.join(timeout=5)
+        assert child.exitcode == 0, f"child crashed with exitcode {child.exitcode}"
 
 
 def test_dream_cost_guardrail_pre_check_refuses(tmp_path):
@@ -488,7 +518,8 @@ def test_dream_apply_takes_agent_lock(agents_root, monkeypatch):
     quickly rather than hanging.  We patch the lock in apply() to use wait_seconds=0
     so the test doesn't take 30 s.
     """
-    from atomic_agents._locks import AgentLock
+    from atomic_agents.locks import FilesystemLockBackend
+    from atomic_agents.memory.filesystem import FilesystemBackend
     agent_dir = agents_root / "dreamer"
     _write_note(agent_dir, "feedback_test.md", "feedback", "Test",
                 "Test body", "2026-03-01")
@@ -502,21 +533,29 @@ def test_dream_apply_takes_agent_lock(agents_root, monkeypatch):
     # (already done by start())
     assert result.status == "completed"
 
-    # Acquire the agent lock directly, simulating an in-flight call()
-    held_lock = AgentLock(agent_dir, wait_seconds=0)
-    held_lock.acquire()
+    # Acquire the agent lock directly, simulating an in-flight call().
+    # Post-#60 PR 2: agent.call() acquires via FilesystemLockBackend
+    # on ``<agent_root>/.lock`` (empty-name). This held backend uses the
+    # same scope_root + empty name so the held .lock collides with
+    # apply_staging's acquire.
+    held_backend = FilesystemLockBackend(agent_dir)
+    held_handle = held_backend.acquire("", timeout=0)
     try:
-        # Patch AgentLock in dream.py to use wait_seconds=0 so apply() fails fast
-        original_agent_lock = __import__("atomic_agents.dream", fromlist=["AgentLock"]).AgentLock
-
-        def fast_failing_lock(agent_root, wait_seconds=30):
-            return original_agent_lock(agent_root, wait_seconds=0)
-
-        with patch("atomic_agents.dream.AgentLock", side_effect=fast_failing_lock):
-            with pytest.raises(AgentLockBusy):
-                runner.apply(result.dream_id)
+        # Force apply_staging's internal lock acquire to fail fast
+        # (default is 30s — too long for a held-lock test). The
+        # constructor kwarg ``apply_staging_lock_timeout`` is the
+        # documented override surface (per-instance, immutable
+        # post-construction — class-level monkey-patching was rejected
+        # by Step 9.1 security review as a process-wide mutation risk).
+        # Patch ``FilesystemBackend.__init__`` so the existing runner's
+        # internal backend re-instantiates with the fail-fast value.
+        runner._backend = FilesystemBackend(
+            agent_dir, apply_staging_lock_timeout=0.0
+        )
+        with pytest.raises(AgentLockBusy):
+            runner.apply(result.dream_id)
     finally:
-        held_lock.release()
+        held_backend.release(held_handle)
 
 
 def test_dream_discard_refuses_dotdot_dream_id(agents_root):

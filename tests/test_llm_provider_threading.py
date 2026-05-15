@@ -152,9 +152,9 @@ def test_agent_provider_field_threads_to_call_llm_main_loop(tmp_path):
     )
     assert agent.config.provider == "azure-openai"
 
-    with patch("atomic_agents.agent.AgentLock") as mock_lock:
-        mock_lock.return_value.acquire.return_value = None
-        mock_lock.return_value.release.return_value = None
+    with patch.object(agent, "lock_backend") as mock_lock:
+        mock_lock.acquire.return_value = MagicMock()  # fake LockHandle (#60 PR 2)
+        mock_lock.release.return_value = None
         agent.call("test")
 
     # First (and only) call resolves to azure-openai, not openai
@@ -240,9 +240,9 @@ def test_agent_provider_field_threads_to_tool_loop_continuation(tmp_path):
     (agent_dir / "log").mkdir()
     agent = AtomicAgent(name="loop-azure", agents_root=tmp_path, tools=tool_registry)
 
-    with patch("atomic_agents.agent.AgentLock") as mock_lock:
-        mock_lock.return_value.acquire.return_value = None
-        mock_lock.return_value.release.return_value = None
+    with patch.object(agent, "lock_backend") as mock_lock:
+        mock_lock.acquire.return_value = MagicMock()  # fake LockHandle (#60 PR 2)
+        mock_lock.release.return_value = None
         # Pre-PR-3-Finding-1-fix: this raised AmbiguousBackendError.
         # Post-fix: completes cleanly with both calls + the loop
         # continuation routed to azure-openai.

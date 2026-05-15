@@ -349,9 +349,9 @@ def test_agent_passes_custom_tools_to_llm(tmp_path):
         return _RawLLMResponse(text="Done.", input_tokens=10, output_tokens=5)
 
     with patch("atomic_agents.agent._llm.call_llm", side_effect=fake_call_llm):
-        with patch("atomic_agents.agent.AgentLock") as mock_lock:
-            mock_lock.return_value.acquire.return_value = None
-            mock_lock.return_value.release.return_value = None
+        with patch.object(agent, "lock_backend") as mock_lock:
+            mock_lock.acquire.return_value = MagicMock()  # fake LockHandle (#60 PR 2)
+            mock_lock.release.return_value = None
             agent.call("Test work item")
 
     tools_passed = captured_kwargs.get("tools", [])
@@ -400,9 +400,9 @@ def test_agent_executes_tool_and_loops(tmp_path):
     ]
 
     with patch.dict(sys.modules, {"anthropic": fake_anthropic}):
-        with patch("atomic_agents.agent.AgentLock") as mock_lock:
-            mock_lock.return_value.acquire.return_value = None
-            mock_lock.return_value.release.return_value = None
+        with patch.object(agent, "lock_backend") as mock_lock:
+            mock_lock.acquire.return_value = MagicMock()  # fake LockHandle (#60 PR 2)
+            mock_lock.release.return_value = None
             response = agent.call("Please echo hello.")
 
     # Should have made 2 LLM calls
@@ -478,9 +478,9 @@ def test_agent_max_iterations_caps_loop(tmp_path):
     fake_anthropic.Anthropic.return_value.messages.create.side_effect = always_tool_use
 
     with patch.dict(sys.modules, {"anthropic": fake_anthropic}):
-        with patch("atomic_agents.agent.AgentLock") as mock_lock:
-            mock_lock.return_value.acquire.return_value = None
-            mock_lock.return_value.release.return_value = None
+        with patch.object(agent, "lock_backend") as mock_lock:
+            mock_lock.acquire.return_value = MagicMock()  # fake LockHandle (#60 PR 2)
+            mock_lock.release.return_value = None
             response = agent.call("Keep calling the counter.")
 
     # Should have stopped at max_iterations
@@ -535,9 +535,9 @@ def test_agent_cost_cap_breaks_tool_loop(tmp_path):
 
     with patch.dict(sys.modules, {"anthropic": fake_anthropic}):
         with patch("atomic_agents.agent._costs.sum_cost_for_period", side_effect=fake_sum_cost):
-            with patch("atomic_agents.agent.AgentLock") as mock_lock:
-                mock_lock.return_value.acquire.return_value = None
-                mock_lock.return_value.release.return_value = None
+            with patch.object(agent, "lock_backend") as mock_lock:
+                mock_lock.acquire.return_value = MagicMock()  # fake LockHandle (#60 PR 2)
+                mock_lock.release.return_value = None
                 response = agent.call("Run until cap.")
 
     # Should have stopped early (first LLM call got through, then cap hit)
@@ -573,9 +573,9 @@ def test_agent_atomic_capture_still_works_alongside_custom_tools(tmp_path):
     fake_anthropic.Anthropic.return_value.messages.create.return_value = response_1
 
     with patch.dict(sys.modules, {"anthropic": fake_anthropic}):
-        with patch("atomic_agents.agent.AgentLock") as mock_lock:
-            mock_lock.return_value.acquire.return_value = None
-            mock_lock.return_value.release.return_value = None
+        with patch.object(agent, "lock_backend") as mock_lock:
+            mock_lock.acquire.return_value = MagicMock()  # fake LockHandle (#60 PR 2)
+            mock_lock.release.return_value = None
             response = agent.call("Please remember something.")
 
     # Capture should have been extracted
@@ -598,9 +598,9 @@ def test_response_includes_tool_calls_field(tmp_path):
     )
 
     with patch.dict(sys.modules, {"anthropic": fake_anthropic}):
-        with patch("atomic_agents.agent.AgentLock") as mock_lock:
-            mock_lock.return_value.acquire.return_value = None
-            mock_lock.return_value.release.return_value = None
+        with patch.object(agent, "lock_backend") as mock_lock:
+            mock_lock.acquire.return_value = MagicMock()  # fake LockHandle (#60 PR 2)
+            mock_lock.release.return_value = None
             response = agent.call("Ping.")
 
     # Fields exist and have correct defaults for a no-tool-call run
@@ -636,9 +636,9 @@ def test_run_log_records_tool_calls_rollup(tmp_path):
     fake_anthropic.Anthropic.return_value.messages.create.side_effect = [resp1, resp2]
 
     with patch.dict(sys.modules, {"anthropic": fake_anthropic}):
-        with patch("atomic_agents.agent.AgentLock") as mock_lock:
-            mock_lock.return_value.acquire.return_value = None
-            mock_lock.return_value.release.return_value = None
+        with patch.object(agent, "lock_backend") as mock_lock:
+            mock_lock.acquire.return_value = MagicMock()  # fake LockHandle (#60 PR 2)
+            mock_lock.release.return_value = None
             response = agent.call("Run a query.")
 
     # Find the run log record (not the tool_call log line)
