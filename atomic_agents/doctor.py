@@ -722,15 +722,32 @@ def _connect_sync_with_timeout(spec, mcp_module, timeout_seconds: float):
     return mcp_module._ServerConnection(spec=spec, tools=tools)
 
 
+# TODO(#60 PR 3): thread operator-pinned lock_backend through here once
+# AtomicAgent gains its constructor kwarg. Today, doctor constructs a
+# FilesystemLockBackend directly — correct for the filesystem-only
+# deployment shape PR 2 wires, but a Redis-backed deployment in PR 3+
+# needs doctor to consult the same backend the runtime uses.
 def check_locks(agent_root: Path, *, stale_seconds: float = 300.0) -> CheckResult:
-    """Agent's .lock file is not currently held by another process.
+    """Agent's lock is not currently held by another process.
+
+    Routes through ``FilesystemLockBackend.is_held("")`` per the spec/21
+    LockBackend Protocol (#60 PR 2) instead of probing ``flock`` directly.
+    The on-disk artifact at ``<agent_root>/.lock`` is unchanged — doctor
+    still reads it for the PID/staleness diagnostic message — but the
+    held-check now goes through the Protocol contract so future
+    distributed backends can implement ``is_held`` against their own
+    primitives (Redis SETNX probe, Postgres advisory lock query).
 
     A .lock file lingering on disk is normal — POSIX flock() releases on
     process death and Python doesn't unlink the file on exit. The only
-    problematic state is "file currently held": doctor tests that with a
-    non-blocking flock attempt. If the file is held AND its mtime is older
-    than ``stale_seconds``, the holder is likely stuck.
+    problematic state is "file currently held". If the file is held AND
+    its mtime is older than ``stale_seconds``, the holder is likely
+    stuck.
     """
+    import time
+
+    from .locks.filesystem import FilesystemLockBackend
+
     lock_path = agent_root / ".lock"
     if not lock_path.exists():
         return CheckResult(
@@ -738,51 +755,32 @@ def check_locks(agent_root: Path, *, stale_seconds: float = 300.0) -> CheckResul
             message="no lock file (agent has not run yet, or last run released cleanly)",
         )
 
-    import errno
-    import fcntl
-    import time
-
-    try:
-        fd = os.open(lock_path, os.O_RDWR)
-    except OSError as e:
+    backend = FilesystemLockBackend(agent_root)
+    if backend.is_held(""):
+        # Lock is held by some process. Read the recorded PID for the
+        # human-readable diagnostic; the Protocol's ``is_held`` returns
+        # bool only, so the diagnostic detail (PID, staleness) lives
+        # in doctor's domain.
+        try:
+            contents = lock_path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            contents = ""
+        mtime = lock_path.stat().st_mtime
+        age = time.time() - mtime
+        stale = age > stale_seconds
         return CheckResult(
             name="locks", status=FAIL,
-            message=f"could not open {lock_path}: {e}",
-            fix_hint=f"Check filesystem permissions on {lock_path}.",
+            message=(
+                f"agent lock at {lock_path} is held"
+                + (f" (stale: age {age:.0f}s > {stale_seconds:.0f}s threshold)" if stale else "")
+                + (f"; recorded {contents}" if contents else "")
+            ),
+            fix_hint=(
+                "If the holder process is alive, wait for it to finish or kill it. "
+                f"If the holder is dead, remove the file: rm {lock_path}"
+            ),
+            detail={"path": str(lock_path), "age_seconds": age, "contents": contents, "stale": stale},
         )
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as e:
-            # BlockingIOError (EWOULDBLOCK / EAGAIN) means the lock is held.
-            # Any other OSError is a genuine problem with the file or fd.
-            if not isinstance(e, BlockingIOError) and e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
-                raise
-            # Lock is held. Read the recorded PID for diagnostics.
-            try:
-                contents = lock_path.read_text(encoding="utf-8", errors="replace").strip()
-            except OSError:
-                contents = ""
-            mtime = lock_path.stat().st_mtime
-            age = time.time() - mtime
-            stale = age > stale_seconds
-            return CheckResult(
-                name="locks", status=FAIL,
-                message=(
-                    f"agent lock at {lock_path} is held"
-                    + (f" (stale: age {age:.0f}s > {stale_seconds:.0f}s threshold)" if stale else "")
-                    + (f"; recorded {contents}" if contents else "")
-                ),
-                fix_hint=(
-                    "If the holder process is alive, wait for it to finish or kill it. "
-                    f"If the holder is dead, remove the file: rm {lock_path}"
-                ),
-                detail={"path": str(lock_path), "age_seconds": age, "contents": contents, "stale": stale},
-            )
-        # Acquired — release immediately.
-        fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
 
     return CheckResult(
         name="locks", status=PASS,

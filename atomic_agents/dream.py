@@ -42,7 +42,6 @@ Exit codes: 0 success, 1 failed/canceled, 2 cost-guardrail-blocked.
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import secrets
@@ -58,7 +57,7 @@ import frontmatter
 from . import _costs, _llm, _model
 from ._capture import _render_note, _update_index
 from ._io import atomic_write
-from ._locks import AgentLock
+from .locks import LockBusy, get_lock_backend
 from ._platform import get_agents_root
 from .exceptions import AtomicAgentsError, DreamInProgress, DreamNotFound
 from .memory.backend import WritePolicy
@@ -127,48 +126,20 @@ class DreamResult:
 
 
 # ──────────────────────────────────────────────────────────────────
-# Dream lock (separate from agent's main lock — dreams must not block calls)
-
-class _DreamLock:
-    """flock on <agent>/dreams/.lock — separate from the agent's main .lock."""
-
-    def __init__(self, dreams_dir: Path, wait_seconds: float = 30.0,
-                 poll_interval: float = 0.5):
-        self._path = dreams_dir / ".lock"
-        self._wait = wait_seconds
-        self._poll = poll_interval
-        self._fd: int | None = None
-
-    def acquire(self) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._fd = os.open(str(self._path), os.O_RDWR | os.O_CREAT, 0o644)
-        deadline = time.monotonic() + self._wait
-        while True:
-            try:
-                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                os.lseek(self._fd, 0, os.SEEK_SET)
-                os.ftruncate(self._fd, 0)
-                os.write(self._fd, f"pid={os.getpid()} acquired={time.time()}\n".encode())
-                return
-            except (BlockingIOError, OSError) as exc:
-                import errno
-                if not (isinstance(exc, BlockingIOError) or exc.errno == errno.EWOULDBLOCK):
-                    raise
-                if time.monotonic() >= deadline:
-                    os.close(self._fd)
-                    self._fd = None
-                    raise DreamInProgress(
-                        f"Dream lock at {self._path} is held; another dream is in progress."
-                    )
-                time.sleep(self._poll)
-
-    def release(self) -> None:
-        if self._fd is not None:
-            try:
-                fcntl.flock(self._fd, fcntl.LOCK_UN)
-            finally:
-                os.close(self._fd)
-                self._fd = None
+# Dream lock — replaced in #60 PR 2.
+#
+# The internal ``_DreamLock`` class used raw ``fcntl.flock`` against
+# ``<dreams_dir>/.lock``. It is now a ``FilesystemLockBackend(dreams_dir)
+# .acquire("")`` call wired in ``DreamRunner.__init__`` below. The
+# on-disk artifact is unchanged (still ``<dreams_dir>/.lock`` with
+# the legacy ``pid=<pid> acquired=<ts>`` payload). Operators / external
+# diagnostic scripts that probed that path keep working.
+#
+# Domain exception: ``LockBusy`` from the backend is wrapped in
+# ``DreamInProgress`` at the call site (via ``raise ... from exc``) so
+# the existing semantic — "another dream pipeline is in progress" —
+# stays distinct from the agent's main-lock exception. See
+# ``docs/spec/21-lock-backend.md`` §"What this PR does NOT do".
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -1026,11 +997,18 @@ class DreamRunner:
         agents_root: Path | str,
         agent_name: str,
         model: str | None = None,
+        *,
+        dream_lock_timeout: float = 30.0,
     ):
         self.agents_root = Path(agents_root)
         self.agent_name = agent_name
         self.agent_root = self.agents_root / agent_name
         self.dreams_dir = self.agent_root / "dreams"
+        # Per-instance dream-lock timeout (constructor kwarg, not a class
+        # attribute, matching the FilesystemBackend.apply_staging_lock_
+        # timeout pattern — Step 9.1 security specialist rejected
+        # class-attribute mutation as a process-wide risk).
+        self._dream_lock_timeout = dream_lock_timeout
 
         if not self.agent_root.exists():
             raise AtomicAgentsError(
@@ -1040,6 +1018,16 @@ class DreamRunner:
 
         # Memory backend — shared across start/apply/discard calls
         self._backend = FilesystemBackend(self.agent_root, "memory")
+
+        # Dream lock backend — scoped to ``<agent>/dreams`` so that
+        # ``acquire("")`` produces ``<dreams_dir>/.lock``, byte-identical
+        # to the legacy ``_DreamLock`` artifact. Distinct scope from the
+        # agent's main lock (``<agent_root>/.lock``) so that an
+        # in-progress dream does NOT block ``agent.call()`` and vice
+        # versa — the long-standing invariant captured in spec/16.
+        # Routed through the registry (default ``"filesystem"``) for
+        # PR 3 forward-compat with operator-pinned backend overrides.
+        self._dream_lock_backend = get_lock_backend("filesystem")(self.dreams_dir)
 
         # Resolve model: explicit > agent's model.md default
         if model:
@@ -1094,9 +1082,19 @@ class DreamRunner:
         )
         _write_manifest(dream_dir, result)
 
-        # Acquire dream lock
-        lock = _DreamLock(self.dreams_dir, wait_seconds=30)
-        lock.acquire()
+        # Acquire dream lock via the bound LockBackend. ``LockBusy`` is
+        # wrapped in ``DreamInProgress`` (with PEP-3134 ``from exc``
+        # exception chaining for debug traceback) so operators catching
+        # the domain exception see the same surface as pre-PR 2.
+        try:
+            lock_handle = self._dream_lock_backend.acquire(
+                "", timeout=self._dream_lock_timeout
+            )
+        except LockBusy as exc:
+            raise DreamInProgress(
+                f"Dream lock at {self.dreams_dir / '.lock'} is held; "
+                f"another dream is in progress."
+            ) from exc
 
         result.status = "running"
         _write_manifest(dream_dir, result)
@@ -1119,10 +1117,19 @@ class DreamRunner:
             result.error = str(exc)
             result.ended_at = datetime.now().astimezone().isoformat()
             _write_manifest(dream_dir, result)
-            lock.release()
             raise
         finally:
-            lock.release()
+            # Single release-on-exit covers both the success and the
+            # failure paths. The legacy ``_DreamLock``-era code called
+            # release() in both the ``except`` AND the ``finally`` and
+            # relied on FilesystemLockBackend.release() being idempotent
+            # (spec/21 §"release(handle)"). That worked but depended on
+            # idempotency where it was avoidable — Step 9.1 testing
+            # specialist flagged the pattern as a footgun if a future
+            # backend's release() is not idempotent. The single-release
+            # finally is the safer shape (CLAUDE.md rule #8 — "no
+            # half-finished state").
+            self._dream_lock_backend.release(lock_handle)
 
         return result
 
@@ -1181,7 +1188,8 @@ class DreamRunner:
             )
 
         # Build a permissive write policy allowing the agent's memory dir.
-        # apply_staging() handles the AgentLock + atomic rename internally.
+        # apply_staging() handles the agent lock (via FilesystemBackend.
+        # _lock_backend per #60 PR 2) + atomic rename internally.
         memory_dir = self.agent_root / "memory"
         policy = WritePolicy(write_paths=[memory_dir, self.agent_root])
 
@@ -1193,7 +1201,8 @@ class DreamRunner:
         )
 
         # apply_staging archives current memory to memory.archived-<ts>, promotes
-        # dreamed_memory to memory/, acquires AgentLock internally.
+        # dreamed_memory to memory/, acquires the agent lock internally (via
+        # FilesystemBackend._lock_backend per #60 PR 2).
         self._backend.apply_staging(staged, policy)
 
         # Retrieve the archived path from disk (apply_staging uses its own ts)
