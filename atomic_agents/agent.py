@@ -36,7 +36,13 @@ from ._io import atomic_append_jsonl, atomic_write, safe_resolve_under
 from .memory.filesystem import FilesystemBackend
 from .memory.backend import WritePolicy
 from .mcp import MCPClientPool, parse_mcp_md
-from .locks import LockBusy, get_lock_backend
+from .locks import (
+    LockBackend,
+    LockBusy,
+    LockLost,
+    check_lock_lost,
+    get_default_lock_backend,
+)
 from ._platform import get_agents_root
 from ._schema import validate_atomic_note_frontmatter
 from .goal import parse_agent_mode
@@ -112,6 +118,13 @@ def _canonicalize_tool_loop(raw_tool_uses, tool_results):
 
 
 class AtomicAgent:
+    # Public type annotation pins ``lock_backend`` to the Protocol
+    # (not the concrete ``FilesystemLockBackend`` subclass) so static
+    # analysis treats the attribute as "any LockBackend implementation
+    # — could be filesystem, Redis, or a future third-party backend"
+    # rather than narrowing to the filesystem default. Step 9.1
+    # maintainability specialist CRITICAL.
+    lock_backend: LockBackend
     """The main agent runtime.
 
     Responsible for:
@@ -130,6 +143,8 @@ class AtomicAgent:
         run_id: str | None = None,
         tools: ToolRegistry | None = None,
         max_tool_iterations: int = DEFAULT_MAX_TOOL_ITERATIONS,
+        *,
+        lock_backend: LockBackend | None = None,
     ):
         self.name = name
         self.trigger = trigger
@@ -147,13 +162,20 @@ class AtomicAgent:
                 f"Set ATOMIC_AGENTS_ROOT env var or create the agent."
             )
 
-        # LockBackend instance bound to this agent's root. Routed through
-        # the registry (default ``"filesystem"``) so PR 3 of #60 can add
-        # an operator-pinned override (constructor kwarg or env var)
-        # without changing this construction line. ``lock_backend`` is
-        # public — mirrors ``self.memory`` and lets diagnostic code
-        # (``atomic-agents doctor``) reuse the same backend instance.
-        self.lock_backend = get_lock_backend("filesystem")(self.agent_root)
+        # LockBackend instance bound to this agent's root. Operators may
+        # pin a backend via the ``lock_backend=...`` constructor kwarg
+        # (programmatic path) OR via ``ATOMIC_AGENTS_LOCK_BACKEND`` +
+        # ``ATOMIC_AGENTS_LOCK_BACKEND_URL`` env vars (deployment path
+        # — Docker, launchd, Cloud Run). See spec/21 §"Operator override
+        # surface". Default (both unset) is the filesystem backend
+        # scoped to this agent's root — matches pre-#60 PR 3 behavior.
+        # ``lock_backend`` is public — mirrors ``self.memory`` and lets
+        # diagnostic code (``atomic-agents doctor``) reuse the same
+        # backend instance.
+        if lock_backend is None:
+            self.lock_backend = get_default_lock_backend(self.agent_root)
+        else:
+            self.lock_backend = lock_backend
 
         # Cascade detection — None for single-agent layouts (load behaves as before),
         # populated for paths shaped <system>/projects/<project>/agents/<role>/.
@@ -238,10 +260,15 @@ class AtomicAgent:
         # Parse config files
         self.config = self._load_config()
 
-        # Memory backend (spec/20 — routes all memory I/O through the protocol)
+        # Memory backend (spec/20 — routes all memory I/O through the protocol).
+        # Threads the agent's resolved lock_backend so memory.apply_staging
+        # serializes against agent.call() through the SAME backend instance —
+        # operator-pinned Redis backends see consistent locking across the
+        # agent + memory paths instead of two independent backend resolutions.
         self.memory: FilesystemBackend = FilesystemBackend(
             agent_root=self.agent_root,
             memory_subdir="memory",
+            lock_backend=self.lock_backend,
         )
 
     def _register_skill_tools(self) -> None:
@@ -2202,6 +2229,16 @@ class AtomicAgent:
             start_total = time.time()
             while True:
                 iteration_count += 1
+
+                # Inter-iteration lock-loss check (#60 PR 3 + spec/21
+                # §"Lease and heartbeat"). For lease-backed backends
+                # (Redis, future Postgres advisory) the heartbeat thread
+                # spawned at acquire() may detect lease expiry mid-call.
+                # Surface as ``LockLost`` BEFORE the next LLM round-trip
+                # so the agent aborts cleanly instead of writing under
+                # a lock another holder now owns. No-op for the
+                # filesystem default (``supports_lease=False``).
+                check_lock_lost(lock_handle)
 
                 # Pre-check cost cap before each iteration (except first, already checked).
                 # Pass the in-flight accumulator so the guardrail sees spend that

@@ -57,7 +57,13 @@ import frontmatter
 from . import _costs, _llm, _model
 from ._capture import _render_note, _update_index
 from ._io import atomic_write
-from .locks import LockBusy, get_lock_backend
+from .locks import (
+    LockBackend,
+    LockBusy,
+    LockLost,
+    check_lock_lost,
+    get_default_lock_backend,
+)
 from ._platform import get_agents_root
 from .exceptions import AtomicAgentsError, DreamInProgress, DreamNotFound
 from .memory.backend import WritePolicy
@@ -999,6 +1005,7 @@ class DreamRunner:
         model: str | None = None,
         *,
         dream_lock_timeout: float = 30.0,
+        lock_backend: LockBackend | None = None,
     ):
         self.agents_root = Path(agents_root)
         self.agent_name = agent_name
@@ -1016,18 +1023,34 @@ class DreamRunner:
                 f"Set ATOMIC_AGENTS_ROOT or create the agent."
             )
 
-        # Memory backend — shared across start/apply/discard calls
-        self._backend = FilesystemBackend(self.agent_root, "memory")
+        # Operator-config resolution: kwarg ALWAYS wins over env vars
+        # per spec/21 §"Operator override surface".
+        if lock_backend is None:
+            agent_lock_backend = get_default_lock_backend(self.agent_root)
+        else:
+            agent_lock_backend = lock_backend
 
-        # Dream lock backend — scoped to ``<agent>/dreams`` so that
-        # ``acquire("")`` produces ``<dreams_dir>/.lock``, byte-identical
-        # to the legacy ``_DreamLock`` artifact. Distinct scope from the
-        # agent's main lock (``<agent_root>/.lock``) so that an
+        # Memory backend — shared across start/apply/discard calls.
+        # PASS the resolved agent_lock_backend so apply_staging's lock
+        # acquires through the SAME backend instance the agent uses
+        # (Step 11 adversarial P0-1: without this, an operator who
+        # passes ``DreamRunner(..., lock_backend=RedisLockBackend(...))``
+        # with env vars unset gets a Redis dream lock but a filesystem
+        # apply_staging lock — meaningless across hosts, opening a
+        # write-data-race on memory/ during dream apply).
+        self._backend = FilesystemBackend(
+            self.agent_root, "memory", lock_backend=agent_lock_backend
+        )
+
+        # Dream lock backend — re-scoped to ``"dreams"`` via the
+        # Protocol's ``scope()`` method (#60 PR 3 + spec/21 §"scope()").
+        # Filesystem produces ``<dreams_dir>/.lock`` (byte-identical to
+        # the legacy ``_DreamLock`` artifact); Redis produces a key
+        # under ``<key_prefix>dreams:``. Distinct scope from the agent's
+        # main lock — long-standing invariant from spec/16: an
         # in-progress dream does NOT block ``agent.call()`` and vice
-        # versa — the long-standing invariant captured in spec/16.
-        # Routed through the registry (default ``"filesystem"``) for
-        # PR 3 forward-compat with operator-pinned backend overrides.
-        self._dream_lock_backend = get_lock_backend("filesystem")(self.dreams_dir)
+        # versa.
+        self._dream_lock_backend = agent_lock_backend.scope("dreams")
 
         # Resolve model: explicit > agent's model.md default
         if model:
@@ -1112,6 +1135,16 @@ class DreamRunner:
                 backend=self._backend,
             )
             _write_manifest(dream_dir, result)
+            # Inter-pipeline lock-loss check (#60 PR 3 + spec/21
+            # §"Lease and heartbeat"). For lease-backed backends, the
+            # heartbeat thread may have detected lease expiry during
+            # the pipeline. Surface as ``LockLost`` BEFORE marking the
+            # dream as completed so a dream run that lost its lease
+            # mid-flight aborts instead of writing a completed manifest
+            # under a lock another holder now owns. No-op for the
+            # filesystem default. Step 9.1 maintainability specialist
+            # flagged the unwired ``check_lock_lost`` import.
+            check_lock_lost(lock_handle)
         except Exception as exc:
             result.status = "failed"
             result.error = str(exc)

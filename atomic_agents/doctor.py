@@ -55,6 +55,11 @@ from ._platform import get_agents_root
 PASS = "pass"
 FAIL = "fail"
 SKIP = "skip"
+# WARN = "operator-config asks for a backend doctor can't fully probe
+# from this host (e.g., Redis URL set but unreachable from the dev
+# machine running doctor). Matches the ``check_provider_keys`` pattern
+# — doctor never crashes on missing/unreachable optional infrastructure."
+WARN = "warn"
 
 # Minimum supported Python version. Mirror pyproject.toml's requires-python.
 MIN_PYTHON = (3, 11)
@@ -182,6 +187,7 @@ def run_doctor(
     else:
         results.extend(check_mcp(agent_root, read_paths=tools_data.get("read_paths", [])))
 
+    results.append(check_lock_backend(agent_root))
     results.append(check_locks(agent_root))
     results.append(check_memory_backend(agent_root))
     results.append(check_write_paths(tools_data, agent_root=agent_root))
@@ -722,21 +728,22 @@ def _connect_sync_with_timeout(spec, mcp_module, timeout_seconds: float):
     return mcp_module._ServerConnection(spec=spec, tools=tools)
 
 
-# TODO(#60 PR 3): thread operator-pinned lock_backend through here once
-# AtomicAgent gains its constructor kwarg. Today, doctor constructs a
-# FilesystemLockBackend directly — correct for the filesystem-only
-# deployment shape PR 2 wires, but a Redis-backed deployment in PR 3+
-# needs doctor to consult the same backend the runtime uses.
 def check_locks(agent_root: Path, *, stale_seconds: float = 300.0) -> CheckResult:
     """Agent's lock is not currently held by another process.
 
-    Routes through ``FilesystemLockBackend.is_held("")`` per the spec/21
-    LockBackend Protocol (#60 PR 2) instead of probing ``flock`` directly.
-    The on-disk artifact at ``<agent_root>/.lock`` is unchanged — doctor
-    still reads it for the PID/staleness diagnostic message — but the
-    held-check now goes through the Protocol contract so future
-    distributed backends can implement ``is_held`` against their own
-    primitives (Redis SETNX probe, Postgres advisory lock query).
+    Routes through the operator-pinned ``LockBackend.is_held("")``
+    (defaults to filesystem; reads ``ATOMIC_AGENTS_LOCK_BACKEND`` /
+    ``ATOMIC_AGENTS_LOCK_BACKEND_URL`` for the override path —
+    #60 PR 3 + spec/21 §"Operator override surface"). For the
+    filesystem default, the on-disk artifact at ``<agent_root>/.lock``
+    is unchanged and doctor still reads it for the PID/staleness
+    diagnostic message.
+
+    For a Redis-backed deployment whose URL is unreachable from the
+    host running doctor (e.g., a developer running ``atomic-agents
+    doctor`` from a coffee-shop wifi), the check returns ``WARN``
+    rather than ``FAIL`` — matching the ``check_provider_keys`` pattern:
+    doctor never crashes on missing/unreachable optional infrastructure.
 
     A .lock file lingering on disk is normal — POSIX flock() releases on
     process death and Python doesn't unlink the file on exit. The only
@@ -746,45 +753,245 @@ def check_locks(agent_root: Path, *, stale_seconds: float = 300.0) -> CheckResul
     """
     import time
 
-    from .locks.filesystem import FilesystemLockBackend
+    from .locks import get_default_lock_backend
 
+    backend_id = os.environ.get(
+        "ATOMIC_AGENTS_LOCK_BACKEND", "filesystem"
+    ).strip().lower()
+
+    try:
+        backend = get_default_lock_backend(agent_root)
+    except ImportError as exc:
+        # Operator pinned a backend whose extra isn't installed.
+        # FAIL with the specific install command.
+        return CheckResult(
+            name="locks", status=FAIL,
+            message=(
+                f"ATOMIC_AGENTS_LOCK_BACKEND={backend_id!r} requires "
+                f"an extra that isn't installed: {exc}"
+            ),
+            fix_hint=f"pip install 'atomic-agents-stack[{backend_id}]'",
+        )
+    except Exception as exc:
+        # Misconfigured backend (e.g., redis URL malformed, unknown
+        # backend_id). Use FAIL — operator-config drift is doctor's
+        # whole job to surface.
+        return CheckResult(
+            name="locks", status=FAIL,
+            message=f"lock backend construction failed: {exc}",
+            fix_hint=(
+                "Check ATOMIC_AGENTS_LOCK_BACKEND + "
+                "ATOMIC_AGENTS_LOCK_BACKEND_URL env vars; unset to use "
+                "the filesystem default."
+            ),
+        )
+
+    # Filesystem-specific .lock file check (PID diagnostic + staleness)
+    # is still applicable for the filesystem default.
     lock_path = agent_root / ".lock"
-    if not lock_path.exists():
+    if backend_id == "filesystem" and not lock_path.exists():
         return CheckResult(
             name="locks", status=PASS,
             message="no lock file (agent has not run yet, or last run released cleanly)",
         )
 
-    backend = FilesystemLockBackend(agent_root)
-    if backend.is_held(""):
-        # Lock is held by some process. Read the recorded PID for the
-        # human-readable diagnostic; the Protocol's ``is_held`` returns
-        # bool only, so the diagnostic detail (PID, staleness) lives
-        # in doctor's domain.
-        try:
-            contents = lock_path.read_text(encoding="utf-8", errors="replace").strip()
-        except OSError:
-            contents = ""
-        mtime = lock_path.stat().st_mtime
-        age = time.time() - mtime
-        stale = age > stale_seconds
+    try:
+        held = backend.is_held("")
+    except Exception as exc:
+        # Backend reachability failure (e.g., Redis URL unreachable).
+        # WARN — operator-config is set but doctor can't probe.
+        return CheckResult(
+            name="locks", status=WARN,
+            message=(
+                f"operator-pinned lock backend {backend_id!r} is not "
+                f"reachable from this host; doctor cannot probe lock "
+                f"state ({exc})"
+            ),
+            fix_hint=(
+                "Verify ATOMIC_AGENTS_LOCK_BACKEND_URL is correct and "
+                "the backend is reachable from this host. doctor will "
+                "warn but not fail — the framework runtime will fail at "
+                "first lock acquire if the backend is truly down."
+            ),
+        )
+
+    if held:
+        # Lock is held by some process. Diagnostic detail is
+        # backend-specific: filesystem reads ``<agent_root>/.lock`` for
+        # the PID + staleness; distributed backends just report which
+        # backend reported held. The Protocol's ``is_held`` returns
+        # bool only, so this detail lives in doctor's domain.
+        if backend_id == "filesystem" and lock_path.exists():
+            try:
+                contents = lock_path.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                contents = ""
+            mtime = lock_path.stat().st_mtime
+            age = time.time() - mtime
+            stale = age > stale_seconds
+            return CheckResult(
+                name="locks", status=FAIL,
+                message=(
+                    f"agent lock at {lock_path} is held"
+                    + (f" (stale: age {age:.0f}s > {stale_seconds:.0f}s threshold)" if stale else "")
+                    + (f"; recorded {contents}" if contents else "")
+                ),
+                fix_hint=(
+                    "If the holder process is alive, wait for it to finish or kill it. "
+                    f"If the holder is dead, remove the file: rm {lock_path}"
+                ),
+                detail={"path": str(lock_path), "age_seconds": age, "contents": contents, "stale": stale},
+            )
+        # Non-filesystem backend reported held; no PID/staleness signal
+        # from the Protocol. Surface what we know.
         return CheckResult(
             name="locks", status=FAIL,
             message=(
-                f"agent lock at {lock_path} is held"
-                + (f" (stale: age {age:.0f}s > {stale_seconds:.0f}s threshold)" if stale else "")
-                + (f"; recorded {contents}" if contents else "")
+                f"agent lock is held according to backend "
+                f"{backend_id!r} (is_held returned True)"
             ),
             fix_hint=(
-                "If the holder process is alive, wait for it to finish or kill it. "
-                f"If the holder is dead, remove the file: rm {lock_path}"
+                "Inspect the backend directly for holder details "
+                "(e.g., redis-cli KEYS 'atomic_agents:lock:*'). The "
+                "framework will block on the next acquire until the "
+                "holder releases or the lease expires."
             ),
-            detail={"path": str(lock_path), "age_seconds": age, "contents": contents, "stale": stale},
+            detail={"backend_id": backend_id},
         )
 
     return CheckResult(
         name="locks", status=PASS,
         message="lock file present but not held (clean)",
+    )
+
+
+def check_lock_backend(agent_root: Path) -> CheckResult:
+    """Operator-config coherence check for the lock backend (#60 PR 3).
+
+    Validates that ``ATOMIC_AGENTS_LOCK_BACKEND`` (plus
+    ``ATOMIC_AGENTS_LOCK_BACKEND_URL`` when non-filesystem) is
+    correctly configured:
+
+    * unset / ``filesystem`` → PASS (today's deployment shape — no
+      extras needed, no URL needed)
+    * ``redis`` with extra installed AND URL reachable → PASS
+    * ``redis`` with extra NOT installed → FAIL with the install command
+    * ``redis`` with extra installed but URL unreachable → WARN
+      (matches ``check_provider_keys`` pattern — doctor doesn't crash
+      on missing optional infrastructure)
+    * unknown backend_id (typo) → FAIL with the registered backend list
+
+    This is the operator-coherence layer; ``check_locks`` then runs the
+    actual held-check through the configured backend. Both checks reuse
+    ``get_default_lock_backend`` internally so doctor's verdict and the
+    runtime's behavior cannot diverge.
+    """
+    from .locks import get_default_lock_backend, list_lock_backends
+
+    backend_id = os.environ.get(
+        "ATOMIC_AGENTS_LOCK_BACKEND", "filesystem"
+    ).strip().lower()
+
+    if backend_id == "filesystem":
+        return CheckResult(
+            name="lock-backend", status=PASS,
+            message="filesystem backend (default; no extra needed)",
+            detail={"backend_id": "filesystem"},
+        )
+
+    # ``redis`` is lazy-resolved in ``get_default_lock_backend`` rather
+    # than eagerly registered at framework import (avoids pulling the
+    # ``redis`` optional dependency into every startup). Treat it as a
+    # known id alongside the eagerly-registered backends.
+    known_ids = set(list_lock_backends()) | {"redis"}
+    if backend_id not in known_ids:
+        return CheckResult(
+            name="lock-backend", status=FAIL,
+            message=(
+                f"ATOMIC_AGENTS_LOCK_BACKEND={backend_id!r} is not "
+                f"a known backend. Known: {sorted(known_ids)}"
+            ),
+            fix_hint=(
+                "Set ATOMIC_AGENTS_LOCK_BACKEND to one of the known "
+                "ids, or unset to use the filesystem default."
+            ),
+        )
+
+    # Non-filesystem backend selected. URL must be set, extra must be
+    # importable, backend must be reachable.
+    url = os.environ.get("ATOMIC_AGENTS_LOCK_BACKEND_URL")
+    if not url:
+        return CheckResult(
+            name="lock-backend", status=FAIL,
+            message=(
+                f"ATOMIC_AGENTS_LOCK_BACKEND={backend_id!r} requires "
+                "ATOMIC_AGENTS_LOCK_BACKEND_URL to be set"
+            ),
+            fix_hint=(
+                "export ATOMIC_AGENTS_LOCK_BACKEND_URL=<url> (e.g., "
+                "redis://localhost:6379/0 for the redis backend)."
+            ),
+        )
+
+    try:
+        backend = get_default_lock_backend(agent_root)
+    except ImportError as exc:
+        return CheckResult(
+            name="lock-backend", status=FAIL,
+            message=(
+                f"ATOMIC_AGENTS_LOCK_BACKEND={backend_id!r} requires "
+                f"an extra that isn't installed: {exc}"
+            ),
+            fix_hint=f"pip install 'atomic-agents-stack[{backend_id}]'",
+        )
+    except Exception as exc:
+        return CheckResult(
+            name="lock-backend", status=FAIL,
+            message=f"lock backend construction failed: {exc}",
+            fix_hint=(
+                "Check ATOMIC_AGENTS_LOCK_BACKEND and "
+                "ATOMIC_AGENTS_LOCK_BACKEND_URL for typos."
+            ),
+        )
+
+    # Probe with a cheap is_held call. Failure is reachability, not held
+    # state — WARN, not FAIL (same rationale as check_provider_keys).
+    try:
+        backend.is_held("")
+    except Exception as exc:
+        return CheckResult(
+            name="lock-backend", status=WARN,
+            message=(
+                f"operator-pinned backend {backend_id!r} configured "
+                f"but not reachable from this host: {exc}"
+            ),
+            fix_hint=(
+                f"Verify {url!r} is correct and the backend is up. "
+                "Doctor warns instead of failing — the framework "
+                "runtime will fail at first acquire if the backend "
+                "is truly down."
+            ),
+        )
+
+    # Redact credentials from the URL before echoing in the message /
+    # detail dict — Step 9.1 security specialist Finding 9 (#60 PR 3).
+    # ``redis://user:password@host:port/db`` URLs leak the credential
+    # to anything that captures doctor output (CI logs, telemetry).
+    # urlparse + _replace strips the userinfo segment.
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.password:
+        netloc = parsed.hostname or ""
+        if parsed.port:
+            netloc = f"{netloc}:{parsed.port}"
+        safe_url = parsed._replace(netloc=netloc).geturl()
+    else:
+        safe_url = url
+
+    return CheckResult(
+        name="lock-backend", status=PASS,
+        message=f"{backend_id} backend reachable at {safe_url}",
+        detail={"backend_id": backend_id, "url": safe_url},
     )
 
 
