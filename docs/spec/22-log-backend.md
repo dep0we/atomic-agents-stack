@@ -1,8 +1,8 @@
 # 22 — LogBackend Protocol
 
-**Status:** **DRAFT** (locks at #61 PR 4).
+**Status:** **locked** (spec matches implementation as of #61 PR 4).
 **Origin:** [#61](https://github.com/dep0we/atomic-agents-stack/issues/61).
-**Will ship across four PRs:** PR 1 (Protocol scaffolding + filesystem reference impl + conformance suite + DRAFT spec — this PR), PR 2 (wire backend into the 27+ ``self._log`` call sites + ``outcome._append_iteration_log`` + ``_costs.sum_cost_for_period`` + dashboard readers + ``doctor.check_log_backend`` coherence check + operator override surface), PR 3 (``SQLiteLogBackend`` reference impl + cross-primitive run records + parametrized conformance), PR 4 (spec lock-in + ``Implementer contract for queryable backends`` documented + README/CLAUDE.md status refresh).
+**Shipped across four PRs:** PR 1 (Protocol scaffolding + ``FilesystemLogBackend`` reference impl + conformance suite + DRAFT spec — #185), PR 2 (wire backend into the 27+ ``self._log`` call sites + ``outcome._append_iteration_log`` + ``_costs.sum_cost_for_period`` + dashboard readers + ``doctor.check_log_backend`` coherence check + operator override surface — #186), PR 3 (``SQLiteLogBackend`` reference impl + parametrized conformance suite + ``LogQuery.agent_name`` filter for shared-backend cross-agent isolation + URL parsing — #187), PR 4 (spec lock-in + ``Implementer contract for queryable backends`` documented + README/CLAUDE.md status refresh — this PR).
 
 ## Overview
 
@@ -478,7 +478,29 @@ PR 2 wires:
 PR 3 ships ``SQLiteLogBackend`` (stdlib ``sqlite3``; no optional
 extra needed) and parametrizes the conformance suite across both
 backends. PR 4 locks this spec and adds the
-``§"Implementer contract for queryable backends"`` section.
+``§"Implementer contract for queryable backends"`` section below.
+
+## Implementer contract for queryable backends (#61 PR 4)
+
+A backend that claims ``LogCapabilities.supports_aggregation_pushdown=True`` is committing to the indexed-query + native-aggregate pattern documented above. Concretely, **implementers MUST**:
+
+1. **Push every ``LogQuery`` predicate to native query primitives**. SQL backends translate to ``WHERE`` clauses; document-store backends translate to facet filters; remote-API backends translate to query parameters. The filesystem reference impl is the in-memory fallback; pushdown backends MUST NOT materialize records into the client before filtering. Specifically: ``LogQuery.since/until`` MUST become indexed range scans (the ``ts`` column or equivalent MUST be indexed); ``LogQuery.run_id``, ``LogQuery.primitive``, ``LogQuery.parent_run_id``, ``LogQuery.agent_name`` MUST become exact-match equality clauses (each backed by an index for hot-path queries — at minimum ``ts``, ``run_id``, ``primitive``, ``parent_run_id``). The reference ``SQLiteLogBackend`` ships six indexes (``ts``, ``run_id``, ``primitive``, ``parent_run_id``, ``cost_source``, ``mandate_id``) and uses ``EXPLAIN QUERY PLAN`` verification in the test suite to assert index use.
+
+2. **Lenient ``agent_name`` filtering**. Records with ``agent_name IS NULL`` (legacy pre-PR-2 records imported from a filesystem export) MUST match any ``agent_name`` filter — under filesystem's per-agent-dir scoping, every record in the dir IS the named agent's; strict filtering would break dashboard reads of legacy data. Backends translate to ``WHERE (agent_name = :name OR agent_name IS NULL)`` or equivalent. The cross-agent-isolation property holds for explicitly-stamped records (every post-PR-2 record carries ``agent_name`` set by ``agent.py:_log()``).
+
+3. **Backward-compat ``cost_source`` filtering**. Records with ``cost_source IS NULL`` (legacy pre-spec/28 records) MUST be treated as ``"actor"`` for filter purposes — this preserves the cost-guardrail semantic from before the spec/28 actor/judge split. Backends translate to ``WHERE (cost_source = 'actor' OR cost_source IS NULL)`` when the filter is ``"actor"``; strict equality for any other value.
+
+4. **Atomic schema initialization across processes**. Multi-process operators may have N replicas all opening a fresh backend file simultaneously. Schema-creation INSERTs MUST use idempotent patterns (``INSERT OR IGNORE``, ``ON CONFLICT DO NOTHING``, equivalent) so the cold-start race doesn't deadlock a replica. The reference ``SQLiteLogBackend`` learned this in PR 3 review-pass (Step 11 adversarial P0 #2); future backends MUST mirror.
+
+5. **``delete_older_than`` raises ``ValueError`` on naive datetimes**. The spec/22 ``LogBackend`` contract is strict on this; the queryable-backend contract additionally requires that backends do NOT silently convert naive ``→`` UTC ``→`` query parameter. Operators MUST pass tz-aware thresholds to avoid the off-by-one-day retention failure shape near midnight.
+
+6. **Aggregation pushdown — ``group_by`` resolution**. ``group_by`` field names that match canonical ``RunRecord`` columns MUST resolve to direct column references in the native ``GROUP BY``. Field names that resolve only through ``record.extra`` MAY raise ``NotImplementedError`` when the backend's primitive doesn't support JSON-extraction (e.g., a backend without a SQL JSON1 equivalent). When the backend does support JSON extraction, the implementer MUST validate ``group_by`` identifiers against an allowlist of safe identifiers (alphanumeric + underscore, ASCII-only) before interpolating into the native query — the reference ``SQLiteLogBackend`` does this at ``sqlite.py:aggregate()``. Operators wanting ``extra``-field group_bys on a pushdown backend that doesn't support JSON extraction MUST either canonicalize the field by promoting it to ``RunRecord`` (Protocol expansion, semver minor) or use the filesystem reference for that query.
+
+7. **Connection / handle management**. Backends MUST be safe to construct, use, and abandon without explicit ``close()``. A ``release()``-equivalent method is not part of the Protocol because the framework's call-site lifecycle (one ``LogBackend`` instance per ``AtomicAgent`` for the agent's full life) doesn't have a deterministic teardown point. Backends with limited connection pools (Postgres, HTTP) MUST use ``threading.local`` or a connection-pool library that handles thread-life-tied cleanup automatically. The reference ``SQLiteLogBackend`` uses ``threading.local`` for per-thread connections; the WAL journal mode lets the kernel reclaim connections on thread exit without explicit close.
+
+8. **Multi-tenant scoping (deferred to the implementer)**. The Protocol's per-backend ``scope_root`` (passed to the constructor) is the framework's default isolation primitive. Operators who pin a single shared backend across multiple agents rely on ``LogQuery.agent_name`` filtering at the read boundary. Backends with native multi-tenant capabilities (Postgres row-level security, Datadog org tags) MAY enforce additional isolation; the Protocol does not require it but the implementer documentation MUST surface whatever guarantees the backend provides.
+
+The reference ``SQLiteLogBackend`` implementation in ``atomic_agents/logs/sqlite.py`` is the canonical example of this contract. Future Postgres / Datadog / Loki / Cloud Logging adapters should mirror its shape; the conformance suite (``tests/test_log_protocol_conformance.py``) parametrizes across every registered backend so the contract is verified by the same tests that pin ``append`` / ``query`` / ``aggregate`` / ``delete_older_than`` / ``stats`` semantics.
 
 ## Reserved future capabilities
 
@@ -498,19 +520,52 @@ future expansions don't need a breaking Protocol change:
 
 ## Conformance test surface
 
-PR 1 ships:
+The conformance suite (PR 4 lock):
 
-* ``tests/test_log_protocol_conformance.py`` — 30 tests parametrized
-  via a ``backend_factory`` fixture, ready to receive PR 3's
-  ``SQLiteLogBackend`` factory entry.
-* ``tests/test_log_filesystem_backend.py`` — 20 filesystem-specific
+* ``tests/test_log_protocol_conformance.py`` — 46 tests parametrized
+  via a ``backend_factory`` fixture across both reference backends
+  (``FilesystemLogBackend`` + ``SQLiteLogBackend``). 92 total test
+  invocations (46 × 2). Third-party backends import the
+  ``BACKEND_FACTORIES`` list to verify their own conformance against
+  the same contract. Tests cover: Protocol surface, append semantics
+  (persist / no-dedup / no-mutate / empty-string round-trip /
+  arbitrary primitive), every query filter (run_id, primitive
+  single/tuple, status, model, since/until inclusive boundary,
+  sub-second precision, cost_source legacy-actor backward-compat,
+  mandate_id, parent_run_id, agent_name strict-isolation +
+  lenient-on-legacy, limit, chronological order), tail (chronological-
+  LAST, zero, more-than-total, negative-raises, empty-backend),
+  aggregate (count, sum_cost_usd, sum_input_tokens int-type,
+  sum_output_tokens int-type, unknown-metric ValueError,
+  avg_latency None-bucket, empty group_by), retention (removes
+  old records, idempotent, strictly-before boundary, empty-backend,
+  rejects naive datetime), stats (with records, empty backend),
+  capabilities (type + behavior parity).
+* ``tests/test_log_filesystem_backend.py`` — 22 filesystem-specific
   tests (on-disk path mapping, byte-for-byte legacy reader compat,
   ``atomic_append_jsonl`` integration, retention rewrite atomicity,
   multi-file tail walk, ``extra``-field aggregation, registry
-  resolution).
+  resolution, URL credential redaction).
+* ``tests/test_log_sqlite_backend.py`` — 31 SQLite-specific tests
+  (schema creation + version tracking + version-mismatch refusal +
+  cold-start race idempotency, six indexes, WAL journal mode,
+  round-trip preserves every RunRecord field with extra JSON,
+  EXPLAIN QUERY PLAN index use, cost_source legacy NULL handling,
+  delete_older_than SQL pushdown, concurrent multi-threaded
+  appends, multi-instance reopen, aggregate group_by via JSON1 +
+  SQL injection guard, URL parsing edge cases, in-memory data-loss
+  RuntimeWarning, _CANONICAL_COLUMNS derivation from
+  RunRecord.__dataclass_fields__, empty-string round-trip
+  preservation, registry resolution).
+* ``tests/test_log_integration.py`` — 19 wiring integration tests
+  pinning ``AtomicAgent.log_backend`` public attribute + kwarg
+  override, primitive derivation from legacy trigger, byte-for-byte
+  legacy-reader compat at the end-to-end boundary, OutcomeRunner +
+  DreamRunner kwarg threading, sum_cost routing, dashboard load_runs
+  routing, count_provenance wiring, doctor PASS/FAIL/URL-redaction.
 
-PR 4 freezes the conformance surface against both filesystem +
-``SQLiteLogBackend`` and locks this spec doc.
+Total: 124 LogBackend-arc tests + 92 parametrized invocations =
+**216 test runs** verifying the Protocol contract.
 
 ## Related
 
