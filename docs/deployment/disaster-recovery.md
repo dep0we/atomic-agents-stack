@@ -438,11 +438,20 @@ internally via `apply_staging` on dream paths, and via `_per_file_lock`
 on direct writes), or take the lock manually:
 
 ```python
-from atomic_agents._locks import AgentLock
-with AgentLock(agent_root, wait_seconds=30):
+# Post-#60 PR 2: route through the LockBackend Protocol (spec/21).
+# acquire("") preserves the legacy `<agent_root>/.lock` on-disk artifact
+# so any external diagnostic scripts you have pinned to that path keep
+# working unchanged.
+from atomic_agents.locks import FilesystemLockBackend
+with FilesystemLockBackend(agent_root).acquire("", timeout=30):
     # mutate the vault here
     ...
 ```
+
+The legacy `from atomic_agents._locks import AgentLock` import continues to
+work as a deprecation shim (sunset planned for v1.0) — if you have older
+runbooks or scripts pinned to that path, they'll keep working but emit
+`DeprecationWarning` on import.
 
 ### Verify
 

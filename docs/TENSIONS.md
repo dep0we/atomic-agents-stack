@@ -82,14 +82,14 @@ Both are LockBackend's job per #60.
 
 **Where:** `atomic_agents/_locks.py` (entire file, 96 lines). Used by:
 - `agent.py` `call()` line 582 (per-call serialization)
-- `dream.py` `_DreamLock` (separate lock for dreams)
+- `dream.py` `DreamRunner._dream_lock_backend` (separate scope from the agent's main lock so dreams don't block calls — formerly `_DreamLock` class, replaced in #60 PR 2)
 - `_cascade.py` queue-claim mechanics use POSIX `Path.rename()` which has the same single-host assumption
 
 **When this bites:** First time someone tries to run two `atomic-agents run` processes against the same vault on different hosts. Issue #60 is flagged "Highest urgency — multi-process cliff."
 
 **What to watch for:**
 - Any deployment doc that hand-waves "make sure only one host runs the cron." That's a sign the cliff is being accepted, not solved.
-- `dream.py`'s parallel lock (`_DreamLock`) — same pattern, separate codepath. When LockBackend lands, both should route through the same protocol or the abstraction is leaky.
+- `dream.py`'s parallel lock (formerly `_DreamLock`, now `_dream_lock_backend` per #60 PR 2) — both routes now go through `FilesystemLockBackend`; the abstraction is no longer leaky between agent and dream. PR 3 of #60 swaps the registry default for operator-pinned backends to address multi-host; PR 4 locks the spec.
 
 **Related:** Issue #60. ROADMAP Tier 2 backend roadmap.
 
