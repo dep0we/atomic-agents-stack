@@ -1,7 +1,6 @@
 """REVISE state-machine helpers: amend ActionProposal, re-validate.
 
-Implements spec/28 §"Revise" (lines 268-285). Two cycles consume this
-module:
+Implements spec/28 §"Revise". Two cycles consume this module:
 
 1. **Judge-driven REVISE** (in ``agent.py:_run_ensemble``): a judge
    returns ``Judgment(outcome=REVISE, amendment=ProposalAmendment)``;
@@ -16,21 +15,37 @@ module:
    validate primitives. For ``high_risk``, a fresh ensemble re-judges
    the amended proposal; for non-``high_risk``, schema/policy
    validation alone is sufficient. The non-vs-high-risk gate keys on
-   the **recomputed** classification (Codex round-1 P1-4 fix —
-   otherwise an operator-revise can upgrade `reversible_write` →
-   `delete_files` and skip judge eyes).
+   the **recomputed** classification — otherwise an operator-revise
+   can upgrade ``reversible_write`` → ``delete_files`` and skip judge
+   eyes.
 
-Validation scope: PR 3c ships **weakened** validation — tool registered
-+ args dict-shaped + arguments_hash recomputes. Full JSON-Schema
-validation against the registered ``input_schema`` lands in PR 5 with
-the ``jsonschema`` dep (see #112 PR 5). Operators see a one-shot
-per-agent log warning the first time amendment validation runs without
-the full validator (per CLAUDE.md rule #13: docs match reality).
+Validation scope is gated by ``judges.md``'s top-level ``validation:``
+field, NOT by transitive import availability of ``jsonschema``:
+
+- ``validation: weakened`` (default) — tool registered + args
+  dict-shaped + ``arguments_hash`` recomputes. Operators see a
+  one-shot per-agent log warning the first time amendment validation
+  runs in this mode, pointing at the ``[validation]`` extra.
+- ``validation: strict`` (opt-in, PR 5b of #112) — runs
+  ``jsonschema.validate(args, registered.input_schema)`` after the
+  weakened checks pass. Requires the ``[validation]`` extra installed;
+  the parser checks for ``jsonschema`` importability at agent-load
+  and raises ``JudgePolicyInvalid`` LOUD when the operator flips
+  strict without installing the extra. Exception taxonomy:
+
+  * ``jsonschema.ValidationError`` → ``JudgeAmendedProposalRejected``
+    (per-amendment rejection; normal failure_policy flow).
+  * ``jsonschema.SchemaError`` / ``RefResolutionError`` →
+    ``JudgePolicyInvalid`` (operator authoring bug — the tool's
+    own ``input_schema`` is malformed or has broken ``$ref``s).
+  * ``ImportError`` / ``AttributeError`` / ``TypeError`` (runtime
+    jsonschema API surprise) → ``JudgeAmendedProposalRejected``
+    with a descriptive message.
 
 The ``re_judged: bool`` field on the audit record is framework-set,
 not operator-supplied: operators express intent via the amendment;
 the framework decides whether re-judge fires based on the AMENDED
-classification (Codex round-1 P1-4 — gate on amended, not original).
+classification (gate on amended, not original).
 """
 
 from __future__ import annotations
@@ -39,9 +54,9 @@ import logging
 import re
 from dataclasses import replace as dc_replace
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
-from ..exceptions import JudgeAmendedProposalRejected
+from ..exceptions import JudgeAmendedProposalRejected, JudgePolicyInvalid
 from .proposal import (
     compute_arguments_hash,
     compute_tool_definition_hash,
@@ -209,29 +224,38 @@ def validate_amended_args(
     tool_registry,
     *,
     agent_name: str = "",
+    validation_mode: Literal["weakened", "strict"] = "weakened",
 ) -> None:
     """Validate amended args before the framework executes the bound
     action.
 
-    PR 3c implements weakened validation (spec/28:274 calls for full
-    JSON-Schema validation — deferred to PR 4 with the `jsonschema`
-    dep). Checks:
+    Always-on weakened checks:
 
     - ``tool_name`` resolves to a registered handler in
-      ``tool_registry``. Unknown tool → JudgeAmendedProposalRejected.
+      ``tool_registry``. Unknown tool → ``JudgeAmendedProposalRejected``.
     - ``tool_arguments`` is a dict (not None, not a list, not a
       scalar). Raises on wrong shape.
     - ``arguments_hash`` recomputes successfully (defends against
       args that fail canonical_sha256 — e.g. non-serializable values).
 
-    Emits a one-shot warning per agent the first time this function
-    runs without `jsonschema` available, so operators see the gap.
+    Then branches on ``validation_mode``:
+
+    - ``weakened`` (default) — emits a one-shot warning per agent
+      pointing at the ``[validation]`` extra, then returns.
+    - ``strict`` — runs ``jsonschema.validate(args, input_schema)``
+      against the registered tool's ``input_schema``. Empty dict
+      (``{}``) and ``None`` schemas pass (no constraint). Exception
+      taxonomy per the module docstring: ``ValidationError`` raises
+      ``JudgeAmendedProposalRejected``; ``SchemaError`` /
+      ``RefResolutionError`` raise ``JudgePolicyInvalid`` (operator
+      authoring bug); ``ImportError`` / ``AttributeError`` /
+      ``TypeError`` raise ``JudgeAmendedProposalRejected`` with a
+      descriptive message (runtime jsonschema API failure).
     """
     if tool_registry is None or tool_registry.get(amended.tool_name) is None:
         raise JudgeAmendedProposalRejected(
             f"amended tool_name {amended.tool_name!r} is not registered "
-            "in the tool_registry (PR 3c validation: weakened schema "
-            "check — full JSON-Schema validation deferred to PR 4)"
+            "in the tool_registry"
         )
     if not isinstance(amended.tool_arguments, dict):
         raise JudgeAmendedProposalRejected(
@@ -255,7 +279,88 @@ def validate_amended_args(
             f"amended arguments_hash mismatch: recomputed "
             f"{recomputed[:12]}... != stored {amended.arguments_hash[:12]}..."
         )
+
+    if validation_mode == "strict":
+        _run_strict_jsonschema_validation(amended, tool_registry)
+        return
+
     _warn_jsonschema_gap_once(agent_name)
+
+
+def _run_strict_jsonschema_validation(
+    amended: ActionProposal,
+    tool_registry,
+) -> None:
+    """Validate amended tool_arguments against the registered tool's
+    input_schema using jsonschema.
+
+    Defensive re-import: the parser already probed jsonschema
+    importability at agent-load (via
+    ``judges_md._check_jsonschema_importable``). Re-importing here
+    lets us produce a ``JudgeAmendedProposalRejected`` with a
+    descriptive runtime message if jsonschema's API changes shape at
+    runtime — that's a per-amendment rejection (normal flow), not
+    operator policy invalid.
+    """
+    registered = tool_registry.get(amended.tool_name)
+    # Empty / None schema → no constraint, no validation work.
+    #
+    # Be precise about what counts as "no schema": ``None`` and ``{}``
+    # both mean "the tool doesn't declare a schema." Per /ship Step 11
+    # adversarial review (PR 5b), ``not schema`` truthiness would ALSO
+    # short-circuit on ``False`` (a legitimate JSON-Schema construct
+    # meaning "reject all instances") and ``[]`` (malformed shape that
+    # SHOULD trigger ``SchemaError → JudgePolicyInvalid``). Use
+    # explicit identity / equality checks so those cases reach
+    # ``jsonschema.validate`` and route through the correct exception
+    # branch below.
+    schema = registered.input_schema if registered is not None else None
+    if schema is None or schema == {}:
+        return
+
+    try:
+        import jsonschema
+        from jsonschema import ValidationError, SchemaError
+        # jsonschema 4.18+ deprecated ``RefResolutionError`` in favor of
+        # ``referencing.exceptions.Unresolvable``; both shapes are
+        # in-the-wild. Prefer the modern path; fall back to the
+        # legacy class on older installs. ``getattr`` (not
+        # ``import``) on the legacy name avoids triggering the
+        # DeprecationWarning when both paths are available.
+        try:
+            from referencing.exceptions import Unresolvable as _RefErr
+        except ImportError:
+            _RefErr = getattr(jsonschema.exceptions, "RefResolutionError", None)
+    except (ImportError, AttributeError) as exc:
+        raise JudgeAmendedProposalRejected(
+            f"validation: strict configured but jsonschema runtime "
+            f"surface unavailable: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    schema_authoring_errors: tuple[type[Exception], ...] = (SchemaError,)
+    if _RefErr is not None:
+        schema_authoring_errors = (SchemaError, _RefErr)
+
+    try:
+        jsonschema.validate(amended.tool_arguments, schema)
+    except ValidationError as exc:
+        path = list(exc.absolute_path) or ["<root>"]
+        raise JudgeAmendedProposalRejected(
+            f"amended tool_arguments failed jsonschema validation at "
+            f"{path}: {exc.message}"
+        ) from exc
+    except schema_authoring_errors as exc:
+        raise JudgePolicyInvalid(
+            f"tool {amended.tool_name!r} input_schema is malformed "
+            f"(operator authoring bug — fix the schema or remove the "
+            f"tool from the registry): {type(exc).__name__}: {exc}"
+        ) from exc
+    except (TypeError, AttributeError) as exc:
+        raise JudgeAmendedProposalRejected(
+            f"validation: strict configured but jsonschema.validate "
+            f"raised an unexpected runtime error: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def _warn_jsonschema_gap_once(agent_name: str) -> None:
@@ -271,10 +376,12 @@ def _warn_jsonschema_gap_once(agent_name: str) -> None:
         return
     _jsonschema_warned_agents.add(agent_name)
     _logger.warning(
-        "agent %r: PR 3c REVISE validation does NOT run full "
-        "JSON-Schema validation on amended args. The framework checks "
-        "tool registration, dict shape, and arguments_hash recompute. "
-        "Full schema validation lands in PR 4 with the jsonschema dep.",
+        "agent %r: REVISE amendment validation is running in "
+        "``validation: weakened`` mode (tool registration, dict "
+        "shape, args_hash recompute). To enable full JSON-Schema "
+        "validation of amended tool_arguments, install "
+        "``atomic-agents-stack[validation]`` and set "
+        "``validation: strict`` in judges.md.",
         agent_name,
     )
 

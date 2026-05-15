@@ -454,6 +454,26 @@ class AtomicAgent:
             },
         )
 
+    def _resolved_validation_mode(self) -> str:
+        """Return the validation mode threaded to
+        ``_revise.validate_amended_args`` from the agent's parsed
+        ``JudgesConfig`` (PR 5b of #112).
+
+        Pulls ``judges_config.validation`` when ``judges.md`` was
+        parsed; falls back to ``"weakened"`` when the agent opted
+        into the judge layer via ``AGENT_JUDGE_ENABLED=1`` without
+        authoring a ``judges.md`` (env-var quickstart path — strict
+        validation requires intentional opt-in via the file).
+
+        Extracted as a helper so the two REVISE call sites
+        (``_run_ensemble`` for judge-driven REVISE, ``_process_
+        operator_revise`` for operator-driven resolution) cannot
+        drift on default-fallback semantics.
+        """
+        if self.judges_config is None:
+            return "weakened"
+        return self.judges_config.validation
+
     def _ensure_policy_judge(self):
         """Lazy-construct and cache the default ``PolicyJudge`` for
         this agent. Returns the cached instance on subsequent calls.
@@ -597,7 +617,25 @@ class AtomicAgent:
         )
 
         for event in events:
-            self._process_resolution_event(event)
+            # /ship Step 11 adversarial P1 (PR 5b): exception isolation
+            # per-event. Pre-fix, one event raising an uncaught
+            # exception (OSError, KeyError on malformed frontmatter,
+            # JudgeError class the per-path handlers don't yet catch)
+            # silently swallowed every subsequent event in the same
+            # poll cycle. PR 5b's strict-mode validation widens the
+            # raise surface (JudgePolicyInvalid in particular), making
+            # the poison-pill failure mode load-bearing to fix here.
+            try:
+                self._process_resolution_event(event)
+            except Exception as exc:  # noqa: BLE001
+                _logger.exception(
+                    "agent %r: resolution event for proposal_id=%r "
+                    "raised %s; continuing to next event",
+                    self.name,
+                    getattr(event.frontmatter, "proposal_id", "<unknown>"),
+                    type(exc).__name__,
+                )
+                continue
         return events
 
     def _process_resolution_event(self, event) -> None:
@@ -757,7 +795,7 @@ class AtomicAgent:
         """
         from .judge import _revise as _rv
         from .judge.types import ActionClass
-        from .exceptions import JudgeAmendedProposalRejected
+        from .exceptions import JudgeAmendedProposalRejected, JudgePolicyInvalid
 
         amendment = event.amendment
         fm = event.frontmatter
@@ -775,14 +813,29 @@ class AtomicAgent:
                 tool_classifications=self._tool_classifications,
             )
             _rv.validate_amended_args(
-                amended, self.tool_registry, agent_name=self.name
+                amended,
+                self.tool_registry,
+                agent_name=self.name,
+                validation_mode=self._resolved_validation_mode(),
             )
             _rv.enforce_amended_write_paths(
                 amended,
                 write_paths=list(self.config.write_paths or []),
                 read_only_paths=list(self.config.read_only_paths or []),
             )
-        except JudgeAmendedProposalRejected as exc:
+        except (JudgeAmendedProposalRejected, JudgePolicyInvalid) as exc:
+            # PR 5b /ship Step 9.1 (testing+security cross-confirmed):
+            # strict-mode validation can raise BOTH exception classes.
+            # JudgeAmendedProposalRejected = the amendment itself is
+            # malformed (per-amendment refusal — the original
+            # behavior). JudgePolicyInvalid = the registered tool's
+            # ``input_schema`` is malformed (operator authoring bug).
+            # In the operator-revise path there is no failure_policy
+            # injection point — the operator IS the trust anchor and
+            # the safe outcome on either exception is "do not execute
+            # the amended action and emit an audit record." Pre-fix
+            # JudgePolicyInvalid was uncaught here and propagated out
+            # of ``poll_escalations``, killing ``agent.call()``.
             _logger.warning(
                 "agent %r: operator_revise validation failed for "
                 "proposal_id=%r: %s",
@@ -1124,7 +1177,7 @@ class AtomicAgent:
             ProposalBinding,
             ToolPolicyEntry,
         )
-        from .exceptions import JudgeError, JudgeAmendedProposalRejected
+        from .exceptions import JudgeError, JudgeAmendedProposalRejected, JudgePolicyInvalid
         from .judge.types import ClassPolicyValue as _CPV
 
         tool_name = proposal_obj.tool_name
@@ -1358,13 +1411,135 @@ class AtomicAgent:
                         tool_classifications=self._tool_classifications,
                     )
                     _rv.validate_amended_args(
-                        amended, self.tool_registry, agent_name=self.name
+                        amended,
+                        self.tool_registry,
+                        agent_name=self.name,
+                        validation_mode=self._resolved_validation_mode(),
                     )
                     _rv.enforce_amended_write_paths(
                         amended,
                         write_paths=list(self.config.write_paths or []),
                         read_only_paths=list(self.config.read_only_paths or []),
                     )
+                except JudgePolicyInvalid as exc:
+                    # PR 5b /ship Step 9.1 (testing+security
+                    # cross-confirmed): under ``validation: strict`` a
+                    # malformed registered ``input_schema`` raises
+                    # JudgePolicyInvalid — an operator authoring bug
+                    # distinct from a per-amendment rejection. Route
+                    # through ``failure_policy[JudgePolicyInvalid]`` so
+                    # operators can configure the outcome (block /
+                    # escalate / allow) as ``docs/deployment/
+                    # judges-md.md`` already documents. Pre-fix the
+                    # exception bubbled out of ``_run_ensemble`` and
+                    # was caught by the generic ``except Exception`` at
+                    # the dispatch site, producing a generic ``judge
+                    # dispatch error`` audit message and a hard BLOCK
+                    # regardless of operator failure_policy.
+                    outcome = _outcome_for_failure("JudgePolicyInvalid")
+                    reason_text = (
+                        f"revise_invalid_amendment: {type(exc).__name__}: {exc}"
+                    )
+                    if outcome == JudgmentOutcome.ESCALATE:
+                        # Mirror the judge.evaluate failure ESCALATE
+                        # path at line ~1518: write the PENDING file +
+                        # emit the escalate_pending audit so operators
+                        # see the malformed-schema event in the queue.
+                        from .judge import escalation as _esc
+                        _pending_path, queue_id = _esc.write_pending_escalation(
+                            proposal=proposal_obj,
+                            judgment_reason=reason_text,
+                            judge_id=judgment.judge_id,
+                            agent_root=self.agent_root,
+                            agent_name=self.name,
+                            parent_run_id=self.run_id,
+                            policy_version=judgment.policy_version,
+                            judges_config_escalation=escalation_cfg,
+                            synthesis_source="failure_policy",
+                            triggered_by="failure_policy:JudgePolicyInvalid",
+                            revised_from_proposal_id=(
+                                original_proposal.proposal_id
+                                if original_proposal is not None
+                                else None
+                            ),
+                        )
+                        synth_judgment = Judgment(
+                            outcome=JudgmentOutcome.ESCALATE,
+                            reason=reason_text,
+                            judge_id=judgment.judge_id,
+                            policy_version=judgment.policy_version,
+                            latency_ms=judgment.latency_ms,
+                            escalation_queue_id=queue_id,
+                        )
+                        event = self._build_judgment_event_dict(
+                            proposal=proposal_obj,
+                            tool_use=tu,
+                            judgment=synth_judgment,
+                            enforcement_action="revise_invalid_amendment",
+                            binding=binding,
+                            synthesis_source="failure_policy",
+                            triggered_by="failure_policy:JudgePolicyInvalid",
+                        )
+                        event["original_proposal_id"] = (
+                            original_proposal.proposal_id
+                            if original_proposal is not None
+                            else None
+                        )
+                        event["revise_iteration"] = revise_iteration
+                        events.append(event)
+                        final_allow = False
+                        escalation_queue_id = queue_id
+                        break
+                    synth_judgment = Judgment(
+                        outcome=outcome,
+                        reason=reason_text,
+                        judge_id=judgment.judge_id,
+                        policy_version=judgment.policy_version,
+                        latency_ms=judgment.latency_ms,
+                    )
+                    event = self._build_judgment_event_dict(
+                        proposal=proposal_obj,
+                        tool_use=tu,
+                        judgment=synth_judgment,
+                        enforcement_action="revise_invalid_amendment",
+                        binding=binding,
+                        # /ship Step 11 adversarial P2: BLOCK/ALLOW
+                        # branches need the same synthesis_source +
+                        # triggered_by labels the ESCALATE branch
+                        # above already set, so audit consumers
+                        # filtering by these structured fields don't
+                        # miss failure_policy-synthesized
+                        # block/allow events.
+                        synthesis_source="failure_policy",
+                        triggered_by="failure_policy:JudgePolicyInvalid",
+                    )
+                    event["original_proposal_id"] = (
+                        original_proposal.proposal_id
+                        if original_proposal is not None
+                        else None
+                    )
+                    event["revise_iteration"] = revise_iteration
+                    events.append(event)
+                    if outcome == JudgmentOutcome.ALLOW:
+                        # /ship Step 11 adversarial P1: honor
+                        # failure_policy[JudgePolicyInvalid]=allow as
+                        # "tolerate the failure" — execute the
+                        # ORIGINAL pre-amendment action, mirroring
+                        # the JudgeUnavailable:allow / JudgeBudget
+                        # Exhausted:allow shape elsewhere. The judge
+                        # wanted REVISE because it thought the
+                        # original was risky; the operator explicitly
+                        # opted into "tolerate the failure" via the
+                        # ``allow`` policy. The amendment can't run
+                        # (it failed validation), so the original is
+                        # the only meaningful "let it through"
+                        # interpretation. Pre-fix this silently set
+                        # final_allow=False — audit said ALLOW while
+                        # the action was actually blocked.
+                        final_allow = True
+                    else:
+                        final_allow = False
+                    break
                 except JudgeAmendedProposalRejected as exc:
                     block_judgment = Judgment(
                         outcome=JudgmentOutcome.BLOCK,

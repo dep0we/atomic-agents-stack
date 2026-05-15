@@ -37,7 +37,7 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 
@@ -70,6 +70,36 @@ _POLICY_STRICTNESS: dict[ClassPolicyValue, int] = {
     ClassPolicyValue.JUDGE_REQUIRED: 2,
     ClassPolicyValue.ESCALATE: 3,
 }
+
+# Accepted ``validation:`` values (PR 5b of #112). Strictness ordering:
+# higher number = stricter. A delegate that explicitly sets
+# ``validation`` must be at least as strict as the project floor's.
+# ``audit`` and ``paranoid`` are reserved namespaces — the parser
+# rejects them with "not yet implemented" pointing at their tracking
+# issue, so operator typos surface differently from operators reaching
+# for a future feature.
+#
+# Indices start at 1 (not 0) to leave headroom for a future weaker
+# tier — e.g. a hypothetical ``validation: off`` (no weakened-mode
+# checks at all) would land at 0 without renumbering existing entries
+# or rebasing the integer-pinning regression tests in
+# ``tests/test_judges_md_parser.py::TestValidationFloor``. Mirrors the
+# 0-based ``_POLICY_STRICTNESS`` precedent above where ``bypass`` is
+# the floor at 0; we just don't have a "bypass" equivalent for
+# ``validation`` shipped today.
+_VALID_VALIDATION_VALUES: tuple[str, ...] = ("weakened", "strict")
+_VALIDATION_STRICTNESS: dict[str, int] = {"weakened": 1, "strict": 2}
+_RESERVED_VALIDATION_VALUES: dict[str, str] = {
+    "audit": (
+        "validation: audit is not yet implemented; tracked at "
+        "https://github.com/dep0we/atomic-agents-stack/issues/176"
+    ),
+    "paranoid": (
+        "validation: paranoid is not yet implemented; tracked at "
+        "https://github.com/dep0we/atomic-agents-stack/issues/179"
+    ),
+}
+
 
 # Default failure_policy per spec/28:570 — fail-closed for everything.
 _DEFAULT_FAILURE_POLICY_PER_EXCEPTION: dict[str, str] = {
@@ -137,6 +167,33 @@ class JudgesConfig:
     # Audit toggles
     judge_captures: bool = False
     read_audit_mode: bool = False
+
+    # Amendment validation (PR 5b of #112). ``weakened`` (the default)
+    # matches PR 3c behavior — tool registered + dict shape +
+    # canonical args_hash. ``strict`` runs jsonschema.validate against
+    # the tool's registered ``input_schema``. Operators must install
+    # the ``[validation]`` extra BEFORE setting ``validation: strict``;
+    # the parser fails LOUD at agent-load otherwise.
+    #
+    # ``validation_source`` mirrors ``class_policy.source`` and takes
+    # one of four values across the parse → cascade-merge pipeline:
+    #
+    # - ``"default"``   — operator omitted the ``validation:`` field;
+    #                     parser default-filled to ``weakened``.
+    #                     Pre-merge state for delegate configs the
+    #                     cascade-floor check treats as "inherit the
+    #                     floor" rather than "explicit relax-attempt".
+    # - ``"judges.md"`` — operator explicitly set the value in
+    #                     the agent's own ``judges.md``. Pre-merge.
+    #                     The cascade-floor strictness check fires
+    #                     against this state.
+    # - ``"delegate"``  — post-``apply_project_floor`` resolved value
+    #                     came from the delegate's explicit setting.
+    # - ``"floor"``     — post-``apply_project_floor`` resolved value
+    #                     came from the project floor (delegate
+    #                     omitted; inherits the floor's value).
+    validation: Literal["weakened", "strict"] = "weakened"
+    validation_source: str = "default"
 
     # Specialist composition axes — parsed-but-unused in PR 3a.
     # Operators may author the section now; PR 3b/4's ensemble dispatch
@@ -210,6 +267,8 @@ def parse_judges_md(path: Path | None) -> JudgesConfig | None:
         judge_captures=cfg.judge_captures,
         read_audit_mode=cfg.read_audit_mode,
         specialist_axes=cfg.specialist_axes,
+        validation=cfg.validation,
+        validation_source=cfg.validation_source,
         tools_md_hash=cfg.tools_md_hash,
         judges_md_hash=judges_md_hash,
         source_path=str(path),
@@ -261,6 +320,7 @@ def parse_judges_md_text(text: str) -> JudgesConfig:
     judge_captures = bool(merged.get("judge_captures", False))
     read_audit_mode = bool(merged.get("read_audit_mode", False))
     specialist_axes = _parse_specialist_axes(merged.get("specialist_composition"))
+    validation, validation_source = _parse_validation(merged.get("validation"))
 
     return JudgesConfig(
         default_backend=default_backend,
@@ -273,6 +333,8 @@ def parse_judges_md_text(text: str) -> JudgesConfig:
         judge_captures=judge_captures,
         read_audit_mode=read_audit_mode,
         specialist_axes=specialist_axes,
+        validation=validation,
+        validation_source=validation_source,
     )
 
 
@@ -332,6 +394,31 @@ def apply_project_floor(
         source=resolved_source,
     )
 
+    # PR 5b of #112: cascade-floor strictness on ``validation``.
+    # Mirrors ``class_policy``: only enforce relax violations when the
+    # delegate EXPLICITLY set the field (source=="judges.md"). A
+    # delegate that omits ``validation:`` default-fills to "weakened"
+    # with source=="default" and inherits the floor's value rather
+    # than tripping a false-positive relax violation against a
+    # ``validation: strict`` floor.
+    if own.validation_source == "judges.md":
+        if _VALIDATION_STRICTNESS[own.validation] < _VALIDATION_STRICTNESS[floor.validation]:
+            raise JudgePolicyInvalid(
+                f"delegate's judges.md relaxes the project floor for "
+                f"``validation``: floor={floor.validation!r} but "
+                f"delegate={own.validation!r}. Stricter values are: "
+                f"{list(_VALID_VALIDATION_VALUES)}. Make the delegate's "
+                f"value at least as strict as the floor's, or remove the "
+                f"override entirely."
+            )
+        resolved_validation = own.validation
+        resolved_validation_source = "delegate"
+    else:
+        resolved_validation = floor.validation
+        resolved_validation_source = (
+            "floor" if floor.validation_source == "judges.md" else floor.validation_source
+        )
+
     return JudgesConfig(
         default_backend=own.default_backend or floor.default_backend,
         default_model=own.default_model or floor.default_model,
@@ -352,6 +439,8 @@ def apply_project_floor(
         judge_captures=own.judge_captures or floor.judge_captures,
         read_audit_mode=own.read_audit_mode or floor.read_audit_mode,
         specialist_axes=own.specialist_axes or floor.specialist_axes,
+        validation=resolved_validation,
+        validation_source=resolved_validation_source,
         tools_md_hash=own.tools_md_hash,
         judges_md_hash=own.judges_md_hash,
         source_path=own.source_path,
@@ -412,6 +501,8 @@ def load_judges_config(
         judge_captures=merged.judge_captures,
         read_audit_mode=merged.read_audit_mode,
         specialist_axes=merged.specialist_axes,
+        validation=merged.validation,
+        validation_source=merged.validation_source,
         tools_md_hash=tools_md_hash,
         judges_md_hash=merged.judges_md_hash,
         source_path=merged.source_path,
@@ -810,3 +901,71 @@ def _merge_failure_policy(
         merged.update(own.get(cls, {}))
         out[cls] = merged
     return out
+
+
+def _check_jsonschema_importable() -> None:
+    """Probe ``import jsonschema`` and raise ``JudgePolicyInvalid`` with
+    an actionable install message if it isn't available.
+
+    Indirected so tests can monkeypatch the probe without monkeypatching
+    the global import machinery. The probe runs at agent-load time when
+    ``validation: strict`` is configured — operators see the failure
+    LOUD at parse time, never at the first amendment.
+    """
+    try:
+        import jsonschema  # noqa: F401
+    except ImportError as exc:
+        raise JudgePolicyInvalid(
+            "judges.md sets ``validation: strict`` but the ``jsonschema`` "
+            "package is not importable. Install the ``[validation]`` "
+            "extra BEFORE setting ``validation: strict`` in judges.md: "
+            "``pip install 'atomic-agents-stack[validation]'`` (or "
+            "``uv sync --extra validation`` for uv-managed projects). "
+            f"Underlying import error: {exc}"
+        ) from exc
+
+
+def _parse_validation(raw: Any) -> tuple[str, str]:
+    """Parse the top-level ``validation:`` field.
+
+    Returns ``(value, source)`` where source is ``"default"`` when the
+    field is omitted and ``"judges.md"`` when explicitly set. The
+    distinction is load-bearing for cascade-floor strictness — a
+    delegate that omits ``validation:`` must inherit the floor's value
+    rather than trip a false-positive relax violation (PR 0-1a from
+    the PR 5b plan-review re-round).
+
+    Rejects:
+
+    - ``audit`` with "not yet implemented; tracked at #176".
+    - ``paranoid`` with "not yet implemented; tracked at #179" (the
+      reserved-but-not-yet-implemented namespace is distinct from a
+      generic operator typo per CLAUDE.md taste rule).
+    - Any other unknown value with "validation must be one of
+      {weakened, strict}; got <repr>".
+    - Non-string values with the canonical "must be a string" message.
+
+    On ``validation: strict``, probes ``import jsonschema`` and raises
+    ``JudgePolicyInvalid`` with the install instruction when it fails.
+    Operators who flip to strict without installing the extra see the
+    failure LOUD at agent-load, not at the first amendment.
+    """
+    if raw is None:
+        return "weakened", "default"
+    if not isinstance(raw, str):
+        raise JudgePolicyInvalid(
+            f"judges.md ``validation`` must be a string "
+            f"({list(_VALID_VALIDATION_VALUES)}); got "
+            f"{type(raw).__name__}={raw!r}"
+        )
+    normalized = raw.lower().strip()
+    if normalized in _RESERVED_VALIDATION_VALUES:
+        raise JudgePolicyInvalid(_RESERVED_VALIDATION_VALUES[normalized])
+    if normalized not in _VALID_VALIDATION_VALUES:
+        raise JudgePolicyInvalid(
+            f"judges.md ``validation`` must be one of "
+            f"{list(_VALID_VALIDATION_VALUES)}; got {raw!r}"
+        )
+    if normalized == "strict":
+        _check_jsonschema_importable()
+    return normalized, "judges.md"

@@ -806,3 +806,167 @@ class TestLoadJudgesConfig:
         assert cfg is not None
         assert cfg.default_backend == "llm"
         assert cfg.class_policy.high_risk == ClassPolicyValue.ESCALATE
+
+
+# ──────────────────────────────────────────────────────────────────
+# validation: field (PR 5b of #112)
+
+
+class TestValidationField:
+    """``validation:`` top-level field gates JSON-Schema validation of
+    amended ``tool_arguments`` on REVISE. Default is ``weakened``
+    (PR 3c behavior); ``strict`` opts into ``jsonschema.validate``
+    against the registered tool's ``input_schema``.
+
+    The gate is on the parsed config, NOT on transitive import
+    availability of ``jsonschema`` — operators with the package
+    pulled in by an unrelated dependency must not see strict
+    validation kick in without explicit opt-in (plan review §8).
+    """
+
+    def test_omitted_defaults_to_weakened(self):
+        cfg = parse_judges_md_text("```yaml\nbackend: rules\n```\n")
+        assert cfg.validation == "weakened"
+        assert cfg.validation_source == "default"
+
+    def test_explicit_weakened_parses(self):
+        cfg = parse_judges_md_text(
+            "```yaml\nvalidation: weakened\n```\n"
+        )
+        assert cfg.validation == "weakened"
+        assert cfg.validation_source == "judges.md"
+
+    def test_strict_parses_when_jsonschema_importable(self):
+        # The default test environment has jsonschema available via the
+        # [validation] extra installed for CI. If a future env strips
+        # it, this test fails LOUD — that's the contract working.
+        cfg = parse_judges_md_text(
+            "```yaml\nvalidation: strict\n```\n"
+        )
+        assert cfg.validation == "strict"
+        assert cfg.validation_source == "judges.md"
+
+    def test_strict_raises_when_jsonschema_missing(self, monkeypatch):
+        # Monkeypatch the load-time probe — exercises the LOUD-at-load
+        # contract operators see when they flip strict without first
+        # installing the [validation] extra.
+        from atomic_agents import judges_md
+
+        def _fake_check():
+            raise JudgePolicyInvalid(
+                "judges.md sets ``validation: strict`` but the "
+                "``jsonschema`` package is not importable. Install "
+                "the ``[validation]`` extra BEFORE setting "
+                "``validation: strict`` in judges.md: "
+                "``pip install 'atomic-agents-stack[validation]'``."
+            )
+
+        monkeypatch.setattr(judges_md, "_check_jsonschema_importable", _fake_check)
+        with pytest.raises(JudgePolicyInvalid, match="not importable"):
+            parse_judges_md_text("```yaml\nvalidation: strict\n```\n")
+
+    def test_audit_rejected_with_namespace_pointer(self):
+        # Reserved namespace — operator reaching for a future feature
+        # gets a distinct error from a typo. (#176 tracks the work.)
+        with pytest.raises(JudgePolicyInvalid, match="issues/176"):
+            parse_judges_md_text("```yaml\nvalidation: audit\n```\n")
+
+    def test_paranoid_rejected_with_namespace_pointer(self):
+        # Reserved namespace symmetric with audit. (#179 tracks the work.)
+        with pytest.raises(JudgePolicyInvalid, match="issues/179"):
+            parse_judges_md_text("```yaml\nvalidation: paranoid\n```\n")
+
+    def test_unknown_value_rejected_with_allowed_set(self):
+        with pytest.raises(
+            JudgePolicyInvalid,
+            match=r"validation`` must be one of \['weakened', 'strict'\]",
+        ):
+            parse_judges_md_text(
+                "```yaml\nvalidation: super_strict\n```\n"
+            )
+
+    def test_non_string_rejected(self):
+        with pytest.raises(JudgePolicyInvalid, match="must be a string"):
+            parse_judges_md_text("```yaml\nvalidation: 42\n```\n")
+
+    def test_uppercase_normalized(self):
+        cfg = parse_judges_md_text("```yaml\nvalidation: STRICT\n```\n")
+        assert cfg.validation == "strict"
+
+
+class TestValidationFloor:
+    """Cascade-floor strictness on ``validation``. Mirrors
+    ``class_policy``: a delegate that explicitly sets the field must
+    be at least as strict as the floor. A delegate that omits the
+    field inherits the floor (no false-positive relax violation).
+    """
+
+    def test_floor_strict_delegate_weakened_explicit_raises(self):
+        floor = parse_judges_md_text(
+            "```yaml\nvalidation: strict\n```\n"
+        )
+        delegate = parse_judges_md_text(
+            "```yaml\nvalidation: weakened\n```\n"
+        )
+        with pytest.raises(
+            JudgePolicyInvalid,
+            match="relaxes the project floor for ``validation``",
+        ):
+            apply_project_floor(delegate, floor)
+
+    def test_floor_strict_delegate_strict_passes(self):
+        floor = parse_judges_md_text(
+            "```yaml\nvalidation: strict\n```\n"
+        )
+        delegate = parse_judges_md_text(
+            "```yaml\nvalidation: strict\n```\n"
+        )
+        merged = apply_project_floor(delegate, floor)
+        assert merged.validation == "strict"
+
+    def test_floor_strict_delegate_omits_inherits_floor(self):
+        # Delegate didn't specify validation — must inherit floor's
+        # value rather than trip a false-positive relax violation
+        # against the parser-default "weakened".
+        floor = parse_judges_md_text(
+            "```yaml\nvalidation: strict\n```\n"
+        )
+        delegate = parse_judges_md_text("```yaml\nbackend: rules\n```\n")
+        merged = apply_project_floor(delegate, floor)
+        assert merged.validation == "strict"
+
+    def test_floor_weakened_delegate_strict_passes(self):
+        # Strengthening is always allowed.
+        floor = parse_judges_md_text(
+            "```yaml\nvalidation: weakened\n```\n"
+        )
+        delegate = parse_judges_md_text(
+            "```yaml\nvalidation: strict\n```\n"
+        )
+        merged = apply_project_floor(delegate, floor)
+        assert merged.validation == "strict"
+
+    def test_floor_strict_delegate_explicit_strict_source_is_delegate(self):
+        # /ship Step 9.1 maintainability gap-fill: post-merge
+        # validation_source should be "delegate" when the delegate
+        # explicitly set strict. Regression guard for cascade-chain
+        # checks that key on validation_source.
+        floor = parse_judges_md_text(
+            "```yaml\nvalidation: strict\n```\n"
+        )
+        delegate = parse_judges_md_text(
+            "```yaml\nvalidation: strict\n```\n"
+        )
+        merged = apply_project_floor(delegate, floor)
+        assert merged.validation_source == "delegate"
+
+    def test_floor_strict_delegate_omits_source_is_floor(self):
+        # Symmetric gap-fill: when the delegate omits and inherits the
+        # floor, post-merge validation_source should be "floor"
+        # (because the floor explicitly set it).
+        floor = parse_judges_md_text(
+            "```yaml\nvalidation: strict\n```\n"
+        )
+        delegate = parse_judges_md_text("```yaml\nbackend: rules\n```\n")
+        merged = apply_project_floor(delegate, floor)
+        assert merged.validation_source == "floor"

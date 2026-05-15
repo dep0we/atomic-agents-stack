@@ -264,7 +264,7 @@ The judge returns a `ProposalAmendment` (the small dataclass defined above conta
 
 1. **Framework recomputation**: framework constructs a new `ActionProposal` by merging the original with the amendment. `tool_name`, `tool_arguments`, `target_audience`, `expected_consequence`, `reversibility`, `rollback_path` come from the amendment (when present) or the original (when amendment fields are `None`). `evidence` is the original's `evidence + amendment.appended_evidence`. `reason` and `authorization` are taken **from the original** — the judge cannot rewrite them. `classification` is recomputed by the framework from the new `tool_name` against `tools.md` / `mcp.md`. New `tool_definition_hash`, `arguments_hash`, `proposal_id`, and `proposal_ts` are framework-set.
 2. **Class non-downgrade by exploit**: because the framework recomputes classification from the (potentially new) tool, the judge cannot bypass class policy by editing the classification field — it doesn't have access to that field. If the new tool is registered at a higher class, the stricter class's policy applies to the second judgment.
-3. **Schema validation**: amended `tool_arguments` validates against the (possibly new) tool's registered JSON schema.
+3. **Schema validation**: amended `tool_arguments` validates against the (possibly new) tool's registered JSON schema. The mode is operator-controlled via `judges.md`'s `validation:` field — `weakened` (default; tool registered + dict shape + `arguments_hash` recomputes) or `strict` (opt-in, requires the `[validation]` extra; runs `jsonschema.validate` and surfaces field-path failures). See [Schema validation](#schema-validation) below for the full taxonomy.
 4. **Policy re-check**: amended args still pass `tools.md` write-path enforcement.
 5. **Second judgment — deterministic ensemble selection**: the amended proposal passes through a fresh judgment cycle using the **identical ensemble configuration** as the original proposal — same backends in the same order, same `JudgePolicyContext` (except for the amended-proposal-derived fields), against the framework-recomputed amended proposal. This makes revise paths reproducible: given the same original proposal and the same amendment, the second judgment is deterministic. The second judgment must return `ALLOW`; if it returns `REVISE` again, the framework returns `BLOCK` with reason `revise_loop_exhausted` (no infinite revise loops). `max_revise_iterations` is bounded at 1 by spec.
 
@@ -275,6 +275,37 @@ Revise is the empirically most-useful outcome for production failure modes that 
 - Strip an attachment from an email send
 - Lower a spend limit before proceeding
 - Open a PR as draft, not for merge
+
+#### Schema validation
+
+The `validation:` top-level field in `judges.md` gates how the framework validates amended `tool_arguments` before executing the bound action. The gate is on the parsed config — NOT on whether `jsonschema` happens to be importable in the runtime — so operators with the package pulled in by an unrelated dependency do not see strict validation kick in without explicit opt-in.
+
+**Modes.** Two values ship in PR 5b; `audit` and `paranoid` namespaces are reserved (see below):
+
+| `validation:` | Behavior                                                                                                                                                                                                                  |
+|---------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `weakened` (default) | Tool registered + `tool_arguments` dict-shaped + `arguments_hash` recomputes. One-shot per-agent log warning fires the first time, pointing at the `[validation]` extra and the `validation: strict` upgrade path.        |
+| `strict`             | Weakened checks run first, then `jsonschema.validate(tool_arguments, registered.input_schema)`. Requires the `[validation]` extra installed (`pip install 'atomic-agents-stack[validation]'`).                              |
+
+**Load-time gate.** When `validation: strict` is parsed, the framework probes `import jsonschema` and raises `JudgePolicyInvalid` with an actionable install message if the package is not importable. Operators flipping strict without first installing the extra fail LOUD at agent-load, never silently at the first amendment.
+
+**Exception taxonomy under `validation: strict`:**
+
+| Underlying failure                                       | Re-raised as                       | Why                                                                                                                              |
+|----------------------------------------------------------|------------------------------------|----------------------------------------------------------------------------------------------------------------------------------|
+| `jsonschema.ValidationError`                             | `JudgeAmendedProposalRejected`     | Per-amendment rejection. Normal `failure_policy[JudgeAmendedProposalRejected]` flow. Message carries the failing field path.      |
+| `jsonschema.SchemaError` or `referencing.exceptions.Unresolvable` (legacy `jsonschema.RefResolutionError`) | `JudgePolicyInvalid`               | Operator authoring bug — the tool's own `input_schema` is malformed or has broken `$ref`s. Different exception, different policy. |
+| `ImportError` / `AttributeError` / `TypeError` from `jsonschema.validate` | `JudgeAmendedProposalRejected`     | Runtime jsonschema API surprise. Per-amendment failure, not policy invalid. Message names the underlying exception class.         |
+
+**Empty / None schema is a no-op.** When the registered tool's `input_schema` is `{}` or absent, `validation: strict` short-circuits — `jsonschema.validate(args, {})` matches any object by definition, so the framework skips the call entirely. Tools that don't author a schema get no strict-mode enforcement (and operators should treat missing schemas as a doctor finding, tracked at [#175](https://github.com/dep0we/atomic-agents-stack/issues/175)).
+
+**Cascade-floor strictness.** Mirrors `class_policy`: a delegate's `judges.md` may strengthen `validation` (`weakened` → `strict`) but cannot relax it. Strictness ordering: `strict > weakened`. Relax attempts raise `JudgePolicyInvalid` at agent-load. A delegate that omits `validation:` default-fills with `source="default"` and inherits the floor's value — no false-positive relax violation against a `validation: strict` floor.
+
+**`additionalProperties: false` is not imposed by the framework.** Operator authors of `input_schema` may set it themselves to refuse keys outside the documented surface. A future `validation: paranoid` mode (reserved; not yet implemented) would impose it defensively across every registered tool's schema; that namespace exists so the parser rejects `validation: paranoid` with a tracking-issue pointer rather than a generic "unknown value" error.
+
+**Reserved namespaces.** `validation: audit` (validate + JSONL warn without BLOCK; tracked at [#176](https://github.com/dep0we/atomic-agents-stack/issues/176)) and `validation: paranoid` ([#179](https://github.com/dep0we/atomic-agents-stack/issues/179)) are accepted by the lexical parser but rejected with "not yet implemented" messages pointing at their tracking issues. Operator typos surface as the generic "must be one of {weakened, strict}" rejection.
+
+**Migration aid.** Operators flipping `validation: strict` on a production agent may discover amendments that previously passed weakened validation now BLOCK. The `check_tool_schemas_for_amendment_validation` doctor check (tracked at [#175](https://github.com/dep0we/atomic-agents-stack/issues/175)) will detect tools whose `input_schema` is missing or trivially permissive before the flip.
 
 ### Escalate
 
@@ -1021,7 +1052,7 @@ Coverage map:
 - **Framework-side** (run once): hash determinism + sensitivity, project-floor non-relaxable, atomic-snapshot semantics, ESCALATE state machine (O_EXCL sidecar, body integrity, strict resolution-block parser, auto-decide CAS), REVISE state machine (`amend_proposal` recomputes classification, `JudgeAmendedProposalRejected` on schema-invalid).
 - **Per-backend** (parametrized): Protocol surface (`isinstance`), `evaluate` idempotency, `policy_version` changes on policy change, `policy_version` is non-sentinel, `judge_id` stable, `close()` idempotent, `supports_read_audit` + `supports_specialist_composition` return bools, `supported_outcomes` returns the canonical set.
 - **LLM-only**: latency-bounded timeout → `JudgeUnavailable`; concurrent-call connection-state integrity; UUID-canary assertion that `JudgeRuntimeConfig` fields never appear in the serialized LLM prompt.
-- **Deferred** (filed as follow-up issues): judge_budget_counter live state (not implemented), schema-shape JSON-Schema validation (jsonschema dep — see PR 5).
+- **Deferred** (filed as follow-up issues): judge_budget_counter live state (not implemented). Full JSON-Schema validation of amended `tool_arguments` ships in PR 5b under the opt-in `[validation]` extra — see [Schema validation](#schema-validation) above for the parser surface, exception taxonomy, and load-time gating semantics.
 
 The conformance suite is reusable by third-party `JudgeBackend` implementations: importing the fixtures + invariant tests into a downstream package exercises any registered backend.
 

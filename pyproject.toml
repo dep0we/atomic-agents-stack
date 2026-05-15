@@ -30,6 +30,7 @@ dependencies = [
 
 [project.optional-dependencies]
 openai = ["openai>=1.30"]
+validation = ["jsonschema>=4.0"]
 dev = [
     "pytest>=8.0",
 ]

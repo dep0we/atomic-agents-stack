@@ -36,7 +36,33 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --extra dev --extra openai --python ${{ matrix.python-version }}
+        # Includes [validation] (PR 5b of #112) so the strict-mode
+        # tests in test_judge_revise_jsonschema.py and the strict
+        # end-to-end tests in test_agent_judge_revise_dispatch.py
+        # exercise the real jsonschema dependency.
+        run: uv sync --extra dev --extra openai --extra validation --python ${{ matrix.python-version }}
 
       - name: Run tests
         run: uv run --python ${{ matrix.python-version }} pytest -v --tb=short
+
+  # NOTE on the load-time fail-loud gate (PR 5b of #112):
+  #
+  # An earlier draft of this workflow included a third job that ran
+  # WITHOUT ``--extra validation`` against a real Python interpreter
+  # and asserted ``parse_judges_md_text("validation: strict")`` raised
+  # ``JudgePolicyInvalid`` with "not importable" in the message — i.e.,
+  # pinning the load-time fail-loud guarantee operationally instead of
+  # under a monkeypatched probe. That job is intentionally absent.
+  #
+  # Why: ``jsonschema`` is a transitive dependency of ``mcp>=1.0.0``
+  # (which ``atomic_agents`` requires unconditionally), so the
+  # "operator without jsonschema" scenario is unreachable in this
+  # dependency tree. Uninstalling jsonschema would break ``mcp``
+  # imports, which would crash the test script before it reached the
+  # parser at all. Coverage of the gate's behavior lives in
+  # ``tests/test_judges_md_parser.py::TestValidationField::test_strict_raises_when_jsonschema_missing``,
+  # which monkeypatches ``_check_jsonschema_importable`` to simulate
+  # the missing-import path — the realistic shape of the gate in this
+  # ecosystem. If a future change drops the ``mcp`` requirement or
+  # ``mcp`` drops its jsonschema dep, the real-interpreter negative-
+  # path job can be re-added here.
