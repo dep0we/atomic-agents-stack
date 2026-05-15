@@ -6,9 +6,12 @@ Pricing table is hardcoded; update when Anthropic/OpenAI/Moonshot change rates.
 from __future__ import annotations
 import json
 import logging
-from datetime import date
+from datetime import date, datetime, time, timezone
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from .logs import LogBackend
 
 logger = logging.getLogger(__name__)
 
@@ -104,8 +107,9 @@ def sum_cost_for_period(
     *,
     source: CostSource | None = None,
     mandate_id: str | None = None,
+    backend: "LogBackend | None" = None,
 ) -> float:
-    """Sum cost_usd across log JSONL for the given period.
+    """Sum cost_usd across log records for the given period.
 
     period: 'today' or 'this_month'.
 
@@ -119,10 +123,27 @@ def sum_cost_for_period(
         only records with cost.mandate_id == mandate_id contribute. When None,
         mandate_id is not consulted.
 
+    backend: optional ``LogBackend`` (#61 PR 2). When set, the period sum
+        is computed via ``backend.query(LogQuery(...))`` — honoring the
+        operator's pinned backend (filesystem default; ``SQLiteLogBackend``
+        in PR 3; future Postgres/Datadog). When ``None``, falls back to
+        the legacy filesystem walk against ``log_dir`` (backward
+        compatibility for any external callers + the dashboard layer
+        before its readers were rewired).
+
     Filters AND together. Backward-compatible: omitting both kwargs preserves
-    the pre-#122 behavior verbatim.
+    the pre-#122 behavior verbatim. When ``backend`` is provided, the
+    function pushes filter predicates into ``LogQuery`` so SQL backends
+    can use indexed ``WHERE`` clauses instead of materializing every
+    record into the client.
     """
     today = today or date.today()
+
+    if backend is not None:
+        return _sum_via_backend(
+            backend, today, period, source, mandate_id
+        )
+
     total = 0.0
     if period == "today":
         log_path = log_dir / today.strftime("%Y-%m") / f"{today.isoformat()}.jsonl"
@@ -162,6 +183,57 @@ def sum_cost_for_period(
                 total += float(rec.get("cost_usd", 0.0))
             except (TypeError, ValueError):
                 continue
+    return total
+
+
+def _sum_via_backend(
+    backend: "LogBackend",
+    today: date,
+    period: str,
+    source: CostSource | None,
+    mandate_id: str | None,
+) -> float:
+    """Sum cost_usd via LogBackend.query (PR 2 backend-routed path).
+
+    Uses ISO-8601 lexicographic comparison via LogQuery.since/until —
+    backends with index pushdown (SQLite PR 3 forward) translate this
+    to ``WHERE ts >= :since AND ts < :until`` natively. Filesystem
+    backend walks month dirs as before.
+    """
+    from .logs import LogQuery
+
+    if period == "today":
+        # Local-tz day boundaries — matches the legacy idiom where
+        # ``log_path = log_dir / today.strftime("%Y-%m") / today.isoformat() ``
+        # selects records whose filename matches the local date.
+        since_dt = datetime.combine(today, time.min).astimezone()
+        until_dt = datetime.combine(today, time.max).astimezone()
+    elif period == "this_month":
+        first_of_month = today.replace(day=1)
+        # Next month's first day, then back off to last microsecond.
+        if today.month == 12:
+            next_month = date(today.year + 1, 1, 1)
+        else:
+            next_month = date(today.year, today.month + 1, 1)
+        since_dt = datetime.combine(first_of_month, time.min).astimezone()
+        until_dt = datetime.combine(next_month, time.min).astimezone()
+    else:
+        raise ValueError(f"unknown period: {period}")
+
+    cost_source_filter: str | None = source if source is not None else None
+
+    records = backend.query(LogQuery(
+        since=since_dt,
+        until=until_dt,
+        cost_source=cost_source_filter,
+        mandate_id=mandate_id,
+    ))
+
+    total = 0.0
+    for r in records:
+        if r.cost_usd is None:
+            continue
+        total += r.cost_usd
     return total
 
 

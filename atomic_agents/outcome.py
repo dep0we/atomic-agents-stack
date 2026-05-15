@@ -581,14 +581,23 @@ class OutcomeRunner:
         record: IterationRecord,
         verdict_summary: Any,
     ) -> None:
-        """Append a per-iteration JSONL record to the agent's daily log."""
-        today = date.today()
-        log_path = (
-            self.agent_root / "log" / today.strftime("%Y-%m") / f"{today.isoformat()}.jsonl"
-        )
+        """Append a per-iteration RunRecord via the agent's LogBackend.
+
+        Per #61 PR 2 — routes through ``agent.log_backend.append(...)``
+        instead of writing to the daily JSONL directly. This honors the
+        operator's ``log_backend=`` kwarg (programmatic path) and
+        ``ATOMIC_AGENTS_LOG_BACKEND`` env var (deployment path); the
+        runtime's outcome iteration records land in the same backend
+        as ``agent.call()`` records (matching the multi-backend split-
+        brain failure shape the LockBackend arc PR 3 Step 11
+        adversarial caught for DreamRunner — fixed forward here).
+        """
+        from .logs.types import PRIMITIVE_OUTCOME_ITERATION, RunRecord
+
         line: dict = {
             "ts": record.timestamp,
             "trigger": "outcome_iteration",
+            "primitive": PRIMITIVE_OUTCOME_ITERATION,
             "run_id": run_id,
             "iteration": record.iteration,
             "agent_input_tokens": record.agent_input_tokens,
@@ -603,7 +612,7 @@ class OutcomeRunner:
         }
         if isinstance(verdict_summary, str):
             line["judge_error"] = verdict_summary
-        atomic_append_jsonl(log_path, json.dumps(line))
+        agent.log_backend.append(RunRecord.from_dict(line))
 
     def _write_result_json(self, output_dir: Path, result: OutcomeResult) -> None:
         """Write the full OutcomeResult to result.json in the run's output dir."""

@@ -123,47 +123,37 @@ def load_runs(
     since: date,
     until: date | None = None,
 ) -> list[RunRecord]:
-    """Read all log JSONL files for one agent in [since, until]."""
-    log_dir = agents_root / agent / "log"
-    if not log_dir.exists():
-        return []
+    """Read all log records for one agent in [since, until].
+
+    Per #61 PR 2: routes through ``LogBackend.query()`` instead of
+    walking the filesystem directly. Uses ``get_default_log_backend``
+    so the dashboard honors the operator's pinned backend (filesystem
+    default; ``SQLiteLogBackend`` in PR 3 forward) — same env-var
+    resolution path as ``AtomicAgent.__init__``, keeping runtime
+    writes and dashboard reads in sync. Falls back silently to an
+    empty list when the agent has no log dir / no records yet.
+
+    The returned ``RunRecord`` shape is the dashboard's own dataclass
+    (with ``ts: datetime`` and ``agent: str`` required); we adapt the
+    spec/22 ``logs.types.RunRecord`` via ``_record_from_dict`` to
+    preserve the existing dashboard's reader contract.
+    """
+    from datetime import datetime, time as dt_time
+    from .._platform import get_agents_root
+    from ..logs import LogQuery, get_default_log_backend
+
     until = until or date.today()
+    backend = get_default_log_backend(agents_root / agent)
+    since_dt = datetime.combine(since, dt_time.min).astimezone()
+    until_dt = datetime.combine(until, dt_time.max).astimezone()
+
     runs: list[RunRecord] = []
-    # Walk YYYY-MM directories; only open files plausibly in range
-    for month_dir in sorted(log_dir.iterdir()):
-        if not month_dir.is_dir():
+    for rec in backend.query(LogQuery(since=since_dt, until=until_dt)):
+        rr = _record_from_dict(rec.to_dict(), agent)
+        if rr is None:
             continue
-        try:
-            year, month = map(int, month_dir.name.split("-"))
-        except ValueError:
-            continue
-        # Quick range filter on month
-        month_start = date(year, month, 1)
-        month_end = (
-            date(year + 1, 1, 1) - timedelta(days=1)
-            if month == 12
-            else date(year, month + 1, 1) - timedelta(days=1)
-        )
-        if month_end < since or month_start > until:
-            continue
-        for path in sorted(month_dir.glob("*.jsonl")):
-            try:
-                text = path.read_text(encoding="utf-8")
-            except OSError:
-                continue
-            for line in text.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue  # skip malformed lines; surface via lint
-                rr = _record_from_dict(rec, agent)
-                if rr is None:
-                    continue
-                if since <= rr.ts.date() <= until:
-                    runs.append(rr)
+        if since <= rr.ts.date() <= until:
+            runs.append(rr)
     return runs
 
 

@@ -21,13 +21,22 @@ from atomic_agents.dashboard.costs import (
 
 
 def _write_log(agents_root: Path, agent: str, when: date, records: list[dict]) -> Path:
-    """Helper: create a log JSONL file with given records."""
+    """Helper: create a log JSONL file with given records.
+
+    Per #61 PR 2: records get a tz-aware ts to match what
+    ``agent._log()`` produces in production (``datetime.now().astimezone()
+    .isoformat()``). Naive ts breaks ``FilesystemLogBackend.query`` lex
+    comparison against tz-aware since/until bounds.
+    """
     log_dir = agents_root / agent / "log" / when.strftime("%Y-%m")
     log_dir.mkdir(parents=True, exist_ok=True)
     path = log_dir / f"{when.isoformat()}.jsonl"
     lines = []
     for rec in records:
-        rec.setdefault("ts", datetime.combine(when, datetime.min.time()).isoformat())
+        rec.setdefault(
+            "ts",
+            datetime.combine(when, datetime.min.time()).astimezone().isoformat(),
+        )
         rec.setdefault("trigger", "cron")
         rec.setdefault("model", "claude-opus-4-7-20260101")
         rec.setdefault("input_tokens", 1000)
@@ -70,12 +79,16 @@ def test_load_runs_basic(tmp_path):
 
 def test_load_runs_skips_malformed(tmp_path):
     today = date.today()
+    # Per #61 PR 2: full ISO-8601 tz-aware ts required (the legacy
+    # ``date.isoformat()`` was a test shortcut; production records via
+    # ``agent._log()`` always carry full datetimes).
+    ts_today = datetime.combine(today, datetime.min.time()).astimezone().isoformat()
     log_dir = tmp_path / "alice" / "log" / today.strftime("%Y-%m")
     log_dir.mkdir(parents=True)
     log_dir.joinpath(f"{today.isoformat()}.jsonl").write_text(
-        json.dumps({"ts": today.isoformat(), "cost_usd": 0.10, "model": "claude-opus-4-7-20260101"}) + "\n"
+        json.dumps({"ts": ts_today, "cost_usd": 0.10, "model": "claude-opus-4-7-20260101"}) + "\n"
         + "not valid json\n"
-        + json.dumps({"ts": today.isoformat(), "cost_usd": 0.20, "model": "claude-opus-4-7-20260101"}) + "\n"
+        + json.dumps({"ts": ts_today, "cost_usd": 0.20, "model": "claude-opus-4-7-20260101"}) + "\n"
     )
     runs = load_runs(tmp_path, "alice", today, today)
     assert len(runs) == 2  # malformed line skipped

@@ -374,6 +374,11 @@ def test_outcome_writes_iteration_records_to_agent_log(agent_vault, rubric_text,
         mock_instance.call.return_value = agent_resp
         mock_instance.config.default_model = "claude-sonnet-4-6-20260101"
         mock_instance._check_cost_guardrails.return_value = CostCheckResult(allow=True)
+        # Per #61 PR 2: outcome._append_iteration_log routes through
+        # agent.log_backend.append(...). Wire a real FilesystemLogBackend
+        # so the test continues to verify the on-disk landing point.
+        from atomic_agents.logs import FilesystemLogBackend
+        mock_instance.log_backend = FilesystemLogBackend(agents_root / agent_name)
         MockAgent.return_value = mock_instance
 
         with patch("atomic_agents.outcome._llm.call_llm", return_value=judge_resp):

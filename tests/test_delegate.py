@@ -221,15 +221,21 @@ def test_delegate_refuses_when_parent_cap_hit(tmp_agents):
 
     coordinator = AtomicAgent(name="director", agents_root=tmp_agents)
 
-    # Write a log record to eat up the cap
-    from datetime import date
+    # Write a log record to eat up the cap.
+    # Per #61 PR 2: sum_cost_for_period now routes through LogBackend.query()
+    # which filters records by ts (not by file location like the legacy
+    # walk did), so the test record needs a real ISO-8601 ts in today's
+    # local-tz window — placeholder "x" gets filtered out.
+    from datetime import date, datetime as _dt
     today = date.today()
     log_path = (
         coordinator.agent_root / "log"
         / today.strftime("%Y-%m") / f"{today.isoformat()}.jsonl"
     )
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text(json.dumps({"cost_usd": 0.001, "ts": "x"}) + "\n")
+    log_path.write_text(
+        json.dumps({"cost_usd": 0.001, "ts": _dt.now().astimezone().isoformat()}) + "\n"
+    )
 
     fake_client = MagicMock()
     fake_anthropic = types.SimpleNamespace(Anthropic=lambda api_key: fake_client)
@@ -540,15 +546,19 @@ def test_delegate_critical_bypasses_cap(tmp_agents):
 
     coordinator = AtomicAgent(name="director", agents_root=tmp_agents)
 
-    # Eat up the cap
-    from datetime import date
+    # Eat up the cap.
+    # Per #61 PR 2: real ts required for backend.query() filtering — see
+    # test_delegate_refuses_when_parent_cap_hit for context.
+    from datetime import date, datetime as _dt
     today = date.today()
     log_path = (
         coordinator.agent_root / "log"
         / today.strftime("%Y-%m") / f"{today.isoformat()}.jsonl"
     )
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text(json.dumps({"cost_usd": 0.001, "ts": "x"}) + "\n")
+    log_path.write_text(
+        json.dumps({"cost_usd": 0.001, "ts": _dt.now().astimezone().isoformat()}) + "\n"
+    )
 
     resp = _make_anthropic_resp("Critical response.")
     fake_client = MagicMock()

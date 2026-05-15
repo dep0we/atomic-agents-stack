@@ -48,9 +48,12 @@ import secrets
 import shutil
 import time
 from dataclasses import dataclass, field, asdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as dt_time, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .logs import LogBackend
 
 import frontmatter
 
@@ -276,13 +279,38 @@ def _read_journal_entries(agent_root: Path, lookback_days: int) -> list[dict]:
     return entries
 
 
-def _read_log_lines(agent_root: Path, lookback_days: int) -> list[dict]:
-    """Return non-helper log records within lookback window."""
+def _read_log_lines(
+    agent_root: Path,
+    lookback_days: int,
+    *,
+    log_backend: "LogBackend | None" = None,
+) -> list[dict]:
+    """Return non-helper log records within lookback window.
+
+    When ``log_backend`` is provided (#61 PR 2), reads via
+    ``backend.query(LogQuery(since=cutoff))`` and filters helpers
+    in-memory — same record shape as the legacy walk via
+    ``RunRecord.to_dict()``. Falls back to the legacy filesystem walk
+    when ``log_backend`` is None for backward compatibility (any
+    callers reading ``<agent>/log/`` directly).
+    """
+    cutoff = date.today() - timedelta(days=lookback_days)
+
+    if log_backend is not None:
+        from .logs import LogQuery
+        since_dt = datetime.combine(cutoff, dt_time.min).astimezone()
+        records = []
+        for rec in log_backend.query(LogQuery(since=since_dt)):
+            # filter out helper runs — too noisy
+            if rec.trigger == "helper":
+                continue
+            records.append(rec.to_dict())
+        return records
+
     log_dir = agent_root / "log"
     records = []
     if not log_dir.exists():
         return records
-    cutoff = date.today() - timedelta(days=lookback_days)
     for month_dir in sorted(log_dir.iterdir()):
         if not month_dir.is_dir():
             continue
@@ -614,13 +642,26 @@ def _estimate_dream_cost(
     return round(input_cost + output_cost, 6)
 
 
-def _check_cap(agent_root: Path, model: str, reserved: float, critical: bool) -> None:
-    """Raise ValueError if reserved cost exceeds remaining headroom (unless critical)."""
+def _check_cap(
+    agent_root: Path,
+    model: str,
+    reserved: float,
+    critical: bool,
+    *,
+    log_backend: "LogBackend | None" = None,
+) -> None:
+    """Raise ValueError if reserved cost exceeds remaining headroom (unless critical).
+
+    Per #61 PR 2: when ``log_backend`` is provided, the cost sums are
+    computed via the backend's ``query()`` rather than walking the
+    filesystem directly. Honors the operator's pinned LogBackend
+    (filesystem default; SQLiteLogBackend in PR 3 forward).
+    """
     if critical or reserved <= 0:
         return
     log_dir = agent_root / "log"
-    today_cost = _costs.sum_cost_for_period(log_dir, "today", source="actor")
-    month_cost = _costs.sum_cost_for_period(log_dir, "this_month", source="actor")
+    today_cost = _costs.sum_cost_for_period(log_dir, "today", source="actor", backend=log_backend)
+    month_cost = _costs.sum_cost_for_period(log_dir, "this_month", source="actor", backend=log_backend)
     # Load caps from model.md
     model_data = _model.parse_model_md(agent_root / "model.md")
     if not model_data.get("cost_guardrails_enabled"):
@@ -650,6 +691,7 @@ def _run_pipeline(
     model: str,
     critical: bool,
     backend: FilesystemBackend | None = None,
+    log_backend: "LogBackend | None" = None,
 ) -> DreamResult:
     """Execute the full dream pipeline. Mutates and returns result."""
     total_input_tokens = 0
@@ -663,7 +705,9 @@ def _run_pipeline(
     else:
         notes = _read_memory_notes(agent_root)
     journal_entries = _read_journal_entries(agent_root, journal_lookback_days)
-    log_lines = _read_log_lines(agent_root, log_lookback_days)
+    log_lines = _read_log_lines(
+        agent_root, log_lookback_days, log_backend=log_backend
+    )
 
     # Update manifest inputs
     result.inputs = DreamInputs(
@@ -1006,6 +1050,7 @@ class DreamRunner:
         *,
         dream_lock_timeout: float = 30.0,
         lock_backend: LockBackend | None = None,
+        log_backend: "LogBackend | None" = None,
     ):
         self.agents_root = Path(agents_root)
         self.agent_name = agent_name
@@ -1052,6 +1097,23 @@ class DreamRunner:
         # versa.
         self._dream_lock_backend = agent_lock_backend.scope("dreams")
 
+        # LogBackend for cost reads and log_lines walk (#61 PR 2).
+        # Operators may pin the backend via the ``log_backend=`` kwarg
+        # OR via ``ATOMIC_AGENTS_LOG_BACKEND`` env var. The kwarg
+        # ALWAYS wins. Same forward-pointer rule as the lock backend:
+        # PR 2 must thread this through to ``_read_log_lines`` and
+        # ``_check_cap`` so dream cost rollups read from the SAME
+        # backend ``agent.call()`` writes to — preventing the
+        # multi-backend split-brain the lock arc PR 3 Step 11
+        # adversarial caught (operator pins Redis lock, DreamRunner
+        # silently constructs filesystem; here: operator pins SQLite
+        # log backend, dream silently walks empty filesystem).
+        if log_backend is None:
+            from .logs import get_default_log_backend
+            self._log_backend = get_default_log_backend(self.agent_root)
+        else:
+            self._log_backend = log_backend
+
         # Resolve model: explicit > agent's model.md default
         if model:
             self._model = model
@@ -1074,9 +1136,14 @@ class DreamRunner:
         # Upfront cost estimate and cap check
         notes = _read_memory_notes(self.agent_root)
         journal_entries = _read_journal_entries(self.agent_root, journal_lookback_days)
-        log_lines = _read_log_lines(self.agent_root, log_lookback_days)
+        log_lines = _read_log_lines(
+            self.agent_root, log_lookback_days, log_backend=self._log_backend
+        )
         estimated_cost = _estimate_dream_cost(self._model, notes, journal_entries, log_lines)
-        _check_cap(self.agent_root, self._model, estimated_cost, critical)
+        _check_cap(
+            self.agent_root, self._model, estimated_cost, critical,
+            log_backend=self._log_backend,
+        )
 
         # Initialise manifest
         result = DreamResult(
@@ -1133,6 +1200,7 @@ class DreamRunner:
                 model=self._model,
                 critical=critical,
                 backend=self._backend,
+                log_backend=self._log_backend,
             )
             _write_manifest(dream_dir, result)
             # Inter-pipeline lock-loss check (#60 PR 3 + spec/21
