@@ -21,6 +21,7 @@ from .exceptions import (
     AtomicAgentsError,
     CostGuardrailBlocked,
     AgentLockBusy,
+    LockBusy,
     SchemaValidationError,
     NoJudgeAvailable,
     HelperBatchPartialFailure,
@@ -60,6 +61,16 @@ from .llm import (
     iter_registered_backends,
     find_backend_for_model,
 )
+from .locks import (
+    LockBackend,
+    LockHandle,
+    LockCapabilities,
+    FilesystemLockBackend,
+    register_lock_backend,
+    unregister_lock_backend,
+    get_lock_backend,
+    list_lock_backends,
+)
 from .judge import (
     # Protocol contract + outcome model
     JudgeBackend,
@@ -95,6 +106,7 @@ __all__ = [
     "AtomicAgentsError",
     "CostGuardrailBlocked",
     "AgentLockBusy",
+    "LockBusy",
     "SchemaValidationError",
     "NoJudgeAvailable",
     "HelperBatchPartialFailure",
@@ -140,6 +152,16 @@ __all__ = [
     "get_backend",
     "iter_registered_backends",
     "find_backend_for_model",
+    # LockBackend Protocol surface (spec/21 — #60 PR 1 scaffolding;
+    # call-site wiring + deprecation shim for _locks.AgentLock land in PR 2)
+    "LockBackend",
+    "LockHandle",
+    "LockCapabilities",
+    "FilesystemLockBackend",
+    "register_lock_backend",
+    "unregister_lock_backend",
+    "get_lock_backend",
+    "list_lock_backends",
     # JudgeBackend Protocol surface (spec/28 — #112 PR 1 scaffolding;
     # reference implementations + agent.call() wiring land in PR 2)
     "JudgeBackend",

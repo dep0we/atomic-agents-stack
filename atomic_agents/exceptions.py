@@ -13,8 +13,25 @@ class WritePathViolation(AtomicAgentsError):
     """Attempted write outside the agent's tools.md write paths."""
 
 
-class AgentLockBusy(AtomicAgentsError):
-    """Could not acquire the agent's lock — another process holds it."""
+class LockBusy(AtomicAgentsError):
+    """A LockBackend could not acquire the named lock within the timeout.
+
+    Raised by ``atomic_agents.locks.LockBackend.acquire()`` when the
+    deadline elapses without the lock being granted. Backend-agnostic:
+    a ``FilesystemLockBackend`` raises it when another process holds the
+    advisory ``flock``; a future ``RedisLockBackend`` raises it when the
+    Redis SET NX call returns nil within the wait window.
+
+    Held lock identity is in the message text for human inspection;
+    consumers branching on identity should query
+    ``LockBackend.is_held(name)`` (racy by design — see spec/21).
+    """
+
+
+# Backwards-compat alias — was the pre-spec/21 name and is exported
+# at the package top level. Existing ``except AgentLockBusy`` code paths
+# keep working unchanged because the class identity is preserved.
+AgentLockBusy = LockBusy
 
 
 class CostGuardrailBlocked(AtomicAgentsError):
