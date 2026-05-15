@@ -12,7 +12,7 @@ For broader context, read these in order on a fresh session:
 
 ## What this is
 
-Atomic Agents is a vault-native AI agent framework: agents live as plain markdown files, the runtime is stateless, and storage is moving toward swappable protocols layer by layer. **Shipped backend protocols**: MemoryBackend (PR #57); LLMBackend (#87 — Anthropic + OpenAI + Moonshot reference impls); JudgeBackend Protocol (#112 — locked at PR 4 with conformance suite, PolicyJudge + LLMJudgeBackend reference impls, ESCALATE + REVISE state machines, `judges.md` operator config + cascade-aware project floor, operator-driven resolution flow). **Next per ROADMAP**: Lock / Log / Persona / AgentProfile / ToolRegistry / Corpus protocols. A person at home runs filesystem-everything with one agent. An organization runs the same agents over Postgres, behind an HTTP service, with a fleet of orchestrated roles. **Same agent definitions, same call() flow, same audit trail. Different backends.**
+Atomic Agents is a vault-native AI agent framework: agents live as plain markdown files, the runtime is stateless, and storage is moving toward swappable protocols layer by layer. **Shipped backend protocols**: MemoryBackend (PR #57); LLMBackend (#87 — Anthropic + OpenAI + Moonshot reference impls); JudgeBackend Protocol (#112 — locked at PR 4 with conformance suite, PolicyJudge + LLMJudgeBackend reference impls, ESCALATE + REVISE state machines, `judges.md` operator config + cascade-aware project floor, operator-driven resolution flow); **LockBackend Protocol (#60 — locked at PR 4 with `FilesystemLockBackend` + `RedisLockBackend` reference impls, `scope()` Protocol method, daemon-thread heartbeat with `LockLost` lease-expiry detection, operator override via env vars + constructor kwarg, doctor `check_lock_backend` coherence check — closes the multi-host cliff so atomic-agents runs on Cloud Run / Kubernetes / gizmo without forking).** **Next per ROADMAP**: Log / Persona / AgentProfile / ToolRegistry / Corpus protocols. A person at home runs filesystem-everything with one agent. An organization runs the same agents over Postgres, behind an HTTP service, with a fleet of orchestrated roles. **Same agent definitions, same call() flow, same audit trail. Different backends.**
 
 The spec is the central artifact. The Python package is one conforming reference implementation. Anyone can build agents to the spec without using this code — and eventually, alternate implementations will.
 
@@ -43,7 +43,7 @@ When you can't tell whether a design move helps both — stop, name the tradeoff
                                 │
                   Backend Protocols (the moat)
                   Memory ✅  LLM ✅  Judge ✅ (locked at #112 PR 4)
-                  Lock 🟡  Log 🟡  Persona 🟡
+                  Lock ✅ (locked at #60 PR 4)  Log 🟡  Persona 🟡
                   AgentProfile 🟡  ToolRegistry 🟡  Corpus 🟡
                                 │
                   Storage substrate — swappable
@@ -336,12 +336,13 @@ These are not forbidden forever — they're explicitly deferred with rationale. 
 
 ## Status
 
-**v0.13.0, alpha, PUBLIC.** Core runtime stable, 1327 tests passing (+ 2 LLM-only conformance skips on PolicyJudge) on Python 3.11/3.12. Three backend protocols shipped:
+**v0.13.0, alpha, PUBLIC.** Core runtime stable, 1425 tests passing (+ 7 conformance skips: 5 for cross-process Redis tests that lift against real Redis instead of fakeredis, plus the 2 pre-existing LLM-only skips on PolicyJudge) on Python 3.11/3.12. Four backend protocols shipped:
 
 - **MemoryBackend** (PR #57) — filesystem reference impl + conformance suite.
 - **LLMBackend** (#87) — Anthropic + OpenAI + Moonshot reference impls, registered at framework import; conformance suite parametrizes across all three.
 - **JudgeBackend Protocol** (#112, **locked at PR 4** with `tests/test_judge_protocol_conformance.py`) — PolicyJudge (rule engine) + LLMJudgeBackend reference impls; ESCALATE + REVISE state machines; `judges.md` operator config with cascade-aware project floor; operator-driven resolution flow (Approved / Denied / Redacted / Revised / Auto-decided); body-integrity check + O_EXCL sidecar de-dup + CAS-safe auto-decide. **PR 5a (unreleased):** `escalation.fallback_on_timeout` widens to per-class dict form; auto-decide resolves policy from PENDING frontmatter `action_class`. **PR 5b (unreleased):** strict JSON-Schema validation of amended `tool_arguments` via the opt-in `[validation]` extra (`validation: strict` in `judges.md`); default remains `weakened` (PR 3c behavior), so operators upgrading without flipping the field see no behavior change. Concludes the #112 arc-with-amendments. Dispatch opt-in via `judges.md` in the agent root or `AGENT_JUDGE_ENABLED=1` — existing deployments see no judge invocation by default.
+- **LockBackend Protocol** (#60, **locked at PR 4** with `tests/test_lock_protocol_conformance.py` parametrized across both backends) — `FilesystemLockBackend` (POSIX `fcntl.flock` advisory; preserves the legacy `<agent>/.lock` on-disk artifact byte-for-byte) + `RedisLockBackend` (single-instance Redis advisory lock + atomic Lua release/renew + daemon heartbeat at TTL/3 + `LockLost` lease-expiry detection) reference impls. `scope(sub_path)` Protocol method lets operators pass ONE backend; framework re-scopes for dream + memory paths internally. Operator override via `ATOMIC_AGENTS_LOCK_BACKEND` + `ATOMIC_AGENTS_LOCK_BACKEND_URL` env vars (deployment path) OR `AtomicAgent(..., lock_backend=...)` constructor kwarg (programmatic path — always wins). `doctor.check_lock_backend` validates operator-config coherence with PASS/WARN/FAIL ladder + credential-redacted URL output. `_locks.AgentLock` preserved as a deprecation shim (sunset v1.0). **Closes the multi-host cliff** that motivated the entire arc: atomic-agents now runs on Cloud Run / Kubernetes / gizmo without forking the framework.
 
-MCP client support shipped (PRs #55 + #56). Active backlog covers the remaining protocols (Lock / Log / Persona / AgentProfile / ToolRegistry / Corpus / Policy). Single-developer project; reference implementation that anyone can use, fork, or extend.
+MCP client support shipped (PRs #55 + #56). Active backlog covers the remaining protocols (Log / Persona / AgentProfile / ToolRegistry / Corpus / Policy). Single-developer project; reference implementation that anyone can use, fork, or extend.
 
 Going forward: **the elegance is the product.** Protect it.

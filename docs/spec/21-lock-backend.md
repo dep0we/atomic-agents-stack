@@ -1,8 +1,8 @@
 # 21 — LockBackend Protocol
 
-**Status:** DRAFT — locks at PR 4 of #60 after the conformance suite parametrizes across filesystem + Redis.
+**Status:** **locked** (spec matches implementation as of #60 PR 4).
 **Origin:** [#60](https://github.com/dep0we/atomic-agents-stack/issues/60).
-**Arc shape:** PR 1 (Protocol scaffolding + filesystem reference impl + conformance suite), PR 2 (wire backend into the five legacy lock sites + ``_locks.py`` deprecation shim + ``doctor.check_locks`` through the backend), PR 3 (Redis reference impl + ``scope()`` Protocol method + ``LockLost`` exception + heartbeat thread + operator override surface — this prose), PR 4 (spec lock + parameterized conformance across both backends + README/ROADMAP refresh).
+**Shipped across four PRs:** PR 1 (Protocol scaffolding + filesystem reference impl + conformance suite), PR 2 (wire backend into the five legacy lock sites + ``_locks.py`` deprecation shim + ``doctor.check_locks`` through the backend), PR 3 (Redis reference impl + ``scope()`` Protocol method + ``LockLost`` exception + heartbeat thread + operator override surface), PR 4 (spec lock-in + ``Implementer contract for lease-backed backends`` documented + README/CLAUDE.md status refresh).
 
 ## Overview
 
@@ -241,6 +241,22 @@ PR 3 of #60 adds a new ``check_lock_backend`` doctor check that validates **oper
 - Unknown ``backend_id`` (typo) → FAIL with the registered backend list
 
 ``check_locks`` (the held-state probe) is also operator-config-aware after PR 3: it constructs the same backend the runtime would construct via ``get_default_lock_backend`` and probes via ``is_held("")``. WARN-on-unreachable applies here too.
+
+## Implementer contract for lease-backed backends (#60 PR 4)
+
+A backend that claims ``LockCapabilities.supports_lease=True`` is committing to the heartbeat-driven lock-loss detection pattern documented above. Concretely, **implementers MUST**:
+
+1. **Spawn a heartbeat thread (or equivalent)** inside ``acquire()`` that renews the lease before expiry. The renewal cadence MUST be smaller than the lease TTL — the canonical default is TTL/3, which tolerates two missed renewals before lock loss. The thread MUST be joined or cleanly terminated inside ``release()``.
+
+2. **Surface lock loss via a handle attribute named ``lock_lost``** on whatever opaque value the backend stashes in ``LockHandle.backend_state``. The attribute MUST be ``None`` while the lease is healthy and MUST be an instance of ``atomic_agents.exceptions.LockLost`` after the heartbeat detects expiry. The framework's ``atomic_agents.locks.check_lock_lost(handle)`` dispatcher uses ``getattr(state, "lock_lost", None)`` plus ``isinstance(LockLost)`` — a structural check that auto-integrates any conforming backend without editing the dispatcher.
+
+3. **Log at ``WARNING`` level** when lock loss is detected, in addition to the state-flag mutation. Silent state mutation alone is invisible to operators whose call sites don't promptly invoke ``check_lock_lost``; the log line is the operator-facing signal.
+
+4. **Atomic release** semantics. The backend MUST ensure ``release(handle)`` cannot inadvertently revoke a successor holder's lock (e.g., when ``release`` races against a TTL-driven expiry-then-reacquire on another caller). The reference Redis impl uses a Lua script that deletes the key only when its value still matches the caller's lease token; future backends should adopt an equivalent token-check pattern at their native primitive's atomicity boundary.
+
+5. **Renewal returns False on lease lost**. ``renew(handle) -> bool`` MUST return ``False`` when the backend detects the lease was expired or claimed by another holder. Returns ``True`` on successful renewal. Backends without a lease (``supports_lease=False``) return ``True`` unconditionally as a no-op.
+
+The reference ``RedisLockBackend`` implementation in ``atomic_agents/locks/redis.py`` is the canonical example of this contract. Future Postgres advisory backends, Cloud Run-specific backends, or third-party adapters should mirror its shape; the conformance suite (``tests/test_lock_protocol_conformance.py``) parametrizes across every registered backend so the lock-loss-detection contract is verified by the same tests that pin acquire/release semantics.
 
 ## Reserved future capabilities
 
