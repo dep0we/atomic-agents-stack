@@ -70,6 +70,41 @@ BACKEND_FACTORIES: list[tuple[str, BackendFactory]] = [
 ]
 
 
+# Redis backend joins the conformance suite via fakeredis. Skipped at
+# import time when fakeredis is not installed — matches the optional-
+# SDK detection pattern from test_llm_protocol_conformance.py.
+try:
+    import fakeredis as _fakeredis_for_conformance
+
+    from atomic_agents.locks.redis import RedisLockBackend as _RedisLockBackend
+
+    def _redis_factory(scope_root: Path) -> LockBackend:
+        """Per-test fresh fakeredis instance + tight TTL/heartbeat for fast tests.
+
+        Isolation between tests comes from the FRESH ``FakeRedis()``
+        instance (in-process, per-test pytest fixture teardown — no
+        cross-test state), NOT from the key_prefix. The earlier
+        comment claimed key_prefix isolation but that's misleading:
+        each ``FakeRedis()`` is its own independent store; there's no
+        shared state between fixtures to namespace. The scope_root.name
+        in the key prefix is just diagnostic — makes ``KEYS`` output
+        readable when debugging. (Step 9.1 testing specialist
+        CRITICAL #5.)
+        """
+        client = _fakeredis_for_conformance.FakeRedis(decode_responses=True)
+        return _RedisLockBackend(
+            client,
+            key_prefix=f"conformance:{scope_root.name}:lock:",
+            lease_ttl_seconds=5.0,
+            heartbeat_interval_seconds=1.0,
+            poll_interval_seconds=0.02,
+        )
+
+    BACKEND_FACTORIES.append(("redis", _redis_factory))
+except ImportError:
+    pass  # fakeredis not installed — Redis backend skipped
+
+
 @pytest.fixture(params=BACKEND_FACTORIES, ids=lambda p: p[0])
 def backend_factory(request) -> BackendFactory:
     """Yields a callable ``(scope_root: Path) -> LockBackend``."""
@@ -210,7 +245,31 @@ def test_distinct_names_do_not_conflict(backend):
 # Timeout behavior
 
 
+def _skip_if_in_process_only_backend(backend_factory, tmp_path) -> None:
+    """Skip cross-process tests against backends whose state doesn't survive
+    a subprocess fork — currently the Redis backend via fakeredis (in-
+    process simulation). Production deployments running conformance
+    against a real Redis instance lift this skip — but they ALSO need
+    to refactor ``_hold_lock_in_child`` to spawn a child using the
+    actual parametrized backend (today it hardcodes
+    ``atomic_agents.locks.filesystem`` / ``FilesystemLockBackend``),
+    otherwise lifting the skip would test FS-child-vs-Redis-parent
+    instead of Redis-vs-Redis. Tracked as a PR 4 follow-up for the
+    spec lock work — Step 9.1 testing specialist CRITICAL #3 flagged
+    the latent shape. The skip is safe today; the helper-refactor is
+    the additional gate for real-Redis CI."""
+    backend = backend_factory(tmp_path)
+    if backend.backend_id == "redis":
+        pytest.skip(
+            "Cross-process test requires a backend whose state is "
+            "visible to subprocesses; fakeredis is per-instance "
+            "in-process simulation. Run against real Redis to exercise "
+            "this path in a deployment smoke test."
+        )
+
+
 def test_timeout_zero_fails_fast_against_held_lock(backend_factory, tmp_path):
+    _skip_if_in_process_only_backend(backend_factory, tmp_path)
     """timeout=0 raises LockBusy immediately when the lock is held."""
     backend = backend_factory(tmp_path)
     backend_for_other_process = backend_factory(tmp_path)
@@ -243,6 +302,7 @@ def test_timeout_zero_fails_fast_against_held_lock(backend_factory, tmp_path):
 
 def test_timeout_positive_respects_deadline(backend_factory, tmp_path):
     """timeout=0.3 raises LockBusy within ~deadline when never granted."""
+    _skip_if_in_process_only_backend(backend_factory, tmp_path)
     backend = backend_factory(tmp_path)
 
     ready = tmp_path / ".ready"
@@ -272,6 +332,7 @@ def test_timeout_positive_respects_deadline(backend_factory, tmp_path):
 
 def test_timeout_grants_when_holder_releases(backend_factory, tmp_path):
     """timeout=2 succeeds when holder releases before the deadline."""
+    _skip_if_in_process_only_backend(backend_factory, tmp_path)
     backend = backend_factory(tmp_path)
 
     ready = tmp_path / ".ready"
@@ -311,6 +372,7 @@ def test_is_held_true_during_other_process_hold(backend_factory, tmp_path):
     decision); this test just asserts the snapshot is honest at the
     moment of the call.
     """
+    _skip_if_in_process_only_backend(backend_factory, tmp_path)
     backend = backend_factory(tmp_path)
 
     ready = tmp_path / ".ready"
@@ -382,3 +444,43 @@ def test_agent_lock_busy_alias_identity():
     """``AgentLockBusy`` must be the SAME class as ``LockBusy`` so existing
     ``except AgentLockBusy:`` code paths catch the new exception."""
     assert AgentLockBusy is LockBusy
+
+
+# ──────────────────────────────────────────────────────────────────
+# scope() Protocol method (#60 PR 3)
+
+
+def test_scope_returns_protocol_conforming_backend(backend):
+    """scope() MUST return a LockBackend with the same backend_id."""
+    sub = backend.scope("dreams")
+    assert isinstance(sub, LockBackend)
+    assert sub.backend_id == backend.backend_id
+
+
+def test_scope_preserves_capabilities(backend):
+    """scope() MUST NOT change capability claims — a filesystem backend
+    doesn't suddenly become distributed by being sub-scoped."""
+    sub = backend.scope("dreams")
+    assert sub.capabilities() == backend.capabilities()
+
+
+def test_scope_isolates_locks_from_parent(backend):
+    """parent.acquire("") and parent.scope("x").acquire("") MUST NOT collide.
+
+    For filesystem: different on-disk paths (parent: <root>/.lock vs
+    sub: <root>/dreams/.lock). For Redis: different key prefixes
+    (parent: <prefix>__main__ vs sub: <prefix>dreams:__main__). Either
+    way, the two locks are in independent namespaces.
+    """
+    parent_handle = backend.acquire("", timeout=0)
+    try:
+        sub = backend.scope("dreams")
+        sub_handle = sub.acquire("", timeout=0)
+        sub.release(sub_handle)
+    finally:
+        backend.release(parent_handle)
+
+
+def test_scope_empty_path_raises(backend):
+    with pytest.raises(ValueError, match="non-empty"):
+        backend.scope("")
