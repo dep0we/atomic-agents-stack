@@ -56,15 +56,15 @@ from atomic_agents.logs import (
     LogCapabilities,
     LogQuery,
     RunRecord,
+    SQLiteLogBackend,
 )
 
 
 # ──────────────────────────────────────────────────────────────────
-# Backend factory parametrization
-#
-# PR 3 of #61 appends ``("sqlite", _sqlite_factory)`` to this list.
-# Until then, only filesystem participates — but the parametrization
-# scaffolding is already in place so PR 3's wiring is a one-line edit.
+# Backend factory parametrization — every conformance test runs once
+# per registered backend. Both reference impls today (#61 PR 3 added
+# the sqlite factory); third-party backends import this module's
+# BACKEND_FACTORIES list to verify their own conformance.
 
 BackendFactory = Callable[[Path], LogBackend]
 
@@ -73,8 +73,15 @@ def _filesystem_factory(scope_root: Path) -> LogBackend:
     return FilesystemLogBackend(scope_root)
 
 
+def _sqlite_factory(scope_root: Path) -> LogBackend:
+    # Per-test fresh database file — isolation via the per-test
+    # tmp_path fixture (matches the FilesystemLogBackend approach).
+    return SQLiteLogBackend(scope_root / "logs.db")
+
+
 BACKEND_FACTORIES: list[tuple[str, BackendFactory]] = [
     ("filesystem", _filesystem_factory),
+    ("sqlite", _sqlite_factory),
 ]
 
 

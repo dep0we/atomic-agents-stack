@@ -1072,10 +1072,10 @@ def check_log_backend(agent_root: Path) -> CheckResult:
             ),
         )
 
-    # Non-filesystem id selected — try to construct via the factory.
-    # In PR 2, the only non-filesystem id is ``sqlite`` (forward-
-    # declared) which PR 3 will register; for now ``get_default_log_
-    # backend`` raises ``BackendNotRegistered`` for it.
+    # Non-filesystem id selected — construct via the factory and run a
+    # lightweight stats() probe to verify the backend is reachable +
+    # schema-healthy. For SQLite, this confirms the file is writable
+    # and the schema is at the expected version.
     #
     # Credential safety: any exception from ``get_default_log_backend``
     # may include a URL with embedded credentials. We redact via the
@@ -1095,18 +1095,22 @@ def check_log_backend(agent_root: Path) -> CheckResult:
             safe_url = url
 
     try:
-        get_default_log_backend(agent_root)
-    except BackendNotRegistered as exc:
+        backend = get_default_log_backend(agent_root)
+    except BackendNotRegistered:
+        # PR 3 registered "sqlite"; any remaining BackendNotRegistered
+        # path here means the operator typed an id whose lazy resolver
+        # raised. Surface the known-id list (already done above at the
+        # eager-registry check) — fall through to the failure path.
         return CheckResult(
             name="log-backend", status=FAIL,
-            message=f"log backend {backend_id!r} not yet registered",
+            message=f"log backend {backend_id!r} not registered",
             fix_hint=(
-                f"The {backend_id!r} backend is reserved but not shipped in "
-                "this version. Unset ATOMIC_AGENTS_LOG_BACKEND to use the "
-                "filesystem default."
+                f"The {backend_id!r} backend is reserved but its lazy "
+                "resolver failed. Unset ATOMIC_AGENTS_LOG_BACKEND to "
+                "use the filesystem default."
             ),
         )
-    except Exception as exc:
+    except Exception:
         # Sanitize the exception message — connection errors from
         # backend constructors commonly embed the full URL including
         # credentials. Drop the exception class name and rely on
@@ -1123,12 +1127,45 @@ def check_log_backend(agent_root: Path) -> CheckResult:
             ),
         )
 
-    detail: dict[str, Any] = {"backend_id": backend_id}
+    # Probe with stats() — verifies schema health + reachability.
+    # Match check_lock_backend's WARN-on-unreachable pattern: doctor
+    # never crashes on missing/unreachable optional infrastructure.
+    try:
+        stats = backend.stats()
+    except Exception:
+        # Same credential-redaction rule applies to the probe error
+        # path — drop the verbatim exception message.
+        return CheckResult(
+            name="log-backend", status=WARN,
+            message=(
+                f"operator-pinned backend {backend_id!r} configured "
+                "but stats() probe failed"
+            ),
+            fix_hint=(
+                f"Verify ATOMIC_AGENTS_LOG_BACKEND_URL is correct + "
+                "the backend is reachable from this host. Doctor "
+                "warns instead of failing — the framework runtime "
+                "will fail at first append if the backend is "
+                "truly down."
+            ),
+        )
+
+    detail: dict[str, Any] = {
+        "backend_id": backend_id,
+        "total_records": stats.total_records,
+        "records_today": stats.records_today,
+        "records_this_month": stats.records_this_month,
+    }
     if safe_url is not None:
         detail["url"] = safe_url
+    if stats.size_bytes is not None:
+        detail["size_bytes"] = stats.size_bytes
     return CheckResult(
         name="log-backend", status=PASS,
-        message=f"{backend_id} backend constructed",
+        message=(
+            f"{backend_id} backend ok ({stats.total_records} records, "
+            f"{stats.records_this_month} this month)"
+        ),
         detail=detail,
     )
 

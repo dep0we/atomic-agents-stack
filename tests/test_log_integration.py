@@ -435,18 +435,22 @@ def test_doctor_check_log_backend_unknown_id_fail(tmp_path, monkeypatch):
     assert "filesystem" in result.message
 
 
-def test_doctor_check_log_backend_sqlite_forward_pointer_fail(tmp_path, monkeypatch):
-    """check_log_backend for 'sqlite' (PR 3 forward-pointer) returns FAIL
-    with the 'not yet registered' hint."""
+def test_doctor_check_log_backend_sqlite_passes_after_pr3(tmp_path, monkeypatch):
+    """check_log_backend for ``sqlite`` returns PASS post-PR-3.
+
+    Prior to PR 3 this raised FAIL with "not yet registered"; PR 3
+    registered SQLiteLogBackend and the doctor now reports its stats.
+    """
     from atomic_agents.doctor import check_log_backend
 
     agent_root = _build_minimal_agent_dir(tmp_path, "alice")
     monkeypatch.setenv("ATOMIC_AGENTS_LOG_BACKEND", "sqlite")
+    monkeypatch.delenv("ATOMIC_AGENTS_LOG_BACKEND_URL", raising=False)
 
     result = check_log_backend(agent_root)
-    assert result.status == "fail"
-    assert "sqlite" in result.message
-    assert "not yet registered" in result.message
+    assert result.status == "pass"
+    assert result.detail["backend_id"] == "sqlite"
+    assert "total_records" in result.detail
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -573,19 +577,23 @@ def test_sum_cost_filesystem_tolerates_malformed_ts_record(tmp_path):
 
 def test_doctor_check_log_backend_redacts_url_credential(tmp_path, monkeypatch):
     """check_log_backend's error message MUST NOT echo URL credentials.
-    Step 9.1 security CRITICAL #3 (PR 2). Parity with check_lock_backend."""
+    Step 9.1 security CRITICAL #3 (PR 2). Parity with check_lock_backend.
+
+    Uses an UNKNOWN scheme with a credential — guaranteed to error out
+    of ``make_sqlite_backend_from_url`` regardless of which backend ID
+    is set, so the redaction is exercised."""
     from atomic_agents.doctor import check_log_backend
 
     agent_root = _build_minimal_agent_dir(tmp_path, "alice")
     monkeypatch.setenv("ATOMIC_AGENTS_LOG_BACKEND", "sqlite")
     monkeypatch.setenv(
         "ATOMIC_AGENTS_LOG_BACKEND_URL",
-        "sqlite://super-secret-token@host/db",
+        # Wrong scheme triggers ValueError in URL parser.
+        "postgres://super-secret-token@host/db",
     )
 
     result = check_log_backend(agent_root)
-    # Should FAIL (sqlite not yet registered) — the message MUST NOT
-    # leak the credential, regardless of which backend code path runs.
+    # Backend construction failed; message MUST NOT leak credential.
     assert result.status == "fail"
     assert "super-secret-token" not in result.message
     if "url" in (result.detail or {}):
