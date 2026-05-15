@@ -56,15 +56,15 @@ from atomic_agents.logs import (
     LogCapabilities,
     LogQuery,
     RunRecord,
+    SQLiteLogBackend,
 )
 
 
 # ──────────────────────────────────────────────────────────────────
-# Backend factory parametrization
-#
-# PR 3 of #61 appends ``("sqlite", _sqlite_factory)`` to this list.
-# Until then, only filesystem participates — but the parametrization
-# scaffolding is already in place so PR 3's wiring is a one-line edit.
+# Backend factory parametrization — every conformance test runs once
+# per registered backend. Both reference impls today (#61 PR 3 added
+# the sqlite factory); third-party backends import this module's
+# BACKEND_FACTORIES list to verify their own conformance.
 
 BackendFactory = Callable[[Path], LogBackend]
 
@@ -73,8 +73,15 @@ def _filesystem_factory(scope_root: Path) -> LogBackend:
     return FilesystemLogBackend(scope_root)
 
 
+def _sqlite_factory(scope_root: Path) -> LogBackend:
+    # Per-test fresh database file — isolation via the per-test
+    # tmp_path fixture (matches the FilesystemLogBackend approach).
+    return SQLiteLogBackend(scope_root / "logs.db")
+
+
 BACKEND_FACTORIES: list[tuple[str, BackendFactory]] = [
     ("filesystem", _filesystem_factory),
+    ("sqlite", _sqlite_factory),
 ]
 
 
@@ -362,6 +369,53 @@ def test_query_filters_by_parent_run_id(backend):
     backend.append(_make_record(parent_run_id="parent-y", run_id="child-3", ts=_ts_at(2026, 5, 15, 12)))
     out = backend.query(LogQuery(parent_run_id="parent-x"))
     assert {r.run_id for r in out} == {"child-1", "child-2"}
+
+
+def test_query_filters_by_agent_name_isolates_explicit_agent_records(backend):
+    """Records with explicit agent_name are isolated by the filter.
+
+    Step 11 P0 #1 pin: shared-backend deployments (single SQLite/
+    Postgres file across agents) MUST isolate cross-agent records.
+    Alice's reads MUST NOT include bob's explicitly-stamped records.
+    """
+    backend.append(_make_record(
+        agent_name="alice", run_id="a1", ts=_ts_at(2026, 5, 15, 10),
+    ))
+    backend.append(_make_record(
+        agent_name="bob", run_id="b1", ts=_ts_at(2026, 5, 15, 11),
+    ))
+    backend.append(_make_record(
+        agent_name="alice", run_id="a2", ts=_ts_at(2026, 5, 15, 12),
+    ))
+    out = backend.query(LogQuery(agent_name="alice"))
+    assert {r.run_id for r in out} == {"a1", "a2"}
+    out_bob = backend.query(LogQuery(agent_name="bob"))
+    assert {r.run_id for r in out_bob} == {"b1"}
+
+
+def test_query_filters_by_agent_name_lenient_on_missing(backend):
+    """Records WITHOUT agent_name match the filter (legacy compat).
+
+    Pre-PR-2 records on disk don't carry agent_name. Under filesystem's
+    per-agent-dir scoping, every record in the dir IS the named
+    agent's — strict filtering would break dashboard reads of legacy
+    data. Lenient matching (column == filter OR column IS NULL)
+    preserves backward compat without weakening cross-agent isolation
+    for explicitly-stamped records.
+    """
+    backend.append(_make_record(
+        agent_name=None, run_id="legacy", ts=_ts_at(2026, 5, 15, 10),
+    ))
+    backend.append(_make_record(
+        agent_name="alice", run_id="explicit_alice", ts=_ts_at(2026, 5, 15, 11),
+    ))
+    backend.append(_make_record(
+        agent_name="bob", run_id="explicit_bob", ts=_ts_at(2026, 5, 15, 12),
+    ))
+    out = backend.query(LogQuery(agent_name="alice"))
+    # Legacy record matches (no agent_name) AND alice's explicit
+    # records match. Bob's explicit records are excluded.
+    assert {r.run_id for r in out} == {"legacy", "explicit_alice"}
 
 
 def test_query_respects_limit(backend):

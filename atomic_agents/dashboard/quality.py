@@ -317,7 +317,11 @@ def _count_provenance(
     preserved = 0
     total = 0
     # NO primitive filter in the LogQuery — see docstring rationale.
-    for rec in backend.query(LogQuery(since=since_dt, until=until_dt)):
+    # agent_name filter prevents shared-backend cross-agent record mix
+    # (Step 11 P0 #1).
+    for rec in backend.query(LogQuery(
+        since=since_dt, until=until_dt, agent_name=agent,
+    )):
         # Helper records are identified by EITHER primitive (post-PR-2)
         # OR trigger (legacy, pre-PR-2). Belt-and-suspenders.
         if rec.primitive != "helper" and rec.trigger != "helper":

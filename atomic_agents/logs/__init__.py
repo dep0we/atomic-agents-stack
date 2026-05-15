@@ -44,6 +44,7 @@ from pathlib import Path
 from ..exceptions import BackendNotRegistered
 from .backend import LogBackend
 from .filesystem import FilesystemLogBackend
+from .sqlite import SQLiteLogBackend, make_sqlite_backend_from_url
 from .types import (
     LogAggregate,
     LogCapabilities,
@@ -103,6 +104,9 @@ __all__ = [
     "PRIMITIVE_OTHER",
     # Reference implementations
     "FilesystemLogBackend",
+    "SQLiteLogBackend",
+    # URL factories
+    "make_sqlite_backend_from_url",
     # Registry
     "register_log_backend",
     "unregister_log_backend",
@@ -164,10 +168,12 @@ def get_log_backend(backend_id: str) -> type:
     ``get_default_log_backend`` to keep both raise sites consistent.
     """
     if backend_id not in _registry:
-        known_ids = sorted(set(_registry.keys()) | {"sqlite"})
+        # ``sqlite`` was a forward-pointer in PR 1/PR 2; eagerly
+        # registered in PR 3. The known-id list comes directly from
+        # the registry — no union needed.
         raise BackendNotRegistered(
             f"No LogBackend registered under {backend_id!r}. "
-            f"Available: {known_ids}"
+            f"Available: {sorted(_registry.keys())}"
         )
     return _registry[backend_id]
 
@@ -181,6 +187,15 @@ def list_log_backends() -> list[str]:
 # Lock registry pattern (``atomic_agents/locks/__init__.py:139``) —
 # the default is always available without an extra resolution step.
 register_log_backend("filesystem", FilesystemLogBackend)
+
+
+# Register the SQLite backend at import time (#61 PR 3). Stdlib
+# ``sqlite3`` — no optional dependency, no install step. Eager
+# registration matches FilesystemLogBackend's pattern; future
+# external-dependency backends (Postgres, Datadog) will lazy-register
+# inside ``get_default_log_backend`` to keep framework startup cost
+# down for operators who haven't selected them.
+register_log_backend("sqlite", SQLiteLogBackend)
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -262,13 +277,23 @@ def get_default_log_backend(scope_root: Path) -> LogBackend:
     if raw_backend_id == "filesystem":
         return FilesystemLogBackend(scope_root)
 
+    if raw_backend_id == "sqlite":
+        # SQLite backend was registered eagerly at module load (line
+        # 196 below). Use the registry-returned class for the no-URL
+        # path; route through ``make_sqlite_backend_from_url`` for
+        # the URL-set path so URL parsing logic stays in one place.
+        url = os.environ.get("ATOMIC_AGENTS_LOG_BACKEND_URL")
+        if not url:
+            # No URL → default to ``<scope_root>/.logs.db`` (sibling of
+            # the agent's log/ dir). Operators who want a custom path
+            # set ATOMIC_AGENTS_LOG_BACKEND_URL=sqlite:///path/to.db.
+            return SQLiteLogBackend(scope_root / ".logs.db")
+        return make_sqlite_backend_from_url(url)
+
     # Unknown backend_id — surface a fail-fast error with the FULL
     # known-id list so operators can spot the typo. Includes the
-    # lazy-resolved ``"sqlite"`` that PR 3 will ship even though it
-    # isn't in the eager registry yet — same forward-pointer pattern
-    # spec/21 §"Operator surface" uses to dodge the Step 11 adversarial
-    # P0-3 finding (operators who typed ``redus`` got "Available:
-    # ['filesystem']" and concluded Redis wasn't supported).
+    # lazy-resolved ``"sqlite"`` (now registered in PR 3) so the
+    # error message remains stable as the registry evolves.
     #
     # Credential safety: ``raw_backend_id`` is sanitized before
     # interpolation in case an operator accidentally pastes a URL
@@ -279,11 +304,12 @@ def get_default_log_backend(scope_root: Path) -> LogBackend:
     # Same fix applies to ``locks/__init__.py:194`` per the systemic
     # gap Step 9.1 security specialist surfaced.
     safe_backend_id = _redact_for_error_message(raw_backend_id)
-    known_ids = sorted(set(list_log_backends()) | {"sqlite"})
+    # ``sqlite`` is eagerly registered as of PR 3; no forward-pointer
+    # union needed.
     raise BackendNotRegistered(
         f"ATOMIC_AGENTS_LOG_BACKEND={safe_backend_id!r} is not a known "
-        f"backend. Available: {known_ids}. Unset the env var to use "
-        f"the filesystem default."
+        f"backend. Available: {list_log_backends()}. Unset the env var "
+        f"to use the filesystem default."
     )
 
 

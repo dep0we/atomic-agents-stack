@@ -147,7 +147,14 @@ def load_runs(
     until_dt = datetime.combine(until, dt_time.max).astimezone()
 
     runs: list[RunRecord] = []
-    for rec in backend.query(LogQuery(since=since_dt, until=until_dt)):
+    # Filter by agent_name so shared-backend deployments (single
+    # SQLite/Postgres file shared across agents) don't mix cross-agent
+    # records into one agent's dashboard view. Step 11 P0 #1 — the
+    # filesystem-default per-agent dir shape provides this isolation
+    # naturally; shared backends require the explicit filter.
+    for rec in backend.query(LogQuery(
+        since=since_dt, until=until_dt, agent_name=agent,
+    )):
         rr = _record_from_dict(rec.to_dict(), agent)
         if rr is None:
             continue

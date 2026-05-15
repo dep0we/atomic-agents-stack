@@ -3087,11 +3087,11 @@ class AtomicAgent:
         if self.config.cost_guardrails_enabled and not critical:
             log_dir = self.agent_root / "log"
             today_cost = (
-                _costs.sum_cost_for_period(log_dir, "today", source="actor", backend=self.log_backend)
+                _costs.sum_cost_for_period(log_dir, "today", source="actor", backend=self.log_backend, agent_name=self.name)
                 + self._delegated_cost_this_run
             )
             month_cost = (
-                _costs.sum_cost_for_period(log_dir, "this_month", source="actor", backend=self.log_backend)
+                _costs.sum_cost_for_period(log_dir, "this_month", source="actor", backend=self.log_backend, agent_name=self.name)
                 + self._delegated_cost_this_run
             )
             daily_remaining = (
@@ -3319,8 +3319,8 @@ class AtomicAgent:
         if not self.config.cost_guardrails_enabled or reserved_usd <= 0:
             return
         log_dir = self.agent_root / "log"
-        today_cost = _costs.sum_cost_for_period(log_dir, "today", source="actor", backend=self.log_backend)
-        month_cost = _costs.sum_cost_for_period(log_dir, "this_month", source="actor", backend=self.log_backend)
+        today_cost = _costs.sum_cost_for_period(log_dir, "today", source="actor", backend=self.log_backend, agent_name=self.name)
+        month_cost = _costs.sum_cost_for_period(log_dir, "this_month", source="actor", backend=self.log_backend, agent_name=self.name)
         daily_remaining = (
             self.config.daily_cap_usd - today_cost
             if self.config.daily_cap_usd > 0
@@ -3429,8 +3429,8 @@ class AtomicAgent:
             return CostCheckResult(allow=True, reason="critical_override")
 
         log_dir = self.agent_root / "log"
-        today_cost = _costs.sum_cost_for_period(log_dir, "today", source="actor", backend=self.log_backend) + extra_in_flight_cost_usd
-        month_cost = _costs.sum_cost_for_period(log_dir, "this_month", source="actor", backend=self.log_backend) + extra_in_flight_cost_usd
+        today_cost = _costs.sum_cost_for_period(log_dir, "today", source="actor", backend=self.log_backend, agent_name=self.name) + extra_in_flight_cost_usd
+        month_cost = _costs.sum_cost_for_period(log_dir, "this_month", source="actor", backend=self.log_backend, agent_name=self.name) + extra_in_flight_cost_usd
 
         daily_pct = (today_cost / self.config.daily_cap_usd) if self.config.daily_cap_usd > 0 else 0
         monthly_pct = (month_cost / self.config.monthly_cap_usd) if self.config.monthly_cap_usd > 0 else 0
@@ -3542,6 +3542,12 @@ class AtomicAgent:
             "primitive",
             _derive_primitive_from_trigger(record.get("trigger")),
         )
+        # Stamp the originating agent. Critical for shared-backend
+        # deployments (#61 PR 3 review-pass Step 11 P0 #1) — without
+        # ``agent_name``, the dashboard + cost-guardrail readers can't
+        # filter to a single agent's records when multiple agents
+        # share one SQLite/Postgres file.
+        record.setdefault("agent_name", self.name)
         self.log_backend.append(RunRecord.from_dict(record))
 
     def _derive_summary(self, work_item: str) -> str:

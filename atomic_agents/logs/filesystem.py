@@ -568,6 +568,20 @@ def _matches(
         return False
     if filter.parent_run_id is not None and record.parent_run_id != filter.parent_run_id:
         return False
+    if filter.agent_name is not None:
+        # Lenient: match when record.agent_name equals filter OR is None.
+        # Pre-PR-2 on-disk records don't carry agent_name; under
+        # filesystem's per-agent-dir scoping, every record in the dir
+        # IS the named agent's. The filter is load-bearing only for
+        # shared-backend deployments (SQLite/Postgres shared file),
+        # where post-PR-2 records all carry the field. Lenient matching
+        # preserves backward compat for filesystem reads without
+        # weakening the shared-backend cross-agent isolation property.
+        if (
+            record.agent_name is not None
+            and record.agent_name != filter.agent_name
+        ):
+            return False
     if since_str is not None and record.ts < since_str:
         return False
     if until_str is not None and record.ts > until_str:
