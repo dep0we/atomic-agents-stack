@@ -130,7 +130,8 @@ class MCPClientPool:
     finally. Subprocess servers live for the duration of the call.
 
     Thread safety: this class is NOT thread-safe. One pool per agent.call()
-    invocation, and the agent's AgentLock serialises concurrent calls.
+    invocation, and the agent's ``lock_backend`` (``LockBackend`` per
+    spec/21) serialises concurrent calls.
     """
 
     def __init__(self, server_specs: list[MCPServerSpec], agents_root: Path) -> None:

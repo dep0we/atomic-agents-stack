@@ -176,9 +176,9 @@ def test_tool_loop_cost_cap_enforced_mid_flight(tmp_path):
     )
 
     with patch.dict(sys.modules, {"anthropic": fake_anthropic}):
-        with patch("atomic_agents.agent.AgentLock") as mock_lock:
-            mock_lock.return_value.acquire.return_value = None
-            mock_lock.return_value.release.return_value = None
+        with patch.object(agent, "lock_backend") as mock_lock:
+            mock_lock.acquire.return_value = MagicMock()  # fake LockHandle (#60 PR 2)
+            mock_lock.release.return_value = None
             # sum_cost_for_period always returns 0 — all blocking via accumulator
             with patch("atomic_agents.agent._costs.sum_cost_for_period", return_value=0.0):
                 response = agent.call("Run the loop.")
@@ -409,9 +409,9 @@ def test_unknown_tool_logs_warning_does_not_raise_nameerror(tmp_path):
 
     try:
         with patch.dict(sys.modules, {"anthropic": fake_anthropic}):
-            with patch("atomic_agents.agent.AgentLock") as mock_lock:
-                mock_lock.return_value.acquire.return_value = None
-                mock_lock.return_value.release.return_value = None
+            with patch.object(agent, "lock_backend") as mock_lock:
+                mock_lock.acquire.return_value = MagicMock()  # fake LockHandle (#60 PR 2)
+                mock_lock.release.return_value = None
                 # This should NOT raise NameError — if _logger is undefined, it would
                 response = agent.call("Call a ghost tool.")
     finally:

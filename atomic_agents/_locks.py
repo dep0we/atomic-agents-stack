@@ -1,93 +1,135 @@
-"""Per-agent file locking — flock-based, with stale-lock recovery via OS.
+"""DEPRECATED: use ``atomic_agents.locks.FilesystemLockBackend`` instead.
 
-Per spec/04 + shared-helper.md. The agent acquires its lock before any vault
-write; releases on completion. Crashes release the lock automatically (OS
-releases flock on process death).
+This module is a thin backwards-compatibility shim. ``AgentLock`` (class)
+and ``acquire()`` (module-level contextmanager) are preserved at this
+import path so existing call sites and operator runbooks keep working,
+but every public symbol here emits ``DeprecationWarning`` and delegates
+to ``atomic_agents.locks.FilesystemLockBackend`` under the hood.
 
-Cron jobs that find the lock held by another process should fail-fast and
-retry next cycle. Skill sessions can wait briefly.
+# SUNSET v1.0
+Per CLAUDE.md rule #14 ("Backward compatibility by default"), this shim
+is planned for removal in the v1.0 release. New code MUST import from
+``atomic_agents.locks`` directly. Existing code should migrate via the
+mechanical substitution:
+
+    # Before
+    from atomic_agents._locks import AgentLock
+    with AgentLock(agent_root, wait_seconds=30):
+        ...
+
+    # After
+    from atomic_agents.locks import FilesystemLockBackend
+    with FilesystemLockBackend(agent_root).acquire("", timeout=30):
+        ...
+
+The on-disk artifact at ``<agent_root>/.lock`` and the ``pid=<pid>
+acquired=<ts>`` payload format are preserved byte-shape so external
+diagnostic scripts (including ``atomic-agents doctor``) continue to
+work without change. See ``docs/spec/21-lock-backend.md`` for the
+full LockBackend Protocol contract this shim wraps.
 """
 
 from __future__ import annotations
+
 import contextlib
-import errno
-import fcntl
-import os
-import time
+import warnings
 from pathlib import Path
 
-from .exceptions import AgentLockBusy
+from .exceptions import AgentLockBusy  # noqa: F401 — back-compat re-export
+from .locks.filesystem import FilesystemLockBackend
+from .locks.types import LockHandle
 
 
+# SUNSET v1.0
 class AgentLock:
-    """Per-agent flock, used as a context manager.
+    """DEPRECATED: thin wrapper over ``FilesystemLockBackend.acquire("")``.
 
-    Usage:
-        with AgentLock(agent_root, wait_seconds=30):
-            # do all vault writes here
-            ...
+    Preserves the legacy per-agent-flock construction signature
+    ``AgentLock(agent_root, wait_seconds=...)`` while delegating the
+    actual acquire/release to the new Protocol-shaped backend.
+
+    Sunset planned for v1.0 — new code should construct
+    ``FilesystemLockBackend(agent_root).acquire("", timeout=...)``
+    directly.
     """
 
-    def __init__(self, agent_root: Path, wait_seconds: float = 0.0,
-                  poll_interval: float = 0.5):
-        """
-        agent_root: <agents_root>/<agent_name>/
-        wait_seconds: how long to wait for a busy lock before giving up
-                      (0 = fail immediately; useful for cron)
-        """
+    def __init__(
+        self,
+        agent_root: Path,
+        wait_seconds: float = 0.0,
+        poll_interval: float = 0.5,
+    ) -> None:
+        warnings.warn(
+            "atomic_agents._locks.AgentLock is deprecated; use "
+            "atomic_agents.locks.FilesystemLockBackend instead. "
+            "See docs/spec/21-lock-backend.md. Sunset planned for v1.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.agent_root = agent_root
         self.wait_seconds = wait_seconds
-        self.poll_interval = poll_interval
+        # ``lock_path`` is preserved as a public attribute so legacy
+        # callers that inspected ``lock.lock_path`` (e.g., diagnostic
+        # scripts) keep working.
         self.lock_path = agent_root / ".lock"
-        self._fd: int | None = None
+        self._backend = FilesystemLockBackend(agent_root, poll_interval=poll_interval)
+        self._handle: LockHandle | None = None
 
-    def __enter__(self):
+    @property
+    def _fd(self) -> int | None:
+        """Legacy attribute exposed for backwards compatibility.
+
+        Returns the open file descriptor underlying the held lock, or
+        ``None`` when the lock is not held. Tests that asserted
+        ``lock._fd is not None`` after acquire (see
+        ``tests/test_locks.py``) keep working unchanged.
+        """
+        if self._handle is None:
+            return None
+        # ``LockHandle.backend_state`` carries the open fd for the
+        # filesystem backend per spec/21. Wiped to None on release.
+        state = self._handle.backend_state
+        return state if isinstance(state, int) else None
+
+    def __enter__(self) -> "AgentLock":
         self.acquire()
         return self
 
-    def __exit__(self, exc_type, exc, tb):
+    def __exit__(self, exc_type, exc, tb) -> bool:
         self.release()
         return False
 
     def acquire(self) -> None:
-        """Acquire the lock or raise AgentLockBusy."""
-        self.agent_root.mkdir(parents=True, exist_ok=True)
-        # Open the lock file (create if needed)
-        self._fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o644)
-
-        deadline = time.monotonic() + self.wait_seconds
-        while True:
-            try:
-                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                # Got it — write our PID for debugging
-                os.lseek(self._fd, 0, os.SEEK_SET)
-                os.ftruncate(self._fd, 0)
-                os.write(self._fd, f"pid={os.getpid()} acquired={time.time()}\n".encode())
-                return
-            except (BlockingIOError, OSError) as e:
-                if e.errno != errno.EWOULDBLOCK and not isinstance(e, BlockingIOError):
-                    raise
-                if time.monotonic() >= deadline:
-                    os.close(self._fd)
-                    self._fd = None
-                    raise AgentLockBusy(
-                        f"Agent lock at {self.lock_path} held by another process; "
-                        f"waited {self.wait_seconds}s"
-                    )
-                time.sleep(self.poll_interval)
+        """Acquire the lock; raise ``AgentLockBusy`` on timeout."""
+        self._handle = self._backend.acquire("", timeout=self.wait_seconds)
 
     def release(self) -> None:
-        if self._fd is not None:
-            try:
-                fcntl.flock(self._fd, fcntl.LOCK_UN)
-            finally:
-                os.close(self._fd)
-                self._fd = None
+        """Release the lock. Idempotent — safe to call twice."""
+        if self._handle is not None:
+            self._backend.release(self._handle)
+            self._handle = None
 
 
+# SUNSET v1.0
 @contextlib.contextmanager
 def acquire(agent_root: Path, wait_seconds: float = 0.0):
-    """Functional alias for `with AgentLock(...) as lock:`."""
+    """DEPRECATED: contextmanager wrapper for ``AgentLock``.
+
+    Preserved for backwards compatibility with the legacy module-level
+    ``acquire(agent_root, wait_seconds)`` shape. Emits a
+    ``DeprecationWarning`` and delegates to ``AgentLock``.
+
+    Sunset planned for v1.0 — new code should use
+    ``with FilesystemLockBackend(agent_root).acquire("",
+    timeout=wait_seconds) as handle: ...`` directly.
+    """
+    warnings.warn(
+        "atomic_agents._locks.acquire() is deprecated; use "
+        "atomic_agents.locks.FilesystemLockBackend instead. "
+        "Sunset planned for v1.0.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     lock = AgentLock(agent_root, wait_seconds=wait_seconds)
     lock.acquire()
     try:

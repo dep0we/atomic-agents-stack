@@ -36,7 +36,7 @@ from ._io import atomic_append_jsonl, atomic_write, safe_resolve_under
 from .memory.filesystem import FilesystemBackend
 from .memory.backend import WritePolicy
 from .mcp import MCPClientPool, parse_mcp_md
-from ._locks import AgentLock
+from .locks import LockBusy, get_lock_backend
 from ._platform import get_agents_root
 from ._schema import validate_atomic_note_frontmatter
 from .goal import parse_agent_mode
@@ -146,6 +146,14 @@ class AtomicAgent:
                 f"Agent folder not found: {self.agent_root}. "
                 f"Set ATOMIC_AGENTS_ROOT env var or create the agent."
             )
+
+        # LockBackend instance bound to this agent's root. Routed through
+        # the registry (default ``"filesystem"``) so PR 3 of #60 can add
+        # an operator-pinned override (constructor kwarg or env var)
+        # without changing this construction line. ``lock_backend`` is
+        # public — mirrors ``self.memory`` and lets diagnostic code
+        # (``atomic-agents doctor``) reuse the same backend instance.
+        self.lock_backend = get_lock_backend("filesystem")(self.agent_root)
 
         # Cascade detection — None for single-agent layouts (load behaves as before),
         # populated for paths shaped <system>/projects/<project>/agents/<role>/.
@@ -2068,11 +2076,19 @@ class AtomicAgent:
         if not self._persona_text:
             self.load()
 
-        # Acquire agent lock
+        # Acquire agent lock via the bound LockBackend. Empty name maps
+        # to ``<agent_root>/.lock`` on the filesystem backend — preserves
+        # the legacy on-disk artifact so doctor + external scripts keep
+        # working without migration (spec/21 §"acquire(name, timeout)
+        # semantics"). ``LockBusy`` is the canonical exception; the
+        # legacy ``AgentLockBusy`` alias keeps existing operator
+        # except-clauses working unchanged (see ``atomic_agents.
+        # exceptions.AgentLockBusy = LockBusy``).
         try:
-            lock = AgentLock(self.agent_root, wait_seconds=30 if self.trigger == "skill" else 0)
-            lock.acquire()
-        except AgentLockBusy as e:
+            lock_handle = self.lock_backend.acquire(
+                "", timeout=30 if self.trigger == "skill" else 0
+            )
+        except LockBusy as e:
             self._log({
                 "trigger": self.trigger,
                 "model": self.config.default_model,
@@ -2586,7 +2602,7 @@ class AtomicAgent:
             # when a later call's server fails to reconnect.
             for _mcp_name in _mcp_registered_names:
                 self.tool_registry.unregister(_mcp_name)
-            lock.release()
+            self.lock_backend.release(lock_handle)
 
     def _build_tool_loop_messages(
         self,

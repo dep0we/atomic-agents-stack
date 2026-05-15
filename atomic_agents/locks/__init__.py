@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import logging
 
-from ..exceptions import BackendNotRegistered
+from ..exceptions import BackendNotRegistered, LockBusy
 from .backend import LockBackend
 from .filesystem import FilesystemLockBackend
 from .types import LockCapabilities, LockHandle
@@ -56,6 +56,9 @@ __all__ = [
     "unregister_lock_backend",
     "get_lock_backend",
     "list_lock_backends",
+    # Exception (re-exported from atomic_agents.exceptions for ergonomic
+    # callers that import the backend and the exception together).
+    "LockBusy",
 ]
 
 

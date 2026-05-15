@@ -43,7 +43,7 @@ from .backend import (
     WritePolicy,
 )
 from .._io import atomic_write, safe_resolve_under
-from .._locks import AgentLock
+from ..locks import get_lock_backend
 from .._schema import CURRENT_SCHEMA_VERSION, derive_filename
 from ..exceptions import (
     MemoryPreconditionFailed,
@@ -142,10 +142,34 @@ class FilesystemBackend:
     memory_subdir: subdirectory name under agent_root for notes (default "memory")
     """
 
-    def __init__(self, agent_root: Path, memory_subdir: str = "memory"):
+    def __init__(
+        self,
+        agent_root: Path,
+        memory_subdir: str = "memory",
+        *,
+        apply_staging_lock_timeout: float = 30.0,
+    ):
         self._agent_root = agent_root
         self._memory_dir = agent_root / memory_subdir
         self._versions_dir = self._memory_dir / ".versions"
+        # Per-instance lock timeout for ``apply_staging``. Constructor
+        # kwarg (not a class attribute) so tests can construct
+        # ``FilesystemBackend(root, apply_staging_lock_timeout=0.0)``
+        # for fail-fast scenarios WITHOUT mutating shared class state
+        # that could leak across tests or be exploited by an in-process
+        # actor (Step 9.1 security specialist CRITICAL — class-level
+        # mutation propagates to ALL FilesystemBackend instances in the
+        # process). The MemoryBackend Protocol (spec/20) does NOT take
+        # a lock-timeout argument on ``apply_staging`` and widening the
+        # Protocol surface for a test ergonomic would be the wrong
+        # tradeoff (CLAUDE.md rule #2 — Protocols stay clean); the
+        # constructor kwarg lives on the concrete reference impl only.
+        self._apply_staging_lock_timeout = apply_staging_lock_timeout
+        # Cached LockBackend scoped to ``agent_root`` so that
+        # ``apply_staging`` serializes against ``agent.call()`` (both
+        # acquire ``<agent_root>/.lock`` via empty-name). Routed through
+        # the registry (default ``"filesystem"``) for PR 3 forward-compat.
+        self._lock_backend = get_lock_backend("filesystem")(agent_root)
 
     # ───── Internal helpers ─────────────────────────────────────────
 
@@ -502,10 +526,13 @@ class FilesystemBackend:
         ts_unique = f"{ts}_{uuid.uuid4().hex[:8]}"
         archived = self._agent_root / f"memory.archived-{ts_unique}"
 
-        # Acquire the per-agent lock to serialize against in-flight agent.call() writes.
-        agent_lock = AgentLock(self._agent_root, wait_seconds=30)
-        agent_lock.acquire()
-        try:
+        # Acquire the per-agent lock to serialize against in-flight
+        # agent.call() writes. ``acquire("")`` produces
+        # ``<agent_root>/.lock`` (the exact path ``agent.call()``
+        # acquires), so the kernel flock serializes the two paths
+        # cross-process. Context-manager release is idempotent per
+        # spec/21 §"release(handle)".
+        with self._lock_backend.acquire("", timeout=self._apply_staging_lock_timeout):
             if current_memory.exists():
                 os.rename(str(current_memory), str(archived))
             try:
@@ -516,8 +543,6 @@ class FilesystemBackend:
                     os.rename(str(archived), str(current_memory))
                 raise
             staging._applied = True
-        finally:
-            agent_lock.release()
 
     def discard_staging(self, staging: StagedMemory) -> None:
         if not isinstance(staging, FilesystemStagedMemory):
@@ -621,7 +646,16 @@ def _enforce_write_path(
 
 @contextlib.contextmanager
 def _per_file_lock(target: Path):
-    """Acquire an exclusive POSIX flock on <target>.lock to close TOCTOU window."""
+    """Acquire an exclusive POSIX flock on <target>.lock to close TOCTOU window.
+
+    Deliberately NOT subsumed by ``atomic_agents.locks.LockBackend`` —
+    this is a filesystem-implementation invariant of the FilesystemBackend's
+    write path, not a Protocol-level concern. A future Redis-backed memory
+    backend would use Redis transactions or row locks here, not
+    ``<note>.lock`` files. Forcing this through the LockBackend Protocol
+    would distort both Protocols. See ``docs/spec/21-lock-backend.md``
+    §"What this PR does NOT do" for the full rationale.
+    """
     if sys.platform == "win32" or not hasattr(os, "O_RDWR"):
         yield
         return

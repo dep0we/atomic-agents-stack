@@ -49,6 +49,19 @@ packages = ["atomic_agents"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+# Suppress the deprecation warnings emitted by the ``atomic_agents._locks``
+# shim (#60 PR 2 — sunset planned for v1.0). The shim is intentionally
+# noisy on import to nudge operator migration; suppressing in the test
+# suite keeps CI output focused on real warnings. Tests that positively
+# assert the warning fires use ``warnings.catch_warnings(record=True)
+# warnings.simplefilter('always')`` to override the filter locally.
+filterwarnings = [
+    # Filter by message text (not module path) because the shim's
+    # ``warnings.warn(..., stacklevel=2)`` attributes the warning to the
+    # caller's module, not ``atomic_agents._locks``.
+    "ignore:atomic_agents\\._locks\\.AgentLock is deprecated.*:DeprecationWarning",
+    "ignore:atomic_agents\\._locks\\.acquire\\(\\) is deprecated.*:DeprecationWarning",
+]
 
 [dependency-groups]
 dev = [
