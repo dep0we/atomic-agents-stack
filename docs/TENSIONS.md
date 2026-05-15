@@ -33,7 +33,7 @@ These aren't bugs. They're design tensions, often with no obviously-better answe
 
 **Where:** `atomic_agents/agent.py:544-930` (`call()` method, ~390 lines). File: 1752 lines total.
 
-**When this bites:** As soon as 3 of 6 backend protocols (#60–#65) land. Today, only MemoryBackend is implemented; `call()` is "fine, dense." After LockBackend + LogBackend, it's "ache." After PersonaBackend, it wants surgery.
+**When this bites:** As soon as 3 of 6 backend protocols (#60–#65) land. Two have shipped (#57 MemoryBackend, #60 LockBackend); `call()` is "fine, dense — but the public surface widened with `self.lock_backend`." After LogBackend (#61), it's "ache." After PersonaBackend, it wants surgery.
 
 **What to watch for:**
 - Length of `call()` after each backend lands. Trigger: line count >450 OR cyclomatic complexity rising visibly.
@@ -70,28 +70,19 @@ The MCP integration already documents this tension in spec/19: `asyncio.run()` p
 
 ---
 
-### 🟡 T3. MemoryBackend is the only protocol; LockBackend is the actual scaling cliff
+### ✅ T3. LockBackend ships — multi-host cliff closed (resolved 2026-05-15 via #60)
 
-**One-sentence:** The protocol pattern is in place (registry + Memory + spec/20), but `AgentLock` is filesystem-flock-only — until LockBackend (#60) lands, nothing runs multi-host.
+**One-sentence:** The LockBackend Protocol arc shipped across four PRs ([#180](https://github.com/dep0we/atomic-agents-stack/pull/180) / [#181](https://github.com/dep0we/atomic-agents-stack/pull/181) / [#182](https://github.com/dep0we/atomic-agents-stack/pull/182) / [#183](https://github.com/dep0we/atomic-agents-stack/pull/183)) — `FilesystemLockBackend` (POSIX flock, single-host) + `RedisLockBackend` (single-instance advisory lock, multi-host) reference impls; `scope(sub_path)` Protocol method for namespace isolation; `LockLost` exception + daemon-thread heartbeat for lease-backed backends; operator override via `ATOMIC_AGENTS_LOCK_BACKEND` env vars OR `AtomicAgent(..., lock_backend=...)` kwarg; `doctor.check_lock_backend` coherence check with PASS/WARN/FAIL ladder. Spec locked at `docs/spec/21-lock-backend.md`.
 
-**Why load-bearing:** `_locks.py` uses `fcntl.flock()` on a `.lock` file. POSIX flock works on local filesystems and *most* network filesystems but is unreliable on NFS variants and not portable to Windows / S3 / Cloud Run / Lambda. "Multi-host fleet running shared agents" requires either:
-- Distributed lock service (Redis, etcd, Postgres advisory locks)
-- Or a fundamentally different concurrency model (single-writer queue per agent)
+**What was the cliff:** `_locks.AgentLock` used `fcntl.flock()` on a `.lock` file. POSIX flock works on local filesystems but is unreliable on NFS variants and not portable to Windows / S3 / Cloud Run / Lambda. "Multi-host fleet running shared agents" required either a distributed lock service or a fundamentally different concurrency model.
 
-Both are LockBackend's job per #60.
+**How #60 resolved it:** Protocol + filesystem default (zero behavior change for existing deployments) + Redis reference impl (multi-host). Operators on Cloud Run / Kubernetes / gizmo flip `ATOMIC_AGENTS_LOCK_BACKEND=redis` + `ATOMIC_AGENTS_LOCK_BACKEND_URL=redis://...`; no code changes required. `_locks.AgentLock` preserved as a deprecation shim through v1.0 (CLAUDE.md rule #14).
 
-**Where:** `atomic_agents/_locks.py` (entire file, 96 lines). Used by:
-- `agent.py` `call()` line 582 (per-call serialization)
-- `dream.py` `DreamRunner._dream_lock_backend` (separate scope from the agent's main lock so dreams don't block calls — formerly `_DreamLock` class, replaced in #60 PR 2)
-- `_cascade.py` queue-claim mechanics use POSIX `Path.rename()` which has the same single-host assumption
+**Residual single-host assumptions** (NOT in scope for #60, tracked elsewhere):
+- `_cascade.py` queue-claim mechanics use POSIX `Path.rename()` — see T4 below.
+- `memory/filesystem.py:_per_file_lock` (per-note flock) is deliberately a filesystem-implementation invariant, NOT part of the LockBackend Protocol per spec/21. Future Redis-backed memory backends would use Redis transactions, not `<note>.lock` files.
 
-**When this bites:** First time someone tries to run two `atomic-agents run` processes against the same vault on different hosts. Issue #60 is flagged "Highest urgency — multi-process cliff."
-
-**What to watch for:**
-- Any deployment doc that hand-waves "make sure only one host runs the cron." That's a sign the cliff is being accepted, not solved.
-- `dream.py`'s parallel lock (formerly `_DreamLock`, now `_dream_lock_backend` per #60 PR 2) — both routes now go through `FilesystemLockBackend`; the abstraction is no longer leaky between agent and dream. PR 3 of #60 swaps the registry default for operator-pinned backends to address multi-host; PR 4 locks the spec.
-
-**Related:** Issue #60. ROADMAP Tier 2 backend roadmap.
+**Related:** Issue #60 (closed by #183), `docs/spec/21-lock-backend.md`, T4 below for the parallel cascade-claim story.
 
 ---
 
