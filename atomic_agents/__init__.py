@@ -91,6 +91,18 @@ from .profile import (
     list_profile_backends,
     get_default_profile_backend,
 )
+from .registry import (
+    ToolRegistryBackend,
+    ToolRef,
+    ToolRegistryCapabilities,
+    ValidationResult,
+    FilesystemToolRegistryBackend,
+    register_tool_registry_backend,
+    unregister_tool_registry_backend,
+    get_tool_registry_backend,
+    list_tool_registry_backends,
+    get_default_tool_registry_backend,
+)
 from .judge import (
     # Protocol contract + outcome model
     JudgeBackend,
@@ -120,6 +132,10 @@ from .exceptions import (
     AgentProfileNotFound,
     AgentProfileExists,
     SnapshotNotFound,
+    ToolNotInRegistry,
+    ToolHandlerImportFailed,
+    ToolDescriptorInvalid,
+    ToolAlreadyInstalled,
 )
 
 __version__ = "0.13.0"
@@ -223,4 +239,21 @@ __all__ = [
     "AgentProfileNotFound",
     "AgentProfileExists",
     "SnapshotNotFound",
+    # ToolRegistryBackend Protocol surface (spec/25 — #64 PR 1 scaffolding;
+    # AtomicAgent.__init__ wiring + doctor.check_tool_registry_backend
+    # land in PR 2; second backend + install/uninstall land in PR 3)
+    "ToolRegistryBackend",
+    "ToolRef",
+    "ToolRegistryCapabilities",
+    "ValidationResult",
+    "FilesystemToolRegistryBackend",
+    "register_tool_registry_backend",
+    "unregister_tool_registry_backend",
+    "get_tool_registry_backend",
+    "list_tool_registry_backends",
+    "get_default_tool_registry_backend",
+    "ToolNotInRegistry",
+    "ToolHandlerImportFailed",
+    "ToolDescriptorInvalid",
+    "ToolAlreadyInstalled",
 ]
