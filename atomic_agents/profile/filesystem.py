@@ -44,6 +44,7 @@ writer wins, but neither caller sees a partially-written file.
 
 from __future__ import annotations
 
+import shutil
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -60,10 +61,11 @@ from ..exceptions import (
     AgentProfileExists,
     AgentProfileNotFound,
     MCPServerConnectFailed,
+    SkillFileTraversal,
 )
-from ..goal import parse_agent_mode
+from ..goal import parse_agent_mode_text
 from ..judges_md import load_judges_config
-from ..mcp import parse_mcp_md
+from ..mcp import parse_mcp_md_text
 from ..skills import (
     SKILL_ENTRY_POINT,
     SkillManifest,
@@ -239,34 +241,46 @@ class FilesystemAgentProfileBackend:
         )
         roster = parse_roster_md_text(roster_md_raw)
 
-        # ── mcp.md ──
+        # ── mcp.md — raw text + parsed servers from one read ──
+        # Read mcp.md ONCE — both ``mcp_md_raw`` and ``mcp_servers``
+        # consume the same bytes. Step 9.1 perf finding F-D flagged
+        # the original double-read (``read_text`` + ``parse_mcp_md``
+        # internally re-reading). Using ``parse_mcp_md_text`` on the
+        # already-loaded raw eliminates one syscall on every load.
         mcp_md_path = agent_root / "mcp.md"
         mcp_md_raw = (
             mcp_md_path.read_text(encoding="utf-8") if mcp_md_path.is_file() else ""
         )
-        # Pass read_paths so path-traversal validation matches the live
-        # bootstrap behavior. parse_mcp_md raises if env var refs can't be
-        # resolved; for load purposes we accept that single failure mode
-        # so a profile referencing dev-only env vars is still inspectable
-        # in a fresh process. The raw text on the profile is preserved
-        # so the operator can write back without losing the references.
-        #
         # NARROW catch: only ``MCPServerConnectFailed`` — the env-var-
-        # resolution failure shape parse_mcp_md raises at line 562-565.
+        # resolution failure shape parse_mcp_md_text raises. The raw
+        # text on the profile is preserved so the operator can write
+        # back without losing $VAR references.
         # ``PathTraversalError`` (mcp.md server arg escaping read_paths)
         # is a security finding and MUST propagate — silently returning
         # ``mcp_servers = []`` would mask malicious server declarations
         # at load time. Pre-#63-PR-1-review-pass this was ``except
         # Exception`` which swallowed both — Step 9 pre-landing review
         # finding F-3.
-        try:
-            mcp_servers = parse_mcp_md(
-                mcp_md_path, read_paths=tool_config.get("read_paths")
-            )
-        except MCPServerConnectFailed:
+        if mcp_md_raw:
+            try:
+                mcp_servers = parse_mcp_md_text(
+                    mcp_md_raw,
+                    mcp_md_path=mcp_md_path,
+                    read_paths=tool_config.get("read_paths"),
+                )
+            except MCPServerConnectFailed:
+                mcp_servers = []
+        else:
             mcp_servers = []
 
         # ── persona/IDENTITY.md, SOUL.md, USER.md — raw text ──
+        # Read IDENTITY.md ONCE — used both for persona_identity and to
+        # derive agent_mode (Decision 6). Step 9.1 perf finding F-C
+        # flagged the original double-read (``read_text`` + ``parse_
+        # agent_mode`` re-reading via ``identity_path.read_text``).
+        # ``parse_agent_mode_text`` is the text-taking variant added
+        # to ``goal.py`` so callers with the content already in memory
+        # pay one syscall, not two.
         persona_identity = identity_path.read_text(encoding="utf-8")
         soul_path = agent_root / _SOUL_RELATIVE
         persona_soul = (
@@ -281,8 +295,8 @@ class FilesystemAgentProfileBackend:
         goal_path = agent_root / "goal.md"
         goal_text = goal_path.read_text(encoding="utf-8") if goal_path.is_file() else ""
 
-        # ── agent_mode — derived (Decision 6) ──
-        agent_mode = parse_agent_mode(identity_path)
+        # ── agent_mode — derived from in-memory persona_identity (Decision 6) ──
+        agent_mode = parse_agent_mode_text(persona_identity)
 
         return AgentProfile(
             name=agent_id,
@@ -437,7 +451,20 @@ class FilesystemAgentProfileBackend:
         return discover_skills(agent_root)
 
     def load_skill_body(self, agent_id: str, skill_name: str) -> str:
-        """Read the named skill's SKILL.md body (frontmatter stripped)."""
+        """Read the named skill's SKILL.md body (frontmatter stripped).
+
+        Validates ``skill_name`` against path-traversal — Step 9.1
+        security + testing specialist finding F-A. Without this guard,
+        an operator-supplied ``skill_name`` containing ``/``, ``\\``,
+        or ``..`` could escape the agent's skills directory (the
+        existing ``_agent_root`` guard only validates ``agent_id``).
+        ``load_skill_body(agent_id, "../../../etc/passwd")`` is the
+        attack shape; pre-fix it returned ``FileNotFoundError`` only
+        because the constructed path didn't exist, giving no security
+        signal and offering no defense against valid cross-agent
+        paths like ``../<other-agent>/skills/<name>``.
+        """
+        _validate_skill_name(skill_name)
         agent_root = self._agent_root(agent_id)
         if not (agent_root / _IDENTITY_RELATIVE).is_file():
             raise AgentProfileNotFound(f"agent {agent_id!r} not found at {agent_root}")
@@ -585,7 +612,52 @@ def _copy_dir_tree(source: Path, target: Path) -> None:
     Uses Python's ``shutil.copytree`` semantics — preserves directory
     structure and file content. Used by ``clone`` to copy the skills
     directory after the profile itself has been written.
-    """
-    import shutil
 
-    shutil.copytree(source, target, dirs_exist_ok=False)
+    ``symlinks=True`` preserves symlinks as-is rather than resolving
+    them at copy time. Step 9.1 security finding F-G: with the default
+    ``symlinks=False``, a malicious source agent whose ``skills/`` dir
+    contained a symlink to ``/etc/passwd`` or to another agent's
+    secrets would have those target contents copied into the cloned
+    agent — a cross-agent contamination / data-exfiltration path.
+    Preserving the symlinks keeps them as symlinks in the target;
+    they'll still error at read time if the target is unreachable, but
+    they don't materialize secrets at copy time.
+    """
+    shutil.copytree(source, target, dirs_exist_ok=False, symlinks=True)
+
+
+def _validate_skill_name(skill_name: str) -> None:
+    """Reject ``skill_name`` values that could escape the agent's skills dir.
+
+    Step 9.1 security + testing specialist finding F-A. Mirrors the
+    ``_agent_root`` validation shape — refuse path separators, leading
+    ``.``, empty strings, and parent-dir tokens. Raises
+    ``SkillFileTraversal`` (the existing security-tagged exception
+    from ``skills.py``) for parity with ``load_skill_referenced_file``'s
+    traversal-rejection contract.
+
+    Args:
+        skill_name: operator-supplied skill identifier.
+
+    Raises:
+        SkillFileTraversal: when the value contains a path separator,
+            a parent-dir token, or starts with ``.``.
+        ValueError: when the value is empty.
+    """
+    if not skill_name:
+        raise ValueError("skill_name must not be empty")
+    if "/" in skill_name or "\\" in skill_name:
+        raise SkillFileTraversal(
+            f"skill_name {skill_name!r} contains a path separator — "
+            f"filesystem backend requires plain directory names"
+        )
+    if skill_name.startswith("."):
+        raise SkillFileTraversal(
+            f"skill_name {skill_name!r} starts with '.' — refused to "
+            f"prevent hidden-directory traversal"
+        )
+    if ".." in skill_name:
+        raise SkillFileTraversal(
+            f"skill_name {skill_name!r} contains a parent-dir token — "
+            f"path traversal refused"
+        )

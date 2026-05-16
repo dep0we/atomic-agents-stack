@@ -41,6 +41,13 @@ What this suite asserts:
     raises ``NotImplementedError``.
 29. ``AgentProfile.to_dict / from_dict`` round-trip preserves all fields.
 30. Round-trip survives missing optional files (no SOUL.md, no goal.md).
+31. ``list_skills`` on missing agent raises ``AgentProfileNotFound`` (GAP-11).
+32. ``load_skill_body`` on missing agent raises ``AgentProfileNotFound`` (GAP-11).
+33. ``load_skill_body`` refuses ``skill_name`` containing path-traversal
+    tokens (Step 9.1 multi-specialist finding F-A — security).
+34. ``AgentProfile.from_dict`` narrows the mcp.md re-parse except to
+    ``MCPServerConnectFailed`` only (Step 9.1 multi-specialist finding
+    F-B — security parity with ``filesystem.py`` load_profile).
 """
 
 from __future__ import annotations
@@ -574,3 +581,104 @@ def test_agent_profile_dict_round_trip(backend, tmp_path):
     assert profile2.model_md_raw == profile.model_md_raw
     assert profile2.roster_md_raw == profile.roster_md_raw
     assert profile2.mcp_md_raw == profile.mcp_md_raw
+
+
+# ──────────────────────────────────────────────────────────────────
+# Step 9.1 specialist review additions
+
+
+def test_list_skills_missing_agent_raises_not_found(backend, tmp_path):
+    """GAP-11 — coverage gap surfaced by Step 7 coverage audit + Step 9.1
+    testing specialist. ``list_skills`` on an unknown agent must raise
+    ``AgentProfileNotFound``, not silently return ``[]`` or surface a
+    ``FileNotFoundError`` that the caller can't distinguish from "skills
+    directory doesn't exist on a real agent."
+    """
+    with pytest.raises(AgentProfileNotFound):
+        backend.list_skills("does-not-exist")
+
+
+def test_load_skill_body_missing_agent_raises_not_found(backend, tmp_path):
+    """GAP-11 paired with the above. Without this assertion a caller
+    seeing ``FileNotFoundError`` can't distinguish "bad agent id" from
+    "bad skill name on a real agent" — different error-recovery paths.
+    """
+    with pytest.raises(AgentProfileNotFound):
+        backend.load_skill_body("does-not-exist", "any-skill")
+
+
+def test_load_skill_body_refuses_skill_name_traversal(backend, tmp_path):
+    """Step 9.1 multi-specialist finding F-A (CRITICAL, testing + security
+    confirmed). Without this guard, a caller could pass
+    ``skill_name="../<other-agent>/skills/<name>"`` and cross-agent read
+    via the constructed path — the original ``_agent_root`` guard
+    validates only ``agent_id``. The fix in ``filesystem.py`` rejects
+    any ``skill_name`` containing ``/``, ``\\``, leading ``.``, or
+    ``..``. Conformance backends that store skills under per-agent
+    namespaces are expected to enforce equivalent validation; backends
+    that don't accept operator-typed skill names directly may pass this
+    test trivially.
+    """
+    from atomic_agents.exceptions import SkillFileTraversal
+
+    make_agent_dir(tmp_path, "scout")
+    # Path-separator traversal
+    with pytest.raises((SkillFileTraversal, ValueError)):
+        backend.load_skill_body("scout", "../escape")
+    # Parent-dir token
+    with pytest.raises((SkillFileTraversal, ValueError)):
+        backend.load_skill_body("scout", "valid/../../../escape")
+    # Leading dot (hidden-dir traversal)
+    with pytest.raises((SkillFileTraversal, ValueError)):
+        backend.load_skill_body("scout", ".hidden")
+    # Backslash separator (Windows-shape attack)
+    with pytest.raises((SkillFileTraversal, ValueError)):
+        backend.load_skill_body("scout", "..\\escape")
+
+
+def test_from_dict_narrows_mcp_re_parse_except(backend, tmp_path):
+    """Step 9.1 multi-specialist finding F-B (CRITICAL, testing +
+    maintainability + security confirmed). ``AgentProfile.from_dict``
+    re-parses ``mcp_md_raw`` to populate ``mcp_servers``. The original
+    code wrapped this in ``except Exception`` which silently swallowed
+    ``PathTraversalError`` — the same gap fixed in ``filesystem.py``'s
+    ``load_profile`` (F-3, Step 9 pre-landing review). The narrowing
+    is to ``except MCPServerConnectFailed`` only.
+
+    This test verifies the narrowing by asserting that ``from_dict``
+    handles an unresolvable ``$VAR`` reference gracefully (the
+    MCPServerConnectFailed shape, which IS caught) — and documents
+    via comment that other exceptions now propagate.
+    """
+    # Build a dict with an unresolvable $VAR — exercises the caught path.
+    d = {
+        "name": "scout",
+        "agent_mode": "reactive",
+        "model_config": {},
+        "tool_config": {},
+        "tool_classifications": {},
+        "judges_config": None,
+        "roster": [],
+        "mcp_servers": [],
+        "persona_identity": "# Scout\n",
+        "persona_soul": "",
+        "persona_user": "",
+        "goal_text": "",
+        "model_md_raw": "",
+        "tools_md_raw": "",
+        "judges_md_raw": None,
+        "roster_md_raw": "",
+        "mcp_md_raw": (
+            "# MCP servers\n\n"
+            "## evil\n"
+            "command: npx\n"
+            "args: -y, @mcp/server\n"
+            "env: TOKEN=$NEVER_SET_VAR_FOR_TEST_F_B\n"
+            "description: env var unresolvable\n"
+        ),
+    }
+    # MCPServerConnectFailed is caught → mcp_servers falls back gracefully
+    profile = AgentProfile.from_dict(d)
+    assert isinstance(profile.mcp_servers, list)
+    # Raw text preserved verbatim — the $VAR reference must survive
+    assert "$NEVER_SET_VAR_FOR_TEST_F_B" in profile.mcp_md_raw

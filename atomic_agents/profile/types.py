@@ -42,36 +42,9 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any
 
+from ..exceptions import MCPServerConnectFailed
 from ..judges_md import JudgesConfig
 from ..mcp import MCPServerSpec
-
-
-# ──────────────────────────────────────────────────────────────────
-# Required dataclass fields needed by ``from_dict`` to decide which
-# keys flow into top-level vs ``extra``. Mirrors the ``RunRecord``
-# precedent in ``logs/types.py``.
-
-_CANONICAL_FIELDS = frozenset(
-    {
-        "name",
-        "agent_mode",
-        "model_config",
-        "tool_config",
-        "tool_classifications",
-        "judges_config",
-        "roster",
-        "mcp_servers",
-        "persona_identity",
-        "persona_soul",
-        "persona_user",
-        "goal_text",
-        "model_md_raw",
-        "tools_md_raw",
-        "judges_md_raw",
-        "roster_md_raw",
-        "mcp_md_raw",
-    }
-)
 
 
 # Canonical agent_mode taxonomy. Backends MUST accept arbitrary strings —
@@ -311,17 +284,28 @@ class AgentProfile:
             roster = list(d.get("roster") or [])
 
         if mcp_md_raw:
-            # Note: parser resolves $VAR refs at parse time. The raw
-            # text preserves them verbatim; this re-parse will only
-            # succeed if the env vars referenced in the raw text are
-            # ACTUALLY SET in the current process. For round-trip
-            # tests in environments without those vars set, callers
-            # SHOULD pass an empty mcp_md_raw or pre-set the vars.
+            # NARROW catch: only ``MCPServerConnectFailed`` (env-var
+            # resolution failure shape). Step 9.1 multi-specialist
+            # finding F-B — the same security narrowing applied in
+            # ``filesystem.py:load_profile`` (F-3 in Step 9 pre-
+            # landing review) must apply here. ``PathTraversalError``
+            # raised by ``parse_mcp_md_text`` when an mcp.md server
+            # arg escapes ``read_paths`` is a security finding and
+            # MUST propagate — silently returning the dict's
+            # structured form would mask malicious server declarations
+            # in a database-round-trip scenario.
+            #
+            # Note: this code path doesn't pass read_paths to
+            # ``parse_mcp_md_text``, so the in-parser path-traversal
+            # check is currently skipped. Narrowing the except still
+            # matters because (a) future callers may pass read_paths
+            # via from_dict, (b) other unexpected exceptions (yaml
+            # errors, OSError) should NOT be silently swallowed.
             try:
                 mcp_servers = parse_mcp_md_text(mcp_md_raw)
-            except Exception:
-                # Don't crash from_dict on env-var resolution failure —
-                # the structured form is best-effort here. The raw text
+            except MCPServerConnectFailed:
+                # Env-var unresolvable in this process — fall back to
+                # the dict's structured form (best-effort). Raw text
                 # is preserved for write-back regardless.
                 mcp_servers = list(d.get("mcp_servers") or [])
         else:

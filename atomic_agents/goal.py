@@ -43,8 +43,8 @@ HARD RULES (per spec/12):
 from __future__ import annotations
 import json
 import re
-from dataclasses import dataclass, field, asdict
-from datetime import date, datetime, timedelta
+from dataclasses import dataclass, field
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
@@ -64,9 +64,7 @@ from .exceptions import (
 
 CURRENT_GOAL_SCHEMA_VERSION = 1
 
-VALID_SUB_GOAL_STATUSES = {
-    "pending", "in_progress", "complete", "blocked", "abandoned"
-}
+VALID_SUB_GOAL_STATUSES = {"pending", "in_progress", "complete", "blocked", "abandoned"}
 VALID_PRIORITIES = {"high", "medium", "low"}
 VALID_AGENT_MODES = {"reactive", "goal-driven", "hybrid"}
 
@@ -74,29 +72,34 @@ VALID_AGENT_MODES = {"reactive", "goal-driven", "hybrid"}
 # ──────────────────────────────────────────────────────────────────
 # Data model
 
+
 @dataclass
 class SubGoal:
     """One decomposed unit of work toward the parent goal."""
+
     id: str
     label: str
     status: str = "pending"
-    assigned: str | None = None        # role name | "self" | None
-    deadline: str | None = None         # YYYY-MM-DD
-    blocked_by: str | None = None       # id of another sub_goal
-    completed: str | None = None        # YYYY-MM-DD when status=complete
-    output: str | None = None           # path to artifact this sub_goal produced
-    body: str | None = None             # optional longer description / narrative
-    acceptance_criteria: list[str] = field(default_factory=list)  # optional per-sub-goal criteria
+    assigned: str | None = None  # role name | "self" | None
+    deadline: str | None = None  # YYYY-MM-DD
+    blocked_by: str | None = None  # id of another sub_goal
+    completed: str | None = None  # YYYY-MM-DD when status=complete
+    output: str | None = None  # path to artifact this sub_goal produced
+    body: str | None = None  # optional longer description / narrative
+    acceptance_criteria: list[str] = field(
+        default_factory=list
+    )  # optional per-sub-goal criteria
 
 
 @dataclass
 class Goal:
     """An agent's persistent objective."""
+
     schema_version: int
     active: bool
     intent: str
     priority: str
-    created: str                       # YYYY-MM-DD
+    created: str  # YYYY-MM-DD
     last_progress_check: str
     success_criteria: list[str]
     sub_goals: list[SubGoal] = field(default_factory=list)
@@ -105,12 +108,13 @@ class Goal:
     related_atomic_notes: list[str] = field(default_factory=list)
     related_decisions: list[str] = field(default_factory=list)
     related_canon_pages: list[str] = field(default_factory=list)
-    body: str = ""                     # narrative + history (markdown body of goal.md)
+    body: str = ""  # narrative + history (markdown body of goal.md)
 
 
 @dataclass
 class CompletionEvaluation:
     """Result of checking whether a goal's success_criteria are met."""
+
     all_criteria_met: bool
     sub_goals_complete: int
     sub_goals_total: int
@@ -124,10 +128,18 @@ class CompletionEvaluation:
 # ──────────────────────────────────────────────────────────────────
 # Validation
 
+
 def validate_goal(goal_dict: dict[str, Any]) -> None:
     """Validate a goal.md frontmatter dict. Raises SchemaValidationError on failure."""
-    for field_name in ("schema_version", "active", "intent", "priority",
-                        "created", "last_progress_check", "success_criteria"):
+    for field_name in (
+        "schema_version",
+        "active",
+        "intent",
+        "priority",
+        "created",
+        "last_progress_check",
+        "success_criteria",
+    ):
         if field_name not in goal_dict:
             raise SchemaValidationError(f"goal missing required field '{field_name}'")
 
@@ -166,7 +178,9 @@ def validate_goal(goal_dict: dict[str, Any]) -> None:
             )
         bb = sub.get("blocked_by")
         if bb is not None and not isinstance(bb, str):
-            raise SchemaValidationError(f"sub_goal[{sub['id']}] blocked_by must be string or null")
+            raise SchemaValidationError(
+                f"sub_goal[{sub['id']}] blocked_by must be string or null"
+            )
         if bb is not None and bb not in seen_ids:
             raise SchemaValidationError(
                 f"sub_goal[{sub['id']}] blocked_by references unknown id '{bb}'"
@@ -183,11 +197,15 @@ def validate_agent_mode(mode: str) -> None:
 # ──────────────────────────────────────────────────────────────────
 # IDENTITY.md mode parsing
 
-def parse_agent_mode(identity_path: Path) -> str:
-    """Parse the 'Operating mode' section of IDENTITY.md.
 
-    Looks for a line like 'This agent is **reactive**' or 'This agent is goal-driven'.
-    Defaults to 'reactive' if no mode declared (per spec/01).
+def parse_agent_mode(identity_path: Path) -> str:
+    """Parse the 'Operating mode' section of IDENTITY.md from disk.
+
+    Thin wrapper around ``parse_agent_mode_text`` for callers who only
+    have a path. Profile-backend callers that have already loaded the
+    text (e.g., ``FilesystemAgentProfileBackend.load_profile`` reads
+    IDENTITY.md once for ``persona_identity``) should call
+    ``parse_agent_mode_text`` directly to avoid the second read.
     """
     if not identity_path.exists():
         return "reactive"
@@ -195,8 +213,22 @@ def parse_agent_mode(identity_path: Path) -> str:
         text = identity_path.read_text(encoding="utf-8")
     except OSError:
         return "reactive"
+    return parse_agent_mode_text(text)
 
-    # Look for the Operating mode section
+
+def parse_agent_mode_text(text: str) -> str:
+    """Derive the agent mode from already-loaded IDENTITY.md content.
+
+    Looks for a line like 'This agent is **reactive**' or 'This agent
+    is goal-driven' inside the ``## Operating mode`` section. Defaults
+    to 'reactive' if the section is missing or no recognized mode
+    keyword is found (per spec/01).
+
+    Empty input returns 'reactive'. Same defaults as ``parse_agent_mode``.
+    """
+    if not text:
+        return "reactive"
+
     section_match = re.search(
         r"##\s+Operating mode\b.*?(?=\n##\s|\Z)",
         text,
@@ -206,7 +238,6 @@ def parse_agent_mode(identity_path: Path) -> str:
         return "reactive"
 
     section = section_match.group(0)
-    # Look for one of the mode keywords
     for mode in ("hybrid", "goal-driven", "reactive"):
         if re.search(rf"\b{re.escape(mode)}\b", section, re.IGNORECASE):
             return mode
@@ -215,6 +246,7 @@ def parse_agent_mode(identity_path: Path) -> str:
 
 # ──────────────────────────────────────────────────────────────────
 # GoalManager
+
 
 class GoalManager:
     """Manages one agent's goal.md.
@@ -228,7 +260,9 @@ class GoalManager:
     """
 
     def __init__(
-        self, agents_root: Path | None = None, agent_name: str = "",
+        self,
+        agents_root: Path | None = None,
+        agent_name: str = "",
         today: date | None = None,
     ):
         self.agents_root = agents_root or get_agents_root()
@@ -392,7 +426,9 @@ class GoalManager:
             return sg
         return None
 
-    def mark_in_progress(self, sub_goal_id: str, assigned: str | None = None) -> SubGoal:
+    def mark_in_progress(
+        self, sub_goal_id: str, assigned: str | None = None
+    ) -> SubGoal:
         """Transition sub_goal to in_progress. Optionally update assigned.
 
         When transitioning from blocked → in_progress, blocked_by is automatically
@@ -432,8 +468,10 @@ class GoalManager:
         sg.completed = self.today.isoformat()
         if output is not None:
             sg.output = output
-        self._append_history(f"sub_goal `{sub_goal_id}` → complete" +
-                              (f" (output: {output})" if output else ""))
+        self._append_history(
+            f"sub_goal `{sub_goal_id}` → complete"
+            + (f" (output: {output})" if output else "")
+        )
         return sg
 
     def mark_blocked(self, sub_goal_id: str, blocked_by: str) -> SubGoal:
@@ -451,9 +489,7 @@ class GoalManager:
                 f"blocked_by references unknown sub_goal: {blocked_by}"
             )
         if sub_goal_id == blocked_by:
-            raise AtomicAgentsError(
-                f"sub_goal '{sub_goal_id}' cannot block itself"
-            )
+            raise AtomicAgentsError(f"sub_goal '{sub_goal_id}' cannot block itself")
         if self._would_cycle(sub_goal_id, blocked_by):
             raise AtomicAgentsError(
                 f"marking '{sub_goal_id}' blocked by '{blocked_by}' would create a cycle"
@@ -488,9 +524,7 @@ class GoalManager:
             raise AtomicAgentsError(f"sub_goal {id} already exists")
         if blocked_by is not None:
             if blocked_by == id:
-                raise AtomicAgentsError(
-                    f"sub_goal {id} cannot block itself"
-                )
+                raise AtomicAgentsError(f"sub_goal {id} cannot block itself")
             if not self.find_sub_goal(blocked_by):
                 raise AtomicAgentsError(
                     f"sub_goal {id} blocked_by references unknown id '{blocked_by}'"
@@ -503,8 +537,12 @@ class GoalManager:
             # this can only happen if the graph already contains a path from
             # id to blocked_by.  Since id is new, no such path can exist.
         sg = SubGoal(
-            id=id, label=label, status="pending",
-            assigned=assigned, deadline=deadline, blocked_by=blocked_by,
+            id=id,
+            label=label,
+            status="pending",
+            assigned=assigned,
+            deadline=deadline,
+            blocked_by=blocked_by,
         )
         self._goal.sub_goals.append(sg)
         self._append_history(f"sub_goal `{id}` added")
@@ -534,10 +572,7 @@ class GoalManager:
         blocked = sum(1 for s in sg if s.status == "blocked")
         pending = sum(1 for s in sg if s.status == "pending")
 
-        all_done = (
-            len(sg) > 0
-            and pending == 0 and in_progress == 0 and blocked == 0
-        )
+        all_done = len(sg) > 0 and pending == 0 and in_progress == 0 and blocked == 0
 
         # Deadline analysis
         days_until_deadline: int | None = None
@@ -585,7 +620,9 @@ class GoalManager:
             raise AtomicAgentsError("No active goal to archive")
 
         self.archive_dir.mkdir(parents=True, exist_ok=True)
-        intent_slug = re.sub(r"[^a-z0-9]+", "_", self._goal.intent.lower()).strip("_")[:60]
+        intent_slug = re.sub(r"[^a-z0-9]+", "_", self._goal.intent.lower()).strip("_")[
+            :60
+        ]
         base_name = f"{self.today.isoformat()}_{intent_slug}"
         archive_path = self.archive_dir / f"{base_name}.md"
 
@@ -600,18 +637,23 @@ class GoalManager:
         self._append_history(f"goal archived ({reason})")
 
         # Write archive first — unlink goal.md only after successful write
-        post = frontmatter.Post(self._goal.body, **{
-            "schema_version": self._goal.schema_version,
-            "active": False,
-            "intent": self._goal.intent,
-            "priority": self._goal.priority,
-            "created": self._goal.created,
-            "last_progress_check": self.today.isoformat(),
-            "success_criteria": self._goal.success_criteria,
-            "sub_goals": [self._serialize_sub_goal(sg) for sg in self._goal.sub_goals],
-            "archived_at": self.today.isoformat(),
-            "archive_reason": reason,
-        })
+        post = frontmatter.Post(
+            self._goal.body,
+            **{
+                "schema_version": self._goal.schema_version,
+                "active": False,
+                "intent": self._goal.intent,
+                "priority": self._goal.priority,
+                "created": self._goal.created,
+                "last_progress_check": self.today.isoformat(),
+                "success_criteria": self._goal.success_criteria,
+                "sub_goals": [
+                    self._serialize_sub_goal(sg) for sg in self._goal.sub_goals
+                ],
+                "archived_at": self.today.isoformat(),
+                "archive_reason": reason,
+            },
+        )
         atomic_write(archive_path, frontmatter.dumps(post) + "\n")
 
         # Remove the active goal.md only after archive is safely written
@@ -643,7 +685,11 @@ class GoalManager:
             f"Created: {self._goal.created}  |  Last check: {self._goal.last_progress_check}",
         ]
         if self._goal.deadline:
-            deadline_note = f"  ({ev.days_until_deadline} days remaining)" if ev.days_until_deadline is not None else ""
+            deadline_note = (
+                f"  ({ev.days_until_deadline} days remaining)"
+                if ev.days_until_deadline is not None
+                else ""
+            )
             if ev.overdue:
                 deadline_note = f"  ⚠ OVERDUE by {abs(ev.days_until_deadline)} days"
             lines.append(f"Deadline: {self._goal.deadline}{deadline_note}")
@@ -677,7 +723,9 @@ class GoalManager:
 
         if ev.all_criteria_met:
             lines.append("")
-            lines.append("✓ All sub-goals complete. Run `goal complete <agent>` to archive.")
+            lines.append(
+                "✓ All sub-goals complete. Run `goal complete <agent>` to archive."
+            )
 
         return "\n".join(lines)
 
@@ -712,7 +760,9 @@ class GoalManager:
             f"  ▸ {ev.sub_goals_complete} of {sg_total} sub-goals complete ({pct_complete:.1f}%)",
         ]
         if ev.sub_goals_in_progress > 0:
-            in_progress = [sg for sg in self._goal.sub_goals if sg.status == "in_progress"]
+            in_progress = [
+                sg for sg in self._goal.sub_goals if sg.status == "in_progress"
+            ]
             for sg in in_progress:
                 assigned = f" ({sg.assigned})" if sg.assigned else ""
                 lines.append(f"  ▸ In progress: {sg.label}{assigned}")
@@ -798,7 +848,9 @@ class GoalManager:
         # Mark in_progress before running so observers see the dispatch in-flight
         if sg.status == "pending":
             sg.status = "in_progress"
-            self._append_history(f"sub_goal `{sub_goal_id}` → in_progress (outcome dispatch)")
+            self._append_history(
+                f"sub_goal `{sub_goal_id}` → in_progress (outcome dispatch)"
+            )
 
         # Build the outcome description from the sub-goal
         description = self._build_outcome_description_from_sub_goal(sg)
@@ -852,16 +904,18 @@ class GoalManager:
             )
 
         # Record dedicated JSONL history entry
-        self._append_goal_history_jsonl({
-            "ts": datetime.now().astimezone().isoformat(),
-            "event": "sub_goal_outcome_dispatched",
-            "sub_goal_id": sub_goal_id,
-            "outcome_run_id": result.run_id,
-            "terminal_state": result.status,
-            "applied_status": applied_status,
-            "iterations": len(result.iterations),
-            "total_cost_usd": result.total_cost_usd,
-        })
+        self._append_goal_history_jsonl(
+            {
+                "ts": datetime.now().astimezone().isoformat(),
+                "event": "sub_goal_outcome_dispatched",
+                "sub_goal_id": sub_goal_id,
+                "outcome_run_id": result.run_id,
+                "terminal_state": result.status,
+                "applied_status": applied_status,
+                "iterations": len(result.iterations),
+                "total_cost_usd": result.total_cost_usd,
+            }
+        )
 
         return result, sg
 
@@ -932,8 +986,12 @@ class GoalManager:
             return
         history_marker = "## History"
         if history_marker not in self._goal.body:
-            self._goal.body = self._goal.body.rstrip() + f"\n\n{history_marker} (auto-appended)\n"
-        self._goal.body = self._goal.body.rstrip() + f"\n- {self.today.isoformat()} — {entry}"
+            self._goal.body = (
+                self._goal.body.rstrip() + f"\n\n{history_marker} (auto-appended)\n"
+            )
+        self._goal.body = (
+            self._goal.body.rstrip() + f"\n- {self.today.isoformat()} — {entry}"
+        )
 
     def _append_goal_history_jsonl(self, entry: dict) -> None:
         """Append a structured event to goal_history.jsonl in the agent root."""
@@ -944,6 +1002,7 @@ class GoalManager:
 # ──────────────────────────────────────────────────────────────────
 # CLI
 
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
     import sys
@@ -952,8 +1011,9 @@ def main(argv: list[str] | None = None) -> int:
         prog="atomic-agents.goal",
         description="Goal manager for goal-driven and hybrid Atomic Agents",
     )
-    parser.add_argument("--agents-root", default=None,
-                        help="override ATOMIC_AGENTS_ROOT")
+    parser.add_argument(
+        "--agents-root", default=None, help="override ATOMIC_AGENTS_ROOT"
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_status = sub.add_parser("status", help="Print current goal status")
@@ -965,20 +1025,30 @@ def main(argv: list[str] | None = None) -> int:
     p_advance = sub.add_parser("advance", help="Advance a sub-goal status")
     p_advance.add_argument("agent")
     p_advance.add_argument("sub_goal_id")
-    p_advance.add_argument("--complete", action="store_true",
-                           help="mark complete (default: mark in_progress)")
+    p_advance.add_argument(
+        "--complete",
+        action="store_true",
+        help="mark complete (default: mark in_progress)",
+    )
     p_advance.add_argument("--assigned", default=None)
-    p_advance.add_argument("--output", default=None,
-                           help="path to artifact (when --complete)")
+    p_advance.add_argument(
+        "--output", default=None, help="path to artifact (when --complete)"
+    )
 
-    p_abandon = sub.add_parser("abandon", help="Abandon the goal — non-destructive archive")
+    p_abandon = sub.add_parser(
+        "abandon", help="Abandon the goal — non-destructive archive"
+    )
     p_abandon.add_argument("agent")
     p_abandon.add_argument("--reason", required=True)
 
-    p_complete = sub.add_parser("complete", help="Mark the entire goal complete + archive")
+    p_complete = sub.add_parser(
+        "complete", help="Mark the entire goal complete + archive"
+    )
     p_complete.add_argument("agent")
 
-    p_report = sub.add_parser("report", help="Periodic progress report (suitable for journal)")
+    p_report = sub.add_parser(
+        "report", help="Periodic progress report (suitable for journal)"
+    )
     p_report.add_argument("agent")
 
     p_dispatch_outcome = sub.add_parser(
@@ -988,15 +1058,19 @@ def main(argv: list[str] | None = None) -> int:
     p_dispatch_outcome.add_argument("agent")
     p_dispatch_outcome.add_argument("sub_goal_id")
     p_dispatch_outcome.add_argument(
-        "--rubric", required=True,
+        "--rubric",
+        required=True,
         help="path to rubric file, or 'inline:<text>'",
     )
     p_dispatch_outcome.add_argument(
-        "--max-iterations", type=int, default=3,
+        "--max-iterations",
+        type=int,
+        default=3,
         help="max iterations for the outcome loop (default 3)",
     )
     p_dispatch_outcome.add_argument(
-        "--judge-model", default=None,
+        "--judge-model",
+        default=None,
         help="override the judge model",
     )
 
@@ -1004,7 +1078,8 @@ def main(argv: list[str] | None = None) -> int:
 
     agents_root = (
         Path(args.agents_root).expanduser().resolve()
-        if args.agents_root else get_agents_root()
+        if args.agents_root
+        else get_agents_root()
     )
 
     try:
@@ -1031,7 +1106,9 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  deadline: {next_sg.deadline}")
             return 0
         else:
-            print("No dispatchable sub-goal — all are complete, in progress, or blocked.")
+            print(
+                "No dispatchable sub-goal — all are complete, in progress, or blocked."
+            )
             return 0
 
     if args.cmd == "advance":
@@ -1041,8 +1118,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"✓ {sg.id} → complete")
         else:
             sg = gm.mark_in_progress(args.sub_goal_id, assigned=args.assigned)
-            print(f"▶ {sg.id} → in_progress" +
-                  (f" (assigned: {sg.assigned})" if sg.assigned else ""))
+            print(
+                f"▶ {sg.id} → in_progress"
+                + (f" (assigned: {sg.assigned})" if sg.assigned else "")
+            )
         gm.save()
         return 0
 
@@ -1071,12 +1150,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "dispatch-outcome":
         import sys as _sys
+
         gm.load()
 
         # Resolve rubric arg
         rubric: "str | Path"
         if args.rubric.startswith("inline:"):
-            rubric = args.rubric[len("inline:"):]
+            rubric = args.rubric[len("inline:") :]
         else:
             rubric = Path(args.rubric)
 
@@ -1102,7 +1182,9 @@ def main(argv: list[str] | None = None) -> int:
         outcome_label = status_labels.get(result.status, result.status.upper())
         print(f"\n=== Outcome: {outcome_label} ===")
         print(f"Run ID:              {result.run_id}")
-        print(f"Iterations:          {len(result.iterations)} / {result.max_iterations}")
+        print(
+            f"Iterations:          {len(result.iterations)} / {result.max_iterations}"
+        )
         print(f"Total cost:          ${result.total_cost_usd:.4f}")
         print(f"Explanation:         {result.explanation}")
         print(f"Sub-goal '{sg.id}' → {sg.status}")
@@ -1119,4 +1201,5 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     import sys
+
     sys.exit(main())

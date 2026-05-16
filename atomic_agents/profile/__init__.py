@@ -147,8 +147,11 @@ register_profile_backend("filesystem", FilesystemAgentProfileBackend)
 
 
 # ────────────────────────────────────────────────────────────────────
-# PR 2 wiring contract — post-PR-2 state (this block describes what
-# WILL be wired by PR 2; today none of these call sites exist).
+# PR 2 wiring contract — PRE-PR-2 state (describes what WILL be wired
+# by PR 2; today, in PR 1 scaffolding, none of these call sites exist).
+# Sister modules' ``__init__.py`` files use a "post-PR-2 state" label
+# when their wiring has already landed; this file flips the label so
+# readers don't mistake the block for live behavior.
 #
 # Wired by #63 PR 2:
 #   1. ``AtomicAgent.__init__`` accepts ``profile_backend:
@@ -218,8 +221,13 @@ def get_default_profile_backend(scope_root: Path) -> AgentProfileBackend:
     # ``ATOMIC_AGENTS_PROFILE_BACKEND_URL``. Without the sanitize the
     # credential lands in exception text that may be logged by
     # exception handlers, WSGI middleware, or error-tracking services.
-    # Same fix applies to ``logs/__init__.py:316`` and
-    # ``locks/__init__.py:194``.
+    # Same shape applies in ``logs/__init__.py:316`` (already fixed
+    # at the log-arc PR 1). ``locks/__init__.py`` does NOT yet apply
+    # this redaction at its ``BackendNotRegistered`` raise site — that
+    # is a separate, pre-existing gap in the locks module; this file
+    # is not the place to fix it, and the gap pre-dates the #63 arc.
+    # A follow-up issue should be filed against the locks module to
+    # bring it to parity with the log and profile redaction story.
     safe_backend_id = _redact_for_error_message(raw_backend_id)
     raise BackendNotRegistered(
         f"ATOMIC_AGENTS_PROFILE_BACKEND={safe_backend_id!r} is not a known "
