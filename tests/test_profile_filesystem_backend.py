@@ -322,3 +322,104 @@ def test_cascade_save_writes_to_instance_when_instance_file_exists(tmp_path):
     assert instance_tools.read_text(encoding="utf-8") == "# UPDATED INSTANCE\n"
     # Role tools.md was NOT
     assert "Role tools" in (role_root / "tools.md").read_text(encoding="utf-8")
+
+
+def test_cascade_floor_judges_md_does_not_materialize_instance_shadow(tmp_path):
+    """Step 11 adversarial Finding P1#1 regression test.
+
+    When a cascaded agent inherits ``judges.md`` from the project floor
+    WITHOUT authoring its own instance-layer judges.md, a load → save
+    round-trip MUST NOT materialize a ghost instance/judges.md file
+    containing a copy of the floor text. Such a ghost would shadow the
+    floor forever — future floor changes would be silently ignored.
+
+    The fix (filesystem.py ``load_profile``): ``judges_md_raw`` is
+    None when the instance file is absent, regardless of whether a
+    floor exists. The structured ``judges_config`` still carries the
+    merged effective config via ``load_judges_config``.
+    """
+    instance_root, _, project_root = _make_cascaded_layout(tmp_path)
+    # Floor judges.md with a meaningful policy
+    floor_judges = project_root / "judges.md"
+    floor_judges.write_text(
+        "# Project floor judges\n\n"
+        "```yaml\n"
+        "default_backend: rules\n"
+        "class_policy:\n"
+        "  read_only: bypass\n"
+        "  reversible_write: judge_required\n"
+        "  external_side_effect: judge_required\n"
+        "  high_risk: escalate\n"
+        "```\n",
+        encoding="utf-8",
+    )
+    # Instance has NO judges.md
+    instance_judges = instance_root / "judges.md"
+    assert not instance_judges.exists()
+
+    backend = FilesystemAgentProfileBackend(
+        tmp_path / "system" / "projects" / "novella" / "agents"
+    )
+    profile = backend.load_profile("editor")
+
+    # judges_md_raw must be None — represents instance layer only.
+    # Floor inheritance is invisible at the raw_text level (by design).
+    assert profile.judges_md_raw is None
+    # But judges_config IS populated — load_judges_config merges the floor.
+    assert profile.judges_config is not None
+
+    # Round-trip: save → load should NOT materialize instance/judges.md
+    backend.save_profile("editor", profile)
+    assert not instance_judges.exists(), (
+        "Ghost instance judges.md materialized — the floor would be "
+        "silently shadowed from this point forward"
+    )
+    # Floor file untouched
+    assert floor_judges.read_text(encoding="utf-8").startswith("# Project floor judges")
+
+
+def test_from_dict_raises_loud_when_judges_config_is_dict_shape(tmp_path):
+    """Step 11 adversarial Finding P1#2 regression test.
+
+    When a database backend round-trips an AgentProfile via to_dict() →
+    JSONB store → retrieve → from_dict(), the retrieved
+    ``judges_config`` value will be a plain dict (not a JudgesConfig
+    instance). The pre-Step-11 code silently dropped it to None,
+    losing the operator's judge policy without warning. The fix:
+    raise TypeError loudly so the failure surfaces at deserialization
+    rather than silently corrupting the agent's runtime judge policy.
+
+    The expected resolution path is: PR 3 DB backend persists
+    judges_md_raw alongside structured columns (the typed-shadow +
+    raw-text design from Decision 1), OR a future JudgesConfig.from_dict
+    implementation reconstructs the dataclass from the dict shape.
+    """
+    from atomic_agents.profile import AgentProfile
+
+    # Build a dict where judges_md_raw is absent but judges_config
+    # is present as a dict (simulating DB-only round-trip).
+    d = {
+        "name": "scout",
+        "agent_mode": "reactive",
+        "model_config": {},
+        "tool_config": {},
+        "tool_classifications": {},
+        "judges_config": {  # dict shape — what _judges_config_to_dict produces
+            "default_backend": "rules",
+            "default_model": None,
+            "timeout_ms": 5000,
+        },
+        "roster": [],
+        "mcp_servers": [],
+        "persona_identity": "# Scout\n",
+        "persona_soul": "",
+        "persona_user": "",
+        "goal_text": "",
+        "model_md_raw": "",
+        "tools_md_raw": "",
+        "judges_md_raw": None,  # critical: no raw text alongside structured
+        "roster_md_raw": "",
+        "mcp_md_raw": "",
+    }
+    with pytest.raises(TypeError, match="judges_md_raw"):
+        AgentProfile.from_dict(d)

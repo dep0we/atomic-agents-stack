@@ -215,17 +215,26 @@ class FilesystemAgentProfileBackend:
         tool_classifications = parse_tool_classifications_text(tools_md_raw)
 
         # ── judges.md — cascade-aware via load_judges_config ──
+        # judges_md_raw represents ONLY the instance-layer file. When a
+        # cascaded agent inherits the floor without authoring its own
+        # judges.md, judges_md_raw is None — the structured
+        # judges_config still carries the merged effective config via
+        # load_judges_config below.
+        #
+        # The pre-Step-11 draft populated judges_md_raw from the floor
+        # text when the instance lacked its own file ("mirror what the
+        # runtime composes"). Step 11 adversarial finding P1#1 caught
+        # the resulting GHOST-INSTANCE bug: save_profile would then
+        # write the floor text to instance/judges.md, materializing a
+        # shadow file the operator never authored. From that point
+        # forward, every floor change is silently ignored by this
+        # agent because the instance file shadows it — exactly the
+        # opposite of the cascade carve-out (Decision 5) the design
+        # was supposed to preserve. Fix: judges_md_raw is None when
+        # the instance file is absent, even if a floor exists.
         judges_md_path = agent_root / "judges.md"
-        floor_path = cascade.project_root / "judges.md" if cascade is not None else None
         if judges_md_path.is_file():
             judges_md_raw: str | None = judges_md_path.read_text(encoding="utf-8")
-        elif floor_path is not None and floor_path.is_file():
-            # Cascaded agent inheriting the floor only — no instance file.
-            # Mirror the behavior of load_judges_config which returns the
-            # floor as the effective config. Raw text on the profile
-            # represents what the agent sees after merging — we use the
-            # floor text since that's what the runtime composes with.
-            judges_md_raw = floor_path.read_text(encoding="utf-8")
         else:
             judges_md_raw = None
         judges_config = load_judges_config(

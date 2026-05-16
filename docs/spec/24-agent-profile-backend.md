@@ -324,10 +324,18 @@ PR 2 wires:
 - `_load_config()` becomes a thin shim calling `self.profile_backend.load_profile(self.name)` and unpacks structured fields onto `self`.
 - `_load_persona()` reads `profile.persona_*` fields instead of raw file reads.
 - `_load_goal_text()` reads `profile.goal_text` instead of raw file read.
-- `DreamRunner`, `OutcomeRunner`, `EvalRunner`, `delegate.py` thread the kwarg.
+- `DreamRunner`, `OutcomeRunner`, `EvalRunner`, `delegate.py` thread the kwarg. **Note**: `DreamRunner` calls `_model.parse_model_md(agent_root / "model.md")` in TWO places — `dream.py:1128` (DreamRunner pipeline, the obvious site) AND `dream.py:672` inside `_check_cap` (cost-guardrail check, easy to miss). PR 2 wiring MUST route BOTH through the profile backend, otherwise an operator using a non-filesystem backend will have correct config for `AtomicAgent.call()` but stale cost caps applied to dream runs. Surfaced by #63 PR 1 Step 11 adversarial finding P1#3.
 - `doctor.check_agent_profile_backend` coherence check.
 
 PR 3 ships the second reference impl (likely `SQLiteAgentProfileBackend` — registry table + per-agent row + snapshots table) and parametrizes the conformance suite. PR 4 locks this spec and adds the `§"Implementer contract for registry-backed backends"` section below.
+
+### Known gaps deferred to follow-up issues
+
+The #63 PR 1 Step 11 adversarial review surfaced two filesystem-backend rough edges that don't block scaffolding but should land before PR 4 locks:
+
+- **`clone()` TOCTOU race** — two concurrent `clone(source, target)` calls can both pass the `exists(target)` check before either writes, then both proceed and the second silently overwrites the first. `clone()`'s contract promises `AgentProfileExists` for an existing target, but the guarantee is window-wide rather than atomic. Single-host typical deployments rarely trip this; Cloud Run / Kubernetes multi-replica deployments will. Fix shape: replace the check-then-mkdir pattern with `os.mkdir(target_root, mode=0o755)` which raises `FileExistsError` atomically as the sentinel.
+
+- **`atomic_write` destroys symlinks** — `_io.atomic_write` uses `os.replace`, which atomically replaces the target including any symlink. Operators with `persona/SOUL.md` symlinked to a shared fleet-wide persona file would have the symlink silently converted to a regular file on first `save_profile`. The agent continues to work normally (reads the now-regular file), but the shared-persona update path breaks without any error. Fix shape: in `save_profile`, detect `path.is_symlink()` before writing and either refuse (with `WritePathViolation`) or follow the symlink (write to target rather than replace the symlink). Document the chosen behavior in the Implementer contract.
 
 ## Implementer contract for registry-backed backends
 
@@ -353,10 +361,10 @@ These are not committed in PR 1 but are reserved in the namespace so future expa
 
 The conformance suite (PR 1):
 
-- `tests/test_profile_protocol_conformance.py` — 33 tests parametrized via a `backend_factory` fixture. PR 1 has only the filesystem factory; PR 3 of #63 adds the second. Third-party backends import the `BACKEND_FACTORIES` list to verify their own conformance. Tests cover: Protocol surface, append semantics, every load/save edge case, round-trip raw byte preservation, MCP `$VAR` preservation (Decision 1), agent_mode derivation asymmetry (Decision 6), `list_agents` filtering, `exists` correctness, skill listing + body loading, clone + overrides + skills directory copy, capability parity for snapshot trio, `AgentProfile.to_dict / from_dict` round-trip.
-- `tests/test_profile_filesystem_backend.py` — 21 filesystem-specific tests: on-disk path mapping (matches `agent.py:_load_config` expectations exactly), hidden-directory exclusion (matches log/lock arc discipline), path-traversal refusal, atomic save (no .tmp leftovers), registry resolution, `get_default_profile_backend` env-var dispatch + credential redaction + long-value truncation, cascade carve-out (load picks up role layer; save writes instance-layer only — Decision 5).
+- `tests/test_profile_protocol_conformance.py` — 37 tests parametrized via a `backend_factory` fixture. PR 1 has only the filesystem factory; PR 3 of #63 adds the second. Third-party backends import the `BACKEND_FACTORIES` list to verify their own conformance. Tests cover: Protocol surface, every load/save edge case, round-trip raw byte preservation, MCP `$VAR` preservation (Decision 1), agent_mode derivation asymmetry (Decision 6), `list_agents` filtering, `exists` correctness, skill listing + body loading, skill_name path-traversal refusal (Step 9.1 multi-specialist finding F-A), `from_dict` narrow except (Step 9.1 finding F-B), clone + overrides + skills directory copy, capability parity for snapshot trio, `AgentProfile.to_dict / from_dict` round-trip, list_skills/load_skill_body on missing agent (GAP-11).
+- `tests/test_profile_filesystem_backend.py` — 23 filesystem-specific tests: on-disk path mapping (matches `agent.py:_load_config` expectations exactly), hidden-directory exclusion (matches log/lock arc discipline), path-traversal refusal, atomic save (no .tmp leftovers), registry resolution, `get_default_profile_backend` env-var dispatch + credential redaction + long-value truncation, cascade carve-out (load picks up role layer; save writes instance-layer only — Decision 5; cascade floor judges.md does NOT materialize ghost instance shadow — Step 11 adversarial finding P1#1), `from_dict` raises loudly when judges_config is dict-shape without raw text (Step 11 finding P1#2).
 
-Total: **54 AgentProfileBackend-arc tests** verifying the Protocol contract. PR 3 of #63 will parametrize the conformance suite across two backends, taking the parametrized count to roughly 66+ test invocations.
+Total: **60 AgentProfileBackend-arc tests** verifying the Protocol contract. PR 3 of #63 will parametrize the conformance suite across two backends, taking the parametrized count higher.
 
 ## Related
 

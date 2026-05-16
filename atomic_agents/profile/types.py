@@ -272,11 +272,42 @@ class AgentProfile:
         if judges_md_raw is not None and judges_md_raw.strip():
             judges_config: JudgesConfig | None = parse_judges_md_text(judges_md_raw)
         else:
-            # Source dict may carry structured form from a DB backend
-            # that doesn't ship raw text. Don't reconstruct in that
-            # case; the dict shape isn't a JudgesConfig directly.
+            # Source dict may carry the structured judges_config (either
+            # as a JudgesConfig instance from a direct caller, or as a
+            # plain dict from a database backend whose to_dict() output
+            # round-tripped through JSONB columns).
+            #
+            # JudgesConfig instance → use as-is.
+            # None → return None (the framework's pre-#112 opt-in default).
+            # dict / other → raise loudly. Step 11 adversarial finding
+            # P1#2 caught the silent-loss bug here: the pre-fix code
+            # treated dict the same as None, so a DB backend that stored
+            # judges_config as JSON without preserving judges_md_raw
+            # alongside would silently drop the operator's judge policy
+            # on round-trip. The right call is to make the failure mode
+            # explicit so PR 3's DB backend either ships
+            # ``judges_md_raw`` alongside structured columns (per spec/24
+            # Decision 1's typed-shadow + raw-text design) OR implements
+            # a proper ``JudgesConfig.from_dict`` reconstruction (tracked
+            # as a follow-up issue).
             jc_raw = d.get("judges_config")
-            judges_config = jc_raw if isinstance(jc_raw, JudgesConfig) else None
+            if jc_raw is None:
+                judges_config = None
+            elif isinstance(jc_raw, JudgesConfig):
+                judges_config = jc_raw
+            else:
+                raise TypeError(
+                    f"AgentProfile.from_dict received judges_config as "
+                    f"{type(jc_raw).__name__} (not JudgesConfig or None). "
+                    f"This means the dict shape from to_dict() round-"
+                    f"tripped through a backend that stored structured "
+                    f"columns without preserving judges_md_raw. "
+                    f"Reconstruction from the dict shape is not yet "
+                    f"supported. Backends MUST persist judges_md_raw "
+                    f"alongside any structured judges_config columns "
+                    f"(spec/24 Decision 1). See follow-up issue for "
+                    f"future JudgesConfig.from_dict support."
+                )
 
         if roster_md_raw:
             roster = parse_roster_md_text(roster_md_raw)
