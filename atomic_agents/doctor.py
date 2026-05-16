@@ -148,14 +148,18 @@ def run_doctor(
     )
 
     if agent_name is None:
+        # Order matches run_doctor()'s actual execution sequence below
+        # (lock-backend → log-backend → profile-backend → memory-backend)
+        # so contributors adding a fourth scope-level backend check see
+        # the SKIP enumeration mirror reality.
         for n in (
             "vault",
             "provider-keys",
             "model",
             "mcp",
             "locks",
-            "memory-backend",
             "profile-backend",
+            "memory-backend",
             "write-paths",
         ):
             results.append(
@@ -1362,7 +1366,20 @@ def check_agent_profile_backend(agents_root: Path) -> CheckResult:
         from urllib.parse import urlparse
 
         parsed = urlparse(url)
-        if parsed.password:
+        # Redact when EITHER password OR username is present. The
+        # password-only check inherited from check_lock_backend /
+        # check_log_backend misses token-as-username URLs common with
+        # managed services (Upstash ``redis://ghp_TOKEN@host``,
+        # PlanetScale ``mysql://API_KEY@host``, Heroku-style URLs).
+        # Step 9.1 security specialist finding F-S1; the same gap
+        # exists in the sister checks and is tracked as a separate
+        # follow-up — fixing all three together would expand PR 2's
+        # scope into pre-existing code paths, so PR 2 fixes only the
+        # new site (check_agent_profile_backend) and notes the
+        # sister-check gap inline. Future cleanup: lift the redaction
+        # helper into a shared utility and have all three checks
+        # consume it.
+        if parsed.password or parsed.username:
             netloc = parsed.hostname or ""
             if parsed.port:
                 netloc = f"{netloc}:{parsed.port}"

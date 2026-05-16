@@ -1978,7 +1978,7 @@ class AtomicAgent:
         ``self._profile``. The profile was loaded once in __init__ via
         ``self.profile_backend.load_profile(self.name)``, which handles
         cascade resolution internally (the cascade branch that used to
-        live here was deleted — Decision 7). All five structured config
+        live here was deleted — Decision 7). All six structured config
         fields (model_config, tool_config, tool_classifications,
         judges_config, mcp_servers, roster) are read off the snapshot;
         no filesystem reads happen inside this method anymore.

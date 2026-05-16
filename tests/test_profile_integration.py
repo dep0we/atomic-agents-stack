@@ -22,7 +22,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from atomic_agents import AtomicAgent, AgentProfileBackend, FilesystemAgentProfileBackend
+from atomic_agents import (
+    AtomicAgent,
+    AgentProfileBackend,
+    FilesystemAgentProfileBackend,
+)
 from atomic_agents.dream import DreamRunner, _check_cap
 from atomic_agents.eval import EvalRunner
 from atomic_agents.outcome import OutcomeRunner
@@ -318,6 +322,128 @@ def test_check_cap_falls_back_to_disk_when_model_config_omitted(tmp_path):
         reserved=10.0,
         critical=False,
     )  # Should not raise
+
+
+def test_dreamrunner_start_forwards_model_config_to_check_cap(tmp_path, monkeypatch):
+    """Step 9.1 testing-specialist finding F-T1 — the end-to-end test
+    for the Step 11 P1#3 trap.
+
+    ``test_dreamrunner_uses_profile_model_when_modelmd_absent`` above
+    verifies Site 1 (``__init__``'s model resolution doesn't read
+    disk). ``test_check_cap_uses_passed_model_config_not_disk_read``
+    verifies that ``_check_cap`` USES the kwarg when supplied.
+    Neither verifies the LOAD-BEARING CONNECTION: that
+    ``DreamRunner.start()`` actually passes
+    ``model_config=self._profile.model_config`` to ``_check_cap``.
+
+    If that single line at ``dream.py:start()`` were dropped in a
+    future refactor, the pre-fix tests would still pass — both
+    function-level tests verify their own behavior, but neither
+    catches the start() forwarding. This test plugs that gap.
+
+    Approach: monkey-patch ``_check_cap`` at the dream module level
+    to record the kwargs it receives. Construct DreamRunner with a
+    fake profile_backend and call ``start()``; assert the captured
+    kwargs include ``model_config`` pointing at the fake profile's
+    model_config dict.
+    """
+    from atomic_agents.profile import AgentProfile
+    from atomic_agents import dream as dream_module
+
+    agent_root = tmp_path / "scout"
+    (agent_root / "persona").mkdir(parents=True)
+    (agent_root / "persona" / "IDENTITY.md").write_text(
+        "# Scout\n\n## Operating mode\n\nThis agent is reactive.\n",
+        encoding="utf-8",
+    )
+    (agent_root / "memory").mkdir()
+    (agent_root / "journal").mkdir()
+    (agent_root / "log").mkdir()
+    (agent_root / "dreams").mkdir()
+
+    fake_model_config = {
+        "default_model": "claude-haiku-4-5-20251001",
+        "fallback_model": None,
+        "provider": None,
+        "max_input_tokens": 12000,
+        "max_output_tokens": 4000,
+        "cost_guardrails_enabled": False,  # Skip the cap math; just verify the kwarg
+        "daily_cap_usd": 0.0,
+        "monthly_cap_usd": 0.0,
+        "daily_cap_action": "skip",
+        "monthly_cap_action": "alert",
+        "warning_thresholds": [0.5, 0.8],
+        "alert_channel": "log_only",
+    }
+
+    fake_profile = AgentProfile(
+        name="scout",
+        agent_mode="reactive",
+        model_config=fake_model_config,
+        tool_config={
+            "read_paths": [],
+            "write_paths": [],
+            "read_only_paths": [],
+            "external_apis": [],
+            "hard_nos": [],
+        },
+        tool_classifications={},
+        judges_config=None,
+        roster=[],
+        mcp_servers=[],
+        persona_identity="# Scout\n",
+        persona_soul="",
+        persona_user="",
+        goal_text="",
+        model_md_raw="",
+        tools_md_raw="",
+        judges_md_raw=None,
+        roster_md_raw="",
+        mcp_md_raw="",
+    )
+
+    fake_backend = MagicMock(spec=AgentProfileBackend)
+    fake_backend.load_profile.return_value = fake_profile
+
+    captured = {}
+    real_check_cap = dream_module._check_cap
+
+    def tracking_check_cap(*args, **kwargs):
+        captured.update(kwargs)
+        # Don't actually run — just capture
+        return None
+
+    monkeypatch.setattr(dream_module, "_check_cap", tracking_check_cap)
+
+    runner = DreamRunner(
+        agents_root=tmp_path,
+        agent_name="scout",
+        profile_backend=fake_backend,
+    )
+
+    # Call start() — it'll invoke _check_cap (now mocked) and proceed
+    # into the rest of the pipeline. We may hit other failures further
+    # in (e.g., LLM calls), but the _check_cap kwarg capture happens
+    # before any of those, so we'll see the captured kwargs even on
+    # downstream failure.
+    try:
+        runner.start()
+    except Exception:
+        # Expected — start() will fail somewhere downstream (no real LLM).
+        pass
+
+    # The load-bearing assertion: model_config kwarg was passed and
+    # points at the fake profile's model_config dict (not a fresh disk
+    # read or None).
+    assert "model_config" in captured, (
+        "DreamRunner.start() did not pass model_config= to _check_cap "
+        "— Step 11 P1#3 forwarding gap regression. The start() call "
+        "site must include `model_config=self._profile.model_config`."
+    )
+    assert captured["model_config"] is fake_model_config, (
+        "model_config kwarg was passed but did not match the profile's "
+        "model_config — start() may be reading from a different source."
+    )
 
 
 # ──────────────────────────────────────────────────────────────────
