@@ -6,6 +6,17 @@ provider-agnostic: the registry formats them for Anthropic, OpenAI, or
 Moonshot as needed, matching the approach used by _capture.py for
 atomic_capture.
 
+**Relationship to** ``atomic_agents.registry.ToolRegistryBackend`` (spec/25,
+#64 PR 1+): ``ToolRegistry`` here is the **dispatch-layer** class — the
+in-memory registry the multi-turn loop's ``execute()`` consumes during
+``agent.call()``. ``ToolRegistryBackend`` is the **discovery-layer**
+Protocol one level above — the catalog (filesystem ``tools/<name>.{md,py}``,
+SQLite catalog, future PyPI / git) that produces ``ToolDefinition``
+instances which then register into the in-memory ``ToolRegistry``. The
+two compose: ``backend.list_tools() → backend.load_tool(name) → tool_registry.register(td)``.
+``ToolRegistry`` is NOT going away — spec/25 Decision 1 deliberately
+preserves it as the LLM-tool-loop dispatch surface.
+
 Usage::
 
     from atomic_agents.tools import ToolDefinition, ToolRegistry

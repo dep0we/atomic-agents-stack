@@ -387,3 +387,76 @@ class SnapshotNotFound(AtomicAgentsError):
     fires when an operator passes a stale id, a typo, or a snapshot id
     from a different agent.
     """
+
+
+# ──────────────────────────────────────────────────────────────────
+# ToolRegistryBackend exceptions (spec/25 — issue #64 PR 1 of 4)
+
+
+class ToolNotInRegistry(AtomicAgentsError):
+    """``ToolRegistryBackend.load_tool(name)`` was called with an unknown name.
+
+    Raised by the discovery-layer backend (filesystem walks
+    ``<agent>/tools/`` for descriptors; SQLite queries the catalog
+    table). Distinct from ``ToolNotRegistered`` which is raised by
+    the in-memory ``ToolRegistry.execute`` when the LLM emits a
+    tool_use whose ``name`` isn't in the dispatch registry.
+
+    The two cover different layers — ``ToolNotInRegistry`` is the
+    catalog miss; ``ToolNotRegistered`` is the dispatch miss. They
+    are NOT interchangeable — an operator catching one and expecting
+    to also catch the other will be surprised. Spec/25 keeps the
+    distinction explicit so the layering composes cleanly with the
+    existing tools.py.
+    """
+
+
+class ToolHandlerImportFailed(AtomicAgentsError):
+    """A handler module could not be imported during ``load_tool`` / ``validate``.
+
+    Filesystem backends raise this when ``<agent>/tools/<name>.py``
+    is missing, fails to import (top-level exception), or imports
+    cleanly but doesn't expose a callable named ``handler``. Wraps
+    the underlying import error in the exception message for
+    operator triage.
+
+    Surfaced via ``ValidationResult.errors`` from ``validate(name)``
+    so operators reviewing a catalog see import failures alongside
+    descriptor parse errors. Propagates as an exception from
+    ``load_tool(name)`` because the caller expects a callable
+    handler back.
+    """
+
+
+class ToolDescriptorInvalid(AtomicAgentsError):
+    """A tool descriptor (``<name>.md`` frontmatter) is malformed.
+
+    Filesystem backends raise this for: missing YAML frontmatter
+    delimiters, frontmatter YAML parse errors, frontmatter root that
+    isn't a dict, ``input_schema`` field that isn't a dict, descriptor
+    ``name`` field that doesn't match the file stem.
+
+    Same surface contract as ``ToolHandlerImportFailed`` — surfaced
+    via ``ValidationResult.errors`` from ``validate(name)``, raised
+    from ``load_tool(name)``. Operators triaging "tool isn't being
+    discovered" run ``validate(name)`` first to read the specific
+    parse error.
+    """
+
+
+class ToolAlreadyInstalled(AtomicAgentsError):
+    """``ToolRegistryBackend.install(source, version)`` collided on tool name.
+
+    Raised by backends declaring ``supports_install=True`` (SQLite #64
+    PR 3; future PyPI / git) when a tool with the same name already
+    exists in the catalog. Mirrors the ``AgentProfileExists`` shape
+    spec/24 established — install is a safe-create primitive; operators
+    wanting overwrite call ``uninstall`` first.
+
+    Spec/25 MUST #7 — install is atomic at the tool level; concurrent
+    install calls with the same name resolve exactly one winner; the
+    others raise this exception. Reserved at the exception level in
+    PR 1 even though no backend in PR 1 raises it (filesystem doesn't
+    support install). The SQLite backend (#64 PR 3) is the first
+    implementer.
+    """
