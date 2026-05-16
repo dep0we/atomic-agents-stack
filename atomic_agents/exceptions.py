@@ -116,6 +116,7 @@ class DreamNotFound(AtomicAgentsError):
 # ──────────────────────────────────────────────────────────────────
 # Custom tools exceptions (spec/17)
 
+
 class ToolNotRegistered(AtomicAgentsError):
     """Model called a tool name that is not in the ToolRegistry."""
 
@@ -140,6 +141,7 @@ class ToolHandlerError(AtomicAgentsError):
 # ──────────────────────────────────────────────────────────────────
 # Memory versioning exceptions (spec/02 versioning section)
 
+
 class MemoryPreconditionFailed(AtomicAgentsError):
     """write_atomic_note expected_content_sha256 precondition did not match.
 
@@ -160,6 +162,7 @@ class MemoryPreconditionFailed(AtomicAgentsError):
 
 # ──────────────────────────────────────────────────────────────────
 # Skills exceptions (spec/18)
+
 
 class SkillFileTraversal(AtomicAgentsError):
     """Attempted path traversal (../) in a skill file reference.
@@ -189,6 +192,7 @@ class PathTraversalError(AtomicAgentsError):
 
 # ──────────────────────────────────────────────────────────────────
 # MCP exceptions (spec/19)
+
 
 class MCPServerConnectFailed(AtomicAgentsError):
     """An MCP server failed to connect or initialize.
@@ -220,6 +224,7 @@ class MCPToolDispatchFailed(AtomicAgentsError):
 # ──────────────────────────────────────────────────────────────────
 # MemoryBackend exceptions (spec/20)
 
+
 class BackendNotRegistered(AtomicAgentsError):
     """Operator declared a backend that isn't registered.
 
@@ -245,6 +250,7 @@ class StagingNotApplied(AtomicAgentsError):
 
 
 # LLMBackend exceptions (spec/31 — PR #87 PR-1)
+
 
 class UnknownModelError(AtomicAgentsError):
     """No registered LLMBackend claims the requested model id.
@@ -300,6 +306,7 @@ class AmbiguousBackendError(AtomicAgentsError):
 # validation surface that runs between LLM tool_use emission and tool
 # handler dispatch. Both judges coexist; they cover different surfaces.
 
+
 class JudgeError(AtomicAgentsError):
     """Base for all spec/28 judge-layer exceptions.
 
@@ -341,4 +348,42 @@ class UnknownJudgeBackendError(JudgeError):
     Raised by ``atomic_agents.judge.get_backend(name)`` when the name
     has not been ``register_backend()``-ed. Distinct from
     ``BackendNotRegistered`` which covers the memory-backend registry.
+    """
+
+
+# ──────────────────────────────────────────────────────────────────
+# AgentProfileBackend exceptions (spec/24 — issue #63 PR 1 of 4)
+
+
+class AgentProfileNotFound(AtomicAgentsError):
+    """``load_profile(agent_id)`` was called with an id the backend
+    does not know about.
+
+    The filesystem reference impl raises this when the agent directory
+    is missing or has no ``persona/IDENTITY.md`` sentinel. Database /
+    registry backends raise this when the row is absent.
+
+    Distinct from ``BackendNotRegistered`` (operator pinned a backend
+    string that nobody registered) — this exception means the BACKEND
+    is fine, the AGENT ID is not.
+    """
+
+
+class AgentProfileExists(AtomicAgentsError):
+    """``clone(source, target)`` or equivalent refused to overwrite an
+    existing agent.
+
+    Profile backends MUST refuse silent overwrites; operators who want
+    to replace an existing profile call ``save_profile()`` directly
+    (which is documented to overwrite). ``clone`` and other create-
+    flavored operations raise this.
+    """
+
+
+class SnapshotNotFound(AtomicAgentsError):
+    """``restore(agent_id, snapshot_id)`` referenced an unknown snapshot.
+
+    Snapshot ids are backend-issued by ``snapshot()``; this exception
+    fires when an operator passes a stale id, a typo, or a snapshot id
+    from a different agent.
     """

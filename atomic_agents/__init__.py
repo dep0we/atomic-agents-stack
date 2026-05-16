@@ -36,7 +36,12 @@ from .exceptions import (
     SkillFileTraversal,
 )
 from .tools import ToolDefinition, ToolRegistry, ToolCallResult
-from .skills import SkillManifest, discover_skills, load_skill_body, load_skill_referenced_file
+from .skills import (
+    SkillManifest,
+    discover_skills,
+    load_skill_body,
+    load_skill_referenced_file,
+)
 from .types import Capture, Response, AgentConfig, CostCheckResult
 from .outcome import OutcomeRunner, OutcomeResult, IterationRecord
 from .dream import (
@@ -71,6 +76,21 @@ from .locks import (
     get_lock_backend,
     list_lock_backends,
 )
+from .profile import (
+    AgentProfileBackend,
+    AgentProfile,
+    ProfileSnapshot,
+    ProfileCapabilities,
+    AGENT_MODE_REACTIVE,
+    AGENT_MODE_GOAL_DRIVEN,
+    AGENT_MODE_HYBRID,
+    FilesystemAgentProfileBackend,
+    register_profile_backend,
+    unregister_profile_backend,
+    get_profile_backend,
+    list_profile_backends,
+    get_default_profile_backend,
+)
 from .judge import (
     # Protocol contract + outcome model
     JudgeBackend,
@@ -97,6 +117,9 @@ from .exceptions import (
     JudgeProposalInvalid,
     JudgeAmendedProposalRejected,
     UnknownJudgeBackendError,
+    AgentProfileNotFound,
+    AgentProfileExists,
+    SnapshotNotFound,
 )
 
 __version__ = "0.13.0"
@@ -181,4 +204,23 @@ __all__ = [
     "JudgeProposalInvalid",
     "JudgeAmendedProposalRejected",
     "UnknownJudgeBackendError",
+    # AgentProfileBackend Protocol surface (spec/24 — #63 PR 1 scaffolding;
+    # AtomicAgent.__init__ + _load_config() wiring + doctor.check_agent_profile_backend
+    # land in PR 2)
+    "AgentProfileBackend",
+    "AgentProfile",
+    "ProfileSnapshot",
+    "ProfileCapabilities",
+    "AGENT_MODE_REACTIVE",
+    "AGENT_MODE_GOAL_DRIVEN",
+    "AGENT_MODE_HYBRID",
+    "FilesystemAgentProfileBackend",
+    "register_profile_backend",
+    "unregister_profile_backend",
+    "get_profile_backend",
+    "list_profile_backends",
+    "get_default_profile_backend",
+    "AgentProfileNotFound",
+    "AgentProfileExists",
+    "SnapshotNotFound",
 ]
