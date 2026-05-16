@@ -14,7 +14,6 @@ Usage:
 
 from __future__ import annotations
 import concurrent.futures
-import json
 import logging
 import os
 import re
@@ -31,15 +30,14 @@ _logger = logging.getLogger(__name__)
 
 import frontmatter
 
-from . import _capture, _cascade, _costs, _llm, _model, _roster, _tools
-from ._io import atomic_append_jsonl, atomic_write, safe_resolve_under
+from . import _capture, _cascade, _costs, _llm
+from ._io import safe_resolve_under
 from .memory.filesystem import FilesystemBackend
 from .memory.backend import WritePolicy
-from .mcp import MCPClientPool, parse_mcp_md
+from .mcp import MCPClientPool
 from .locks import (
     LockBackend,
     LockBusy,
-    LockLost,
     check_lock_lost,
     get_default_lock_backend,
 )
@@ -47,6 +45,11 @@ from .logs import (
     LogBackend,
     RunRecord,
     get_default_log_backend,
+)
+from .profile import (
+    AgentProfile,
+    AgentProfileBackend,
+    get_default_profile_backend,
 )
 from .logs.types import (
     PRIMITIVE_AGENT_CALL,
@@ -63,10 +66,7 @@ from .logs.types import (
     PRIMITIVE_TOOL,
 )
 from ._platform import get_agents_root
-from ._schema import validate_atomic_note_frontmatter
-from .goal import parse_agent_mode
 from .exceptions import (
-    AgentLockBusy,
     AtomicAgentsError,
     CostGuardrailBlocked,
     HelperBatchPartialFailure,
@@ -74,7 +74,6 @@ from .exceptions import (
     NotInRoster,
     PathTraversalError,
     SelfDelegationError,
-    ToolNotRegistered,
 )
 from .tools import (
     DEFAULT_MAX_TOOL_ITERATIONS,
@@ -83,7 +82,12 @@ from .tools import (
     ToolDefinition,
     ToolRegistry,
 )
-from .skills import SkillManifest, discover_skills, load_skill_body, load_skill_referenced_file
+from .skills import (
+    SkillManifest,
+    discover_skills,
+    load_skill_body,
+    load_skill_referenced_file,
+)
 from .types import (
     AgentConfig,
     Capture,
@@ -166,6 +170,7 @@ def _canonicalize_tool_loop(raw_tool_uses, tool_results):
     helpers — a PR 2.5 review caught the gap empirically.
     """
     from .llm.types import LLMToolResult, LLMToolUse
+
     canonical_tool_uses = [
         LLMToolUse(id=tu["id"], name=tu["name"], input=tu.get("input", {}))
         for tu in raw_tool_uses
@@ -173,17 +178,21 @@ def _canonicalize_tool_loop(raw_tool_uses, tool_results):
     canonical_tool_results = []
     for tr in tool_results:
         if tr.error is not None:
-            canonical_tool_results.append(LLMToolResult(
-                tool_use_id=tr.tool_use_id,
-                content=f"[tool error] {tr.error}",
-                is_error=True,
-            ))
+            canonical_tool_results.append(
+                LLMToolResult(
+                    tool_use_id=tr.tool_use_id,
+                    content=f"[tool error] {tr.error}",
+                    is_error=True,
+                )
+            )
         else:
-            canonical_tool_results.append(LLMToolResult(
-                tool_use_id=tr.tool_use_id,
-                content=tr.output,
-                is_error=False,
-            ))
+            canonical_tool_results.append(
+                LLMToolResult(
+                    tool_use_id=tr.tool_use_id,
+                    content=tr.output,
+                    is_error=False,
+                )
+            )
     return canonical_tool_uses, canonical_tool_results
 
 
@@ -223,6 +232,7 @@ class AtomicAgent:
         *,
         lock_backend: LockBackend | None = None,
         log_backend: LogBackend | None = None,
+        profile_backend: AgentProfileBackend | None = None,
     ):
         self.name = name
         self.trigger = trigger
@@ -271,9 +281,42 @@ class AtomicAgent:
         else:
             self.log_backend = log_backend
 
+        # AgentProfileBackend instance (#63 PR 2 — wires the bootstrap path
+        # through the Protocol established in PR 1). Operators may pin via
+        # the ``profile_backend=...`` constructor kwarg (programmatic path
+        # — always wins) OR via ``ATOMIC_AGENTS_PROFILE_BACKEND`` +
+        # ``ATOMIC_AGENTS_PROFILE_BACKEND_URL`` env vars (deployment path
+        # — Docker, launchd, Cloud Run). Default (both unset) is the
+        # filesystem backend scoped at the agents_root — matches pre-#63
+        # PR 2 behavior byte-for-byte (the on-disk markdown layout is
+        # preserved). ``profile_backend`` is public — mirrors
+        # ``self.lock_backend`` / ``self.log_backend`` so diagnostic code
+        # (``atomic-agents doctor``) and runners can reuse the same
+        # backend instance instead of resolving twice.
+        if profile_backend is None:
+            self.profile_backend = get_default_profile_backend(self.agents_root)
+        else:
+            self.profile_backend = profile_backend
+
+        # Load the agent's profile ONCE at init time. ``self._profile`` is
+        # an init-time snapshot — private cache, not a stable operator
+        # surface. Operators read persona text via assemble_system_prompt()
+        # or the filesystem directly, not via agent._profile. The downstream
+        # bootstrap methods (``_load_config``, ``_load_persona``,
+        # ``_load_goal_text``) read fields off this snapshot instead of
+        # re-reading the filesystem.
+        self._profile: AgentProfile = self.profile_backend.load_profile(self.name)
+
         # Cascade detection — None for single-agent layouts (load behaves as before),
         # populated for paths shaped <system>/projects/<project>/agents/<role>/.
-        self.cascade: _cascade.CascadePaths | None = _cascade.detect_cascade(self.agent_root)
+        # NOTE: kept after the profile_backend.load_profile call because
+        # the profile backend handles cascade internally for config loading,
+        # but downstream methods (load_role_prompt, load_project_layer_text,
+        # _load_tools_text, tool registration at lines ~622+657) still need
+        # ``self.cascade`` for prompt assembly + tool-path resolution.
+        self.cascade: _cascade.CascadePaths | None = _cascade.detect_cascade(
+            self.agent_root
+        )
 
         # Skills (spec/18) — discover at init so metadata is available for
         # system-prompt assembly. Empty list when no skills/ directory exists.
@@ -345,11 +388,13 @@ class AtomicAgent:
         # Single-agent goal context (per spec/04 step 3.5; empty for cascaded agents)
         self._goal_text: str = ""
 
-        # Agent operating mode (reactive / goal-driven / hybrid), parsed from
-        # IDENTITY.md at init time. Defaults to "reactive" if no IDENTITY.md or
-        # no Operating-mode section.
-        identity_path = self.agent_root / "persona" / "IDENTITY.md"
-        self.agent_mode: str = parse_agent_mode(identity_path)
+        # Agent operating mode (reactive / goal-driven / hybrid), derived
+        # from IDENTITY.md content via the profile backend. Defaults to
+        # "reactive" when no Operating-mode section is present
+        # (FilesystemAgentProfileBackend.load_profile handles this via
+        # parse_agent_mode_text). #63 PR 2: read from the pre-loaded
+        # profile snapshot instead of re-reading IDENTITY.md from disk.
+        self.agent_mode: str = self._profile.agent_mode
 
         # Parse config files
         self.config = self._load_config()
@@ -380,9 +425,9 @@ class AtomicAgent:
             manifest = skill_index.get(skill_name)
             if manifest is None:
                 from .exceptions import ToolHandlerError
+
                 raise ToolHandlerError(
-                    f"Unknown skill {skill_name!r}. "
-                    f"Available skills: {skill_names}"
+                    f"Unknown skill {skill_name!r}. Available skills: {skill_names}"
                 )
             return load_skill_body(manifest)
 
@@ -392,59 +437,63 @@ class AtomicAgent:
             manifest = skill_index.get(skill_name)
             if manifest is None:
                 from .exceptions import ToolHandlerError
+
                 raise ToolHandlerError(
-                    f"Unknown skill {skill_name!r}. "
-                    f"Available skills: {skill_names}"
+                    f"Unknown skill {skill_name!r}. Available skills: {skill_names}"
                 )
             return load_skill_referenced_file(manifest, relative_path)
 
-        self.tool_registry.register(ToolDefinition(
-            name="load_skill",
-            description=(
-                "Loads the full instructions for a skill by name. "
-                "Use this when a skill listed in the system prompt is relevant "
-                "to the current task and you need its detailed guidance."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "skill_name": {
-                        "type": "string",
-                        "description": "Name of the skill to load (as listed in Available skills).",
-                    }
+        self.tool_registry.register(
+            ToolDefinition(
+                name="load_skill",
+                description=(
+                    "Loads the full instructions for a skill by name. "
+                    "Use this when a skill listed in the system prompt is relevant "
+                    "to the current task and you need its detailed guidance."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "skill_name": {
+                            "type": "string",
+                            "description": "Name of the skill to load (as listed in Available skills).",
+                        }
+                    },
+                    "required": ["skill_name"],
                 },
-                "required": ["skill_name"],
-            },
-            handler=_handle_load_skill,
-        ))
+                handler=_handle_load_skill,
+            )
+        )
 
-        self.tool_registry.register(ToolDefinition(
-            name="load_skill_file",
-            description=(
-                "Loads a supporting file referenced by a skill (one level deep from "
-                "the skill's SKILL.md). Use after calling load_skill when you need "
-                "extended reference material that was not included in the main body."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "skill_name": {
-                        "type": "string",
-                        "description": "Name of the skill that owns the file.",
+        self.tool_registry.register(
+            ToolDefinition(
+                name="load_skill_file",
+                description=(
+                    "Loads a supporting file referenced by a skill (one level deep from "
+                    "the skill's SKILL.md). Use after calling load_skill when you need "
+                    "extended reference material that was not included in the main body."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "skill_name": {
+                            "type": "string",
+                            "description": "Name of the skill that owns the file.",
+                        },
+                        "relative_path": {
+                            "type": "string",
+                            "description": (
+                                "Path to the file relative to the skill directory "
+                                "(e.g. 'reference.md', 'examples.md'). "
+                                "Must be one level deep — no subdirectory traversal."
+                            ),
+                        },
                     },
-                    "relative_path": {
-                        "type": "string",
-                        "description": (
-                            "Path to the file relative to the skill directory "
-                            "(e.g. 'reference.md', 'examples.md'). "
-                            "Must be one level deep — no subdirectory traversal."
-                        ),
-                    },
+                    "required": ["skill_name", "relative_path"],
                 },
-                "required": ["skill_name", "relative_path"],
-            },
-            handler=_handle_load_skill_file,
-        ))
+                handler=_handle_load_skill_file,
+            )
+        )
 
     @staticmethod
     def _generate_run_id() -> str:
@@ -464,9 +513,11 @@ class AtomicAgent:
         the agent layer no longer branches on ``model.startswith`` (the
         codex P1 fix from the #87 LLMBackend plan, landed in PR 2.5).
         """
-        if (model.startswith("claude-")
-                or model.startswith("gpt-")
-                or model.startswith("moonshot/")):
+        if (
+            model.startswith("claude-")
+            or model.startswith("gpt-")
+            or model.startswith("moonshot/")
+        ):
             return [_capture.canonical_tool_definition()]
         return None
 
@@ -482,9 +533,11 @@ class AtomicAgent:
         Returns None for providers without tool-call support — the agent
         then falls back to Path 2 fenced-block parsing only.
         """
-        if (model.startswith("claude-")
-                or model.startswith("gpt-")
-                or model.startswith("moonshot/")):
+        if (
+            model.startswith("claude-")
+            or model.startswith("gpt-")
+            or model.startswith("moonshot/")
+        ):
             defs = [_capture.canonical_tool_definition()]
             defs.extend(self.tool_registry.to_canonical_definitions())
             # Judge layer side-channel marker (spec/28 + #112 PR 2a).
@@ -494,6 +547,7 @@ class AtomicAgent:
             # judge layer is disabled (no judges.md, no env var) the
             # markers are silently ignored at proposal-assembly time.
             from .judge.atomic_action import canonical_tool_definition as _action_def
+
             defs.append(_action_def())
             return defs
         return None
@@ -520,7 +574,10 @@ class AtomicAgent:
            authoring a judges.md.
         """
         if os.environ.get("AGENT_JUDGE_ENABLED", "").strip().lower() in (
-            "1", "true", "yes", "on",
+            "1",
+            "true",
+            "yes",
+            "on",
         ):
             return True
         if (self.agent_root / "judges.md").exists():
@@ -570,6 +627,7 @@ class AtomicAgent:
         per class.
         """
         from .judge.types import ClassPolicySnapshot, ClassPolicyValue
+
         return ClassPolicySnapshot(
             read_only=ClassPolicyValue.JUDGE_REQUIRED,
             reversible_write=ClassPolicyValue.JUDGE_REQUIRED,
@@ -614,6 +672,7 @@ class AtomicAgent:
         if self._policy_judge is not None:
             return self._policy_judge
         from .judge.rules import make_default_policy_judge
+
         # Read the tools.md content for policy_version derivation.
         # Use the resolved tools.md (cascade-aware) when available; fall
         # back to the agent_root file otherwise.
@@ -651,6 +710,7 @@ class AtomicAgent:
             return self._llm_judge
         self._llm_judge_constructed = True
         from .judge.llm import make_default_llm_judge
+
         # Read tools.md text for policy_version derivation (cascade-aware).
         tools_md_text = ""
         if self.cascade:
@@ -710,7 +770,6 @@ class AtomicAgent:
           intent so PR 3c can surface stale-deferred revisions.
         """
         from .judge import escalation as _esc
-        from .judge.backend import Judgment, JudgmentOutcome
 
         if self.judges_config is None:
             return []
@@ -732,7 +791,8 @@ class AtomicAgent:
         except Exception as exc:  # noqa: BLE001
             _logger.exception(
                 "agent %r: poll_escalations raised; skipping cycle: %s",
-                self.name, exc,
+                self.name,
+                exc,
             )
             # Do NOT touch_last_poll on error (Codex round-1 P1-5).
             # Persistent failures (e.g., disk full) should not silently
@@ -826,8 +886,7 @@ class AtomicAgent:
         judgment = Judgment(
             outcome=(
                 JudgmentOutcome.ALLOW
-                if decision is _esc.ResolutionDecision.APPROVED
-                and stale_reason is None
+                if decision is _esc.ResolutionDecision.APPROVED and stale_reason is None
                 else JudgmentOutcome.BLOCK
             ),
             reason=(stale_reason or event.reason or decision.value),
@@ -861,10 +920,7 @@ class AtomicAgent:
         # closed). cost_source="actor" keeps the spend on the
         # proposing actor's ledger per the operator-approval-as-consent
         # discipline.
-        if (
-            decision is _esc.ResolutionDecision.APPROVED
-            and stale_reason is None
-        ):
+        if decision is _esc.ResolutionDecision.APPROVED and stale_reason is None:
             try:
                 tool_use_payload = {
                     "name": proposal.tool_name,
@@ -872,29 +928,35 @@ class AtomicAgent:
                     "input": proposal.tool_arguments,
                 }
                 tool_result = self.tool_registry.execute(tool_use_payload)
-                self._log({
-                    "trigger": "escalation_deferred_execution",
-                    "parent_run_id": fm.parent_run_id,
-                    "escalation_queue_id": fm.proposal_id,
-                    "tool_name": tool_result.tool_name,
-                    "latency_ms": tool_result.latency_ms,
-                    "error": tool_result.error,
-                    "cost_source": "actor",
-                })
+                self._log(
+                    {
+                        "trigger": "escalation_deferred_execution",
+                        "parent_run_id": fm.parent_run_id,
+                        "escalation_queue_id": fm.proposal_id,
+                        "tool_name": tool_result.tool_name,
+                        "latency_ms": tool_result.latency_ms,
+                        "error": tool_result.error,
+                        "cost_source": "actor",
+                    }
+                )
             except Exception as exc:  # noqa: BLE001
                 _logger.exception(
                     "agent %r: escalation_deferred_execution failed for "
                     "proposal_id=%r: %s",
-                    self.name, proposal.proposal_id, exc,
+                    self.name,
+                    proposal.proposal_id,
+                    exc,
                 )
-                self._log({
-                    "trigger": "escalation_deferred_execution",
-                    "parent_run_id": fm.parent_run_id,
-                    "escalation_queue_id": fm.proposal_id,
-                    "tool_name": proposal.tool_name,
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "cost_source": "actor",
-                })
+                self._log(
+                    {
+                        "trigger": "escalation_deferred_execution",
+                        "parent_run_id": fm.parent_run_id,
+                        "escalation_queue_id": fm.proposal_id,
+                        "tool_name": proposal.tool_name,
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "cost_source": "actor",
+                    }
+                )
 
         # PR 3c: operator-revise execution path.
         if decision is _esc.ResolutionDecision.OPERATOR_REVISED:
@@ -966,17 +1028,20 @@ class AtomicAgent:
             # JudgePolicyInvalid was uncaught here and propagated out
             # of ``poll_escalations``, killing ``agent.call()``.
             _logger.warning(
-                "agent %r: operator_revise validation failed for "
-                "proposal_id=%r: %s",
-                self.name, fm.proposal_id, exc,
+                "agent %r: operator_revise validation failed for proposal_id=%r: %s",
+                self.name,
+                fm.proposal_id,
+                exc,
             )
-            self._log({
-                "trigger": "escalation_operator_revise_invalid_amendment",
-                "parent_run_id": fm.parent_run_id,
-                "escalation_queue_id": fm.proposal_id,
-                "tool_name": original.tool_name,
-                "error": f"{type(exc).__name__}: {exc}",
-            })
+            self._log(
+                {
+                    "trigger": "escalation_operator_revise_invalid_amendment",
+                    "parent_run_id": fm.parent_run_id,
+                    "escalation_queue_id": fm.proposal_id,
+                    "tool_name": original.tool_name,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
             return
 
         # Gate on AMENDED classification (Codex round-1 P1-4 fix).
@@ -993,15 +1058,14 @@ class AtomicAgent:
                 judge_budget = self.judges_config.budget
                 escalation_cfg = self.judges_config.escalation
                 flat_failure_policy = dict(
-                    self.judges_config.failure_policy[
-                        ActionClass.EXTERNAL_SIDE_EFFECT
-                    ]
+                    self.judges_config.failure_policy[ActionClass.EXTERNAL_SIDE_EFFECT]
                 )
                 backend_name = self.judges_config.default_backend
             else:
                 class_policy = self._default_class_policy_snapshot()
                 from .judge.types import EscalationConfig as _EC
                 from .judge.types import BudgetConfig as _BC
+
                 timeout_ms = 5000
                 judge_budget = _BC()
                 escalation_cfg = _EC()
@@ -1055,7 +1119,9 @@ class AtomicAgent:
                 _logger.info(
                     "agent %r: operator_revise high_risk re-judge BLOCKed "
                     "for proposal_id=%r (queue_id=%r); refusing execution",
-                    self.name, original.proposal_id, fm.proposal_id,
+                    self.name,
+                    original.proposal_id,
+                    fm.proposal_id,
                 )
                 return
         else:
@@ -1069,35 +1135,40 @@ class AtomicAgent:
                 "input": amended.tool_arguments,
             }
             tool_result = self.tool_registry.execute(tool_use_payload)
-            self._log({
-                "trigger": "escalation_operator_revise_executed",
-                "parent_run_id": fm.parent_run_id,
-                "escalation_queue_id": fm.proposal_id,
-                "original_proposal_id": original.proposal_id,
-                "amended_proposal_id": amended.proposal_id,
-                "tool_name": tool_result.tool_name,
-                "latency_ms": tool_result.latency_ms,
-                "error": tool_result.error,
-                "re_judged": re_judged,
-                "cost_source": "actor",
-            })
+            self._log(
+                {
+                    "trigger": "escalation_operator_revise_executed",
+                    "parent_run_id": fm.parent_run_id,
+                    "escalation_queue_id": fm.proposal_id,
+                    "original_proposal_id": original.proposal_id,
+                    "amended_proposal_id": amended.proposal_id,
+                    "tool_name": tool_result.tool_name,
+                    "latency_ms": tool_result.latency_ms,
+                    "error": tool_result.error,
+                    "re_judged": re_judged,
+                    "cost_source": "actor",
+                }
+            )
         except Exception as exc:  # noqa: BLE001
             _logger.exception(
-                "agent %r: operator_revise execution failed for "
-                "proposal_id=%r: %s",
-                self.name, original.proposal_id, exc,
+                "agent %r: operator_revise execution failed for proposal_id=%r: %s",
+                self.name,
+                original.proposal_id,
+                exc,
             )
-            self._log({
-                "trigger": "escalation_operator_revise_executed",
-                "parent_run_id": fm.parent_run_id,
-                "escalation_queue_id": fm.proposal_id,
-                "original_proposal_id": original.proposal_id,
-                "amended_proposal_id": amended.proposal_id,
-                "tool_name": amended.tool_name,
-                "error": f"{type(exc).__name__}: {exc}",
-                "re_judged": re_judged,
-                "cost_source": "actor",
-            })
+            self._log(
+                {
+                    "trigger": "escalation_operator_revise_executed",
+                    "parent_run_id": fm.parent_run_id,
+                    "escalation_queue_id": fm.proposal_id,
+                    "original_proposal_id": original.proposal_id,
+                    "amended_proposal_id": amended.proposal_id,
+                    "tool_name": amended.tool_name,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "re_judged": re_judged,
+                    "cost_source": "actor",
+                }
+            )
 
     def _dispatch_with_judge(
         self,
@@ -1122,16 +1193,11 @@ class AtomicAgent:
         from .judge.backend import JudgmentOutcome
         from .judge.types import (
             ActionClass,
-            JudgmentContext,
-            JudgePolicyContext,
-            JudgeRuntimeConfig,
             BudgetConfig,
             EscalationConfig,
-            PersonaDigest,
             ProposalBinding,
-            ToolPolicyEntry,
         )
-        from .exceptions import JudgeError, JudgeProposalInvalid
+        from .exceptions import JudgeProposalInvalid
 
         tool_name = tu.get("name", "")
         tool_call_id = tu.get("id", "")
@@ -1174,6 +1240,7 @@ class AtomicAgent:
             # Single-event return — proposal-assembly failure means no
             # ensemble judges ran.
             from .judge.backend import Judgment
+
             judgment = Judgment(
                 outcome=JudgmentOutcome.BLOCK,
                 reason=f"JudgeProposalInvalid: {exc}",
@@ -1306,7 +1373,11 @@ class AtomicAgent:
             ProposalBinding,
             ToolPolicyEntry,
         )
-        from .exceptions import JudgeError, JudgeAmendedProposalRejected, JudgePolicyInvalid
+        from .exceptions import (
+            JudgeError,
+            JudgeAmendedProposalRejected,
+            JudgePolicyInvalid,
+        )
         from .judge.types import ClassPolicyValue as _CPV
 
         tool_name = proposal_obj.tool_name
@@ -1339,7 +1410,6 @@ class AtomicAgent:
         # allow_with_audit want every judge's decision recorded but
         # never enforced. Both short-circuit BEFORE building the
         # ensemble loop.
-        from .judge.types import ClassPolicyValue as _CPV
         effective_class_policy = {
             ActionClass.READ_ONLY: class_policy.read_only,
             ActionClass.REVERSIBLE_WRITE: class_policy.reversible_write,
@@ -1353,6 +1423,7 @@ class AtomicAgent:
             # itself the decision. Write PENDING + signal defer.
             from .judge.backend import Judgment
             from .judge import escalation as _esc
+
             escalate_judgment = Judgment(
                 outcome=JudgmentOutcome.ESCALATE,
                 reason=(
@@ -1398,6 +1469,7 @@ class AtomicAgent:
             # Synthesize a single bypass-recording event. No judge
             # ensemble runs. Tool executes immediately.
             from .judge.backend import Judgment
+
             bypass_judgment = Judgment(
                 outcome=JudgmentOutcome.ALLOW,
                 reason=(
@@ -1438,7 +1510,9 @@ class AtomicAgent:
         # operator failure_policy configuration entirely.
         def _outcome_for_failure(exception_name: str) -> JudgmentOutcome:
             if self.judges_config is not None:
-                raw = self.judges_config.failure_policy_for(classification, exception_name)
+                raw = self.judges_config.failure_policy_for(
+                    classification, exception_name
+                )
             else:
                 raw = "block"
             try:
@@ -1461,6 +1535,7 @@ class AtomicAgent:
                 # per-exception. PR 3b: "escalate" outcome now produces
                 # a real PENDING file + deferred Response.
                 from .judge.backend import Judgment
+
                 outcome = _outcome_for_failure(type(exc).__name__)
                 if outcome == JudgmentOutcome.ESCALATE:
                     failure_synthesis = "failure_policy"
@@ -1575,6 +1650,7 @@ class AtomicAgent:
                         # emit the escalate_pending audit so operators
                         # see the malformed-schema event in the queue.
                         from .judge import escalation as _esc
+
                         _pending_path, queue_id = _esc.write_pending_escalation(
                             proposal=proposal_obj,
                             judgment_reason=reason_text,
@@ -1744,6 +1820,7 @@ class AtomicAgent:
             # Ensemble short-circuits — downstream judges do not run.
             if judgment.outcome == JudgmentOutcome.ESCALATE and not audit_mode:
                 from .judge import escalation as _esc
+
                 _pending_path, queue_id = _esc.write_pending_escalation(
                     proposal=proposal_obj,
                     judgment_reason=judgment.reason,
@@ -1895,52 +1972,29 @@ class AtomicAgent:
     # Config loading
 
     def _load_config(self) -> AgentConfig:
-        if self.cascade:
-            # model.md: instance overrides role; if neither, defaults
-            model_path = _cascade.resolve_model_md(self.cascade)
-            model_data = _model.parse_model_md(model_path)
-            # tools.md: instance .override.md merges with role; instance tools.md replaces role
-            _, tools_text = _cascade.resolve_tools_md(self.cascade)
-            tools_data = _tools.parse_tools_md_text(tools_text)
-            # Judge-layer per-tool classifications from tools.md (#112 PR 2a).
-            # Lookup at proposal-assembly time via _resolve_classification.
-            self._tool_classifications = _tools.parse_tool_classifications_text(
-                tools_text
-            )
-        else:
-            model_data = _model.parse_model_md(self.agent_root / "model.md")
-            tools_data = _tools.parse_tools_md(self.agent_root / "tools.md")
-            self._tool_classifications = _tools.parse_tool_classifications(
-                self.agent_root / "tools.md"
-            )
-            tools_text = ""
-            tools_md_path = self.agent_root / "tools.md"
-            if tools_md_path.exists():
-                tools_text = tools_md_path.read_text(encoding="utf-8")
+        """Assemble AgentConfig from the pre-loaded profile snapshot.
 
-        # judges.md operator config (#112 PR 3a). Cascade-aware: own
-        # judges.md + project-floor judges.md (when cascade); the
-        # floor is non-relaxable per spec/28:408. ``None`` when no
-        # judges.md exists — PR 2a/2b's hardcoded defaults run.
-        # ``JudgePolicyInvalid`` at parse time stops _load_config
-        # with a clear diagnostic per spec/28 fail-loud discipline.
-        from . import judges_md as _judges_md_mod
-        self.judges_config = _judges_md_mod.load_judges_config(
-            agent_root=self.agent_root,
-            cascade=self.cascade,
-            tools_md_text=tools_text,
-        )
+        #63 PR 2: refactored from direct file reads to read from
+        ``self._profile``. The profile was loaded once in __init__ via
+        ``self.profile_backend.load_profile(self.name)``, which handles
+        cascade resolution internally (the cascade branch that used to
+        live here was deleted — Decision 7). All five structured config
+        fields (model_config, tool_config, tool_classifications,
+        judges_config, mcp_servers, roster) are read off the snapshot;
+        no filesystem reads happen inside this method anymore.
+        """
+        model_data = self._profile.model_config
+        tools_data = self._profile.tool_config
+        # Judge-layer per-tool classifications from tools.md (#112 PR 2a).
+        # Lookup at proposal-assembly time via _resolve_classification.
+        self._tool_classifications = self._profile.tool_classifications
 
-        # roster.md lives at the instance root (same for cascaded + single-agent layouts)
-        roster = _roster.parse_roster_md(self.agent_root / "roster.md")
-
-        # mcp.md lives at the instance root (same for cascaded + single-agent layouts).
-        # Empty list when no mcp.md exists — that's fine.
-        # Pass read_paths so path-shaped args are validated at parse time (spec/19).
-        mcp_servers = parse_mcp_md(
-            self.agent_root / "mcp.md",
-            read_paths=tools_data["read_paths"],
-        )
+        # judges.md operator config (#112 PR 3a). Cascade-aware merge
+        # (instance + project-floor with non-relaxable floor per
+        # spec/28:408) already happened inside
+        # FilesystemAgentProfileBackend.load_profile, which called
+        # load_judges_config internally.
+        self.judges_config = self._profile.judges_config
 
         return AgentConfig(
             default_model=model_data["default_model"],
@@ -1960,8 +2014,8 @@ class AtomicAgent:
             read_only_paths=tools_data.get("read_only_paths", []),
             external_apis=tools_data["external_apis"],
             hard_nos=tools_data["hard_nos"],
-            roster=roster,
-            mcp_servers=mcp_servers,
+            roster=list(self._profile.roster),
+            mcp_servers=list(self._profile.mcp_servers),
         )
 
     # ────────────────────────────────────────────────────────────
@@ -1999,19 +2053,32 @@ class AtomicAgent:
         Only called for non-cascaded agents. Cascaded agents pick up the
         project-level goal via _load_project_layer_text(); loading the
         instance goal.md on top would create duplicate sections.
+
+        #63 PR 2: reads from the pre-loaded profile snapshot's
+        ``goal_text`` field (populated by FilesystemAgentProfileBackend
+        from goal.md at init time) instead of re-reading the file.
         """
-        goal_path = self.agent_root / "goal.md"
-        if goal_path.exists():
-            self._goal_text = goal_path.read_text(encoding="utf-8")
-        else:
-            self._goal_text = ""
+        self._goal_text = self._profile.goal_text
 
     def _load_persona(self) -> None:
+        """Assemble the persona section from the profile snapshot.
+
+        #63 PR 2: reads from the pre-loaded profile snapshot's
+        ``persona_identity / persona_soul / persona_user`` fields
+        (populated by FilesystemAgentProfileBackend from the three
+        persona/ markdown files at init time) instead of re-reading
+        the files. Preserves the legacy assembled-text shape exactly:
+        each non-empty body gets its filename as an H1 header, joined
+        by blank lines.
+        """
         parts = []
-        for filename in ("IDENTITY.md", "SOUL.md", "USER.md"):
-            path = self.agent_root / "persona" / filename
-            if path.exists():
-                parts.append(f"# {filename}\n\n" + path.read_text(encoding="utf-8").strip())
+        for filename, body in (
+            ("IDENTITY.md", self._profile.persona_identity),
+            ("SOUL.md", self._profile.persona_soul),
+            ("USER.md", self._profile.persona_user),
+        ):
+            if body:
+                parts.append(f"# {filename}\n\n" + body.strip())
         self._persona_text = "\n\n".join(parts)
 
     def _load_tools_text(self) -> None:
@@ -2061,8 +2128,7 @@ class AtomicAgent:
             return
         entries = sorted(journal_dir.rglob("*.md"), reverse=True)[:n]
         self._recent_journal = [
-            f"# Journal — {p.stem}\n\n" + p.read_text(encoding="utf-8")
-            for p in entries
+            f"# Journal — {p.stem}\n\n" + p.read_text(encoding="utf-8") for p in entries
         ]
 
     @staticmethod
@@ -2143,7 +2209,9 @@ class AtomicAgent:
             if self._project_goal_text:
                 sections.append("# project goal.md\n\n" + self._project_goal_text)
             if self._project_style_guide_text:
-                sections.append("# project style_guide.md\n\n" + self._project_style_guide_text)
+                sections.append(
+                    "# project style_guide.md\n\n" + self._project_style_guide_text
+                )
             if self._project_policy_text:
                 sections.append("# project policy/\n\n" + self._project_policy_text)
         if self._memory_index_text:
@@ -2151,11 +2219,17 @@ class AtomicAgent:
         if self._wiki_index_text:
             sections.append("# wiki/INDEX.md\n\n" + self._wiki_index_text)
         if self._pinned_notes:
-            sections.append("# Pinned atomic notes\n\n" + "\n\n---\n\n".join(self._pinned_notes))
+            sections.append(
+                "# Pinned atomic notes\n\n" + "\n\n---\n\n".join(self._pinned_notes)
+            )
         if self._recent_notes:
-            sections.append("# Recent atomic notes\n\n" + "\n\n---\n\n".join(self._recent_notes))
+            sections.append(
+                "# Recent atomic notes\n\n" + "\n\n---\n\n".join(self._recent_notes)
+            )
         if self._recent_journal:
-            sections.append("# Recent journal\n\n" + "\n\n---\n\n".join(self._recent_journal))
+            sections.append(
+                "# Recent journal\n\n" + "\n\n---\n\n".join(self._recent_journal)
+            )
         return "\n\n═══════════════════════════\n\n".join(sections)
 
     # ────────────────────────────────────────────────────────────
@@ -2210,14 +2284,16 @@ class AtomicAgent:
                 "", timeout=30 if self.trigger == "skill" else 0
             )
         except LockBusy as e:
-            self._log({
-                "trigger": self.trigger,
-                "model": self.config.default_model,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "status": "lock_busy",
-                "summary": str(e),
-            })
+            self._log(
+                {
+                    "trigger": self.trigger,
+                    "model": self.config.default_model,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "status": "lock_busy",
+                    "summary": str(e),
+                }
+            )
             raise
 
         # Track MCP tool names registered this call so we can clean them up in
@@ -2240,15 +2316,19 @@ class AtomicAgent:
                 parent_remaining_headroom_usd=parent_remaining_headroom_usd,
             )
             if not check.allow:
-                self._log({
-                    "trigger": self.trigger,
-                    "model": self.config.default_model,
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "status": "skipped",
-                    "summary": f"Skipped: {check.reason}",
-                })
-                return Response.skipped_response(check.reason, self.config.default_model)
+                self._log(
+                    {
+                        "trigger": self.trigger,
+                        "model": self.config.default_model,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "status": "skipped",
+                        "summary": f"Skipped: {check.reason}",
+                    }
+                )
+                return Response.skipped_response(
+                    check.reason, self.config.default_model
+                )
 
             # MCP client pool — lazy init (spec/19).
             # Only spin up when mcp.md declares servers and pool not yet live.
@@ -2266,7 +2346,9 @@ class AtomicAgent:
                     _mcp_registered_names.append(td.name)
                 _logger.debug(
                     "agent %r: MCP pool ready — %d tools from %d server(s)",
-                    self.name, len(mcp_tool_defs), len(self.config.mcp_servers),
+                    self.name,
+                    len(mcp_tool_defs),
+                    len(self.config.mcp_servers),
                 )
 
             # PR 3b ESCALATE: opportunistic throttled poll of the
@@ -2365,18 +2447,20 @@ class AtomicAgent:
                             tool_calls=all_tool_call_results,
                             tool_iterations=iteration_count - 1,
                         )
-                        self._log({
-                            "trigger": self.trigger,
-                            "model": model,
-                            "input_tokens": total_input_tokens,
-                            "output_tokens": total_output_tokens,
-                            "cost_usd": total_cost,
-                            "cost_source": "actor",
-                            "latency_ms": latency_ms,
-                            "status": "skipped",
-                            "summary": skip_reason,
-                            "run_id": self.run_id,
-                        })
+                        self._log(
+                            {
+                                "trigger": self.trigger,
+                                "model": model,
+                                "input_tokens": total_input_tokens,
+                                "output_tokens": total_output_tokens,
+                                "cost_usd": total_cost,
+                                "cost_source": "actor",
+                                "latency_ms": latency_ms,
+                                "status": "skipped",
+                                "summary": skip_reason,
+                                "run_id": self.run_id,
+                            }
+                        )
                         return response
 
                 iter_start = time.time()
@@ -2386,7 +2470,9 @@ class AtomicAgent:
                     messages=messages,
                     max_tokens=max_tokens or self.config.max_output_tokens,
                     temperature=temperature if temperature is not None else 0.6,
-                    cache_control_breakpoints=[len(system_prompt)] if iteration_count == 1 else None,
+                    cache_control_breakpoints=[len(system_prompt)]
+                    if iteration_count == 1
+                    else None,
                     tools=tool_definitions,
                     preferred_provider=self.config.provider,
                 )
@@ -2409,7 +2495,8 @@ class AtomicAgent:
 
                 # Extract captures from this iteration (Path 1 + Path 2)
                 iter_captures, iter_failures = _capture.extract_all_captures(
-                    raw.text, tool_uses=raw.tool_uses,
+                    raw.text,
+                    tool_uses=raw.tool_uses,
                 )
                 all_captures.extend(iter_captures)
                 all_parse_failures.extend(iter_failures)
@@ -2418,13 +2505,16 @@ class AtomicAgent:
                 # atomic_action) handled above / by judge dispatch, vs
                 # custom tools the operator registered.
                 from .judge.proposal import is_framework_managed_tool
+
                 custom_tool_uses = [
-                    tu for tu in raw.tool_uses
+                    tu
+                    for tu in raw.tool_uses
                     if not is_framework_managed_tool(tu.get("name", ""))
                     and self.tool_registry.get(tu.get("name", "")) is not None
                 ]
                 unknown_tool_uses = [
-                    tu for tu in raw.tool_uses
+                    tu
+                    for tu in raw.tool_uses
                     if not is_framework_managed_tool(tu.get("name", ""))
                     and self.tool_registry.get(tu.get("name", "")) is None
                     and tu.get("name", "")  # non-empty name
@@ -2434,15 +2524,18 @@ class AtomicAgent:
                 for tu in unknown_tool_uses:
                     _logger.warning(
                         "agent %r: LLM called unknown tool %r (not in registry)",
-                        self.name, tu.get("name", ""),
+                        self.name,
+                        tu.get("name", ""),
                     )
-                    self._log({
-                        "trigger": "tool_call",
-                        "parent_run_id": self.run_id,
-                        "tool_name": tu.get("name", ""),
-                        "latency_ms": 0,
-                        "error": "ToolNotRegistered",
-                    })
+                    self._log(
+                        {
+                            "trigger": "tool_call",
+                            "parent_run_id": self.run_id,
+                            "tool_name": tu.get("name", ""),
+                            "latency_ms": 0,
+                            "error": "ToolNotRegistered",
+                        }
+                    )
 
                 # Judge layer (#112 PR 2a). Extract atomic_action markers and
                 # dispatch the judge ensemble for each side-effectful tool_use
@@ -2458,6 +2551,7 @@ class AtomicAgent:
                 if self._judge_enabled() and custom_tool_uses:
                     from .judge.atomic_action import extract_atomic_action_markers
                     from .exceptions import JudgeProposalInvalid
+
                     try:
                         markers = extract_atomic_action_markers(raw.tool_uses)
                     except JudgeProposalInvalid as exc:
@@ -2466,7 +2560,8 @@ class AtomicAgent:
                         # block ALL side-effectful tool_uses this iteration.
                         _logger.warning(
                             "agent %r: judge layer marker extraction failed: %s",
-                            self.name, exc,
+                            self.name,
+                            exc,
                         )
                         markers = {}
                         for tu in custom_tool_uses:
@@ -2478,7 +2573,8 @@ class AtomicAgent:
                         for tu in custom_tool_uses:
                             try:
                                 allow, events, queue_id = self._dispatch_with_judge(
-                                    tu, markers,
+                                    tu,
+                                    markers,
                                 )
                             except Exception as exc:  # noqa: BLE001
                                 # Defensive: any uncaught judge-path error
@@ -2488,11 +2584,11 @@ class AtomicAgent:
                                 _logger.exception(
                                     "agent %r: judge dispatch raised; "
                                     "fail-closing to BLOCK for tool_call_id=%r",
-                                    self.name, tu.get("id", ""),
+                                    self.name,
+                                    tu.get("id", ""),
                                 )
                                 judge_blocked[tu.get("id", "")] = (
-                                    f"judge dispatch error: "
-                                    f"{type(exc).__name__}: {exc}"
+                                    f"judge dispatch error: {type(exc).__name__}: {exc}"
                                 )
                                 continue
                             # Per-judge audit lines (#112 PR 2b ensemble).
@@ -2512,8 +2608,8 @@ class AtomicAgent:
                                 # The LAST event in the list is the BLOCKing
                                 # judge — the others ALLOWed. Its reason is
                                 # what flows back to the actor.
-                                judge_blocked[tu.get("id", "")] = (
-                                    events[-1].get("judgment_reason", "judge_blocked")
+                                judge_blocked[tu.get("id", "")] = events[-1].get(
+                                    "judgment_reason", "judge_blocked"
                                 )
 
                 # Execute custom tools
@@ -2526,6 +2622,7 @@ class AtomicAgent:
                         # running the handler. The reason flows back to the
                         # actor verbatim per spec/28 §"Block".
                         from .tools import ToolCallResult as _TCR
+
                         blocked_result = _TCR(
                             tool_name=tu.get("name", ""),
                             tool_use_id=tcid,
@@ -2536,13 +2633,15 @@ class AtomicAgent:
                         )
                         all_tool_call_results.append(blocked_result)
                         iter_tool_results.append(blocked_result)
-                        self._log({
-                            "trigger": "tool_call",
-                            "parent_run_id": self.run_id,
-                            "tool_name": blocked_result.tool_name,
-                            "latency_ms": 0,
-                            "error": blocked_result.error,
-                        })
+                        self._log(
+                            {
+                                "trigger": "tool_call",
+                                "parent_run_id": self.run_id,
+                                "tool_name": blocked_result.tool_name,
+                                "latency_ms": 0,
+                                "error": blocked_result.error,
+                            }
+                        )
                         continue
                     if tcid in judge_deferred:
                         # PR 3b ESCALATE: PENDING file already written.
@@ -2557,6 +2656,7 @@ class AtomicAgent:
                         # ``tool_call_deferred`` keeps dashboard failure
                         # counts honest (P2-5 fix).
                         from .tools import ToolCallResult as _TCR
+
                         deferred_result = _TCR(
                             tool_name=tu.get("name", ""),
                             tool_use_id=tcid,
@@ -2571,26 +2671,30 @@ class AtomicAgent:
                         )
                         all_tool_call_results.append(deferred_result)
                         iter_tool_results.append(deferred_result)
-                        self._log({
-                            "trigger": "tool_call_deferred",
-                            "parent_run_id": self.run_id,
-                            "tool_name": deferred_result.tool_name,
-                            "latency_ms": 0,
-                            "error": deferred_result.error,
-                            "escalation_queue_id": judge_deferred[tcid],
-                        })
+                        self._log(
+                            {
+                                "trigger": "tool_call_deferred",
+                                "parent_run_id": self.run_id,
+                                "tool_name": deferred_result.tool_name,
+                                "latency_ms": 0,
+                                "error": deferred_result.error,
+                                "escalation_queue_id": judge_deferred[tcid],
+                            }
+                        )
                         continue
                     tool_result = self.tool_registry.execute(tu)
                     all_tool_call_results.append(tool_result)
                     iter_tool_results.append(tool_result)
                     # Per-tool JSONL log line
-                    self._log({
-                        "trigger": "tool_call",
-                        "parent_run_id": self.run_id,
-                        "tool_name": tool_result.tool_name,
-                        "latency_ms": tool_result.latency_ms,
-                        "error": tool_result.error,
-                    })
+                    self._log(
+                        {
+                            "trigger": "tool_call",
+                            "parent_run_id": self.run_id,
+                            "tool_name": tool_result.tool_name,
+                            "latency_ms": tool_result.latency_ms,
+                            "error": tool_result.error,
+                        }
+                    )
 
                 # If no custom tools were called, the loop is done
                 if not custom_tool_uses:
@@ -2641,15 +2745,17 @@ class AtomicAgent:
                         self.memory.write_note(c, policy)
                         written_captures.append(c)
                     except Exception as e:
-                        self._log({
-                            "trigger": "capture_write_error",
-                            "parent_run_id": self.run_id,
-                            "model": "n/a",
-                            "input_tokens": 0,
-                            "output_tokens": 0,
-                            "status": "error",
-                            "summary": f"capture write failed for {c.name}: {e}",
-                        })
+                        self._log(
+                            {
+                                "trigger": "capture_write_error",
+                                "parent_run_id": self.run_id,
+                                "model": "n/a",
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "status": "error",
+                                "summary": f"capture write failed for {c.name}: {e}",
+                            }
+                        )
 
             # Build response
             response = Response(
@@ -2760,7 +2866,8 @@ class AtomicAgent:
 
         messages = list(prior_messages)
         canonical_tool_uses, canonical_tool_results = _canonicalize_tool_loop(
-            raw.tool_uses, tool_results,
+            raw.tool_uses,
+            tool_results,
         )
         # Thread the agent's ``model.md provider:`` preference (#87 PR 3)
         # so a multi-iteration tool loop on an ambiguously-claimed model
@@ -2770,11 +2877,13 @@ class AtomicAgent:
         # AmbiguousBackendError. Bug caught by Opus subagent review of
         # this PR (Finding 1); regression test in test_codex_r2_agent.py.
         backend = find_backend_for_model(model, preferred_provider=self.config.provider)
-        messages.extend(backend.format_tool_results(
-            tool_uses=canonical_tool_uses,
-            tool_results=canonical_tool_results,
-            assistant_text=raw.text or "",
-        ))
+        messages.extend(
+            backend.format_tool_results(
+                tool_uses=canonical_tool_uses,
+                tool_results=canonical_tool_results,
+                assistant_text=raw.text or "",
+            )
+        )
         return messages
 
     # ────────────────────────────────────────────────────────────
@@ -2826,7 +2935,9 @@ class AtomicAgent:
             preferred_provider=self.config.provider,
         )
         latency_ms = int((time.time() - start) * 1000)
-        cost, _cost_fallback = _costs.calc_cost(actual_model, raw.input_tokens, raw.output_tokens)
+        cost, _cost_fallback = _costs.calc_cost(
+            actual_model, raw.input_tokens, raw.output_tokens
+        )
 
         provenance_preserved = self._detect_provenance(raw.text, sources_list)
 
@@ -2907,9 +3018,7 @@ class AtomicAgent:
 
         check = self._check_cost_guardrails(critical=False)
         if not check.allow:
-            raise CostGuardrailBlocked(
-                f"Parallel helper batch blocked: {check.reason}"
-            )
+            raise CostGuardrailBlocked(f"Parallel helper batch blocked: {check.reason}")
 
         # Worst-case reservation: check that the parent's remaining headroom can
         # cover all helpers at max_tokens output each. This prevents the "each
@@ -2923,18 +3032,20 @@ class AtomicAgent:
         results: list[Any] = [None] * total  # list[HelperResult | Exception]
 
         # Log the reservation so an audit trail can see what was reserved.
-        self._log({
-            "trigger": "helper_batch_reservation",
-            "parent_agent": self.name,
-            "parent_run_id": self.run_id,
-            "model": actual_model,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "reserved_usd": reserved_usd,
-            "batch_size": total,
-            "status": "ok",
-            "summary": f"reserved worst-case ${reserved_usd:.6f} for {total}-helper batch",
-        })
+        self._log(
+            {
+                "trigger": "helper_batch_reservation",
+                "parent_agent": self.name,
+                "parent_run_id": self.run_id,
+                "model": actual_model,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "reserved_usd": reserved_usd,
+                "batch_size": total,
+                "status": "ok",
+                "summary": f"reserved worst-case ${reserved_usd:.6f} for {total}-helper batch",
+            }
+        )
 
         def sources_for(idx: int) -> list[str] | None:
             if sources_per_prompt is not None:
@@ -2967,22 +3078,24 @@ class AtomicAgent:
 
         # Log the release: actual aggregate cost vs what was reserved.
         actual_usd = sum(r.cost_usd for r in results if isinstance(r, HelperResult))
-        self._log({
-            "trigger": "helper_batch_release",
-            "parent_agent": self.name,
-            "parent_run_id": self.run_id,
-            "model": actual_model,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "reserved_usd": reserved_usd,
-            "actual_usd": actual_usd,
-            "batch_size": total,
-            "status": "ok",
-            "summary": (
-                f"batch complete: actual ${actual_usd:.6f} vs "
-                f"reserved ${reserved_usd:.6f}"
-            ),
-        })
+        self._log(
+            {
+                "trigger": "helper_batch_release",
+                "parent_agent": self.name,
+                "parent_run_id": self.run_id,
+                "model": actual_model,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "reserved_usd": reserved_usd,
+                "actual_usd": actual_usd,
+                "batch_size": total,
+                "status": "ok",
+                "summary": (
+                    f"batch complete: actual ${actual_usd:.6f} vs "
+                    f"reserved ${reserved_usd:.6f}"
+                ),
+            }
+        )
 
         return results  # type: ignore
 
@@ -3087,11 +3200,23 @@ class AtomicAgent:
         if self.config.cost_guardrails_enabled and not critical:
             log_dir = self.agent_root / "log"
             today_cost = (
-                _costs.sum_cost_for_period(log_dir, "today", source="actor", backend=self.log_backend, agent_name=self.name)
+                _costs.sum_cost_for_period(
+                    log_dir,
+                    "today",
+                    source="actor",
+                    backend=self.log_backend,
+                    agent_name=self.name,
+                )
                 + self._delegated_cost_this_run
             )
             month_cost = (
-                _costs.sum_cost_for_period(log_dir, "this_month", source="actor", backend=self.log_backend, agent_name=self.name)
+                _costs.sum_cost_for_period(
+                    log_dir,
+                    "this_month",
+                    source="actor",
+                    backend=self.log_backend,
+                    agent_name=self.name,
+                )
                 + self._delegated_cost_this_run
             )
             daily_remaining = (
@@ -3234,18 +3359,20 @@ class AtomicAgent:
         )
         self._check_batch_reservation(reserved_usd)
 
-        self._log({
-            "trigger": "delegate_batch_reservation",
-            "parent_agent": self.name,
-            "parent_run_id": self.run_id,
-            "model": self.config.default_model,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "reserved_usd": reserved_usd,
-            "batch_size": total,
-            "status": "ok",
-            "summary": f"reserved worst-case ${reserved_usd:.6f} for {total}-delegate batch",
-        })
+        self._log(
+            {
+                "trigger": "delegate_batch_reservation",
+                "parent_agent": self.name,
+                "parent_run_id": self.run_id,
+                "model": self.config.default_model,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "reserved_usd": reserved_usd,
+                "batch_size": total,
+                "status": "ok",
+                "summary": f"reserved worst-case ${reserved_usd:.6f} for {total}-delegate batch",
+            }
+        )
 
         results: list[Any] = [None] * total
 
@@ -3276,29 +3403,31 @@ class AtomicAgent:
         if failures:
             raise HelperBatchPartialFailure(failures, results)
 
-        actual_usd = sum(
-            r.cost_usd for r in results if isinstance(r, Response)
+        actual_usd = sum(r.cost_usd for r in results if isinstance(r, Response))
+        self._log(
+            {
+                "trigger": "delegate_batch_release",
+                "parent_agent": self.name,
+                "parent_run_id": self.run_id,
+                "model": self.config.default_model,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "reserved_usd": reserved_usd,
+                "actual_usd": actual_usd,
+                "batch_size": total,
+                "status": "ok",
+                "summary": (
+                    f"delegate batch complete: actual ${actual_usd:.6f} vs "
+                    f"reserved ${reserved_usd:.6f}"
+                ),
+            }
         )
-        self._log({
-            "trigger": "delegate_batch_release",
-            "parent_agent": self.name,
-            "parent_run_id": self.run_id,
-            "model": self.config.default_model,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "reserved_usd": reserved_usd,
-            "actual_usd": actual_usd,
-            "batch_size": total,
-            "status": "ok",
-            "summary": (
-                f"delegate batch complete: actual ${actual_usd:.6f} vs "
-                f"reserved ${reserved_usd:.6f}"
-            ),
-        })
 
         return results  # type: ignore
 
-    def _estimate_batch_cost(self, model: str, max_tokens: int, batch_size: int) -> float:
+    def _estimate_batch_cost(
+        self, model: str, max_tokens: int, batch_size: int
+    ) -> float:
         """Compute a worst-case USD estimate for a helper batch.
 
         Uses max_tokens output per helper at the model's output rate. Input
@@ -3319,8 +3448,20 @@ class AtomicAgent:
         if not self.config.cost_guardrails_enabled or reserved_usd <= 0:
             return
         log_dir = self.agent_root / "log"
-        today_cost = _costs.sum_cost_for_period(log_dir, "today", source="actor", backend=self.log_backend, agent_name=self.name)
-        month_cost = _costs.sum_cost_for_period(log_dir, "this_month", source="actor", backend=self.log_backend, agent_name=self.name)
+        today_cost = _costs.sum_cost_for_period(
+            log_dir,
+            "today",
+            source="actor",
+            backend=self.log_backend,
+            agent_name=self.name,
+        )
+        month_cost = _costs.sum_cost_for_period(
+            log_dir,
+            "this_month",
+            source="actor",
+            backend=self.log_backend,
+            agent_name=self.name,
+        )
         daily_remaining = (
             self.config.daily_cap_usd - today_cost
             if self.config.daily_cap_usd > 0
@@ -3429,11 +3570,37 @@ class AtomicAgent:
             return CostCheckResult(allow=True, reason="critical_override")
 
         log_dir = self.agent_root / "log"
-        today_cost = _costs.sum_cost_for_period(log_dir, "today", source="actor", backend=self.log_backend, agent_name=self.name) + extra_in_flight_cost_usd
-        month_cost = _costs.sum_cost_for_period(log_dir, "this_month", source="actor", backend=self.log_backend, agent_name=self.name) + extra_in_flight_cost_usd
+        today_cost = (
+            _costs.sum_cost_for_period(
+                log_dir,
+                "today",
+                source="actor",
+                backend=self.log_backend,
+                agent_name=self.name,
+            )
+            + extra_in_flight_cost_usd
+        )
+        month_cost = (
+            _costs.sum_cost_for_period(
+                log_dir,
+                "this_month",
+                source="actor",
+                backend=self.log_backend,
+                agent_name=self.name,
+            )
+            + extra_in_flight_cost_usd
+        )
 
-        daily_pct = (today_cost / self.config.daily_cap_usd) if self.config.daily_cap_usd > 0 else 0
-        monthly_pct = (month_cost / self.config.monthly_cap_usd) if self.config.monthly_cap_usd > 0 else 0
+        daily_pct = (
+            (today_cost / self.config.daily_cap_usd)
+            if self.config.daily_cap_usd > 0
+            else 0
+        )
+        monthly_pct = (
+            (month_cost / self.config.monthly_cap_usd)
+            if self.config.monthly_cap_usd > 0
+            else 0
+        )
 
         # Fire warnings (idempotent — won't fire twice for same threshold/day)
         self._maybe_fire_warning("daily", daily_pct)
@@ -3480,22 +3647,32 @@ class AtomicAgent:
     def _maybe_fire_warning(self, period: str, pct: float) -> None:
         state_path = self.agent_root / ".cost-warnings.json"
         state = _costs.load_warning_state(state_path)
-        today_key = date.today().isoformat() if period == "daily" else date.today().strftime("%Y-%m")
+        today_key = (
+            date.today().isoformat()
+            if period == "daily"
+            else date.today().strftime("%Y-%m")
+        )
 
         for threshold in self.config.warning_thresholds:
-            already = state.get(period, {}).get(today_key, {}).get(str(threshold), False)
+            already = (
+                state.get(period, {}).get(today_key, {}).get(str(threshold), False)
+            )
             if pct >= threshold and not already:
                 # Fire (just log to journal/log for v1; future: telegram/email)
                 severity = "WARN" if threshold >= 0.80 else "INFO"
-                self._log({
-                    "trigger": "cost_warning",
-                    "model": "n/a",
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "status": "ok",
-                    "summary": f"{severity}: {period} cost at {pct*100:.0f}% of cap (threshold {threshold*100:.0f}%)",
-                })
-                state.setdefault(period, {}).setdefault(today_key, {})[str(threshold)] = True
+                self._log(
+                    {
+                        "trigger": "cost_warning",
+                        "model": "n/a",
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "status": "ok",
+                        "summary": f"{severity}: {period} cost at {pct * 100:.0f}% of cap (threshold {threshold * 100:.0f}%)",
+                    }
+                )
+                state.setdefault(period, {}).setdefault(today_key, {})[
+                    str(threshold)
+                ] = True
 
         _costs.save_warning_state(state_path, state)
 
@@ -3504,7 +3681,9 @@ class AtomicAgent:
             return CostCheckResult(allow=False, action="skip", reason=reason)
         if action == "fallback":
             return CostCheckResult(
-                allow=True, action="fallback", reason=reason,
+                allow=True,
+                action="fallback",
+                reason=reason,
                 fallback_model=self.config.fallback_model,
             )
         if action == "alert":
