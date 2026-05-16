@@ -1,10 +1,11 @@
 """Conformance test suite for the AgentProfileBackend Protocol (spec/24).
 
 Parametrized over a ``backend_factory`` fixture. Each registered backend
-that ships in core (``FilesystemAgentProfileBackend`` today; PR 3 of #63
-adds a second reference impl) is exercised against the same contract. A
-third-party backend in a downstream package imports this test module's
-``BACKEND_FACTORIES`` parametrization to verify its own conformance.
+that ships in core (``FilesystemAgentProfileBackend``,
+``SQLiteAgentProfileBackend`` as of #63 PR 3) is exercised against the
+same contract. A third-party backend in a downstream package imports
+this test module's ``BACKEND_FACTORIES`` parametrization to verify its
+own conformance.
 
 What this suite asserts:
 
@@ -60,19 +61,23 @@ import pytest
 from atomic_agents.exceptions import (
     AgentProfileExists,
     AgentProfileNotFound,
+    SnapshotNotFound,
 )
 from atomic_agents.profile import (
     AgentProfile,
     AgentProfileBackend,
     FilesystemAgentProfileBackend,
     ProfileCapabilities,
+    SQLiteAgentProfileBackend,
 )
 
 
 # ──────────────────────────────────────────────────────────────────
 # Backend factory parametrization — every conformance test runs once
-# per registered backend. PR 1 ships only the filesystem reference;
-# PR 3 of #63 will add the second factory entry.
+# per registered backend. PR 3 of #63 added the SQLite factory; the
+# parametrization is the conformance-suite contract that future
+# backends extend (downstream packages append their factory to
+# ``BACKEND_FACTORIES`` in their own test module).
 
 BackendFactory = Callable[[Path], AgentProfileBackend]
 
@@ -81,8 +86,21 @@ def _filesystem_factory(scope_root: Path) -> AgentProfileBackend:
     return FilesystemAgentProfileBackend(scope_root)
 
 
+def _sqlite_factory(scope_root: Path) -> AgentProfileBackend:
+    """SQLite backend rooted at ``<scope_root>/.profile.db``.
+
+    A real on-disk SQLite file (not ``:memory:``) so the conformance
+    suite exercises the filesystem-touching code path that operators
+    will hit in production. The db file is colocated with the scope
+    root for parity with the filesystem backend's per-tmp_path
+    isolation.
+    """
+    return SQLiteAgentProfileBackend(scope_root / ".profile.db")
+
+
 BACKEND_FACTORIES: list[tuple[str, BackendFactory]] = [
     ("filesystem", _filesystem_factory),
+    ("sqlite", _sqlite_factory),
 ]
 
 
@@ -214,6 +232,94 @@ def make_agent_dir(
     return agent_root
 
 
+def _derive_agent_mode_from_identity(identity: str) -> str:
+    """Mini parser mirroring ``goal.parse_agent_mode`` for fixture use.
+
+    Reads the ``## Operating mode`` body to pick reactive / goal-driven
+    / hybrid. Keeps the helper self-contained so the conformance suite
+    doesn't depend on the framework's goal module shape.
+    """
+    lower = identity.lower()
+    if "goal-driven" in lower:
+        return "goal-driven"
+    if "hybrid" in lower:
+        return "hybrid"
+    return "reactive"
+
+
+def make_agent_in_backend(
+    backend: AgentProfileBackend,
+    scope_root: Path,
+    agent_id: str,
+    *,
+    identity: str = _IDENTITY_BODY,
+    soul: str | None = _SOUL_BODY,
+    user: str | None = _USER_BODY,
+    goal: str | None = None,
+    tools: str | None = _TOOLS_BODY,
+    model: str | None = _MODEL_BODY,
+    roster: str | None = _ROSTER_BODY,
+    mcp: str | None = _MCP_BODY_PLAIN,
+    judges: str | None = None,
+    skills: dict[str, str] | None = None,
+) -> AgentProfile:
+    """Set up an agent via the Protocol surface (works for any backend).
+
+    Constructs an ``AgentProfile`` from the same default markdown bodies
+    as ``make_agent_dir`` and calls ``backend.save_profile`` to install
+    it. Returns the saved ``AgentProfile`` so callers can assert against
+    it directly.
+
+    **Skills handling:** ``AgentProfile`` doesn't carry skills, so
+    skill fixture data is written separately:
+    - For backends with ``supports_skills=True`` (filesystem), skills
+      are also written to disk under ``<scope_root>/<agent_id>/skills/``
+      since the filesystem backend's ``list_skills`` walks the disk.
+    - For backends with ``supports_skills=False`` (sqlite), the skills
+      kwarg is silently ignored — the backend would refuse to surface
+      them via ``list_skills`` anyway, and skill-content tests gate on
+      the capability before calling this helper.
+
+    Compared to ``make_agent_dir`` (which writes filesystem only):
+    ``make_agent_in_backend`` exercises the Protocol's write path so
+    a non-filesystem backend's ``load_profile`` can find the agent it
+    was asked to load. Per Plan-subagent Decision 4 of #63 PR 3.
+    """
+    d = {
+        "name": agent_id,
+        "agent_mode": _derive_agent_mode_from_identity(identity),
+        "persona_identity": identity,
+        "persona_soul": soul if soul is not None else "",
+        "persona_user": user if user is not None else "",
+        "goal_text": goal if goal is not None else "",
+        "model_md_raw": model if model is not None else "",
+        "tools_md_raw": tools if tools is not None else "",
+        "judges_md_raw": judges,
+        "roster_md_raw": roster if roster is not None else "",
+        "mcp_md_raw": mcp if mcp is not None else "",
+        # Structured fields populated by from_dict re-parse from raw.
+        "model_config": {},
+        "tool_config": {},
+        "tool_classifications": {},
+        "judges_config": None,
+        "roster": [],
+        "mcp_servers": [],
+    }
+    profile = AgentProfile.from_dict(d)
+    backend.save_profile(agent_id, profile)
+
+    # Skill bodies live outside AgentProfile; write them directly when
+    # the backend stores skills filesystem-style.
+    if skills and backend.capabilities().supports_skills:
+        agent_root = scope_root / agent_id
+        for skill_name, body in skills.items():
+            skill_dir = agent_root / "skills" / skill_name
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            (skill_dir / "SKILL.md").write_text(body, encoding="utf-8")
+
+    return profile
+
+
 # ──────────────────────────────────────────────────────────────────
 # Surface conformance
 
@@ -250,7 +356,7 @@ def test_load_profile_missing_agent_raises(backend, tmp_path):
 
 
 def test_load_profile_basic_round_trip(backend, tmp_path):
-    make_agent_dir(tmp_path, "scout")
+    make_agent_in_backend(backend, tmp_path, "scout")
     profile = backend.load_profile("scout")
     assert profile.name == "scout"
     assert profile.persona_identity == _IDENTITY_BODY
@@ -259,7 +365,7 @@ def test_load_profile_basic_round_trip(backend, tmp_path):
 
 
 def test_load_profile_populates_structured_fields(backend, tmp_path):
-    make_agent_dir(tmp_path, "scout")
+    make_agent_in_backend(backend, tmp_path, "scout")
     profile = backend.load_profile("scout")
     # model_config from model.md
     assert profile.model_config["default_model"] == "claude-sonnet-4-6-20260101"
@@ -275,7 +381,8 @@ def test_load_profile_populates_structured_fields(backend, tmp_path):
 
 
 def test_load_profile_derives_agent_mode(backend, tmp_path):
-    make_agent_dir(
+    make_agent_in_backend(
+        backend,
         tmp_path,
         "goal-agent",
         identity=("# Goal Agent\n\n## Operating mode\n\nThis agent is goal-driven.\n"),
@@ -286,14 +393,15 @@ def test_load_profile_derives_agent_mode(backend, tmp_path):
 
 def test_load_profile_preserves_persona_byte_for_byte(backend, tmp_path):
     custom_identity = "# Custom\n\nCustom content with **markdown** and `code`.\n"
-    make_agent_dir(tmp_path, "scout", identity=custom_identity)
+    make_agent_in_backend(backend, tmp_path, "scout", identity=custom_identity)
     profile = backend.load_profile("scout")
     assert profile.persona_identity == custom_identity
 
 
 def test_load_profile_optional_files_absent(backend, tmp_path):
     """Goal, soul, user, judges, mcp, roster all optional."""
-    make_agent_dir(
+    make_agent_in_backend(
+        backend,
         tmp_path,
         "minimal",
         soul=None,
@@ -322,7 +430,7 @@ def test_load_profile_optional_files_absent(backend, tmp_path):
 
 
 def test_save_profile_round_trip_raw_fields_byte_for_byte(backend, tmp_path):
-    make_agent_dir(tmp_path, "scout")
+    make_agent_in_backend(backend, tmp_path, "scout")
     profile = backend.load_profile("scout")
     backend.save_profile("scout", profile)
     profile2 = backend.load_profile("scout")
@@ -337,7 +445,7 @@ def test_save_profile_round_trip_raw_fields_byte_for_byte(backend, tmp_path):
 
 def test_save_profile_preserves_mcp_dollar_var_refs(backend, tmp_path):
     """Decision 1 — security-critical: $VAR refs MUST NOT be baked into save."""
-    make_agent_dir(tmp_path, "scout", mcp=_MCP_BODY_WITH_VAR)
+    make_agent_in_backend(backend, tmp_path, "scout", mcp=_MCP_BODY_WITH_VAR)
     profile = backend.load_profile("scout")
     # Raw text retains the literal $NEVER_SET_VAR_FOR_TEST reference
     assert "$NEVER_SET_VAR_FOR_TEST" in profile.mcp_md_raw
@@ -351,7 +459,7 @@ def test_save_profile_preserves_tools_operator_comments(backend, tmp_path):
     custom_tools = (
         "# Tools\n\n## Read paths\n\n- ~/scout/data — Dan's notes, scout-specific\n"
     )
-    make_agent_dir(tmp_path, "scout", tools=custom_tools)
+    make_agent_in_backend(backend, tmp_path, "scout", tools=custom_tools)
     profile = backend.load_profile("scout")
     assert "Dan's notes, scout-specific" in profile.tools_md_raw
     backend.save_profile("scout", profile)
@@ -361,7 +469,7 @@ def test_save_profile_preserves_tools_operator_comments(backend, tmp_path):
 
 def test_save_profile_ignores_agent_mode_field(backend, tmp_path):
     """Decision 6 — agent_mode is documented-derived; save ignores it."""
-    make_agent_dir(tmp_path, "scout")  # identity says "reactive"
+    make_agent_in_backend(backend, tmp_path, "scout")  # identity says "reactive"
     profile = backend.load_profile("scout")
     assert profile.agent_mode == "reactive"
     # Override agent_mode but leave persona_identity unchanged
@@ -374,7 +482,7 @@ def test_save_profile_ignores_agent_mode_field(backend, tmp_path):
 
 def test_save_profile_removes_optional_files_when_empty(backend, tmp_path):
     """Empty raw_text fields → corresponding on-disk files removed."""
-    make_agent_dir(tmp_path, "scout")
+    make_agent_in_backend(backend, tmp_path, "scout")
     profile = backend.load_profile("scout")
     # Strip the optional fields (use replace so frozen dataclass is fine)
     profile_minimal = profile.replace(
@@ -402,16 +510,25 @@ def test_list_agents_empty(backend, tmp_path):
 
 
 def test_list_agents_lexicographic_order(backend, tmp_path):
-    make_agent_dir(tmp_path, "charlie")
-    make_agent_dir(tmp_path, "alpha")
-    make_agent_dir(tmp_path, "bravo")
+    make_agent_in_backend(backend, tmp_path, "charlie")
+    make_agent_in_backend(backend, tmp_path, "alpha")
+    make_agent_in_backend(backend, tmp_path, "bravo")
     assert backend.list_agents() == ["alpha", "bravo", "charlie"]
 
 
 def test_list_agents_excludes_hidden_dirs(backend, tmp_path):
-    make_agent_dir(tmp_path, "alpha")
-    # Hidden dir shouldn't appear even with a valid IDENTITY.md (by design:
-    # backend-internal storage uses these prefixes).
+    """Filesystem-specific: hidden dirs (.snapshots/) on disk aren't agents.
+
+    SQLite has no on-disk agent dirs — there's nothing to "exclude". The
+    SQLite-equivalent invariant (only saved agents appear in list_agents)
+    is covered by ``test_list_agents_lexicographic_order``.
+    """
+    if backend.backend_id != "filesystem":
+        pytest.skip(
+            f"{backend.backend_id!r}: hidden-dir exclusion is a "
+            f"filesystem-specific behavior; SQLite has no disk agent dirs"
+        )
+    make_agent_in_backend(backend, tmp_path, "alpha")
     hidden = tmp_path / ".snapshots"
     (hidden / "persona").mkdir(parents=True)
     (hidden / "persona" / "IDENTITY.md").write_text("# Hidden\n", encoding="utf-8")
@@ -419,8 +536,17 @@ def test_list_agents_excludes_hidden_dirs(backend, tmp_path):
 
 
 def test_list_agents_excludes_dirs_without_identity(backend, tmp_path):
-    make_agent_dir(tmp_path, "alpha")
-    # A non-agent dir — has files but no persona/IDENTITY.md
+    """Filesystem-specific: dirs without IDENTITY.md aren't agents.
+
+    SQLite agents are rows; "row without identity" is impossible by
+    schema. Covered for SQLite by the basic list test.
+    """
+    if backend.backend_id != "filesystem":
+        pytest.skip(
+            f"{backend.backend_id!r}: dir-without-identity exclusion is "
+            f"a filesystem-specific behavior"
+        )
+    make_agent_in_backend(backend, tmp_path, "alpha")
     not_an_agent = tmp_path / "junk"
     not_an_agent.mkdir()
     (not_an_agent / "README.md").write_text("not an agent", encoding="utf-8")
@@ -432,7 +558,7 @@ def test_list_agents_excludes_dirs_without_identity(backend, tmp_path):
 
 
 def test_exists_true_for_valid_agent(backend, tmp_path):
-    make_agent_dir(tmp_path, "scout")
+    make_agent_in_backend(backend, tmp_path, "scout")
     assert backend.exists("scout") is True
 
 
@@ -441,6 +567,16 @@ def test_exists_false_for_missing_agent(backend, tmp_path):
 
 
 def test_exists_false_for_dir_without_identity(backend, tmp_path):
+    """Filesystem-specific: dir without IDENTITY.md → exists() False.
+
+    SQLite has no concept of a dir-without-identity — covered by
+    ``test_exists_false_for_missing_agent``.
+    """
+    if backend.backend_id != "filesystem":
+        pytest.skip(
+            f"{backend.backend_id!r}: dir-without-identity is a "
+            f"filesystem-specific shape"
+        )
     (tmp_path / "junk").mkdir()
     assert backend.exists("junk") is False
 
@@ -450,11 +586,24 @@ def test_exists_false_for_dir_without_identity(backend, tmp_path):
 
 
 def test_list_skills_empty(backend, tmp_path):
-    make_agent_dir(tmp_path, "scout")
+    """Both backends return ``[]`` for an agent with no skills."""
+    make_agent_in_backend(backend, tmp_path, "scout")
     assert backend.list_skills("scout") == []
 
 
 def test_list_skills_returns_metadata(backend, tmp_path):
+    """Skill content test — gates on ``supports_skills``.
+
+    SQLite (``supports_skills=False``) doesn't store skill bodies;
+    ``list_skills`` always returns ``[]`` for present agents (covered
+    by ``test_list_skills_empty``). Future ``save_skill`` Protocol
+    method will close this gap.
+    """
+    if not backend.capabilities().supports_skills:
+        pytest.skip(
+            f"{backend.backend_id!r}: supports_skills=False — skill "
+            f"content tests don't apply"
+        )
     skill_body = (
         "---\n"
         "name: spreadsheet-analysis\n"
@@ -462,7 +611,9 @@ def test_list_skills_returns_metadata(backend, tmp_path):
         "---\n\n"
         "# Spreadsheet Analysis\n\nBody content here.\n"
     )
-    make_agent_dir(tmp_path, "scout", skills={"spreadsheet-analysis": skill_body})
+    make_agent_in_backend(
+        backend, tmp_path, "scout", skills={"spreadsheet-analysis": skill_body}
+    )
     skills = backend.list_skills("scout")
     assert len(skills) == 1
     assert skills[0].name == "spreadsheet-analysis"
@@ -470,6 +621,12 @@ def test_list_skills_returns_metadata(backend, tmp_path):
 
 
 def test_load_skill_body_returns_body_without_frontmatter(backend, tmp_path):
+    """Skill content test — gates on ``supports_skills`` (see above)."""
+    if not backend.capabilities().supports_skills:
+        pytest.skip(
+            f"{backend.backend_id!r}: supports_skills=False — skill "
+            f"content tests don't apply"
+        )
     skill_body = (
         "---\n"
         "name: data-cleaning\n"
@@ -477,14 +634,22 @@ def test_load_skill_body_returns_body_without_frontmatter(backend, tmp_path):
         "---\n\n"
         "# Body line one\n\n## Body line two\n"
     )
-    make_agent_dir(tmp_path, "scout", skills={"data-cleaning": skill_body})
+    make_agent_in_backend(
+        backend, tmp_path, "scout", skills={"data-cleaning": skill_body}
+    )
     body = backend.load_skill_body("scout", "data-cleaning")
     assert "# Body line one" in body
     assert "name: data-cleaning" not in body  # frontmatter stripped
 
 
 def test_load_skill_body_unknown_skill_raises(backend, tmp_path):
-    make_agent_dir(tmp_path, "scout")
+    """Both backends raise FileNotFoundError for unknown skill name.
+
+    SQLite raises because no skills exist for any agent in the SQLite
+    backend; filesystem raises because the directory isn't there. Same
+    exception type, different reason — fine.
+    """
+    make_agent_in_backend(backend, tmp_path, "scout")
     with pytest.raises(FileNotFoundError):
         backend.load_skill_body("scout", "nonexistent-skill")
 
@@ -494,7 +659,7 @@ def test_load_skill_body_unknown_skill_raises(backend, tmp_path):
 
 
 def test_clone_copies_profile_to_new_id(backend, tmp_path):
-    make_agent_dir(tmp_path, "source")
+    make_agent_in_backend(backend, tmp_path, "source")
     backend.clone("source", "target")
     assert backend.exists("target")
     target_profile = backend.load_profile("target")
@@ -505,7 +670,7 @@ def test_clone_copies_profile_to_new_id(backend, tmp_path):
 
 
 def test_clone_applies_overrides(backend, tmp_path):
-    make_agent_dir(tmp_path, "source")
+    make_agent_in_backend(backend, tmp_path, "source")
     new_identity = "# Cloned\n\n## Operating mode\n\nThis agent is hybrid.\n"
     backend.clone("source", "target", overrides={"persona_identity": new_identity})
     target = backend.load_profile("target")
@@ -514,14 +679,14 @@ def test_clone_applies_overrides(backend, tmp_path):
 
 
 def test_clone_refuses_overwrite(backend, tmp_path):
-    make_agent_dir(tmp_path, "source")
-    make_agent_dir(tmp_path, "target")  # already exists
+    make_agent_in_backend(backend, tmp_path, "source")
+    make_agent_in_backend(backend, tmp_path, "target")  # already exists
     with pytest.raises(AgentProfileExists):
         backend.clone("source", "target")
 
 
 def test_clone_unknown_override_raises(backend, tmp_path):
-    make_agent_dir(tmp_path, "source")
+    make_agent_in_backend(backend, tmp_path, "source")
     with pytest.raises(ValueError):
         backend.clone("source", "target", overrides={"not_a_field": "value"})
 
@@ -532,13 +697,25 @@ def test_clone_missing_source_raises(backend, tmp_path):
 
 
 def test_clone_copies_skills_directory(backend, tmp_path):
+    """Skill clone test — gates on ``supports_skills``.
+
+    SQLite doesn't store skills, so cloning a SQLite agent doesn't
+    copy them (there are none to copy). Filesystem backend walks the
+    skills dir on clone and copies the tree.
+    """
+    if not backend.capabilities().supports_skills:
+        pytest.skip(
+            f"{backend.backend_id!r}: supports_skills=False — clone doesn't copy skills"
+        )
     skill_body = (
         "---\n"
         "name: example-skill\n"
         "description: A test skill for clone.\n"
         "---\n\n# Body\n"
     )
-    make_agent_dir(tmp_path, "source", skills={"example-skill": skill_body})
+    make_agent_in_backend(
+        backend, tmp_path, "source", skills={"example-skill": skill_body}
+    )
     backend.clone("source", "target")
     skills = backend.list_skills("target")
     assert len(skills) == 1
@@ -552,8 +729,8 @@ def test_clone_copies_skills_directory(backend, tmp_path):
 def test_snapshot_unsupported_raises_not_implemented(backend, tmp_path):
     """When supports_snapshot=False, the trio MUST raise NotImplementedError."""
     if backend.capabilities().supports_snapshot:
-        pytest.skip("backend supports snapshots; tested in supports_snapshot test")
-    make_agent_dir(tmp_path, "scout")
+        pytest.skip("backend supports snapshots; tested in supports_snapshot tests")
+    make_agent_in_backend(backend, tmp_path, "scout")
     with pytest.raises(NotImplementedError):
         backend.snapshot("scout", "label")
     with pytest.raises(NotImplementedError):
@@ -563,12 +740,165 @@ def test_snapshot_unsupported_raises_not_implemented(backend, tmp_path):
 
 
 # ──────────────────────────────────────────────────────────────────
+# Snapshot trio — claim-vs-behavior parity for backends advertising
+# ``supports_snapshot=True``. 7 tests added in #63 PR 3 alongside
+# the filesystem snapshot trio + SQLite snapshot table.
+
+
+def test_snapshot_round_trip(backend, tmp_path):
+    """snapshot → mutate → restore returns the snapshotted state."""
+    if not backend.capabilities().supports_snapshot:
+        pytest.skip(f"{backend.backend_id!r}: supports_snapshot=False")
+    make_agent_in_backend(backend, tmp_path, "scout")
+    original_profile = backend.load_profile("scout")
+    snapshot_id = backend.snapshot("scout", "baseline")
+    # Mutate the agent after the snapshot.
+    mutated = original_profile.replace(persona_soul="# Soul\n\nMutated soul.\n")
+    backend.save_profile("scout", mutated)
+    post_mutate = backend.load_profile("scout")
+    assert post_mutate.persona_soul == "# Soul\n\nMutated soul.\n"
+    # Restore — the snapshotted state is back.
+    backend.restore("scout", snapshot_id)
+    restored = backend.load_profile("scout")
+    assert restored.persona_soul == original_profile.persona_soul
+    assert restored.persona_identity == original_profile.persona_identity
+
+
+def test_list_snapshots_empty(backend, tmp_path):
+    """No snapshots taken → ``list_snapshots`` returns ``[]``."""
+    if not backend.capabilities().supports_snapshot:
+        pytest.skip(f"{backend.backend_id!r}: supports_snapshot=False")
+    make_agent_in_backend(backend, tmp_path, "scout")
+    assert backend.list_snapshots("scout") == []
+
+
+def test_list_snapshots_chronological_order(backend, tmp_path):
+    """Snapshots returned in ``created_at`` ascending order."""
+    if not backend.capabilities().supports_snapshot:
+        pytest.skip(f"{backend.backend_id!r}: supports_snapshot=False")
+    import time as _time
+
+    make_agent_in_backend(backend, tmp_path, "scout")
+    first = backend.snapshot("scout", "first")
+    _time.sleep(1.0)  # snapshot_id timestamp granularity is seconds
+    second = backend.snapshot("scout", "second")
+    _time.sleep(1.0)
+    third = backend.snapshot("scout", "third")
+    snapshots = backend.list_snapshots("scout")
+    assert len(snapshots) == 3
+    assert [s.snapshot_id for s in snapshots] == [first, second, third]
+
+
+def test_list_snapshots_preserves_label(backend, tmp_path):
+    """Operator-supplied ``label`` round-trips through list_snapshots."""
+    if not backend.capabilities().supports_snapshot:
+        pytest.skip(f"{backend.backend_id!r}: supports_snapshot=False")
+    make_agent_in_backend(backend, tmp_path, "scout")
+    backend.snapshot("scout", "pre-rewrite")
+    snapshots = backend.list_snapshots("scout")
+    assert len(snapshots) == 1
+    assert snapshots[0].label == "pre-rewrite"
+
+
+def test_restore_unknown_snapshot_raises(backend, tmp_path):
+    """``restore`` raises ``SnapshotNotFound`` for an unknown snapshot_id."""
+    if not backend.capabilities().supports_snapshot:
+        pytest.skip(f"{backend.backend_id!r}: supports_snapshot=False")
+    make_agent_in_backend(backend, tmp_path, "scout")
+    with pytest.raises(SnapshotNotFound):
+        backend.restore("scout", "snap_2026-05-15T120000_aabbcc")
+
+
+def test_restore_cross_agent_isolation(backend, tmp_path):
+    """A snapshot for agent A MUST NOT be restorable onto agent B.
+
+    The conformance contract per spec/24 § ProfileSnapshot.agent_id:
+    snapshots are scoped per-agent; ``restore(agent_id, snapshot_id)``
+    raises ``SnapshotNotFound`` if the snapshot exists but belongs to
+    a different agent.
+    """
+    if not backend.capabilities().supports_snapshot:
+        pytest.skip(f"{backend.backend_id!r}: supports_snapshot=False")
+    make_agent_in_backend(backend, tmp_path, "agent-a")
+    make_agent_in_backend(backend, tmp_path, "agent-b")
+    snapshot_a = backend.snapshot("agent-a", "a-snapshot")
+    with pytest.raises(SnapshotNotFound):
+        backend.restore("agent-b", snapshot_a)
+
+
+def test_list_snapshots_refuses_path_traversal_agent_id(backend, tmp_path):
+    """``list_snapshots`` MUST refuse path-traversal agent_id values.
+
+    #63 PR 3 Step 11 adversarial F-3 — the filesystem backend's
+    ``list_snapshots`` originally built ``<scope>/.snapshots/<agent_id>``
+    via raw path concat and only validated the snapshot_id segment,
+    leaving operator-controlled agent_id free to enumerate metadata
+    from outside ``scope_root``. SQLite backends store agent_id as
+    opaque string and refuse via the Protocol's own boundary checks
+    or simply return no rows. Both shapes are acceptable; the
+    invariant is: a path-traversal agent_id MUST NOT leak anything.
+    """
+    if not backend.capabilities().supports_snapshot:
+        pytest.skip(f"{backend.backend_id!r}: supports_snapshot=False")
+    # Path-traversal attempts. Filesystem backend raises ValueError
+    # (refuses up-front); SQLite backend accepts the string as an
+    # opaque key and returns an empty list (no rows match).
+    for traversal in ("../escape", "../../other", "/etc/passwd"):
+        try:
+            result = backend.list_snapshots(traversal)
+            # If no exception, result MUST be empty — no cross-scope leak.
+            assert result == [], (
+                f"backend {backend.backend_id!r} returned snapshots for "
+                f"path-traversal agent_id {traversal!r} — security leak"
+            )
+        except (ValueError, OSError):
+            # Filesystem backend's expected refusal.
+            pass
+
+
+def test_restore_refuses_path_traversal_agent_id(backend, tmp_path):
+    """``restore`` MUST refuse path-traversal agent_id values.
+
+    #63 PR 3 Step 11 adversarial F-3 — paired with the list_snapshots
+    test above. A path-traversal agent_id must NOT read metadata.json
+    or profile.json from outside ``scope_root``.
+    """
+    if not backend.capabilities().supports_snapshot:
+        pytest.skip(f"{backend.backend_id!r}: supports_snapshot=False")
+    for traversal in ("../escape", "../../other", "/etc/passwd"):
+        with pytest.raises((ValueError, SnapshotNotFound, OSError)):
+            backend.restore(traversal, "snap_2026-05-15T120000_aabbcc")
+
+
+def test_snapshot_id_uniqueness_across_rapid_calls(backend, tmp_path):
+    """Snapshot ids stay unique across N rapid calls (no collision).
+
+    100 back-to-back snapshots exercises the random-tail entropy
+    budget far past a 5-call probe (which would pass even on a
+    pathologically weak generator). With 48-bit randomness (#63 PR 3
+    Step 11 adversarial F-8 fix), 100 same-second calls have a
+    collision probability of ~1.8e-11 — vanishingly small.
+    """
+    if not backend.capabilities().supports_snapshot:
+        pytest.skip(f"{backend.backend_id!r}: supports_snapshot=False")
+    make_agent_in_backend(backend, tmp_path, "scout")
+    ids = {backend.snapshot("scout", f"snap-{i}") for i in range(100)}
+    assert len(ids) == 100
+    # Structural: the random tail must carry enough entropy. 12-hex
+    # (48-bit) brings 4K-snapshot-per-second collision down to ~6e-8;
+    # operators relying on the post-PR-3 entropy budget would notice
+    # immediately if a future change reduced it.
+    sample_tail = next(iter(ids)).rsplit("_", 1)[-1]
+    assert len(sample_tail) >= 12
+
+
+# ──────────────────────────────────────────────────────────────────
 # AgentProfile dict round-trip — independent of any backend
 
 
 def test_agent_profile_dict_round_trip(backend, tmp_path):
     """to_dict → from_dict preserves every field on a real profile."""
-    make_agent_dir(tmp_path, "scout")
+    make_agent_in_backend(backend, tmp_path, "scout")
     profile = backend.load_profile("scout")
     d = profile.to_dict()
     profile2 = AgentProfile.from_dict(d)
@@ -618,10 +948,21 @@ def test_load_skill_body_refuses_skill_name_traversal(backend, tmp_path):
     namespaces are expected to enforce equivalent validation; backends
     that don't accept operator-typed skill names directly may pass this
     test trivially.
+
+    Gates on ``supports_skills``: SQLite raises FileNotFoundError for
+    every skill_name regardless of shape (no skills stored), so the
+    path-traversal-specific failure mode isn't observable there. The
+    cross-agent isolation security property is enforced structurally —
+    by not storing skills at all.
     """
+    if not backend.capabilities().supports_skills:
+        pytest.skip(
+            f"{backend.backend_id!r}: supports_skills=False — no "
+            f"skill-name path-traversal surface exists"
+        )
     from atomic_agents.exceptions import SkillFileTraversal
 
-    make_agent_dir(tmp_path, "scout")
+    make_agent_in_backend(backend, tmp_path, "scout")
     # Path-separator traversal
     with pytest.raises((SkillFileTraversal, ValueError)):
         backend.load_skill_body("scout", "../escape")
