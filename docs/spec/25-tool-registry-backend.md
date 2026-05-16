@@ -302,17 +302,33 @@ Conforms to the Protocol with the constructor signature `FilesystemToolRegistryB
 
 Capabilities: `supports_install=False, supports_uninstall=False, supports_versioning=False, supports_sandbox_validate=False, supports_skills_catalog=False, durable=True`.
 
-### `SQLiteToolRegistryBackend` (#64 PR 3 — planned)
+### `SQLiteToolRegistryBackend` (#64 PR 3)
 
-Conforms to the Protocol with the constructor signature `SQLiteToolRegistryBackend(db_path, agent_scope)`. Constructed from the `sqlite://` URL family via `make_sqlite_tool_registry_backend_from_url(url)` honoring the `sqlite:///<path>?agent_scope=<name>` shape.
+Conforms to the Protocol with the constructor signature `SQLiteToolRegistryBackend(db_path, agent_scope, *, handlers_root=None)`. Constructed from the `sqlite://` URL family via `make_sqlite_tool_registry_backend_from_url(url)` honoring the `sqlite:///<path>?agent_scope=<name>` shape (default `agent_scope="default"` when the query param is absent).
 
 - **No optional dependency** — stdlib `sqlite3` only.
-- **Schema** (planned): `tools(name PK, agent_scope, descriptor_json, handler_blob, version, classification, created_at, updated_at)` with `idx_tools_scope_name` composite index; `meta(key PK, value)` schema-version tracking with idempotent `INSERT OR IGNORE` cold-start race fix (#61 PR 3 + #63 PR 3 lesson).
-- **Handler storage** (planned): base64-encoded Python source + `handler_function_name` column; `load_tool()` decodes + `exec()`-loads into a namespace + pulls out the named function. Sandbox concerns addressed via the judge layer at dispatch time; raw `exec` is acceptable here because the registry IS the trust boundary — operators choose what to install.
-- **Cross-agent isolation** (planned): schema includes `agent_scope` so a single DB file can serve multiple agents (SaaS / multi-tenant story). `list_tools()` filters `WHERE agent_scope = ?`. **Critical security primitive** — Step 11 adversarial will probe this (R3 in plan §6).
-- **Capabilities** (planned): `supports_install=True, supports_uninstall=True, supports_versioning=False (RESERVED — field round-trips but no resolution), supports_sandbox_validate=False, supports_skills_catalog=False, durable=True (False for :memory:)`.
+- **Hybrid storage shape (plan-subagent Risk A fix)**: SQLite stores **metadata only** (descriptor JSON + handler path + version + classification + scope + timestamps); handler **bodies** are .py files on disk under `handlers_root/<agent_scope>/<name>.py`. The base64-exec'd-source approach was rejected at the plan-subagent stage because:
+  1. `exec(source, namespace)` creates a function whose `__globals__` is the synthetic exec namespace — module-level `import requests; session = requests.Session()` patterns at handler-module top-level produce a `handler` that loses access to those imports at first invocation (`NameError` at runtime).
+  2. Decorators, closures-over-module-globals, and any `from __future__ import` directives don't work cleanly.
+  3. Operators lose `cat <path>` inspectability.
+  Filepath storage uses the same `importlib.util.spec_from_file_location` + `exec_module` path the filesystem reference uses — handler ergonomics are identical to filesystem. The SQLite layer owns metadata, version, scope, and atomic install/uninstall semantics; the on-disk file body is the same shape Python expects.
+- **Schema**: `tools(agent_scope TEXT NOT NULL, name TEXT NOT NULL, descriptor_json TEXT, handler_path TEXT, version TEXT, classification TEXT, created_at TEXT, updated_at TEXT, PRIMARY KEY (agent_scope, name))` — composite primary key so two scopes can both have a tool named the same. `meta(key PRIMARY KEY, value)` schema-version tracking with idempotent `INSERT OR IGNORE` cold-start race fix (#61 PR 3 + #63 PR 3 lesson).
+- **`handlers_root`**: constructor kwarg (default `db_path.parent / "handlers"`). Created with `mkdir(parents=True, exist_ok=True)` on first install. Layout: `<handlers_root>/<agent_scope>/<name>.py` — per-scope subdir for cross-scope isolation at the filesystem layer too (defense in depth — even if a future migration drops the agent_scope SQL filter, the per-scope subdir keeps handler files separated).
+- **`install(source, version=None)` semantics**:
+  - `source` is a filesystem path to a directory containing `<name>.md` (descriptor) + `<name>.py` (handler module).
+  - `version` MUST be `None` when `supports_versioning=False` (which PR 3 declares); the column accepts non-NULL values for forward compatibility but PR 3 rejects them at the call site with `ValueError` (plan-subagent Risk L — capability honesty).
+  - Handler source path is resolved + validated under the source directory (no path-traversal via name).
+  - Handler .py file is copied into `<handlers_root>/<agent_scope>/<name>.py` via `_io.atomic_write`.
+  - INSERT INTO tools ON CONFLICT(agent_scope, name) DO NOTHING — if `cursor.rowcount == 0`, raises `ToolAlreadyInstalled`. Atomic at the storage layer (plan-subagent Risk D).
+- **`uninstall(name)`**: DELETE FROM tools WHERE agent_scope=? AND name=? + remove handler file. Idempotent — uninstalling an absent name is a no-op.
+- **Cross-scope isolation**: schema includes `agent_scope` so a single DB file can serve multiple agents (SaaS / multi-tenant story). `list_tools()` / `load_tool()` / `uninstall()` ALL filter `WHERE agent_scope = ?`. The scope is hardcoded from the constructor; install() never accepts a scope parameter. **Critical security primitive** — Step 11 adversarial probes this.
+- **Trust model (plan-subagent Risk K)**: SQLite is the SaaS-shape backend per spec/25 Decision 9, but the catalog being process-shared does NOT mean trust is process-shared. Multi-tenant deployments MUST scope at the process level (one framework process per tenant), NOT just at the `agent_scope` column. The framework is NOT a sandbox; install() chooses what code executes in the framework's process. The judge layer (spec/28) is the runtime defense, not the registry layer.
+- **Concurrency**: `threading.local` connection pool gives each thread its own `sqlite3.Connection`. WAL journal mode + `synchronous=NORMAL` for multi-process safety on local filesystems. **Network-mounted filesystems (NFS, SMB) NOT supported** — SQLite WAL on NFS is documented-broken upstream.
+- **In-memory mode**: `SQLiteToolRegistryBackend(":memory:")` or URL `sqlite::memory:` / `sqlite:///:memory:` constructs a non-persistent backend; emits `RuntimeWarning` and reports `durable=False`. Single-threaded (test-only — `check_same_thread=True`); cross-thread access raises `ProgrammingError` honestly rather than silently corrupting (plan-subagent Risk G — the F-1 docstring-lying-about-thread-safety shape from #63 PR 3).
+- **Schema migration**: when a future arc bumps schema_version, the open path mirrors `profile/sqlite.py` — raises `RuntimeError` with the expected-vs-found versions and a migration-required note. No auto-migration; operators run an explicit migrate command (successor issue tracked).
+- **Capabilities**: `supports_install=True, supports_uninstall=True, supports_versioning=False (column exists but not dispatched on — plan-subagent Risk L), supports_sandbox_validate=False, supports_skills_catalog=False, durable=True (False for :memory:)`.
 
-PR 3 will be plan-subagent-vetted before implementation (lesson from #63 PR 3 — caught 2 design risks pre-impl) and Step 11 adversarial is mandatory post-implementation (#63 PR 3 caught 6 P0/P1 findings, including a REPRODUCED cross-agent path-traversal).
+PR 3 ships plan-subagent-vetted before implementation (3 SEVERE risks caught pre-impl, including the base64-exec design rejection); Step 11 adversarial is mandatory post-implementation (#63 PR 3 caught 6 P0/P1 findings including a REPRODUCED cross-agent path-traversal).
 
 ## Exception surface
 

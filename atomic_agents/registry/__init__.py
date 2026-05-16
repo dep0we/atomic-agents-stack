@@ -51,6 +51,10 @@ from ..exceptions import (
 )
 from .backend import ToolRegistryBackend
 from .filesystem import FilesystemToolRegistryBackend
+from .sqlite import (
+    SQLiteToolRegistryBackend,
+    make_sqlite_tool_registry_backend_from_url,
+)
 from .types import (
     ToolRef,
     ToolRegistryCapabilities,
@@ -68,6 +72,8 @@ __all__ = [
     "ValidationResult",
     # Reference implementations
     "FilesystemToolRegistryBackend",
+    "SQLiteToolRegistryBackend",
+    "make_sqlite_tool_registry_backend_from_url",
     # Registry
     "register_tool_registry_backend",
     "unregister_tool_registry_backend",
@@ -153,6 +159,11 @@ def list_tool_registry_backends() -> list[str]:
 # available without an extra resolution step.
 register_tool_registry_backend("filesystem", FilesystemToolRegistryBackend)
 
+# Register the built-in SQLite backend at import time (#64 PR 3). Same
+# pattern as profile/__init__.py:157 — both reference impls land in the
+# registry on package import; the operator picks via env var.
+register_tool_registry_backend("sqlite", SQLiteToolRegistryBackend)
+
 
 # ────────────────────────────────────────────────────────────────────
 # PR 2 wiring contract — PRE-PR-2 state (describes what WILL be wired
@@ -218,6 +229,22 @@ def get_default_tool_registry_backend(agent_root: Path) -> ToolRegistryBackend:
 
     if raw_backend_id == "filesystem":
         return FilesystemToolRegistryBackend(agent_root)
+
+    if raw_backend_id == "sqlite":
+        # SQLite backend reads its db location from the URL env var.
+        # If the URL is absent, default to ``<agent_root>/.tools.db``
+        # with ``agent_scope=<agent_root.name>`` — single-host operators
+        # get a working SQLite default by flipping ONE env var. Mirrors
+        # spec/24's same shape for profile_backend.
+        url = os.environ.get(
+            "ATOMIC_AGENTS_TOOL_REGISTRY_BACKEND_URL", ""
+        ).strip()
+        if not url:
+            return SQLiteToolRegistryBackend(
+                agent_root / ".tools.db",
+                agent_scope=agent_root.name or "default",
+            )
+        return make_sqlite_tool_registry_backend_from_url(url)
 
     # Unknown backend_id — surface a fail-fast error with the FULL
     # known-id list so operators can spot the typo. Credential safety:
