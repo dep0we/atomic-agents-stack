@@ -1333,6 +1333,7 @@ def check_agent_profile_backend(agents_root: Path) -> CheckResult:
                 "supports_clone": caps.supports_clone,
                 "supports_snapshot": caps.supports_snapshot,
                 "supports_subscribe": caps.supports_subscribe,
+                "supports_skills": caps.supports_skills,
                 "durable": caps.durable,
                 "agent_count": agent_count,
             },
@@ -1442,6 +1443,7 @@ def check_agent_profile_backend(agents_root: Path) -> CheckResult:
         "supports_clone": caps.supports_clone,
         "supports_snapshot": caps.supports_snapshot,
         "supports_subscribe": caps.supports_subscribe,
+        "supports_skills": caps.supports_skills,
         "durable": caps.durable,
         "agent_count": agent_count,
     }

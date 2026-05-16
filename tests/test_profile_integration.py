@@ -16,7 +16,6 @@ cost caps applied to dream runs.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -31,7 +30,6 @@ from atomic_agents.dream import DreamRunner, _check_cap
 from atomic_agents.eval import EvalRunner
 from atomic_agents.outcome import OutcomeRunner
 from atomic_agents.doctor import check_agent_profile_backend
-from atomic_agents.exceptions import BackendNotRegistered
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -406,7 +404,6 @@ def test_dreamrunner_start_forwards_model_config_to_check_cap(tmp_path, monkeypa
     fake_backend.load_profile.return_value = fake_profile
 
     captured = {}
-    real_check_cap = dream_module._check_cap
 
     def tracking_check_cap(*args, **kwargs):
         captured.update(kwargs)
@@ -460,7 +457,12 @@ def test_doctor_check_profile_backend_filesystem_pass(tmp_path):
     assert "2 agents" in result.message
     assert result.detail["backend_id"] == "filesystem"
     assert result.detail["supports_save"] is True
-    assert result.detail["supports_snapshot"] is False  # Decision 3
+    # supports_snapshot flipped to True in #63 PR 3 (Decision 3 — JSON-
+    # based snapshot trio shipped alongside the SQLite reference impl).
+    assert result.detail["supports_snapshot"] is True
+    # supports_skills added in #63 PR 3 (Decision 8) — filesystem=True,
+    # exposed via doctor so operators can compare backends.
+    assert result.detail["supports_skills"] is True
     assert result.detail["agent_count"] == 2
 
 

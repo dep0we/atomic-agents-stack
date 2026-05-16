@@ -442,6 +442,20 @@ class ProfileCapabilities:
             ``FilesystemAgentProfileBackend`` is True (writes go through
             ``_io.atomic_write`` which fsyncs file + parent dir). A
             hypothetical memory-only test backend would be False.
+        supports_skills: True when ``list_skills(agent_id)`` and
+            ``load_skill_body(agent_id, skill_name)`` return meaningful
+            data for the backend's storage shape. ``FilesystemAgentProfileBackend``
+            is True (skills are walked from ``<agent>/skills/<name>/SKILL.md``).
+            ``SQLiteAgentProfileBackend`` (#63 PR 3) is False — skills
+            stay filesystem-only in PR 3; a future Protocol method
+            ``save_skill()`` will land when SaaS UI editing requires
+            DB-backed skill bodies. Conformance tests for skill
+            CONTENT (``test_list_skills_returns_metadata``,
+            ``test_load_skill_body_returns_body_without_frontmatter``,
+            ``test_clone_copies_skills_directory``) gate on this
+            capability; empty-skill tests (``test_list_skills_empty``)
+            pass for both backends because non-supporting backends
+            return ``[]`` from ``list_skills``.
     """
 
     supports_save: bool
@@ -449,6 +463,7 @@ class ProfileCapabilities:
     supports_snapshot: bool
     supports_subscribe: bool
     durable: bool
+    supports_skills: bool
 
 
 # ──────────────────────────────────────────────────────────────────
