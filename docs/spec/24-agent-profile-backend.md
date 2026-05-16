@@ -1,8 +1,8 @@
 # 24 — AgentProfileBackend Protocol
 
-**Status:** **DRAFT** (PR 1 of #63 — locked at PR 4).
+**Status:** **DRAFT** (PR 2 of #63 — locked at PR 4).
 **Origin:** [#63](https://github.com/dep0we/atomic-agents-stack/issues/63).
-**Shipping plan across four PRs:** PR 1 (Protocol scaffolding + `FilesystemAgentProfileBackend` reference impl + conformance suite + DRAFT spec — this PR), PR 2 (wire `AtomicAgent.__init__` + `_load_config()` through the profile backend + per-runner kwargs + `doctor.check_agent_profile_backend` coherence check + operator override surface), PR 3 (second reference impl — likely `SQLiteAgentProfileBackend` — with parametrized conformance suite + snapshot trio implementation), PR 4 (spec lock-in + `Implementer contract for registry-backed backends` documented + README/CLAUDE.md status refresh).
+**Shipping plan across four PRs:** PR 1 (Protocol scaffolding + `FilesystemAgentProfileBackend` reference impl + conformance suite + DRAFT spec — merged at #192), **PR 2 (wire `AtomicAgent.__init__` + `_load_config()` through the profile backend + per-runner kwargs + `doctor.check_agent_profile_backend` coherence check + cascade unblocker — this PR)**, PR 3 (second reference impl — likely `SQLiteAgentProfileBackend` — with parametrized conformance suite + snapshot trio implementation), PR 4 (spec lock-in + `Implementer contract for registry-backed backends` documented + README/CLAUDE.md status refresh).
 
 ## Overview
 
@@ -303,29 +303,50 @@ PR 2 of #63 will expose the choice via TWO paths (parallel to the LogBackend / L
 
 The constructor kwarg ALWAYS wins. Operator-config layering: env vars are deployment-level (per-instance, per-host); the kwarg is per-agent-construction. A test that constructs an `AtomicAgent` with an explicit `profile_backend=` bypasses any env vars the deployment may have set.
 
-## What PR 1 does NOT do
+## What PR 1 did NOT do (now done in PR 2)
 
-PR 1 ships pure scaffolding — Protocol, filesystem reference impl, conformance suite, DRAFT spec. **Zero call-site changes.**
+PR 1 shipped pure scaffolding — Protocol, filesystem reference impl, conformance suite, DRAFT spec — with **zero call-site changes**. PR 2 wires the bootstrap path.
 
-- `AtomicAgent.__init__` is untouched.
-- `_load_config()` is untouched.
-- `cli.py`, `delegate.py`, `outcome.py`, `eval.py`, `dream.py`, `doctor.py`, `migrate.py` are untouched.
-- No `AtomicAgent.from_profile(backend, agent_id)` constructor — PR 2 wires it.
-- No `doctor.check_agent_profile_backend` coherence check — PR 2 adds it.
-- No env-var dispatch beyond the factory shell — PR 2 wires it.
-- No `subscribe` / hot-reload (deferred indefinitely; capability flag reserved in the namespace).
-- No second backend — PR 3.
-- No `renderers.py` (Decision 1; deferred to PR 3 if a DB backend needs export).
-- No snapshot implementation (Decision 3).
+## What PR 2 wires
 
-PR 2 wires:
+**Core (`atomic_agents/agent.py`):**
 
-- `AtomicAgent.__init__` accepts an optional `profile_backend: AgentProfileBackend | None` constructor kwarg that, when set, bypasses `get_default_profile_backend`.
-- `_load_config()` becomes a thin shim calling `self.profile_backend.load_profile(self.name)` and unpacks structured fields onto `self`.
-- `_load_persona()` reads `profile.persona_*` fields instead of raw file reads.
-- `_load_goal_text()` reads `profile.goal_text` instead of raw file read.
-- `DreamRunner`, `OutcomeRunner`, `EvalRunner`, `delegate.py` thread the kwarg. **Note**: `DreamRunner` calls `_model.parse_model_md(agent_root / "model.md")` in TWO places — `dream.py:1128` (DreamRunner pipeline, the obvious site) AND `dream.py:672` inside `_check_cap` (cost-guardrail check, easy to miss). PR 2 wiring MUST route BOTH through the profile backend, otherwise an operator using a non-filesystem backend will have correct config for `AtomicAgent.call()` but stale cost caps applied to dream runs. Surfaced by #63 PR 1 Step 11 adversarial finding P1#3.
-- `doctor.check_agent_profile_backend` coherence check.
+- `AtomicAgent.__init__` accepts `profile_backend: AgentProfileBackend | None = None` as a keyword-only kwarg (after `lock_backend` + `log_backend`, mirroring the established pattern). When unset, resolves via `get_default_profile_backend(self.agents_root)` (env-var-aware default). Stored as the **public** `self.profile_backend` for diagnostic + runner reuse, matching `self.lock_backend` / `self.log_backend`.
+- `self._profile = self.profile_backend.load_profile(self.name)` snapshots the agent's config ONCE at init — private cache, not a stable operator surface.
+- `_load_config()` is now a thin adapter reading fields from `self._profile` instead of file reads. **Cascade branch deleted** (Decision 7): `FilesystemAgentProfileBackend.load_profile` handles cascade internally. `self.cascade` is preserved at init for downstream uses (`_load_role_prompt`, `_load_project_layer_text`, `_load_tools_text`, tool-registration paths) — those load call-time content, not init-time config.
+- `_load_persona()` and `_load_goal_text()` read from `self._profile` instead of re-reading the files.
+- `agent_mode` is derived from the profile snapshot's `agent_mode` field (re-derived from `persona_identity` via the profile backend's `goal.parse_agent_mode_text`).
+
+**Cascade unblocker (`atomic_agents/profile/filesystem.py:_agent_root`):**
+
+- Removed the `/` refusal that PR 1 added as overly-restrictive belt-and-suspenders. Cascade agents have multi-segment `agent_id` values like `"muse/projects/the-unfinished/agents/writer"`. The `.resolve() + .relative_to(scope_root)` check is the actual security boundary; it catches `..` traversal after path resolution. All other validations (empty rejection, leading `.` refusal, backslash refusal, explicit `..` refusal) stay. **This unblocks all 9 cascade integration tests under PR 2.**
+
+**Runner threading (`outcome.py`, `eval.py`, `dream.py`):**
+
+- `OutcomeRunner.__init__` adds `profile_backend` kwarg; threaded to internal `AtomicAgent` at `run()`.
+- `EvalRunner.__init__` adds `log_backend` AND `profile_backend` kwargs (Decision 3: fixed the pre-existing `log_backend` drop-trap simultaneously).
+- `DreamRunner.__init__` adds `profile_backend` kwarg; pre-resolves `self._profile = self._profile_backend.load_profile(self.agent_name)` at init. **The Step 11 P1#3 trap**: `DreamRunner` reads `model.md` in TWO call sites — `dream.py:1128` (pipeline) AND `dream.py:672` (`_check_cap` cost-guardrail). PR 2 routes BOTH through the profile backend:
+  - **Site 1** (`__init__:1128`): `self._model = self._profile.model_config["default_model"]` (replaces direct `_model.parse_model_md` read)
+  - **Site 2** (`_check_cap:672`): the function now accepts `model_config: dict | None = None` kwarg (Decision 2 — passing pre-resolved config beats threading `profile_backend` + re-resolving the agent_name from `agent_root`). `DreamRunner.start()` passes `model_config=self._profile.model_config` so the cost-guardrail uses the same source the rest of DreamRunner uses. Legacy fallback (`_model.parse_model_md`) preserved for callers who don't pass `model_config`.
+
+**Doctor (`atomic_agents/doctor.py:check_agent_profile_backend`):**
+
+- New function mirroring `check_log_backend` shape (PASS/WARN/FAIL ladder, URL credential redaction via `urlparse + _replace`, capability + agent-count probe).
+- Wired into `run_doctor()` between `check_log_backend` and `check_memory_backend`.
+- Added `"profile-backend"` to the skip-names tuple so it emits a SKIP entry when no agent is supplied (parity with `memory-backend`).
+
+**Public surface:**
+
+- `atomic_agents.__init__` already exported the AgentProfileBackend surface in PR 1.
+- `outcome.py`, `eval.py`, `dream.py` now import `AgentProfileBackend` (under `TYPE_CHECKING` in dream.py to match existing pattern).
+
+**What PR 2 still does NOT do:**
+
+- No second backend — that's PR 3 (`SQLiteAgentProfileBackend` likely).
+- No `renderers.py` — Decision 1; deferred to PR 3 if a DB backend needs canonical markdown export.
+- No snapshot implementation — Decision 3; lands with PR 3's second backend.
+- No `subscribe` / hot-reload — capability flag reserved; deferred indefinitely.
+- No CLI flag for `--profile-backend` — env var path (`ATOMIC_AGENTS_PROFILE_BACKEND`) covers operator config; CLI flag would add API surface without a use case.
 
 PR 3 ships the second reference impl (likely `SQLiteAgentProfileBackend` — registry table + per-agent row + snapshots table) and parametrizes the conformance suite. PR 4 locks this spec and adds the `§"Implementer contract for registry-backed backends"` section below.
 
