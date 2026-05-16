@@ -356,6 +356,162 @@ def test_load_tool_handler_invokes_correctly(backend, tmp_path):
 
 
 # ──────────────────────────────────────────────────────────────────
+# Tier B round-trip pins — spec/25 MUST #4 (#207)
+#
+# Spec/25 §"Implementer contract for registry-backed tool backends"
+# MUST #4 Tier B says structured-storage backends (SQLite-shape) MUST
+# round-trip every ``ToolDefinition`` field that affects dispatch —
+# ``name``, ``description``, ``classification``, ``input_schema``,
+# ``handler`` — losslessly. The earlier conformance tests pin name
+# (via ``list_tools`` + ``load_tool``), classification (via
+# ``test_tool_ref_classification_round_trip``), description-substring,
+# and handler-callable+invokes. The three tests below close the gap:
+# strict round-trip on input_schema, exact-string round-trip on
+# description, and handler invocation+arity (catches a Tier B backend
+# that silently stores a stub or rewrites the signature).
+#
+# Both reference backends pass without code changes — these are
+# regression pins for future PyPI / HTTP / SaaS-database adapters.
+
+
+_RICH_SCHEMA_DESCRIPTOR = """\
+---
+name: echo_rich
+description: Echo a message back — supports "quotes", unicode ✓, and counts.
+classification: read_only
+input_schema:
+  type: object
+  properties:
+    msg:
+      type: string
+      description: The message to echo back verbatim.
+      minLength: 1
+    count:
+      type: integer
+      minimum: 1
+      maximum: 10
+      default: 1
+    options:
+      type: object
+      properties:
+        upper:
+          type: boolean
+      additionalProperties: false
+  required: [msg]
+  additionalProperties: false
+---
+"""
+
+_RICH_SCHEMA_EXPECTED = {
+    "type": "object",
+    "properties": {
+        "msg": {
+            "type": "string",
+            "description": "The message to echo back verbatim.",
+            "minLength": 1,
+        },
+        "count": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10,
+            "default": 1,
+        },
+        "options": {
+            "type": "object",
+            "properties": {"upper": {"type": "boolean"}},
+            "additionalProperties": False,
+        },
+    },
+    "required": ["msg"],
+    "additionalProperties": False,
+}
+
+_RICH_SCHEMA_DESCRIPTION = (
+    'Echo a message back — supports "quotes", unicode ✓, and counts.'
+)
+
+_RICH_SCHEMA_HANDLER = """\
+def handler(input):
+    msg = input["msg"]
+    count = input.get("count", 1)
+    upper = (input.get("options") or {}).get("upper", False)
+    out = (msg.upper() if upper else msg)
+    return " ".join([out] * count)
+"""
+
+
+def test_load_tool_round_trips_input_schema(backend, tmp_path):
+    """Spec/25 MUST #4 Tier B: ``input_schema`` MUST round-trip
+    losslessly across install → load_tool. Pins against silent drift:
+    structured-storage backends MUST preserve nested objects,
+    integer constraints (``minimum``/``maximum``/``default``),
+    booleans (``additionalProperties: false``), and required arrays
+    — a backend that re-serializes via JSON without preserving the
+    structured shape would pass the existing description-substring
+    test while violating the Tier B round-trip MUST.
+    """
+    make_tool_in_backend(
+        backend,
+        tmp_path,
+        "echo_rich",
+        descriptor=_RICH_SCHEMA_DESCRIPTOR,
+        handler=_RICH_SCHEMA_HANDLER,
+    )
+    td = backend.load_tool("echo_rich")
+    assert td.input_schema == _RICH_SCHEMA_EXPECTED, (
+        f"input_schema round-trip failed: got {td.input_schema!r}, "
+        f"expected {_RICH_SCHEMA_EXPECTED!r}"
+    )
+
+
+def test_load_tool_round_trips_description(backend, tmp_path):
+    """Spec/25 MUST #4 Tier B: ``description`` MUST round-trip exactly
+    across install → load_tool. Pins against silent normalization
+    (whitespace trim, quote-style coercion, unicode escape) that
+    would change what the LLM sees in the system prompt.
+    """
+    make_tool_in_backend(
+        backend,
+        tmp_path,
+        "echo_rich",
+        descriptor=_RICH_SCHEMA_DESCRIPTOR,
+        handler=_RICH_SCHEMA_HANDLER,
+    )
+    td = backend.load_tool("echo_rich")
+    assert td.description == _RICH_SCHEMA_DESCRIPTION, (
+        f"description round-trip failed: got {td.description!r}, "
+        f"expected {_RICH_SCHEMA_DESCRIPTION!r}"
+    )
+
+
+def test_load_tool_round_trips_handler_callable(backend, tmp_path):
+    """Spec/25 MUST #4 Tier B: the materialized ``handler`` MUST be a
+    callable that dispatches correctly — install → load_tool MUST NOT
+    return a stub, a wrapped placeholder, or a handler with a
+    rewritten signature. Catches a Tier B backend that drops the
+    actual handler body and substitutes a no-op.
+
+    Invokes with structured input that exercises the handler's
+    real branches (``msg`` + ``count`` + nested ``options.upper``)
+    and asserts the return value matches the source semantics —
+    a stub returning ``None`` or echoing input would fail both.
+    """
+    make_tool_in_backend(
+        backend,
+        tmp_path,
+        "echo_rich",
+        descriptor=_RICH_SCHEMA_DESCRIPTOR,
+        handler=_RICH_SCHEMA_HANDLER,
+    )
+    td = backend.load_tool("echo_rich")
+    assert callable(td.handler), "handler MUST be callable after load_tool"
+    out = td.handler({"msg": "hi", "count": 3, "options": {"upper": True}})
+    assert out == "HI HI HI", (
+        f"handler invocation round-trip failed: got {out!r}, expected 'HI HI HI'"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
 # Path-traversal refusal — spec/25 MUST #1
 
 
