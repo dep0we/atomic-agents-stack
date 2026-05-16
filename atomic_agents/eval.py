@@ -39,6 +39,7 @@ from ._platform import get_agents_root
 from .agent import AtomicAgent
 from .logs import LogBackend
 from .profile import AgentProfileBackend
+from .registry import ToolRegistryBackend
 from .exceptions import (
     AtomicAgentsError,
     NoJudgeAvailable,
@@ -119,6 +120,7 @@ class EvalRunner:
         *,
         log_backend: "LogBackend | None" = None,
         profile_backend: "AgentProfileBackend | None" = None,
+        tool_registry_backend: "ToolRegistryBackend | None" = None,
     ):
         self.agents_root = agents_root or get_agents_root()
         self.agent_name = agent_name
@@ -133,6 +135,8 @@ class EvalRunner:
         # the agent's own env-var-resolved default.
         self._log_backend = log_backend
         self._profile_backend = profile_backend
+        # #64 PR 2 — ToolRegistryBackend forwarding. Same discipline.
+        self._tool_registry_backend = tool_registry_backend
 
         if not self.evals_dir.exists():
             raise AtomicAgentsError(
@@ -330,6 +334,7 @@ class EvalRunner:
             agents_root=self.agents_root,
             log_backend=self._log_backend,
             profile_backend=self._profile_backend,
+            tool_registry_backend=self._tool_registry_backend,
         )
         try:
             agent_response = agent.call(work_item=work_item, write_captures=False)

@@ -51,6 +51,10 @@ from .profile import (
     AgentProfileBackend,
     get_default_profile_backend,
 )
+from .registry import (
+    ToolRegistryBackend,
+    get_default_tool_registry_backend,
+)
 from .logs.types import (
     PRIMITIVE_AGENT_CALL,
     PRIMITIVE_CAPTURE,
@@ -74,6 +78,9 @@ from .exceptions import (
     NotInRoster,
     PathTraversalError,
     SelfDelegationError,
+    ToolDescriptorInvalid,
+    ToolHandlerImportFailed,
+    ToolNotInRegistry,
 )
 from .tools import (
     DEFAULT_MAX_TOOL_ITERATIONS,
@@ -233,6 +240,7 @@ class AtomicAgent:
         lock_backend: LockBackend | None = None,
         log_backend: LogBackend | None = None,
         profile_backend: AgentProfileBackend | None = None,
+        tool_registry_backend: ToolRegistryBackend | None = None,
     ):
         self.name = name
         self.trigger = trigger
@@ -298,6 +306,36 @@ class AtomicAgent:
         else:
             self.profile_backend = profile_backend
 
+        # ToolRegistryBackend instance (#64 PR 2 — wires the bootstrap
+        # path through the Protocol established in PR 1). Operators may
+        # pin via the ``tool_registry_backend=...`` constructor kwarg
+        # (programmatic path — always wins) OR via
+        # ``ATOMIC_AGENTS_TOOL_REGISTRY_BACKEND`` +
+        # ``ATOMIC_AGENTS_TOOL_REGISTRY_BACKEND_URL`` env vars
+        # (deployment path). Default (both unset) is the filesystem
+        # backend scoped at THIS agent's root (per-agent scope, NOT
+        # agents_root — distinct from profile_backend which is
+        # fleet-scoped). The on-disk ``<agent>/tools/`` layout is the
+        # surface, so an empty / absent ``tools/`` dir yields zero
+        # backend tools and preserves byte-identical pre-#64-PR-2
+        # behavior for every existing AtomicAgent test site.
+        # ``tool_registry_backend`` is public — mirrors
+        # ``self.lock_backend`` / ``self.log_backend`` / ``self.profile_backend``
+        # so diagnostic code (``atomic-agents doctor``) and runners can
+        # reuse the same backend instance instead of resolving twice.
+        # Assigned before ``profile_backend.load_profile`` so a backend
+        # factory failure (e.g., ``BackendNotRegistered`` from a typo'd
+        # ``ATOMIC_AGENTS_TOOL_REGISTRY_BACKEND``) surfaces before any
+        # profile-load I/O. The backend constructor itself is I/O-free
+        # — actual ``tools/`` walks happen in ``list_tools`` /
+        # ``load_tool`` below.
+        if tool_registry_backend is None:
+            self.tool_registry_backend = get_default_tool_registry_backend(
+                self.agent_root
+            )
+        else:
+            self.tool_registry_backend = tool_registry_backend
+
         # Load the agent's profile ONCE at init time. ``self._profile`` is
         # an init-time snapshot — private cache, not a stable operator
         # surface. Operators read persona text via assemble_system_prompt()
@@ -306,6 +344,87 @@ class AtomicAgent:
         # ``_load_goal_text``) read fields off this snapshot instead of
         # re-reading the filesystem.
         self._profile: AgentProfile = self.profile_backend.load_profile(self.name)
+
+        # Register backend-discovered tools into the in-memory
+        # ``self.tool_registry`` (#64 PR 2 — Decision 1 + Decision 8 of
+        # spec/25). The Protocol layer COMPOSES with the in-memory
+        # dispatch class:
+        #
+        #     backend.list_tools()       → list[ToolRef]      # discovery
+        #     backend.load_tool(name)    → ToolDefinition     # materialization
+        #     self.tool_registry.register(td)                 # dispatch
+        #
+        # Collision discipline: operator-supplied tools (already in
+        # ``self.tool_registry`` from the ``tools=`` constructor kwarg
+        # initialized at line ~243) registered FIRST. Backend tools
+        # register with ``allow_overwrite=False`` (the default) so
+        # name collisions between operator + backend surface loudly
+        # as ``ToolNameCollision`` — operator intent wins. MCP
+        # discovery (still later, at call-time around line ~2345)
+        # uses ``allow_overwrite=True`` per established semantics;
+        # MCP names ALWAYS namespace as ``server__tool`` so collisions
+        # with backend tools indicate a genuine conflict.
+        #
+        # Discovery is lazy at the descriptor layer (``list_tools()``
+        # parses frontmatter only) but eager at the handler layer
+        # here — each ``load_tool(name)`` runs ``importlib.util.spec_
+        # from_file_location`` + ``exec_module`` on the filesystem
+        # reference. For an agent with no ``tools/`` directory (the
+        # 96 existing test fixtures), the loop body executes zero
+        # times. Operators with side-effecting handler-module top-
+        # level code see the side effect on agent construction; this
+        # is spec/25 Decision 5 + the §"Known gaps" note about
+        # lazy-import semantics.
+        for ref in self.tool_registry_backend.list_tools():
+            try:
+                td = self.tool_registry_backend.load_tool(ref.name)
+            except (
+                ToolDescriptorInvalid,
+                ToolHandlerImportFailed,
+                ToolNotInRegistry,
+                ValueError,
+                OSError,
+            ) as exc:
+                # Per-tool failures don't block agent construction —
+                # other tools may still be usable. Emit a debug log so
+                # operators triaging "why is my tool not registered?"
+                # find the cause without re-running ``backend.validate(name)``
+                # by hand. ``ref.name`` is already validated by
+                # ``list_tools()`` (descriptor frontmatter must be
+                # well-formed for the ref to exist), so log-injection
+                # risk is bounded — no control chars reach this string.
+                _logger.debug(
+                    "skipping tool %r during agent construction: %s: %s",
+                    ref.name,
+                    type(exc).__name__,
+                    exc,
+                )
+                # Operators triage specific tools via
+                # ``backend.validate(name)`` (spec/25 Decision 6 —
+                # static check that returns ``ValidationResult``
+                # instead of raising).
+                #
+                # Caught exception classes:
+                #   - ``ToolDescriptorInvalid`` — descriptor parse error
+                #     (frontmatter YAML, missing closing ``---``, etc.)
+                #   - ``ToolHandlerImportFailed`` — handler module raised
+                #     at import time OR missing ``handler`` symbol
+                #   - ``ToolNotInRegistry`` — descriptor parsed but handler
+                #     module disappeared between ``list_tools`` and
+                #     ``load_tool`` (TOCTOU race the spec/25 §"Known
+                #     gaps" documents)
+                #   - ``ValueError`` — tool name has a control char,
+                #     leading dot, or path-separator that the descriptor
+                #     filename smuggled in (Step 9.1 security finding;
+                #     a single ``tool\twith_tab.md`` would otherwise
+                #     break agent construction for every operator)
+                #   - ``OSError`` — filesystem-level failure during
+                #     descriptor / handler read (``tools/`` chmod'd to
+                #     000; permission glitch; disk error). Same
+                #     defense-in-depth shape as ``list_tools`` already
+                #     applies to descriptor parsing.
+                continue
+            self.tool_registry.register(td)
 
         # Cascade detection — None for single-agent layouts (load behaves as before),
         # populated for paths shaped <system>/projects/<project>/agents/<role>/.
@@ -3257,6 +3376,19 @@ class AtomicAgent:
         # env vars at the deployment level — both target and
         # coordinator then pick up the same operator-pinned backend
         # via the default factory.
+        #
+        # ``tool_registry_backend`` is ALSO not threaded (#64 PR 2) —
+        # same reason. The filesystem reference is per-agent-rooted
+        # (``tools/<name>.md`` belongs to ONE agent's directory).
+        # Threading the coordinator's instance to the target would
+        # surface the COORDINATOR's tools in the target's catalog —
+        # not the operator's intent. Operators wanting a shared tool
+        # catalog across agents set ``ATOMIC_AGENTS_TOOL_REGISTRY_BACKEND``
+        # at the deployment level (when the PR 3 SQLite / future
+        # PyPI / HTTP backends land — those ARE shared-catalog by
+        # nature). Filesystem-default deployments behave correctly:
+        # the target builds its own ``FilesystemToolRegistryBackend``
+        # over ``<target_path>/tools/`` via the default factory.
         target_agent = AtomicAgent(
             name=target_agent_name,
             trigger="delegate",

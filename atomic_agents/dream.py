@@ -54,6 +54,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from .logs import LogBackend
     from .profile import AgentProfileBackend
+    from .registry import ToolRegistryBackend
 
 import frontmatter
 
@@ -1164,6 +1165,7 @@ class DreamRunner:
         lock_backend: LockBackend | None = None,
         log_backend: "LogBackend | None" = None,
         profile_backend: "AgentProfileBackend | None" = None,
+        tool_registry_backend: "ToolRegistryBackend | None" = None,
     ):
         self.agents_root = Path(agents_root)
         self.agent_name = agent_name
@@ -1242,6 +1244,17 @@ class DreamRunner:
         else:
             self._profile_backend = profile_backend
         self._profile = self._profile_backend.load_profile(self.agent_name)
+
+        # #64 PR 2 — ToolRegistryBackend stored for API parity with
+        # OutcomeRunner / EvalRunner. DreamRunner currently makes raw
+        # LLM calls (``_llm.call_*``) without dispatching agent tools —
+        # there is no internal ``AtomicAgent`` construction to thread
+        # through. The kwarg + storage exist so an operator wiring
+        # multiple runners uses ONE signature shape across all three.
+        # Reserved for future dream pipelines that DO dispatch tools
+        # (a future ``DreamRunner`` capability that emits agent calls
+        # for note synthesis would consume this).
+        self._tool_registry_backend = tool_registry_backend
 
         # Resolve model: explicit kwarg > profile.model_config default.
         # PR 2 Decision 2: pre-resolved model_config is also passed to
