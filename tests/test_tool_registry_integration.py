@@ -558,6 +558,20 @@ def test_doctor_check_tool_registry_backend_unknown_id_fails(tmp_path, monkeypat
     assert "filesystem" in result.message  # known-id list surfaces
 
 
+def test_doctor_check_tool_registry_backend_sqlite_pass(tmp_path, monkeypatch):
+    """#64 PR 3: doctor surfaces SQLite-specific capability snapshot."""
+    monkeypatch.setenv("ATOMIC_AGENTS_TOOL_REGISTRY_BACKEND", "sqlite")
+    monkeypatch.delenv("ATOMIC_AGENTS_TOOL_REGISTRY_BACKEND_URL", raising=False)
+    _make_minimal_agent_dir(tmp_path, "scout")
+    result = check_tool_registry_backend(tmp_path / "scout")
+    assert result.status == "pass"
+    assert "sqlite" in result.message
+    # SQLite flips supports_install/uninstall=True (vs filesystem False)
+    assert result.detail["backend_id"] == "sqlite"
+    assert result.detail["supports_install"] is True
+    assert result.detail["supports_uninstall"] is True
+
+
 def test_doctor_check_tool_registry_backend_redacts_url_credentials(
     tmp_path, monkeypatch
 ):

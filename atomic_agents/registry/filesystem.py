@@ -747,5 +747,18 @@ def _import_handler(handler_path: Path, name: str) -> Callable[[dict], Any]:
             f"handler module {handler_path} for tool {name!r} does not "
             f"expose a `handler` callable"
         )
+    # Step 11 specialist finding: `_import_handler` previously returned
+    # WHATEVER ``handler`` was — `handler = 42` slipped through; the
+    # non-callable check happened only in ``validate()``. install() on
+    # SQLite consequently accepted broken handlers. Catching at the
+    # import boundary means install() refuses non-callable handlers
+    # up-front (capability honesty for ``supports_install=True``
+    # backends).
+    if not callable(handler):
+        raise ToolHandlerImportFailed(
+            f"handler module {handler_path} for tool {name!r} exposes a "
+            f"`handler` attribute of type {type(handler).__name__} which "
+            f"is not callable"
+        )
 
     return handler

@@ -75,6 +75,7 @@ from atomic_agents.exceptions import (
 )
 from atomic_agents.registry import (
     FilesystemToolRegistryBackend,
+    SQLiteToolRegistryBackend,
     ToolRef,
     ToolRegistryBackend,
     ToolRegistryCapabilities,
@@ -85,7 +86,7 @@ from atomic_agents.tools import ToolDefinition, ToolRegistry
 
 # ──────────────────────────────────────────────────────────────────
 # Backend factory parametrization — every conformance test runs once
-# per registered backend. PR 3 of #64 will add the SQLite factory; the
+# per registered backend. PR 3 of #64 added the SQLite factory; the
 # parametrization is the conformance-suite contract that future
 # backends extend (downstream packages append their factory to
 # ``BACKEND_FACTORIES`` in their own test module).
@@ -96,14 +97,30 @@ BackendFactory = Callable[[Path], ToolRegistryBackend]
 def _filesystem_factory(agent_root: Path) -> ToolRegistryBackend:
     """Filesystem backend rooted at ``agent_root`` (the agent's own dir).
 
-    Per-agent backend instance, vs. ``FilesystemAgentProfileBackend``'s
-    per-``agents_root`` shape — see spec/25 Decision 9.
+    Per-agent backend instance — see spec/25 Decision 9.
     """
     return FilesystemToolRegistryBackend(agent_root)
 
 
+def _sqlite_factory(agent_root: Path) -> ToolRegistryBackend:
+    """SQLite backend rooted at ``<agent_root>/.tools.db``.
+
+    Single-scope conformance — uses ``agent_scope='default'`` for the
+    parametrized suite. Cross-scope isolation tests live in the
+    SQLite-specific suite (``test_tool_registry_sqlite_backend.py``)
+    and construct backends with explicit per-test scopes. Matches the
+    #63 PR 3 precedent (``_sqlite_factory`` for the profile arc).
+    """
+    return SQLiteToolRegistryBackend(
+        agent_root / ".tools.db",
+        agent_scope="default",
+        handlers_root=agent_root / ".handlers",
+    )
+
+
 BACKEND_FACTORIES: list[tuple[str, BackendFactory]] = [
     ("filesystem", _filesystem_factory),
+    ("sqlite", _sqlite_factory),
 ]
 
 
@@ -182,6 +199,61 @@ def make_good_tool(agent_root: Path, name: str = "query_database") -> tuple[Path
     )
 
 
+def make_tool_in_backend(
+    backend: ToolRegistryBackend,
+    tmp_path: Path,
+    name: str = "query_database",
+    *,
+    descriptor: str | None = None,
+    handler: str | None = None,
+) -> None:
+    """Install a tool into the backend via its native shape.
+
+    Plan-subagent Risk J fix: the original `make_tool_in_backend(backend, tmp_path,
+    name)` writes to `<tmp_path>/tools/<name>.{md,py}` — works for
+    filesystem because the filesystem backend reads those files;
+    FAILS on SQLite because the SQLite backend reads its rows, not
+    files in `<tmp_path>/tools/`. This helper dispatches per-backend-
+    type via the `supports_install` capability:
+
+    - **Filesystem (supports_install=False)**: writes descriptor +
+      handler to ``<tmp_path>/tools/``. The backend's ``list_tools()``
+      walks that dir.
+    - **SQLite (supports_install=True)**: writes descriptor + handler
+      to a staging dir under ``<tmp_path>/.staging/``, then calls
+      ``backend.install(source=<staging_dir>)``. The handler file ends
+      up at the backend's ``handlers_root``; the SQL row references
+      that path.
+
+    For backends with ``supports_install=True`` but a different
+    ``install(source=...)`` shape (e.g., future PyPI / git backends),
+    the helper can be extended via a backend_id check — until then,
+    the assumption is that ``supports_install=True`` → directory-
+    source install (the SQLite shape).
+
+    Mirrors ``make_agent_in_backend`` from the profile arc — Plan-
+    subagent Decision 4 of #63 PR 3.
+    """
+    descriptor = descriptor or _GOOD_DESCRIPTOR.replace("query_database", name)
+    handler = handler or _GOOD_HANDLER
+
+    if backend.capabilities().supports_install:
+        # SQLite (or future install-capable backends) — install via
+        # directory-source.
+        staging = tmp_path / ".staging" / name
+        staging.mkdir(parents=True, exist_ok=True)
+        (staging / f"{name}.md").write_text(descriptor, encoding="utf-8")
+        (staging / f"{name}.py").write_text(handler, encoding="utf-8")
+        backend.install(source=str(staging))
+    else:
+        # Filesystem — write directly into the backend's tools_dir.
+        # The factory rooted the backend at tmp_path, so its tools_dir
+        # is <tmp_path>/tools/.
+        make_tool_files(
+            tmp_path, name, descriptor=descriptor, handler=handler
+        )
+
+
 # ──────────────────────────────────────────────────────────────────
 # Surface conformance
 
@@ -223,16 +295,16 @@ def test_list_tools_empty_when_no_tools_dir(backend):
 
 
 def test_list_tools_populated(backend, tmp_path):
-    make_good_tool(tmp_path, "query_database")
+    make_tool_in_backend(backend, tmp_path, "query_database")
     refs = backend.list_tools()
     assert len(refs) == 1
     assert refs[0].name == "query_database"
 
 
 def test_list_tools_lexicographic_order(backend, tmp_path):
-    make_good_tool(tmp_path, "zeta_tool")
-    make_good_tool(tmp_path, "alpha_tool")
-    make_good_tool(tmp_path, "mid_tool")
+    make_tool_in_backend(backend, tmp_path, "zeta_tool")
+    make_tool_in_backend(backend, tmp_path, "alpha_tool")
+    make_tool_in_backend(backend, tmp_path, "mid_tool")
     refs = backend.list_tools()
     names = [r.name for r in refs]
     assert names == sorted(names)
@@ -240,7 +312,7 @@ def test_list_tools_lexicographic_order(backend, tmp_path):
 
 
 def test_list_tools_returns_tool_ref_instances(backend, tmp_path):
-    make_good_tool(tmp_path, "query_database")
+    make_tool_in_backend(backend, tmp_path, "query_database")
     refs = backend.list_tools()
     assert all(isinstance(r, ToolRef) for r in refs)
 
@@ -250,20 +322,20 @@ def test_list_tools_returns_tool_ref_instances(backend, tmp_path):
 
 
 def test_load_tool_returns_tool_definition_with_callable_handler(backend, tmp_path):
-    make_good_tool(tmp_path, "query_database")
+    make_tool_in_backend(backend, tmp_path, "query_database")
     td = backend.load_tool("query_database")
     assert isinstance(td, ToolDefinition)
     assert callable(td.handler)
 
 
 def test_load_tool_populates_description(backend, tmp_path):
-    make_good_tool(tmp_path, "query_database")
+    make_tool_in_backend(backend, tmp_path, "query_database")
     td = backend.load_tool("query_database")
     assert "Run a read-only SQL query" in td.description
 
 
 def test_load_tool_populates_classification(backend, tmp_path):
-    make_good_tool(tmp_path, "query_database")
+    make_tool_in_backend(backend, tmp_path, "query_database")
     td = backend.load_tool("query_database")
     assert td.classification == "read_only"
 
@@ -276,7 +348,7 @@ def test_load_tool_missing_raises_tool_not_in_registry(backend):
 def test_load_tool_handler_invokes_correctly(backend, tmp_path):
     """The materialized handler is fully usable — round-trips through
     a real call."""
-    make_good_tool(tmp_path, "query_database")
+    make_tool_in_backend(backend, tmp_path, "query_database")
     td = backend.load_tool("query_database")
     result = td.handler({"query": "SELECT 1"})
     assert "ran query" in result
@@ -337,7 +409,8 @@ def handler(input):
     Path({str(handler_call_marker)!r}).touch()
     return "called"
 """
-    make_tool_files(
+    make_tool_in_backend(
+        backend,
         tmp_path,
         "side_effecting",
         descriptor=_GOOD_DESCRIPTOR.replace("query_database", "side_effecting"),
@@ -369,7 +442,8 @@ name: no_description
 classification: read_only
 ---
 """
-    make_tool_files(
+    make_tool_in_backend(
+        backend,
         tmp_path,
         "no_description",
         descriptor=descriptor,
@@ -390,7 +464,8 @@ name: no_class
 description: A tool with no classification declared.
 ---
 """
-    make_tool_files(
+    make_tool_in_backend(
+        backend,
         tmp_path,
         "no_class",
         descriptor=descriptor,
@@ -411,7 +486,8 @@ description: A tool with an invalid classification.
 classification: super_dangerous
 ---
 """
-    make_tool_files(
+    make_tool_in_backend(
+        backend,
         tmp_path,
         "bad_class",
         descriptor=descriptor,
@@ -424,7 +500,19 @@ classification: super_dangerous
 
 def test_validate_handler_module_missing_handler_symbol(backend, tmp_path):
     """Handler module imports cleanly but exposes no ``handler`` symbol —
-    tool is unusable."""
+    tool is unusable.
+
+    **Lazy-validation regime only.** Backends with ``supports_install=True``
+    catch this at install time (the install path imports the handler to
+    verify it has a ``handler`` symbol). For those backends, the
+    equivalent assertion lives in the install-rejection tests in the
+    backend-specific suite.
+    """
+    if backend.capabilities().supports_install:
+        pytest.skip(
+            "install-capable backends reject missing handler symbol at "
+            "install time; see backend-specific suite for install-rejection test"
+        )
     descriptor = _GOOD_DESCRIPTOR.replace("query_database", "no_handler")
     handler = "# Empty module — no `handler` symbol exposed.\n"
     make_tool_files(
@@ -442,11 +530,15 @@ def test_validate_handler_symbol_not_callable(backend, tmp_path):
     """Handler module exposes a ``handler`` symbol that isn't callable
     (e.g., ``handler = 42``) — distinct branch from "no handler symbol".
 
-    Without this test, the documented callability check in
-    filesystem.py:validate() (``if not callable(handler):``) had
-    zero coverage. The pre-existing test only exercised the "symbol
-    missing" branch via ToolHandlerImportFailed.
+    Lazy-validation regime only — install-capable backends now reject
+    non-callable handlers at install time via the strengthened
+    ``_import_handler`` callable check (Step 11 specialist finding).
     """
+    if backend.capabilities().supports_install:
+        pytest.skip(
+            "install-capable backends reject non-callable handler at "
+            "install time; see backend-specific install-rejection test"
+        )
     descriptor = _GOOD_DESCRIPTOR.replace("query_database", "non_callable")
     handler = "# handler exists but is not callable\nhandler = 42\n"
     make_tool_files(
@@ -464,7 +556,16 @@ def test_validate_handler_symbol_not_callable(backend, tmp_path):
 
 
 def test_validate_descriptor_parse_failure_is_error(backend, tmp_path):
-    """Frontmatter unparseable → error (tool unusable)."""
+    """Frontmatter unparseable → error (tool unusable).
+
+    Lazy-validation regime only — install-capable backends reject
+    malformed descriptors at install time.
+    """
+    if backend.capabilities().supports_install:
+        pytest.skip(
+            "install-capable backends reject malformed descriptors at "
+            "install time; see backend-specific suite"
+        )
     bad_descriptor = "no frontmatter here at all\nplain markdown\n"
     make_tool_files(
         tmp_path,
@@ -481,7 +582,17 @@ def test_validate_descriptor_parse_failure_is_error(backend, tmp_path):
 
 
 def test_validate_handler_import_failure_is_error(backend, tmp_path):
-    """Handler module raises at import time → error."""
+    """Handler module raises at import time → error.
+
+    Lazy-validation regime only — install-capable backends reject
+    broken handler modules at install time (import is part of the
+    install validation).
+    """
+    if backend.capabilities().supports_install:
+        pytest.skip(
+            "install-capable backends reject broken handler imports at "
+            "install time; see backend-specific suite"
+        )
     descriptor = _GOOD_DESCRIPTOR.replace("query_database", "broken_handler")
     handler = "raise RuntimeError('broken handler module')\n"
     make_tool_files(
@@ -501,7 +612,7 @@ def test_validate_handler_import_failure_is_error(backend, tmp_path):
 def test_validate_well_formed_tool_returns_ok(backend, tmp_path):
     """Happy path — well-formed descriptor + handler → ok=True, no
     errors, no warnings."""
-    make_good_tool(tmp_path, "query_database")
+    make_tool_in_backend(backend, tmp_path, "query_database")
     result = backend.validate("query_database")
     assert result.ok is True
     assert result.errors == []
@@ -556,7 +667,7 @@ def test_tool_ref_version_round_trips(backend, tmp_path):
     """Even on backends declaring ``supports_versioning=False``,
     ``ToolRef.version`` round-trips (filesystem always returns None;
     future PyPI backends populate from package metadata)."""
-    make_good_tool(tmp_path, "query_database")
+    make_tool_in_backend(backend, tmp_path, "query_database")
     refs = backend.list_tools()
     ref = refs[0]
     # Field is present on the dataclass
@@ -570,7 +681,7 @@ def test_tool_ref_version_round_trips(backend, tmp_path):
 
 def test_tool_ref_classification_round_trip(backend, tmp_path):
     """Classification from descriptor frontmatter surfaces on ToolRef."""
-    make_good_tool(tmp_path, "query_database")
+    make_tool_in_backend(backend, tmp_path, "query_database")
     refs = backend.list_tools()
     assert refs[0].classification == "read_only"
 
@@ -580,7 +691,7 @@ def test_tool_ref_source_populated(backend, tmp_path):
     marker for diagnostic audit. Empty string is allowed only when
     the backend genuinely can't surface an origin (rare — purely
     structural)."""
-    make_good_tool(tmp_path, "query_database")
+    make_tool_in_backend(backend, tmp_path, "query_database")
     refs = backend.list_tools()
     # Filesystem sets the descriptor path; SQLite would set
     # `sqlite://<table>/<scope>/<name>` etc. Either way: non-empty.
@@ -606,14 +717,15 @@ def test_tool_ref_to_dict_from_dict_round_trip():
 
 def test_descriptor_without_name_field_succeeds(backend, tmp_path):
     """When the descriptor omits the ``name`` field, the file stem is
-    the canonical source — ``load_tool("query_database")`` succeeds."""
+    the canonical source — ``load_tool("stem_only")`` succeeds."""
     descriptor = """\
 ---
 description: A tool without an explicit name field.
 classification: read_only
 ---
 """
-    make_tool_files(
+    make_tool_in_backend(
+        backend,
         tmp_path,
         "stem_only",
         descriptor=descriptor,
@@ -625,8 +737,17 @@ classification: read_only
 
 def test_descriptor_with_mismatched_name_raises(backend, tmp_path):
     """When the descriptor declares a ``name`` that doesn't match the
-    file stem, ``load_tool`` MUST raise — defensive against operator
-    typos."""
+    file stem, ``load_tool`` MUST raise — defensive against operator typos.
+
+    Lazy-validation regime only — install-capable backends catch the
+    mismatch at install time (the install path validates descriptor
+    name matches file stem).
+    """
+    if backend.capabilities().supports_install:
+        pytest.skip(
+            "install-capable backends reject descriptor name mismatch at "
+            "install time; see backend-specific suite"
+        )
     descriptor = """\
 ---
 name: typo_name
@@ -645,7 +766,16 @@ classification: read_only
 
 
 def test_descriptor_invalid_yaml_raises(backend, tmp_path):
-    """Malformed YAML in the frontmatter → ``ToolDescriptorInvalid``."""
+    """Malformed YAML in the frontmatter → ``ToolDescriptorInvalid``.
+
+    Lazy-validation regime only — install-capable backends reject
+    malformed YAML at install time.
+    """
+    if backend.capabilities().supports_install:
+        pytest.skip(
+            "install-capable backends reject malformed YAML at install time; "
+            "see backend-specific suite"
+        )
     descriptor = """\
 ---
 name: bad_yaml
@@ -665,7 +795,16 @@ classification: read_only
 
 def test_descriptor_missing_frontmatter_raises(backend, tmp_path):
     """A markdown file with no ``---`` frontmatter delimiter →
-    ``ToolDescriptorInvalid`` on load."""
+    ``ToolDescriptorInvalid`` on load.
+
+    Lazy-validation regime only — install-capable backends reject
+    descriptors lacking frontmatter at install time.
+    """
+    if backend.capabilities().supports_install:
+        pytest.skip(
+            "install-capable backends reject missing-frontmatter descriptors "
+            "at install time; see backend-specific suite"
+        )
     descriptor = "# Plain Markdown\n\nNo frontmatter here.\n"
     make_tool_files(
         tmp_path,
@@ -679,7 +818,16 @@ def test_descriptor_missing_frontmatter_raises(backend, tmp_path):
 
 def test_handler_module_without_handler_symbol_raises(backend, tmp_path):
     """Handler module imports cleanly but exposes no ``handler`` →
-    ``ToolHandlerImportFailed`` on load."""
+    ``ToolHandlerImportFailed`` on load.
+
+    Lazy-validation regime only — install-capable backends reject
+    handler modules missing the ``handler`` symbol at install time.
+    """
+    if backend.capabilities().supports_install:
+        pytest.skip(
+            "install-capable backends reject missing handler symbol at "
+            "install time; see backend-specific suite"
+        )
     descriptor = _GOOD_DESCRIPTOR.replace("query_database", "no_handler_symbol")
     handler = "x = 1\n# no `handler` callable here\n"
     make_tool_files(
@@ -706,7 +854,7 @@ def test_tool_name_collision_survives_through_backend_load(backend, tmp_path):
     dispatch surface; ``ToolNameCollision`` semantics stay unchanged
     after PR 2 wiring.
     """
-    make_good_tool(tmp_path, "query_database")
+    make_tool_in_backend(backend, tmp_path, "query_database")
 
     # Operator's programmatic registration first (operator intent wins
     # on the collision shape).
@@ -730,32 +878,33 @@ def test_tool_name_collision_survives_through_backend_load(backend, tmp_path):
 # Capability claim-vs-behavior parity
 
 
-def test_capability_parity_install(backend):
-    """``supports_install=True`` ↔ ``install`` does not raise NotImplementedError.
+def test_capability_parity_install(backend, tmp_path):
+    """``supports_install=True`` ↔ ``install`` actually installs.
 
-    Mirrors the conformance discipline in ``ProfileCapabilities`` /
-    ``LogCapabilities`` — backends can't lie about what they support.
-    The shape covers both directions: a True claim means the method
-    works; a False claim means the method raises.
+    Step 11 / plan-subagent Risk C: the original test only checked
+    that ``NotImplementedError`` wasn't raised. A backend whose
+    install() silently no-op'd would pass — every other exception
+    was swallowed via ``except Exception: pass``. This strengthened
+    shape uses a real well-formed source and asserts the installed
+    tool surfaces in ``list_tools()`` afterwards.
     """
     caps = backend.capabilities()
     if caps.supports_install:
-        # MUST NOT raise NotImplementedError — but MAY raise other
-        # errors (ValueError on malformed source, etc.). We catch
-        # NotImplementedError specifically.
-        try:
-            backend.install("local:///nonexistent/path", version=None)
-        except NotImplementedError:
-            pytest.fail(
-                "backend claims supports_install=True but install() "
-                "raised NotImplementedError"
-            )
-        except Exception:
-            # Any other exception is acceptable — the source is bogus
-            # so a real backend will raise ValueError / FileNotFoundError
-            # / similar. The point of the test is just to assert the
-            # NotImplementedError path isn't taken.
-            pass
+        # Real well-formed install — verify the tool actually persists.
+        staging = tmp_path / ".parity_staging" / "parity_tool"
+        staging.mkdir(parents=True, exist_ok=True)
+        (staging / "parity_tool.md").write_text(
+            _GOOD_DESCRIPTOR.replace("query_database", "parity_tool"),
+            encoding="utf-8",
+        )
+        (staging / "parity_tool.py").write_text(_GOOD_HANDLER, encoding="utf-8")
+        ref = backend.install(source=str(staging))
+        assert ref.name == "parity_tool"
+        # Confirm the tool actually landed in the catalog.
+        assert "parity_tool" in [r.name for r in backend.list_tools()]
+        # Confirm load_tool() materializes a usable handler.
+        td = backend.load_tool("parity_tool")
+        assert callable(td.handler)
     else:
         with pytest.raises(NotImplementedError):
             backend.install("local:///any/path")
