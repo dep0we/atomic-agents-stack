@@ -45,6 +45,10 @@ from pathlib import Path
 from ..exceptions import BackendNotRegistered
 from .backend import AgentProfileBackend
 from .filesystem import FilesystemAgentProfileBackend
+from .sqlite import (
+    SQLiteAgentProfileBackend,
+    make_sqlite_profile_backend_from_url,
+)
 from .types import (
     AGENT_MODE_GOAL_DRIVEN,
     AGENT_MODE_HYBRID,
@@ -69,6 +73,8 @@ __all__ = [
     "AGENT_MODE_HYBRID",
     # Reference implementations
     "FilesystemAgentProfileBackend",
+    "SQLiteAgentProfileBackend",
+    "make_sqlite_profile_backend_from_url",
     # Registry
     "register_profile_backend",
     "unregister_profile_backend",
@@ -145,6 +151,11 @@ def list_profile_backends() -> list[str]:
 # an extra resolution step.
 register_profile_backend("filesystem", FilesystemAgentProfileBackend)
 
+# Register the built-in SQLite backend at import time (#63 PR 3). Same
+# pattern as logs/__init__.py:198 — both reference impls land in the
+# registry on package import; the operator picks via env var.
+register_profile_backend("sqlite", SQLiteAgentProfileBackend)
+
 
 # ────────────────────────────────────────────────────────────────────
 # PR 2 wiring contract — PRE-PR-2 state (describes what WILL be wired
@@ -212,6 +223,16 @@ def get_default_profile_backend(scope_root: Path) -> AgentProfileBackend:
 
     if raw_backend_id == "filesystem":
         return FilesystemAgentProfileBackend(scope_root)
+
+    if raw_backend_id == "sqlite":
+        # SQLite backend reads its db location from the URL env var. If
+        # the URL is absent, default to ``<scope_root>/.profile.db`` —
+        # mirrors the logs/sqlite default-URL convention so single-host
+        # operators get a working default without setting two env vars.
+        url = os.environ.get("ATOMIC_AGENTS_PROFILE_BACKEND_URL", "").strip()
+        if not url:
+            return SQLiteAgentProfileBackend(scope_root / ".profile.db")
+        return make_sqlite_profile_backend_from_url(url)
 
     # Unknown backend_id — surface a fail-fast error with the FULL
     # known-id list so operators can spot the typo. Credential safety:
