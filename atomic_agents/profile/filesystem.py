@@ -44,8 +44,12 @@ writer wins, but neither caller sees a partially-written file.
 
 from __future__ import annotations
 
+import json
+import re
+import secrets
 import shutil
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +66,7 @@ from ..exceptions import (
     AgentProfileNotFound,
     MCPServerConnectFailed,
     SkillFileTraversal,
+    SnapshotNotFound,
 )
 from ..goal import parse_agent_mode_text
 from ..judges_md import load_judges_config
@@ -582,34 +587,209 @@ class FilesystemAgentProfileBackend:
             _copy_dir_tree(source_skills, target_skills)
 
     # ────────────────────────────────────────────────────────────
-    # Snapshot — DEFERRED to PR 3 (Decision 3)
+    # Snapshot — JSON-based (#63 PR 3 Decision 3)
 
     def snapshot(self, agent_id: str, label: str) -> str:
-        """NOT IMPLEMENTED in PR 1 — see Decision 3 in spec/24."""
-        raise NotImplementedError(
-            "FilesystemAgentProfileBackend does not support snapshots in "
-            "#63 PR 1; capabilities().supports_snapshot is False. PR 3 "
-            "ships snapshot implementation alongside the second reference "
-            "backend."
+        """Snapshot the agent's current profile state. Returns ``snapshot_id``.
+
+        Serializes ``self.load_profile(agent_id).to_dict()`` as JSON to
+        ``<scope_root>/.snapshots/<agent_id>/<snapshot_id>/profile.json``
+        + ``metadata.json``. Atomic via ``_io.atomic_write``.
+
+        **Why JSON, not directory copy** (Decision 3 of #63 PR 3):
+        ``shutil.copytree`` is not atomic at the agent level — a crash
+        mid-copy leaves the agent partially snapshotted. The JSON shape
+        round-trips through ``AgentProfile.to_dict / from_dict`` and
+        ``restore`` writes the profile back via ``save_profile`` which
+        uses the same per-file atomic_write discipline as a fresh save.
+        Skills are NOT snapshotted — they aren't in ``AgentProfile``
+        (Decision 2 of PR 1), and they require their own ``save_skill``
+        Protocol surface that PR 3 explicitly does not add.
+
+        Cascade carve-out: for cascaded agents, the snapshot captures
+        the post-merge ``AgentProfile`` view (tools_md_raw is the
+        cascade-resolved text; judges_md_raw is instance-only). Restore
+        writes only the instance layer (per Decision 5 of PR 1); the
+        role + project layers are read-only.
+        """
+        # Reuse load_profile — raises AgentProfileNotFound if missing.
+        profile = self.load_profile(agent_id)
+
+        # 6 hex (24 bits) had ~52% collision probability per second at
+        # 4K snapshots/sec — fleet-scale concern flagged in Step 11
+        # adversarial F-8. 12 hex (48 bits) brings same-second collision
+        # at 4K/sec down to ~6e-8.
+        snapshot_id = (
+            f"snap_"
+            f"{datetime.now().astimezone().strftime('%Y-%m-%dT%H%M%S')}_"
+            f"{secrets.token_hex(6)}"
         )
+        created_at = datetime.now().astimezone().isoformat()
+
+        agent_root = self._agent_root(agent_id)
+        snapshots_dir = self._scope_root / ".snapshots" / agent_id / snapshot_id
+        snapshots_dir.mkdir(parents=True, exist_ok=False)
+
+        # Atomic per-file writes via _io.atomic_write. The directory
+        # is created above; the metadata + profile files are written
+        # individually with fsync+rename atomicity.
+        # default=str — AgentProfile.tool_config["read_paths"] holds
+        # PosixPath objects from the parser; from_dict re-derives the
+        # structured forms from raw text on restore, so stringified
+        # paths round-trip losslessly via the parser.
+        profile_blob = json.dumps(profile.to_dict(), indent=2, default=str)
+        atomic_write(snapshots_dir / "profile.json", profile_blob)
+        metadata = {
+            "snapshot_id": snapshot_id,
+            "label": label,
+            "created_at": created_at,
+            "agent_id": agent_id,
+        }
+        atomic_write(snapshots_dir / "metadata.json", json.dumps(metadata, indent=2))
+        # Confirm agent_root resolves (defensive — load_profile already
+        # checked this; this catches a race between load_profile + write).
+        if not agent_root.exists():
+            # Roll back the just-created snapshot dir on race.
+            shutil.rmtree(snapshots_dir, ignore_errors=True)
+            raise AgentProfileNotFound(
+                f"agent {agent_id!r} disappeared between load_profile "
+                f"and snapshot write — snapshot rolled back"
+            )
+
+        return snapshot_id
 
     def restore(self, agent_id: str, snapshot_id: str) -> None:
-        """NOT IMPLEMENTED in PR 1 — see Decision 3 in spec/24."""
-        raise NotImplementedError(
-            "FilesystemAgentProfileBackend does not support snapshot "
-            "restore in #63 PR 1; capabilities().supports_snapshot is "
-            "False. PR 3 ships restore implementation alongside the "
-            "second reference backend."
-        )
+        """Restore the agent's profile to a prior snapshot.
+
+        Loads the snapshot's ``profile.json`` + ``metadata.json``,
+        validates cross-agent isolation (snapshot's agent_id must match
+        ``agent_id``), then calls ``self.save_profile(agent_id,
+        restored_profile)`` — atomic via the existing per-file
+        atomic_write discipline.
+
+        **Security checks (path-scoping + cross-agent isolation):**
+
+        1. ``snapshot_id`` validated against the
+           ``^snap_[\\w\\-T:]+$``-shaped pattern via ``_validate_snapshot_id``.
+        2. Snapshot directory path is resolved + ``relative_to`` checked
+           under ``<scope_root>/.snapshots/<agent_id>/`` — refuses
+           paths that escape via symlinks / `..` even if the validator
+           missed them.
+        3. ``metadata.agent_id`` MUST equal ``agent_id`` — defensive
+           double-check; ``relative_to`` already enforces this at the
+           path level, but operators editing metadata to spoof an
+           agent_id would otherwise pass the path check.
+        4. ``agent_id`` is validated against ``_agent_root`` BEFORE
+           any disk access — refuses ``"../../other"``-shape inputs at
+           the API boundary so an operator-controlled agent_id cannot
+           read metadata.json from outside ``scope_root``. The check
+           is structurally identical to ``load_profile`` /
+           ``save_profile``; PR 3 Step 11 adversarial review caught
+           that the snapshot trio's read-side methods skipped it.
+        """
+        # Step 11 adversarial F-3: refuse path-traversal agent_id at
+        # the API boundary. Without this, list_snapshots/restore would
+        # build snapshots_root via raw path concat and the resolve()
+        # check below only protects the snapshot_id segment, not the
+        # agent_id segment.
+        self._agent_root(agent_id)
+        _validate_snapshot_id(snapshot_id)
+
+        snapshots_root = self._scope_root / ".snapshots" / agent_id
+        snapshot_dir = snapshots_root / snapshot_id
+
+        # Path-scope check: resolved snapshot_dir MUST be under
+        # snapshots_root. Catches symlink escapes that the snapshot_id
+        # validator can't see.
+        try:
+            snapshot_dir.resolve().relative_to(snapshots_root.resolve())
+        except (ValueError, OSError) as exc:
+            raise SnapshotNotFound(
+                f"snapshot {snapshot_id!r} for agent {agent_id!r} "
+                f"resolves outside snapshots root"
+            ) from exc
+
+        metadata_path = snapshot_dir / "metadata.json"
+        profile_path = snapshot_dir / "profile.json"
+        if not metadata_path.is_file() or not profile_path.is_file():
+            raise SnapshotNotFound(
+                f"snapshot {snapshot_id!r} not found for agent "
+                f"{agent_id!r} at {snapshot_dir}"
+            )
+
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise SnapshotNotFound(
+                f"snapshot {snapshot_id!r} metadata unreadable: {exc}"
+            ) from exc
+
+        # Cross-agent isolation — defensive double-check on top of the
+        # path-scope check above. If the metadata claims a different
+        # agent than the directory it lives in, refuse.
+        if metadata.get("agent_id") != agent_id:
+            raise SnapshotNotFound(
+                f"snapshot {snapshot_id!r} metadata agent_id "
+                f"{metadata.get('agent_id')!r} does not match requested "
+                f"agent {agent_id!r}"
+            )
+
+        try:
+            profile_dict = json.loads(profile_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise SnapshotNotFound(
+                f"snapshot {snapshot_id!r} profile unreadable: {exc}"
+            ) from exc
+
+        # Reconstruct AgentProfile from the JSON dict + write via the
+        # existing atomic save path.
+        restored_profile = AgentProfile.from_dict(profile_dict)
+        self.save_profile(agent_id, restored_profile)
 
     def list_snapshots(self, agent_id: str) -> list[ProfileSnapshot]:
-        """NOT IMPLEMENTED in PR 1 — see Decision 3 in spec/24."""
-        raise NotImplementedError(
-            "FilesystemAgentProfileBackend does not list snapshots in "
-            "#63 PR 1; capabilities().supports_snapshot is False. PR 3 "
-            "ships snapshot enumeration alongside the second reference "
-            "backend."
-        )
+        """Return chronological-ordered snapshots for ``agent_id``.
+
+        Enumerates ``<scope_root>/.snapshots/<agent_id>/`` and reads
+        each subdirectory's ``metadata.json``. Empty list when the
+        snapshots dir is absent (no snapshots ever taken for this
+        agent). Snapshots with unreadable / missing metadata are
+        silently skipped — they're effectively dead.
+
+        ``agent_id`` is validated against ``_agent_root`` BEFORE any
+        disk access — refuses ``"../../other"``-shape inputs so an
+        operator-controlled agent_id cannot enumerate metadata.json
+        from outside ``scope_root`` (Step 11 adversarial F-3).
+        """
+        self._agent_root(agent_id)
+        snapshots_root = self._scope_root / ".snapshots" / agent_id
+        if not snapshots_root.is_dir():
+            return []
+
+        results: list[ProfileSnapshot] = []
+        for entry in snapshots_root.iterdir():
+            if not entry.is_dir():
+                continue
+            metadata_path = entry / "metadata.json"
+            if not metadata_path.is_file():
+                continue
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                # Skip corrupt metadata — dead snapshot, operator can
+                # rm -rf to clean.
+                continue
+            results.append(
+                ProfileSnapshot(
+                    snapshot_id=str(metadata.get("snapshot_id", entry.name)),
+                    label=str(metadata.get("label", "")),
+                    created_at=str(metadata.get("created_at", "")),
+                    agent_id=str(metadata.get("agent_id", agent_id)),
+                )
+            )
+        # Sort by created_at (ISO-8601 lexicographic == chronological
+        # for tz-aware timestamps).
+        results.sort(key=lambda s: s.created_at)
+        return results
 
     # ────────────────────────────────────────────────────────────
     # Capabilities
@@ -618,11 +798,18 @@ class FilesystemAgentProfileBackend:
         return ProfileCapabilities(
             supports_save=True,
             supports_clone=True,
-            # Snapshot trio deferred to PR 3 (Decision 3).
-            supports_snapshot=False,
+            # Snapshot trio implemented in #63 PR 3 — JSON-based
+            # (Decision 3 of PR 3): both backends serialize
+            # ``AgentProfile.to_dict()`` and write atomically through
+            # ``save_profile`` on restore. Plan-subagent caught that
+            # the original ``shutil.copytree`` design wasn't atomic.
+            supports_snapshot=True,
             # Hot-reload reserved for future Protocol expansion.
             supports_subscribe=False,
             durable=True,
+            # Filesystem walks ``<agent>/skills/<name>/SKILL.md`` —
+            # full skill support. SQLite backend (#63 PR 3) sets False.
+            supports_skills=True,
         )
 
 
@@ -698,4 +885,36 @@ def _validate_skill_name(skill_name: str) -> None:
         raise SkillFileTraversal(
             f"skill_name {skill_name!r} contains a parent-dir token — "
             f"path traversal refused"
+        )
+
+
+# Snapshot IDs are generated by ``snapshot()`` as
+# ``snap_<YYYY-MM-DDTHHMMSS+TZ>_<6hex>``. The validator refuses
+# operator-supplied IDs that don't match this shape — defensive guard
+# against path-traversal attacks via the snapshot_id argument to
+# ``restore()``. Allows: digits, letters, hyphen, underscore, colon
+# (for tz offset like ``+05:30``), plus. Refuses everything else
+# including ``/``, ``\\``, ``..``, NULL bytes, control chars.
+_VALID_SNAPSHOT_ID = re.compile(r"^snap_[\w\-T:+]+$")
+
+
+def _validate_snapshot_id(snapshot_id: str) -> None:
+    """Reject ``snapshot_id`` values that don't match the generated shape.
+
+    Belt-and-suspenders against path-traversal — the ``relative_to``
+    check in ``restore()`` is the actual security boundary, but
+    refusing malformed IDs up front gives a cleaner error message and
+    blocks attempts before any filesystem access.
+
+    Raises ``SnapshotNotFound`` (not ValueError) so callers can catch
+    a single exception type for "snapshot doesn't exist / can't be
+    reached" cases.
+    """
+    if not snapshot_id:
+        raise SnapshotNotFound("snapshot_id must not be empty")
+    if not _VALID_SNAPSHOT_ID.match(snapshot_id):
+        raise SnapshotNotFound(
+            f"snapshot_id {snapshot_id!r} is not a valid snapshot id — "
+            f"expected snap_<timestamp>_<hex> shape generated by "
+            f"snapshot()"
         )
