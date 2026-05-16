@@ -3234,12 +3234,35 @@ class AtomicAgent:
                 remaining_headroom = headroom
 
         target_path = self._resolve_delegated_agent_path(target_agent_name)
-        # Build the target agent; it inherits no state from the coordinator
+        # Build the target agent. It inherits no agent-state (run history,
+        # captures) from the coordinator. ``profile_backend`` IS threaded
+        # because the profile backend is fleet-scoped (one backend per
+        # ``agents_root``) — an operator who pinned
+        # ``DatabaseAgentProfileBackend`` on the coordinator wants every
+        # delegated agent to load its config from the same DB, not
+        # silently fall back to filesystem. Step 11 adversarial
+        # Finding 1 from #63 PR 2 caught the drop-trap here as the
+        # exact recurrence of the runner-drop-trap shape on the
+        # production multi-agent delegation path.
+        #
+        # ``lock_backend`` and ``log_backend`` are NOT threaded — they
+        # are per-agent scoped (filesystem lock at ``<agent>/.lock``,
+        # log at ``<agent>/log/``). Threading them would put the
+        # target's locks/logs in the COORDINATOR's directory, mixing
+        # the two agents' on-disk artifacts. The pre-PR-2 convention
+        # was "don't thread per-agent backends through delegation";
+        # PR 2 preserves that. Operators who want shared lock / log
+        # backends across delegated agents can set the
+        # ``ATOMIC_AGENTS_LOCK_BACKEND`` / ``ATOMIC_AGENTS_LOG_BACKEND``
+        # env vars at the deployment level — both target and
+        # coordinator then pick up the same operator-pinned backend
+        # via the default factory.
         target_agent = AtomicAgent(
             name=target_agent_name,
             trigger="delegate",
             agents_root=target_path.parent,
             run_id=None,  # generates its own fresh run_id
+            profile_backend=self.profile_backend,
         )
 
         start = time.time()

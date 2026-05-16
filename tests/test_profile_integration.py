@@ -509,3 +509,80 @@ def test_doctor_check_profile_backend_zero_agents(tmp_path):
     result = check_agent_profile_backend(tmp_path)
     assert result.status == "pass"
     assert "0 agents" in result.message
+
+
+def test_atomic_agent_delegate_threads_profile_backend_to_target(tmp_path):
+    """Step 11 adversarial Finding 1 (HIGH) regression test.
+
+    ``AtomicAgent.delegate()`` constructs an internal target ``AtomicAgent``.
+    Pre-fix this construction silently DROPPED ``profile_backend``,
+    recreating the runner-drop-trap shape PR 2 was specifically
+    designed to close on every other AtomicAgent-constructing path.
+    In a SaaS deployment where the operator pins a non-filesystem
+    ``profile_backend`` on the coordinator, every delegated target
+    would silently load its config from the wrong source.
+    Adversarial-flagged HIGH because ``delegate()`` is the production
+    multi-agent path, not just a test surface.
+
+    **Scope note**: only ``profile_backend`` is threaded.
+    ``lock_backend`` and ``log_backend`` are per-agent scoped (the
+    filesystem default writes to ``<agent>/.lock`` and ``<agent>/log/``
+    respectively), so threading them would put the target's locks and
+    logs in the coordinator's directory — mixing on-disk artifacts.
+    Pre-PR-2 convention preserved: those use their own default
+    factories. Operators wanting shared lock / log backends use the
+    deployment-level env vars; both coordinator + target then resolve
+    the same backend via the default factory.
+    """
+    # Build coordinator + target as siblings under tmp_path
+    _make_minimal_agent_dir(tmp_path, "coordinator")
+    _make_minimal_agent_dir(tmp_path, "target")
+    # Coordinator needs the target in its roster
+    (tmp_path / "coordinator" / "roster.md").write_text(
+        "# Roster\n\n## Delegate to\n\n- target — for delegation tests\n",
+        encoding="utf-8",
+    )
+
+    explicit_profile = FilesystemAgentProfileBackend(tmp_path)
+
+    coordinator = AtomicAgent(
+        name="coordinator",
+        agents_root=tmp_path,
+        profile_backend=explicit_profile,
+    )
+
+    # Capture the delegated target's instance via monkey-patch on
+    # AtomicAgent.__init__. The test cannot run delegate() end-to-end
+    # without an LLM, but the AtomicAgent construction happens
+    # BEFORE call() — that's what we're measuring.
+    captured = {}
+    original_init = AtomicAgent.__init__
+
+    def capturing_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        if self.name == "target":
+            captured["target"] = self
+
+    import unittest.mock as _mock
+
+    with _mock.patch.object(AtomicAgent, "__init__", capturing_init):
+        try:
+            coordinator.delegate(target_agent_name="target", work_item="test")
+        except Exception:
+            # Expected — call() needs LLM credentials we don't have here.
+            pass
+
+    target = captured.get("target")
+    assert target is not None, (
+        "delegate() did not construct a target AtomicAgent — test setup "
+        "may be incomplete"
+    )
+
+    # Load-bearing assertion: target inherits coordinator's
+    # operator-pinned profile_backend. Pre-fix, this would silently
+    # fall back to the default factory.
+    assert target.profile_backend is explicit_profile, (
+        "target agent did not inherit coordinator's profile_backend — "
+        "Step 11 adversarial Finding 1 regression. delegate() must "
+        "thread profile_backend=self.profile_backend."
+    )

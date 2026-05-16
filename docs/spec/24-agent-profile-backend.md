@@ -350,6 +350,14 @@ PR 1 shipped pure scaffolding — Protocol, filesystem reference impl, conforman
 
 PR 3 ships the second reference impl (likely `SQLiteAgentProfileBackend` — registry table + per-agent row + snapshots table) and parametrizes the conformance suite. PR 4 locks this spec and adds the `§"Implementer contract for registry-backed backends"` section below.
 
+### PR 3 implementer note — synchronous load_profile at __init__ blocks construction
+
+`AtomicAgent.__init__` calls `self.profile_backend.load_profile(self.name)` UNCONDITIONALLY and SYNCHRONOUSLY at construction time (`agent.py:308`). For `FilesystemAgentProfileBackend`, this is a handful of file reads — sub-millisecond. For a future `SQLiteAgentProfileBackend` or `DatabaseAgentProfileBackend` on a remote server, this is a network round-trip on every `AtomicAgent()` construction site (96 existing test sites today; production fleet deployments may construct hundreds per process). #63 PR 2 Step 11 adversarial Finding 2 flagged this as a PR 3 trap shape preview.
+
+PR 3 backend implementers MUST EITHER (a) ensure `load_profile` completes within a sub-second budget under typical network conditions, OR (b) propose a Protocol extension that allows lazy-loading (e.g., a `lazy_load_profile` flag on the backend, or a `@cached_property` shape inside `AtomicAgent`). The latter is a Protocol change and would land via PR 3's spec-doc updates, not as a code-only addition.
+
+Filesystem-default operators see no impact; this affects the deployment surface for non-filesystem backends.
+
 ### Known gaps deferred to follow-up issues
 
 The #63 PR 1 Step 11 adversarial review surfaced two filesystem-backend rough edges that don't block scaffolding but should land before PR 4 locks:
