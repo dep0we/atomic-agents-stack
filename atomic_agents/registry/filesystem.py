@@ -299,13 +299,36 @@ class FilesystemToolRegistryBackend:
         filesystem layout). Descriptors that fail to parse are SKIPPED
         with a debug log line; operators who want the parse error
         surfaced call ``validate(name)`` for the specific tool.
+
+        Step 11 adversarial regression fix: ``OSError`` from
+        ``iterdir()`` (chmod 000 on the dir, filesystem error,
+        unreadable mount) is treated as 'this tools/ dir is not
+        usable' and returns ``[]`` — same shape as 'tools/ absent'.
+        Without this defense, a single misconfigured permission on
+        one agent's ``tools/`` would block EVERY ``AtomicAgent``
+        construction process-wide (the wiring loop at
+        ``agent.py:381`` calls this method unconditionally on every
+        agent build). The behavior is logged at WARN so operators
+        triaging "why is my tool not showing up?" find the cause.
         """
         tools_dir = self.tools_dir
         if not tools_dir.is_dir():
             return []
 
+        try:
+            entries = sorted(tools_dir.iterdir())
+        except OSError as exc:
+            _logger.warning(
+                "could not enumerate tool registry at %s: %s: %s — "
+                "treating as empty",
+                tools_dir,
+                type(exc).__name__,
+                exc,
+            )
+            return []
+
         refs: list[ToolRef] = []
-        for entry in sorted(tools_dir.iterdir()):
+        for entry in entries:
             if not entry.is_file():
                 continue
             if entry.suffix != _DESCRIPTOR_SUFFIX:

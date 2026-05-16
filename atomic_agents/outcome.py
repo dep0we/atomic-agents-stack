@@ -50,6 +50,7 @@ from ._platform import get_agents_root
 from .agent import AtomicAgent
 from .eval import EvalRunner, _provider_available
 from .profile import AgentProfileBackend
+from .registry import ToolRegistryBackend
 from .exceptions import AtomicAgentsError, CostGuardrailBlocked
 
 # ──────────────────────────────────────────────────────────────────
@@ -121,6 +122,7 @@ class OutcomeRunner:
         *,
         log_backend: "LogBackend | None" = None,
         profile_backend: "AgentProfileBackend | None" = None,
+        tool_registry_backend: "ToolRegistryBackend | None" = None,
     ):
         self.agents_root = Path(agents_root) if agents_root else get_agents_root()
         self.agent_name = agent_name
@@ -140,6 +142,13 @@ class OutcomeRunner:
         # pinning a SaaS profile backend would silently drop it at the
         # OutcomeRunner→AtomicAgent boundary.
         self._profile_backend = profile_backend
+        # #64 PR 2 — ToolRegistryBackend forwarding. Same threading
+        # discipline. The internal AtomicAgent uses THIS runner's
+        # ``self.agent_root``, so threading the operator's backend
+        # surfaces the operator-pinned tool catalog. Filesystem-default
+        # operators (None kwarg) get the per-agent-rooted filesystem
+        # backend via the agent's own ``get_default_tool_registry_backend``.
+        self._tool_registry_backend = tool_registry_backend
 
         if not self.agent_root.exists():
             raise AtomicAgentsError(
@@ -220,6 +229,7 @@ class OutcomeRunner:
             run_id=run_id,
             log_backend=self._log_backend,
             profile_backend=self._profile_backend,
+            tool_registry_backend=self._tool_registry_backend,
         )
 
         # Resolve judge model: explicit > cross-family via eval config > pick_judge_model fallback

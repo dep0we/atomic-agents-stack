@@ -149,9 +149,10 @@ def run_doctor(
 
     if agent_name is None:
         # Order matches run_doctor()'s actual execution sequence below
-        # (lock-backend → log-backend → profile-backend → memory-backend)
-        # so contributors adding a fourth scope-level backend check see
-        # the SKIP enumeration mirror reality.
+        # (lock-backend → log-backend → profile-backend →
+        # tool-registry-backend → memory-backend) so contributors
+        # adding a fifth scope-level backend check see the SKIP
+        # enumeration mirror reality.
         for n in (
             "vault",
             "provider-keys",
@@ -159,6 +160,7 @@ def run_doctor(
             "mcp",
             "locks",
             "profile-backend",
+            "tool-registry-backend",
             "memory-backend",
             "write-paths",
         ):
@@ -212,6 +214,7 @@ def run_doctor(
     results.append(check_locks(agent_root))
     results.append(check_log_backend(agent_root))
     results.append(check_agent_profile_backend(resolved_root))
+    results.append(check_tool_registry_backend(agent_root))
     results.append(check_memory_backend(agent_root))
     results.append(check_write_paths(tools_data, agent_root=agent_root))
 
@@ -1455,6 +1458,212 @@ def check_agent_profile_backend(agents_root: Path) -> CheckResult:
         message=(
             f"{backend_id} backend ok ({agent_count} agent"
             f"{'' if agent_count == 1 else 's'} discovered)"
+        ),
+        detail=detail,
+    )
+
+
+def check_tool_registry_backend(agent_root: Path) -> CheckResult:
+    """Operator-config coherence check for the tool-registry backend (#64 PR 2).
+
+    Validates that ``ATOMIC_AGENTS_TOOL_REGISTRY_BACKEND`` is correctly
+    configured. Scoped at ``agent_root`` (not ``agents_root``) — the
+    filesystem reference is per-agent-rooted (``<agent>/tools/<name>.md``
+    belongs to ONE agent), distinct from ``check_agent_profile_backend``
+    which sits at the scope-flat ``agents_root`` layer.
+
+    PASS / WARN / FAIL ladder mirrors ``check_agent_profile_backend``:
+
+    * unset / ``filesystem`` → PASS with capability snapshot + tool
+      count (0 when no ``tools/`` dir, which is the typical case for
+      most agents — that's intentional, not a failure mode)
+    * unknown backend_id (typo) → FAIL with the known-id list pulled
+      from ``list_tool_registry_backends()`` so doctor's verdict cannot
+      diverge from the registry's actual contents
+    * non-filesystem id reachable + ``capabilities()`` probe ok → PASS
+      with redacted URL in detail
+    * non-filesystem id construction failure → FAIL (credentials
+      dropped from exception text to prevent leak in error-tracking
+      services); ``capabilities()`` probe failure → WARN
+
+    URL credential redaction follows the same urlparse + ``_replace``
+    pattern as ``check_agent_profile_backend`` / ``check_log_backend``
+    / ``check_lock_backend`` (PR 2 inherits the same defense-in-depth
+    + sister-check redaction gap noted in spec/22 — fixing all four
+    together is tracked as a separate follow-up).
+    """
+    from .exceptions import BackendNotRegistered
+    from .registry import (
+        get_default_tool_registry_backend,
+        list_tool_registry_backends,
+    )
+
+    backend_id = (
+        os.environ.get("ATOMIC_AGENTS_TOOL_REGISTRY_BACKEND", "filesystem")
+        .strip()
+        .lower()
+    )
+
+    if backend_id == "filesystem":
+        try:
+            backend = get_default_tool_registry_backend(agent_root)
+            caps = backend.capabilities()
+            tool_count = len(backend.list_tools())
+        except Exception as exc:
+            return CheckResult(
+                name="tool-registry-backend",
+                status=FAIL,
+                message=(
+                    f"filesystem tool registry backend probe raised "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                fix_hint=(
+                    f"Check that {agent_root}/tools/ is readable when present. "
+                    "The default FilesystemToolRegistryBackend tolerates a "
+                    "missing tools/ directory (returns empty list) — a probe "
+                    "failure usually means agent_root itself is unreadable."
+                ),
+            )
+        return CheckResult(
+            name="tool-registry-backend",
+            status=PASS,
+            message=(
+                f"filesystem backend ok ({tool_count} tool"
+                f"{'' if tool_count == 1 else 's'} discovered)"
+            ),
+            detail={
+                "backend_id": "filesystem",
+                "supports_install": caps.supports_install,
+                "supports_uninstall": caps.supports_uninstall,
+                "supports_versioning": caps.supports_versioning,
+                "supports_sandbox_validate": caps.supports_sandbox_validate,
+                "supports_skills_catalog": caps.supports_skills_catalog,
+                "durable": caps.durable,
+                "tool_count": tool_count,
+            },
+        )
+
+    # Non-filesystem id selected — verify it's known to the registry
+    # BEFORE invoking the factory (lazy registrations of future
+    # backends — SQLite (PR 3), PyPI, git, HTTP — slot in via
+    # list_tool_registry_backends).
+    known_ids = set(list_tool_registry_backends())
+    if backend_id not in known_ids:
+        # Redact the echoed value: if an operator accidentally pastes a
+        # URL into the BACKEND env var (instead of ..._URL), it carries
+        # credentials. Strip anything past ``://`` and truncate at 32
+        # chars — same shape as ``registry/__init__.py:_redact_for_error_message``.
+        # Sister checks (check_agent_profile_backend / check_log_backend
+        # / check_lock_backend) have the same gap; fixing all four
+        # together is tracked as a separate follow-up.
+        safe_id: str
+        if "://" in backend_id:
+            safe_id = backend_id.split("://", 1)[0] + "://..."
+        elif len(backend_id) > 32:
+            safe_id = backend_id[:32] + "..."
+        else:
+            safe_id = backend_id
+        return CheckResult(
+            name="tool-registry-backend",
+            status=FAIL,
+            message=(
+                f"ATOMIC_AGENTS_TOOL_REGISTRY_BACKEND={safe_id!r} is "
+                f"not a known backend. Known: {sorted(known_ids)}"
+            ),
+            fix_hint=(
+                "Set ATOMIC_AGENTS_TOOL_REGISTRY_BACKEND to one of the "
+                "known ids, or unset to use the filesystem default."
+            ),
+        )
+
+    # URL credential redaction — same urlparse + _replace pattern as
+    # sister checks. PR 1 also has a textual redaction in
+    # get_default_tool_registry_backend's BackendNotRegistered message;
+    # this is the structured form for the PASS-path detail dict.
+    url = os.environ.get("ATOMIC_AGENTS_TOOL_REGISTRY_BACKEND_URL")
+    safe_url: str | None = None
+    if url:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        # Redact when EITHER password OR username is present — covers
+        # token-as-username URLs common with managed services. Same
+        # shape as check_agent_profile_backend's redaction.
+        if parsed.password or parsed.username:
+            netloc = parsed.hostname or ""
+            if parsed.port:
+                netloc = f"{netloc}:{parsed.port}"
+            safe_url = parsed._replace(netloc=netloc).geturl()
+        else:
+            safe_url = url
+
+    try:
+        backend = get_default_tool_registry_backend(agent_root)
+    except BackendNotRegistered:
+        return CheckResult(
+            name="tool-registry-backend",
+            status=FAIL,
+            message=f"tool registry backend {backend_id!r} not registered",
+            fix_hint=(
+                f"The {backend_id!r} backend is reserved but its lazy "
+                "resolver failed. Unset ATOMIC_AGENTS_TOOL_REGISTRY_BACKEND "
+                "to use the filesystem default."
+            ),
+        )
+    except Exception:
+        # Drop the verbatim exception message — connection errors from
+        # backend constructors commonly embed the full URL with credentials.
+        return CheckResult(
+            name="tool-registry-backend",
+            status=FAIL,
+            message=f"tool registry backend {backend_id!r} construction failed",
+            fix_hint=(
+                "Check ATOMIC_AGENTS_TOOL_REGISTRY_BACKEND and "
+                "ATOMIC_AGENTS_TOOL_REGISTRY_BACKEND_URL for typos. Run with "
+                "DEBUG logging to see the full exception."
+            ),
+        )
+
+    # Probe via capabilities() + list_tools() — both lightweight,
+    # verify the backend is reachable + schema-healthy. Match the
+    # WARN-on-unreachable-probe pattern from sister checks.
+    try:
+        caps = backend.capabilities()
+        tool_count = len(backend.list_tools())
+    except Exception:
+        return CheckResult(
+            name="tool-registry-backend",
+            status=WARN,
+            message=(
+                f"operator-pinned backend {backend_id!r} configured "
+                "but capabilities() / list_tools() probe failed"
+            ),
+            fix_hint=(
+                "Verify ATOMIC_AGENTS_TOOL_REGISTRY_BACKEND_URL is correct "
+                "+ the backend is reachable from this host. Doctor warns "
+                "instead of failing — the framework runtime will fail at "
+                "first load_tool if the backend is truly down."
+            ),
+        )
+
+    detail: dict[str, Any] = {
+        "backend_id": backend_id,
+        "supports_install": caps.supports_install,
+        "supports_uninstall": caps.supports_uninstall,
+        "supports_versioning": caps.supports_versioning,
+        "supports_sandbox_validate": caps.supports_sandbox_validate,
+        "supports_skills_catalog": caps.supports_skills_catalog,
+        "durable": caps.durable,
+        "tool_count": tool_count,
+    }
+    if safe_url is not None:
+        detail["url"] = safe_url
+    return CheckResult(
+        name="tool-registry-backend",
+        status=PASS,
+        message=(
+            f"{backend_id} backend ok ({tool_count} tool"
+            f"{'' if tool_count == 1 else 's'} discovered)"
         ),
         detail=detail,
     )
