@@ -5,27 +5,41 @@ captured at v0.10.0 (2026-05-09). This is not a contributor guide; it is a
 description of practices that have shipped recognisable correctness and
 velocity, written down so they survive the session that produced them.
 
-The shape of the project so far: 4 published tags (v0.1.0 retroactive,
-v0.9.0 retroactive, v0.10.0, v0.13.0), ~70 merged PRs, ~1327 tests,
-no production rollback events. Three backend protocols shipped
-(MemoryBackend, LLMBackend, JudgeBackend) with parametrized
-conformance suites.
+The shape of the project so far (snapshot at the time of original capture,
+2026-05-09): 4 published tags (v0.1.0 retroactive, v0.9.0 retroactive,
+v0.10.0, v0.13.0), ~70 merged PRs, ~1327 tests, no production rollback
+events. Three backend protocols shipped at that point (MemoryBackend,
+LLMBackend, JudgeBackend); today seven are shipped (MemoryBackend,
+LLMBackend, JudgeBackend, LockBackend, LogBackend, AgentProfileBackend,
+ToolRegistryBackend) with parametrized conformance suites and 1953+ tests
+— see the empirical record table below for arc-by-arc evidence of how the
+methodology held across them.
 
 ---
 
 ## The biggest method: review in rounds, not passes
 
-Most teams treat code review as one pass. This project does 3-5 rounds per
-non-trivial PR. Recent examples:
+Most teams treat code review as one pass. This project does 2-5 rounds per
+non-trivial PR — 2 is the minimum for non-trivial diffs (let the round-1 fix
+commit become its own review surface in round 2), 3-5 when the diff is large
+or the round-1 fix is substantial. The rounds-not-passes discipline holds
+even on docs-only PRs. Recent examples:
 
 - **PR #75 (`atomic-agents doctor`)** — 3 rounds, 9 P2 findings closed.
 - **PR #76 (SemVer policy + upgrade runbook)** — 5 rounds, 11 P2 findings closed.
+- **PR #206 (#64 PR 4 — docs-only spec lock + status refresh)** — **2 rounds, 11 findings + 1 new successor issue (#207).** Round 1 caught 5 (P1 numerical drift, P2 stale tense, P2 marketing voice, P3 skip-count, P3 MUST #4 conflation). **Round 2 caught 6 residuals round 1 missed PLUS a count-drift that the round-1 fix commit itself introduced** ("96 → 115 test sites"), plus 1 new P2 (unpinned Tier B conformance gap → filed inline as #207). Round 2's count-drift catch is the load-bearing empirical evidence: each round catches different things not because the reviewer tries harder, but because **each fix changes the diff and exposes new edges**.
 
-The non-obvious property: **each round catches different things.** Not because
-the reviewer "tries harder" the second time. Because each fix changes the
-diff and exposes new edges. Round 5 of PR #76 was the only round that flagged
-the `No migrations needed` claim — earlier rounds had cleared the diff that
-contained it.
+The non-obvious property: **each round catches different things.** Round 5 of
+PR #76 was the only round that flagged the `No migrations needed` claim —
+earlier rounds had cleared the diff that contained it. Round 2 of PR #206 was
+the only round that could have caught the count-drift, because round 1's fix
+commit was what introduced it.
+
+**Even on docs-only PRs.** The PR #206 evidence is the clean empirical case
+for "rounds-not-passes even when no code changed." Don't downgrade the
+review cadence because the diff is markdown — markdown drift is the same
+shape as code drift, and a single-pass review on a fix commit cannot catch
+what that fix commit introduces.
 
 Sequential refinement is qualitatively different from one thorough pass.
 Plan for it.
@@ -36,38 +50,46 @@ amortises against the compounding correctness payoff.
 
 ---
 
-## Codex as a real outside voice — not Claude-roleplaying-Claude
+## Reviewer roster — what the project actually does
 
-Reviews use the OpenAI Codex CLI, which pulls the actual diff via `git`,
-reads files itself, and runs its own commands. **It is a different model
-family with different blind spots.** When Codex and Claude agree on a
-finding, that's high-confidence. When Codex catches something Claude
-missed, that's the whole point.
+The early v0.x convention was "Codex first, fall back to Claude / Kimi if
+Codex hangs." The actual practice across the last five protocol arcs is the
+opposite: **the Opus adversarial subagent is the default reviewer, Codex is
+skipped per the standing project rule.** Documenting reality here so future
+sessions don't try to re-prove the deferred convention.
 
-Empirically: 3 rounds is sufficient for most diffs. We hit OpenAI's usage
-cap on the 4th round of one PR; the prior 3 rounds had already covered the
-same code thoroughly enough to ship.
+The empirical record across recent arcs:
 
-The wrong version of this practice is "ask Claude to imagine being a
-reviewer." That's prompting; this is verification.
+| Arc | PRs | Codex run? | Opus subagent run? | Findings caught pre-merge |
+|---|---|---|---|---|
+| #112 JudgeBackend | #162–#171, #174, #178 | Skipped (standing rule) | Every PR | P0 uncaught `JudgePolicyInvalid` at both `validate_amended_args` call sites; P1 `allow` semantic silently demoted in Step 9.1 patch; several P2/P3 |
+| #60 LockBackend | #180–#184 | Skipped | Every PR | `RedisLockBackend` heartbeat lease-expiry race (`LockLost` detection); daemon-thread teardown shape |
+| #61 LogBackend | #185–#188 | Skipped | Every PR | P0 cross-agent log isolation (`LogQuery.agent_name` filter) REPRODUCED; P0 cold-start schema race REPRODUCED via concurrent backend init |
+| #63 AgentProfileBackend | #192–#195 | Skipped | Every PR | F-3 cross-agent path-traversal in `list_snapshots`/`restore` REPRODUCED; F-8 48-bit snapshot id entropy budget; 6 P0/P1 across the arc |
+| #64 ToolRegistryBackend | #197–#199, #206 | Skipped | Every PR | **12 P0/P1 REPRODUCED across PRs 1-3** — REPRODUCED YAML alias-bomb DoS at 33 GB RSS, REPRODUCED control-char log-injection, REPRODUCED `chmod-000 tools/` blocks every agent, REPRODUCED TOCTOU install race 50/50, REPRODUCED multi-process WAL race 3/5, REPRODUCED URL credential leak. PR 4 docs-only added 11 findings + 1 new successor issue (#207) across 2 rounds (the docs-only P1 numerical drift is excluded from the 12-count). |
 
-### Reviewer roster (when to reach for which)
+That's five consecutive arcs with Codex skipped and the Opus subagent doing
+the load-bearing review — every arc produced multiple P0 / P1 findings from
+the subagent pass, and the #61 / #63 / #64 arcs in particular produced
+**REPRODUCED** findings (race conditions / data-corruption shapes where the
+adversarial subagent ran the reproducer and confirmed the failure mode
+pre-fix). Codex hasn't been re-validated since the #112-arc hang. The
+reviewer comparison table below reflects that.
 
-Three reviewers cover the cross-family slot today. They are *not*
-interchangeable — pick the one whose blind spots are opposite to the
-author's.
+### Reviewer comparison table
 
 | Reviewer | Family | When to use | Caveats |
 |---|---|---|---|
-| `codex exec` / `codex review` | OpenAI (GPT) | **Default** for any non-trivial diff. Pulls git diff itself; reads files; runs commands; produces structured findings with high signal. | Has hung on multiple occasions during round 2-3 of large spec docs (PR #117 + #118); has session-level rate limits. When Codex is unavailable, fall back per below. |
-| Opus subagent + verify-against-code prompt | Anthropic (Claude) | Codex unavailable. Use as a same-family fallback with the verify-discipline system prompt that mirrors Codex's structured-findings shape. | Same model family as the author — catches less than a true cross-family reviewer would. Use as partial coverage, not substitute. Precedent: PR #118 audit-spec round 2. |
-| `atomic-agents review --backend kimi` | Moonshot | Codex unavailable AND you want genuine cross-family coverage. Calls Moonshot via the project's `_llm.py` client with the same verify-against-code system prompt. | Today's default model is `moonshot/moonshot-v1-128k` (non-thinking). In one empirical test (PR #145 cost-source filter) it caught 0 of 3 findings Opus caught and produced several hallucinated ones; use it as a *third* opinion alongside Opus, not as a primary reviewer. The Kimi K2.x thinking models are stronger reviewers but their output lives in a separate `reasoning_content` field not extracted by `_llm._call_moonshot` yet — tracked as a follow-up to ship with the LLMBackend protocol (#87). |
+| Opus adversarial subagent + verify-against-code prompt | Anthropic (Claude) | **Default** for every non-trivial PR — including docs-only PRs. Use the Step 11 adversarial brief: think like an attacker, find ways production fails, classify P0/P1/P2/P3, end with a `Recommendation:` line. Run in rounds (2-5), not one pass. | Same model family as the author — in theory catches less than a true cross-family reviewer would. In practice across 5 arcs has caught REPRODUCED P0/P1 findings every arc. The "same-family blind spot" risk is real but bounded; cross-family coverage is the deferred-not-deleted backup. |
+| `codex exec` / `codex review` | OpenAI (GPT) | **Deprecated default.** Skipped per the standing project rule since the #112-arc hang. Worth re-evaluating when a session has time to verify Codex is responsive AND the diff is large enough (~500+ LOC) to justify the cross-family overhead. | Has hung on multiple occasions during round 2-3 of large spec docs (PR #117 + #118); has session-level rate limits. The five-arc Opus-subagent track record is the data; before re-instating Codex as default, run a verified Codex round alongside an Opus round on the same PR and compare findings. |
+| `atomic-agents review --backend kimi` | Moonshot | Codex unavailable AND the reviewer wants a genuine cross-family second opinion. Calls Moonshot via the project's `_llm.py` client with the same verify-against-code system prompt. | Today's default model is `moonshot/moonshot-v1-128k` (non-thinking). In one empirical test (PR #145 cost-source filter) it caught 0 of 3 findings Opus caught and produced several hallucinated ones; use it as a *third* opinion alongside Opus, not as a primary reviewer. The Kimi K2.x thinking models are stronger reviewers but their output lives in a separate `reasoning_content` field not extracted by `_llm._call_moonshot` yet — tracked as a follow-up to ship with the LLMBackend protocol (#87). |
 
-**Decision rule.** Always run Codex first. If Codex hangs / rate-limits /
-errors twice in a row, run Opus subagent (catches more issues per call than
-Kimi today) AND Kimi (cross-family coverage even at lower quality). Two
-weaker reviewers in parallel still beat one strong reviewer alone for
-finding blind-spot misses.
+**Decision rule.** Run the Opus subagent on every non-trivial PR — including
+docs-only PRs — in rounds (2 minimum for non-trivial diffs, 3+ when the
+round-1 fix is large enough to be its own review surface). Codex is the
+deferred cross-family backup; re-instate when a session can verify
+responsiveness on a small probe before committing to a full review pass.
+Kimi is third-opinion-only.
 
 **Setup notes for Kimi.** Reads `MOONSHOT_API_KEY` (or
 `ATOMIC_AGENTS_MOONSHOT_KEY`) from env, or `atomic-agents-moonshot` from
@@ -81,6 +103,51 @@ the operator's Moonshot API key AND the full review prompt (including any
 `--read-files` contents) are sent. Don't set it to a host you don't trust.
 Anthropic and OpenAI clients in `_llm.py` don't expose the same per-call
 endpoint override, so this is a new affordance the wrapper introduces.
+
+---
+
+## Plan-subagent — pre-implementation design review
+
+A second-layer review surface added in the #63/#64 arcs: **a plan subagent
+that runs BEFORE implementation**, takes the implementation plan as input,
+and surfaces architectural risks the Step 11 adversarial would catch only
+after the code is written. Five SEVERE risks caught pre-implementation
+across two arcs:
+
+- **#63 PR 3** — 2 SEVERE risks. **Snapshot non-atomicity**: original
+  design called for `shutil.copytree` to snapshot an agent's directory
+  tree — but a crash mid-copy leaves the agent partially snapshotted, and
+  `copytree(snapshot_dir, agent_root, dirs_exist_ok=True)` on restore has
+  no good atomicity story either. Switched to JSON-based snapshot trio
+  (serialize `AgentProfile.to_dict()` once; restore via
+  `AgentProfile.from_dict()` + the backend's existing atomic
+  `save_profile()`). **Conformance helper trap**: the previous
+  `make_agent_dir`-only helper writes filesystem state which SQLite's
+  `load_profile` can't see — would have broken ~20 of the parametrized
+  conformance tests when SQLite landed. Added `make_agent_in_backend`
+  (uses the Protocol surface `save_profile`) pre-implementation.
+- **#64 PR 3** — 3 SEVERE risks. **Risk A**: base64-encoded handler source +
+  `exec()` would have silently broken closures, module-level `import`
+  statements, top-level resource setup (`session = requests.Session()`).
+  Switched to hybrid metadata-in-SQL + handler-bodies-on-disk under
+  `<handlers_root>/<agent_scope>/<name>.py` using `importlib.util.
+  spec_from_file_location`. **Risk D**: schema `PRIMARY KEY (name)` would
+  have collided across `agent_scope` values → switched to composite
+  `PRIMARY KEY (agent_scope, name)`. **Risk J**: parametrized conformance
+  suite needed a `make_tool_in_backend` helper to dispatch per-backend-shape
+  BEFORE SQLite landed → added pre-implementation (same shape as #63 PR 3's
+  helper-trap catch).
+
+All five would likely have surfaced in Step 11 adversarial post-
+implementation, but at the cost of a re-architecture cycle when they did.
+**The plan-subagent is genuinely additive to Step 11 — runs at the
+cheapest possible time, before code is written.** Empirically ratified
+across two arcs.
+
+When to invoke: any PR introducing a new Protocol, a new storage shape, a
+new lifecycle hook, or any change that touches the agent-construction or
+agent-dispatch path. Skip for one-line atomic-primitive fixes (e.g., the
+#208 SQLiteLogBackend cold-start race fix didn't need it).
 
 ---
 
@@ -285,9 +352,10 @@ that's arriving.**
 
 - **Maximum velocity.** A 5-round review cycle is slower than a 1-round
   review cycle. The compensation is shipped correctness, not raw throughput.
-- **Cheap reviews.** Each Codex round is real spend. The compensation is
-  9-11 P2 findings closed pre-merge per non-trivial PR, which would
-  otherwise be field issues.
+- **Cheap reviews.** Each adversarial round is real spend (Opus subagent
+  tokens for the default reviewer; Codex tokens when the cross-family
+  backup is re-instated). The compensation is 9-11 P2 findings closed
+  pre-merge per non-trivial PR, which would otherwise be field issues.
 - **Brevity.** PR bodies are large. CHANGELOG entries are detailed. Spec
   docs are exhaustive. The compensation is durable institutional memory
   that survives the maintainer's session — and eventually, the maintainer.
