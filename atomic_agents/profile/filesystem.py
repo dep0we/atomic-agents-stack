@@ -59,6 +59,7 @@ from .._tools import (
 from ..exceptions import (
     AgentProfileExists,
     AgentProfileNotFound,
+    MCPServerConnectFailed,
 )
 from ..goal import parse_agent_mode
 from ..judges_md import load_judges_config
@@ -244,20 +245,25 @@ class FilesystemAgentProfileBackend:
             mcp_md_path.read_text(encoding="utf-8") if mcp_md_path.is_file() else ""
         )
         # Pass read_paths so path-traversal validation matches the live
-        # bootstrap behavior. parse_mcp_md_text raises if env var refs
-        # can't be resolved; for load purposes we accept that — the same
-        # failure mode AtomicAgent.__init__ has today.
+        # bootstrap behavior. parse_mcp_md raises if env var refs can't be
+        # resolved; for load purposes we accept that single failure mode
+        # so a profile referencing dev-only env vars is still inspectable
+        # in a fresh process. The raw text on the profile is preserved
+        # so the operator can write back without losing the references.
+        #
+        # NARROW catch: only ``MCPServerConnectFailed`` — the env-var-
+        # resolution failure shape parse_mcp_md raises at line 562-565.
+        # ``PathTraversalError`` (mcp.md server arg escaping read_paths)
+        # is a security finding and MUST propagate — silently returning
+        # ``mcp_servers = []`` would mask malicious server declarations
+        # at load time. Pre-#63-PR-1-review-pass this was ``except
+        # Exception`` which swallowed both — Step 9 pre-landing review
+        # finding F-3.
         try:
             mcp_servers = parse_mcp_md(
                 mcp_md_path, read_paths=tool_config.get("read_paths")
             )
-        except Exception:
-            # Defensive: if the on-disk mcp.md references env vars that
-            # aren't set in this process, fall back to an empty list
-            # rather than aborting load_profile entirely. The raw text
-            # is preserved so the operator can still inspect / write
-            # back without losing the references. This matches the
-            # spirit of RunRecord.from_dict's permissive shape.
+        except MCPServerConnectFailed:
             mcp_servers = []
 
         # ── persona/IDENTITY.md, SOUL.md, USER.md — raw text ──
