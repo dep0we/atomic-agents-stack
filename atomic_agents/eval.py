@@ -25,10 +25,9 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import datetime, date
 from pathlib import Path
-from typing import Any
 
 _log = logging.getLogger(__name__)
 
@@ -38,20 +37,22 @@ from . import _llm, _costs
 from ._io import atomic_write, atomic_append_jsonl
 from ._platform import get_agents_root
 from .agent import AtomicAgent
+from .logs import LogBackend
+from .profile import AgentProfileBackend
 from .exceptions import (
     AtomicAgentsError,
     NoJudgeAvailable,
-    SchemaValidationError,
 )
 
 
 @dataclass
 class EvalTest:
     """One golden test case."""
+
     test_id: str
     category: str
     path: Path
-    setup: str               # markdown body of the Setup section
+    setup: str  # markdown body of the Setup section
     input: str
     expected_behavior: str
     pass_criteria: str
@@ -62,18 +63,23 @@ class EvalTest:
 @dataclass
 class EvalResult:
     """Outcome of running one EvalTest."""
+
     test_id: str
     category: str
     agent_model: str
     judge_model: str
-    scores: dict[str, int]              # {dimension: score 1-5}
+    scores: dict[str, int]  # {dimension: score 1-5}
     score_justifications: dict[str, str]  # {dimension: one-sentence rationale}
     weighted_score: float
     hard_fails: list[str]
-    verdict: str                         # 'pass' | 'fail' | 'judge_error'
+    verdict: str  # 'pass' | 'fail' | 'judge_error'
     overall_justification: str
-    factual_checks: list[dict] = field(default_factory=list)  # populated when expected_facts present
-    clamped_scores: list[dict] = field(default_factory=list)  # records out-of-range judge scores: [{dimension, raw, clamped}]
+    factual_checks: list[dict] = field(
+        default_factory=list
+    )  # populated when expected_facts present
+    clamped_scores: list[dict] = field(
+        default_factory=list
+    )  # records out-of-range judge scores: [{dimension, raw, clamped}]
     agent_response: str = ""
     agent_input_tokens: int = 0
     agent_output_tokens: int = 0
@@ -81,15 +87,16 @@ class EvalResult:
     judge_input_tokens: int = 0
     judge_output_tokens: int = 0
     judge_cost_usd: float = 0.0
-    judge_raw: str = ""                  # full judge output, for debugging
-    error: str = ""                      # populated on agent or judge failure
+    judge_raw: str = ""  # full judge output, for debugging
+    error: str = ""  # populated on agent or judge failure
     timestamp: str = ""
-    setup_applied: bool = False          # True when test.setup was prepended to work item
+    setup_applied: bool = False  # True when test.setup was prepended to work item
 
 
 @dataclass
 class SuiteResults:
     """Aggregate results from running multiple tests."""
+
     agent: str
     run_date: str
     tests_run: int
@@ -109,11 +116,23 @@ class EvalRunner:
         agents_root: Path | None = None,
         agent_name: str = "",
         today: date | None = None,
+        *,
+        log_backend: "LogBackend | None" = None,
+        profile_backend: "AgentProfileBackend | None" = None,
     ):
         self.agents_root = agents_root or get_agents_root()
         self.agent_name = agent_name
         self.today = today or date.today()
         self.evals_dir = self.agents_root / agent_name / "evals"
+        # #63 PR 2 — backend forwarding. EvalRunner previously had a
+        # pre-existing log_backend drop-trap (the #61 LogBackend arc's
+        # PR 2 wired OutcomeRunner + DreamRunner but missed EvalRunner).
+        # PR 2 of #63 fixes BOTH gaps at once: any operator-pinned
+        # log_backend OR profile_backend survives the runner→agent
+        # construction boundary at line 297. ``None`` means: defer to
+        # the agent's own env-var-resolved default.
+        self._log_backend = log_backend
+        self._profile_backend = profile_backend
 
         if not self.evals_dir.exists():
             raise AtomicAgentsError(
@@ -134,7 +153,9 @@ class EvalRunner:
             raise AtomicAgentsError(f"Rubric not found at {path}")
         parsed = frontmatter.load(path)
         meta = parsed.metadata
-        self.weights: dict[str, float] = {k: float(v) for k, v in meta.get("weights", {}).items()}
+        self.weights: dict[str, float] = {
+            k: float(v) for k, v in meta.get("weights", {}).items()
+        }
         self.threshold_pass: float = float(meta.get("threshold_pass", 4.0))
         self.rubric_body: str = parsed.content
         if not self.weights:
@@ -151,7 +172,9 @@ class EvalRunner:
         meta = parsed.metadata
         rec = meta.get("recommended_judge", {})
         self.judge_cross_family: list[str] = list(rec.get("cross_family", []))
-        self.judge_same_family_fallback: list[str] = list(rec.get("same_family_fallback", []))
+        self.judge_same_family_fallback: list[str] = list(
+            rec.get("same_family_fallback", [])
+        )
         self.strict_mode: bool = bool(meta.get("strict_mode", True))
         self.audit_sample_pct: float = float(meta.get("audit_sample_pct", 0.10))
         self.judge_template: str = parsed.content
@@ -211,11 +234,15 @@ class EvalRunner:
             test_id=test_id,
             category=category,
             path=path,
-            setup=sections.get("Setup (vault state for this test)", sections.get("Setup", "")),
+            setup=sections.get(
+                "Setup (vault state for this test)", sections.get("Setup", "")
+            ),
             input=sections.get("Input", ""),
             expected_behavior=sections.get("Expected behavior", ""),
-            pass_criteria=sections.get("Pass criteria (rubric thresholds + hard-fail checks)",
-                                       sections.get("Pass criteria", "")),
+            pass_criteria=sections.get(
+                "Pass criteria (rubric thresholds + hard-fail checks)",
+                sections.get("Pass criteria", ""),
+            ),
             expected_facts=list(meta.get("expected_facts", [])),
             notes=sections.get("Notes", ""),
         )
@@ -293,35 +320,50 @@ class EvalRunner:
             work_item = test.input
             setup_applied = False
 
-        # 1. Run the agent against the (possibly setup-prepended) work item
+        # 1. Run the agent against the (possibly setup-prepended) work item.
+        # Thread the operator's pinned backends through so they survive
+        # the runner→agent construction boundary (#63 PR 2 + drop-trap
+        # fix for the pre-existing log_backend gap).
         agent = AtomicAgent(
             name=self.agent_name,
             trigger="eval",
             agents_root=self.agents_root,
+            log_backend=self._log_backend,
+            profile_backend=self._profile_backend,
         )
         try:
             agent_response = agent.call(work_item=work_item, write_captures=False)
         except Exception as e:
             return EvalResult(
-                test_id=test.test_id, category=test.category,
-                agent_model=agent.config.default_model, judge_model="(not invoked)",
-                scores={}, score_justifications={},
-                weighted_score=0.0, hard_fails=["agent_error"],
+                test_id=test.test_id,
+                category=test.category,
+                agent_model=agent.config.default_model,
+                judge_model="(not invoked)",
+                scores={},
+                score_justifications={},
+                weighted_score=0.0,
+                hard_fails=["agent_error"],
                 verdict="fail",
                 overall_justification=f"Agent crashed: {e}",
-                error=str(e), timestamp=ts_str,
+                error=str(e),
+                timestamp=ts_str,
                 setup_applied=setup_applied,
             )
 
         if agent_response.skipped:
             return EvalResult(
-                test_id=test.test_id, category=test.category,
-                agent_model=agent.config.default_model, judge_model="(skipped)",
-                scores={}, score_justifications={},
-                weighted_score=0.0, hard_fails=[],
+                test_id=test.test_id,
+                category=test.category,
+                agent_model=agent.config.default_model,
+                judge_model="(skipped)",
+                scores={},
+                score_justifications={},
+                weighted_score=0.0,
+                hard_fails=[],
                 verdict="judge_error",
                 overall_justification=f"Agent run skipped: {agent_response.skip_reason}",
-                error=agent_response.skip_reason, timestamp=ts_str,
+                error=agent_response.skip_reason,
+                timestamp=ts_str,
                 setup_applied=setup_applied,
             )
 
@@ -330,13 +372,18 @@ class EvalRunner:
             judge_model = self.pick_judge_model(agent_response.model)
         except NoJudgeAvailable as e:
             return EvalResult(
-                test_id=test.test_id, category=test.category,
-                agent_model=agent_response.model, judge_model="(none)",
-                scores={}, score_justifications={},
-                weighted_score=0.0, hard_fails=[],
+                test_id=test.test_id,
+                category=test.category,
+                agent_model=agent_response.model,
+                judge_model="(none)",
+                scores={},
+                score_justifications={},
+                weighted_score=0.0,
+                hard_fails=[],
                 verdict="judge_error",
                 overall_justification=str(e),
-                error=str(e), timestamp=ts_str,
+                error=str(e),
+                timestamp=ts_str,
                 setup_applied=setup_applied,
             )
 
@@ -353,17 +400,22 @@ class EvalRunner:
             )
         except Exception as e:
             return EvalResult(
-                test_id=test.test_id, category=test.category,
-                agent_model=agent_response.model, judge_model=judge_model,
-                scores={}, score_justifications={},
-                weighted_score=0.0, hard_fails=[],
+                test_id=test.test_id,
+                category=test.category,
+                agent_model=agent_response.model,
+                judge_model=judge_model,
+                scores={},
+                score_justifications={},
+                weighted_score=0.0,
+                hard_fails=[],
                 verdict="judge_error",
                 overall_justification=f"Judge call failed: {e}",
                 agent_response=agent_response.text,
                 agent_input_tokens=agent_response.input_tokens,
                 agent_output_tokens=agent_response.output_tokens,
                 agent_cost_usd=agent_response.cost_usd,
-                error=str(e), timestamp=ts_str,
+                error=str(e),
+                timestamp=ts_str,
                 setup_applied=setup_applied,
             )
 
@@ -374,7 +426,7 @@ class EvalRunner:
         # 4. Parse judge JSON
         try:
             scores_dict = self._parse_judge_response(judge_response.text)
-        except Exception as e:
+        except Exception:
             # One retry with stricter prompt
             try:
                 stricter = (
@@ -382,22 +434,32 @@ class EvalRunner:
                     + "\n\nIMPORTANT: Output ONLY valid JSON. No markdown, no prose, no code fences."
                 )
                 judge_response_2 = _llm.call_llm(
-                    model=judge_model, system_prompt="",
+                    model=judge_model,
+                    system_prompt="",
                     messages=[{"role": "user", "content": stricter}],
-                    max_tokens=2048, temperature=0.0,
+                    max_tokens=2048,
+                    temperature=0.0,
                 )
                 scores_dict = self._parse_judge_response(judge_response_2.text)
                 _retry_cost, _ = _costs.calc_cost(
-                    judge_model, judge_response_2.input_tokens, judge_response_2.output_tokens
+                    judge_model,
+                    judge_response_2.input_tokens,
+                    judge_response_2.output_tokens,
                 )
                 judge_cost += _retry_cost
-                judge_response.text = judge_response_2.text  # use the cleaner output for the record
+                judge_response.text = (
+                    judge_response_2.text
+                )  # use the cleaner output for the record
             except Exception as e2:
                 return EvalResult(
-                    test_id=test.test_id, category=test.category,
-                    agent_model=agent_response.model, judge_model=judge_model,
-                    scores={}, score_justifications={},
-                    weighted_score=0.0, hard_fails=[],
+                    test_id=test.test_id,
+                    category=test.category,
+                    agent_model=agent_response.model,
+                    judge_model=judge_model,
+                    scores={},
+                    score_justifications={},
+                    weighted_score=0.0,
+                    hard_fails=[],
                     verdict="judge_error",
                     overall_justification=f"Judge returned malformed JSON twice: {e2}",
                     agent_response=agent_response.text,
@@ -408,7 +470,8 @@ class EvalRunner:
                     judge_output_tokens=judge_response.output_tokens,
                     judge_cost_usd=judge_cost,
                     judge_raw=judge_response.text,
-                    error=str(e2), timestamp=ts_str,
+                    error=str(e2),
+                    timestamp=ts_str,
                     setup_applied=setup_applied,
                 )
 
@@ -427,16 +490,24 @@ class EvalRunner:
             category=test.category,
             agent_model=agent_response.model,
             judge_model=judge_model,
-            scores={k: v["score"] for k, v in scores_dict.items()
-                    if isinstance(v, dict) and "score" in v},
-            score_justifications={k: v.get("justification", "") for k, v in scores_dict.items()
-                                   if isinstance(v, dict)},
+            scores={
+                k: v["score"]
+                for k, v in scores_dict.items()
+                if isinstance(v, dict) and "score" in v
+            },
+            score_justifications={
+                k: v.get("justification", "")
+                for k, v in scores_dict.items()
+                if isinstance(v, dict)
+            },
             weighted_score=round(weighted, 2),
             hard_fails=hard_fails,
             verdict=verdict,
-            overall_justification=scores_dict.get("overall", {}).get("justification", "")
-                                  if isinstance(scores_dict.get("overall"), dict)
-                                  else "",
+            overall_justification=scores_dict.get("overall", {}).get(
+                "justification", ""
+            )
+            if isinstance(scores_dict.get("overall"), dict)
+            else "",
             factual_checks=list(scores_dict.get("factual_checks", [])),
             clamped_scores=clamped_scores,
             agent_response=agent_response.text,
@@ -463,9 +534,12 @@ class EvalRunner:
             return SuiteResults(
                 agent=self.agent_name,
                 run_date=self.today.isoformat(),
-                tests_run=0, tests_passed=0,
-                avg_weighted_score=0.0, hard_fails_total=0,
-                total_cost_usd=0.0, total_duration_s=0.0,
+                tests_run=0,
+                tests_passed=0,
+                avg_weighted_score=0.0,
+                hard_fails_total=0,
+                total_cost_usd=0.0,
+                total_duration_s=0.0,
             )
 
         start = time.time()
@@ -480,8 +554,7 @@ class EvalRunner:
         passed = sum(1 for r in results if r.verdict == "pass")
         scored = [r for r in results if r.verdict in ("pass", "fail") and r.scores]
         avg_score = (
-            sum(r.weighted_score for r in scored) / len(scored)
-            if scored else 0.0
+            sum(r.weighted_score for r in scored) / len(scored) if scored else 0.0
         )
         hard_fails = sum(len(r.hard_fails) for r in results)
         total_cost = sum(r.agent_cost_usd + r.judge_cost_usd for r in results)
@@ -528,7 +601,9 @@ class EvalRunner:
                 f"## Agent's response\n\n{agent_response}"
             )
         if test.expected_facts:
-            base = base + "\n\n" + self._render_factual_check_section(test.expected_facts)
+            base = (
+                base + "\n\n" + self._render_factual_check_section(test.expected_facts)
+            )
         return base
 
     @staticmethod
@@ -547,7 +622,7 @@ class EvalRunner:
             expected = f.get("expected_value", "")
             bullets.append(
                 f'- claim: "{claim}"\n'
-                f'  source: {source}\n'
+                f"  source: {source}\n"
                 f'  expected_value: "{expected}"'
             )
         bullet_text = "\n".join(bullets)
@@ -588,9 +663,7 @@ class EvalRunner:
             text = text.strip()
         return json.loads(text)
 
-    def _compute_weighted_score(
-        self, scores_dict: dict
-    ) -> tuple[float, list[dict]]:
+    def _compute_weighted_score(self, scores_dict: dict) -> tuple[float, list[dict]]:
         """Apply rubric weights to the judge's per-dimension scores.
 
         Per spec/13 Layer 2: when the rubric declares ``factual_accuracy`` as
@@ -650,9 +723,12 @@ class EvalRunner:
                 _log.warning(
                     "eval: judge returned non-numeric score %r for dimension %r — "
                     "skipping dimension",
-                    raw_value, dim,
+                    raw_value,
+                    dim,
                 )
-                clamped_scores.append({"dimension": dim, "raw": raw_value, "clamped": None})
+                clamped_scores.append(
+                    {"dimension": dim, "raw": raw_value, "clamped": None}
+                )
                 continue
 
             # Clamp to valid rubric range [1, 5].
@@ -661,9 +737,15 @@ class EvalRunner:
                 _log.warning(
                     "eval: judge score %.3g for dimension %r is outside valid range "
                     "[%g, %g]; clamping to %.3g",
-                    score, dim, _SCORE_MIN, _SCORE_MAX, clamped,
+                    score,
+                    dim,
+                    _SCORE_MIN,
+                    _SCORE_MAX,
+                    clamped,
                 )
-                clamped_scores.append({"dimension": dim, "raw": raw_value, "clamped": clamped})
+                clamped_scores.append(
+                    {"dimension": dim, "raw": raw_value, "clamped": clamped}
+                )
                 score = clamped
 
             total += score * weight_pct
@@ -764,6 +846,7 @@ def compute_factual_accuracy_from_checks(checks: list[dict]) -> float | None:
 # ──────────────────────────────────────────────────────────────────
 # Helpers
 
+
 def _extract_sections(markdown_body: str) -> dict[str, str]:
     """Parse a markdown body into {section_header: section_content}.
 
@@ -792,6 +875,7 @@ def _provider_available(model_id: str) -> bool:
     Doesn't actually call the API — just checks key sources in priority order.
     """
     import os
+
     if model_id.startswith("claude-"):
         env_vars = ["ATOMIC_AGENTS_ANTHROPIC_KEY", "ANTHROPIC_API_KEY"]
         keychain = "atomic-agents-anthropic"
@@ -815,15 +899,30 @@ def _provider_available(model_id: str) -> bool:
     # Source 2: macOS Keychain
     if os.uname().sysname == "Darwin":
         import subprocess
+
         try:
             result = subprocess.run(
-                ["security", "find-generic-password",
-                 "-a", os.environ.get("USER", ""), "-s", keychain, "-w"],
-                capture_output=True, text=True, check=True, timeout=2,
+                [
+                    "security",
+                    "find-generic-password",
+                    "-a",
+                    os.environ.get("USER", ""),
+                    "-s",
+                    keychain,
+                    "-w",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=2,
             )
             if result.stdout.strip():
                 return True
-        except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        except (
+            FileNotFoundError,
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+        ):
             pass
 
     # Source 3: config file
@@ -842,6 +941,7 @@ def _provider_available(model_id: str) -> bool:
 # ──────────────────────────────────────────────────────────────────
 # CLI entry: python -m atomic_agents.eval
 
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
     import sys
@@ -851,22 +951,34 @@ def main(argv: list[str] | None = None) -> int:
         description="Run an agent against golden tests; score via LLM-as-judge",
     )
     parser.add_argument("agent", help="agent name (folder under agents-root)")
-    parser.add_argument("--category", choices=["happy", "edge", "adversarial", "decline"],
-                        help="run only one category of tests")
+    parser.add_argument(
+        "--category",
+        choices=["happy", "edge", "adversarial", "decline"],
+        help="run only one category of tests",
+    )
     parser.add_argument("--test", help="run a single test by test_id")
-    parser.add_argument("--all", action="store_true",
-                        help="run the full suite (default if no --test or --category)")
-    parser.add_argument("--summary-only", action="store_true",
-                        help="print only pass/fail counts, not per-test details")
-    parser.add_argument("--no-write", action="store_true",
-                        help="don't write results to evals/runs/")
-    parser.add_argument("--agents-root", default=None,
-                        help="override ATOMIC_AGENTS_ROOT")
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="run the full suite (default if no --test or --category)",
+    )
+    parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="print only pass/fail counts, not per-test details",
+    )
+    parser.add_argument(
+        "--no-write", action="store_true", help="don't write results to evals/runs/"
+    )
+    parser.add_argument(
+        "--agents-root", default=None, help="override ATOMIC_AGENTS_ROOT"
+    )
     args = parser.parse_args(argv)
 
     agents_root = (
         Path(args.agents_root).expanduser().resolve()
-        if args.agents_root else get_agents_root()
+        if args.agents_root
+        else get_agents_root()
     )
 
     try:
@@ -894,8 +1006,10 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _print_test(r: "EvalResult", summary_only: bool = False) -> None:
-    status = "✅ pass" if r.verdict == "pass" else (
-        "❌ fail" if r.verdict == "fail" else "⚠ judge error"
+    status = (
+        "✅ pass"
+        if r.verdict == "pass"
+        else ("❌ fail" if r.verdict == "fail" else "⚠ judge error")
     )
     if summary_only:
         print(f"{r.test_id}  {status}  {r.weighted_score}")
@@ -922,8 +1036,10 @@ def _print_suite(s: "SuiteResults", summary_only: bool = False) -> None:
     print("═" * 60)
     if not summary_only:
         for r in s.results:
-            status = "✅ pass" if r.verdict == "pass" else (
-                "❌ fail" if r.verdict == "fail" else "⚠ judge error"
+            status = (
+                "✅ pass"
+                if r.verdict == "pass"
+                else ("❌ fail" if r.verdict == "fail" else "⚠ judge error")
             )
             cat_label = f"({r.category})"
             print(f"  {r.test_id:<40} {cat_label:<14} {r.weighted_score:>4}  {status}")
@@ -938,4 +1054,5 @@ def _print_suite(s: "SuiteResults", summary_only: bool = False) -> None:
 
 if __name__ == "__main__":
     import sys
+
     sys.exit(main())

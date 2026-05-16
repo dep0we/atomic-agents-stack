@@ -46,24 +46,23 @@ import json
 import os
 import secrets
 import shutil
-import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from datetime import date, datetime, time as dt_time, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .logs import LogBackend
+    from .profile import AgentProfileBackend
 
 import frontmatter
 
 from . import _costs, _llm, _model
-from ._capture import _render_note, _update_index
+from ._capture import _render_note
 from ._io import atomic_write
 from .locks import (
     LockBackend,
     LockBusy,
-    LockLost,
     check_lock_lost,
     get_default_lock_backend,
 )
@@ -77,11 +76,13 @@ from .types import Capture
 # any sequence of alphanumeric + underscore + hyphen with no path separators.
 # This prevents path traversal via dream_id such as "../../persona".
 import re as _re
-_VALID_DREAM_ID_RE = _re.compile(r'^[a-zA-Z0-9_-]+$')
+
+_VALID_DREAM_ID_RE = _re.compile(r"^[a-zA-Z0-9_-]+$")
 
 
 # ──────────────────────────────────────────────────────────────────
 # Public data classes
+
 
 @dataclass
 class DreamInputs:
@@ -94,33 +95,33 @@ class DreamInputs:
 
 @dataclass
 class ConsolidatedNote:
-    new: str                   # filename of the consolidated note
-    supersedes: list[str]      # filenames of notes it replaces
-    reason: str                # one-sentence explanation
+    new: str  # filename of the consolidated note
+    supersedes: list[str]  # filenames of notes it replaces
+    reason: str  # one-sentence explanation
 
 
 @dataclass
 class PromotedNote:
     new: str
-    from_journal_entries: list[str]   # journal file names
+    from_journal_entries: list[str]  # journal file names
     reason: str
 
 
 @dataclass
 class StaleMarking:
     note: str
-    new_expires_at: str        # ISO date
+    new_expires_at: str  # ISO date
 
 
 @dataclass
 class DreamResult:
     dream_id: str
     agent_name: str
-    status: str                # pending | running | completed | failed | canceled
+    status: str  # pending | running | completed | failed | canceled
     model: str
     instructions: str
     inputs: DreamInputs
-    output_memory_count: int   # 0 until completed
+    output_memory_count: int  # 0 until completed
     consolidated: list[ConsolidatedNote]
     promoted: list[PromotedNote]
     marked_stale: list[StaleMarking]
@@ -154,6 +155,7 @@ class DreamResult:
 # ──────────────────────────────────────────────────────────────────
 # ID generation
 
+
 def _new_dream_id() -> str:
     ts = datetime.now().strftime("%Y-%m-%dT%H%M%S")
     hex6 = secrets.token_hex(3)
@@ -162,6 +164,7 @@ def _new_dream_id() -> str:
 
 # ──────────────────────────────────────────────────────────────────
 # Manifest I/O
+
 
 def _manifest_to_dict(result: DreamResult) -> dict:
     d = asdict(result)
@@ -200,6 +203,7 @@ def _read_manifest(dream_dir: Path) -> DreamResult:
 # ──────────────────────────────────────────────────────────────────
 # Input reading helpers
 
+
 def _read_memory_notes(agent_root: Path) -> list[dict]:
     """Return list of parsed notes from memory/. Each dict has filename, meta, body."""
     memory_dir = agent_root / "memory"
@@ -211,11 +215,13 @@ def _read_memory_notes(agent_root: Path) -> list[dict]:
             continue
         try:
             parsed = frontmatter.load(path)
-            notes.append({
-                "filename": path.name,
-                "meta": dict(parsed.metadata),
-                "body": parsed.content,
-            })
+            notes.append(
+                {
+                    "filename": path.name,
+                    "meta": dict(parsed.metadata),
+                    "body": parsed.content,
+                }
+            )
         except Exception:
             continue
     return notes
@@ -232,25 +238,27 @@ def _read_memory_notes_via_backend(backend: "FilesystemBackend") -> list[dict]:
         note = backend.read_note(ref.name)
         if note is None:
             continue
-        notes.append({
-            "filename": ref.name,
-            "meta": {
-                "type": note.type,
-                "name": note.name,
-                "description": note.description,
-                "confidence": note.confidence,
-                "sources": note.sources,
-                "captured": note.captured.isoformat() if note.captured else None,
-                "last_seen": note.last_seen.isoformat() if note.last_seen else None,
-                "pinned": note.pinned,
-                "archived": note.archived,
-                "superseded_by": note.superseded_by,
-                "expires_at": note.expires_at,
-                "tags": note.tags,
-                **note.extra_frontmatter,
-            },
-            "body": note.body,
-        })
+        notes.append(
+            {
+                "filename": ref.name,
+                "meta": {
+                    "type": note.type,
+                    "name": note.name,
+                    "description": note.description,
+                    "confidence": note.confidence,
+                    "sources": note.sources,
+                    "captured": note.captured.isoformat() if note.captured else None,
+                    "last_seen": note.last_seen.isoformat() if note.last_seen else None,
+                    "pinned": note.pinned,
+                    "archived": note.archived,
+                    "superseded_by": note.superseded_by,
+                    "expires_at": note.expires_at,
+                    "tags": note.tags,
+                    **note.extra_frontmatter,
+                },
+                "body": note.body,
+            }
+        )
     return notes
 
 
@@ -270,10 +278,12 @@ def _read_journal_entries(agent_root: Path, lookback_days: int) -> list[dict]:
         except (ValueError, TypeError):
             pass  # include if we can't parse the date
         try:
-            entries.append({
-                "filename": path.name,
-                "text": path.read_text(encoding="utf-8"),
-            })
+            entries.append(
+                {
+                    "filename": path.name,
+                    "text": path.read_text(encoding="utf-8"),
+                }
+            )
         except OSError:
             continue
     return entries
@@ -299,6 +309,7 @@ def _read_log_lines(
 
     if log_backend is not None:
         from .logs import LogQuery
+
         since_dt = datetime.combine(cutoff, dt_time.min).astimezone()
         records = []
         for rec in log_backend.query(LogQuery(since=since_dt, agent_name=agent_name)):
@@ -352,7 +363,9 @@ STALE_THRESHOLD_DAYS = 90
 STALE_EXPIRES_EXTEND_DAYS = 30
 
 
-def _detect_stale_notes(notes: list[dict], today: date | None = None) -> list[StaleMarking]:
+def _detect_stale_notes(
+    notes: list[dict], today: date | None = None
+) -> list[StaleMarking]:
     """Mechanical stale detection: notes older than threshold, not pinned."""
     today = today or date.today()
     cutoff = today - timedelta(days=STALE_THRESHOLD_DAYS)
@@ -377,8 +390,12 @@ def _detect_stale_notes(notes: list[dict], today: date | None = None) -> list[St
         except (ValueError, TypeError):
             continue
         if ls_date < cutoff:
-            new_expires = (today + timedelta(days=STALE_EXPIRES_EXTEND_DAYS)).isoformat()
-            markings.append(StaleMarking(note=note["filename"], new_expires_at=new_expires))
+            new_expires = (
+                today + timedelta(days=STALE_EXPIRES_EXTEND_DAYS)
+            ).isoformat()
+            markings.append(
+                StaleMarking(note=note["filename"], new_expires_at=new_expires)
+            )
     return markings
 
 
@@ -404,9 +421,13 @@ def _cluster_by_type_and_name(notes: list[dict]) -> list[list[dict]]:
             seed_tokens = _name_tokens(seed["meta"].get("name", seed["filename"]))
             remaining = []
             for candidate in ungrouped:
-                cand_tokens = _name_tokens(candidate["meta"].get("name", candidate["filename"]))
+                cand_tokens = _name_tokens(
+                    candidate["meta"].get("name", candidate["filename"])
+                )
                 if seed_tokens and cand_tokens:
-                    overlap = len(seed_tokens & cand_tokens) / min(len(seed_tokens), len(cand_tokens))
+                    overlap = len(seed_tokens & cand_tokens) / min(
+                        len(seed_tokens), len(cand_tokens)
+                    )
                     if overlap >= 0.5:
                         cluster.append(candidate)
                         continue
@@ -419,6 +440,7 @@ def _cluster_by_type_and_name(notes: list[dict]) -> list[list[dict]]:
 def _name_tokens(name: str) -> set[str]:
     """Lower-case word-tokens from a name string."""
     import re
+
     tokens = re.findall(r"[a-z0-9]+", name.lower())
     # Remove very short/common tokens
     stopwords = {"a", "an", "the", "is", "in", "at", "of", "to", "and", "or"}
@@ -431,7 +453,9 @@ def _name_tokens(name: str) -> set[str]:
 _HAIKU = "claude-haiku-4-5-20251001"
 
 
-def _build_duplicate_prompts(clusters: list[list[dict]]) -> tuple[list[str], list[list[dict]]]:
+def _build_duplicate_prompts(
+    clusters: list[list[dict]],
+) -> tuple[list[str], list[list[dict]]]:
     """Build one prompt per multi-note cluster. Return (prompts, matching_clusters)."""
     prompts = []
     active_clusters = []
@@ -480,7 +504,9 @@ def _build_contradiction_prompts(
     return prompts
 
 
-def _build_promotion_prompts(journal_entries: list[dict], notes: list[dict]) -> list[str]:
+def _build_promotion_prompts(
+    journal_entries: list[dict], notes: list[dict]
+) -> list[str]:
     """Build prompts to cluster journal entries and find promotion candidates."""
     if not journal_entries:
         return []
@@ -509,6 +535,7 @@ def _parse_helper_text(text: str) -> dict:
     text = text.strip()
     # Handle ```json ... ``` fences
     import re
+
     m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
     if m:
         text = m.group(1).strip()
@@ -521,6 +548,7 @@ def _parse_helper_text(text: str) -> dict:
 # ──────────────────────────────────────────────────────────────────
 # Output writing helpers
 
+
 def _write_note_to_dir(
     target_dir: Path,
     capture: Capture,
@@ -529,6 +557,7 @@ def _write_note_to_dir(
 ) -> str:
     """Write one memory note to target_dir. Returns the filename written."""
     from ._schema import derive_filename
+
     filename = derive_filename(capture.type, capture.name)
     target = target_dir / filename
     content = _render_note(capture, today)
@@ -543,8 +572,14 @@ def _write_note_to_dir(
     return filename
 
 
-def _copy_note_to_dir(target_dir: Path, filename: str, meta: dict, body: str, today: date,
-                      new_expires_at: str | None = None) -> str:
+def _copy_note_to_dir(
+    target_dir: Path,
+    filename: str,
+    meta: dict,
+    body: str,
+    today: date,
+    new_expires_at: str | None = None,
+) -> str:
     """Copy an existing note (possibly updating expires_at) to target_dir."""
     target = target_dir / filename
     if new_expires_at:
@@ -593,7 +628,7 @@ def _build_report(
     """Build the human-readable report.md content."""
     lines = ["# Dream Report\n"]
     lines.append(f"Generated: {datetime.now().isoformat()}\n")
-    lines.append(f"\n## Summary\n")
+    lines.append("\n## Summary\n")
     lines.append(f"- Consolidated: {len(consolidated)}")
     lines.append(f"- Promoted from journal: {len(promoted)}")
     lines.append(f"- Marked stale: {len(stale)}")
@@ -610,7 +645,9 @@ def _build_report(
         lines.append("\n## Promoted from Journal\n")
         for p in promoted:
             lines.append(f"### {p.new}")
-            lines.append(f"**From journal entries:** {', '.join(p.from_journal_entries)}")
+            lines.append(
+                f"**From journal entries:** {', '.join(p.from_journal_entries)}"
+            )
             lines.append(f"**Reason:** {p.reason}\n")
 
     if stale:
@@ -623,6 +660,7 @@ def _build_report(
 
 # ──────────────────────────────────────────────────────────────────
 # Cost estimation
+
 
 def _estimate_dream_cost(
     model: str,
@@ -655,6 +693,7 @@ def _check_cap(
     *,
     log_backend: "LogBackend | None" = None,
     agent_name: str | None = None,
+    model_config: dict | None = None,
 ) -> None:
     """Raise ValueError if reserved cost exceeds remaining headroom (unless critical).
 
@@ -662,14 +701,37 @@ def _check_cap(
     computed via the backend's ``query()`` rather than walking the
     filesystem directly. Honors the operator's pinned LogBackend
     (filesystem default; SQLiteLogBackend in PR 3 forward).
+
+    Per #63 PR 2 Decision 2: when ``model_config`` is provided, the
+    caps are read from the already-resolved dict (the same one
+    DreamRunner pulled from ``profile_backend.load_profile().model_config``)
+    instead of re-reading model.md from disk. This is the load-bearing
+    fix for Step 11 P1#3 — the cost-guardrail call site was the OTHER
+    model.md read in dream.py (alongside DreamRunner.__init__:1128) and
+    BOTH must route through the profile backend for operator-pinned
+    backends to apply consistently. Falls back to the legacy
+    ``_model.parse_model_md`` read when ``model_config`` is None, so
+    pre-PR-2 callers (none in core; safety belt) continue to work.
     """
     if critical or reserved <= 0:
         return
     log_dir = agent_root / "log"
-    today_cost = _costs.sum_cost_for_period(log_dir, "today", source="actor", backend=log_backend, agent_name=agent_name)
-    month_cost = _costs.sum_cost_for_period(log_dir, "this_month", source="actor", backend=log_backend, agent_name=agent_name)
-    # Load caps from model.md
-    model_data = _model.parse_model_md(agent_root / "model.md")
+    today_cost = _costs.sum_cost_for_period(
+        log_dir, "today", source="actor", backend=log_backend, agent_name=agent_name
+    )
+    month_cost = _costs.sum_cost_for_period(
+        log_dir,
+        "this_month",
+        source="actor",
+        backend=log_backend,
+        agent_name=agent_name,
+    )
+    # Load caps from the resolved model_config (PR 2) or fall back to a
+    # direct parse_model_md (legacy / standalone _check_cap callers).
+    if model_config is not None:
+        model_data = model_config
+    else:
+        model_data = _model.parse_model_md(agent_root / "model.md")
     if not model_data.get("cost_guardrails_enabled"):
         return
     daily_cap = model_data.get("daily_cap_usd", 0.0)
@@ -686,6 +748,7 @@ def _check_cap(
 
 # ──────────────────────────────────────────────────────────────────
 # Main pipeline
+
 
 def _run_pipeline(
     agent_root: Path,
@@ -712,8 +775,10 @@ def _run_pipeline(
         notes = _read_memory_notes(agent_root)
     journal_entries = _read_journal_entries(agent_root, journal_lookback_days)
     log_lines = _read_log_lines(
-        agent_root, log_lookback_days,
-        log_backend=log_backend, agent_name=agent_root.name,
+        agent_root,
+        log_lookback_days,
+        log_backend=log_backend,
+        agent_name=agent_root.name,
     )
 
     # Update manifest inputs
@@ -734,25 +799,33 @@ def _run_pipeline(
     dup_prompts, active_clusters = _build_duplicate_prompts(clusters)
 
     consolidated: list[ConsolidatedNote] = []
-    notes_to_consolidate: set[str] = set()  # filenames that are consumed by consolidation
+    notes_to_consolidate: set[str] = (
+        set()
+    )  # filenames that are consumed by consolidation
 
     if dup_prompts:
         dup_results = _batch_llm_calls(dup_prompts, model, max_tokens=512)
         for i, raw_text in enumerate(dup_results):
             total_input_tokens += raw_text.input_tokens
             total_output_tokens += raw_text.output_tokens
-            cost, _ = _costs.calc_cost(model, raw_text.input_tokens, raw_text.output_tokens)
+            cost, _ = _costs.calc_cost(
+                model, raw_text.input_tokens, raw_text.output_tokens
+            )
             total_cost += cost
             parsed = _parse_helper_text(raw_text.text)
             if parsed.get("is_duplicate") and parsed.get("merged_body"):
                 cluster = active_clusters[i]
                 filenames = [n["filename"] for n in cluster]
-                merged_name = parsed.get("merged_name") or cluster[0]["meta"].get("name", "merged")
-                consolidated.append(ConsolidatedNote(
-                    new=f"consolidated_{len(consolidated) + 1}.md",
-                    supersedes=filenames,
-                    reason=f"Duplicate notes merged: {', '.join(filenames)}",
-                ))
+                merged_name = parsed.get("merged_name") or cluster[0]["meta"].get(
+                    "name", "merged"
+                )
+                consolidated.append(
+                    ConsolidatedNote(
+                        new=f"consolidated_{len(consolidated) + 1}.md",
+                        supersedes=filenames,
+                        reason=f"Duplicate notes merged: {', '.join(filenames)}",
+                    )
+                )
                 # Store merged body for synthesis
                 cluster[0]["_merged_body"] = parsed["merged_body"]
                 cluster[0]["_merged_name"] = merged_name
@@ -766,7 +839,9 @@ def _run_pipeline(
         for raw_text in contr_results:
             total_input_tokens += raw_text.input_tokens
             total_output_tokens += raw_text.output_tokens
-            cost, _ = _costs.calc_cost(model, raw_text.input_tokens, raw_text.output_tokens)
+            cost, _ = _costs.calc_cost(
+                model, raw_text.input_tokens, raw_text.output_tokens
+            )
             total_cost += cost
             # Contradictions inform the synthesis pass via journal content already read
 
@@ -779,7 +854,9 @@ def _run_pipeline(
         for raw_text in promo_results:
             total_input_tokens += raw_text.input_tokens
             total_output_tokens += raw_text.output_tokens
-            cost, _ = _costs.calc_cost(model, raw_text.input_tokens, raw_text.output_tokens)
+            cost, _ = _costs.calc_cost(
+                model, raw_text.input_tokens, raw_text.output_tokens
+            )
             total_cost += cost
             parsed = _parse_helper_text(raw_text.text)
             for promo in parsed.get("promotions", []):
@@ -789,14 +866,17 @@ def _run_pipeline(
                 promo_data.append(promo)
                 promo_name = promo.get("name", f"promoted_{len(promoted) + 1}")
                 from ._schema import derive_filename
+
                 promo_filename = derive_filename(
                     promo.get("type", "feedback"), promo_name
                 )
-                promoted.append(PromotedNote(
-                    new=promo_filename,
-                    from_journal_entries=from_entries,
-                    reason=f"Recurring journal observation: {promo_name}",
-                ))
+                promoted.append(
+                    PromotedNote(
+                        new=promo_filename,
+                        from_journal_entries=from_entries,
+                        reason=f"Recurring journal observation: {promo_name}",
+                    )
+                )
 
     # Phase 5: Synthesis pass — one main model call
     today = date.today()
@@ -812,7 +892,9 @@ def _run_pipeline(
     )
     total_input_tokens += synthesis_result.input_tokens
     total_output_tokens += synthesis_result.output_tokens
-    syn_cost, _ = _costs.calc_cost(model, synthesis_result.input_tokens, synthesis_result.output_tokens)
+    syn_cost, _ = _costs.calc_cost(
+        model, synthesis_result.input_tokens, synthesis_result.output_tokens
+    )
     total_cost += syn_cost
 
     # Parse synthesis output
@@ -841,7 +923,9 @@ def _run_pipeline(
         if seed is None:
             continue
         merged_body = seed.get("_merged_body") or seed["body"]
-        merged_name = seed.get("_merged_name") or seed["meta"].get("name", "Merged note")
+        merged_name = seed.get("_merged_name") or seed["meta"].get(
+            "name", "Merged note"
+        )
         meta = dict(seed["meta"])
         meta["name"] = merged_name
         capture = Capture(
@@ -856,13 +940,17 @@ def _run_pipeline(
             expires_at=meta.get("expires_at"),
             tags=list(meta.get("tags", [])),
         )
-        filename = _write_note_to_dir(output_dir, capture, today, supersedes=cluster_filenames)
+        filename = _write_note_to_dir(
+            output_dir, capture, today, supersedes=cluster_filenames
+        )
         written_notes.append(filename)
-        final_consolidated.append(ConsolidatedNote(
-            new=filename,
-            supersedes=cluster_filenames,
-            reason=c_proposal.reason,
-        ))
+        final_consolidated.append(
+            ConsolidatedNote(
+                new=filename,
+                supersedes=cluster_filenames,
+                reason=c_proposal.reason,
+            )
+        )
 
     # 6b: Write promoted notes
     final_promoted: list[PromotedNote] = []
@@ -882,11 +970,13 @@ def _run_pipeline(
         )
         filename = _write_note_to_dir(output_dir, capture, today)
         written_notes.append(filename)
-        final_promoted.append(PromotedNote(
-            new=filename,
-            from_journal_entries=p_proposal.from_journal_entries,
-            reason=p_proposal.reason,
-        ))
+        final_promoted.append(
+            PromotedNote(
+                new=filename,
+                from_journal_entries=p_proposal.from_journal_entries,
+                reason=p_proposal.reason,
+            )
+        )
 
     # Track which notes have been processed
     consolidated_superseded: set[str] = set()
@@ -900,13 +990,15 @@ def _run_pipeline(
             continue  # dropped by consolidation
         # Check if this note was written already as a consolidated note
         from ._schema import derive_filename
+
         if any(fn in c.supersedes for c in final_consolidated):
             if fn not in [c.supersedes[0] for c in final_consolidated]:
                 continue  # secondary in consolidation cluster, skip
 
         expires = stale_lookup.get(fn) if fn in stale_filenames else None
-        _copy_note_to_dir(output_dir, fn, note["meta"], note["body"], today,
-                          new_expires_at=expires)
+        _copy_note_to_dir(
+            output_dir, fn, note["meta"], note["body"], today, new_expires_at=expires
+        )
         if fn not in written_notes:
             written_notes.append(fn)
 
@@ -916,8 +1008,12 @@ def _run_pipeline(
     atomic_write(output_dir / "INDEX.md", index_content)
 
     # 6e: Write report.md
-    unchanged_count = len(notes) - len(consolidated_superseded) - len(notes_to_consolidate)
-    report_content = _build_report(final_consolidated, final_promoted, stale_markings, unchanged_count)
+    unchanged_count = (
+        len(notes) - len(consolidated_superseded) - len(notes_to_consolidate)
+    )
+    report_content = _build_report(
+        final_consolidated, final_promoted, stale_markings, unchanged_count
+    )
     atomic_write(dream_dir / "report.md", report_content)
 
     # 6f: Move staging area to dream_dir/memory/ for operator review.
@@ -947,8 +1043,10 @@ def _run_pipeline(
 # ──────────────────────────────────────────────────────────────────
 # LLM helpers (bypass AtomicAgent persona — meta-task)
 
+
 class _RawLLMResult:
     """Minimal result from _llm.call_llm."""
+
     def __init__(self, text: str, input_tokens: int, output_tokens: int):
         self.text = text
         self.input_tokens = input_tokens
@@ -974,9 +1072,12 @@ def _single_llm_call(prompt: str, model: str, max_tokens: int = 2048) -> _RawLLM
     )
 
 
-def _batch_llm_calls(prompts: list[str], model: str, max_tokens: int = 512) -> list[_RawLLMResult]:
+def _batch_llm_calls(
+    prompts: list[str], model: str, max_tokens: int = 512
+) -> list[_RawLLMResult]:
     """Run prompts in parallel via threads. Returns results in order."""
     import concurrent.futures
+
     results: list[Any] = [None] * len(prompts)
 
     def call_one(idx: int, prompt: str):
@@ -988,7 +1089,7 @@ def _batch_llm_calls(prompts: list[str], model: str, max_tokens: int = 512) -> l
             try:
                 idx, res = future.result()
                 results[idx] = res
-            except Exception as exc:
+            except Exception:
                 idx = futures[future]
                 results[idx] = _RawLLMResult(text="{}", input_tokens=0, output_tokens=0)
 
@@ -1012,12 +1113,15 @@ def _synthesis_pass(
         f"last_seen={n['meta'].get('last_seen', '?')})"
         for n in notes
     )
-    stale_summary = "\n".join(f"- {s.note} -> expires {s.new_expires_at}" for s in stale_markings)
+    stale_summary = "\n".join(
+        f"- {s.note} -> expires {s.new_expires_at}" for s in stale_markings
+    )
     consolidated_summary = "\n".join(
         f"- Merge {c.supersedes} -> {c.new}" for c in consolidated_proposals
     )
     promoted_summary = "\n".join(
-        f"- Promote from {p.from_journal_entries} -> {p.new}" for p in promoted_proposals
+        f"- Promote from {p.from_journal_entries} -> {p.new}"
+        for p in promoted_proposals
     )
 
     prompt = (
@@ -1029,15 +1133,16 @@ def _synthesis_pass(
         f"Promotion proposals ({len(promoted_proposals)}):\n"
         f"{promoted_summary or '(none)'}\n\n"
         + (f"Operator instructions: {instructions}\n\n" if instructions else "")
-        + f"Confirm these changes are sound and complete.\n"
-        f"Respond with JSON: "
-        f'{{"confirmed": true, "notes": "any final observations"}}'
+        + "Confirm these changes are sound and complete.\n"
+        "Respond with JSON: "
+        '{"confirmed": true, "notes": "any final observations"}'
     )
     return _single_llm_call(prompt, model, max_tokens=512)
 
 
 # ──────────────────────────────────────────────────────────────────
 # DreamRunner
+
 
 class DreamRunner:
     """Operator-facing dream pipeline coordinator.
@@ -1058,6 +1163,7 @@ class DreamRunner:
         dream_lock_timeout: float = 30.0,
         lock_backend: LockBackend | None = None,
         log_backend: "LogBackend | None" = None,
+        profile_backend: "AgentProfileBackend | None" = None,
     ):
         self.agents_root = Path(agents_root)
         self.agent_name = agent_name
@@ -1117,16 +1223,34 @@ class DreamRunner:
         # log backend, dream silently walks empty filesystem).
         if log_backend is None:
             from .logs import get_default_log_backend
+
             self._log_backend = get_default_log_backend(self.agent_root)
         else:
             self._log_backend = log_backend
 
-        # Resolve model: explicit > agent's model.md default
+        # Profile backend resolution + pre-load the agent's profile once.
+        # #63 PR 2 Step 11 P1#3: DreamRunner had TWO model.md call sites
+        # (this one at __init__ + the _check_cap cost-guardrail). PR 2
+        # routes BOTH through the profile backend so an operator-pinned
+        # backend (e.g., SaaS DatabaseAgentProfileBackend) supplies the
+        # canonical model_config for both. Same kwarg-wins-over-env-var
+        # discipline as lock_backend / log_backend.
+        if profile_backend is None:
+            from .profile import get_default_profile_backend
+
+            self._profile_backend = get_default_profile_backend(self.agents_root)
+        else:
+            self._profile_backend = profile_backend
+        self._profile = self._profile_backend.load_profile(self.agent_name)
+
+        # Resolve model: explicit kwarg > profile.model_config default.
+        # PR 2 Decision 2: pre-resolved model_config is also passed to
+        # _check_cap in start() so the cost-guardrail uses the same
+        # model_config — no second profile load, no second model.md read.
         if model:
             self._model = model
         else:
-            model_data = _model.parse_model_md(self.agent_root / "model.md")
-            self._model = model_data["default_model"]
+            self._model = self._profile.model_config["default_model"]
 
     def start(
         self,
@@ -1144,14 +1268,31 @@ class DreamRunner:
         notes = _read_memory_notes(self.agent_root)
         journal_entries = _read_journal_entries(self.agent_root, journal_lookback_days)
         log_lines = _read_log_lines(
-            self.agent_root, log_lookback_days,
-            log_backend=self._log_backend, agent_name=self.agent_name,
-        )
-        estimated_cost = _estimate_dream_cost(self._model, notes, journal_entries, log_lines)
-        _check_cap(
-            self.agent_root, self._model, estimated_cost, critical,
+            self.agent_root,
+            log_lookback_days,
             log_backend=self._log_backend,
             agent_name=self.agent_name,
+        )
+        estimated_cost = _estimate_dream_cost(
+            self._model, notes, journal_entries, log_lines
+        )
+        _check_cap(
+            self.agent_root,
+            self._model,
+            estimated_cost,
+            critical,
+            log_backend=self._log_backend,
+            agent_name=self.agent_name,
+            # #63 PR 2 Decision 2: pass the pre-resolved model_config
+            # from the profile_backend so _check_cap doesn't re-read
+            # model.md from disk. Step 11 P1#3 from PR 1 named this as
+            # the load-bearing fix — without it, an operator using a
+            # non-filesystem profile_backend would have correct config
+            # for AtomicAgent.call() but stale cost caps applied to
+            # dream runs (the dream cost-guardrail would silently fall
+            # back to filesystem model.md, which may be absent or
+            # diverge from the operator's pinned source).
+            model_config=self._profile.model_config,
         )
 
         # Initialise manifest
@@ -1248,7 +1389,9 @@ class DreamRunner:
         if dream_id:
             dream_dir = self.dreams_dir / dream_id
             if not dream_dir.exists():
-                raise DreamNotFound(f"Dream {dream_id!r} not found for agent {self.agent_name!r}")
+                raise DreamNotFound(
+                    f"Dream {dream_id!r} not found for agent {self.agent_name!r}"
+                )
             return _read_manifest(dream_dir)
         # Most recent
         dreams = self.list_dreams()
@@ -1260,10 +1403,14 @@ class DreamRunner:
         """Return the contents of <dream-dir>/report.md."""
         dream_dir = self.dreams_dir / dream_id
         if not dream_dir.exists():
-            raise DreamNotFound(f"Dream {dream_id!r} not found for agent {self.agent_name!r}")
+            raise DreamNotFound(
+                f"Dream {dream_id!r} not found for agent {self.agent_name!r}"
+            )
         report_path = dream_dir / "report.md"
         if not report_path.exists():
-            raise AtomicAgentsError(f"No report.md in dream {dream_id!r} — pipeline may not be complete")
+            raise AtomicAgentsError(
+                f"No report.md in dream {dream_id!r} — pipeline may not be complete"
+            )
         return report_path.read_text(encoding="utf-8")
 
     def apply(self, dream_id: str) -> Path:
@@ -1387,6 +1534,7 @@ class DreamRunner:
 # ──────────────────────────────────────────────────────────────────
 # CLI
 
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
     import sys
@@ -1396,35 +1544,55 @@ def main(argv: list[str] | None = None) -> int:
         description="Memory consolidation pipeline — dream between sessions",
     )
     parser.add_argument("agent", help="agent name (folder under agents-root)")
-    parser.add_argument("--status", nargs="?", const=True, default=None,
-                        metavar="DREAM_ID",
-                        help="show status of DREAM_ID, or most recent if omitted")
-    parser.add_argument("--review", metavar="DREAM_ID",
-                        help="print report.md for DREAM_ID")
-    parser.add_argument("--apply", metavar="DREAM_ID",
-                        help="atomically apply DREAM_ID to memory/")
-    parser.add_argument("--discard", metavar="DREAM_ID",
-                        help="remove DREAM_ID output dir")
-    parser.add_argument("--list", action="store_true",
-                        help="list all dreams for this agent")
-    parser.add_argument("--instructions", default="",
-                        help="operator hint for the synthesis pass")
-    parser.add_argument("--journal-lookback", type=int, default=30,
-                        metavar="DAYS", help="days of journal to include")
-    parser.add_argument("--log-lookback", type=int, default=30,
-                        metavar="DAYS", help="days of log to include")
-    parser.add_argument("--critical", action="store_true",
-                        help="bypass cost cap")
-    parser.add_argument("--model", default=None,
-                        help="override model id")
-    parser.add_argument("--agents-root", default=None,
-                        help="override ATOMIC_AGENTS_ROOT")
+    parser.add_argument(
+        "--status",
+        nargs="?",
+        const=True,
+        default=None,
+        metavar="DREAM_ID",
+        help="show status of DREAM_ID, or most recent if omitted",
+    )
+    parser.add_argument(
+        "--review", metavar="DREAM_ID", help="print report.md for DREAM_ID"
+    )
+    parser.add_argument(
+        "--apply", metavar="DREAM_ID", help="atomically apply DREAM_ID to memory/"
+    )
+    parser.add_argument(
+        "--discard", metavar="DREAM_ID", help="remove DREAM_ID output dir"
+    )
+    parser.add_argument(
+        "--list", action="store_true", help="list all dreams for this agent"
+    )
+    parser.add_argument(
+        "--instructions", default="", help="operator hint for the synthesis pass"
+    )
+    parser.add_argument(
+        "--journal-lookback",
+        type=int,
+        default=30,
+        metavar="DAYS",
+        help="days of journal to include",
+    )
+    parser.add_argument(
+        "--log-lookback",
+        type=int,
+        default=30,
+        metavar="DAYS",
+        help="days of log to include",
+    )
+    parser.add_argument("--critical", action="store_true", help="bypass cost cap")
+    parser.add_argument("--model", default=None, help="override model id")
+    parser.add_argument(
+        "--agents-root", default=None, help="override ATOMIC_AGENTS_ROOT"
+    )
 
     args = parser.parse_args(argv)
 
     agents_root = (
         Path(args.agents_root).expanduser().resolve()
-        if args.agents_root else get_agents_root()
+        if args.agents_root
+        else get_agents_root()
     )
 
     try:
@@ -1504,13 +1672,20 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  Marked stale:  {len(result.marked_stale)}")
     print(f"  Output notes:  {result.output_memory_count}")
     print(f"  Cost:          ${result.total_cost_usd:.6f}")
-    print(f"\nTo review:  python -m atomic_agents.dream {args.agent} --review {result.dream_id}")
-    print(f"To apply:   python -m atomic_agents.dream {args.agent} --apply {result.dream_id}")
-    print(f"To discard: python -m atomic_agents.dream {args.agent} --discard {result.dream_id}")
+    print(
+        f"\nTo review:  python -m atomic_agents.dream {args.agent} --review {result.dream_id}"
+    )
+    print(
+        f"To apply:   python -m atomic_agents.dream {args.agent} --apply {result.dream_id}"
+    )
+    print(
+        f"To discard: python -m atomic_agents.dream {args.agent} --discard {result.dream_id}"
+    )
 
     return 0 if result.status == "completed" else 1
 
 
 if __name__ == "__main__":
     import sys
+
     sys.exit(main())

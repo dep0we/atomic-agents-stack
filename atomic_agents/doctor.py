@@ -148,12 +148,27 @@ def run_doctor(
     )
 
     if agent_name is None:
-        for n in ("vault", "provider-keys", "model", "mcp", "locks",
-                  "memory-backend", "write-paths"):
-            results.append(CheckResult(
-                name=n, status=SKIP,
-                message="no --agent supplied; skipped",
-            ))
+        # Order matches run_doctor()'s actual execution sequence below
+        # (lock-backend → log-backend → profile-backend → memory-backend)
+        # so contributors adding a fourth scope-level backend check see
+        # the SKIP enumeration mirror reality.
+        for n in (
+            "vault",
+            "provider-keys",
+            "model",
+            "mcp",
+            "locks",
+            "profile-backend",
+            "memory-backend",
+            "write-paths",
+        ):
+            results.append(
+                CheckResult(
+                    name=n,
+                    status=SKIP,
+                    message="no --agent supplied; skipped",
+                )
+            )
         return results
 
     agent_root = resolved_root / agent_name
@@ -181,16 +196,22 @@ def run_doctor(
     results.append(check_model(model_data))
 
     if skip_mcp:
-        results.append(CheckResult(
-            name="mcp", status=SKIP,
-            message="--no-mcp specified; skipped",
-        ))
+        results.append(
+            CheckResult(
+                name="mcp",
+                status=SKIP,
+                message="--no-mcp specified; skipped",
+            )
+        )
     else:
-        results.extend(check_mcp(agent_root, read_paths=tools_data.get("read_paths", [])))
+        results.extend(
+            check_mcp(agent_root, read_paths=tools_data.get("read_paths", []))
+        )
 
     results.append(check_lock_backend(agent_root))
     results.append(check_locks(agent_root))
     results.append(check_log_backend(agent_root))
+    results.append(check_agent_profile_backend(resolved_root))
     results.append(check_memory_backend(agent_root))
     results.append(check_write_paths(tools_data, agent_root=agent_root))
 
@@ -223,7 +244,8 @@ def _safe_parse_model(agent_root: Path, cascade) -> tuple[dict, CheckResult | No
             text = mp.read_text(encoding="utf-8") if mp.exists() else ""
     except Exception as e:  # noqa: BLE001 — operator config issue, not a doctor bug
         return _model.parse_model_md_text(""), CheckResult(
-            name="config-parse[model.md]", status=FAIL,
+            name="config-parse[model.md]",
+            status=FAIL,
             message=f"could not parse model.md: {type(e).__name__}: {e}",
             fix_hint=(
                 "Check model.md syntax — see docs/spec/04-runtime-assembly.md "
@@ -238,7 +260,8 @@ def _safe_parse_model(agent_root: Path, cascade) -> tuple[dict, CheckResult | No
     yaml_failure = _detect_yaml_fence_errors(text)
     if yaml_failure is not None:
         return data, CheckResult(
-            name="config-parse[model.md]", status=FAIL,
+            name="config-parse[model.md]",
+            status=FAIL,
             message=f"model.md contains invalid YAML: {yaml_failure}",
             fix_hint=(
                 "Check the ```yaml fenced block(s) in model.md. Run "
@@ -261,6 +284,7 @@ def _detect_yaml_fence_errors(text: str) -> str | None:
         return None
     import re
     import yaml  # type: ignore[import-untyped]
+
     blocks = re.findall(r"```yaml\s*\n(.*?)```", text, re.DOTALL)
     for block in blocks:
         try:
@@ -283,7 +307,8 @@ def _safe_parse_tools(agent_root: Path, cascade) -> tuple[dict, CheckResult | No
         return data, None
     except Exception as e:  # noqa: BLE001 — operator config issue, not a doctor bug
         return {}, CheckResult(
-            name="config-parse[tools.md]", status=FAIL,
+            name="config-parse[tools.md]",
+            status=FAIL,
             message=f"could not parse tools.md: {type(e).__name__}: {e}",
             fix_hint=(
                 "Check tools.md syntax — see docs/spec/01-anatomy.md for the "
@@ -314,7 +339,8 @@ def check_env(agents_root_override: Path | None) -> CheckResult:
 
     if not path.exists():
         return CheckResult(
-            name="env", status=FAIL,
+            name="env",
+            status=FAIL,
             message=f"agents-root does not exist: {path} ({source})",
             fix_hint=(
                 f"Create it: mkdir -p {path}\n"
@@ -324,13 +350,15 @@ def check_env(agents_root_override: Path | None) -> CheckResult:
         )
     if not path.is_dir():
         return CheckResult(
-            name="env", status=FAIL,
+            name="env",
+            status=FAIL,
             message=f"agents-root is not a directory: {path}",
             fix_hint=f"Remove the file at {path} and recreate it as a directory.",
             detail={"path": str(path), "source": source},
         )
     return CheckResult(
-        name="env", status=PASS,
+        name="env",
+        status=PASS,
         message=f"agents-root resolves to {path} ({source})",
         detail={"path": str(path), "source": source},
     )
@@ -342,12 +370,14 @@ def check_python() -> CheckResult:
     cur_str = f"{cur[0]}.{cur[1]}.{sys.version_info.micro}"
     if cur >= MIN_PYTHON:
         return CheckResult(
-            name="python", status=PASS,
+            name="python",
+            status=PASS,
             message=f"Python {cur_str} (>= {MIN_PYTHON[0]}.{MIN_PYTHON[1]} required)",
             detail={"version": cur_str},
         )
     return CheckResult(
-        name="python", status=FAIL,
+        name="python",
+        status=FAIL,
         message=f"Python {cur_str} is too old; need >= {MIN_PYTHON[0]}.{MIN_PYTHON[1]}",
         fix_hint=(
             f"Install Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ and re-run via that "
@@ -373,7 +403,8 @@ def check_vault(agent_root: Path, *, cascade=None) -> CheckResult:
     """
     if not agent_root.exists():
         return CheckResult(
-            name="vault", status=FAIL,
+            name="vault",
+            status=FAIL,
             message=f"agent folder does not exist: {agent_root}",
             fix_hint=(
                 f"Create it (or copy a sample): "
@@ -403,7 +434,8 @@ def check_vault(agent_root: Path, *, cascade=None) -> CheckResult:
 
     if missing:
         return CheckResult(
-            name="vault", status=FAIL,
+            name="vault",
+            status=FAIL,
             message=f"required files missing: {', '.join(missing)}",
             fix_hint=(
                 "Create the missing files. See docs/spec/01-anatomy.md for the "
@@ -418,7 +450,8 @@ def check_vault(agent_root: Path, *, cascade=None) -> CheckResult:
             },
         )
     return CheckResult(
-        name="vault", status=PASS,
+        name="vault",
+        status=PASS,
         message=(
             f"all required files present under {agent_root}"
             + (" (cascaded)" if cascade is not None else "")
@@ -462,10 +495,13 @@ def check_provider_keys(model_data: dict) -> list[CheckResult]:
             seen.add(prov)
 
     if not providers:
-        return [CheckResult(
-            name="provider-keys", status=SKIP,
-            message="no recognised provider in model.md (default/fallback)",
-        )]
+        return [
+            CheckResult(
+                name="provider-keys",
+                status=SKIP,
+                message="no recognised provider in model.md (default/fallback)",
+            )
+        ]
 
     return [_check_one_provider_key(p) for p in providers]
 
@@ -480,7 +516,8 @@ def _check_one_provider_key(provider: str) -> CheckResult:
     """
     if provider not in _PROVIDER_KEYS:
         return CheckResult(
-            name=f"provider-keys[{provider}]", status=SKIP,
+            name=f"provider-keys[{provider}]",
+            status=SKIP,
             message=f"no key-resolution chain registered for {provider!r}",
         )
     keychain_name, env_vars, config_key, sdk_module = _PROVIDER_KEYS[provider]
@@ -493,7 +530,8 @@ def _check_one_provider_key(provider: str) -> CheckResult:
         except ImportError as e:
             extra = "openai" if sdk_module == "openai" else sdk_module
             return CheckResult(
-                name=f"provider-keys[{provider}]", status=FAIL,
+                name=f"provider-keys[{provider}]",
+                status=FAIL,
                 message=f"{provider} requires the {sdk_module!r} package, which is not installed",
                 fix_hint=(
                     f"Install the optional extra: uv add 'atomic-agents-stack[{extra}]'\n"
@@ -510,18 +548,20 @@ def _check_one_provider_key(provider: str) -> CheckResult:
     # behaviour can never disagree on key resolution.
     from ._llm import _get_key
     from .exceptions import AtomicAgentsError
+
     try:
         _get_key(env_vars=env_vars, keychain_name=keychain_name, config_key=config_key)
     except AtomicAgentsError as e:
         return CheckResult(
-            name=f"provider-keys[{provider}]", status=FAIL,
+            name=f"provider-keys[{provider}]",
+            status=FAIL,
             message=f"{provider} API key not found",
             fix_hint=(
                 f"Choose one:\n"
                 f"  - export {env_vars[0]}='<key>'\n"
                 f"  - security add-generic-password -a $USER -s {keychain_name} -w '<key>' "
                 f"(macOS Keychain)\n"
-                f"  - add {{\"{config_key}\": \"<key>\"}} to ~/.config/atomic_agents/keys.json"
+                f'  - add {{"{config_key}": "<key>"}} to ~/.config/atomic_agents/keys.json'
             ),
             detail={
                 "provider": provider,
@@ -531,7 +571,8 @@ def _check_one_provider_key(provider: str) -> CheckResult:
             },
         )
     return CheckResult(
-        name=f"provider-keys[{provider}]", status=PASS,
+        name=f"provider-keys[{provider}]",
+        status=PASS,
         message=f"{provider} API key resolves",
         detail={"provider": provider},
     )
@@ -542,7 +583,8 @@ def check_model(model_data: dict) -> CheckResult:
     default_model = model_data.get("default_model", "")
     if not default_model:
         return CheckResult(
-            name="model", status=FAIL,
+            name="model",
+            status=FAIL,
             message="model.md has no default_model",
             fix_hint=(
                 "Add a `## Default model` section to model.md with the model id "
@@ -551,7 +593,8 @@ def check_model(model_data: dict) -> CheckResult:
         )
     if default_model not in PRICING:
         return CheckResult(
-            name="model", status=FAIL,
+            name="model",
+            status=FAIL,
             message=f"default_model {default_model!r} is not in the pricing table",
             fix_hint=(
                 f"Use one of {sorted(PRICING.keys())}, or add {default_model!r} "
@@ -567,7 +610,8 @@ def check_model(model_data: dict) -> CheckResult:
         monthly = float(model_data.get("monthly_cap_usd", 0.0))
         if daily <= 0 or monthly <= 0:
             return CheckResult(
-                name="model", status=FAIL,
+                name="model",
+                status=FAIL,
                 message=(
                     "cost_guardrails enabled but daily_cap_usd or monthly_cap_usd "
                     f"is 0 (daily={daily}, monthly={monthly})"
@@ -581,7 +625,8 @@ def check_model(model_data: dict) -> CheckResult:
             )
 
     return CheckResult(
-        name="model", status=PASS,
+        name="model",
+        status=PASS,
         message=f"default_model {default_model!r} priced; guardrails ok",
         detail={
             "default_model": default_model,
@@ -603,10 +648,13 @@ def check_mcp(agent_root: Path, *, read_paths: list | None = None) -> list[Check
     """
     mcp_path = agent_root / "mcp.md"
     if not mcp_path.exists():
-        return [CheckResult(
-            name="mcp", status=SKIP,
-            message="no mcp.md (agent does not use MCP)",
-        )]
+        return [
+            CheckResult(
+                name="mcp",
+                status=SKIP,
+                message="no mcp.md (agent does not use MCP)",
+            )
+        ]
 
     # Lazy import — keeps the doctor command's startup cost low for agents
     # that don't use MCP (which is the majority).
@@ -615,22 +663,28 @@ def check_mcp(agent_root: Path, *, read_paths: list | None = None) -> list[Check
     try:
         specs = mcp_module.parse_mcp_md(mcp_path, read_paths=read_paths)
     except Exception as e:
-        return [CheckResult(
-            name="mcp", status=FAIL,
-            message=f"could not parse mcp.md: {type(e).__name__}: {e}",
-            fix_hint=(
-                "Check mcp.md syntax — see docs/spec/19-mcp.md for the format. "
-                "Common causes: unresolved env-var reference, malformed YAML, "
-                "or path-shaped server args that fall outside tools.md "
-                "read_paths (PathTraversalError)."
-            ),
-        )]
+        return [
+            CheckResult(
+                name="mcp",
+                status=FAIL,
+                message=f"could not parse mcp.md: {type(e).__name__}: {e}",
+                fix_hint=(
+                    "Check mcp.md syntax — see docs/spec/19-mcp.md for the format. "
+                    "Common causes: unresolved env-var reference, malformed YAML, "
+                    "or path-shaped server args that fall outside tools.md "
+                    "read_paths (PathTraversalError)."
+                ),
+            )
+        ]
 
     if not specs:
-        return [CheckResult(
-            name="mcp", status=SKIP,
-            message="mcp.md present but declares no servers",
-        )]
+        return [
+            CheckResult(
+                name="mcp",
+                status=SKIP,
+                message="mcp.md present but declares no servers",
+            )
+        ]
 
     results: list[CheckResult] = []
     for spec in specs:
@@ -642,8 +696,9 @@ def check_mcp(agent_root: Path, *, read_paths: list | None = None) -> list[Check
 DEFAULT_MCP_HANDSHAKE_TIMEOUT_SECONDS = 10.0
 
 
-def _check_one_mcp_server(spec, mcp_module,
-                           timeout_seconds: float = DEFAULT_MCP_HANDSHAKE_TIMEOUT_SECONDS) -> CheckResult:
+def _check_one_mcp_server(
+    spec, mcp_module, timeout_seconds: float = DEFAULT_MCP_HANDSHAKE_TIMEOUT_SECONDS
+) -> CheckResult:
     """Run one server's stdio handshake with a bounded timeout.
 
     The MCP SDK's ClientSession has no default read timeout. Without a bound
@@ -652,16 +707,19 @@ def _check_one_mcp_server(spec, mcp_module,
     --json liveness-probe use case.
     """
     from .exceptions import MCPServerConnectFailed
+
     if spec.transport != "stdio":
         return CheckResult(
-            name=f"mcp[{spec.name}]", status=SKIP,
+            name=f"mcp[{spec.name}]",
+            status=SKIP,
             message=f"transport {spec.transport!r} not supported in v1 (stdio only)",
         )
     try:
         conn = _connect_sync_with_timeout(spec, mcp_module, timeout_seconds)
     except TimeoutError:
         return CheckResult(
-            name=f"mcp[{spec.name}]", status=FAIL,
+            name=f"mcp[{spec.name}]",
+            status=FAIL,
             message=(
                 f"server {spec.name!r} did not respond within {timeout_seconds:.0f}s "
                 f"(stdio handshake)"
@@ -677,7 +735,8 @@ def _check_one_mcp_server(spec, mcp_module,
         )
     except MCPServerConnectFailed as e:
         return CheckResult(
-            name=f"mcp[{spec.name}]", status=FAIL,
+            name=f"mcp[{spec.name}]",
+            status=FAIL,
             message=f"server {spec.name!r} failed to connect",
             fix_hint=(
                 f"Verify the command is on PATH and the server is reachable: "
@@ -688,12 +747,14 @@ def _check_one_mcp_server(spec, mcp_module,
         )
     except Exception as e:
         return CheckResult(
-            name=f"mcp[{spec.name}]", status=FAIL,
+            name=f"mcp[{spec.name}]",
+            status=FAIL,
             message=f"server {spec.name!r} unexpected error: {type(e).__name__}: {e}",
             fix_hint=f"Manually run: {spec.command} {' '.join(spec.args)}",
         )
     return CheckResult(
-        name=f"mcp[{spec.name}]", status=PASS,
+        name=f"mcp[{spec.name}]",
+        status=PASS,
         message=f"server {spec.name!r} responded ({len(conn.tools)} tools)",
         detail={"server": spec.name, "tool_count": len(conn.tools)},
     )
@@ -723,6 +784,7 @@ def _connect_sync_with_timeout(spec, mcp_module, timeout_seconds: float):
         # _connect_sync would have produced, so the caller's exception
         # taxonomy stays the same.
         from .exceptions import MCPServerConnectFailed
+
         raise MCPServerConnectFailed(
             f"MCP server '{spec.name}' failed to connect: {type(e).__name__}: {e}"
         ) from e
@@ -757,9 +819,9 @@ def check_locks(agent_root: Path, *, stale_seconds: float = 300.0) -> CheckResul
 
     from .locks import get_default_lock_backend
 
-    backend_id = os.environ.get(
-        "ATOMIC_AGENTS_LOCK_BACKEND", "filesystem"
-    ).strip().lower()
+    backend_id = (
+        os.environ.get("ATOMIC_AGENTS_LOCK_BACKEND", "filesystem").strip().lower()
+    )
 
     try:
         backend = get_default_lock_backend(agent_root)
@@ -767,7 +829,8 @@ def check_locks(agent_root: Path, *, stale_seconds: float = 300.0) -> CheckResul
         # Operator pinned a backend whose extra isn't installed.
         # FAIL with the specific install command.
         return CheckResult(
-            name="locks", status=FAIL,
+            name="locks",
+            status=FAIL,
             message=(
                 f"ATOMIC_AGENTS_LOCK_BACKEND={backend_id!r} requires "
                 f"an extra that isn't installed: {exc}"
@@ -779,7 +842,8 @@ def check_locks(agent_root: Path, *, stale_seconds: float = 300.0) -> CheckResul
         # backend_id). Use FAIL — operator-config drift is doctor's
         # whole job to surface.
         return CheckResult(
-            name="locks", status=FAIL,
+            name="locks",
+            status=FAIL,
             message=f"lock backend construction failed: {exc}",
             fix_hint=(
                 "Check ATOMIC_AGENTS_LOCK_BACKEND + "
@@ -793,7 +857,8 @@ def check_locks(agent_root: Path, *, stale_seconds: float = 300.0) -> CheckResul
     lock_path = agent_root / ".lock"
     if backend_id == "filesystem" and not lock_path.exists():
         return CheckResult(
-            name="locks", status=PASS,
+            name="locks",
+            status=PASS,
             message="no lock file (agent has not run yet, or last run released cleanly)",
         )
 
@@ -803,7 +868,8 @@ def check_locks(agent_root: Path, *, stale_seconds: float = 300.0) -> CheckResul
         # Backend reachability failure (e.g., Redis URL unreachable).
         # WARN — operator-config is set but doctor can't probe.
         return CheckResult(
-            name="locks", status=WARN,
+            name="locks",
+            status=WARN,
             message=(
                 f"operator-pinned lock backend {backend_id!r} is not "
                 f"reachable from this host; doctor cannot probe lock "
@@ -825,29 +891,42 @@ def check_locks(agent_root: Path, *, stale_seconds: float = 300.0) -> CheckResul
         # bool only, so this detail lives in doctor's domain.
         if backend_id == "filesystem" and lock_path.exists():
             try:
-                contents = lock_path.read_text(encoding="utf-8", errors="replace").strip()
+                contents = lock_path.read_text(
+                    encoding="utf-8", errors="replace"
+                ).strip()
             except OSError:
                 contents = ""
             mtime = lock_path.stat().st_mtime
             age = time.time() - mtime
             stale = age > stale_seconds
             return CheckResult(
-                name="locks", status=FAIL,
+                name="locks",
+                status=FAIL,
                 message=(
                     f"agent lock at {lock_path} is held"
-                    + (f" (stale: age {age:.0f}s > {stale_seconds:.0f}s threshold)" if stale else "")
+                    + (
+                        f" (stale: age {age:.0f}s > {stale_seconds:.0f}s threshold)"
+                        if stale
+                        else ""
+                    )
                     + (f"; recorded {contents}" if contents else "")
                 ),
                 fix_hint=(
                     "If the holder process is alive, wait for it to finish or kill it. "
                     f"If the holder is dead, remove the file: rm {lock_path}"
                 ),
-                detail={"path": str(lock_path), "age_seconds": age, "contents": contents, "stale": stale},
+                detail={
+                    "path": str(lock_path),
+                    "age_seconds": age,
+                    "contents": contents,
+                    "stale": stale,
+                },
             )
         # Non-filesystem backend reported held; no PID/staleness signal
         # from the Protocol. Surface what we know.
         return CheckResult(
-            name="locks", status=FAIL,
+            name="locks",
+            status=FAIL,
             message=(
                 f"agent lock is held according to backend "
                 f"{backend_id!r} (is_held returned True)"
@@ -862,7 +941,8 @@ def check_locks(agent_root: Path, *, stale_seconds: float = 300.0) -> CheckResul
         )
 
     return CheckResult(
-        name="locks", status=PASS,
+        name="locks",
+        status=PASS,
         message="lock file present but not held (clean)",
     )
 
@@ -890,13 +970,14 @@ def check_lock_backend(agent_root: Path) -> CheckResult:
     """
     from .locks import get_default_lock_backend, list_lock_backends
 
-    backend_id = os.environ.get(
-        "ATOMIC_AGENTS_LOCK_BACKEND", "filesystem"
-    ).strip().lower()
+    backend_id = (
+        os.environ.get("ATOMIC_AGENTS_LOCK_BACKEND", "filesystem").strip().lower()
+    )
 
     if backend_id == "filesystem":
         return CheckResult(
-            name="lock-backend", status=PASS,
+            name="lock-backend",
+            status=PASS,
             message="filesystem backend (default; no extra needed)",
             detail={"backend_id": "filesystem"},
         )
@@ -908,7 +989,8 @@ def check_lock_backend(agent_root: Path) -> CheckResult:
     known_ids = set(list_lock_backends()) | {"redis"}
     if backend_id not in known_ids:
         return CheckResult(
-            name="lock-backend", status=FAIL,
+            name="lock-backend",
+            status=FAIL,
             message=(
                 f"ATOMIC_AGENTS_LOCK_BACKEND={backend_id!r} is not "
                 f"a known backend. Known: {sorted(known_ids)}"
@@ -924,7 +1006,8 @@ def check_lock_backend(agent_root: Path) -> CheckResult:
     url = os.environ.get("ATOMIC_AGENTS_LOCK_BACKEND_URL")
     if not url:
         return CheckResult(
-            name="lock-backend", status=FAIL,
+            name="lock-backend",
+            status=FAIL,
             message=(
                 f"ATOMIC_AGENTS_LOCK_BACKEND={backend_id!r} requires "
                 "ATOMIC_AGENTS_LOCK_BACKEND_URL to be set"
@@ -939,7 +1022,8 @@ def check_lock_backend(agent_root: Path) -> CheckResult:
         backend = get_default_lock_backend(agent_root)
     except ImportError as exc:
         return CheckResult(
-            name="lock-backend", status=FAIL,
+            name="lock-backend",
+            status=FAIL,
             message=(
                 f"ATOMIC_AGENTS_LOCK_BACKEND={backend_id!r} requires "
                 f"an extra that isn't installed: {exc}"
@@ -948,7 +1032,8 @@ def check_lock_backend(agent_root: Path) -> CheckResult:
         )
     except Exception as exc:
         return CheckResult(
-            name="lock-backend", status=FAIL,
+            name="lock-backend",
+            status=FAIL,
             message=f"lock backend construction failed: {exc}",
             fix_hint=(
                 "Check ATOMIC_AGENTS_LOCK_BACKEND and "
@@ -962,7 +1047,8 @@ def check_lock_backend(agent_root: Path) -> CheckResult:
         backend.is_held("")
     except Exception as exc:
         return CheckResult(
-            name="lock-backend", status=WARN,
+            name="lock-backend",
+            status=WARN,
             message=(
                 f"operator-pinned backend {backend_id!r} configured "
                 f"but not reachable from this host: {exc}"
@@ -981,6 +1067,7 @@ def check_lock_backend(agent_root: Path) -> CheckResult:
     # to anything that captures doctor output (CI logs, telemetry).
     # urlparse + _replace strips the userinfo segment.
     from urllib.parse import urlparse
+
     parsed = urlparse(url)
     if parsed.password:
         netloc = parsed.hostname or ""
@@ -991,7 +1078,8 @@ def check_lock_backend(agent_root: Path) -> CheckResult:
         safe_url = url
 
     return CheckResult(
-        name="lock-backend", status=PASS,
+        name="lock-backend",
+        status=PASS,
         message=f"{backend_id} backend reachable at {safe_url}",
         detail={"backend_id": backend_id, "url": safe_url},
     )
@@ -1021,9 +1109,9 @@ def check_log_backend(agent_root: Path) -> CheckResult:
     from .exceptions import BackendNotRegistered
     from .logs import get_default_log_backend, list_log_backends
 
-    backend_id = os.environ.get(
-        "ATOMIC_AGENTS_LOG_BACKEND", "filesystem"
-    ).strip().lower()
+    backend_id = (
+        os.environ.get("ATOMIC_AGENTS_LOG_BACKEND", "filesystem").strip().lower()
+    )
 
     if backend_id == "filesystem":
         try:
@@ -1031,7 +1119,8 @@ def check_log_backend(agent_root: Path) -> CheckResult:
             stats = backend.stats()
         except Exception as exc:
             return CheckResult(
-                name="log-backend", status=FAIL,
+                name="log-backend",
+                status=FAIL,
                 message=f"filesystem log backend stats() raised {type(exc).__name__}: {exc}",
                 fix_hint=(
                     f"Check that {agent_root}/log is readable. The default "
@@ -1040,7 +1129,8 @@ def check_log_backend(agent_root: Path) -> CheckResult:
                 ),
             )
         return CheckResult(
-            name="log-backend", status=PASS,
+            name="log-backend",
+            status=PASS,
             message=(
                 f"filesystem backend ok ({stats.total_records} records, "
                 f"{stats.records_this_month} this month)"
@@ -1063,7 +1153,8 @@ def check_log_backend(agent_root: Path) -> CheckResult:
     known_ids = set(list_log_backends())
     if backend_id not in known_ids:
         return CheckResult(
-            name="log-backend", status=FAIL,
+            name="log-backend",
+            status=FAIL,
             message=(
                 f"ATOMIC_AGENTS_LOG_BACKEND={backend_id!r} is not "
                 f"a known backend. Known: {sorted(known_ids)}"
@@ -1087,6 +1178,7 @@ def check_log_backend(agent_root: Path) -> CheckResult:
     safe_url: str | None = None
     if url:
         from urllib.parse import urlparse
+
         parsed = urlparse(url)
         if parsed.password:
             netloc = parsed.hostname or ""
@@ -1104,7 +1196,8 @@ def check_log_backend(agent_root: Path) -> CheckResult:
         # raised. Surface the known-id list (already done above at the
         # eager-registry check) — fall through to the failure path.
         return CheckResult(
-            name="log-backend", status=FAIL,
+            name="log-backend",
+            status=FAIL,
             message=f"log backend {backend_id!r} not registered",
             fix_hint=(
                 f"The {backend_id!r} backend is reserved but its lazy "
@@ -1120,7 +1213,8 @@ def check_log_backend(agent_root: Path) -> CheckResult:
         # available in the LOG level above DEBUG (not echoed via
         # CheckResult) for the operator who has logging access.
         return CheckResult(
-            name="log-backend", status=FAIL,
+            name="log-backend",
+            status=FAIL,
             message=f"log backend {backend_id!r} construction failed",
             fix_hint=(
                 "Check ATOMIC_AGENTS_LOG_BACKEND and "
@@ -1138,13 +1232,14 @@ def check_log_backend(agent_root: Path) -> CheckResult:
         # Same credential-redaction rule applies to the probe error
         # path — drop the verbatim exception message.
         return CheckResult(
-            name="log-backend", status=WARN,
+            name="log-backend",
+            status=WARN,
             message=(
                 f"operator-pinned backend {backend_id!r} configured "
                 "but stats() probe failed"
             ),
             fix_hint=(
-                f"Verify ATOMIC_AGENTS_LOG_BACKEND_URL is correct + "
+                "Verify ATOMIC_AGENTS_LOG_BACKEND_URL is correct + "
                 "the backend is reachable from this host. Doctor "
                 "warns instead of failing — the framework runtime "
                 "will fail at first append if the backend is "
@@ -1163,10 +1258,201 @@ def check_log_backend(agent_root: Path) -> CheckResult:
     if stats.size_bytes is not None:
         detail["size_bytes"] = stats.size_bytes
     return CheckResult(
-        name="log-backend", status=PASS,
+        name="log-backend",
+        status=PASS,
         message=(
             f"{backend_id} backend ok ({stats.total_records} records, "
             f"{stats.records_this_month} this month)"
+        ),
+        detail=detail,
+    )
+
+
+def check_agent_profile_backend(agents_root: Path) -> CheckResult:
+    """Operator-config coherence check for the agent-profile backend (#63 PR 2).
+
+    Validates that ``ATOMIC_AGENTS_PROFILE_BACKEND`` (plus
+    ``ATOMIC_AGENTS_PROFILE_BACKEND_URL`` when non-filesystem) is
+    correctly configured. Scoped at ``agents_root`` (not ``agent_root``)
+    because the profile backend is the scope-flat layer that holds ALL
+    agents — `list_agents()` enumerates siblings under the root.
+
+    PASS / WARN / FAIL ladder mirrors ``check_log_backend`` (#61 PR 2):
+
+    * unset / ``filesystem`` → PASS with capability snapshot +
+      enumerated agent count
+    * unknown backend_id (typo) → FAIL with the known-id list
+      pulled from ``list_profile_backends()`` so doctor's verdict
+      cannot diverge from the registry's actual contents
+    * non-filesystem id reachable + ``capabilities()`` probe ok → PASS
+      with redacted URL in detail
+    * non-filesystem id construction failure → FAIL (credentials
+      dropped from exception text to prevent leak in error-tracking
+      services); ``capabilities()`` probe failure → WARN
+
+    URL credential redaction follows the same urlparse + ``_replace``
+    pattern as ``check_log_backend`` / ``check_lock_backend`` — strips
+    password from netloc.
+    """
+    from .exceptions import BackendNotRegistered
+    from .profile import get_default_profile_backend, list_profile_backends
+
+    backend_id = (
+        os.environ.get("ATOMIC_AGENTS_PROFILE_BACKEND", "filesystem").strip().lower()
+    )
+
+    if backend_id == "filesystem":
+        try:
+            backend = get_default_profile_backend(agents_root)
+            caps = backend.capabilities()
+            agent_count = len(backend.list_agents())
+        except Exception as exc:
+            return CheckResult(
+                name="profile-backend",
+                status=FAIL,
+                message=(
+                    f"filesystem profile backend probe raised "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                fix_hint=(
+                    f"Check that {agents_root} is readable. The default "
+                    "FilesystemAgentProfileBackend enumerates subdirectories "
+                    "under agents_root that contain persona/IDENTITY.md."
+                ),
+            )
+        return CheckResult(
+            name="profile-backend",
+            status=PASS,
+            message=(
+                f"filesystem backend ok ({agent_count} agent"
+                f"{'' if agent_count == 1 else 's'} discovered)"
+            ),
+            detail={
+                "backend_id": "filesystem",
+                "supports_save": caps.supports_save,
+                "supports_clone": caps.supports_clone,
+                "supports_snapshot": caps.supports_snapshot,
+                "supports_subscribe": caps.supports_subscribe,
+                "durable": caps.durable,
+                "agent_count": agent_count,
+            },
+        )
+
+    # Non-filesystem id selected — verify it's known to the registry
+    # BEFORE invoking the factory (lazy registrations of future
+    # backends — Database / Git / S3 — slot in via list_profile_backends).
+    known_ids = set(list_profile_backends())
+    if backend_id not in known_ids:
+        return CheckResult(
+            name="profile-backend",
+            status=FAIL,
+            message=(
+                f"ATOMIC_AGENTS_PROFILE_BACKEND={backend_id!r} is not "
+                f"a known backend. Known: {sorted(known_ids)}"
+            ),
+            fix_hint=(
+                "Set ATOMIC_AGENTS_PROFILE_BACKEND to one of the known "
+                "ids, or unset to use the filesystem default."
+            ),
+        )
+
+    # URL credential redaction — same urlparse + _replace pattern as
+    # check_log_backend / check_lock_backend. PR 1 also has a textual
+    # redaction in get_default_profile_backend's BackendNotRegistered
+    # message; this is the structured form for the PASS-path detail dict.
+    url = os.environ.get("ATOMIC_AGENTS_PROFILE_BACKEND_URL")
+    safe_url: str | None = None
+    if url:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        # Redact when EITHER password OR username is present. The
+        # password-only check inherited from check_lock_backend /
+        # check_log_backend misses token-as-username URLs common with
+        # managed services (Upstash ``redis://ghp_TOKEN@host``,
+        # PlanetScale ``mysql://API_KEY@host``, Heroku-style URLs).
+        # Step 9.1 security specialist finding F-S1; the same gap
+        # exists in the sister checks and is tracked as a separate
+        # follow-up — fixing all three together would expand PR 2's
+        # scope into pre-existing code paths, so PR 2 fixes only the
+        # new site (check_agent_profile_backend) and notes the
+        # sister-check gap inline. Future cleanup: lift the redaction
+        # helper into a shared utility and have all three checks
+        # consume it.
+        if parsed.password or parsed.username:
+            netloc = parsed.hostname or ""
+            if parsed.port:
+                netloc = f"{netloc}:{parsed.port}"
+            safe_url = parsed._replace(netloc=netloc).geturl()
+        else:
+            safe_url = url
+
+    try:
+        backend = get_default_profile_backend(agents_root)
+    except BackendNotRegistered:
+        return CheckResult(
+            name="profile-backend",
+            status=FAIL,
+            message=f"profile backend {backend_id!r} not registered",
+            fix_hint=(
+                f"The {backend_id!r} backend is reserved but its lazy "
+                "resolver failed. Unset ATOMIC_AGENTS_PROFILE_BACKEND to "
+                "use the filesystem default."
+            ),
+        )
+    except Exception:
+        # Drop the verbatim exception message — connection errors from
+        # backend constructors commonly embed the full URL with credentials.
+        return CheckResult(
+            name="profile-backend",
+            status=FAIL,
+            message=f"profile backend {backend_id!r} construction failed",
+            fix_hint=(
+                "Check ATOMIC_AGENTS_PROFILE_BACKEND and "
+                "ATOMIC_AGENTS_PROFILE_BACKEND_URL for typos. Run with "
+                "DEBUG logging to see the full exception."
+            ),
+        )
+
+    # Probe via capabilities() + list_agents() — both lightweight,
+    # verify the backend is reachable + schema-healthy. Match the
+    # WARN-on-unreachable-probe pattern from check_log_backend.
+    try:
+        caps = backend.capabilities()
+        agent_count = len(backend.list_agents())
+    except Exception:
+        return CheckResult(
+            name="profile-backend",
+            status=WARN,
+            message=(
+                f"operator-pinned backend {backend_id!r} configured "
+                "but capabilities() / list_agents() probe failed"
+            ),
+            fix_hint=(
+                "Verify ATOMIC_AGENTS_PROFILE_BACKEND_URL is correct + "
+                "the backend is reachable from this host. Doctor warns "
+                "instead of failing — the framework runtime will fail "
+                "at first load_profile if the backend is truly down."
+            ),
+        )
+
+    detail: dict[str, Any] = {
+        "backend_id": backend_id,
+        "supports_save": caps.supports_save,
+        "supports_clone": caps.supports_clone,
+        "supports_snapshot": caps.supports_snapshot,
+        "supports_subscribe": caps.supports_subscribe,
+        "durable": caps.durable,
+        "agent_count": agent_count,
+    }
+    if safe_url is not None:
+        detail["url"] = safe_url
+    return CheckResult(
+        name="profile-backend",
+        status=PASS,
+        message=(
+            f"{backend_id} backend ok ({agent_count} agent"
+            f"{'' if agent_count == 1 else 's'} discovered)"
         ),
         detail=detail,
     )
@@ -1177,17 +1463,20 @@ def check_memory_backend(agent_root: Path) -> CheckResult:
     memory_dir = agent_root / "memory"
     if not memory_dir.exists():
         return CheckResult(
-            name="memory-backend", status=FAIL,
+            name="memory-backend",
+            status=FAIL,
             message=f"memory/ directory missing at {memory_dir}",
             fix_hint=f"Create it: mkdir -p {memory_dir} && touch {memory_dir}/INDEX.md",
         )
     try:
         from .memory.filesystem import FilesystemBackend
+
         backend = FilesystemBackend(agent_root, "memory")
         stats = backend.stats()
     except Exception as e:
         return CheckResult(
-            name="memory-backend", status=FAIL,
+            name="memory-backend",
+            status=FAIL,
             message=f"backend stats() raised {type(e).__name__}: {e}",
             fix_hint=(
                 "Check that memory/ is readable and INDEX.md is well-formed. "
@@ -1195,7 +1484,8 @@ def check_memory_backend(agent_root: Path) -> CheckResult:
             ),
         )
     return CheckResult(
-        name="memory-backend", status=PASS,
+        name="memory-backend",
+        status=PASS,
         message=f"FilesystemBackend ok ({stats.total_notes} notes)",
         detail={
             "total_notes": stats.total_notes,
@@ -1205,7 +1495,9 @@ def check_memory_backend(agent_root: Path) -> CheckResult:
     )
 
 
-def check_write_paths(tools_data: dict, *, agent_root: Path | None = None) -> CheckResult:
+def check_write_paths(
+    tools_data: dict, *, agent_root: Path | None = None
+) -> CheckResult:
     """Each tools.md write_paths entry exists and is writable.
 
     Also verifies that the agent's memory directory falls inside at least
@@ -1225,11 +1517,13 @@ def check_write_paths(tools_data: dict, *, agent_root: Path | None = None) -> Ch
         # tools-only callers (no agent_root), empty == "n/a" and we skip.
         if agent_root is None:
             return CheckResult(
-                name="write-paths", status=SKIP,
+                name="write-paths",
+                status=SKIP,
                 message="tools.md declares no write_paths",
             )
         return CheckResult(
-            name="write-paths", status=FAIL,
+            name="write-paths",
+            status=FAIL,
             message="tools.md declares no write_paths; every capture write would be rejected",
             fix_hint=(
                 "Add a `## Write paths` section to tools.md listing at least "
@@ -1258,28 +1552,35 @@ def check_write_paths(tools_data: dict, *, agent_root: Path | None = None) -> Ch
         readonly_resolved = [Path(str(p)).expanduser().resolve() for p in read_only]
 
         if not any(_is_relative_to(memory_dir, w) for w in write_resolved):
-            failures.append((
-                str(memory_dir),
-                "agent memory dir is not inside any write_path "
-                "(captures would fail at runtime)",
-            ))
+            failures.append(
+                (
+                    str(memory_dir),
+                    "agent memory dir is not inside any write_path "
+                    "(captures would fail at runtime)",
+                )
+            )
         elif any(_is_relative_to(memory_dir, ro) for ro in readonly_resolved):
-            failures.append((
-                str(memory_dir),
-                "agent memory dir is inside a read_only_path "
-                "(captures would be rejected)",
-            ))
+            failures.append(
+                (
+                    str(memory_dir),
+                    "agent memory dir is inside a read_only_path "
+                    "(captures would be rejected)",
+                )
+            )
         elif memory_dir.exists() and not os.access(memory_dir, os.W_OK):
-            failures.append((
-                str(memory_dir),
-                "agent memory dir exists but is not writable "
-                "(captures would fail with PermissionError)",
-            ))
+            failures.append(
+                (
+                    str(memory_dir),
+                    "agent memory dir exists but is not writable "
+                    "(captures would fail with PermissionError)",
+                )
+            )
 
     if failures:
         rendered = "; ".join(f"{p} ({why})" for p, why in failures)
         return CheckResult(
-            name="write-paths", status=FAIL,
+            name="write-paths",
+            status=FAIL,
             message=f"write_paths invalid: {rendered}",
             fix_hint=(
                 "Create the missing directories or fix permissions. "
@@ -1290,7 +1591,8 @@ def check_write_paths(tools_data: dict, *, agent_root: Path | None = None) -> Ch
             detail={"failures": [{"path": p, "reason": w} for p, w in failures]},
         )
     return CheckResult(
-        name="write-paths", status=PASS,
+        name="write-paths",
+        status=PASS,
         message=f"all {len(paths)} write_paths exist and are writable",
         detail={"count": len(paths)},
     )

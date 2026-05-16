@@ -35,7 +35,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, date
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -49,6 +49,7 @@ from ._io import atomic_write
 from ._platform import get_agents_root
 from .agent import AtomicAgent
 from .eval import EvalRunner, _provider_available
+from .profile import AgentProfileBackend
 from .exceptions import AtomicAgentsError, CostGuardrailBlocked
 
 # ──────────────────────────────────────────────────────────────────
@@ -65,36 +66,38 @@ DEFAULT_MAX_ITERATIONS = 3
 @dataclass
 class IterationRecord:
     """Record of one agent+judge iteration within an OutcomeResult."""
-    iteration: int                    # 0-indexed
+
+    iteration: int  # 0-indexed
     agent_response: str
     agent_input_tokens: int
     agent_output_tokens: int
     agent_cost_usd: float
     agent_latency_ms: int
     judge_response_raw: str
-    judge_verdict: dict               # parsed: {satisfied, criterion_results, explanation, ...}
+    judge_verdict: dict  # parsed: {satisfied, criterion_results, explanation, ...}
     judge_cost_usd: float
     judge_input_tokens: int
     judge_output_tokens: int
-    artifact_path: Path | None        # if the agent wrote a file
-    timestamp: str                    # ISO 8601
+    artifact_path: Path | None  # if the agent wrote a file
+    timestamp: str  # ISO 8601
 
 
 @dataclass
 class OutcomeResult:
     """Complete result of an OutcomeRunner.run() call."""
+
     run_id: str
     description: str
-    rubric_source: str                # "<agent>/outcomes/foo.md" or "inline"
+    rubric_source: str  # "<agent>/outcomes/foo.md" or "inline"
     max_iterations: int
-    status: str                       # 'satisfied' | 'max_iterations_reached' | 'failed' | 'interrupted'
-    explanation: str                  # final judge explanation
+    status: str  # 'satisfied' | 'max_iterations_reached' | 'failed' | 'interrupted'
+    explanation: str  # final judge explanation
     iterations: list[IterationRecord] = field(default_factory=list)
     final_iteration_idx: int = -1
     total_cost_usd: float = 0.0
     total_input_tokens: int = 0
     total_output_tokens: int = 0
-    started_at: str = ""              # ISO 8601
+    started_at: str = ""  # ISO 8601
     ended_at: str = ""
     output_files: list[Path] = field(default_factory=list)
 
@@ -117,6 +120,7 @@ class OutcomeRunner:
         judge_model: str | None = None,
         *,
         log_backend: "LogBackend | None" = None,
+        profile_backend: "AgentProfileBackend | None" = None,
     ):
         self.agents_root = Path(agents_root) if agents_root else get_agents_root()
         self.agent_name = agent_name
@@ -127,11 +131,15 @@ class OutcomeRunner:
         # inside ``run()`` inherits it. Without this threading, the
         # operator-pinned backend would be silently dropped at the
         # agent-construction boundary — the DreamRunner-kwarg-drop trap
-        # shape the lock arc PR 3 Step 11 caught. Step 11 of THIS arc
-        # (PR 2) caught the equivalent at OutcomeRunner; fixed here.
+        # shape the lock arc PR 3 Step 11 caught.
         # ``None`` means: defer to the agent's own ``get_default_log_
         # backend`` resolution (env var → filesystem default).
         self._log_backend = log_backend
+        # #63 PR 2 — AgentProfileBackend forwarding. Same threading
+        # discipline as ``_log_backend``. Without this, an operator
+        # pinning a SaaS profile backend would silently drop it at the
+        # OutcomeRunner→AtomicAgent boundary.
+        self._profile_backend = profile_backend
 
         if not self.agent_root.exists():
             raise AtomicAgentsError(
@@ -175,7 +183,9 @@ class OutcomeRunner:
                 f"got {max_iterations}"
             )
 
-        run_id = f"outcome-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        run_id = (
+            f"outcome-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        )
         started_at = datetime.now().astimezone().isoformat()
 
         # Resolve rubric
@@ -193,20 +203,23 @@ class OutcomeRunner:
             description=description,
             rubric_source=rubric_source,
             max_iterations=max_iterations,
-            status="failed",           # overwritten on success
+            status="failed",  # overwritten on success
             explanation="",
             started_at=started_at,
         )
 
         # Initialize the agent (lazy-loads on first call).
-        # Thread ``self._log_backend`` through so operator-pinned
-        # backends survive the runner→agent construction boundary.
+        # Thread the operator's pinned backends through so they survive
+        # the runner→agent construction boundary. #61 PR 2 added the
+        # log_backend thread; #63 PR 2 adds profile_backend on the same
+        # discipline.
         agent = AtomicAgent(
             name=self.agent_name,
             trigger="outcome",
             agents_root=self.agents_root,
             run_id=run_id,
             log_backend=self._log_backend,
+            profile_backend=self._profile_backend,
         )
 
         # Resolve judge model: explicit > cross-family via eval config > pick_judge_model fallback
@@ -306,9 +319,7 @@ class OutcomeRunner:
             judge_check = agent._check_cost_guardrails(critical=False)
             if not judge_check.allow:
                 result.status = "interrupted"
-                result.explanation = (
-                    f"cost guardrail hit before judge call at iteration {i}: {judge_check.reason}"
-                )
+                result.explanation = f"cost guardrail hit before judge call at iteration {i}: {judge_check.reason}"
                 break
 
             # ── Step 7: Call judge ────────────────────────────────────────
@@ -376,7 +387,9 @@ class OutcomeRunner:
                         timestamp=ts_iter,
                     )
                     result.iterations.append(iter_record)
-                    self._append_iteration_log(agent, run_id, iter_record, "malformed_json")
+                    self._append_iteration_log(
+                        agent, run_id, iter_record, "malformed_json"
+                    )
                     result.status = "failed"
                     result.explanation = (
                         f"judge returned malformed JSON twice at iteration {i}: {e2}"
@@ -400,7 +413,9 @@ class OutcomeRunner:
                 timestamp=ts_iter,
             )
             result.iterations.append(iter_record)
-            self._append_iteration_log(agent, run_id, iter_record, verdict.get("satisfied", False))
+            self._append_iteration_log(
+                agent, run_id, iter_record, verdict.get("satisfied", False)
+            )
 
             # ── Step 10: Decide next ──────────────────────────────────────
             satisfied = bool(verdict.get("satisfied", False))
@@ -443,7 +458,9 @@ class OutcomeRunner:
         for rec in result.iterations:
             result.total_cost_usd += rec.agent_cost_usd + rec.judge_cost_usd
             result.total_input_tokens += rec.agent_input_tokens + rec.judge_input_tokens
-            result.total_output_tokens += rec.agent_output_tokens + rec.judge_output_tokens
+            result.total_output_tokens += (
+                rec.agent_output_tokens + rec.judge_output_tokens
+            )
         result.total_cost_usd = round(result.total_cost_usd, 6)
 
         # Write result.json to output dir
@@ -468,7 +485,9 @@ class OutcomeRunner:
             path = rubric if rubric.is_absolute() else self.agent_root / rubric
             if not path.exists():
                 raise AtomicAgentsError(f"Rubric file not found: {path}")
-            return path.read_text(encoding="utf-8"), str(path.relative_to(self.agents_root))
+            return path.read_text(encoding="utf-8"), str(
+                path.relative_to(self.agents_root)
+            )
 
         # String — check if it looks like a path
         rubric_str = str(rubric)
@@ -476,10 +495,16 @@ class OutcomeRunner:
             # Might be a path string
             candidate = Path(rubric_str)
             if candidate.is_absolute() and candidate.exists():
-                return candidate.read_text(encoding="utf-8"), str(candidate.relative_to(self.agents_root) if candidate.is_relative_to(self.agents_root) else candidate)
+                return candidate.read_text(encoding="utf-8"), str(
+                    candidate.relative_to(self.agents_root)
+                    if candidate.is_relative_to(self.agents_root)
+                    else candidate
+                )
             rel_candidate = self.agent_root / rubric_str
             if rel_candidate.exists():
-                return rel_candidate.read_text(encoding="utf-8"), str(rel_candidate.relative_to(self.agents_root))
+                return rel_candidate.read_text(encoding="utf-8"), str(
+                    rel_candidate.relative_to(self.agents_root)
+                )
 
         # Inline text
         return rubric_str, "inline"
@@ -496,7 +521,11 @@ class OutcomeRunner:
 
         # Try to use the eval runner's judge config if evals/ exists
         evals_dir = self.agent_root / "evals"
-        if evals_dir.exists() and (evals_dir / "rubric.md").exists() and (evals_dir / "judge.md").exists():
+        if (
+            evals_dir.exists()
+            and (evals_dir / "rubric.md").exists()
+            and (evals_dir / "judge.md").exists()
+        ):
             try:
                 eval_runner = EvalRunner(self.agents_root, self.agent_name)
                 return eval_runner.pick_judge_model(agent_model)
@@ -527,7 +556,9 @@ class OutcomeRunner:
             f"If you produce a file artifact, save it there. "
             f"If you produce a text artifact, just include it in your response."
         )
-        parts.append(f"## Rubric\n\nYour output will be graded against this rubric:\n\n{rubric_text}")
+        parts.append(
+            f"## Rubric\n\nYour output will be graded against this rubric:\n\n{rubric_text}"
+        )
         if extra_context:
             parts.append(f"## Additional context\n\n{extra_context}")
         if iteration > 0 and revision_feedback:
@@ -559,7 +590,7 @@ class OutcomeRunner:
             f'  "satisfied": true or false,\n'
             f'  "criterion_results": [\n'
             f'    {{"criterion": "<name>", "met": true or false, "gap": "<what is missing — only if not met>"}}\n'
-            f'  ],\n'
+            f"  ],\n"
             f'  "explanation": "<one-paragraph summary of verdict>",\n'
             f'  "rubric_contradicts_description": false\n'
             f"}}\n\n"
@@ -571,9 +602,7 @@ class OutcomeRunner:
 
     def _build_revision_feedback(self, verdict: dict, iteration: int) -> str:
         """Build human-readable feedback from the judge verdict for the next iteration."""
-        lines: list[str] = [
-            f"Iteration {iteration} did not satisfy the rubric."
-        ]
+        lines: list[str] = [f"Iteration {iteration} did not satisfy the rubric."]
         criterion_results = verdict.get("criterion_results", [])
         unmet = [c for c in criterion_results if not c.get("met", True)]
         if unmet:
@@ -625,8 +654,12 @@ class OutcomeRunner:
             "judge_input_tokens": record.judge_input_tokens,
             "judge_output_tokens": record.judge_output_tokens,
             "judge_cost_usd": record.judge_cost_usd,
-            "satisfied": verdict_summary if isinstance(verdict_summary, bool) else False,
-            "artifact_path": str(record.artifact_path) if record.artifact_path else None,
+            "satisfied": verdict_summary
+            if isinstance(verdict_summary, bool)
+            else False,
+            "artifact_path": str(record.artifact_path)
+            if record.artifact_path
+            else None,
         }
         if isinstance(verdict_summary, str):
             line["judge_error"] = verdict_summary
@@ -693,31 +726,40 @@ def main(argv: list[str] | None = None) -> int:
         description="Run an iterate-to-rubric outcome loop for an agent",
     )
     parser.add_argument("agent", help="agent name (folder under agents-root)")
-    parser.add_argument("--description", required=True,
-                        help="what the agent should produce")
-    parser.add_argument("--rubric", required=True,
-                        help="path to rubric file, or 'inline:<text>'")
-    parser.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS,
-                        help=f"max iterations (default {DEFAULT_MAX_ITERATIONS}, max {MAX_ITERATIONS_CAP})")
-    parser.add_argument("--judge-model", default=None,
-                        help="override the judge model")
-    parser.add_argument("--output-dir", default=None,
-                        help="where the agent writes artifact files")
-    parser.add_argument("--extra-context", default=None,
-                        help="additional context for the agent")
-    parser.add_argument("--agents-root", default=None,
-                        help="override ATOMIC_AGENTS_ROOT")
+    parser.add_argument(
+        "--description", required=True, help="what the agent should produce"
+    )
+    parser.add_argument(
+        "--rubric", required=True, help="path to rubric file, or 'inline:<text>'"
+    )
+    parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=DEFAULT_MAX_ITERATIONS,
+        help=f"max iterations (default {DEFAULT_MAX_ITERATIONS}, max {MAX_ITERATIONS_CAP})",
+    )
+    parser.add_argument("--judge-model", default=None, help="override the judge model")
+    parser.add_argument(
+        "--output-dir", default=None, help="where the agent writes artifact files"
+    )
+    parser.add_argument(
+        "--extra-context", default=None, help="additional context for the agent"
+    )
+    parser.add_argument(
+        "--agents-root", default=None, help="override ATOMIC_AGENTS_ROOT"
+    )
     args = parser.parse_args(argv)
 
     agents_root = (
         Path(args.agents_root).expanduser().resolve()
-        if args.agents_root else get_agents_root()
+        if args.agents_root
+        else get_agents_root()
     )
 
     # Resolve rubric arg
     rubric: str | Path
     if args.rubric.startswith("inline:"):
-        rubric = args.rubric[len("inline:"):]
+        rubric = args.rubric[len("inline:") :]
     else:
         rubric = Path(args.rubric)
 
@@ -772,7 +814,7 @@ def _print_result(result: OutcomeResult) -> None:
     print(f"Total cost:  ${result.total_cost_usd:.4f}")
     print(f"Explanation: {result.explanation}")
     if result.output_files:
-        print(f"Output files:")
+        print("Output files:")
         for f in result.output_files:
             print(f"  {f}")
     print()
@@ -780,4 +822,5 @@ def _print_result(result: OutcomeResult) -> None:
 
 if __name__ == "__main__":
     import sys
+
     sys.exit(main())
