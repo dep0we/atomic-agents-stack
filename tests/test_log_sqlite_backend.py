@@ -159,6 +159,63 @@ def test_wal_journal_mode_enabled(tmp_path):
     assert mode.lower() == "wal"
 
 
+def test_busy_timeout_set_before_wal_pragma(tmp_path):
+    """#208: ``PRAGMA busy_timeout=5000`` MUST be set before the WAL
+    pragma so the cold-start WAL-transition race waits instead of
+    raising ``OperationalError: database is locked``. Same shape as
+    the parallel #64 PR 3 fix in ``atomic_agents/registry/sqlite.py``.
+
+    The pre-existing ``test_concurrent_appends_from_threads`` flake
+    (~80% local-macOS fail rate) was the same race — multiple threads
+    open per-thread connections to the same fresh db and race the
+    WAL transition; without busy_timeout, the losers hard-fail.
+    """
+    db = tmp_path / "logs.db"
+    backend = SQLiteLogBackend(db)
+    # Trigger _get_conn for this thread.
+    backend.append(_make_record())
+    conn = backend._get_conn()
+    timeout_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    assert timeout_ms == 5000, (
+        f"busy_timeout must be 5000ms (got {timeout_ms}) — without it, "
+        f"concurrent threads/processes opening a fresh db race the WAL "
+        f"transition and the losers raise OperationalError"
+    )
+
+
+def test_concurrent_appends_no_wal_race_under_repeated_runs(tmp_path):
+    """#208 regression: repeat the concurrent-append scenario 10 times
+    against a fresh db each iteration. With busy_timeout=5000 set
+    BEFORE the WAL pragma, all 10 iterations MUST succeed without
+    ``sqlite3.OperationalError`` from the cold-start WAL race.
+
+    Pre-fix: ~80% fail rate on macOS for a single run. Post-fix:
+    10/10 success.
+    """
+    for iteration in range(10):
+        db = tmp_path / f"logs_{iteration}.db"
+        backend = SQLiteLogBackend(db)
+
+        def worker(thread_id: int):
+            for i in range(10):
+                backend.append(_make_record(
+                    run_id=f"i{iteration}-t{thread_id}-r{i}",
+                    ts=_ts(2026, 5, 15, thread_id),
+                ))
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        stats = backend.stats()
+        assert stats.total_records == 40, (
+            f"iteration {iteration}: expected 40 records (4 threads × 10), "
+            f"got {stats.total_records} — WAL race likely dropped writes"
+        )
+
+
 # ──────────────────────────────────────────────────────────────────
 # Round-trip fidelity
 
