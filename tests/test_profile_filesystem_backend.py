@@ -125,12 +125,50 @@ def test_other_hidden_prefixes_excluded(tmp_path):
 # Path-traversal refusal — _agent_root() should refuse separators
 
 
-def test_agent_id_with_path_separator_refused(tmp_path):
+def test_agent_id_with_backslash_refused(tmp_path):
+    """Windows-shape path tokens stay refused — backslash attack shape."""
     backend = FilesystemAgentProfileBackend(tmp_path)
-    with pytest.raises(ValueError, match="path separator"):
+    with pytest.raises(ValueError, match="backslash"):
+        backend.load_profile("nested\\path")
+
+
+def test_agent_id_with_dotdot_refused(tmp_path):
+    """Explicit ``..`` segments stay refused (path traversal)."""
+    backend = FilesystemAgentProfileBackend(tmp_path)
+    with pytest.raises(ValueError, match="\\.\\.|resolves outside"):
         backend.load_profile("../escape")
-    with pytest.raises(ValueError, match="path separator"):
-        backend.load_profile("nested/path")
+    with pytest.raises(ValueError, match="\\.\\.|resolves outside"):
+        backend.load_profile("foo/../../escape")
+
+
+def test_agent_id_with_slash_allowed_for_cascade(tmp_path):
+    """Cascade agents have multi-segment identities under ``scope_root``.
+
+    Per spec/06, a cascade-layout agent lives at
+    ``<system>/projects/<project>/agents/<role>/`` — when ``scope_root``
+    is the system root, the agent's identity is the full path beneath
+    it. The PR 1 draft refused ``/`` in ``agent_id`` for safety, but
+    that broke cascade integration. The relax-and-rely-on-relative_to
+    fix (#63 PR 2 Decision 1) makes slash-containing IDs valid as long
+    as they resolve under ``scope_root``.
+    """
+    # Build a cascade-shaped agent dir under scope_root
+    instance_root = (
+        tmp_path / "muse" / "projects" / "the-unfinished" / "agents" / "writer"
+    )
+    instance_root.mkdir(parents=True)
+    (instance_root / "persona").mkdir()
+    (instance_root / "persona" / "IDENTITY.md").write_text(
+        "# Writer\n\n## Operating mode\n\nThis agent is reactive.\n",
+        encoding="utf-8",
+    )
+
+    backend = FilesystemAgentProfileBackend(tmp_path)
+    cascade_id = "muse/projects/the-unfinished/agents/writer"
+    # Should NOT raise — cascade-shaped agent_id resolves correctly under scope_root
+    assert backend.exists(cascade_id) is True
+    profile = backend.load_profile(cascade_id)
+    assert profile.name == cascade_id
 
 
 def test_agent_id_starting_with_dot_refused(tmp_path):

@@ -142,19 +142,48 @@ class FilesystemAgentProfileBackend:
 
         Filesystem backends MUST validate ``agent_id`` cannot escape
         ``scope_root``. ``"../other-system/agent"`` is the obvious
-        attack shape; refuse via the standard relative-to check rather
-        than a regex blocklist.
+        attack shape; the ``.resolve() + .relative_to(scope_root)``
+        check below is the load-bearing security boundary.
+
+        **Cascade support (PR 2 of #63):** ``agent_id`` MAY contain
+        forward slashes for cascade-layout agents whose identity is a
+        multi-segment relative path under ``scope_root`` (e.g.,
+        ``"muse/projects/the-unfinished/agents/writer"`` for the
+        cascade-shaped layout described in spec/06). The slash refusal
+        in the original PR 1 draft was overly restrictive for cascade
+        layouts; the ``relative_to`` check is what actually catches
+        traversal after path resolution.
+
+        Still refused (security):
+
+        - Empty string — no agent
+        - Leading ``.`` — hidden-directory traversal (e.g., ``.hidden``,
+          ``.snapshots``)
+        - Backslash ``\\`` — Windows-shape path traversal attack
+        - ``..`` anywhere in the path — explicit parent-dir token,
+          refused before resolution so the operator gets an actionable
+          error message instead of an opaque "resolves outside"
+        - Final resolved path outside ``scope_root`` (relative_to check
+          is the security boundary)
         """
         if not agent_id:
             raise ValueError("agent_id must not be empty")
-        # Forbid path separators and parent-dir tokens up front so the
-        # error message is actionable. The ``relative_to`` check below
-        # is the belt-and-suspenders.
-        if "/" in agent_id or "\\" in agent_id or agent_id.startswith("."):
+        if "\\" in agent_id:
             raise ValueError(
-                f"agent_id {agent_id!r} contains a path separator or "
-                f"starts with '.' — filesystem backend requires plain "
-                f"directory names"
+                f"agent_id {agent_id!r} contains a backslash — "
+                f"filesystem backend rejects Windows-shape path tokens"
+            )
+        if agent_id.startswith("."):
+            raise ValueError(
+                f"agent_id {agent_id!r} starts with '.' — refused to "
+                f"prevent hidden-directory traversal"
+            )
+        # Reject ``..`` anywhere (including inside multi-segment cascade
+        # paths) so operator typos surface immediately rather than
+        # bouncing off the relative_to boundary downstream.
+        if ".." in agent_id.split("/"):
+            raise ValueError(
+                f"agent_id {agent_id!r} contains '..' segment — path traversal refused"
             )
         candidate = (self._scope_root / agent_id).resolve()
         try:
