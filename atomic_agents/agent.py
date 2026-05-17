@@ -3564,26 +3564,18 @@ class AtomicAgent:
             # mandate_id + proposal_id when at least one mandate cite
             # committed this call. _sum_prior_token_cost queries by
             # cost_source=actor + mandate_id; without this tag, cumulative
-            # token-cap defense is unenforceable. Single-mandate-per-call
-            # case sets the top-level fields exactly; multi-mandate-per-call
-            # picks the most-recent cite (apportionment across mandates is
-            # a documented gap, follow-up issue #TODO).
-            if self._successful_mandate_cites_this_call:
-                _distinct_mids = {
-                    _m for _m, _p in self._successful_mandate_cites_this_call
-                }
-                if len(_distinct_mids) == 1:
-                    _last_mid, _last_pid = self._successful_mandate_cites_this_call[-1]
-                    log_record["mandate_id"] = _last_mid
-                    log_record["proposal_id"] = _last_pid
-                else:
-                    # Multi-mandate iteration: attribute spend to the most
-                    # recent cite. Documented under-attribution; spec/29
-                    # apportionment is a v1 simplification.
-                    _last_mid, _last_pid = self._successful_mandate_cites_this_call[-1]
-                    log_record["mandate_id"] = _last_mid
-                    log_record["proposal_id"] = _last_pid
-                    log_record["mandate_cites_in_call"] = sorted(_distinct_mids)
+            # token-cap defense is unenforceable. Round 2 R2-2: extracted
+            # to a pure helper so the test suite pins the contract without
+            # re-implementing the logic inline.
+            from .judge.mandate_reservations import (
+                build_mandate_log_record_extras,
+            )
+
+            log_record.update(
+                build_mandate_log_record_extras(
+                    self._successful_mandate_cites_this_call
+                )
+            )
             if self._helpers_this_run:
                 # Spec/13 Layer 3 — research log: roll up helper provenance
                 # into the parent run record so an audit can trace every fact

@@ -635,3 +635,37 @@ def compute_outstanding(
     # and reorders — sort defensively to keep the contract stable).
     outstanding.sort(key=lambda r: r.ts)
     return outstanding
+
+
+def build_mandate_log_record_extras(
+    successful_cites: list[tuple[str, str]],
+) -> dict[str, object]:
+    """Build the mandate tagging fields for an agent_call cost log record.
+
+    Round 1 Finding 1 + Round 2 R2-2 — extracted into a pure helper so the
+    test suite can pin the tagging contract without re-implementing the logic
+    inline. The agent loop calls this with its
+    ``_successful_mandate_cites_this_call`` list at log_record build time.
+
+    Returns a dict to merge into the log_record:
+      - Empty dict when no mandate cites committed this call (back-compat).
+      - {'mandate_id': X, 'proposal_id': Y} on single-mandate calls.
+      - {'mandate_id': X (most-recent), 'proposal_id': Y, 'mandate_cites_in_call': [...]}
+        on multi-mandate calls so operators see the v1 under-attribution.
+
+    Spec/29 §"Atomic emission of `mandate_used`" (commit 15089f2 amendment):
+    the cost event IS the mandate_used surface. ``_sum_prior_token_cost``
+    queries by ``cost_source=actor + mandate_id``; the top-level
+    ``mandate_id`` field is load-bearing for that query.
+    """
+    if not successful_cites:
+        return {}
+    distinct_mids = {m for m, _ in successful_cites}
+    last_mid, last_pid = successful_cites[-1]
+    extras: dict[str, object] = {
+        "mandate_id": last_mid,
+        "proposal_id": last_pid,
+    }
+    if len(distinct_mids) > 1:
+        extras["mandate_cites_in_call"] = sorted(distinct_mids)
+    return extras

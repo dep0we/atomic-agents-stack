@@ -506,46 +506,67 @@ class TestAtomicAgentCostEventMandateIdExtra:
         # The tagging logic in call() guards on the list being non-empty.
         assert agent._successful_mandate_cites_this_call == []
 
-    def test_single_mandate_cite_tags_agent_call_log_record(self, tmp_path: Path):
-        """A single mandate cite committed this call → log_record carries
+    def test_single_mandate_cite_tags_agent_call_log_record(self):
+        """A single mandate cite committed this call → helper returns
         mandate_id + proposal_id top-level. _sum_prior_token_cost matches.
-        Round 1 Finding 1 regression pin.
+        Round 1 Finding 1 regression pin via the helper extracted in R2-2.
         """
-        _make_minimal_agent_dir(tmp_path, "scout")
-        agent = AtomicAgent(name="scout", agents_root=tmp_path)
-        agent._successful_mandate_cites_this_call = [
-            ("procurement-q2-2026", "prop-abc123"),
-        ]
-        # Re-run the tagging logic from agent.call() (the load-bearing block):
-        log_record: dict = {}
-        distinct_mids = {m for m, p in agent._successful_mandate_cites_this_call}
-        if len(distinct_mids) == 1:
-            last_mid, last_pid = agent._successful_mandate_cites_this_call[-1]
-            log_record["mandate_id"] = last_mid
-            log_record["proposal_id"] = last_pid
-        assert log_record["mandate_id"] == "procurement-q2-2026"
-        assert log_record["proposal_id"] == "prop-abc123"
+        from atomic_agents.judge.mandate_reservations import (
+            build_mandate_log_record_extras,
+        )
 
-    def test_multi_mandate_cite_emits_apportionment_hint(self, tmp_path: Path):
-        """Two distinct mandates cited in one call → log_record carries the
+        extras = build_mandate_log_record_extras(
+            [("procurement-q2-2026", "prop-abc123")]
+        )
+        assert extras["mandate_id"] == "procurement-q2-2026"
+        assert extras["proposal_id"] == "prop-abc123"
+        assert "mandate_cites_in_call" not in extras
+
+    def test_multi_mandate_cite_emits_apportionment_hint(self):
+        """Two distinct mandates cited in one call → helper returns the
         most-recent mandate_id but also a 'mandate_cites_in_call' list so
         operators see the under-attribution. Documents the v1 limitation.
         """
-        _make_minimal_agent_dir(tmp_path, "scout")
-        agent = AtomicAgent(name="scout", agents_root=tmp_path)
-        agent._successful_mandate_cites_this_call = [
-            ("mandate-a", "prop-1"),
-            ("mandate-b", "prop-2"),
-        ]
-        log_record: dict = {}
-        distinct_mids = {m for m, p in agent._successful_mandate_cites_this_call}
-        last_mid, last_pid = agent._successful_mandate_cites_this_call[-1]
-        log_record["mandate_id"] = last_mid
-        log_record["proposal_id"] = last_pid
-        if len(distinct_mids) > 1:
-            log_record["mandate_cites_in_call"] = sorted(distinct_mids)
-        assert log_record["mandate_id"] == "mandate-b"
-        assert log_record["mandate_cites_in_call"] == ["mandate-a", "mandate-b"]
+        from atomic_agents.judge.mandate_reservations import (
+            build_mandate_log_record_extras,
+        )
+
+        extras = build_mandate_log_record_extras(
+            [("mandate-a", "prop-1"), ("mandate-b", "prop-2")]
+        )
+        assert extras["mandate_id"] == "mandate-b"
+        assert extras["proposal_id"] == "prop-2"
+        assert extras["mandate_cites_in_call"] == ["mandate-a", "mandate-b"]
+
+    def test_empty_cites_list_returns_empty_dict(self):
+        """No mandate cites committed → helper returns {} so log_record stays
+        back-compat for non-mandate-citing calls. R2-2 regression pin."""
+        from atomic_agents.judge.mandate_reservations import (
+            build_mandate_log_record_extras,
+        )
+
+        assert build_mandate_log_record_extras([]) == {}
+
+    def test_repeated_same_mandate_cite_treats_as_single(self):
+        """Same mandate cited across 5 iterations → still single-mandate
+        tagging (no mandate_cites_in_call hint). Round 2 R2-2 pin: distinct
+        check on mids, not entry count."""
+        from atomic_agents.judge.mandate_reservations import (
+            build_mandate_log_record_extras,
+        )
+
+        extras = build_mandate_log_record_extras(
+            [
+                ("M1", "p1"),
+                ("M1", "p2"),
+                ("M1", "p3"),
+                ("M1", "p4"),
+                ("M1", "p5"),
+            ]
+        )
+        assert extras["mandate_id"] == "M1"
+        assert extras["proposal_id"] == "p5"  # most-recent
+        assert "mandate_cites_in_call" not in extras
 
 
 # ──────────────────────────────────────────────────────────────────

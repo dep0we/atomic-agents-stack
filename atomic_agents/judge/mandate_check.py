@@ -560,17 +560,6 @@ class MandateCheck:
             caps_exceeded.update(ext_result["caps_exceeded"])
             contributing_reservation_ids.extend(ext_result.get("reservation_ids", []))
 
-        # Round 1 Finding 6: cache the projection so the agent loop can
-        # create a reservation with non-zero ``projected_usd``. Without this,
-        # the stale-budget race defense in compute_outstanding is vacuous
-        # (outstanding reservations contribute 0 to cumulative; concurrent
-        # mandate-citing actions all see "no outstanding spend" and exceed
-        # the cap silently). Recorded BEFORE every potential ALLOW return so
-        # the cache reflects the most recent projection for this proposal.
-        self.record_projection(
-            proposal.proposal_id, projected_token_usd, projected_external_usd
-        )
-
         # ── Step 9: Escalation thresholds (spec/29 line 382-384, Risk 7) ─────
         # Spec/29 line 384 amendment: step 9 ESCALATE preempts step 8 BLOCK
         # when both fire for the same projection.  Evaluate before returning
@@ -601,6 +590,15 @@ class MandateCheck:
                 cumulative_external_now=cumulative_external_now,
                 projected_usd=max(projected_token_usd, projected_external_usd),
             )
+
+        # Round 1 Finding 6 + Round 2 Finding R2-1: cache the projection so
+        # the agent loop can create a reservation with non-zero ``projected_usd``.
+        # Recorded ONLY on the ALLOW path — recording before BLOCK/ESCALATE
+        # returns would leak cache entries that no caller ever pops, slowly
+        # growing _projection_cache across the agent's lifetime.
+        self.record_projection(
+            proposal.proposal_id, projected_token_usd, projected_external_usd
+        )
 
         # ── All checks pass → ALLOW ────────────────────────────────────────────
         # Spec/29 line 390: "If all checks pass: ALLOW. The judgment event's
