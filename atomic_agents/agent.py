@@ -21,7 +21,7 @@ import time
 from dataclasses import asdict
 from datetime import date, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from .llm.types import LLMToolDefinition  # noqa: F401 — used in str type hints
@@ -376,6 +376,27 @@ class AtomicAgent:
         # re-reading the filesystem.
         self._profile: AgentProfile = self.profile_backend.load_profile(self.name)
 
+        # Per-agent target extractor registry (spec/29 §"Target extraction",
+        # #124 PR 3a). MUST initialize BEFORE tool_registry loading below so
+        # ToolDefinitions that declare a target_extractor_id can be validated
+        # at tool_registry.register() time rather than silently failing at
+        # MandateCheck evaluation time (plan-subagent Risk A + spec/29
+        # §"Registration order discipline"). Built-in heuristic extractors
+        # (recipient_to, recipient_field, target_field, url_field,
+        # repository_field, customer_id_field, channel_id_field) are
+        # pre-registered by TargetExtractorRegistry.__init__ — they are always
+        # available for all tool descriptors. Operators add custom extractors
+        # via agent.register_target_extractor(name, callable) AFTER agent
+        # construction, then register the tool that references the extractor.
+        # NOT persisted on AgentProfile snapshot (Callable values cannot
+        # satisfy spec/25 MUST #4 Tier B lossless round-trip for structured-
+        # storage backends). Per-agent scoping: delegate agents construct their
+        # own TargetExtractorRegistry fresh — coordinator-registered extractors
+        # do NOT flow to delegates (mirrors spec/15 delegate isolation +
+        # spec/25 Decision 9 per-agent backend scoping).
+        from .judge.target_extractor_registry import TargetExtractorRegistry
+        self._target_extractors = TargetExtractorRegistry()
+
         # Register backend-discovered tools into the in-memory
         # ``self.tool_registry`` (#64 PR 2 — Decision 1 + Decision 8 of
         # spec/25). The Protocol layer COMPOSES with the in-memory
@@ -455,7 +476,9 @@ class AtomicAgent:
                 #     defense-in-depth shape as ``list_tools`` already
                 #     applies to descriptor parsing.
                 continue
-            self.tool_registry.register(td)
+            self.tool_registry.register(
+                td, target_extractor_registry=self._target_extractors
+            )
 
         # Cascade detection — None for single-agent layouts (load behaves as before),
         # populated for paths shaped <system>/projects/<project>/agents/<role>/.
@@ -518,6 +541,7 @@ class AtomicAgent:
         self._policy_judge = None
         self._llm_judge = None  # type: ignore[assignment]
         self._llm_judge_constructed = False  # distinct from None-cache
+        self._mandate_check = None  # type: ignore[assignment]  # #124 PR 3a
         self._tool_classifications: dict[str, str] = {}
         self.judges_config = None  # type: ignore[assignment]
 
@@ -644,6 +668,49 @@ class AtomicAgent:
                 handler=_handle_load_skill_file,
             )
         )
+
+    def register_target_extractor(
+        self, name: str, callable_: Callable[[dict], str | None]
+    ) -> None:
+        """Register a per-agent target extractor for mandate target matching.
+
+        Binds a named callable to the agent's ``TargetExtractorRegistry``
+        (spec/29 §"Target extraction", #124 PR 3a). Tool definitions reference
+        the extractor by string ID via ``ToolDefinition.target_extractor_id``.
+        The framework invokes the callable against ``tool_arguments`` at
+        proposal-assembly time to populate ``ActionProposal.target_canonical``,
+        which ``MandateCheck`` step 5 reads to enforce
+        ``constraints.allowed_targets`` / ``blocked_targets``.
+
+        **Registration order matters.** Call this method BEFORE calling
+        ``tool_registry.register()`` for any tool that references ``name``
+        via ``target_extractor_id``. If you register the tool first, the
+        validation at ``tool_registry.register()`` time will fail with
+        ``UnknownTargetExtractor`` (spec/29 §"Registration order discipline").
+
+        Built-in heuristic extractors (``recipient_to``, ``recipient_field``,
+        ``target_field``, ``url_field``, ``repository_field``,
+        ``customer_id_field``, ``channel_id_field``) are pre-registered at
+        agent construction — no need to register them again. Use this method
+        for tools whose argument shape doesn't match the built-in heuristics.
+
+        Raises ``ValueError`` if ``name`` is already registered (collision
+        guard mirrors ``register_tool_registry_backend`` precedent — no silent
+        overwrite). To replace a registered extractor (including a built-in),
+        call ``self._target_extractors.replace(name, callable_)`` directly.
+
+        Args:
+            name: Unique string ID for this extractor. Must be non-empty and
+                contain only lowercase alphanumeric characters plus underscore.
+            callable_: A callable ``(dict) → str | None``. Receives the tool's
+                ``tool_arguments`` dict; returns the canonical target string or
+                ``None`` when no target can be extracted.
+
+        Raises:
+            ValueError: ``name`` is already registered or has an invalid format
+                (not lowercase alphanumeric + underscore).
+        """
+        self._target_extractors.register(name, callable_)
 
     @staticmethod
     def _generate_run_id() -> str:
@@ -839,6 +906,51 @@ class AtomicAgent:
             read_only_paths=[Path(p) for p in (self.config.read_only_paths or [])],
         )
         return self._policy_judge
+
+    def _ensure_mandate_check(self):
+        """Lazy-construct and cache the ``MandateCheck`` judge specialist
+        (spec/29 + #124 PR 3a). Returns the cached instance on subsequent
+        calls.
+
+        MandateCheck is a sibling of PolicyJudge in the composition
+        ``[PolicyJudge, MandateCheck, LLMCatchAll]`` per spec/29 line 392.
+        Both rule-engine, both always-on, both fail-fast. MandateCheck
+        pass-throughs (ALLOW immediately) on proposals that don't cite a
+        mandate so the ensemble overhead is bounded by an Authorization
+        field check on non-mandate-citing actions.
+        """
+        if getattr(self, "_mandate_check", None) is not None:
+            return self._mandate_check
+        from .judge.mandate_check import MandateCheck
+        from .judge.mandate_state import MandateStateManager
+
+        # Scope derivation: agent-local for now (project-root mandate
+        # resolution lands in PR 4 alongside cross-agent budget aggregation).
+        scope = f"agent:{self.agent_root.name}"
+
+        # Mandate settings: prefer parsed judges.md config; fall back to
+        # default-fill via MandateSettings() factory (zero-operator-action
+        # upgrade per spec/29 + the #218 prep).
+        if self.judges_config is not None:
+            mandate_settings = self.judges_config.mandate_settings
+        else:
+            from .judges_md import MandateSettings
+            mandate_settings = MandateSettings()
+
+        state_manager = MandateStateManager(
+            mandate_backend=self.mandate_backend,
+            scope=scope,
+        )
+
+        self._mandate_check = MandateCheck(
+            mandate_backend=self.mandate_backend,
+            scope=scope,
+            target_extractor_registry=self._target_extractors,
+            mandate_state_manager=state_manager,
+            mandate_settings=mandate_settings,
+            log_backend=self.log_backend,
+        )
+        return self._mandate_check
 
     def _ensure_llm_judge(self):
         """Lazy-construct and cache the default ``LLMJudgeBackend`` for
@@ -1649,6 +1761,20 @@ class AtomicAgent:
         # but does not let BLOCKs gate execution (audit-only).
         audit_mode = effective_class_policy == _CPV.ALLOW_WITH_AUDIT
         judges = [self._ensure_policy_judge()]
+        # MandateCheck inserted between PolicyJudge and LLMJudge per
+        # spec/29 line 392 — `[PolicyJudge, MandateCheck, LLMCatchAll]`.
+        # Conditionally included: only when the proposal cites a mandate
+        # (Authorization.granted_by starts with "mandate:"). This keeps
+        # the ensemble shape unchanged for non-mandate-citing actions —
+        # zero behavior change for existing operator deployments per the
+        # #124 PR 2 zero-behavior-change discipline. Mandate-citing
+        # proposals get the spec/29 composition.
+        cites_mandate = (
+            proposal_obj.authorization is not None
+            and proposal_obj.authorization.granted_by.startswith("mandate:")
+        )
+        if cites_mandate:
+            judges.append(self._ensure_mandate_check())
         llm_judge = self._ensure_llm_judge()
         if llm_judge is not None:
             judges.append(llm_judge)

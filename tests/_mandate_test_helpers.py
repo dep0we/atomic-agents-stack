@@ -40,6 +40,7 @@ def make_mandate_md_content(
     granted_at: datetime | None = None,
     expires_at: datetime | None = None,
     revocation_state: str = "active",
+    scope: str = "test mandate authority for unit/integration tests",
     allowed_tools: list[str] | None = None,
     allowed_targets: list[str] | None = None,
     blocked_targets: list[str] | None = None,
@@ -63,6 +64,7 @@ def make_mandate_md_content(
     lines = [
         f"granted_by: {granted_by}",
         f"granted_at: {granted_at.isoformat()}",
+        f"scope: {scope}",  # prose authority description; required per mandates_md parser
     ]
     if expires_at is not None:
         lines.append(f"expires_at: {expires_at.isoformat()}")
