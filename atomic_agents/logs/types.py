@@ -56,6 +56,7 @@ PRIMITIVE_COST_WARNING = "cost_warning"
 PRIMITIVE_CAPTURE = "capture"
 PRIMITIVE_ESCALATION = "escalation"
 PRIMITIVE_JUDGMENT = "judgment"
+PRIMITIVE_MANDATE_RESERVATION = "mandate_reservation"  # #124 PR 3b — reservation event family (granted/used/committed/rolled_back/expired/_on_recovery/_external_unverified) all share this primitive so LogQuery(primitive=PRIMITIVE_MANDATE_RESERVATION, mandate_id=...) is an indexed query on SQLite backends and a bounded scan on filesystem
 PRIMITIVE_OTHER = "other"
 
 

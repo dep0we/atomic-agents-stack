@@ -85,6 +85,7 @@ if TYPE_CHECKING:
     # but the string annotation in the method signature stays safe via
     # TYPE_CHECKING + ``from __future__ import annotations``.
     from .judge.target_extractor_registry import TargetExtractorRegistry
+    from .judge.cost_estimator_registry import CostEstimatorRegistry  # #124 PR 3b prep
 
 from .exceptions import ToolHandlerError, ToolInputInvalid, ToolNameCollision, ToolNotRegistered
 
@@ -179,6 +180,8 @@ class ToolDefinition:
     handler: Callable[[dict], Any]
     classification: str | None = None
     target_extractor_id: str | None = None
+    cost_estimator_id: str | None = None
+    expected_external_cost_usd: float | None = None
 
 
 @dataclass
@@ -223,6 +226,7 @@ class ToolRegistry:
         *,
         allow_overwrite: bool = False,
         target_extractor_registry: "TargetExtractorRegistry | None" = None,
+        cost_estimator_registry: "CostEstimatorRegistry | None" = None,
     ) -> None:
         """Register a tool.
 
@@ -303,6 +307,29 @@ class ToolRegistry:
                 f"agent.register_target_extractor({tool.target_extractor_id!r}, fn) "
                 f"BEFORE registering this tool, or use one of the built-in "
                 f"extractors: {target_extractor_registry.list_names()}"
+            )
+        # Fail-fast cost_estimator_id validation (spec/29 §"Registration
+        # order discipline", #124 PR 3b prep — plan-subagent Risk D).
+        # Same shape as target_extractor_id validation: when the agent's
+        # CostEstimatorRegistry is wired, an operator-configured
+        # cost_estimator_id that references a missing estimator surfaces
+        # HERE (at register time) instead of silently fail-closing with
+        # mandate_external_cost_unprojectable at MandateCheck step 8.
+        if (
+            tool.cost_estimator_id is not None
+            and cost_estimator_registry is not None
+            and not cost_estimator_registry.has(tool.cost_estimator_id)
+        ):
+            from .judge.cost_estimator_registry import UnknownCostEstimator
+            raise UnknownCostEstimator(
+                f"Tool {tool.name!r} declares cost_estimator_id "
+                f"{tool.cost_estimator_id!r} which is not registered in the "
+                f"agent's CostEstimatorRegistry. Register it via "
+                f"agent.register_cost_estimator({tool.cost_estimator_id!r}, fn) "
+                f"BEFORE registering this tool. No built-in cost estimators "
+                f"ship by default — tools with dynamic pricing must register "
+                f"explicitly; tools with static pricing should use "
+                f"ToolDefinition.expected_external_cost_usd instead."
             )
         self._tools[tool.name] = tool
         _logger.debug("registered tool %r", tool.name)
