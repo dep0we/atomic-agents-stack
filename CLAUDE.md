@@ -122,15 +122,15 @@ Code without spec is incomplete. New backend = new spec doc, numbered, in `docs/
 
 Spec lock cadence: spec gets locked when the implementation matches and tests pass. Spec changes that imply implementation changes get filed as issues. Spec docs are not aspirational; they describe what's true today.
 
-### 11. Codex review in rounds, not passes
+### 11. Adversarial review in rounds, not passes
 
-For any non-trivial PR — especially backend protocols, framework refactors, anything touching `agent.call()`, `_capture.py`, `_costs.py`, `_locks.py`, the protocol surfaces — run **3-5 codex rounds pre-merge**, not one thorough pass.
+For any non-trivial PR — especially backend protocols, framework refactors, anything touching `agent.call()`, `_capture.py`, `_costs.py`, `_locks.py`, the protocol surfaces, AND even docs-only PRs — run **2-5 Opus adversarial rounds pre-merge**, not one thorough pass. The Opus adversarial subagent is the default reviewer; Codex is skipped per the standing project rule (corroborated across 5 arcs: #112, #60, #61, #63, #64). The full reviewer-roster rationale is in `docs/methodology.md` §"Reviewer roster — what the project actually does".
 
-The non-obvious property: **each round catches different things.** Not because the reviewer "tries harder" the second time. Because each fix changes the diff and exposes new edges. Recent track record: PR #75 (`doctor`) — 3 rounds, 9 P2 findings closed. PR #76 (SemVer policy) — 5 rounds, 11 P2 findings closed. Round 5 of #76 was the only round that flagged the `No migrations needed` claim — earlier rounds had cleared the diff that contained it.
+The non-obvious property: **each round catches different things.** Not because the reviewer "tries harder" the second time. Because each fix changes the diff and exposes new edges. Recent track record: PR #75 (`doctor`) — 3 rounds, 9 P2 findings closed. PR #76 (SemVer policy) — 5 rounds, 11 P2 findings closed. Round 5 of #76 was the only round that flagged the `No migrations needed` claim — earlier rounds had cleared the diff that contained it. **PR #206 (#64 PR 4, docs-only) — 2 rounds, 11 findings + 1 new successor issue (#207). Round 2 caught a count-drift the round-1 fix commit itself introduced.** Rounds-not-passes holds even when the diff has no code.
 
-Codex is a different model family with different blind spots. When Codex and Claude agree, that's high-confidence. When Codex catches what Claude missed, that's the whole point. **The wrong version of this practice is "ask Claude to imagine being a reviewer." That's prompting; this is verification.**
+A different-model-family reviewer would catch what same-family blind spots miss — Codex is the deferred-not-deleted cross-family backup; re-instate when a session can verify Codex is responsive on a small probe first. **The wrong version of this practice is "ask Claude to imagine being a reviewer." That's prompting; this is verification — the subagent gets a fresh context, reads the diff itself, and runs its own commands.**
 
-Empirically, 3 rounds is sufficient for most diffs. Most rounds run as background tasks while you're doing something else — wall-clock cost stays low, token cost amortizes against the compounding correctness payoff.
+Empirically, 2-3 rounds is sufficient for most diffs (2 is the minimum because round 2 catches what round 1's fix commit introduces). Most rounds run as background tasks while you're doing something else — wall-clock cost stays low, token cost amortizes against the compounding correctness payoff.
 
 Don't merge without it. The full retrospective is in `docs/methodology.md`.
 
@@ -191,7 +191,7 @@ ROADMAP.md (in vault) is the strategic narrative; GitHub Issues are the executab
 
 ### Branches + PRs
 
-Default workflow: feature branch → PR → codex review → self-review → merge. **Never push to main directly.** This applies even on solo work — the PR body is the audit trail and CI runs there.
+Default workflow: feature branch → PR → adversarial review (Opus subagent, in rounds per rule 11) → self-review → merge. **Never push to main directly.** This applies even on solo work — the PR body is the audit trail and CI runs there.
 
 The `/ship` skill handles the full pipeline (branch, test, CHANGELOG, VERSION bump, PR). Use it.
 
@@ -277,7 +277,7 @@ When you finish a session that established a convention, shipped a non-trivial P
 Naming the trade-offs explicitly so future sessions don't try to "optimize" by skipping:
 
 - **Maximum velocity.** A 5-round review cycle is slower than a 1-round cycle. The compensation is shipped correctness, not raw throughput.
-- **Cheap reviews.** Each Codex round is real spend. The compensation is 9-11 P2 findings closed pre-merge per non-trivial PR — issues that would otherwise be field bugs.
+- **Cheap reviews.** Each adversarial round is real spend (Opus subagent tokens; Codex tokens if re-instated). The compensation is 9-11 P2 findings closed pre-merge per non-trivial PR — issues that would otherwise be field bugs.
 - **Brevity.** PR bodies are large. CHANGELOG entries are detailed. Spec docs are exhaustive. The compensation is durable institutional memory.
 
 If the project ever needs to optimize differently, `docs/methodology.md` is the honest description of the current trade-offs being accepted. **Don't quietly drop one of these to ship faster.** Name it, and write down the decision.
@@ -314,7 +314,7 @@ If the project ever needs to optimize differently, `docs/methodology.md` is the 
 
 **Before optimizing for the org case** — ask whether the change makes the home user case worse.
 
-**Before merging a non-trivial PR** — codex review on scope, then implementation. Both pre-merge.
+**Before merging a non-trivial PR** — Opus adversarial review on scope, then implementation, in rounds (rule 11). Both pre-merge.
 
 **Before claiming a feature is done** — verify against the spec doc, run the test suite, check the dashboard renders correctly if observability is touched.
 
