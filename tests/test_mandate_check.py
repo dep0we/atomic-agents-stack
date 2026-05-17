@@ -22,6 +22,10 @@ import pytest
 from atomic_agents.judge.backend import Judgment, JudgmentOutcome
 from atomic_agents.judge.mandate_check import MandateCheck
 from atomic_agents.judge.mandate_state import MandateStateManager
+from atomic_agents.judge.cost_estimator_registry import (
+    CostEstimatorRegistry,
+    UnknownCostEstimator,
+)
 from atomic_agents.judge.target_extractor_registry import (
     TargetExtractorRegistry,
     UnknownTargetExtractor,
@@ -1180,6 +1184,181 @@ class TestTargetExtractorRegistry:
 
 
 # ──────────────────────────────────────────────────────────────────
+# CostEstimatorRegistry unit tests
+
+
+class TestCostEstimatorRegistry:
+    """CostEstimatorRegistry unit tests (spec/29 §'Validation steps' step 8).
+
+    Mirrors TestTargetExtractorRegistry shape; the key behavioral differences:
+    - No built-in estimators ship by default (external-cost projection is too
+      tool-specific for a "guess from arg shape" heuristic to be safe).
+    - Missing estimator → +inf (fail-closed), distinct from target-extractor
+      heuristic-fallback-to-None.
+    - estimator_id None → +inf (no projection available), NOT an error.
+    """
+
+    def test_no_builtin_estimators_at_construction(self):
+        """Registry is empty at construction — no built-ins ship by default."""
+        registry = CostEstimatorRegistry()
+        assert not registry.has("anything")
+        # estimate() with None estimator_id → +inf (fail-closed)
+        assert registry.estimate("some_tool", {"x": 1}) == float("inf")
+
+    def test_register_raises_on_collision(self):
+        """register() on an already-registered name raises ValueError."""
+        registry = CostEstimatorRegistry()
+        registry.register("my_estimator", lambda args: 0.01)
+        with pytest.raises(ValueError, match="already registered"):
+            registry.register("my_estimator", lambda args: 0.02)
+
+    def test_register_rejects_invalid_name_chars(self):
+        """register() rejects names with non-alphanumeric/underscore characters."""
+        registry = CostEstimatorRegistry()
+        with pytest.raises(ValueError, match="lowercase alphanumeric"):
+            registry.register("bad-name", lambda args: 0.01)
+        with pytest.raises(ValueError, match="lowercase alphanumeric"):
+            registry.register("bad.name", lambda args: 0.01)
+        with pytest.raises(ValueError, match="lowercase alphanumeric"):
+            registry.register("", lambda args: 0.01)
+
+    def test_replace_allows_overwrite(self):
+        """replace() succeeds even if name is already registered."""
+        registry = CostEstimatorRegistry()
+        registry.register("overwritable", lambda args: 0.10)
+        registry.replace("overwritable", lambda args: 0.99)
+        assert registry.estimate("tool", {"x": 1}, "overwritable") == 0.99
+
+    def test_estimate_calls_registered_estimator_with_arguments(self):
+        """Registered estimator receives tool_arguments and projects USD cost."""
+        registry = CostEstimatorRegistry()
+        registry.register(
+            "tokens_to_usd",
+            lambda args: args.get("token_count", 0) * 0.000015,
+        )
+        result = registry.estimate(
+            "openai_call",
+            {"token_count": 1000},
+            "tokens_to_usd",
+        )
+        assert result == pytest.approx(0.015)
+
+    def test_estimate_with_unknown_estimator_id_raises(self):
+        """Unknown estimator_id raises UnknownCostEstimator (loud failure on misconfig)."""
+        registry = CostEstimatorRegistry()
+        with pytest.raises(UnknownCostEstimator, match="not registered"):
+            registry.estimate("some_tool", {"x": 1}, "not_registered")
+
+    def test_estimate_with_none_id_returns_inf(self):
+        """No estimator_id → +inf (caller fails-closed to mandate_external_cost_unprojectable)."""
+        registry = CostEstimatorRegistry()
+        result = registry.estimate("some_tool", {"x": 1}, None)
+        assert result == float("inf")
+
+    def test_estimate_handles_estimator_exception_returns_inf(self):
+        """Estimator that raises → +inf (fail-closed per spec/29 line 380)."""
+        registry = CostEstimatorRegistry()
+        registry.register("exploding", lambda args: 1 / 0)
+        result = registry.estimate("some_tool", {"x": 1}, "exploding")
+        assert result == float("inf")
+
+    def test_estimate_handles_non_numeric_return_returns_inf(self):
+        """Estimator returning non-numeric → +inf (defense against mis-implementation)."""
+        registry = CostEstimatorRegistry()
+        registry.register("bad_return", lambda args: "not a number")
+        result = registry.estimate("some_tool", {"x": 1}, "bad_return")
+        assert result == float("inf")
+
+    def test_estimate_accepts_int_return_coerces_to_float(self):
+        """Estimator returning int is coerced to float."""
+        registry = CostEstimatorRegistry()
+        registry.register("int_return", lambda args: 5)
+        result = registry.estimate("some_tool", {"x": 1}, "int_return")
+        assert isinstance(result, float)
+        assert result == 5.0
+
+
+# ──────────────────────────────────────────────────────────────────
+# ToolRegistry cost_estimator_id validation
+
+
+class TestToolRegistryCostEstimatorValidation:
+    """ToolRegistry.register() validation of cost_estimator_id (spec/29 §'Registration order discipline').
+
+    Mirrors the existing target_extractor_id validation block — surfaces operator
+    misconfiguration at register time rather than silently fail-closing at
+    MandateCheck step 8 evaluation time.
+    """
+
+    def test_register_with_unknown_cost_estimator_id_raises(self):
+        """Registering a tool whose cost_estimator_id is missing → UnknownCostEstimator."""
+        from atomic_agents.tools import ToolDefinition, ToolRegistry
+
+        registry = ToolRegistry()
+        estimators = CostEstimatorRegistry()
+        tool = ToolDefinition(
+            name="paid_api_call",
+            description="Calls a paid API",
+            input_schema={"type": "object"},
+            handler=lambda args: "ok",
+            cost_estimator_id="nonexistent",
+        )
+        with pytest.raises(UnknownCostEstimator, match="not registered"):
+            registry.register(tool, cost_estimator_registry=estimators)
+
+    def test_register_with_registered_cost_estimator_id_succeeds(self):
+        """Registering a tool with a known cost_estimator_id succeeds."""
+        from atomic_agents.tools import ToolDefinition, ToolRegistry
+
+        registry = ToolRegistry()
+        estimators = CostEstimatorRegistry()
+        estimators.register("my_estimator", lambda args: 0.01)
+        tool = ToolDefinition(
+            name="paid_api_call",
+            description="Calls a paid API",
+            input_schema={"type": "object"},
+            handler=lambda args: "ok",
+            cost_estimator_id="my_estimator",
+        )
+        # Should NOT raise.
+        registry.register(tool, cost_estimator_registry=estimators)
+        assert "paid_api_call" in registry.list_names()
+
+    def test_register_without_cost_estimator_id_succeeds_without_registry(self):
+        """Tools that don't declare a cost_estimator_id register cleanly even
+        when no estimator registry is supplied."""
+        from atomic_agents.tools import ToolDefinition, ToolRegistry
+
+        registry = ToolRegistry()
+        tool = ToolDefinition(
+            name="free_tool",
+            description="A free tool",
+            input_schema={"type": "object"},
+            handler=lambda args: "ok",
+        )
+        registry.register(tool)  # no kwargs at all
+        assert "free_tool" in registry.list_names()
+
+    def test_register_with_expected_external_cost_usd_field(self):
+        """ToolDefinition.expected_external_cost_usd is accepted as static-cost
+        alternative to cost_estimator_id (spec/29 §"Token-cost projection")."""
+        from atomic_agents.tools import ToolDefinition, ToolRegistry
+
+        registry = ToolRegistry()
+        tool = ToolDefinition(
+            name="static_paid_api",
+            description="Fixed-price API",
+            input_schema={"type": "object"},
+            handler=lambda args: "ok",
+            expected_external_cost_usd=0.05,
+        )
+        registry.register(tool)
+        registered = registry.get("static_paid_api")
+        assert registered.expected_external_cost_usd == 0.05
+        assert registered.cost_estimator_id is None
+
+
+# ──────────────────────────────────────────────────────────────────
 # AtomicAgent integration tests
 
 
@@ -1223,6 +1402,21 @@ class TestAtomicAgentMandateCheckIntegration:
         custom_fn = lambda args: args.get("custom_key")
         agent.register_target_extractor("custom_key_extractor", custom_fn)
         assert agent._target_extractors.has("custom_key_extractor")
+
+    def test_atomic_agent_register_cost_estimator_public_api(self, tmp_path: Path):
+        """agent.register_cost_estimator('name', fn) registers the estimator successfully."""
+        from atomic_agents import AtomicAgent
+
+        agents_root = tmp_path
+        _make_minimal_agent_dir(agents_root, "scout")
+        agent = AtomicAgent(name="scout", agents_root=agents_root)
+        agent.register_cost_estimator(
+            "tokens_to_usd", lambda args: args.get("tokens", 0) * 0.000015
+        )
+        assert agent._cost_estimators.has("tokens_to_usd")
+        # Cost estimators are per-agent — start empty (no built-ins) and only
+        # contain what this agent has explicitly registered.
+        assert not agent._cost_estimators.has("never_registered")
 
     def test_atomic_agent_dispatch_includes_mandate_check_when_proposal_cites_mandate(
         self, tmp_path: Path

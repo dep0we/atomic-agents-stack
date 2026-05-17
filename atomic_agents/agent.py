@@ -397,6 +397,19 @@ class AtomicAgent:
         from .judge.target_extractor_registry import TargetExtractorRegistry
         self._target_extractors = TargetExtractorRegistry()
 
+        # Per-agent cost estimator registry (#124 PR 3b prep — spec/29
+        # §"Validation steps" step 8). Same per-agent isolation as
+        # target_extractors above; same fail-loud discipline at
+        # tool_registry.register() when a ToolDefinition.cost_estimator_id
+        # references an unregistered name. Empty at construction — no
+        # built-in estimators ship; tools with dynamic pricing register
+        # explicitly, tools with static pricing use
+        # ToolDefinition.expected_external_cost_usd, mandates with
+        # *_external_usd caps over tools with neither registered fail-closed
+        # with mandate_external_cost_unprojectable.
+        from .judge.cost_estimator_registry import CostEstimatorRegistry
+        self._cost_estimators = CostEstimatorRegistry()
+
         # Register backend-discovered tools into the in-memory
         # ``self.tool_registry`` (#64 PR 2 — Decision 1 + Decision 8 of
         # spec/25). The Protocol layer COMPOSES with the in-memory
@@ -477,7 +490,9 @@ class AtomicAgent:
                 #     applies to descriptor parsing.
                 continue
             self.tool_registry.register(
-                td, target_extractor_registry=self._target_extractors
+                td,
+                target_extractor_registry=self._target_extractors,
+                cost_estimator_registry=self._cost_estimators,
             )
 
         # Cascade detection — None for single-agent layouts (load behaves as before),
@@ -711,6 +726,45 @@ class AtomicAgent:
                 (not lowercase alphanumeric + underscore).
         """
         self._target_extractors.register(name, callable_)
+
+    def register_cost_estimator(
+        self, name: str, estimator: Callable[[dict], float]
+    ) -> None:
+        """Register a per-agent cost estimator for mandate external-budget projection.
+
+        Binds a named callable to the agent's ``CostEstimatorRegistry``
+        (spec/29 §"Validation steps" step 8, #124 PR 3b). Tool definitions
+        reference the estimator by string ID via
+        ``ToolDefinition.cost_estimator_id``. ``MandateCheck`` step 8 invokes
+        the callable against ``tool_arguments`` to project the action's
+        external cost against the mandate's ``*_external_usd`` cap budgets.
+
+        **Registration order matters.** Call this BEFORE
+        ``tool_registry.register()`` for any tool that references ``name``
+        via ``cost_estimator_id``. If you register the tool first, the
+        validation at ``tool_registry.register()`` time will fail with
+        ``UnknownCostEstimator`` (spec/29 §"Registration order discipline";
+        same fail-loud-at-registration discipline ``register_target_extractor``
+        uses).
+
+        Unlike ``register_target_extractor``, this registry starts EMPTY —
+        no built-in estimators ship by default. External-cost projection is
+        too tool-specific for "guess from arg shape" defaults; tools with
+        static pricing use ``ToolDefinition.expected_external_cost_usd``,
+        tools with dynamic pricing register an explicit estimator here.
+
+        Args:
+            name: Unique string ID for this estimator. Must be non-empty and
+                contain only lowercase alphanumeric characters plus underscore.
+            estimator: A callable ``(dict) → float``. Receives the tool's
+                ``tool_arguments`` dict; returns the projected USD external
+                cost. Return ``float('inf')`` to signal "cannot project for
+                this arg shape" — caller treats as ``mandate_external_cost_unprojectable``.
+
+        Raises:
+            ValueError: ``name`` is already registered or has an invalid format.
+        """
+        self._cost_estimators.register(name, estimator)
 
     @staticmethod
     def _generate_run_id() -> str:
