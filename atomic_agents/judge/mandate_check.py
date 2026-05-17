@@ -8,11 +8,9 @@ Per spec/29 §"MandateCheck judge specialist" (line 347-394), sibling of
 ``PolicyJudge`` in the composition ``[PolicyJudge, MandateCheck, LLMCatchAll]``.
 Both are rule-engine, both always-on, both fail-fast.
 
-PR 3a of #124. Validation steps 1-6 implemented (existence, source hash
-no-op stub, state, tool allowlist, target allowlist, time window). Steps
-7-9 (token budget, external budget, escalation thresholds) stubbed to
-fail-closed with forever-stable reason ``mandate_budget_check_unavailable``;
-PR 3b ungates them.
+PR 3b of #124. Validation steps 1-6 implemented in PR 3a (existence, source hash
+no-op stub, state, tool allowlist, target allowlist, time window). Steps 7-9
+(token budget, external budget, escalation thresholds) ungated here.
 
 BLOCK reason naming discipline (spec/29 §"BLOCK reason naming discipline",
 line 433): all reasons are forever-stable strings — no PR identifiers,
@@ -40,11 +38,13 @@ from ..mandate.types import (
     TargetPattern,
 )
 from .backend import Judgment, JudgmentOutcome
-from .types import ActionProposal, JudgmentContext
+from .cost_estimator_registry import CostEstimatorRegistry
+from .types import ActionClass, ActionProposal, JudgmentContext
 
 if TYPE_CHECKING:
     from ..judges_md import MandateSettings
     from ..logs.backend import LogBackend
+    from ..tools import ToolRegistry
 
 _logger = logging.getLogger(__name__)
 
@@ -56,14 +56,23 @@ _logger = logging.getLogger(__name__)
 # minimal interface MandateCheck calls; real impls replace them at integration.
 
 
-from .mandate_state import MandateStateManager
-from .target_extractor_registry import TargetExtractorRegistry
+from .mandate_state import MandateStateManager  # noqa: E402
+from .target_extractor_registry import TargetExtractorRegistry  # noqa: E402
+
+# ── Sub-agent A: mandate_reservations ─────────────────────────────────────
+# compute_outstanding shipped by sub-agent A in parallel. Import is
+# intentionally un-guarded: the integration session wires the real module;
+# if the file doesn't exist yet at import time the ImportError surfaces
+# at construction rather than at the first budget check.
+from .mandate_reservations import compute_outstanding  # noqa: E402
 
 
 # ── Judge ID ─────────────────────────────────────────────────────────────────
 
 _JUDGE_ID = "mandate-check"
-_POLICY_VERSION_SENTINEL = "unimplemented"  # replaced at construction when judges.md lands
+_POLICY_VERSION_SENTINEL = (
+    "unimplemented"  # replaced at construction when judges.md lands
+)
 
 
 class MandateCheck:
@@ -106,6 +115,10 @@ class MandateCheck:
         mandate_state_manager: MandateStateManager,
         mandate_settings: "MandateSettings",
         log_backend: "LogBackend",
+        cost_estimator_registry: CostEstimatorRegistry | None = None,
+        tool_registry: "ToolRegistry | None" = None,
+        expected_cost_per_call_usd: float | None = None,
+        iteration_start_ts: str | None = None,
         judge_id: str = _JUDGE_ID,
         policy_version: str = _POLICY_VERSION_SENTINEL,
     ) -> None:
@@ -131,8 +144,28 @@ class MandateCheck:
                 Controls ``suspicious_rebind_throttle_s`` and
                 ``unextractable_target_action``.
             log_backend: the agent's ``LogBackend`` instance. Used to emit
-                lifecycle events (throttle, budget-stub) as ``RunRecord``
-                entries with ``primitive="judgment"``.
+                lifecycle events and query prior cost events for budget
+                checks.
+            cost_estimator_registry: per-agent registry of named cost
+                estimators (spec/29 step 8). Used to project external cost
+                from tool arguments at evaluation time.
+            tool_registry: the agent's tool registry, used to look up
+                ``ToolDefinition.expected_external_cost_usd`` and
+                ``cost_estimator_id`` for step 8. May be ``None`` when
+                the caller doesn't wire the mandate layer (budget steps
+                fail-closed when the tool definition is unavailable).
+            expected_cost_per_call_usd: the agent's model.md
+                ``expected_cost_per_call_usd`` field. Used as the
+                first-iteration baseline for token-cost projection (step 7)
+                when no preceding cost event exists for the current run.
+                When ``None``, the conservative default ($0.10) applies.
+            iteration_start_ts: ISO-8601 timestamp marking the start of
+                the current ``agent.call()`` iteration. Used by step 7's
+                Risk 2 defensive check: if the most-recent matching cost
+                event's ``ts`` is before this value, it is from a prior
+                iteration and the baseline falls back to
+                ``expected_cost_per_call_usd``. When ``None``, the Risk 2
+                check is skipped (all matching events are treated as current).
             judge_id: stable judge identifier recorded in every
                 ``Judgment``. Defaults to ``"mandate-check"``.
             policy_version: sha256-derived policy snapshot string.
@@ -145,6 +178,14 @@ class MandateCheck:
         self._state_manager = mandate_state_manager
         self._settings = mandate_settings
         self._log = log_backend
+        self._cost_estimators = (
+            cost_estimator_registry
+            if cost_estimator_registry is not None
+            else CostEstimatorRegistry()
+        )
+        self._tool_registry = tool_registry
+        self._expected_cost_per_call_usd = expected_cost_per_call_usd
+        self._iteration_start_ts = iteration_start_ts
         self._judge_id = judge_id
         self._policy_version = policy_version
         # Within-process lock for state read-modify-write (spec/29 line 741).
@@ -169,7 +210,10 @@ class MandateCheck:
         6. Tool allowlist check.
         7. Target allowlist / blocklist check.
         8. Time window check.
-        9-11. Budget checks — stubbed fail-closed; PR 3b ungates.
+        9. Token budget check (step 7).
+        10. External budget check (step 8) + escalation threshold check (step 9)
+            evaluated together; step 9 ESCALATE preempts step 8 BLOCK (spec/29
+            line 384, Risk 7 amendment).
 
         Does NOT mutate ``proposal`` or ``context`` (spec/28 idempotency
         invariant). Each call is side-effect-free from the proposal's
@@ -417,37 +461,102 @@ class MandateCheck:
                     ),
                 )
 
-        # ── Steps 7, 8, 9: Budget checks — STUBBED (PR 3a) ──────────────────
-        # Spec/29 §"Validation step split between PR 3a and PR 3b" (line 429):
-        # steps 7-9 (token budget, external budget, escalation thresholds)
-        # land in PR 3b. PR 3a stubs them to fail-closed: any mandate with a
-        # *_budget_usd or *_external_usd or *_escalation_above_* cap returns
-        # BLOCK with reason mandate_budget_check_unavailable.
-        #
-        # BLOCK reason discipline (spec/29 line 433): "mandate_budget_check_unavailable"
-        # is the forever-stable reason. NOT "mandate_budget_check_unavailable_in_3a".
-        # The temporary cause is documented in the PR 3a CHANGELOG; the reason
-        # string itself is stable across the eventual PR 3b unlock.
-        has_budget_cap = any([
-            mandate.constraints.daily_token_usd is not None,
-            mandate.constraints.monthly_token_usd is not None,
-            mandate.constraints.cumulative_token_usd is not None,
-            mandate.constraints.daily_external_usd is not None,
-            mandate.constraints.monthly_external_usd is not None,
-            mandate.constraints.cumulative_external_usd is not None,
-            mandate.constraints.requires_escalation_above_token_usd is not None,
-            mandate.constraints.requires_escalation_above_external_usd is not None,
-        ])
-        if has_budget_cap:
-            return self._block(
-                reason="mandate_budget_check_unavailable",
+        # ── Step 7: Token budget (spec/29 line 372-380) ───────────────────────
+        # Collect all token-cap exceeded entries. Do NOT return here; feed into
+        # the unified cap-exceeded helper at the end (spec says collect all
+        # exceeded caps into an intermediate, then select primary by priority).
+        caps_exceeded: dict[str, dict[str, Any]] = {}
+        contributing_reservation_ids: list[str] = []
+
+        has_token_cap = any(
+            [
+                mandate.constraints.daily_token_usd is not None,
+                mandate.constraints.monthly_token_usd is not None,
+                mandate.constraints.cumulative_token_usd is not None,
+            ]
+        )
+        has_token_escalation_threshold = (
+            mandate.constraints.requires_escalation_above_token_usd is not None
+        )
+        projected_token_usd: float = 0.0
+        if has_token_cap or has_token_escalation_threshold:
+            token_result = self._step7_token_budget(
+                proposal=proposal,
+                mandate=mandate,
                 mandate_id=mandate_id,
-                detail=(
-                    f"Mandate {mandate_id!r} specifies a budget cap, but "
-                    "budget enforcement (steps 7-9) is not yet available. "
-                    "Remove the budget cap from the mandate to proceed, or "
-                    "wait for PR 3b which implements budget checking."
-                ),
+            )
+            projected_token_usd = token_result["projected_usd"]
+            caps_exceeded.update(token_result["caps_exceeded"])
+            contributing_reservation_ids.extend(token_result.get("reservation_ids", []))
+
+        # ── Step 8: External budget (spec/29 line 381) ────────────────────────
+        has_external_escalation_threshold = (
+            mandate.constraints.requires_escalation_above_external_usd is not None
+        )
+        projected_external_usd: float = 0.0
+        has_external_cap = any(
+            [
+                mandate.constraints.daily_external_usd is not None,
+                mandate.constraints.monthly_external_usd is not None,
+                mandate.constraints.cumulative_external_usd is not None,
+                mandate.constraints.per_action_max_usd is not None
+                if hasattr(mandate.constraints, "per_action_max_usd")
+                else False,
+            ]
+        )
+        if has_external_cap or has_external_escalation_threshold:
+            ext_result = self._step8_external_budget(
+                proposal=proposal,
+                mandate=mandate,
+                mandate_id=mandate_id,
+            )
+            # Fail-closed: unprojectable → immediate BLOCK, bypass step 9
+            if ext_result.get("unprojectable"):
+                return self._block(
+                    reason="mandate_external_cost_unprojectable",
+                    mandate_id=mandate_id,
+                    detail=(
+                        f"Mandate {mandate_id!r} requires external budget projection "
+                        f"for tool {proposal.tool_name!r}, but neither a registered "
+                        "cost_estimator_id nor a static expected_external_cost_usd "
+                        "is configured for this tool. Register an estimator via "
+                        "agent.register_cost_estimator() or add "
+                        "expected_external_cost_usd to the tool definition."
+                    ),
+                )
+            projected_external_usd = ext_result["projected_usd"]
+            caps_exceeded.update(ext_result["caps_exceeded"])
+            contributing_reservation_ids.extend(ext_result.get("reservation_ids", []))
+
+        # ── Step 9: Escalation thresholds (spec/29 line 382-384, Risk 7) ─────
+        # Spec/29 line 384 amendment: step 9 ESCALATE preempts step 8 BLOCK
+        # when both fire for the same projection.  Evaluate before returning
+        # any cap-exceeded verdict.
+        escalation_judgment = self._step9_escalation_thresholds(
+            proposal=proposal,
+            mandate=mandate,
+            mandate_id=mandate_id,
+            projected_token_usd=projected_token_usd,
+            projected_external_usd=projected_external_usd,
+        )
+        if escalation_judgment is not None:
+            return escalation_judgment
+
+        # ── Cap-exceeded verdict (steps 7 + 8) ───────────────────────────────
+        if caps_exceeded:
+            cumulative_token_now = self._sum_prior_token_cost(
+                mandate_id, proposal.actor_run_id
+            )
+            cumulative_external_now = self._sum_prior_external_cost(mandate_id)
+            return self._build_cap_exceeded_judgment(
+                proposal=proposal,
+                mandate=mandate,
+                caps_exceeded=caps_exceeded,
+                contributing_reservation_ids=list(set(contributing_reservation_ids)),
+                action_class=proposal.classification,
+                cumulative_token_now=cumulative_token_now,
+                cumulative_external_now=cumulative_external_now,
+                projected_usd=max(projected_token_usd, projected_external_usd),
             )
 
         # ── All checks pass → ALLOW ────────────────────────────────────────────
@@ -492,6 +601,489 @@ class MandateCheck:
     def close(self) -> None:
         # No I/O resources to release. The state_lock is GC'd with the instance.
         return None
+
+    # ── Budget step helpers ───────────────────────────────────────────────────
+
+    # Default token-cost baseline when no preceding iteration cost event
+    # exists AND model.md expected_cost_per_call_usd is not set.
+    _DEFAULT_EXPECTED_TOKEN_COST_USD: float = 0.10
+
+    def _sum_prior_token_cost(
+        self,
+        mandate_id: str,
+        run_id: str,
+    ) -> float:
+        """Sum prior actor-source cost events tagged with ``mandate_id``.
+
+        These are the actual committed token costs for this mandate.  The
+        per-action projection is approximate (spec/29 line 378); this sum
+        is the ground truth after the fact.
+        """
+        from ..logs.types import LogQuery
+
+        try:
+            records = self._log.query(
+                LogQuery(
+                    cost_source="actor",
+                    mandate_id=mandate_id,
+                )
+            )
+            return sum(
+                r.cost_usd
+                for r in records
+                if r.cost_usd is not None
+                # Exclude records without mandate_id set (legacy safeguard)
+                and r.mandate_id == mandate_id
+            )
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning(
+                "MandateCheck step 7: failed to sum prior token cost for "
+                "mandate %r: %s — treating as 0 (optimistic fallback)",
+                mandate_id,
+                exc,
+            )
+            return 0.0
+
+    def _sum_prior_external_cost(self, mandate_id: str) -> float:
+        """Sum prior external_cost events tagged with ``mandate_id``.
+
+        Per spec/29 §"Cost integration" (line 537-554): external costs land
+        in a cost event with ``extra["cost_kind"] == "external"`` and
+        ``mandate_id`` set.  The sum drives the cumulative external budget.
+        """
+        from ..logs.types import LogQuery
+
+        try:
+            records = self._log.query(
+                LogQuery(
+                    mandate_id=mandate_id,
+                )
+            )
+            return sum(
+                r.extra.get("external_cost_usd", 0.0)
+                for r in records
+                if r.extra.get("cost_kind") == "external" and r.mandate_id == mandate_id
+            )
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning(
+                "MandateCheck step 8: failed to sum prior external cost for "
+                "mandate %r: %s — treating as 0 (optimistic fallback)",
+                mandate_id,
+                exc,
+            )
+            return 0.0
+
+    def _project_token_cost(self, proposal: ActionProposal, n_tool_calls: int) -> float:
+        """Project this action's share of the upcoming turn's token cost.
+
+        Uses the preceding iteration's actual token cost as the baseline
+        (spec/29 line 374-376).  Falls back to ``expected_cost_per_call_usd``
+        (from model.md) or the $0.10 conservative default when no prior
+        iteration event exists for the current run (Risk 2 discipline).
+
+        Token cost is apportioned as ``turn_cost / N`` across N concurrent
+        tool calls in the turn (v1 simplification — argument-token-weighted
+        apportionment is a follow-up issue per spec/29 line 376).
+        """
+        from ..logs.types import LogQuery
+
+        # Find the preceding iteration's cost event for this run.
+        turn_cost: float | None = None
+        try:
+            records = self._log.query(
+                LogQuery(
+                    run_id=proposal.actor_run_id,
+                    cost_source="actor",
+                    limit=1,
+                )
+            )
+            # query() returns chronological order; take the last entry.
+            if records:
+                most_recent = records[-1]
+                # Risk 2 defensive check: if the most recent event's ts is
+                # before the current iteration's start, it is from a prior
+                # agent.call() iteration and represents a stale baseline.
+                # Fall back to expected_cost_per_call_usd to avoid drift.
+                if (
+                    self._iteration_start_ts is not None
+                    and most_recent.ts < self._iteration_start_ts
+                ):
+                    # Stale baseline — treat as first iteration.
+                    turn_cost = None
+                elif most_recent.cost_usd is not None:
+                    turn_cost = most_recent.cost_usd
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning(
+                "MandateCheck step 7: failed to read preceding iteration "
+                "cost event for run %r: %s — falling back to default baseline",
+                proposal.actor_run_id,
+                exc,
+            )
+
+        if turn_cost is None:
+            # First iteration or stale baseline: use model.md field or default.
+            turn_cost = (
+                self._expected_cost_per_call_usd
+                if self._expected_cost_per_call_usd is not None
+                else self._DEFAULT_EXPECTED_TOKEN_COST_USD
+            )
+
+        # Simple N-way apportionment (v1 — see spec/29 line 376).
+        n = max(1, n_tool_calls)
+        return turn_cost / n
+
+    def _step7_token_budget(
+        self,
+        *,
+        proposal: ActionProposal,
+        mandate: Any,
+        mandate_id: str,
+    ) -> dict[str, Any]:
+        """Evaluate step 7 token budget caps.
+
+        Returns a dict with keys:
+          ``projected_usd`` — the apportioned token cost projection.
+          ``caps_exceeded`` — dict of cap_kind → metadata for caps that fire.
+          ``reservation_ids`` — list of outstanding reservation IDs that
+              contributed to pushing the cumulative over the cap.
+        """
+        # Simple assumption: one tool call per turn for v1 apportionment.
+        # The framework does not yet pass N across tool calls per turn to
+        # MandateCheck; argument-token-weighted apportionment is a follow-up.
+        n_tool_calls = 1
+        projected = self._project_token_cost(proposal, n_tool_calls)
+
+        prior_spend = self._sum_prior_token_cost(mandate_id, proposal.actor_run_id)
+
+        # Sum outstanding reservations for this mandate (token kind).
+        try:
+            outstanding = compute_outstanding(self._log, self._scope, mandate_id)
+            token_reservations = [r for r in outstanding if r.cost_kind == "token"]
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning(
+                "MandateCheck step 7: compute_outstanding failed for mandate "
+                "%r: %s — treating outstanding reservations as 0",
+                mandate_id,
+                exc,
+            )
+            token_reservations = []
+
+        reserved = sum(r.projected_usd for r in token_reservations)
+        reservation_ids = [r.proposal_id for r in token_reservations]
+        cumulative = prior_spend + projected + reserved
+
+        caps_exceeded: dict[str, dict[str, Any]] = {}
+        c = mandate.constraints
+
+        if c.cumulative_token_usd is not None and cumulative > c.cumulative_token_usd:
+            caps_exceeded["cumulative_token_usd"] = {
+                "projected": projected,
+                "cumulative": cumulative,
+                "cap": c.cumulative_token_usd,
+            }
+
+        # For daily/monthly window sums: in v1 we conservatively re-use the
+        # full cumulative spend (no per-window scan implemented yet — a
+        # follow-up issue should add LogQuery.since/until window scoping).
+        # The full cumulative is always ≥ the windowed sum, so this never
+        # under-blocks.  It may over-block near cap exhaustion within the
+        # window; operators can widen the window cap as a workaround.
+        if c.daily_token_usd is not None and cumulative > c.daily_token_usd:
+            caps_exceeded["daily_token_usd"] = {
+                "projected": projected,
+                "cumulative": cumulative,
+                "cap": c.daily_token_usd,
+            }
+
+        if c.monthly_token_usd is not None and cumulative > c.monthly_token_usd:
+            caps_exceeded["monthly_token_usd"] = {
+                "projected": projected,
+                "cumulative": cumulative,
+                "cap": c.monthly_token_usd,
+            }
+
+        return {
+            "projected_usd": projected,
+            "caps_exceeded": caps_exceeded,
+            "reservation_ids": reservation_ids,
+        }
+
+    def _step8_external_budget(
+        self,
+        *,
+        proposal: ActionProposal,
+        mandate: Any,
+        mandate_id: str,
+    ) -> dict[str, Any]:
+        """Evaluate step 8 external budget caps.
+
+        Returns a dict with keys:
+          ``projected_usd`` — the projected external cost for this action.
+          ``caps_exceeded`` — dict of cap_kind → metadata for caps that fire.
+          ``reservation_ids`` — list of outstanding reservation IDs.
+          ``unprojectable`` — True when the external cost cannot be
+              projected (fail-closed per spec/29 line 381).
+        """
+        # Resolve the tool definition for cost_estimator_id and
+        # expected_external_cost_usd.
+        tool_def = None
+        if self._tool_registry is not None:
+            try:
+                tool_def = self._tool_registry.get(proposal.tool_name)
+            except Exception:
+                tool_def = None
+
+        estimator_id: str | None = (
+            tool_def.cost_estimator_id if tool_def is not None else None
+        )
+        static_cost: float | None = (
+            tool_def.expected_external_cost_usd if tool_def is not None else None
+        )
+
+        # Project external cost — prefer registry estimator, fall back to
+        # static estimate, fail-closed when neither is available.
+        projected: float
+        if estimator_id is not None:
+            projected = self._cost_estimators.estimate(
+                proposal.tool_name,
+                proposal.tool_arguments,
+                estimator_id=estimator_id,
+            )
+            # +inf from estimator means unprojectable.
+            if projected == float("inf"):
+                if static_cost is not None:
+                    projected = static_cost
+                else:
+                    return {
+                        "projected_usd": float("inf"),
+                        "caps_exceeded": {},
+                        "reservation_ids": [],
+                        "unprojectable": True,
+                    }
+        elif static_cost is not None:
+            projected = static_cost
+        else:
+            # Neither estimator nor static estimate configured — fail-closed.
+            return {
+                "projected_usd": float("inf"),
+                "caps_exceeded": {},
+                "reservation_ids": [],
+                "unprojectable": True,
+            }
+
+        prior_external = self._sum_prior_external_cost(mandate_id)
+
+        # Outstanding external reservations.
+        try:
+            outstanding = compute_outstanding(self._log, self._scope, mandate_id)
+            ext_reservations = [r for r in outstanding if r.cost_kind == "external"]
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning(
+                "MandateCheck step 8: compute_outstanding failed for mandate "
+                "%r: %s — treating outstanding external reservations as 0",
+                mandate_id,
+                exc,
+            )
+            ext_reservations = []
+
+        reserved = sum(r.projected_usd for r in ext_reservations)
+        reservation_ids = [r.proposal_id for r in ext_reservations]
+        cumulative = prior_external + projected + reserved
+
+        caps_exceeded: dict[str, dict[str, Any]] = {}
+        c = mandate.constraints
+
+        if (
+            c.cumulative_external_usd is not None
+            and cumulative > c.cumulative_external_usd
+        ):
+            caps_exceeded["cumulative_external_usd"] = {
+                "projected": projected,
+                "cumulative": cumulative,
+                "cap": c.cumulative_external_usd,
+            }
+
+        if c.daily_external_usd is not None and cumulative > c.daily_external_usd:
+            caps_exceeded["daily_external_usd"] = {
+                "projected": projected,
+                "cumulative": cumulative,
+                "cap": c.daily_external_usd,
+            }
+
+        if c.monthly_external_usd is not None and cumulative > c.monthly_external_usd:
+            caps_exceeded["monthly_external_usd"] = {
+                "projected": projected,
+                "cumulative": cumulative,
+                "cap": c.monthly_external_usd,
+            }
+
+        # per_action_max_usd — single-action cap, compared against projected
+        # only (not cumulative), per spec/29 §"Validation steps" step 8.
+        if (
+            hasattr(c, "per_action_max_usd")
+            and c.per_action_max_usd is not None
+            and projected > c.per_action_max_usd
+        ):
+            caps_exceeded["per_action_max_usd"] = {
+                "projected": projected,
+                "cumulative": cumulative,
+                "cap": c.per_action_max_usd,
+            }
+
+        return {
+            "projected_usd": projected,
+            "caps_exceeded": caps_exceeded,
+            "reservation_ids": reservation_ids,
+            "unprojectable": False,
+        }
+
+    def _step9_escalation_thresholds(
+        self,
+        *,
+        proposal: ActionProposal,
+        mandate: Any,
+        mandate_id: str,
+        projected_token_usd: float,
+        projected_external_usd: float,
+    ) -> Judgment | None:
+        """Evaluate step 9 escalation thresholds.
+
+        Returns an ESCALATE Judgment when any threshold is exceeded; else
+        None.  Step 9 ESCALATE preempts step 8 BLOCK per spec/29 line 384
+        (Risk 7 amendment) — the caller checks this BEFORE returning the
+        cap-exceeded verdict.
+        """
+        c = mandate.constraints
+
+        # Token escalation threshold (spec/29 line 382).
+        if (
+            c.requires_escalation_above_token_usd is not None
+            and projected_token_usd > c.requires_escalation_above_token_usd
+        ):
+            return self._escalate(
+                reason="mandate_escalation_threshold_hit_token",
+                mandate_id=mandate_id,
+                detail=(
+                    f"Projected token cost ${projected_token_usd:.6f} exceeds "
+                    f"escalation threshold ${c.requires_escalation_above_token_usd:.6f} "
+                    f"for mandate {mandate_id!r}. Operator approval required."
+                ),
+            )
+
+        # External escalation threshold (spec/29 line 382).
+        if (
+            c.requires_escalation_above_external_usd is not None
+            and projected_external_usd > c.requires_escalation_above_external_usd
+        ):
+            return self._escalate(
+                reason="mandate_escalation_threshold_hit_external",
+                mandate_id=mandate_id,
+                detail=(
+                    f"Projected external cost ${projected_external_usd:.6f} exceeds "
+                    f"escalation threshold ${c.requires_escalation_above_external_usd:.6f} "
+                    f"for mandate {mandate_id!r}. Operator approval required."
+                ),
+            )
+
+        return None
+
+    # Priority order for cap_kind selection in mandate_cap_exceeded_block event.
+    # Forever-stable per spec/29 line 629 (Risk 1 amendment):
+    # monthly_external > daily_external > cumulative_external >
+    # monthly_token > daily_token > cumulative_token > per_action_max
+    _CAP_KIND_PRIORITY: tuple[str, ...] = (
+        "monthly_external_usd",
+        "daily_external_usd",
+        "cumulative_external_usd",
+        "monthly_token_usd",
+        "daily_token_usd",
+        "cumulative_token_usd",
+        "per_action_max_usd",
+    )
+
+    def _build_cap_exceeded_judgment(
+        self,
+        *,
+        proposal: ActionProposal,
+        mandate: Any,
+        caps_exceeded: dict[str, dict[str, Any]],
+        contributing_reservation_ids: list[str],
+        action_class: ActionClass,
+        cumulative_token_now: float,
+        cumulative_external_now: float,
+        projected_usd: float,
+    ) -> Judgment:
+        """Build a ``mandate_cap_exceeded_block`` judgment with priority-selected cap_kind.
+
+        Priority order (spec/29 line 629, Risk 1 amendment — forever-stable):
+        ``monthly_external > daily_external > cumulative_external >
+        monthly_token > daily_token > cumulative_token > per_action_max``.
+
+        Action class → outcome (spec/29 line 386-390):
+        - ``high_risk`` → ESCALATE with reason ``mandate_cap_would_exceed_high_risk``
+        - ``external_side_effect``, ``reversible_write`` → BLOCK with reason ``mandate_cap_would_exceed``
+        """
+        # Select primary cap_kind by priority; collect the rest as additional.
+        primary_cap_kind: str | None = None
+        for candidate in self._CAP_KIND_PRIORITY:
+            if candidate in caps_exceeded:
+                primary_cap_kind = candidate
+                break
+
+        if primary_cap_kind is None:
+            # Defensive: caps_exceeded was non-empty so at least one key exists.
+            primary_cap_kind = next(iter(caps_exceeded))
+
+        additional_caps_exceeded: tuple[str, ...] = tuple(
+            k
+            for k in self._CAP_KIND_PRIORITY
+            if k in caps_exceeded and k != primary_cap_kind
+        )
+
+        mandate_id = mandate.mandate_id
+
+        self._emit_event(
+            "mandate_cap_exceeded_block",
+            proposal=proposal,
+            mandate_id=mandate_id,
+            extra={
+                "cumulative_token_now": cumulative_token_now,
+                "cumulative_external_now": cumulative_external_now,
+                "projected_usd": projected_usd,
+                "cap_kind": primary_cap_kind,
+                "additional_caps_exceeded": additional_caps_exceeded,
+                "contributing_reservation_ids": contributing_reservation_ids,
+                "reconcile_cli_hint": None,  # wired by sub-agent C when recovery orphans present
+            },
+        )
+
+        # Budget-breach action per action class (spec/29 line 386-390).
+        is_high_risk = (
+            action_class == ActionClass.HIGH_RISK
+            # Also accept string form (StrEnum comparison).
+            or str(action_class) == "high_risk"
+        )
+        if is_high_risk:
+            return self._escalate(
+                reason="mandate_cap_would_exceed_high_risk",
+                mandate_id=mandate_id,
+                detail=(
+                    f"High-risk action: cumulative + projected would exceed "
+                    f"{primary_cap_kind} cap for mandate {mandate_id!r}. "
+                    "Operator approval required."
+                ),
+            )
+
+        return self._block(
+            reason="mandate_cap_would_exceed",
+            mandate_id=mandate_id,
+            detail=(
+                f"Cumulative + projected cost would exceed {primary_cap_kind} "
+                f"cap for mandate {mandate_id!r}. Cap: "
+                f"{caps_exceeded[primary_cap_kind].get('cap')}, "
+                f"cumulative: {caps_exceeded[primary_cap_kind].get('cumulative'):.6f}."
+            ),
+        )
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 

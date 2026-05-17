@@ -67,10 +67,14 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .._io import atomic_write, safe_resolve_under
-from ..exceptions import PathTraversalError
+from ..exceptions import LockBusy, PathTraversalError
+from ..logs.types import PRIMITIVE_MANDATE_RESERVATION, LogQuery, RunRecord
 from .types import (
     Mandate,
     MandateCapabilities,
@@ -79,6 +83,15 @@ from .types import (
     MandateStateSchemaUnsupported,
     RevocationState,
 )
+
+if TYPE_CHECKING:
+    from ..locks.backend import LockBackend
+    from ..logs.backend import LogBackend
+
+    # ReservationRecord is produced by sub-agent A in judge/mandate_reservations.py.
+    # Import is TYPE_CHECKING-only to avoid a circular import at module load;
+    # runtime import happens inside the method body.
+    from ..judge.mandate_reservations import ReservationRecord
 
 _logger = logging.getLogger(__name__)
 
@@ -313,8 +326,7 @@ class FilesystemMandateBackend:
             raise
         except Exception as exc:
             _logger.warning(
-                "unexpected error parsing %s for scope %r: %s: %s — "
-                "treating as empty",
+                "unexpected error parsing %s for scope %r: %s: %s — treating as empty",
                 mandates_path,
                 scope,
                 type(exc).__name__,
@@ -327,6 +339,7 @@ class FilesystemMandateBackend:
         # edited). The parser produces ACTIVE; we re-stamp REVOCATION_STATE
         # here so callers see derived state consistently.
         from datetime import datetime as _dt, timezone as _tz
+
         now = _dt.now(_tz.utc)
         derived: list[Mandate] = []
         for m in mandates:
@@ -337,6 +350,7 @@ class FilesystemMandateBackend:
             ):
                 # frozen dataclass — use dataclasses.replace
                 from dataclasses import replace as _replace
+
                 derived.append(_replace(m, revocation_state=RevocationState.EXPIRED))
             else:
                 derived.append(m)
@@ -463,7 +477,289 @@ class FilesystemMandateBackend:
             # The <scope_root> directory tree is durable — files survive
             # process restart.
             durable=True,
+            # The filesystem backend scans the JSONL log via LogBackend
+            # and can emit recovery events (spec/29 MUST #7).
+            supports_crash_recovery=True,
         )
+
+    # ────────────────────────────────────────────────────────────────
+    # Crash recovery (spec/29 §"Crash recovery for reservations")
+
+    def recover_orphan_reservations(
+        self,
+        log_backend: "LogBackend",
+        scope: str,
+        *,
+        lock_backend: "LockBackend | None" = None,
+        lock_ttl_s: int = 30,
+    ) -> int:
+        """Scan for orphan reservations and emit recovery events.
+
+        See ``MandateBackend.recover_orphan_reservations`` for the full
+        contract.  This implementation:
+
+        1. When ``lock_backend`` is provided, acquires
+           ``"mandate-recovery:<scope>"`` before scanning — spec/29 Risk B
+           (multi-process duplicate-recovery defense).  Returns 0 immediately
+           on ``LockBusy`` (another replica is already recovering).
+        2. Performs SCAN + DECIDE + EMIT inside the held lock — spec/29
+           Risk 3 discipline: scanning outside the lock and emitting inside
+           allows double-emission when two replicas race.
+        3. When ``lock_backend`` is ``None``, proceeds in single-process mode
+           (correct only when the caller guarantees one writer — spec/29
+           Risk H: TTL-expiry is in-process-only; cross-process callers MUST
+           pass a ``lock_backend`` or accept potential duplicate recovery).
+        """
+        if lock_backend is None:
+            return self._recover_unsafe_single_process(log_backend, scope)
+
+        lock_key = f"mandate-recovery:{scope}"
+        try:
+            with lock_backend.acquire(lock_key, timeout=float(lock_ttl_s)):
+                # SCAN + DECIDE + EMIT all happen inside the held lock
+                # (spec/29 Risk 3).  Re-scan inside the lock so two replicas
+                # that both called acquire() never both emit for the same
+                # orphan — the second acquirer will find the first's recovery
+                # events already in the log and see zero orphans.
+                orphans = self._scan_orphan_reservations(log_backend, scope)
+                for orphan in orphans:
+                    self._emit_recovery_for_orphan(log_backend, scope, orphan)
+                return len(orphans)
+        except LockBusy:
+            # Another replica is recovering this scope — skip cleanly per
+            # spec/29 Risk B.  0 = "no orphans recovered by this replica",
+            # not "no orphans exist".
+            _logger.debug(
+                "mandate recovery for scope %r skipped — recovery lock "
+                "already held by another replica",
+                scope,
+            )
+            return 0
+
+    def _recover_unsafe_single_process(
+        self,
+        log_backend: "LogBackend",
+        scope: str,
+    ) -> int:
+        """Single-process recovery path (no lock serialization).
+
+        Correct only when the caller guarantees this is the sole writer.
+        Named "unsafe" because it silently allows duplicate recovery in
+        multi-process deployments — callers MUST pass ``lock_backend``
+        for multi-process correctness (spec/29 Risk H).
+        """
+        orphans = self._scan_orphan_reservations(log_backend, scope)
+        for orphan in orphans:
+            self._emit_recovery_for_orphan(log_backend, scope, orphan)
+        return len(orphans)
+
+    def _scan_orphan_reservations(
+        self,
+        log_backend: "LogBackend",
+        scope: str,
+    ) -> "list[ReservationRecord]":
+        """Identify orphan reservations in the JSONL log.
+
+        An orphan is a ``mandate_reservation`` event whose ``proposal_id``
+        has NO matching:
+        - ``mandate_reservation_committed`` event
+        - ``mandate_reservation_rolled_back`` event
+        - ``mandate_reservation_expired`` event
+        - ``mandate_reservation_committed_on_recovery`` event
+        AND no cost event carrying the same ``proposal_id``.
+
+        The TTL-age gate from ``compute_outstanding`` does NOT apply — after
+        a crash, TTL is suspect; the recovery pass assumes committed
+        (spec/29 line 604).
+        """
+        from ..judge.mandate_reservations import ReservationRecord  # runtime import
+
+        # Fetch all mandate_reservation family events for this scope.
+        all_records = log_backend.query(
+            LogQuery(primitive=PRIMITIVE_MANDATE_RESERVATION)
+        )
+
+        # Build proposal_id → ReservationRecord from "mandate_reservation"
+        # (the base reservation events, not the lifecycle variants).
+        reservations: dict[str, "ReservationRecord"] = {}
+        # Collect proposal_ids that are already resolved (any lifecycle
+        # resolution event or a cost event with matching proposal_id).
+        resolved_proposal_ids: set[str] = set()
+
+        _RESOLUTION_EVENTS = {
+            "mandate_reservation_committed",
+            "mandate_reservation_rolled_back",
+            "mandate_reservation_expired",
+            "mandate_reservation_committed_on_recovery",
+        }
+
+        for record in all_records:
+            event_type: str = record.extra.get("event", "")
+            proposal_id: str | None = record.extra.get("proposal_id")
+            if not proposal_id:
+                continue
+
+            if event_type == "mandate_reservation":
+                # Base reservation — build ReservationRecord from extra fields.
+                try:
+                    res = ReservationRecord(
+                        reservation_id=str(record.extra.get("reservation_id", "")),
+                        mandate_id=str(
+                            record.mandate_id or record.extra.get("mandate_id", "")
+                        ),
+                        proposal_id=proposal_id,
+                        cost_kind=record.extra.get("cost_kind", "token"),
+                        projected_usd=float(record.extra.get("projected_usd", 0.0)),
+                        ts=record.ts,
+                        ttl_s=int(record.extra.get("ttl_s", 60)),
+                    )
+                    reservations[proposal_id] = res
+                except (KeyError, TypeError, ValueError) as exc:
+                    _logger.warning(
+                        "mandate recovery: could not parse reservation record "
+                        "proposal_id=%r ts=%r: %s — skipping",
+                        proposal_id,
+                        record.ts,
+                        exc,
+                    )
+                    continue
+
+            elif event_type in _RESOLUTION_EVENTS:
+                resolved_proposal_ids.add(proposal_id)
+
+        # Also resolve proposal_ids covered by cost events — clause 3 of
+        # the orphan definition (spec/29 line 582).  A cost event with a
+        # matching proposal_id means the spend was recorded even if the
+        # framework crashed before writing _committed.
+        #
+        # Cost events use primitives like "agent_call", "tool", "outcome_iteration",
+        # etc. — NOT PRIMITIVE_MANDATE_RESERVATION — so we need a separate query
+        # that is NOT filtered by primitive.  cost_source is a top-level RunRecord
+        # field, not stored in extra.
+        cost_records = log_backend.query(LogQuery())
+        for record in cost_records:
+            cost_proposal_id: str | None = record.extra.get("proposal_id")
+            if cost_proposal_id and record.cost_source == "actor":
+                # A cost event carrying proposal_id → treat as resolved.
+                resolved_proposal_ids.add(cost_proposal_id)
+
+        orphans = [
+            res for pid, res in reservations.items() if pid not in resolved_proposal_ids
+        ]
+        _logger.debug(
+            "mandate recovery scan for scope %r: %d reservation(s) found, "
+            "%d orphan(s) identified",
+            scope,
+            len(reservations),
+            len(orphans),
+        )
+        return orphans
+
+    def _emit_recovery_for_orphan(
+        self,
+        log_backend: "LogBackend",
+        scope: str,
+        orphan: "ReservationRecord",
+    ) -> None:
+        """Emit recovery event(s) for one orphan reservation.
+
+        Pessimistic over-report semantics (spec/29 §"Crash recovery"):
+        - token orphan → emit ``mandate_reservation_committed_on_recovery``
+          at ``projected_usd``.
+        - external orphan → emit BOTH ``_committed_on_recovery`` AND
+          ``mandate_reservation_external_unverified``.
+
+        Recovery event timestamp uses NOW (not the original reservation ts)
+        because the recovery event IS a new event; readers that want the
+        original reservation ts read it from the ``ts`` field in the extra
+        payload of the ``_committed_on_recovery`` event.
+        """
+        now_ts = datetime.now(timezone.utc).isoformat()
+        run_id = str(uuid.uuid4())
+
+        # Common fields for both event types.
+        committed_extra: dict = {
+            "event": "mandate_reservation_committed_on_recovery",
+            "reservation_id": orphan.reservation_id,
+            "mandate_id": orphan.mandate_id,
+            "proposal_id": orphan.proposal_id,
+            "cost_kind": orphan.cost_kind,
+            # Pessimistic: actual_usd = projected_usd (spec/29 line 601).
+            "actual_usd": orphan.projected_usd,
+            "recovery": True,
+            # Original reservation ts preserved for audit readers.
+            "reservation_ts": orphan.ts,
+        }
+
+        committed_record = RunRecord(
+            ts=now_ts,
+            run_id=run_id,
+            primitive=PRIMITIVE_MANDATE_RESERVATION,
+            status="ok",
+            summary=(
+                f"mandate reservation committed on recovery: "
+                f"{orphan.reservation_id} scope={scope}"
+            ),
+            model="n/a",
+            input_tokens=0,
+            output_tokens=0,
+            mandate_id=orphan.mandate_id or None,
+            extra=committed_extra,
+        )
+        log_backend.append(committed_record)
+        _logger.info(
+            "mandate recovery: emitted committed_on_recovery for "
+            "reservation_id=%r proposal_id=%r scope=%r cost_kind=%r "
+            "projected_usd=%.6f",
+            orphan.reservation_id,
+            orphan.proposal_id,
+            scope,
+            orphan.cost_kind,
+            orphan.projected_usd,
+        )
+
+        if orphan.cost_kind == "external":
+            # External orphan: also emit _external_unverified so the doctor
+            # surfaces it for operator reconciliation (spec/29 line 602).
+            unverified_extra: dict = {
+                "event": "mandate_reservation_external_unverified",
+                "reservation_id": orphan.reservation_id,
+                "mandate_id": orphan.mandate_id,
+                "proposal_id": orphan.proposal_id,
+                "cost_kind": "external",
+                "projected_usd": orphan.projected_usd,
+                # Original reservation ts for audit trail.
+                "reservation_ts": orphan.ts,
+                # Operator-actionable hint surfaced by doctor.
+                "reconcile_cli_hint": (
+                    f"atomic-agents mandate reconcile "
+                    f"{orphan.reservation_id} "
+                    f"--action committed|rolled_back"
+                ),
+            }
+            unverified_record = RunRecord(
+                ts=datetime.now(timezone.utc).isoformat(),
+                run_id=str(uuid.uuid4()),
+                primitive=PRIMITIVE_MANDATE_RESERVATION,
+                status="warn",
+                summary=(
+                    f"mandate external reservation unverified after crash: "
+                    f"{orphan.reservation_id} scope={scope}"
+                ),
+                model="n/a",
+                input_tokens=0,
+                output_tokens=0,
+                mandate_id=orphan.mandate_id or None,
+                extra=unverified_extra,
+            )
+            log_backend.append(unverified_record)
+            _logger.warning(
+                "mandate recovery: external reservation %r scope=%r "
+                "marked unverified — operator must reconcile via: %s",
+                orphan.reservation_id,
+                scope,
+                unverified_extra["reconcile_cli_hint"],
+            )
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -498,7 +794,7 @@ def make_filesystem_mandate_backend_from_url(url: str) -> FilesystemMandateBacke
             f"starting with 'filesystem://' — got {url!r}. "
             f"Use a URL of the form 'filesystem:///path/to/scope_root'."
         )
-    path_str = url[len(_SCHEME):]
+    path_str = url[len(_SCHEME) :]
     if not path_str:
         raise ValueError(
             f"make_filesystem_mandate_backend_from_url: URL {url!r} has "

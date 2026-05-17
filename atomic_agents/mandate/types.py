@@ -43,9 +43,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, time as dt_time
 from enum import Enum
-from typing import Literal
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 from atomic_agents.exceptions import AtomicAgentsError
+
+if TYPE_CHECKING:
+    from ..locks.backend import LockBackend
+    from ..logs.backend import LogBackend
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -322,3 +326,147 @@ class MandateCapabilities:
     # restarts. Reference filesystem backend: True. In-memory test backends:
     # False.
     durable: bool = True
+
+    # Whether the backend implements ``recover_orphan_reservations`` per
+    # spec/29 §"Crash recovery for reservations" + Implementer contract
+    # MUST #7. Reference filesystem backend: True. Backends that genuinely
+    # cannot scan their storage for orphans (e.g., a stateless HTTP proxy
+    # that has no queryable log) declare False; the conformance suite gates
+    # crash-recovery tests on this flag so capability-gated skips are loud
+    # rather than silent.
+    supports_crash_recovery: bool = True
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# MandateBackend Protocol
+
+
+@runtime_checkable
+class MandateBackend(Protocol):
+    """Contract every mandate backend implementation must satisfy.
+
+    Implementations MUST NOT subclass this Protocol — it is structural.
+    Implementations satisfy it by exposing the methods below with the
+    documented behavior.  The ``@runtime_checkable`` decorator enables
+    ``isinstance(obj, MandateBackend)`` to perform a method-presence check
+    (not a signature check — signatures are static-typing's job).
+
+    Backends are constructed once per deployment scope.  The reference
+    ``FilesystemMandateBackend`` is rooted at a ``scope_root`` directory;
+    future SaaS / SQL backends carry equivalent construction args.
+
+    See spec/29 §"Implementer contract for mandate backends" for the full
+    normative contract (8 MUSTs).
+    """
+
+    @property
+    def backend_id(self) -> str:
+        """Stable identifier — e.g., ``"filesystem"``, ``"sqlite"``."""
+        ...
+
+    def list_mandates(self, scope: str) -> list[Mandate]:
+        """Walk the scope's ``mandates.md`` and return all mandates.
+
+        Returns ``[]`` when ``mandates.md`` is absent or empty.
+        Source hash is freshly computed on every call (spec/29 MUST #4).
+        """
+        ...
+
+    def load_mandate(self, mandate_id: str, scope: str) -> Mandate:
+        """Look up and return the mandate with ``mandate_id`` in ``scope``.
+
+        Raises ``MandateNotFound`` when the id is absent from the scope.
+        Raises ``MandateInvalid`` when ``mandate_id`` fails the
+        ``[a-z0-9][a-z0-9-]*`` charset check (spec/29 MUST #1).
+        """
+        ...
+
+    def read_state(self, scope: str) -> dict:
+        """Read the dedup sidecar for ``scope``.
+
+        Returns a default empty-state dict when the sidecar is absent.
+        Raises ``MandateStateSchemaUnsupported`` on unknown
+        ``schema_version`` (spec/29 MUST #3 forward-compat discipline).
+        """
+        ...
+
+    def write_state(self, scope: str, state: dict) -> None:
+        """Atomically persist the state dict for ``scope``.
+
+        Writes MUST be atomic (temp + fsync + rename for filesystem;
+        transactional for SQL) per spec/29 MUST #3.
+        """
+        ...
+
+    def recover_orphan_reservations(
+        self,
+        log_backend: "LogBackend",
+        scope: str,
+        *,
+        lock_backend: "LockBackend | None" = None,
+        lock_ttl_s: int = 30,
+    ) -> int:
+        """Scan the log for orphan reservations and emit recovery events.
+
+        Returns the count of orphans recovered.  Returns 0 immediately if
+        ``lock_backend`` is provided and the recovery lease is already held
+        by a sibling replica — correct multi-process behavior per spec/29
+        Risk B.
+
+        An *orphan* reservation is a ``mandate_reservation`` log event with
+        no matching ``_committed`` / ``_rolled_back`` / ``_expired`` /
+        ``_committed_on_recovery`` event AND no cost event tagged with the
+        same ``proposal_id`` (spec/29 §"Crash recovery for reservations").
+        The TTL-expiry clause from ``compute_outstanding`` does NOT apply
+        here — after a crash, TTL is suspect; the recovery pass takes over
+        unconditionally.
+
+        For each orphan:
+
+        - ``cost_kind="token"`` → emit ``mandate_reservation_committed_on_recovery``
+          at the original ``projected_usd`` amount with ``recovery: true``
+          annotation (pessimistic over-report, spec/29 §"Crash recovery").
+        - ``cost_kind="external"`` → emit BOTH
+          ``mandate_reservation_committed_on_recovery`` AND
+          ``mandate_reservation_external_unverified`` so that
+          ``doctor.check_mandate_unverified_external_reservations`` surfaces
+          the orphan for operator reconciliation via
+          ``atomic-agents mandate reconcile <reservation_id> --action
+          committed|rolled_back``.
+
+        All scan + decide + emit operations happen **inside** the held
+        ``LockBackend`` lease (spec/29 Risk 3 discipline) — scanning before
+        acquiring the lock and emitting inside allows double-emission under
+        concurrent recovery.  Implementations MUST re-scan after acquiring
+        the lock.
+
+        ``lock_ttl_s`` defaults to 30 seconds, which is sufficient for
+        typical log sizes.  Callers whose agents have unusually large JSONL
+        logs SHOULD pass a longer value OR periodically call
+        ``lock_backend.renew(handle)`` inside a custom recovery wrapper.
+        The 30 s default is documented as the safe-for-typical-use bound;
+        it is NOT enforced as a hard limit.
+
+        Args:
+            log_backend: the ``LogBackend`` instance to scan and append to.
+            scope: one of ``"agent:<name>"`` or ``"project:<name>"``.
+                A single agent may have BOTH scopes; callers (sub-agent D
+                in agent.py) are responsible for iterating all scopes.
+                This method takes ONE scope and recovers within it.
+            lock_backend: when provided, serializes recovery emission via
+                ``LockBackend.acquire("mandate-recovery:<scope>",
+                timeout=lock_ttl_s)`` so only the lock-holding replica
+                writes recovery events (spec/29 Risk B).  When ``None``,
+                the method proceeds in single-process mode (correct only
+                when the operator guarantees one writer — documented
+                assumption per spec/29 Risk H).
+            lock_ttl_s: timeout for the recovery lease acquisition.
+                Replicas that cannot acquire within this window return 0
+                immediately (spec/29 Risk B — skip cleanly).
+
+        Returns:
+            Count of orphan reservations recovered (events emitted).
+            0 when the lock was unavailable (another replica is
+            recovering this scope).
+        """
+        ...

@@ -19,12 +19,14 @@ import os
 import re
 import time
 from dataclasses import asdict
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from .llm.types import LLMToolDefinition  # noqa: F401 — used in str type hints
+    from .judge.mandate_reservations import MandateReservationManager
+    from .judge.types import ActionProposal
 
 _logger = logging.getLogger(__name__)
 
@@ -367,6 +369,28 @@ class AtomicAgent:
         else:
             self.mandate_backend = mandate_backend
 
+        # ── Mandate crash recovery + reservation managers (#124 PR 3b) ──────
+        # Per spec/29 §"Crash recovery for reservations" + plan-subagent
+        # Risks 8 (invocation site = agent init) + 9 (multi-scope iteration).
+        # Recovery is invoked BEFORE profile load so that orphan reservations
+        # from the previous run are reconciled before any mandate checks fire
+        # in this run. Reservation managers are instantiated per-scope so each
+        # scope gets its own TTL watcher and in-process pending table.
+        #
+        # The ``_mandate_reservation_managers`` dict and the reservation
+        # managers themselves are populated lazily below via
+        # ``_run_mandate_recovery_for_all_scopes`` — we store the map
+        # before profile load so judges_config can refine TTL settings after
+        # ``_load_config`` without re-instantiating (TTL is read from
+        # judges_config.mandate_settings.reservation_ttl_s once available).
+        #
+        # NOTE: ``_mandate_reservation_managers`` is intentionally empty at
+        # this point; ``_init_mandate_reservation_managers`` is called at the
+        # END of __init__ after ``_load_config`` has populated judges_config
+        # (so the correct TTL from judges.md is available).
+        self._mandate_reservation_managers: dict[str, "MandateReservationManager"] = {}
+        self._run_mandate_recovery_for_all_scopes()
+
         # Load the agent's profile ONCE at init time. ``self._profile`` is
         # an init-time snapshot — private cache, not a stable operator
         # surface. Operators read persona text via assemble_system_prompt()
@@ -395,6 +419,7 @@ class AtomicAgent:
         # do NOT flow to delegates (mirrors spec/15 delegate isolation +
         # spec/25 Decision 9 per-agent backend scoping).
         from .judge.target_extractor_registry import TargetExtractorRegistry
+
         self._target_extractors = TargetExtractorRegistry()
 
         # Per-agent cost estimator registry (#124 PR 3b prep — spec/29
@@ -408,6 +433,7 @@ class AtomicAgent:
         # *_external_usd caps over tools with neither registered fail-closed
         # with mandate_external_cost_unprojectable.
         from .judge.cost_estimator_registry import CostEstimatorRegistry
+
         self._cost_estimators = CostEstimatorRegistry()
 
         # Register backend-discovered tools into the in-memory
@@ -559,6 +585,13 @@ class AtomicAgent:
         self._mandate_check = None  # type: ignore[assignment]  # #124 PR 3a
         self._tool_classifications: dict[str, str] = {}
         self.judges_config = None  # type: ignore[assignment]
+        # Per-iteration side-channel: tool_call_id → ActionProposal for
+        # mandate-citing proposals that the ensemble ALLOWed. Reset at
+        # the start of each call() while-loop iteration. Populated by
+        # _dispatch_with_judge when allow=True + cites_mandate. Consumed
+        # in the tool-execution loop to create/commit/rollback reservations
+        # and run post-action verification (#124 PR 3b).
+        self._mandate_allowed_proposals: dict[str, "ActionProposal"] = {}
 
         # Loaded later via load() — populated in __init__ for clarity
         self._persona_text: str = ""
@@ -588,6 +621,12 @@ class AtomicAgent:
         # Parse config files
         self.config = self._load_config()
 
+        # Instantiate per-scope reservation managers AFTER _load_config so
+        # judges_config.mandate_settings.reservation_ttl_s (from judges.md)
+        # is resolved. Each scope gets its own MandateReservationManager
+        # with the correct TTL from the operator's configuration.
+        self._init_mandate_reservation_managers()
+
         # Memory backend (spec/20 — routes all memory I/O through the protocol).
         # Threads the agent's resolved lock_backend so memory.apply_staging
         # serializes against agent.call() through the SAME backend instance —
@@ -598,6 +637,207 @@ class AtomicAgent:
             memory_subdir="memory",
             lock_backend=self.lock_backend,
         )
+
+    # ────────────────────────────────────────────────────────────────────
+    # Mandate crash recovery + reservation managers (#124 PR 3b)
+
+    def _compute_effective_mandate_scopes(self) -> list[str]:
+        """Return the mandate scope keys this agent participates in.
+
+        Per spec/29 §"Crash recovery for reservations" + plan-subagent Risk 9:
+        - ``agent:<name>`` is always present (the agent's own mandates.md).
+        - ``project:<root_name>`` is added when a project-root mandates.md
+          exists (cascade layout per spec/06).
+
+        Returns a list of 1 or 2 scope strings. Never empty.
+        """
+        scopes: list[str] = [f"agent:{self.agent_root.name}"]
+        # Project-root scope: present in cascade layouts where the agents_root
+        # parent has a mandates.md (spec/06 + spec/29 §"Scope derivation").
+        if self.cascade is not None:
+            # cascade.project_root is the <system>/projects/<project>/ dir;
+            # the mandates.md lives at its root level (sibling of agents/).
+            project_mandates = self.cascade.project_root / "mandates.md"
+            if project_mandates.exists():
+                scopes.append(f"project:{self.cascade.project_root.name}")
+        return scopes
+
+    def _run_mandate_recovery_for_all_scopes(self) -> None:
+        """Invoke crash recovery for each effective mandate scope at agent boot.
+
+        Per spec/29 §"Crash recovery for reservations" + plan-subagent
+        Risks 8 (invocation site = agent init) + 9 (multi-scope iteration).
+
+        Iterates the effective scope set (agent:<name> always; project:<root>
+        when project-root mandates.md exists) and invokes
+        ``recover_orphan_reservations`` for each.
+
+        Multi-process safety via LockBackend lease per spec/29 Risk B. Sibling
+        replicas that don't hold the lease return 0 immediately — no startup
+        cliff.
+
+        No-op when ``mandate_backend`` is None or no mandates.md exists at
+        any scope (``recover_orphan_reservations`` handles the empty-orphan
+        list cheaply).
+
+        Called from ``__init__`` BEFORE ``_load_config`` so orphans are
+        reconciled before any mandate checks fire in this run. ``cascade`` is
+        NOT yet set at this point in init order (cascade detection happens
+        after profile load), so we can only recover ``agent:`` scope here;
+        project-scope recovery happens in ``_init_mandate_reservation_managers``
+        after cascade detection.
+        """
+        if self.mandate_backend is None:
+            return
+        # Only agent-scope available at this point (cascade not yet set).
+        agent_scope = f"agent:{self.agent_root.name}"
+        try:
+            self.mandate_backend.recover_orphan_reservations(
+                self.log_backend,
+                agent_scope,
+                lock_backend=self.lock_backend,
+            )
+        except Exception:
+            _logger.exception("mandate recovery failed for scope %s", agent_scope)
+
+    def _init_mandate_reservation_managers(self) -> None:
+        """Instantiate per-scope MandateReservationManagers after _load_config.
+
+        Called from ``__init__`` AFTER ``_load_config`` so
+        ``judges_config.mandate_settings.reservation_ttl_s`` is resolved.
+        Also runs project-scope crash recovery now that ``self.cascade``
+        is set.
+
+        Per spec/29 §"Cost reservation pattern" + plan-subagent Risk 9:
+        one manager per scope (agent + optional project).
+        """
+        from .judge.mandate_reservations import MandateReservationManager
+
+        # Resolve TTL from parsed judges.md (or default 60s).
+        if self.judges_config is not None:
+            ttl_s = self.judges_config.mandate_settings.reservation_ttl_s
+        else:
+            from .judges_md import MandateSettings
+
+            ttl_s = MandateSettings().reservation_ttl_s
+
+        scopes = self._compute_effective_mandate_scopes()
+
+        # Project-scope recovery: runs now that cascade is detected.
+        if self.mandate_backend is not None and len(scopes) > 1:
+            project_scope = scopes[1]
+            try:
+                self.mandate_backend.recover_orphan_reservations(
+                    self.log_backend,
+                    project_scope,
+                    lock_backend=self.lock_backend,
+                )
+            except Exception:
+                _logger.exception("mandate recovery failed for scope %s", project_scope)
+
+        for scope in scopes:
+            self._mandate_reservation_managers[scope] = MandateReservationManager(
+                self.log_backend,
+                scope,
+                ttl_s=ttl_s,
+                agent_name=self.name,
+            )
+
+    def _verify_post_action(
+        self,
+        proposal: "ActionProposal",
+        tool_result: "ToolCallResult",
+    ) -> None:
+        """Emit post-action verification lifecycle event.
+
+        Per spec/29 §"Mandate lifecycle events" rows for
+        ``mandate_action_verified`` / ``_diverged`` / ``_verification_unavailable``.
+
+        Fires AFTER cost commit (spec/29 Risk 6). Uses EXECUTED
+        ``tool_arguments`` (post-REVISE) for post-extraction — NOT
+        ``tool_result.output`` (spec/29 Risk 10).
+
+        No-op when:
+        - proposal.action_class is not external_side_effect or irreversible.
+        - proposal.authorization is None or doesn't cite a mandate.
+        """
+        from .judge.types import ActionClass
+
+        if proposal.classification not in (
+            ActionClass.EXTERNAL_SIDE_EFFECT,
+            ActionClass.HIGH_RISK,
+        ):
+            return
+        if (
+            proposal.authorization is None
+            or not proposal.authorization.granted_by.startswith("mandate:")
+        ):
+            return
+
+        mandate_id: str = proposal.authorization.granted_by.removeprefix("mandate:")
+
+        # Pre-extraction recorded at proposal time (PR 3a's #218).
+        target_at_proposal = proposal.target_canonical
+
+        # Post-extraction uses EXECUTED tool_arguments (Risk 10).
+        # Same extractor lookup as proposal-time path.
+        tool_def = self.tool_registry.get(proposal.tool_name)
+        extractor_id = tool_def.target_extractor_id if tool_def is not None else None
+        target_at_execution = self._target_extractors.extract(
+            tool_name=proposal.tool_name,
+            tool_arguments=proposal.tool_arguments,
+            extractor_id=extractor_id,
+            mcp_server=proposal.mcp_server,
+        )
+
+        # Determine verification_status per spec/29 lines 641-643.
+        if target_at_proposal is None and target_at_execution is None:
+            status = "unavailable"
+            event_name = "mandate_action_verification_unavailable"
+        elif target_at_proposal == target_at_execution:
+            status = "match"
+            event_name = "mandate_action_verified"
+        else:
+            status = "diverged"
+            event_name = "mandate_action_diverged"
+
+        # Emit via the existing _log() path — mirrors MandateCheck's
+        # _emit_lifecycle_event shape: primitive="judgment", trigger=event_name.
+        try:
+            from .logs.types import RunRecord
+
+            now_iso = datetime.now(timezone.utc).isoformat()
+            record = RunRecord(
+                ts=now_iso,
+                run_id=self.run_id,
+                primitive="judgment",
+                status="ok",
+                summary=(f"mandate post-action: {event_name} for {mandate_id!r}"),
+                model="n/a",
+                input_tokens=0,
+                output_tokens=0,
+                trigger=event_name,
+                agent_name=self.name,
+                mandate_id=mandate_id,
+                extra={
+                    "event": event_name,
+                    "mandate_id": mandate_id,
+                    "proposal_id": proposal.proposal_id,
+                    "tool_name": proposal.tool_name,
+                    "target_canonical_at_proposal": target_at_proposal,
+                    "target_canonical_at_execution": target_at_execution,
+                    "verification_status": status,
+                },
+            )
+            self.log_backend.append(record)
+        except Exception:
+            _logger.warning(
+                "agent %r: failed to emit mandate post-action lifecycle event "
+                "%r for mandate_id=%r",
+                self.name,
+                event_name,
+                mandate_id,
+            )
 
     def _register_skill_tools(self) -> None:
         """Register load_skill and load_skill_file as built-in tools in the registry.
@@ -989,6 +1229,7 @@ class AtomicAgent:
             mandate_settings = self.judges_config.mandate_settings
         else:
             from .judges_md import MandateSettings
+
             mandate_settings = MandateSettings()
 
         state_manager = MandateStateManager(
@@ -1630,7 +1871,7 @@ class AtomicAgent:
             arguments_hash=proposal_obj.arguments_hash,
         )
 
-        return self._run_ensemble(
+        result = self._run_ensemble(
             proposal_obj=proposal_obj,
             tu=tu,
             binding=binding,
@@ -1643,6 +1884,18 @@ class AtomicAgent:
             revise_iteration=0,
             original_proposal=None,
         )
+        # PR 3b: when the ensemble ALLOWs a mandate-citing proposal,
+        # cache the proposal on the instance so the tool-execution loop
+        # can create a reservation and run post-action verification.
+        # Keyed by tool_call_id; cleared at the start of each call()
+        # iteration via ``_mandate_allowed_proposals``.
+        allow_result, _events, _qid = result
+        if allow_result and (
+            proposal_obj.authorization is not None
+            and proposal_obj.authorization.granted_by.startswith("mandate:")
+        ):
+            self._mandate_allowed_proposals[tool_call_id] = proposal_obj
+        return result
 
     def _run_ensemble(
         self,
@@ -2735,6 +2988,16 @@ class AtomicAgent:
             start_total = time.time()
             while True:
                 iteration_count += 1
+                # Reset per-iteration mandate-proposal side-channel (#124 PR 3b).
+                # Populated by _dispatch_with_judge when ensemble ALLOWs a
+                # mandate-citing proposal; consumed by the tool-execution loop
+                # below for reservation create/commit/rollback + post-action
+                # verification. Cleared every iteration so stale proposals from
+                # prior iterations don't affect the current one.
+                self._mandate_allowed_proposals = {}
+                # Per-iteration reservation tracking: tool_call_id → reservation_id.
+                # Used to commit on success or rollback on error.
+                _mandate_reservations: dict[str, str] = {}
 
                 # Inter-iteration lock-loss check (#60 PR 3 + spec/21
                 # §"Lease and heartbeat"). For lease-backed backends
@@ -2941,6 +3204,61 @@ class AtomicAgent:
                                 judge_blocked[tu.get("id", "")] = events[-1].get(
                                     "judgment_reason", "judge_blocked"
                                 )
+                            else:
+                                # Ensemble ALLOWed. If this is a mandate-citing
+                                # proposal, create a reservation (#124 PR 3b).
+                                tcid = tu.get("id", "")
+                                mandate_proposal = self._mandate_allowed_proposals.get(
+                                    tcid
+                                )
+                                if (
+                                    mandate_proposal is not None
+                                    and mandate_proposal.authorization is not None
+                                ):
+                                    mandate_id = mandate_proposal.authorization.granted_by.removeprefix(
+                                        "mandate:"
+                                    )
+                                    scope = f"agent:{self.agent_root.name}"
+                                    mgr = self._mandate_reservation_managers.get(scope)
+                                    if mgr is not None:
+                                        tool_def_for_cost = self.tool_registry.get(
+                                            mandate_proposal.tool_name
+                                        )
+                                        cost_kind = (
+                                            "external"
+                                            if tool_def_for_cost is not None
+                                            and (
+                                                tool_def_for_cost.expected_external_cost_usd
+                                                is not None
+                                                or tool_def_for_cost.cost_estimator_id
+                                                is not None
+                                            )
+                                            else "token"
+                                        )
+                                        try:
+                                            rid = mgr.create(
+                                                mandate_id=mandate_id,
+                                                proposal_id=mandate_proposal.proposal_id,
+                                                cost_kind=cost_kind,
+                                                # projected_usd not yet surfaced by
+                                                # MandateCheck Judgment; default 0.0.
+                                                # Follow-up: #TODO extend Judgment to
+                                                # carry projected_usd so reservation
+                                                # headroom is accurate (#124 follow-up).
+                                                projected_usd=0.0,
+                                                run_id=self.run_id,
+                                                parent_run_id=None,
+                                            )
+                                            _mandate_reservations[tcid] = rid
+                                        except Exception:
+                                            _logger.warning(
+                                                "agent %r: mandate reservation create "
+                                                "failed for tool_call_id=%r mandate_id=%r "
+                                                "— execution proceeds (best-effort)",
+                                                self.name,
+                                                tcid,
+                                                mandate_id,
+                                            )
 
                 # Execute custom tools
                 iter_tool_results: list[ToolCallResult] = []
@@ -3015,16 +3333,80 @@ class AtomicAgent:
                     tool_result = self.tool_registry.execute(tu)
                     all_tool_call_results.append(tool_result)
                     iter_tool_results.append(tool_result)
-                    # Per-tool JSONL log line
-                    self._log(
-                        {
-                            "trigger": "tool_call",
-                            "parent_run_id": self.run_id,
-                            "tool_name": tool_result.tool_name,
-                            "latency_ms": tool_result.latency_ms,
-                            "error": tool_result.error,
-                        }
-                    )
+                    # Per-tool JSONL log line. For mandate-citing ALLOWed
+                    # tools, extend with mandate_id + proposal_id in extra
+                    # so the cost event IS the mandate_used surface per
+                    # spec/29 Risk 4 amendment (#124 PR 3b).
+                    mandate_proposal = self._mandate_allowed_proposals.get(tcid)
+                    tool_log_record: dict = {
+                        "trigger": "tool_call",
+                        "parent_run_id": self.run_id,
+                        "tool_name": tool_result.tool_name,
+                        "latency_ms": tool_result.latency_ms,
+                        "error": tool_result.error,
+                    }
+                    if (
+                        mandate_proposal is not None
+                        and mandate_proposal.authorization is not None
+                        and mandate_proposal.authorization.granted_by.startswith(
+                            "mandate:"
+                        )
+                    ):
+                        _mid = mandate_proposal.authorization.granted_by.removeprefix(
+                            "mandate:"
+                        )
+                        tool_log_record["mandate_id"] = _mid
+                        tool_log_record["proposal_id"] = mandate_proposal.proposal_id
+                    self._log(tool_log_record)
+
+                    # Reservation lifecycle (#124 PR 3b):
+                    # - On tool error → rollback (spec/29 ordering).
+                    # - On success → commit AFTER cost event (Risk 6:
+                    #   commit first, verify after).
+                    # Verification fires last (Risk 6: after commit).
+                    _rid = _mandate_reservations.get(tcid)
+                    if _rid is not None:
+                        _scope_for_rid = f"agent:{self.agent_root.name}"
+                        _mgr_for_rid = self._mandate_reservation_managers.get(
+                            _scope_for_rid
+                        )
+                        if _mgr_for_rid is not None:
+                            if tool_result.error is not None:
+                                # Tool errored — rollback reservation.
+                                try:
+                                    _mgr_for_rid.rollback(
+                                        _rid,
+                                        reason="tool_error",
+                                        run_id=self.run_id,
+                                    )
+                                except Exception:
+                                    _logger.warning(
+                                        "agent %r: mandate reservation rollback "
+                                        "failed for rid=%r",
+                                        self.name,
+                                        _rid,
+                                    )
+                            else:
+                                # Tool succeeded — commit reservation
+                                # (spec/29 Risk 6: commit before verify).
+                                try:
+                                    _mgr_for_rid.commit(
+                                        _rid,
+                                        actual_usd=0.0,  # tool cost is zero for token-class; external-class actual tracked via cost event
+                                        run_id=self.run_id,
+                                    )
+                                except Exception:
+                                    _logger.warning(
+                                        "agent %r: mandate reservation commit "
+                                        "failed for rid=%r",
+                                        self.name,
+                                        _rid,
+                                    )
+
+                    # Post-action verification (spec/29 Risk 6: after cost
+                    # commit). No-op for non-mandate or wrong action class.
+                    if mandate_proposal is not None and tool_result.error is None:
+                        self._verify_post_action(mandate_proposal, tool_result)
 
                 # If no custom tools were called, the loop is done
                 if not custom_tool_uses:
