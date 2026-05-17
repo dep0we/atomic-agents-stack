@@ -40,6 +40,7 @@ from .agent import AtomicAgent
 from .logs import LogBackend
 from .profile import AgentProfileBackend
 from .registry import ToolRegistryBackend
+from .mandate import MandateBackend
 from .exceptions import (
     AtomicAgentsError,
     NoJudgeAvailable,
@@ -121,6 +122,7 @@ class EvalRunner:
         log_backend: "LogBackend | None" = None,
         profile_backend: "AgentProfileBackend | None" = None,
         tool_registry_backend: "ToolRegistryBackend | None" = None,
+        mandate_backend: "MandateBackend | None" = None,
     ):
         self.agents_root = agents_root or get_agents_root()
         self.agent_name = agent_name
@@ -137,6 +139,13 @@ class EvalRunner:
         self._profile_backend = profile_backend
         # #64 PR 2 — ToolRegistryBackend forwarding. Same discipline.
         self._tool_registry_backend = tool_registry_backend
+        # #124 PR 2 — MandateBackend forwarding. Same threading discipline.
+        # Without this, an operator pinning a custom mandate backend would
+        # silently drop it at the EvalRunner→AtomicAgent boundary.
+        # ``None`` means: defer to the agent's own
+        # ``get_default_mandate_backend`` resolution (env var → filesystem
+        # default).
+        self._mandate_backend = mandate_backend
 
         if not self.evals_dir.exists():
             raise AtomicAgentsError(
@@ -335,6 +344,7 @@ class EvalRunner:
             log_backend=self._log_backend,
             profile_backend=self._profile_backend,
             tool_registry_backend=self._tool_registry_backend,
+            mandate_backend=self._mandate_backend,
         )
         try:
             agent_response = agent.call(work_item=work_item, write_captures=False)
