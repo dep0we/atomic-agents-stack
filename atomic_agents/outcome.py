@@ -51,6 +51,7 @@ from .agent import AtomicAgent
 from .eval import EvalRunner, _provider_available
 from .profile import AgentProfileBackend
 from .registry import ToolRegistryBackend
+from .mandate import MandateBackend
 from .exceptions import AtomicAgentsError, CostGuardrailBlocked
 
 # ──────────────────────────────────────────────────────────────────
@@ -123,6 +124,7 @@ class OutcomeRunner:
         log_backend: "LogBackend | None" = None,
         profile_backend: "AgentProfileBackend | None" = None,
         tool_registry_backend: "ToolRegistryBackend | None" = None,
+        mandate_backend: "MandateBackend | None" = None,
     ):
         self.agents_root = Path(agents_root) if agents_root else get_agents_root()
         self.agent_name = agent_name
@@ -149,6 +151,14 @@ class OutcomeRunner:
         # operators (None kwarg) get the per-agent-rooted filesystem
         # backend via the agent's own ``get_default_tool_registry_backend``.
         self._tool_registry_backend = tool_registry_backend
+        # #124 PR 2 — MandateBackend forwarding. Same threading discipline
+        # as ``_tool_registry_backend``. Without this, an operator pinning
+        # a custom mandate backend would silently drop it at the
+        # OutcomeRunner→AtomicAgent boundary.
+        # ``None`` means: defer to the agent's own
+        # ``get_default_mandate_backend`` resolution (env var → filesystem
+        # default).
+        self._mandate_backend = mandate_backend
 
         if not self.agent_root.exists():
             raise AtomicAgentsError(
@@ -230,6 +240,7 @@ class OutcomeRunner:
             log_backend=self._log_backend,
             profile_backend=self._profile_backend,
             tool_registry_backend=self._tool_registry_backend,
+            mandate_backend=self._mandate_backend,
         )
 
         # Resolve judge model: explicit > cross-family via eval config > pick_judge_model fallback

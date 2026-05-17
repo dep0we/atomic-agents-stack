@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     from .logs import LogBackend
     from .profile import AgentProfileBackend
     from .registry import ToolRegistryBackend
+    from .mandate import MandateBackend
 
 import frontmatter
 
@@ -1166,6 +1167,7 @@ class DreamRunner:
         log_backend: "LogBackend | None" = None,
         profile_backend: "AgentProfileBackend | None" = None,
         tool_registry_backend: "ToolRegistryBackend | None" = None,
+        mandate_backend: "MandateBackend | None" = None,
     ):
         self.agents_root = Path(agents_root)
         self.agent_name = agent_name
@@ -1255,6 +1257,16 @@ class DreamRunner:
         # (a future ``DreamRunner`` capability that emits agent calls
         # for note synthesis would consume this).
         self._tool_registry_backend = tool_registry_backend
+        # #124 PR 2 — MandateBackend stored for API parity with
+        # OutcomeRunner / EvalRunner. DreamRunner currently makes raw
+        # LLM calls (``_llm.call_*``) without dispatching agent tools
+        # — there is no internal ``AtomicAgent`` construction to thread
+        # through. The kwarg + storage exist so an operator wiring
+        # multiple runners uses ONE signature shape across all four. Per
+        # spec/29, mandate validation is per-agent scoped; future dream
+        # pipelines that emit agent calls for note synthesis would consume
+        # this backend via ``AtomicAgent(..., mandate_backend=...)``.
+        self._mandate_backend = mandate_backend
 
         # Resolve model: explicit kwarg > profile.model_config default.
         # PR 2 Decision 2: pre-resolved model_config is also passed to

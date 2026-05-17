@@ -55,6 +55,10 @@ from .registry import (
     ToolRegistryBackend,
     get_default_tool_registry_backend,
 )
+from .mandate import (
+    MandateBackend,
+    get_default_mandate_backend,
+)
 from .logs.types import (
     PRIMITIVE_AGENT_CALL,
     PRIMITIVE_CAPTURE,
@@ -218,6 +222,13 @@ class AtomicAgent:
     # breaking the operator-pinned-SQLite/Postgres/Datadog case PR 3
     # forward.
     log_backend: LogBackend
+    # Same class-level annotation rationale for ``mandate_backend`` (#124
+    # PR 2). Without this, static analysis would narrow
+    # ``agent.mandate_backend`` to the concrete
+    # ``FilesystemMandateBackend`` default rather than treating it as any
+    # ``MandateBackend`` Protocol implementer — breaking the
+    # operator-pinned-SaaS/mobile/Slack-bot case PR 3a forward.
+    mandate_backend: MandateBackend
     """The main agent runtime.
 
     Responsible for:
@@ -241,6 +252,7 @@ class AtomicAgent:
         log_backend: LogBackend | None = None,
         profile_backend: AgentProfileBackend | None = None,
         tool_registry_backend: ToolRegistryBackend | None = None,
+        mandate_backend: MandateBackend | None = None,
     ):
         self.name = name
         self.trigger = trigger
@@ -335,6 +347,25 @@ class AtomicAgent:
             )
         else:
             self.tool_registry_backend = tool_registry_backend
+
+        # MandateBackend instance (#124 PR 2 — wires the bootstrap path
+        # through the Protocol established in PR 1). Operators may pin via
+        # the ``mandate_backend=...`` constructor kwarg (programmatic path
+        # — always wins) OR via ``ATOMIC_AGENTS_MANDATE_BACKEND`` env var
+        # (deployment path — Docker, launchd, Cloud Run). Default (both
+        # unset) is the filesystem backend scoped at THIS agent's root
+        # (per-agent scope, NOT agents_root — distinct from
+        # profile_backend which is fleet-scoped; mirrors
+        # tool_registry_backend's per-agent scoping per spec/29 and
+        # spec/25 Decision 9). ``mandate_backend`` is public — mirrors
+        # ``self.lock_backend`` / ``self.log_backend`` /
+        # ``self.profile_backend`` / ``self.tool_registry_backend`` so
+        # diagnostic code (``atomic-agents doctor``) and runners can
+        # reuse the same backend instance instead of resolving twice.
+        if mandate_backend is None:
+            self.mandate_backend = get_default_mandate_backend(self.agent_root)
+        else:
+            self.mandate_backend = mandate_backend
 
         # Load the agent's profile ONCE at init time. ``self._profile`` is
         # an init-time snapshot — private cache, not a stable operator
@@ -3389,6 +3420,18 @@ class AtomicAgent:
         # nature). Filesystem-default deployments behave correctly:
         # the target builds its own ``FilesystemToolRegistryBackend``
         # over ``<target_path>/tools/`` via the default factory.
+        #
+        # ``mandate_backend`` is ALSO not threaded (#124 PR 2 + spec/29).
+        # Mandates are per-agent scoped — a coordinator's mandates.md
+        # grants authority to THAT coordinator only. Threading the
+        # coordinator's mandate backend to the target would allow the
+        # target to validate actions against the coordinator's authority
+        # grants, not its own — a security boundary violation.
+        # Per spec/29 §"Per-agent vs project-root resolution", the target
+        # builds its own ``FilesystemMandateBackend`` over its own
+        # ``<target_path>/mandates.md`` via the default factory. Operators
+        # needing fleet-level mandate policy use project-root mandates
+        # (``project:<name>`` scope), not cross-agent backend threading.
         target_agent = AtomicAgent(
             name=target_agent_name,
             trigger="delegate",
