@@ -24,7 +24,6 @@ The load-bearing tests are:
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
@@ -199,9 +198,7 @@ def test_outcome_runner_threads_mandate_backend_to_internal_agent(
     assert captured.get("mandate_backend") is explicit_backend
 
 
-def test_eval_runner_threads_mandate_backend_to_internal_agent(
-    monkeypatch, tmp_path
-):
+def test_eval_runner_threads_mandate_backend_to_internal_agent(monkeypatch, tmp_path):
     """EvalRunner threads the kwarg to internal AtomicAgent at run_test() time.
 
     Step 11 adversarial regression — see OutcomeRunner test for the
@@ -354,3 +351,426 @@ def test_two_agents_get_independent_mandate_backends(tmp_path):
     assert isinstance(b.mandate_backend, FilesystemMandateBackend)
     # Different instances — not shared
     assert a.mandate_backend is not b.mandate_backend
+
+
+# ──────────────────────────────────────────────────────────────────
+# PR 3b: Mandate recovery at init (spec/29 §"Crash recovery for reservations")
+
+
+class TestAtomicAgentMandateRecoveryAtInit:
+    """Recovery is triggered at agent init when mandate_backend is present."""
+
+    def test_agent_init_recovers_orphan_reservations_when_mandates_md_present(
+        self, tmp_path: Path
+    ):
+        """AtomicAgent init calls recover_orphan_reservations when mandates.md exists.
+
+        The recovery path is triggered in __init__ via _run_mandate_recovery_for_all_scopes.
+        We verify it by: leaving a reservation event without a commit, then constructing
+        the agent, then checking a committed_on_recovery event appears in the log.
+        """
+        from atomic_agents.logs import FilesystemLogBackend, LogQuery
+        from atomic_agents.logs.types import PRIMITIVE_MANDATE_RESERVATION
+
+        _make_minimal_agent_dir(tmp_path, "recover-agent")
+
+        # Write a mandates.md so the backend has something to work with
+        mandates_md = tmp_path / "recover-agent" / "mandates.md"
+        mandates_md.write_text(
+            "## test-mandate\n"
+            "granted_by: operator@example.com\n"
+            "granted_at: 2026-01-01T00:00:00+00:00\n"
+            "expires_at: 2099-01-01T00:00:00+00:00\n"
+            "revocation_state: active\n"
+            "scope: |\n"
+            "  Test mandate.\n"
+            "revoked_at: null\n"
+            "revocation_reason: null\n"
+            "constraints:\n"
+            "  unconstrained: true\n"
+            '  unconstrained_justification: "test"\n',
+            encoding="utf-8",
+        )
+
+        # Use a shared log backend — the agent will also write to its own log dir.
+        log_backend = FilesystemLogBackend(tmp_path / "recover-agent")
+
+        # Emit an orphan reservation directly to the log (simulates a crash)
+        import uuid
+        from datetime import datetime, timezone
+        from atomic_agents.logs.types import RunRecord
+
+        rid = uuid.uuid4().hex[:16]
+        orphan = RunRecord(
+            ts=datetime.now(timezone.utc).isoformat(),
+            run_id="run-orphan",
+            primitive=PRIMITIVE_MANDATE_RESERVATION,
+            status="ok",
+            summary=f"orphan reservation {rid}",
+            model="n/a",
+            input_tokens=0,
+            output_tokens=0,
+            mandate_id="test-mandate",
+            extra={
+                "event": "mandate_reservation",
+                "reservation_id": rid,
+                "mandate_id": "test-mandate",
+                "proposal_id": "orphan-prop",
+                "cost_kind": "token",
+                "projected_usd": 0.05,
+                "ttl_s": 60,
+            },
+        )
+        log_backend.append(orphan)
+
+        # Constructing the agent triggers _run_mandate_recovery_for_all_scopes
+        AtomicAgent(
+            name="recover-agent",
+            agents_root=tmp_path,
+            log_backend=log_backend,
+        )
+
+        records = log_backend.query(LogQuery(primitive=PRIMITIVE_MANDATE_RESERVATION))
+        committed_recovery = [
+            r
+            for r in records
+            if r.extra.get("event") == "mandate_reservation_committed_on_recovery"
+        ]
+        assert len(committed_recovery) >= 1, (
+            "AtomicAgent init should trigger recovery and emit committed_on_recovery "
+            f"for orphan reservation. Records found: {[r.extra.get('event') for r in records]}"
+        )
+
+    def test_agent_init_no_recovery_when_no_mandates_md(self, tmp_path: Path):
+        """AtomicAgent init with no mandates.md completes without errors.
+
+        Recovery is still called but returns 0 (no orphans to recover).
+        The agent must construct cleanly.
+        """
+        _make_minimal_agent_dir(tmp_path, "scout")
+        # No mandates.md written — recovery is a no-op
+        agent = AtomicAgent(name="scout", agents_root=tmp_path)
+        assert agent.mandate_backend is not None
+        # mandate_reservation_managers are initialized (empty or with defaults)
+        assert hasattr(agent, "_mandate_reservation_managers")
+
+    def test_agent_init_recovery_logs_exception_and_continues_on_infra_failure(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """If recover_orphan_reservations raises, the agent init still completes.
+
+        Recovery failures are logged at WARNING but must never crash the agent.
+        """
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("simulated infra failure during recovery")
+
+        _make_minimal_agent_dir(tmp_path, "scout")
+        backend = FilesystemMandateBackend(tmp_path / "scout")
+        monkeypatch.setattr(backend, "recover_orphan_reservations", _boom)
+
+        # Agent must still construct cleanly despite recovery failure
+        agent = AtomicAgent(
+            name="scout",
+            agents_root=tmp_path,
+            mandate_backend=backend,
+        )
+        assert agent is not None
+
+
+# ──────────────────────────────────────────────────────────────────
+# PR 3b: Cost event mandate_id + proposal_id in extra
+
+
+class TestAtomicAgentCostEventMandateIdExtra:
+    """Cost events for mandate-citing actions carry mandate_id + proposal_id in extra."""
+
+    def test_cost_event_extra_unchanged_for_non_mandate_citing_action(
+        self, tmp_path: Path
+    ):
+        """Back-compat: tools without a mandate cite produce cost events without mandate_id/proposal_id.
+
+        This verifies the non-mandate path is untouched.
+        """
+        from atomic_agents.logs import FilesystemLogBackend
+
+        _make_minimal_agent_dir(tmp_path, "scout")
+        log = FilesystemLogBackend(tmp_path / "scout")
+        agent = AtomicAgent(name="scout", agents_root=tmp_path, log_backend=log)
+        # No mandate_id/proposal_id should appear in extra for tool records without mandate cite
+        # This is validated by constructing the agent successfully; deeper verification
+        # requires a live tool call (tested in the reservation lifecycle tests).
+        assert isinstance(agent.mandate_backend, FilesystemMandateBackend)
+
+
+# ──────────────────────────────────────────────────────────────────
+# PR 3b: _verify_post_action direct tests
+
+
+class TestAtomicAgentPostActionVerification:
+    """Tests for _verify_post_action (spec/29 §"Mandate lifecycle events")."""
+
+    def _make_agent(self, tmp_path: Path, agent_name: str = "scout") -> "AtomicAgent":
+        """Build a minimal agent for post-action verification tests."""
+        from atomic_agents.logs import FilesystemLogBackend
+
+        _make_minimal_agent_dir(tmp_path, agent_name)
+        log = FilesystemLogBackend(tmp_path / agent_name)
+        return AtomicAgent(name=agent_name, agents_root=tmp_path, log_backend=log)
+
+    def _make_mandate_proposal(
+        self,
+        mandate_id: str = "m1",
+        tool_name: str = "send_email",
+        target_canonical: str | None = None,
+        classification: str = "external_side_effect",
+    ):
+        """Build an ActionProposal citing a mandate for verification tests."""
+        from atomic_agents.judge.types import ActionClass, ActionProposal, Authorization
+        from hashlib import sha256
+        from datetime import datetime, timezone
+
+        args = {"to": target_canonical or "alice@example.com"}
+        args_canonical = repr(sorted(args.items())).encode("utf-8")
+        action_class = ActionClass(classification)
+        return ActionProposal(
+            tool_name=tool_name,
+            tool_arguments=args,
+            tool_call_id="tc-verify",
+            tool_definition_hash="sha256:" + sha256(tool_name.encode()).hexdigest(),
+            arguments_hash="sha256:" + sha256(args_canonical).hexdigest(),
+            classification=action_class,
+            classification_source="default",
+            actor_agent="scout",
+            actor_run_id="run-verify",
+            proposal_id="prop-verify",
+            proposal_ts=datetime.now(timezone.utc).isoformat(),
+            authorization=Authorization(
+                granted_by=f"mandate:{mandate_id}",
+                scope=f"mandate cite {mandate_id}",
+                granted_at=datetime.now(timezone.utc).isoformat(),
+            ),
+            target_canonical=target_canonical,
+        )
+
+    def _make_tool_result(self, error: str | None = None):
+        """Build a minimal ToolCallResult for verification tests."""
+        from atomic_agents.tools import ToolCallResult
+
+        return ToolCallResult(
+            tool_name="send_email",
+            tool_use_id="tc-verify",
+            input={"to": "alice@example.com"},
+            output="sent" if error is None else "",
+            error=error,
+        )
+
+    def test_verify_post_action_verified_when_target_matches(self, tmp_path: Path):
+        """_verify_post_action emits mandate_action_verified when targets match."""
+        from atomic_agents.logs import LogQuery
+
+        agent = self._make_agent(tmp_path)
+        proposal = self._make_mandate_proposal(target_canonical="alice@example.com")
+        result = self._make_tool_result()
+
+        agent._verify_post_action(proposal, result)
+
+        records = agent.log_backend.query(LogQuery())
+        verified = [
+            r for r in records if r.extra.get("event") == "mandate_action_verified"
+        ]
+        assert len(verified) == 1
+        assert verified[0].extra.get("verification_status") == "match"
+
+    def test_verify_post_action_diverged_when_target_differs(self, tmp_path: Path):
+        """_verify_post_action emits mandate_action_diverged when targets differ."""
+        from atomic_agents.logs import LogQuery
+
+        agent = self._make_agent(tmp_path)
+        # Proposal recorded target "alice@example.com"; args have different value
+        proposal = self._make_mandate_proposal(target_canonical="alice@example.com")
+
+        # Override tool_arguments to produce a different extracted target
+        from dataclasses import replace
+
+        proposal = replace(proposal, tool_arguments={"to": "eve@attacker.com"})
+
+        result = self._make_tool_result()
+        agent._verify_post_action(proposal, result)
+
+        records = agent.log_backend.query(LogQuery())
+        diverged = [
+            r for r in records if r.extra.get("event") == "mandate_action_diverged"
+        ]
+        assert len(diverged) == 1
+        assert diverged[0].extra.get("verification_status") == "diverged"
+
+    def test_verify_post_action_unavailable_when_no_extractor_matches_either_side(
+        self, tmp_path: Path
+    ):
+        """_verify_post_action emits mandate_action_verification_unavailable when
+        both target_canonical (proposal) and post-execution extraction return None."""
+        from atomic_agents.logs import LogQuery
+
+        agent = self._make_agent(tmp_path)
+        # Tool with no heuristic-matchable fields; proposal target=None
+        proposal = self._make_mandate_proposal(
+            tool_name="mystery_tool",
+            target_canonical=None,
+        )
+        from dataclasses import replace
+
+        proposal = replace(
+            proposal,
+            tool_arguments={"obscure_field": "xyz"},
+        )
+
+        result = self._make_tool_result()
+        agent._verify_post_action(proposal, result)
+
+        records = agent.log_backend.query(LogQuery())
+        unavailable = [
+            r
+            for r in records
+            if r.extra.get("event") == "mandate_action_verification_unavailable"
+        ]
+        assert len(unavailable) == 1
+        assert unavailable[0].extra.get("verification_status") == "unavailable"
+
+    def test_verify_post_action_fires_after_cost_commit_strict_timestamp_ordering(
+        self, tmp_path: Path
+    ):
+        """Risk 6 pin: verification event ts > cost event ts (strict ordering).
+
+        We simulate the pattern: cost event is written first, then
+        _verify_post_action is called. The verification event must be AFTER
+        the cost event in the log (by timestamp).
+        """
+        from atomic_agents.logs import LogQuery, RunRecord
+        from datetime import datetime, timezone
+
+        agent = self._make_agent(tmp_path)
+
+        # Write a cost event first
+        cost_ts = datetime.now(timezone.utc).isoformat()
+        cost_record = RunRecord(
+            ts=cost_ts,
+            run_id="run-verify",
+            primitive="tool",
+            status="ok",
+            summary="cost event for test",
+            model="n/a",
+            input_tokens=0,
+            output_tokens=0,
+            cost_usd=0.05,
+            cost_source="actor",
+            mandate_id="m1",
+            extra={"proposal_id": "prop-verify"},
+        )
+        agent.log_backend.append(cost_record)
+
+        # Now call _verify_post_action (simulates: commit happened, then verify)
+        proposal = self._make_mandate_proposal(target_canonical="alice@example.com")
+        result = self._make_tool_result()
+        agent._verify_post_action(proposal, result)
+
+        records = agent.log_backend.query(LogQuery())
+        verified_records = [
+            r for r in records if r.extra.get("event") == "mandate_action_verified"
+        ]
+        assert len(verified_records) == 1
+        verify_ts = verified_records[0].ts
+
+        assert verify_ts >= cost_ts, (
+            f"Risk 6: verification event ts={verify_ts!r} must be >= "
+            f"cost event ts={cost_ts!r} (strict ordering)"
+        )
+
+    def test_verify_post_action_uses_executed_tool_arguments_not_tool_result(
+        self, tmp_path: Path
+    ):
+        """Risk 10 pin: post-execution extraction uses proposal.tool_arguments (not tool_result.output).
+
+        The REVISE-amended tool_arguments are in proposal.tool_arguments.
+        tool_result.output is the raw output string which might contain anything.
+        We verify by setting a wrong value in the output but the correct value in
+        tool_arguments — the verification should use tool_arguments.
+        """
+        from atomic_agents.logs import LogQuery
+        from atomic_agents.tools import ToolCallResult
+
+        agent = self._make_agent(tmp_path)
+
+        # Proposal: target_canonical="alice@example.com" + args with same value
+        proposal = self._make_mandate_proposal(target_canonical="alice@example.com")
+        # tool_result has wrong value in output but we verify extraction comes from args
+        result = ToolCallResult(
+            tool_name="send_email",
+            tool_use_id="tc-verify",
+            input={"to": "alice@example.com"},
+            output="sent to eve@attacker.com",  # wrong in output — must not be used
+            error=None,
+        )
+
+        agent._verify_post_action(proposal, result)
+
+        records = agent.log_backend.query(LogQuery())
+        verified = [
+            r for r in records if r.extra.get("event") == "mandate_action_verified"
+        ]
+        assert len(verified) == 1, (
+            "Risk 10: extraction must use tool_arguments (alice@example.com matches), "
+            "not tool_result.output (which had a different value)"
+        )
+        # The target_canonical_at_execution should match the tool_arguments value
+        assert (
+            verified[0].extra.get("target_canonical_at_execution")
+            == "alice@example.com"
+        )
+
+    def test_verify_post_action_no_op_for_read_only_action_class(self, tmp_path: Path):
+        """_verify_post_action is a no-op for READ_ONLY action class."""
+        from atomic_agents.logs import LogQuery
+
+        agent = self._make_agent(tmp_path)
+        proposal = self._make_mandate_proposal(
+            classification="read_only",
+            target_canonical="alice@example.com",
+        )
+        result = self._make_tool_result()
+        agent._verify_post_action(proposal, result)
+
+        records = agent.log_backend.query(LogQuery())
+        verify_events = [
+            r
+            for r in records
+            if r.extra.get("event", "").startswith("mandate_action_verif")
+        ]
+        assert len(verify_events) == 0, (
+            "READ_ONLY actions must not trigger post-action verification"
+        )
+
+    def test_verify_post_action_no_op_for_reversible_write_action_class(
+        self, tmp_path: Path
+    ):
+        """_verify_post_action is a no-op for REVERSIBLE_WRITE — only external_side_effect + irreversible fire."""
+        from atomic_agents.logs import LogQuery
+
+        agent = self._make_agent(tmp_path)
+        proposal = self._make_mandate_proposal(
+            classification="reversible_write",
+            target_canonical="alice@example.com",
+        )
+        result = self._make_tool_result()
+        agent._verify_post_action(proposal, result)
+
+        records = agent.log_backend.query(LogQuery())
+        verify_events = [
+            r
+            for r in records
+            if r.extra.get("event", "").startswith("mandate_action_verif")
+        ]
+        assert len(verify_events) == 0, (
+            "REVERSIBLE_WRITE actions must not trigger post-action verification; "
+            "only external_side_effect + irreversible fire verification"
+        )

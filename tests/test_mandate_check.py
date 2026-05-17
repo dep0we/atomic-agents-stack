@@ -19,7 +19,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from atomic_agents.judge.backend import Judgment, JudgmentOutcome
+from atomic_agents.judge.backend import JudgmentOutcome
 from atomic_agents.judge.mandate_check import MandateCheck
 from atomic_agents.judge.mandate_state import MandateStateManager
 from atomic_agents.judge.cost_estimator_registry import (
@@ -40,6 +40,8 @@ from atomic_agents.mandate.types import (
     TargetPattern,
     TimeWindow,
 )
+
+from atomic_agents.judge.mandate_reservations import MandateReservationManager
 
 from tests._mandate_test_helpers import make_proposal_citing
 
@@ -78,7 +80,7 @@ def _write_mandate(
 
     lines = [
         f"## {mandate_id}",
-        f"granted_by: test-operator@example.com",
+        "granted_by: test-operator@example.com",
         f"granted_at: {ga}",
         f"expires_at: {ea}",
         f"revocation_state: {revocation_state}",
@@ -92,7 +94,9 @@ def _write_mandate(
     if unconstrained:
         lines.append("  unconstrained: true")
         lines.append('  unconstrained_justification: "test unconstrained"')
-    elif any([allowed_tools, allowed_targets, blocked_targets, daily_token_usd is not None]):
+    elif any(
+        [allowed_tools, allowed_targets, blocked_targets, daily_token_usd is not None]
+    ):
         if allowed_tools:
             lines.append("  allowed_tools:")
             for t in allowed_tools:
@@ -171,9 +175,10 @@ def mandate_settings() -> MandateSettings:
 
 @pytest.fixture
 def null_log_backend():
-    """Minimal LogBackend stub — records appends but never raises."""
+    """Minimal LogBackend stub — records appends; query returns []."""
     mock = MagicMock()
     mock.append = MagicMock()
+    mock.query = MagicMock(return_value=[])
     return mock
 
 
@@ -184,7 +189,9 @@ def extractor_registry() -> TargetExtractorRegistry:
 
 
 @pytest.fixture
-def state_manager(mandate_backend: FilesystemMandateBackend, scope: str) -> MandateStateManager:
+def state_manager(
+    mandate_backend: FilesystemMandateBackend, scope: str
+) -> MandateStateManager:
     """MandateStateManager wired to the test backend + scope."""
     return MandateStateManager(mandate_backend=mandate_backend, scope=scope)
 
@@ -275,7 +282,9 @@ def _make_mc(
         mandate_backend=mandate_backend,
         scope=scope,
         target_extractor_registry=TargetExtractorRegistry(),
-        mandate_state_manager=MandateStateManager(mandate_backend=mandate_backend, scope=scope),
+        mandate_state_manager=MandateStateManager(
+            mandate_backend=mandate_backend, scope=scope
+        ),
         mandate_settings=settings or MandateSettings(),
         log_backend=null_log_backend,
     )
@@ -355,7 +364,9 @@ class TestMandateCheckStep05Throttle:
                     "expires_at_iso": (
                         datetime.now(timezone.utc) - timedelta(seconds=1)
                     ).isoformat(),
-                    "original_state_inconsistent_at": datetime.now(timezone.utc).isoformat(),
+                    "original_state_inconsistent_at": datetime.now(
+                        timezone.utc
+                    ).isoformat(),
                 }
             },
         }
@@ -381,8 +392,12 @@ class TestMandateCheckStep05Throttle:
         mandate_id = "cross-run-mandate"
         _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
 
-        state_manager = MandateStateManager(mandate_backend=mandate_backend, scope=scope)
-        state_manager.arm_rebind_throttle(mandate_id, "run-other", throttle_seconds=3600)
+        state_manager = MandateStateManager(
+            mandate_backend=mandate_backend, scope=scope
+        )
+        state_manager.arm_rebind_throttle(
+            mandate_id, "run-other", throttle_seconds=3600
+        )
 
         mc = MandateCheck(
             mandate_backend=mandate_backend,
@@ -393,6 +408,7 @@ class TestMandateCheckStep05Throttle:
             log_backend=null_log_backend,
         )
         from dataclasses import replace
+
         proposal = make_proposal_citing(
             mandate_id, tool_name="test_tool", actor_agent="test-agent"
         )
@@ -437,6 +453,7 @@ class TestMandateCheckStep2SourceHash:
         assert judgment.outcome == JudgmentOutcome.ALLOW
         # Confirm the no-op TODO comment is still in the source
         import inspect
+
         src = inspect.getsource(MandateCheck.evaluate)
         assert "step 2 is intentionally no-op in PR 3a" in src
 
@@ -454,7 +471,9 @@ class TestMandateCheckStep3State:
         """Step 3: revocation_state=revoked → BLOCK 'mandate_revoked'."""
         mandate_id = "revoked-mandate"
         _write_mandate(
-            scope_root, scope, mandate_id,
+            scope_root,
+            scope,
+            mandate_id,
             revocation_state="revoked",
             allowed_tools=["test_tool"],
         )
@@ -476,7 +495,9 @@ class TestMandateCheckStep3State:
         past = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
         granted = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
         _write_mandate(
-            scope_root, scope, mandate_id,
+            scope_root,
+            scope,
+            mandate_id,
             allowed_tools=["test_tool"],
             granted_at=granted,
             expires_at=past,
@@ -551,7 +572,9 @@ class TestMandateCheckStep5TargetAllowlist:
         """Step 5b: extracted target not in allowed_targets → BLOCK 'mandate_target_not_allowed'."""
         mandate_id = "target-allowlist"
         _write_mandate(
-            scope_root, scope, mandate_id,
+            scope_root,
+            scope,
+            mandate_id,
             allowed_tools=["send_email"],
             allowed_targets=["alice@example.com"],
         )
@@ -575,7 +598,9 @@ class TestMandateCheckStep5TargetAllowlist:
         """Step 5c: extracted target matches blocked_targets → BLOCK 'mandate_target_blocked'."""
         mandate_id = "target-blocklist"
         _write_mandate(
-            scope_root, scope, mandate_id,
+            scope_root,
+            scope,
+            mandate_id,
             allowed_tools=["send_email"],
             blocked_targets=["danger@example.com"],
         )
@@ -599,7 +624,9 @@ class TestMandateCheckStep5TargetAllowlist:
         """Step 5a: no extractor matches + allowed_targets set → BLOCK 'mandate_target_unextractable'."""
         mandate_id = "unextractable-block"
         _write_mandate(
-            scope_root, scope, mandate_id,
+            scope_root,
+            scope,
+            mandate_id,
             allowed_tools=["mystery_tool"],
             allowed_targets=["expected-target"],
         )
@@ -624,7 +651,9 @@ class TestMandateCheckStep5TargetAllowlist:
         """Step 5a: unextractable_target_action='escalate' → ESCALATE instead of BLOCK."""
         mandate_id = "unextractable-escalate"
         _write_mandate(
-            scope_root, scope, mandate_id,
+            scope_root,
+            scope,
+            mandate_id,
             allowed_tools=["mystery_tool"],
             allowed_targets=["expected-target"],
         )
@@ -649,7 +678,9 @@ class TestMandateCheckStep5TargetAllowlist:
         """Step 5b: heuristic extractor matches 'to' field → target extracted, allowlist passes."""
         mandate_id = "heuristic-target"
         _write_mandate(
-            scope_root, scope, mandate_id,
+            scope_root,
+            scope,
+            mandate_id,
             allowed_tools=["send_email"],
             allowed_targets=["alice@example.com"],
         )
@@ -670,14 +701,21 @@ class TestMandateCheckStep5TargetAllowlist:
         any Gmail MCP target; 'mcp:stripe:' does not match a Gmail target.
         """
         gmail_prefix = TargetPattern(pattern="mcp:gmail:", kind="prefix")
-        assert mandate_check._matches_any("mcp:gmail:alice@example.com", (gmail_prefix,)) is True
+        assert (
+            mandate_check._matches_any("mcp:gmail:alice@example.com", (gmail_prefix,))
+            is True
+        )
         assert mandate_check._matches_any("mcp:stripe:pi_abc", (gmail_prefix,)) is False
 
     def test_evaluate_uses_named_extractor_id_via_registry_extract(self):
         """Step 5: named extractor registered in registry; extract() returns custom field value."""
         registry = TargetExtractorRegistry()
-        registry.register("custom_field_extractor", lambda args: args.get("custom_field"))
-        result = registry.extract("custom_tool", {"custom_field": "expected-value"}, "custom_field_extractor")
+        registry.register(
+            "custom_field_extractor", lambda args: args.get("custom_field")
+        )
+        result = registry.extract(
+            "custom_tool", {"custom_field": "expected-value"}, "custom_field_extractor"
+        )
         assert result == "expected-value"
 
     def test_evaluate_prefixes_mcp_target_with_mcp_server(self):
@@ -738,8 +776,10 @@ class TestMandateCheckStep6TimeWindow:
         mc = _make_mc(mandate_backend, scope, null_log_backend)
         frozen_midnight = datetime(2025, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 
-        with patch.object(mandate_backend, "load_mandate", return_value=constrained), \
-             patch("atomic_agents.judge.mandate_check.datetime") as mock_dt:
+        with (
+            patch.object(mandate_backend, "load_mandate", return_value=constrained),
+            patch("atomic_agents.judge.mandate_check.datetime") as mock_dt,
+        ):
             mock_dt.now.return_value = frozen_midnight
             proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
             judgment = mc.evaluate(proposal)
@@ -763,8 +803,10 @@ class TestMandateCheckStep6TimeWindow:
         mc = _make_mc(mandate_backend, scope, null_log_backend)
         noon_utc = datetime(2025, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
 
-        with patch.object(mandate_backend, "load_mandate", return_value=constrained), \
-             patch("atomic_agents.judge.mandate_check.datetime") as mock_dt:
+        with (
+            patch.object(mandate_backend, "load_mandate", return_value=constrained),
+            patch("atomic_agents.judge.mandate_check.datetime") as mock_dt,
+        ):
             mock_dt.now.return_value = noon_utc
             proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
             judgment = mc.evaluate(proposal)
@@ -787,8 +829,10 @@ class TestMandateCheckStep6TimeWindow:
         mc = _make_mc(mandate_backend, scope, null_log_backend)
         two_am_utc = datetime(2025, 1, 1, 2, 0, 0, tzinfo=timezone.utc)
 
-        with patch.object(mandate_backend, "load_mandate", return_value=constrained), \
-             patch("atomic_agents.judge.mandate_check.datetime") as mock_dt:
+        with (
+            patch.object(mandate_backend, "load_mandate", return_value=constrained),
+            patch("atomic_agents.judge.mandate_check.datetime") as mock_dt,
+        ):
             mock_dt.now.return_value = two_am_utc
             proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
             judgment = mc.evaluate(proposal)
@@ -796,55 +840,13 @@ class TestMandateCheckStep6TimeWindow:
         assert judgment.outcome == JudgmentOutcome.ALLOW
 
 
-class TestMandateCheckSteps789BudgetStub:
-    """Steps 7-9: budget checks stubbed fail-closed in PR 3a (spec/29 §stub discipline)."""
-
-    def test_evaluate_blocks_when_mandate_has_budget_cap(
-        self,
-        mandate_backend: FilesystemMandateBackend,
-        scope_root: Path,
-        scope: str,
-        null_log_backend: Any,
-    ):
-        """Steps 7-9: mandate with daily_token_usd cap → BLOCK 'mandate_budget_check_unavailable'.
-        Fail-closed stub per spec/29 §'Validation step split between PR 3a and PR 3b'.
-        """
-        mandate_id = "budget-capped"
-        _write_mandate(
-            scope_root, scope, mandate_id,
-            allowed_tools=["test_tool"],
-            daily_token_usd=5.0,
-        )
-        mc = _make_mc(mandate_backend, scope, null_log_backend)
-        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
-        judgment = mc.evaluate(proposal)
-        assert judgment.outcome == JudgmentOutcome.BLOCK
-        assert judgment.reason.startswith("mandate_budget_check_unavailable")
-
-    def test_evaluate_block_reason_is_forever_stable_no_pr_identifier(
-        self,
-        mandate_backend: FilesystemMandateBackend,
-        scope_root: Path,
-        scope: str,
-        null_log_backend: Any,
-    ):
-        """BLOCK reason MUST NOT contain '_in_3a' or any PR/version identifier.
-        Spec/29 §'BLOCK reason naming discipline' — reason strings are forever-stable.
-        """
-        mandate_id = "budget-stable-reason"
-        _write_mandate(
-            scope_root, scope, mandate_id,
-            allowed_tools=["test_tool"],
-            daily_token_usd=1.0,
-        )
-        mc = _make_mc(mandate_backend, scope, null_log_backend)
-        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
-        judgment = mc.evaluate(proposal)
-        assert judgment.outcome == JudgmentOutcome.BLOCK
-        reason_prefix = judgment.reason.split(":")[0]
-        assert "_in_3a" not in reason_prefix
-        assert "_pr3" not in reason_prefix.lower()
-        assert reason_prefix == "mandate_budget_check_unavailable"
+# NOTE: TestMandateCheckSteps789BudgetStub deleted in PR 3b body — the stub
+# it pinned (BLOCK 'mandate_budget_check_unavailable' for any budget-capped
+# mandate) is gone now that steps 7-9 are ungated. Replacement tests for the
+# new ungated behavior (token + external projection, cap_kind priority,
+# step 8/9 precedence) live in TestMandateCheckStep7TokenBudget,
+# TestMandateCheckStep8ExternalBudget, TestMandateCheckStep9Escalation, and
+# TestMandateCheckCapExceededBlock below.
 
 
 class TestMandateCheckStepOrdering:
@@ -860,7 +862,9 @@ class TestMandateCheckStepOrdering:
         """Step 3 before step 4: revoked mandate + non-allowed tool → BLOCK 'mandate_revoked'."""
         mandate_id = "revoked-with-tool"
         _write_mandate(
-            scope_root, scope, mandate_id,
+            scope_root,
+            scope,
+            mandate_id,
             revocation_state="revoked",
             allowed_tools=["only_this"],
         )
@@ -913,7 +917,9 @@ class TestMandateCheckJudgmentShape:
         """BLOCK judgment reason contains the mandate_id for operator traceability."""
         mandate_id = "block-shape-check"
         _write_mandate(
-            scope_root, scope, mandate_id,
+            scope_root,
+            scope,
+            mandate_id,
             revocation_state="revoked",
             allowed_tools=["test_tool"],
         )
@@ -959,7 +965,13 @@ class TestMandateStateManagerTransitions:
         manager.compute_transitions(mandate_backend.list_mandates(scope))
 
         # Simulate operator revocation
-        _write_mandate(scope_root, scope, mandate_id, revocation_state="revoked", allowed_tools=["test_tool"])
+        _write_mandate(
+            scope_root,
+            scope,
+            mandate_id,
+            revocation_state="revoked",
+            allowed_tools=["test_tool"],
+        )
 
         events = manager.compute_transitions(mandate_backend.list_mandates(scope))
         revoked = [e for e in events if e["event"] == "mandate_revoked"]
@@ -975,14 +987,27 @@ class TestMandateStateManagerTransitions:
         """active → expired (derived from expires_at < now) → 'mandate_expired' event."""
         mandate_id = "will-expire"
         future = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
-        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"], expires_at=future)
+        _write_mandate(
+            scope_root,
+            scope,
+            mandate_id,
+            allowed_tools=["test_tool"],
+            expires_at=future,
+        )
         manager = MandateStateManager(mandate_backend=mandate_backend, scope=scope)
         manager.compute_transitions(mandate_backend.list_mandates(scope))
 
         # Overwrite with an already-expired date
         past = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
         granted = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
-        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"], granted_at=granted, expires_at=past)
+        _write_mandate(
+            scope_root,
+            scope,
+            mandate_id,
+            allowed_tools=["test_tool"],
+            granted_at=granted,
+            expires_at=past,
+        )
 
         events = manager.compute_transitions(mandate_backend.list_mandates(scope))
         expired = [e for e in events if e["event"] == "mandate_expired"]
@@ -999,7 +1024,9 @@ class TestMandateStateManagerTransitions:
         mandate_id = "stable-mandate"
         _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
         manager = MandateStateManager(mandate_backend=mandate_backend, scope=scope)
-        manager.compute_transitions(mandate_backend.list_mandates(scope))  # primes state
+        manager.compute_transitions(
+            mandate_backend.list_mandates(scope)
+        )  # primes state
         events = manager.compute_transitions(mandate_backend.list_mandates(scope))
         assert events == []
 
@@ -1053,7 +1080,9 @@ class TestMandateStateManagerThrottle:
                     "expires_at_iso": (
                         datetime.now(timezone.utc) - timedelta(hours=1)
                     ).isoformat(),
-                    "original_state_inconsistent_at": datetime.now(timezone.utc).isoformat(),
+                    "original_state_inconsistent_at": datetime.now(
+                        timezone.utc
+                    ).isoformat(),
                 }
             },
         }
@@ -1141,7 +1170,9 @@ class TestTargetExtractorRegistry:
         """Named extractor mode: registered extractor called with tool_arguments."""
         registry = TargetExtractorRegistry()
         registry.register("my_email_extractor", lambda args: args.get("email_to"))
-        result = registry.extract("send_email", {"email_to": "alice@example.com"}, "my_email_extractor")
+        result = registry.extract(
+            "send_email", {"email_to": "alice@example.com"}, "my_email_extractor"
+        )
         assert result == "alice@example.com"
 
     def test_extract_with_unknown_extractor_id_raises_UnknownTargetExtractor(self):
@@ -1399,7 +1430,10 @@ class TestAtomicAgentMandateCheckIntegration:
         agents_root = tmp_path
         _make_minimal_agent_dir(agents_root, "scout")
         agent = AtomicAgent(name="scout", agents_root=agents_root)
-        custom_fn = lambda args: args.get("custom_key")
+
+        def custom_fn(args):
+            return args.get("custom_key")
+
         agent.register_target_extractor("custom_key_extractor", custom_fn)
         assert agent._target_extractors.has("custom_key_extractor")
 
@@ -1429,10 +1463,14 @@ class TestAtomicAgentMandateCheckIntegration:
         agents_root = tmp_path
         _make_minimal_agent_dir(agents_root, "scout")
         backend = FilesystemMandateBackend(agents_root)
-        agent = AtomicAgent(name="scout", agents_root=agents_root, mandate_backend=backend)
+        agent = AtomicAgent(
+            name="scout", agents_root=agents_root, mandate_backend=backend
+        )
 
         mandate_id = "test-dispatch-mandate"
-        _write_mandate(agents_root, "agent:scout", mandate_id, allowed_tools=["test_tool"])
+        _write_mandate(
+            agents_root, "agent:scout", mandate_id, allowed_tools=["test_tool"]
+        )
 
         # _ensure_mandate_check constructs a real MandateCheck
         mc = agent._ensure_mandate_check()
@@ -1440,7 +1478,9 @@ class TestAtomicAgentMandateCheckIntegration:
         assert isinstance(mc, MandateCheck)
 
         # Verify the ensemble branch: cites_mandate fires on 'mandate:' prefix
-        proposal = make_proposal_citing(mandate_id, tool_name="test_tool", actor_agent="scout")
+        proposal = make_proposal_citing(
+            mandate_id, tool_name="test_tool", actor_agent="scout"
+        )
         assert (
             proposal.authorization is not None
             and proposal.authorization.granted_by.startswith("mandate:")
@@ -1457,7 +1497,7 @@ class TestAtomicAgentMandateCheckIntegration:
         agents_root = tmp_path
         _make_minimal_agent_dir(agents_root, "scout")
         backend = FilesystemMandateBackend(agents_root)
-        agent = AtomicAgent(name="scout", agents_root=agents_root, mandate_backend=backend)
+        AtomicAgent(name="scout", agents_root=agents_root, mandate_backend=backend)
 
         proposal = _make_proposal_no_auth()
         cites_mandate = (
@@ -1492,3 +1532,1144 @@ class TestAtomicAgentMandateCheckIntegration:
                 tool_def,
                 target_extractor_registry=agent._target_extractors,
             )
+
+
+# ──────────────────────────────────────────────────────────────────
+# Step 7 — Token budget (PR 3b ungated)
+#
+# Strategy: construct a Mandate directly with the desired constraints,
+# then patch mandate_backend.load_mandate to return it.  The null_log_backend
+# fixture returns [] on query() so prior_spend is always 0.
+
+
+def _make_token_capped_mandate(
+    mandate_id: str,
+    *,
+    daily_token_usd: float | None = None,
+    monthly_token_usd: float | None = None,
+    cumulative_token_usd: float | None = None,
+    requires_escalation_above_token_usd: float | None = None,
+    requires_escalation_above_external_usd: float | None = None,
+    allowed_tools: frozenset[str] = frozenset(["test_tool"]),
+    scope: str = "agent:test-agent",
+) -> Mandate:
+    """Build a Mandate with the given token budget constraints."""
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    return Mandate(
+        mandate_id=mandate_id,
+        scope=scope,
+        granted_by="test-operator@example.com",
+        granted_at=now,
+        expires_at=now + timedelta(days=30),
+        revocation_state=RevocationState.ACTIVE,
+        revoked_at=None,
+        revoked_by=None,
+        revocation_reason=None,
+        constraints=MandateConstraints(
+            allowed_tools=allowed_tools,
+            daily_token_usd=daily_token_usd,
+            monthly_token_usd=monthly_token_usd,
+            cumulative_token_usd=cumulative_token_usd,
+            requires_escalation_above_token_usd=requires_escalation_above_token_usd,
+            requires_escalation_above_external_usd=requires_escalation_above_external_usd,
+        ),
+        source_hash="sha256:aaaa",
+    )
+
+
+def _make_external_capped_mandate(
+    mandate_id: str,
+    *,
+    daily_external_usd: float | None = None,
+    monthly_external_usd: float | None = None,
+    cumulative_external_usd: float | None = None,
+    requires_escalation_above_external_usd: float | None = None,
+    requires_escalation_above_token_usd: float | None = None,
+    allowed_tools: frozenset[str] = frozenset(["test_tool"]),
+    scope: str = "agent:test-agent",
+) -> Mandate:
+    """Build a Mandate with the given external budget constraints."""
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    return Mandate(
+        mandate_id=mandate_id,
+        scope=scope,
+        granted_by="test-operator@example.com",
+        granted_at=now,
+        expires_at=now + timedelta(days=30),
+        revocation_state=RevocationState.ACTIVE,
+        revoked_at=None,
+        revoked_by=None,
+        revocation_reason=None,
+        constraints=MandateConstraints(
+            allowed_tools=allowed_tools,
+            daily_external_usd=daily_external_usd,
+            monthly_external_usd=monthly_external_usd,
+            cumulative_external_usd=cumulative_external_usd,
+            requires_escalation_above_external_usd=requires_escalation_above_external_usd,
+            requires_escalation_above_token_usd=requires_escalation_above_token_usd,
+        ),
+        source_hash="sha256:bbbb",
+    )
+
+
+class TestMandateCheckStep7TokenBudget:
+    """Step 7: token budget checks (spec/29 line 372-380, ungated in PR 3b)."""
+
+    def test_step7_allows_when_no_token_cap_set_on_mandate(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Step 7: mandate with only external caps + token-only action → ALLOW."""
+        mandate_id = "no-token-cap"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        # Use a mandate with no caps (no token or external limits) → ALLOW
+        mandate_no_caps = _make_token_capped_mandate(mandate_id)
+        mc = _make_mc(mandate_backend, scope, null_log_backend)
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(
+            mandate_backend, "load_mandate", return_value=mandate_no_caps
+        ):
+            judgment = mc.evaluate(proposal)
+        assert judgment.outcome == JudgmentOutcome.ALLOW
+
+    def test_step7_blocks_when_daily_token_cap_exceeded(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Step 7: daily_token_usd=0.01 + default projection ($0.10) → BLOCK mandate_cap_would_exceed."""
+        mandate_id = "daily-token-cap"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = _make_token_capped_mandate(mandate_id, daily_token_usd=0.01)
+        mc = _make_mc(mandate_backend, scope, null_log_backend)
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+        assert judgment.outcome == JudgmentOutcome.BLOCK
+        assert "mandate_cap_would_exceed" in judgment.reason
+
+    def test_step7_blocks_when_monthly_token_cap_exceeded(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Step 7: monthly_token_usd=0.01 + default projection ($0.10) → BLOCK."""
+        mandate_id = "monthly-token-cap"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = _make_token_capped_mandate(mandate_id, monthly_token_usd=0.01)
+        mc = _make_mc(mandate_backend, scope, null_log_backend)
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+        assert judgment.outcome == JudgmentOutcome.BLOCK
+        assert "mandate_cap_would_exceed" in judgment.reason
+
+    def test_step7_blocks_when_cumulative_token_cap_exceeded(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Step 7: cumulative_token_usd=0.01 + default projection ($0.10) → BLOCK."""
+        mandate_id = "cumulative-token-cap"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = _make_token_capped_mandate(mandate_id, cumulative_token_usd=0.01)
+        mc = _make_mc(mandate_backend, scope, null_log_backend)
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+        assert judgment.outcome == JudgmentOutcome.BLOCK
+        assert "mandate_cap_would_exceed" in judgment.reason
+
+    def test_step7_allows_when_under_cap(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Step 7: daily_token_usd=10.0 + default projection $0.10 + no prior spend → ALLOW."""
+        mandate_id = "under-daily-token-cap"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = _make_token_capped_mandate(mandate_id, daily_token_usd=10.0)
+        mc = _make_mc(mandate_backend, scope, null_log_backend)
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+        assert judgment.outcome == JudgmentOutcome.ALLOW
+
+    def test_step7_first_iteration_falls_back_to_expected_cost_per_call_usd(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Step 7: empty log + expected_cost_per_call_usd=0.5 → projection = 0.5.
+
+        A cap of 0.4 (below 0.5) should BLOCK; a cap of 0.6 should ALLOW.
+        """
+        mandate_id = "fallback-expected-cost"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+
+        # Cap at 0.4 — projection 0.5 exceeds it → BLOCK
+        mandate_tight = _make_token_capped_mandate(mandate_id, daily_token_usd=0.4)
+        mc_tight = MandateCheck(
+            mandate_backend=mandate_backend,
+            scope=scope,
+            target_extractor_registry=TargetExtractorRegistry(),
+            mandate_state_manager=MandateStateManager(
+                mandate_backend=mandate_backend, scope=scope
+            ),
+            mandate_settings=MandateSettings(),
+            log_backend=null_log_backend,
+            expected_cost_per_call_usd=0.5,
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate_tight):
+            j_tight = mc_tight.evaluate(proposal)
+        assert j_tight.outcome == JudgmentOutcome.BLOCK
+
+        # Cap at 0.6 — projection 0.5 is under → ALLOW
+        mandate_wide = _make_token_capped_mandate(mandate_id, daily_token_usd=0.6)
+        mc_wide = MandateCheck(
+            mandate_backend=mandate_backend,
+            scope=scope,
+            target_extractor_registry=TargetExtractorRegistry(),
+            mandate_state_manager=MandateStateManager(
+                mandate_backend=mandate_backend, scope=scope
+            ),
+            mandate_settings=MandateSettings(),
+            log_backend=null_log_backend,
+            expected_cost_per_call_usd=0.5,
+        )
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate_wide):
+            j_wide = mc_wide.evaluate(proposal)
+        assert j_wide.outcome == JudgmentOutcome.ALLOW
+
+    def test_step7_first_iteration_falls_back_to_default_when_no_expected_cost(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Step 7: empty log + no expected_cost_per_call_usd → projection = $0.10 (default)."""
+        mandate_id = "default-fallback"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+
+        # Cap at 0.05 — below $0.10 default → BLOCK
+        mandate = _make_token_capped_mandate(mandate_id, daily_token_usd=0.05)
+        mc = MandateCheck(
+            mandate_backend=mandate_backend,
+            scope=scope,
+            target_extractor_registry=TargetExtractorRegistry(),
+            mandate_state_manager=MandateStateManager(
+                mandate_backend=mandate_backend, scope=scope
+            ),
+            mandate_settings=MandateSettings(),
+            log_backend=null_log_backend,
+            expected_cost_per_call_usd=None,  # explicit None → default $0.10
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+        assert judgment.outcome == JudgmentOutcome.BLOCK
+
+    def test_step7_stale_preceding_cost_event_falls_back_to_default(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Risk 2 pin: prior cost event with ts before iteration_start_ts → stale baseline.
+
+        The stale event (ts < iteration_start_ts) must NOT drive the projection.
+        Instead, the code falls back to expected_cost_per_call_usd.
+        A stale cost event of $0.001 with iteration_start_ts in the future
+        is treated as 'no prior event' → defaults to $0.10.
+        """
+        mandate_id = "stale-event-risk2"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+
+        from unittest.mock import MagicMock
+
+        # Mock log backend that returns a single record with ts "earlier than now"
+        stale_ts = "2000-01-01T00:00:00+00:00"  # ancient — always before any iteration_start_ts
+        future_iteration_ts = datetime.now(timezone.utc).isoformat()
+
+        stale_record = MagicMock()
+        stale_record.ts = stale_ts
+        stale_record.cost_usd = 0.001  # would be under any cap if used
+        stale_record.extra = {}
+        stale_record.mandate_id = mandate_id
+
+        mock_log = MagicMock()
+        mock_log.append = MagicMock()
+        mock_log.query = MagicMock(return_value=[stale_record])
+
+        # Cap at 0.05 — below $0.10 default but above $0.001 stale.
+        # If stale event drove projection → ALLOW. If default drives → BLOCK.
+        mandate = _make_token_capped_mandate(mandate_id, daily_token_usd=0.05)
+        mc = MandateCheck(
+            mandate_backend=mandate_backend,
+            scope=scope,
+            target_extractor_registry=TargetExtractorRegistry(),
+            mandate_state_manager=MandateStateManager(
+                mandate_backend=mandate_backend, scope=scope
+            ),
+            mandate_settings=MandateSettings(),
+            log_backend=mock_log,
+            expected_cost_per_call_usd=None,  # default $0.10
+            iteration_start_ts=future_iteration_ts,  # stale record is before this
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+        # Stale event must not drive projection — default $0.10 > cap $0.05 → BLOCK
+        assert judgment.outcome == JudgmentOutcome.BLOCK, (
+            "Risk 2: stale cost event should not drive projection; "
+            "expected $0.10 default to trigger BLOCK"
+        )
+
+    def test_step7_outstanding_reservations_count_toward_cumulative(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        tmp_path: Path,
+    ):
+        """Step 7: open reservation for the same mandate counts toward cumulative cap."""
+        from atomic_agents.logs import FilesystemLogBackend
+
+        mandate_id = "reservation-cumulative"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+
+        log = FilesystemLogBackend(tmp_path)
+        # Emit a reservation of $0.08 — when cap is $0.09, projection $0.05 alone
+        # doesn't exceed, but projection + reservation ($0.13) does.
+        mgr = MandateReservationManager(log, scope)
+        mgr.create(mandate_id, "prop-xyz", "token", 0.08)
+        mgr.shutdown()
+
+        mandate = _make_token_capped_mandate(mandate_id, cumulative_token_usd=0.09)
+        mc = MandateCheck(
+            mandate_backend=mandate_backend,
+            scope=scope,
+            target_extractor_registry=TargetExtractorRegistry(),
+            mandate_state_manager=MandateStateManager(
+                mandate_backend=mandate_backend, scope=scope
+            ),
+            mandate_settings=MandateSettings(),
+            log_backend=log,
+            expected_cost_per_call_usd=0.05,
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+        assert judgment.outcome == JudgmentOutcome.BLOCK
+
+
+# ──────────────────────────────────────────────────────────────────
+# Step 8 — External budget (PR 3b ungated)
+
+# Helper: build a ToolDefinition for step 8 tests
+
+
+def _make_tool_def_with_static_cost(tool_name: str, external_cost_usd: float | None):
+    """Build a minimal ToolDefinition with an optional static external cost."""
+    from atomic_agents.tools import ToolDefinition
+
+    return ToolDefinition(
+        name=tool_name,
+        description="test external tool",
+        input_schema={"type": "object"},
+        handler=lambda args: "ok",
+        expected_external_cost_usd=external_cost_usd,
+    )
+
+
+def _make_mc_with_tool(
+    mandate_backend: FilesystemMandateBackend,
+    scope: str,
+    null_log_backend: Any,
+    tool_name: str,
+    external_cost_usd: float | None,
+) -> MandateCheck:
+    """Convenience builder for a MandateCheck wired with a tool registry."""
+    from atomic_agents.tools import ToolRegistry
+
+    registry = ToolRegistry()
+    tool_def = _make_tool_def_with_static_cost(tool_name, external_cost_usd)
+    registry.register(tool_def)
+
+    return MandateCheck(
+        mandate_backend=mandate_backend,
+        scope=scope,
+        target_extractor_registry=TargetExtractorRegistry(),
+        mandate_state_manager=MandateStateManager(
+            mandate_backend=mandate_backend, scope=scope
+        ),
+        mandate_settings=MandateSettings(),
+        log_backend=null_log_backend,
+        tool_registry=registry,
+    )
+
+
+class TestMandateCheckStep8ExternalBudget:
+    """Step 8: external budget checks (spec/29 line 381, ungated in PR 3b)."""
+
+    def test_step8_allows_when_no_external_cap_set_on_mandate(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Step 8: mandate with no external caps → ALLOW regardless of tool cost."""
+        mandate_id = "no-ext-cap"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = _make_token_capped_mandate(mandate_id)  # no external caps
+        mc = _make_mc_with_tool(
+            mandate_backend, scope, null_log_backend, "test_tool", 99.0
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+        assert judgment.outcome == JudgmentOutcome.ALLOW
+
+    def test_step8_blocks_when_daily_external_cap_exceeded(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Step 8: daily_external_usd=0.01 + tool static cost $1.00 → BLOCK."""
+        mandate_id = "daily-ext-cap"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = _make_external_capped_mandate(mandate_id, daily_external_usd=0.01)
+        mc = _make_mc_with_tool(
+            mandate_backend, scope, null_log_backend, "test_tool", 1.0
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+        assert judgment.outcome == JudgmentOutcome.BLOCK
+        assert "mandate_cap_would_exceed" in judgment.reason
+
+    def test_step8_blocks_when_monthly_external_cap_exceeded(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Step 8: monthly_external_usd=0.01 + tool static cost $1.00 → BLOCK."""
+        mandate_id = "monthly-ext-cap"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = _make_external_capped_mandate(mandate_id, monthly_external_usd=0.01)
+        mc = _make_mc_with_tool(
+            mandate_backend, scope, null_log_backend, "test_tool", 1.0
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+        assert judgment.outcome == JudgmentOutcome.BLOCK
+
+    def test_step8_blocks_when_cumulative_external_cap_exceeded(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Step 8: cumulative_external_usd=0.01 + tool static cost $1.00 → BLOCK."""
+        mandate_id = "cumulative-ext-cap"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = _make_external_capped_mandate(
+            mandate_id, cumulative_external_usd=0.01
+        )
+        mc = _make_mc_with_tool(
+            mandate_backend, scope, null_log_backend, "test_tool", 1.0
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+        assert judgment.outcome == JudgmentOutcome.BLOCK
+
+    def test_step8_unprojectable_tool_blocks_with_mandate_external_cost_unprojectable(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Step 8: tool with no cost estimator AND no static cost + external cap → BLOCK with mandate_external_cost_unprojectable."""
+        from atomic_agents.tools import ToolDefinition, ToolRegistry
+
+        mandate_id = "unprojectable-tool"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["mystery_tool"])
+
+        # Tool with neither cost_estimator_id nor expected_external_cost_usd
+        registry = ToolRegistry()
+        tool = ToolDefinition(
+            name="mystery_tool",
+            description="tool with no cost info",
+            input_schema={"type": "object"},
+            handler=lambda args: "ok",
+        )
+        registry.register(tool)
+
+        # Mandate must allow mystery_tool (otherwise step 4 blocks before step 8)
+        from datetime import timedelta
+
+        now = datetime.now(timezone.utc)
+        mandate = Mandate(
+            mandate_id=mandate_id,
+            scope=scope,
+            granted_by="test-op",
+            granted_at=now,
+            expires_at=now + timedelta(days=30),
+            revocation_state=RevocationState.ACTIVE,
+            revoked_at=None,
+            revoked_by=None,
+            revocation_reason=None,
+            constraints=MandateConstraints(
+                allowed_tools=frozenset(["mystery_tool"]),
+                daily_external_usd=0.5,
+            ),
+            source_hash="sha256:unprojectable",
+        )
+        mc = MandateCheck(
+            mandate_backend=mandate_backend,
+            scope=scope,
+            target_extractor_registry=TargetExtractorRegistry(),
+            mandate_state_manager=MandateStateManager(
+                mandate_backend=mandate_backend, scope=scope
+            ),
+            mandate_settings=MandateSettings(),
+            log_backend=null_log_backend,
+            tool_registry=registry,
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="mystery_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+        assert judgment.outcome == JudgmentOutcome.BLOCK
+        assert "mandate_external_cost_unprojectable" in judgment.reason
+
+    def test_step8_static_expected_external_cost_usd_drives_projection_when_no_estimator_id(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Step 8: static expected_external_cost_usd drives projection when no estimator."""
+        mandate_id = "static-ext-cost"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["static_tool"])
+
+        # Static cost $0.50; cap $1.00 → ALLOW
+        mandate_wide = _make_external_capped_mandate(
+            mandate_id,
+            daily_external_usd=1.0,
+            allowed_tools=frozenset(["static_tool"]),
+        )
+        mc_wide = _make_mc_with_tool(
+            mandate_backend, scope, null_log_backend, "static_tool", 0.5
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="static_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate_wide):
+            j_wide = mc_wide.evaluate(proposal)
+        assert j_wide.outcome == JudgmentOutcome.ALLOW
+
+        # Static cost $0.50; cap $0.10 → BLOCK
+        mandate_tight = _make_external_capped_mandate(
+            mandate_id,
+            daily_external_usd=0.10,
+            allowed_tools=frozenset(["static_tool"]),
+        )
+        mc_tight = _make_mc_with_tool(
+            mandate_backend, scope, null_log_backend, "static_tool", 0.5
+        )
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate_tight):
+            j_tight = mc_tight.evaluate(proposal)
+        assert j_tight.outcome == JudgmentOutcome.BLOCK
+
+    def test_step8_cost_estimator_returns_inf_fails_closed_with_unprojectable_reason(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Step 8: registered estimator returns +inf → BLOCK with mandate_external_cost_unprojectable."""
+        from atomic_agents.tools import ToolDefinition, ToolRegistry
+        from atomic_agents.judge.cost_estimator_registry import CostEstimatorRegistry
+
+        mandate_id = "inf-estimator"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["inf_tool"])
+
+        estimators = CostEstimatorRegistry()
+        estimators.register("inf_estimator", lambda args: float("inf"))
+
+        registry = ToolRegistry()
+        tool = ToolDefinition(
+            name="inf_tool",
+            description="tool whose estimator returns inf",
+            input_schema={"type": "object"},
+            handler=lambda args: "ok",
+            cost_estimator_id="inf_estimator",
+        )
+        registry.register(tool, cost_estimator_registry=estimators)
+
+        mandate = _make_external_capped_mandate(
+            mandate_id,
+            daily_external_usd=100.0,
+            allowed_tools=frozenset(["inf_tool"]),
+        )
+        mc = MandateCheck(
+            mandate_backend=mandate_backend,
+            scope=scope,
+            target_extractor_registry=TargetExtractorRegistry(),
+            mandate_state_manager=MandateStateManager(
+                mandate_backend=mandate_backend, scope=scope
+            ),
+            mandate_settings=MandateSettings(),
+            log_backend=null_log_backend,
+            tool_registry=registry,
+            cost_estimator_registry=estimators,
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="inf_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+        assert judgment.outcome == JudgmentOutcome.BLOCK
+        assert "mandate_external_cost_unprojectable" in judgment.reason
+
+    def test_step8_cost_estimator_used_when_estimator_id_set(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Step 8: registered estimator returns a finite value → used for cap evaluation."""
+        from atomic_agents.tools import ToolDefinition, ToolRegistry
+        from atomic_agents.judge.cost_estimator_registry import CostEstimatorRegistry
+
+        mandate_id = "real-estimator"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["est_tool"])
+
+        estimators = CostEstimatorRegistry()
+        estimators.register("cheap_estimator", lambda args: 0.02)
+
+        registry = ToolRegistry()
+        tool = ToolDefinition(
+            name="est_tool",
+            description="tool with a real estimator",
+            input_schema={"type": "object"},
+            handler=lambda args: "ok",
+            cost_estimator_id="cheap_estimator",
+        )
+        registry.register(tool, cost_estimator_registry=estimators)
+
+        # Cap $1.00 → ALLOW (estimated $0.02 < $1.00)
+        mandate = _make_external_capped_mandate(
+            mandate_id,
+            daily_external_usd=1.0,
+            allowed_tools=frozenset(["est_tool"]),
+        )
+        mc = MandateCheck(
+            mandate_backend=mandate_backend,
+            scope=scope,
+            target_extractor_registry=TargetExtractorRegistry(),
+            mandate_state_manager=MandateStateManager(
+                mandate_backend=mandate_backend, scope=scope
+            ),
+            mandate_settings=MandateSettings(),
+            log_backend=null_log_backend,
+            tool_registry=registry,
+            cost_estimator_registry=estimators,
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="est_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+        assert judgment.outcome == JudgmentOutcome.ALLOW
+
+
+# ──────────────────────────────────────────────────────────────────
+# Step 9 — Escalation thresholds
+
+
+class TestMandateCheckStep9Escalation:
+    """Step 9: escalation thresholds (spec/29 line 382-384, ungated in PR 3b)."""
+
+    def test_step9_escalates_when_token_threshold_exceeded(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Step 9: projected token cost > requires_escalation_above_token_usd → ESCALATE."""
+        mandate_id = "token-escalation"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        # Escalation threshold $0.01, default projection $0.10 → exceeds
+        mandate = _make_token_capped_mandate(
+            mandate_id, requires_escalation_above_token_usd=0.01
+        )
+        mc = _make_mc(mandate_backend, scope, null_log_backend)
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+        assert judgment.outcome == JudgmentOutcome.ESCALATE
+        assert "mandate_escalation_threshold_hit_token" in judgment.reason
+
+    def test_step9_escalates_when_external_threshold_exceeded(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Step 9: projected external cost > requires_escalation_above_external_usd → ESCALATE."""
+        mandate_id = "ext-escalation"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        # External threshold $0.01, static tool cost $1.00 → exceeds
+        mandate = _make_external_capped_mandate(
+            mandate_id, requires_escalation_above_external_usd=0.01
+        )
+        mc = _make_mc_with_tool(
+            mandate_backend, scope, null_log_backend, "test_tool", 1.0
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+        assert judgment.outcome == JudgmentOutcome.ESCALATE
+        assert "mandate_escalation_threshold_hit_external" in judgment.reason
+
+    def test_step9_no_escalation_when_thresholds_not_set(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Step 9: neither requires_escalation_above_* set + all caps OK → ALLOW."""
+        mandate_id = "no-escalation"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = _make_token_capped_mandate(mandate_id, daily_token_usd=100.0)
+        mc = _make_mc(mandate_backend, scope, null_log_backend)
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+        assert judgment.outcome == JudgmentOutcome.ALLOW
+
+    def test_step9_escalate_preempts_step8_block_when_both_fire(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Risk 7 pin: external cap exceeded (would BLOCK) AND external threshold exceeded (would ESCALATE) → ESCALATE wins.
+
+        step 9 ESCALATE must preempt step 8 BLOCK per spec/29 line 384.
+        """
+        from datetime import timedelta
+
+        mandate_id = "step9-preempts-step8"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+
+        now = datetime.now(timezone.utc)
+        # Both: daily_external_usd=0.01 (cap, tool cost $1.00 would exceed)
+        # AND requires_escalation_above_external_usd=0.005 (threshold, $1.00 > $0.005)
+        mandate = Mandate(
+            mandate_id=mandate_id,
+            scope=scope,
+            granted_by="test-op",
+            granted_at=now,
+            expires_at=now + timedelta(days=30),
+            revocation_state=RevocationState.ACTIVE,
+            revoked_at=None,
+            revoked_by=None,
+            revocation_reason=None,
+            constraints=MandateConstraints(
+                allowed_tools=frozenset(["test_tool"]),
+                daily_external_usd=0.01,  # cap: $1.00 tool cost exceeds → would BLOCK
+                requires_escalation_above_external_usd=0.005,  # threshold: $1.00 > $0.005 → ESCALATE
+            ),
+            source_hash="sha256:risk7",
+        )
+        mc = _make_mc_with_tool(
+            mandate_backend, scope, null_log_backend, "test_tool", 1.0
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+        assert judgment.outcome == JudgmentOutcome.ESCALATE, (
+            "Risk 7: step 9 ESCALATE must preempt step 8 BLOCK when both fire"
+        )
+
+
+# ──────────────────────────────────────────────────────────────────
+# Cap exceeded block — priority + shape invariants
+
+
+class TestMandateCheckCapExceededBlock:
+    """mandate_cap_exceeded_block priority, shape, and reason invariants (Risk 1)."""
+
+    def _make_both_capped_mandate(
+        self,
+        mandate_id: str,
+        scope: str,
+        *,
+        daily_token_usd: float | None = None,
+        monthly_token_usd: float | None = None,
+        cumulative_token_usd: float | None = None,
+        daily_external_usd: float | None = None,
+        monthly_external_usd: float | None = None,
+        cumulative_external_usd: float | None = None,
+    ) -> Mandate:
+        """Mandate with both token and external caps for priority tests."""
+        from datetime import timedelta
+
+        now = datetime.now(timezone.utc)
+        return Mandate(
+            mandate_id=mandate_id,
+            scope=scope,
+            granted_by="test-op",
+            granted_at=now,
+            expires_at=now + timedelta(days=30),
+            revocation_state=RevocationState.ACTIVE,
+            revoked_at=None,
+            revoked_by=None,
+            revocation_reason=None,
+            constraints=MandateConstraints(
+                allowed_tools=frozenset(["test_tool"]),
+                daily_token_usd=daily_token_usd,
+                monthly_token_usd=monthly_token_usd,
+                cumulative_token_usd=cumulative_token_usd,
+                daily_external_usd=daily_external_usd,
+                monthly_external_usd=monthly_external_usd,
+                cumulative_external_usd=cumulative_external_usd,
+            ),
+            source_hash="sha256:priority-test",
+        )
+
+    def test_cap_kind_priority_external_over_token(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Risk 1 pin: daily_token + monthly_external both exceeded → primary cap_kind == 'monthly_external_usd'.
+
+        Priority order: monthly_external > daily_external > cumulative_external >
+        monthly_token > daily_token > cumulative_token > per_action_max.
+        """
+        mandate_id = "priority-ext-over-token"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+
+        # Both daily_token ($0.01 < $0.10 projection) and monthly_external ($0.01 < $1.00 tool)
+        mandate = self._make_both_capped_mandate(
+            mandate_id,
+            scope,
+            daily_token_usd=0.01,
+            monthly_external_usd=0.01,
+        )
+        mc = _make_mc_with_tool(
+            mandate_backend, scope, null_log_backend, "test_tool", 1.0
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+
+        # Capture the emit_event call to inspect cap_kind
+        captured_extra: dict = {}
+        original_emit = mc._emit_event
+
+        def capturing_emit(event_name, *, proposal, mandate_id, extra=None):
+            if event_name == "mandate_cap_exceeded_block" and extra:
+                captured_extra.update(extra)
+            return original_emit(
+                event_name, proposal=proposal, mandate_id=mandate_id, extra=extra
+            )
+
+        mc._emit_event = capturing_emit
+
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+
+        assert judgment.outcome == JudgmentOutcome.BLOCK
+        assert captured_extra.get("cap_kind") == "monthly_external_usd", (
+            f"Risk 1: expected 'monthly_external_usd' but got {captured_extra.get('cap_kind')!r}"
+        )
+        # daily_token_usd should appear in additional_caps_exceeded
+        additional = captured_extra.get("additional_caps_exceeded", ())
+        assert "daily_token_usd" in additional
+
+    def test_cap_kind_priority_monthly_over_daily_within_external(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Risk 1 pin: daily_external + monthly_external both exceeded → primary == 'monthly_external_usd'."""
+        mandate_id = "monthly-over-daily-ext"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+
+        mandate = self._make_both_capped_mandate(
+            mandate_id,
+            scope,
+            daily_external_usd=0.01,
+            monthly_external_usd=0.01,
+        )
+        mc = _make_mc_with_tool(
+            mandate_backend, scope, null_log_backend, "test_tool", 1.0
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+
+        captured_extra: dict = {}
+        original_emit = mc._emit_event
+
+        def capturing_emit(event_name, *, proposal, mandate_id, extra=None):
+            if event_name == "mandate_cap_exceeded_block" and extra:
+                captured_extra.update(extra)
+            return original_emit(
+                event_name, proposal=proposal, mandate_id=mandate_id, extra=extra
+            )
+
+        mc._emit_event = capturing_emit
+
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            mc.evaluate(proposal)
+
+        assert captured_extra.get("cap_kind") == "monthly_external_usd"
+        assert "daily_external_usd" in captured_extra.get(
+            "additional_caps_exceeded", ()
+        )
+
+    def test_cap_kind_priority_cumulative_after_monthly_and_daily(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Risk 1 pin: cumulative_external alone exceeded (no monthly/daily) → primary == 'cumulative_external_usd'."""
+        mandate_id = "cumulative-only"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+
+        mandate = self._make_both_capped_mandate(
+            mandate_id,
+            scope,
+            cumulative_external_usd=0.01,
+        )
+        mc = _make_mc_with_tool(
+            mandate_backend, scope, null_log_backend, "test_tool", 1.0
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+
+        captured_extra: dict = {}
+        original_emit = mc._emit_event
+
+        def capturing_emit(event_name, *, proposal, mandate_id, extra=None):
+            if event_name == "mandate_cap_exceeded_block" and extra:
+                captured_extra.update(extra)
+            return original_emit(
+                event_name, proposal=proposal, mandate_id=mandate_id, extra=extra
+            )
+
+        mc._emit_event = capturing_emit
+
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            mc.evaluate(proposal)
+
+        assert captured_extra.get("cap_kind") == "cumulative_external_usd"
+
+    def test_additional_caps_exceeded_tuple_lists_all_exceeded_caps_when_multiple_fire(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """All exceeded caps appear in additional_caps_exceeded when multiple fire."""
+        mandate_id = "multi-cap-exceed"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+
+        mandate = self._make_both_capped_mandate(
+            mandate_id,
+            scope,
+            monthly_external_usd=0.01,
+            daily_external_usd=0.01,
+            cumulative_external_usd=0.01,
+        )
+        mc = _make_mc_with_tool(
+            mandate_backend, scope, null_log_backend, "test_tool", 1.0
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+
+        captured_extra: dict = {}
+        original_emit = mc._emit_event
+
+        def capturing_emit(event_name, *, proposal, mandate_id, extra=None):
+            if event_name == "mandate_cap_exceeded_block" and extra:
+                captured_extra.update(extra)
+            return original_emit(
+                event_name, proposal=proposal, mandate_id=mandate_id, extra=extra
+            )
+
+        mc._emit_event = capturing_emit
+
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            mc.evaluate(proposal)
+
+        additional = set(captured_extra.get("additional_caps_exceeded", ()))
+        assert "daily_external_usd" in additional
+        assert "cumulative_external_usd" in additional
+
+    def test_additional_caps_exceeded_empty_when_only_one_cap_exceeded(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """additional_caps_exceeded is empty when only one cap is exceeded."""
+        mandate_id = "single-cap-exceed"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+
+        mandate = self._make_both_capped_mandate(
+            mandate_id,
+            scope,
+            daily_external_usd=0.01,
+        )
+        mc = _make_mc_with_tool(
+            mandate_backend, scope, null_log_backend, "test_tool", 1.0
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+
+        captured_extra: dict = {}
+        original_emit = mc._emit_event
+
+        def capturing_emit(event_name, *, proposal, mandate_id, extra=None):
+            if event_name == "mandate_cap_exceeded_block" and extra:
+                captured_extra.update(extra)
+            return original_emit(
+                event_name, proposal=proposal, mandate_id=mandate_id, extra=extra
+            )
+
+        mc._emit_event = capturing_emit
+
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            mc.evaluate(proposal)
+
+        additional = captured_extra.get("additional_caps_exceeded", ())
+        assert len(additional) == 0
+
+    def test_cap_exceeded_block_reason_for_external_side_effect_class(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """EXTERNAL_SIDE_EFFECT action class + cap exceeded → reason is 'mandate_cap_would_exceed'."""
+        mandate_id = "ext-side-effect-block"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = self._make_both_capped_mandate(
+            mandate_id, scope, daily_external_usd=0.01
+        )
+        mc = _make_mc_with_tool(
+            mandate_backend, scope, null_log_backend, "test_tool", 1.0
+        )
+        # make_proposal_citing uses EXTERNAL_SIDE_EFFECT by default
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+        assert judgment.outcome == JudgmentOutcome.BLOCK
+        assert judgment.reason.startswith("mandate_cap_would_exceed")
+
+    def test_cap_exceeded_escalate_reason_for_high_risk_class(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """HIGH_RISK action class + cap exceeded → ESCALATE with reason 'mandate_cap_would_exceed_high_risk'."""
+        from dataclasses import replace
+        from atomic_agents.judge.types import ActionClass as JudgeActionClass
+
+        mandate_id = "high-risk-escalate"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = self._make_both_capped_mandate(
+            mandate_id, scope, daily_external_usd=0.01
+        )
+        mc = _make_mc_with_tool(
+            mandate_backend, scope, null_log_backend, "test_tool", 1.0
+        )
+        base_proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        # Override classification to HIGH_RISK
+        proposal = replace(base_proposal, classification=JudgeActionClass.HIGH_RISK)
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+        assert judgment.outcome == JudgmentOutcome.ESCALATE
+        assert judgment.reason.startswith("mandate_cap_would_exceed_high_risk")
+
+    def test_block_reasons_are_forever_stable_no_pr_identifier(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """BLOCK reason naming discipline: no reason contains PR identifiers or version suffixes.
+
+        Replacement for the deleted PR 3a stub test — asserts the forever-stable
+        reason contract per spec/29 §'BLOCK reason naming discipline'.
+        """
+        mandate_id = "stable-reason-check"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+
+        all_known_reasons = [
+            "no_mandate_cite",
+            "mandate_rebind_suspicious_throttled",
+            "mandate_not_found",
+            "mandate_invalid",
+            "mandate_revoked",
+            "mandate_expired",
+            "mandate_tool_not_allowed",
+            "mandate_target_unextractable",
+            "mandate_target_not_allowed",
+            "mandate_target_blocked",
+            "mandate_outside_time_window",
+            "mandate_cap_would_exceed",
+            "mandate_cap_would_exceed_high_risk",
+            "mandate_external_cost_unprojectable",
+            "mandate_escalation_threshold_hit_token",
+            "mandate_escalation_threshold_hit_external",
+        ]
+        forbidden_fragments = ["_in_3a", "_pr3", "_v2", "_phase_b", "_3b", "_stub"]
+
+        for reason in all_known_reasons:
+            for fragment in forbidden_fragments:
+                assert fragment not in reason, (
+                    f"Reason {reason!r} contains PR-identifier fragment {fragment!r}; "
+                    "BLOCK reasons must be forever-stable per spec/29 §'BLOCK reason naming discipline'"
+                )
