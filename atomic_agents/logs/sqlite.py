@@ -65,6 +65,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 import warnings
 from datetime import date, datetime, time as dt_time
 from pathlib import Path
@@ -243,13 +244,46 @@ class SQLiteLogBackend:
             conn = sqlite3.connect(self._db_path_str)
             # Row factory — caller-friendly column access by name.
             conn.row_factory = sqlite3.Row
+            # busy_timeout BEFORE the WAL pragma — same shape as the
+            # #64 PR 3 fix in `atomic_agents/registry/sqlite.py`.
+            # `PRAGMA journal_mode=WAL` raises `sqlite3.OperationalError:
+            # database is locked` when N threads/processes concurrently
+            # open the same fresh db (the WAL transition needs an
+            # EXCLUSIVE lock; contention is a hard failure without a
+            # busy_timeout). 5000ms is generous for a race that should
+            # resolve in <50ms once the winner completes the transition.
+            conn.execute("PRAGMA busy_timeout=5000")
             # WAL journal mode: concurrent readers don't block writers.
+            # Empirically (#208), even with busy_timeout set, the
+            # cold-start WAL transition itself is NOT fully covered by
+            # the busy_handler — SQLite's journal-mode switch path can
+            # surface `database is locked` immediately when N threads
+            # race the very first transition on a fresh file. Retry on
+            # SQLITE_BUSY / SQLITE_LOCKED with exponential backoff:
+            # 7 attempts means up to 6 retries sleeping 0.05/0.1/0.2/
+            # 0.4/0.8/1.6s (cumulative ~3.15s of sleep), plus the
+            # busy_timeout wait of up to 5s per attempt. Subsequent
+            # connections see the file already in WAL and return
+            # immediately. Match on `sqlite_errorcode` (Python 3.11+)
+            # rather than message text so a future SQLite wording
+            # change can't silently re-raise legitimate corruption.
+            _RECOVERABLE = (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+            for attempt in range(7):
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if (
+                        getattr(exc, "sqlite_errorcode", None) not in _RECOVERABLE
+                        or attempt == 6
+                    ):
+                        raise
+                    time.sleep(0.05 * (2 ** attempt))
             # ``synchronous=NORMAL`` trades a tiny power-loss window
             # for ~3x write throughput vs ``FULL`` — same trade-off
             # Postgres ``synchronous_commit=local`` makes. Acceptable
             # for log data (the framework's audit trail is structural
             # but not transactional).
-            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             self._ensure_schema(conn)
             self._tls.conn = conn
