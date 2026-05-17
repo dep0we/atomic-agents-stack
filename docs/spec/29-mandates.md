@@ -1,14 +1,11 @@
 # spec/29 — Mandates
 
-> Status: **RFC — implementation-ready** (origin: #115; sharpened by /office-hours
-> 2026-05-17 + /plan-eng-review 2026-05-17 before #124 PR 1 opens). This spec
-> describes a planned surface, not current behavior. The spec locks (drops the
-> RFC marker) when the first reference implementation ships and the conformance
-> suite passes — projected at #124 PR 5. RFC convention is documented in
-> `docs/spec/28-judge-layer.md` §"RFC vs locked spec".
->
-> Pre-implementation amendments (recorded 2026-05-17):
-> - `MandateBackend` Protocol added (§"Implementer contract for mandate backends" below) — the framework now ships mandates via a Protocol seam from day 1, with `FilesystemMandateBackend` as the only reference impl in v1. Future SaaS / mobile / Slack-bot adapters slot in via `register_mandate_backend(...)` without forking core (per /office-hours Option 2 decision: build the seam upfront, don't retrofit later).
+**Status:** **LOCKED** at #124 PR 4 (locked 2026-05-17 against commit [`1f83824`](https://github.com/dep0we/atomic-agents-stack/commit/1f83824)).
+**Origin:** [#124](https://github.com/dep0we/atomic-agents-stack/issues/124); RFC origin [#115](https://github.com/dep0we/atomic-agents-stack/issues/115); sharpened by /office-hours 2026-05-17 + /plan-eng-review 2026-05-17 before #124 PR 1 opened.
+**Shipping plan across the #124 arc (all landed):** Pre-PR-1 spec amendments (#213), **PR 1** — `MandateBackend` Protocol scaffolding + `FilesystemMandateBackend` reference impl + `mandates.md` parser + parametrized conformance suite (#214), **PR 2** — wire `AtomicAgent.__init__` + per-runner kwargs + `ATOMIC_AGENTS_MANDATE_BACKEND` env var (#217), **PR 3a** — `MandateCheck` specialist + validation steps 1-6 + lifecycle dedup + `target_extractor` registry + `judges.md ## Mandates` parser (#219, prep #218), **PR 3b** — validation steps 7-9 + reservation pattern + crash recovery + post-action verification events (#221, prep #220; commit `15089f2` second-pass amendments), **PR 4** — spec LOCKED + CLAUDE.md status flip to "eight backend protocols shipped" — this PR.
+
+> Pre-implementation design amendments (recorded 2026-05-17, pre-PR-1; preserved as historical record of how the spec reached its final shape):
+> - `MandateBackend` Protocol added (§"Implementer contract for mandate backends" below) — the framework ships mandates via a Protocol seam from day 1, with `FilesystemMandateBackend` as the only reference impl in v1. Future SaaS / mobile / Slack-bot adapters slot in via `register_mandate_backend(...)` without forking core (per /office-hours Option 2 decision: build the seam upfront, don't retrofit later).
 > - `target_extractor` is a named per-agent registry, NOT a `Callable` field on `ToolDefinition` (per /plan-eng-review finding — `Callable` fields cannot satisfy spec/25 MUST #4 Tier B round-trip).
 > - State persistence is a `MandateBackend.read_state`/`write_state` Protocol contract (NOT a filesystem-path contract). State carries `schema_version: 1` from PR 3a onward.
 > - Suspicious-rebind throttle (60s default) closes the source-hash-before-state edit window for prompt-injection-style threats.
@@ -25,7 +22,7 @@ A **mandate** is a durable, operator-granted scoped authority record. It lives i
 
 Where the judge layer's `Authorization` dataclass (per `spec/28`) captures *per-action* authorization (\"the operator told me, in this conversation, to do this thing\"), a mandate captures **durable, cross-run, revocable scoped authority** (\"the operator authorized this agent to handle procurement for Q2 2026 under these constraints\"). The two compose: an action proposal's `Authorization` can cite a mandate by ID, and the judge's `MandateCheck` specialist validates the cite against the mandate's live state.
 
-This spec describes a planned surface. Implementation is tracked by follow-up issues filed after this spec merges.
+This spec describes the shipped surface as of the #124 arc close. Post-lock follow-ups are tracked in issues #222–#229 (filed alongside PR 4).
 
 ## Why this exists
 
@@ -842,7 +839,7 @@ This spec describes the **what** and the **where**. It does not pin:
 
 - LLM-judge prompt templates that reference mandate context — refined in the impl PR
 - Dashboard tab for mandate browsing — separate implementation issue
-- Cross-fleet mandate templates (org-scale standard mandate shapes) — see PolicyBackend (#89) territory; **boundary holds** per /office-hours 2026-05-17 decision; PolicyBackend scope-design queued as the next /office-hours target after #124 PR 5 merges
+- Cross-fleet mandate templates (org-scale standard mandate shapes) — see PolicyBackend (#89) territory; **boundary holds** per /office-hours 2026-05-17 decision; PolicyBackend scope-design queued as the next /office-hours target now that #124 PR 4 has merged
 - Second `MandateBackend` reference impl (SaaS / mobile / Slack-bot) — `FilesystemMandateBackend` is the only reference in v1; adapters slot in via `register_mandate_backend(...)` post-arc (per /office-hours Option 2 decision: ship the Protocol seam, defer alternate impls until concrete user demand surfaces)
 - Auto-detection of mandate-shaped intent in conversation (\"operator just said something that sounds like a mandate, propose adding it\") — operator UX problem, not a framework concern
 - Mandate composition / inheritance beyond project-root vs per-agent — no transitively-inherited mandates from coordinator to delegate beyond the shared project-root file
