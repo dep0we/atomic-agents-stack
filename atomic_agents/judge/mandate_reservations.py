@@ -562,9 +562,14 @@ def compute_outstanding(
         primitive=tuple(_COST_EVENT_PRIMITIVES),
         mandate_id=mandate_id,
         agent_name=agent_name,
+        cost_source="actor",
     )
     cost_records = log_backend.query(cost_query)
     for rec in cost_records:
+        # Round 1 Finding 5: only ACTOR-source cost records suppress a
+        # reservation (helper/delegate proposal_id annotations are not spend).
+        if rec.cost_source != "actor":
+            continue
         proposal_id = rec.extra.get("proposal_id")
         if proposal_id:
             cost_event_proposal_ids.add(proposal_id)

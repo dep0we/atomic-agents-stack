@@ -2890,6 +2890,13 @@ class AtomicAgent:
             self._delegations_this_run = []
             # Reset cumulative delegated cost for this run (fix R2-A2)
             self._delegated_cost_this_run = 0.0
+            # Round 1 Finding 1: accumulate successful mandate cites across
+            # iterations so the per-call agent_call cost event can carry the
+            # mandate_id + proposal_id top-level fields (the LogQuery shape
+            # _sum_prior_token_cost relies on). Single-mandate-per-call is the
+            # common case; multi-mandate iterations accept a documented
+            # apportionment gap (see CHANGELOG).
+            self._successful_mandate_cites_this_call: list[tuple[str, str]] = []
 
             # Cost guardrails check FIRST — before spinning up MCP subprocesses.
             # A call that will be skipped due to cost cap should not pay the
@@ -3235,17 +3242,35 @@ class AtomicAgent:
                                             )
                                             else "token"
                                         )
+                                        # Round 1 Finding 6 fix: read the
+                                        # projection MandateCheck cached during
+                                        # evaluate() so the reservation carries
+                                        # non-zero headroom. compute_outstanding
+                                        # sums these projections into cumulative,
+                                        # which is the stale-budget race defense.
+                                        mc_for_projection = getattr(
+                                            self, "_mandate_check", None
+                                        )
+                                        if mc_for_projection is not None:
+                                            (
+                                                proj_token,
+                                                proj_external,
+                                            ) = mc_for_projection.pop_projection(
+                                                mandate_proposal.proposal_id
+                                            )
+                                            projected_usd_for_rsvp = (
+                                                proj_external
+                                                if cost_kind == "external"
+                                                else proj_token
+                                            )
+                                        else:
+                                            projected_usd_for_rsvp = 0.0
                                         try:
                                             rid = mgr.create(
                                                 mandate_id=mandate_id,
                                                 proposal_id=mandate_proposal.proposal_id,
                                                 cost_kind=cost_kind,
-                                                # projected_usd not yet surfaced by
-                                                # MandateCheck Judgment; default 0.0.
-                                                # Follow-up: #TODO extend Judgment to
-                                                # carry projected_usd so reservation
-                                                # headroom is accurate (#124 follow-up).
-                                                projected_usd=0.0,
+                                                projected_usd=projected_usd_for_rsvp,
                                                 run_id=self.run_id,
                                                 parent_run_id=None,
                                             )
@@ -3395,6 +3420,27 @@ class AtomicAgent:
                                         actual_usd=0.0,  # tool cost is zero for token-class; external-class actual tracked via cost event
                                         run_id=self.run_id,
                                     )
+                                    # Round 1 Finding 1: record this successful
+                                    # mandate cite so the per-call agent_call
+                                    # cost event can carry mandate_id+proposal_id
+                                    # (the LogQuery shape _sum_prior_token_cost
+                                    # relies on for cumulative-spend defense).
+                                    if (
+                                        mandate_proposal is not None
+                                        and mandate_proposal.authorization is not None
+                                        and mandate_proposal.authorization.granted_by.startswith(
+                                            "mandate:"
+                                        )
+                                    ):
+                                        _mid_for_ledger = mandate_proposal.authorization.granted_by.removeprefix(
+                                            "mandate:"
+                                        )
+                                        self._successful_mandate_cites_this_call.append(
+                                            (
+                                                _mid_for_ledger,
+                                                mandate_proposal.proposal_id,
+                                            )
+                                        )
                                 except Exception:
                                     _logger.warning(
                                         "agent %r: mandate reservation commit "
@@ -3514,6 +3560,30 @@ class AtomicAgent:
                 log_record["critical"] = True
             if all_parse_failures:
                 log_record["capture_parse_failures"] = len(all_parse_failures)
+            # Round 1 Finding 1 fix: tag the agent_call cost event with
+            # mandate_id + proposal_id when at least one mandate cite
+            # committed this call. _sum_prior_token_cost queries by
+            # cost_source=actor + mandate_id; without this tag, cumulative
+            # token-cap defense is unenforceable. Single-mandate-per-call
+            # case sets the top-level fields exactly; multi-mandate-per-call
+            # picks the most-recent cite (apportionment across mandates is
+            # a documented gap, follow-up issue #TODO).
+            if self._successful_mandate_cites_this_call:
+                _distinct_mids = {
+                    _m for _m, _p in self._successful_mandate_cites_this_call
+                }
+                if len(_distinct_mids) == 1:
+                    _last_mid, _last_pid = self._successful_mandate_cites_this_call[-1]
+                    log_record["mandate_id"] = _last_mid
+                    log_record["proposal_id"] = _last_pid
+                else:
+                    # Multi-mandate iteration: attribute spend to the most
+                    # recent cite. Documented under-attribution; spec/29
+                    # apportionment is a v1 simplification.
+                    _last_mid, _last_pid = self._successful_mandate_cites_this_call[-1]
+                    log_record["mandate_id"] = _last_mid
+                    log_record["proposal_id"] = _last_pid
+                    log_record["mandate_cites_in_call"] = sorted(_distinct_mids)
             if self._helpers_this_run:
                 # Spec/13 Layer 3 — research log: roll up helper provenance
                 # into the parent run record so an audit can trace every fact

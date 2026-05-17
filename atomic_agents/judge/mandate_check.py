@@ -190,6 +190,38 @@ class MandateCheck:
         self._policy_version = policy_version
         # Within-process lock for state read-modify-write (spec/29 line 741).
         self._state_lock = threading.Lock()
+        # Round 1 Finding 6: per-proposal projection cache so callers can
+        # pass non-zero ``projected_usd`` to MandateReservationManager.create().
+        # Keyed by proposal_id; entries are tuples (projected_token_usd,
+        # projected_external_usd). Cleared by callers via pop_projection()
+        # after consumption (typical lifetime = one iteration of the agent
+        # loop). NOT shared across agent instances.
+        self._projection_cache: dict[str, tuple[float, float]] = {}
+        self._projection_lock = threading.Lock()
+
+    def record_projection(
+        self,
+        proposal_id: str,
+        projected_token_usd: float,
+        projected_external_usd: float,
+    ) -> None:
+        """Cache the projection for ``proposal_id`` so caller can read it
+        before creating a reservation. Internal; called from ``evaluate()``
+        on every ALLOW path."""
+        with self._projection_lock:
+            self._projection_cache[proposal_id] = (
+                projected_token_usd,
+                projected_external_usd,
+            )
+
+    def pop_projection(self, proposal_id: str) -> tuple[float, float]:
+        """Read-and-clear the cached projection for ``proposal_id``.
+
+        Returns ``(0.0, 0.0)`` when no projection was recorded (no caps on
+        the mandate, or the proposal didn't go through evaluate()).
+        """
+        with self._projection_lock:
+            return self._projection_cache.pop(proposal_id, (0.0, 0.0))
 
     # ── JudgeBackend Protocol surface ─────────────────────────────────────────
 
@@ -528,6 +560,17 @@ class MandateCheck:
             caps_exceeded.update(ext_result["caps_exceeded"])
             contributing_reservation_ids.extend(ext_result.get("reservation_ids", []))
 
+        # Round 1 Finding 6: cache the projection so the agent loop can
+        # create a reservation with non-zero ``projected_usd``. Without this,
+        # the stale-budget race defense in compute_outstanding is vacuous
+        # (outstanding reservations contribute 0 to cumulative; concurrent
+        # mandate-citing actions all see "no outstanding spend" and exceed
+        # the cap silently). Recorded BEFORE every potential ALLOW return so
+        # the cache reflects the most recent projection for this proposal.
+        self.record_projection(
+            proposal.proposal_id, projected_token_usd, projected_external_usd
+        )
+
         # ── Step 9: Escalation thresholds (spec/29 line 382-384, Risk 7) ─────
         # Spec/29 line 384 amendment: step 9 ESCALATE preempts step 8 BLOCK
         # when both fire for the same projection.  Evaluate before returning
@@ -844,11 +887,22 @@ class MandateCheck:
         # static estimate, fail-closed when neither is available.
         projected: float
         if estimator_id is not None:
-            projected = self._cost_estimators.estimate(
-                proposal.tool_name,
-                proposal.tool_arguments,
-                estimator_id=estimator_id,
-            )
+            try:
+                projected = self._cost_estimators.estimate(
+                    proposal.tool_name,
+                    proposal.tool_arguments,
+                    estimator_id=estimator_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Round 1 Finding 3: estimator raise must fail-closed to the
+                # spec-stable reason, NOT bubble up as "judge dispatch error".
+                _logger.warning(
+                    "MandateCheck step 8: cost_estimator_id %r raised %s — "
+                    "treating as unprojectable",
+                    estimator_id,
+                    type(exc).__name__,
+                )
+                projected = float("inf")
             # +inf from estimator means unprojectable.
             if projected == float("inf"):
                 if static_cost is not None:
@@ -1063,26 +1117,46 @@ class MandateCheck:
             # Also accept string form (StrEnum comparison).
             or str(action_class) == "high_risk"
         )
+        # Round 1 Finding 11: per_action_max_usd is compared against the
+        # projection only (not cumulative); the detail string must reflect that.
+        is_per_action_max = primary_cap_kind == "per_action_max_usd"
         if is_high_risk:
-            return self._escalate(
-                reason="mandate_cap_would_exceed_high_risk",
-                mandate_id=mandate_id,
-                detail=(
+            if is_per_action_max:
+                detail = (
+                    f"High-risk action: projected cost would exceed "
+                    f"{primary_cap_kind} per-action cap for mandate "
+                    f"{mandate_id!r}. Operator approval required."
+                )
+            else:
+                detail = (
                     f"High-risk action: cumulative + projected would exceed "
                     f"{primary_cap_kind} cap for mandate {mandate_id!r}. "
                     "Operator approval required."
-                ),
+                )
+            return self._escalate(
+                reason="mandate_cap_would_exceed_high_risk",
+                mandate_id=mandate_id,
+                detail=detail,
             )
 
-        return self._block(
-            reason="mandate_cap_would_exceed",
-            mandate_id=mandate_id,
-            detail=(
+        if is_per_action_max:
+            detail = (
+                f"Projected cost would exceed {primary_cap_kind} per-action cap "
+                f"for mandate {mandate_id!r}. Cap: "
+                f"{caps_exceeded[primary_cap_kind].get('cap')}, "
+                f"projected: {caps_exceeded[primary_cap_kind].get('projected'):.6f}."
+            )
+        else:
+            detail = (
                 f"Cumulative + projected cost would exceed {primary_cap_kind} "
                 f"cap for mandate {mandate_id!r}. Cap: "
                 f"{caps_exceeded[primary_cap_kind].get('cap')}, "
                 f"cumulative: {caps_exceeded[primary_cap_kind].get('cumulative'):.6f}."
-            ),
+            )
+        return self._block(
+            reason="mandate_cap_would_exceed",
+            mandate_id=mandate_id,
+            detail=detail,
         )
 
     # ── Helpers ──────────────────────────────────────────────────────────────

@@ -2329,6 +2329,47 @@ class TestMandateCheckStep9Escalation:
 # Cap exceeded block — priority + shape invariants
 
 
+class TestMandateCheckProjectionCache:
+    """Round 1 Finding 6: MandateCheck caches projections so the agent loop
+    can create a reservation with non-zero ``projected_usd``. Without this
+    cache, the stale-budget race defense in compute_outstanding is vacuous —
+    outstanding reservations contribute 0 to cumulative, and concurrent
+    mandate-citing actions all see "no outstanding spend" and exceed the cap
+    silently.
+    """
+
+    def test_record_projection_then_pop_returns_values(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Direct API: record_projection caches; pop_projection returns + clears."""
+        mc = _make_mc(mandate_backend, scope, null_log_backend)
+        mc.record_projection(
+            "prop-123", projected_token_usd=0.07, projected_external_usd=12.5
+        )
+        token, external = mc.pop_projection("prop-123")
+        assert token == 0.07
+        assert external == 12.5
+        # Second pop returns defaults (cleared on first pop).
+        token2, external2 = mc.pop_projection("prop-123")
+        assert token2 == 0.0
+        assert external2 == 0.0
+
+    def test_pop_projection_no_record_returns_zeros(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Defensive default for proposals that never went through evaluate()."""
+        mc = _make_mc(mandate_backend, scope, null_log_backend)
+        token, external = mc.pop_projection("never-recorded")
+        assert token == 0.0
+        assert external == 0.0
+
+
 class TestMandateCheckCapExceededBlock:
     """mandate_cap_exceeded_block priority, shape, and reason invariants (Risk 1)."""
 
