@@ -1,10 +1,19 @@
 # spec/29 — Mandates
 
-> Status: **RFC** (origin: #115). This spec describes a planned surface, not current
-> behavior. It is the design hypothesis the maintainer is committing to before
-> implementation. The spec locks (drops the RFC marker) when the first reference
-> implementation ships and the conformance suite passes. RFC convention is documented
-> in `docs/spec/28-judge-layer.md` §"RFC vs locked spec".
+> Status: **RFC — implementation-ready** (origin: #115; sharpened by /office-hours
+> 2026-05-17 + /plan-eng-review 2026-05-17 before #124 PR 1 opens). This spec
+> describes a planned surface, not current behavior. The spec locks (drops the
+> RFC marker) when the first reference implementation ships and the conformance
+> suite passes — projected at #124 PR 5. RFC convention is documented in
+> `docs/spec/28-judge-layer.md` §"RFC vs locked spec".
+>
+> Pre-implementation amendments (recorded 2026-05-17):
+> - `MandateBackend` Protocol added (§"Implementer contract for mandate backends" below) — the framework now ships mandates via a Protocol seam from day 1, with `FilesystemMandateBackend` as the only reference impl in v1. Future SaaS / mobile / Slack-bot adapters slot in via `register_mandate_backend(...)` without forking core (per /office-hours Option 2 decision: build the seam upfront, don't retrofit later).
+> - `target_extractor` is a named per-agent registry, NOT a `Callable` field on `ToolDefinition` (per /plan-eng-review finding — `Callable` fields cannot satisfy spec/25 MUST #4 Tier B round-trip).
+> - State persistence is a `MandateBackend.read_state`/`write_state` Protocol contract (NOT a filesystem-path contract). State carries `schema_version: 1` from PR 3a onward.
+> - Suspicious-rebind throttle (60s default) closes the source-hash-before-state edit window for prompt-injection-style threats.
+> - `BLOCK` reason naming is forever-stable; PR/version identifiers do NOT leak into JSONL audit reasons.
+> - `mandate_cap_exceeded_block` events carry `contributing_reservation_ids` + `reconcile_cli_hint` so operators see WHY they're blocked, not just THAT they are.
 >
 > Cross-links: spec/01 (anatomy — graduated autonomy framing), spec/03 (file formats), spec/05 (capture rules — operator-confirmation discipline), spec/06 (multi-agent projects — project-root resolution), spec/09 (cost-observability — cumulative budget), spec/17 (tools), spec/27 (doctor), spec/28 (judge layer — Authorization integration)
 >
@@ -382,6 +391,30 @@ If all checks pass: `ALLOW`. The judgment event's `binding` carries the `mandate
 
 `MandateCheck` is **always-on** when a proposal cites a mandate. It runs before the LLM catch-all judge (per spec/28's `[PolicyJudge, LLMCatchAll]` default composition pattern; `MandateCheck` is a sibling of `PolicyJudge`, both rule-engine, both always-on, both fail-fast). Composition becomes effectively `[PolicyJudge, MandateCheck, LLMCatchAll]` when mandate cites are involved.
 
+### Suspicious-rebind throttle (closes the source-hash-before-state edit window)
+
+The source-hash-before-state ordering (step 2 before step 3) creates a small attack-surface window: an actor seeing `mandate_state_inconsistent` (hash mismatch) re-authors with a fresh binding against the operator's mid-edit `mandates.md`. If the operator typed the new hash but hasn't yet flipped `revocation_state: revoked` (multi-line edit, not atomic), the actor could bind to a still-active state and bypass the revocation by ~seconds. This is exploitable by a malicious or hallucinating actor on a tight retry loop.
+
+**Defense:** when `MandateCheck` surfaces `mandate_state_inconsistent` for a mandate, the framework refuses re-binding on the same mandate for `suspicious_rebind_throttle_s` seconds (default 60). The throttle is per-(mandate_id, agent_run_id) — a different agent run citing the same mandate is not throttled (closes the window without serializing legitimate cross-run usage).
+
+Throttle config lives in `judges.md`:
+```markdown
+## Mandates
+suspicious_rebind_throttle_s: 60       # default 60; lower to 10 for tight-loop testing
+```
+
+When the throttle is active and the actor re-cites the same mandate, `MandateCheck` returns `BLOCK` with reason `mandate_rebind_suspicious_throttled`. A new lifecycle event `mandate_rebind_suspicious_throttled` is emitted (carries `mandate_id`, `agent_run_id`, `original_state_inconsistent_at`, `throttle_expires_at`). The doctor's `check_mandate_rebind_throttle_active` surfaces active throttles for operator awareness — an operator-edited revoke that lands cleanly clears the throttle on next agent run; an operator who sees sustained throttles knows their actor is exhibiting suspicious retry behavior.
+
+### Validation step split between PR 3a and PR 3b (implementation discipline)
+
+Per the #124 PR 3 split decision (/office-hours + /plan-eng-review 2026-05-17): PR 3a ships validation steps 1-6 (existence, source hash, state, tool allowlist, target allowlist, time window). PR 3b ships validation steps 7-9 (token budget, external budget, escalation thresholds). **Step 9 belongs in PR 3b** because escalation thresholds operate on the projected costs from steps 7+8 — step 9 cannot evaluate without 7+8 in place. PR 3a stubs steps 7-9 to fail-closed: any mandate with a `*_budget_usd` cap returns `BLOCK` with reason `mandate_budget_check_unavailable` (NOT `mandate_budget_check_unavailable_in_3a` — JSONL audit reasons are forever-stable and MUST NOT leak PR identifiers). The temporary cause is documented in the PR 3a CHANGELOG entry; the reason field stays stable across the eventual 3b unlock.
+
+### BLOCK reason naming discipline (general)
+
+All `BLOCK` reasons emitted by `MandateCheck` (or any downstream MandateBackend) MUST be forever-stable strings — they land in JSONL audit logs that operators read indefinitely. Reasons MUST NOT carry version identifiers (`_in_3a`, `_v2`, `_phase_b`), PR identifiers, or transient context. The temporary-cause story belongs in the CHANGELOG entry of the release that introduces the reason, not in the reason itself.
+
+Reasons SHOULD be greppable: dot-or-underscore-separated tokens with one canonical form (`mandate_target_unextractable`, NOT `MandateTargetUnextractable` or `mandate.target.unextractable`). Existing reasons in this spec follow this convention.
+
 ### Target extraction (framework-owned, not actor-supplied)
 
 The framework extracts a `target_canonical` value from the proposal at assembly time. This is a **framework-owned** field — the actor does not supply it, and the actor-supplied `target_audience` field from spec/28 (which is a *privacy* surface, not a binding target) is never used as the basis for mandate target matching. The two fields exist for different concerns:
@@ -389,21 +422,31 @@ The framework extracts a `target_canonical` value from the proposal at assembly 
 - `target_audience`: actor-supplied privacy surface (`internal` | `external:<surface>`). The privacy judge consumes this. The mandate layer does not.
 - `target_canonical`: framework-extracted binding target. The mandate layer consumes this. The actor cannot influence it.
 
-The framework extracts `target_canonical` per the registered tool's metadata. Tool definitions gain an optional `target_extractor: Callable[[dict], str | None]` field:
+The framework extracts `target_canonical` via a **per-agent named extractor registry** (NOT a `Callable` field on `ToolDefinition` — that shape was considered and rejected at the /plan-eng-review stage because `Callable` fields cannot satisfy spec/25 MUST #4 Tier B's lossless round-trip obligation for structured-storage tool backends). The registry pattern mirrors the established spec/25 Decision 9 + spec/15 delegate-isolation precedent: each agent owns its registry; coordinator-registered extractors do NOT leak into delegate evaluations.
+
+`ToolDefinition` carries an optional `target_extractor_id: str | None` field that names an extractor registered on the agent's registry. The agent setup registers the named callable; `MandateCheck` resolves the name at evaluation time. Backend-storable (the string ID round-trips through Tier B losslessly per spec/25 MUST #4).
 
 ```python
+# Agent setup — register per-agent
+agent.register_target_extractor("recipient_to", lambda args: args.get("to"))
+
+# Tool definition references the extractor by name (string, not callable)
 ToolDefinition(
     name="send_email",
     input_schema={...},
     handler=send_email_handler,
-    target_extractor=lambda args: args.get("to"),    # extracts the recipient
+    target_extractor_id="recipient_to",                # string ID, not Callable
     action_class=ActionClass.EXTERNAL_SIDE_EFFECT,
 )
 ```
 
-For tools without a registered extractor, the framework falls back to a set of well-known argument-shape heuristics (the same heuristics that today's audit-classification logic uses): `to`, `recipient`, `target`, `url`, `repository`, `customer_id`, `channel_id`. MCP tools add the `mcp_server` prefix to the extracted value.
+Built-in heuristic extractors are pre-registered on every agent's registry at construction time (so operators don't need to register them manually): `recipient_to` (extracts `to` field), `recipient_field` (extracts `recipient`), `target_field` (extracts `target`), `url_field` (extracts `url`), `repository_field` (extracts `repository`), `customer_id_field`, `channel_id_field`. MCP tools' extracted values are prefixed with `mcp:<server>:` by the framework before pattern matching.
 
-If extraction returns `None` and the mandate's `constraints.allowed_targets` is set → `BLOCK` with reason `mandate_target_unextractable`. The fallback is intentionally fail-closed: a mandate that says "only send to these vendors" + a tool the framework can't extract a target from = the framework refuses. Operators who want a tool to be mandate-target-aware must register an `target_extractor` on the tool definition (small impl cost) or omit `allowed_targets` from the mandate (operator decision).
+If extraction returns `None` and the mandate's `constraints.allowed_targets` is set → `BLOCK` with reason `mandate_target_unextractable`. The fallback is intentionally fail-closed: a mandate that says "only send to these vendors" + a tool the framework can't extract a target from = the framework refuses. Operators who want a tool to be mandate-target-aware must register an extractor name on the tool definition (small impl cost) or omit `allowed_targets` from the mandate (operator decision).
+
+**Registry collision discipline**: `agent.register_target_extractor(name, callable)` raises `ValueError` on collision (same `name` already registered). Mirrors `register_tool_registry_backend` precedent — no silent overwrite. Operators replace via explicit `agent.replace_target_extractor(name, callable)`.
+
+**Delegate isolation**: per spec/15, a delegate loads a fresh target vault. The target_extractor registry is a per-agent surface owned by `AgentProfile`; the delegate registers its own extractors (or inherits the project-root defaults). Coordinator-local extractors do NOT flow to the delegate. This matches the tool-permission-non-inheritance discipline from spec/15 and the per-agent backend-scoping pattern from spec/25 Decision 9.
 
 The extracted `target_canonical` is recorded in the proposal at assembly time (per the ActionProposal field below) and surfaces in the JSONL judgment event under `mandate_cite.target_canonical`, so post-hoc audit can verify the target the framework *actually saw* matches the target the operator intended to constrain.
 
@@ -546,24 +589,27 @@ Every mandate state transition writes a JSONL event tied to the agent's run log 
 | `mandate_used` | Action citing the mandate executes and emits a cost event | `mandate_id`, `proposal_id`, `parent_run_id`, `tool_name`, `cost_kind`, `actual_usd`, `cumulative_token_after`, `cumulative_external_after` |
 | `mandate_revoked` | First load that observes `revocation_state: revoked` for a mandate whose state file recorded `active` | `mandate_id`, `revoked_at`, `revoked_by`, `revocation_reason`, prior `cumulative_token_at_revocation`, prior `cumulative_external_at_revocation` |
 | `mandate_expired` | First load that observes current time >= `expires_at` for a mandate whose state file recorded `active`. **EXPIRED is derived state, not a file mutation** — the framework computes it at load time from `expires_at` vs. current time; `mandates.md` itself is never edited. | `mandate_id`, `expired_at`, `cumulative_token_at_expiry`, `cumulative_external_at_expiry` |
-| `mandate_cap_exceeded_block` | MandateCheck blocks an action because cumulative + projected > cap | `mandate_id`, `proposal_id`, `cumulative_token_now`, `cumulative_external_now`, `projected_usd`, `cap_kind` (daily_token / monthly_token / cumulative_token / daily_external / monthly_external / cumulative_external) |
+| `mandate_cap_exceeded_block` | MandateCheck blocks an action because cumulative + projected > cap | `mandate_id`, `proposal_id`, `cumulative_token_now`, `cumulative_external_now`, `projected_usd`, `cap_kind` (daily_token / monthly_token / cumulative_token / daily_external / monthly_external / cumulative_external), `contributing_reservation_ids: [...]` (reservations whose still-outstanding budget pushed cumulative over; empty if no outstanding reservations), `reconcile_cli_hint: str | null` (when any contributing_reservation_ids are recovery orphans, this is the operator-runnable command — e.g., `"atomic-agents mandate reconcile <id> --action committed\|rolled_back"` — that surfaces in the BLOCK reason so operators see why they're blocked AND what to do, not just that they are) |
 | `mandate_reservation` / `_committed` / `_rolled_back` / `_expired` / `_committed_on_recovery` / `_external_unverified` | Per cost reservation pattern above | per-event fields documented above |
 | `mandate_id_collision` | Load-time collision between project-root and per-agent files (per-agent entry refused) | `mandate_id`, both source paths, resolution outcome |
 | `mandate_unconstrained_loaded` | A mandate with `constraints.unconstrained: true` is loaded | `mandate_id`, `unconstrained_justification` (operator-supplied) |
 
 ### Lifecycle event deduplication (state file)
 
-To prevent re-emitting `mandate_granted` / `mandate_revoked` / `mandate_expired` events on every load, the framework maintains per-scope state files. Mandate IDs can repeat across unrelated agents and projects (`procurement-q2-2026` is a common-enough mandate name that two unrelated projects will collide); keying state by ID alone would cause cross-scope event suppression. State files are therefore scoped:
+To prevent re-emitting `mandate_granted` / `mandate_revoked` / `mandate_expired` events on every load, the framework maintains per-scope state. **State persistence is a `MandateBackend` Protocol concern, not a filesystem-path contract.** The Protocol exposes `read_state(scope)` and `write_state(scope, state)` methods; the `FilesystemMandateBackend` reference impl persists state at `<agent>/.judge-state/mandates.json` (and `<project>/.judge-state/mandates.json` for project-root scope), but a future SaaS / database backend can persist the same state shape in a SQL table or external store.
 
-- **Agent-local mandates** → `<agent>/.judge-state/mandates.json`
-- **Project-root mandates** → `<project>/.judge-state/mandates.json`
+Mandate IDs can repeat across unrelated agents and projects (`procurement-q2-2026` is a common-enough mandate name that two unrelated projects will collide); keying state by ID alone would cause cross-scope event suppression. State is therefore scoped at the Protocol method boundary:
 
-Each is independent. An agent computing dedup for a project-root mandate cite reads `<project>/.judge-state/mandates.json`; for an agent-local mandate it reads `<agent>/.judge-state/mandates.json`. Cross-scope collision is impossible because the IDs live in different files.
+- **Agent-local mandates** → `read_state("agent:<name>")` / `write_state("agent:<name>", ...)`. `FilesystemMandateBackend` persists at `<agent>/.judge-state/mandates.json`.
+- **Project-root mandates** → `read_state("project:<name>")` / `write_state("project:<name>", ...)`. `FilesystemMandateBackend` persists at `<project>/.judge-state/mandates.json`.
 
-State file shape (per file):
+Each is independent. An agent computing dedup for a project-root mandate cite calls `read_state("project:<name>")`; for an agent-local mandate it calls `read_state("agent:<name>")`. Cross-scope collision is impossible because the IDs live in different keys.
+
+State shape (returned by `read_state`, accepted by `write_state`):
 
 ```json
 {
+  "schema_version": 1,
   "scope": "agent:<name>" | "project:<name>",
   "mandates": {
     "procurement-q2-2026": {
@@ -575,6 +621,8 @@ State file shape (per file):
   }
 }
 ```
+
+**`schema_version: 1` is mandatory from PR 3a onward.** PR 3b extends the state shape with reservation-orphan fields; readers MUST consult `schema_version` and treat unknown versions as a forward-incompat error (raise `MandateStateSchemaUnsupported`). This mirrors the spec/22/24/25 schema_version discipline — silent migrations are the failure shape `INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1')` closes everywhere else.
 
 On each load:
 
@@ -708,14 +756,38 @@ The framework enforces write-path safety for operator-authored config (per `spec
 
 This means: even a malicious actor with a write-capable tool cannot edit `mandates.md` to grant itself authority. The WritePolicy is the authoritative protection. The `## Only operators grant mandates` section above describes the *behavioral* discipline (the actor doesn't get to grant mandates via skills / dreams / captures / helpers / MCP results); the WritePolicy is the *structural* enforcement that backs that discipline.
 
+## Implementer contract for mandate backends
+
+A backend that implements the `MandateBackend` Protocol commits to the contract below. The reference `FilesystemMandateBackend` (markdown + JSON state) ships in #124 PR 1; future SaaS / database / mobile / Slack-bot adapters slot in via `register_mandate_backend(...)` without forking core. Mirrors the spec/22/24/25 Implementer contract patterns.
+
+**Implementers MUST:**
+
+1. **Path-traversal refusal at the API boundary.** Operator-supplied `mandate_id` MUST be validated against `[a-z0-9][a-z0-9-]*` BEFORE any storage access. Reject with `MandateInvalid` for path-traversal tokens, embedded slashes, or control characters. The reference filesystem backend rejects at construction-of-scope-path time; SQL backends parameterize but still refuse at the API boundary as defense-in-depth.
+
+2. **Per-scope isolation enforced at the storage layer.** Agent-local and project-root mandate scopes MUST NOT bleed across. For SQL backends, every query filters `WHERE scope = ?`. For filesystem, scope is enforced by `<agent>/mandates.md` vs `<project>/mandates.md` path discipline + `_io.safe_resolve_under(scope_root)` guards. Cross-scope read or write is a backend bug.
+
+3. **State persistence via `read_state(scope)` / `write_state(scope, state)` Protocol methods, NOT a filesystem-path contract.** The state shape (per §"Lifecycle event deduplication") is the contract; the persistence mechanism is the backend's concern. State writes MUST be atomic (temp + fsync + rename per rule #8 for filesystem; transactional for SQL). State reads MUST return the current `schema_version` field and raise `MandateStateSchemaUnsupported` on unknown versions.
+
+4. **Source-hash recomputation on every `load_mandate(mandate_id)`.** The backend MUST recompute the canonical source hash from the persisted representation on every load. Cached hashes are forbidden — `MandateCheck` step 2 (source hash) relies on fresh computation to detect operator edits. The reference filesystem backend reads `mandates.md` from disk on every load; SQL backends recompute the hash from `descriptor_json` + canonical field ordering.
+
+5. **Lifecycle event emission via `LogBackend.append(record)`, not direct file write.** All lifecycle events (`mandate_granted`, `mandate_used`, `mandate_revoked`, `mandate_expired`, `mandate_cap_exceeded_block`, `mandate_reservation` + 5 variants, `mandate_id_collision`, `mandate_unconstrained_loaded`, `mandate_rebind_suspicious_throttled`) flow through the agent's `LogBackend`. The `MandateBackend` Protocol takes the `LogBackend` instance via constructor injection or per-method parameter so events land in the same JSONL stream that the dashboard + cost guardrail read.
+
+6. **Reservation events use the base `MandateReservationEvent` discriminator shape.** All reservation event variants carry `mandate_id`, `proposal_id`, `cost_kind`, `ts`, `event` (discriminator) at minimum. Variant-specific fields layer on top. Audit readers iterate over the family uniformly; one parser handles all variants. Backends MAY collapse storage (e.g., a single `reservations` table with `event_type` column) but the JSONL emission shape is fixed.
+
+7. **Crash recovery semantics: pessimistic, over-report > under-report.** On framework startup, `MandateBackend.recover_orphan_reservations(log_backend, scope)` MUST scan the JSONL for `mandate_reservation` events lacking a matching `_committed` / `_rolled_back` / `_expired` event. For each orphan: emit `mandate_reservation_committed_on_recovery` (token cost) OR both `_committed_on_recovery` AND `_external_unverified` (external cost). Recovery MUST commit immediately, NOT wait for the TTL — TTL-expiry is only valid when the framework was alive through the entire window. The over-count is recoverable via the reconcile CLI; the under-count (silent budget bypass) is not.
+
+8. **Capability honesty: claim-vs-behavior parity is the load-bearing invariant.** `capabilities() -> MandateCapabilities` is a contract, not a hint. Backends declaring `supports_revocation=True` MUST observe `revocation_state: revoked` from the persisted representation and surface it via `load_mandate(id).revocation_state`. Backends declaring `supports_external_state_change_notification=True` MUST emit `subscribe`-shape callbacks when the persisted representation changes between loads (out-of-process operator edits); backends without external-change observation (filesystem reference) declare `False` and operators get state-change events only on next agent run. Conformance tests gate capability-specific tests on the flag; backends that lie produce silent failures rather than loud refusals.
+
+The reference `FilesystemMandateBackend` implementation in `atomic_agents/mandate/filesystem.py` is the canonical example of this contract. Future Postgres / SaaS / mobile / Slack-bot adapters should mirror its shape; the conformance suite (`tests/test_mandate_protocol_conformance.py`) parametrizes across every registered backend so the contract is verified by the same tests that pin `list_mandates` / `load_mandate` / `read_state` / `write_state` / `recover_orphan_reservations` / `capabilities` semantics.
+
 ## Out of scope
 
 This spec describes the **what** and the **where**. It does not pin:
 
-- Concrete protocol method signatures beyond what the dataclasses define — refined in the implementation PR
 - LLM-judge prompt templates that reference mandate context — refined in the impl PR
 - Dashboard tab for mandate browsing — separate implementation issue
-- Cross-fleet mandate templates (org-scale standard mandate shapes) — see PolicyBackend (#89) territory; out of scope here
+- Cross-fleet mandate templates (org-scale standard mandate shapes) — see PolicyBackend (#89) territory; **boundary holds** per /office-hours 2026-05-17 decision; PolicyBackend scope-design queued as the next /office-hours target after #124 PR 5 merges
+- Second `MandateBackend` reference impl (SaaS / mobile / Slack-bot) — `FilesystemMandateBackend` is the only reference in v1; adapters slot in via `register_mandate_backend(...)` post-arc (per /office-hours Option 2 decision: ship the Protocol seam, defer alternate impls until concrete user demand surfaces)
 - Auto-detection of mandate-shaped intent in conversation (\"operator just said something that sounds like a mandate, propose adding it\") — operator UX problem, not a framework concern
 - Mandate composition / inheritance beyond project-root vs per-agent — no transitively-inherited mandates from coordinator to delegate beyond the shared project-root file
 
