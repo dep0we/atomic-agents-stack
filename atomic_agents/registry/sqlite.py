@@ -70,6 +70,7 @@ import json
 import sqlite3
 import tempfile
 import threading
+import time
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -347,7 +348,33 @@ class SQLiteToolRegistryBackend:
             # for a cold-start race that should resolve in <50ms once
             # the winning process completes the WAL transition.
             conn.execute("PRAGMA busy_timeout=5000")
-            conn.execute("PRAGMA journal_mode=WAL")
+            # WAL journal mode: concurrent readers don't block writers.
+            # Empirically (#208 + #215), even with busy_timeout set, the
+            # cold-start WAL transition itself is NOT fully covered by
+            # the busy_handler — SQLite's journal-mode switch path can
+            # surface `database is locked` immediately when N threads
+            # race the very first transition on a fresh file. Retry on
+            # SQLITE_BUSY / SQLITE_LOCKED with exponential backoff:
+            # 7 attempts means up to 6 retries sleeping 0.05/0.1/0.2/
+            # 0.4/0.8/1.6s (cumulative ~3.15s of sleep), plus the
+            # busy_timeout wait of up to 5s per attempt. Subsequent
+            # connections see the file already in WAL and return
+            # immediately. Match on `sqlite_errorcode` (Python 3.11+)
+            # rather than message text so a future SQLite wording
+            # change can't silently re-raise legitimate corruption.
+            # Mirrors the #208 fix in `atomic_agents/logs/sqlite.py`.
+            _RECOVERABLE = (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+            for attempt in range(7):
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if (
+                        getattr(exc, "sqlite_errorcode", None) not in _RECOVERABLE
+                        or attempt == 6
+                    ):
+                        raise
+                    time.sleep(0.05 * (2 ** attempt))
             conn.execute("PRAGMA synchronous=NORMAL")
             self._ensure_schema(conn)
             self._tls.conn = conn

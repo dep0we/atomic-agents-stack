@@ -190,6 +190,53 @@ def test_concurrent_schema_init_no_race(tmp_path):
     conn.close()
 
 
+def test_busy_timeout_set_before_wal_pragma(tmp_path):
+    """#215: ``PRAGMA busy_timeout=5000`` MUST be set before the WAL
+    pragma so the cold-start WAL-transition race waits instead of
+    raising ``OperationalError: database is locked``. Same shape as
+    the #208 fix in ``atomic_agents/logs/sqlite.py``; the registry
+    SQLite backend now mirrors the same primitive + retry loop to
+    meet spec/25 MUST #5 (parity with spec/22 MUST #4).
+    """
+    backend = SQLiteToolRegistryBackend(tmp_path / "tools.db", agent_scope="test")
+    backend.list_tools()  # trigger _get_conn
+    conn = backend._get_conn()
+    timeout_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    assert timeout_ms == 5000, (
+        f"busy_timeout must be 5000ms (got {timeout_ms}) — without it, "
+        f"concurrent threads/processes opening a fresh db race the WAL "
+        f"transition and the losers raise OperationalError"
+    )
+
+
+def test_concurrent_schema_init_no_race_under_repeated_runs(tmp_path):
+    """#215 regression: repeat the 16-thread concurrent-init scenario 10
+    times against a fresh db each iteration. With busy_timeout=5000 +
+    retry-on-SQLITE_BUSY/LOCKED on the WAL pragma, all 10 iterations
+    MUST succeed.
+
+    Pre-fix: CI Python 3.11 flaked at this exact scenario. Post-fix:
+    10/10 success matching the #208 SQLiteLogBackend regression test.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    for iteration in range(10):
+        db_path = tmp_path / f"tools_{iteration}.db"
+
+        def init_backend(i: int):
+            b = SQLiteToolRegistryBackend(db_path, agent_scope=f"thread-{i}")
+            return b.list_tools()
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            futures = [pool.submit(init_backend, i) for i in range(16)]
+            results = [f.result() for f in futures]
+
+        assert all(r == [] for r in results), (
+            f"iteration {iteration}: not all threads returned []; "
+            f"WAL race likely surfaced again"
+        )
+
+
 def test_wal_journal_mode_active(tmp_path):
     """File-backed backend MUST enable WAL — verified via PRAGMA probe."""
     db_path = tmp_path / "tools.db"
