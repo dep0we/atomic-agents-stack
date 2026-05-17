@@ -120,6 +120,56 @@ _RECOGNIZED_EXCEPTION_NAMES: frozenset[str] = frozenset(
 
 
 @dataclass(frozen=True)
+class MandateSettings:
+    """Mandate-specific operator config (spec/29 + #124 PR 3a).
+
+    Parsed from ``judges.md`` ``## Mandates`` section. All fields
+    default-fill from the spec/29 documented defaults when the section
+    is absent — operators upgrading from pre-#124 deployments see zero
+    behavior change unless they explicitly add a ``## Mandates`` section.
+
+    Spec/29 amendments (via #213) added several fields ahead of impl;
+    the ones PR 3a consumes are pre-declared here so the implementer
+    doesn't have to extend the dataclass during PR 3a.
+    """
+
+    # Spec/29 §"Suspicious-rebind throttle" — defends against the
+    # source-hash-before-state edit window. Throttle re-binding on
+    # (mandate_id, agent_run_id) for N seconds after MandateCheck
+    # surfaces mandate_state_inconsistent. Default 60s per spec/29.
+    suspicious_rebind_throttle_s: int = 60
+
+    # Spec/29 §"Validation steps" step 5 — target extraction failure mode.
+    # When the per-agent target_extractor registry can't produce a
+    # target_canonical AND the mandate's constraints.allowed_targets is
+    # set, this controls the BLOCK vs ESCALATE choice.
+    unextractable_target_action: Literal["block", "escalate"] = "block"
+
+    # Spec/29 §"Cost reservation pattern" (PR 3b) — reservation TTL in
+    # seconds. PR 3a stores; PR 3b consumes.
+    reservation_ttl_s: int = 60
+
+    # Spec/29 §"Validation steps" budget-breach action defaults — per-
+    # class override (PR 3b). PR 3a stores; PR 3b consumes.
+    cap_breach_action_class_default: dict[str, str] = field(
+        default_factory=lambda: {
+            "external_side_effect": "block",
+            "high_risk": "escalate",
+            "reversible_write": "block",
+        }
+    )
+
+    # Spec/29 §"High-risk lock specification" (PR 4) — lock acquisition
+    # timeout in seconds. PR 3a stores for forward-compat; PR 4 consumes.
+    high_risk_lock_timeout_s: int = 30
+
+    # Doctor toggle — when True, emit check_mandate_no_expiry on
+    # mandates with expires_at == None. Default per spec/29 §"Doctor
+    # integration".
+    no_expiry_warning: bool = True
+
+
+@dataclass(frozen=True)
 class JudgesConfig:
     """Parsed operator config from ``judges.md``.
 
@@ -199,6 +249,17 @@ class JudgesConfig:
     # Operators may author the section now; PR 3b/4's ensemble dispatch
     # consumes it.
     specialist_axes: list[str] = field(default_factory=list)
+
+    # Mandate settings (spec/29 + #124 PR 3a). Operators configure
+    # MandateCheck behavior via judges.md ``## Mandates`` section. Fields
+    # default-fill from spec/29 when the section is absent (zero
+    # operator-action upgrade from pre-#124 deployments). PR 3a consumes
+    # ``suspicious_rebind_throttle_s`` and ``unextractable_target_action``;
+    # PR 3b consumes ``reservation_ttl_s`` and the budget-breach action
+    # defaults; PR 4 consumes ``high_risk_lock_timeout_s``.
+    mandate_settings: "MandateSettings" = field(
+        default_factory=lambda: MandateSettings()
+    )
 
     # Snapshot hashes for centralized policy_version computation
     # (compute_policy_version reads these). Empty string means

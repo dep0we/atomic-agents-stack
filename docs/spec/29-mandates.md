@@ -405,6 +405,27 @@ suspicious_rebind_throttle_s: 60       # default 60; lower to 10 for tight-loop 
 
 When the throttle is active and the actor re-cites the same mandate, `MandateCheck` returns `BLOCK` with reason `mandate_rebind_suspicious_throttled`. A new lifecycle event `mandate_rebind_suspicious_throttled` is emitted (carries `mandate_id`, `agent_run_id`, `original_state_inconsistent_at`, `throttle_expires_at`). The doctor's `check_mandate_rebind_throttle_active` surfaces active throttles for operator awareness — an operator-edited revoke that lands cleanly clears the throttle on next agent run; an operator who sees sustained throttles knows their actor is exhibiting suspicious retry behavior.
 
+**Persistence (load-bearing security property):** throttle state MUST live in the same `MandateBackend.read_state(scope) / write_state(scope, state)` shape as the lifecycle dedup state — under the top-level `"throttles"` key in the state shape. **In-memory-only throttle persistence is forbidden** because a crash-restart loop (which a malicious actor can induce by exhausting a tool's budget or triggering a Python exception) would bypass the throttle, defeating the prompt-injection defense this section was designed to close. Spec/29 PR 3a plan-subagent pressure-test identified this as a SEVERE risk.
+
+The state shape extends per §"Lifecycle event deduplication" below:
+
+```json
+{
+  "schema_version": 1,
+  "scope": "agent:<name>",
+  "mandates": { ... },
+  "throttles": {
+    "<mandate_id>": {
+      "agent_run_id": "...",
+      "expires_at_iso": "2026-05-17T16:32:00Z",
+      "original_state_inconsistent_at": "2026-05-17T16:31:00Z"
+    }
+  }
+}
+```
+
+PR 3a writes `schema_version: 1` with `throttles` present (empty `{}` when no throttle active). PR 3b extends with a separate `"reservation_orphans"` key under the same `schema_version: 1` (backward-compatible additive). Schema bump to 2 only if a field type changes. Operator-edited revoke that lands cleanly removes the corresponding entry from `throttles` on next state read (transition-only dedup logic).
+
 ### Validation step split between PR 3a and PR 3b (implementation discipline)
 
 Per the #124 PR 3 split decision (/office-hours + /plan-eng-review 2026-05-17): PR 3a ships validation steps 1-6 (existence, source hash, state, tool allowlist, target allowlist, time window). PR 3b ships validation steps 7-9 (token budget, external budget, escalation thresholds). **Step 9 belongs in PR 3b** because escalation thresholds operate on the projected costs from steps 7+8 — step 9 cannot evaluate without 7+8 in place. PR 3a stubs steps 7-9 to fail-closed: any mandate with a `*_budget_usd` cap returns `BLOCK` with reason `mandate_budget_check_unavailable` (NOT `mandate_budget_check_unavailable_in_3a` — JSONL audit reasons are forever-stable and MUST NOT leak PR identifiers). The temporary cause is documented in the PR 3a CHANGELOG entry; the reason field stays stable across the eventual 3b unlock.
@@ -446,7 +467,9 @@ If extraction returns `None` and the mandate's `constraints.allowed_targets` is 
 
 **Registry collision discipline**: `agent.register_target_extractor(name, callable)` raises `ValueError` on collision (same `name` already registered). Mirrors `register_tool_registry_backend` precedent — no silent overwrite. Operators replace via explicit `agent.replace_target_extractor(name, callable)`.
 
-**Delegate isolation**: per spec/15, a delegate loads a fresh target vault. The target_extractor registry is a per-agent surface owned by `AgentProfile`; the delegate registers its own extractors (or inherits the project-root defaults). Coordinator-local extractors do NOT flow to the delegate. This matches the tool-permission-non-inheritance discipline from spec/15 and the per-agent backend-scoping pattern from spec/25 Decision 9.
+**Delegate isolation**: per spec/15, a delegate loads a fresh target vault. The target_extractor registry is a per-agent surface owned by `AtomicAgent` (in-memory `self._target_extractors: dict[str, Callable[[dict], str | None]]`) — NOT stored on the `AgentProfile` snapshot (which is JSON-serializable per spec/24 and cannot store `Callable` values). "Per-agent" means *scoped per agent instance*, not *persisted on the agent profile snapshot*. The delegate registers its own extractors (or inherits the project-root defaults at agent construction); coordinator-local extractors do NOT flow to the delegate. This matches the tool-permission-non-inheritance discipline from spec/15 and the per-agent backend-scoping pattern from spec/25 Decision 9.
+
+**Registration order discipline:** the framework MUST register built-in heuristic extractors BEFORE `tool_registry` loading begins in `AtomicAgent.__init__`. Tools whose descriptors reference `target_extractor_id` strings via `ToolDefinition.target_extractor_id` are validated against the registry at `tool_registry.register()` time (loud early failure with `UnknownTargetExtractor` exception). Validating at MandateCheck evaluation time would be a silent fail-closed surface where operators discover at first mandate-citing action that a tool's extractor is missing — too late to be useful. Plan-subagent PR 3a Risk A.
 
 The extracted `target_canonical` is recorded in the proposal at assembly time (per the ActionProposal field below) and surfaces in the JSONL judgment event under `mandate_cite.target_canonical`, so post-hoc audit can verify the target the framework *actually saw* matches the target the operator intended to constrain.
 
@@ -710,6 +733,12 @@ The `mandate_source_hash` field is added to spec/28's `ProposalBinding`-equivale
 ### Source-hash-before-state ordering (tradeoff documentation)
 
 `MandateCheck`'s validation order (step 2 = source hash; step 3 = state) means that when an operator revokes a mandate AND the file changes in the same edit pass, the first action-after-revoke surfaces as `mandate_state_inconsistent` (hash drift), not `mandate_revoked` (state). On the actor's next turn (after the inconsistent block, the actor re-authors with a fresh proposal binding against the new mandate state), the state-based block surfaces as `mandate_revoked` properly. This is a deliberate two-turn surfacing for the compound-failure case: the framework refuses to render a state-based block on stale bytes, because state-from-stale-bytes is misleading. Operators reading audit logs see both events — the inconsistent block on the first turn and the revoked block on the second. The doctor's `check_mandate_state_inconsistent_followed_by_revoked` flags this sequence so audit readers know it's the same operator action, not two separate events.
+
+**Clarification — `source_hash` covers file content only, NOT derived EXPIRED state.** `source_hash` is computed over the canonical mandates.md section bytes (per `MandateBackend.load_mandate` MUST #4). The framework derives `EXPIRED` state at load time from `expires_at < now` without editing `mandates.md`. Therefore: when a mandate's `expires_at` tips past `now` between proposal binding (T-1s) and judgment (T+1s) with no file change, step 2 (source hash) passes (hash matches; bytes unchanged) AND step 3 (state) BLOCKs with `mandate_expired` (derived state reads EXPIRED on the fresh load). This is correct behavior: hash equality covers operator-visible state; clock-driven expiry surfaces via step 3 independently. Plan-subagent PR 3a Risk H — explicit rationale added so PR 3a tests pin this timeline (bind at T-1s, judge at T+1s, assert step 2 ALLOW + step 3 BLOCK).
+
+### Concurrent state writes — eventual-consistency boundary
+
+The lifecycle event dedup pattern (`read_state → compute transitions → write_state`) is a read-modify-write that the `MandateBackend` Protocol does NOT atomically guard at the protocol level. Within a single agent process, PR 3a serializes via a `threading.Lock` on the `MandateCheck` instance's per-scope state computation (cheap; matches the framework's "JSONL append is atomic enough" pattern). Across agent processes sharing a project-root mandate, concurrent state writes can race — one transition may be lost. This is documented as an eventual-consistency limitation; the doctor's `check_mandate_state_inconsistent_followed_by_revoked` surfaces sequences where a later read recovers the missed transition. Operators needing strict cross-process atomicity at the state-file layer must use a SQL-backed `MandateBackend` (post-#124 arc) or accept the limitation. Plan-subagent PR 3a Risk D.
 
 ## Operator CLI
 

@@ -238,6 +238,21 @@ class ActionProposal:
     rollback_path: str | None = None
     target_audience: str | None = None  # "internal" | "external:<surface>"
 
+    # Framework-extracted at proposal-assembly time per spec/29 §"Target
+    # extraction" (#124 PR 3a prep). The framework invokes the agent's
+    # per-agent target_extractor registry against the proposal's
+    # `tool_arguments` to populate this; the actor CANNOT supply or
+    # influence it. Distinct from `target_audience` (actor-supplied
+    # privacy surface) — the two fields exist for different concerns:
+    # `target_audience` is the privacy judge's input; `target_canonical`
+    # is the mandate layer's binding target. Nullable: tools without a
+    # registered extractor / heuristic-extractable target get None.
+    # NOT part of `proposal_binding` hash — `MandateCheck` re-extracts
+    # at execution time and the proposal records what was seen for audit
+    # (per spec/29 §"`ActionProposal` field extension"). `ProposalAmendment`
+    # does NOT include this field — framework-owned end-to-end.
+    target_canonical: str | None = None
+
 
 @dataclass(frozen=True)
 class ProposalAmendment:
