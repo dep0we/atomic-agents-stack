@@ -75,7 +75,16 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    # TargetExtractorRegistry is imported only for type-checking (and for the
+    # inline isinstance check in ToolRegistry.register). The actual class is
+    # imported lazily inside the method body to avoid a circular import:
+    # tools.py → judge/target_extractor_registry.py → exceptions.py is fine,
+    # but the string annotation in the method signature stays safe via
+    # TYPE_CHECKING + ``from __future__ import annotations``.
+    from .judge.target_extractor_registry import TargetExtractorRegistry
 
 from .exceptions import ToolHandlerError, ToolInputInvalid, ToolNameCollision, ToolNotRegistered
 
@@ -126,6 +135,42 @@ class ToolDefinition:
             ``## Tool classification`` section; if no entry there
             either, the proposal-assembly path defaults to
             ``external_side_effect`` per spec/28's safe default.
+        target_extractor_id: Optional string ID naming a per-agent
+            target extractor registered on the agent's
+            ``TargetExtractorRegistry`` (spec/29 §"Target extraction",
+            #124 PR 3a). The framework invokes the named callable at
+            proposal-assembly time against the tool's ``tool_arguments``
+            to populate ``ActionProposal.target_canonical``, which
+            ``MandateCheck`` step 5 reads to enforce
+            ``constraints.allowed_targets`` / ``blocked_targets``.
+
+            Stored as a string (not a ``Callable``) so this field can
+            round-trip through spec/25 Tier B structured-storage
+            backends (SQLite catalog, future PyPI / git / database
+            catalogs) that cannot store ``Callable`` values per spec/25
+            MUST #4. The named extractor is registered on the per-agent
+            ``TargetExtractorRegistry``; the string ID is the durable
+            cross-layer contract. Validated at ``ToolRegistry.register()``
+            time against the agent's registry (loud early failure per
+            spec/29 §"Registration order discipline").
+
+            When ``None`` (default), the framework applies built-in
+            heuristic extractors (``recipient_to``, ``recipient_field``,
+            etc.) in priority order at proposal-assembly time. Built-in
+            heuristics are sufficient for tools whose argument shape uses
+            conventional field names; custom extractors are for tools
+            with non-standard shapes.
+
+            NOTE: Validation against the agent's ``TargetExtractorRegistry``
+            requires the registry reference to be passed to
+            ``ToolRegistry.register()`` via the ``target_extractor_registry``
+            kwarg. When the kwarg is absent (e.g., programmatic callers
+            that don't wire the mandate layer), the validation is skipped
+            and the field is accepted as-is. The agent's ``__init__``
+            always passes the registry kwarg (spec/29 §"Registration
+            order discipline"). See spec/25 — spec/25 will be amended in
+            PR 5 to document this field alongside the other ToolDefinition
+            descriptor fields.
     """
 
     name: str
@@ -133,6 +178,7 @@ class ToolDefinition:
     input_schema: dict
     handler: Callable[[dict], Any]
     classification: str | None = None
+    target_extractor_id: str | None = None
 
 
 @dataclass
@@ -171,7 +217,13 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, ToolDefinition] = {}
 
-    def register(self, tool: ToolDefinition, *, allow_overwrite: bool = False) -> None:
+    def register(
+        self,
+        tool: ToolDefinition,
+        *,
+        allow_overwrite: bool = False,
+        target_extractor_registry: "TargetExtractorRegistry | None" = None,
+    ) -> None:
         """Register a tool.
 
         By default, raises ToolNameCollision if a tool with the same name is
@@ -182,9 +234,32 @@ class ToolRegistry:
         server named ``foo`` whose tool is named ``bar`` — surface loudly at
         startup rather than silently winning.
 
+        When ``target_extractor_registry`` is passed (i.e., the mandate layer
+        is wired — the agent's ``__init__`` always passes it per spec/29
+        §"Registration order discipline"), validates
+        ``tool.target_extractor_id`` against the registry at registration time.
+        Unknown IDs raise ``UnknownTargetExtractor`` immediately — loud early
+        failure surfaces misconfiguration BEFORE first mandate-citing dispatch.
+        When the kwarg is absent (programmatic callers that don't wire the
+        mandate layer), the validation is skipped.
+
+        Args:
+            tool: The ``ToolDefinition`` to register.
+            allow_overwrite: When ``True``, silently replaces an existing tool
+                with the same name. Default ``False``.
+            target_extractor_registry: Optional per-agent
+                ``TargetExtractorRegistry`` used to validate
+                ``tool.target_extractor_id`` at registration time per spec/29
+                §"Registration order discipline". When ``None``, validation is
+                skipped (backward-compatible for callers that don't wire the
+                mandate layer).
+
         Raises:
             ToolNameCollision: tool name already in registry and allow_overwrite
                 is False.
+            ValueError: tool has an invalid ``classification`` value.
+            UnknownTargetExtractor: ``tool.target_extractor_id`` is set and
+                not registered in ``target_extractor_registry``.
         """
         if not allow_overwrite and tool.name in self._tools:
             raise ToolNameCollision(
@@ -205,6 +280,29 @@ class ToolRegistry:
                 f"Tool {tool.name!r} has invalid classification "
                 f"{tool.classification!r}. Must be one of: "
                 f"read_only, reversible_write, external_side_effect, high_risk."
+            )
+        # Fail-fast target_extractor_id validation (spec/29 §"Registration
+        # order discipline", #124 PR 3a). Built-in heuristic extractors are
+        # pre-registered BEFORE tool_registry loading in AtomicAgent.__init__,
+        # so an operator-configured target_extractor_id that references a
+        # missing extractor surfaces HERE (at register time) instead of
+        # silently fail-closing at MandateCheck evaluation time (plan-subagent
+        # Risk A). Validation is skipped when target_extractor_registry is
+        # absent for backward compatibility with programmatic callers that
+        # don't wire the mandate layer.
+        if (
+            tool.target_extractor_id is not None
+            and target_extractor_registry is not None
+            and not target_extractor_registry.has(tool.target_extractor_id)
+        ):
+            from .judge.target_extractor_registry import UnknownTargetExtractor
+            raise UnknownTargetExtractor(
+                f"Tool {tool.name!r} declares target_extractor_id "
+                f"{tool.target_extractor_id!r} which is not registered in the "
+                f"agent's TargetExtractorRegistry. Register it via "
+                f"agent.register_target_extractor({tool.target_extractor_id!r}, fn) "
+                f"BEFORE registering this tool, or use one of the built-in "
+                f"extractors: {target_extractor_registry.list_names()}"
             )
         self._tools[tool.name] = tool
         _logger.debug("registered tool %r", tool.name)

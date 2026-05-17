@@ -330,6 +330,7 @@ def parse_judges_md(path: Path | None) -> JudgesConfig | None:
         specialist_axes=cfg.specialist_axes,
         validation=cfg.validation,
         validation_source=cfg.validation_source,
+        mandate_settings=cfg.mandate_settings,
         tools_md_hash=cfg.tools_md_hash,
         judges_md_hash=judges_md_hash,
         source_path=str(path),
@@ -340,12 +341,30 @@ def parse_judges_md_text(text: str) -> JudgesConfig:
     """Parse in-memory ``judges.md`` text. Useful for cascade-merged
     content. Raises ``JudgePolicyInvalid`` on malformed content.
 
-    Embedded-YAML shape: every config block lives inside a ```` ```yaml ````
-    fenced block. Operators may have multiple such blocks; we merge
-    them in document order with later blocks winning on per-key
-    conflicts (matches the precedent in ``_model.py``'s
-    ``cost_guardrails`` parser).
+    Two config shapes co-exist:
+
+    1. **Fenced YAML blocks** (legacy, first-class) — every config block
+       lives inside a ```` ```yaml ```` fenced block. Operators may have
+       multiple such blocks; we merge them in document order with later
+       blocks winning on per-key conflicts (matches the precedent in
+       ``_model.py``'s ``cost_guardrails`` parser).
+
+    2. **Named sections** (spec/29 + #124 PR 3a) — ``## <SectionName>``
+       headings introduce a section whose body is parsed as inline YAML
+       (no fence markers). Recognized sections: ``Mandates``. Unknown
+       section headings are silently ignored (operator-authored headings
+       for prose / TOC are fine). The ``## Mandates`` section body is
+       plain YAML — the operator writes field:value lines directly under
+       the heading rather than inside a fenced block.
     """
+    # ── Pass 1: extract inline ``## Mandates`` section body ──────────
+    # Split by ``## `` headings to find the Mandates section body.
+    # The body runs from the heading line's end to the next ``## ``
+    # heading or EOF. Fenced YAML blocks INSIDE a section body are NOT
+    # double-parsed here — they go through the fenced-block pass below.
+    mandates_section_body: str | None = _extract_named_section(text, "Mandates")
+
+    # ── Pass 2: fenced ```yaml blocks (existing path) ────────────────
     parsed_blocks: list[dict[str, Any]] = []
     for block in re.findall(r"```yaml\s*\n(.*?)```", text, re.DOTALL):
         try:
@@ -383,6 +402,9 @@ def parse_judges_md_text(text: str) -> JudgesConfig:
     specialist_axes = _parse_specialist_axes(merged.get("specialist_composition"))
     validation, validation_source = _parse_validation(merged.get("validation"))
 
+    # ── Pass 3: parse named sections ─────────────────────────────────
+    mandate_settings = _parse_mandates_section(mandates_section_body)
+
     return JudgesConfig(
         default_backend=default_backend,
         default_model=default_model,
@@ -396,6 +418,7 @@ def parse_judges_md_text(text: str) -> JudgesConfig:
         specialist_axes=specialist_axes,
         validation=validation,
         validation_source=validation_source,
+        mandate_settings=mandate_settings,
     )
 
 
@@ -480,6 +503,46 @@ def apply_project_floor(
             "floor" if floor.validation_source == "judges.md" else floor.validation_source
         )
 
+    # ── mandate_settings cascade-merge ───────────────────────────────
+    # Spec/29 §"judges.md integration" documents the ## Mandates section
+    # shape but does NOT pin the cascade-merge direction for each field.
+    # The merge discipline below defaults to "floor-wins where stricter;
+    # own-wins where ambiguous." PR 5 / spec/29 amendment should lock
+    # the merge direction once the mandate arc is complete.
+    #
+    # Field-by-field merge rationale (document for PR 5 input):
+    #
+    # suspicious_rebind_throttle_s: floor's HIGHER value wins.
+    #   Longer throttle is safer (harder to re-bind on an inconsistent
+    #   mandate); a delegate that set a shorter throttle must not be
+    #   allowed to weaken the project floor's window.
+    #
+    # unextractable_target_action: if floor is "block", floor wins.
+    #   "block" is stricter than "escalate" — floor-wins when stricter.
+    #   If both are "escalate" or floor is "escalate", delegate's value
+    #   is used (owns the escalation routing for its own mandates).
+    #
+    # reservation_ttl_s: floor's LOWER value wins.
+    #   A shorter TTL frees reserved budget faster, reducing the window
+    #   in which an abandoned reservation holds capacity hostage.
+    #   Spec/29 doesn't pin direction; "shorter is safer from budget-
+    #   overrun perspective" is the conservative read. PR 5 to confirm.
+    #
+    # high_risk_lock_timeout_s: floor's HIGHER value wins.
+    #   More time to acquire the lock reduces spurious BLOCK on contention
+    #   while remaining under operator control. Floor's higher value
+    #   ensures the project-wide minimum lock patience is respected.
+    #
+    # no_expiry_warning: floor-wins if floor is True (more conservative).
+    #   The doctor emits check_mandate_no_expiry when True. A floor that
+    #   opts into the warning must not be silenced by a delegate omitting
+    #   or disabling it.
+    #
+    # cap_breach_action_class_default: per-class merge with floor-wins.
+    #   "block" is stricter than "escalate". For each per-class entry,
+    #   if floor's value is "block" and own's is "escalate", floor wins.
+    merged_mandate_settings = _merge_mandate_settings(own.mandate_settings, floor.mandate_settings)
+
     return JudgesConfig(
         default_backend=own.default_backend or floor.default_backend,
         default_model=own.default_model or floor.default_model,
@@ -502,6 +565,7 @@ def apply_project_floor(
         specialist_axes=own.specialist_axes or floor.specialist_axes,
         validation=resolved_validation,
         validation_source=resolved_validation_source,
+        mandate_settings=merged_mandate_settings,
         tools_md_hash=own.tools_md_hash,
         judges_md_hash=own.judges_md_hash,
         source_path=own.source_path,
@@ -564,6 +628,7 @@ def load_judges_config(
         specialist_axes=merged.specialist_axes,
         validation=merged.validation,
         validation_source=merged.validation_source,
+        mandate_settings=merged.mandate_settings,
         tools_md_hash=tools_md_hash,
         judges_md_hash=merged.judges_md_hash,
         source_path=merged.source_path,
@@ -984,6 +1049,259 @@ def _check_jsonschema_importable() -> None:
             "``uv sync --extra validation`` for uv-managed projects). "
             f"Underlying import error: {exc}"
         ) from exc
+
+
+# ──────────────────────────────────────────────────────────────────
+# Named-section helpers (## Mandates, spec/29 §"judges.md integration")
+
+
+_SECTION_HEADING_RE = re.compile(r"^## (.+)$", re.MULTILINE)
+
+
+def _extract_named_section(text: str, section_name: str) -> str | None:
+    """Extract the body of a named ``## <section_name>`` section.
+
+    Searches ``text`` for a line matching ``## <section_name>`` (exact
+    case). Returns the text between that heading and the next ``## ``
+    heading (or EOF), stripped. Returns ``None`` when the section is not
+    found.
+
+    Unknown section headings are silently ignored — operators may author
+    ``## Notes`` or ``## Overview`` prose sections in their ``judges.md``
+    without triggering an error.
+
+    The returned body may still contain fenced ```yaml blocks; callers
+    that want plain inline YAML should expect only the non-fenced content.
+    The ``## Mandates`` body in spec/29 is inline (no fence markers), so
+    the full body string is passed directly to ``yaml.safe_load``.
+    """
+    matches = list(_SECTION_HEADING_RE.finditer(text))
+    for i, match in enumerate(matches):
+        heading = match.group(1).strip()
+        if heading != section_name:
+            continue
+        body_start = match.end()
+        body_end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        body = text[body_start:body_end].strip()
+        return body if body else ""
+    return None
+
+
+def _parse_mandates_section(body: str | None) -> MandateSettings:
+    """Parse the ``## Mandates`` section body into a ``MandateSettings``.
+
+    The body is inline YAML (no fenced code block) per spec/29
+    §"judges.md integration" line 661. All fields are optional; missing
+    fields fall back to the ``MandateSettings`` dataclass defaults
+    (spec/29-documented defaults).
+
+    When ``body`` is ``None`` (section absent from the file), returns a
+    default-constructed ``MandateSettings()`` — operators upgrading from
+    pre-#124 deployments see zero behavior change.
+
+    When ``body`` is an empty string (heading present, body empty),
+    returns ``MandateSettings()`` defaults with no error — same as absent.
+
+    Validation:
+    - ``unextractable_target_action`` must be ``"block"`` or
+      ``"escalate"`` (spec/29 line 367). Other values raise
+      ``JudgePolicyInvalid``.
+    - ``suspicious_rebind_throttle_s``, ``reservation_ttl_s``, and
+      ``high_risk_lock_timeout_s`` must be non-negative integers
+      (delegated to ``_coerce_int``).
+    - ``no_expiry_warning`` must be a boolean; non-bool values raise
+      ``JudgePolicyInvalid``.
+    - ``cap_breach_action_class_default`` must be a mapping when present;
+      non-mapping values raise ``JudgePolicyInvalid``.
+    """
+    if body is None or not body.strip():
+        return MandateSettings()
+
+    try:
+        raw = yaml.safe_load(body)
+    except yaml.YAMLError as exc:
+        raise JudgePolicyInvalid(
+            f"judges.md ``## Mandates`` section contains invalid YAML: {exc}"
+        ) from exc
+
+    if raw is None:
+        return MandateSettings()
+    if not isinstance(raw, dict):
+        raise JudgePolicyInvalid(
+            f"judges.md ``## Mandates`` section must be a YAML mapping; "
+            f"got {type(raw).__name__}"
+        )
+
+    # suspicious_rebind_throttle_s — spec/29 §"Suspicious-rebind throttle"
+    # default 60s per spec/29 line 398.
+    suspicious_rebind_throttle_s = _coerce_int(
+        raw.get("suspicious_rebind_throttle_s"),
+        default=60,
+        field_label="Mandates.suspicious_rebind_throttle_s",
+    )
+    if suspicious_rebind_throttle_s == 0:
+        raise JudgePolicyInvalid(
+            "judges.md ``Mandates.suspicious_rebind_throttle_s`` must be "
+            "a positive integer (> 0); got 0. A zero throttle disables the "
+            "re-bind defense entirely (spec/29 §'Suspicious-rebind throttle')."
+        )
+
+    # unextractable_target_action — spec/29 §"Validation steps" step 5
+    # (line 366). Default "block" per spec/29.
+    raw_uta = raw.get("unextractable_target_action")
+    if raw_uta is None:
+        unextractable_target_action: str = "block"
+    else:
+        if not isinstance(raw_uta, str):
+            raise JudgePolicyInvalid(
+                f"judges.md ``Mandates.unextractable_target_action`` must be "
+                f"a string (\"block\" or \"escalate\"); got "
+                f"{type(raw_uta).__name__}={raw_uta!r}"
+            )
+        unextractable_target_action = raw_uta.lower().strip()
+        if unextractable_target_action not in ("block", "escalate"):
+            raise JudgePolicyInvalid(
+                f"judges.md ``Mandates.unextractable_target_action`` must be "
+                f"\"block\" or \"escalate\" (spec/29 line 367); got "
+                f"{raw_uta!r}"
+            )
+
+    # reservation_ttl_s — spec/29 §"Cost reservation pattern" (PR 3b).
+    # Default 60s per spec/29 line 668. Stored by PR 3a; consumed by PR 3b.
+    reservation_ttl_s = _coerce_int(
+        raw.get("reservation_ttl_s"),
+        default=60,
+        field_label="Mandates.reservation_ttl_s",
+    )
+    if reservation_ttl_s == 0:
+        raise JudgePolicyInvalid(
+            "judges.md ``Mandates.reservation_ttl_s`` must be a positive "
+            "integer (> 0); got 0. A zero TTL makes every reservation "
+            "immediately expired (spec/29 §'Cost reservation pattern')."
+        )
+
+    # high_risk_lock_timeout_s — spec/29 §"High-risk lock specification"
+    # (PR 4). Default 30s per spec/29 line 601. Stored here; consumed by PR 4.
+    high_risk_lock_timeout_s = _coerce_int(
+        raw.get("high_risk_lock_timeout_s"),
+        default=30,
+        field_label="Mandates.high_risk_lock_timeout_s",
+    )
+    if high_risk_lock_timeout_s == 0:
+        raise JudgePolicyInvalid(
+            "judges.md ``Mandates.high_risk_lock_timeout_s`` must be a "
+            "positive integer (> 0); got 0. A zero timeout makes every "
+            "high-risk lock acquisition immediately fail "
+            "(spec/29 §'High-risk lock specification')."
+        )
+
+    # no_expiry_warning — spec/29 §"Doctor integration" (line 674).
+    # Default True per spec/29. Doctor emits check_mandate_no_expiry when True.
+    raw_new = raw.get("no_expiry_warning")
+    if raw_new is None:
+        no_expiry_warning = True
+    elif not isinstance(raw_new, bool):
+        raise JudgePolicyInvalid(
+            f"judges.md ``Mandates.no_expiry_warning`` must be a boolean "
+            f"(true/false); got {type(raw_new).__name__}={raw_new!r}"
+        )
+    else:
+        no_expiry_warning = raw_new
+
+    # cap_breach_action_class_default — spec/29 §"Validation steps" budget-
+    # breach action defaults (PR 3b). Default per spec/29 line 669-672.
+    # Stored by PR 3a; consumed by PR 3b.
+    raw_cbac = raw.get("cap_breach_action_class_default")
+    if raw_cbac is None:
+        cap_breach_action_class_default = {
+            "external_side_effect": "block",
+            "high_risk": "escalate",
+            "reversible_write": "block",
+        }
+    else:
+        if not isinstance(raw_cbac, dict):
+            raise JudgePolicyInvalid(
+                f"judges.md ``Mandates.cap_breach_action_class_default`` "
+                f"must be a mapping; got {type(raw_cbac).__name__}"
+            )
+        cap_breach_action_class_default = dict(raw_cbac)
+
+    return MandateSettings(
+        suspicious_rebind_throttle_s=suspicious_rebind_throttle_s,
+        unextractable_target_action=unextractable_target_action,  # type: ignore[arg-type]
+        reservation_ttl_s=reservation_ttl_s,
+        high_risk_lock_timeout_s=high_risk_lock_timeout_s,
+        no_expiry_warning=no_expiry_warning,
+        cap_breach_action_class_default=cap_breach_action_class_default,
+    )
+
+
+def _merge_mandate_settings(
+    own: MandateSettings,
+    floor: MandateSettings,
+) -> MandateSettings:
+    """Cascade-merge two ``MandateSettings`` with floor-wins-where-stricter.
+
+    Called from ``apply_project_floor`` when both delegate and project floor
+    have a ``mandate_settings``. The merge direction per field is documented
+    in the ``apply_project_floor`` comment block and in the inline rationale
+    below. Spec/29 does not pin the cascade-merge direction; these choices
+    default to "floor-wins where stricter" and are documented for PR 5 /
+    spec/29 amendment input.
+
+    Floor-wins rules:
+    - ``suspicious_rebind_throttle_s``: max (longer throttle is safer).
+    - ``unextractable_target_action``: "block" beats "escalate" (stricter).
+    - ``reservation_ttl_s``: min (shorter TTL is safer; reduces budget-hold
+      window; PR 5 should confirm this direction).
+    - ``high_risk_lock_timeout_s``: max (more time to acquire lock;
+      project floor's patience is a minimum guarantee).
+    - ``no_expiry_warning``: True beats False (floor's opt-in to the
+      doctor warning must not be silenced by a delegate).
+    - ``cap_breach_action_class_default``: per-class floor-wins where
+      floor is "block" and own is "escalate"; own wins otherwise.
+    """
+    # suspicious_rebind_throttle_s: floor's HIGHER value wins (longer = safer).
+    merged_throttle = max(own.suspicious_rebind_throttle_s, floor.suspicious_rebind_throttle_s)
+
+    # unextractable_target_action: "block" is stricter than "escalate";
+    # floor's "block" overrides delegate's "escalate" (floor-wins where stricter).
+    if floor.unextractable_target_action == "block":
+        merged_uta = "block"
+    else:
+        merged_uta = own.unextractable_target_action
+
+    # reservation_ttl_s: floor's LOWER value wins (shorter TTL frees budget
+    # faster; conservative read per "floor-wins where stricter" discipline).
+    # PR 5 to confirm direction per spec/29.
+    merged_ttl = min(own.reservation_ttl_s, floor.reservation_ttl_s)
+
+    # high_risk_lock_timeout_s: floor's HIGHER value wins (more lock patience
+    # is the floor's guarantee; delegate cannot undercut it).
+    merged_lock = max(own.high_risk_lock_timeout_s, floor.high_risk_lock_timeout_s)
+
+    # no_expiry_warning: True beats False (floor's opt-in must not be silenced).
+    merged_no_expiry = own.no_expiry_warning or floor.no_expiry_warning
+
+    # cap_breach_action_class_default: per-class floor-wins where floor is "block".
+    merged_cbac: dict[str, str] = dict(own.cap_breach_action_class_default)
+    for class_name, floor_action in floor.cap_breach_action_class_default.items():
+        own_action = merged_cbac.get(class_name)
+        if floor_action == "block" and own_action == "escalate":
+            # Floor's stricter "block" overrides delegate's "escalate".
+            merged_cbac[class_name] = "block"
+        elif class_name not in merged_cbac:
+            # Delegate didn't specify this class; inherit from floor.
+            merged_cbac[class_name] = floor_action
+
+    return MandateSettings(
+        suspicious_rebind_throttle_s=merged_throttle,
+        unextractable_target_action=merged_uta,  # type: ignore[arg-type]
+        reservation_ttl_s=merged_ttl,
+        high_risk_lock_timeout_s=merged_lock,
+        no_expiry_warning=merged_no_expiry,
+        cap_breach_action_class_default=merged_cbac,
+    )
 
 
 def _parse_validation(raw: Any) -> tuple[str, str]:

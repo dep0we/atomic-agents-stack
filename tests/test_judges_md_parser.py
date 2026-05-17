@@ -31,6 +31,7 @@ from atomic_agents.judge.types import (
 )
 from atomic_agents.judges_md import (
     JudgesConfig,
+    MandateSettings,
     apply_project_floor,
     load_judges_config,
     parse_judges_md,
@@ -970,3 +971,270 @@ class TestValidationFloor:
         delegate = parse_judges_md_text("```yaml\nbackend: rules\n```\n")
         merged = apply_project_floor(delegate, floor)
         assert merged.validation_source == "floor"
+
+
+# ──────────────────────────────────────────────────────────────────
+# ## Mandates section (spec/29 §"judges.md integration", #124 PR 3a)
+
+
+class TestMandatesSection:
+    """``## Mandates`` section in ``judges.md``. Inline YAML (no fenced
+    block) per spec/29 §"judges.md integration" line 661. All fields
+    default-fill from the ``MandateSettings`` dataclass defaults when the
+    section is absent — zero behavior change for pre-#124 deployments.
+    """
+
+    def test_parse_judges_md_without_mandates_section_uses_defaults(self):
+        # Backward-compat: no ## Mandates section → MandateSettings defaults.
+        cfg = parse_judges_md_text(
+            "```yaml\n"
+            "backend: rules\n"
+            "```\n"
+        )
+        assert cfg.mandate_settings == MandateSettings()
+        assert cfg.mandate_settings.suspicious_rebind_throttle_s == 60
+        assert cfg.mandate_settings.unextractable_target_action == "block"
+        assert cfg.mandate_settings.reservation_ttl_s == 60
+        assert cfg.mandate_settings.high_risk_lock_timeout_s == 30
+        assert cfg.mandate_settings.no_expiry_warning is True
+        assert cfg.mandate_settings.cap_breach_action_class_default == {
+            "external_side_effect": "block",
+            "high_risk": "escalate",
+            "reversible_write": "block",
+        }
+
+    def test_parse_judges_md_with_mandates_section_all_fields(self):
+        # All fields supplied → populated correctly.
+        text = (
+            "```yaml\n"
+            "backend: rules\n"
+            "```\n"
+            "\n"
+            "## Mandates\n"
+            "\n"
+            "reservation_ttl_s: 120\n"
+            "suspicious_rebind_throttle_s: 90\n"
+            "unextractable_target_action: escalate\n"
+            "no_expiry_warning: false\n"
+            "high_risk_lock_timeout_s: 45\n"
+            "cap_breach_action_class_default:\n"
+            "  external_side_effect: escalate\n"
+            "  high_risk: block\n"
+            "  reversible_write: escalate\n"
+        )
+        cfg = parse_judges_md_text(text)
+        ms = cfg.mandate_settings
+        assert ms.reservation_ttl_s == 120
+        assert ms.suspicious_rebind_throttle_s == 90
+        assert ms.unextractable_target_action == "escalate"
+        assert ms.no_expiry_warning is False
+        assert ms.high_risk_lock_timeout_s == 45
+        assert ms.cap_breach_action_class_default == {
+            "external_side_effect": "escalate",
+            "high_risk": "block",
+            "reversible_write": "escalate",
+        }
+
+    def test_parse_mandates_section_partial_fields_fallback_to_defaults(self):
+        # Only some fields set → others fall back to MandateSettings defaults.
+        text = (
+            "## Mandates\n"
+            "\n"
+            "suspicious_rebind_throttle_s: 30\n"
+        )
+        cfg = parse_judges_md_text(text)
+        ms = cfg.mandate_settings
+        assert ms.suspicious_rebind_throttle_s == 30
+        # Defaults for everything else.
+        assert ms.reservation_ttl_s == 60
+        assert ms.unextractable_target_action == "block"
+        assert ms.high_risk_lock_timeout_s == 30
+        assert ms.no_expiry_warning is True
+
+    def test_parse_mandates_section_spec29_example_shape(self):
+        # Reproduce the exact spec/29 §"judges.md integration" example
+        # (line 666-674).
+        text = (
+            "## Mandates\n"
+            "\n"
+            "reservation_ttl_s: 60\n"
+            "cap_breach_action_class_default:\n"
+            "  external_side_effect: block\n"
+            "  high_risk: escalate\n"
+            "  reversible_write: block\n"
+            "unextractable_target_action: block\n"
+            "no_expiry_warning: true\n"
+        )
+        cfg = parse_judges_md_text(text)
+        ms = cfg.mandate_settings
+        assert ms.reservation_ttl_s == 60
+        assert ms.unextractable_target_action == "block"
+        assert ms.no_expiry_warning is True
+        assert ms.cap_breach_action_class_default == {
+            "external_side_effect": "block",
+            "high_risk": "escalate",
+            "reversible_write": "block",
+        }
+
+    def test_parse_mandates_section_invalid_unextractable_target_action(self):
+        # Value outside {block, escalate} raises JudgePolicyInvalid.
+        text = (
+            "## Mandates\n"
+            "\n"
+            "unextractable_target_action: allow\n"
+        )
+        with pytest.raises(JudgePolicyInvalid, match="block.*escalate|escalate.*block"):
+            parse_judges_md_text(text)
+
+    def test_parse_mandates_section_invalid_throttle_zero(self):
+        # Zero throttle disables the re-bind defense; refused at parse time.
+        text = (
+            "## Mandates\n"
+            "\n"
+            "suspicious_rebind_throttle_s: 0\n"
+        )
+        with pytest.raises(JudgePolicyInvalid, match="suspicious_rebind_throttle_s"):
+            parse_judges_md_text(text)
+
+    def test_parse_mandates_section_invalid_throttle_negative(self):
+        # Negative value is refused by _coerce_int (>= 0 check).
+        text = (
+            "## Mandates\n"
+            "\n"
+            "suspicious_rebind_throttle_s: -5\n"
+        )
+        with pytest.raises(JudgePolicyInvalid, match=">= 0"):
+            parse_judges_md_text(text)
+
+    def test_parse_mandates_section_invalid_reservation_ttl_zero(self):
+        text = (
+            "## Mandates\n"
+            "\n"
+            "reservation_ttl_s: 0\n"
+        )
+        with pytest.raises(JudgePolicyInvalid, match="reservation_ttl_s"):
+            parse_judges_md_text(text)
+
+    def test_parse_mandates_section_no_expiry_warning_must_be_bool(self):
+        text = (
+            "## Mandates\n"
+            "\n"
+            "no_expiry_warning: yes_please\n"
+        )
+        with pytest.raises(JudgePolicyInvalid, match="no_expiry_warning.*bool"):
+            parse_judges_md_text(text)
+
+    def test_parse_mandates_section_cap_breach_must_be_mapping(self):
+        text = (
+            "## Mandates\n"
+            "\n"
+            "cap_breach_action_class_default: block\n"
+        )
+        with pytest.raises(JudgePolicyInvalid, match="cap_breach_action_class_default.*mapping"):
+            parse_judges_md_text(text)
+
+    def test_mandates_section_coexists_with_fenced_yaml_blocks(self):
+        # Both config paths are active in the same file — fenced blocks
+        # handle existing fields; ## Mandates handles mandate fields.
+        text = (
+            "```yaml\n"
+            "backend: llm\n"
+            "timeout_ms: 8000\n"
+            "```\n"
+            "\n"
+            "## Mandates\n"
+            "\n"
+            "suspicious_rebind_throttle_s: 120\n"
+            "unextractable_target_action: escalate\n"
+        )
+        cfg = parse_judges_md_text(text)
+        assert cfg.default_backend == "llm"
+        assert cfg.timeout_ms == 8000
+        assert cfg.mandate_settings.suspicious_rebind_throttle_s == 120
+        assert cfg.mandate_settings.unextractable_target_action == "escalate"
+
+    def test_mandates_section_empty_body_uses_defaults(self):
+        # Heading present but body empty → defaults.
+        text = (
+            "## Mandates\n"
+            "\n"
+            "## SomeOtherSection\n"
+            "\n"
+            "Prose here.\n"
+        )
+        cfg = parse_judges_md_text(text)
+        assert cfg.mandate_settings == MandateSettings()
+
+    def test_apply_project_floor_mandate_settings_cascade(self):
+        # Floor-wins discipline: stricter values from the project floor
+        # override the delegate's more permissive values.
+        floor_text = (
+            "## Mandates\n"
+            "\n"
+            "suspicious_rebind_throttle_s: 120\n"
+            "unextractable_target_action: block\n"
+            "reservation_ttl_s: 30\n"
+            "high_risk_lock_timeout_s: 60\n"
+            "no_expiry_warning: true\n"
+            "cap_breach_action_class_default:\n"
+            "  external_side_effect: block\n"
+            "  high_risk: block\n"
+            "  reversible_write: block\n"
+        )
+        delegate_text = (
+            "## Mandates\n"
+            "\n"
+            "suspicious_rebind_throttle_s: 60\n"
+            "unextractable_target_action: escalate\n"
+            "reservation_ttl_s: 90\n"
+            "high_risk_lock_timeout_s: 30\n"
+            "no_expiry_warning: false\n"
+            "cap_breach_action_class_default:\n"
+            "  external_side_effect: escalate\n"
+            "  high_risk: escalate\n"
+            "  reversible_write: escalate\n"
+        )
+        floor = parse_judges_md_text(floor_text)
+        delegate = parse_judges_md_text(delegate_text)
+        merged = apply_project_floor(delegate, floor)
+        ms = merged.mandate_settings
+
+        # suspicious_rebind_throttle_s: max(60, 120) = 120 (floor's higher wins)
+        assert ms.suspicious_rebind_throttle_s == 120
+        # unextractable_target_action: floor's "block" overrides delegate's "escalate"
+        assert ms.unextractable_target_action == "block"
+        # reservation_ttl_s: min(90, 30) = 30 (floor's shorter wins)
+        assert ms.reservation_ttl_s == 30
+        # high_risk_lock_timeout_s: max(30, 60) = 60 (floor's higher wins)
+        assert ms.high_risk_lock_timeout_s == 60
+        # no_expiry_warning: True or False = True (floor's True wins)
+        assert ms.no_expiry_warning is True
+        # cap_breach_action_class_default: floor's "block" beats delegate's "escalate"
+        assert ms.cap_breach_action_class_default["external_side_effect"] == "block"
+        assert ms.cap_breach_action_class_default["high_risk"] == "block"
+        assert ms.cap_breach_action_class_default["reversible_write"] == "block"
+
+    def test_apply_project_floor_mandate_settings_own_wins_where_not_stricter(self):
+        # When the delegate is already stricter or equal, own value is
+        # preserved. Confirms floor-wins doesn't unconditionally clobber.
+        floor_text = (
+            "## Mandates\n"
+            "\n"
+            "suspicious_rebind_throttle_s: 30\n"
+            "unextractable_target_action: escalate\n"
+        )
+        delegate_text = (
+            "## Mandates\n"
+            "\n"
+            "suspicious_rebind_throttle_s: 90\n"
+            "unextractable_target_action: block\n"
+        )
+        floor = parse_judges_md_text(floor_text)
+        delegate = parse_judges_md_text(delegate_text)
+        merged = apply_project_floor(delegate, floor)
+        ms = merged.mandate_settings
+
+        # Delegate's 90 is higher (stricter) → wins.
+        assert ms.suspicious_rebind_throttle_s == 90
+        # Delegate's "block" is stricter → wins (floor is "escalate").
+        assert ms.unextractable_target_action == "block"
