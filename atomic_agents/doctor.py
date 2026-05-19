@@ -137,6 +137,7 @@ def run_doctor(
 
     results.append(check_env(agents_root))
     results.append(check_python())
+    results.append(check_bundle_cache_writable())
 
     # Resolve agents_root for downstream checks. We tolerate a missing path
     # because check_env will already have flagged it; downstream checks
@@ -1703,6 +1704,62 @@ def check_memory_backend(agent_root: Path) -> CheckResult:
             "by_type": stats.by_type,
             "live_bytes": stats.live_bytes,
         },
+    )
+
+
+def check_bundle_cache_writable() -> CheckResult:
+    """The bundle cache directory exists / can be created and is writable.
+
+    Per spec/26: the ``atomic-agents bundle`` command writes pre-rendered
+    cascades to ``$ATOMIC_AGENTS_CACHE_DIR`` (default
+    ``~/.cache/atomic-agents/bundles``). Skill-mode invocations need this dir
+    to be writable; this check probes that without touching agent state.
+    """
+    from . import bundle as bundle_mod
+
+    cache_dir = bundle_mod.default_cache_dir()
+    source = (
+        f"ATOMIC_AGENTS_CACHE_DIR={os.environ['ATOMIC_AGENTS_CACHE_DIR']}"
+        if os.environ.get("ATOMIC_AGENTS_CACHE_DIR")
+        else "default ~/.cache/atomic-agents/bundles"
+    )
+
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return CheckResult(
+            name="bundle-cache",
+            status=FAIL,
+            message=f"cannot create bundle cache dir {cache_dir}: {type(e).__name__}: {e}",
+            fix_hint=(
+                f"Create it manually: mkdir -p {cache_dir}\n"
+                f"  Or set ATOMIC_AGENTS_CACHE_DIR to a writable directory."
+            ),
+            detail={"path": str(cache_dir), "source": source},
+        )
+
+    # Probe write access via a temp file in the cache dir itself.
+    probe = cache_dir / ".doctor-probe.tmp"
+    try:
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except OSError as e:
+        return CheckResult(
+            name="bundle-cache",
+            status=FAIL,
+            message=f"bundle cache dir not writable: {cache_dir} ({e})",
+            fix_hint=(
+                f"Fix permissions: chmod u+w {cache_dir}\n"
+                f"  Or set ATOMIC_AGENTS_CACHE_DIR to a writable directory."
+            ),
+            detail={"path": str(cache_dir), "source": source},
+        )
+
+    return CheckResult(
+        name="bundle-cache",
+        status=PASS,
+        message=f"bundle cache dir ok at {cache_dir} ({source})",
+        detail={"path": str(cache_dir), "source": source},
     )
 
 
