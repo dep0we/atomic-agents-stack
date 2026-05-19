@@ -6,6 +6,7 @@ Usage:
     atomic-agents skills <agent> [options]
     atomic-agents version <agent> <note-filename>
     atomic-agents restore <agent> <note-filename> <version-name>
+    atomic-agents bundle <agent> [--if-stale | --refresh] [options]
     atomic-agents doctor [--agent <name>] [--json] [--no-mcp]
     atomic-agents review --backend <kimi> [options]
 
@@ -15,6 +16,7 @@ Subcommands:
     skills  — List all skills for an agent with metadata and warnings
     version — List memory note version snapshots
     restore — Restore a memory note from a snapshot
+    bundle  — Pre-render the cascade into one file for skill-mode loads (spec/26)
     doctor  — Preflight checks before scheduling an agent run
     review  — Cross-family adversarial code review (CLAUDE.md rule #11)
 """
@@ -33,19 +35,25 @@ from .skills import discover_skills, validate_skill_manifest
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="atomic-agents", description="Atomic Agents CLI")
+    parser = argparse.ArgumentParser(
+        prog="atomic-agents", description="Atomic Agents CLI"
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     run = sub.add_parser("run", help="Run an agent against a work item")
     run.add_argument("agent", help="agent name (folder under agents-root)")
     run.add_argument("--work-item", required=True, help="user message / work item text")
-    run.add_argument("--trigger", default="manual", choices=["cron", "skill", "manual", "api"])
+    run.add_argument(
+        "--trigger", default="manual", choices=["cron", "skill", "manual", "api"]
+    )
     run.add_argument("--model", default=None, help="override default model")
     run.add_argument("--critical", action="store_true", help="bypass cost guardrails")
-    run.add_argument("--no-write-captures", action="store_true",
-                      help="extract captures but don't persist (dry-run)")
-    run.add_argument("--agents-root", default=None,
-                      help="override ATOMIC_AGENTS_ROOT")
+    run.add_argument(
+        "--no-write-captures",
+        action="store_true",
+        help="extract captures but don't persist (dry-run)",
+    )
+    run.add_argument("--agents-root", default=None, help="override ATOMIC_AGENTS_ROOT")
 
     info = sub.add_parser("info", help="Show config for an agent without running it")
     info.add_argument("agent")
@@ -56,19 +64,84 @@ def main(argv: list[str] | None = None) -> int:
         help="List all skills for an agent (name, description, body line count, warnings)",
     )
     skills_cmd.add_argument("agent", help="agent name (folder under agents-root)")
-    skills_cmd.add_argument("--agents-root", default=None,
-                             help="override ATOMIC_AGENTS_ROOT")
+    skills_cmd.add_argument(
+        "--agents-root", default=None, help="override ATOMIC_AGENTS_ROOT"
+    )
 
     version_cmd = sub.add_parser("version", help="List versions for a memory note")
     version_cmd.add_argument("agent", help="agent name (folder under agents-root)")
-    version_cmd.add_argument("note_filename", help="bare filename, e.g. feedback_comm_style.md")
+    version_cmd.add_argument(
+        "note_filename", help="bare filename, e.g. feedback_comm_style.md"
+    )
     version_cmd.add_argument("--agents-root", default=None)
 
-    restore_cmd = sub.add_parser("restore", help="Restore a memory note from a snapshot")
+    restore_cmd = sub.add_parser(
+        "restore", help="Restore a memory note from a snapshot"
+    )
     restore_cmd.add_argument("agent", help="agent name (folder under agents-root)")
-    restore_cmd.add_argument("note_filename", help="bare filename, e.g. feedback_comm_style.md")
+    restore_cmd.add_argument(
+        "note_filename", help="bare filename, e.g. feedback_comm_style.md"
+    )
     restore_cmd.add_argument("version_name", help="version filename to restore from")
     restore_cmd.add_argument("--agents-root", default=None)
+
+    bundle_cmd = sub.add_parser(
+        "bundle",
+        help="Pre-render the cascade into a single file for skill-mode loads (spec/26)",
+        description=(
+            "Concatenate every cascade file (persona, tools, model, project layer, "
+            "memory INDEX + pinned/recent atomic notes, wiki INDEX, recent journal) "
+            "into one markdown file the skill can load via a single Read. Issue #231."
+        ),
+    )
+    bundle_cmd.add_argument("agent", help="agent name (folder under agents-root)")
+    bundle_cmd.add_argument(
+        "--agents-root",
+        default=None,
+        help="override ATOMIC_AGENTS_ROOT",
+    )
+    bundle_cmd.add_argument(
+        "--cache-dir",
+        default=None,
+        help=(
+            "override the bundle cache directory "
+            "(default: $ATOMIC_AGENTS_CACHE_DIR or ~/.cache/atomic-agents/bundles)"
+        ),
+    )
+    bundle_cmd.add_argument(
+        "--extra-file",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help=(
+            "include an extra file in the bundle (repeatable). For declarative "
+            "extras, create <agent>/bundle.md listing one path per line."
+        ),
+    )
+    staleness_group = bundle_cmd.add_mutually_exclusive_group()
+    staleness_group.add_argument(
+        "--if-stale",
+        action="store_true",
+        help=(
+            "skip regeneration when the bundle's mtime is at least as new as "
+            "every source file's mtime (the skill-mode invocation path)"
+        ),
+    )
+    staleness_group.add_argument(
+        "--refresh",
+        action="store_true",
+        help="force regeneration even when the bundle is fresh",
+    )
+    bundle_cmd.add_argument(
+        "--to-stdout",
+        action="store_true",
+        help="print the bundle contents to stdout instead of writing to disk",
+    )
+    bundle_cmd.add_argument(
+        "--print-path",
+        action="store_true",
+        help="print the bundle path without (re)generating",
+    )
 
     doctor_cmd = sub.add_parser(
         "doctor",
@@ -80,15 +153,18 @@ def main(argv: list[str] | None = None) -> int:
         help="check this agent specifically (omit to run host-only checks)",
     )
     doctor_cmd.add_argument(
-        "--agents-root", default=None,
+        "--agents-root",
+        default=None,
         help="override ATOMIC_AGENTS_ROOT for this run",
     )
     doctor_cmd.add_argument(
-        "--json", action="store_true",
+        "--json",
+        action="store_true",
         help="emit machine-readable JSON instead of the human report",
     )
     doctor_cmd.add_argument(
-        "--no-mcp", action="store_true",
+        "--no-mcp",
+        action="store_true",
         help="skip MCP server handshake (faster; useful when servers are remote)",
     )
 
@@ -162,7 +238,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Error: {e}", file=sys.stderr)
             return 1
 
-    agents_root = Path(args.agents_root).expanduser().resolve() if args.agents_root else get_agents_root()
+    agents_root = (
+        Path(args.agents_root).expanduser().resolve()
+        if args.agents_root
+        else get_agents_root()
+    )
 
     # Doctor has its own exit-code semantics (0/1/2) and must never raise to the user.
     if args.cmd == "doctor":
@@ -179,6 +259,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_version(args, agents_root)
         elif args.cmd == "restore":
             return _cmd_restore(args, agents_root)
+        elif args.cmd == "bundle":
+            return _cmd_bundle(args, agents_root)
     except AtomicAgentsError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
@@ -257,11 +339,14 @@ def _cmd_run(args, agents_root: Path) -> int:
         return 2
     print(response.text)
     print("", file=sys.stderr)
-    print(f"--- Stats: model={response.model} "
-          f"in={response.input_tokens} out={response.output_tokens} "
-          f"cost=${response.cost_usd:.4f} "
-          f"latency={response.latency_ms}ms "
-          f"captures={len(response.captures)}", file=sys.stderr)
+    print(
+        f"--- Stats: model={response.model} "
+        f"in={response.input_tokens} out={response.output_tokens} "
+        f"cost=${response.cost_usd:.4f} "
+        f"latency={response.latency_ms}ms "
+        f"captures={len(response.captures)}",
+        file=sys.stderr,
+    )
     return 0
 
 
@@ -279,7 +364,9 @@ def _cmd_info(args, agents_root: Path) -> int:
     print(f"Cost guardrails enabled: {cfg.cost_guardrails_enabled}")
     if cfg.cost_guardrails_enabled:
         print(f"  Daily cap:   ${cfg.daily_cap_usd}  → action: {cfg.daily_cap_action}")
-        print(f"  Monthly cap: ${cfg.monthly_cap_usd} → action: {cfg.monthly_cap_action}")
+        print(
+            f"  Monthly cap: ${cfg.monthly_cap_usd} → action: {cfg.monthly_cap_action}"
+        )
         print(f"  Warning thresholds: {cfg.warning_thresholds}")
     print(f"Read paths:       {len(cfg.read_paths)}")
     for p in cfg.read_paths:
@@ -321,17 +408,29 @@ def _cmd_skills(args, agents_root: Path) -> int:
         manifest, warnings = validate_skill_manifest(skill_subdir)
         found_any = True
         if manifest is None:
-            print(f"  [ERROR] {skill_subdir.name}/: {warnings[0] if warnings else 'unknown error'}")
+            print(
+                f"  [ERROR] {skill_subdir.name}/: {warnings[0] if warnings else 'unknown error'}"
+            )
             has_warnings = True
             continue
         status = "ok" if not warnings else "warn"
-        desc_preview = manifest.description[:80] + "..." if len(manifest.description) > 80 else manifest.description
+        desc_preview = (
+            manifest.description[:80] + "..."
+            if len(manifest.description) > 80
+            else manifest.description
+        )
         print(f"  [{status}] {manifest.name}")
         print(f"         description: {desc_preview}")
-        print(f"         body lines:  {manifest.body_lines}"
-              + (" (> 500 — consider splitting)" if manifest.body_lines > 500 else ""))
+        print(
+            f"         body lines:  {manifest.body_lines}"
+            + (" (> 500 — consider splitting)" if manifest.body_lines > 500 else "")
+        )
         if manifest.when_to_use:
-            wtu_preview = manifest.when_to_use[:60] + "..." if len(manifest.when_to_use) > 60 else manifest.when_to_use
+            wtu_preview = (
+                manifest.when_to_use[:60] + "..."
+                if len(manifest.when_to_use) > 60
+                else manifest.when_to_use
+            )
             print(f"         when_to_use: {wtu_preview}")
         for w in warnings:
             print(f"         WARNING: {w}")
@@ -380,6 +479,60 @@ def _cmd_restore(args, agents_root: Path) -> int:
     ref = backend.restore_version(args.note_filename, vref, policy)
     print(f"Restored {args.note_filename} from {args.version_name}")
     print(f"  live note: {memory_dir / ref.name}")
+    return 0
+
+
+def _cmd_bundle(args, agents_root: Path) -> int:
+    """Pre-render the cascade into a single file for skill-mode loads.
+
+    See spec/26 and issue #231. The skill template's load instructions
+    become "run `atomic-agents bundle --if-stale <agent>`, then Read the
+    cache file" — turning 18+ sequential Reads into 1 cheap Bash + 1 Read.
+    """
+    from . import bundle as bundle_mod
+
+    agent_root = agents_root / args.agent
+    if not agent_root.exists():
+        print(f"Error: agent folder not found: {agent_root}", file=sys.stderr)
+        return 1
+
+    cache_dir = (
+        Path(args.cache_dir).expanduser().resolve()
+        if args.cache_dir
+        else bundle_mod.default_cache_dir()
+    )
+
+    if args.print_path:
+        slug = bundle_mod.slug_for(agent_root, agents_root)
+        print(cache_dir / f"{slug}.md")
+        return 0
+
+    extra_files = [Path(p) for p in args.extra_file]
+
+    try:
+        result = bundle_mod.render_bundle(
+            agent_root,
+            agents_root=agents_root,
+            cache_dir=cache_dir,
+            extra_files=extra_files,
+            if_stale=args.if_stale,
+        )
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    if args.to_stdout:
+        sys.stdout.write(result.path.read_text(encoding="utf-8"))
+        return 0
+
+    status = "regenerated" if result.regenerated else "fresh (skipped)"
+    print(f"Bundle {status}: {result.path}")
+    print(
+        f"  {result.section_count if result.section_count >= 0 else '?'} sections, "
+        f"{result.source_count} source files, "
+        f"{result.total_bytes / 1024:.1f}KB",
+        file=sys.stderr,
+    )
     return 0
 
 

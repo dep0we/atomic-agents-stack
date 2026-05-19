@@ -55,7 +55,20 @@ You are Caldwell. Load this agent's persona and memory from the vault before res
 
 ## Setup (do this every invocation)
 
-Read these files in order, IN A SINGLE PARALLEL TOOL CALL where possible:
+Run this Bash command first, then Read the single file it produces:
+
+```bash
+atomic-agents bundle --if-stale ~/agents/caldwell
+```
+
+Then Read: `~/.cache/atomic-agents/bundles/caldwell.md`
+
+The bundle contains the agent's full cascade (persona, tools, memory INDEX, wiki INDEX,
+pinned notes, recent notes, recent journal) in canonical spec/04 order. One Bash call +
+one Read replaces 6+ sequential file reads. See [`../spec/26-cascade-bundle.md`](../spec/26-cascade-bundle.md).
+
+If `atomic-agents bundle` is unavailable in the operator's environment, fall back to
+reading the cascade files directly, IN A SINGLE PARALLEL TOOL CALL where possible:
 
 1. `~/agents/caldwell/persona/IDENTITY.md`
 2. `~/agents/caldwell/persona/SOUL.md`
@@ -64,8 +77,8 @@ Read these files in order, IN A SINGLE PARALLEL TOOL CALL where possible:
 5. `~/agents/caldwell/memory/INDEX.md`
 6. `~/agents/caldwell/wiki/INDEX.md`
 
-After reading these, you embody Caldwell. The persona files define who you are; the
-INDEX files tell you what additional memory exists.
+After reading the bundle (or the fallback files), you embody Caldwell. The persona files
+define who you are; the INDEX files tell you what additional memory exists.
 
 ## Recall pattern
 
@@ -214,9 +227,20 @@ Apply capture rules from `~/agents/Atomic Agents/spec/05-capture-rules.md`.
 
 This way, spec updates propagate to all skills automatically.
 
-### Use parallel reads aggressively
+### Use `atomic-agents bundle` to collapse startup loads
 
-Caldwell reads 5-10 small files at startup. They should all happen in one parallel tool call. Token cost: trivial. Latency: ~1 second instead of 5+.
+A realistic cascade (especially the spec/06 three-layer pattern) reads 15+ files at startup
+— each Read is its own model round-trip (~1-5s wall time each). Use
+`atomic-agents bundle --if-stale <agent>` in Bash to pre-render the cascade to one file,
+then a single Read consumes it. Startup latency drops from 30-90s to 1-3s.
+
+See [`../spec/26-cascade-bundle.md`](../spec/26-cascade-bundle.md) for the bundle command's
+full contract, including the `bundle.md` declarative-extras file for skill-specific extras
+like operator-identity references that aren't part of the standard cascade.
+
+If `atomic-agents bundle` is unavailable, the fallback is parallel reads — fire all
+cascade reads in one tool call. Better than sequential but still N round-trips; the
+bundle command is the right path for any cascade with more than ~5 files.
 
 ### Make the capture marker explicit
 
