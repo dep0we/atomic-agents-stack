@@ -755,3 +755,156 @@ def test_doctor_bundle_cache_reports_env_var_source(tmp_path, monkeypatch):
     monkeypatch.setenv("ATOMIC_AGENTS_CACHE_DIR", str(custom))
     result = check_bundle_cache_writable()
     assert "ATOMIC_AGENTS_CACHE_DIR" in result.detail["source"]
+
+
+# ──────────────────────────────────────────────────────────────────
+# Adversarial-review follow-ups (F-4, F-5, F-8, F-9)
+
+
+def test_pinned_strips_inline_comment(tmp_path):
+    """F-4: `pinned: true  # set by /pin-this` is truthy after stripping the comment."""
+    agents_root, agent_root = _build_cascaded(tmp_path)
+    memory_dir = agent_root / "memory"
+    memory_dir.mkdir()
+    (memory_dir / "INDEX.md").write_text("# INDEX")
+    (memory_dir / "with-comment.md").write_text(
+        "---\npinned: true # set by /pin-this command\n---\n\nWith comment body."
+    )
+    (memory_dir / "without-comment.md").write_text(
+        "---\npinned: true\n---\n\nWithout comment body."
+    )
+
+    result = bundle.render_bundle(
+        agent_root, agents_root=agents_root, cache_dir=tmp_path / "cache"
+    )
+    text = result.path.read_text(encoding="utf-8")
+    assert "With comment body." in text
+    assert "Without comment body." in text
+
+
+def test_pinned_inline_comment_false_value_not_pinned(tmp_path):
+    """Negative case: `pinned: false # was true` parses as false, not pinned."""
+    agents_root, agent_root = _build_cascaded(tmp_path)
+    memory_dir = agent_root / "memory"
+    memory_dir.mkdir()
+    (memory_dir / "INDEX.md").write_text("# INDEX")
+    (memory_dir / "false-with-comment.md").write_text(
+        "---\npinned: false # was true previously\n---\n\nShould not pin."
+    )
+
+    result = bundle.render_bundle(
+        agent_root, agents_root=agents_root, cache_dir=tmp_path / "cache"
+    )
+    text = result.path.read_text(encoding="utf-8")
+    # The note may appear in recent atomic notes, but NOT under Pinned.
+    if "Pinned atomic notes" in text:
+        pinned_section = text.split("Pinned atomic notes")[1].split("BREAKPOINT")[0]
+        assert "Should not pin." not in pinned_section
+
+
+def test_if_stale_strict_mtime_no_false_negative_on_equality(tmp_path):
+    """F-5: bundle_mtime == source_mtime must regenerate (not be treated as fresh).
+
+    On filesystems with 1s mtime granularity, an edit-and-regenerate within the
+    same second leaves the source's mtime equal to (not strictly greater than)
+    the bundle's. The bundle should regenerate in that case.
+    """
+    agents_root, agent_root = _build_cascaded(tmp_path)
+    cache_dir = tmp_path / "cache"
+
+    first = bundle.render_bundle(
+        agent_root, agents_root=agents_root, cache_dir=cache_dir
+    )
+    # Touch a source file's mtime to *exactly equal* the bundle's mtime.
+    canon = agent_root.parent.parent / "canon.md"
+    bundle_mtime = first.path.stat().st_mtime
+    import os
+
+    os.utime(canon, (bundle_mtime, bundle_mtime))
+
+    second = bundle.render_bundle(
+        agent_root,
+        agents_root=agents_root,
+        cache_dir=cache_dir,
+        if_stale=True,
+    )
+    # Equality should trigger regen, not be treated as fresh.
+    assert second.regenerated is True
+
+
+def test_if_stale_force_regen_when_all_sources_deleted(tmp_path):
+    """F-5: After a bundle exists, deleting every source forces a regen on next --if-stale.
+
+    Previously: `default=0.0` for max() of source mtimes made `0.0 <= bundle_mtime`
+    always-true, so the bundle would be treated as fresh forever.
+    """
+    agents_root, agent_root = _build_cascaded(tmp_path)
+    cache_dir = tmp_path / "cache"
+
+    first = bundle.render_bundle(
+        agent_root, agents_root=agents_root, cache_dir=cache_dir
+    )
+    assert first.regenerated is True
+
+    # Wipe the cascade contents (but leave dirs so detect_cascade still matches).
+    for f in (agent_root.parent.parent).rglob("*.md"):
+        f.unlink()
+    for f in (agent_root.parent.parent.parent.parent / "roles").rglob("*.md"):
+        f.unlink()
+
+    # With if_stale=True the empty-source-mtime case should still regenerate.
+    second = bundle.render_bundle(
+        agent_root, agents_root=agents_root, cache_dir=cache_dir, if_stale=True
+    )
+    assert second.regenerated is True
+
+
+def test_if_stale_detects_deletion_of_memory_note(tmp_path):
+    """F-9: Deleting an existing source (which left no newer-mtime trail) must trigger regen.
+
+    Achieved by including the parent directory's mtime in the staleness set —
+    POSIX bumps the directory's mtime when its children are added or removed.
+    """
+    agents_root, agent_root = _build_cascaded(tmp_path)
+    memory_dir = agent_root / "memory"
+    memory_dir.mkdir()
+    (memory_dir / "INDEX.md").write_text("# INDEX")
+    (memory_dir / "note-to-delete.md").write_text(
+        "---\npinned: true\n---\n\nWill be deleted."
+    )
+
+    cache_dir = tmp_path / "cache"
+    first = bundle.render_bundle(
+        agent_root, agents_root=agents_root, cache_dir=cache_dir
+    )
+    assert "Will be deleted." in first.path.read_text(encoding="utf-8")
+
+    time.sleep(0.05)
+    (memory_dir / "note-to-delete.md").unlink()
+
+    second = bundle.render_bundle(
+        agent_root, agents_root=agents_root, cache_dir=cache_dir, if_stale=True
+    )
+    assert second.regenerated is True
+    assert "Will be deleted." not in second.path.read_text(encoding="utf-8")
+
+
+def test_non_utf8_source_does_not_crash(tmp_path):
+    """F-8: A single non-UTF-8 source file must not crash the whole bundle.
+
+    Use bytes containing latin-1 chars (e.g., 0xE9) which aren't valid UTF-8
+    standalone. The bundle should render with a warning + replacement chars
+    rather than raising UnicodeDecodeError.
+    """
+    agents_root, agent_root = _build_cascaded(tmp_path)
+    # Plant a latin-1 byte in a cascade file (canon.md)
+    canon = agent_root.parent.parent / "canon.md"
+    canon.write_bytes(b"# Canon\n\nA boy. A m\xe9moire orb.\n")
+
+    result = bundle.render_bundle(
+        agent_root, agents_root=agents_root, cache_dir=tmp_path / "cache"
+    )
+    text = result.path.read_text(encoding="utf-8")
+    # The bundle survives + flags the bad encoding via a header comment
+    assert "Canon" in text
+    assert "non-UTF-8" in text or "�" in text  # replacement char or warning

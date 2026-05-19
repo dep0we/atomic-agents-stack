@@ -135,21 +135,33 @@ def render_bundle(
 
     all_extras = _collect_extras(agent_root, extra_files)
     sources = _source_paths(agent_root) + all_extras
+    staleness_paths = _staleness_paths(agent_root) + all_extras
 
     if if_stale and bundle_path.is_file():
         bundle_mtime = bundle_path.stat().st_mtime
-        max_source = max(
-            (p.stat().st_mtime for p in sources if p.is_file()),
-            default=0.0,
-        )
-        if max_source <= bundle_mtime:
-            return BundleResult(
-                path=bundle_path,
-                regenerated=False,
-                section_count=-1,
-                total_bytes=bundle_path.stat().st_size,
-                source_count=sum(1 for p in sources if p.is_file()),
-            )
+        # Include directory mtimes alongside file mtimes: POSIX bumps a
+        # directory's mtime when files are added or removed in it, which is
+        # how we catch the case where a memory note or journal entry was
+        # *deleted* (no file mtime would otherwise be newer than the bundle).
+        source_mtimes = [p.stat().st_mtime for p in staleness_paths if p.exists()]
+        if not source_mtimes:
+            # No sources currently exist — either everything was deleted or the
+            # cascade is empty. Force regeneration so the bundle reflects reality
+            # rather than silently serving stale phantom content.
+            pass
+        else:
+            max_source = max(source_mtimes)
+            # Strict < (not <=) catches the same-second edit-and-regenerate case
+            # on filesystems with 1s mtime granularity (ext4, HFS+). Equality
+            # means "could have been edited just after bundle wrote" — be safe.
+            if max_source < bundle_mtime:
+                return BundleResult(
+                    path=bundle_path,
+                    regenerated=False,
+                    section_count=-1,
+                    total_bytes=bundle_path.stat().st_size,
+                    source_count=sum(1 for p in sources if p.is_file()),
+                )
 
     sections = _render_sections(agent_root, all_extras)
     header = _render_header(agent_root, sources)
@@ -214,9 +226,7 @@ def _collect_extras(
                     matches = sorted(agent_root.glob(str(expanded)))
                 file_matches = [m for m in matches if m.is_file()]
                 if not file_matches:
-                    raise FileNotFoundError(
-                        f"bundle.md glob matched no files: {raw!r}"
-                    )
+                    raise FileNotFoundError(f"bundle.md glob matched no files: {raw!r}")
                 extras.extend(file_matches)
             else:
                 target = expanded if expanded.is_absolute() else (agent_root / expanded)
@@ -230,9 +240,7 @@ def _collect_extras(
         for p in cli_extras:
             resolved = Path(p).expanduser()
             if not resolved.is_file():
-                raise FileNotFoundError(
-                    f"--extra-file path is not a file: {resolved}"
-                )
+                raise FileNotFoundError(f"--extra-file path is not a file: {resolved}")
             extras.append(resolved)
 
     return extras
@@ -295,6 +303,36 @@ def _source_paths(agent_root: Path) -> list[Path]:
     return [p for p in paths if p.is_file()]
 
 
+def _staleness_paths(agent_root: Path) -> list[Path]:
+    """Return paths whose mtime drives staleness — files PLUS directories.
+
+    Directories are included so that *deletions* trigger regeneration. POSIX
+    bumps a directory's mtime when its children are added/removed; without
+    this signal, deleting `memory/foo.md` would leave a bundle still
+    referencing that note with no source-file mtime newer than the bundle.
+
+    Returns the same files :func:`_source_paths` does plus the parent
+    directories that scope the bundle's runtime-assembly content (memory/,
+    wiki/, journal/, project policy/).
+    """
+    paths = _source_paths(agent_root)
+
+    cascade = _cascade.detect_cascade(agent_root)
+    instance_root = cascade.instance_root if cascade else agent_root
+
+    # Directories whose mtime tracks add/delete of their direct children.
+    dir_candidates = [
+        instance_root / "memory",
+        instance_root / "wiki",
+        instance_root / "journal",
+    ]
+    if cascade:
+        dir_candidates.append(cascade.project_root / "policy")
+
+    paths.extend(d for d in dir_candidates if d.is_dir())
+    return paths
+
+
 # ──────────────────────────────────────────────────────────────────
 # Section rendering
 
@@ -331,11 +369,20 @@ def _render_cascaded(cascade: _cascade.CascadePaths) -> list[str]:
     """Render BP1 content for a cascaded layout per spec/06."""
     out: list[str] = []
 
-    role_prompt = _cascade.load_role_prompt(cascade)
-    if role_prompt:
-        out.append(
-            f"## Role layer · PROMPT.md\n`{cascade.role_root / 'PROMPT.md'}`\n\n{role_prompt}"
+    # Role PROMPT.md — `_cascade.load_role_prompt` reads with strict UTF-8;
+    # catch and fall back to safe-read so a single non-UTF-8 byte in PROMPT.md
+    # doesn't crash the whole bundle (F-8 from /ship adversarial review).
+    role_prompt_path = cascade.role_root / "PROMPT.md"
+    try:
+        role_prompt = _cascade.load_role_prompt(cascade)
+    except UnicodeDecodeError:
+        role_prompt = (
+            _safe_read_text(role_prompt_path).strip()
+            if role_prompt_path.is_file()
+            else ""
         )
+    if role_prompt:
+        out.append(f"## Role layer · PROMPT.md\n`{role_prompt_path}`\n\n{role_prompt}")
 
     # Instance persona — all three files per spec/06 Layer 3.
     for persona_name in ("IDENTITY.md", "SOUL.md", "USER.md"):
@@ -346,20 +393,28 @@ def _render_cascaded(cascade: _cascade.CascadePaths) -> list[str]:
             )
 
     # Tools — merged via _cascade.resolve_tools_md (instance override appended
-    # to role base, or instance full-replacement, or role base).
-    tools_source, tools_text = _cascade.resolve_tools_md(cascade)
+    # to role base, or instance full-replacement, or role base). Wrap for the
+    # same encoding-tolerance reason as role PROMPT above.
+    try:
+        tools_source, tools_text = _cascade.resolve_tools_md(cascade)
+    except UnicodeDecodeError:
+        # Fall back: try the role tools.md via safe-read; mark source as None
+        # so the section header reflects that resolution didn't complete.
+        role_tools = cascade.role_root / "tools.md"
+        tools_source = role_tools if role_tools.is_file() else None
+        tools_text = _safe_read_text(role_tools) if role_tools.is_file() else ""
     if tools_text.strip():
         label = "Tools (merged)" if tools_source else "Tools"
-        out.append(
-            f"## {label}\n`{tools_source or '(none)'}`\n\n{tools_text.strip()}"
-        )
+        out.append(f"## {label}\n`{tools_source or '(none)'}`\n\n{tools_text.strip()}")
 
     model_source = _cascade.resolve_model_md(cascade)
     if model_source and model_source.is_file():
         out.append(_render_file_section(model_source, label="Model"))
 
-    # Project shared layer per spec/06 Layer 2.
-    project = _cascade.load_project_layer(cascade)
+    # Project shared layer per spec/06 Layer 2. Wrap each project file
+    # individually via safe-read so one bad canon.md doesn't lose
+    # style_guide / goal / policy sections too.
+    project = _safe_load_project_layer(cascade)
     if project["canon"]:
         out.append(
             f"## Project shared · canon.md\n`{cascade.project_root / 'canon.md'}`\n\n{project['canon']}"
@@ -377,6 +432,31 @@ def _render_cascaded(cascade: _cascade.CascadePaths) -> list[str]:
             f"## Project shared · policy/\n`{cascade.project_root / 'policy/'}`\n\n{project['policy']}"
         )
 
+    return out
+
+
+def _safe_load_project_layer(cascade: _cascade.CascadePaths) -> dict[str, str]:
+    """Encoding-tolerant version of :func:`_cascade.load_project_layer`.
+
+    Reads each project file individually via :func:`_safe_read_text` so a
+    single non-UTF-8 byte in (say) canon.md doesn't lose style_guide / goal /
+    policy too. Returns the same dict shape as the cascade helper.
+    """
+    out: dict[str, str] = {}
+    for name in ("canon", "style_guide", "goal"):
+        p = cascade.project_root / f"{name}.md"
+        out[name] = _safe_read_text(p).strip() if p.is_file() else ""
+    policy_dir = cascade.project_root / "policy"
+    if policy_dir.is_dir():
+        parts: list[str] = []
+        for path in sorted(policy_dir.rglob("*.md")):
+            rel = path.relative_to(policy_dir)
+            parts.append(
+                f"# policy/{rel.as_posix()}\n\n{_safe_read_text(path).strip()}"
+            )
+        out["policy"] = "\n\n---\n\n".join(parts)
+    else:
+        out["policy"] = ""
     return out
 
 
@@ -404,13 +484,13 @@ def _render_memory_breakpoint(instance_root: Path) -> list[str]:
 
     out: list[str] = []
     if (memory_dir / "INDEX.md").is_file():
-        out.append(_render_file_section(memory_dir / "INDEX.md", label="Memory · INDEX.md"))
+        out.append(
+            _render_file_section(memory_dir / "INDEX.md", label="Memory · INDEX.md")
+        )
 
     pinned = _load_pinned_notes(memory_dir)
     if pinned:
-        out.append(
-            "## Memory · Pinned atomic notes\n\n" + "\n\n---\n\n".join(pinned)
-        )
+        out.append("## Memory · Pinned atomic notes\n\n" + "\n\n---\n\n".join(pinned))
 
     if (wiki_dir / "INDEX.md").is_file():
         out.append(_render_file_section(wiki_dir / "INDEX.md", label="Wiki · INDEX.md"))
@@ -428,7 +508,8 @@ def _render_recent_notes_breakpoint(instance_root: Path) -> list[str]:
 
     pinned_names = {p.name for p in _iter_pinned(memory_dir)}
     candidates = [
-        p for p in memory_dir.glob("*.md")
+        p
+        for p in memory_dir.glob("*.md")
         if p.name not in {"INDEX.md", "bundle.md"} and p.name not in pinned_names
     ]
     candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
@@ -437,10 +518,7 @@ def _render_recent_notes_breakpoint(instance_root: Path) -> list[str]:
     if not recent:
         return []
 
-    rendered = [
-        f"# {p.name}\n\n{p.read_text(encoding='utf-8')}"
-        for p in recent
-    ]
+    rendered = [f"# {p.name}\n\n{_safe_read_text(p)}" for p in recent]
     return [
         "# === BREAKPOINT 3: Session (recent atomic notes) ===",
         "## Recent atomic notes\n\n" + "\n\n---\n\n".join(rendered),
@@ -467,7 +545,9 @@ def _iter_pinned(memory_dir: Path):
     """Yield Paths to memory notes whose frontmatter contains ``pinned: true``.
 
     Cheap lexical check (no YAML parser) — matches the agent's own approach
-    when scanning memory directories for the pinned filter.
+    when scanning memory directories for the pinned filter. Accepts ``true``,
+    ``yes``, or ``1`` as truthy. Strips inline ``# comment`` suffixes so
+    ``pinned: true  # set by /pin-this`` still pins.
     """
     if not memory_dir.is_dir():
         return
@@ -476,7 +556,7 @@ def _iter_pinned(memory_dir: Path):
             continue
         try:
             text = path.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             continue
         if not text.startswith("---"):
             continue
@@ -487,8 +567,13 @@ def _iter_pinned(memory_dir: Path):
         for line in front.splitlines():
             stripped = line.strip()
             if stripped.startswith("pinned:"):
-                value = stripped.split(":", 1)[1].strip().lower()
-                if value in ("true", "yes", "1"):
+                value = stripped.split(":", 1)[1].strip()
+                # Strip trailing inline comment so `pinned: true # set by op`
+                # still parses as truthy. YAML treats `#` as a comment unless
+                # quoted; we follow that convention with a cheap lexical strip.
+                if "#" in value:
+                    value = value.split("#", 1)[0].strip()
+                if value.lower() in ("true", "yes", "1"):
                     yield path
                 break
 
@@ -497,14 +582,15 @@ def _load_pinned_notes(memory_dir: Path, max_pinned: int = PINNED_MAX) -> list[s
     """Return rendered pinned atomic notes (full body, including frontmatter)."""
     notes: list[str] = []
     for path in _iter_pinned(memory_dir):
-        text = path.read_text(encoding="utf-8")
-        notes.append(f"# {path.name}\n\n{text}")
+        notes.append(f"# {path.name}\n\n{_safe_read_text(path)}")
         if len(notes) >= max_pinned:
             break
     return notes
 
 
-def _load_recent_journal(journal_dir: Path, n: int = RECENT_JOURNAL_DEFAULT) -> list[str]:
+def _load_recent_journal(
+    journal_dir: Path, n: int = RECENT_JOURNAL_DEFAULT
+) -> list[str]:
     """Return the n most-recent journal entries by filename (newest first).
 
     Matches :meth:`AtomicAgent._load_recent_journal`: sort by filename
@@ -513,19 +599,36 @@ def _load_recent_journal(journal_dir: Path, n: int = RECENT_JOURNAL_DEFAULT) -> 
     if not journal_dir.is_dir():
         return []
     entries = sorted(journal_dir.rglob("*.md"), reverse=True)[:n]
-    return [
-        f"# Journal — {p.stem}\n`{p}`\n\n{p.read_text(encoding='utf-8')}"
-        for p in entries
-    ]
+    return [f"# Journal — {p.stem}\n`{p}`\n\n{_safe_read_text(p)}" for p in entries]
 
 
 # ──────────────────────────────────────────────────────────────────
 # Rendering helpers
 
 
+def _safe_read_text(path: Path) -> str:
+    """Read a file as UTF-8; on UnicodeDecodeError, fall back with replacement.
+
+    Bundle rendering should never crash because one source file has a stray
+    non-UTF-8 byte — operators want the rest of their bundle even when a
+    single file is malformed. Returns the file body verbatim on success;
+    on decode failure, returns the same content with invalid bytes replaced
+    by Unicode replacement characters and a leading warning comment so the
+    operator can find and fix the bad file.
+    """
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        body = path.read_text(encoding="utf-8", errors="replace")
+        return (
+            f"<!-- WARNING: {path.name} contained non-UTF-8 bytes; replaced. -->\n"
+            f"{body}"
+        )
+
+
 def _render_file_section(path: Path, *, label: str) -> str:
     """Render one file as ``## {label}\\n`{path}`\\n\\n{body}``."""
-    return f"## {label}\n`{path}`\n\n{path.read_text(encoding='utf-8').strip()}"
+    return f"## {label}\n`{path}`\n\n{_safe_read_text(path).strip()}"
 
 
 def _render_header(agent_root: Path, sources: list[Path]) -> str:

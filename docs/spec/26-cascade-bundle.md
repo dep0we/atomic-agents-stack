@@ -106,7 +106,18 @@ Two equivalent shapes:
 
 **Failure mode**: missing files raise `FileNotFoundError` rather than silently dropping. Operators learn about misspellings immediately. Globs that match zero files also raise — a `bundle.md` line like `~/missing-dir/*.md` is a configuration error, not an empty result.
 
-**Trust model**: the bundle command reads + concatenates files the operator's process can already read. There is no privilege boundary to cross. Operators authoring `bundle.md` declare their own filesystem reads; the bundle does not execute the listed files or transmit them off-machine. Per-line `..` segments are accepted because operator extras legitimately reference paths outside the agent root (e.g., shared operator-identity files).
+**Trust model**: the bundle command itself reads + concatenates files the operator's process can already read at the OS level. There is no OS privilege boundary to cross. Operators authoring `bundle.md` declare their own filesystem reads; the bundle does not execute the listed files or transmit them off-machine. Per-line `..` segments are accepted because operator extras legitimately reference paths outside the agent root (e.g., shared operator-identity files).
+
+**The load-bearing trust boundary, however, is operator → agent, NOT operator → OS.** `bundle.md` lives at `<agent>/bundle.md` — inside the agent folder. If an agent has any tool that can write under its own folder (atomic captures, journal entries, a custom write tool, an MCP tool with broad write paths), it could in principle edit `bundle.md` to include sensitive paths like `~/.ssh/id_rsa` or `/etc/passwd`. On the next skill invocation, the operator-trusted `atomic-agents bundle` command would render those file contents into the cache, and the skill's single `Read` would inject the secrets verbatim into the LLM's next-turn context — a prompt-injection-to-exfiltration pivot.
+
+`bundle.md` is operator-authored config and SHOULD be treated the same as `tools.md`, `judges.md`, `mandates.md`, and `persona/*.md`:
+
+- The operator's `tools.md` MUST NOT include `<agent>/` itself (or any path that would cover `bundle.md`) in its `write_paths`. The framework's write-path enforcement (`_capture.enforce_write_path`) refuses writes outside declared `write_paths`, so the threat surfaces only if an operator misconfigures their tools.md to grant the agent broader write than necessary.
+- The bundle command's `_collect_extras` does NOT recursively follow extras' contents — operators who add `~/.ssh/id_rsa` to `bundle.md` would see that secret in the rendered bundle and notice the misconfiguration. Bundle rendering surfaces extras explicitly with their source path in backticks, so a misconfigured bundle.md is visible.
+
+**Future hardening (filed as a follow-up issue):** a hardcoded denylist that refuses writes to `<agent>/bundle.md` regardless of `tools.md` `write_paths` — matching the precedent set by mandate (#124) for `mandates.md` and `tools.md`. v1 ships with documentation + the explicit-rendering surface; hardcoded refusal is a separate spec amendment when the framework grows agents with broader write surfaces than today's.
+
+A doctor check `check_bundle_md_not_writable_by_agent` (future enhancement) would warn an operator whose `tools.md` `write_paths` would permit the agent to edit `bundle.md`.
 
 ### Decision 6: Section headers mirror spec/04 cache breakpoints
 
