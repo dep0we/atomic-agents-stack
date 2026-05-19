@@ -162,6 +162,7 @@ Start at [`docs/README.md`](docs/README.md) for the spec entry point. The 23 loc
 - [13 — Research integrity](docs/spec/13-research-integrity.md) — citations + factual accuracy
 - [14-19](docs/spec/) — capture markers, delegation, dreams, skills, MCP, alternative-runtime contracts
 - [20 — Memory backend protocol](docs/spec/20-memory-backend.md) — the protocol-pattern moat
+- [26 — Cascade bundle](docs/spec/26-cascade-bundle.md) — pre-rendered cascade for skill-mode loads (DRAFT)
 - [27 — Doctor](docs/spec/27-doctor.md) — preflight verification
 
 Each spec doc is locked when the implementation matches and tests pass. Spec changes that imply implementation changes get filed as GitHub issues. **Spec docs separate shipped behavior from explicit future / deferred boundaries** — sections that describe behavior not yet implemented are explicitly marked as such, not silently aspirational.
@@ -339,6 +340,7 @@ Eight operator runbooks for the common deployment paths. Pick the one that match
 | Disaster recovery runbook — `docs/deployment/disaster-recovery.md` | ✅ v0.11.0 |
 | Cost guardrail sizing guidance — `docs/deployment/cost-guardrail-sizing.md` | ✅ v0.11.0 |
 | LLMBackend protocol + Anthropic/OpenAI/Moonshot reference impls — `atomic_agents.llm` | ✅ v0.13.0 |
+| `atomic-agents bundle` cascade pre-render for skill-mode loads — `atomic_agents.bundle` + spec/26 | ✅ Unreleased |
 
 See [CHANGELOG.md](CHANGELOG.md) for per-version detail.
 
@@ -390,6 +392,7 @@ atomic_agents/                  # the Python package
 ├── cli.py                      # `atomic-agents` console script
 ├── doctor.py                   # preflight verification
 ├── migrate.py                  # schema migration runner
+├── bundle.py                   # cascade pre-render for skill-mode loads (spec/26)
 ├── memory/                     # MemoryBackend protocol + filesystem default
 ├── dashboard/                  # cost & observability dashboard
 ├── mcp.py                      # MCP client (stdio transport)

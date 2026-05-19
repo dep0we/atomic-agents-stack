@@ -290,7 +290,7 @@ If the project ever needs to optimize differently, `docs/methodology.md` is the 
 | Doc | Purpose |
 |-----|---------|
 | `docs/architecture.md` | Mental model in diagrams. Read first. |
-| `docs/spec/01-...31-llm-backend.md` | Locked spec (29 docs today — 28 locked + 1 RFC at spec/30). The product. |
+| `docs/spec/01-...31-llm-backend.md` | Locked spec (30 docs today — 28 locked + 2 drafts at spec/26 (cascade bundle) and spec/30 (responsibility audit)). The product. |
 | `docs/implementation/` | Build guides per runtime (cron, Claude skill, dashboard) |
 | `docs/deployment/versioning.md`, `upgrading.md` | SemVer + operator runbook |
 | `docs/deployment/release-runbook.md` | Maintainer `/ship` runbook: two-mode workflow + manual surface check |
