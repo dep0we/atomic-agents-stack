@@ -889,6 +889,46 @@ def test_if_stale_detects_deletion_of_memory_note(tmp_path):
     assert "Will be deleted." not in second.path.read_text(encoding="utf-8")
 
 
+def test_oserror_on_source_does_not_crash(tmp_path):
+    """R2-F4: A persona file that raises OSError on read shouldn't crash the bundle.
+
+    Make a persona file unreadable (chmod 000). The bundle should produce a
+    warning section in place of that file, not raise PermissionError.
+    """
+    agents_root, agent_root = _build_cascaded(tmp_path)
+    identity = agent_root / "persona" / "IDENTITY.md"
+    identity.chmod(0o000)
+    try:
+        result = bundle.render_bundle(
+            agent_root, agents_root=agents_root, cache_dir=tmp_path / "cache"
+        )
+        text = result.path.read_text(encoding="utf-8")
+        # Bundle survived + flagged the unreadable file
+        assert "WARNING" in text
+        assert "IDENTITY.md" in text
+        # Other persona files still landed in the bundle
+        assert "Taste: literary realism." in text  # from SOUL.md
+    finally:
+        identity.chmod(0o600)  # restore for cleanup
+
+
+def test_bundle_cache_file_mode_owner_readable_only(tmp_path):
+    """R2-F9: Cache file should be mode 0600, not whatever umask the operator has.
+
+    Operator extras can pull in identity-adjacent / secrets-adjacent content per
+    spec/26 §"Trust model" — the cache file shouldn't be world-readable.
+    """
+    import stat
+
+    agents_root, agent_root = _build_cascaded(tmp_path)
+    result = bundle.render_bundle(
+        agent_root, agents_root=agents_root, cache_dir=tmp_path / "cache"
+    )
+    mode = stat.S_IMODE(result.path.stat().st_mode)
+    # Owner read+write only; no group or other access
+    assert mode == 0o600, f"Bundle cache file mode is {oct(mode)}, want 0o600"
+
+
 def test_non_utf8_source_does_not_crash(tmp_path):
     """F-8: A single non-UTF-8 source file must not crash the whole bundle.
 

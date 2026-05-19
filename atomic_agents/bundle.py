@@ -169,6 +169,19 @@ def render_bundle(
     content = header + "\n\n" + body + "\n\n<!-- end bundle -->\n"
 
     atomic_write(bundle_path, content)
+    # Bundle content can include operator-extras (e.g., ~/.ssh-adjacent
+    # identity files, secrets-adjacent operator notes per spec/26 §"Trust
+    # model"). Tighten mode so the cache file is owner-readable only —
+    # `atomic_write` writes with the inheriting umask, which is often 0644
+    # on shared hosts. Defense-in-depth alongside the operator-discipline
+    # WritePolicy boundary (round-2 R2-F9).
+    try:
+        os.chmod(bundle_path, 0o600)
+    except OSError:
+        # Filesystem doesn't support chmod (FAT32, network mounts in some
+        # configurations) — fall through. The bundle is still functional;
+        # operator just doesn't get the tightened mode.
+        pass
 
     return BundleResult(
         path=bundle_path,
@@ -369,13 +382,14 @@ def _render_cascaded(cascade: _cascade.CascadePaths) -> list[str]:
     """Render BP1 content for a cascaded layout per spec/06."""
     out: list[str] = []
 
-    # Role PROMPT.md — `_cascade.load_role_prompt` reads with strict UTF-8;
-    # catch and fall back to safe-read so a single non-UTF-8 byte in PROMPT.md
-    # doesn't crash the whole bundle (F-8 from /ship adversarial review).
+    # Role PROMPT.md — `_cascade.load_role_prompt` reads with strict UTF-8 and
+    # may raise OSError on permission failures. Catch BOTH and fall back to
+    # safe-read so a single bad source doesn't crash the whole bundle (F-8 +
+    # round-2 R2-F2 from /ship adversarial review).
     role_prompt_path = cascade.role_root / "PROMPT.md"
     try:
         role_prompt = _cascade.load_role_prompt(cascade)
-    except UnicodeDecodeError:
+    except (UnicodeDecodeError, OSError):
         role_prompt = (
             _safe_read_text(role_prompt_path).strip()
             if role_prompt_path.is_file()
@@ -393,11 +407,11 @@ def _render_cascaded(cascade: _cascade.CascadePaths) -> list[str]:
             )
 
     # Tools — merged via _cascade.resolve_tools_md (instance override appended
-    # to role base, or instance full-replacement, or role base). Wrap for the
-    # same encoding-tolerance reason as role PROMPT above.
+    # to role base, or instance full-replacement, or role base). Catch both
+    # UnicodeDecodeError and OSError for the same reason as role PROMPT above.
     try:
         tools_source, tools_text = _cascade.resolve_tools_md(cascade)
-    except UnicodeDecodeError:
+    except (UnicodeDecodeError, OSError):
         # Fall back: try the role tools.md via safe-read; mark source as None
         # so the section header reflects that resolution didn't complete.
         role_tools = cascade.role_root / "tools.md"
@@ -607,14 +621,18 @@ def _load_recent_journal(
 
 
 def _safe_read_text(path: Path) -> str:
-    """Read a file as UTF-8; on UnicodeDecodeError, fall back with replacement.
+    """Read a file as UTF-8; on UnicodeDecodeError or OSError, degrade gracefully.
 
     Bundle rendering should never crash because one source file has a stray
-    non-UTF-8 byte — operators want the rest of their bundle even when a
-    single file is malformed. Returns the file body verbatim on success;
-    on decode failure, returns the same content with invalid bytes replaced
-    by Unicode replacement characters and a leading warning comment so the
-    operator can find and fix the bad file.
+    non-UTF-8 byte, a permission error, or an OS-level read failure — operators
+    want the rest of their bundle even when a single file is malformed.
+
+    - On success: returns the file body verbatim.
+    - On UnicodeDecodeError: re-reads with ``errors="replace"`` and prepends a
+      warning comment so the operator can find the bad file.
+    - On OSError (PermissionError, IsADirectoryError, etc.): returns just the
+      warning comment naming the failure mode. No body content — there is none
+      readable.
     """
     try:
         return path.read_text(encoding="utf-8")
@@ -623,6 +641,10 @@ def _safe_read_text(path: Path) -> str:
         return (
             f"<!-- WARNING: {path.name} contained non-UTF-8 bytes; replaced. -->\n"
             f"{body}"
+        )
+    except OSError as exc:
+        return (
+            f"<!-- WARNING: {path.name} unreadable: {type(exc).__name__}: {exc} -->\n"
         )
 
 
