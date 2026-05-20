@@ -46,10 +46,13 @@ storage and wire shapes.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Literal
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Callable, Literal
 
 from atomic_agents.exceptions import AtomicAgentsError
+
+if TYPE_CHECKING:
+    from ..logs.backend import LogBackend
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -198,3 +201,107 @@ class PolicyDecision:
     cache_ttl_s: int | None = None  # backend capability snapshot at decision time
     ts: datetime | None = None
     proposal_id: str | None = None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# PolicySnapshotForCall
+
+
+@dataclass(frozen=True)
+class PolicySnapshotForCall:
+    """Per-call frozen view of Policy state, taken at ``agent.call()`` entry.
+
+    Per design Premise 3 ("snapshot at call entry"): every consumption site
+    within the same ``agent.call()`` reads from THIS snapshot — operator edits
+    to ``policy.md`` mid-call are deferred to the NEXT call.  Predictability
+    over freshness within the call.
+
+    Fields:
+
+    ``effective_caps``: MIN-composed Policy caps for THIS agent (Policy layer
+    only; model_md + per-call layers are MIN'd inside
+    ``_check_cost_guardrails`` at check time).
+
+    ``cache_ttl_s``: backend capability snapshot at call-entry time.  Included
+    so audit events can carry the staleness contract without re-querying the
+    backend after call entry.
+
+    ``tool_allow_fn``, ``mcp_allow_fn``, ``model_override``: captured for
+    snapshot-shape parity with PR 3b.  PR 3a does NOT consume these fields —
+    they are ``None`` / always-allow stubs here.  PR 3b populates and uses
+    them when it wires tool / MCP / model surfaces.
+    """
+
+    effective_caps: CostCaps
+    cache_ttl_s: int | None = None
+    # PR 3b fields — captured in snapshot shape but unconsumed in PR 3a:
+    tool_allow_fn: Callable[[str], bool] | None = None
+    mcp_allow_fn: Callable[[str], bool] | None = None
+    model_override: str | None = None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Emission helper
+
+
+def _emit_policy_decision(
+    decision: PolicyDecision,
+    log_backend: "LogBackend",
+    *,
+    run_id: str,
+) -> None:
+    """Append a ``policy_decision`` audit event to ``log_backend``.
+
+    Builds a ``RunRecord`` from ``decision`` and calls
+    ``log_backend.append(record)``.  The record uses the ``policy_decision``
+    primitive so operators can filter with
+    ``LogQuery(primitive="policy_decision")``.
+
+    Called by ``_check_cost_guardrails`` for cost-cap denials (PR 3a).
+    PR 3b calls it for tool / MCP / model surfaces.
+    """
+    # Deferred import to avoid top-level circular dependency:
+    # policy/types.py → logs/types.py is safe; logs/types.py does NOT import policy.
+    from ..logs.types import PRIMITIVE_POLICY_DECISION, RunRecord
+
+    ts_dt = decision.ts or datetime.now(timezone.utc)
+    ts_str = ts_dt.isoformat()
+    extra: dict = {
+        "decision_kind": decision.decision_kind,
+        "denying_layer": decision.denying_layer,
+        "axis": decision.axis,
+        "enforced": decision.enforced,
+    }
+    if decision.cap_dimension is not None:
+        extra["cap_dimension"] = decision.cap_dimension
+    if decision.attempted_value is not None:
+        extra["attempted_value"] = decision.attempted_value
+    if decision.effective_cap is not None:
+        extra["effective_cap"] = decision.effective_cap
+    if decision.tool_name is not None:
+        extra["tool_name"] = decision.tool_name
+    if decision.mcp_server_name is not None:
+        extra["mcp_server_name"] = decision.mcp_server_name
+    if decision.model_from_md is not None:
+        extra["model_from_md"] = decision.model_from_md
+    if decision.model_from_policy is not None:
+        extra["model_from_policy"] = decision.model_from_policy
+    if decision.cache_ttl_s is not None:
+        extra["cache_ttl_s"] = decision.cache_ttl_s
+    if decision.proposal_id is not None:
+        extra["proposal_id"] = decision.proposal_id
+
+    record = RunRecord(
+        primitive=PRIMITIVE_POLICY_DECISION,
+        trigger="policy_decision",
+        agent_name=decision.agent_name,
+        run_id=run_id,
+        ts=ts_str,
+        model="n/a",
+        input_tokens=0,
+        output_tokens=0,
+        status="recorded",
+        summary=f"policy_decision: {decision.decision_kind} axis={decision.axis} layer={decision.denying_layer}",
+        extra=extra,
+    )
+    log_backend.append(record)

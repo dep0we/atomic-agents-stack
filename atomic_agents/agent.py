@@ -590,6 +590,13 @@ class AtomicAgent:
         if self.skills:
             self._register_skill_tools()
 
+        # Per-call Policy snapshot (#89 PR 3a). Reset at call() entry,
+        # cleared in call() finally block. ``None`` outside of call().
+        # The snapshot is taken ONCE at call() entry (Premise 3: predictability
+        # over freshness within the call). All cost-cap checks within the same
+        # call() read from this frozen snapshot instead of re-querying the backend.
+        self._policy_snapshot_this_call = None
+
         # Per-call helper-provenance rollup (spec/13 Layer 3). Reset at the
         # start of each call(); appended to by helper_call(). Empty list
         # means either no helpers ran or the call started outside call().
@@ -1292,8 +1299,52 @@ class AtomicAgent:
             mandate_state_manager=state_manager,
             mandate_settings=mandate_settings,
             log_backend=self.log_backend,
+            policy_effective_caps=(
+                self._policy_snapshot_this_call.effective_caps
+                if self._policy_snapshot_this_call is not None
+                else None
+            ),
         )
         return self._mandate_check
+
+    def _take_policy_snapshot(self):
+        """Take a frozen per-call Policy snapshot at call() entry (#89 PR 3a).
+
+        Called once at the START of ``call()`` (alongside the ``_helpers_this_run``
+        reset).  All cost-cap checks within the same ``call()`` read from this
+        snapshot — operator edits to ``policy.md`` mid-call are deferred to the
+        NEXT call (Premise 3: predictability over freshness within the call).
+
+        Returns a ``PolicySnapshotForCall`` with:
+        - ``effective_caps``: MIN-composed Policy caps for THIS agent.
+        - ``cache_ttl_s``: backend capability snapshot at call-entry time.
+        - PR 3b stub fields (``tool_allow_fn``, ``mcp_allow_fn``,
+          ``model_override``) are ``None`` in PR 3a — only cost caps are consumed.
+
+        On any backend error, falls back to a no-opinion ``CostCaps()`` and
+        logs a warning rather than aborting the call.
+        """
+        from .policy.types import CostCaps, PolicySnapshotForCall
+
+        try:
+            effective_caps = self.policy_backend.get_effective_caps(self.name)
+            cache_ttl_s = self.policy_backend.capabilities().cache_ttl_s
+        except Exception as exc:  # noqa: BLE001
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "PolicyBackend.get_effective_caps(%r) failed — "
+                "falling back to no-opinion CostCaps(): %s",
+                self.name,
+                exc,
+            )
+            effective_caps = CostCaps()
+            cache_ttl_s = None
+
+        return PolicySnapshotForCall(
+            effective_caps=effective_caps,
+            cache_ttl_s=cache_ttl_s,
+        )
 
     def _ensure_llm_judge(self):
         """Lazy-construct and cache the default ``LLMJudgeBackend`` for
@@ -2932,6 +2983,10 @@ class AtomicAgent:
         _mcp_registered_names: list[str] = []
 
         try:
+            # Take Policy snapshot at call entry (#89 PR 3a / design Premise 3).
+            # Frozen for the duration of this call() — operator edits to policy.md
+            # mid-call are deferred to the NEXT call.
+            self._policy_snapshot_this_call = self._take_policy_snapshot()
             # Reset helper-provenance rollup for this run (spec/13 Layer 3)
             self._helpers_this_run = []
             # Reset delegation rollup for this run
@@ -3661,6 +3716,8 @@ class AtomicAgent:
             # when a later call's server fails to reconnect.
             for _mcp_name in _mcp_registered_names:
                 self.tool_registry.unregister(_mcp_name)
+            # Clear Policy snapshot at call exit — None outside of call().
+            self._policy_snapshot_this_call = None
             self.lock_backend.release(lock_handle)
 
     def _build_tool_loop_messages(
@@ -4428,6 +4485,41 @@ class AtomicAgent:
     # ────────────────────────────────────────────────────────────
     # Cost guardrails
 
+    @staticmethod
+    def _min_or_other(a: float | None, b: float | None) -> float | None:
+        """None-aware MIN for cost-cap composition (#89 PR 3a / spec/32 D2).
+
+        ``None`` means "no opinion at this layer" — drops out of the MIN.
+        Returns ``None`` only when BOTH inputs are ``None``.
+        """
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return min(a, b)
+
+    @staticmethod
+    def _resolve_denying_layer(
+        *,
+        policy_value: float | None,
+        model_md_value: float,
+        effective: float | None,
+    ) -> str:
+        """Pick the layer whose cap equals ``effective`` (#89 PR 3a F14).
+
+        Tiebreaker order (policy > model_md) — policy wins on a tie.
+        Returns ``"policy"`` when Policy's value equals the effective cap;
+        ``"model_md"`` otherwise (including when Policy has no opinion).
+
+        Per-call and mandate layers are N/A in ``_check_cost_guardrails``
+        and are omitted here; PR 3b adds them for tool/MCP surfaces.
+        """
+        if effective is None:
+            return "model_md"
+        if policy_value is not None and policy_value == effective:
+            return "policy"
+        return "model_md"
+
     def _check_cost_guardrails(
         self,
         critical: bool = False,
@@ -4473,44 +4565,74 @@ class AtomicAgent:
             + extra_in_flight_cost_usd
         )
 
-        daily_pct = (
-            (today_cost / self.config.daily_cap_usd)
-            if self.config.daily_cap_usd > 0
-            else 0
+        # ── Policy MIN composition (#89 PR 3a / spec/32 D2) ──────────────────
+        # Resolve Policy caps from the per-call frozen snapshot taken at
+        # call() entry (Premise 3 — snapshot is stable for the whole call).
+        # ``None`` on either side means "no opinion at that layer"; _min_or_other
+        # returns the opinionated one (or None when both are silent).
+        from .policy.types import CostCaps as _CostCaps
+
+        _policy_caps: _CostCaps = (
+            self._policy_snapshot_this_call.effective_caps
+            if self._policy_snapshot_this_call is not None
+            else _CostCaps()
         )
-        monthly_pct = (
-            (month_cost / self.config.monthly_cap_usd)
-            if self.config.monthly_cap_usd > 0
-            else 0
+        # model.md daily/monthly caps: 0 means "disabled" (unlimited).
+        # Convert to None so _min_or_other treats disabled == no-opinion.
+        _model_daily: float | None = (
+            self.config.daily_cap_usd if self.config.daily_cap_usd > 0 else None
         )
+        _model_monthly: float | None = (
+            self.config.monthly_cap_usd if self.config.monthly_cap_usd > 0 else None
+        )
+        _effective_daily = self._min_or_other(_model_daily, _policy_caps.daily_usd)
+        _effective_monthly = self._min_or_other(
+            _model_monthly, _policy_caps.monthly_usd
+        )
+        # ─────────────────────────────────────────────────────────────────────
+
+        daily_pct = (today_cost / _effective_daily) if _effective_daily else 0
+        monthly_pct = (month_cost / _effective_monthly) if _effective_monthly else 0
 
         # Fire warnings (idempotent — won't fire twice for same threshold/day)
         self._maybe_fire_warning("daily", daily_pct)
         self._maybe_fire_warning("monthly", monthly_pct)
 
         if daily_pct >= 1.0:
+            # Emit policy_decision event when Policy contributed to this denial.
+            self._maybe_emit_cost_cap_policy_decision(
+                dimension="daily",
+                policy_value=_policy_caps.daily_usd,
+                model_md_value=_model_daily,
+                effective=_effective_daily,
+                attempted_value=today_cost,
+            )
             return self._cap_action(
                 self.config.daily_cap_action,
-                f"daily cap hit (${today_cost:.2f}/${self.config.daily_cap_usd:.2f})",
+                f"daily cap hit (${today_cost:.2f}/${_effective_daily:.2f})",
             )
         if monthly_pct >= 1.0:
+            # Emit policy_decision event when Policy contributed to this denial.
+            self._maybe_emit_cost_cap_policy_decision(
+                dimension="monthly",
+                policy_value=_policy_caps.monthly_usd,
+                model_md_value=_model_monthly,
+                effective=_effective_monthly,
+                attempted_value=month_cost,
+            )
             return self._cap_action(
                 self.config.monthly_cap_action,
-                f"monthly cap hit (${month_cost:.2f}/${self.config.monthly_cap_usd:.2f})",
+                f"monthly cap hit (${month_cost:.2f}/${_effective_monthly:.2f})",
             )
 
         # Parent headroom check: coordinator's remaining budget caps the delegate.
         # (fix R2-A2) — clamp to min(own remaining, parent headroom)
         if parent_remaining_headroom_usd is not None:
             daily_remaining = (
-                self.config.daily_cap_usd - today_cost
-                if self.config.daily_cap_usd > 0
-                else float("inf")
+                _effective_daily - today_cost if _effective_daily else float("inf")
             )
             monthly_remaining = (
-                self.config.monthly_cap_usd - month_cost
-                if self.config.monthly_cap_usd > 0
-                else float("inf")
+                _effective_monthly - month_cost if _effective_monthly else float("inf")
             )
             own_remaining = min(daily_remaining, monthly_remaining)
             effective_remaining = min(own_remaining, parent_remaining_headroom_usd)
@@ -4525,6 +4647,57 @@ class AtomicAgent:
                 )
 
         return CostCheckResult(allow=True)
+
+    def _maybe_emit_cost_cap_policy_decision(
+        self,
+        *,
+        dimension: str,
+        policy_value: float | None,
+        model_md_value: float | None,
+        effective: float | None,
+        attempted_value: float,
+    ) -> None:
+        """Emit a ``policy_decision`` audit event if Policy contributed to this
+        cost-cap denial (#89 PR 3a).
+
+        Policy "contributed" when its cap value is lower than or equal to
+        model.md's value (or model.md has no opinion / is disabled).
+        When model.md alone would have fired the cap (policy_value is None
+        or model_md_value < policy_value), no Policy event is emitted —
+        the denial is a pure model.md event; Policy was not the decisive
+        layer.
+        """
+        if self._policy_snapshot_this_call is None:
+            return
+        # Policy contributed only when it had an opinion and that opinion was
+        # the binding cap (i.e. policy_value <= model_md_value, or model_md was
+        # disabled/None).  _resolve_denying_layer returns "policy" in that case.
+        denying_layer = self._resolve_denying_layer(
+            policy_value=policy_value,
+            model_md_value=model_md_value if model_md_value is not None else 0.0,
+            effective=effective,
+        )
+        if denying_layer != "policy":
+            return
+
+        from .policy.types import PolicyDecision, _emit_policy_decision
+
+        decision = PolicyDecision(
+            decision_kind="deny",
+            denying_layer=denying_layer,
+            agent_name=self.name,
+            axis="cost_cap",
+            cap_dimension=dimension,
+            attempted_value=attempted_value,
+            effective_cap=effective,
+            cache_ttl_s=self._policy_snapshot_this_call.cache_ttl_s,
+            enforced=True,
+        )
+        _emit_policy_decision(
+            decision,
+            self.log_backend,
+            run_id=self.run_id or "unknown",
+        )
 
     def _maybe_fire_warning(self, period: str, pct: float) -> None:
         state_path = self.agent_root / ".cost-warnings.json"
