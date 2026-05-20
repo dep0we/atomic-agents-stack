@@ -13,7 +13,7 @@ The framework's protocol-pattern scaling story closes at v1.0. **Eight of twelve
 | Issue | Backend | Status | What it unblocks |
 |-------|---------|--------|------------------|
 | [#89](https://github.com/dep0we/atomic-agents-stack/issues/89) | `PolicyBackend` | **In progress** (4-PR arc) | Org-level policy that supersedes per-agent caps and allowlists — multi-tenant tenancy primitive |
-| [#62](https://github.com/dep0we/atomic-agents-stack/issues/62) | `PersonaBackend` | Scope-design pass needed | UI-editable IDENTITY/SOUL/USER, persona versioning, A/B testing |
+| [#62](https://github.com/dep0we/atomic-agents-stack/issues/62) | `PersonaBackend` | Planned (scope-design pass queued) | UI-editable IDENTITY/SOUL/USER, persona versioning, A/B testing |
 | [#65](https://github.com/dep0we/atomic-agents-stack/issues/65) | `CorpusBackend` | Planned | Wiki/raw corpus at GB scale, semantic search, RAG retrieval |
 | [#201](https://github.com/dep0we/atomic-agents-stack/issues/201) | `MCPServerRegistryBackend` | Planned | Catalog + install/audit for MCP servers (the MCP equivalent of the ToolRegistry pattern) |
 
@@ -23,7 +23,11 @@ The framework's protocol-pattern scaling story closes at v1.0. **Eight of twelve
 
 ## Tier 2 — scaling unlocks
 
-Higher-leverage moves that change what the framework *is*, not just what backends it supports.
+Higher-leverage moves that change what the framework *is*, not just what backends it supports. Ordered with the throughline (home user → org fleet) in mind.
+
+### Multi-tenant deployment shape
+
+`atomic-agents serve` runs as an HTTP service exposing an MCP-compatible API. A team or family shares one agent fleet without each person running their own framework. Auth, scoping, audit logging, rate limits. The move that turns the framework into **infrastructure** — matches the "home user with one agent and an org with a fleet experience the same framework" throughline.
 
 ### Semantic memory retrieval
 
@@ -33,17 +37,13 @@ Vector index alongside `INDEX.md`. Embeddings in a sidecar SQLite (or pgvector f
 
 `pip install atomic-caldwell` installs a complete agent into your vault. The "npm for agents" shape — lets the community share whole agents, not just primitives. Pairs with the GitHub template repo for "5-minute first-run."
 
-### Multi-tenant deployment shape
-
-`atomic-agents serve` runs as an HTTP service exposing an MCP-compatible API. A team or family shares one agent fleet without each person running their own framework. Auth, scoping, audit logging, rate limits. The move that turns the framework into **infrastructure**.
-
 ### Skill marketplace
 
 `atomic-agents skills install <name>` pulls from a community registry. Compounds with agent-as-package — skills are the unit of expertise sharing.
 
 ### Conformance test suite
 
-`atomic-agents conformance <agent>` verifies an agent meets the spec. Other framework authors can adopt the spec without using this code. Turns the project from "one framework" into "an open standard with multiple implementations."
+`atomic-agents conformance <agent>` verifies a third-party implementation meets the spec. Distinct from the per-backend conformance suites already in `tests/` — those gate this code; this one gates *other* implementations. Turns the project from "one framework" into "an open standard with multiple implementations."
 
 ---
 

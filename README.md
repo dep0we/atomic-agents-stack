@@ -26,7 +26,7 @@ Your AI agent's persona, memory, and audit trail live in someone else's database
 
 Concretely: INDEX.md routing layer. Persona in `IDENTITY.md` / `SOUL.md` / `USER.md`. Typed atomic notes. Audit trail as JSONL. Cost guardrails in markdown config. Crash-safe writes (temp + fsync + rename + parent-dir fsync — a power loss never leaves a half-written note). Schema migrations are scripts you read before running. The runtime is stateless — point cron, launchd, a Claude Code skill, or embedded Python at the folder.
 
-That's what `atomic-agents-stack` defines, in 23 locked spec docs + 2 RFCs, with a Python reference implementation, 2323 tests, and a Caldwell sample shipping 5 days of real JSONL run logs, a rendered cost dashboard, evals across happy / edge / adversarial / decline categories, and a helper-pattern day showing ~76% cost savings vs. all-Opus.
+That's what `atomic-agents-stack` defines, in 28 locked spec docs + 3 RFCs, with a Python reference implementation, 2381 tests, and a Caldwell sample shipping 5 days of real JSONL run logs, a rendered cost dashboard, evals across happy / edge / adversarial / decline categories, and a helper-pattern day showing ~76% cost savings vs. all-Opus.
 
 A home user with one agent and an org with a fleet experience the same framework — graceful, coherent, self-explanatory at every scale.
 
@@ -123,21 +123,21 @@ This is the slot in the AI-agent-tooling landscape `atomic-agents-stack` occupie
 | **Audit trail** | JSONL per run with `parent_run_id` rollups; helper + delegate + tool + capture lines all link back | Dashboards in Letta UI / cloud | Mem0 dashboards | LangSmith (hosted) | Build it |
 | **Cost guardrails** | First-class — daily / monthly caps, threshold warnings, fallback action, `critical=True` override, tree-cap across delegates | Per their pricing model | Per their pricing model | Not built into core OSS | Build it |
 | **Multi-agent coordination** | Role × project cascade defined in spec/06 | Multi-agent shared memory blocks | Agent-shared memory pools | LangGraph: graph-based orchestration (more flexible) | Build it |
-| **Numbered, locked spec** | 23 docs in `docs/spec/` (+ 2 RFCs) | API + concept docs | API + concept docs | API reference + concept docs | None |
+| **Numbered, locked spec** | 28 docs in `docs/spec/` (+ 3 RFCs) | API + concept docs | API + concept docs | API reference + concept docs | None |
 | **Reference runtime** | Python, macOS / Linux primary | Python (server) + multi-language clients | Python (OSS) + multi-language clients | Python + JavaScript | Whatever |
 
 **Where the alternatives win:**
 
-- **Letta** has the polished hosted-service UX, multi-language clients, and a more mature multi-agent shared-memory primitive.
-- **Mem0** has stronger memory-retrieval optimization (embeddings + retrieval research is their core focus); if memory quality is the bottleneck, evaluate them directly.
-- **LangGraph** has more flexible graph-based orchestration and the **LangSmith** observability stack is broader than any single project's audit trail can replicate.
-- **Direct SDK** wins when your problem is so domain-specific that any framework's structure is overhead.
+- **Letta** ships a polished hosted UX and multi-language clients; vault-only doesn't.
+- **Mem0** owns the embeddings-retrieval research; if memory quality is the bottleneck, look there first.
+- **LangGraph** wins on graph-shaped orchestration; **LangSmith** observability is broader than any single repo's audit trail can replicate.
+- **Direct SDK** wins when the problem is so domain-specific that any framework's structure is overhead.
 
 **Where Atomic Agents wins:**
 
 - **Markdown-source-of-truth, human-editable.** Operators can edit persona / tools / memory from any text editor or Obsidian without a vendor app.
 - **No required server.** The framework is "files + Python." A complete agent runs on a laptop with zero infrastructure.
-- **Spec-level file layout.** 23 numbered docs lock the contract (plus 2 RFCs in progress); conformance is testable; alternate implementations are possible.
+- **Spec-level file layout.** 28 numbered docs lock the contract (plus 3 RFCs in progress); conformance is testable; alternate implementations are possible.
 - **Crash-safe writes by default.** `temp file + fsync + rename + parent-dir fsync` for every mutation; an interrupted run leaves recoverable artifacts, not corruption.
 - **Cost story is structural, not bolted on.** Daily / monthly caps + tree-cap for delegations + per-call cost reservation for helper batches + a `critical=True` override that's part of the API, not a per-vendor workaround.
 
@@ -147,7 +147,7 @@ This is the slot in the AI-agent-tooling landscape `atomic-agents-stack` occupie
 
 `atomic-agents-stack` is a **spec** for vault-native AI agents, plus one **reference implementation** in Python. The spec is the central artifact; anyone can build agents to the spec without using this code.
 
-Start at [`docs/README.md`](docs/README.md) for the spec entry point. The 23 locked spec docs (plus 2 RFCs) in [`docs/spec/`](docs/spec/) cover:
+Start at [`docs/README.md`](docs/README.md) for the spec entry point. The 28 locked spec docs (plus 3 RFCs) in [`docs/spec/`](docs/spec/) cover:
 
 - [01 — Anatomy](docs/spec/01-anatomy.md) — file layout, persona, memory, wiki, journal, log
 - [02 — Atomic Memory](docs/spec/02-atomic-memory.md) — Notes + Wiki + INDEX-driven recall
@@ -186,7 +186,7 @@ The framework is moving toward swappable backends layer by layer. The shape: a P
 | `ToolRegistryBackend` | ✅ Shipped | Filesystem + SQLite reference impls; hybrid metadata-in-SQL + handler-bodies-on-disk; install / uninstall capability | [`spec/25`](docs/spec/25-tool-registry-backend.md) |
 | `MandateBackend` | ✅ Shipped | Filesystem reference impl; `MandateCheck` specialist + reservation pattern + crash recovery; closes the durable-authorization cliff | [`spec/29`](docs/spec/29-mandates.md) |
 | `PolicyBackend` | 🟡 In progress (4-PR arc) | Org-level policy that supersedes per-agent caps and allowlists | [`#89`](https://github.com/dep0we/atomic-agents-stack/issues/89) |
-| `PersonaBackend` | Planned | UI-editable IDENTITY/SOUL/USER + persona versioning | [`#62`](https://github.com/dep0we/atomic-agents-stack/issues/62) |
+| `PersonaBackend` | Planned (scope-design queued) | UI-editable IDENTITY/SOUL/USER + persona versioning | [`#62`](https://github.com/dep0we/atomic-agents-stack/issues/62) |
 | `CorpusBackend` | Planned | Wiki/raw corpus at GB scale + semantic search | [`#65`](https://github.com/dep0we/atomic-agents-stack/issues/65) |
 | `MCPServerRegistryBackend` | Planned | Catalog + install/audit for MCP servers (MCP equivalent of ToolRegistry) | [`#201`](https://github.com/dep0we/atomic-agents-stack/issues/201) |
 
@@ -265,8 +265,8 @@ Same pattern for OpenAI (`atomic-agents-openai`) and Moonshot (`atomic-agents-mo
 ## Repository structure
 
 - `atomic_agents/` — the Python package (runtime in `agent.py`; backend protocols in `memory/`, `_llm.py`, `_locks.py`, `_costs.py`, etc.; CLI in `cli.py`; preflight in `doctor.py`)
-- `tests/` — 2323 tests, Python 3.11 + 3.12 matrix
-- `docs/` — [spec entry point](docs/README.md), [`architecture.md`](docs/architecture.md), [`spec/`](docs/spec/) (23 locked docs + 2 RFCs), [`deployment/`](docs/deployment/) (8 operator runbooks), [`samples/caldwell/`](docs/samples/caldwell/) (complete worked example), [`GOVERNANCE.md`](docs/GOVERNANCE.md), [`TENSIONS.md`](docs/TENSIONS.md), [`methodology.md`](docs/methodology.md)
+- `tests/` — 2381 tests, Python 3.11 + 3.12 matrix
+- `docs/` — [spec entry point](docs/README.md), [`architecture.md`](docs/architecture.md), [`spec/`](docs/spec/) (28 locked docs + 3 RFCs), [`deployment/`](docs/deployment/) (8 operator runbooks), [`samples/caldwell/`](docs/samples/caldwell/) (complete worked example), [`GOVERNANCE.md`](docs/GOVERNANCE.md), [`TENSIONS.md`](docs/TENSIONS.md), [`methodology.md`](docs/methodology.md)
 - `extras/` — operational templates (Claude Code skill wrappers, macOS LaunchAgent plists, cron examples)
 
 ---
@@ -296,4 +296,4 @@ Before opening a PR, read [`CLAUDE.md`](CLAUDE.md) (the project's design ethos a
 
 ## Status
 
-**v0.13.0, alpha.** Core runtime stable. 2323 tests passing on Python 3.11 / 3.12. Eight of twelve backend protocols shipped (see the backend protocols table above); four remain for v1.0 (`PolicyBackend` in progress; `PersonaBackend` / `CorpusBackend` / `MCPServerRegistryBackend` planned). The surface stabilizes at v1.0. Pre-1.0 — Minor releases may contain breaking changes (see [`docs/deployment/versioning.md`](docs/deployment/versioning.md)). Single-maintainer project; reference implementation anyone can use, fork, or extend.
+**v0.13.0, alpha.** Core runtime stable. 2381 tests passing on Python 3.11 / 3.12. Eight of twelve backend protocols shipped (see the backend protocols table above); four remain for v1.0 (`PolicyBackend` in progress; `PersonaBackend` / `CorpusBackend` / `MCPServerRegistryBackend` planned). The surface stabilizes at v1.0. Pre-1.0 — Minor releases may contain breaking changes (see [`docs/deployment/versioning.md`](docs/deployment/versioning.md)). Single-maintainer project; reference implementation anyone can use, fork, or extend.
