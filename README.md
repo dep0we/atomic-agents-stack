@@ -128,7 +128,7 @@ This is the slot in the AI-agent-tooling landscape `atomic-agents-stack` occupie
 
 **Where the alternatives win:**
 
-- **Letta** ships a polished hosted UX and multi-language clients; vault-only doesn't.
+- **Letta** ships a polished hosted UX and multi-language clients; vault-only ships neither.
 - **Mem0** owns the embeddings-retrieval research; if memory quality is the bottleneck, look there first.
 - **LangGraph** wins on graph-shaped orchestration; **LangSmith** observability is broader than any single repo's audit trail can replicate.
 - **Direct SDK** wins when the problem is so domain-specific that any framework's structure is overhead.
@@ -186,7 +186,7 @@ The framework is moving toward swappable backends layer by layer. The shape: a P
 | `ToolRegistryBackend` | ✅ Shipped | Filesystem + SQLite reference impls; hybrid metadata-in-SQL + handler-bodies-on-disk; install / uninstall capability | [`spec/25`](docs/spec/25-tool-registry-backend.md) |
 | `MandateBackend` | ✅ Shipped | Filesystem reference impl; `MandateCheck` specialist + reservation pattern + crash recovery; closes the durable-authorization cliff | [`spec/29`](docs/spec/29-mandates.md) |
 | `PolicyBackend` | 🟡 In progress (4-PR arc) | Org-level policy that supersedes per-agent caps and allowlists | [`#89`](https://github.com/dep0we/atomic-agents-stack/issues/89) |
-| `PersonaBackend` | Planned (scope-design queued) | UI-editable IDENTITY/SOUL/USER + persona versioning | [`#62`](https://github.com/dep0we/atomic-agents-stack/issues/62) |
+| `PersonaBackend` | Planned (scope-design pass queued) | UI-editable IDENTITY/SOUL/USER + persona versioning | [`#62`](https://github.com/dep0we/atomic-agents-stack/issues/62) |
 | `CorpusBackend` | Planned | Wiki/raw corpus at GB scale + semantic search | [`#65`](https://github.com/dep0we/atomic-agents-stack/issues/65) |
 | `MCPServerRegistryBackend` | Planned | Catalog + install/audit for MCP servers (MCP equivalent of ToolRegistry) | [`#201`](https://github.com/dep0we/atomic-agents-stack/issues/201) |
 
