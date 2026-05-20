@@ -436,3 +436,122 @@ def test_doctor_check_policy_backend_no_policy_md_warns(tmp_path):
     # detail is still populated (backend is healthy; just no policy file)
     assert result.detail is not None
     assert result.detail.get("policy_md_exists") is False
+
+
+# ──────────────────────────────────────────────────────────────────
+# Cascade-aware PolicyBackend scoping (#236 fix, PR 3a)
+
+
+def _make_cascade_layout(tmp_path: Path, role_name: str = "researcher") -> Path:
+    """Create a minimal cascade layout and return the instance root (agent_root).
+
+    Layout::
+
+        tmp_path/
+          roles/<role_name>/              # role_root (must exist for detect_cascade)
+          projects/myproject/
+            agents/<role_name>/           # instance_root (= agent_root)
+              persona/IDENTITY.md
+              tools.md
+              model.md
+              memory/
+
+    ``detect_cascade(instance_root)`` returns a ``CascadePaths`` with:
+      - ``cascade.project_root = tmp_path/projects/myproject``
+      - ``cascade.instance_root = tmp_path/projects/myproject/agents/<role_name>``
+    """
+    # Role root (must exist for detect_cascade to fire)
+    role_root = tmp_path / "roles" / role_name
+    role_root.mkdir(parents=True)
+
+    # Instance root under cascade shape
+    instance_root = tmp_path / "projects" / "myproject" / "agents" / role_name
+    instance_root.mkdir(parents=True)
+    (instance_root / "persona").mkdir()
+    (instance_root / "persona" / "IDENTITY.md").write_text(
+        f"# {role_name.title()}\n\n## Operating mode\n\nThis agent is reactive.\n",
+        encoding="utf-8",
+    )
+    (instance_root / "tools.md").write_text(
+        "# Tools\n\n## Read paths\n\n- ~/data\n",
+        encoding="utf-8",
+    )
+    (instance_root / "model.md").write_text(
+        "# Model\n\n## Default model\n\nclaude-sonnet-4-6-20260101\n\n"
+        "```yaml\ncost_guardrails:\n  enabled: true\n  daily_cap_usd: 5.0\n"
+        "  monthly_cap_usd: 100.0\n```\n",
+        encoding="utf-8",
+    )
+    (instance_root / "memory").mkdir()
+    return instance_root
+
+
+def test_atomic_agent_cascade_layout_uses_cascade_project_root(tmp_path):
+    """In a cascade layout, the default policy_backend is scoped to
+    ``cascade.project_root``, NOT ``agents_root`` (#236 fix, PR 3a).
+
+    This is load-bearing: ``policy.md`` in cascade layouts lives at
+    ``<system>/projects/<project>/policy.md``, not at the agents/ subdir.
+    An agent reading caps from agents_root would silently miss the fleet policy
+    because that directory has no policy.md.
+    """
+    instance_root = _make_cascade_layout(tmp_path, "researcher")
+
+    # agents_root for the cascade layout is the agents/ directory
+    agents_root = instance_root.parent  # tmp_path/projects/myproject/agents/
+    expected_project_root = tmp_path / "projects" / "myproject"
+
+    agent = AtomicAgent(name="researcher", agents_root=agents_root)
+
+    # Must be a filesystem backend
+    assert isinstance(agent.policy_backend, FilesystemPolicyBackend)
+    # Must be scoped to cascade.project_root, not agents_root
+    assert (
+        agent.policy_backend._project_root.resolve() == expected_project_root.resolve()
+    ), (
+        f"policy_backend._project_root={agent.policy_backend._project_root!r} "
+        f"expected {expected_project_root!r} — cascade-aware re-resolution failed (#236)"
+    )
+
+
+def test_atomic_agent_non_cascade_uses_agents_root(tmp_path):
+    """In a flat (non-cascade) layout, the default policy_backend is scoped to
+    ``agents_root`` (preserves PR 2 behavior for non-cascade agents).
+    """
+    _make_minimal_agent_dir(tmp_path, "scout")
+    agent = AtomicAgent(name="scout", agents_root=tmp_path)
+
+    assert isinstance(agent.policy_backend, FilesystemPolicyBackend)
+    assert agent.policy_backend._project_root.resolve() == tmp_path.resolve(), (
+        "Non-cascade agent's policy_backend._project_root must equal agents_root"
+    )
+
+
+def test_doctor_warns_on_cascade_scope_mismatch(tmp_path):
+    """When doctor is called in a cascade layout with agents_root as scope_root
+    AND the cascade context is passed, it emits WARN about scope mismatch.
+
+    This covers the case where an operator explicitly passed
+    ``FilesystemPolicyBackend(agents_root)`` instead of
+    ``FilesystemPolicyBackend(cascade.project_root)`` — the doctor surfaces
+    the misconfiguration so they can correct it.
+    """
+    from atomic_agents._cascade import detect_cascade
+
+    instance_root = _make_cascade_layout(tmp_path, "researcher")
+    agents_root = instance_root.parent
+
+    # Detect cascade from instance_root perspective
+    cascade = detect_cascade(instance_root)
+    assert cascade is not None, "test fixture must produce a cascade layout"
+
+    # Doctor called with agents_root scope and cascade context
+    # The backend will be scoped to agents_root (not project_root) which is wrong
+    result = check_policy_backend(agents_root, cascade=cascade)
+
+    assert result.status == "warn", (
+        f"Expected WARN for cascade scope mismatch; got {result.status!r}: {result.message}"
+    )
+    assert "cascade" in result.message.lower(), (
+        f"WARN message should mention 'cascade'; got {result.message!r}"
+    )

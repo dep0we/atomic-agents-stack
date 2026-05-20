@@ -381,22 +381,24 @@ class AtomicAgent:
         else:
             self.mandate_backend = mandate_backend
 
-        # ── PolicyBackend resolution (#89 PR 2) ──────────────────────────
+        # ── PolicyBackend resolution (#89 PR 2, cascade-aware in PR 3a) ──────
         # Policy is fleet-shaped (one policy.md applies to all agents in the
         # project), NOT per-agent like Mandate. Default backend resolves at
-        # ``self.agents_root`` scope, mirroring AgentProfile. The operator's
-        # explicit kwarg always wins (programmatic-override discipline).
+        # ``self.agents_root`` scope; cascade-aware re-resolution below bumps
+        # this to ``cascade.project_root`` after cascade detection (fixes #236).
+        # The operator's explicit kwarg always wins (programmatic-override
+        # discipline — cascade re-resolution is skipped when kwarg is supplied).
         #
         # Per spec/32 MUST #4, FilesystemPolicyBackend construction is
         # side-effect-free — no stat, no parse. The instance is held but
-        # never read in PR 2 (zero behavior change); PR 3 wires consumption
-        # via _check_cost_guardrails MIN composition + tool dispatch site +
-        # MCP discovery site + model selection site + policy_decision event
-        # emission behind ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP=false.
+        # never read in PR 2 (zero behavior change); PR 3a wires consumption
+        # via _check_cost_guardrails MIN composition + MandateCheck integration
+        # + policy_decision event emission. Non-cap surfaces (tool/MCP/model)
+        # ship in PR 3b behind ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP.
         #
-        # Cascade-aware project_root semantics for non-default operators are
-        # handled by passing an explicit ``policy_backend=FilesystemPolicy
-        # Backend(cascade.project_root)`` instance via the kwarg.
+        # _policy_backend_was_explicit tracks whether the operator supplied a
+        # kwarg so the post-cascade re-resolution can skip it correctly.
+        _policy_backend_was_explicit = policy_backend is not None
         if policy_backend is None:
             self.policy_backend = get_default_policy_backend(self.agents_root)
         else:
@@ -564,6 +566,19 @@ class AtomicAgent:
         self.cascade: _cascade.CascadePaths | None = _cascade.detect_cascade(
             self.agent_root
         )
+
+        # ── Cascade-aware PolicyBackend re-resolution (#236 fix, PR 3a) ────────
+        # In cascade layouts, policy.md lives at cascade.project_root (the
+        # project-level directory), NOT at agents_root (the <project>/agents/
+        # subdirectory). The default resolution above ran before cascade
+        # detection, so it targeted agents_root — which is wrong for cascade.
+        #
+        # Re-resolve here ONLY when:
+        #   (a) the operator did NOT supply an explicit policy_backend kwarg,
+        #   AND (b) we are in a cascade layout.
+        # Operator-supplied backends ALWAYS win (programmatic-override discipline).
+        if not _policy_backend_was_explicit and self.cascade is not None:
+            self.policy_backend = get_default_policy_backend(self.cascade.project_root)
 
         # Skills (spec/18) — discover at init so metadata is available for
         # system-prompt assembly. Empty list when no skills/ directory exists.

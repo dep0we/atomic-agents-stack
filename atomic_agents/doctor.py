@@ -217,7 +217,9 @@ def run_doctor(
     results.append(check_log_backend(agent_root))
     results.append(check_agent_profile_backend(resolved_root))
     results.append(check_tool_registry_backend(agent_root))
-    results.append(check_policy_backend(resolved_root))
+    # Pass cascade so check_policy_backend can warn when the backend is
+    # scoped to agents_root instead of cascade.project_root (fix #236).
+    results.append(check_policy_backend(resolved_root, cascade=cascade))
     results.append(check_memory_backend(agent_root))
     results.append(check_write_paths(tools_data, agent_root=agent_root))
 
@@ -1672,14 +1674,20 @@ def check_tool_registry_backend(agent_root: Path) -> CheckResult:
     )
 
 
-def check_policy_backend(scope_root: Path) -> CheckResult:
-    """Operator-config coherence check for the policy backend (#89 PR 2).
+def check_policy_backend(scope_root: Path, *, cascade=None) -> CheckResult:
+    """Operator-config coherence check for the policy backend (#89 PR 2 + 3a).
 
     Validates that ``ATOMIC_AGENTS_POLICY_BACKEND`` is correctly configured.
     Scoped at ``scope_root`` (not ``agent_root``) because the policy backend
     is fleet-scoped — ``<scope_root>/policy.md`` declares fleet-default caps,
     tool allowlists, MCP server allowlists, and model selection that apply
     across all agents under the root.
+
+    When ``cascade`` is supplied (a ``_cascade.CascadePaths`` or any object
+    with a ``.project_root`` attribute), the check also warns when a filesystem
+    backend is scoped to ``agents_root`` instead of ``cascade.project_root``
+    because in cascade layouts, ``policy.md`` lives at the project root and the
+    runtime re-resolves the backend there (fix #236 PR 3a).
 
     PASS / WARN / FAIL ladder mirrors ``check_agent_profile_backend`` /
     ``check_tool_registry_backend``:
@@ -1752,6 +1760,41 @@ def check_policy_backend(scope_root: Path) -> CheckResult:
             "policy_md_exists": policy_md_exists,
             "resolved_path": str(policy_md_path),
         }
+        # Cascade-scope mismatch warning (#236 fix, PR 3a).
+        # When the agent is in a cascade layout, policy.md should live at
+        # cascade.project_root (the project-level dir), not at agents_root.
+        # The runtime auto-corrects this at agent construction time; the doctor
+        # surfaces it so operators who passed an explicit FilesystemPolicyBackend
+        # scoped to agents_root instead of cascade.project_root see a warning
+        # before production traffic hits the wrong scope.
+        # Only emits for filesystem backends — SaaS/Postgres backends manage
+        # their own scope resolution without a project_root attribute.
+        if (
+            cascade is not None
+            and hasattr(backend, "_project_root")
+            and Path(backend._project_root).resolve()
+            != Path(cascade.project_root).resolve()
+        ):
+            detail["cascade_scope_mismatch"] = True
+            detail["cascade_project_root"] = str(cascade.project_root)
+            return CheckResult(
+                name="policy-backend",
+                status=WARN,
+                message=(
+                    "filesystem policy backend is scoped to agents_root "
+                    f"({scope_root}) but this is a cascade layout — "
+                    f"policy.md should live at cascade.project_root "
+                    f"({cascade.project_root})"
+                ),
+                fix_hint=(
+                    "The runtime auto-corrects this (AtomicAgent re-resolves "
+                    "the default backend to cascade.project_root after cascade "
+                    "detection). If you passed an explicit policy_backend= kwarg, "
+                    f"scope it to {cascade.project_root} instead of {scope_root}."
+                ),
+                detail=detail,
+            )
+
         if not policy_md_exists:
             return CheckResult(
                 name="policy-backend",
