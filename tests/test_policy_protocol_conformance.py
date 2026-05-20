@@ -6,11 +6,12 @@ in-memory ``MockPolicyBackend`` registered under ``"mock"`` for the duration
 of each test.  Every conformance test runs against BOTH backends so the
 Protocol contract is verified independently of the storage substrate.
 
-What this suite asserts (25 tests, PR 1 of #89):
+What this suite asserts (28 tests, PR 3a of #89 — updated from PR 1's 25):
 
 1.  ``FilesystemPolicyBackend(non_existent_path)`` succeeds — construction is
     side-effect-free (F4 / spec/32 MUST #4).
-2.  No ``policy.md`` → ``CostCaps()`` returned by ``get_effective_caps``.
+2.  No ``policy.md`` → ``CostCaps()`` returned by ``get_effective_caps``
+    (daily + monthly only; cumulative deferred to v1.1 per D1).
 3.  No ``policy.md`` → ``is_tool_allowed`` returns ``True``.
 4.  No ``policy.md`` → ``is_mcp_server_allowed`` returns ``True``.
 5.  No ``policy.md`` → ``get_effective_model`` returns ``None``.
@@ -35,6 +36,9 @@ What this suite asserts (25 tests, PR 1 of #89):
 23. Per-agent ``tools.deny`` unions with fleet deny.
 24. Per-agent model override replaces fleet model.
 25. Empty ``agents: foo: {}`` body means no override — fleet defaults apply.
+26. D2 loosened charset — "caldwell.research" (dots) accepted.
+27. D2 loosened charset — "team-2024+ops" (plus, hyphen) accepted.
+28. D2 loosened charset — "ops@fleet" (at-sign) accepted.
 """
 
 from __future__ import annotations
@@ -64,12 +68,13 @@ from atomic_agents.policy.types import (
 # Validation helpers — intentional duplication from MockPolicyBackend so mock
 # is self-contained and does NOT import from the implementation under test.
 
-_AGENT_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
+# D2 — loosened to match the charset the filesystem backend accepts.
+_AGENT_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_.+@-]+$")
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def _validate_agent_name_for_mock(name: str) -> None:  # noqa: D401
-    """Raise ``ValueError`` for any agent_name that violates spec/32 MUST #1."""
+    """Raise ``ValueError`` for any agent_name that violates spec/32 MUST #1 (D2)."""
     if not isinstance(name, str) or not name:
         raise ValueError(f"agent_name must be non-empty; got {name!r}")
     if name.startswith(".") or ".." in name or "/" in name or "\\" in name:
@@ -77,7 +82,7 @@ def _validate_agent_name_for_mock(name: str) -> None:  # noqa: D401
     if _CONTROL_CHARS.search(name):
         raise ValueError(f"agent_name has control/newline char; got {name!r}")
     if not _AGENT_NAME_PATTERN.match(name):
-        raise ValueError(f"agent_name must match [a-zA-Z0-9_-]+; got {name!r}")
+        raise ValueError(f"agent_name must match [a-zA-Z0-9_.+@-]+; got {name!r}")
 
 
 def _validate_tool_or_server_for_mock(name: str) -> None:  # noqa: D401
@@ -153,9 +158,6 @@ class MockPolicyBackend:
         return CostCaps(
             daily_usd=_min_or_other(fleet.daily_usd, caps_override.daily_usd),
             monthly_usd=_min_or_other(fleet.monthly_usd, caps_override.monthly_usd),
-            cumulative_usd=_min_or_other(
-                fleet.cumulative_usd, caps_override.cumulative_usd
-            ),
         )
 
     def is_tool_allowed(self, agent_name: str, tool_name: str) -> bool:
@@ -361,13 +363,15 @@ def test_construction_is_side_effect_free(tmp_path: Path) -> None:
 
 def test_no_policy_md_returns_no_opinion_caps(backend_factory) -> None:
     """Absent ``policy.md`` (or empty mock) → ``get_effective_caps`` returns
-    a ``CostCaps()`` with all-``None`` fields (no opinion on any dimension)."""
+    a ``CostCaps()`` with all-``None`` fields (no opinion on any dimension).
+
+    v1 ships daily + monthly only (cumulative deferred to v1.1 per D1).
+    """
     with backend_factory() as backend:
         caps = backend.get_effective_caps("some_agent")
     assert isinstance(caps, CostCaps)
     assert caps.daily_usd is None
     assert caps.monthly_usd is None
-    assert caps.cumulative_usd is None
 
 
 def test_no_policy_md_returns_true_for_tool(backend_factory) -> None:
@@ -669,3 +673,48 @@ def test_empty_agents_body_means_no_override(backend_factory) -> None:
         caps = backend.get_effective_caps("foo")
     # Must equal fleet_caps — no override applied
     assert caps.daily_usd == 50.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests 26-28 — D2 loosened agent_name charset
+
+
+def test_agent_name_with_dot_accepted(backend_factory) -> None:
+    """``agent_name="caldwell.research"`` (internal dot) is accepted by all
+    four query methods after D2 charset loosening.
+
+    Dots were previously rejected but appear in real operator deployments
+    (e.g. role-scoped names, project-qualified names).  The loosened pattern
+    ``[a-zA-Z0-9_.+@-]+`` permits them while still rejecting leading-dot
+    (filesystem hidden-file trick) and ``..`` (directory traversal).
+    """
+    with backend_factory() as backend:
+        backend.get_effective_caps("caldwell.research")
+        backend.is_tool_allowed("caldwell.research", "some_tool")
+        backend.is_mcp_server_allowed("caldwell.research", "some_server")
+        backend.get_effective_model("caldwell.research")
+
+
+def test_agent_name_with_plus_and_hyphen_accepted(backend_factory) -> None:
+    """``agent_name="team-2024+ops"`` (plus + hyphen) is accepted by all four
+    query methods after D2 charset loosening."""
+    with backend_factory() as backend:
+        backend.get_effective_caps("team-2024+ops")
+        backend.is_tool_allowed("team-2024+ops", "some_tool")
+        backend.is_mcp_server_allowed("team-2024+ops", "some_server")
+        backend.get_effective_model("team-2024+ops")
+
+
+def test_agent_name_with_at_sign_accepted(backend_factory) -> None:
+    """``agent_name="ops@fleet"`` (at-sign) is accepted by all four query
+    methods after D2 charset loosening.
+
+    Path-traversal tokens (.., /, \\), leading dot, control chars, and
+    newlines are STILL rejected — the loosening only adds the characters
+    operators actually use in practice.
+    """
+    with backend_factory() as backend:
+        backend.get_effective_caps("ops@fleet")
+        backend.is_tool_allowed("ops@fleet", "some_tool")
+        backend.is_mcp_server_allowed("ops@fleet", "some_server")
+        backend.get_effective_model("ops@fleet")

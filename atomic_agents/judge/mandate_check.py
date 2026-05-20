@@ -44,6 +44,7 @@ from .types import ActionClass, ActionProposal, JudgmentContext
 if TYPE_CHECKING:
     from ..judges_md import MandateSettings
     from ..logs.backend import LogBackend
+    from ..policy.types import CostCaps
     from ..tools import ToolRegistry
 
 _logger = logging.getLogger(__name__)
@@ -121,6 +122,7 @@ class MandateCheck:
         iteration_start_ts: str | None = None,
         judge_id: str = _JUDGE_ID,
         policy_version: str = _POLICY_VERSION_SENTINEL,
+        policy_effective_caps: "CostCaps | None" = None,
     ) -> None:
         """Construct the ``MandateCheck`` specialist.
 
@@ -188,6 +190,10 @@ class MandateCheck:
         self._iteration_start_ts = iteration_start_ts
         self._judge_id = judge_id
         self._policy_version = policy_version
+        # Policy effective caps snapshot for cost-cap MIN composition in
+        # steps 7-8 (#89 PR 3a).  ``None`` means no Policy opinion — steps
+        # use mandate constraint values unchanged (pre-PR-3a behavior).
+        self._policy_effective_caps = policy_effective_caps
         # Within-process lock for state read-modify-write (spec/29 line 741).
         self._state_lock = threading.Lock()
         # Round 1 Finding 6: per-proposal projection cache so callers can
@@ -773,6 +779,19 @@ class MandateCheck:
         n = max(1, n_tool_calls)
         return turn_cost / n
 
+    @staticmethod
+    def _min_or_other(a: float | None, b: float | None) -> float | None:
+        """None-aware MIN for Policy cost-cap composition (#89 PR 3a / spec/32 D2).
+
+        ``None`` means "no opinion at this layer" and drops out of the MIN.
+        Returns ``None`` only when BOTH inputs are ``None``.
+        """
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return min(a, b)
+
     def _step7_token_budget(
         self,
         *,
@@ -823,24 +842,33 @@ class MandateCheck:
                 "cap": c.cumulative_token_usd,
             }
 
+        # Policy MIN composition (#89 PR 3a / spec/32 D2).
+        # Effective cap for each dimension = MIN(mandate constraint, Policy cap).
+        # ``None`` on Policy side means "no opinion" — mandate constraint used as-is.
+        _policy_caps = self._policy_effective_caps
+        _policy_daily = _policy_caps.daily_usd if _policy_caps is not None else None
+        _policy_monthly = _policy_caps.monthly_usd if _policy_caps is not None else None
+
         # For daily/monthly window sums: in v1 we conservatively re-use the
         # full cumulative spend (no per-window scan implemented yet — a
         # follow-up issue should add LogQuery.since/until window scoping).
         # The full cumulative is always ≥ the windowed sum, so this never
         # under-blocks.  It may over-block near cap exhaustion within the
         # window; operators can widen the window cap as a workaround.
-        if c.daily_token_usd is not None and cumulative > c.daily_token_usd:
+        _eff_daily_token = self._min_or_other(c.daily_token_usd, _policy_daily)
+        if _eff_daily_token is not None and cumulative > _eff_daily_token:
             caps_exceeded["daily_token_usd"] = {
                 "projected": projected,
                 "cumulative": cumulative,
-                "cap": c.daily_token_usd,
+                "cap": _eff_daily_token,
             }
 
-        if c.monthly_token_usd is not None and cumulative > c.monthly_token_usd:
+        _eff_monthly_token = self._min_or_other(c.monthly_token_usd, _policy_monthly)
+        if _eff_monthly_token is not None and cumulative > _eff_monthly_token:
             caps_exceeded["monthly_token_usd"] = {
                 "projected": projected,
                 "cumulative": cumulative,
-                "cap": c.monthly_token_usd,
+                "cap": _eff_monthly_token,
             }
 
         return {
@@ -955,18 +983,31 @@ class MandateCheck:
                 "cap": c.cumulative_external_usd,
             }
 
-        if c.daily_external_usd is not None and cumulative > c.daily_external_usd:
+        # Policy MIN composition (#89 PR 3a / spec/32 D2) for external budget.
+        _policy_caps_ext = self._policy_effective_caps
+        _policy_daily_ext = (
+            _policy_caps_ext.daily_usd if _policy_caps_ext is not None else None
+        )
+        _policy_monthly_ext = (
+            _policy_caps_ext.monthly_usd if _policy_caps_ext is not None else None
+        )
+
+        _eff_daily_ext = self._min_or_other(c.daily_external_usd, _policy_daily_ext)
+        if _eff_daily_ext is not None and cumulative > _eff_daily_ext:
             caps_exceeded["daily_external_usd"] = {
                 "projected": projected,
                 "cumulative": cumulative,
-                "cap": c.daily_external_usd,
+                "cap": _eff_daily_ext,
             }
 
-        if c.monthly_external_usd is not None and cumulative > c.monthly_external_usd:
+        _eff_monthly_ext = self._min_or_other(
+            c.monthly_external_usd, _policy_monthly_ext
+        )
+        if _eff_monthly_ext is not None and cumulative > _eff_monthly_ext:
             caps_exceeded["monthly_external_usd"] = {
                 "projected": projected,
                 "cumulative": cumulative,
-                "cap": c.monthly_external_usd,
+                "cap": _eff_monthly_ext,
             }
 
         # per_action_max_usd — single-action cap, compared against projected

@@ -57,6 +57,7 @@ PRIMITIVE_CAPTURE = "capture"
 PRIMITIVE_ESCALATION = "escalation"
 PRIMITIVE_JUDGMENT = "judgment"
 PRIMITIVE_MANDATE_RESERVATION = "mandate_reservation"  # #124 PR 3b — reservation event family (granted/used/committed/rolled_back/expired/_on_recovery/_external_unverified) all share this primitive so LogQuery(primitive=PRIMITIVE_MANDATE_RESERVATION, mandate_id=...) is an indexed query on SQLite backends and a bounded scan on filesystem
+PRIMITIVE_POLICY_DECISION = "policy_decision"  # #89 PR 3a — Policy/Mandate cap denial + model override audit events; PolicyDecision schema in atomic_agents.policy.types
 PRIMITIVE_OTHER = "other"
 
 
@@ -65,29 +66,31 @@ PRIMITIVE_OTHER = "other"
 # set is intentionally narrow — only fields the framework reads
 # uniformly across primitives. Anything else is primitive-specific
 # and stays in ``extra``.
-_CANONICAL_FIELDS = frozenset({
-    "ts",
-    "run_id",
-    "primitive",
-    "status",
-    "summary",
-    "model",
-    "input_tokens",
-    "output_tokens",
-    # common-but-optional
-    "cost_usd",
-    "cost_source",
-    "latency_ms",
-    "cache_hit_tokens",
-    "cache_miss_tokens",
-    "mandate_id",
-    "parent_run_id",
-    "parent_agent",
-    "trigger",
-    "agent_name",
-    "fallback",
-    "critical",
-})
+_CANONICAL_FIELDS = frozenset(
+    {
+        "ts",
+        "run_id",
+        "primitive",
+        "status",
+        "summary",
+        "model",
+        "input_tokens",
+        "output_tokens",
+        # common-but-optional
+        "cost_usd",
+        "cost_source",
+        "latency_ms",
+        "cache_hit_tokens",
+        "cache_miss_tokens",
+        "mandate_id",
+        "parent_run_id",
+        "parent_agent",
+        "trigger",
+        "agent_name",
+        "fallback",
+        "critical",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -407,13 +410,15 @@ METRIC_SUM_INPUT_TOKENS = "sum_input_tokens"
 METRIC_SUM_OUTPUT_TOKENS = "sum_output_tokens"
 METRIC_AVG_LATENCY_MS = "avg_latency_ms"
 
-VALID_METRICS = frozenset({
-    METRIC_COUNT,
-    METRIC_SUM_COST_USD,
-    METRIC_SUM_INPUT_TOKENS,
-    METRIC_SUM_OUTPUT_TOKENS,
-    METRIC_AVG_LATENCY_MS,
-})
+VALID_METRICS = frozenset(
+    {
+        METRIC_COUNT,
+        METRIC_SUM_COST_USD,
+        METRIC_SUM_INPUT_TOKENS,
+        METRIC_SUM_OUTPUT_TOKENS,
+        METRIC_AVG_LATENCY_MS,
+    }
+)
 
 
 @dataclass(frozen=True)

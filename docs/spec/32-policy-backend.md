@@ -29,7 +29,7 @@ The Mandate primitive (shipped at PR #230) closed the per-agent durable-authoriz
 | Premise 5 (revised per D7) | Default semantics | No `policy.md` = no opinion. `policy.md` present but agent NOT in `agents:` section = fleet-default rules apply. `policy.md` present and agent IN `agents:` section = per-agent override (MIN-composed for caps, MERGE+UNION for allowlists, REPLACE for model) |
 | Premise 6 | Cross-host bound | (replica count) × (per-call cost_cap ceiling); per-call ceiling is the safety net |
 | D1 | `delegate.py` threading | Thread it (coordinator's `PolicyBackend` flows to delegates per PR 2) |
-| D2 | Cost-cap math | Per-dimension MIN (daily / monthly / cumulative independent) |
+| D2 | Cost-cap math | Per-dimension MIN (daily / monthly independent; cumulative deferred to v1.1 per plan-subagent D1) |
 | D3 | Enforcement flag granularity | Single `ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP` flag covering tools + MCP + model together |
 | D4 | Strict-mode capability | Don't expose in v1; parser handles deny-default via `tools.allow:` non-empty |
 | D5 | Cache TTL | Expose `PolicyCapabilities.cache_ttl_s: int | None`; filesystem returns 0 with mtime+size-gated parse cache as filesystem-specific behavior |
@@ -81,7 +81,6 @@ Worked example:
 cost_caps:
   daily_usd: 50.0
   monthly_usd: 1000.0
-  cumulative_usd: 5000.0
 
 tools:
   allow:
@@ -132,7 +131,7 @@ Composition between fleet defaults and per-agent overrides:
 - Malformed YAML.
 - Negative cost-cap value.
 - `agents:` is not a mapping (e.g., a list).
-- `agent_name` containing path-traversal tokens (`..`, `/`, `\`), control characters, newlines, or leading dots; or not matching `[a-zA-Z0-9_-]+`.
+- `agent_name` containing path-traversal tokens (`..`, `/`, `\`), control characters, newlines, or leading dots; or not matching `[a-zA-Z0-9_.+@-]+` (D2 loosened charset — dots, plus, at-sign permitted to cover real operator names like `caldwell.research`, `ops@fleet`, `team-2024+ops`).
 - Tool / MCP server name containing control characters or newlines.
 
 Same tool in both fleet allow AND fleet deny is NOT a refusal (deny wins per the in-layer rule) but emits a logger warning at parse time.
@@ -161,14 +160,16 @@ The reference `FilesystemPolicyBackend` holds one cached `PolicySnapshot` keyed 
 
 ## Composition math
 
-Per Premise 1 (most-restrictive wins) + D2 (per-dimension MIN):
+Per Premise 1 (most-restrictive wins) + D2 (per-dimension MIN; cumulative deferred to v1.1):
 
 ```
-effective_daily_cap     = MIN(policy.daily, model_md.daily)        # PR 3 will fold call.cost_cap as a separate per-call ceiling
-effective_monthly_cap   = MIN(policy.monthly, model_md.monthly)
-effective_cumulative_cap = MIN(policy.cumulative, model_md.cumulative)
+effective_daily_cap   = MIN(policy.daily, model_md.daily)     # per-call ceiling is separate
+effective_monthly_cap = MIN(policy.monthly, model_md.monthly)
 
-per_call_ceiling        = agent.call(cost_cap=N)                   # bounds same-dimension cap arithmetic
+# Note: cumulative_usd dimension deferred to v1.1 (plan-subagent D1).
+# v1 ships daily + monthly only, matching model.md cost_guardrails dimensions.
+
+per_call_ceiling = agent.call(cost_cap=N)                     # bounds same-dimension cap arithmetic
 
 # Allowlist (tool + MCP)
 effective_allow = (fleet.allow | agent.allow)
@@ -176,7 +177,17 @@ effective_deny  = (fleet.deny  | agent.deny)
 is_allowed(x) = x not in effective_deny AND (effective_allow is empty OR x in effective_allow)
 ```
 
-`MandateCheck` (spec/29) steps 7-9 consume the PRE-COMPOSED effective caps so Policy and Mandate cost-cap checks share the same arithmetic. This lands in PR 3 — PR 1 ships only the contract.
+`MandateCheck` (spec/29) steps 7-8 consume the PRE-COMPOSED effective caps so Policy and Mandate cost-cap checks share the same arithmetic. Landed in PR 3a — PR 1 + 2 shipped only the contract.
+
+### Denying-layer resolution
+
+When multiple layers contribute the same MIN-composed cap, the `denying_layer` field in `PolicyDecision` names the TIGHTEST contributing layer. Tiebreaker order (most-fleet to least-fleet):
+
+```
+policy > mandate > model_md > per_call
+```
+
+Example: fleet cap = 50, model_md cap = 30, per_call cap = 30 → `denying_layer = "model_md"` (ties broken toward most-fleet contributor, model_md beats per_call).
 
 ## Per-agent vs fleet-default resolution
 
@@ -212,13 +223,15 @@ class PolicyDecision:
     agent_name: str
     axis: Literal["cost_cap", "tool_allowlist", "mcp_allowlist", "model_selection"]
     # axis-specific (None when not relevant):
-    cap_dimension: Literal["daily", "monthly", "cumulative", "per_call"] | None = None
+    cap_dimension: Literal["daily", "monthly", "per_call"] | None = None  # cumulative dropped D1
     attempted_value: float | None = None
     effective_cap: float | None = None
     tool_name: str | None = None
     mcp_server_name: str | None = None
     model_from_md: str | None = None
     model_from_policy: str | None = None
+    # enforcement flag:
+    enforced: bool = False
     # common:
     cache_ttl_s: int | None = None
     ts: datetime | None = None
@@ -230,7 +243,16 @@ class PolicyDecision:
 - `decision_kind="deny"`: some layer denied the action. `denying_layer` names which (`policy` / `mandate` / `model_md` / `per_call`). Axis-specific fields populate per the surface: `cost_cap` → cap_dimension + attempted_value + effective_cap; `tool_allowlist` → tool_name; `mcp_allowlist` → mcp_server_name.
 - `decision_kind="override"`: Policy returned a non-None model selection that supersedes `model.md`. `denying_layer` is None (no denial occurred — the override applied without violation). Axis is `model_selection`; `model_from_md` and `model_from_policy` populate.
 
+**`enforced` field semantics:**
+
+- `enforced=True`: the denial or override blocked / altered the action. Cost-cap denials set `enforced=True` when `cap_action="skip"` (the default — the call is blocked outright). For `cap_action ∈ {"alert", "fallback"}` the call proceeds (alert logs a warning + continues; fallback substitutes a cheaper model + continues) and the cost-cap event records `enforced=False` so the audit trail truthfully reflects whether money was actually spent. Operators reading `LogQuery(primitive="policy_decision", enforced=True)` for billing-incident attribution see only the actually-blocked events.
+- `enforced=False`: log-only mode — the denial or override was recorded in the audit trail but the action proceeded. Non-cap surfaces (tools / MCP / model) set `enforced=value_of_ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP` (default `false`). That env-var and those surfaces ship in PR 3b.
+
 Operators reading the audit log filter by `decision_kind` first, then `axis`. The single event family closes the Premise 4 promise that operators see ONE event for "was this Policy or Mandate?" with `denying_layer` answering the question directly.
+
+### `agent_name` character set
+
+The accepted charset for `agent_name` at the API boundary is `[a-zA-Z0-9_.+@-]+` (D2 loosened from the RFC's `[a-zA-Z0-9_-]+`). Still rejected: path-traversal tokens (`..`, `/`, `\`), leading dots, control characters, newlines, empty strings. The loosening covers real operator deployment names observed in the test corpus: `caldwell.research` (dot-qualified), `team-2024+ops` (plus suffix), `ops@fleet` (at-sign scoped).
 
 ## Implementer contract for policy backends
 
@@ -238,7 +260,7 @@ A backend that implements the `PolicyBackend` Protocol commits to the contract b
 
 **Implementers MUST:**
 
-1. **Path-traversal refusal at the API boundary.** Every Protocol method validates `agent_name` against `[a-zA-Z0-9_-]+` BEFORE any storage access. Reject path-traversal tokens (`..`, `/`, `\`), control characters, newlines, leading dots, or empty strings with `ValueError`. `tool_name` and `mcp_server_name` validation rejects only control characters and newlines (allows dots, dashes, colons because `mcp:server:tool.name` is legitimate). The reference filesystem backend rejects before any dict access; SQL backends parameterize but still refuse at the API boundary as defense-in-depth.
+1. **Path-traversal refusal at the API boundary.** Every Protocol method validates `agent_name` against `[a-zA-Z0-9_.+@-]+` BEFORE any storage access (D2 loosened charset — see §"`agent_name` character set"). Reject path-traversal tokens (`..`, `/`, `\`), control characters, newlines, leading dots, or empty strings with `ValueError`. `tool_name` and `mcp_server_name` validation rejects only control characters and newlines (allows dots, dashes, colons because `mcp:server:tool.name` is legitimate). The reference filesystem backend rejects before any dict access; SQL backends parameterize but still refuse at the API boundary as defense-in-depth.
 
 2. **Per-agent isolation enforced at the storage layer.** A `get_effective_caps("foo")` query MUST NOT leak agent `bar`'s caps. For SQL backends, every query filters `WHERE agent_name = ?`. For filesystem, the parsed `PolicySnapshot.agent_overrides` dict is keyed strictly by `agent_name` — no fallback to fuzzy matching, no prefix matching.
 

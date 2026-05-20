@@ -381,22 +381,24 @@ class AtomicAgent:
         else:
             self.mandate_backend = mandate_backend
 
-        # ── PolicyBackend resolution (#89 PR 2) ──────────────────────────
+        # ── PolicyBackend resolution (#89 PR 2, cascade-aware in PR 3a) ──────
         # Policy is fleet-shaped (one policy.md applies to all agents in the
         # project), NOT per-agent like Mandate. Default backend resolves at
-        # ``self.agents_root`` scope, mirroring AgentProfile. The operator's
-        # explicit kwarg always wins (programmatic-override discipline).
+        # ``self.agents_root`` scope; cascade-aware re-resolution below bumps
+        # this to ``cascade.project_root`` after cascade detection (fixes #236).
+        # The operator's explicit kwarg always wins (programmatic-override
+        # discipline — cascade re-resolution is skipped when kwarg is supplied).
         #
         # Per spec/32 MUST #4, FilesystemPolicyBackend construction is
         # side-effect-free — no stat, no parse. The instance is held but
-        # never read in PR 2 (zero behavior change); PR 3 wires consumption
-        # via _check_cost_guardrails MIN composition + tool dispatch site +
-        # MCP discovery site + model selection site + policy_decision event
-        # emission behind ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP=false.
+        # never read in PR 2 (zero behavior change); PR 3a wires consumption
+        # via _check_cost_guardrails MIN composition + MandateCheck integration
+        # + policy_decision event emission. Non-cap surfaces (tool/MCP/model)
+        # ship in PR 3b behind ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP.
         #
-        # Cascade-aware project_root semantics for non-default operators are
-        # handled by passing an explicit ``policy_backend=FilesystemPolicy
-        # Backend(cascade.project_root)`` instance via the kwarg.
+        # _policy_backend_was_explicit tracks whether the operator supplied a
+        # kwarg so the post-cascade re-resolution can skip it correctly.
+        _policy_backend_was_explicit = policy_backend is not None
         if policy_backend is None:
             self.policy_backend = get_default_policy_backend(self.agents_root)
         else:
@@ -565,6 +567,19 @@ class AtomicAgent:
             self.agent_root
         )
 
+        # ── Cascade-aware PolicyBackend re-resolution (#236 fix, PR 3a) ────────
+        # In cascade layouts, policy.md lives at cascade.project_root (the
+        # project-level directory), NOT at agents_root (the <project>/agents/
+        # subdirectory). The default resolution above ran before cascade
+        # detection, so it targeted agents_root — which is wrong for cascade.
+        #
+        # Re-resolve here ONLY when:
+        #   (a) the operator did NOT supply an explicit policy_backend kwarg,
+        #   AND (b) we are in a cascade layout.
+        # Operator-supplied backends ALWAYS win (programmatic-override discipline).
+        if not _policy_backend_was_explicit and self.cascade is not None:
+            self.policy_backend = get_default_policy_backend(self.cascade.project_root)
+
         # Skills (spec/18) — discover at init so metadata is available for
         # system-prompt assembly. Empty list when no skills/ directory exists.
         self.skills: list[SkillManifest] = discover_skills(self.agent_root)
@@ -574,6 +589,13 @@ class AtomicAgent:
         # so operators can still register their own tools on the same registry.
         if self.skills:
             self._register_skill_tools()
+
+        # Per-call Policy snapshot (#89 PR 3a). Reset at call() entry,
+        # cleared in call() finally block. ``None`` outside of call().
+        # The snapshot is taken ONCE at call() entry (Premise 3: predictability
+        # over freshness within the call). All cost-cap checks within the same
+        # call() read from this frozen snapshot instead of re-querying the backend.
+        self._policy_snapshot_this_call = None
 
         # Per-call helper-provenance rollup (spec/13 Layer 3). Reset at the
         # start of each call(); appended to by helper_call(). Empty list
@@ -1277,8 +1299,52 @@ class AtomicAgent:
             mandate_state_manager=state_manager,
             mandate_settings=mandate_settings,
             log_backend=self.log_backend,
+            policy_effective_caps=(
+                self._policy_snapshot_this_call.effective_caps
+                if self._policy_snapshot_this_call is not None
+                else None
+            ),
         )
         return self._mandate_check
+
+    def _take_policy_snapshot(self):
+        """Take a frozen per-call Policy snapshot at call() entry (#89 PR 3a).
+
+        Called once at the START of ``call()`` (alongside the ``_helpers_this_run``
+        reset).  All cost-cap checks within the same ``call()`` read from this
+        snapshot — operator edits to ``policy.md`` mid-call are deferred to the
+        NEXT call (Premise 3: predictability over freshness within the call).
+
+        Returns a ``PolicySnapshotForCall`` with:
+        - ``effective_caps``: MIN-composed Policy caps for THIS agent.
+        - ``cache_ttl_s``: backend capability snapshot at call-entry time.
+        - PR 3b stub fields (``tool_allow_fn``, ``mcp_allow_fn``,
+          ``model_override``) are ``None`` in PR 3a — only cost caps are consumed.
+
+        On any backend error, falls back to a no-opinion ``CostCaps()`` and
+        logs a warning rather than aborting the call.
+        """
+        from .policy.types import CostCaps, PolicySnapshotForCall
+
+        try:
+            effective_caps = self.policy_backend.get_effective_caps(self.name)
+            cache_ttl_s = self.policy_backend.capabilities().cache_ttl_s
+        except Exception as exc:  # noqa: BLE001
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "PolicyBackend.get_effective_caps(%r) failed — "
+                "falling back to no-opinion CostCaps(): %s",
+                self.name,
+                exc,
+            )
+            effective_caps = CostCaps()
+            cache_ttl_s = None
+
+        return PolicySnapshotForCall(
+            effective_caps=effective_caps,
+            cache_ttl_s=cache_ttl_s,
+        )
 
     def _ensure_llm_judge(self):
         """Lazy-construct and cache the default ``LLMJudgeBackend`` for
@@ -2917,6 +2983,24 @@ class AtomicAgent:
         _mcp_registered_names: list[str] = []
 
         try:
+            # Take Policy snapshot at call entry (#89 PR 3a / design Premise 3).
+            # Frozen for the duration of this call() — operator edits to policy.md
+            # mid-call are deferred to the NEXT call.
+            self._policy_snapshot_this_call = self._take_policy_snapshot()
+            # F1 fix (PR 3a Round 1 P0): MandateCheck is cached on
+            # self._mandate_check (constructed lazily by _ensure_mandate_check).
+            # The cached instance bakes in the FIRST call's policy_effective_caps.
+            # Without this refresh, operators who tighten policy.md between calls
+            # see Policy honored by _check_cost_guardrails (which reads the live
+            # snapshot) but IGNORED by MandateCheck steps 7-8 (stale baked-in
+            # caps). Mutate the cached instance to keep both surfaces consistent.
+            if (
+                self._mandate_check is not None
+                and self._policy_snapshot_this_call is not None
+            ):
+                self._mandate_check._policy_effective_caps = (
+                    self._policy_snapshot_this_call.effective_caps
+                )
             # Reset helper-provenance rollup for this run (spec/13 Layer 3)
             self._helpers_this_run = []
             # Reset delegation rollup for this run
@@ -3646,6 +3730,8 @@ class AtomicAgent:
             # when a later call's server fails to reconnect.
             for _mcp_name in _mcp_registered_names:
                 self.tool_registry.unregister(_mcp_name)
+            # Clear Policy snapshot at call exit — None outside of call().
+            self._policy_snapshot_this_call = None
             self.lock_backend.release(lock_handle)
 
     def _build_tool_loop_messages(
@@ -4413,6 +4499,46 @@ class AtomicAgent:
     # ────────────────────────────────────────────────────────────
     # Cost guardrails
 
+    @staticmethod
+    def _min_or_other(a: float | None, b: float | None) -> float | None:
+        """None-aware MIN for cost-cap composition (#89 PR 3a / spec/32 D2).
+
+        ``None`` means "no opinion at this layer" — drops out of the MIN.
+        Returns ``None`` only when BOTH inputs are ``None``.
+        """
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return min(a, b)
+
+    @staticmethod
+    def _resolve_denying_layer(
+        *,
+        policy_value: float | None,
+        model_md_value: float | None,
+        effective: float | None,
+    ) -> str:
+        """Pick the layer whose cap equals ``effective`` (#89 PR 3a F14).
+
+        Tiebreaker order (policy > model_md) — policy wins on a tie.
+        Returns ``"policy"`` when Policy's value equals the effective cap;
+        ``"model_md"`` otherwise (including when Policy has no opinion).
+
+        Per-call and mandate layers are N/A in ``_check_cost_guardrails``
+        and are omitted here; PR 3b adds them for tool/MCP surfaces.
+
+        F4 fix (PR 3a Round 1): ``model_md_value`` is ``float | None`` —
+        the helper handles None directly rather than relying on the call
+        site to coerce None → 0.0 (which was a footgun if anyone touched
+        the resolution logic and changed the tiebreak rules).
+        """
+        if effective is None:
+            return "model_md"
+        if policy_value is not None and policy_value == effective:
+            return "policy"
+        return "model_md"
+
     def _check_cost_guardrails(
         self,
         critical: bool = False,
@@ -4458,44 +4584,104 @@ class AtomicAgent:
             + extra_in_flight_cost_usd
         )
 
+        # ── Policy MIN composition (#89 PR 3a / spec/32 D2) ──────────────────
+        # Resolve Policy caps from the per-call frozen snapshot taken at
+        # call() entry (Premise 3 — snapshot is stable for the whole call).
+        # ``None`` on either side means "no opinion at that layer"; _min_or_other
+        # returns the opinionated one (or None when both are silent).
+        from .policy.types import CostCaps as _CostCaps
+
+        _policy_caps: _CostCaps = (
+            self._policy_snapshot_this_call.effective_caps
+            if self._policy_snapshot_this_call is not None
+            else _CostCaps()
+        )
+        # model.md daily/monthly caps: 0 means "disabled" (unlimited).
+        # Convert to None so _min_or_other treats disabled == no-opinion.
+        _model_daily: float | None = (
+            self.config.daily_cap_usd if self.config.daily_cap_usd > 0 else None
+        )
+        _model_monthly: float | None = (
+            self.config.monthly_cap_usd if self.config.monthly_cap_usd > 0 else None
+        )
+        _effective_daily = self._min_or_other(_model_daily, _policy_caps.daily_usd)
+        _effective_monthly = self._min_or_other(
+            _model_monthly, _policy_caps.monthly_usd
+        )
+        # ─────────────────────────────────────────────────────────────────────
+
+        # F2 fix (PR 3a Round 1 P1): a Policy operator writing
+        # `cost_caps: {daily_usd: 0}` intends "freeze this agent — no spend."
+        # The old shape `(today_cost / _effective_daily) if _effective_daily else 0`
+        # treated 0 as falsy → pct=0 → cap never fired → Policy's strictest
+        # intent SILENTLY INVERTED to no-cap. New shape: cap is "fired" when
+        # _effective_daily is not None AND today_cost >= _effective_daily.
+        # (Same for monthly.)
+        _daily_fired = _effective_daily is not None and today_cost >= _effective_daily
+        _monthly_fired = (
+            _effective_monthly is not None and month_cost >= _effective_monthly
+        )
+
+        # Warnings still use a percentage signal; for warnings, cap=0 behavior
+        # is "always at 100%" which is the right alert posture too.
         daily_pct = (
-            (today_cost / self.config.daily_cap_usd)
-            if self.config.daily_cap_usd > 0
-            else 0
+            (today_cost / _effective_daily)
+            if (_effective_daily is not None and _effective_daily > 0)
+            else (1.0 if _daily_fired else 0)
         )
         monthly_pct = (
-            (month_cost / self.config.monthly_cap_usd)
-            if self.config.monthly_cap_usd > 0
-            else 0
+            (month_cost / _effective_monthly)
+            if (_effective_monthly is not None and _effective_monthly > 0)
+            else (1.0 if _monthly_fired else 0)
         )
 
         # Fire warnings (idempotent — won't fire twice for same threshold/day)
         self._maybe_fire_warning("daily", daily_pct)
         self._maybe_fire_warning("monthly", monthly_pct)
 
-        if daily_pct >= 1.0:
-            return self._cap_action(
+        if _daily_fired:
+            # F3 fix (PR 3a Round 1 P1): compute _cap_action FIRST so the
+            # policy_decision event records whether the action was actually
+            # blocked. cap_action ∈ {"skip", "alert", "fallback"} — only "skip"
+            # blocks (allow=False); "alert" + "fallback" let the call proceed.
+            # Old shape always emitted enforced=True, lying when alert/fallback
+            # were configured.
+            result = self._cap_action(
                 self.config.daily_cap_action,
-                f"daily cap hit (${today_cost:.2f}/${self.config.daily_cap_usd:.2f})",
+                f"daily cap hit (${today_cost:.2f}/${_effective_daily:.2f})",
             )
-        if monthly_pct >= 1.0:
-            return self._cap_action(
+            self._maybe_emit_cost_cap_policy_decision(
+                dimension="daily",
+                policy_value=_policy_caps.daily_usd,
+                model_md_value=_model_daily,
+                effective=_effective_daily,
+                attempted_value=today_cost,
+                enforced=(not result.allow),
+            )
+            return result
+        if _monthly_fired:
+            result = self._cap_action(
                 self.config.monthly_cap_action,
-                f"monthly cap hit (${month_cost:.2f}/${self.config.monthly_cap_usd:.2f})",
+                f"monthly cap hit (${month_cost:.2f}/${_effective_monthly:.2f})",
             )
+            self._maybe_emit_cost_cap_policy_decision(
+                dimension="monthly",
+                policy_value=_policy_caps.monthly_usd,
+                model_md_value=_model_monthly,
+                effective=_effective_monthly,
+                attempted_value=month_cost,
+                enforced=(not result.allow),
+            )
+            return result
 
         # Parent headroom check: coordinator's remaining budget caps the delegate.
         # (fix R2-A2) — clamp to min(own remaining, parent headroom)
         if parent_remaining_headroom_usd is not None:
             daily_remaining = (
-                self.config.daily_cap_usd - today_cost
-                if self.config.daily_cap_usd > 0
-                else float("inf")
+                _effective_daily - today_cost if _effective_daily else float("inf")
             )
             monthly_remaining = (
-                self.config.monthly_cap_usd - month_cost
-                if self.config.monthly_cap_usd > 0
-                else float("inf")
+                _effective_monthly - month_cost if _effective_monthly else float("inf")
             )
             own_remaining = min(daily_remaining, monthly_remaining)
             effective_remaining = min(own_remaining, parent_remaining_headroom_usd)
@@ -4510,6 +4696,64 @@ class AtomicAgent:
                 )
 
         return CostCheckResult(allow=True)
+
+    def _maybe_emit_cost_cap_policy_decision(
+        self,
+        *,
+        dimension: str,
+        policy_value: float | None,
+        model_md_value: float | None,
+        effective: float | None,
+        attempted_value: float,
+        enforced: bool,
+    ) -> None:
+        """Emit a ``policy_decision`` audit event if Policy contributed to this
+        cost-cap denial (#89 PR 3a).
+
+        Policy "contributed" when its cap value is lower than or equal to
+        model.md's value (or model.md has no opinion / is disabled).
+        When model.md alone would have fired the cap (policy_value is None
+        or model_md_value < policy_value), no Policy event is emitted —
+        the denial is a pure model.md event; Policy was not the decisive
+        layer.
+
+        F3 fix (PR 3a Round 1): ``enforced`` is computed by the caller from
+        the ``_cap_action`` result — True only when the action actually
+        blocked (cap_action="skip"). For "alert" / "fallback" the call
+        proceeds with money spent, so the event records ``enforced=False``
+        — the audit log truthfully reflects what happened.
+        """
+        if self._policy_snapshot_this_call is None:
+            return
+        # Policy contributed only when it had an opinion and that opinion was
+        # the binding cap (F4 fix: helper handles model_md_value=None natively;
+        # no coercion needed at the call site).
+        denying_layer = self._resolve_denying_layer(
+            policy_value=policy_value,
+            model_md_value=model_md_value,
+            effective=effective,
+        )
+        if denying_layer != "policy":
+            return
+
+        from .policy.types import PolicyDecision, _emit_policy_decision
+
+        decision = PolicyDecision(
+            decision_kind="deny",
+            denying_layer=denying_layer,
+            agent_name=self.name,
+            axis="cost_cap",
+            cap_dimension=dimension,
+            attempted_value=attempted_value,
+            effective_cap=effective,
+            cache_ttl_s=self._policy_snapshot_this_call.cache_ttl_s,
+            enforced=enforced,
+        )
+        _emit_policy_decision(
+            decision,
+            self.log_backend,
+            run_id=self.run_id or "unknown",
+        )
 
     def _maybe_fire_warning(self, period: str, pct: float) -> None:
         state_path = self.agent_root / ".cost-warnings.json"
