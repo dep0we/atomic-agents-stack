@@ -151,8 +151,8 @@ def run_doctor(
     if agent_name is None:
         # Order matches run_doctor()'s actual execution sequence below
         # (lock-backend → log-backend → profile-backend →
-        # tool-registry-backend → memory-backend) so contributors
-        # adding a fifth scope-level backend check see the SKIP
+        # tool-registry-backend → policy-backend → memory-backend) so
+        # contributors adding a scope-level backend check see the SKIP
         # enumeration mirror reality.
         for n in (
             "vault",
@@ -162,6 +162,7 @@ def run_doctor(
             "locks",
             "profile-backend",
             "tool-registry-backend",
+            "policy-backend",
             "memory-backend",
             "write-paths",
         ):
@@ -216,6 +217,7 @@ def run_doctor(
     results.append(check_log_backend(agent_root))
     results.append(check_agent_profile_backend(resolved_root))
     results.append(check_tool_registry_backend(agent_root))
+    results.append(check_policy_backend(resolved_root))
     results.append(check_memory_backend(agent_root))
     results.append(check_write_paths(tools_data, agent_root=agent_root))
 
@@ -1670,6 +1672,244 @@ def check_tool_registry_backend(agent_root: Path) -> CheckResult:
     )
 
 
+def check_policy_backend(scope_root: Path) -> CheckResult:
+    """Operator-config coherence check for the policy backend (#89 PR 2).
+
+    Validates that ``ATOMIC_AGENTS_POLICY_BACKEND`` is correctly configured.
+    Scoped at ``scope_root`` (not ``agent_root``) because the policy backend
+    is fleet-scoped — ``<scope_root>/policy.md`` declares fleet-default caps,
+    tool allowlists, MCP server allowlists, and model selection that apply
+    across all agents under the root.
+
+    PASS / WARN / FAIL ladder mirrors ``check_agent_profile_backend`` /
+    ``check_tool_registry_backend``:
+
+    * unset / ``filesystem`` → PASS with capability snapshot (``cache_ttl_s``
+      + ``durable``) + ``policy_md_exists`` indicator.  When ``policy.md`` is
+      absent, emits WARN — every agent operates in no-opinion mode; this is
+      informational so the operator knows they haven't authored fleet policy yet.
+    * unknown backend_id (typo in ``ATOMIC_AGENTS_POLICY_BACKEND``) → FAIL
+    * non-filesystem id reachable + ``capabilities()`` probe ok → PASS
+      with capability snapshot; WARN if ``policy.md`` is absent (same
+      no-opinion informational)
+    * non-filesystem id construction failure → FAIL (credentials dropped
+      from exception text to prevent leak in error-tracking services);
+      ``capabilities()`` probe failure → WARN
+
+    URL credential redaction follows the same urlparse + ``_replace`` pattern
+    as ``check_agent_profile_backend`` / ``check_tool_registry_backend`` /
+    ``check_log_backend`` / ``check_lock_backend`` — strips password AND
+    username from netloc (covers token-as-username URLs common with managed
+    services).  Although ``ATOMIC_AGENTS_POLICY_BACKEND_URL`` is not yet
+    wired in PR 1 (only ``ATOMIC_AGENTS_POLICY_BACKEND`` env var exists
+    today), the redaction code path is included here for symmetry with sister
+    checks and to avoid a sister-check gap follow-up being filed.
+    """
+    from .exceptions import BackendNotRegistered
+    from .policy import PolicyError, get_default_policy_backend
+
+    backend_id = (
+        os.environ.get("ATOMIC_AGENTS_POLICY_BACKEND", "filesystem").strip().lower()
+    )
+
+    policy_md_path = scope_root / "policy.md"
+
+    if backend_id == "filesystem":
+        try:
+            backend = get_default_policy_backend(scope_root)
+            caps = backend.capabilities()
+        except PolicyError as exc:
+            return CheckResult(
+                name="policy-backend",
+                status=FAIL,
+                message=(
+                    f"filesystem policy backend probe raised "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                fix_hint=(
+                    f"Check that {scope_root} is readable. The default "
+                    "FilesystemPolicyBackend resolves policy.md under scope_root."
+                ),
+            )
+        except Exception as exc:
+            return CheckResult(
+                name="policy-backend",
+                status=FAIL,
+                message=(
+                    f"filesystem policy backend probe raised "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                fix_hint=(
+                    f"Check that {scope_root} is readable. The default "
+                    "FilesystemPolicyBackend resolves policy.md under scope_root."
+                ),
+            )
+        policy_md_exists = policy_md_path.exists()
+        detail: dict[str, Any] = {
+            "backend_id": "filesystem",
+            "cache_ttl_s": caps.cache_ttl_s,
+            "durable": caps.durable,
+            "policy_md_exists": policy_md_exists,
+            "resolved_path": str(policy_md_path),
+        }
+        if not policy_md_exists:
+            return CheckResult(
+                name="policy-backend",
+                status=WARN,
+                message=(
+                    "filesystem backend ok but policy.md absent — "
+                    "all agents operate in no-opinion mode"
+                ),
+                fix_hint=(
+                    f"Create {policy_md_path} to declare fleet-default cost "
+                    "caps, tool allowlists, and model overrides. "
+                    "See docs/spec/32-policy-backend.md."
+                ),
+                detail=detail,
+            )
+        return CheckResult(
+            name="policy-backend",
+            status=PASS,
+            message="filesystem backend ok (policy.md found)",
+            detail=detail,
+        )
+
+    # Non-filesystem id selected — verify it's known to the registry
+    # BEFORE invoking the factory (lazy registrations of future
+    # backends — Postgres, SaaS, git — slot in via list_policy_backends).
+    from .policy import list_policy_backends
+
+    known_ids = set(list_policy_backends())
+    if backend_id not in known_ids:
+        return CheckResult(
+            name="policy-backend",
+            status=FAIL,
+            message=(
+                f"ATOMIC_AGENTS_POLICY_BACKEND={backend_id!r} is not "
+                f"a known backend. Known: {sorted(known_ids)}"
+            ),
+            fix_hint=(
+                "Set ATOMIC_AGENTS_POLICY_BACKEND to one of the known "
+                "ids, or unset to use the filesystem default."
+            ),
+        )
+
+    # URL credential redaction — same urlparse + _replace pattern as
+    # check_agent_profile_backend / check_tool_registry_backend /
+    # check_log_backend / check_lock_backend. Redacts when EITHER password
+    # OR username is present — covers token-as-username URLs common with
+    # managed services (Upstash ``redis://ghp_TOKEN@host``, PlanetScale
+    # ``mysql://API_KEY@host``, Heroku-style URLs).
+    # ATOMIC_AGENTS_POLICY_BACKEND_URL is not yet wired in PR 1 (only
+    # ATOMIC_AGENTS_POLICY_BACKEND exists today) — the redaction code
+    # path is included for symmetry with sister checks so a future URL
+    # env var already has its credential-safety handled from day 1.
+    url = os.environ.get("ATOMIC_AGENTS_POLICY_BACKEND_URL")
+    safe_url: str | None = None
+    if url:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        # Redact when EITHER password OR username is present. The
+        # password-only check inherited from check_lock_backend /
+        # check_log_backend misses token-as-username URLs common with
+        # managed services (Upstash ``redis://ghp_TOKEN@host``,
+        # PlanetScale ``mysql://API_KEY@host``, Heroku-style URLs).
+        # The sister-check gap (sister checks share this same pattern
+        # but the fix was applied per-check starting from
+        # check_agent_profile_backend F-S1) is tracked as a separate
+        # follow-up for a shared-utility lift.
+        if parsed.password or parsed.username:
+            netloc = parsed.hostname or ""
+            if parsed.port:
+                netloc = f"{netloc}:{parsed.port}"
+            safe_url = parsed._replace(netloc=netloc).geturl()
+        else:
+            safe_url = url
+
+    try:
+        backend = get_default_policy_backend(scope_root)
+    except BackendNotRegistered:
+        return CheckResult(
+            name="policy-backend",
+            status=FAIL,
+            message=f"policy backend {backend_id!r} not registered",
+            fix_hint=(
+                f"The {backend_id!r} backend is reserved but its lazy "
+                "resolver failed. Unset ATOMIC_AGENTS_POLICY_BACKEND to "
+                "use the filesystem default."
+            ),
+        )
+    except Exception:
+        # Drop the verbatim exception message — connection errors from
+        # backend constructors commonly embed the full URL with credentials.
+        return CheckResult(
+            name="policy-backend",
+            status=FAIL,
+            message=f"policy backend {backend_id!r} construction failed",
+            fix_hint=(
+                "Check ATOMIC_AGENTS_POLICY_BACKEND and "
+                "ATOMIC_AGENTS_POLICY_BACKEND_URL for typos. Run with "
+                "DEBUG logging to see the full exception."
+            ),
+        )
+
+    # Probe via capabilities() — lightweight, verifies the backend is
+    # reachable + schema-healthy. PolicyBackend has no list_X method, so
+    # we probe only capabilities(). Match the WARN-on-unreachable-probe
+    # pattern from sister checks.
+    try:
+        caps = backend.capabilities()
+    except Exception:
+        return CheckResult(
+            name="policy-backend",
+            status=WARN,
+            message=(
+                f"operator-pinned backend {backend_id!r} configured "
+                "but capabilities() probe failed"
+            ),
+            fix_hint=(
+                "Verify ATOMIC_AGENTS_POLICY_BACKEND_URL is correct + "
+                "the backend is reachable from this host. Doctor warns "
+                "instead of failing — the framework runtime will fail "
+                "at first policy resolution if the backend is truly down."
+            ),
+        )
+
+    policy_md_exists = policy_md_path.exists()
+    detail = {
+        "backend_id": backend_id,
+        "cache_ttl_s": caps.cache_ttl_s,
+        "durable": caps.durable,
+        "policy_md_exists": policy_md_exists,
+        "resolved_path": str(policy_md_path),
+    }
+    if safe_url is not None:
+        detail["url"] = safe_url
+
+    if not policy_md_exists:
+        return CheckResult(
+            name="policy-backend",
+            status=WARN,
+            message=(
+                f"{backend_id} backend ok but policy.md absent — "
+                "all agents operate in no-opinion mode"
+            ),
+            fix_hint=(
+                f"Create {policy_md_path} to declare fleet-default cost "
+                "caps, tool allowlists, and model overrides. "
+                "See docs/spec/32-policy-backend.md."
+            ),
+            detail=detail,
+        )
+    return CheckResult(
+        name="policy-backend",
+        status=PASS,
+        message=f"{backend_id} backend ok (policy.md found)",
+        detail=detail,
+    )
+
+
 def check_memory_backend(agent_root: Path) -> CheckResult:
     """FilesystemBackend resolves and stats() returns successfully."""
     memory_dir = agent_root / "memory"
@@ -1885,7 +2125,7 @@ def render_human(results: list[CheckResult]) -> str:
         return "(no checks run)\n"
 
     name_width = max(len(r.name) for r in results)
-    badge = {PASS: "[ OK ]", FAIL: "[FAIL]", SKIP: "[skip]"}
+    badge = {PASS: "[ OK ]", FAIL: "[FAIL]", SKIP: "[skip]", WARN: "[warn]"}
 
     lines: list[str] = []
     for r in results:

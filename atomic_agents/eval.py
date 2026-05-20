@@ -28,6 +28,10 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, date
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .policy import PolicyBackend
 
 _log = logging.getLogger(__name__)
 
@@ -123,6 +127,7 @@ class EvalRunner:
         profile_backend: "AgentProfileBackend | None" = None,
         tool_registry_backend: "ToolRegistryBackend | None" = None,
         mandate_backend: "MandateBackend | None" = None,
+        policy_backend: "PolicyBackend | None" = None,
     ):
         self.agents_root = agents_root or get_agents_root()
         self.agent_name = agent_name
@@ -146,6 +151,14 @@ class EvalRunner:
         # ``get_default_mandate_backend`` resolution (env var → filesystem
         # default).
         self._mandate_backend = mandate_backend
+        # #89 PR 2 — PolicyBackend forwarding. Same threading discipline
+        # as ``_mandate_backend``. Without this, an operator pinning a
+        # custom policy backend would silently drop it at the
+        # EvalRunner→AtomicAgent boundary.
+        # ``None`` means: defer to the agent's own
+        # ``get_default_policy_backend`` resolution (env var → filesystem
+        # default).
+        self._policy_backend = policy_backend
 
         if not self.evals_dir.exists():
             raise AtomicAgentsError(
@@ -345,6 +358,7 @@ class EvalRunner:
             profile_backend=self._profile_backend,
             tool_registry_backend=self._tool_registry_backend,
             mandate_backend=self._mandate_backend,
+            policy_backend=self._policy_backend,
         )
         try:
             agent_response = agent.call(work_item=work_item, write_captures=False)
