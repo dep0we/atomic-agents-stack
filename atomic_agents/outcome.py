@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .logs import LogBackend
+    from .policy import PolicyBackend
 
 _log = logging.getLogger(__name__)
 
@@ -125,6 +126,7 @@ class OutcomeRunner:
         profile_backend: "AgentProfileBackend | None" = None,
         tool_registry_backend: "ToolRegistryBackend | None" = None,
         mandate_backend: "MandateBackend | None" = None,
+        policy_backend: "PolicyBackend | None" = None,
     ):
         self.agents_root = Path(agents_root) if agents_root else get_agents_root()
         self.agent_name = agent_name
@@ -159,6 +161,14 @@ class OutcomeRunner:
         # ``get_default_mandate_backend`` resolution (env var → filesystem
         # default).
         self._mandate_backend = mandate_backend
+        # #89 PR 2 — PolicyBackend forwarding. Same threading discipline
+        # as ``_mandate_backend``. Without this, an operator pinning a
+        # custom policy backend would silently drop it at the
+        # OutcomeRunner→AtomicAgent boundary.
+        # ``None`` means: defer to the agent's own
+        # ``get_default_policy_backend`` resolution (env var → filesystem
+        # default).
+        self._policy_backend = policy_backend
 
         if not self.agent_root.exists():
             raise AtomicAgentsError(
@@ -241,6 +251,7 @@ class OutcomeRunner:
             profile_backend=self._profile_backend,
             tool_registry_backend=self._tool_registry_backend,
             mandate_backend=self._mandate_backend,
+            policy_backend=self._policy_backend,
         )
 
         # Resolve judge model: explicit > cross-family via eval config > pick_judge_model fallback

@@ -61,6 +61,10 @@ from .mandate import (
     MandateBackend,
     get_default_mandate_backend,
 )
+from .policy import (
+    PolicyBackend,
+    get_default_policy_backend,
+)
 from .logs.types import (
     PRIMITIVE_AGENT_CALL,
     PRIMITIVE_CAPTURE,
@@ -231,6 +235,13 @@ class AtomicAgent:
     # ``MandateBackend`` Protocol implementer — breaking the
     # operator-pinned-SaaS/mobile/Slack-bot case PR 3a forward.
     mandate_backend: MandateBackend
+    # Same class-level annotation rationale for ``policy_backend`` (#89
+    # PR 2). Without this, static analysis would narrow
+    # ``agent.policy_backend`` to the concrete ``FilesystemPolicyBackend``
+    # default rather than treating it as any ``PolicyBackend`` Protocol
+    # implementer — breaking the operator-pinned-SaaS/Postgres/org-admin-
+    # console case PR 3 forward.
+    policy_backend: PolicyBackend
     """The main agent runtime.
 
     Responsible for:
@@ -255,6 +266,7 @@ class AtomicAgent:
         profile_backend: AgentProfileBackend | None = None,
         tool_registry_backend: ToolRegistryBackend | None = None,
         mandate_backend: MandateBackend | None = None,
+        policy_backend: PolicyBackend | None = None,
     ):
         self.name = name
         self.trigger = trigger
@@ -368,6 +380,27 @@ class AtomicAgent:
             self.mandate_backend = get_default_mandate_backend(self.agent_root)
         else:
             self.mandate_backend = mandate_backend
+
+        # ── PolicyBackend resolution (#89 PR 2) ──────────────────────────
+        # Policy is fleet-shaped (one policy.md applies to all agents in the
+        # project), NOT per-agent like Mandate. Default backend resolves at
+        # ``self.agents_root`` scope, mirroring AgentProfile. The operator's
+        # explicit kwarg always wins (programmatic-override discipline).
+        #
+        # Per spec/32 MUST #4, FilesystemPolicyBackend construction is
+        # side-effect-free — no stat, no parse. The instance is held but
+        # never read in PR 2 (zero behavior change); PR 3 wires consumption
+        # via _check_cost_guardrails MIN composition + tool dispatch site +
+        # MCP discovery site + model selection site + policy_decision event
+        # emission behind ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP=false.
+        #
+        # Cascade-aware project_root semantics for non-default operators are
+        # handled by passing an explicit ``policy_backend=FilesystemPolicy
+        # Backend(cascade.project_root)`` instance via the kwarg.
+        if policy_backend is None:
+            self.policy_backend = get_default_policy_backend(self.agents_root)
+        else:
+            self.policy_backend = policy_backend
 
         # ── Mandate crash recovery + reservation managers (#124 PR 3b) ──────
         # Per spec/29 §"Crash recovery for reservations" + plan-subagent
@@ -4019,6 +4052,17 @@ class AtomicAgent:
         # exact recurrence of the runner-drop-trap shape on the
         # production multi-agent delegation path.
         #
+        # ``policy_backend`` IS threaded (#89 PR 2 + spec/32 D1). Policy
+        # is fleet-scoped (one policy.md applies to ALL agents in the
+        # project), not per-agent — same shape as ``profile_backend``.
+        # An operator who pinned a custom ``PolicyBackend`` (Postgres,
+        # SaaS, org-admin-console) on the coordinator wants every
+        # delegated agent to evaluate actions against THE SAME policy
+        # store, not silently fall back to filesystem. Without threading,
+        # an operator's custom PolicyBackend is bypassed entirely for all
+        # delegated work — defeating the core purpose of Policy as a
+        # fleet-level authority surface.
+        #
         # ``lock_backend`` and ``log_backend`` are NOT threaded — they
         # are per-agent scoped (filesystem lock at ``<agent>/.lock``,
         # log at ``<agent>/log/``). Threading them would put the
@@ -4062,6 +4106,7 @@ class AtomicAgent:
             agents_root=target_path.parent,
             run_id=None,  # generates its own fresh run_id
             profile_backend=self.profile_backend,
+            policy_backend=self.policy_backend,
         )
 
         start = time.time()
