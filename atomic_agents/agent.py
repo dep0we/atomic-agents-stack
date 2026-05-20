@@ -2987,6 +2987,20 @@ class AtomicAgent:
             # Frozen for the duration of this call() — operator edits to policy.md
             # mid-call are deferred to the NEXT call.
             self._policy_snapshot_this_call = self._take_policy_snapshot()
+            # F1 fix (PR 3a Round 1 P0): MandateCheck is cached on
+            # self._mandate_check (constructed lazily by _ensure_mandate_check).
+            # The cached instance bakes in the FIRST call's policy_effective_caps.
+            # Without this refresh, operators who tighten policy.md between calls
+            # see Policy honored by _check_cost_guardrails (which reads the live
+            # snapshot) but IGNORED by MandateCheck steps 7-8 (stale baked-in
+            # caps). Mutate the cached instance to keep both surfaces consistent.
+            if (
+                self._mandate_check is not None
+                and self._policy_snapshot_this_call is not None
+            ):
+                self._mandate_check._policy_effective_caps = (
+                    self._policy_snapshot_this_call.effective_caps
+                )
             # Reset helper-provenance rollup for this run (spec/13 Layer 3)
             self._helpers_this_run = []
             # Reset delegation rollup for this run
@@ -4502,7 +4516,7 @@ class AtomicAgent:
     def _resolve_denying_layer(
         *,
         policy_value: float | None,
-        model_md_value: float,
+        model_md_value: float | None,
         effective: float | None,
     ) -> str:
         """Pick the layer whose cap equals ``effective`` (#89 PR 3a F14).
@@ -4513,6 +4527,11 @@ class AtomicAgent:
 
         Per-call and mandate layers are N/A in ``_check_cost_guardrails``
         and are omitted here; PR 3b adds them for tool/MCP surfaces.
+
+        F4 fix (PR 3a Round 1): ``model_md_value`` is ``float | None`` —
+        the helper handles None directly rather than relying on the call
+        site to coerce None → 0.0 (which was a footgun if anyone touched
+        the resolution logic and changed the tiebreak rules).
         """
         if effective is None:
             return "model_md"
@@ -4591,39 +4610,69 @@ class AtomicAgent:
         )
         # ─────────────────────────────────────────────────────────────────────
 
-        daily_pct = (today_cost / _effective_daily) if _effective_daily else 0
-        monthly_pct = (month_cost / _effective_monthly) if _effective_monthly else 0
+        # F2 fix (PR 3a Round 1 P1): a Policy operator writing
+        # `cost_caps: {daily_usd: 0}` intends "freeze this agent — no spend."
+        # The old shape `(today_cost / _effective_daily) if _effective_daily else 0`
+        # treated 0 as falsy → pct=0 → cap never fired → Policy's strictest
+        # intent SILENTLY INVERTED to no-cap. New shape: cap is "fired" when
+        # _effective_daily is not None AND today_cost >= _effective_daily.
+        # (Same for monthly.)
+        _daily_fired = _effective_daily is not None and today_cost >= _effective_daily
+        _monthly_fired = (
+            _effective_monthly is not None and month_cost >= _effective_monthly
+        )
+
+        # Warnings still use a percentage signal; for warnings, cap=0 behavior
+        # is "always at 100%" which is the right alert posture too.
+        daily_pct = (
+            (today_cost / _effective_daily)
+            if (_effective_daily is not None and _effective_daily > 0)
+            else (1.0 if _daily_fired else 0)
+        )
+        monthly_pct = (
+            (month_cost / _effective_monthly)
+            if (_effective_monthly is not None and _effective_monthly > 0)
+            else (1.0 if _monthly_fired else 0)
+        )
 
         # Fire warnings (idempotent — won't fire twice for same threshold/day)
         self._maybe_fire_warning("daily", daily_pct)
         self._maybe_fire_warning("monthly", monthly_pct)
 
-        if daily_pct >= 1.0:
-            # Emit policy_decision event when Policy contributed to this denial.
+        if _daily_fired:
+            # F3 fix (PR 3a Round 1 P1): compute _cap_action FIRST so the
+            # policy_decision event records whether the action was actually
+            # blocked. cap_action ∈ {"skip", "alert", "fallback"} — only "skip"
+            # blocks (allow=False); "alert" + "fallback" let the call proceed.
+            # Old shape always emitted enforced=True, lying when alert/fallback
+            # were configured.
+            result = self._cap_action(
+                self.config.daily_cap_action,
+                f"daily cap hit (${today_cost:.2f}/${_effective_daily:.2f})",
+            )
             self._maybe_emit_cost_cap_policy_decision(
                 dimension="daily",
                 policy_value=_policy_caps.daily_usd,
                 model_md_value=_model_daily,
                 effective=_effective_daily,
                 attempted_value=today_cost,
+                enforced=(not result.allow),
             )
-            return self._cap_action(
-                self.config.daily_cap_action,
-                f"daily cap hit (${today_cost:.2f}/${_effective_daily:.2f})",
+            return result
+        if _monthly_fired:
+            result = self._cap_action(
+                self.config.monthly_cap_action,
+                f"monthly cap hit (${month_cost:.2f}/${_effective_monthly:.2f})",
             )
-        if monthly_pct >= 1.0:
-            # Emit policy_decision event when Policy contributed to this denial.
             self._maybe_emit_cost_cap_policy_decision(
                 dimension="monthly",
                 policy_value=_policy_caps.monthly_usd,
                 model_md_value=_model_monthly,
                 effective=_effective_monthly,
                 attempted_value=month_cost,
+                enforced=(not result.allow),
             )
-            return self._cap_action(
-                self.config.monthly_cap_action,
-                f"monthly cap hit (${month_cost:.2f}/${_effective_monthly:.2f})",
-            )
+            return result
 
         # Parent headroom check: coordinator's remaining budget caps the delegate.
         # (fix R2-A2) — clamp to min(own remaining, parent headroom)
@@ -4656,6 +4705,7 @@ class AtomicAgent:
         model_md_value: float | None,
         effective: float | None,
         attempted_value: float,
+        enforced: bool,
     ) -> None:
         """Emit a ``policy_decision`` audit event if Policy contributed to this
         cost-cap denial (#89 PR 3a).
@@ -4666,15 +4716,21 @@ class AtomicAgent:
         or model_md_value < policy_value), no Policy event is emitted —
         the denial is a pure model.md event; Policy was not the decisive
         layer.
+
+        F3 fix (PR 3a Round 1): ``enforced`` is computed by the caller from
+        the ``_cap_action`` result — True only when the action actually
+        blocked (cap_action="skip"). For "alert" / "fallback" the call
+        proceeds with money spent, so the event records ``enforced=False``
+        — the audit log truthfully reflects what happened.
         """
         if self._policy_snapshot_this_call is None:
             return
         # Policy contributed only when it had an opinion and that opinion was
-        # the binding cap (i.e. policy_value <= model_md_value, or model_md was
-        # disabled/None).  _resolve_denying_layer returns "policy" in that case.
+        # the binding cap (F4 fix: helper handles model_md_value=None natively;
+        # no coercion needed at the call site).
         denying_layer = self._resolve_denying_layer(
             policy_value=policy_value,
-            model_md_value=model_md_value if model_md_value is not None else 0.0,
+            model_md_value=model_md_value,
             effective=effective,
         )
         if denying_layer != "policy":
@@ -4691,7 +4747,7 @@ class AtomicAgent:
             attempted_value=attempted_value,
             effective_cap=effective,
             cache_ttl_s=self._policy_snapshot_this_call.cache_ttl_s,
-            enforced=True,
+            enforced=enforced,
         )
         _emit_policy_decision(
             decision,

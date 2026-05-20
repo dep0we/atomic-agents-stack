@@ -1769,9 +1769,16 @@ def check_policy_backend(scope_root: Path, *, cascade=None) -> CheckResult:
         # before production traffic hits the wrong scope.
         # Only emits for filesystem backends — SaaS/Postgres backends manage
         # their own scope resolution without a project_root attribute.
+        # F7 fix (PR 3a Round 1 P3): use isinstance(FilesystemPolicyBackend)
+        # instead of hasattr(_project_root). Third-party PolicyBackend impls
+        # may happen to have a _project_root attribute that isn't a Path
+        # (e.g., a tenant ID); the hasattr guard alone produces spurious
+        # warnings + breaks Protocol abstraction (private-attr access).
+        from .policy.filesystem import FilesystemPolicyBackend
+
         if (
             cascade is not None
-            and hasattr(backend, "_project_root")
+            and isinstance(backend, FilesystemPolicyBackend)
             and Path(backend._project_root).resolve()
             != Path(cascade.project_root).resolve()
         ):
