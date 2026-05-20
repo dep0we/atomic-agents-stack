@@ -245,7 +245,7 @@ class PolicyDecision:
 
 **`enforced` field semantics:**
 
-- `enforced=True`: the denial or override blocked / altered the action. Cost-cap denials always set `enforced=True` — they enforce immediately with no flag gate.
+- `enforced=True`: the denial or override blocked / altered the action. Cost-cap denials set `enforced=True` when `cap_action="skip"` (the default — the call is blocked outright). For `cap_action ∈ {"alert", "fallback"}` the call proceeds (alert logs a warning + continues; fallback substitutes a cheaper model + continues) and the cost-cap event records `enforced=False` so the audit trail truthfully reflects whether money was actually spent. Operators reading `LogQuery(primitive="policy_decision", enforced=True)` for billing-incident attribution see only the actually-blocked events.
 - `enforced=False`: log-only mode — the denial or override was recorded in the audit trail but the action proceeded. Non-cap surfaces (tools / MCP / model) set `enforced=value_of_ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP` (default `false`). That env-var and those surfaces ship in PR 3b.
 
 Operators reading the audit log filter by `decision_kind` first, then `axis`. The single event family closes the Premise 4 promise that operators see ONE event for "was this Policy or Mandate?" with `denying_layer` answering the question directly.
