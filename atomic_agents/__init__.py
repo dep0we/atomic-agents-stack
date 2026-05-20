@@ -105,6 +105,18 @@ from .registry import (
     list_tool_registry_backends,
     get_default_tool_registry_backend,
 )
+
+# PolicyBackend Protocol surface (spec/32 — #89 PR 1 scaffolding;
+# AtomicAgent.__init__ wiring + doctor.check_policy_backend land in PR 2;
+# consumption + policy_decision event emission land in PR 3).
+# Side-effect import: triggers `atomic_agents.policy` package init so the
+# filesystem-backend bootstrap fires + `atomic_agents.policy_md` cold-imports
+# correctly (the package's load order resolves the cycle policy_md → policy
+# package → backend → filesystem → policy_md would otherwise produce on a
+# from-scratch standalone import). Public surface remains under
+# `atomic_agents.policy.*` per the precedent of `atomic_agents.mandate.*`.
+from . import policy as _policy_bootstrap  # noqa: F401
+
 from .judge import (
     # Protocol contract + outcome model
     JudgeBackend,
