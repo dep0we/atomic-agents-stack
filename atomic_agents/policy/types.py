@@ -88,6 +88,10 @@ class CostCaps:
     for each dimension is ``MIN(fleet, agent-override, model_md, per-call)``.
     ``None`` at any dimension means "no opinion at this layer."
 
+    v1 ships daily + monthly only.  The ``cumulative_usd`` dimension from
+    the original RFC has been deferred to v1.1 (plan-subagent D1) so the
+    shipped surface matches ``model.md cost_guardrails`` dimensions exactly.
+
     A ``CostCaps()`` (no fields set) is the no-opinion default returned by
     ``FilesystemPolicyBackend`` when ``policy.md`` is absent or the agent is
     not mentioned in the ``agents:`` section (and no fleet-default
@@ -96,7 +100,6 @@ class CostCaps:
 
     daily_usd: float | None = None
     monthly_usd: float | None = None
-    cumulative_usd: float | None = None
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -158,6 +161,16 @@ class PolicyDecision:
     - ``"model_selection"``: Policy model override applied; ``model_from_md``
       and ``model_from_policy`` populated; ``denying_layer`` is ``None``.
 
+    ``enforced`` semantics:
+
+    - ``True``: the denial or override blocked / altered the action.  Cost-cap
+      denials always emit ``enforced=True`` — they enforce immediately.
+    - ``False``: log-only mode — the denial or override was recorded but the
+      action proceeded (or the model.md model was used despite an override
+      being present).  Non-cap surfaces (tools / MCP / model) emit
+      ``enforced=value_of_ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP``; that env-var
+      and those surfaces ship in PR 3b.
+
     Fields not relevant to the axis are ``None``.  Operators reading the
     audit log filter by ``decision_kind`` first, then ``axis``.
     """
@@ -168,13 +181,18 @@ class PolicyDecision:
     axis: Literal["cost_cap", "tool_allowlist", "mcp_allowlist", "model_selection"]
 
     # axis-specific (None when not relevant):
-    cap_dimension: Literal["daily", "monthly", "cumulative", "per_call"] | None = None
+    cap_dimension: Literal["daily", "monthly", "per_call"] | None = None
     attempted_value: float | None = None
     effective_cap: float | None = None
     tool_name: str | None = None
     mcp_server_name: str | None = None
     model_from_md: str | None = None
     model_from_policy: str | None = None
+
+    # enforcement flag — always True for cost-cap denials (PR 3a);
+    # PR 3b populates based on ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP for
+    # non-cap surfaces (tools / MCP / model).
+    enforced: bool = False
 
     # common:
     cache_ttl_s: int | None = None  # backend capability snapshot at decision time

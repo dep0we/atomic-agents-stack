@@ -63,9 +63,13 @@ _logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────────
 # Validation patterns (zero I/O at module level)
 
-# agent_name: alphanumeric + underscore + hyphen only.  Rejects path separators,
-# dots (leading-dot hidden-file trick), colons, spaces, and control chars.
-_AGENT_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
+# agent_name: alphanumeric + underscore + hyphen + dot + plus + at-sign.
+# This charset covers the framework's accepted agent names (e.g. "caldwell",
+# "agent_v2", "team-2024", "caldwell.research") without the restrictions
+# that were causing real operator names to fail (D2).
+# Still rejects: path-traversal tokens (.., /, \\), leading dot (filesystem
+# hidden-file trick), control characters, newlines, and empty strings.
+_AGENT_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_.+@-]+$")
 
 # Control-character detector (0x00-0x1F + DEL 0x7F).
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
@@ -76,16 +80,23 @@ _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def _validate_agent_name(name: str) -> None:
-    """Validate an agent_name at the API boundary.
+    """Validate an agent_name at the API boundary (D2 — loosened charset).
 
-    Permits: ``[a-zA-Z0-9_-]+``
-    Rejects:
+    Permits: ``[a-zA-Z0-9_.+@-]+`` (letters, digits, underscore, dot, plus,
+    at-sign, hyphen).  This covers the full range of names observed in the
+    test corpus and operator deployments (e.g. "caldwell.research",
+    "team-2024", "agent_v2", "ops@fleet").
+
+    Still rejects (path-traversal + injection defenses):
     - Non-string or empty string.
-    - Leading dot (hidden-file traversal trick).
+    - Leading dot (hidden-file filesystem traversal trick).
     - ``..`` anywhere (directory traversal).
     - ``/`` or ``\\`` (path separators).
     - Control characters or newlines (log injection + path-token splitting).
-    - Anything not matching ``[a-zA-Z0-9_-]+``.
+    - Anything not matching the allowed charset.
+
+    The looser pattern preserves the agent_name → dict key + filesystem
+    safety properties required by spec/32 MUST #1.
 
     Raises ``ValueError`` on any violation.  Called BEFORE any storage or
     dict access in every public method (spec/32 MUST #1).
@@ -103,7 +114,7 @@ def _validate_agent_name(name: str) -> None:
             f"agent_name must not contain control characters or newlines; got {name!r}"
         )
     if not _AGENT_NAME_PATTERN.match(name):
-        raise ValueError(f"agent_name must match [a-zA-Z0-9_-]+; got {name!r}")
+        raise ValueError(f"agent_name must match [a-zA-Z0-9_.+@-]+; got {name!r}")
 
 
 def _validate_tool_or_server_name(name: str) -> None:
@@ -326,9 +337,6 @@ class FilesystemPolicyBackend:
         return CostCaps(
             daily_usd=_min_or_other(fleet.daily_usd, agent_caps.daily_usd),
             monthly_usd=_min_or_other(fleet.monthly_usd, agent_caps.monthly_usd),
-            cumulative_usd=_min_or_other(
-                fleet.cumulative_usd, agent_caps.cumulative_usd
-            ),
         )
 
     def is_tool_allowed(self, agent_name: str, tool_name: str) -> bool:

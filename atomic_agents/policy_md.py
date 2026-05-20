@@ -23,7 +23,6 @@ YAML shape supported::
     cost_caps:
       daily_usd: 50.0
       monthly_usd: 1000.0
-      cumulative_usd: 5000.0
 
     tools:
       allow: [read_file, search, write_note]
@@ -39,7 +38,7 @@ YAML shape supported::
     agents:
       caldwell:
         cost_caps:
-          daily_usd: 30.0      # tighter cap; MIN(50, 30) = 30 effective
+          daily_usd: 30.0       # tighter cap; MIN(50, 30) = 30 effective
         tools:
           deny: [search]       # in addition to fleet deny
       procurement:
@@ -108,9 +107,10 @@ _FENCED_YAML_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
-# agent_name: same pattern used in FilesystemPolicyBackend._validate_agent_name.
+# agent_name: same loosened pattern used in FilesystemPolicyBackend._validate_agent_name
+# (D2 — permits dots, plus, at-sign in addition to the original alphanumeric + _-).
 # Checked at parse time to catch operator file errors at load, not runtime.
-_AGENT_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+_AGENT_NAME_RE = re.compile(r"^[a-zA-Z0-9_.+@-]+$")
 
 # Control-character detector (used for tool/MCP names and agent names).
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -390,25 +390,26 @@ def _build_snapshot(raw: dict[str, Any], path: Path) -> PolicySnapshot:
 def _parse_cost_caps(raw: Any, *, section: str) -> CostCaps:
     """Parse a ``cost_caps:`` dict into a ``CostCaps`` dataclass.
 
-    All three dimensions are optional; ``None`` means "no opinion at this
-    layer."  Negative values raise ``PolicyInvalid``.
+    Both dimensions (daily_usd, monthly_usd) are optional; ``None`` means
+    "no opinion at this layer."  Negative values raise ``PolicyInvalid``.
+
+    The ``cumulative_usd`` dimension from the original RFC is deferred to
+    v1.1 (plan-subagent D1) — any ``cumulative_usd`` key present in the
+    YAML is silently ignored so operators do not get a parse error after
+    upgrading from a pre-PR-3a policy.md that included it.
     """
     if not isinstance(raw, dict):
         raise PolicyInvalid(
             f"{section}: must be a mapping with optional keys daily_usd, "
-            f"monthly_usd, cumulative_usd; got {type(raw).__name__}"
+            f"monthly_usd; got {type(raw).__name__}"
         )
 
     daily_usd = _parse_usd_cap(raw.get("daily_usd"), field=f"{section}.daily_usd")
     monthly_usd = _parse_usd_cap(raw.get("monthly_usd"), field=f"{section}.monthly_usd")
-    cumulative_usd = _parse_usd_cap(
-        raw.get("cumulative_usd"), field=f"{section}.cumulative_usd"
-    )
 
     return CostCaps(
         daily_usd=daily_usd,
         monthly_usd=monthly_usd,
-        cumulative_usd=cumulative_usd,
     )
 
 
@@ -540,7 +541,7 @@ def _parse_agent_override(
     if not _AGENT_NAME_RE.match(agent_name):
         raise PolicyInvalid(
             f"policy.md at {path}: agents: key {agent_name!r} must match "
-            f"[a-zA-Z0-9_-]+ (no path separators, dots, or special chars)"
+            f"[a-zA-Z0-9_.+@-]+ (no path separators, leading dot, or control chars)"
         )
 
     # ── F12: empty/null body → no override (all fields None) ──────────
