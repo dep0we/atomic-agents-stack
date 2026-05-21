@@ -127,7 +127,7 @@ graph TB
         <dd>Default: walks <code>&lt;agent&gt;/tools/</code> for markdown descriptors and Python handlers. Alternative: SQLite-backed catalog with cross-tenant isolation, used for plugin-marketplace shapes where tools come from a central registry with audit and approval.</dd>
 
         <dt><strong>MandateBackend</strong> — durable revocable scoped authority for actions that touch real money or external side effects.</dt>
-        <dd>Operators author a <code>mandates.md</code> file granting agents specific authority (e.g., "spend up to ,000 cumulatively on the Q2 ad campaign"). The framework defends that cap against concurrent runs and crash-restart, and surfaces audit signals when an action's executed target diverges from what was authorized at proposal time.</dd>
+        <dd>Operators author a <code>mandates.md</code> file granting agents specific authority (e.g., "spend up to $6,000 cumulatively on the Q2 ad campaign"). The framework defends that cap against concurrent runs and crash-restart, and surfaces audit signals when an action's executed target diverges from what was authorized at proposal time.</dd>
       </div>
 
       <h2>What's still to come</h2>
@@ -162,7 +162,7 @@ graph TB
             <li>POSIX-lock LockBackend</li>
             <li>Filesystem ProfileBackend</li>
             <li>Filesystem ToolRegistry</li>
-            <li>Filesystem MandateBackend (or none — opt-in)</li>
+            <li>Filesystem MandateBackend (off by default — opt-in via <code>mandates.md</code>)</li>
             <li>Anthropic LLMBackend</li>
             <li>Rule-engine JudgeBackend</li>
             <li>One agent, one folder, zero servers</li>
@@ -177,7 +177,7 @@ graph TB
             <li>Redis LockBackend (multi-host coordination)</li>
             <li>SQLite ProfileBackend (UI-editable)</li>
             <li>SQLite ToolRegistry (audit + install approval)</li>
-            <li>Filesystem MandateBackend (op-edited <code>mandates.md</code>)</li>
+            <li>Filesystem MandateBackend <em>(same — v1 ships filesystem-only; SaaS/DB seam in place)</em></li>
             <li>Anthropic LLMBackend <em>(same)</em></li>
             <li>LLM JudgeBackend (smarter review)</li>
             <li>Same agent — different substrate underneath</li>
@@ -185,7 +185,7 @@ graph TB
         </div>
       </div>
 
-      <p>The home user opens the folder in Obsidian and reads the journal. The company runs the same agent across three Cloud Run instances behind a load balancer, with logs flowing to a dashboard that answers "show me all escalations from this team this quarter" in milliseconds. <strong>The agent's persona doesn't know which world it's in.</strong> The agent's tools don't know. The agent's memory doesn't know. The only difference is what's registered as the backend for each protocol.</p>
+      <p>The home user opens the folder in Obsidian and reads the journal. The company runs the same agent across three Cloud Run instances behind a load balancer, with logs flowing to a dashboard that answers "show me all escalations from this team this quarter" in milliseconds. <strong>The agent's persona doesn't know which world it's in.</strong> The agent's tools don't know. The agent's memory doesn't know. The only difference is what's registered as the backend for each protocol. (MandateBackend is the one shipped protocol where v1 only includes the filesystem reference impl — the Protocol seam ships from day one so future SaaS / mobile / Slack-bot adapters slot in via <code>register_mandate_backend()</code> without forking core.)</p>
 
       <h2>How the swap actually happens</h2>
       <p>Concretely, switching from filesystem-everything to SQLite-for-logs looks like setting one environment variable:</p>
@@ -239,7 +239,7 @@ flowchart TB
 
       <div class="callout callout-note">
         <p class="callout-title">One last thing — the spec is the product</p>
-        <p>Twenty-three numbered spec documents (plus two in-progress drafts) describe the framework in precise detail. The Python code in this repository is <em>one</em> implementation of that spec. Eventually there will be others — in different languages, with different optimizations, integrated into different tools. What you build on top of this framework doesn't depend on any one of them. It depends on the shape.</p>
+        <p>Twenty-eight numbered spec documents (plus three in-progress drafts) describe the framework in precise detail. The Python code in this repository is <em>one</em> implementation of that spec. Eventually there will be others — in different languages, with different optimizations, integrated into different tools. What you build on top of this framework doesn't depend on any one of them. It depends on the shape.</p>
       </div>
 
       <nav class="pagenav">
