@@ -739,6 +739,17 @@ footer p {
   margin: 2rem 0;
 }
 
+/* 3-stat variant: 3-across at desktop, stacks below 720px */
+.intro-row-3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+@media (max-width: 720px) {
+  .intro-row-3 {
+    grid-template-columns: 1fr;
+  }
+}
+
 @media (max-width: 640px) {
   .intro-row {
     grid-template-columns: 1fr;
@@ -849,7 +860,18 @@ footer p {
   line-height: 1.55;
 }
 
-/* Two-column layout: content + sticky TOC sidebar on right */
+/* Wider container specifically for the long-scroll explainer body.
+   Hero stays in .container (760px); explainer-layout breaks out to 1200px
+   so content has actual breathing room next to the TOC.
+   Math at 1200px container: 1200 - 48px padding - 240px TOC - 64px gap
+   = ~848px content column. Comfortable reading + visible TOC. */
+.container-explainer {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 1.5rem;
+}
+
+/* Two-column layout: content (DOM-first → LEFT) + sticky TOC sidebar (DOM-second → RIGHT) */
 .explainer-layout {
   display: grid;
   grid-template-columns: 1fr;
@@ -858,14 +880,16 @@ footer p {
   position: relative;
 }
 
-@media (min-width: 1100px) {
+@media (min-width: 1024px) {
   .explainer-layout {
-    grid-template-columns: minmax(0, 1fr) 220px;
+    grid-template-columns: minmax(0, 1fr) 240px;
+    gap: 4rem;
   }
 }
 
 .explainer {
   min-width: 0; /* prevent grid blowout */
+  /* Grid column sizing handles content width — see .explainer-layout below */
 }
 
 /* Sticky TOC */
@@ -873,7 +897,7 @@ footer p {
   display: none;
 }
 
-@media (min-width: 1100px) {
+@media (min-width: 1024px) {
   .toc {
     display: block;
     position: sticky;
