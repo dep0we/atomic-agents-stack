@@ -58,10 +58,10 @@
         </div>
         <div class="intro-stat">
           <p class="intro-stat-num">28 + 3</p>
-          <p class="intro-stat-label">Spec docs + RFCs (the product)</p>
+          <p class="intro-stat-label">Spec docs + in-flight (the product)</p>
         </div>
         <div class="intro-stat">
-          <p class="intro-stat-num">2,381</p>
+          <p class="intro-stat-num">2,383</p>
           <p class="intro-stat-label">Tests gating the contract</p>
         </div>
       </div>
@@ -118,7 +118,7 @@
 │   └── YYYY-MM/YYYY-MM-DD.md
 └── log/                 audit trail (JSONL, one line per run)
     └── YYYY-MM/YYYY-MM-DD.jsonl</code></pre>
-            <p class="figure-caption">An agent's whole shape is on disk. Open <code>persona/IDENTITY.md</code> in any text editor and you're looking at the agent's mission statement. Open <code>journal/2026-05/2026-05-21.md</code> and you're reading what it did today.</p>
+            <p class="figure-caption">An agent's whole shape is on disk. Open <code>persona/IDENTITY.md</code> in any text editor and you're looking at the agent's mission statement. Open today's <code>journal/YYYY-MM/YYYY-MM-DD.md</code> and you're reading what the agent did today.</p>
           </figure>
 
           <p>Most AI agents store their state somewhere you don't own — an app database, a vector store, a hosted trace system. If the company goes away, your agent goes away. If you switch laptops, you migrate through their interface. If you want a feature they don't offer, you wait.</p>
@@ -280,7 +280,7 @@ flowchart TD
 
           <p>Most agent frameworks let the model call tools directly. Atomic Agents inserts a checkpoint: before any side-effectful tool runs, a separate <code>JudgeBackend</code> inspects a structured proposal of what's about to happen and returns one of <strong>ALLOW</strong>, <strong>BLOCK</strong>, <strong>REVISE</strong>, or <strong>ESCALATE</strong>. Every judgment writes a JSONL audit event carrying the proposal's hashes, the outcome, the policy version, and the judge's reason.</p>
 
-          <p><strong>The layer is fully opt-in.</strong> Existing deployments see no judge invocation until they drop a <code>judges.md</code> file into the agent folder (or set an environment variable for the hardcoded defaults). The minimum viable config is six lines.</p>
+          <p><strong>The layer is fully opt-in.</strong> Existing deployments see no judge invocation until they drop a <code>judges.md</code> file into the agent folder (or set an environment variable for the hardcoded defaults). The minimum viable config is a handful of YAML lines specifying which action classes to gate.</p>
 
           <h3>Mandates: durable cumulative authorization</h3>
           <p>The judge layer handles single-action approval. <strong>Mandates</strong> handle the longer arc: an operator authoring <code>mandates.md</code> grants the agent durable scoped authority — for instance, "spend up to $6,000 cumulatively on the Q2 ad campaign, only through these tools, only on these targets, only this month." The framework defends that cap against concurrent runs <em>and</em> crash-restart, and surfaces audit signals when an action's executed target diverged from what was authorized at proposal time.</p>
@@ -485,7 +485,7 @@ flowchart TB
             <dd>Default: filesystem. Operators author <code>mandates.md</code>; the backend enforces cumulative caps + crash recovery + post-action verification.</dd>
           </dl>
 
-          <p><strong>Four remaining for v1.0:</strong> <code>PolicyBackend</code> (org-level policy that supersedes per-agent caps and allowlists — in progress, 4-PR arc), <code>PersonaBackend</code> (UI-editable identity/soul/user), <code>CorpusBackend</code> (GB-scale wiki + semantic search), <code>MCPServerRegistryBackend</code> (catalog for MCP servers). v1.0 closes when those four ship + their conformance suites pin the contract.</p>
+          <p><strong>Four remaining for v1.0:</strong> <code>PolicyBackend</code> (org-level policy that supersedes per-agent caps and allowlists — in progress, multi-PR arc), <code>PersonaBackend</code> (UI-editable identity/soul/user), <code>CorpusBackend</code> (GB-scale wiki + semantic search), <code>MCPServerRegistryBackend</code> (catalog for MCP servers). v1.0 closes when those four ship + their conformance suites pin the contract.</p>
 
           <h3>Home shape vs company shape</h3>
           <p>Here's the same agent — same folder, same persona, same tools, same judge config — running in two very different deployments. Notice what changes and what doesn't.</p>
@@ -523,12 +523,12 @@ flowchart TB
             </div>
           </div>
 
-          <p>The home user opens the folder in Obsidian and reads the journal. The company runs the same agent across three Cloud Run instances behind a load balancer, with logs flowing to a SQLite-backed dashboard that answers "show me all escalations from this team this quarter" in milliseconds. <strong>The agent's persona doesn't know which world it's in.</strong> The agent's tools don't know. The agent's memory doesn't know. The only difference is what's registered as the backend for each protocol.</p>
+          <p>The home user opens the folder in Obsidian and reads the journal. The company runs the same agent across multiple Cloud Run instances behind a load balancer, with logs flowing to a SQLite-backed dashboard that answers "show me all escalations from this team this quarter" in milliseconds. <strong>The agent's persona doesn't know which world it's in.</strong> The agent's tools don't know. The agent's memory doesn't know. The only difference is what's registered as the backend for each protocol.</p>
 
           <p>Two shipped protocols (MemoryBackend and MandateBackend) ship filesystem-only in v1 — both retain the company-shape pane as "(same)" above. The Protocol seams are in place from day one so future adapters (vector-database memory, SaaS / mobile / Slack-bot mandates) register via <code>register_memory_backend()</code> / <code>register_mandate_backend()</code> without forking core. The four remaining v1.0 protocols on the roadmap (Persona, Corpus, Policy, MCPServerRegistry) close the rest of the substrate-swap surface.</p>
 
           <h3>Postgres adapters — the next substrate</h3>
-          <p>SQLite covers single-host org-shape deployments. <strong>Postgres is the next step up</strong> — multi-host shared-substrate org deployments where SQLite's single-writer model isn't enough. The umbrella tracking this work is <a href="https://github.com/dep0we/atomic-agents-stack/issues/258">issue #258</a> with sub-tasks for LogBackend / ProfileBackend / ToolRegistry / Memory+pgvector / Mandate / Lock Postgres adapters in priority order. The Implementer-contract sections in <code>spec/22</code>, <code>spec/24</code>, <code>spec/25</code>, and <code>spec/29</code> already document the 8-MUST shape every adapter has to satisfy.</p>
+          <p>SQLite covers single-host org-shape deployments. <strong>Postgres is the next step up</strong> — multi-host shared-substrate org deployments where SQLite's single-writer model isn't enough. The umbrella tracking this work is <a href="https://github.com/dep0we/atomic-agents-stack/issues/258">issue #258</a> with sub-tasks for LogBackend / ProfileBackend / ToolRegistry / Memory+pgvector / Mandate / Lock Postgres adapters in priority order. The Implementer-contract sections in <code>spec/20</code>, <code>spec/22</code>, <code>spec/24</code>, <code>spec/25</code>, and <code>spec/29</code> already document the 8-MUST shape every adapter has to satisfy.</p>
 
           <details class="deep-dive">
             <summary>Deep dive: how the swap actually happens</summary>
@@ -543,7 +543,7 @@ uv run atomic-agents run scout --work-item "Daily morning brief"</code></pre>
           <details class="deep-dive">
             <summary>Deep dive: PolicyBackend (in progress)</summary>
             <p>The eighth-and-a-half protocol. Where <code>MandateBackend</code> is per-agent durable authorization, <code>PolicyBackend</code> is the <strong>fleet-wide</strong> policy layer that supersedes per-agent caps and allowlists. A company can author a <code>policy.md</code> at the project root that says "no agent in this tenant may spend more than $50/day, regardless of what their model.md says" — and the framework enforces that cap on every run.</p>
-            <p>PR 3a shipped 2026-05-20 with cost-cap consumption live (the daily/monthly caps in <code>policy.md</code> now enforce on real money). PR 3b ships the non-cap surfaces (tool allowlists, model allowlists, MCP allowlists) in log-only mode behind a feature flag. PR 4 will lock the spec.</p>
+            <p>Cost-cap consumption shipped (the daily/monthly caps in <code>policy.md</code> now enforce on real money). The non-cap surfaces (tool allowlists, model allowlists, MCP allowlists) ship next in log-only mode behind a feature flag. The final PR locks the spec.</p>
             <p>The semantic shift: per-agent caps in <code>model.md</code> set what the agent <em>can</em> spend; PolicyBackend sets what the operator <em>permits</em> it to spend. Operator-level always wins.</p>
           </details>
 
@@ -560,16 +560,16 @@ uv run atomic-agents run scout --work-item "Daily morning brief"</code></pre>
         <section class="section" id="spec">
           <p class="section-eyebrow">Section 6</p>
           <h2>The spec is the product</h2>
-          <p class="section-lede"><strong>The framework's central artifact isn't the Python code — it's the spec.</strong> 28 numbered spec documents (plus 3 RFCs in progress) describe every load-bearing primitive in precise detail. The Python package is one conforming reference implementation. Anyone can build a different one in any language.</p>
+          <p class="section-lede"><strong>The framework's central artifact isn't the Python code — it's the spec.</strong> 28 locked spec documents (plus 3 in-flight — 1 DRAFT, 2 RFC) describe every load-bearing primitive in precise detail. The Python package is one conforming reference implementation. Anyone can build a different one in any language.</p>
 
           <p>This matters because it means the framework is <strong>not vendor lock-in</strong>. The spec documents are public. The reference implementations are MIT-licensed. If this Python project disappeared tomorrow, your atomic agent in your folder would still work — because what your folder depends on is the <em>spec</em>, not this particular implementation of it.</p>
 
           <p>The spec docs are organized by primitive:</p>
           <ul class="spec-list">
-            <li><strong>01-19</strong> — the foundations: anatomy, memory, file formats, runtime assembly, capture rules, multi-agent projects, research, evaluation, cost/observability, helpers, tuning, goals, research integrity, capture markers, delegation, dreams, skills, MCP, alternative-runtime contracts</li>
+            <li><strong>01-19</strong> — the foundations: anatomy, atomic memory, file formats, runtime assembly, capture rules, multi-agent projects, research foundations, evaluation, cost/observability, helpers, tuning, goals and intent, research integrity, outcomes, delegation, dreams, tools, skills, MCP</li>
             <li><strong>20-25</strong> — backend protocols: MemoryBackend, LockBackend, LogBackend, (23 reserved), AgentProfileBackend, ToolRegistryBackend</li>
             <li><strong>26-29</strong> — recent additions: cascade bundle (DRAFT), doctor preflight, judge layer, mandates</li>
-            <li><strong>30-32</strong> — RFCs in progress: responsibility audit, LLMBackend (locked at 31), policy backend (RFC)</li>
+            <li><strong>30-32</strong> — most-recent: responsibility audit (RFC), LLMBackend (locked at 31), policy backend (RFC)</li>
           </ul>
 
           <p>Every spec doc is <strong>locked when the implementation matches and tests pass</strong>. Spec changes that imply implementation changes get filed as GitHub issues. <strong>Spec docs separate shipped behavior from explicit future / deferred boundaries</strong> — sections describing behavior not yet implemented are explicitly marked, not silently aspirational.</p>
