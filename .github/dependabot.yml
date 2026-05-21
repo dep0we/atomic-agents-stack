@@ -1,0 +1,50 @@
+version: 2
+
+# Weekly version-update PRs grouped by ecosystem. Security updates (CVE-driven)
+# are handled separately by `dependabot_security_updates` at the repo-settings
+# layer — they file PRs immediately, ungrouped.
+
+updates:
+  # Python deps (pip ecosystem handles pyproject.toml; uv.lock is gitignored).
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: America/Chicago
+    open-pull-requests-limit: 5
+    groups:
+      # Group minor + patch upgrades into one PR per week to cap noise.
+      # Major upgrades stay separate so they get individual review.
+      python-minor-patch:
+        update-types:
+          - minor
+          - patch
+    labels:
+      - dependencies
+      - python
+    commit-message:
+      prefix: "chore(deps)"
+      include: scope
+
+  # GitHub Actions pinned versions (test.yml + pages.yml + future workflows).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: America/Chicago
+    open-pull-requests-limit: 5
+    groups:
+      actions-minor-patch:
+        update-types:
+          - minor
+          - patch
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: "chore(ci)"
+      include: scope
