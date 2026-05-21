@@ -14,18 +14,18 @@ These tests make sure:
 from __future__ import annotations
 
 import importlib
+import json
 import re
 import subprocess
 import sys
 from pathlib import Path
-
-import pytest
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
 REPO_ROOT = Path(__file__).parent.parent
 DOCS = REPO_ROOT / "docs"
 EXTRAS = REPO_ROOT / "extras"
+CALDWELL_SAMPLE_LOGS = DOCS / "samples" / "caldwell" / "log" / "2026-05"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -47,6 +47,15 @@ def grep_tree(root: Path, pattern: str) -> list[tuple[Path, int, str]]:
     return hits
 
 
+def iter_jsonl_records(root: Path) -> list[tuple[Path, int, dict]]:
+    """Return parsed JSONL records from a sample log tree."""
+    records: list[tuple[Path, int, dict]] = []
+    for path in sorted(root.glob("*.jsonl")):
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            records.append((path, lineno, json.loads(line)))
+    return records
+
+
 # ── Test #19 — no ghost module references ─────────────────────────────────────
 
 
@@ -54,11 +63,10 @@ def test_no_atomic_agents_tune_references() -> None:
     """atomic_agents.tune does not exist; the module is atomic_agents.tuning."""
     hits = grep_tree(DOCS, r"atomic_agents\.tune\b")
     hits += grep_tree(EXTRAS, r"atomic_agents\.tune\b")
-    messages = [f"  {p}:{n}: {l}" for p, n, l in hits]
+    messages = [f"  {p}:{n}: {line}" for p, n, line in hits]
     assert not hits, (
         "Found references to nonexistent module `atomic_agents.tune`.\n"
-        "Use `atomic_agents.tuning` instead.\n"
-        + "\n".join(messages)
+        "Use `atomic_agents.tuning` instead.\n" + "\n".join(messages)
     )
 
 
@@ -66,12 +74,49 @@ def test_no_atomic_agents_run_references() -> None:
     """atomic_agents.run does not exist; use `atomic_agents.cli run` or the console script."""
     hits = grep_tree(DOCS, r"atomic_agents\.run\b")
     hits += grep_tree(EXTRAS, r"atomic_agents\.run\b")
-    messages = [f"  {p}:{n}: {l}" for p, n, l in hits]
+    messages = [f"  {p}:{n}: {line}" for p, n, line in hits]
     assert not hits, (
         "Found references to nonexistent module `atomic_agents.run`.\n"
         "Use `atomic-agents run` (console script) or "
-        "`python -m atomic_agents.cli run` instead.\n"
-        + "\n".join(messages)
+        "`python -m atomic_agents.cli run` instead.\n" + "\n".join(messages)
+    )
+
+
+def test_caldwell_sample_logs_include_run_ids() -> None:
+    """
+    Caldwell sample logs must match the current audit-trail shape.
+
+    `AtomicAgent._log()` defaults every record to the active agent run_id,
+    and helper/delegate/tool child records link back with parent_run_id.
+    The sample JSONL files are documentation, so they should not elide run_id.
+    """
+    missing = [
+        f"  {path.relative_to(REPO_ROOT)}:{lineno}"
+        for path, lineno, record in iter_jsonl_records(CALDWELL_SAMPLE_LOGS)
+        if not record.get("run_id")
+    ]
+    assert not missing, "Caldwell sample log records missing run_id:\n" + "\n".join(
+        missing
+    )
+
+
+def test_caldwell_sample_parent_run_ids_resolve() -> None:
+    """Child sample records carrying parent_run_id must reference a sample run_id."""
+    records = iter_jsonl_records(CALDWELL_SAMPLE_LOGS)
+    run_ids = {
+        record["run_id"] for _path, _lineno, record in records if record.get("run_id")
+    }
+    unresolved = [
+        (
+            f"  {path.relative_to(REPO_ROOT)}:{lineno} "
+            f"parent_run_id={record.get('parent_run_id')!r}"
+        )
+        for path, lineno, record in records
+        if record.get("parent_run_id") and record["parent_run_id"] not in run_ids
+    ]
+    assert not unresolved, (
+        "Caldwell sample log child records reference unknown parent_run_id:\n"
+        + "\n".join(unresolved)
     )
 
 
@@ -161,8 +206,7 @@ def test_goal_cli_subcommand_first() -> None:
     # The old (broken) shape would have been: goal <agent> status
     # Confirm usage line is NOT "goal agent status" shape.
     assert "goal status" in usage or "atomic-agents.goal status" in usage, (
-        "Usage line does not show subcommand-first shape. "
-        f"Got:\n{usage}"
+        f"Usage line does not show subcommand-first shape. Got:\n{usage}"
     )
 
 

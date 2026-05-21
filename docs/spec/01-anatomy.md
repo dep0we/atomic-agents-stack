@@ -411,8 +411,8 @@ log/
 **Format**: JSONL, one record per run.
 
 ```json
-{"ts":"2026-05-06T07:00:00-05:00","trigger":"cron","model":"claude-opus-4-7-20260101","input_tokens":3421,"output_tokens":892,"status":"ok","summary":"Daily debt-payoff progress check"}
-{"ts":"2026-05-06T11:32:00-05:00","trigger":"skill","model":"claude-opus-4-7-20260101","input_tokens":4102,"output_tokens":2103,"status":"ok","summary":"Quarterly income target review"}
+{"ts":"2026-05-06T07:00:00-05:00","run_id":"caldwell-2026-05-06-001","trigger":"cron","model":"claude-opus-4-7-20260101","input_tokens":3421,"output_tokens":892,"status":"ok","summary":"Daily debt-payoff progress check"}
+{"ts":"2026-05-06T11:32:00-05:00","run_id":"caldwell-2026-05-06-002","trigger":"skill","model":"claude-opus-4-7-20260101","input_tokens":4102,"output_tokens":2103,"status":"ok","summary":"Quarterly income target review"}
 ```
 
 **Why structured (not markdown)**: queryable for cost analysis, error rate, etc. The journal is for *content*; the log is for *observability*.
