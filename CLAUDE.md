@@ -205,7 +205,7 @@ uv run pytest                            # full suite
 uv run pytest tests/test_<module>.py -v  # one module
 ```
 
-1750 tests today. New backend protocols add ~25 conformance + ~10 impl-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol — the conformance suite is what keeps the protocol honest.
+Run `uv run pytest --collect-only -q | tail -1` for the live test count (last refresh: 2,381 tests, 2026-05-20). New backend protocols add ~25 conformance + ~10 impl-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol — the conformance suite is what keeps the protocol honest.
 
 ### Releases + SemVer
 
@@ -217,7 +217,7 @@ Every release: `vX.Y.Z` git tag + GitHub Release with CHANGELOG entry verbatim. 
 
 ## Working methods
 
-These are the methods that have produced this codebase's quality (4 published tags through v0.13.0, ~55 merged PRs, ~1750 tests, no production rollback events). Captured here to survive the session that produced them. Full retrospective in `docs/methodology.md`.
+These are the methods that have produced this codebase's quality (4 published tags through v0.13.0, ~55 merged PRs, ~2.4k tests, no production rollback events). Captured here to survive the session that produced them. Full retrospective in `docs/methodology.md`.
 
 ### Always run `/ship` end-to-end — never bypass
 
@@ -339,7 +339,7 @@ These are not forbidden forever — they're explicitly deferred with rationale. 
 
 ## Status
 
-**v0.13.0, alpha, PUBLIC.** Core runtime stable, 2201 tests passing + 34 capability-gated skips on Python 3.11/3.12 under full CI extras (`uv sync --extra dev --extra openai --extra validation --extra redis`). Skip breakdown: 18 ToolRegistry conformance skips (10 filesystem-shape tests skip on SQLite where the assertion is filesystem-specific; 8 `supports_uninstall=False` path-traversal + idempotent-uninstall variants skip on filesystem) + 9 AgentProfile capability-gated skips (skill-content + filesystem-shape tests skip on SQLite) + 5 cross-process Redis tests that require real Redis instead of fakeredis + 2 judge-conformance dispatch skips (1 LLM-only `policy_judge_returns_escalate[llm_judge]` + 1 PolicyJudge concurrent-evaluate `concurrent_evaluate_no_corrupted_stub_state[policy_judge]`). **Eight backend protocols shipped**:
+**v0.13.0, alpha, PUBLIC.** Core runtime stable. Test suite: run `uv run pytest --collect-only -q | tail -1` for the live count (last refresh: 2,381 tests collected, 2026-05-20). Capability-gated skips fall into four buckets — ToolRegistry conformance (filesystem-shape + `supports_uninstall=False` variants), AgentProfile (skill-content + filesystem-shape on SQLite), cross-process Redis (require real Redis instead of fakeredis), and judge-conformance dispatch (LLM-only + PolicyJudge concurrent-evaluate). Full CI runs against `uv sync --extra dev --extra openai --extra validation --extra redis`. **Eight backend protocols shipped**:
 
 - **MemoryBackend** (PR #57) — filesystem reference impl + conformance suite.
 - **LLMBackend** (#87) — Anthropic + OpenAI + Moonshot reference impls, registered at framework import; conformance suite parametrizes across all three.
