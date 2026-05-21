@@ -16,6 +16,8 @@ Vault-native, MIT-licensed, Markdown-source-of-truth.
   </picture>
 </p>
 
+**New here?** Read the [visual guide](https://dep0we.github.io/atomic-agents-stack/) — a 30-minute plain-English walkthrough of what an atomic agent is, how it runs, the safety layer, and the protocol-pattern scaling story.
+
 ---
 
 ## Why this exists
