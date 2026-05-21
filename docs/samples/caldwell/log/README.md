@@ -6,13 +6,16 @@ Format: `YYYY-MM/YYYY-MM-DD.jsonl`
 
 Each record includes:
 - `ts` — ISO timestamp
+- `run_id` — stable ID for the agent run
 - `trigger` — `cron | skill | api | manual`
 - `model` — model ID used
 - `input_tokens`, `output_tokens` — counts
 - `status` — `ok | error | skipped`
 - `summary` — one-line description
 
-Optional fields: `error`, `cost_usd`, `cache_hit`, `tools_called`, `skill_invocation_id`.
+Helper, delegate, and tool child records also carry `parent_run_id` to link back to the parent run.
+
+Optional fields: `error`, `cost_usd`, `cache_hit_tokens`, `cache_miss_tokens`, `tools_called`, `skill_invocation_id`.
 
 ## Why JSONL not Markdown
 

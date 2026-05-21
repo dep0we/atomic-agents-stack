@@ -18,6 +18,7 @@ Every agent invocation produces one JSONL line in `log/YYYY-MM/YYYY-MM-DD.jsonl`
 ```json
 {
   "ts": "ISO 8601 timestamp with timezone",
+  "run_id": "stable ID for this agent run",
   "trigger": "cron | skill | api | manual",
   "model": "model ID used (FULL ID, e.g., claude-opus-4-7-20260101)",
   "input_tokens": 4102,
@@ -35,6 +36,8 @@ Strongly recommended additional fields:
 - `error` — error message string when status=error
 
 The dashboard depends on these being populated. A runtime that doesn't write them gets a dashboard with blank cells; runtimes should populate everything they reasonably can.
+
+Helper, tool, and delegate child records use the same `run_id`-anchored audit trail and add `parent_run_id` to link back to the parent agent run. Sample JSONL files should include those IDs instead of eliding them for readability.
 
 ### Why model is critical
 
