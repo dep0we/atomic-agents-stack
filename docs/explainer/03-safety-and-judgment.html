@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Safety and judgment · Atomic Agents Guide</title>
+  <link rel="stylesheet" href="style.css" />
+  <script>
+    (function() {
+      const saved = localStorage.getItem('atomic-explainer-theme');
+      if (saved === 'dark') document.documentElement.classList.add('dark');
+      else if (saved === 'light') document.documentElement.classList.add('light');
+    })();
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="topnav-inner">
+    <a href="index.html" class="topnav-brand"><span class="topnav-brand-dot"></span>Atomic Agents</a>
+    <div class="topnav-links">
+      <a href="01-the-agent-is-a-folder.html" class="topnav-link">What is it?</a>
+      <a href="02-a-day-in-the-life.html" class="topnav-link">How it runs</a>
+      <a href="03-safety-and-judgment.html" class="topnav-link active">Safety</a>
+      <a href="04-growing-and-collaborating.html" class="topnav-link">Growing</a>
+      <a href="05-portable-to-anywhere.html" class="topnav-link">Scaling</a>
+      <button class="theme-toggle" id="theme-toggle" aria-label="Toggle dark mode" type="button">
+        <svg class="icon-sun" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm0 1.5a4.5 4.5 0 1 1 0-9 4.5 4.5 0 0 1 0 9zM8 0a.5.5 0 0 1 .5.5v1.5a.5.5 0 0 1-1 0V.5A.5.5 0 0 1 8 0zm0 13.5a.5.5 0 0 1 .5.5v1.5a.5.5 0 0 1-1 0V14a.5.5 0 0 1 .5-.5zM15.5 8a.5.5 0 0 1-.5.5h-1.5a.5.5 0 0 1 0-1H15a.5.5 0 0 1 .5.5zm-13 0a.5.5 0 0 1-.5.5H.5a.5.5 0 0 1 0-1H2a.5.5 0 0 1 .5.5zm10.6-5.6a.5.5 0 0 1 0 .7l-1.1 1.1a.5.5 0 1 1-.7-.7l1.1-1.1a.5.5 0 0 1 .7 0zM4.7 11.3a.5.5 0 0 1 0 .7l-1.1 1.1a.5.5 0 1 1-.7-.7l1.1-1.1a.5.5 0 0 1 .7 0zM13.1 13.1a.5.5 0 0 1-.7 0l-1.1-1.1a.5.5 0 1 1 .7-.7l1.1 1.1a.5.5 0 0 1 0 .7zM4.7 4.7a.5.5 0 0 1-.7 0L2.9 3.6a.5.5 0 1 1 .7-.7l1.1 1.1a.5.5 0 0 1 0 .7z"/></svg>
+        <svg class="icon-moon" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6 .278a.77.77 0 0 1 .08.858 7.2 7.2 0 0 0-.878 3.46c0 4.021 3.278 7.277 7.318 7.277.527 0 1.04-.055 1.533-.16a.78.78 0 0 1 .81.316.73.73 0 0 1-.031.893A8.35 8.35 0 0 1 8.344 16C3.734 16 0 12.286 0 7.71 0 4.266 2.114 1.312 5.124.06A.75.75 0 0 1 6 .278z"/></svg>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<main>
+  <div class="container">
+    <article>
+      <header class="hero" style="text-align:left;padding:3rem 0 1.5rem;">
+        <span class="hero-eyebrow">Chapter 03</span>
+        <h1>Safety and judgment</h1>
+        <p class="lead">An AI assistant that can take real action — send emails, write files, spend money — needs guardrails. Atomic Agents has two: a "judge" that reviews risky actions before they happen, and cost caps that stop runaway spending. Both are configured in plain markdown.</p>
+      </header>
+
+      <h2>The problem we're solving</h2>
+      <p>Language models are clever but not infallible. They occasionally misread a situation. They occasionally hallucinate confidence. They have no sense of what a dollar costs you. Left alone with the ability to take real-world action, even a well-intentioned agent will eventually do something you didn't want — send the wrong email, overwrite a file you needed, rack up a $200 bill chasing a bad hypothesis.</p>
+
+      <p>Atomic Agents addresses this with two independent safety layers:</p>
+      <ol>
+        <li><strong>The judge layer</strong> — a separate review step that gates risky actions before they happen, with four possible outcomes: allow, block, revise, or escalate to you.</li>
+        <li><strong>Cost guardrails</strong> — daily and monthly spending caps, with threshold warnings at 50%, 80%, and 100%.</li>
+      </ol>
+
+      <p>Both are <strong>opt-in</strong>. Your agent runs without them just fine for low-stakes work. You turn them on when the stakes warrant — and you configure their strictness yourself, per agent, in markdown.</p>
+
+      <h2>The judge layer</h2>
+      <p>Before any side-effectful action runs — sending an email, modifying a file, calling an external API — the framework hands the proposed action to a "judge." The judge is a separate AI (or, for cheap simple checks, a rule engine) whose only job is to look at this single action and decide what to do.</p>
+
+      <div class="diagram">
+        <pre class="mermaid">
+flowchart TD
+  Action["🎯 Action Proposal<br/>e.g., 'send email to alice@example.com<br/>about Q3 deadline'"]
+  Action --> Class{"What class<br/>of action?"}
+  Class -- "read-only<br/>(load a note)" --> Bypass["✅ Bypass<br/>No judge needed"]
+  Class -- "reversible write<br/>(save a note)" --> Audit["📝 Allow + audit<br/>Run, log decision"]
+  Class -- "external side-effect<br/>(send email, post to API)" --> Judge["⚖️ Judge runs"]
+  Class -- "high-risk<br/>(delete files, spend money)" --> Esc["🛑 Always escalate"]
+  Judge --> Outcome{"Judge's<br/>outcome"}
+  Outcome -- "ALLOW" --> Run["✅ Execute"]
+  Outcome -- "BLOCK" --> Refuse["❌ Refuse + log reason"]
+  Outcome -- "REVISE" --> Amend["✏️ Amend the action<br/>(re-judge once)"]
+  Outcome -- "ESCALATE" --> Pending["📥 Write to pending queue<br/>Wait for your approval"]
+  Amend --> Run
+  Esc --> Pending
+  Pending --> You["🧑 You review in your text editor<br/>Approve, Deny, Redact, or Revise"]
+  You --> Run
+  style Action fill:#e8f1fc,stroke:#0071e3,color:#000
+  style Bypass fill:#e6f7eb,stroke:#34c759,color:#000
+  style Audit fill:#e6f7eb,stroke:#34c759,color:#000
+  style Run fill:#e6f7eb,stroke:#34c759,color:#000
+  style Refuse fill:#ffe5e3,stroke:#ff3b30,color:#000
+  style Judge fill:#fff3e0,stroke:#ff9500,color:#000
+  style Esc fill:#fff3e0,stroke:#ff9500,color:#000
+  style Pending fill:#fff3e0,stroke:#ff9500,color:#000
+        </pre>
+        <p class="diagram-caption">Every side-effectful action is classified, then routed through the appropriate gate before execution.</p>
+      </div>
+
+      <h3>The four action classes</h3>
+      <p>Every tool an agent can use is tagged with one of four classes in <code>tools.md</code>:</p>
+
+      <div class="deflist">
+        <dt><span class="pill pill-success">read_only</span> Reading a memory note, loading a wiki article, fetching a public web page.</dt>
+        <dd>No side effects. The judge is bypassed entirely — running the judge would add latency and cost for no safety gain.</dd>
+
+        <dt><span class="pill pill-accent">reversible_write</span> Saving a new memory note, updating the journal, appending a log line.</dt>
+        <dd>Side-effectful but recoverable. By default the judge runs and writes its opinion to the audit log, but the action is allowed regardless. You see "the judge had thoughts" without the judge being able to block you.</dd>
+
+        <dt><span class="pill pill-warning">external_side_effect</span> Sending an email, posting to a webhook, calling a paid API.</dt>
+        <dd>This is where the judge's opinion actually gates execution. Default policy is "judge required" — the action runs only if the judge returns ALLOW.</dd>
+
+        <dt><span class="pill" style="background:var(--danger-soft);color:var(--danger);border-color:rgba(255,59,48,0.18);">high_risk</span> Deleting many files, spending money over a threshold, anything irreversible.</dt>
+        <dd>Always escalates to you, regardless of what the judge thinks. The agent pauses; the framework writes a PENDING file to <code>vault/escalations/</code>; you review and approve in your text editor.</dd>
+      </div>
+
+      <h3>The four outcomes</h3>
+      <p>When the judge runs, it can produce one of four outcomes:</p>
+
+      <div class="deflist">
+        <dt><strong>ALLOW</strong> — looks fine, proceed.</dt>
+        <dd>The action runs as proposed. The judgment is still logged so you have a record.</dd>
+
+        <dt><strong>BLOCK</strong> — refuses to run this action.</dt>
+        <dd>The action is dropped. The reason is written to the audit log and surfaced in the run's response so the agent (and you) know what happened.</dd>
+
+        <dt><strong>REVISE</strong> — proposes an amendment.</dt>
+        <dd>The most interesting outcome. The judge might say: "Send this email, but strip the attachment." or "Open the PR as draft, not for merge." The framework merges the amendment into the proposal, re-runs the judge once (so revisions don't loop forever), and if the second judgment ALLOWs, executes the amended version.</dd>
+
+        <dt><strong>ESCALATE</strong> — kicks it up to you.</dt>
+        <dd>The agent writes a PENDING file describing the action; the run pauses; you go review it. We'll look at that flow next.</dd>
+      </div>
+
+      <h2>The escalation queue — where you come in</h2>
+      <p>When something escalates, the framework creates a file like:</p>
+      <pre><code>~/agents/scout/vault/escalations/high_risk/p-abc123.md</code></pre>
+
+      <p>You open it in your editor (Obsidian, vim, VS Code, anything). The file shows the proposed action, the judge's reason, and a small set of instructions. You scroll to the bottom and add exactly one resolution block:</p>
+
+      <pre><code>### Approved by dan
+resolved_at: 2026-05-17T09:14:22Z
+note: Reviewed — the email is correct, the recipients are right.</code></pre>
+
+      <p>That's it. The next time Scout runs (or the next time you ask her to "check pending"), she sees the resolution, verifies the proposal hasn't been tampered with, and executes the approved action. There are five resolution verbs: <strong>Approved</strong>, <strong>Denied</strong>, <strong>Redacted</strong>, <strong>Revised</strong> (you write an amendment yourself), and <strong>Auto-decided</strong> (after a timeout, the framework picks for you per a configured policy).</p>
+
+      <div class="callout callout-key">
+        <p class="callout-title">Why a markdown file, not a dialog box?</p>
+        <p>Because the markdown file is part of the audit trail. There's no separate "approval database." Six months from now if you need to know who approved what, the answer is in your folder — same as everything else.</p>
+      </div>
+
+      <h2>Configuring the judge — judges.md</h2>
+      <p>The whole judge layer is opt-in. To activate it, drop a file called <code>judges.md</code> into the agent folder. The minimum viable version is just:</p>
+
+      <pre><code>backend: rules
+class_policy:
+  read_only: bypass
+  reversible_write: allow_with_audit
+  external_side_effect: judge_required
+  high_risk: escalate</code></pre>
+
+      <p>That's the four default behaviors above. You can be stricter (<code>read_only: judge_required</code> means even loading a note gets reviewed). You can be looser (<code>external_side_effect: allow_with_audit</code> means external calls run, but with a log of the judge's thoughts). The strictness ordering is fixed: <code>bypass &lt; allow_with_audit &lt; judge_required &lt; escalate</code>.</p>
+
+      <p>For multi-agent projects, a <code>judges.md</code> dropped at the project root acts as a <strong>floor</strong> — individual agents can be stricter than the floor, but can't be looser. A coordinator can ensure no specialist in the team ever runs a high-risk action without escalating, regardless of what the specialist's own config says.</p>
+
+      <h2>Cost guardrails — model.md</h2>
+      <p>The second safety layer addresses spend, not safety per se. Every LLM call costs money (typically pennies to dollars depending on the model and the prompt size). Without guardrails, an agent in a loop could rack up significant charges before you notice.</p>
+
+      <p>Each agent's <code>model.md</code> file has a structured block that sets caps:</p>
+
+      <pre><code>cost_guardrails:
+  daily_cap_usd: 5.00
+  monthly_cap_usd: 100.00
+  thresholds:
+    warn_at: 0.5    # log a warning at 50% used
+    alert_at: 0.8   # send an alert at 80%
+    cap_action: stop  # at 100%, what to do: stop | log | alert</code></pre>
+
+      <p>Before every language-model call, the runtime checks current cumulative spend. The behavior depends on where you are:</p>
+
+      <div class="diagram">
+        <pre class="mermaid">
+flowchart LR
+  Run["agent.call()"] --> Check{"Spend<br/>this period?"}
+  Check -- "< 50%" --> Green["✅ Green light<br/>Proceed normally"]
+  Check -- "50–80%" --> Yellow["⚠️ Yellow<br/>Proceed + log warning"]
+  Check -- "80–100%" --> Orange["⚠️ Orange<br/>Proceed + send alert"]
+  Check -- "≥ 100%" --> Red["❌ Red<br/>Refuse to start"]
+  style Green fill:#e6f7eb,stroke:#34c759,color:#000
+  style Yellow fill:#fff3e0,stroke:#ff9500,color:#000
+  style Orange fill:#fff3e0,stroke:#ff9500,color:#000
+  style Red fill:#ffe5e3,stroke:#ff3b30,color:#000
+        </pre>
+        <p class="diagram-caption">A four-zone meter — green to red — that the runtime checks before every model call.</p>
+      </div>
+
+      <p>Three things worth knowing about cost guardrails:</p>
+
+      <ol>
+        <li><strong>They check before the call.</strong> The check happens before any tokens are billed. If you're at 100%, the runtime refuses to start; you don't pay for the discovery.</li>
+        <li><strong>They re-check every iteration.</strong> A complex run might bounce between the language model and tools five or ten times. Each iteration re-checks the budget — so a runaway loop catches itself instead of accelerating.</li>
+        <li><strong>Delegation is tree-capped.</strong> When one agent delegates to another (covered in the next chapter), the delegate's budget is capped to the parent's <em>remaining</em> budget. A coordinator running a team of five specialists doesn't get five copies of the daily cap — the whole team shares the parent's leftover budget. This is what makes "running an army" not a financial event.</li>
+      </ol>
+
+      <div class="callout callout-warning">
+        <p class="callout-title">The "critical" escape hatch</p>
+        <p>Sometimes you really do want an action to proceed even past the cap — an urgent customer reply, say. The API has a <code>critical=True</code> flag you can pass to bypass the check on a single call. The flag exists, but it's deliberately not the default. You have to ask for it, every time, in code. The framework's design refuses to make irresponsible spending easy.</p>
+      </div>
+
+      <h2>How the two safety layers work together</h2>
+      <p>The judge layer asks "<em>should this action be taken?</em>" The cost layer asks "<em>can we afford to think about this any longer?</em>" They're independent — turning one on doesn't require turning the other on — but they're complementary.</p>
+
+      <div class="compare">
+        <div class="compare-pane">
+          <h4>Judge layer protects against:</h4>
+          <p>Sending the wrong email. Writing to a sensitive file. Calling an API with bad parameters. Taking an irreversible action you'd regret.</p>
+        </div>
+        <div class="compare-pane">
+          <h4>Cost layer protects against:</h4>
+          <p>A runaway loop spending money. An expensive model used by mistake. A long-running task consuming the month's budget in an hour. Forgetting an agent is even running.</p>
+        </div>
+      </div>
+
+      <p>Together, they let you give your agent real capabilities — not just "summarize this article," but "send the weekly update to the team" — while keeping the failure surface bounded. The judge keeps actions correct; the cost cap keeps the exploration bounded.</p>
+
+      <div class="callout callout-key">
+        <p class="callout-title">The audit trail closes the loop</p>
+        <p>Both layers feed the audit trail. Every judgment writes a log line. Every cost-threshold crossing writes a log line. Every escalation writes a markdown file. When you come back tomorrow and want to understand "why did Scout refuse to send that email?" — the answer is in the log, written in plain English. No hidden behavior, no support ticket required.</p>
+      </div>
+
+      <p>Next we'll move from safety into growth: how an agent gets smarter over time (dreaming), and how multiple agents work together as a team (delegation).</p>
+
+      <nav class="pagenav">
+        <a href="02-a-day-in-the-life.html" class="pagenav-link">
+          <div class="pagenav-eyebrow">← Previous</div>
+          <div class="pagenav-title">A day in the life</div>
+        </a>
+        <a href="04-growing-and-collaborating.html" class="pagenav-link next">
+          <div class="pagenav-eyebrow">Next chapter →</div>
+          <div class="pagenav-title">Growing and collaborating</div>
+        </a>
+      </nav>
+    </article>
+  </div>
+</main>
+
+<footer>
+  <div class="container">
+    <p>Chapter 3 of 5 · <a href="index.html">Return to overview</a></p>
+  </div>
+</footer>
+
+<script>
+  document.querySelectorAll('pre.mermaid').forEach(function(el){ el.dataset.source = el.textContent.trim(); });
+  function isDarkActive() {
+    const html = document.documentElement;
+    if (html.classList.contains('dark')) return true;
+    if (html.classList.contains('light')) return false;
+    return window.matchMedia('(prefers-color-scheme: dark)').matches;
+  }
+  function renderMermaid() {
+    document.querySelectorAll('pre.mermaid').forEach(function(el){
+      el.removeAttribute('data-processed');
+      el.innerHTML = el.dataset.source;
+    });
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: isDarkActive() ? 'dark' : 'default',
+      themeVariables: { fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif', fontSize: '15px' },
+      flowchart: { curve: 'basis', padding: 14, useMaxWidth: true },
+    });
+    mermaid.run({ querySelector: 'pre.mermaid' });
+  }
+  renderMermaid();
+  document.getElementById('theme-toggle').addEventListener('click', function() {
+    const html = document.documentElement;
+    const wantDark = !isDarkActive();
+    html.classList.remove('dark', 'light');
+    html.classList.add(wantDark ? 'dark' : 'light');
+    localStorage.setItem('atomic-explainer-theme', wantDark ? 'dark' : 'light');
+    renderMermaid();
+  });
+</script>
+
+</body>
+</html>

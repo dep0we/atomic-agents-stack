@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Growing and collaborating · Atomic Agents Guide</title>
+  <link rel="stylesheet" href="style.css" />
+  <script>
+    (function() {
+      const saved = localStorage.getItem('atomic-explainer-theme');
+      if (saved === 'dark') document.documentElement.classList.add('dark');
+      else if (saved === 'light') document.documentElement.classList.add('light');
+    })();
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="topnav-inner">
+    <a href="index.html" class="topnav-brand"><span class="topnav-brand-dot"></span>Atomic Agents</a>
+    <div class="topnav-links">
+      <a href="01-the-agent-is-a-folder.html" class="topnav-link">What is it?</a>
+      <a href="02-a-day-in-the-life.html" class="topnav-link">How it runs</a>
+      <a href="03-safety-and-judgment.html" class="topnav-link">Safety</a>
+      <a href="04-growing-and-collaborating.html" class="topnav-link active">Growing</a>
+      <a href="05-portable-to-anywhere.html" class="topnav-link">Scaling</a>
+      <button class="theme-toggle" id="theme-toggle" aria-label="Toggle dark mode" type="button">
+        <svg class="icon-sun" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm0 1.5a4.5 4.5 0 1 1 0-9 4.5 4.5 0 0 1 0 9zM8 0a.5.5 0 0 1 .5.5v1.5a.5.5 0 0 1-1 0V.5A.5.5 0 0 1 8 0zm0 13.5a.5.5 0 0 1 .5.5v1.5a.5.5 0 0 1-1 0V14a.5.5 0 0 1 .5-.5zM15.5 8a.5.5 0 0 1-.5.5h-1.5a.5.5 0 0 1 0-1H15a.5.5 0 0 1 .5.5zm-13 0a.5.5 0 0 1-.5.5H.5a.5.5 0 0 1 0-1H2a.5.5 0 0 1 .5.5zm10.6-5.6a.5.5 0 0 1 0 .7l-1.1 1.1a.5.5 0 1 1-.7-.7l1.1-1.1a.5.5 0 0 1 .7 0zM4.7 11.3a.5.5 0 0 1 0 .7l-1.1 1.1a.5.5 0 1 1-.7-.7l1.1-1.1a.5.5 0 0 1 .7 0zM13.1 13.1a.5.5 0 0 1-.7 0l-1.1-1.1a.5.5 0 1 1 .7-.7l1.1 1.1a.5.5 0 0 1 0 .7zM4.7 4.7a.5.5 0 0 1-.7 0L2.9 3.6a.5.5 0 1 1 .7-.7l1.1 1.1a.5.5 0 0 1 0 .7z"/></svg>
+        <svg class="icon-moon" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6 .278a.77.77 0 0 1 .08.858 7.2 7.2 0 0 0-.878 3.46c0 4.021 3.278 7.277 7.318 7.277.527 0 1.04-.055 1.533-.16a.78.78 0 0 1 .81.316.73.73 0 0 1-.031.893A8.35 8.35 0 0 1 8.344 16C3.734 16 0 12.286 0 7.71 0 4.266 2.114 1.312 5.124.06A.75.75 0 0 1 6 .278z"/></svg>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<main>
+  <div class="container">
+    <article>
+      <header class="hero" style="text-align:left;padding:3rem 0 1.5rem;">
+        <span class="hero-eyebrow">Chapter 04</span>
+        <h1>Growing and collaborating</h1>
+        <p class="lead">An agent that only ever follows instructions doesn't really grow. Two features close that loop. <strong>Dreaming</strong> is a background process that periodically reviews and consolidates memory, making the agent smarter over time. <strong>Delegation</strong> lets agents call other agents — turning a single assistant into a focused team.</p>
+      </header>
+
+      <h2>Dreaming — how an agent gets smarter</h2>
+      <p>Every time Scout runs, she may write new atomic notes — a fact she learned, a decision she made, a preference she noticed. After a month of regular use, her <code>memory/</code> folder might have a hundred notes. Some are still useful. Some duplicate each other. Some contradict each other. Some have aged out of relevance.</p>
+
+      <p>Without intervention, this accumulates into noise. The INDEX gets bigger; recall gets less precise; the agent's behavior becomes less coherent. The solution is a periodic background process called <strong>dream</strong>.</p>
+
+      <div class="diagram">
+        <pre class="mermaid">
+gantt
+  title A week in Scout's life
+  dateFormat YYYY-MM-DD
+  axisFormat %a
+  section Awake runs
+  Mon morning brief    :2026-05-11, 1h
+  Mon research task    :2026-05-11, 1h
+  Tue planning         :2026-05-12, 1h
+  Wed deep work        :2026-05-13, 2h
+  Thu writeup          :2026-05-14, 1h
+  Fri reflection       :2026-05-15, 1h
+  Sat                  :2026-05-16, 1h
+  section Dreams
+  Nightly dream 1      :crit, dream1, 2026-05-12, 12h
+  Nightly dream 2      :crit, dream2, 2026-05-13, 12h
+  Nightly dream 3      :crit, dream3, 2026-05-14, 12h
+  Nightly dream 4      :crit, dream4, 2026-05-15, 12h
+  Nightly dream 5      :crit, dream5, 2026-05-16, 12h
+        </pre>
+        <p class="diagram-caption">Awake runs happen on demand; dreams run on a schedule (typically nightly via cron or launchd).</p>
+      </div>
+
+      <h3>What dreaming actually does</h3>
+      <p>A dream isn't mystical — it's a separate run mode that scans recent activity and reorganizes the memory layers. Specifically, during a dream Scout:</p>
+
+      <ol>
+        <li><strong>Reviews recent atomic notes.</strong> Anything created since the last dream.</li>
+        <li><strong>Identifies patterns and duplicates.</strong> Three separate notes saying "Dan prefers concise replies" should become one canonical note (or a wiki entry).</li>
+        <li><strong>Consolidates into the wiki.</strong> Take a cluster of related atomic notes and write a longer, distilled wiki article that subsumes them. The atomic notes get tagged as "consolidated" or get archived; the wiki article becomes the new source of truth on that topic.</li>
+        <li><strong>Tightens the INDEX.</strong> Removes stale entries, updates summaries, keeps the routing layer small.</li>
+        <li><strong>Surfaces patterns worth your attention.</strong> If Scout noticed that three different projects have been blocked on the same dependency, she may write a note pointing this out.</li>
+        <li><strong>Updates the journal.</strong> A "what I dreamed about" entry, so you can scan it in the morning.</li>
+      </ol>
+
+      <div class="diagram">
+        <pre class="mermaid">
+graph LR
+  subgraph Before["Before dream"]
+    n1["📝 Note: 'Dan likes short emails'"]
+    n2["📝 Note: 'Dan said no preamble'"]
+    n3["📝 Note: 'Dan: skip the throat-clearing'"]
+  end
+  subgraph After["After dream"]
+    w1["📚 wiki/communication-style.md<br/>Dan prefers concise, direct prose.<br/>No preamble, no hedging,<br/>no 'I think' filler. Examples: ..."]
+  end
+  n1 -- consolidate --> w1
+  n2 -- consolidate --> w1
+  n3 -- consolidate --> w1
+  style n1 fill:#fff3e0,stroke:#ff9500,color:#000
+  style n2 fill:#fff3e0,stroke:#ff9500,color:#000
+  style n3 fill:#fff3e0,stroke:#ff9500,color:#000
+  style w1 fill:#e6f7eb,stroke:#34c759,color:#000
+        </pre>
+        <p class="diagram-caption">A dream turns scattered observations into one distilled understanding.</p>
+      </div>
+
+      <h3>Why this matters</h3>
+      <p>Without dreaming, an agent's memory is like a desk where every observation gets a fresh sticky note and nothing ever gets thrown away. Within weeks the desk is unusable.</p>
+
+      <p>With dreaming, the memory layer naturally tiers itself:</p>
+
+      <div class="deflist">
+        <dt>Fresh atomic notes</dt>
+        <dd>Recent observations, high signal-to-noise. Less than a week old. Loaded into context aggressively.</dd>
+
+        <dt>Wiki articles</dt>
+        <dd>Distilled, durable knowledge. Loaded on demand when the topic comes up.</dd>
+
+        <dt>Archived atomic notes</dt>
+        <dd>The raw observations that fed the wiki article. Still in the folder for audit ("what did Scout actually observe?") but no longer in the routing INDEX.</dd>
+      </div>
+
+      <div class="callout callout-key">
+        <p class="callout-title">Dreaming is just another run</p>
+        <p>It uses the same runtime, the same language model, the same cost guardrails. It has its own budget (typically smaller — consolidation is cheap). It writes its own log lines. There's no separate "dream system." It's a job that runs nightly with a particular task: "review your recent activity and consolidate."</p>
+      </div>
+
+      <h2>Delegation — turning one agent into a team</h2>
+      <p>Some tasks are too big or too varied for a single agent. Writing a research report involves research (gathering facts), writing (drafting prose), and editing (polishing). Each of those is a different skill with different prompts, different tools, and different judges.</p>
+
+      <p>Atomic Agents handles this with <strong>delegation</strong>: one agent can call another agent as if it were a tool. The called agent runs in its own folder, with its own persona, its own memory, its own budget — but its run is tied to the parent's run via the audit log.</p>
+
+      <div class="diagram">
+        <pre class="mermaid">
+graph TD
+  You["🧑 You"] -- "Write a report<br/>on agentic memory" --> Coord["🎯 coordinator<br/>~/agents/coordinator/"]
+  Coord -- delegates --> Res["🔬 researcher<br/>~/agents/researcher/"]
+  Coord -- delegates --> Writer["✍️ writer<br/>~/agents/writer/"]
+  Coord -- delegates --> Editor["✏️ editor<br/>~/agents/editor/"]
+  Res -- "facts + sources" --> Coord
+  Writer -- "draft" --> Coord
+  Editor -- "polished draft" --> Coord
+  Coord -- "final report" --> You
+  style You fill:#e8f1fc,stroke:#0071e3,color:#000
+  style Coord fill:#fff3e0,stroke:#ff9500,color:#000
+  style Res fill:#e6f7eb,stroke:#34c759,color:#000
+  style Writer fill:#e6f7eb,stroke:#34c759,color:#000
+  style Editor fill:#e6f7eb,stroke:#34c759,color:#000
+        </pre>
+        <p class="diagram-caption">A coordinator orchestrates specialists. Each specialist is its own folder with its own brain.</p>
+      </div>
+
+      <h3>The one-level rule</h3>
+      <p>The framework intentionally limits delegation to <strong>one level deep</strong>. The coordinator can call researcher, writer, and editor. Those specialists <strong>cannot</strong> delegate further — researcher can't call a sub-researcher to call a sub-sub-researcher.</p>
+
+      <p>This is a deliberate constraint, not a missing feature. Two-level (and deeper) delegation chains look like flexibility but produce unauditable trees: who called whom for what reason, with whose budget? The one-level rule keeps the call graph readable. If a specialist needs help, the framework expects it to ask the coordinator, which makes the decision visible.</p>
+
+      <div class="callout callout-note">
+        <p class="callout-title">In Apple terms: the same shape at every scale</p>
+        <p>One coordinator with three specialists, or one coordinator with thirty specialists — the structure is identical. The coordinator's job is orchestration; the specialists' job is focused execution. No level above, no level below. You always know where you are in the tree.</p>
+      </div>
+
+      <h3>The tree-cap — running a team isn't a bankruptcy event</h3>
+      <p>The cost guardrails from Chapter 3 extend to delegation in an important way. When the coordinator delegates to a specialist, the specialist's budget is capped to the <em>minimum</em> of (the specialist's own daily cap) and (the coordinator's <em>remaining</em> budget for this run).</p>
+
+      <p>Concretely: if the coordinator has $5/day and has already spent $1.20 this morning, all the delegates today combined are capped at $3.80. The whole team shares the parent's pool. You can't trigger one expensive task that explodes into ten parallel expensive sub-tasks. The math is bounded.</p>
+
+      <div class="diagram">
+        <pre class="mermaid">
+flowchart LR
+  Parent["🎯 coordinator<br/>daily cap: $5<br/>spent today: $1.20<br/>remaining: $3.80"]
+  Parent -- "budget passed down" --> R["🔬 researcher<br/>effective cap:<br/>min($daily, $3.80)"]
+  Parent -- "budget passed down" --> W["✍️ writer<br/>effective cap:<br/>min($daily, $3.80 - researcher spend)"]
+  Parent -- "budget passed down" --> E["✏️ editor<br/>effective cap:<br/>min($daily, leftover)"]
+  style Parent fill:#fff3e0,stroke:#ff9500,color:#000
+        </pre>
+        <p class="diagram-caption">Each delegate gets a budget capped by the parent's remaining pool. The team can't spend more than the parent had to give.</p>
+      </div>
+
+      <h3>The roster — who knows whom</h3>
+      <p>The coordinator's folder includes a <code>roster.md</code> file listing the agents it knows about and what each one is good for:</p>
+
+      <pre><code># Roster
+
+- researcher — gathers facts, cites sources, scans recent papers
+- writer — drafts prose in our standard voice
+- editor — proofreads, tightens, checks claims against sources</code></pre>
+
+      <p>When the coordinator's language model decides "I need help researching this," it consults the roster to figure out which delegate to call. The roster is just a markdown bulleted list — readable by you, editable by you.</p>
+
+      <h2>The project layout — multiple agents on a shared mission</h2>
+      <p>For larger work, the framework supports a "project" layout where multiple agents share some context but each have their own persona and memory:</p>
+
+      <div class="filetree">
+<span class="ft-line"><span class="ft-dir">~/agents/scout-project/</span></span>
+<span class="ft-line">├── <span class="ft-name">canon.md</span><span class="ft-desc"># shared knowledge all roles read</span></span>
+<span class="ft-line">├── <span class="ft-name">style_guide.md</span><span class="ft-desc"># shared writing/output conventions</span></span>
+<span class="ft-line">├── <span class="ft-name">policy.md</span><span class="ft-desc"># shared rules (e.g., 'never cite Wikipedia')</span></span>
+<span class="ft-line">├── <span class="ft-name">judges.md</span><span class="ft-desc"># project-level safety floor</span></span>
+<span class="ft-line">└── <span class="ft-dir">agents/</span></span>
+<span class="ft-line">    ├── <span class="ft-dir">coordinator/</span></span>
+<span class="ft-line">    ├── <span class="ft-dir">researcher/</span></span>
+<span class="ft-line">    ├── <span class="ft-dir">writer/</span></span>
+<span class="ft-line">    └── <span class="ft-dir">editor/</span></span>
+      </div>
+
+      <p>When an agent inside the project runs, the runtime <strong>cascades</strong> its config — the role's own settings layered on top of the project's shared defaults. The researcher inherits the project's tools, style guide, and judge policy, and adds their own role-specific persona. The project-floor <code>judges.md</code> means even if a specialist's own config is lax, the project's safety rules can't be relaxed below the floor.</p>
+
+      <h2>Putting it together</h2>
+      <p>Dreaming is how an individual agent gets sharper over time. Delegation is how multiple agents become a team. Together they cover the two main growth paths:</p>
+
+      <div class="compare">
+        <div class="compare-pane">
+          <h4>Dreaming → depth</h4>
+          <p>Scout, used regularly, develops nuanced understanding of you and your work. Her wiki grows. Her INDEX stays clean. After three months she's noticeably more useful than after one week.</p>
+        </div>
+        <div class="compare-pane">
+          <h4>Delegation → breadth</h4>
+          <p>For tasks bigger than one agent can handle well, a coordinator dispatches to specialists who each do their part well. The call graph is auditable. The cost is bounded.</p>
+        </div>
+      </div>
+
+      <p>Both follow the same shape as everything else in the framework: <strong>more files in the folder.</strong> Dreaming writes new wiki articles. Delegation writes child run logs that link to the parent. The folder stays the source of truth, and you can read every step of the growth.</p>
+
+      <div class="callout callout-key">
+        <p class="callout-title">No magic, just persistence and orchestration</p>
+        <p>An agent doesn't "learn" in a machine-learning sense — the language model itself doesn't get retrained. Instead, the agent's <em>folder</em> accumulates better-organized knowledge over time. When you ask Scout something tomorrow, the language model reads a cleaner, more relevant memory layer than it did yesterday. The agent's "growth" is the folder's improving quality.</p>
+      </div>
+
+      <p>One topic remains: how does the same agent run unchanged from your laptop to a company-scale deployment? That's the protocol-pattern story, and it's the final chapter.</p>
+
+      <nav class="pagenav">
+        <a href="03-safety-and-judgment.html" class="pagenav-link">
+          <div class="pagenav-eyebrow">← Previous</div>
+          <div class="pagenav-title">Safety and judgment</div>
+        </a>
+        <a href="05-portable-to-anywhere.html" class="pagenav-link next">
+          <div class="pagenav-eyebrow">Next chapter →</div>
+          <div class="pagenav-title">Portable to anywhere</div>
+        </a>
+      </nav>
+    </article>
+  </div>
+</main>
+
+<footer>
+  <div class="container">
+    <p>Chapter 4 of 5 · <a href="index.html">Return to overview</a></p>
+  </div>
+</footer>
+
+<script>
+  document.querySelectorAll('pre.mermaid').forEach(function(el){ el.dataset.source = el.textContent.trim(); });
+  function isDarkActive() {
+    const html = document.documentElement;
+    if (html.classList.contains('dark')) return true;
+    if (html.classList.contains('light')) return false;
+    return window.matchMedia('(prefers-color-scheme: dark)').matches;
+  }
+  function renderMermaid() {
+    document.querySelectorAll('pre.mermaid').forEach(function(el){
+      el.removeAttribute('data-processed');
+      el.innerHTML = el.dataset.source;
+    });
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: isDarkActive() ? 'dark' : 'default',
+      themeVariables: { fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif', fontSize: '15px' },
+      flowchart: { curve: 'basis', padding: 14, useMaxWidth: true },
+      gantt: { useMaxWidth: true },
+    });
+    mermaid.run({ querySelector: 'pre.mermaid' });
+  }
+  renderMermaid();
+  document.getElementById('theme-toggle').addEventListener('click', function() {
+    const html = document.documentElement;
+    const wantDark = !isDarkActive();
+    html.classList.remove('dark', 'light');
+    html.classList.add(wantDark ? 'dark' : 'light');
+    localStorage.setItem('atomic-explainer-theme', wantDark ? 'dark' : 'light');
+    renderMermaid();
+  });
+</script>
+
+</body>
+</html>

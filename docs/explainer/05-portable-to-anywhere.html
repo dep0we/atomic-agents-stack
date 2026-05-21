@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Portable to anywhere · Atomic Agents Guide</title>
+  <link rel="stylesheet" href="style.css" />
+  <script>
+    (function() {
+      const saved = localStorage.getItem('atomic-explainer-theme');
+      if (saved === 'dark') document.documentElement.classList.add('dark');
+      else if (saved === 'light') document.documentElement.classList.add('light');
+    })();
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="topnav-inner">
+    <a href="index.html" class="topnav-brand"><span class="topnav-brand-dot"></span>Atomic Agents</a>
+    <div class="topnav-links">
+      <a href="01-the-agent-is-a-folder.html" class="topnav-link">What is it?</a>
+      <a href="02-a-day-in-the-life.html" class="topnav-link">How it runs</a>
+      <a href="03-safety-and-judgment.html" class="topnav-link">Safety</a>
+      <a href="04-growing-and-collaborating.html" class="topnav-link">Growing</a>
+      <a href="05-portable-to-anywhere.html" class="topnav-link active">Scaling</a>
+      <button class="theme-toggle" id="theme-toggle" aria-label="Toggle dark mode" type="button">
+        <svg class="icon-sun" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm0 1.5a4.5 4.5 0 1 1 0-9 4.5 4.5 0 0 1 0 9zM8 0a.5.5 0 0 1 .5.5v1.5a.5.5 0 0 1-1 0V.5A.5.5 0 0 1 8 0zm0 13.5a.5.5 0 0 1 .5.5v1.5a.5.5 0 0 1-1 0V14a.5.5 0 0 1 .5-.5zM15.5 8a.5.5 0 0 1-.5.5h-1.5a.5.5 0 0 1 0-1H15a.5.5 0 0 1 .5.5zm-13 0a.5.5 0 0 1-.5.5H.5a.5.5 0 0 1 0-1H2a.5.5 0 0 1 .5.5zm10.6-5.6a.5.5 0 0 1 0 .7l-1.1 1.1a.5.5 0 1 1-.7-.7l1.1-1.1a.5.5 0 0 1 .7 0zM4.7 11.3a.5.5 0 0 1 0 .7l-1.1 1.1a.5.5 0 1 1-.7-.7l1.1-1.1a.5.5 0 0 1 .7 0zM13.1 13.1a.5.5 0 0 1-.7 0l-1.1-1.1a.5.5 0 1 1 .7-.7l1.1 1.1a.5.5 0 0 1 0 .7zM4.7 4.7a.5.5 0 0 1-.7 0L2.9 3.6a.5.5 0 1 1 .7-.7l1.1 1.1a.5.5 0 0 1 0 .7z"/></svg>
+        <svg class="icon-moon" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6 .278a.77.77 0 0 1 .08.858 7.2 7.2 0 0 0-.878 3.46c0 4.021 3.278 7.277 7.318 7.277.527 0 1.04-.055 1.533-.16a.78.78 0 0 1 .81.316.73.73 0 0 1-.031.893A8.35 8.35 0 0 1 8.344 16C3.734 16 0 12.286 0 7.71 0 4.266 2.114 1.312 5.124.06A.75.75 0 0 1 6 .278z"/></svg>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<main>
+  <div class="container">
+    <article>
+      <header class="hero" style="text-align:left;padding:3rem 0 1.5rem;">
+        <span class="hero-eyebrow">Chapter 05</span>
+        <h1>Portable to anywhere</h1>
+        <p class="lead">A person at home with one agent and a company with fifty agents should not need different software. Atomic Agents achieves that with a pattern called <strong>protocols</strong> — a set of standardized interfaces that let the storage <em>underneath</em> the agent be swapped without changing the agent itself.</p>
+      </header>
+
+      <h2>The challenge</h2>
+      <p>Everything we've covered so far assumes the agent's data lives in a folder on a single computer. That works wonderfully for one person with one agent — which is the primary shape the framework is designed for.</p>
+
+      <p>But the same framework has to also work when:</p>
+      <ul>
+        <li>The agent is part of an internal tool used by twenty people, where everyone's edits to the persona need to sync.</li>
+        <li>The agent runs on three identical servers behind a load balancer, all reading the same memory and writing the same logs.</li>
+        <li>The agent's logs need to ship to a centralized monitoring system instead of sitting in JSONL files.</li>
+        <li>The agent's tool catalog comes from a company-internal "tool store" with audit and approval, not just files on disk.</li>
+      </ul>
+
+      <p>The naive answer would be: "fork the framework, swap the file reads for database reads, deal with the merge pain forever." That's how most frameworks scale — by giving up portability when you outgrow the laptop. Atomic Agents takes a different path.</p>
+
+      <h2>Protocols — the moat</h2>
+      <p>A <strong>protocol</strong>, in this framework's vocabulary, is a precisely-specified interface for a single concern. Each protocol has:</p>
+
+      <ol>
+        <li><strong>A spec document</strong> — a numbered markdown file describing what the protocol promises (e.g., <code>docs/spec/22-log-backend.md</code>).</li>
+        <li><strong>A reference implementation</strong> — a default that uses your filesystem. Free, no setup, works for one person on one laptop.</li>
+        <li><strong>A conformance test suite</strong> — a battery of tests that any implementation must pass. This is the actual contract.</li>
+        <li><strong>An implementer contract</strong> — a short list of must-have behaviors any new implementation has to honor.</li>
+      </ol>
+
+      <p>The agent itself doesn't know or care which implementation it's using. It calls the protocol; the framework dispatches to whichever backend is registered. Swap the backend at deployment time via a single environment variable, and the agent is suddenly running over Postgres, or Redis, or a remote HTTP service — without any change to the agent's folder or behavior.</p>
+
+      <div class="diagram">
+        <pre class="mermaid">
+graph TB
+  subgraph Agent["Your agent — unchanged at every scale"]
+    Code["agent.call()<br/>(the runtime)"]
+  end
+  subgraph Protocols["Protocols — the moat (8 shipped of 12)"]
+    direction LR
+    P1["Memory"]
+    P2["LLM"]
+    P3["Judge"]
+    P4["Lock"]
+    P5["Log"]
+    P6["Profile"]
+    P7["ToolRegistry"]
+    P8["Mandate"]
+  end
+  subgraph Storage["Storage — swappable per protocol"]
+    direction LR
+    Disk["📁 Filesystem<br/>(default)"]
+    SQLite["💾 SQLite<br/>(indexed queries)"]
+    Redis["⚡ Redis<br/>(distributed locks)"]
+    PG["🗄️ Postgres<br/>(future)"]
+    HTTP["🌐 HTTP service<br/>(future)"]
+  end
+  Code --> Protocols
+  Protocols --> Storage
+  style Agent fill:#e8f1fc,stroke:#0071e3,color:#000
+  style Protocols fill:#fff3e0,stroke:#ff9500,color:#000
+  style Storage fill:#e6f7eb,stroke:#34c759,color:#000
+        </pre>
+        <p class="diagram-caption">The agent calls protocols. Each protocol can be backed by any storage that implements it. Swap underneath, not on top.</p>
+      </div>
+
+      <h2>The eight shipped protocols</h2>
+      <p>Today, eight protocols are locked and in production. Each closes one specific scaling cliff.</p>
+
+      <div class="deflist">
+        <dt><strong>MemoryBackend</strong> — atomic notes, INDEX, wiki, capture flow.</dt>
+        <dd>Default: filesystem (the <code>memory/</code> folder you've already seen). Future implementations could store memory in a vector database for semantic search at scale.</dd>
+
+        <dt><strong>LLMBackend</strong> — the call to the language model itself.</dt>
+        <dd>Ships with three reference implementations: Anthropic (Claude), OpenAI (GPT family), and Moonshot (Kimi). Adding a fourth (Gemini, vLLM-local, Bedrock) is a single registration call — no fork needed.</dd>
+
+        <dt><strong>JudgeBackend</strong> — the safety layer from Chapter 3.</dt>
+        <dd>Ships with a rule-engine judge (fast, free) and an LLM-judge (slower, smarter). You configure which judge handles which action class in <code>judges.md</code>.</dd>
+
+        <dt><strong>LockBackend</strong> — prevents two copies of the same agent from clobbering each other.</dt>
+        <dd>Default: a per-file lock on disk (POSIX <code>flock</code>) — works fine for one host. Alternative: Redis-based advisory locks for multi-host deployments where different servers might run the same agent.</dd>
+
+        <dt><strong>LogBackend</strong> — where the audit trail goes.</dt>
+        <dd>Default: JSONL files (one per day per agent). Alternative: a SQLite database with indexed queries for dashboards that need to answer "show me all the high-cost runs this week" in milliseconds instead of scanning thousands of JSONL lines.</dd>
+
+        <dt><strong>AgentProfileBackend</strong> — the bootstrap (persona, tools, model, judges, MCP, goal).</dt>
+        <dd>Default: walks the folder, reads each file. Alternative: load from a SQLite database — required for SaaS deployments where the persona is editable through a web UI.</dd>
+
+        <dt><strong>ToolRegistryBackend</strong> — the catalog of installable tools.</dt>
+        <dd>Default: walks <code>&lt;agent&gt;/tools/</code> for markdown descriptors and Python handlers. Alternative: SQLite-backed catalog with cross-tenant isolation, used for plugin-marketplace shapes where tools come from a central registry with audit and approval.</dd>
+
+        <dt><strong>MandateBackend</strong> — durable revocable scoped authority for actions that touch real money or external side effects.</dt>
+        <dd>Operators author a <code>mandates.md</code> file granting agents specific authority (e.g., "spend up to $6,000 cumulatively on the Q2 ad campaign"). The framework defends that cap against concurrent runs and crash-restart, and surfaces audit signals when an action's executed target diverges from what was authorized at proposal time.</dd>
+      </div>
+
+      <h2>What's still to come</h2>
+      <p>Four protocols remain on the roadmap for v1.0:</p>
+
+      <div class="deflist">
+        <dt><strong>PersonaBackend</strong></dt>
+        <dd>Unlocks: UI-editable identity/soul/user, persona versioning, A/B testing different personas against the same eval suite.</dd>
+
+        <dt><strong>CorpusBackend</strong></dt>
+        <dd>Unlocks: wiki and raw knowledge at GB scale, semantic search, RAG retrieval — the things the filesystem MemoryBackend doesn't try to do.</dd>
+
+        <dt><strong>PolicyBackend</strong></dt>
+        <dd>Unlocks: org-level policy that supersedes per-agent settings. A company can enforce "no agent in this tenant may call the legal-document tool without escalation" centrally, without trusting each agent's local config.</dd>
+
+        <dt><strong>MCPServerRegistryBackend</strong></dt>
+        <dd>Unlocks: a catalog for MCP servers (external tool providers) parallel to what ToolRegistryBackend does for in-process tools.</dd>
+      </div>
+
+      <p>v1.0 of the framework closes when all four ship with their own reference implementations and conformance suites. Eight-of-twelve is where we are today; twelve-of-twelve is the stable surface.</p>
+
+      <h2>The home shape vs. the company shape</h2>
+      <p>Here's the same agent — same folder, same persona, same tools, same judge config — running in two very different deployments. Notice what changes and what doesn't.</p>
+
+      <div class="compare">
+        <div class="compare-pane">
+          <h4>🏠 The home shape</h4>
+          <ul style="font-size:0.92rem;margin:0;padding-left:1.2rem;">
+            <li>Folder on your laptop</li>
+            <li>Filesystem MemoryBackend</li>
+            <li>Filesystem LogBackend</li>
+            <li>POSIX-lock LockBackend</li>
+            <li>Filesystem ProfileBackend</li>
+            <li>Filesystem ToolRegistry</li>
+            <li>Filesystem MandateBackend (off by default — opt-in via <code>mandates.md</code>)</li>
+            <li>Anthropic LLMBackend</li>
+            <li>Rule-engine JudgeBackend</li>
+            <li>One agent, one folder, zero servers</li>
+          </ul>
+        </div>
+        <div class="compare-pane">
+          <h4>🏢 The company shape</h4>
+          <ul style="font-size:0.92rem;margin:0;padding-left:1.2rem;">
+            <li>Same folder layout — possibly on shared storage</li>
+            <li>Filesystem MemoryBackend <em>(same)</em></li>
+            <li>SQLite LogBackend (indexed dashboards)</li>
+            <li>Redis LockBackend (multi-host coordination)</li>
+            <li>SQLite ProfileBackend (UI-editable)</li>
+            <li>SQLite ToolRegistry (audit + install approval)</li>
+            <li>Filesystem MandateBackend <em>(same)</em></li>
+            <li>Anthropic LLMBackend <em>(same)</em></li>
+            <li>LLM JudgeBackend (smarter review)</li>
+            <li>Same agent — different substrate underneath</li>
+          </ul>
+        </div>
+      </div>
+
+      <p>The home user opens the folder in Obsidian and reads the journal. The company runs the same agent across three Cloud Run instances behind a load balancer, with logs flowing to a dashboard that answers "show me all escalations from this team this quarter" in milliseconds. <strong>The agent's persona doesn't know which world it's in.</strong> The agent's tools don't know. The agent's memory doesn't know. The only difference is what's registered as the backend for each protocol.</p>
+
+      <p>Two shipped protocols (MemoryBackend and MandateBackend) ship filesystem-only in v1 — both retain the company-shape pane as "(same)" above. The Protocol seams are in place from day one so future adapters (vector-database memory, SaaS / mobile / Slack-bot mandates) register via <code>register_memory_backend()</code> / <code>register_mandate_backend()</code> without forking core. The four remaining v1.0 protocols on the roadmap (Persona, Corpus, Policy, MCPServerRegistry — see "What's still to come" above) close the rest of the substrate-swap surface.</p>
+
+      <h2>How the swap actually happens</h2>
+      <p>Concretely, switching from filesystem-everything to SQLite-for-logs looks like setting one environment variable:</p>
+
+      <pre><code>export ATOMIC_AGENTS_LOG_BACKEND=sqlite
+export ATOMIC_AGENTS_LOG_BACKEND_URL=sqlite:///shared/logs.db
+uv run atomic-agents run scout --work-item "Daily morning brief"</code></pre>
+
+      <p>That's it. The agent's folder doesn't change. The agent's persona doesn't change. The runtime sees the env var, dispatches log writes to SQLite, and everything else continues as before. Tomorrow you can flip it back. Next month you can flip Profile to SQLite too. The home user has none of these env vars set; they get the filesystem defaults and never need to think about it.</p>
+
+      <div class="callout callout-key">
+        <p class="callout-title">The conformance suite is the actual moat</p>
+        <p>Anyone — a third party, a company integrating internally, you in a year — can write a new backend. They drop their implementation into the conformance test harness. If the tests pass, their backend is fully interoperable with everything else. If the tests fail, they know exactly which guarantees they're violating. The framework isn't trying to ship every possible backend itself; it's trying to be a contract that other backends can plug into.</p>
+      </div>
+
+      <h2>Why this matters for a non-developer</h2>
+      <p>You probably won't write a new backend. You probably won't deploy across three Cloud Run instances. So why care about all this?</p>
+
+      <p>Two reasons:</p>
+
+      <ol>
+        <li><strong>Your agent is portable forever.</strong> If a year from now you want to move from Anthropic's Claude to a different language model, the agent doesn't change — just the LLMBackend. If you want to move from filesystem logs to a cloud monitoring tool, the agent doesn't change — just the LogBackend. The shape you depend on (the folder, the markdown files, the persona, the memory) is the layer that never moves.</li>
+        <li><strong>The framework is not a vendor lock-in.</strong> The spec documents are public. The reference implementations are MIT-licensed. Anyone can build a conforming runtime in any language. The atomic agent in your folder doesn't depend on this Python project surviving — it depends on the <em>spec</em> surviving. If the maintainer disappears, your agent still works because the spec is the product.</li>
+      </ol>
+
+      <h2>The throughline, one more time</h2>
+      <p>We started with: "the agent IS a folder." Five chapters later, that's still the core idea — but now with the supporting picture:</p>
+
+      <div class="diagram">
+        <pre class="mermaid">
+flowchart TB
+  Home["🏠 One person, one agent<br/>filesystem everything<br/>(today, on your laptop)"]
+  Org["🏢 A fleet of fifty<br/>SQLite + Redis + cloud<br/>(also today, with the same agents)"]
+  Spec["📜 The spec<br/>(28 locked documents + 3 RFCs<br/>+ conformance tests)"]
+  Agent["📁 Your agent's folder<br/>(persona, tools, memory,<br/>judge config, journal, log)"]
+  Spec -.governs.-> Home
+  Spec -.governs.-> Org
+  Agent --> Home
+  Agent --> Org
+  style Spec fill:#e8f1fc,stroke:#0071e3,color:#000
+  style Agent fill:#e6f7eb,stroke:#34c759,color:#000
+  style Home fill:#fff3e0,stroke:#ff9500,color:#000
+  style Org fill:#fff3e0,stroke:#ff9500,color:#000
+        </pre>
+        <p class="diagram-caption">The folder is the agent. The spec is the contract. The backends are the substrate. Same agent, every scale.</p>
+      </div>
+
+      <p>That's the framework. Plain markdown files for what the agent is. Protocols for what the agent depends on. A spec for what every implementation must promise. A reference implementation that's the default. And the freedom to swap any layer underneath without disturbing the one above.</p>
+
+      <p>For most people, "the layer above" is enough. Open Obsidian. Edit a persona. Run a task. Read the journal. Watch the agent get sharper week by week. The complicated machinery underneath is there if you ever need it — but you can use the framework for years without needing to.</p>
+
+      <div class="callout callout-note">
+        <p class="callout-title">One last thing — the spec is the product</p>
+        <p>Twenty-eight numbered spec documents (plus three in-progress drafts) describe the framework in precise detail. The Python code in this repository is <em>one</em> implementation of that spec. Eventually there will be others — in different languages, with different optimizations, integrated into different tools. What you build on top of this framework doesn't depend on any one of them. It depends on the shape.</p>
+      </div>
+
+      <nav class="pagenav">
+        <a href="04-growing-and-collaborating.html" class="pagenav-link">
+          <div class="pagenav-eyebrow">← Previous</div>
+          <div class="pagenav-title">Growing and collaborating</div>
+        </a>
+        <a href="index.html" class="pagenav-link next">
+          <div class="pagenav-eyebrow">Back to →</div>
+          <div class="pagenav-title">Guide overview</div>
+        </a>
+      </nav>
+    </article>
+  </div>
+</main>
+
+<footer>
+  <div class="container">
+    <p>Chapter 5 of 5 · <a href="index.html">Return to overview</a></p>
+    <p style="margin-top:1rem;">Thank you for reading. If something didn't make sense, please tell me so I can fix it.</p>
+  </div>
+</footer>
+
+<script>
+  document.querySelectorAll('pre.mermaid').forEach(function(el){ el.dataset.source = el.textContent.trim(); });
+  function isDarkActive() {
+    const html = document.documentElement;
+    if (html.classList.contains('dark')) return true;
+    if (html.classList.contains('light')) return false;
+    return window.matchMedia('(prefers-color-scheme: dark)').matches;
+  }
+  function renderMermaid() {
+    document.querySelectorAll('pre.mermaid').forEach(function(el){
+      el.removeAttribute('data-processed');
+      el.innerHTML = el.dataset.source;
+    });
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: isDarkActive() ? 'dark' : 'default',
+      themeVariables: { fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif', fontSize: '15px' },
+      flowchart: { curve: 'basis', padding: 14, useMaxWidth: true },
+    });
+    mermaid.run({ querySelector: 'pre.mermaid' });
+  }
+  renderMermaid();
+  document.getElementById('theme-toggle').addEventListener('click', function() {
+    const html = document.documentElement;
+    const wantDark = !isDarkActive();
+    html.classList.remove('dark', 'light');
+    html.classList.add(wantDark ? 'dark' : 'light');
+    localStorage.setItem('atomic-explainer-theme', wantDark ? 'dark' : 'light');
+    renderMermaid();
+  });
+</script>
+
+</body>
+</html>
