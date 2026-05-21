@@ -177,7 +177,7 @@ graph TB
             <li>Redis LockBackend (multi-host coordination)</li>
             <li>SQLite ProfileBackend (UI-editable)</li>
             <li>SQLite ToolRegistry (audit + install approval)</li>
-            <li>Filesystem MandateBackend <em>(same — v1 ships filesystem-only; SaaS/DB seam in place)</em></li>
+            <li>Filesystem MandateBackend <em>(same)</em></li>
             <li>Anthropic LLMBackend <em>(same)</em></li>
             <li>LLM JudgeBackend (smarter review)</li>
             <li>Same agent — different substrate underneath</li>
@@ -185,7 +185,9 @@ graph TB
         </div>
       </div>
 
-      <p>The home user opens the folder in Obsidian and reads the journal. The company runs the same agent across three Cloud Run instances behind a load balancer, with logs flowing to a dashboard that answers "show me all escalations from this team this quarter" in milliseconds. <strong>The agent's persona doesn't know which world it's in.</strong> The agent's tools don't know. The agent's memory doesn't know. The only difference is what's registered as the backend for each protocol. (MandateBackend is the one shipped protocol where v1 only includes the filesystem reference impl — the Protocol seam ships from day one so future SaaS / mobile / Slack-bot adapters slot in via <code>register_mandate_backend()</code> without forking core.)</p>
+      <p>The home user opens the folder in Obsidian and reads the journal. The company runs the same agent across three Cloud Run instances behind a load balancer, with logs flowing to a dashboard that answers "show me all escalations from this team this quarter" in milliseconds. <strong>The agent's persona doesn't know which world it's in.</strong> The agent's tools don't know. The agent's memory doesn't know. The only difference is what's registered as the backend for each protocol.</p>
+
+      <p>Two shipped protocols (MemoryBackend and MandateBackend) ship filesystem-only in v1 — both retain the company-shape pane as "(same)" above. The Protocol seams are in place from day one so future adapters (vector-database memory, SaaS / mobile / Slack-bot mandates) register via <code>register_memory_backend()</code> / <code>register_mandate_backend()</code> without forking core. The four remaining v1.0 protocols on the roadmap (Persona, Corpus, Policy, MCPServerRegistry — see "What's still to come" above) close the rest of the substrate-swap surface.</p>
 
       <h2>How the swap actually happens</h2>
       <p>Concretely, switching from filesystem-everything to SQLite-for-logs looks like setting one environment variable:</p>
