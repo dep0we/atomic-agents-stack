@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Understanding Atomic Agents — A Visual Guide</title>
+  <meta name="description" content="A plain-English visual guide to atomic agents — what they are, how they work, and why they live in a folder you own." />
+  <link rel="stylesheet" href="style.css" />
+  <script>
+    // Apply saved theme BEFORE paint to avoid flash.
+    (function() {
+      const saved = localStorage.getItem('atomic-explainer-theme');
+      if (saved === 'dark') document.documentElement.classList.add('dark');
+      else if (saved === 'light') document.documentElement.classList.add('light');
+    })();
+  </script>
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="topnav-inner">
+    <a href="index.html" class="topnav-brand">
+      <span class="topnav-brand-dot"></span>Atomic Agents
+    </a>
+    <div class="topnav-links">
+      <a href="01-the-agent-is-a-folder.html" class="topnav-link">What is it?</a>
+      <a href="02-a-day-in-the-life.html" class="topnav-link">How it runs</a>
+      <a href="03-safety-and-judgment.html" class="topnav-link">Safety</a>
+      <a href="04-growing-and-collaborating.html" class="topnav-link">Growing</a>
+      <a href="05-portable-to-anywhere.html" class="topnav-link">Scaling</a>
+      <button class="theme-toggle" id="theme-toggle" aria-label="Toggle dark mode" type="button">
+        <svg class="icon-sun" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+          <path d="M8 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm0 1.5a4.5 4.5 0 1 1 0-9 4.5 4.5 0 0 1 0 9zM8 0a.5.5 0 0 1 .5.5v1.5a.5.5 0 0 1-1 0V.5A.5.5 0 0 1 8 0zm0 13.5a.5.5 0 0 1 .5.5v1.5a.5.5 0 0 1-1 0V14a.5.5 0 0 1 .5-.5zM15.5 8a.5.5 0 0 1-.5.5h-1.5a.5.5 0 0 1 0-1H15a.5.5 0 0 1 .5.5zm-13 0a.5.5 0 0 1-.5.5H.5a.5.5 0 0 1 0-1H2a.5.5 0 0 1 .5.5zm10.6-5.6a.5.5 0 0 1 0 .7l-1.1 1.1a.5.5 0 1 1-.7-.7l1.1-1.1a.5.5 0 0 1 .7 0zM4.7 11.3a.5.5 0 0 1 0 .7l-1.1 1.1a.5.5 0 1 1-.7-.7l1.1-1.1a.5.5 0 0 1 .7 0zM13.1 13.1a.5.5 0 0 1-.7 0l-1.1-1.1a.5.5 0 1 1 .7-.7l1.1 1.1a.5.5 0 0 1 0 .7zM4.7 4.7a.5.5 0 0 1-.7 0L2.9 3.6a.5.5 0 1 1 .7-.7l1.1 1.1a.5.5 0 0 1 0 .7z"/>
+        </svg>
+        <svg class="icon-moon" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+          <path d="M6 .278a.77.77 0 0 1 .08.858 7.2 7.2 0 0 0-.878 3.46c0 4.021 3.278 7.277 7.318 7.277.527 0 1.04-.055 1.533-.16a.78.78 0 0 1 .81.316.73.73 0 0 1-.031.893A8.35 8.35 0 0 1 8.344 16C3.734 16 0 12.286 0 7.71 0 4.266 2.114 1.312 5.124.06A.75.75 0 0 1 6 .278z"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<main>
+  <div class="container">
+    <section class="hero">
+      <span class="hero-eyebrow">A Visual Guide</span>
+      <h1>Understanding Atomic Agents</h1>
+      <p class="hero-lead">
+        Atomic Agents are AI assistants that live as plain markdown files in a folder you own — not in someone else's database. This guide explains what that means, how they work, and why the shape matters.
+      </p>
+      <div class="intro-row">
+        <div class="intro-stat">
+          <p class="intro-stat-num">8</p>
+          <p class="intro-stat-label">Storage protocols shipped of 12</p>
+        </div>
+        <div class="intro-stat">
+          <p class="intro-stat-num">2,381</p>
+          <p class="intro-stat-label">Tests verifying the contract</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Pick a starting point</h2>
+      <p>Each page is a self-contained chapter. They build on each other but you can also jump around. Reading time for the whole guide: about 30 minutes.</p>
+
+      <div class="card-grid">
+        <a href="01-the-agent-is-a-folder.html" class="card">
+          <span class="card-number">CHAPTER 01</span>
+          <h3 class="card-title">The agent IS a folder</h3>
+          <p class="card-desc">What an atomic agent actually is. The folder structure, the markdown files, and why everything is something you can read with your own eyes.</p>
+        </a>
+
+        <a href="02-a-day-in-the-life.html" class="card">
+          <span class="card-number">CHAPTER 02</span>
+          <h3 class="card-title">A day in the life</h3>
+          <p class="card-desc">What happens when an agent runs. The call flow, how memory works, and how every action writes a record of itself.</p>
+        </a>
+
+        <a href="03-safety-and-judgment.html" class="card">
+          <span class="card-number">CHAPTER 03</span>
+          <h3 class="card-title">Safety and judgment</h3>
+          <p class="card-desc">The judge layer that gates risky actions, the escalation queue for human review, and the cost guardrails that stop runaway spend.</p>
+        </a>
+
+        <a href="04-growing-and-collaborating.html" class="card">
+          <span class="card-number">CHAPTER 04</span>
+          <h3 class="card-title">Growing and collaborating</h3>
+          <p class="card-desc">Dreaming (the nightly process that consolidates memory), delegation (one agent calling another), and how a team of agents works as a project.</p>
+        </a>
+
+        <a href="05-portable-to-anywhere.html" class="card">
+          <span class="card-number">CHAPTER 05</span>
+          <h3 class="card-title">Portable to anywhere</h3>
+          <p class="card-desc">The protocol-pattern story: how the same agent runs unchanged from a laptop to a multi-host cloud deployment, by swapping the storage underneath.</p>
+        </a>
+
+        <a href="https://github.com/dep0we/atomic-agents-stack" class="card">
+          <span class="card-number">REFERENCE</span>
+          <h3 class="card-title">The source code &amp; specs</h3>
+          <p class="card-desc">The Python reference implementation plus 28 locked spec documents (and 3 RFCs in progress). The spec is the product; the code is one conforming implementation.</p>
+        </a>
+      </div>
+    </section>
+
+    <section>
+      <h2>What problem does this solve?</h2>
+      <p>Most AI agents store their state — your memories, your conversation history, your preferences — somewhere you don't own. An app database, a vector store, a hosted trace system. If the company goes away, your agent goes away. If you switch laptops, you migrate through their interface. If you want a feature they don't offer, you wait.</p>
+      <p>Atomic Agents take a different shape: <strong>your agent's brain lives in your folder.</strong> Persona in markdown files. Memory as notes you can read with a text editor. Tools defined in a markdown table. Run logs as plain text. Move computers? Copy the folder. Want to see what the agent remembered yesterday? Open the file.</p>
+
+      <div class="callout callout-key">
+        <p class="callout-title">The throughline</p>
+        <p>A home user with one agent and a company with a fleet of fifty experience the <em>same framework</em> — graceful and self-explanatory at every scale. The agent's <em>brain</em> stays portable; the storage <em>underneath</em> can scale.</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>How to read this guide</h2>
+      <p>You don't need to be a developer. Every concept gets a concrete example and a diagram. When a technical term is unavoidable, it's defined the first time it appears.</p>
+      <p>If you only have five minutes, read <a href="01-the-agent-is-a-folder.html">Chapter 1</a> — that's the load-bearing idea. The rest of the guide builds on it.</p>
+    </section>
+  </div>
+</main>
+
+<footer>
+  <div class="container">
+    <p>A visual companion to <a href="https://github.com/dep0we/atomic-agents-stack">atomic-agents-stack</a>.</p>
+    <p>Each page works in your browser, light or dark. No tracking, no analytics — just files on your disk.</p>
+  </div>
+</footer>
+
+<script>
+  // Theme toggle
+  const toggle = document.getElementById('theme-toggle');
+  toggle.addEventListener('click', function() {
+    const html = document.documentElement;
+    const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    const isDark = html.classList.contains('dark') ||
+                   (!html.classList.contains('light') && systemDark);
+    if (isDark) {
+      html.classList.remove('dark');
+      html.classList.add('light');
+      localStorage.setItem('atomic-explainer-theme', 'light');
+    } else {
+      html.classList.remove('light');
+      html.classList.add('dark');
+      localStorage.setItem('atomic-explainer-theme', 'dark');
+    }
+  });
+</script>
+
+</body>
+</html>
