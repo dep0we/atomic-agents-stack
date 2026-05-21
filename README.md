@@ -20,11 +20,13 @@ Vault-native, MIT-licensed, Markdown-source-of-truth.
 
 ## Why this exists
 
-Most agent state ends up somewhere you don't fully control — an app database, a vector store, a hosted trace system, or bespoke glue code rebuilt per project. Some popular tools offer self-hosted modes (Letta has a Docker path; Mem0 has an OSS distribution); even so, the operator usually doesn't end up owning the durable shape of their agents.
+Your AI agent's persona, memory, and audit trail live in someone else's database. The persona is locked inside Letta's hosted memory blocks. The memory is in Mem0's vector store. The audit trail is in LangSmith. The cost guardrails are in your wrapper code. Migrating any of it costs a project.
 
-There's another shape: **your agents live in your folder.** Plain markdown files. INDEX.md routing. Persona in `IDENTITY.md` / `SOUL.md` / `USER.md`. Typed atomic notes you can `cat`. Audit trail as JSONL you can grep. Cost guardrails in markdown config. Crash-safe writes — every mutation goes through `temp file + fsync + rename + parent-dir fsync`, so a power loss never leaves a half-written note. Schema migrations are scripts you read before running. If you switch laptops, you copy a folder. If you want a shipped runtime — cron, launchd, a Claude Code skill, or embedded Python — you point the runtime at the folder.
+**There's another shape: your agents live in your folder.** Plain markdown files you can `cat`, `grep`, and `git diff`. No hosted service. No vendor that owns your agent's continuity. Switch laptops, you copy a folder.
 
-That's the shape `atomic-agents-stack` defines, in 23 locked spec docs + 2 RFCs (locked when implementation matches), with a Python reference implementation, 2323 tests, and a Caldwell sample that includes 5 days of real JSONL run logs, a rendered cost dashboard, evals across happy / edge / adversarial / decline categories, and a helper-pattern day showing ~76% cost savings vs. all-Opus.
+Concretely: INDEX.md routing layer. Persona in `IDENTITY.md` / `SOUL.md` / `USER.md`. Typed atomic notes. Audit trail as JSONL. Cost guardrails in markdown config. Crash-safe writes (temp + fsync + rename + parent-dir fsync — a power loss never leaves a half-written note). Schema migrations are scripts you read before running. The runtime is stateless — point cron, launchd, a Claude Code skill, or embedded Python at the folder.
+
+That's what `atomic-agents-stack` defines, in 28 locked spec docs + 3 RFCs, with a Python reference implementation, 2381 tests, and a Caldwell sample shipping 5 days of real JSONL run logs, a rendered cost dashboard, evals across happy / edge / adversarial / decline categories, and a helper-pattern day showing ~76% cost savings vs. all-Opus.
 
 A home user with one agent and an org with a fleet experience the same framework — graceful, coherent, self-explanatory at every scale.
 
@@ -121,21 +123,21 @@ This is the slot in the AI-agent-tooling landscape `atomic-agents-stack` occupie
 | **Audit trail** | JSONL per run with `parent_run_id` rollups; helper + delegate + tool + capture lines all link back | Dashboards in Letta UI / cloud | Mem0 dashboards | LangSmith (hosted) | Build it |
 | **Cost guardrails** | First-class — daily / monthly caps, threshold warnings, fallback action, `critical=True` override, tree-cap across delegates | Per their pricing model | Per their pricing model | Not built into core OSS | Build it |
 | **Multi-agent coordination** | Role × project cascade defined in spec/06 | Multi-agent shared memory blocks | Agent-shared memory pools | LangGraph: graph-based orchestration (more flexible) | Build it |
-| **Numbered, locked spec** | 23 docs in `docs/spec/` (+ 2 RFCs) | API + concept docs | API + concept docs | API reference + concept docs | None |
+| **Numbered, locked spec** | 28 docs in `docs/spec/` (+ 3 RFCs) | API + concept docs | API + concept docs | API reference + concept docs | None |
 | **Reference runtime** | Python, macOS / Linux primary | Python (server) + multi-language clients | Python (OSS) + multi-language clients | Python + JavaScript | Whatever |
 
 **Where the alternatives win:**
 
-- **Letta** has the polished hosted-service UX, multi-language clients, and a more mature multi-agent shared-memory primitive.
-- **Mem0** has stronger memory-retrieval optimization (embeddings + retrieval research is their core focus); if memory quality is the bottleneck, evaluate them directly.
-- **LangGraph** has more flexible graph-based orchestration and the **LangSmith** observability stack is broader than any single project's audit trail can replicate.
-- **Direct SDK** wins when your problem is so domain-specific that any framework's structure is overhead.
+- **Letta** ships a polished hosted UX and multi-language clients; vault-only ships neither.
+- **Mem0** owns the embeddings-retrieval research; if memory quality is the bottleneck, look there first.
+- **LangGraph** wins on graph-shaped orchestration; **LangSmith** observability is broader than any single repo's audit trail can replicate.
+- **Direct SDK** wins when the problem is so domain-specific that any framework's structure is overhead.
 
 **Where Atomic Agents wins:**
 
 - **Markdown-source-of-truth, human-editable.** Operators can edit persona / tools / memory from any text editor or Obsidian without a vendor app.
 - **No required server.** The framework is "files + Python." A complete agent runs on a laptop with zero infrastructure.
-- **Spec-level file layout.** 23 numbered docs lock the contract (plus 2 RFCs in progress); conformance is testable; alternate implementations are possible.
+- **Spec-level file layout.** 28 numbered docs lock the contract (plus 3 RFCs in progress); conformance is testable; alternate implementations are possible.
 - **Crash-safe writes by default.** `temp file + fsync + rename + parent-dir fsync` for every mutation; an interrupted run leaves recoverable artifacts, not corruption.
 - **Cost story is structural, not bolted on.** Daily / monthly caps + tree-cap for delegations + per-call cost reservation for helper batches + a `critical=True` override that's part of the API, not a per-vendor workaround.
 
@@ -145,7 +147,7 @@ This is the slot in the AI-agent-tooling landscape `atomic-agents-stack` occupie
 
 `atomic-agents-stack` is a **spec** for vault-native AI agents, plus one **reference implementation** in Python. The spec is the central artifact; anyone can build agents to the spec without using this code.
 
-Start at [`docs/README.md`](docs/README.md) for the spec entry point. The 23 locked spec docs (plus 2 RFCs) in [`docs/spec/`](docs/spec/) cover:
+Start at [`docs/README.md`](docs/README.md) for the spec entry point. The 28 locked spec docs (plus 3 RFCs) in [`docs/spec/`](docs/spec/) cover:
 
 - [01 — Anatomy](docs/spec/01-anatomy.md) — file layout, persona, memory, wiki, journal, log
 - [02 — Atomic Memory](docs/spec/02-atomic-memory.md) — Notes + Wiki + INDEX-driven recall
@@ -173,121 +175,33 @@ Each spec doc is locked when the implementation matches and tests pass. Spec cha
 
 The framework is moving toward swappable backends layer by layer. The shape: a Python `Protocol` for each primitive that touches storage, a filesystem-default implementation, capability advertisement, and a conformance test suite. Same agent definitions, same `call()` flow, same audit trail — different backends registered.
 
-| Backend | Status | Spec |
-|---|---|---|
-| `MemoryBackend` | ✅ Shipped (v0.10.0) | [`spec/20-memory-backend.md`](docs/spec/20-memory-backend.md) |
-| `LLMBackend` | ✅ Shipped (v0.13.0) | [`spec/31-llm-backend.md`](docs/spec/31-llm-backend.md) |
-| `JudgeBackend` | ✅ Locked at [#112](https://github.com/dep0we/atomic-agents-stack/issues/112) PR 4. `PolicyJudge` + `LLMJudgeBackend` reference impls; opt-in dispatch + `atomic_action` proposal marker; two-judge ensemble + per-judge audit events; `judges.md` operator config + cascade-aware project floor; ESCALATE state machine (PENDING-file writer + operator resolution polling + auto-decide timeout + inline Approved execution); REVISE state machine (judge-driven amendment + second-judgment cycle + operator `### Revised by <op>` with embedded amendment YAML + class-upgrade re-judge gate). Conformance suite (`tests/test_judge_protocol_conformance.py`) gates the spec lock. PR 5a ([#112](https://github.com/dep0we/atomic-agents-stack/issues/112) unreleased): `escalation.fallback_on_timeout` widens to per-class dict form; auto-decide resolves policy from PENDING frontmatter `action_class`. PR 5b ([#112](https://github.com/dep0we/atomic-agents-stack/issues/112) unreleased): strict JSON-Schema validation of amended `tool_arguments` via opt-in `[validation]` extra (`validation: strict` in `judges.md`); concludes the #112 arc-with-amendments | [`spec/28-judge-layer.md`](docs/spec/28-judge-layer.md) |
-| `LockBackend` | ✅ Locked at [#60](https://github.com/dep0we/atomic-agents-stack/issues/60) PR 4. `FilesystemLockBackend` (POSIX `fcntl.flock` advisory) + `RedisLockBackend` (single-instance Redis advisory lock + atomic Lua release/renew + daemon heartbeat at TTL/3 + `LockLost` surfacing) reference impls. `scope(sub_path)` Protocol method lets operators pass ONE backend; framework re-scopes for dream + memory paths. Operator override via `ATOMIC_AGENTS_LOCK_BACKEND` + `ATOMIC_AGENTS_LOCK_BACKEND_URL` env vars OR `AtomicAgent(..., lock_backend=...)` constructor kwarg. `doctor.check_lock_backend` validates operator-config coherence with PASS/WARN/FAIL ladder + credential-redacted URL output. `_locks.AgentLock` preserved as a deprecation shim (sunset v1.0). Closes the multi-host cliff: operators on Cloud Run / Kubernetes / gizmo can now run atomic-agents against a Redis advisory-lock backend instead of per-host POSIX `fcntl.flock`. Conformance suite parametrizes across both backends. | [`spec/21-lock-backend.md`](docs/spec/21-lock-backend.md) |
-| `LogBackend` | ✅ Locked at [#61](https://github.com/dep0we/atomic-agents-stack/issues/61) PR 4. `FilesystemLogBackend` (JSONL-on-disk; preserves the legacy `<agent>/log/YYYY-MM/YYYY-MM-DD.jsonl` artifact byte-for-byte via `_io.atomic_append_jsonl`) + `SQLiteLogBackend` (stdlib `sqlite3`, no optional extra; six indexes; WAL journal mode + per-thread connections for multi-process append safety on local filesystems; aggregation pushdown via SQL `GROUP BY` + SQLite JSON1 `json_extract` for `extra`-field group_bys; index-driven `delete_older_than`; idempotent `INSERT OR IGNORE` cold-start init) reference impls. `LogQuery.agent_name` filter for shared-backend cross-agent isolation with lenient match for legacy records (records without `agent_name` match any filter — filesystem per-agent-dir scoping is the natural isolation primitive). Operator override via `ATOMIC_AGENTS_LOG_BACKEND` + `ATOMIC_AGENTS_LOG_BACKEND_URL` env vars OR `AtomicAgent(..., log_backend=...)` / `OutcomeRunner(..., log_backend=...)` / `DreamRunner(..., log_backend=...)` constructor kwargs (always wins; threads through to internal sub-agents). `doctor.check_log_backend` validates operator-config coherence with PASS/WARN/FAIL ladder + stats probe (records_today / records_this_month) + URL-credential redaction. Implementer contract for queryable backends documented in spec/22 §"Implementer contract for queryable backends" — future Postgres / Datadog / Loki / Cloud Logging adapters mirror the SQLite reference's shape. Closes the dashboard-perf cliff: operators on Cloud Run / Kubernetes can pin SQLite for O(log N) indexed query/aggregate/retention. Conformance suite parametrizes across both backends. | [`spec/22-log-backend.md`](docs/spec/22-log-backend.md) |
-| `PersonaBackend` | Planned | [`#62`](https://github.com/dep0we/atomic-agents-stack/issues/62) |
-| `AgentProfileBackend` | ✅ Locked at PR 4 ([#63](https://github.com/dep0we/atomic-agents-stack/issues/63)): `FilesystemAgentProfileBackend` + `SQLiteAgentProfileBackend` reference impls, JSON-based snapshot trio, parametrized conformance across both backends, `supports_skills` capability dimension, operator override via `ATOMIC_AGENTS_PROFILE_BACKEND=sqlite` (+ optional URL), `doctor.check_agent_profile_backend` coherence check, Implementer contract for registry-backed backends. | [`spec/24-agent-profile-backend.md`](docs/spec/24-agent-profile-backend.md) |
-| `ToolRegistryBackend` | ✅ Locked at PR 4 ([#64](https://github.com/dep0we/atomic-agents-stack/issues/64)): `FilesystemToolRegistryBackend` + `SQLiteToolRegistryBackend` reference impls, parametrized conformance across both backends, hybrid storage shape on SQLite (metadata in SQL + handler bodies on disk under `<handlers_root>/<agent_scope>/<name>.py`), `install` / `uninstall` capability flipped True on SQLite + idempotent + atomic-on-install (TOCTOU-safe via INSERT-first + atomic_write-on-success-only), cross-scope isolation enforced at SQL layer (`WHERE agent_scope = ?` on every query), operator override via `ATOMIC_AGENTS_TOOL_REGISTRY_BACKEND=sqlite` (+ optional URL with `?agent_scope=`), `doctor.check_tool_registry_backend` coherence check, Implementer contract for registry-backed tool backends. | [`spec/25-tool-registry-backend.md`](docs/spec/25-tool-registry-backend.md) |
-| `MandateBackend` | ✅ Locked at PR 4 ([#124](https://github.com/dep0we/atomic-agents-stack/issues/124), merged at PR #230 on 2026-05-17): `FilesystemMandateBackend` reference impl + parametrized conformance suite + `MandateCheck` judge specialist with validation steps 1-9 (existence, source-hash binding, state, tool allowlist, target allowlist via per-agent named `TargetExtractorRegistry`, time window, token-cost projection, external-cost projection via `CostEstimatorRegistry`, escalation thresholds with ESCALATE-preempts-BLOCK precedence) + reservation pattern (`MandateReservationManager` lifecycle with `threading.Timer`-driven TTL watchers + `threading.Lock`-serialized in-process state) + crash recovery via `MandateBackend.recover_orphan_reservations` with LockBackend-serialized scan-inside-lock discipline (pessimistic over-report > silent under-bill) + post-action verification event family + suspicious-rebind throttle + `mandates.md` parser + `judges.md ## Mandates` operator config + structural write protection + operator override via `ATOMIC_AGENTS_MANDATE_BACKEND` env var + per-runner kwargs + `doctor.check_mandate_backend` + Implementer contract for mandate backends + operator CLI surface (`atomic-agents mandate list` / `show` / `usage` / `reconcile`). Closes the durable-authorization cliff. Orthogonal to the original Tier 2 protocol queue but ships its own `MandateBackend` Protocol seam from day 1. | [`spec/29-mandates.md`](docs/spec/29-mandates.md) |
-| `CorpusBackend` | Planned | [`#65`](https://github.com/dep0we/atomic-agents-stack/issues/65) |
-| `PolicyBackend` | In progress (PR 2 of 4 wiring shipped 2026-05-20; spec/32 RFC; PR 3 consumption next) | [`#89`](https://github.com/dep0we/atomic-agents-stack/issues/89) |
-| `MCPServerRegistryBackend` | Planned (carved out of #64 via spec/25 Decision 3 — MCP servers are processes, distinct from ToolRegistry's function-shaped catalog) | [`#201`](https://github.com/dep0we/atomic-agents-stack/issues/201) |
+| Backend | Status | What it does | Spec |
+|---|---|---|---|
+| `MemoryBackend` | ✅ Shipped | Notes + Wiki + INDEX storage; filesystem default | [`spec/20`](docs/spec/20-memory-backend.md) |
+| `LLMBackend` | ✅ Shipped | Provider routing; Anthropic + OpenAI + Moonshot reference impls | [`spec/31`](docs/spec/31-llm-backend.md) |
+| `JudgeBackend` | ✅ Shipped | Pre-action validation; `PolicyJudge` (rules) + `LLMJudgeBackend` reference impls; ESCALATE + REVISE state machines | [`spec/28`](docs/spec/28-judge-layer.md) |
+| `LockBackend` | ✅ Shipped | Filesystem (`fcntl.flock`) + Redis reference impls; closes the multi-host cliff for Cloud Run / Kubernetes | [`spec/21`](docs/spec/21-lock-backend.md) |
+| `LogBackend` | ✅ Shipped | Filesystem (JSONL) + SQLite reference impls; indexed query/aggregate/retention; closes the dashboard-perf cliff | [`spec/22`](docs/spec/22-log-backend.md) |
+| `AgentProfileBackend` | ✅ Shipped | Filesystem + SQLite reference impls; JSON snapshot trio; closes the SaaS-shape cliff for DB-backed agent registries | [`spec/24`](docs/spec/24-agent-profile-backend.md) |
+| `ToolRegistryBackend` | ✅ Shipped | Filesystem + SQLite reference impls; hybrid metadata-in-SQL + handler-bodies-on-disk; install / uninstall capability | [`spec/25`](docs/spec/25-tool-registry-backend.md) |
+| `MandateBackend` | ✅ Shipped | Filesystem reference impl; `MandateCheck` specialist + reservation pattern + crash recovery; closes the durable-authorization cliff | [`spec/29`](docs/spec/29-mandates.md) |
+| `PolicyBackend` | 🟡 In progress (4-PR arc) | Org-level policy that supersedes per-agent caps and allowlists | [`#89`](https://github.com/dep0we/atomic-agents-stack/issues/89) |
+| `PersonaBackend` | Planned (scope-design pass queued) | UI-editable IDENTITY/SOUL/USER + persona versioning | [`#62`](https://github.com/dep0we/atomic-agents-stack/issues/62) |
+| `CorpusBackend` | Planned | Wiki/raw corpus at GB scale + semantic search | [`#65`](https://github.com/dep0we/atomic-agents-stack/issues/65) |
+| `MCPServerRegistryBackend` | Planned | Catalog + install/audit for MCP servers (MCP equivalent of ToolRegistry) | [`#201`](https://github.com/dep0we/atomic-agents-stack/issues/201) |
 
-**v1 direction:** a home user runs filesystem-everything (today). An organization runs the same agent definitions over Postgres / Redis / SQLite-Datadog / behind an HTTP service, with a fleet of orchestrated roles — *once the remaining backend protocols ship*. Today, **eight of twelve** backend protocols are non-filesystem-default-ready (`MemoryBackend`, `LLMBackend`, `JudgeBackend`, `LockBackend`, `LogBackend`, `AgentProfileBackend`, `ToolRegistryBackend`, `MandateBackend`); the four remaining (`PersonaBackend`, `CorpusBackend`, `PolicyBackend`, `MCPServerRegistryBackend`) are roadmap — v1.0 closes when those ship + their conformance suites pin the contract. `PolicyBackend` (#89) is scope-designed via /office-hours + /plan-eng-review (2026-05-19); the 4-PR implementation arc is queued. See [`docs/architecture.md`](docs/architecture.md) for the mental model and [`docs/TENSIONS.md`](docs/TENSIONS.md) for the architectural tensions this scaling story has to survive.
+**v1 direction:** a home user runs filesystem-everything today. An organization runs the same agent definitions over Postgres / Redis / SQLite-Datadog / behind an HTTP service once the remaining four protocols ship. v1.0 closes when those four land + their conformance suites pin the contract. See [`docs/architecture.md`](docs/architecture.md) for the mental model, [`docs/TENSIONS.md`](docs/TENSIONS.md) for architectural tensions this scaling story has to survive, and [`ROADMAP.md`](ROADMAP.md) for the full backlog beyond v1.0.
 
 ---
 
 ## Judge layer (opt-in)
 
-The **judge layer** is a pre-action validation surface. Before any side-effectful tool call executes, a separate `JudgeBackend` inspects a structured action proposal — built from the LLM's `tool_use` block plus an `atomic_action` side-channel marker the actor emits in the same turn — and returns ALLOW / BLOCK / REVISE / ESCALATE. Every judgment writes a JSONL audit event carrying the proposal hashes, the outcome, the policy version, and the judge's reason. The full design is in [`docs/spec/28-judge-layer.md`](docs/spec/28-judge-layer.md); this README section is the orientation.
+The **judge layer** is a pre-action validation surface. Before any side-effectful tool call executes, a separate `JudgeBackend` inspects a structured action proposal and returns ALLOW / BLOCK / REVISE / ESCALATE. Every judgment writes a JSONL audit event carrying the proposal hashes, the outcome, the policy version, and the judge's reason. ESCALATE pauses execution and writes a PENDING file to `<agent_root>/vault/escalations/` that an operator resolves by editing in any text editor. REVISE supports both judge-driven amendments (e.g., *"send this email but strip the attachment"*) and operator-driven amendments via an embedded `amendment:` YAML block on the PENDING file.
 
-The layer is **fully opt-in**. Existing deployments see no judge invocation until they drop a `judges.md` file in the agent root (or set `AGENT_JUDGE_ENABLED=1` for the hardcoded defaults).
+The layer is **fully opt-in**. Existing deployments see no judge invocation until they drop a `judges.md` file in the agent root (or set `AGENT_JUDGE_ENABLED=1`). The default `failure_policy` is fail-closed (`block` for every exception type); cascade-aware project floors enforce a non-relaxable minimum across delegates per spec/28 §408.
 
-### Minimum-viable `judges.md`
-
-```markdown
-# Judges — <agent>
-
-```yaml
-backend: rules
-class_policy:
-  read_only: bypass
-  reversible_write: allow_with_audit
-  external_side_effect: judge_required
-  high_risk: escalate
-```
-```
-
-That single file opts the agent into the two-judge ensemble: `PolicyJudge` (rule-engine, microseconds, always-on) then `LLMJudgeBackend` (OpenAI `gpt-5-nano` by default, lazy-skipped if no `OPENAI_API_KEY` resolves so Claude-only deployments aren't blocked).
-
-### The four class policies
-
-Every tool call is classified into one of four action classes per `tools.md`. The `class_policy` block in `judges.md` says what the framework does with each class:
-
-| Policy              | What it means                                                                                                                                   |
-|---------------------|-------------------------------------------------------------------------------------------------------------------------------------------------|
-| `bypass`            | Skip the judge entirely. No proposal, no judgment event, no audit line.                                                                          |
-| `allow_with_audit`  | Run the judge; **always allow**; write the full judgment event to the audit trail. Surface for "I want to see the judge's opinion without it gating actions yet." |
-| `judge_required`    | Run the judge; its outcome is enforced. BLOCK refuses; ALLOW executes; REVISE/ESCALATE follow spec/28 semantics.                                 |
-| `escalate`          | Pause for operator approval. Framework writes a PENDING file to `vault/escalations/<class>/<proposal_id>.md`; `agent.call()` returns `Response(deferred=True, escalation_queue_ids=[...])`; operator writes a resolution block; the next `call()` (or an explicit `agent.poll_escalations()`) reads the decision and executes Approved actions inline. See [Escalation queue](#escalation-queue) below. |
-
-Strictness ordering: `bypass < allow_with_audit < judge_required < escalate`. Unspecified classes default-fill to safe values (`read_only: bypass`, everything else `judge_required` or `escalate` for `high_risk`).
-
-### Cascade-aware project floor
-
-In multi-agent project layouts, `<project>/judges.md` is the **non-relaxable floor** per spec/28 §408. A delegate's own `<agent>/judges.md` may strengthen per-class policy but cannot weaken it below the floor; attempts raise `JudgePolicyInvalid` at load. Classes the delegate didn't override inherit the floor's value (visible in `ClassPolicySnapshot.source` as `"floor"` vs `"judges.md"` vs `"default"`).
-
-This pattern lets a project lead drop one `judges.md` at the project root that guarantees a minimum-policy floor across every agent in the project, with each agent free to strengthen further.
-
-### `failure_policy` — fail-closed by default
-
-When a judge errors (timeout, budget exhausted, malformed proposal), the framework consults `failure_policy` to decide the enforcement outcome. **Default is `block` for every exception type** — operators must explicitly opt into looser behavior.
-
-Two shapes are accepted. **Flat** (one fallback for every class):
-
-```yaml
-failure_policy:
-  JudgeUnavailable: block
-  JudgeBudgetExhausted: block
-```
-
-**Nested per-class** (different fallback per `(action_class, exception)` pair):
-
-```yaml
-failure_policy:
-  read_only:
-    JudgeUnavailable: allow      # read_only actions tolerate judge outages
-  high_risk:
-    JudgeUnavailable: escalate   # high_risk actions escalate to operator
-```
-
-The parser auto-detects the shape — top-level keys are either exception names (flat) or action class names (nested). Mixing shapes raises `JudgePolicyInvalid`.
-
-### Escalation queue
-
-When the judge ensemble returns ESCALATE — or when `class_policy.<X>=escalate` synthesizes the outcome at the framework layer, or when a judge exception is mapped to `escalate` via `failure_policy` — the action is paused for operator review. The framework writes a PENDING file to `<agent_root>/vault/escalations/<action_class>/<proposal_id>.md` (atomic, frontmatter + full `ActionProposal` serialized as fenced YAML + the judge's reason), and `agent.call()` returns `Response(deferred=True, escalation_queue_ids=[id1, id2, ...])`. The actor's run terminates immediately — ALLOWed tool_uses in the same turn still execute and their results land in `Response.tool_calls`, but the multi-turn loop does not continue.
-
-The operator resolves a PENDING by editing the file in any text editor (Obsidian, vim, VS Code) and writing exactly one resolution block at the bottom. Header grammar is **strict** — h3 + exact-case verb + the literal word `by` + a non-empty operator name:
-
-```
-### Approved by alice
-resolved_at: 2026-05-13T09:14:22Z
-note: Reviewed — sender list is correct, attachment is the public report.
-```
-
-The five resolution verbs are `Approved`, `Denied`, `Redacted`, `Revised` (PR 3c — operator amends the proposal with an embedded `amendment:` YAML block; see [Revise — judge- and operator-driven amendments](#revise--judge--and-operator-driven-amendments) below), and `Auto-decided` (the framework writes the auto-decide block itself when `escalation.auto_decide_after_seconds` elapses). Header typos surface as doctor warnings rather than silent denials.
-
-On the next `agent.call()` (or when an operator runs `agent.poll_escalations()` directly), the framework throttle-checks (`escalation.resolution_poll_cycle_seconds`, default 60s), scans the queue, re-verifies the proposal body's `arguments_hash` (mismatch → `proposal_body_tampered`, refuses execution), and for Approved resolutions re-verifies `tool_definition_hash` against the current tool registry before executing the bound action inline. Concurrent pollers race a `.<proposal_id>.resolved-emitted` sidecar via `O_CREAT|O_EXCL` for exactly-once audit emit; auto-decide writes use a sha256 compare-and-swap so an operator edit-in-progress always wins. See [`docs/deployment/judges-md.md`](docs/deployment/judges-md.md#escalation-queue) for the full grammar, audit shape (`enforcement_action`, `synthesis_source`, `triggered_by`), and the `approved_stale_tool_definition` refusal path.
-
-### Revise — judge- and operator-driven amendments
-
-`REVISE` is the third outcome the framework acts on (after `ALLOW` and `BLOCK`; `ESCALATE` covered above). Two cycles ship in PR 3c:
-
-**Judge-driven.** An ensemble judge returns `Judgment(outcome=REVISE, amendment=ProposalAmendment(judge_note=..., tool_arguments=..., ...))` — for instance, *"send this email but strip the attachment"* or *"open the PR as draft, not for merge."* The framework merges the amendment with the original proposal (recomputing `classification` from the possibly-new `tool_name`, carrying `reason` + `authorization` verbatim per spec/28:271, appending evidence non-destructively), re-validates against the tool registry + write-path policy, and runs a **second judgment** against the amended proposal through the same ensemble. Bounded at `max_revise_iterations=1` per spec/28:276 — the second judgment must return `ALLOW` to execute; `BLOCK` refuses; `REVISE` produces `revise_loop_exhausted_blocked`. Operators see this path as a sequence of audit events (`revise_pending_second_judgment` → `revise_executed`) — no PENDING file is written.
-
-**Operator-driven.** Operators resolving an ESCALATEd `### Revised by <op>` block with an embedded `amendment:` YAML payload follow the same primitives. The framework parses the YAML, applies the amendment, and **gates on the recomputed classification** (NOT the PENDING file's original `action_class`): `high_risk` after amendment → fresh ensemble re-judgment; other classes → schema/policy validation alone is sufficient. This means an operator who swaps `tool_name` to upgrade `reversible_write` → `high_risk` cannot skip the second-judgment eyes by phrasing the original proposal as a lower class. `re_judged: bool` on the executed audit event reports whether the ensemble re-ran; it is framework-set, not operator-supplied. Invalid amendments (missing YAML, malformed YAML, unknown fields, unknown tool, non-dict args, write-path violation) emit `operator_revise_invalid_amendment` and refuse execution. See [`docs/deployment/judges-md.md`](docs/deployment/judges-md.md#operator-revise-resolution) for the full block format, amendment field table, class-upgrade gate semantics, and audit shape.
-
-PR 3c shipped the weakened-validation default (tool registration + dict shape + `arguments_hash` recompute). PR 5b (unreleased) closes spec/28:274 with an opt-in strict path: install `pip install 'atomic-agents-stack[validation]'` and set `validation: strict` in `judges.md` to run `jsonschema.validate(args, registered.input_schema)` after the weakened checks. The default remains `weakened` for any `judges.md` that omits the field — operators see no behavior change on upgrade.
-
-### See also
-
-- [`docs/deployment/judges-md.md`](docs/deployment/judges-md.md) — the full operator runbook for `judges.md` (every field, every error message, examples).
-- [`docs/spec/28-judge-layer.md`](docs/spec/28-judge-layer.md) — locked at #112 PR 4: ESCALATE + REVISE state machines, audit-event schema, specialist composition, failure-mode catalog, conformance suite reference. PR 5a amends §"Escalation queue" with per-class `fallback_on_timeout` examples and parser rules. PR 5b amends §"REVISE state machine" with the strict JSON-Schema validation path and the `[validation]` extra install gate.
+- [`docs/deployment/judges-md.md`](docs/deployment/judges-md.md) — operator runbook: every `judges.md` field, every error message, examples
+- [`docs/spec/28-judge-layer.md`](docs/spec/28-judge-layer.md) — full spec: ESCALATE + REVISE state machines, audit-event schema, conformance suite reference
 
 ---
 
@@ -308,42 +222,7 @@ Eight operator runbooks for the common deployment paths. Pick the one that match
 
 ## What's shipped
 
-| Component | Shipped |
-|---|---|
-| `AtomicAgent` runtime | ✅ v0.1.0 |
-| Persona loading (IDENTITY, SOUL, USER) | ✅ v0.1.0 |
-| `memory/` + `wiki/` INDEX-driven recall | ✅ v0.1.0 |
-| Helper-mediated atomic captures (fenced JSON) | ✅ v0.1.0 |
-| Multi-tier cost guardrails (50% / 80% / 100%) | ✅ v0.1.0 |
-| Helper calls — sequential + parallel | ✅ v0.1.0 |
-| Anthropic / OpenAI / Moonshot Kimi routing | ✅ v0.1.0 |
-| File locking with stale-lock recovery | ✅ v0.1.0 |
-| Schema validation incl. date-suffix filenames | ✅ v0.1.0 |
-| Cost dashboard (HTML, global + per-agent) | ✅ v0.1.0 |
-| Optional local dashboard server | ✅ v0.1.0 |
-| Eval runner — `atomic_agents.eval` | ✅ v0.9.0 |
-| Tuning analyzer — `atomic_agents.tuning` | ✅ v0.9.0 |
-| Goal manager — `atomic_agents.goal` | ✅ v0.9.0 |
-| Schema migration runner — `atomic_agents.migrate` | ✅ v0.9.0 |
-| Tool-call captures (Path 1) | ✅ v0.9.0 |
-| Multi-agent project cascade loader — `atomic_agents._cascade` | ✅ v0.9.0 |
-| Helper provenance preservation | ✅ v0.9.0 |
-| Research integrity layers 2 + 3 | ✅ v0.9.0 |
-| Claude Code skill wrappers — `extras/claude-code-skills/` | ✅ v0.9.0 |
-| Spec docs in repo — `docs/` | ✅ v0.9.0 |
-| CI (Python 3.11 + 3.12 matrix) | ✅ v0.9.0 |
-| MCP (Model Context Protocol) client — `atomic_agents.mcp` | ✅ v0.10.0 |
-| MemoryBackend protocol + FilesystemBackend default — `atomic_agents.memory` | ✅ v0.10.0 |
-| `atomic-agents doctor` preflight CLI — `atomic_agents.doctor` | ✅ v0.10.0 |
-| SemVer policy + upgrade runbook — `docs/deployment/` | ✅ v0.10.0 |
-| Obsidian-backed deployment guide — `docs/deployment/obsidian.md` | ✅ v0.11.0 |
-| Programmatic invocation guide + public exception table — `docs/deployment/programmatic.md` | ✅ v0.11.0 |
-| Disaster recovery runbook — `docs/deployment/disaster-recovery.md` | ✅ v0.11.0 |
-| Cost guardrail sizing guidance — `docs/deployment/cost-guardrail-sizing.md` | ✅ v0.11.0 |
-| LLMBackend protocol + Anthropic/OpenAI/Moonshot reference impls — `atomic_agents.llm` | ✅ v0.13.0 |
-| `atomic-agents bundle` cascade pre-render for skill-mode loads — `atomic_agents.bundle` + spec/26 | ✅ Unreleased |
-
-See [CHANGELOG.md](CHANGELOG.md) for per-version detail.
+The backend protocols table above covers the load-bearing capabilities. For per-version detail across every shipped runtime feature, CLI command, deployment runbook, and spec doc, see [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
@@ -385,43 +264,10 @@ Same pattern for OpenAI (`atomic-agents-openai`) and Moonshot (`atomic-agents-mo
 
 ## Repository structure
 
-```
-atomic_agents/                  # the Python package
-├── agent.py                    # AtomicAgent class — the main runtime
-├── exceptions.py               # 27 public exception classes
-├── types.py                    # shared dataclasses
-├── cli.py                      # `atomic-agents` console script
-├── doctor.py                   # preflight verification
-├── migrate.py                  # schema migration runner
-├── bundle.py                   # cascade pre-render for skill-mode loads (spec/26)
-├── memory/                     # MemoryBackend protocol + filesystem default
-├── dashboard/                  # cost & observability dashboard
-├── mcp.py                      # MCP client (stdio transport)
-├── _llm.py                     # provider routing (Anthropic / OpenAI / Moonshot)
-├── _costs.py                   # pricing + multi-tier guardrails
-├── _locks.py                   # per-agent flock with stale-lock recovery
-└── _io.py                      # atomic file writes (temp + fsync + rename)
-
-tests/                          # 2323 tests, all passing on Python 3.11 + 3.12
-
-docs/
-├── README.md                   # spec entry point
-├── architecture.md             # mental model + design rationale
-├── getting-started.md          # 15-minute clone-to-running-agent walk-through
-├── spec/                       # 23 locked spec docs + 2 RFCs
-├── implementation/             # build guides per runtime
-├── deployment/                 # 8 operator runbooks (Obsidian, programmatic, disaster-recovery, cost-guardrail-sizing, judges-md, versioning, upgrading, release-runbook)
-├── samples/caldwell/           # complete worked single-agent example
-├── appendix/portability.md     # using Atomic Agents without Obsidian / on any OS
-├── GOVERNANCE.md               # solo / small-team operator guide
-├── TENSIONS.md                 # architectural tensions to protect
-└── methodology.md              # working-methods retrospective
-
-extras/                         # operational templates
-├── claude-code-skills/         # SKILL.md wrappers for Claude Code
-├── launchd/                    # macOS LaunchAgent .plist templates
-└── cron/                       # crontab examples + portable wrapper script
-```
+- `atomic_agents/` — the Python package (runtime in `agent.py`; backend protocols in `memory/`, `_llm.py`, `_locks.py`, `_costs.py`, etc.; CLI in `cli.py`; preflight in `doctor.py`)
+- `tests/` — 2381 tests, Python 3.11 + 3.12 matrix
+- `docs/` — [spec entry point](docs/README.md), [`architecture.md`](docs/architecture.md), [`spec/`](docs/spec/) (28 locked docs + 3 RFCs), [`deployment/`](docs/deployment/) (8 operator runbooks), [`samples/caldwell/`](docs/samples/caldwell/) (complete worked example), [`GOVERNANCE.md`](docs/GOVERNANCE.md), [`TENSIONS.md`](docs/TENSIONS.md), [`methodology.md`](docs/methodology.md)
+- `extras/` — operational templates (Claude Code skill wrappers, macOS LaunchAgent plists, cron examples)
 
 ---
 
@@ -450,4 +296,4 @@ Before opening a PR, read [`CLAUDE.md`](CLAUDE.md) (the project's design ethos a
 
 ## Status
 
-**v0.13.0, alpha.** Core runtime stable. 2323 tests passing on Python 3.11 / 3.12. **Eight backend protocols shipped**: `MemoryBackend`, `LLMBackend`, `JudgeBackend` (locked at [#112](https://github.com/dep0we/atomic-agents-stack/issues/112) PR 4 with `tests/test_judge_protocol_conformance.py` parametrized over `PolicyJudge` + `LLMJudgeBackend`; PR 5a adds per-class `escalation.fallback_on_timeout`; PR 5b adds strict JSON-Schema validation of amended `tool_arguments` via the opt-in `[validation]` extra and concludes the #112 arc — both unreleased), `LockBackend` (locked at [#60](https://github.com/dep0we/atomic-agents-stack/issues/60) PR 4 with `FilesystemLockBackend` + `RedisLockBackend` reference impls and parametrized conformance), `LogBackend` (locked at [#61](https://github.com/dep0we/atomic-agents-stack/issues/61) PR 4 with `FilesystemLogBackend` + `SQLiteLogBackend` reference impls, `LogQuery.agent_name` cross-agent isolation filter, and parametrized conformance), `AgentProfileBackend` (locked at [#63](https://github.com/dep0we/atomic-agents-stack/issues/63) PR 4 with `FilesystemAgentProfileBackend` + `SQLiteAgentProfileBackend` reference impls, JSON-based snapshot trio across both backends, `supports_skills` capability dimension, operator override via `ATOMIC_AGENTS_PROFILE_BACKEND=sqlite` + optional URL, `doctor.check_agent_profile_backend` coherence check, and Implementer contract for registry-backed backends — closes the SaaS-shape cliff), `ToolRegistryBackend` (locked at [#64](https://github.com/dep0we/atomic-agents-stack/issues/64) PR 4 with `FilesystemToolRegistryBackend` + `SQLiteToolRegistryBackend` reference impls, parametrized conformance across both backends, hybrid metadata-in-SQL + handler-bodies-on-disk storage shape on SQLite, `install` / `uninstall` capability flipped True on SQLite with TOCTOU-safe INSERT-first + atomic_write-on-success-only atomicity, cross-scope isolation enforced at SQL layer, operator override via `ATOMIC_AGENTS_TOOL_REGISTRY_BACKEND=sqlite` + optional URL with `?agent_scope=`, `doctor.check_tool_registry_backend` coherence check, and Implementer contract for registry-backed tool backends — closes the plugin-ecosystem cliff), and **`MandateBackend` (locked at [#124](https://github.com/dep0we/atomic-agents-stack/issues/124) PR 4 / merged at PR #230 on 2026-05-17: `FilesystemMandateBackend` reference impl + `MandateCheck` judge specialist with validation steps 1-9 + reservation pattern + crash recovery + post-action verification event family + suspicious-rebind throttle + `judges.md ## Mandates` operator config + structural write protection + operator override via `ATOMIC_AGENTS_MANDATE_BACKEND` env var + per-runner kwargs + `doctor.check_mandate_backend` + Implementer contract for mandate backends + operator CLI surface — closes the durable-authorization cliff: operators authoring `cumulative_external_usd: 6000` on a procurement mandate now have that cap defended against concurrent action races + crash-restart, with operator-facing audit signal when an action's executed target diverged from authorization at proposal time).** The judge layer is opt-in — existing deployments see no judge invocation unless `judges.md` is in the agent root or `AGENT_JUDGE_ENABLED=1` is set. The remaining protocol-pattern roadmap (`PersonaBackend` / `CorpusBackend` / `PolicyBackend` (scope-designed 2026-05-19; 4-PR implementation arc queued) / `MCPServerRegistryBackend`) is what v1.0 closes; the surface stabilizes there. Pre-1.0 — Minor releases may contain breaking changes (see [`docs/deployment/versioning.md`](docs/deployment/versioning.md)). Single-maintainer project; reference implementation that anyone can use, fork, or extend.
+**v0.13.0, alpha.** Core runtime stable. 2381 tests passing on Python 3.11 / 3.12. Eight of twelve backend protocols shipped (see the backend protocols table above); four remain for v1.0 (`PolicyBackend` in progress; `PersonaBackend` / `CorpusBackend` / `MCPServerRegistryBackend` planned). The surface stabilizes at v1.0. Pre-1.0 — Minor releases may contain breaking changes (see [`docs/deployment/versioning.md`](docs/deployment/versioning.md)). Single-maintainer project; reference implementation anyone can use, fork, or extend.
