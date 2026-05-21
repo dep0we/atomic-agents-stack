@@ -135,6 +135,8 @@ Zero behavior change for the runtime — none of these touch `AtomicAgent.load()
 
 ### Documentation
 
+- **README's "Planned: Postgres adapters" claim now points at concrete tracking** ([#258](https://github.com/dep0we/atomic-agents-stack/issues/258)). Filed an umbrella issue with sub-task checklist (Log / Profile / ToolRegistry / Memory+pgvector / Mandate / Lock Postgres adapters in priority order) so the calling-card claim has auditable backing instead of being a directional gesture. Surfaced when the maintainer read the new substrate-swap paragraph and assumed Postgres adapters were already shipped — exactly the "soft-pass" P1 the round-1 reviewer flagged on PR [#256](https://github.com/dep0we/atomic-agents-stack/pull/256). Closes that gap.
+
 - **README "Why this exists" gains substrate-swap paragraph.** Calling-card framing closed on the abstract throughline ("home user with one agent / org with a fleet experience the same framework") but never proved it. New paragraph after the throughline names the actually-shipped non-filesystem backends (LogBackend + SQLite; LockBackend + Redis; AgentProfileBackend + ToolRegistryBackend + SQLite), flags Postgres as planned, and reinforces that the agent definition / persona / folder layout / audit trail don't change when the substrate swaps — only the backend registration does. Closes the "is this serious?" doubt for the 60-second drive-by reader who would have bounced before reaching the "Backend protocols — the scaling story" section.
 
 ### Security
