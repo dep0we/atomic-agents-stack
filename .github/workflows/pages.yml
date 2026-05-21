@@ -1,0 +1,42 @@
+name: Pages
+
+# Publishes docs/explainer/ as the project's GitHub Pages site.
+# URL: https://dep0we.github.io/atomic-agents-stack/
+#
+# One-time enable: Settings → Pages → Source: "GitHub Actions".
+# After that, this workflow runs on every push to main that touches docs/explainer/.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/explainer/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/explainer
+
+      - id: deployment
+        uses: actions/deploy-pages@v4
