@@ -1,0 +1,6 @@
+# CODEOWNERS — auto-requests review on every PR.
+# Single maintainer today; this file formalizes the ownership so external
+# contributors (see MAINTAINER.md tiered review process) get routed to a
+# reviewer automatically rather than depending on the maintainer noticing.
+
+* @dep0we
