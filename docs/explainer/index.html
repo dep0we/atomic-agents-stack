@@ -4,8 +4,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Understanding Atomic Agents — A Visual Guide</title>
-  <meta name="description" content="A plain-English visual guide to atomic agents — what they are, how they work, and why they live in a folder you own." />
+  <meta name="description" content="A plain-English visual guide to atomic agents — what they are, how they run, the safety layer, and the protocol-pattern story that scales them from a single folder to a fleet." />
   <link rel="stylesheet" href="style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
   <script>
     // Apply saved theme BEFORE paint to avoid flash.
     (function() {
@@ -23,11 +24,9 @@
       <span class="topnav-brand-dot"></span>Atomic Agents
     </a>
     <div class="topnav-links">
-      <a href="01-the-agent-is-a-folder.html" class="topnav-link">What is it?</a>
-      <a href="02-a-day-in-the-life.html" class="topnav-link">How it runs</a>
-      <a href="03-safety-and-judgment.html" class="topnav-link">Safety</a>
-      <a href="04-growing-and-collaborating.html" class="topnav-link">Growing</a>
-      <a href="05-portable-to-anywhere.html" class="topnav-link">Scaling</a>
+      <a href="https://github.com/dep0we/atomic-agents-stack" class="topnav-link">Repo</a>
+      <a href="https://github.com/dep0we/atomic-agents-stack/blob/main/docs/getting-started.md" class="topnav-link">Get started</a>
+      <a href="https://github.com/dep0we/atomic-agents-stack/blob/main/ROADMAP.md" class="topnav-link">Roadmap</a>
       <button class="theme-toggle" id="theme-toggle" aria-label="Toggle dark mode" type="button">
         <svg class="icon-sun" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
           <path d="M8 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm0 1.5a4.5 4.5 0 1 1 0-9 4.5 4.5 0 0 1 0 9zM8 0a.5.5 0 0 1 .5.5v1.5a.5.5 0 0 1-1 0V.5A.5.5 0 0 1 8 0zm0 13.5a.5.5 0 0 1 .5.5v1.5a.5.5 0 0 1-1 0V14a.5.5 0 0 1 .5-.5zM15.5 8a.5.5 0 0 1-.5.5h-1.5a.5.5 0 0 1 0-1H15a.5.5 0 0 1 .5.5zm-13 0a.5.5 0 0 1-.5.5H.5a.5.5 0 0 1 0-1H2a.5.5 0 0 1 .5.5zm10.6-5.6a.5.5 0 0 1 0 .7l-1.1 1.1a.5.5 0 1 1-.7-.7l1.1-1.1a.5.5 0 0 1 .7 0zM4.7 11.3a.5.5 0 0 1 0 .7l-1.1 1.1a.5.5 0 1 1-.7-.7l1.1-1.1a.5.5 0 0 1 .7 0zM13.1 13.1a.5.5 0 0 1-.7 0l-1.1-1.1a.5.5 0 1 1 .7-.7l1.1 1.1a.5.5 0 0 1 0 .7zM4.7 4.7a.5.5 0 0 1-.7 0L2.9 3.6a.5.5 0 1 1 .7-.7l1.1 1.1a.5.5 0 0 1 0 .7z"/>
@@ -42,111 +41,627 @@
 
 <main>
   <div class="container">
-    <section class="hero">
+
+    <!-- ============================================================
+         HERO
+         ============================================================ -->
+    <header class="hero">
       <span class="hero-eyebrow">A Visual Guide</span>
       <h1>Understanding Atomic Agents</h1>
       <p class="hero-lead">
-        Atomic Agents are AI assistants that live as plain markdown files in a folder you own — not in someone else's database. This guide explains what that means, how they work, and why the shape matters.
+        AI agents that live as plain markdown files in a folder <em>you</em> own — not in someone else's database. This guide explains what that means, how the framework works, and why the shape matters from one agent on your laptop to a fleet behind a load balancer.
       </p>
       <div class="intro-row">
         <div class="intro-stat">
-          <p class="intro-stat-num">8</p>
-          <p class="intro-stat-label">Storage protocols shipped of 12</p>
+          <p class="intro-stat-num">8 / 12</p>
+          <p class="intro-stat-label">Backend protocols shipped</p>
+        </div>
+        <div class="intro-stat">
+          <p class="intro-stat-num">28 + 3</p>
+          <p class="intro-stat-label">Spec docs + RFCs (the product)</p>
         </div>
         <div class="intro-stat">
           <p class="intro-stat-num">2,381</p>
-          <p class="intro-stat-label">Tests verifying the contract</p>
+          <p class="intro-stat-label">Tests gating the contract</p>
         </div>
       </div>
-    </section>
-
-    <section>
-      <h2>Pick a starting point</h2>
-      <p>Each page is a self-contained chapter. They build on each other but you can also jump around. Reading time for the whole guide: about 30 minutes.</p>
-
-      <div class="card-grid">
-        <a href="01-the-agent-is-a-folder.html" class="card">
-          <span class="card-number">CHAPTER 01</span>
-          <h3 class="card-title">The agent IS a folder</h3>
-          <p class="card-desc">What an atomic agent actually is. The folder structure, the markdown files, and why everything is something you can read with your own eyes.</p>
-        </a>
-
-        <a href="02-a-day-in-the-life.html" class="card">
-          <span class="card-number">CHAPTER 02</span>
-          <h3 class="card-title">A day in the life</h3>
-          <p class="card-desc">What happens when an agent runs. The call flow, how memory works, and how every action writes a record of itself.</p>
-        </a>
-
-        <a href="03-safety-and-judgment.html" class="card">
-          <span class="card-number">CHAPTER 03</span>
-          <h3 class="card-title">Safety and judgment</h3>
-          <p class="card-desc">The judge layer that gates risky actions, the escalation queue for human review, and the cost guardrails that stop runaway spend.</p>
-        </a>
-
-        <a href="04-growing-and-collaborating.html" class="card">
-          <span class="card-number">CHAPTER 04</span>
-          <h3 class="card-title">Growing and collaborating</h3>
-          <p class="card-desc">Dreaming (the nightly process that consolidates memory), delegation (one agent calling another), and how a team of agents works as a project.</p>
-        </a>
-
-        <a href="05-portable-to-anywhere.html" class="card">
-          <span class="card-number">CHAPTER 05</span>
-          <h3 class="card-title">Portable to anywhere</h3>
-          <p class="card-desc">The protocol-pattern story: how the same agent runs unchanged from a laptop to a multi-host cloud deployment, by swapping the storage underneath.</p>
-        </a>
-
-        <a href="https://github.com/dep0we/atomic-agents-stack" class="card">
-          <span class="card-number">REFERENCE</span>
-          <h3 class="card-title">The source code &amp; specs</h3>
-          <p class="card-desc">The Python reference implementation plus 28 locked spec documents (and 3 RFCs in progress). The spec is the product; the code is one conforming implementation.</p>
-        </a>
+      <div class="hero-cta-row">
+        <a href="#folder" class="cta cta-primary">Read the essentials (5&nbsp;min)</a>
+        <a href="#everything" class="cta cta-secondary">Keep scrolling for everything</a>
       </div>
-    </section>
+      <p class="hero-note">Each section opens with the load-bearing idea. Click any <strong>Deep dive</strong> for the operator-level detail. Skim the bold sentences for a 5-minute read; expand everything for the full ~25-minute picture.</p>
+    </header>
 
-    <section>
-      <h2>What problem does this solve?</h2>
-      <p>Most AI agents store their state — your memories, your conversation history, your preferences — somewhere you don't own. An app database, a vector store, a hosted trace system. If the company goes away, your agent goes away. If you switch laptops, you migrate through their interface. If you want a feature they don't offer, you wait.</p>
-      <p>Atomic Agents take a different shape: <strong>your agent's brain lives in your folder.</strong> Persona in markdown files. Memory as notes you can read with a text editor. Tools defined in a markdown table. Run logs as plain text. Move computers? Copy the folder. Want to see what the agent remembered yesterday? Open the file.</p>
+    <div class="explainer-layout">
 
-      <div class="callout callout-key">
-        <p class="callout-title">The throughline</p>
-        <p>A home user with one agent and a company with a fleet of fifty experience the <em>same framework</em> — graceful and self-explanatory at every scale. The agent's <em>brain</em> stays portable; the storage <em>underneath</em> can scale.</p>
-      </div>
-    </section>
+      <!-- ============================================================
+           STICKY TOC (right sidebar on desktop, collapsed on mobile)
+           ============================================================ -->
+      <aside class="toc" aria-label="Sections on this page">
+        <p class="toc-label">On this page</p>
+        <ol class="toc-list">
+          <li><a href="#folder">The agent IS a folder</a></li>
+          <li><a href="#day">A day in the life</a></li>
+          <li><a href="#safety">Safety + judgment</a></li>
+          <li><a href="#growing">Growing + collaborating</a></li>
+          <li><a href="#scaling">Scaling: the protocol pattern</a></li>
+          <li><a href="#spec">The spec is the product</a></li>
+        </ol>
+      </aside>
 
-    <section>
-      <h2>How to read this guide</h2>
-      <p>You don't need to be a developer. Every concept gets a concrete example and a diagram. When a technical term is unavoidable, it's defined the first time it appears.</p>
-      <p>If you only have five minutes, read <a href="01-the-agent-is-a-folder.html">Chapter 1</a> — that's the load-bearing idea. The rest of the guide builds on it.</p>
-    </section>
+      <article class="explainer" id="everything">
+
+        <!-- ============================================================
+             SECTION 1 — THE AGENT IS A FOLDER
+             ============================================================ -->
+        <section class="section" id="folder">
+          <p class="section-eyebrow">Section 1</p>
+          <h2>The agent IS a folder</h2>
+          <p class="section-lede"><strong>Every atomic agent is a directory of plain markdown files.</strong> Persona, tools, memory, journal, and audit log all live as text you can read in any editor and version-control with git. There is no hidden database. The folder <em>is</em> the agent.</p>
+
+          <figure class="figure">
+            <figcaption class="figure-title">Inside an agent folder</figcaption>
+            <pre class="filetree"><code>~/agents/scout/
+├── persona/
+│   ├── IDENTITY.md      who I am, my mission, my scope
+│   ├── SOUL.md          personality, voice, how I evolve
+│   └── USER.md          about the operator, what they care about
+├── tools.md             what I can read, write, and call
+├── model.md             which LLM, token budgets, cost guardrails
+├── judges.md            (optional) safety/approval policy
+├── mandates.md          (optional) durable cumulative caps
+├── memory/              typed atomic notes
+│   ├── INDEX.md         always-loaded routing layer
+│   └── *.md             one file per note
+├── wiki/                distilled corpus (optional)
+├── journal/             narrative episodic log
+│   └── YYYY-MM/YYYY-MM-DD.md
+└── log/                 audit trail (JSONL, one line per run)
+    └── YYYY-MM/YYYY-MM-DD.jsonl</code></pre>
+            <p class="figure-caption">An agent's whole shape is on disk. Open <code>persona/IDENTITY.md</code> in any text editor and you're looking at the agent's mission statement. Open <code>journal/2026-05/2026-05-21.md</code> and you're reading what it did today.</p>
+          </figure>
+
+          <p>Most AI agents store their state somewhere you don't own — an app database, a vector store, a hosted trace system. If the company goes away, your agent goes away. If you switch laptops, you migrate through their interface. If you want a feature they don't offer, you wait.</p>
+
+          <p><strong>Atomic Agents takes the opposite shape.</strong> Persona in markdown files. Memory as notes you can read with a text editor. Tools defined in a markdown table. Run logs as plain text. Move computers? Copy the folder. Want to see what the agent remembered yesterday? Open the file.</p>
+
+          <div class="callout callout-key">
+            <p class="callout-title">The throughline</p>
+            <p>A home user with one agent and a company with a fleet of fifty experience the <em>same framework</em> — graceful and self-explanatory at every scale. The agent's <em>brain</em> stays portable. The storage <em>underneath</em> can scale (more on that in Section 5).</p>
+          </div>
+
+          <details class="deep-dive">
+            <summary>Deep dive: the persona layer</summary>
+            <p>The persona splits across three files because they answer different questions and evolve at different cadences:</p>
+            <dl class="deflist">
+              <dt><code>IDENTITY.md</code></dt>
+              <dd>Stable. The mission, the scope, the non-goals. What this agent does and refuses to do. Rarely edited.</dd>
+              <dt><code>SOUL.md</code></dt>
+              <dd>Slow-moving. Personality, voice, ethical posture, how the agent learns from its journal. Edited when the agent's character itself needs to shift.</dd>
+              <dt><code>USER.md</code></dt>
+              <dd>Living. Who the operator is, what they care about right now, what context the agent should always carry. Edited when life changes.</dd>
+            </dl>
+            <p>The three together become the system prompt's stable preamble. Every agent <em>call</em> assembles them in canonical order.</p>
+          </details>
+
+          <details class="deep-dive">
+            <summary>Deep dive: the memory layer</summary>
+            <p>Memory is structured into <strong>atomic notes</strong> (typed, one file each — feedback / decision / project / reference / user) and an <strong>INDEX.md</strong> that routes the agent to relevant notes without loading everything.</p>
+            <p>If the agent has 200 notes, loading them all into the prompt would be expensive and noisy. Instead, <code>memory/INDEX.md</code> contains a compressed map: short titles, types, and one-line summaries of every note. The model reads the INDEX (cheap), decides which 1–3 notes it actually needs, then loads those specific files. This is <strong>INDEX-driven recall</strong> — the pattern that lets memory scale to thousands of entries without scaling prompt cost.</p>
+            <p>An optional <code>wiki/</code> directory holds the distilled corpus — articles, references, long-form material — that the agent can search but doesn't auto-load.</p>
+          </details>
+
+          <details class="deep-dive">
+            <summary>Deep dive: the journal and the log</summary>
+            <p>Two parallel records, different audiences:</p>
+            <ul>
+              <li><strong>Journal</strong> — narrative, written by the agent in its own voice. "Today I helped Dan triage three issues; the second one surfaced a deeper pattern about…" Daily entries in markdown, organized by month. You read these like a diary.</li>
+              <li><strong>Log</strong> — structured, machine-readable. One JSONL line per run with <code>run_id</code>, model called, tokens used, cost, tools invoked, captures written. You query these for dashboards, cost analysis, and debugging.</li>
+            </ul>
+            <p>Same events, two formats. Humans get the prose; machines get the structured trail.</p>
+          </details>
+        </section>
+
+        <!-- ============================================================
+             SECTION 2 — A DAY IN THE LIFE
+             ============================================================ -->
+        <section class="section" id="day">
+          <p class="section-eyebrow">Section 2</p>
+          <h2>A day in the life</h2>
+          <p class="section-lede"><strong>An agent run is one stateless invocation that reads from the folder, calls a language model, executes any tools, and writes back what it learned.</strong> The runtime holds no state between runs. The folder is the agent's only memory.</p>
+
+          <figure class="figure">
+            <figcaption class="figure-title">The shape of <code>agent.call()</code></figcaption>
+            <pre class="mermaid">
+flowchart TD
+    Trigger["Operator triggers a run<br/>(cron, CLI, embedded Python, Claude Code skill)"]
+    Load["Load folder<br/>persona + tools + model + memory INDEX + recent journal"]
+    Assemble["Assemble system prompt"]
+    Cost1{"Cost guardrail check<br/>(daily/monthly cap)"}
+    LLM["Call the language model"]
+    Tools["Execute any tool calls<br/>(read files, search memory, call MCP)"]
+    Judge{"Judge layer<br/>(if judges.md is present)"}
+    Capture["Extract capture markers<br/>(new memories, journal additions)"]
+    Write["Write to vault<br/>atomic notes + journal entry + JSONL log line"]
+    Done["Return Response"]
+
+    Trigger --> Load
+    Load --> Assemble
+    Assemble --> Cost1
+    Cost1 -->|under cap| LLM
+    Cost1 -->|over cap| Done
+    LLM --> Tools
+    Tools --> Judge
+    Judge -->|allow| Capture
+    Judge -->|block| Done
+    Judge -->|escalate| Done
+    Capture --> Write
+    Write --> Done
+            </pre>
+            <p class="figure-caption">The runtime is stateless. Every box that touches the agent's persistent state reads from or writes to the vault. The judge layer is opt-in — without a <code>judges.md</code>, the diamond is skipped.</p>
+          </figure>
+
+          <p>Concretely: the operator triggers a run (could be cron at 7am, could be a <code>uv run atomic-agents run scout</code> from the terminal, could be embedded Python in their own app). The runtime reads the agent folder, assembles the system prompt in a canonical order, checks cost guardrails, calls the model, runs whatever tools the model invoked, lets the judge layer gate any risky actions, extracts capture markers from the model's response, writes new memory entries and a journal addition, appends one JSONL line to the audit log, and returns.</p>
+
+          <p>If the runtime crashes mid-run, the next invocation picks up where the folder left off — there's no in-memory state to recover. Every write goes through <code>temp file + fsync + rename + parent-dir fsync</code>, so a power loss never leaves a half-written note. You get either the old version or the new version. Never both, never neither.</p>
+
+          <div class="callout callout-key">
+            <p class="callout-title">Why stateless matters</p>
+            <p>Stateless means the same agent runs unchanged from cron, launchd, a Claude Code skill, or embedded Python. The runtime just points at the folder. Switch hosts? Same agent. Switch from a CLI invocation to a scheduled job? Same agent. The folder is the agent.</p>
+          </div>
+
+          <details class="deep-dive">
+            <summary>Deep dive: how memory is recalled</summary>
+            <p>If Scout has 200 atomic notes, loading them all into the prompt would be expensive and noisy. Instead, <code>memory/INDEX.md</code> contains a compressed map: short titles, types, and one-line summaries of every note. The language model reads the INDEX (cheap), decides which 1–3 notes it actually needs for the current task, then asks the runtime to load those specific files (also cheap).</p>
+            <p>This is <strong>INDEX-driven recall</strong>. The model pays context tokens for <em>capability awareness</em>, not capability content. The pattern scales to thousands of notes without scaling prompt cost.</p>
+          </details>
+
+          <details class="deep-dive">
+            <summary>Deep dive: capture markers</summary>
+            <p>When the model writes its response, it can include structured capture markers — fenced JSON blocks or tool calls — that the runtime extracts and turns into new atomic notes, journal additions, or memory updates. The model never directly writes to the file system; the runtime mediates every write, validates the shape, and applies the project's <code>WritePolicy</code> rules.</p>
+            <p>Two paths: <strong>Path 1</strong> uses native tool calls (the model explicitly invokes a <code>capture</code> tool). <strong>Path 2</strong> uses fenced-JSON markers in the response prose. Both produce identical artifacts on disk.</p>
+          </details>
+
+          <details class="deep-dive">
+            <summary>Deep dive: cost guardrails</summary>
+            <p>Every <code>agent.call()</code> path checks <code>_check_cost_guardrails</code> before the first LLM call and re-checks each iteration of the multi-turn loop. Daily and monthly caps are set in <code>model.md</code>. When 50% of daily is reached, a warning lands in the log. At 80%, a stronger warning. At 100%, the next call refuses unless explicitly marked <code>critical=True</code>.</p>
+            <p>Helper batches (cheap sub-LLM calls used for transformations) reserve their worst-case cost before dispatch. Delegated calls (one agent calling a specialist) clamp the child's budget to the minimum of <em>(child's own cap)</em> and <em>(parent's remaining budget for this run)</em>. This <strong>tree-cap</strong> is what makes "run a fleet of agents" not bankruptcy.</p>
+            <p>Long-running pipelines outside <code>call()</code> — dream, eval, tuning — have their own cost gates. The discipline: every code path that calls an LLM has a cost gate, even when it's not the same gate.</p>
+          </details>
+        </section>
+
+        <!-- ============================================================
+             SECTION 3 — SAFETY + JUDGMENT
+             ============================================================ -->
+        <section class="section" id="safety">
+          <p class="section-eyebrow">Section 3</p>
+          <h2>Safety + judgment</h2>
+          <p class="section-lede"><strong>Before any side-effectful action executes, a separate <em>judge</em> evaluates it.</strong> The judge can approve, block, request a revision, or escalate to a human. Cumulative-cap mandates defend against the slow-burn failure mode no per-call check can catch.</p>
+
+          <figure class="figure">
+            <figcaption class="figure-title">How the judge layer gates actions</figcaption>
+            <pre class="mermaid">
+flowchart TD
+    A["Tool call from actor agent"]
+    B{"What class of action?"}
+    R["read-only (load a note)"]
+    W["reversible write (save a note)"]
+    E["external side-effect (send email, post to API)"]
+    H["high-risk (delete files, spend money)"]
+    OK["Allow — runs immediately"]
+    OK2["Allow with audit trail"]
+    J{"Judge evaluates"}
+    ALLOW["Allow → execute"]
+    BLOCK["Block — execution refused"]
+    REVISE["Revise — amend the action, re-judge once"]
+    ESC["Escalate — write PENDING file"]
+    OP["You review in your text editor:<br/>Approve / Deny / Redact / Revise"]
+    EXEC["Execute approved action"]
+
+    A --> B
+    B --> R
+    B --> W
+    B --> E
+    B --> H
+    R --> OK
+    W --> OK2
+    E --> J
+    H --> ESC
+    J -->|ALLOW| ALLOW
+    J -->|BLOCK| BLOCK
+    J -->|REVISE| REVISE
+    J -->|ESCALATE| ESC
+    REVISE --> EXEC
+    ESC --> OP
+    OP --> EXEC
+            </pre>
+            <p class="figure-caption">Every side-effectful action is classified, then routed through the appropriate gate before execution. The judge layer is opt-in — without a <code>judges.md</code> in the agent folder, none of this fires and the framework behaves as if the judge layer didn't exist.</p>
+          </figure>
+
+          <p>Most agent frameworks let the model call tools directly. Atomic Agents inserts a checkpoint: before any side-effectful tool runs, a separate <code>JudgeBackend</code> inspects a structured proposal of what's about to happen and returns one of <strong>ALLOW</strong>, <strong>BLOCK</strong>, <strong>REVISE</strong>, or <strong>ESCALATE</strong>. Every judgment writes a JSONL audit event carrying the proposal's hashes, the outcome, the policy version, and the judge's reason.</p>
+
+          <p><strong>The layer is fully opt-in.</strong> Existing deployments see no judge invocation until they drop a <code>judges.md</code> file into the agent folder (or set an environment variable for the hardcoded defaults). The minimum viable config is six lines.</p>
+
+          <h3>Mandates: durable cumulative authorization</h3>
+          <p>The judge layer handles single-action approval. <strong>Mandates</strong> handle the longer arc: an operator authoring <code>mandates.md</code> grants the agent durable scoped authority — for instance, "spend up to $6,000 cumulatively on the Q2 ad campaign, only through these tools, only on these targets, only this month." The framework defends that cap against concurrent runs <em>and</em> crash-restart, and surfaces audit signals when an action's executed target diverged from what was authorized at proposal time.</p>
+
+          <div class="callout callout-key">
+            <p class="callout-title">Why this matters for real money</p>
+            <p>A per-call cost guardrail protects against one expensive turn. A mandate protects against the slow-burn failure mode where 47 individually-cheap turns add up to a procurement disaster. Mandates are how the framework handles actors that touch real money or real external side effects without requiring per-turn re-authorization.</p>
+          </div>
+
+          <details class="deep-dive">
+            <summary>Deep dive: the four class policies</summary>
+            <p>Every tool call is classified into one of four action classes in <code>tools.md</code>. The <code>class_policy</code> block in <code>judges.md</code> says what the framework does with each class:</p>
+            <dl class="deflist">
+              <dt><code>bypass</code></dt>
+              <dd>Skip the judge entirely. No proposal, no judgment event, no audit line.</dd>
+              <dt><code>allow_with_audit</code></dt>
+              <dd>Run the judge; <strong>always allow</strong>; write the full judgment event to the audit trail. Use when you want to see the judge's opinion without it gating actions yet.</dd>
+              <dt><code>judge_required</code></dt>
+              <dd>Run the judge; its outcome is enforced. BLOCK refuses; ALLOW executes; REVISE/ESCALATE follow the state-machine semantics.</dd>
+              <dt><code>escalate</code></dt>
+              <dd>Pause for operator approval. Framework writes a PENDING file; <code>agent.call()</code> returns deferred; operator resolves by editing the file in any text editor.</dd>
+            </dl>
+            <p>Strictness ordering: <code>bypass &lt; allow_with_audit &lt; judge_required &lt; escalate</code>. Unspecified classes default-fill to safe values.</p>
+          </details>
+
+          <details class="deep-dive">
+            <summary>Deep dive: the escalation queue</summary>
+            <p>When the judge ensemble returns ESCALATE, the action is paused for operator review. The framework writes a PENDING file to <code>&lt;agent_root&gt;/vault/escalations/&lt;action_class&gt;/&lt;proposal_id&gt;.md</code> (atomic, with full proposal serialized as YAML and the judge's reason inline), and <code>agent.call()</code> returns with <code>deferred=True</code>.</p>
+            <p>The operator resolves a PENDING by editing the file in any text editor (Obsidian, vim, VS Code) and writing one resolution block at the bottom. Header grammar is strict — h3 + exact-case verb + literal word "by" + operator name:</p>
+            <pre><code>### Approved by alice
+resolved_at: 2026-05-13T09:14:22Z
+note: Reviewed — sender list is correct, attachment is the public report.</code></pre>
+            <p>The five resolution verbs are <code>Approved</code>, <code>Denied</code>, <code>Redacted</code>, <code>Revised</code>, and <code>Auto-decided</code> (the framework writes this itself when a timeout elapses). On the next <code>agent.call()</code>, the framework reads the decision, re-verifies the proposal's body hash hasn't been tampered with, and executes (or doesn't) accordingly.</p>
+          </details>
+
+          <details class="deep-dive">
+            <summary>Deep dive: the Revise state machine</summary>
+            <p>REVISE is the most interesting outcome. The judge might say: <em>"Send this email, but strip the attachment"</em> or <em>"Open the PR as draft, not for merge."</em> The framework merges the amendment into the original proposal (recomputing the classification from the possibly-new tool name), re-runs the judge once against the amended proposal, and if the second judgment ALLOWs, executes the amended version.</p>
+            <p>Bounded at one revise iteration per spec/28 — the second judgment must return ALLOW to execute; REVISE again produces <code>revise_loop_exhausted_blocked</code>. Operators see this path as a sequence of audit events. No PENDING file is written for judge-driven revises.</p>
+            <p>Operator-driven revises (via the <code>### Revised by &lt;op&gt;</code> resolution block with an embedded amendment YAML) follow the same primitives but with one extra gate: if the amendment upgrades the action class (e.g., reversible_write → high_risk), the framework re-runs a fresh ensemble judgment on the amended proposal. An operator can't downgrade their way past the judge by relabeling.</p>
+          </details>
+
+          <details class="deep-dive">
+            <summary>Deep dive: failure_policy — fail-closed by default</summary>
+            <p>When a judge errors (timeout, budget exhausted, malformed proposal), the framework consults <code>failure_policy</code> to decide the enforcement outcome. <strong>Default is <code>block</code> for every exception type</strong> — operators must explicitly opt into looser behavior.</p>
+            <p>Two shapes are accepted. <strong>Flat</strong> (one fallback for every class):</p>
+            <pre><code>failure_policy:
+  JudgeUnavailable: block
+  JudgeBudgetExhausted: block</code></pre>
+            <p><strong>Nested per-class</strong> (different fallback per <code>(action_class, exception)</code> pair):</p>
+            <pre><code>failure_policy:
+  read_only:
+    JudgeUnavailable: allow      # read_only actions tolerate judge outages
+  high_risk:
+    JudgeUnavailable: escalate   # high_risk actions escalate to operator</code></pre>
+            <p>The parser auto-detects which shape you used.</p>
+          </details>
+        </section>
+
+        <!-- ============================================================
+             SECTION 4 — GROWING + COLLABORATING
+             ============================================================ -->
+        <section class="section" id="growing">
+          <p class="section-eyebrow">Section 4</p>
+          <h2>Growing + collaborating</h2>
+          <p class="section-lede"><strong>One agent becomes a team through three primitives: delegation (one agent calls a specialist), dreaming (the agent consolidates its own memory overnight), and cascade (a project layer of shared persona that multiple agents inherit).</strong> Same folder shape, same runtime, same audit trail — just composed.</p>
+
+          <figure class="figure">
+            <figcaption class="figure-title">Role × project cascade</figcaption>
+            <pre class="mermaid">
+flowchart TB
+    P["Project folder<br/>(shared persona, tools, judges, mandates)"]
+    R1["Writer agent<br/>(role-specific persona)"]
+    R2["Editor agent<br/>(role-specific persona)"]
+    R3["Researcher agent<br/>(role-specific persona)"]
+    D["Director agent<br/>(orchestrates the team)"]
+
+    P -.inherited by.-> R1
+    P -.inherited by.-> R2
+    P -.inherited by.-> R3
+    P -.inherited by.-> D
+    D --> R1
+    D --> R2
+    D --> R3
+
+    style P fill:#fff3e0,stroke:#ff9500,color:#000
+    style D fill:#e8f1fc,stroke:#0071e3,color:#000
+            </pre>
+            <p class="figure-caption">A project is a folder that holds shared configuration (persona, tools, judges, mandates) that multiple agent subfolders inherit. The Director coordinates; the Writer / Editor / Researcher each have role-specific persona on top of the shared project layer.</p>
+          </figure>
+
+          <p><strong>Delegation</strong> is the simplest move. A coordinator agent has a specialist it can call: <code>director.delegate("writer", task="Draft section 3")</code>. The runtime constructs the specialist agent fresh, runs it as a sub-agent, and returns the result. The specialist's run writes its own JSONL log line with <code>parent_run_id</code> linking back to the coordinator's run, so the audit trail rolls up naturally.</p>
+
+          <p>Delegation is bounded at <strong>one level</strong> — a coordinator delegates to specialists; specialists don't delegate further. This is a deliberate guardrail. Two-level delegation looks like flexibility; in practice it's how systems become unauditable.</p>
+
+          <p><strong>Dreaming</strong> is the consolidation pass. The agent runs against its own journal and memory during a quiet window (overnight, between work sessions) and asks: <em>what patterns have I noticed? what notes should be merged? what's now stale?</em> The dream produces structured proposals that go through the same capture-and-write pipeline as any other run — including the judge layer if one is configured. Memory gets sharper over time without the operator needing to curate manually.</p>
+
+          <p><strong>Cascade</strong> is the multi-agent shape. A project folder holds shared configuration (persona, tools, judges, mandates) that multiple agent subfolders inherit. The Writer, Editor, and Researcher each have role-specific persona on top of the project's shared layer. The judge layer's <em>project floor</em> is non-relaxable — a delegate's own <code>judges.md</code> may strengthen per-class policy but cannot weaken it below the floor.</p>
+
+          <div class="callout callout-key">
+            <p class="callout-title">Tree-cap: the cost discipline that makes fleets safe</p>
+            <p>When the coordinator delegates to a specialist, the specialist's budget is capped to the <strong>minimum</strong> of (the specialist's own daily cap) and (the coordinator's <em>remaining</em> budget for this run). The tree-cap is what makes "running an army of agents" not bankruptcy — every delegation tightens, never loosens, the cost ceiling.</p>
+          </div>
+
+          <details class="deep-dive">
+            <summary>Deep dive: dream pipelines</summary>
+            <p>Dreams run as a separate pipeline (<code>atomic_agents.dream</code>) with their own state machine: <strong>scan</strong> (collect journal entries and memory candidates from the relevant time window), <strong>propose</strong> (LLM-driven analysis producing structured suggestions), <strong>review</strong> (optional judge pass), <strong>commit</strong> (write the approved changes to memory and journal).</p>
+            <p>Dream proposals are not auto-applied — they flow through the same capture pipeline as any other run. If the agent has a judge configured, the judge sees the dream's proposed changes the same way it sees any other side-effectful action. An operator can review and approve at the same surface they review any other agent decision.</p>
+            <p>Dreams have their own cost gate (<code>_check_cap</code>) — they're typically the most expensive single pass an agent runs, because consolidation requires the agent to consider its entire recent history.</p>
+          </details>
+
+          <details class="deep-dive">
+            <summary>Deep dive: helper provenance preservation</summary>
+            <p>Helpers are cheap sub-LLM calls used for transformations: "summarize this", "extract entities from that", "classify this into one of three buckets." They're typically Haiku-class (fast, cheap) and run in parallel batches. When a helper produces an output that informs the main agent's reasoning, the runtime preserves the <strong>helper provenance</strong> — which helper produced which output, with which prompt, at which cost — and rolls it up into the parent run's audit record.</p>
+            <p>This matters because debugging an agent's reasoning sometimes requires tracing back through what its helpers told it. The provenance trail lets you reconstruct any agent decision down to the helper-prompt level.</p>
+          </details>
+
+          <details class="deep-dive">
+            <summary>Deep dive: eval and tuning</summary>
+            <p>Eval (<code>atomic_agents.eval</code>) runs the agent against curated test cases organized by category: happy path, edge cases, adversarial inputs, decline cases (things the agent should refuse). Each category produces pass/fail metrics and qualitative judgments from an LLM-as-judge that scores along configurable rubrics.</p>
+            <p>Tuning (<code>atomic_agents.tuning</code>) takes the eval results and proposes persona refinements — "the SOUL.md draft is producing too-formal output on edge cases; consider this adjustment." The proposals are not auto-applied. The operator reviews them as standard markdown diffs.</p>
+            <p>Both run as long-lived pipelines with their own cost gates, separate from the per-call cost guardrails on <code>agent.call()</code>.</p>
+          </details>
+        </section>
+
+        <!-- ============================================================
+             SECTION 5 — SCALING: THE PROTOCOL-PATTERN STORY
+             ============================================================ -->
+        <section class="section" id="scaling">
+          <p class="section-eyebrow">Section 5</p>
+          <h2>Scaling: the protocol-pattern story</h2>
+          <p class="section-lede"><strong>The same agent definition runs unchanged when the operator swaps the storage underneath.</strong> A home user with one agent runs filesystem-everything. An org with a fleet swaps in SQLite for logs, Redis for locks, Postgres for fleet config — same agent, different substrate. The protocol seams are what make this real.</p>
+
+          <figure class="figure">
+            <figcaption class="figure-title">Protocols — the moat</figcaption>
+            <pre class="mermaid">
+flowchart TB
+    Agent["Your agent<br/>(unchanged at every scale)"]
+    P1["MemoryBackend"]
+    P2["LLMBackend"]
+    P3["JudgeBackend"]
+    P4["LockBackend"]
+    P5["LogBackend"]
+    P6["AgentProfileBackend"]
+    P7["ToolRegistryBackend"]
+    P8["MandateBackend"]
+    Disk["Filesystem (default)"]
+    SQLite["SQLite (indexed query)"]
+    Redis["Redis (distributed locks)"]
+    PG["Postgres (planned, tracked at #258)"]
+
+    Agent --> P1
+    Agent --> P2
+    Agent --> P3
+    Agent --> P4
+    Agent --> P5
+    Agent --> P6
+    Agent --> P7
+    Agent --> P8
+
+    P1 --> Disk
+    P5 --> Disk
+    P5 --> SQLite
+    P4 --> Disk
+    P4 --> Redis
+    P6 --> Disk
+    P6 --> SQLite
+    P7 --> Disk
+    P7 --> SQLite
+    P8 --> Disk
+    P1 -.planned.-> PG
+    P5 -.planned.-> PG
+    P6 -.planned.-> PG
+    P7 -.planned.-> PG
+    P8 -.planned.-> PG
+
+    style Agent fill:#e8f1fc,stroke:#0071e3,color:#000
+            </pre>
+            <p class="figure-caption">The agent calls protocols. Each protocol can be backed by any storage that implements the contract. Swap underneath, not on top.</p>
+          </figure>
+
+          <h3>Eight shipped protocols, four remaining for v1.0</h3>
+          <p>The framework defines a <strong>Protocol</strong> (a precisely-specified interface) for each primitive that touches storage. Each protocol has a filesystem reference impl that ships from day one, capability advertisement so the framework knows what each backend can and can't do, and a parametrized conformance test suite that every implementation must pass.</p>
+
+          <p>Today's shipped backends and what they unlock:</p>
+          <dl class="deflist">
+            <dt><strong>MemoryBackend</strong> — atomic notes, INDEX, wiki, capture</dt>
+            <dd>Default: filesystem. Future: Postgres + pgvector for semantic search at scale.</dd>
+            <dt><strong>LLMBackend</strong> — the language-model call itself</dt>
+            <dd>Three reference impls register at framework import: Anthropic, OpenAI (direct), Moonshot. Third-party Gemini / Bedrock / Vertex / vLLM-local backends can register without forking core.</dd>
+            <dt><strong>JudgeBackend</strong> — the safety layer from Section 3</dt>
+            <dd>PolicyJudge (rule engine, microseconds, always-on) + LLMJudgeBackend (slower, smarter, lazy-skipped if no key resolves).</dd>
+            <dt><strong>LockBackend</strong> — prevents two copies of the same agent from clobbering each other</dt>
+            <dd>Default: POSIX <code>flock</code> (single-host). Alternative: Redis advisory locks (multi-host).</dd>
+            <dt><strong>LogBackend</strong> — where the audit trail goes</dt>
+            <dd>Default: JSONL files. Alternative: SQLite with indexed queries (so dashboards answer "show me all high-cost runs this week" in milliseconds instead of scanning thousands of JSONL lines).</dd>
+            <dt><strong>AgentProfileBackend</strong> — the bootstrap (persona, tools, model, judges, MCP, goal)</dt>
+            <dd>Default: walks the folder. Alternative: SQLite-backed, required for SaaS deployments where the persona is editable through a web UI.</dd>
+            <dt><strong>ToolRegistryBackend</strong> — the catalog of installable tools</dt>
+            <dd>Default: walks <code>&lt;agent&gt;/tools/</code>. Alternative: SQLite catalog with cross-tenant isolation, used for plugin-marketplace shapes.</dd>
+            <dt><strong>MandateBackend</strong> — durable revocable authority for actions that touch real money</dt>
+            <dd>Default: filesystem. Operators author <code>mandates.md</code>; the backend enforces cumulative caps + crash recovery + post-action verification.</dd>
+          </dl>
+
+          <p><strong>Four remaining for v1.0:</strong> <code>PolicyBackend</code> (org-level policy that supersedes per-agent caps and allowlists — in progress, 4-PR arc), <code>PersonaBackend</code> (UI-editable identity/soul/user), <code>CorpusBackend</code> (GB-scale wiki + semantic search), <code>MCPServerRegistryBackend</code> (catalog for MCP servers). v1.0 closes when those four ship + their conformance suites pin the contract.</p>
+
+          <h3>Home shape vs company shape</h3>
+          <p>Here's the same agent — same folder, same persona, same tools, same judge config — running in two very different deployments. Notice what changes and what doesn't.</p>
+
+          <div class="compare">
+            <div class="compare-pane">
+              <h4>🏠 Home shape</h4>
+              <ul>
+                <li>Folder on your laptop</li>
+                <li>Filesystem MemoryBackend</li>
+                <li>Filesystem LogBackend (JSONL)</li>
+                <li>POSIX-lock LockBackend</li>
+                <li>Filesystem ProfileBackend</li>
+                <li>Filesystem ToolRegistry</li>
+                <li>Filesystem MandateBackend <em>(off by default — opt-in via <code>mandates.md</code>)</em></li>
+                <li>Anthropic LLMBackend</li>
+                <li>Rule-engine JudgeBackend</li>
+                <li><strong>One agent, one folder, zero servers</strong></li>
+              </ul>
+            </div>
+            <div class="compare-pane">
+              <h4>🏢 Company shape</h4>
+              <ul>
+                <li>Same folder layout — possibly on shared storage</li>
+                <li>Filesystem MemoryBackend <em>(same)</em></li>
+                <li>SQLite LogBackend <em>(indexed dashboards)</em></li>
+                <li>Redis LockBackend <em>(multi-host coordination)</em></li>
+                <li>SQLite ProfileBackend <em>(UI-editable)</em></li>
+                <li>SQLite ToolRegistry <em>(audit + install approval)</em></li>
+                <li>Filesystem MandateBackend <em>(same)</em></li>
+                <li>Anthropic LLMBackend <em>(same)</em></li>
+                <li>LLM JudgeBackend <em>(smarter review)</em></li>
+                <li><strong>Same agent — different substrate underneath</strong></li>
+              </ul>
+            </div>
+          </div>
+
+          <p>The home user opens the folder in Obsidian and reads the journal. The company runs the same agent across three Cloud Run instances behind a load balancer, with logs flowing to a SQLite-backed dashboard that answers "show me all escalations from this team this quarter" in milliseconds. <strong>The agent's persona doesn't know which world it's in.</strong> The agent's tools don't know. The agent's memory doesn't know. The only difference is what's registered as the backend for each protocol.</p>
+
+          <p>Two shipped protocols (MemoryBackend and MandateBackend) ship filesystem-only in v1 — both retain the company-shape pane as "(same)" above. The Protocol seams are in place from day one so future adapters (vector-database memory, SaaS / mobile / Slack-bot mandates) register via <code>register_memory_backend()</code> / <code>register_mandate_backend()</code> without forking core. The four remaining v1.0 protocols on the roadmap (Persona, Corpus, Policy, MCPServerRegistry) close the rest of the substrate-swap surface.</p>
+
+          <h3>Postgres adapters — the next substrate</h3>
+          <p>SQLite covers single-host org-shape deployments. <strong>Postgres is the next step up</strong> — multi-host shared-substrate org deployments where SQLite's single-writer model isn't enough. The umbrella tracking this work is <a href="https://github.com/dep0we/atomic-agents-stack/issues/258">issue #258</a> with sub-tasks for LogBackend / ProfileBackend / ToolRegistry / Memory+pgvector / Mandate / Lock Postgres adapters in priority order. The Implementer-contract sections in <code>spec/22</code>, <code>spec/24</code>, <code>spec/25</code>, and <code>spec/29</code> already document the 8-MUST shape every adapter has to satisfy.</p>
+
+          <details class="deep-dive">
+            <summary>Deep dive: how the swap actually happens</summary>
+            <p>Concretely, switching from filesystem-everything to SQLite-for-logs looks like setting one environment variable:</p>
+            <pre><code>export ATOMIC_AGENTS_LOG_BACKEND=sqlite
+export ATOMIC_AGENTS_LOG_BACKEND_URL=sqlite:///shared/logs.db
+uv run atomic-agents run scout --work-item "Daily morning brief"</code></pre>
+            <p>That's it. The agent's folder doesn't change. The agent's persona doesn't change. The runtime sees the env var, dispatches log writes to SQLite, and everything else continues as before. Tomorrow you can flip it back. Next month you can flip Profile to SQLite too. The home user has none of these env vars set; they get the filesystem defaults and never need to think about it.</p>
+            <p>SQLite-shape backends need just the <code>_BACKEND=sqlite</code> flip — the DB path is derived from a sensible default. Redis-shape backends need both <code>_BACKEND=redis</code> AND <code>_BACKEND_URL=redis://...</code> because there's no derivable default for a Redis instance address.</p>
+          </details>
+
+          <details class="deep-dive">
+            <summary>Deep dive: PolicyBackend (in progress)</summary>
+            <p>The eighth-and-a-half protocol. Where <code>MandateBackend</code> is per-agent durable authorization, <code>PolicyBackend</code> is the <strong>fleet-wide</strong> policy layer that supersedes per-agent caps and allowlists. A company can author a <code>policy.md</code> at the project root that says "no agent in this tenant may spend more than $50/day, regardless of what their model.md says" — and the framework enforces that cap on every run.</p>
+            <p>PR 3a shipped 2026-05-20 with cost-cap consumption live (the daily/monthly caps in <code>policy.md</code> now enforce on real money). PR 3b ships the non-cap surfaces (tool allowlists, model allowlists, MCP allowlists) in log-only mode behind a feature flag. PR 4 will lock the spec.</p>
+            <p>The semantic shift: per-agent caps in <code>model.md</code> set what the agent <em>can</em> spend; PolicyBackend sets what the operator <em>permits</em> it to spend. Operator-level always wins.</p>
+          </details>
+
+          <details class="deep-dive">
+            <summary>Deep dive: the conformance suite is the actual moat</summary>
+            <p>Anyone — a third party, a company integrating internally, you in a year — can write a new backend. They drop their implementation into the conformance test harness. If the tests pass, their backend is fully interoperable with everything else. If the tests fail, they know exactly which guarantees they're violating.</p>
+            <p>The framework isn't trying to ship every possible backend itself; it's trying to be a contract that other backends can plug into. The 8-MUST Implementer contract documented in each protocol's spec doc is the rulebook every implementation has to follow.</p>
+          </details>
+        </section>
+
+        <!-- ============================================================
+             SECTION 6 — THE SPEC IS THE PRODUCT
+             ============================================================ -->
+        <section class="section" id="spec">
+          <p class="section-eyebrow">Section 6</p>
+          <h2>The spec is the product</h2>
+          <p class="section-lede"><strong>The framework's central artifact isn't the Python code — it's the spec.</strong> 28 numbered spec documents (plus 3 RFCs in progress) describe every load-bearing primitive in precise detail. The Python package is one conforming reference implementation. Anyone can build a different one in any language.</p>
+
+          <p>This matters because it means the framework is <strong>not vendor lock-in</strong>. The spec documents are public. The reference implementations are MIT-licensed. If this Python project disappeared tomorrow, your atomic agent in your folder would still work — because what your folder depends on is the <em>spec</em>, not this particular implementation of it.</p>
+
+          <p>The spec docs are organized by primitive:</p>
+          <ul class="spec-list">
+            <li><strong>01-19</strong> — the foundations: anatomy, memory, file formats, runtime assembly, capture rules, multi-agent projects, research, evaluation, cost/observability, helpers, tuning, goals, research integrity, capture markers, delegation, dreams, skills, MCP, alternative-runtime contracts</li>
+            <li><strong>20-25</strong> — backend protocols: MemoryBackend, LockBackend, LogBackend, (23 reserved), AgentProfileBackend, ToolRegistryBackend</li>
+            <li><strong>26-29</strong> — recent additions: cascade bundle (DRAFT), doctor preflight, judge layer, mandates</li>
+            <li><strong>30-32</strong> — RFCs in progress: responsibility audit, LLMBackend (locked at 31), policy backend (RFC)</li>
+          </ul>
+
+          <p>Every spec doc is <strong>locked when the implementation matches and tests pass</strong>. Spec changes that imply implementation changes get filed as GitHub issues. <strong>Spec docs separate shipped behavior from explicit future / deferred boundaries</strong> — sections describing behavior not yet implemented are explicitly marked, not silently aspirational.</p>
+
+          <div class="callout callout-key">
+            <p class="callout-title">Why this matters for a non-developer</p>
+            <p>You probably won't write a new backend. You probably won't deploy across three Cloud Run instances. So why care about the spec?</p>
+            <p>Two reasons. <strong>Your agent is portable forever.</strong> If a year from now you want to move from Claude to a different language model, the agent doesn't change — just the LLMBackend. If you want to move from filesystem logs to a cloud monitoring tool, the agent doesn't change — just the LogBackend. The shape you depend on (the folder, the markdown files, the persona, the memory) is the layer that never moves.</p>
+            <p><strong>And the framework is not a vendor.</strong> The spec is public. The implementations are MIT. Anyone can build a conforming runtime in any language. The atomic agent in your folder doesn't depend on this Python project surviving — it depends on the <em>spec</em> surviving. If the maintainer disappears, your agent still works.</p>
+          </div>
+        </section>
+
+      </article>
+    </div>
   </div>
 </main>
 
 <footer>
   <div class="container">
+    <div class="footer-cta-row">
+      <a href="https://github.com/dep0we/atomic-agents-stack" class="footer-cta">View the repo</a>
+      <a href="https://github.com/dep0we/atomic-agents-stack/blob/main/docs/getting-started.md" class="footer-cta">Get started (15 min)</a>
+      <a href="https://github.com/dep0we/atomic-agents-stack/tree/main/docs/spec" class="footer-cta">Browse the spec</a>
+      <a href="https://github.com/dep0we/atomic-agents-stack/blob/main/ROADMAP.md" class="footer-cta">Read the roadmap</a>
+    </div>
     <p>A visual companion to <a href="https://github.com/dep0we/atomic-agents-stack">atomic-agents-stack</a>.</p>
-    <p>Each page works in your browser, light or dark. No tracking, no analytics — just files on your disk.</p>
+    <p>Renders in your browser, light or dark. No tracking, no analytics — just files on your disk.</p>
   </div>
 </footer>
 
 <script>
-  // Theme toggle
-  const toggle = document.getElementById('theme-toggle');
-  toggle.addEventListener('click', function() {
-    const html = document.documentElement;
-    const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-    const isDark = html.classList.contains('dark') ||
-                   (!html.classList.contains('light') && systemDark);
-    if (isDark) {
-      html.classList.remove('dark');
-      html.classList.add('light');
-      localStorage.setItem('atomic-explainer-theme', 'light');
-    } else {
-      html.classList.remove('light');
-      html.classList.add('dark');
-      localStorage.setItem('atomic-explainer-theme', 'dark');
-    }
+  // ----- Theme toggle + Mermaid re-render on theme change -----
+  document.querySelectorAll('pre.mermaid').forEach(function(el){
+    el.dataset.source = el.textContent.trim();
   });
+
+  function isDarkActive() {
+    const html = document.documentElement;
+    if (html.classList.contains('dark')) return true;
+    if (html.classList.contains('light')) return false;
+    return window.matchMedia('(prefers-color-scheme: dark)').matches;
+  }
+
+  function renderMermaid() {
+    document.querySelectorAll('pre.mermaid').forEach(function(el){
+      el.removeAttribute('data-processed');
+      el.innerHTML = el.dataset.source;
+    });
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: isDarkActive() ? 'dark' : 'default',
+      themeVariables: {
+        fontFamily: '-apple-system, BlinkMacSystemFont, "SF Pro Display", sans-serif',
+        fontSize: '14px',
+      },
+      flowchart: {
+        curve: 'basis',
+        padding: 18,
+        nodeSpacing: 50,
+        rankSpacing: 60,
+        useMaxWidth: true,
+        htmlLabels: true,
+      },
+    });
+    mermaid.run({ querySelector: 'pre.mermaid' });
+  }
+  renderMermaid();
+
+  document.getElementById('theme-toggle').addEventListener('click', function() {
+    const html = document.documentElement;
+    const wantDark = !isDarkActive();
+    html.classList.remove('dark', 'light');
+    html.classList.add(wantDark ? 'dark' : 'light');
+    localStorage.setItem('atomic-explainer-theme', wantDark ? 'dark' : 'light');
+    renderMermaid();
+  });
+
+  // ----- TOC active-section highlighting -----
+  const sections = document.querySelectorAll('.section[id]');
+  const tocLinks = document.querySelectorAll('.toc-list a');
+  function onScroll() {
+    let current = '';
+    sections.forEach(function(s) {
+      const top = s.getBoundingClientRect().top;
+      if (top < 160) current = s.id;
+    });
+    tocLinks.forEach(function(a) {
+      a.classList.toggle('active', a.getAttribute('href') === '#' + current);
+    });
+  }
+  document.addEventListener('scroll', onScroll, { passive: true });
+  onScroll();
 </script>
 
 </body>
