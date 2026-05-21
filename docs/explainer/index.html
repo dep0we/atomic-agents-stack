@@ -576,7 +576,7 @@ uv run atomic-agents run scout --work-item "Daily morning brief"</code></pre>
 
           <div class="callout callout-key">
             <p class="callout-title">Why this matters for a non-developer</p>
-            <p>You probably won't write a new backend. You probably won't deploy across three Cloud Run instances. So why care about the spec?</p>
+            <p>You probably won't write a new backend. You probably won't deploy across a fleet of Cloud Run instances. So why care about the spec?</p>
             <p>Two reasons. <strong>Your agent is portable forever.</strong> If a year from now you want to move from Claude to a different language model, the agent doesn't change — just the LLMBackend. If you want to move from filesystem logs to a cloud monitoring tool, the agent doesn't change — just the LogBackend. The shape you depend on (the folder, the markdown files, the persona, the memory) is the layer that never moves.</p>
             <p><strong>And the framework is not a vendor.</strong> The spec is public. The implementations are MIT. Anyone can build a conforming runtime in any language. The atomic agent in your folder doesn't depend on this Python project surviving — it depends on the <em>spec</em> surviving. If the maintainer disappears, your agent still works.</p>
           </div>
