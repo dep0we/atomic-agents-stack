@@ -51,7 +51,7 @@
       <p class="hero-lead">
         AI agents that live as plain markdown files in a folder <em>you</em> own — not in someone else's database. This guide explains what that means, how the framework works, and why the shape matters from one agent on your laptop to a fleet behind a load balancer.
       </p>
-      <div class="intro-row">
+      <div class="intro-row intro-row-3">
         <div class="intro-stat">
           <p class="intro-stat-num">8 / 12</p>
           <p class="intro-stat-label">Backend protocols shipped</p>
@@ -66,30 +66,20 @@
         </div>
       </div>
       <div class="hero-cta-row">
-        <a href="#folder" class="cta cta-primary">Read the essentials (5&nbsp;min)</a>
-        <a href="#everything" class="cta cta-secondary">Keep scrolling for everything</a>
+        <a href="#folder" class="cta cta-primary">Read the guide&nbsp;→</a>
       </div>
       <p class="hero-note">Each section opens with the load-bearing idea. Click any <strong>Deep dive</strong> for the operator-level detail. Skim the bold sentences for a 5-minute read; expand everything for the full ~25-minute picture.</p>
     </header>
 
-    <div class="explainer-layout">
+  </div>
+
+  <div class="container-explainer">
+    <div class="explainer-layout" id="everything">
 
       <!-- ============================================================
-           STICKY TOC (right sidebar on desktop, collapsed on mobile)
+           ARTICLE (DOM-first → renders in LEFT column on desktop)
            ============================================================ -->
-      <aside class="toc" aria-label="Sections on this page">
-        <p class="toc-label">On this page</p>
-        <ol class="toc-list">
-          <li><a href="#folder">The agent IS a folder</a></li>
-          <li><a href="#day">A day in the life</a></li>
-          <li><a href="#safety">Safety + judgment</a></li>
-          <li><a href="#growing">Growing + collaborating</a></li>
-          <li><a href="#scaling">Scaling: the protocol pattern</a></li>
-          <li><a href="#spec">The spec is the product</a></li>
-        </ol>
-      </aside>
-
-      <article class="explainer" id="everything">
+      <article class="explainer">
 
         <!-- ============================================================
              SECTION 1 — THE AGENT IS A FOLDER
@@ -583,6 +573,23 @@ uv run atomic-agents run scout --work-item "Daily morning brief"</code></pre>
         </section>
 
       </article>
+
+      <!-- ============================================================
+           STICKY TOC (DOM-second → renders in RIGHT column on desktop;
+           collapsed/hidden on mobile)
+           ============================================================ -->
+      <aside class="toc" aria-label="Sections on this page">
+        <p class="toc-label">On this page</p>
+        <ol class="toc-list">
+          <li><a href="#folder">The agent IS a folder</a></li>
+          <li><a href="#day">A day in the life</a></li>
+          <li><a href="#safety">Safety + judgment</a></li>
+          <li><a href="#growing">Growing + collaborating</a></li>
+          <li><a href="#scaling">Scaling: the protocol pattern</a></li>
+          <li><a href="#spec">The spec is the product</a></li>
+        </ol>
+      </aside>
+
     </div>
   </div>
 </main>
