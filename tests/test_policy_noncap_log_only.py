@@ -54,15 +54,20 @@ def _write_policy(project_root: Path, content: str) -> None:
 # Env-flag reader
 
 
-def test_enforce_noncap_default_is_false(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Unset env var → False (PR 3b ships log-only as default)."""
+def test_enforce_noncap_default_is_true(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset env var → True (PR 4 flipped the default to enforce mode).
+
+    Operators authoring ``policy.md`` get tool / MCP / model surfaces
+    enforced by default. Operators wanting to delay enforce mode set the
+    env var explicitly to ``"false"`` (or any documented falsy value).
+    """
     from atomic_agents.policy.types import (
         ENFORCE_NONCAP_ENV_VAR,
         _read_enforce_noncap_flag,
     )
 
     monkeypatch.delenv(ENFORCE_NONCAP_ENV_VAR, raising=False)
-    assert _read_enforce_noncap_flag() is False
+    assert _read_enforce_noncap_flag() is True
 
 
 @pytest.mark.parametrize("val", ["1", "true", "TRUE", "True", "yes", "YES", "on", "ON"])
@@ -79,9 +84,16 @@ def test_enforce_noncap_truthy_values(
     assert _read_enforce_noncap_flag() is True
 
 
-@pytest.mark.parametrize("val", ["0", "false", "FALSE", "no", "off", "", "  ", "maybe"])
+@pytest.mark.parametrize(
+    "val", ["0", "false", "FALSE", "False", "no", "NO", "off", "OFF"]
+)
 def test_enforce_noncap_falsy_values(monkeypatch: pytest.MonkeyPatch, val: str) -> None:
-    """Any non-documented-truthy value reads as False — conservative default."""
+    """Each documented falsy value flips the flag False (case-insensitive).
+
+    PR 4 inverted the default semantic: the explicit falsy set is now the
+    opt-out path. Operators wanting to delay enforce mode set the env to
+    one of these values.
+    """
     from atomic_agents.policy.types import (
         ENFORCE_NONCAP_ENV_VAR,
         _read_enforce_noncap_flag,
@@ -89,6 +101,23 @@ def test_enforce_noncap_falsy_values(monkeypatch: pytest.MonkeyPatch, val: str) 
 
     monkeypatch.setenv(ENFORCE_NONCAP_ENV_VAR, val)
     assert _read_enforce_noncap_flag() is False
+
+
+@pytest.mark.parametrize("val", ["", "  ", "maybe", "garbage", "yesno"])
+def test_enforce_noncap_unknown_values_default_to_true(
+    monkeypatch: pytest.MonkeyPatch, val: str
+) -> None:
+    """Any value outside the documented falsy set reads as True — PR 4 enforce
+    default. Operators must use a documented falsy value (``false``, ``0``,
+    ``no``, ``off``) to opt back into log-only mode.
+    """
+    from atomic_agents.policy.types import (
+        ENFORCE_NONCAP_ENV_VAR,
+        _read_enforce_noncap_flag,
+    )
+
+    monkeypatch.setenv(ENFORCE_NONCAP_ENV_VAR, val)
+    assert _read_enforce_noncap_flag() is True
 
 
 def test_enforce_noncap_strips_whitespace(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -441,12 +470,20 @@ def test_enforce_mode_mcp_filter_drops_denied_servers(
     assert [s.name for s in allowed] == ["filesystem", "weather"]
 
 
-def test_log_only_mode_mcp_filter_keeps_denied_servers(tmp_path: Path) -> None:
-    """In log-only mode (default), the same MCP filter produces effective_mcp_specs
-    that INCLUDES denied servers — the audit-event records the would-be denial
-    but the server still connects."""
+def test_log_only_mode_mcp_filter_keeps_denied_servers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In log-only mode (opt-in after PR 4), the MCP filter produces
+    effective_mcp_specs that INCLUDES denied servers — the audit-event
+    records the would-be denial but the server still connects.
+
+    PR 4 flipped the default to enforce, so this test pins the
+    log-only branch by explicitly setting the env var to ``"false"``."""
     from atomic_agents import AtomicAgent
     from atomic_agents.mcp import MCPServerSpec
+    from atomic_agents.policy.types import ENFORCE_NONCAP_ENV_VAR
+
+    monkeypatch.setenv(ENFORCE_NONCAP_ENV_VAR, "false")
 
     _make_minimal_agent_dir(tmp_path, "scout")
     _write_policy(tmp_path, "mcp_servers:\n  deny: [insecure-server]\n")
@@ -495,10 +532,16 @@ def test_enforce_mode_model_override_replaces_pre_policy_model(
     assert model == "claude-opus-4-7"
 
 
-def test_log_only_mode_model_override_keeps_pre_policy_model(tmp_path: Path) -> None:
+def test_log_only_mode_model_override_keeps_pre_policy_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """In log-only mode the override emission still happens but the
-    pre-Policy model is kept unchanged."""
+    pre-Policy model is kept unchanged. PR 4 flipped the default to
+    enforce, so this test pins the log-only branch explicitly."""
     from atomic_agents import AtomicAgent
+    from atomic_agents.policy.types import ENFORCE_NONCAP_ENV_VAR
+
+    monkeypatch.setenv(ENFORCE_NONCAP_ENV_VAR, "false")
 
     _make_minimal_agent_dir(tmp_path, "scout")
     _write_policy(tmp_path, "model: claude-opus-4-7\n")
