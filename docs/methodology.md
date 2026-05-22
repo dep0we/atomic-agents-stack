@@ -9,11 +9,11 @@ The shape of the project so far (snapshot at the time of original capture,
 2026-05-09): 4 published tags (v0.1.0 retroactive, v0.9.0 retroactive,
 v0.10.0, v0.13.0), ~70 merged PRs, ~1327 tests, no production rollback
 events. Three backend protocols shipped at that point (MemoryBackend,
-LLMBackend, JudgeBackend); today seven are shipped (MemoryBackend,
+LLMBackend, JudgeBackend); today nine are shipped (MemoryBackend,
 LLMBackend, JudgeBackend, LockBackend, LogBackend, AgentProfileBackend,
-ToolRegistryBackend) with parametrized conformance suites and 1953+ tests
-— see the empirical record table below for arc-by-arc evidence of how the
-methodology held across them.
+ToolRegistryBackend, MandateBackend, PolicyBackend) with parametrized
+conformance suites and 2401+ tests — see the empirical record table below
+for arc-by-arc evidence of how the methodology held across them.
 
 ---
 

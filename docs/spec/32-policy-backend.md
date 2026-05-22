@@ -12,7 +12,7 @@
 
 Policy is a **fleet-wide, configuration-time settings layer**. An operator with a fleet of agents authors a single `<project_root>/policy.md` declaring fleet-default cost caps, tool allowlists, MCP server allowlists, and model selection — with optional per-agent overrides under a nested `agents:` section. The framework reads Policy ONCE per `agent.call()` entry (a snapshot), and the existing layers consult the snapshot for the rest of the call.
 
-Eight backend protocols already ship. PolicyBackend closes the cross-agent configuration cliff: operators currently hand-syncing `model.md` / `tools.md` / `mcp.md` across N agents get a single fleet-wide source of truth, with a Protocol seam ready for SaaS / Postgres / org-admin-console adapters from day 1.
+Nine backend protocols ship as of this spec's lock (PolicyBackend is the ninth). PolicyBackend closes the cross-agent configuration cliff: operators currently hand-syncing `model.md` / `tools.md` / `mcp.md` across N agents get a single fleet-wide source of truth, with a Protocol seam ready for SaaS / Postgres / org-admin-console adapters from day 1.
 
 ## Why this exists
 

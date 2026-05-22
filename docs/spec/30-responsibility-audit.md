@@ -8,7 +8,7 @@
 >
 > Cross-links: spec/01 (anatomy — graduated autonomy property), spec/05 (capture rules — generated-provenance evidence discipline), spec/08 (evaluation — sibling rubric-driven primitive), spec/09 (cost-observability — cost-event format the audit reads), spec/15 (delegation — one-level, audit scope), spec/16 (dreams — sibling offline-reflection primitive), spec/17 (tools — tools.md the audit reads), spec/19 (mcp — mcp.md the audit reads), spec/20 (memory backend — protocol-pattern template), spec/27 (doctor — audit-aware checks), spec/28 (judge layer — judgment events + class policy the audit reads), spec/29 (mandates — mandates.md + mandate events the audit reads)
 >
-> Related backends: PolicyBackend (#89 — future fleet-level audit composition), LogBackend (#61 — audit events flow through this), LLMBackend (#87 — optional enrichment uses this)
+> Related backends: PolicyBackend (#89 — shipped; fleet-level audit composition over PolicyBackend is future work), LogBackend (#61 — audit events flow through this), LLMBackend (#87 — optional enrichment uses this)
 
 ## Overview
 
