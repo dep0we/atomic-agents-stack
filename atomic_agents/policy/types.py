@@ -45,6 +45,7 @@ storage and wire shapes.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable, Literal
@@ -53,6 +54,29 @@ from atomic_agents.exceptions import AtomicAgentsError
 
 if TYPE_CHECKING:
     from ..logs.backend import LogBackend
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Env flag (PR 3b)
+
+ENFORCE_NONCAP_ENV_VAR = "ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP"
+
+
+def _read_enforce_noncap_flag() -> bool:
+    """Read ``ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP`` (default ``False``).
+
+    Per spec/32 D3 — single flag covers tool allowlist + MCP server allowlist
+    + model selection together. Cost-cap surfaces enforce immediately (PR 3a)
+    and do not consult this flag.
+
+    Truthy values (case-insensitive): ``"1"``, ``"true"``, ``"yes"``, ``"on"``.
+    Anything else (including unset, ``""``, ``"0"``, ``"false"``) is ``False``.
+
+    PR 3b ships with the flag default ``False`` (log-only mode); PR 4 flips
+    the default to ``True`` and locks spec/32.
+    """
+    val = os.environ.get(ENFORCE_NONCAP_ENV_VAR, "").strip().lower()
+    return val in ("1", "true", "yes", "on")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -148,10 +172,16 @@ class PolicyDecision:
     ``decision_kind`` discriminator:
 
     - ``"deny"``: some layer (Policy / Mandate / model_md / per_call) denied
-      the action.  ``denying_layer`` names which.
+      the action.  ``denying_layer`` names which.  In log-only mode
+      (``enforced=False``, non-cap surfaces with the env-var off) the
+      denial was RECORDED but the action proceeded — operators reading
+      the audit must check ``enforced`` to know whether the denial took
+      effect.
     - ``"override"``: Policy returned a non-None model selection that
-      supersedes model.md.  ``denying_layer`` is ``None`` (no denial
-      occurred).
+      supersedes ``model.md``.  ``denying_layer`` is ``None`` (no denial
+      occurred).  In log-only mode (``enforced=False``) the override was
+      RECORDED but the pre-Policy model was kept — same ``enforced``
+      disambiguation as for denials.
 
     ``axis`` field names the surface:
 
@@ -226,18 +256,28 @@ class PolicySnapshotForCall:
     so audit events can carry the staleness contract without re-querying the
     backend after call entry.
 
-    ``tool_allow_fn``, ``mcp_allow_fn``, ``model_override``: captured for
-    snapshot-shape parity with PR 3b.  PR 3a does NOT consume these fields —
-    they are ``None`` / always-allow stubs here.  PR 3b populates and uses
-    them when it wires tool / MCP / model surfaces.
+    ``tool_allow_fn``, ``mcp_allow_fn``, ``model_override``: populated by
+    PR 3b.  ``tool_allow_fn(tool_name)`` and ``mcp_allow_fn(server_name)``
+    are backend-bound closures returning ``True`` to allow / ``False`` to
+    deny; ``model_override`` is the agent's effective model per Policy or
+    ``None`` to defer to ``model.md``.  All three are ``None`` when no
+    Policy backend is configured.
+
+    ``enforce_noncap``: env-flag value (``ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP``)
+    read ONCE at call entry and frozen for the duration of the call per
+    Premise 3.  ``False`` (PR 3b default) means non-cap denials emit
+    ``policy_decision`` events with ``enforced=False`` and the action
+    proceeds (log-only mode).  ``True`` (PR 4 default) means non-cap
+    denials block.  Cost-cap surfaces ignore this flag — they enforce
+    immediately per PR 3a.
     """
 
     effective_caps: CostCaps
     cache_ttl_s: int | None = None
-    # PR 3b fields — captured in snapshot shape but unconsumed in PR 3a:
     tool_allow_fn: Callable[[str], bool] | None = None
     mcp_allow_fn: Callable[[str], bool] | None = None
     model_override: str | None = None
+    enforce_noncap: bool = False
 
 
 # ──────────────────────────────────────────────────────────────────────────

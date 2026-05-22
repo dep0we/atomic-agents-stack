@@ -1308,42 +1308,133 @@ class AtomicAgent:
         return self._mandate_check
 
     def _take_policy_snapshot(self):
-        """Take a frozen per-call Policy snapshot at call() entry (#89 PR 3a).
+        """Take a frozen per-call Policy snapshot at call() entry (#89 PR 3a + 3b).
 
         Called once at the START of ``call()`` (alongside the ``_helpers_this_run``
-        reset).  All cost-cap checks within the same ``call()`` read from this
-        snapshot — operator edits to ``policy.md`` mid-call are deferred to the
-        NEXT call (Premise 3: predictability over freshness within the call).
+        reset).  All Policy consumption sites within the same ``call()`` read
+        from this snapshot — operator edits to ``policy.md`` mid-call are
+        deferred to the NEXT call (Premise 3: predictability over freshness
+        within the call).
 
         Returns a ``PolicySnapshotForCall`` with:
-        - ``effective_caps``: MIN-composed Policy caps for THIS agent.
-        - ``cache_ttl_s``: backend capability snapshot at call-entry time.
-        - PR 3b stub fields (``tool_allow_fn``, ``mcp_allow_fn``,
-          ``model_override``) are ``None`` in PR 3a — only cost caps are consumed.
 
-        On any backend error, falls back to a no-opinion ``CostCaps()`` and
-        logs a warning rather than aborting the call.
+        - ``effective_caps``: MIN-composed Policy caps for THIS agent (PR 3a).
+        - ``cache_ttl_s``: backend capability snapshot at call-entry time.
+        - ``tool_allow_fn`` / ``mcp_allow_fn``: closures bound to a
+          per-snapshot result cache + the backend reference + the agent name
+          (all captured via default-arg). The cache makes Premise 3's
+          "frozen at call entry" promise visible to consumers: a multi-turn
+          loop that consults the same tool/server name N times queries the
+          backend ONCE per snapshot. Default-arg capture also pins the
+          backend reference, so a later ``self.policy_backend`` reassignment
+          (rare) cannot contaminate the snapshot.
+        - ``model_override``: resolved ONCE at snapshot time via
+          ``get_effective_model``; ``None`` means "no Policy opinion, defer to
+          ``model.md``." PR 3b.
+        - ``enforce_noncap``: env-var value (``ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP``)
+          read ONCE at call entry; non-cap denials emit
+          ``enforced=enforce_noncap`` and either block (True) or proceed
+          (False, the PR 3b default).
+
+        On any snapshot-time backend error (``get_effective_caps`` /
+        ``get_effective_model``), falls back to no-opinion values and logs a
+        warning rather than aborting the call. The closures themselves treat
+        per-call backend failures as "allow" (log-only mode is fail-open;
+        the fail-closed mode tracked at issue #242 is a separate surface).
         """
-        from .policy.types import CostCaps, PolicySnapshotForCall
+        from .policy.types import (
+            CostCaps,
+            PolicySnapshotForCall,
+            _read_enforce_noncap_flag,
+        )
 
         try:
             effective_caps = self.policy_backend.get_effective_caps(self.name)
             cache_ttl_s = self.policy_backend.capabilities().cache_ttl_s
         except Exception as exc:  # noqa: BLE001
-            import logging
-
-            logging.getLogger(__name__).warning(
+            _logger.warning(
                 "PolicyBackend.get_effective_caps(%r) failed — "
-                "falling back to no-opinion CostCaps(): %s",
+                "falling back to no-opinion CostCaps(): %s: %s",
                 self.name,
+                type(exc).__name__,
                 exc,
             )
             effective_caps = CostCaps()
             cache_ttl_s = None
 
+        try:
+            model_override = self.policy_backend.get_effective_model(self.name)
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning(
+                "PolicyBackend.get_effective_model(%r) failed — "
+                "falling back to no-opinion (None): %s: %s",
+                self.name,
+                type(exc).__name__,
+                exc,
+            )
+            model_override = None
+
+        # Per-snapshot result cache + default-arg capture together honor the
+        # frozen-snapshot contract (Premise 3): each (tool_name) or
+        # (server_name) is queried at most once per snapshot, and the backend
+        # reference is pinned even if ``self.policy_backend`` is later
+        # reassigned. The cache dict is a fresh instance per call() so it
+        # cannot leak state across calls.
+        def tool_allow_fn(
+            tool_name: str,
+            _cache: dict[str, bool] = {},
+            _backend=self.policy_backend,
+            _agent_name=self.name,
+        ) -> bool:
+            if tool_name in _cache:
+                return _cache[tool_name]
+            try:
+                result = _backend.is_tool_allowed(_agent_name, tool_name)
+            except Exception as exc:  # noqa: BLE001
+                _logger.warning(
+                    "PolicyBackend.is_tool_allowed(%r, %r) failed — "
+                    "treating as allow (log-only mode fail-open; "
+                    "fail-closed tracked at #242): %s: %s",
+                    _agent_name,
+                    tool_name,
+                    type(exc).__name__,
+                    exc,
+                )
+                result = True
+            _cache[tool_name] = result
+            return result
+
+        def mcp_allow_fn(
+            server_name: str,
+            _cache: dict[str, bool] = {},
+            _backend=self.policy_backend,
+            _agent_name=self.name,
+        ) -> bool:
+            if server_name in _cache:
+                return _cache[server_name]
+            try:
+                result = _backend.is_mcp_server_allowed(_agent_name, server_name)
+            except Exception as exc:  # noqa: BLE001
+                _logger.warning(
+                    "PolicyBackend.is_mcp_server_allowed(%r, %r) failed — "
+                    "treating as allow (log-only mode fail-open; "
+                    "fail-closed tracked at #242): %s: %s",
+                    _agent_name,
+                    server_name,
+                    type(exc).__name__,
+                    exc,
+                )
+                result = True
+            _cache[server_name] = result
+            return result
+
         return PolicySnapshotForCall(
             effective_caps=effective_caps,
             cache_ttl_s=cache_ttl_s,
+            tool_allow_fn=tool_allow_fn,
+            mcp_allow_fn=mcp_allow_fn,
+            model_override=model_override,
+            enforce_noncap=_read_enforce_noncap_flag(),
         )
 
     def _ensure_llm_judge(self):
@@ -3042,21 +3133,60 @@ class AtomicAgent:
             # Discover tools and register them into the tool registry before
             # the first LLM call so the model sees the full tool list.
             if self.config.mcp_servers and self.mcp_pool is None:
-                self.mcp_pool = MCPClientPool(
-                    server_specs=self.config.mcp_servers,
-                    agents_root=self.agents_root,
-                )
-                self.mcp_pool.connect_all()
-                mcp_tool_defs = self.mcp_pool.discover_tools()
-                for td in mcp_tool_defs:
-                    self.tool_registry.register(td, allow_overwrite=True)
-                    _mcp_registered_names.append(td.name)
-                _logger.debug(
-                    "agent %r: MCP pool ready — %d tools from %d server(s)",
-                    self.name,
-                    len(mcp_tool_defs),
-                    len(self.config.mcp_servers),
-                )
+                # ── #89 PR 3b: Policy MCP-allowlist consultation ────────
+                # Consult Policy on each declared server. Emit a
+                # policy_decision event (axis=mcp_allowlist) per denied
+                # server. In log-only mode (enforce_noncap=False, PR 3b
+                # default) all configured servers still connect; in
+                # enforcement mode denied servers are filtered out before
+                # the pool spins up so we don't pay the subprocess cost.
+                effective_mcp_specs = self.config.mcp_servers
+                pol_snap = self._policy_snapshot_this_call
+                if pol_snap is not None and pol_snap.mcp_allow_fn is not None:
+                    from .policy.types import (
+                        PolicyDecision,
+                        _emit_policy_decision,
+                    )
+
+                    allowed_specs = []
+                    for _spec in self.config.mcp_servers:
+                        if pol_snap.mcp_allow_fn(_spec.name):
+                            allowed_specs.append(_spec)
+                            continue
+                        _emit_policy_decision(
+                            PolicyDecision(
+                                decision_kind="deny",
+                                denying_layer="policy",
+                                agent_name=self.name,
+                                axis="mcp_allowlist",
+                                mcp_server_name=_spec.name,
+                                enforced=pol_snap.enforce_noncap,
+                                cache_ttl_s=pol_snap.cache_ttl_s,
+                            ),
+                            self.log_backend,
+                            run_id=self.run_id,
+                        )
+                        if not pol_snap.enforce_noncap:
+                            # Log-only: server still connects.
+                            allowed_specs.append(_spec)
+                    effective_mcp_specs = allowed_specs
+
+                if effective_mcp_specs:
+                    self.mcp_pool = MCPClientPool(
+                        server_specs=effective_mcp_specs,
+                        agents_root=self.agents_root,
+                    )
+                    self.mcp_pool.connect_all()
+                    mcp_tool_defs = self.mcp_pool.discover_tools()
+                    for td in mcp_tool_defs:
+                        self.tool_registry.register(td, allow_overwrite=True)
+                        _mcp_registered_names.append(td.name)
+                    _logger.debug(
+                        "agent %r: MCP pool ready — %d tools from %d server(s)",
+                        self.name,
+                        len(mcp_tool_defs),
+                        len(effective_mcp_specs),
+                    )
 
             # PR 3b ESCALATE: opportunistic throttled poll of the
             # escalation queue. Operators (and the auto-decide-timeout
@@ -3075,6 +3205,55 @@ class AtomicAgent:
                 model = check.fallback_model
             else:
                 model = model_override or self.config.default_model
+
+            # ── #89 PR 3b: Policy model-selection consultation ──────────
+            # If Policy declares an effective model that differs from what
+            # model.md declared as the agent's default, emit a
+            # policy_decision event (decision_kind=override,
+            # axis=model_selection). model_from_md is the model.md value
+            # itself, not the post-cost-cap-fallback effective model — the
+            # audit contrast operators want is "Policy vs model.md", and
+            # cost-cap fallback decisions are their own policy_decision
+            # event family from PR 3a. In log-only mode (enforce_noncap
+            # False, PR 3b default) the prior effective model is kept and
+            # the emission is informational. In enforcement mode Policy's
+            # choice replaces it; cost-cap caps still apply per iteration
+            # and can trigger a fallback on the NEXT iteration regardless.
+            #
+            # NOTE: decision_kind="override" is emitted in log-only mode
+            # too. The enforced=False field is the disambiguator —
+            # operators reading the audit log see "would-have-been
+            # override" while the action still proceeded with the
+            # pre-Policy model.
+            pol_snap = self._policy_snapshot_this_call
+            _md_default_model = self.config.default_model
+            if (
+                pol_snap is not None
+                and pol_snap.model_override is not None
+                and pol_snap.model_override != _md_default_model
+            ):
+                from .policy.types import (
+                    PolicyDecision,
+                    _emit_policy_decision,
+                )
+
+                _emit_policy_decision(
+                    PolicyDecision(
+                        decision_kind="override",
+                        denying_layer=None,
+                        agent_name=self.name,
+                        axis="model_selection",
+                        model_from_md=_md_default_model,
+                        model_from_policy=pol_snap.model_override,
+                        enforced=pol_snap.enforce_noncap,
+                        cache_ttl_s=pol_snap.cache_ttl_s,
+                    ),
+                    self.log_backend,
+                    run_id=self.run_id,
+                )
+                if pol_snap.enforce_noncap:
+                    model = pol_snap.model_override
+                # Log-only: keep the pre-Policy model.
 
             # Build prompt
             system_prompt = self.assemble_system_prompt()
@@ -3472,6 +3651,66 @@ class AtomicAgent:
                             }
                         )
                         continue
+
+                    # ── #89 PR 3b: Policy tool-allowlist consultation ────
+                    # Consult the per-call frozen Policy snapshot. On deny:
+                    # emit a policy_decision event (axis=tool_allowlist).
+                    # In log-only mode (enforce_noncap=False, PR 3b default),
+                    # the action still proceeds — the audit trail records the
+                    # would-be denial so operators can verify policy before
+                    # PR 4 flips the flag. In enforcement mode, synthesize a
+                    # policy_blocked tool_result mirroring the judge_blocked
+                    # shape so the LLM sees the refusal on the next turn.
+                    pol_snap = self._policy_snapshot_this_call
+                    if pol_snap is not None and pol_snap.tool_allow_fn is not None:
+                        _tool_name = tu.get("name", "")
+                        if not pol_snap.tool_allow_fn(_tool_name):
+                            from .policy.types import (
+                                PolicyDecision,
+                                _emit_policy_decision,
+                            )
+
+                            _emit_policy_decision(
+                                PolicyDecision(
+                                    decision_kind="deny",
+                                    denying_layer="policy",
+                                    agent_name=self.name,
+                                    axis="tool_allowlist",
+                                    tool_name=_tool_name,
+                                    enforced=pol_snap.enforce_noncap,
+                                    cache_ttl_s=pol_snap.cache_ttl_s,
+                                ),
+                                self.log_backend,
+                                run_id=self.run_id,
+                            )
+                            if pol_snap.enforce_noncap:
+                                from .tools import ToolCallResult as _TCR
+
+                                policy_blocked_result = _TCR(
+                                    tool_name=_tool_name,
+                                    tool_use_id=tcid,
+                                    input=tu.get("input", {}) or {},
+                                    output=None,
+                                    error=(
+                                        f"policy_denied: tool {_tool_name!r} "
+                                        "not allowed by policy.md"
+                                    ),
+                                    latency_ms=0,
+                                )
+                                all_tool_call_results.append(policy_blocked_result)
+                                iter_tool_results.append(policy_blocked_result)
+                                self._log(
+                                    {
+                                        "trigger": "tool_call",
+                                        "parent_run_id": self.run_id,
+                                        "tool_name": _tool_name,
+                                        "latency_ms": 0,
+                                        "error": policy_blocked_result.error,
+                                    }
+                                )
+                                continue
+                            # Flag-off: log-only, fall through to execute.
+
                     tool_result = self.tool_registry.execute(tu)
                     all_tool_call_results.append(tool_result)
                     iter_tool_results.append(tool_result)
