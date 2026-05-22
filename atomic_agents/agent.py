@@ -3023,6 +3023,19 @@ class AtomicAgent:
         critical=True bypasses cost guardrails (still logged with critical: true).
         write_captures=False extracts but doesn't persist captures (dry-run mode).
 
+        ``model_override``: per-call model selection that supersedes ``model.md``'s
+        default. Policy's ``get_effective_model`` (when set) takes precedence over
+        this per-call kwarg in enforce mode (``ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP``
+        unset or true, the PR 4 default) per spec/32 Premise 1 ("most-restrictive
+        wins"): fleet-config is operator intent at config time, the kwarg is
+        operator intent at call time, and the fleet-config layer is the
+        authoritative one. When Policy overrides a per-call kwarg (kwarg supplied
+        and differs from Policy's value), the ``policy_decision`` audit event
+        carries ``model_from_per_call_override`` so the caller can detect that
+        the kwarg was superseded (issue #274). When the kwarg matches Policy's
+        value the override emission is skipped — operator and Policy aligned and
+        nothing was overridden from either layer's perspective.
+
         parent_remaining_headroom_usd: when set (by a coordinator's delegate()),
         this call's own cap is clamped to min(own remaining, parent headroom).
         This enforces the coordinator's cap as a true tree-cap (spec/15).
@@ -3105,6 +3118,16 @@ class AtomicAgent:
             # common case; multi-mandate iterations accept a documented
             # apportionment gap (see CHANGELOG).
             self._successful_mandate_cites_this_call: list[tuple[str, str]] = []
+            # #273: per-call dedup for tool-allowlist denial emissions. In log-only
+            # mode (enforce_noncap=False) the LLM does not see a refusal and may
+            # re-attempt a denied tool every iteration; without dedup the audit log
+            # records N events per denied tool per call. In enforce mode the
+            # synthesized policy_blocked ToolCallResult feeds back to the LLM and
+            # naturally bounds re-attempts, but dedup is cheap and keeps the audit
+            # shape uniform across both modes. MCP discovery already emits at most
+            # once per server per call (single discovery loop) so no equivalent
+            # set is needed there.
+            self._policy_tool_denials_emitted_this_call: set[str] = set()
 
             # Cost guardrails check FIRST — before spinning up MCP subprocesses.
             # A call that will be skipped due to cost cap should not pay the
@@ -3227,10 +3250,19 @@ class AtomicAgent:
             # pre-Policy model.
             pol_snap = self._policy_snapshot_this_call
             _md_default_model = self.config.default_model
+            # PR 4 R1 P0-2 fix: compare against the actual pre-Policy effective
+            # model (the `model` local already resolved at line 3203-3207 via
+            # cost-cap fallback / per-call kwarg / model.md default) instead of
+            # `_md_default_model`. The original gate missed the silent-override
+            # case where model.md and policy.md agree but the operator's per-call
+            # kwarg differs from both: pre-fix, Policy stomped the kwarg with
+            # zero audit signal. Post-fix, an override emission fires whenever
+            # Policy's value differs from what would have been used.
+            _pre_policy_model = model
             if (
                 pol_snap is not None
                 and pol_snap.model_override is not None
-                and pol_snap.model_override != _md_default_model
+                and pol_snap.model_override != _pre_policy_model
             ):
                 from .policy.types import (
                     PolicyDecision,
@@ -3245,6 +3277,22 @@ class AtomicAgent:
                         axis="model_selection",
                         model_from_md=_md_default_model,
                         model_from_policy=pol_snap.model_override,
+                        # #274: surface the per-call kwarg in the audit so
+                        # operators can distinguish "Policy overrode model.md"
+                        # from "Policy overrode the caller's explicit choice."
+                        # PR 4 R1 P0-1 fix: only populate when the kwarg was
+                        # actually superseded — kwarg supplied AND differs from
+                        # Policy's value. When the kwarg matches Policy's value
+                        # the operator's choice and Policy aligned and no
+                        # kwarg-override occurred (the field would be a lie).
+                        model_from_per_call_override=(
+                            model_override
+                            if (
+                                model_override is not None
+                                and model_override != pol_snap.model_override
+                            )
+                            else None
+                        ),
                         enforced=pol_snap.enforce_noncap,
                         cache_ttl_s=pol_snap.cache_ttl_s,
                     ),
@@ -3670,19 +3718,33 @@ class AtomicAgent:
                                 _emit_policy_decision,
                             )
 
-                            _emit_policy_decision(
-                                PolicyDecision(
-                                    decision_kind="deny",
-                                    denying_layer="policy",
-                                    agent_name=self.name,
-                                    axis="tool_allowlist",
-                                    tool_name=_tool_name,
-                                    enforced=pol_snap.enforce_noncap,
-                                    cache_ttl_s=pol_snap.cache_ttl_s,
-                                ),
-                                self.log_backend,
-                                run_id=self.run_id,
-                            )
+                            # #273: emit at most one event per (tool_name, call).
+                            # In log-only mode, the LLM does not see refusals and
+                            # may re-attempt the same denied tool every iteration;
+                            # without dedup the audit log spams N events. In
+                            # enforce mode the synthesized ToolCallResult bounds
+                            # re-attempts via LLM feedback, but dedup keeps the
+                            # audit shape uniform across modes.
+                            if (
+                                _tool_name
+                                not in self._policy_tool_denials_emitted_this_call
+                            ):
+                                _emit_policy_decision(
+                                    PolicyDecision(
+                                        decision_kind="deny",
+                                        denying_layer="policy",
+                                        agent_name=self.name,
+                                        axis="tool_allowlist",
+                                        tool_name=_tool_name,
+                                        enforced=pol_snap.enforce_noncap,
+                                        cache_ttl_s=pol_snap.cache_ttl_s,
+                                    ),
+                                    self.log_backend,
+                                    run_id=self.run_id,
+                                )
+                                self._policy_tool_denials_emitted_this_call.add(
+                                    _tool_name
+                                )
                             if pol_snap.enforce_noncap:
                                 from .tools import ToolCallResult as _TCR
 
