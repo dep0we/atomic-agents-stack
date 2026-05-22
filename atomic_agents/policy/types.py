@@ -63,20 +63,26 @@ ENFORCE_NONCAP_ENV_VAR = "ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP"
 
 
 def _read_enforce_noncap_flag() -> bool:
-    """Read ``ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP`` (default ``False``).
+    """Read ``ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP`` (default ``True`` — PR 4).
 
     Per spec/32 D3 — single flag covers tool allowlist + MCP server allowlist
     + model selection together. Cost-cap surfaces enforce immediately (PR 3a)
     and do not consult this flag.
 
-    Truthy values (case-insensitive): ``"1"``, ``"true"``, ``"yes"``, ``"on"``.
-    Anything else (including unset, ``""``, ``"0"``, ``"false"``) is ``False``.
+    Falsy values (case-insensitive): ``"0"``, ``"false"``, ``"no"``, ``"off"``,
+    ``""``. Anything else (including unset, ``"1"``, ``"true"``, ``"yes"``,
+    ``"on"``) is ``True`` — PR 4 (#89) flipped the default to enforce so an
+    operator authoring ``policy.md`` sees the surfaces enforce by default.
+    Operators wanting to delay enforce mode set the env var explicitly to
+    ``"false"`` (or any documented falsy value).
 
-    PR 3b ships with the flag default ``False`` (log-only mode); PR 4 flips
-    the default to ``True`` and locks spec/32.
+    PR 3b shipped with the default ``False`` (log-only); PR 4 flips to
+    ``True`` and locks spec/32.
     """
     val = os.environ.get(ENFORCE_NONCAP_ENV_VAR, "").strip().lower()
-    return val in ("1", "true", "yes", "on")
+    if val == "":
+        return True
+    return val not in ("0", "false", "no", "off")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -221,6 +227,19 @@ class PolicyDecision:
     mcp_server_name: str | None = None
     model_from_md: str | None = None
     model_from_policy: str | None = None
+    # #274 (PR 4): when ``decision_kind == "override"`` and the operator
+    # supplied a per-call ``model_override=`` kwarg to
+    # ``AtomicAgent.call(...)`` AND that kwarg differs from Policy's value
+    # (i.e., Policy actually superseded the operator's explicit choice),
+    # this field carries the kwarg value so audit readers can distinguish
+    # "Policy overrode the model.md value" from "Policy overrode the
+    # operator's explicit per-call choice." ``None`` when no kwarg was
+    # supplied, when the kwarg matched Policy (no override of operator
+    # intent), or when the event is not a model_selection override.
+    # Precedence: fleet-config (Policy) wins over per-call kwarg per
+    # spec/32 §"Composition math" — the per-call kwarg is a soft hint,
+    # not a Policy escape.
+    model_from_per_call_override: str | None = None
 
     # enforcement flag — always True for cost-cap denials (PR 3a);
     # PR 3b populates based on ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP for
@@ -326,6 +345,8 @@ def _emit_policy_decision(
         extra["model_from_md"] = decision.model_from_md
     if decision.model_from_policy is not None:
         extra["model_from_policy"] = decision.model_from_policy
+    if decision.model_from_per_call_override is not None:
+        extra["model_from_per_call_override"] = decision.model_from_per_call_override
     if decision.cache_ttl_s is not None:
         extra["cache_ttl_s"] = decision.cache_ttl_s
     if decision.proposal_id is not None:
