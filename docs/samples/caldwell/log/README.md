@@ -13,6 +13,8 @@ Each record includes:
 - `status` — `ok | error | skipped`
 - `summary` — one-line description
 
+Note: Sample `run_id` literals are illustrative and operator-customizable; they do not document the runtime generator format.
+
 Helper, delegate, and tool child records also carry `parent_run_id` to link back to the parent run.
 
 Optional fields: `error`, `cost_usd`, `cache_hit_tokens`, `cache_miss_tokens`, `tools_called`, `skill_invocation_id`.
