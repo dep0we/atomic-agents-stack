@@ -8,16 +8,15 @@ For shipped work, see [CHANGELOG.md](CHANGELOG.md). For the framework's design s
 
 ## v1.0 — remaining backend protocols
 
-The framework's protocol-pattern scaling story closes at v1.0. **Eight of twelve** backend protocols have shipped: `MemoryBackend`, `LLMBackend`, `JudgeBackend`, `LockBackend`, `LogBackend`, `AgentProfileBackend`, `ToolRegistryBackend`, `MandateBackend`. Four remain.
+The framework's protocol-pattern scaling story closes at v1.0. **Nine of twelve** backend protocols have shipped: `MemoryBackend`, `LLMBackend`, `JudgeBackend`, `LockBackend`, `LogBackend`, `AgentProfileBackend`, `ToolRegistryBackend`, `MandateBackend`, `PolicyBackend`. Three remain.
 
 | Issue | Backend | Status | What it unblocks |
 |-------|---------|--------|------------------|
-| [#89](https://github.com/dep0we/atomic-agents-stack/issues/89) | `PolicyBackend` | **In progress** (4-PR arc) | Org-level policy that supersedes per-agent caps and allowlists — multi-tenant tenancy primitive |
 | [#62](https://github.com/dep0we/atomic-agents-stack/issues/62) | `PersonaBackend` | Planned (scope-design pass queued) | UI-editable IDENTITY/SOUL/USER, persona versioning, A/B testing |
 | [#65](https://github.com/dep0we/atomic-agents-stack/issues/65) | `CorpusBackend` | Planned | Wiki/raw corpus at GB scale, semantic search, RAG retrieval |
 | [#201](https://github.com/dep0we/atomic-agents-stack/issues/201) | `MCPServerRegistryBackend` | Planned | Catalog + install/audit for MCP servers (the MCP equivalent of the ToolRegistry pattern) |
 
-**v1.0 ships when all four land + their conformance suites pin the contract.** Same agent definitions, same `agent.call()` flow, same audit trail — different backends registered.
+**v1.0 ships when all three land + their conformance suites pin the contract.** Same agent definitions, same `agent.call()` flow, same audit trail — different backends registered.
 
 ---
 

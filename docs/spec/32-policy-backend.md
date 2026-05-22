@@ -1,8 +1,10 @@
 # spec/32 — PolicyBackend (fleet-wide settings layer)
 
-**Status:** RFC. Locks when the implementation matches and the conformance suite pins the contract. Target lock: PR 4 of #89.
+**Status:** LOCKED at #89 PR 4 (2026-05-22). The shipped reference implementation matches this spec; the parametrized conformance suite pins the Protocol contract; the four arc PRs have shipped (#234 scaffolding, #237 wiring, #244 cost-cap consumption, #276 non-cap log-only) and PR 4 flipped `ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP` to enforce by default. SaaS / Postgres / org-admin-console adapters can target the frozen surface from day 1.
 
 > **Pre-#89 PR 1 amendments (2026-05-19):** Drafted in PR 1 from the /office-hours + /plan-eng-review locked design doc (`~/.gstack/projects/dep0we-atomic-agents-stack/dep0we-main-design-20260519-084540.md`). 11 architectural decisions locked + 14 plan-subagent prep findings folded.
+>
+> **PR 4 amendments (2026-05-22):** Flipped `ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP` default to `true` (non-cap surfaces enforce by default). Added `PolicyDecision.model_from_per_call_override` for per-call kwarg audit (#274). Documented per-call dedup invariant for tool-allowlist emissions (#273). Locked the 7 MUSTs in §"Implementer contract" — provisional footnote removed.
 
 ## Overview
 
@@ -230,6 +232,16 @@ class PolicyDecision:
     mcp_server_name: str | None = None
     model_from_md: str | None = None
     model_from_policy: str | None = None
+    # PR 4 (#274): per-call kwarg audit. Populated on model-selection
+    # overrides when the caller supplied agent.call(model_override=...)
+    # AND that kwarg differs from Policy's value (i.e., Policy actually
+    # superseded the operator's explicit choice). None when no kwarg was
+    # supplied, when the kwarg matched Policy's value (no override of
+    # operator intent), or when the event is not a model_selection
+    # override. Operators reading the audit can distinguish "Policy
+    # overrode model.md" from "Policy overrode the caller's explicit
+    # per-call choice."
+    model_from_per_call_override: str | None = None
     # enforcement flag:
     enforced: bool = False
     # common:
@@ -241,12 +253,16 @@ class PolicyDecision:
 **Discriminator semantics:**
 
 - `decision_kind="deny"`: some layer denied the action. `denying_layer` names which (`policy` / `mandate` / `model_md` / `per_call`). Axis-specific fields populate per the surface: `cost_cap` → cap_dimension + attempted_value + effective_cap; `tool_allowlist` → tool_name; `mcp_allowlist` → mcp_server_name.
-- `decision_kind="override"`: Policy returned a non-None model selection that supersedes `model.md`. `denying_layer` is None (no denial occurred — the override applied without violation). Axis is `model_selection`; `model_from_md` and `model_from_policy` populate.
+- `decision_kind="override"`: Policy returned a non-None model selection that supersedes the **pre-Policy effective model** — the value the framework would have used if Policy had no opinion (the per-call `model_override=` kwarg if supplied, otherwise the cost-cap fallback model if a fallback fired, otherwise `model.md`'s default). `denying_layer` is None (no denial occurred — the override applied without violation). Axis is `model_selection`; `model_from_md` and `model_from_policy` populate. When the operator supplied a per-call kwarg AND Policy superseded that specific choice (kwarg != Policy's value), `model_from_per_call_override` also populates. When the pre-Policy effective model already equals Policy's value (operator and Policy aligned), no emission fires — there is no override to record.
+
+**Cost-cap fallback interaction:** when `_check_cost_guardrails` fires a `fallback` action (substituting a cheaper model to stay under a daily / monthly cap), the pre-Policy effective model is that fallback model. If Policy's `get_effective_model()` returns a different (potentially more expensive) value, the enforce-mode replacement uses Policy's value — defeating the fallback's cost-protection intent for the current iteration. The next iteration's cost-guardrail check will re-evaluate and may fire fallback again, but the current iteration runs the expensive model regardless. Operators who want fallback to win should leave Policy's `model` field unset for that agent; operators who want Policy to win should size cost caps generously enough that Policy's chosen model fits.
 
 **`enforced` field semantics:**
 
 - `enforced=True`: the denial or override blocked / altered the action. Cost-cap denials set `enforced=True` when `cap_action="skip"` (the default — the call is blocked outright). For `cap_action ∈ {"alert", "fallback"}` the call proceeds (alert logs a warning + continues; fallback substitutes a cheaper model + continues) and the cost-cap event records `enforced=False` so the audit trail truthfully reflects whether money was actually spent. Operators reading `LogQuery(primitive="policy_decision", enforced=True)` for billing-incident attribution see only the actually-blocked events.
-- `enforced=False`: log-only mode — the denial or override was recorded in the audit trail but the action proceeded. Non-cap surfaces (tools / MCP / model) set `enforced=value_of_ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP` (default `false`). That env-var and those surfaces ship in PR 3b.
+- `enforced=False`: log-only mode — the denial or override was recorded in the audit trail but the action proceeded. Non-cap surfaces (tools / MCP / model) set `enforced=value_of_ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP`. **The env-var default flipped from `false` to `true` at PR 4 (this lock)** — operators authoring `policy.md` see tool / MCP / model surfaces enforce by default. To opt back into log-only mode, set `ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP=false` explicitly.
+
+**Per-call dedup invariant (#273):** the tool-allowlist consumption site emits at most one `policy_decision(axis="tool_allowlist")` event per `(tool_name, call)`. In log-only mode the LLM does not see refusals and may re-attempt a denied tool every iteration; without dedup the audit log records N events per denied tool per call. The framework tracks emitted denials in a per-call set reset at `agent.call()` entry. MCP discovery emits at most once per server per call by construction (single discovery loop) and does not need the same set. Model-selection emissions are bounded by the once-per-call comparison check.
 
 Operators reading the audit log filter by `decision_kind` first, then `axis`. The single event family closes the Premise 4 promise that operators see ONE event for "was this Policy or Mandate?" with `denying_layer` answering the question directly.
 
@@ -274,17 +290,14 @@ A backend that implements the `PolicyBackend` Protocol commits to the contract b
 
 7. **`PolicyDecision` event schema compliance.** Backends emitting `policy_decision` events (PR 3 onwards) MUST use the schema in §"Policy decision event schema" above without extending field semantics. Custom backend-specific fields MAY be added in an `extra` dict if needed for backend-internal debugging, but the canonical fields keep their canonical semantics. SaaS adapters MUST emit events that the dashboard's `policy_decision` filter can parse uniformly.
 
-*Count provisional; PR 4 may adjust based on PR 3 adversarial review findings.*
-
 The reference `FilesystemPolicyBackend` implementation in `atomic_agents/policy/filesystem.py` is the canonical example of this contract. Future Postgres / SaaS / org-admin-console adapters should mirror its shape; the conformance suite (`tests/test_policy_protocol_conformance.py`) parametrizes across registered backends so the contract is verified by the same tests that pin `get_effective_caps` / `is_tool_allowed` / `is_mcp_server_allowed` / `get_effective_model` / `capabilities` semantics.
 
 ## Out of scope
 
 This spec describes the **what** and the **where**. It does not pin:
 
-- **AtomicAgent wiring** — PR 2 of #89 adds `AtomicAgent(..., policy_backend=...)` kwarg + per-runner kwargs + `doctor.check_policy_backend` + delegate threading per D1.
-- **Consumption logic** — PR 3 of #89 wires `_check_cost_guardrails` MIN composition, `MandateCheck` steps 7-9 pre-composed cap consumption, tool dispatch site, MCP discovery site, model-selection site, and `policy_decision` event emission behind the `ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP=false` flag (log-only mode for non-cap surfaces; cost caps enforce immediately).
-- **Flag flip to enforce** — PR 4 of #89 flips `ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP` default to `true`, locks this spec, and bumps the framework's status from "eight backend protocols shipped" to "nine".
+- **AtomicAgent wiring** — shipped in PR 2 of #89 (`AtomicAgent(..., policy_backend=...)` kwarg + per-runner kwargs + `doctor.check_policy_backend` + delegate threading per D1).
+- **Consumption logic** — shipped in PR 3a / PR 3b of #89 (`_check_cost_guardrails` MIN composition, `MandateCheck` steps 7-9 pre-composed cap consumption, tool dispatch site, MCP discovery site, model-selection site, and `policy_decision` event emission). PR 4 (this lock) flipped the `ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP` default from `false` to `true` so non-cap surfaces enforce by default. Cost caps have always enforced immediately (PR 3a) and ignore this flag.
 - **Strict-mode capability flag** (D4 locked "don't expose in v1"). If compliance-shaped deployments demand explicit strict-mode audit posture later, retrofit `PolicyCapabilities.strict_mode` as an additive change.
 - **`is_model_allowed(model_name) -> bool`** — model-selection allowlist semantics deferred. Current `get_effective_model() -> str | None` covers the override case; allowlist is additive.
 - **Spec-defined model-compatibility families** — `get_effective_model()` override compatibility is operator-owned (D9 fold #2); framework does not enforce.
