@@ -301,3 +301,5 @@ Before opening a PR, read [`CLAUDE.md`](CLAUDE.md) (the project's design ethos a
 ## Status
 
 **v0.13.0, alpha.** Core runtime stable. 2401 tests passing on Python 3.11 / 3.12. Nine of twelve backend protocols shipped (see the backend protocols table above); three remain for v1.0 (`PersonaBackend` / `CorpusBackend` / `MCPServerRegistryBackend` planned). The surface stabilizes at v1.0. Pre-1.0 — Minor releases may contain breaking changes (see [`docs/deployment/versioning.md`](docs/deployment/versioning.md)). Single-maintainer project; reference implementation anyone can use, fork, or extend.
+
+Start at [`docs/README.md`](docs/README.md) for the spec entry point. The locked spec docs and RFCs in [`docs/spec/`](docs/spec/) cover:
