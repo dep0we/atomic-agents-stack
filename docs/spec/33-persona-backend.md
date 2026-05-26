@@ -181,7 +181,7 @@ Personas live under a hidden directory (mirrors the `.snapshots/` pattern from s
 <personas_root>/<persona_id>/IDENTITY.md   -- identity body
 <personas_root>/<persona_id>/SOUL.md       -- soul body
 <personas_root>/<persona_id>/USER.md       -- user body
-<personas_root>/<persona_id>/metadata.json -- version, label, created_at
+<personas_root>/<persona_id>/metadata.json -- schema_version (int = 1), version (int), label (str or null), created_at (ISO 8601 string)
 ```
 
 The `metadata.json` sidecar carries the structured metadata fields that are not naturally represented as markdown:

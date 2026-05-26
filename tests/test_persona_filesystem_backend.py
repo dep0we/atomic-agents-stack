@@ -243,39 +243,46 @@ def test_chmod000_personas_root_propagates_permission_error(tmp_path: Path) -> N
 # Atomic write
 
 
-def test_mid_save_failure_overwrite_leaves_old_record_intact(
+def test_mid_save_failure_overwrite_restores_old_record(
     tmp_path: Path,
 ) -> None:
-    """A mid-save failure during ``overwrite=True`` leaves the OLD persona
-    record intact.
+    """A mid-save failure during ``overwrite=True`` restores the backup and
+    retries. After exhausting retries the old record is preserved on disk.
 
     ``save_persona(overwrite=True)`` writes files to a sibling temp dir,
     renames the existing persona dir to a backup, then renames the temp dir
-    to the persona dir. If the second rename fails, the backup is restored.
-    We monkeypatch ``Path.rename`` to raise on the second call (the
-    temp-dir-to-persona-dir rename) and verify that the old record is intact
-    afterward and that the OSError propagates.
+    to the persona dir. If the second rename fails, the backup is restored
+    and the retry loop continues. To force exhaustion of all retries we
+    monkeypatch ``Path.rename`` to always fail on the temp-to-persona-dir
+    step.
     """
+    from atomic_agents.exceptions import PersonaError
     from atomic_agents.persona.filesystem import FilesystemPersonaBackend
 
     backend = FilesystemPersonaBackend(tmp_path)
     original = _make_persona(identity="Original content.", version=1)
     backend.save_persona("my-persona", original)
 
-    call_count = [0]
     real_rename = Path.rename
+    rename_calls: list[tuple[str, str]] = []
 
-    def _fail_on_second_rename(self, target):
-        call_count[0] += 1
-        if call_count[0] == 2:
-            raise OSError("Simulated mid-save failure")
+    def _always_fail_second_rename(self, target):
+        # First rename (persona_dir -> backup): allow.
+        # Second rename (tmp -> persona_dir): fail every time to exhaust retries.
+        src_name = Path(str(self)).name
+        dst_name = Path(str(target)).name
+        rename_calls.append((src_name, dst_name))
+        if dst_name == "my-persona" and not src_name.startswith(".my-persona.old-"):
+            raise OSError("Simulated persistent mid-save failure")
         return real_rename(self, target)
 
     updated = _make_persona(identity="Updated content.", version=2)
-    with patch.object(Path, "rename", _fail_on_second_rename):
-        with pytest.raises(OSError):
+    with patch.object(Path, "rename", _always_fail_second_rename):
+        with pytest.raises((OSError, PersonaError)):
             backend.save_persona("my-persona", updated, overwrite=True)
 
+    # The backup restore puts the old record back each time; after all retries
+    # exhaust, the original record is still readable.
     loaded = backend.load_persona("my-persona")
     assert loaded.identity == "Original content."
     assert loaded.version == 1
@@ -611,3 +618,190 @@ def test_metadata_unsupported_schema_version_raises_PersonaCorrupted(
 
     with pytest.raises(PersonaCorrupted, match="99"):
         backend.load_persona("future-schema")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P1-1: Concurrent overwrite=True does not raise FileNotFoundError
+
+
+def test_concurrent_save_overwrite_true_does_not_raise(tmp_path: Path) -> None:
+    """16 threads racing ``save_persona(same_id, ..., overwrite=True)`` all
+    complete without raising. Reproduces the pre-fix FileNotFoundError caused
+    by the unguarded ``persona_dir.rename(backup)`` call in the original
+    group-atomic logic.
+
+    After all threads finish, the on-disk persona is readable and is one of
+    the 16 written values (last-writer-wins).
+    """
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    # Seed an initial record so all threads take the overwrite=True path.
+    backend.save_persona("shared", _make_persona(identity="Initial.", version=0))
+
+    errors: list[Exception] = []
+
+    def _overwrite(i: int) -> None:
+        try:
+            backend.save_persona(
+                "shared",
+                _make_persona(identity=f"Writer {i}.", version=i),
+                overwrite=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+        futures = [executor.submit(_overwrite, i) for i in range(16)]
+        concurrent.futures.wait(futures)
+
+    assert not errors, f"Concurrent overwrite raised: {errors}"
+
+    loaded = backend.load_persona("shared")
+    valid_identities = {f"Writer {i}." for i in range(16)}
+    assert loaded.identity in valid_identities, (
+        f"Final identity {loaded.identity!r} is not one of the 16 written values"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P1-2: overwrite=True refuses regular file at persona_dir path
+
+
+def test_overwrite_true_refuses_regular_file(tmp_path: Path) -> None:
+    """When a regular file exists at the persona_dir path, ``save_persona``
+    with ``overwrite=True`` raises ``PersonaExists`` with 'not a directory'
+    in the message rather than silently coercing the file into a persona dir.
+    """
+    from atomic_agents.exceptions import PersonaExists
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    # Plant a regular file where a persona directory would go.
+    stub = tmp_path / "stub"
+    stub.write_text("I am a file, not a directory.", encoding="utf-8")
+
+    with pytest.raises(PersonaExists, match="not a directory"):
+        backend.save_persona("stub", _make_persona(), overwrite=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P1-3: list_personas excludes symlinked IDENTITY.md pointing outside root
+
+
+def test_list_personas_excludes_symlinked_identity_md(tmp_path: Path) -> None:
+    """A persona directory whose IDENTITY.md is a symlink to a file outside
+    personas_root is silently excluded from ``list_personas``.
+
+    Also verifies that ``load_persona`` on the excluded entry raises
+    ``PersonaCorrupted`` (resolves-outside-root) or ``PersonaNotFound``.
+    """
+    import os
+
+    from atomic_agents.exceptions import PersonaCorrupted, PersonaNotFound
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    personas_root = tmp_path / "personas"
+    personas_root.mkdir()
+
+    # File outside personas_root.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secret.md"
+    secret.write_text("MAGIC SECRET", encoding="utf-8")
+
+    # Evil persona dir with a symlinked IDENTITY.md.
+    evil_dir = personas_root / "evil"
+    evil_dir.mkdir()
+    os.symlink(secret, evil_dir / "IDENTITY.md")
+
+    # Real persona.
+    backend = FilesystemPersonaBackend(personas_root)
+    backend.save_persona("real", _make_persona(identity="Legit."))
+
+    result = backend.list_personas()
+    assert result == ["real"], f"Expected only ['real'], got {result}"
+
+    with pytest.raises((PersonaCorrupted, PersonaNotFound)):
+        backend.load_persona("evil")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P2-1: schema_version type discipline
+
+
+@pytest.mark.parametrize(
+    "bad_version",
+    [1.0, True, "1", None, [1], {"v": 1}],
+    ids=["float", "bool", "string", "null", "list", "dict"],
+)
+def test_metadata_schema_version_rejects_non_int(
+    tmp_path: Path, bad_version: object
+) -> None:
+    """``metadata.json`` with a non-integer ``schema_version`` raises
+    ``PersonaCorrupted`` naming the bad type. Covers float, bool (True == 1
+    in Python but must be rejected), string, null, list, and dict.
+    """
+    import json as _json
+
+    from atomic_agents.exceptions import PersonaCorrupted
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    persona_dir = tmp_path / "bad-type"
+    persona_dir.mkdir()
+    (persona_dir / "IDENTITY.md").write_text("identity", encoding="utf-8")
+    (persona_dir / "SOUL.md").write_text("soul", encoding="utf-8")
+    (persona_dir / "USER.md").write_text("user", encoding="utf-8")
+    (persona_dir / "metadata.json").write_text(
+        _json.dumps(
+            {
+                "schema_version": bad_version,
+                "version": 1,
+                "label": None,
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PersonaCorrupted, match="schema_version"):
+        backend.load_persona("bad-type")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P2-4: All four required files missing each raise PersonaNotFound
+
+
+@pytest.mark.parametrize(
+    "missing_file",
+    ["IDENTITY.md", "SOUL.md", "USER.md", "metadata.json"],
+)
+def test_load_persona_raises_when_any_required_file_missing(
+    tmp_path: Path, missing_file: str
+) -> None:
+    """Each of the four required files missing raises ``PersonaNotFound``
+    (FileNotFoundError translated at the load_persona boundary).
+
+    Pre-existing test only deleted USER.md; this parametrized version
+    covers all four files symmetrically.
+    """
+    from atomic_agents.exceptions import PersonaNotFound
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    persona_dir = tmp_path / "partial"
+    persona_dir.mkdir()
+
+    all_files = {
+        "IDENTITY.md": "identity",
+        "SOUL.md": "soul",
+        "USER.md": "user",
+        "metadata.json": '{"schema_version": 1, "version": 1, "label": null, "created_at": "2026-01-01T00:00:00Z"}',
+    }
+    for fname, content in all_files.items():
+        if fname != missing_file:
+            (persona_dir / fname).write_text(content, encoding="utf-8")
+
+    with pytest.raises(PersonaNotFound):
+        backend.load_persona("partial")

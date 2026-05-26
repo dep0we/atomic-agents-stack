@@ -57,6 +57,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .types import Persona, PersonaCapabilities, PersonaSnapshot
+from .._io import safe_resolve_under
 
 _logger = logging.getLogger(__name__)
 
@@ -189,6 +190,16 @@ def _load_persona_from_dir(persona_dir: Path, persona_id: str) -> Persona:
     try:
         meta = json.loads(meta_raw)
         schema_version = meta.get("schema_version", 1)
+        # Reject non-integer types: bool is a subclass of int in Python
+        # (True == 1), so it must be excluded explicitly. float, string,
+        # None, list, and dict are all wrong types from a JSON-schema
+        # perspective.
+        if not isinstance(schema_version, int) or isinstance(schema_version, bool):
+            raise PersonaCorrupted(
+                f"Persona {persona_id!r} metadata.json schema_version must be a "
+                f"JSON integer; got {type(schema_version).__name__} "
+                f"{schema_version!r}."
+            )
         if schema_version != _METADATA_SCHEMA_VERSION:
             raise PersonaCorrupted(
                 f"Persona {persona_id!r} metadata schema_version "
@@ -226,41 +237,90 @@ def _write_persona_files(dest: Path, persona: Persona) -> None:
     )
 
 
-def _save_persona_group_atomic(persona_dir: Path, persona: Persona) -> None:
-    """Write a persona record to ``persona_dir`` with directory-level atomicity.
+def _save_persona_group_atomic(
+    personas_root: Path, persona_id: str, persona: Persona
+) -> None:
+    """Group-atomic save of a persona record via temp-dir-and-rename.
 
-    For the ``overwrite=True`` path (persona_dir already exists): writes to a
-    sibling temp dir, renames the old dir to a backup, renames the temp dir
-    to persona_dir, then removes the backup. If the second rename fails the
-    backup is restored so the old record survives.
+    Writes all four files to a sibling temp directory, then either renames
+    the temp dir into place (fresh create) OR swaps with the existing dir
+    via backup-and-rename (overwrite of existing record). The retry loop
+    handles the concurrent-overwrite race where another writer may rename
+    persona_dir out from under us between our state check and the rename.
 
-    For the fresh-create path (persona_dir does not exist after the exclusive
-    mkdir claim): writes directly into the already-created persona_dir (no
-    temp dir needed because the dir is exclusively owned).
+    On POSIX, directory rename is atomic only when destination is empty.
+    ``tempfile.TemporaryDirectory`` ensures the temp dir is unique per call;
+    ``uuid`` hex ensures backup names don't collide.
 
-    Callers are responsible for the exclusive-mkdir claim (``overwrite=False``
-    path) or for accepting last-writer-wins semantics (``overwrite=True`` path).
+    Concurrent overwrite=True is last-writer-wins. Concurrent fresh-create
+    is exactly-one-wins (the loser sees FileExistsError translated to
+    PersonaExists at the save_persona level).
     """
-    parent = persona_dir.parent
-    persona_id = persona_dir.name
+    from ..exceptions import PersonaError, PersonaExists
 
-    if persona_dir.exists():
-        with tempfile.TemporaryDirectory(
-            prefix=f".{persona_id}.tmp-", dir=parent
-        ) as tmp_str:
-            tmp = Path(tmp_str)
-            _write_persona_files(tmp, persona)
-            backup = parent / f".{persona_id}.old-{uuid.uuid4().hex[:8]}"
-            persona_dir.rename(backup)
-            try:
-                tmp.rename(persona_dir)
-            except OSError:
-                backup.rename(persona_dir)
-                raise
-        shutil.rmtree(backup, ignore_errors=True)
-    else:
-        persona_dir.mkdir(parents=True, exist_ok=True)
-        _write_persona_files(persona_dir, persona)
+    persona_dir = personas_root / persona_id
+    parent = persona_dir.parent
+    parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(
+        prefix=f".{persona_id}.tmp-", dir=parent
+    ) as tmp_str:
+        tmp = Path(tmp_str)
+        _write_persona_files(tmp, persona)
+
+        # 20 attempts bounds concurrent contention. Beyond 20, raise so the
+        # caller can decide retry policy.
+        for _attempt in range(20):
+            if persona_dir.is_dir():
+                # Existing record: swap-and-delete
+                backup = parent / f".{persona_id}.old-{uuid.uuid4().hex[:8]}"
+                try:
+                    persona_dir.rename(backup)
+                except FileNotFoundError:
+                    # Another writer renamed persona_dir out. Loop back;
+                    # the next iteration will see persona_dir missing and
+                    # go through the fresh-create path.
+                    continue
+                try:
+                    tmp.rename(persona_dir)
+                except OSError:
+                    # Another writer placed a directory at persona_dir in
+                    # the window between our rename-out and our rename-in.
+                    # Restore the backup so the old record survives, then
+                    # loop back to try again.
+                    try:
+                        backup.rename(persona_dir)
+                    except OSError:
+                        pass
+                    continue
+                shutil.rmtree(backup, ignore_errors=True)
+                return
+            elif persona_dir.is_file():
+                # A regular file (not a directory) exists stably at persona_dir.
+                # Refuse rather than silently coercing a file into a persona dir.
+                # Using is_file() rather than exists() avoids a false-positive
+                # during the concurrent-rename window where a directory is
+                # briefly invisible to is_dir() but visible to exists().
+                raise PersonaExists(
+                    f"Cannot overwrite {persona_dir!r}: not a directory. "
+                    f"Remove the existing file manually before saving "
+                    f"a persona with this id."
+                )
+            else:
+                # Fresh create: atomic rename. If another writer raced us
+                # and created the dir between is_dir() and rename(), retry
+                # through the existing-dir branch.
+                try:
+                    tmp.rename(persona_dir)
+                    return
+                except OSError:
+                    continue
+
+    raise PersonaError(
+        f"save_persona({persona_id!r}, overwrite=True) failed after "
+        f"20 retries due to concurrent contention. The race target "
+        f"is a temp-dir-rename swap; try again."
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -280,9 +340,14 @@ class FilesystemPersonaBackend:
     The first call that performs I/O creates the directory if needed (save)
     or returns the no-op value (list, exists, load).
 
-    Concurrent access: ``save_persona`` uses ``_io.atomic_write`` (temp +
-    fsync + rename) so concurrent saves on the same persona_id are safe;
-    last-writer-wins is the documented semantics.
+    Concurrent access: ``save_persona`` writes all four persona files to a
+    sibling temp directory and renames it into place via a swap-and-delete
+    sequence (POSIX-atomic for the rename step). Concurrent fresh-create
+    on the same persona_id is exactly-one-wins via ``mkdir(exist_ok=False)``
+    on the ``overwrite=False`` path. Concurrent overwrite=True is
+    last-writer-wins (the retry loop bounds contention to twenty attempts;
+    beyond that a ``PersonaError`` surfaces so the caller can choose a
+    retry policy).
 
     Capabilities: ``supports_save=True, supports_clone=True,
     supports_snapshot=False, supports_subscribe=False, durable=True,
@@ -334,6 +399,18 @@ class FilesystemPersonaBackend:
                 f"Call save_persona() to create it first."
             )
 
+        from ..exceptions import PathTraversalError, PersonaCorrupted
+
+        _required_files = ["IDENTITY.md", "SOUL.md", "USER.md", "metadata.json"]
+        for fname in _required_files:
+            try:
+                safe_resolve_under(persona_dir / fname, self._personas_root)
+            except (PathTraversalError, ValueError) as exc:
+                raise PersonaCorrupted(
+                    f"Persona {persona_id!r} file {fname!r} resolves outside "
+                    f"personas_root {self._personas_root!r}: {exc}"
+                ) from exc
+
         try:
             return _load_persona_from_dir(persona_dir, persona_id)
         except FileNotFoundError as exc:
@@ -379,8 +456,7 @@ class FilesystemPersonaBackend:
                 ) from None
             _write_persona_files(persona_dir, persona)
         else:
-            persona_dir.parent.mkdir(parents=True, exist_ok=True)
-            _save_persona_group_atomic(persona_dir, persona)
+            _save_persona_group_atomic(self._personas_root, persona_id, persona)
 
     def list_personas(self) -> list[str]:
         """Return sorted list of known persona_ids.
@@ -390,16 +466,28 @@ class FilesystemPersonaBackend:
         dot (internal directories like ``.snapshots`` are not personas), or
         that do not contain an IDENTITY.md sentinel file (incomplete or
         externally-mutated dirs are excluded silently).
+
+        The IDENTITY.md sentinel is validated via ``safe_resolve_under`` to
+        refuse symlinks planted in personas_root that point outside the root.
+        Only a regular, non-symlink IDENTITY.md whose resolved path stays
+        inside personas_root qualifies the entry as a valid persona.
         """
+        from ..exceptions import PathTraversalError
+
         if not self._personas_root.is_dir():
             return []
-        ids = [
-            entry.name
-            for entry in self._personas_root.iterdir()
-            if entry.is_dir()
-            and not entry.name.startswith(".")
-            and (entry / "IDENTITY.md").is_file()
-        ]
+        ids = []
+        for entry in self._personas_root.iterdir():
+            if not entry.is_dir() or entry.name.startswith("."):
+                continue
+            identity = entry / "IDENTITY.md"
+            try:
+                resolved = safe_resolve_under(identity, self._personas_root)
+            except (PathTraversalError, ValueError):
+                continue
+            if not resolved.is_file() or resolved.is_symlink():
+                continue
+            ids.append(entry.name)
         return sorted(ids)
 
     def exists(self, persona_id: str) -> bool:
