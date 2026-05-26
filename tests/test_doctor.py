@@ -26,11 +26,22 @@ import pytest
 from atomic_agents import doctor
 from atomic_agents import cli as cli_module
 from atomic_agents.doctor import (
-    PASS, FAIL, SKIP,
+    PASS,
+    FAIL,
+    SKIP,
     CheckResult,
-    check_env, check_python, check_vault, check_provider_keys,
-    check_model, check_locks, check_memory_backend, check_write_paths,
-    run_doctor, render_human, render_json, overall_exit_code,
+    check_env,
+    check_python,
+    check_vault,
+    check_provider_keys,
+    check_model,
+    check_locks,
+    check_memory_backend,
+    check_write_paths,
+    run_doctor,
+    render_human,
+    render_json,
+    overall_exit_code,
 )
 
 
@@ -38,11 +49,15 @@ from atomic_agents.doctor import (
 # Helpers
 
 
-def _make_agent(root: Path, name: str = "test-agent",
-                 *, model_md: str | None = None,
-                 tools_md: str | None = None,
-                 with_index: bool = True,
-                 with_persona: bool = True) -> Path:
+def _make_agent(
+    root: Path,
+    name: str = "test-agent",
+    *,
+    model_md: str | None = None,
+    tools_md: str | None = None,
+    with_index: bool = True,
+    with_persona: bool = True,
+) -> Path:
     """Build a minimal-valid agent vault under <root>/<name>/."""
     agent = root / name
     (agent / "persona").mkdir(parents=True, exist_ok=True)
@@ -53,16 +68,19 @@ def _make_agent(root: Path, name: str = "test-agent",
             "# IDENTITY\n\nI am a test agent.\n", encoding="utf-8"
         )
     (agent / "tools.md").write_text(
-        tools_md if tools_md is not None
-        else "## Read paths\n\n- " + str(agent) + "\n\n## Write paths\n\n- " + str(agent / "memory") + "\n",
+        tools_md
+        if tools_md is not None
+        else "## Read paths\n\n- "
+        + str(agent)
+        + "\n\n## Write paths\n\n- "
+        + str(agent / "memory")
+        + "\n",
         encoding="utf-8",
     )
     (agent / "model.md").write_text(
-        model_md if model_md is not None else (
-            "# model.md\n\n"
-            "## Default model\n\n"
-            "claude-haiku-4-5-20251001\n"
-        ),
+        model_md
+        if model_md is not None
+        else ("# model.md\n\n## Default model\n\nclaude-haiku-4-5-20251001\n"),
         encoding="utf-8",
     )
     if with_index:
@@ -78,14 +96,20 @@ def _isolate_keys(monkeypatch, tmp_home: Path) -> None:
     `security` subprocess so the Keychain branch always fails. This mirrors
     a fresh install with no key configured.
     """
-    for var in ("ATOMIC_AGENTS_ANTHROPIC_KEY", "ANTHROPIC_API_KEY",
-                "ATOMIC_AGENTS_OPENAI_KEY", "OPENAI_API_KEY",
-                "ATOMIC_AGENTS_MOONSHOT_KEY", "MOONSHOT_API_KEY"):
+    for var in (
+        "ATOMIC_AGENTS_ANTHROPIC_KEY",
+        "ANTHROPIC_API_KEY",
+        "ATOMIC_AGENTS_OPENAI_KEY",
+        "OPENAI_API_KEY",
+        "ATOMIC_AGENTS_MOONSHOT_KEY",
+        "MOONSHOT_API_KEY",
+    ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("HOME", str(tmp_home))
 
     # Stub `security` so the Keychain branch never returns a key.
     import subprocess
+
     real_run = subprocess.run
 
     def fake_run(args, *a, **kw):  # noqa: ANN001
@@ -223,7 +247,11 @@ def test_provider_keys_two_providers(monkeypatch, tmp_path):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-anth")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-oai")
 
-    real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
+    real_import = (
+        __builtins__["__import__"]
+        if isinstance(__builtins__, dict)
+        else __builtins__.__import__
+    )
 
     def fake_import(name, *a, **kw):
         if name == "openai":
@@ -238,7 +266,9 @@ def test_provider_keys_two_providers(monkeypatch, tmp_path):
     }
     results = check_provider_keys(model_data)
     assert len(results) == 2
-    assert all(r.status == PASS for r in results), [(r.name, r.message) for r in results]
+    assert all(r.status == PASS for r in results), [
+        (r.name, r.message) for r in results
+    ]
     names = {r.name for r in results}
     assert "provider-keys[anthropic]" in names
     assert "provider-keys[openai]" in names
@@ -274,23 +304,27 @@ def test_model_fail_when_missing():
 
 
 def test_model_fail_when_guardrails_zero_caps():
-    r = check_model({
-        "default_model": "claude-haiku-4-5",
-        "cost_guardrails_enabled": True,
-        "daily_cap_usd": 0.0,
-        "monthly_cap_usd": 5.0,
-    })
+    r = check_model(
+        {
+            "default_model": "claude-haiku-4-5",
+            "cost_guardrails_enabled": True,
+            "daily_cap_usd": 0.0,
+            "monthly_cap_usd": 5.0,
+        }
+    )
     assert r.status == FAIL
     assert "daily_cap_usd" in r.message or "monthly_cap_usd" in r.message
 
 
 def test_model_pass_with_guardrails_set():
-    r = check_model({
-        "default_model": "claude-haiku-4-5",
-        "cost_guardrails_enabled": True,
-        "daily_cap_usd": 1.0,
-        "monthly_cap_usd": 10.0,
-    })
+    r = check_model(
+        {
+            "default_model": "claude-haiku-4-5",
+            "cost_guardrails_enabled": True,
+            "daily_cap_usd": 1.0,
+            "monthly_cap_usd": 10.0,
+        }
+    )
     assert r.status == PASS
 
 
@@ -413,8 +447,15 @@ def test_run_doctor_no_agent_skips_agent_checks(tmp_path):
     assert "env" in names and "python" in names
     # All agent-scoped checks should be SKIP
     skipped = {r.name for r in results if r.status == SKIP}
-    assert {"vault", "provider-keys", "model", "mcp", "locks",
-            "memory-backend", "write-paths"} <= skipped
+    assert {
+        "vault",
+        "provider-keys",
+        "model",
+        "mcp",
+        "locks",
+        "memory-backend",
+        "write-paths",
+    } <= skipped
 
 
 def test_run_doctor_full_pass_against_minimal_agent(monkeypatch, tmp_path):
@@ -464,7 +505,12 @@ def test_render_json_shape():
         CheckResult("vault", FAIL, "missing"),
     ]
     payload = json.loads(render_json(results))
-    assert payload["summary"] == {"passed": 1, "failed": 1, "skipped": 0, "all_ok": False}
+    assert payload["summary"] == {
+        "passed": 1,
+        "failed": 1,
+        "skipped": 0,
+        "all_ok": False,
+    }
     assert payload["results"][0]["name"] == "env"
     assert payload["results"][1]["status"] == FAIL
 
@@ -499,10 +545,16 @@ def test_cli_doctor_json_output(tmp_path, capsys):
 
 
 def test_cli_doctor_failure_returns_one(tmp_path, capsys):
-    rc = cli_module.main([
-        "doctor", "--agent", "ghost",
-        "--agents-root", str(tmp_path), "--no-mcp",
-    ])
+    rc = cli_module.main(
+        [
+            "doctor",
+            "--agent",
+            "ghost",
+            "--agents-root",
+            str(tmp_path),
+            "--no-mcp",
+        ]
+    )
     out = capsys.readouterr().out
     assert rc == 1
     assert "FAIL —" in out
@@ -510,8 +562,10 @@ def test_cli_doctor_failure_returns_one(tmp_path, capsys):
 
 def test_cli_doctor_crash_returns_two(monkeypatch, tmp_path, capsys):
     """If doctor itself raises, the CLI catches it and returns exit code 2."""
+
     def boom(*a, **kw):  # noqa: ANN001
         raise RuntimeError("doctor module bug")
+
     monkeypatch.setattr(doctor, "run_doctor", boom)
     rc = cli_module.main(["doctor", "--agents-root", str(tmp_path)])
     err = capsys.readouterr().err
@@ -550,6 +604,7 @@ def _make_cascade(root: Path, *, project: str = "demo", role: str = "writer") ->
 
 def test_check_vault_cascade_passes_with_role_level_files(tmp_path):
     from atomic_agents import _cascade
+
     instance = _make_cascade(tmp_path)
     cascade = _cascade.detect_cascade(instance)
     assert cascade is not None, "cascade detection precondition"
@@ -560,6 +615,7 @@ def test_check_vault_cascade_passes_with_role_level_files(tmp_path):
 
 def test_check_vault_cascade_still_fails_when_instance_missing_persona(tmp_path):
     from atomic_agents import _cascade
+
     instance = _make_cascade(tmp_path)
     (instance / "persona" / "IDENTITY.md").unlink()
     cascade = _cascade.detect_cascade(instance)
@@ -587,7 +643,8 @@ def test_run_doctor_full_pass_for_cascaded_agent(monkeypatch, tmp_path):
 def test_malformed_model_md_reports_fail_not_crash(monkeypatch, tmp_path, capsys):
     """A malformed model.md must not push the CLI into exit-2 territory."""
     agent = _make_agent(
-        tmp_path, "broken",
+        tmp_path,
+        "broken",
         model_md=(
             "## Default model\n\nclaude-haiku-4-5-20251001\n\n"
             "```yaml\n"
@@ -599,10 +656,16 @@ def test_malformed_model_md_reports_fail_not_crash(monkeypatch, tmp_path, capsys
     )
     _isolate_keys(monkeypatch, tmp_path)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-    rc = cli_module.main([
-        "doctor", "--agent", "broken",
-        "--agents-root", str(tmp_path), "--no-mcp",
-    ])
+    rc = cli_module.main(
+        [
+            "doctor",
+            "--agent",
+            "broken",
+            "--agents-root",
+            str(tmp_path),
+            "--no-mcp",
+        ]
+    )
     out = capsys.readouterr().out
     # The CLI must surface a FAIL (exit 1), not crash (exit 2).
     assert rc == 1
@@ -615,7 +678,11 @@ def test_provider_keys_fail_when_optional_sdk_missing(monkeypatch, tmp_path):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-irrelevant")
 
     # Stub the openai import so __import__("openai") raises ImportError.
-    real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
+    real_import = (
+        __builtins__["__import__"]
+        if isinstance(__builtins__, dict)
+        else __builtins__.__import__
+    )
 
     def fake_import(name, *a, **kw):
         if name == "openai":
@@ -724,7 +791,8 @@ def test_malformed_yaml_in_model_md_reports_fail(monkeypatch, tmp_path, capsys):
     """A truly malformed YAML fence (which parse_model_md_text silently swallows)
     must still surface as a config-parse FAIL."""
     agent = _make_agent(
-        tmp_path, "yaml-broken",
+        tmp_path,
+        "yaml-broken",
         model_md=(
             "## Default model\n\nclaude-haiku-4-5-20251001\n\n"
             "```yaml\n"
@@ -736,10 +804,40 @@ def test_malformed_yaml_in_model_md_reports_fail(monkeypatch, tmp_path, capsys):
     )
     _isolate_keys(monkeypatch, tmp_path)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-    rc = cli_module.main([
-        "doctor", "--agent", "yaml-broken",
-        "--agents-root", str(tmp_path), "--no-mcp",
-    ])
+    rc = cli_module.main(
+        [
+            "doctor",
+            "--agent",
+            "yaml-broken",
+            "--agents-root",
+            str(tmp_path),
+            "--no-mcp",
+        ]
+    )
     out = capsys.readouterr().out
     assert rc == 1
     assert "invalid YAML" in out
+
+
+# ──────────────────────────────────────────────────────────────────
+# P1-2 regression: check_persona_backend redacts credentials in FAIL message
+
+
+def test_check_persona_backend_redacts_credential_url(tmp_path, monkeypatch):
+    """P1-2 regression: when ATOMIC_AGENTS_PERSONA_BACKEND is accidentally set to a
+    credential-bearing URL (instead of ATOMIC_AGENTS_PERSONA_BACKEND_URL), the FAIL
+    message must NOT reproduce the raw credential in the output.
+
+    The redaction strips everything after '://' so 'postgres://user:hunter2@host/db'
+    becomes 'postgres://...' in the message.
+    """
+    from atomic_agents.doctor import check_persona_backend, FAIL
+
+    monkeypatch.setenv(
+        "ATOMIC_AGENTS_PERSONA_BACKEND", "postgres://user:hunter2@host/db"
+    )
+    result = check_persona_backend(tmp_path)
+
+    assert result.status == FAIL
+    assert "hunter2" not in result.message
+    assert "postgres://..." in result.message
