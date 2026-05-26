@@ -189,6 +189,36 @@ def test_nonexistent_personas_root_exists_returns_false(tmp_path: Path) -> None:
     assert backend.exists("any-persona") is False
 
 
+def test_persona_dir_exists_but_files_missing_raises_PersonaNotFound(
+    tmp_path: Path,
+) -> None:
+    """Persona directory exists on disk but one of IDENTITY/SOUL/USER.md is
+    missing.
+
+    Exercises the inner ``FileNotFoundError`` branch of ``load_persona``
+    (where the persona dir is present so the outer ``is_dir()`` check
+    passes, but ``_load_persona_from_dir`` fails on a missing required
+    file). Operator scenario: partial write from an external editor, or
+    manual deletion of one file via the filesystem.
+    """
+    from atomic_agents.exceptions import PersonaNotFound
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    persona_dir = tmp_path / "partial-persona"
+    persona_dir.mkdir()
+    (persona_dir / "IDENTITY.md").write_text("identity body")
+    (persona_dir / "SOUL.md").write_text("soul body")
+    (persona_dir / "metadata.json").write_text(
+        '{"version": 1, "label": null, "created_at": "2026-05-26T00:00:00Z"}'
+    )
+
+    with pytest.raises(PersonaNotFound) as exc_info:
+        backend.load_persona("partial-persona")
+
+    assert "partial-persona" in str(exc_info.value)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Permission error on save
 
@@ -379,3 +409,28 @@ def test_url_factory_credential_redaction(tmp_path: Path) -> None:
     assert "password" not in error_message, (
         f"Credential 'password' leaked into the error message: {error_message!r}"
     )
+
+
+@pytest.mark.parametrize(
+    "bad_input",
+    [
+        "",
+        b"filesystem:///tmp/personas",
+        None,
+        123,
+        ["filesystem:///tmp/personas"],
+    ],
+)
+def test_url_factory_refuses_empty_or_non_string(bad_input: object) -> None:
+    """Empty string and non-string inputs raise ``ValueError`` before parsing.
+
+    Guards the URL factory entry point so callers passing ``None`` or a
+    bytes object get a clean error instead of a confusing ``TypeError``
+    from ``urlparse`` deep in the stack.
+    """
+    from atomic_agents.persona.filesystem import (
+        make_filesystem_persona_backend_from_url,
+    )
+
+    with pytest.raises(ValueError):
+        make_filesystem_persona_backend_from_url(bad_input)  # type: ignore[arg-type]

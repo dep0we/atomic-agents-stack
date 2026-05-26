@@ -33,7 +33,7 @@ The composition shape (D1): PersonaBackend is source of truth; AgentProfile fiel
 | D6 | AgentProfile save discipline | `AgentProfileBackend.save_profile()` ignores `persona_identity/soul/user` when PersonaBackend owns the agent's persona (mirrors spec/24 Decision 6's `agent_mode` pattern) |
 | D7 | A/B persona testing | Deferred to v1.1 as `PolicyBackend.get_effective_persona()` extension; NOT in v1.0 |
 | D-ER-1 | Ownership Protocol method | `AgentProfileBackend.is_persona_externally_owned(agent_id) -> bool` added in PR 2 so the bootstrap path can check ownership without importing PersonaBackend |
-| D-ER-2 | `delegate.py` threading | `delegate.py` does NOT thread `persona_backend` (persona is per-agent scoped; a delegate's persona should not inherit the coordinator's PersonaBackend) |
+| D-ER-2 | `delegate.py` threading | `delegate.py` threads `persona_backend` ONLY when explicitly supplied at the coordinator (mirrors Policy's `_policy_backend_was_explicit` precedent at `agent.py:401`). Default-resolved PersonaBackends do not leak the coordinator's `personas_root` to delegates. See body section "`delegate.py` threading (D-ER-2)" for full rationale. |
 | D-ER-3 | `persona.link.md` parser | Parser (`persona_link_md.py`) lands in PR 2; raises `PersonaLinkInvalid` on malformed YAML, missing `kind:`, unsupported kind, missing `persona_id:`, or invalid `persona_id:` charset |
 | D-ER-4 | `persona.link.md` format | YAML in a code block; two scalar fields: `kind: shared` + `persona_id: customer-support-v3` |
 | D-PI-1 | Exception placement | Persona exceptions live in `atomic_agents/exceptions.py` (not `persona/types.py`) to prevent cross-module import cycles (`PersonaOwnershipConflict` raised by profile backends; `PersonaLinkInvalid` raised by parser) |

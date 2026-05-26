@@ -757,3 +757,39 @@ def test_get_default_persona_backend_respects_env_var(tmp_path: Path) -> None:
         del os.environ[env_key]
         if original is not None:
             os.environ[env_key] = original
+
+
+def test_get_default_persona_backend_url_env_var_dispatches_to_factory(
+    tmp_path: Path,
+) -> None:
+    """``ATOMIC_AGENTS_PERSONA_BACKEND_URL`` routes through the URL factory.
+
+    Exercises the URL-dispatch branch of ``get_default_persona_backend``:
+    when the URL env var is set alongside (or without) the backend id env
+    var, the URL factory parses the URL and returns the backend pinned to
+    the URL's path, not ``scope_root / .personas``.
+    """
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend_key = "ATOMIC_AGENTS_PERSONA_BACKEND"
+    url_key = "ATOMIC_AGENTS_PERSONA_BACKEND_URL"
+    original_backend = os.environ.pop(backend_key, None)
+    original_url = os.environ.pop(url_key, None)
+
+    custom_root = tmp_path / "custom-personas"
+    custom_root.mkdir()
+
+    try:
+        os.environ[backend_key] = "filesystem"
+        os.environ[url_key] = f"filesystem://{custom_root}"
+
+        scope_root = tmp_path / "scope"
+        backend = get_default_persona_backend(scope_root)
+
+        assert isinstance(backend, FilesystemPersonaBackend)
+        assert backend._personas_root == custom_root
+    finally:
+        for key, original in [(backend_key, original_backend), (url_key, original_url)]:
+            os.environ.pop(key, None)
+            if original is not None:
+                os.environ[key] = original
