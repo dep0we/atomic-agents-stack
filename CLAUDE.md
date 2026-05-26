@@ -206,7 +206,7 @@ uv run pytest                            # full suite
 uv run pytest tests/test_<module>.py -v  # one module
 ```
 
-Run `uv run pytest --collect-only -q | tail -1` for the live test count (last refresh: 2,381 tests, 2026-05-20). New backend protocols add ~25 conformance + ~10 impl-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol — the conformance suite is what keeps the protocol honest.
+Run `uv run pytest --collect-only -q | tail -1` for the live test count (last refresh: 2,563 tests collected, 2026-05-26). New backend protocols add ~25 conformance + ~10 impl-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol — the conformance suite is what keeps the protocol honest.
 
 ### Releases + SemVer
 
@@ -291,7 +291,7 @@ If the project ever needs to optimize differently, `docs/methodology.md` is the 
 | Doc | Purpose |
 |-----|---------|
 | `docs/architecture.md` | Mental model in diagrams. Read first. |
-| `docs/spec/01-...32-policy-backend.md` | Locked spec (31 docs today — 28 locked + 3 drafts at spec/26 (cascade bundle), spec/30 (responsibility audit), and spec/32 (policy backend RFC)). The product. |
+| `docs/spec/01-...33-persona-backend.md` | Locked spec (32 docs today — 29 locked + 3 drafts at spec/26 (cascade bundle), spec/30 (responsibility audit), and spec/33 (persona backend RFC, locks at PR 4)). The product. |
 | `docs/implementation/` | Build guides per runtime (cron, Claude skill, dashboard) |
 | `docs/deployment/versioning.md`, `upgrading.md` | SemVer + operator runbook |
 | `docs/deployment/release-runbook.md` | Maintainer `/ship` runbook: two-mode workflow + manual surface check |
@@ -340,7 +340,7 @@ These are not forbidden forever — they're explicitly deferred with rationale. 
 
 ## Status
 
-**v0.13.0, alpha, PUBLIC.** Core runtime stable. Test suite: run `uv run pytest --collect-only -q | tail -1` for the live count (last refresh: 2,401 tests collected, 2026-05-22). Capability-gated skips fall into four buckets — ToolRegistry conformance (filesystem-shape + `supports_uninstall=False` variants), AgentProfile (skill-content + filesystem-shape on SQLite), cross-process Redis (require real Redis instead of fakeredis), and judge-conformance dispatch (LLM-only + PolicyJudge concurrent-evaluate). Full CI runs against `uv sync --extra dev --extra openai --extra validation --extra redis`. **Nine backend protocols shipped**:
+**v0.13.0, alpha, PUBLIC.** Core runtime stable. Test suite: run `uv run pytest --collect-only -q | tail -1` for the live count (last refresh: 2,563 tests collected, 2026-05-26). Capability-gated skips fall into four buckets — ToolRegistry conformance (filesystem-shape + `supports_uninstall=False` variants), AgentProfile (skill-content + filesystem-shape on SQLite), cross-process Redis (require real Redis instead of fakeredis), and judge-conformance dispatch (LLM-only + PolicyJudge concurrent-evaluate). Full CI runs against `uv sync --extra dev --extra openai --extra validation --extra redis`. **Nine backend protocols shipped**:
 
 - **MemoryBackend** (PR #57) — filesystem reference impl + conformance suite.
 - **LLMBackend** (#87) — Anthropic + OpenAI + Moonshot reference impls, registered at framework import; conformance suite parametrizes across all three.
