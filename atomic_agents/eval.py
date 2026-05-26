@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .policy import PolicyBackend
+    from .persona import PersonaBackend
 
 _log = logging.getLogger(__name__)
 
@@ -128,6 +129,7 @@ class EvalRunner:
         tool_registry_backend: "ToolRegistryBackend | None" = None,
         mandate_backend: "MandateBackend | None" = None,
         policy_backend: "PolicyBackend | None" = None,
+        persona_backend: "PersonaBackend | None" = None,
     ):
         self.agents_root = agents_root or get_agents_root()
         self.agent_name = agent_name
@@ -159,6 +161,14 @@ class EvalRunner:
         # ``get_default_policy_backend`` resolution (env var → filesystem
         # default).
         self._policy_backend = policy_backend
+        # #62 PR 2 — PersonaBackend forwarding. Same threading discipline
+        # as ``_policy_backend``. Without this, an operator pinning a
+        # custom persona backend would silently drop it at the
+        # EvalRunner→AtomicAgent boundary.
+        # ``None`` means: defer to the agent's own
+        # ``get_default_persona_backend`` resolution (env var → filesystem
+        # default).
+        self._persona_backend = persona_backend
 
         if not self.evals_dir.exists():
             raise AtomicAgentsError(
@@ -359,6 +369,7 @@ class EvalRunner:
             tool_registry_backend=self._tool_registry_backend,
             mandate_backend=self._mandate_backend,
             policy_backend=self._policy_backend,
+            persona_backend=self._persona_backend,
         )
         try:
             agent_response = agent.call(work_item=work_item, write_captures=False)

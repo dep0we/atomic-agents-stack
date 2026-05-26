@@ -220,6 +220,7 @@ def run_doctor(
     # Pass cascade so check_policy_backend can warn when the backend is
     # scoped to agents_root instead of cascade.project_root (fix #236).
     results.append(check_policy_backend(resolved_root, cascade=cascade))
+    results.append(check_persona_backend(resolved_root))
     results.append(check_memory_backend(agent_root))
     results.append(check_write_paths(tools_data, agent_root=agent_root))
 
@@ -1956,6 +1957,198 @@ def check_policy_backend(scope_root: Path, *, cascade=None) -> CheckResult:
         name="policy-backend",
         status=PASS,
         message=f"{backend_id} backend ok (policy.md found)",
+        detail=detail,
+    )
+
+
+def check_persona_backend(scope_root: Path) -> CheckResult:
+    """Operator-config coherence check for the persona backend (#62 PR 2).
+
+    Validates that ``ATOMIC_AGENTS_PERSONA_BACKEND`` (plus
+    ``ATOMIC_AGENTS_PERSONA_BACKEND_URL`` when non-filesystem) is
+    correctly configured.  Scoped at ``scope_root`` (not ``agent_root``)
+    because the persona backend is scope-flat — ``list_personas()``
+    enumerates the shared ``.personas/`` directory under the root.
+
+    PASS / WARN / FAIL ladder mirrors ``check_agent_profile_backend`` /
+    ``check_policy_backend``:
+
+    * unset / ``filesystem`` → PASS with capability snapshot +
+      enumerated persona count
+    * unknown backend_id (typo in ``ATOMIC_AGENTS_PERSONA_BACKEND``) → FAIL
+      with the known-id list pulled from ``list_persona_backends()``
+    * non-filesystem id reachable + ``capabilities()`` probe ok → PASS
+      with capability snapshot + redacted URL in detail
+    * non-filesystem id construction failure → FAIL (credentials dropped
+      from exception text to prevent leak in error-tracking services);
+      ``capabilities()`` / ``list_personas()`` probe failure → WARN
+
+    URL credential redaction follows the same urlparse + ``_replace``
+    pattern as ``check_agent_profile_backend`` / ``check_policy_backend``
+    — strips password AND username from netloc (covers token-as-username
+    URLs common with managed services).  ``ATOMIC_AGENTS_PERSONA_BACKEND_URL``
+    is read for symmetry with sister checks so a future URL env var already
+    has its credential-safety handled from day 1.
+    """
+    from .exceptions import BackendNotRegistered
+    from .persona import get_default_persona_backend, list_persona_backends
+
+    backend_id = (
+        os.environ.get("ATOMIC_AGENTS_PERSONA_BACKEND", "filesystem").strip().lower()
+    )
+
+    if backend_id == "filesystem":
+        try:
+            backend = get_default_persona_backend(scope_root)
+            caps = backend.capabilities()
+            persona_count = len(backend.list_personas())
+        except Exception as exc:
+            return CheckResult(
+                name="persona-backend",
+                status=FAIL,
+                message=(
+                    f"filesystem persona backend probe raised "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                fix_hint=(
+                    f"Check that {scope_root} is readable. The default "
+                    "FilesystemPersonaBackend enumerates personas under "
+                    f"{scope_root}/.personas/."
+                ),
+            )
+        return CheckResult(
+            name="persona-backend",
+            status=PASS,
+            message=(
+                f"filesystem backend ok ({persona_count} persona"
+                f"{'' if persona_count == 1 else 's'} discovered)"
+            ),
+            detail={
+                "backend_id": "filesystem",
+                "supports_save": caps.supports_save,
+                "supports_clone": caps.supports_clone,
+                "supports_snapshot": caps.supports_snapshot,
+                "supports_subscribe": caps.supports_subscribe,
+                "supports_templates": caps.supports_templates,
+                "durable": caps.durable,
+                "persona_count": persona_count,
+            },
+        )
+
+    # Non-filesystem id selected — verify it's known to the registry
+    # BEFORE invoking the factory (lazy registrations of future
+    # backends — Postgres, SaaS, git — slot in via list_persona_backends).
+    known_ids = set(list_persona_backends())
+    if backend_id not in known_ids:
+        # Redact the echoed value: if an operator accidentally pastes a
+        # credential-bearing URL into ATOMIC_AGENTS_PERSONA_BACKEND (instead
+        # of ATOMIC_AGENTS_PERSONA_BACKEND_URL), it carries a password.
+        # Strip anything past "://" and truncate at 32 chars — same shape as
+        # persona/backend.py:_redact_for_error_message and the identical
+        # redaction in check_tool_registry_backend.
+        from .persona.backend import _redact_for_error_message as _redact_pid
+
+        safe_id = _redact_pid(backend_id)
+        return CheckResult(
+            name="persona-backend",
+            status=FAIL,
+            message=(
+                f"ATOMIC_AGENTS_PERSONA_BACKEND={safe_id!r} is not "
+                f"a known backend. Known: {sorted(known_ids)}"
+            ),
+            fix_hint=(
+                "Set ATOMIC_AGENTS_PERSONA_BACKEND to one of the known "
+                "ids, or unset to use the filesystem default."
+            ),
+        )
+
+    # URL credential redaction — same urlparse + _replace pattern as
+    # check_agent_profile_backend / check_policy_backend / check_log_backend /
+    # check_lock_backend.  Redacts when EITHER password OR username is present
+    # — covers token-as-username URLs common with managed services (Upstash
+    # ``redis://ghp_TOKEN@host``, PlanetScale ``mysql://API_KEY@host``).
+    url = os.environ.get("ATOMIC_AGENTS_PERSONA_BACKEND_URL")
+    safe_url: str | None = None
+    if url:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        if parsed.password or parsed.username:
+            netloc = parsed.hostname or ""
+            if parsed.port:
+                netloc = f"{netloc}:{parsed.port}"
+            safe_url = parsed._replace(netloc=netloc).geturl()
+        else:
+            safe_url = url
+
+    try:
+        backend = get_default_persona_backend(scope_root)
+    except BackendNotRegistered:
+        return CheckResult(
+            name="persona-backend",
+            status=FAIL,
+            message=f"persona backend {backend_id!r} not registered",
+            fix_hint=(
+                f"The {backend_id!r} backend is reserved but its lazy "
+                "resolver failed. Unset ATOMIC_AGENTS_PERSONA_BACKEND to "
+                "use the filesystem default."
+            ),
+        )
+    except Exception:
+        # Drop the verbatim exception message — connection errors from
+        # backend constructors commonly embed the full URL with credentials.
+        return CheckResult(
+            name="persona-backend",
+            status=FAIL,
+            message=f"persona backend {backend_id!r} construction failed",
+            fix_hint=(
+                "Check ATOMIC_AGENTS_PERSONA_BACKEND and "
+                "ATOMIC_AGENTS_PERSONA_BACKEND_URL for typos. Run with "
+                "DEBUG logging to see the full exception."
+            ),
+        )
+
+    # Probe via capabilities() + list_personas() — both lightweight,
+    # verify the backend is reachable + schema-healthy.  Match the
+    # WARN-on-unreachable-probe pattern from sister checks.
+    try:
+        caps = backend.capabilities()
+        persona_count = len(backend.list_personas())
+    except Exception:
+        return CheckResult(
+            name="persona-backend",
+            status=WARN,
+            message=(
+                f"operator-pinned backend {backend_id!r} configured "
+                "but capabilities() / list_personas() probe failed"
+            ),
+            fix_hint=(
+                "Verify ATOMIC_AGENTS_PERSONA_BACKEND_URL is correct + "
+                "the backend is reachable from this host. Doctor warns "
+                "instead of failing — the framework runtime will fail "
+                "at first persona resolution if the backend is truly down."
+            ),
+        )
+
+    detail: dict[str, Any] = {
+        "backend_id": backend_id,
+        "supports_save": caps.supports_save,
+        "supports_clone": caps.supports_clone,
+        "supports_snapshot": caps.supports_snapshot,
+        "supports_subscribe": caps.supports_subscribe,
+        "supports_templates": caps.supports_templates,
+        "durable": caps.durable,
+        "persona_count": persona_count,
+    }
+    if safe_url is not None:
+        detail["url"] = safe_url
+    return CheckResult(
+        name="persona-backend",
+        status=PASS,
+        message=(
+            f"{backend_id} backend ok ({persona_count} persona"
+            f"{'' if persona_count == 1 else 's'} discovered)"
+        ),
         detail=detail,
     )
 
