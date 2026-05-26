@@ -287,11 +287,14 @@ def _save_persona_group_atomic(
                     # Another writer placed a directory at persona_dir in
                     # the window between our rename-out and our rename-in.
                     # Restore the backup so the old record survives, then
-                    # loop back to try again.
+                    # loop back to try again. If the restore also races
+                    # (yet another writer placed a dir at persona_dir),
+                    # best-effort remove the backup so it doesn't leak as
+                    # an orphan with sensitive persona content.
                     try:
                         backup.rename(persona_dir)
                     except OSError:
-                        pass
+                        shutil.rmtree(backup, ignore_errors=True)
                     continue
                 shutil.rmtree(backup, ignore_errors=True)
                 return
@@ -485,7 +488,7 @@ class FilesystemPersonaBackend:
                 resolved = safe_resolve_under(identity, self._personas_root)
             except (PathTraversalError, ValueError):
                 continue
-            if not resolved.is_file() or resolved.is_symlink():
+            if not resolved.is_file():
                 continue
             ids.append(entry.name)
         return sorted(ids)
