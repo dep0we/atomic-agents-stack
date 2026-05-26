@@ -551,3 +551,23 @@ class PersonaLinkInvalid(PersonaError):
     REFERENCE FILE is malformed; ``PersonaNotFound`` means the file
     parsed correctly but the referenced persona record does not exist.
     """
+
+
+class PersonaCorrupted(PersonaError):
+    """A persona record exists on disk but its contents are corrupt or
+    structurally invalid.
+
+    Raised by ``FilesystemPersonaBackend.load_persona`` when the persona
+    directory is present but one of the following holds:
+    - ``metadata.json`` contains invalid JSON.
+    - ``metadata.json`` is missing a required key (``version``,
+      ``created_at``).
+    - A body file (``IDENTITY.md``, ``SOUL.md``, ``USER.md``) contains
+      non-UTF-8 bytes.
+    - The ``schema_version`` field in ``metadata.json`` names a version
+      this release of atomic-agents-stack does not support.
+
+    Distinct from ``PersonaNotFound`` -- the persona directory EXISTS but
+    its data cannot be interpreted. Operators need to repair or remove the
+    corrupt record before the persona is usable.
+    """

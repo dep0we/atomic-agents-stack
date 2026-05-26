@@ -71,17 +71,15 @@ class PersonaBackend(Protocol):
     (spec/33 implementer contract).
     """
 
-    @property
-    def backend_id(self) -> str:
-        """Stable identifier -- e.g., ``"filesystem"``, ``"postgres"``,
-        ``"saas"``.
+    backend_id: str
+    """Stable identifier -- e.g., ``"filesystem"``, ``"postgres"``,
+    ``"saas"``.
 
-        Used by the registry for lookup (``get_persona_backend(backend_id)``)
-        and by diagnostic tooling that wants to record which backend resolved
-        a persona. Treat as a backwards-compatibility surface -- operator
-        deployments may pin against these strings in env vars and config.
-        """
-        ...
+    Used by the registry for lookup (``get_persona_backend(backend_id)``)
+    and by diagnostic tooling that wants to record which backend resolved
+    a persona. Treat as a backwards-compatibility surface -- operator
+    deployments may pin against these strings in env vars and config.
+    """
 
     # ── Core persona CRUD ────────────────────────────────────────────
 
@@ -352,33 +350,6 @@ def list_persona_backends() -> list[str]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# URL factory hook registry
-
-# Registry: scheme -> URL factory callable. URL factories are callables that
-# accept a URL string and return a PersonaBackend instance. The filesystem
-# URL factory is registered at module-import time via
-# ``register_persona_backend_url_factory`` below.
-_url_factory_registry: dict[str, object] = {}
-
-
-def register_persona_backend_url_factory(scheme: str, factory: object) -> None:
-    """Register a URL factory function under ``scheme``.
-
-    URL factories are callables with signature
-    ``(url: str) -> PersonaBackend``. Registered factories are used by
-    ``get_default_persona_backend`` when ``ATOMIC_AGENTS_PERSONA_BACKEND_URL``
-    is set.
-
-    Args:
-        scheme: the URL scheme this factory handles (e.g., ``"filesystem"``).
-        factory: a callable accepting a URL string and returning a
-            ``PersonaBackend`` instance.
-    """
-    _url_factory_registry[scheme] = factory
-    _logger.debug("registered persona backend URL factory for scheme %r", scheme)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Default factory
 
 
@@ -390,9 +361,11 @@ def get_default_persona_backend(scope_root: Path) -> PersonaBackend:
     ``ATOMIC_AGENTS_<PRIMITIVE>_BACKEND`` -- so operators who already pin
     the log or mandate backend use the same vocabulary.
 
-    When ``ATOMIC_AGENTS_PERSONA_BACKEND_URL`` is also set, parses it via
-    the registered URL factory for the URL's scheme (falling back to the
-    filesystem default when not set).
+    When ``ATOMIC_AGENTS_PERSONA_BACKEND_URL`` is also set and the backend id
+    is ``"filesystem"``, passes the URL to ``make_filesystem_persona_backend_from_url``
+    directly. Non-filesystem schemes in the URL env var are not supported in v1;
+    operators using a non-filesystem backend set ``ATOMIC_AGENTS_PERSONA_BACKEND``
+    and construct the backend programmatically.
 
     The ``scope_root`` parameter is the directory under which the
     ``.personas/`` subdirectory lives. For the filesystem backend, personas

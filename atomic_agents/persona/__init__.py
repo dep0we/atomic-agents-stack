@@ -34,6 +34,7 @@ See ``docs/spec/33-persona-backend.md`` for the full normative contract.
 """
 
 from atomic_agents.exceptions import (
+    PersonaCorrupted,
     PersonaError,
     PersonaExists,
     PersonaLinkInvalid,
@@ -48,7 +49,6 @@ from atomic_agents.persona.backend import (
     get_persona_backend,
     list_persona_backends,
     register_persona_backend,
-    register_persona_backend_url_factory,
     unregister_persona_backend,
 )
 from atomic_agents.persona.filesystem import (
@@ -59,12 +59,6 @@ from atomic_agents.persona.types import (
     Persona,
     PersonaCapabilities,
     PersonaSnapshot,
-)
-
-# Register the filesystem URL factory so get_default_persona_backend can
-# resolve ATOMIC_AGENTS_PERSONA_BACKEND_URL with a filesystem:// scheme.
-register_persona_backend_url_factory(
-    "filesystem", make_filesystem_persona_backend_from_url
 )
 
 __all__ = [
@@ -79,12 +73,12 @@ __all__ = [
     "get_persona_backend",
     "list_persona_backends",
     "register_persona_backend",
-    "register_persona_backend_url_factory",
     "unregister_persona_backend",
     # Reference implementation
     "FilesystemPersonaBackend",
     "make_filesystem_persona_backend_from_url",
     # Exceptions (re-exported from atomic_agents.exceptions per D-PI-1)
+    "PersonaCorrupted",
     "PersonaError",
     "PersonaExists",
     "PersonaLinkInvalid",

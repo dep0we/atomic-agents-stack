@@ -27,10 +27,11 @@ Storage layout (D4)::
     <personas_root>/<persona_id>/IDENTITY.md   -- identity body
     <personas_root>/<persona_id>/SOUL.md       -- soul body
     <personas_root>/<persona_id>/USER.md       -- user body
-    <personas_root>/<persona_id>/metadata.json -- version, label, created_at
+    <personas_root>/<persona_id>/metadata.json -- version, label, created_at, schema_version
 
-Atomic write: ``save_persona`` writes to a temp file in the same directory
-and renames, using ``_io.atomic_write`` so partial-write states are impossible.
+Group-atomic write: ``save_persona`` writes all four files to a sibling temp
+directory then renames the directory into place, so a mid-save crash leaves
+either the old record intact (overwrite path) or no record at all (new path).
 
 Capabilities: ``supports_save=True, supports_clone=True,
 supports_snapshot=False, supports_subscribe=False, durable=True,
@@ -49,6 +50,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
+import tempfile
+import uuid
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -118,27 +122,37 @@ def _validate_persona_id(persona_id: str) -> None:
 def _redact_url(url: str, max_len: int = 64) -> str:
     """Strip credentials from a URL for safe inclusion in error messages.
 
-    Replaces the ``user:pass@`` portion with ``***@`` to avoid leaking
-    secrets into logs or exception strings. Truncates to ``max_len``
-    characters after stripping credentials. Mirrors policy/filesystem.py's
-    ``_redact_url`` helper.
+    Replaces ``user:pass@`` in the authority section (scheme + authority,
+    before the first path ``/``) with ``***@`` to avoid leaking secrets into
+    logs or exception strings. Only redacts ``@`` in the authority portion;
+    ``@`` in path components (e.g. ``/home/ops@fleet/personas``) is preserved.
+    Truncates the full result to ``max_len`` characters.
     """
     if "://" not in url:
         return url[:max_len] + ("..." if len(url) > max_len else "")
     scheme, _, rest = url.partition("://")
-    if "@" in rest:
-        _, _, host_part = rest.partition("@")
-        return f"{scheme}://***@{host_part[:max_len]}"
-    return f"{scheme}://{rest[:max_len]}"
+    authority, slash, path = rest.partition("/")
+    if "@" in authority:
+        _, _, host_part = authority.partition("@")
+        rest_redacted = f"***@{host_part}"
+    else:
+        rest_redacted = authority
+    if slash:
+        rest_redacted = f"{rest_redacted}/{path}"
+    return f"{scheme}://{rest_redacted}"[:max_len]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Serialization helpers
 
 
+_METADATA_SCHEMA_VERSION = 1
+
+
 def _persona_to_metadata(persona: Persona) -> dict:
     """Serialize the metadata fields of a Persona to a JSON-compatible dict."""
     return {
+        "schema_version": _METADATA_SCHEMA_VERSION,
         "version": persona.version,
         "label": persona.label,
         "created_at": persona.created_at,
@@ -149,37 +163,104 @@ def _load_persona_from_dir(persona_dir: Path, persona_id: str) -> Persona:
     """Read a Persona from its storage directory.
 
     Assumes the directory exists and contains the expected files. The caller
-    is responsible for existence checks.
+    is responsible for existence checks and for translating exceptions into
+    the appropriate ``PersonaNotFound`` or ``PersonaCorrupted`` raises.
+
+    Raises:
+        FileNotFoundError: a required file is absent (caller translates to
+            ``PersonaNotFound``).
+        PersonaCorrupted: ``metadata.json`` is malformed, missing required
+            keys, uses an unsupported schema_version, or a body file has
+            non-UTF-8 bytes.
     """
-    identity = (persona_dir / "IDENTITY.md").read_text(encoding="utf-8")
-    soul = (persona_dir / "SOUL.md").read_text(encoding="utf-8")
-    user = (persona_dir / "USER.md").read_text(encoding="utf-8")
-    meta_raw = (persona_dir / "metadata.json").read_text(encoding="utf-8")
-    meta = json.loads(meta_raw)
-    return Persona(
-        identity=identity,
-        soul=soul,
-        user=user,
-        version=meta["version"],
-        label=meta.get("label"),
-        created_at=meta["created_at"],
+    from ..exceptions import PersonaCorrupted
+
+    try:
+        identity = (persona_dir / "IDENTITY.md").read_text(encoding="utf-8")
+        soul = (persona_dir / "SOUL.md").read_text(encoding="utf-8")
+        user = (persona_dir / "USER.md").read_text(encoding="utf-8")
+        meta_raw = (persona_dir / "metadata.json").read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise PersonaCorrupted(
+            f"Persona {persona_id!r} record contains non-UTF-8 bytes "
+            f"under {persona_dir!r}: {exc}"
+        ) from exc
+
+    try:
+        meta = json.loads(meta_raw)
+        schema_version = meta.get("schema_version", 1)
+        if schema_version != _METADATA_SCHEMA_VERSION:
+            raise PersonaCorrupted(
+                f"Persona {persona_id!r} metadata schema_version "
+                f"{schema_version!r} is not supported by this release "
+                f"(supported: {_METADATA_SCHEMA_VERSION})."
+            )
+        return Persona(
+            identity=identity,
+            soul=soul,
+            user=user,
+            version=meta["version"],
+            label=meta.get("label"),
+            created_at=meta["created_at"],
+        )
+    except (json.JSONDecodeError, KeyError) as exc:
+        raise PersonaCorrupted(
+            f"Persona {persona_id!r} record is corrupt under {persona_dir!r}: {exc}"
+        ) from exc
+
+
+def _write_persona_files(dest: Path, persona: Persona) -> None:
+    """Write the four persona files directly into ``dest``.
+
+    ``dest`` MUST already exist. Does not create or rename directories;
+    callers handle directory lifecycle. All four files are written with
+    plain ``write_text`` (not ``atomic_write``) because the caller
+    guarantees group-atomicity at the directory level via a temp-dir +
+    rename pattern.
+    """
+    (dest / "IDENTITY.md").write_text(persona.identity, encoding="utf-8")
+    (dest / "SOUL.md").write_text(persona.soul, encoding="utf-8")
+    (dest / "USER.md").write_text(persona.user, encoding="utf-8")
+    (dest / "metadata.json").write_text(
+        json.dumps(_persona_to_metadata(persona), indent=2), encoding="utf-8"
     )
 
 
-def _save_persona_to_dir(persona_dir: Path, persona: Persona) -> None:
-    """Write a Persona atomically to its storage directory.
+def _save_persona_group_atomic(persona_dir: Path, persona: Persona) -> None:
+    """Write a persona record to ``persona_dir`` with directory-level atomicity.
 
-    Uses ``_io.atomic_write`` for each file so partial-write states are
-    impossible. The directory is created if it does not exist.
+    For the ``overwrite=True`` path (persona_dir already exists): writes to a
+    sibling temp dir, renames the old dir to a backup, renames the temp dir
+    to persona_dir, then removes the backup. If the second rename fails the
+    backup is restored so the old record survives.
+
+    For the fresh-create path (persona_dir does not exist after the exclusive
+    mkdir claim): writes directly into the already-created persona_dir (no
+    temp dir needed because the dir is exclusively owned).
+
+    Callers are responsible for the exclusive-mkdir claim (``overwrite=False``
+    path) or for accepting last-writer-wins semantics (``overwrite=True`` path).
     """
-    from .._io import atomic_write
+    parent = persona_dir.parent
+    persona_id = persona_dir.name
 
-    persona_dir.mkdir(parents=True, exist_ok=True)
-    atomic_write(persona_dir / "IDENTITY.md", persona.identity)
-    atomic_write(persona_dir / "SOUL.md", persona.soul)
-    atomic_write(persona_dir / "USER.md", persona.user)
-    metadata_content = json.dumps(_persona_to_metadata(persona), indent=2)
-    atomic_write(persona_dir / "metadata.json", metadata_content)
+    if persona_dir.exists():
+        with tempfile.TemporaryDirectory(
+            prefix=f".{persona_id}.tmp-", dir=parent
+        ) as tmp_str:
+            tmp = Path(tmp_str)
+            _write_persona_files(tmp, persona)
+            backup = parent / f".{persona_id}.old-{uuid.uuid4().hex[:8]}"
+            persona_dir.rename(backup)
+            try:
+                tmp.rename(persona_dir)
+            except OSError:
+                backup.rename(persona_dir)
+                raise
+        shutil.rmtree(backup, ignore_errors=True)
+    else:
+        persona_dir.mkdir(parents=True, exist_ok=True)
+        _write_persona_files(persona_dir, persona)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -266,12 +347,15 @@ class FilesystemPersonaBackend:
     ) -> None:
         """Persist ``persona`` under ``persona_id``.
 
-        When ``overwrite=False`` (default), raises ``PersonaExists`` if the
-        persona directory already exists. When ``overwrite=True``, replaces
-        the existing record atomically.
+        When ``overwrite=False`` (default), uses an atomic ``mkdir`` to claim
+        the persona directory exclusively before writing. This eliminates the
+        TOCTOU race between an ``is_dir()`` check and the first write: if two
+        concurrent writers race, exactly one wins the mkdir and the other sees
+        ``PersonaExists``.
 
-        Uses ``_io.atomic_write`` for each file so partial-write states are
-        impossible on POSIX.
+        When ``overwrite=True``, writes all four files to a sibling temp
+        directory and renames it into place in a swap-and-delete sequence so
+        a mid-save crash leaves the old record intact.
 
         Raises:
             PersonaExists: ``persona_id`` already exists and
@@ -284,28 +368,37 @@ class FilesystemPersonaBackend:
         _validate_persona_id(persona_id)
         persona_dir = self._personas_root / persona_id
 
-        if not overwrite and persona_dir.is_dir():
-            raise PersonaExists(
-                f"Persona {persona_id!r} already exists under "
-                f"{self._personas_root!r}. "
-                f"Pass overwrite=True to replace it."
-            )
-
-        _save_persona_to_dir(persona_dir, persona)
+        if not overwrite:
+            try:
+                persona_dir.mkdir(parents=True, exist_ok=False)
+            except FileExistsError:
+                raise PersonaExists(
+                    f"Persona {persona_id!r} already exists under "
+                    f"{self._personas_root!r}. "
+                    f"Pass overwrite=True to replace it."
+                ) from None
+            _write_persona_files(persona_dir, persona)
+        else:
+            persona_dir.parent.mkdir(parents=True, exist_ok=True)
+            _save_persona_group_atomic(persona_dir, persona)
 
     def list_personas(self) -> list[str]:
         """Return sorted list of known persona_ids.
 
         Returns ``[]`` when ``personas_root`` does not exist or is empty.
-        Skips entries that are not directories or whose names start with a
-        dot (internal directories like ``.snapshots`` are not personas).
+        Skips entries that are not directories, whose names start with a
+        dot (internal directories like ``.snapshots`` are not personas), or
+        that do not contain an IDENTITY.md sentinel file (incomplete or
+        externally-mutated dirs are excluded silently).
         """
         if not self._personas_root.is_dir():
             return []
         ids = [
             entry.name
             for entry in self._personas_root.iterdir()
-            if entry.is_dir() and not entry.name.startswith(".")
+            if entry.is_dir()
+            and not entry.name.startswith(".")
+            and (entry / "IDENTITY.md").is_file()
         ]
         return sorted(ids)
 

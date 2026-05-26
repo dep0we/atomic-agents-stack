@@ -793,3 +793,20 @@ def test_get_default_persona_backend_url_env_var_dispatches_to_factory(
             os.environ.pop(key, None)
             if original is not None:
                 os.environ[key] = original
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P2-3 -- @runtime_checkable isinstance check
+
+
+def test_backend_is_runtime_checkable_protocol_instance(backend_factory) -> None:
+    """``isinstance(backend, PersonaBackend)`` returns True for every backend.
+
+    ``@runtime_checkable`` enables a method-presence check (not a full
+    signature check). Verifies that both the filesystem and mock backends
+    satisfy the Protocol at runtime.
+    """
+    from atomic_agents.persona.backend import PersonaBackend
+
+    with backend_factory() as backend:
+        assert isinstance(backend, PersonaBackend)

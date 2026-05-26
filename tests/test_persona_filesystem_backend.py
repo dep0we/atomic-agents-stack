@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
-import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -244,18 +243,18 @@ def test_chmod000_personas_root_propagates_permission_error(tmp_path: Path) -> N
 # Atomic write
 
 
-def test_atomic_write_original_unchanged_on_mid_save_failure(
+def test_mid_save_failure_overwrite_leaves_old_record_intact(
     tmp_path: Path,
 ) -> None:
-    """If ``os.replace`` fails on the second file mid-save, the first file is
-    already overwritten but the original IDENTITY.md remains unchanged when
-    ``os.replace`` raises before the IDENTITY.md rename fires.
+    """A mid-save failure during ``overwrite=True`` leaves the OLD persona
+    record intact.
 
-    ``_io.atomic_write`` uses ``os.replace`` (not ``os.rename``). We
-    monkeypatch ``atomic_agents._io.os.replace`` to raise on the second call,
-    which happens during the SOUL.md write. IDENTITY.md fires first and succeeds;
-    SOUL.md raises. We verify that by patching at ``_io`` level the side-effect
-    propagates as an OSError out of ``save_persona``.
+    ``save_persona(overwrite=True)`` writes files to a sibling temp dir,
+    renames the existing persona dir to a backup, then renames the temp dir
+    to the persona dir. If the second rename fails, the backup is restored.
+    We monkeypatch ``Path.rename`` to raise on the second call (the
+    temp-dir-to-persona-dir rename) and verify that the old record is intact
+    afterward and that the OSError propagates.
     """
     from atomic_agents.persona.filesystem import FilesystemPersonaBackend
 
@@ -264,19 +263,22 @@ def test_atomic_write_original_unchanged_on_mid_save_failure(
     backend.save_persona("my-persona", original)
 
     call_count = [0]
-    real_replace = os.replace
+    real_rename = Path.rename
 
-    def _fail_on_second_replace(src, dst, **kwargs):
+    def _fail_on_second_rename(self, target):
         call_count[0] += 1
-        if call_count[0] >= 2:
+        if call_count[0] == 2:
             raise OSError("Simulated mid-save failure")
-        return real_replace(src, dst, **kwargs)
+        return real_rename(self, target)
 
     updated = _make_persona(identity="Updated content.", version=2)
-    # Patch at the _io module level where atomic_write actually calls os.replace
-    with patch("atomic_agents._io.os.replace", side_effect=_fail_on_second_replace):
+    with patch.object(Path, "rename", _fail_on_second_rename):
         with pytest.raises(OSError):
             backend.save_persona("my-persona", updated, overwrite=True)
+
+    loaded = backend.load_persona("my-persona")
+    assert loaded.identity == "Original content."
+    assert loaded.version == 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -434,3 +436,178 @@ def test_url_factory_refuses_empty_or_non_string(bad_input: object) -> None:
 
     with pytest.raises(ValueError):
         make_filesystem_persona_backend_from_url(bad_input)  # type: ignore[arg-type]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P1-1: PersonaCorrupted on corrupt metadata.json
+
+
+def test_corrupt_metadata_invalid_json_raises_PersonaCorrupted(
+    tmp_path: Path,
+) -> None:
+    """``metadata.json`` containing invalid JSON raises ``PersonaCorrupted``."""
+    from atomic_agents.exceptions import PersonaCorrupted
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    persona_dir = tmp_path / "corrupt-persona"
+    persona_dir.mkdir()
+    (persona_dir / "IDENTITY.md").write_text("identity", encoding="utf-8")
+    (persona_dir / "SOUL.md").write_text("soul", encoding="utf-8")
+    (persona_dir / "USER.md").write_text("user", encoding="utf-8")
+    (persona_dir / "metadata.json").write_text("not-valid-json{{{", encoding="utf-8")
+
+    with pytest.raises(PersonaCorrupted, match="corrupt-persona"):
+        backend.load_persona("corrupt-persona")
+
+
+def test_corrupt_metadata_missing_key_raises_PersonaCorrupted(
+    tmp_path: Path,
+) -> None:
+    """``metadata.json`` missing the ``version`` key raises ``PersonaCorrupted``."""
+    from atomic_agents.exceptions import PersonaCorrupted
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    persona_dir = tmp_path / "missing-key"
+    persona_dir.mkdir()
+    (persona_dir / "IDENTITY.md").write_text("identity", encoding="utf-8")
+    (persona_dir / "SOUL.md").write_text("soul", encoding="utf-8")
+    (persona_dir / "USER.md").write_text("user", encoding="utf-8")
+    (persona_dir / "metadata.json").write_text(
+        '{"label": null, "created_at": "2026-01-01T00:00:00Z"}', encoding="utf-8"
+    )
+
+    with pytest.raises(PersonaCorrupted, match="missing-key"):
+        backend.load_persona("missing-key")
+
+
+def test_corrupt_body_non_utf8_raises_PersonaCorrupted(tmp_path: Path) -> None:
+    """A body file with non-UTF-8 bytes raises ``PersonaCorrupted``."""
+    from atomic_agents.exceptions import PersonaCorrupted
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    persona_dir = tmp_path / "bad-encoding"
+    persona_dir.mkdir()
+    (persona_dir / "IDENTITY.md").write_bytes(b"\xff\xfe invalid utf-8")
+    (persona_dir / "SOUL.md").write_text("soul", encoding="utf-8")
+    (persona_dir / "USER.md").write_text("user", encoding="utf-8")
+    (persona_dir / "metadata.json").write_text(
+        '{"version": 1, "label": null, "created_at": "2026-01-01T00:00:00Z"}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PersonaCorrupted, match="bad-encoding"):
+        backend.load_persona("bad-encoding")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P1-3: TOCTOU-safe overwrite=False
+
+
+def test_concurrent_save_no_overwrite_only_one_succeeds(tmp_path: Path) -> None:
+    """N threads racing to ``save_persona(..., overwrite=False)`` on the same
+    persona_id: exactly one succeeds and the rest raise ``PersonaExists``."""
+    from atomic_agents.exceptions import PersonaExists
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    persona = _make_persona()
+
+    successes: list[int] = []
+    failures: list[int] = []
+
+    def _try_save(i: int) -> None:
+        try:
+            backend.save_persona("raced", persona, overwrite=False)
+            successes.append(i)
+        except PersonaExists:
+            failures.append(i)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futs = [executor.submit(_try_save, i) for i in range(8)]
+        concurrent.futures.wait(futs)
+
+    assert len(successes) == 1, f"Expected exactly 1 success, got {successes}"
+    assert len(failures) == 7, f"Expected 7 PersonaExists, got {failures}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P2-1: list_personas IDENTITY.md sentinel
+
+
+def test_list_personas_ignores_dirs_without_IDENTITY_md(tmp_path: Path) -> None:
+    """``list_personas`` skips directories that have no ``IDENTITY.md`` file."""
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    backend.save_persona("real-persona", _make_persona())
+
+    (tmp_path / "empty-dir").mkdir()
+    (tmp_path / "partial-dir").mkdir()
+    (tmp_path / "partial-dir" / "SOUL.md").write_text("soul only")
+
+    result = backend.list_personas()
+    assert result == ["real-persona"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P2-2: _redact_url preserves @ in path
+
+
+def test_redact_url_preserves_at_in_path(tmp_path: Path) -> None:
+    """``_redact_url`` does NOT redact ``@`` that appears in the path component."""
+    from atomic_agents.persona.filesystem import _redact_url
+
+    result = _redact_url("filesystem:///home/ops@fleet/personas")
+    assert "ops@fleet" in result
+
+
+def test_redact_url_redacts_at_in_authority(tmp_path: Path) -> None:
+    """``_redact_url`` DOES redact ``user:pass@`` in the authority section."""
+    from atomic_agents.persona.filesystem import _redact_url
+
+    result = _redact_url("postgres://user:pass@hostname/db")
+    assert "pass" not in result
+    assert "***@hostname" in result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P2-6: schema_version field in metadata
+
+
+def test_metadata_schema_version_serialized(tmp_path: Path) -> None:
+    """``metadata.json`` written by ``save_persona`` contains ``schema_version: 1``."""
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    backend.save_persona("versioned", _make_persona())
+
+    raw = json.loads(
+        (tmp_path / "versioned" / "metadata.json").read_text(encoding="utf-8")
+    )
+    assert raw["schema_version"] == 1
+
+
+def test_metadata_unsupported_schema_version_raises_PersonaCorrupted(
+    tmp_path: Path,
+) -> None:
+    """``metadata.json`` with an unsupported ``schema_version`` raises
+    ``PersonaCorrupted`` with the schema version in the message."""
+    from atomic_agents.exceptions import PersonaCorrupted
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    persona_dir = tmp_path / "future-schema"
+    persona_dir.mkdir()
+    (persona_dir / "IDENTITY.md").write_text("identity", encoding="utf-8")
+    (persona_dir / "SOUL.md").write_text("soul", encoding="utf-8")
+    (persona_dir / "USER.md").write_text("user", encoding="utf-8")
+    (persona_dir / "metadata.json").write_text(
+        '{"schema_version": 99, "version": 1, "label": null, "created_at": "2026-01-01T00:00:00Z"}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PersonaCorrupted, match="99"):
+        backend.load_persona("future-schema")

@@ -45,8 +45,7 @@ Every backend implementation MUST satisfy this contract (structurally; do not su
 ```python
 @runtime_checkable
 class PersonaBackend(Protocol):
-    @property
-    def backend_id(self) -> str: ...
+    backend_id: str
 
     # Core persona CRUD
     def load_persona(self, persona_id: str) -> Persona: ...
@@ -72,7 +71,7 @@ class PersonaBackend(Protocol):
     def capabilities(self) -> PersonaCapabilities: ...
 ```
 
-Where `Persona`, `PersonaSnapshot`, and `PersonaCapabilities` are frozen dataclasses defined in `atomic_agents.persona.types`. The `backend_id` property is a stable string identifier (e.g., `"filesystem"`, `"postgres"`, `"saas"`) used by the registry.
+Where `Persona`, `PersonaSnapshot`, and `PersonaCapabilities` are frozen dataclasses defined in `atomic_agents.persona.types`. The `backend_id` class attribute is a stable string identifier (e.g., `"filesystem"`, `"postgres"`, `"saas"`) used by the registry.
 
 ## Canonical types
 
@@ -189,11 +188,14 @@ The `metadata.json` sidecar carries the structured metadata fields that are not 
 
 ```json
 {
+  "schema_version": 1,
   "version": 1,
   "label": "post-tone-rewrite",
   "created_at": "2026-05-26T12:00:00Z"
 }
 ```
+
+`schema_version` is `1` for all records written by this release. Future schema changes will increment this value; `load_persona` raises `PersonaCorrupted` when it encounters an unsupported schema version. Records without `schema_version` default to `1` (backward-compat for pre-PR1-adversarial-fix records).
 
 `label` is `null` when not supplied. `created_at` is an ISO 8601 timestamp string (the backend writes it; callers supply it as part of the `Persona` dataclass fields).
 
@@ -215,27 +217,24 @@ def get_default_persona_backend(scope_root: Path) -> PersonaBackend: ...
 - `unregister_persona_backend`: idempotent (no-op if absent). Used by conformance fixtures for register-in-setup + unregister-in-teardown hygiene (mirrors Policy arc D9 fold #3).
 - `get_persona_backend`: returns the registered class. Raises `BackendNotRegistered` when the id is not in the registry.
 - `list_persona_backends`: returns registered backend ids in lexicographic order.
-- `get_default_persona_backend`: honors `ATOMIC_AGENTS_PERSONA_BACKEND` env var (default `"filesystem"`). Unknown values raise `BackendNotRegistered` with credential-redacted error messages.
+- `get_default_persona_backend`: honors `ATOMIC_AGENTS_PERSONA_BACKEND` env var (default `"filesystem"`). Unknown values raise `BackendNotRegistered` with credential-redacted error messages. When `ATOMIC_AGENTS_PERSONA_BACKEND_URL` is set and the backend is `"filesystem"`, the URL is passed directly to `make_filesystem_persona_backend_from_url`.
 
 Convention: `backend_id: str` + `cls: type[PersonaBackend]` (mirrors the 9 prior backends). The design doc originally used `register_persona_backend(scheme, factory)`; the implementation uses the established convention.
 
-### URL factory hook
+### URL factory (filesystem only)
 
 ```python
-def register_persona_backend_url_factory(scheme: str, factory: object) -> None: ...
 def make_filesystem_persona_backend_from_url(url: str) -> FilesystemPersonaBackend: ...
 ```
 
-URL factories are callables with signature `(url: str) -> PersonaBackend`. Registered factories are used by `get_default_persona_backend` when `ATOMIC_AGENTS_PERSONA_BACKEND_URL` is set.
-
-The filesystem URL factory is registered at module-import time via `atomic_agents/persona/__init__.py`. The factory handles `filesystem:///absolute/path` URLs; see §"URL factory" below.
+The filesystem URL factory handles `filesystem:///absolute/path` URLs. See §"URL factory" below. There is no process-local URL factory registry: `get_default_persona_backend` dispatches to the filesystem URL factory directly, matching the `PolicyBackend` pattern (Policy also has no URL factory registry).
 
 ## Operator override surface
 
 **Environment variables:**
 
 - `ATOMIC_AGENTS_PERSONA_BACKEND`: backend id string (default `"filesystem"`). Follows the established `ATOMIC_AGENTS_<PRIMITIVE>_BACKEND` pattern.
-- `ATOMIC_AGENTS_PERSONA_BACKEND_URL`: optional URL for the filesystem URL factory path. Parsed via the registered URL factory for the URL's scheme.
+- `ATOMIC_AGENTS_PERSONA_BACKEND_URL`: optional `filesystem:///path` URL. When set alongside `ATOMIC_AGENTS_PERSONA_BACKEND=filesystem`, passed directly to `make_filesystem_persona_backend_from_url` to override the default `<scope_root>/.personas` root.
 
 **Constructor kwarg (PR 2):**
 
@@ -307,7 +306,7 @@ Implementers MUST:
 
 4. **URL credential redaction across all `ValueError` sites in factory functions.** URL factories and `get_default_persona_backend` error paths MUST NOT echo raw URL credentials. The reference uses `_redact_url` / `_redact_for_error_message` helpers that strip after `://` and truncate. Operators may accidentally paste `postgres://user:password@host/db` into env vars.
 
-5. **Atomic write on `save_persona`.** Each file written during `save_persona` uses `_io.atomic_write` (temp file + fsync + rename) so partial-write states are impossible on POSIX. Concurrent saves on the same `persona_id` are last-writer-wins by documented semantics.
+5. **Group-atomic save on `save_persona`.** The entire persona record (all four files) is written as a group-atomic operation so a mid-save crash leaves no partial state. For the `overwrite=False` path, `mkdir(exist_ok=False)` claims the directory exclusively before writing, eliminating the TOCTOU race between an `is_dir()` check and the first write. For the `overwrite=True` path, all four files are written to a sibling temp directory and then the temp directory is renamed into place via a swap-and-delete sequence; if the rename fails, the old record is restored. Concurrent saves on the same `persona_id` with `overwrite=True` are last-writer-wins by documented semantics.
 
 6. **Snapshot id determinism.** Backend-issued snapshot ids MUST be monotonic or sortable (supporting `list_snapshots` returning chronological order). Cross-persona isolation MUST be enforced at the storage layer: restoring snapshot `X` from persona A to persona B MUST raise `PersonaSnapshotNotFound`.
 
@@ -322,6 +321,7 @@ All persona exceptions live in `atomic_agents.exceptions` (D-PI-1) and are re-ex
 - `PersonaError`: base class for all persona subsystem errors.
 - `PersonaNotFound`: `load_persona(persona_id)` called with an id the backend does not know about.
 - `PersonaExists`: `save_persona()` or `clone()` refused to overwrite an existing persona (no-overwrite default; `save_persona(..., overwrite=True)` bypasses this).
+- `PersonaCorrupted`: the persona directory exists but its contents are corrupt or structurally invalid. Raised by `load_persona` when `metadata.json` is unparseable JSON, is missing a required key (`version`, `created_at`), uses an unsupported `schema_version`, or a body file contains non-UTF-8 bytes. Distinct from `PersonaNotFound` -- the record EXISTS but cannot be read.
 - `PersonaSnapshotNotFound`: `restore(persona_id, snapshot_id)` referenced an unknown snapshot or a snapshot belonging to a different persona.
 - `PersonaOwnershipConflict`: both `<agent>/persona.link.md` and `<agent>/persona/IDENTITY.md` exist at agent construction (D2a). Raised by profile backends in PR 2.
 - `PersonaLinkInvalid`: `persona.link.md` is malformed or the `persona_id:` value fails the charset pattern. Raised by the `persona_link_md.py` parser in PR 2 (D-ER-3).
