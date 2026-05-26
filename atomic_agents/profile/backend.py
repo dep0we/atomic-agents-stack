@@ -213,6 +213,110 @@ class AgentProfileBackend(Protocol):
         ...
 
     # ────────────────────────────────────────────────────────────
+    # Persona ownership composition (#62 PR 2 — D-PP-3 + D-PP-7)
+
+    def external_persona_ref(self, agent_id: str) -> str | None:
+        """Return the persona_id when the agent's persona is externally owned.
+
+        Returns ``None`` when the agent's persona is internally owned —
+        the legacy three-file layout for filesystem backends, or a NULL
+        persona_id column for SQLite-shaped backends. Returns the
+        persona_id string when the agent is bound to a shared persona
+        record via the ``PersonaBackend`` Protocol.
+
+        The framework consults this on every ``AtomicAgent.__init__`` to
+        decide whether to read persona fields from the AgentProfile's
+        denormalized snapshot (returned by ``load_profile``) or to call
+        ``persona_backend.load_persona(persona_id)`` for the source of
+        truth. See spec/33 §"Composition with AgentProfileBackend" and
+        the locked design doc D-PP-3.
+
+        Semantics:
+
+        * MUST return ``None`` (NOT raise) when the agent is internally
+          owned. Operators use this method on the same code path as
+          ``load_profile``; raising defeats that pattern.
+        * MUST raise ``AgentProfileNotFound`` when the agent itself
+          does not exist. The distinction is load-bearing — "agent
+          missing" vs "agent internally owned" need different
+          downstream handling.
+        * The filesystem reference impl reads
+          ``<agent_root>/persona.link.md`` once and returns its
+          ``persona_id`` field. The SQLite reference impl selects the
+          ``persona_id`` column. Both validate the persona_id charset
+          at the storage layer; malformed records raise
+          ``PersonaLinkInvalid`` (filesystem) or the appropriate
+          storage-layer exception.
+        * The Protocol method check operates on the INSTANCE directory
+          only for filesystem backends (D-PP-6 cascade carve-out).
+          Role-layer persona files are read-paths-only and do not
+          participate in the ownership trigger.
+
+        Args:
+            agent_id: target agent identifier.
+
+        Returns:
+            The persona_id string when externally owned, or ``None``
+            when internally owned.
+
+        Raises:
+            AgentProfileNotFound: when the agent does not exist.
+            PersonaLinkInvalid: when the filesystem backend finds a
+                malformed ``persona.link.md`` file.
+        """
+        ...
+
+    def set_persona_ownership(self, agent_id: str, persona_id: str | None) -> None:
+        """Mark the agent as externally owned, or restore internal ownership.
+
+        When ``persona_id`` is a non-None string, the agent's persona is
+        bound to the named ``PersonaBackend`` record. Subsequent
+        ``load_profile`` calls populate persona fields via the framework's
+        bootstrap path (see D-PP-4). When ``persona_id`` is ``None``,
+        the binding is removed — the agent reverts to internal ownership
+        (legacy three-file layout for filesystem backends; NULL column
+        for SQLite-shaped backends).
+
+        Semantics:
+
+        * MUST persist before returning (same atomic-write discipline
+          as ``save_profile``).
+        * Filesystem backends write ``<agent_root>/persona.link.md`` via
+          ``_io.atomic_write`` when ``persona_id`` is non-None; remove
+          the file when ``None``. Filesystem backends MUST raise
+          ``PersonaOwnershipConflict`` when ``persona_id`` is non-None
+          AND ``<agent_root>/persona/IDENTITY.md`` already exists —
+          enforces D2a at write time so operators cannot create a
+          conflicting state by API.
+        * SQL-shaped backends ``UPDATE ... SET persona_id = ?``. They
+          do NOT raise the ownership conflict on set — the conflict is
+          filesystem-only (D-PP-8). The next ``save_profile`` silently
+          drops any inline persona text when ``persona_id`` is non-NULL,
+          emitting a one-time ``agent_profile_save_dropped_persona_fields``
+          log event.
+        * MAY raise ``NotImplementedError`` when
+          ``capabilities().supports_save=False`` (read-only backends).
+        * MUST validate the ``persona_id`` charset at the API boundary
+          when non-None — the same Protocol-wide charset
+          ``[a-zA-Z0-9_.+@-]+`` enforced by PersonaBackend. Reuse the
+          ``parse_persona_link_md`` validation for filesystem backends.
+
+        Args:
+            agent_id: target agent identifier.
+            persona_id: the persona record id to bind, or ``None`` to
+                restore internal ownership.
+
+        Raises:
+            AgentProfileNotFound: when the agent does not exist.
+            PersonaOwnershipConflict: filesystem backends when both
+                ``persona.link.md`` and ``persona/IDENTITY.md`` would
+                exist after the write.
+            ValueError: ``persona_id`` fails charset validation.
+            NotImplementedError: capability not supported.
+        """
+        ...
+
+    # ────────────────────────────────────────────────────────────
     # Skills — separate Protocol methods (Decision 2)
 
     def list_skills(self, agent_id: str) -> list[SkillManifest]:

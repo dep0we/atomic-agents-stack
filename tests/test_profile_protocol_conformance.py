@@ -61,6 +61,7 @@ import pytest
 from atomic_agents.exceptions import (
     AgentProfileExists,
     AgentProfileNotFound,
+    PersonaLinkInvalid,
     SnapshotNotFound,
 )
 from atomic_agents.profile import (
@@ -1023,3 +1024,169 @@ def test_from_dict_narrows_mcp_re_parse_except(backend, tmp_path):
     assert isinstance(profile.mcp_servers, list)
     # Raw text preserved verbatim — the $VAR reference must survive
     assert "$NEVER_SET_VAR_FOR_TEST_F_B" in profile.mcp_md_raw
+
+
+# ──────────────────────────────────────────────────────────────────
+# Persona ownership composition — #62 PR 2 (D-PP-3 + D-PP-7)
+#
+# Ten conformance tests covering ``external_persona_ref`` and
+# ``set_persona_ownership`` across both FilesystemAgentProfileBackend
+# and SQLiteAgentProfileBackend.  Charset-refusal tests exercise the
+# shared validation rule; the AgentProfileNotFound contract is pinned
+# for both methods.
+#
+# Setup note: the filesystem backend's ``set_persona_ownership(non-None)``
+# raises ``PersonaOwnershipConflict`` when ``persona/IDENTITY.md`` exists
+# (D2a enforcement at write time).  Tests that call set_persona_ownership
+# with a non-None value therefore need an agent WITHOUT an existing
+# IDENTITY.md on the filesystem backend.
+#
+# ``make_persona_bindable_agent`` sets up such an agent for any backend:
+# - Filesystem: writes only ``persona.link.md`` (placeholder persona_id
+#   "placeholder") so the dir passes ``_is_agent_dir`` without IDENTITY.md.
+# - SQLite: saves via ``save_profile`` (no on-disk IDENTITY.md exists;
+#   SQLite stores state as a DB row and never checks for IDENTITY.md).
+# Tests that only need ``external_persona_ref`` (read-side) use the
+# standard ``make_agent_in_backend`` helper because a legacy agent is the
+# canonical "internally owned" starting state.
+
+
+def make_persona_bindable_agent(
+    backend: AgentProfileBackend,
+    scope_root: Path,
+    agent_id: str,
+) -> None:
+    """Create an agent that can receive a non-None set_persona_ownership call.
+
+    Filesystem backend: writes ``persona.link.md`` with a placeholder
+    persona_id so the directory is recognized as an agent (D-PP-1) without
+    a ``persona/IDENTITY.md`` that would trigger D2a conflict.
+
+    SQLite backend: calls ``save_profile`` to insert a row; no on-disk
+    IDENTITY.md is involved, so set_persona_ownership never hits D2a.
+    """
+    if backend.backend_id == "filesystem":
+        agent_root = scope_root / agent_id
+        agent_root.mkdir(parents=True, exist_ok=True)
+        link_body = (
+            "# Persona link\n\n```yaml\nkind: shared\npersona_id: placeholder\n```\n"
+        )
+        (agent_root / "persona.link.md").write_text(link_body, encoding="utf-8")
+    else:
+        # SQLite and any future non-filesystem backend: use the Protocol write path.
+        make_agent_in_backend(backend, scope_root, agent_id)
+
+
+def test_external_persona_ref_internally_owned_returns_none(backend, tmp_path):
+    """An agent with the legacy three-file layout (internally owned) returns None.
+
+    D-PP-3: ``external_persona_ref`` MUST return None (not raise) when
+    the agent exists but has no shared-persona reference.
+    """
+    make_agent_in_backend(backend, tmp_path, "scout")
+    result = backend.external_persona_ref("scout")
+    assert result is None
+
+
+def test_external_persona_ref_missing_agent_raises(backend, tmp_path):
+    """D-PP-3: missing agent raises ``AgentProfileNotFound``, not None.
+
+    The distinction is load-bearing — the framework's bootstrap path
+    must distinguish "agent missing" from "agent internally owned".
+    """
+    with pytest.raises(AgentProfileNotFound):
+        backend.external_persona_ref("ghost-agent")
+
+
+def test_external_persona_ref_returns_persona_id_after_set(backend, tmp_path):
+    """After ``set_persona_ownership``, ``external_persona_ref`` returns
+    the persona_id that was written (D-PP-3 + D-PP-7 round-trip).
+    """
+    make_persona_bindable_agent(backend, tmp_path, "scout")
+    backend.set_persona_ownership("scout", "shared-customer-v3")
+    result = backend.external_persona_ref("scout")
+    assert result == "shared-customer-v3"
+
+
+def test_set_persona_ownership_round_trips_via_external_ref(backend, tmp_path):
+    """``set_persona_ownership`` persists; the value is stable across two
+    ``external_persona_ref`` reads on the same backend instance.
+    """
+    make_persona_bindable_agent(backend, tmp_path, "writer")
+    backend.set_persona_ownership("writer", "shared-customer-v3")
+    assert backend.external_persona_ref("writer") == "shared-customer-v3"
+    # Second read is stable (no caching side-effect that clears the value).
+    assert backend.external_persona_ref("writer") == "shared-customer-v3"
+
+
+def test_set_persona_ownership_none_restores_internal(backend, tmp_path):
+    """Setting ownership to None removes the external binding (D-PP-7).
+
+    After set_persona_ownership(None), the agent is no longer externally
+    owned.  The outcome for external_persona_ref differs by backend:
+
+    - SQLite: the row still exists with persona_id=NULL → returns None.
+    - Filesystem: the link file was the only sentinel; removing it makes
+      the agent invisible to ``_is_agent_dir`` → raises AgentProfileNotFound.
+      Operators must add ``persona/IDENTITY.md`` to restore list visibility
+      (D-PP-7 docstring: "The operator is responsible...").
+
+    Both outcomes are conformant with the Protocol: the binding is gone.
+    """
+    make_persona_bindable_agent(backend, tmp_path, "scout")
+    backend.set_persona_ownership("scout", "some-persona")
+    assert backend.external_persona_ref("scout") == "some-persona"
+    backend.set_persona_ownership("scout", None)
+    # Binding cleared — either None (row-based backends) or not-found (filesystem).
+    try:
+        result = backend.external_persona_ref("scout")
+        assert result is None, f"expected None after clearing, got {result!r}"
+    except AgentProfileNotFound:
+        # Filesystem: link was only sentinel; dir is no longer an agent.
+        pass
+
+
+def test_set_persona_ownership_missing_agent_raises(backend, tmp_path):
+    """D-PP-7: ``set_persona_ownership`` on a non-existent agent raises
+    ``AgentProfileNotFound``.
+    """
+    with pytest.raises(AgentProfileNotFound):
+        backend.set_persona_ownership("ghost-agent", "some-persona")
+
+
+def test_set_persona_ownership_empty_string_raises_value_error(backend, tmp_path):
+    """Charset rule refuses empty-string persona_id at the API boundary (D-PP-7).
+
+    An empty persona_id would break the filesystem file format and the
+    SQL read path; the backend must refuse before any I/O.
+
+    Note: Protocol docstring says ``ValueError``; the filesystem backend
+    raises ``PersonaLinkInvalid`` (a ``PersonaError`` subclass) via
+    ``_validate_persona_id``.  Both are accepted here — they signal the
+    same "bad input" contract; the test pins that SOME error is raised,
+    not which class the backend chooses internally.
+    """
+    make_persona_bindable_agent(backend, tmp_path, "scout")
+    with pytest.raises((ValueError, PersonaLinkInvalid)):
+        backend.set_persona_ownership("scout", "")
+
+
+def test_set_persona_ownership_dotdot_raises_value_error(backend, tmp_path):
+    """Charset rule refuses ``..`` in persona_id (path-traversal defense)."""
+    make_persona_bindable_agent(backend, tmp_path, "scout")
+    with pytest.raises((ValueError, PersonaLinkInvalid)):
+        backend.set_persona_ownership("scout", "../../etc/passwd")
+
+
+def test_set_persona_ownership_slash_raises_value_error(backend, tmp_path):
+    """Charset rule refuses ``/`` (path separator) in persona_id."""
+    make_persona_bindable_agent(backend, tmp_path, "scout")
+    with pytest.raises((ValueError, PersonaLinkInvalid)):
+        backend.set_persona_ownership("scout", "my/persona")
+
+
+def test_set_persona_ownership_control_char_raises_value_error(backend, tmp_path):
+    """Charset rule refuses control characters in persona_id."""
+    make_persona_bindable_agent(backend, tmp_path, "scout")
+    with pytest.raises((ValueError, PersonaLinkInvalid)):
+        backend.set_persona_ownership("scout", "bad\x00persona")
