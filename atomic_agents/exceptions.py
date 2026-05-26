@@ -450,13 +450,104 @@ class ToolAlreadyInstalled(AtomicAgentsError):
     Raised by backends declaring ``supports_install=True`` (SQLite #64
     PR 3; future PyPI / git) when a tool with the same name already
     exists in the catalog. Mirrors the ``AgentProfileExists`` shape
-    spec/24 established — install is a safe-create primitive; operators
+    spec/24 established -- install is a safe-create primitive; operators
     wanting overwrite call ``uninstall`` first.
 
-    Spec/25 MUST #7 — install is atomic at the tool level; concurrent
+    Spec/25 MUST #7 -- install is atomic at the tool level; concurrent
     install calls with the same name resolve exactly one winner; the
     others raise this exception. Reserved at the exception level in
     PR 1 even though no backend in PR 1 raises it (filesystem doesn't
     support install). The SQLite backend (#64 PR 3) is the first
     implementer.
+    """
+
+
+# ──────────────────────────────────────────────────────────────────
+# PersonaBackend exceptions (spec/33 -- issue #62 PR 1 of 4)
+#
+# PersonaError and its subclasses live here (not in persona/types.py)
+# because PersonaOwnershipConflict is raised by profile/filesystem.py
+# and profile/sqlite.py (D2a), and PersonaLinkInvalid is raised by the
+# persona_link_md.py parser (D-ER-4). Cross-module placement matches
+# the convention used by AgentProfileNotFound, ToolNotInRegistry, etc.
+# D-PI-1 (pre-impl prep amendment 2026-05-26).
+
+
+class PersonaError(AtomicAgentsError):
+    """Base class for persona subsystem errors.
+
+    Subclasses cover load, save, snapshot, and ownership-conflict
+    scenarios. Operators catching AtomicAgentsError catch persona
+    failures too; operators catching PersonaError catch only the
+    persona subset.
+    """
+
+
+class PersonaNotFound(PersonaError):
+    """``PersonaBackend.load_persona(persona_id)`` was called with an id
+    the backend does not know about.
+
+    Raised by the filesystem reference impl when the persona directory
+    is absent under ``<personas_root>/<persona_id>/``. Database backends
+    raise this when the persona row is missing.
+
+    Distinct from ``BackendNotRegistered`` (operator pinned a backend
+    string that nobody registered) -- this exception means the BACKEND
+    is fine, the PERSONA ID is not.
+    """
+
+
+class PersonaExists(PersonaError):
+    """``PersonaBackend.save_persona(persona_id, ...)`` or
+    ``PersonaBackend.clone(source_id, target_id)`` refused to overwrite
+    an existing persona.
+
+    Persona backends refuse silent overwrites by default. Operators who
+    want to replace an existing persona call ``save_persona(...,
+    overwrite=True)`` explicitly. ``clone`` and other create-flavored
+    operations raise this when the target persona_id already exists.
+    """
+
+
+class PersonaSnapshotNotFound(PersonaError):
+    """``PersonaBackend.restore(persona_id, snapshot_id)`` referenced an
+    unknown snapshot.
+
+    Snapshot ids are backend-issued by ``PersonaBackend.snapshot()``.
+    This exception fires when an operator passes a stale id, a typo, or
+    a snapshot id belonging to a different persona. Cross-persona
+    snapshot isolation is enforced at the backend level.
+    """
+
+
+class PersonaOwnershipConflict(PersonaError):
+    """Both ``<agent>/persona.link.md`` and ``<agent>/persona/IDENTITY.md``
+    exist at agent construction (D2a).
+
+    Raised by ``FilesystemAgentProfileBackend.load_profile()`` and
+    ``SQLiteAgentProfileBackend.load_profile()`` when both the shared-
+    persona reference file and the legacy three-file layout are present
+    for the same agent. Operators must choose one layout: remove
+    ``persona.link.md`` to keep the legacy layout, or remove the
+    ``persona/IDENTITY|SOUL|USER.md`` files to use the shared-persona
+    reference.
+    """
+
+
+class PersonaLinkInvalid(PersonaError):
+    """The ``persona.link.md`` file is malformed or references an unknown
+    persona record.
+
+    Raised by the ``persona_link_md.py`` parser (D-ER-4) when:
+    - The YAML code block cannot be parsed (malformed YAML).
+    - The ``kind:`` field is missing.
+    - The ``kind:`` value is not a supported kind (v1 supports only
+      ``shared``; future: ``template``, ``git``, ``vault``).
+    - The ``persona_id:`` field is missing.
+    - The ``persona_id:`` value fails the charset pattern
+      ``[a-zA-Z0-9_.+@-]+``.
+
+    Distinct from ``PersonaNotFound`` -- this exception means the
+    REFERENCE FILE is malformed; ``PersonaNotFound`` means the file
+    parsed correctly but the referenced persona record does not exist.
     """
