@@ -239,9 +239,22 @@ def test_future_schema_version_raises_runtime_error(tmp_path):
 
 
 def test_concurrent_migration_from_two_instances(tmp_path):
-    """Two backend instances against a v1 DB both succeed; DB ends at v2."""
+    """Two backend instances against a v1 DB both succeed; DB ends at v2.
+
+    WAL is pre-enabled on the v1 DB so concurrent connections don't race on
+    the journal_mode negotiation step itself (which intermittently surfaces
+    as ``OperationalError('database is locked')`` on macOS APFS even with
+    ``busy_timeout=5000`` set). The test targets the migration serialization
+    path (ALTER + meta UPDATE), not the WAL setup path — same pattern used
+    by ``test_concurrent_inserts_during_migration``.
+    """
     db_path = str(tmp_path / "profiles.db")
     _create_v1_db(db_path)
+    # Pre-enable WAL to avoid journal-mode negotiation races among threads.
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.close()
     _insert_v1_agent(db_path, "scout")
 
     errors: list[Exception] = []
