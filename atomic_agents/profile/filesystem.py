@@ -65,14 +65,12 @@ from ..exceptions import (
     AgentProfileExists,
     AgentProfileNotFound,
     MCPServerConnectFailed,
-    PersonaOwnershipConflict,
     SkillFileTraversal,
     SnapshotNotFound,
 )
 from ..goal import parse_agent_mode_text
 from ..judges_md import load_judges_config
 from ..mcp import parse_mcp_md_text
-from ..persona_link_md import parse_persona_link_md
 from ..skills import (
     SKILL_ENTRY_POINT,
     SkillManifest,
@@ -91,15 +89,12 @@ from .types import (
 # doesn't surface as agents.
 _HIDDEN_PREFIX = "."
 
-# Sentinels that distinguish an agent directory from a non-agent directory.
-# Either ``persona/IDENTITY.md`` (legacy three-file layout) OR
-# ``persona.link.md`` (shared-persona reference, #62 PR 2, D-PP-1) is enough.
-# Mirrors ``doctor.check_vault``'s requirement at ``doctor.py:386`` for the
-# legacy case; the shared-persona case is the new D2a-locked layout.
+# Sentinel that distinguishes an agent directory from a non-agent directory.
+# Mirrors ``doctor.check_vault``'s requirement at ``doctor.py:386`` —
+# IDENTITY.md is the load-bearing identity file every agent has.
 _IDENTITY_RELATIVE = Path("persona") / "IDENTITY.md"
 _SOUL_RELATIVE = Path("persona") / "SOUL.md"
 _USER_RELATIVE = Path("persona") / "USER.md"
-_PERSONA_LINK_RELATIVE = Path("persona.link.md")
 
 
 class FilesystemAgentProfileBackend:
@@ -207,29 +202,6 @@ class FilesystemAgentProfileBackend:
     def _identity_path(self, agent_root: Path) -> Path:
         return agent_root / _IDENTITY_RELATIVE
 
-    def _persona_link_path(self, agent_root: Path) -> Path:
-        return agent_root / _PERSONA_LINK_RELATIVE
-
-    def _is_agent_dir(self, agent_root: Path) -> bool:
-        """Return True when ``agent_root`` has either ownership sentinel.
-
-        The framework treats a directory as "an agent" when EITHER of:
-        - ``persona/IDENTITY.md`` (legacy three-file layout)
-        - ``persona.link.md`` (shared-persona reference, D2a)
-
-        is present. Used by ``load_profile``, ``list_agents``, and
-        ``exists`` so the sentinel choice stays uniform across the three
-        sites (D-PP-1).
-
-        Operates on the INSTANCE directory only — role-layer persona
-        files in a cascade layout do NOT mark a child as an agent on
-        their own; the operator must place either sentinel at the
-        instance level (D-PP-6).
-        """
-        return (agent_root / _IDENTITY_RELATIVE).is_file() or (
-            agent_root / _PERSONA_LINK_RELATIVE
-        ).is_file()
-
     # ────────────────────────────────────────────────────────────
     # Core read
 
@@ -247,26 +219,10 @@ class FilesystemAgentProfileBackend:
         """
         agent_root = self._agent_root(agent_id)
         identity_path = self._identity_path(agent_root)
-        persona_link_path = self._persona_link_path(agent_root)
-        identity_present = identity_path.is_file()
-        link_present = persona_link_path.is_file()
-
-        # D-PP-1: sentinel admits either layout. D2a: mutual exclusion —
-        # both files present is operator error and the framework refuses
-        # to guess which one wins.
-        if not (identity_present or link_present):
+        if not identity_path.is_file():
             raise AgentProfileNotFound(
                 f"agent {agent_id!r} not found at {agent_root}: "
-                f"neither persona/IDENTITY.md nor persona.link.md exists"
-            )
-        if identity_present and link_present:
-            raise PersonaOwnershipConflict(
-                f"agent {agent_id!r} has both persona/IDENTITY.md and "
-                f"persona.link.md at {agent_root}. Remove one — the two "
-                f"are mutually exclusive (D2a). Keep persona.link.md to "
-                f"use a shared PersonaBackend record; keep "
-                f"persona/IDENTITY.md to use the legacy three-file "
-                f"layout."
+                f"persona/IDENTITY.md is missing or not a file"
             )
 
         cascade = detect_cascade(agent_root)
@@ -361,44 +317,28 @@ class FilesystemAgentProfileBackend:
             mcp_servers = []
 
         # ── persona/IDENTITY.md, SOUL.md, USER.md — raw text ──
-        # When persona.link.md is present (link_present is True), the
-        # agent's persona is externally owned by a PersonaBackend.
-        # ``load_profile`` returns empty persona fields as a placeholder;
-        # ``AtomicAgent.__init__`` repopulates them via the bootstrap
-        # sequence at D-PP-4 (calling ``persona_backend.load_persona``
-        # for the source of truth and re-deriving agent_mode). Operators
-        # reading ``self._profile.persona_identity`` after agent
-        # construction see the resolved text; operators reading the
-        # AgentProfile returned by ``load_profile`` directly (no framework
-        # bootstrap layer) see empty strings and MUST consult
-        # ``external_persona_ref`` to drive their own resolution.
-        if link_present:
-            persona_identity = ""
-            persona_soul = ""
-            persona_user = ""
-        else:
-            # Read IDENTITY.md ONCE — used both for persona_identity and
-            # to derive agent_mode (Decision 6). Step 9.1 perf finding
-            # F-C flagged the original double-read.
-            persona_identity = identity_path.read_text(encoding="utf-8")
-            soul_path = agent_root / _SOUL_RELATIVE
-            persona_soul = (
-                soul_path.read_text(encoding="utf-8") if soul_path.is_file() else ""
-            )
-            user_path = agent_root / _USER_RELATIVE
-            persona_user = (
-                user_path.read_text(encoding="utf-8") if user_path.is_file() else ""
-            )
+        # Read IDENTITY.md ONCE — used both for persona_identity and to
+        # derive agent_mode (Decision 6). Step 9.1 perf finding F-C
+        # flagged the original double-read (``read_text`` + ``parse_
+        # agent_mode`` re-reading via ``identity_path.read_text``).
+        # ``parse_agent_mode_text`` is the text-taking variant added
+        # to ``goal.py`` so callers with the content already in memory
+        # pay one syscall, not two.
+        persona_identity = identity_path.read_text(encoding="utf-8")
+        soul_path = agent_root / _SOUL_RELATIVE
+        persona_soul = (
+            soul_path.read_text(encoding="utf-8") if soul_path.is_file() else ""
+        )
+        user_path = agent_root / _USER_RELATIVE
+        persona_user = (
+            user_path.read_text(encoding="utf-8") if user_path.is_file() else ""
+        )
 
         # ── goal.md — raw text (GoalManager handles the structured path) ──
         goal_path = agent_root / "goal.md"
         goal_text = goal_path.read_text(encoding="utf-8") if goal_path.is_file() else ""
 
         # ── agent_mode — derived from in-memory persona_identity (Decision 6) ──
-        # When externally owned (persona_identity == ""), this defaults
-        # to "reactive" (parse_agent_mode_text's default for empty input).
-        # ``AtomicAgent.__init__`` re-derives after PersonaBackend
-        # repopulation (D-PP-4) before any consumer reads the mode.
         agent_mode = parse_agent_mode_text(persona_identity)
 
         return AgentProfile(
@@ -439,36 +379,19 @@ class FilesystemAgentProfileBackend:
 
         cascade = detect_cascade(agent_root)
 
-        # ── Persona — instance-layer, gated on ownership (D6) ──
-        # When ``persona.link.md`` is present, the agent's persona is
-        # owned by a PersonaBackend; ``save_profile`` MUST NOT write
-        # ``persona/IDENTITY|SOUL|USER.md`` (the inline persona-text
-        # fields on the AgentProfile are denormalized snapshots
-        # populated by the framework's bootstrap path, not authoritative
-        # state). Silent skip mirrors spec/24 Decision 6's ``agent_mode``
-        # ignore-on-save pattern.
-        if (agent_root / _PERSONA_LINK_RELATIVE).is_file():
-            # Externally owned — skip persona writes entirely. Operators
-            # editing the persona must do so via the PersonaBackend
-            # (e.g., ``atomic-agents persona <subcommand>`` once PR 3
-            # ships the CLI).
-            # Clean up legacy orphan files so operators editing them
-            # directly don't see ghost effects (P2-A round 2).
-            _unlink_if_exists(agent_root / _SOUL_RELATIVE)
-            _unlink_if_exists(agent_root / _USER_RELATIVE)
+        # ── Persona — always instance-layer ──
+        atomic_write(agent_root / _IDENTITY_RELATIVE, profile.persona_identity)
+        # SOUL.md and USER.md are optional: write only when non-empty
+        # so save→load→save round-trips don't materialize empty files
+        # the operator never authored.
+        if profile.persona_soul:
+            atomic_write(agent_root / _SOUL_RELATIVE, profile.persona_soul)
         else:
-            atomic_write(agent_root / _IDENTITY_RELATIVE, profile.persona_identity)
-            # SOUL.md and USER.md are optional: write only when non-empty
-            # so save→load→save round-trips don't materialize empty files
-            # the operator never authored.
-            if profile.persona_soul:
-                atomic_write(agent_root / _SOUL_RELATIVE, profile.persona_soul)
-            else:
-                _unlink_if_exists(agent_root / _SOUL_RELATIVE)
-            if profile.persona_user:
-                atomic_write(agent_root / _USER_RELATIVE, profile.persona_user)
-            else:
-                _unlink_if_exists(agent_root / _USER_RELATIVE)
+            _unlink_if_exists(agent_root / _SOUL_RELATIVE)
+        if profile.persona_user:
+            atomic_write(agent_root / _USER_RELATIVE, profile.persona_user)
+        else:
+            _unlink_if_exists(agent_root / _USER_RELATIVE)
 
         # ── goal.md — instance-layer; absent when empty ──
         if profile.goal_text:
@@ -538,13 +461,7 @@ class FilesystemAgentProfileBackend:
     # Enumeration
 
     def list_agents(self) -> list[str]:
-        """Return subdirs of ``scope_root`` with the agent sentinel, lex order.
-
-        Sentinel: either ``persona/IDENTITY.md`` (legacy layout) OR
-        ``persona.link.md`` (shared-persona reference, D-PP-1) is enough.
-        Hidden directories (names starting with ``.``) are skipped so
-        ``.snapshots/`` and friends don't surface as agents.
-        """
+        """Return subdirs of ``scope_root`` with persona/IDENTITY.md, lex order."""
         if not self._scope_root.is_dir():
             return []
         agents: list[str] = []
@@ -554,121 +471,17 @@ class FilesystemAgentProfileBackend:
             if entry.name.startswith(_HIDDEN_PREFIX):
                 # Skip hidden dirs (.snapshots, .tmp, .git, etc.).
                 continue
-            if self._is_agent_dir(entry):
+            if (entry / _IDENTITY_RELATIVE).is_file():
                 agents.append(entry.name)
         return agents
 
     def exists(self, agent_id: str) -> bool:
-        """True when the agent dir has the sentinel (IDENTITY.md or link.md).
-
-        Uses the same predicate as ``list_agents`` and ``load_profile``
-        (D-PP-1).
-        """
+        """True when the agent dir + persona/IDENTITY.md sentinel exists."""
         try:
             agent_root = self._agent_root(agent_id)
         except ValueError:
             return False
-        return self._is_agent_dir(agent_root)
-
-    # ────────────────────────────────────────────────────────────
-    # Persona ownership composition (#62 PR 2 — D-PP-3 + D-PP-7)
-
-    def external_persona_ref(self, agent_id: str) -> str | None:
-        """Return the agent's persona_id when externally owned, else None.
-
-        Reads ``<agent_root>/persona.link.md`` once and returns the
-        ``persona_id`` field. Returns None when the file is absent
-        (internally-owned agent, legacy three-file layout).
-
-        Raises ``AgentProfileNotFound`` when the agent itself doesn't
-        exist — the distinction "agent missing" vs "agent internally
-        owned" is load-bearing for the framework's bootstrap path
-        (D-PP-3).
-
-        Raises ``PersonaLinkInvalid`` when ``persona.link.md`` exists
-        but its contents are malformed; the parser's error message
-        carries the file path and the parse failure.
-
-        Operates on the INSTANCE directory only — role-layer files in a
-        cascade layout do NOT participate in ownership (D-PP-6).
-        """
-        agent_root = self._agent_root(agent_id)
-        if not self._is_agent_dir(agent_root):
-            raise AgentProfileNotFound(
-                f"agent {agent_id!r} not found at {agent_root}: "
-                f"neither persona/IDENTITY.md nor persona.link.md exists"
-            )
-        link_path = self._persona_link_path(agent_root)
-        if not link_path.is_file():
-            return None
-        link = parse_persona_link_md(link_path)
-        return link.persona_id
-
-    def set_persona_ownership(self, agent_id: str, persona_id: str | None) -> None:
-        """Write or remove ``<agent_root>/persona.link.md`` to mark ownership.
-
-        When ``persona_id`` is non-None: writes a fresh ``persona.link.md``
-        via ``_io.atomic_write`` containing the locked YAML-in-code-block
-        format (D-ER-4). Raises ``PersonaOwnershipConflict`` if
-        ``<agent_root>/persona/IDENTITY.md`` exists — enforces D2a at
-        write time so operators cannot create a conflicting state via
-        the Protocol surface.
-
-        When ``persona_id`` is None: removes ``persona.link.md`` (no-op
-        if already absent). The operator is responsible for creating
-        ``persona/IDENTITY.md`` afterwards if they want the agent to
-        remain visible to ``list_agents``.
-
-        Raises ``ValueError`` when ``persona_id`` fails the charset
-        rule (delegated to ``parse_persona_link_md`` via the written
-        file's own validation on next read — but checked here for
-        fast-fail UX).
-        """
-        agent_root = self._agent_root(agent_id)
-        if not self._is_agent_dir(agent_root):
-            raise AgentProfileNotFound(
-                f"agent {agent_id!r} not found at {agent_root}: "
-                f"set_persona_ownership requires an existing agent"
-            )
-
-        link_path = self._persona_link_path(agent_root)
-
-        if persona_id is None:
-            # Restore internal ownership — remove the link file.
-            _unlink_if_exists(link_path)
-            return
-
-        # Validate charset BEFORE writing (fast fail). Reuses the same
-        # rule the parser enforces on read so write-time and read-time
-        # validation produce matching error messages.
-        from ..persona_link_md import _validate_persona_id
-
-        _validate_persona_id(persona_id, source=f"set_persona_ownership({agent_id!r})")
-
-        # D2a enforcement at write time: refuse to create a conflict when
-        # ANY part of the legacy three-file layout (IDENTITY.md, SOUL.md,
-        # USER.md) exists.  The three files form one indivisible unit;
-        # treating only IDENTITY.md as the sentinel would leave orphan
-        # SOUL.md/USER.md files that the operator might edit expecting
-        # effect, but reads route through PersonaBackend.
-        _conflicting = [
-            rel
-            for rel in (_IDENTITY_RELATIVE, _SOUL_RELATIVE, _USER_RELATIVE)
-            if (agent_root / rel).is_file()
-        ]
-        if _conflicting:
-            conflicting_names = ", ".join(str(p) for p in _conflicting)
-            raise PersonaOwnershipConflict(
-                f"agent {agent_id!r} at {agent_root} already has "
-                f"{conflicting_names} — cannot set persona ownership to "
-                f"{persona_id!r} without first removing the legacy "
-                f"three-file layout. The two are mutually exclusive (D2a)."
-            )
-
-        body = (
-            f"# Persona link\n\n```yaml\nkind: shared\npersona_id: {persona_id}\n```\n"
-        )
-        atomic_write(link_path, body)
+        return (agent_root / _IDENTITY_RELATIVE).is_file()
 
     # ────────────────────────────────────────────────────────────
     # Skills — delegate to existing skills.py
