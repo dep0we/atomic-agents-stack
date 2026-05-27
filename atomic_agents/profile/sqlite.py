@@ -55,6 +55,8 @@ agent's snapshot id cannot restore it onto another agent.
 from __future__ import annotations
 
 import json
+import logging
+import re
 import secrets
 import sqlite3
 import threading
@@ -74,10 +76,20 @@ from ..skills import SkillManifest
 from .types import AgentProfile, ProfileCapabilities, ProfileSnapshot
 
 
-# Schema version — bumped on any breaking schema change. Idempotent
-# init via ``INSERT OR IGNORE`` per Decision 7 (cold-start race
-# mitigation, same shape as #61 PR 3 SQLiteLogBackend P0 #2).
-_SCHEMA_VERSION = 1
+_logger = logging.getLogger(__name__)
+
+
+# Schema version — bumped on any breaking schema change. v1 → v2
+# migration adds the ``agents.persona_id`` column (#62 PR 2, D-PP-2).
+# Forward-only migration: v1 → v2 happens automatically; v2 → v1 is
+# not supported.
+_SCHEMA_VERSION = 2
+
+# persona_id charset — same Protocol-wide rule used elsewhere
+# (PolicyBackend, PersonaBackend, persona_link_md). Cached at module
+# level so the per-call hot path is one regex match.
+_PERSONA_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_.+@-]+$")
+_PERSONA_ID_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 
 _CREATE_AGENTS = """
@@ -85,7 +97,8 @@ CREATE TABLE IF NOT EXISTS agents (
     name TEXT PRIMARY KEY,
     agent_mode TEXT NOT NULL,
     profile_json TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    persona_id TEXT
 )
 """
 
@@ -136,6 +149,11 @@ class SQLiteAgentProfileBackend:
         return "sqlite"
 
     def __init__(self, db_path: Path | str) -> None:
+        # Track which agents have already received the
+        # agent_profile_save_dropped_persona_fields warning so the
+        # log event fires at most once per agent per backend instance.
+        self._warned_drop_agents: set[str] = set()
+
         # Detect :memory: sentinel — string equality, NOT Path coercion
         # (Path(':memory:') would create a real file named ':memory:').
         if db_path == ":memory:":
@@ -180,6 +198,11 @@ class SQLiteAgentProfileBackend:
             self._db_path.parent.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(self._db_path_str)
             conn.row_factory = sqlite3.Row
+            # busy_timeout BEFORE the WAL pragma — same shape as
+            # logs/sqlite.py and registry/sqlite.py. Without this,
+            # concurrent processes get an immediate SQLITE_BUSY on
+            # WAL negotiation rather than a graceful 5s wait.
+            conn.execute("PRAGMA busy_timeout=5000")
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             self._ensure_schema(conn)
@@ -189,12 +212,26 @@ class SQLiteAgentProfileBackend:
     def _ensure_schema(self, conn: sqlite3.Connection) -> None:
         """Create tables + indexes + meta row. Idempotent across processes.
 
-        Uses ``CREATE TABLE IF NOT EXISTS`` for tables/indexes (always
-        idempotent) and ``INSERT OR IGNORE`` for the schema_version row
-        — the latter is the multi-process cold-start race mitigation
-        per Decision 7 (mirrors #61 PR 3 P0 #2).
+        **v1 → v2 migration** adds the ``agents.persona_id`` column
+        (#62 PR 2, D-PP-2). Cold-start DBs initialize directly at v2
+        with the column present. Existing v1 DBs are upgraded on the
+        first PR 2 process start via explicit ``ALTER TABLE``.
+
+        SQLite DDL note (D-PP-2): Python's ``sqlite3`` driver
+        implicit-commits before DDL statements. ``ALTER TABLE`` inside
+        a ``with conn:`` block commits at execute time, NOT at
+        ``__exit__``. A process kill between ALTER and the subsequent
+        meta UPDATE leaves the DB in state ``(column present,
+        schema_version=1)``; the duplicate-column branch below handles
+        this case correctly.
+
+        Multi-process safety: the ``with conn:`` block for DDL +
+        ``INSERT OR IGNORE`` is a serialized SQLite transaction; the
+        separate ALTER + UPDATE in the v1→v2 path runs under SQLite's
+        WAL + ``busy_timeout=5000`` (set by ``_get_conn`` on file-backed
+        connections) giving concurrent processes a 5 s grace window.
         """
-        with conn:  # implicit transaction
+        with conn:  # implicit transaction — idempotent DDL + cold-start v2
             conn.execute(_CREATE_AGENTS)
             conn.execute(_CREATE_AGENTS_MODE_INDEX)
             conn.execute(_CREATE_SNAPSHOTS)
@@ -202,23 +239,52 @@ class SQLiteAgentProfileBackend:
             conn.execute(_CREATE_META)
             # INSERT OR IGNORE — whichever of N concurrent processes
             # loses the insert sees the row already there and proceeds.
-            # No deadlock, no error.
+            # For cold-start DBs this lands "2" directly; for existing v1
+            # DBs the row already contains "1" (no-op here).
             conn.execute(
                 "INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)",
-                ("schema_version", str(_SCHEMA_VERSION)),
+                ("schema_version", "2"),
             )
-        # Verify schema_version matches expected — defensive guard
-        # against opening a future-incompatible db file.
+
+        # Read the authoritative schema_version row.
         row = conn.execute(
             "SELECT value FROM meta WHERE key = 'schema_version'"
         ).fetchone()
-        if row is None or int(row["value"]) != _SCHEMA_VERSION:
-            raise RuntimeError(
-                f"SQLiteAgentProfileBackend schema version mismatch at "
-                f"{self._db_path_str}: expected {_SCHEMA_VERSION}, "
-                f"found {row['value'] if row else 'no row'}. Migration "
-                f"required."
-            )
+        version = int(row["value"]) if row else 0
+
+        if version == 2:
+            # Already at current schema — nothing to do.
+            return
+
+        if version == 1:
+            # v1 → v2: add the persona_id column.  ALTER TABLE is NOT
+            # transactional in SQLite (auto-commits at execute time), so
+            # we run it outside the ``with conn:`` block and handle the
+            # race-loser case (column already present) explicitly.
+            try:
+                conn.execute("ALTER TABLE agents ADD COLUMN persona_id TEXT")
+                conn.execute("UPDATE meta SET value='2' WHERE key='schema_version'")
+                conn.commit()
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" in str(exc).lower():
+                    # Race winner already added the column but may have
+                    # crashed before updating meta.  Update meta now
+                    # (idempotent — if winner also updated meta this is a
+                    # benign no-op because value is already '2').
+                    conn.execute("UPDATE meta SET value='2' WHERE key='schema_version'")
+                    conn.commit()
+                else:
+                    raise
+            return
+
+        # version not in (1, 2) → future schema, framework downgrade refused.
+        raise RuntimeError(
+            f"SQLiteAgentProfileBackend schema version mismatch at "
+            f"{self._db_path_str}: found version {version}, "
+            f"this build supports versions 1 and 2. "
+            f"Downgrade not supported — use the same or a newer version "
+            f"of atomic-agents-stack to open this database."
+        )
 
     # ────────────────────────────────────────────────────────────
     # Core read
@@ -256,25 +322,80 @@ class SQLiteAgentProfileBackend:
         Both backends would otherwise diverge on operator-edited
         profiles that mutate ``agent_mode`` directly without updating
         ``persona_identity``.
+
+        Per D-PP-8 / D6 (#62 PR 2): when the agent already has a
+        non-NULL ``persona_id`` in the DB (externally owned), the
+        incoming ``persona_identity``, ``persona_soul``, and
+        ``persona_user`` fields are silently dropped before write.
+        A one-time ``agent_profile_save_dropped_persona_fields`` log
+        warning is emitted per agent (tracked in
+        ``self._warned_drop_agents``). This is the SQLite-backend
+        silent-precedence pattern; the filesystem backend raises
+        ``PersonaOwnershipConflict`` instead (D-PP-8 asymmetry).
         """
-        # Re-derive agent_mode from persona_identity — Decision 6.
-        # The profile.agent_mode field is intentionally ignored.
-        derived_mode = parse_agent_mode_text(profile.persona_identity)
-        normalized = profile.replace(agent_mode=derived_mode)
-        # default=str — AgentProfile.tool_config["read_paths"] contains
-        # PosixPath objects from the parser; they aren't JSON-safe
-        # without coercion. from_dict re-derives the structured forms
-        # from raw text on load, so stringified paths recover losslessly
-        # via the parser.
-        profile_blob = json.dumps(normalized.to_dict(), default=str)
-        updated_at = datetime.now().astimezone().isoformat()
         conn = self._get_conn()
+        updated_at = datetime.now().astimezone().isoformat()
+
+        # Read + decide + write inside one transaction so the persona_id
+        # read and the INSERT OR REPLACE are atomic. /ship Step 9 caught
+        # a TOCTOU: a concurrent ``set_persona_ownership(agent, new)`` call
+        # between an outside-transaction SELECT and the INSERT would let
+        # the stale ``current_persona_id`` overwrite the just-set value.
+        # Moving the SELECT inside ``with conn:`` closes the race.
         with conn:
+            # Check current persona_id from the DB for D-PP-8 silent-drop.
+            # For new agents (no row yet) persona_id is implicitly NULL.
+            existing_row = conn.execute(
+                "SELECT persona_id FROM agents WHERE name = ?",
+                (agent_id,),
+            ).fetchone()
+            current_persona_id: str | None = (
+                existing_row["persona_id"] if existing_row is not None else None
+            )
+
+            if current_persona_id is not None:
+                # Agent is externally owned — drop inline persona fields (D6,
+                # D-PP-8). Only emit the warning + zero the fields when at least
+                # one persona field is actually non-empty: when the profile
+                # already has empty persona fields (the normal post-bootstrap
+                # shape for an externally-owned agent), no warning fires and no
+                # replace is needed, preventing spurious "dropped" noise on every
+                # routine save.
+                if (
+                    profile.persona_identity
+                    or profile.persona_soul
+                    or profile.persona_user
+                ):
+                    if agent_id not in self._warned_drop_agents:
+                        _logger.warning(
+                            "agent_profile_save_dropped_persona_fields "
+                            "agent_id=%r dropped_fields=%r",
+                            agent_id,
+                            ["persona_identity", "persona_soul", "persona_user"],
+                        )
+                        self._warned_drop_agents.add(agent_id)
+                    profile = profile.replace(
+                        persona_identity="",
+                        persona_soul="",
+                        persona_user="",
+                    )
+
+            # Re-derive agent_mode from persona_identity — Decision 6.
+            # The profile.agent_mode field is intentionally ignored.
+            derived_mode = parse_agent_mode_text(profile.persona_identity)
+            normalized = profile.replace(agent_mode=derived_mode)
+            # default=str — AgentProfile.tool_config["read_paths"] contains
+            # PosixPath objects from the parser; they aren't JSON-safe
+            # without coercion. from_dict re-derives the structured forms
+            # from raw text on load, so stringified paths recover losslessly
+            # via the parser.
+            profile_blob = json.dumps(normalized.to_dict(), default=str)
+
             conn.execute(
                 "INSERT OR REPLACE INTO agents "
-                "(name, agent_mode, profile_json, updated_at) "
-                "VALUES (?, ?, ?, ?)",
-                (agent_id, derived_mode, profile_blob, updated_at),
+                "(name, agent_mode, profile_json, updated_at, persona_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (agent_id, derived_mode, profile_blob, updated_at, current_persona_id),
             )
 
     # ────────────────────────────────────────────────────────────
@@ -294,6 +415,87 @@ class SQLiteAgentProfileBackend:
             (agent_id,),
         ).fetchone()
         return row is not None
+
+    # ────────────────────────────────────────────────────────────
+    # Persona ownership composition (#62 PR 2 — D-PP-3 + D-PP-7)
+
+    def external_persona_ref(self, agent_id: str) -> str | None:
+        """SELECT persona_id FROM agents WHERE name = ?.
+
+        Returns the persona_id string when the agent is externally
+        owned (column is non-NULL), or ``None`` when internally owned
+        (column is NULL). Raises ``AgentProfileNotFound`` when no row
+        exists for the agent.
+        """
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT persona_id FROM agents WHERE name = ?",
+            (agent_id,),
+        ).fetchone()
+        if row is None:
+            raise AgentProfileNotFound(
+                f"agent {agent_id!r} not found in SQLite backend at {self._db_path_str}"
+            )
+        # persona_id is None when the column value is SQL NULL.
+        return row["persona_id"]
+
+    def set_persona_ownership(self, agent_id: str, persona_id: str | None) -> None:
+        """UPDATE agents SET persona_id = ? WHERE name = ?.
+
+        When ``persona_id`` is non-None, validates the charset
+        (Protocol-wide rule: ``[a-zA-Z0-9_.+@-]+``; no leading dot,
+        no ``..``, no path separators, no control characters, no empty
+        string). Raises ``ValueError`` on charset failure.
+
+        Raises ``AgentProfileNotFound`` when the agent does not exist.
+
+        Per D-PP-8, the SQLite backend does NOT raise
+        ``PersonaOwnershipConflict`` on set — silent precedence is the
+        correct default for programmatic write paths (filesystem is
+        loud because two files on disk is a visible operator mistake;
+        SQLite writes go through this API). The next ``save_profile``
+        call will silently drop inline persona fields when
+        ``persona_id`` is non-NULL, emitting a one-time
+        ``agent_profile_save_dropped_persona_fields`` log event.
+        """
+        if persona_id is not None:
+            # --- charset validation (same rules as PersonaBackend + PolicyBackend) ---
+            if not persona_id:
+                raise ValueError("persona_id must not be empty")
+            if persona_id.startswith("."):
+                raise ValueError(f"persona_id {persona_id!r} must not start with '.'")
+            if ".." in persona_id:
+                raise ValueError(f"persona_id {persona_id!r} must not contain '..'")
+            if "/" in persona_id or "\\" in persona_id:
+                raise ValueError(
+                    f"persona_id {persona_id!r} must not contain path separators"
+                )
+            if _PERSONA_ID_CONTROL_CHARS.search(persona_id):
+                raise ValueError(
+                    f"persona_id {persona_id!r} contains control characters"
+                )
+            if not _PERSONA_ID_PATTERN.match(persona_id):
+                raise ValueError(
+                    f"persona_id {persona_id!r} contains characters outside "
+                    f"the allowed set [a-zA-Z0-9_.+@-]"
+                )
+
+        if not self.exists(agent_id):
+            raise AgentProfileNotFound(
+                f"agent {agent_id!r} not found in SQLite backend at {self._db_path_str}"
+            )
+
+        if persona_id is None:
+            # Unbind path — clear the warned-set so a future rebind
+            # correctly re-fires the one-time silent-drop warning (P2-B round 2).
+            self._warned_drop_agents.discard(agent_id)
+
+        conn = self._get_conn()
+        with conn:
+            conn.execute(
+                "UPDATE agents SET persona_id = ? WHERE name = ?",
+                (persona_id, agent_id),
+            )
 
     # ────────────────────────────────────────────────────────────
     # Skills — NOT stored in SQLite (Decision 2 of #63 PR 3)

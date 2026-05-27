@@ -191,7 +191,7 @@ The framework is moving toward swappable backends layer by layer. The shape: a P
 | `ToolRegistryBackend` | ✅ Shipped | Filesystem + SQLite reference impls; hybrid metadata-in-SQL + handler-bodies-on-disk; install / uninstall capability | [`spec/25`](docs/spec/25-tool-registry-backend.md) |
 | `MandateBackend` | ✅ Shipped | Filesystem reference impl; `MandateCheck` specialist + reservation pattern + crash recovery; closes the durable-authorization cliff | [`spec/29`](docs/spec/29-mandates.md) |
 | `PolicyBackend` | ✅ Shipped | Filesystem reference impl (`policy.md` at project root); cost-cap MIN composition + tool / MCP / model surfaces enforced by default (PR 4 flag flip); unified `policy_decision` audit event family | [`spec/32`](docs/spec/32-policy-backend.md) |
-| `PersonaBackend` | In progress (PR 1 of 4 scaffolding merged) | UI-editable IDENTITY/SOUL/USER + persona versioning | [`spec/33`](docs/spec/33-persona-backend.md) / [`#62`](https://github.com/dep0we/atomic-agents-stack/issues/62) |
+| `PersonaBackend` | In progress (PR 2 of 4 merged) | UI-editable IDENTITY/SOUL/USER + persona versioning; `persona.link.md` ownership + `persona_link_md.py` read/write/validate | [`spec/33`](docs/spec/33-persona-backend.md) / [`#62`](https://github.com/dep0we/atomic-agents-stack/issues/62) |
 | `CorpusBackend` | Planned | Wiki/raw corpus at GB scale + semantic search | [`#65`](https://github.com/dep0we/atomic-agents-stack/issues/65) |
 | `MCPServerRegistryBackend` | Planned | Catalog + install/audit for MCP servers (MCP equivalent of ToolRegistry) | [`#201`](https://github.com/dep0we/atomic-agents-stack/issues/201) |
 
@@ -270,7 +270,7 @@ Same pattern for OpenAI (`atomic-agents-openai`) and Moonshot (`atomic-agents-mo
 ## Repository structure
 
 - `atomic_agents/` — the Python package (runtime in `agent.py`; backend protocols in `memory/`, `_llm.py`, `_locks.py`, `_costs.py`, etc.; CLI in `cli.py`; preflight in `doctor.py`)
-- `tests/` — 2563 tests collected (2529 passing + 34 skipped), Python 3.11 + 3.12 matrix
+- `tests/` — 2647 tests collected (2613 passing + 34 skipped), Python 3.11 + 3.12 matrix
 - `docs/` — [spec entry point](docs/README.md), [`architecture.md`](docs/architecture.md), [`spec/`](docs/spec/) (29 locked docs + 3 RFCs), [`deployment/`](docs/deployment/) (8 operator runbooks), [`samples/caldwell/`](docs/samples/caldwell/) (complete worked example), [`GOVERNANCE.md`](docs/GOVERNANCE.md), [`TENSIONS.md`](docs/TENSIONS.md), [`methodology.md`](docs/methodology.md)
 - `extras/` — operational templates (Claude Code skill wrappers, macOS LaunchAgent plists, cron examples)
 
@@ -301,4 +301,4 @@ Before opening a PR, read [`CLAUDE.md`](CLAUDE.md) (the project's design ethos a
 
 ## Status
 
-**v0.13.0, alpha.** Core runtime stable. 2563 tests collected (2529 passing + 34 skipped) on Python 3.11 / 3.12. Nine of twelve backend protocols shipped (see the backend protocols table above); `PersonaBackend` scaffolding is in progress (PR 1 of 4 merged); `CorpusBackend` and `MCPServerRegistryBackend` planned. The surface stabilizes at v1.0. Pre-1.0 — Minor releases may contain breaking changes (see [`docs/deployment/versioning.md`](docs/deployment/versioning.md)). Single-maintainer project; reference implementation anyone can use, fork, or extend.
+**v0.13.0, alpha.** Core runtime stable. 2647 tests collected (2613 passing + 34 skipped) on Python 3.11 / 3.12. Nine of twelve backend protocols shipped (see the backend protocols table above); `PersonaBackend` is in progress (PR 2 of 4 merged — `persona.link.md` ownership model + `persona_link_md.py` read/write/validate); `CorpusBackend` and `MCPServerRegistryBackend` planned. The surface stabilizes at v1.0. Pre-1.0 — Minor releases may contain breaking changes (see [`docs/deployment/versioning.md`](docs/deployment/versioning.md)). Single-maintainer project; reference implementation anyone can use, fork, or extend.

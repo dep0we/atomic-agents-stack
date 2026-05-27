@@ -97,13 +97,13 @@ def test_schema_tables_created(tmp_path):
 
 
 def test_schema_version_row_present(tmp_path):
-    """meta table has schema_version=1 row."""
+    """meta table has schema_version=2 row (v2 since #62 PR 2 added persona_id)."""
     backend = SQLiteAgentProfileBackend(tmp_path / "profiles.db")
     backend.list_agents()
     conn = sqlite3.connect(str(tmp_path / "profiles.db"))
     row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
     assert row is not None
-    assert row[0] == "1"
+    assert row[0] == "2"
 
 
 def test_schema_init_idempotent_cold_start_race(tmp_path):
@@ -113,11 +113,11 @@ def test_schema_init_idempotent_cold_start_race(tmp_path):
     backend_b = SQLiteAgentProfileBackend(db_path)
     backend_a.list_agents()
     backend_b.list_agents()
-    # Both connections succeed; schema is single-version.
+    # Both connections succeed; schema is at v2 (#62 PR 2 persona_id column).
     conn = sqlite3.connect(str(db_path))
     rows = conn.execute("SELECT key, value FROM meta").fetchall()
     assert len(rows) == 1
-    assert rows[0] == ("schema_version", "1")
+    assert rows[0] == ("schema_version", "2")
 
 
 def test_schema_version_mismatch_raises(tmp_path):
@@ -467,3 +467,70 @@ def test_constructor_creates_parent_dir(tmp_path):
     backend.save_profile("scout", _make_profile("scout"))
     assert db_path.exists()
     assert nested.exists()
+
+
+# ─── P1-1 regression: no "dropped" warning on already-empty persona fields ───
+
+
+def test_save_profile_no_warning_when_persona_fields_already_empty(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """P1-1 regression: save_profile must NOT emit agent_profile_save_dropped_persona_fields
+    when the profile's persona fields are already empty (the normal post-bootstrap shape
+    for an externally-owned agent).
+
+    The warning and field-zeroing guard must only fire when at least one of
+    persona_identity, persona_soul, or persona_user is non-empty.
+    Additionally, the persona_id column must survive the save unchanged.
+    """
+    import logging
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        backend = SQLiteAgentProfileBackend(":memory:")
+
+    # Build a profile whose persona fields are already empty (post-bootstrap shape).
+    empty_persona_profile = AgentProfile.from_dict(
+        {
+            "name": "quiet-agent",
+            "agent_mode": "reactive",
+            "persona_identity": "",  # already empty
+            "persona_soul": "",  # already empty
+            "persona_user": "",  # already empty
+            "goal_text": "",
+            "model_md_raw": _MODEL,
+            "tools_md_raw": _TOOLS,
+            "judges_md_raw": None,
+            "roster_md_raw": _ROSTER,
+            "mcp_md_raw": "",
+            "model_config": {},
+            "tool_config": {},
+            "tool_classifications": {},
+            "judges_config": None,
+            "roster": [],
+            "mcp_servers": [],
+        }
+    )
+
+    # Save normally first (persona_id NULL at this point).
+    backend.save_profile("quiet-agent", empty_persona_profile)
+
+    # Mark as externally owned.
+    backend.set_persona_ownership("quiet-agent", "shared-persona-x")
+
+    # Now save again with the already-empty persona fields — no warning should fire.
+    with caplog.at_level(logging.WARNING, logger="atomic_agents.profile.sqlite"):
+        backend.save_profile("quiet-agent", empty_persona_profile)
+
+    drop_events = [
+        r
+        for r in caplog.records
+        if "agent_profile_save_dropped_persona_fields" in r.message
+    ]
+    assert len(drop_events) == 0, (
+        "save_profile must not emit 'agent_profile_save_dropped_persona_fields' "
+        f"when persona fields are already empty; got {len(drop_events)} event(s)"
+    )
+
+    # persona_id column must survive the save unchanged.
+    assert backend.external_persona_ref("quiet-agent") == "shared-persona-x"
