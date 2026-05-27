@@ -246,9 +246,9 @@ The `AtomicAgent(..., persona_backend=...)` constructor kwarg is wired in PR 2. 
 
 ## `delegate.py` threading (D-ER-2)
 
-`delegate.py` threads `persona_backend` ONLY when the operator supplied the backend explicitly via the `AtomicAgent(..., persona_backend=...)` kwarg. When the backend was resolved from the framework default (via `get_default_persona_backend(scope_root)`), the delegate constructs its own default at ITS scope — preventing the coordinator's `<agents_root>/.personas/` directory from being silently consulted by a cross-vault delegate. Mirrors the `PolicyBackend` precedent at `atomic_agents/agent.py:401` (`_policy_backend_was_explicit`).
+`delegate.py` threads `persona_backend` **only when explicitly supplied** (mirrors Policy's `_policy_backend_was_explicit` precedent at `agent.py:401`). Cross-vault delegation does NOT leak the coordinator's `personas_root` to delegates.
 
-Rationale: persona is per-agent semantic context. A delegate's persona is the delegate's own identity; it should not inherit from its coordinator's PersonaBackend by accident. This mirrors the Mandate precedent (per-agent scoped, delegate.py deliberately NOT threaded) and is distinct from Policy (fleet-scoped, always threaded) and AgentProfile (fleet-scoped, always threaded). The distinction between explicit-kwarg threading and default-resolved threading is the same boundary PolicyBackend draws: an operator who consciously passes `persona_backend=my_shared_backend` signals intent to share; an operator who relies on the default signals per-agent isolation.
+Rationale: persona is per-agent semantic context. A delegate's persona is the delegate's own identity; it should not inherit from its coordinator's PersonaBackend by accident. This mirrors the Mandate precedent (per-agent scoped, delegate.py deliberately NOT threaded) and is distinct from Policy (fleet-scoped, always threaded) and AgentProfile (fleet-scoped, always threaded).
 
 ## Snapshot trio shape (PR 3)
 

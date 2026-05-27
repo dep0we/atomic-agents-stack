@@ -65,10 +65,6 @@ from .policy import (
     PolicyBackend,
     get_default_policy_backend,
 )
-from .persona import (
-    PersonaBackend,
-    get_default_persona_backend,
-)
 from .logs.types import (
     PRIMITIVE_AGENT_CALL,
     PRIMITIVE_CAPTURE,
@@ -91,8 +87,6 @@ from .exceptions import (
     NestedDelegationRefused,
     NotInRoster,
     PathTraversalError,
-    PersonaCorrupted,
-    PersonaNotFound,
     SelfDelegationError,
     ToolDescriptorInvalid,
     ToolHandlerImportFailed,
@@ -248,13 +242,6 @@ class AtomicAgent:
     # implementer — breaking the operator-pinned-SaaS/Postgres/org-admin-
     # console case PR 3 forward.
     policy_backend: PolicyBackend
-    # Same class-level annotation rationale for ``persona_backend`` (#62
-    # PR 2). Without this, static analysis would narrow
-    # ``agent.persona_backend`` to the concrete
-    # ``FilesystemPersonaBackend`` default rather than treating it as any
-    # ``PersonaBackend`` Protocol implementer — breaking the
-    # operator-pinned-SaaS/Postgres/git-backed case PR 3 forward.
-    persona_backend: PersonaBackend
     """The main agent runtime.
 
     Responsible for:
@@ -280,7 +267,6 @@ class AtomicAgent:
         tool_registry_backend: ToolRegistryBackend | None = None,
         mandate_backend: MandateBackend | None = None,
         policy_backend: PolicyBackend | None = None,
-        persona_backend: PersonaBackend | None = None,
     ):
         self.name = name
         self.trigger = trigger
@@ -418,25 +404,6 @@ class AtomicAgent:
         else:
             self.policy_backend = policy_backend
 
-        # ── PersonaBackend resolution (#62 PR 2) ──────────────────────────
-        # Mirrors PolicyBackend's _policy_backend_was_explicit pattern. The
-        # default backend resolves at self.agents_root; delegate threading
-        # (see ``delegate`` method below) consults the explicit flag so
-        # default-resolved backends don't leak the coordinator's scope into
-        # delegates (D-ER-2). Unlike policy_backend (always threaded because
-        # Policy is fleet-scoped), persona_backend is ONLY threaded when the
-        # operator explicitly supplied it via kwarg — cross-vault delegation
-        # uses the coordinator's agents_root as persona scope, which would
-        # silently resolve the wrong .personas/ directory for the delegate.
-        _persona_backend_was_explicit = persona_backend is not None
-        if persona_backend is None:
-            self.persona_backend = get_default_persona_backend(self.agents_root)
-        else:
-            self.persona_backend = persona_backend
-        # Saved on self so delegate() can consult it without re-checking
-        # the constructor kwarg (the kwarg is no longer in scope there).
-        self._persona_backend_was_explicit = _persona_backend_was_explicit
-
         # ── Mandate crash recovery + reservation managers (#124 PR 3b) ──────
         # Per spec/29 §"Crash recovery for reservations" + plan-subagent
         # Risks 8 (invocation site = agent init) + 9 (multi-scope iteration).
@@ -467,39 +434,6 @@ class AtomicAgent:
         # ``_load_goal_text``) read fields off this snapshot instead of
         # re-reading the filesystem.
         self._profile: AgentProfile = self.profile_backend.load_profile(self.name)
-
-        # ── PersonaBackend bootstrap composition (D-PP-4 / #62 PR 2) ────────
-        # When the agent's persona is externally owned (persona.link.md
-        # present on filesystem; persona_id column non-NULL on SQLite),
-        # load_profile() returns an AgentProfile whose persona fields are
-        # empty (AgentProfile does not read from PersonaBackend directly —
-        # D1a keeps the protocols decoupled). Repopulate the persona fields
-        # here from PersonaBackend and explicitly re-derive agent_mode so
-        # downstream bootstrap (cost-checking, policy resolution, cascade
-        # detection) operates against the correct mode (D-PP-4 — agent_mode
-        # is derived from persona_identity; without re-derivation it would
-        # remain 'reactive' for a goal-driven externally-owned persona).
-        _persona_id = self.profile_backend.external_persona_ref(self.name)
-        if _persona_id is not None:
-            from .goal import parse_agent_mode_text
-
-            try:
-                _persona = self.persona_backend.load_persona(_persona_id)
-            except PersonaNotFound as _pnf:
-                raise PersonaNotFound(
-                    f"agent {self.name!r}: persona.link.md references missing "
-                    f"persona record {_persona_id!r}: {_pnf}"
-                ) from _pnf
-            except PersonaCorrupted as _pc:
-                raise PersonaCorrupted(
-                    f"agent {self.name!r}: persona record {_persona_id!r} is corrupt: {_pc}"
-                ) from _pc
-            self._profile = self._profile.replace(
-                persona_identity=_persona.identity,
-                persona_soul=_persona.soul,
-                persona_user=_persona.user,
-                agent_mode=parse_agent_mode_text(_persona.identity),  # re-derive
-            )
 
         # Per-agent target extractor registry (spec/29 §"Target extraction",
         # #124 PR 3a). MUST initialize BEFORE tool_registry loading below so
@@ -4553,31 +4487,14 @@ class AtomicAgent:
         # ``<target_path>/mandates.md`` via the default factory. Operators
         # needing fleet-level mandate policy use project-root mandates
         # (``project:<name>`` scope), not cross-agent backend threading.
-        # Build delegate kwargs. Fleet-scoped backends (profile_backend,
-        # policy_backend) are ALWAYS threaded — a delegate in a different
-        # agent dir still evaluates policy and reads profiles against the
-        # SAME store the coordinator uses (spec/32 D1 for Policy; spec/24
-        # for AgentProfile). Per-agent scoped backends (lock, log, tool
-        # registry, mandate) are NOT threaded — each delegate resolves its
-        # own from its own root.
-        #
-        # persona_backend follows D-ER-2 (#62 PR 2): threaded ONLY when the
-        # operator supplied it explicitly via kwarg. Default-resolved backends
-        # use the coordinator's agents_root as the personas scope; threading
-        # them to a cross-vault delegate would silently resolve the wrong
-        # .personas/ directory. When NOT threaded, the delegate constructs
-        # its own default at ITS scope (own agents_root).
-        _delegate_kwargs: dict = {
-            "name": target_agent_name,
-            "trigger": "delegate",
-            "agents_root": target_path.parent,
-            "run_id": None,  # generates its own fresh run_id
-            "profile_backend": self.profile_backend,
-            "policy_backend": self.policy_backend,
-        }
-        if self._persona_backend_was_explicit:
-            _delegate_kwargs["persona_backend"] = self.persona_backend
-        target_agent = AtomicAgent(**_delegate_kwargs)
+        target_agent = AtomicAgent(
+            name=target_agent_name,
+            trigger="delegate",
+            agents_root=target_path.parent,
+            run_id=None,  # generates its own fresh run_id
+            profile_backend=self.profile_backend,
+            policy_backend=self.policy_backend,
+        )
 
         start = time.time()
         response = target_agent.call(
