@@ -334,52 +334,63 @@ class SQLiteAgentProfileBackend:
         ``PersonaOwnershipConflict`` instead (D-PP-8 asymmetry).
         """
         conn = self._get_conn()
-
-        # Check current persona_id from the DB for D-PP-8 silent-drop.
-        # For new agents (no row yet) persona_id is implicitly NULL.
-        existing_row = conn.execute(
-            "SELECT persona_id FROM agents WHERE name = ?",
-            (agent_id,),
-        ).fetchone()
-        current_persona_id: str | None = (
-            existing_row["persona_id"] if existing_row is not None else None
-        )
-
-        if current_persona_id is not None:
-            # Agent is externally owned — drop inline persona fields (D6,
-            # D-PP-8). Only emit the warning + zero the fields when at least
-            # one persona field is actually non-empty: when the profile
-            # already has empty persona fields (the normal post-bootstrap
-            # shape for an externally-owned agent), no warning fires and no
-            # replace is needed, preventing spurious "dropped" noise on every
-            # routine save.
-            if profile.persona_identity or profile.persona_soul or profile.persona_user:
-                if agent_id not in self._warned_drop_agents:
-                    _logger.warning(
-                        "agent_profile_save_dropped_persona_fields "
-                        "agent_id=%r dropped_fields=%r",
-                        agent_id,
-                        ["persona_identity", "persona_soul", "persona_user"],
-                    )
-                    self._warned_drop_agents.add(agent_id)
-                profile = profile.replace(
-                    persona_identity="",
-                    persona_soul="",
-                    persona_user="",
-                )
-
-        # Re-derive agent_mode from persona_identity — Decision 6.
-        # The profile.agent_mode field is intentionally ignored.
-        derived_mode = parse_agent_mode_text(profile.persona_identity)
-        normalized = profile.replace(agent_mode=derived_mode)
-        # default=str — AgentProfile.tool_config["read_paths"] contains
-        # PosixPath objects from the parser; they aren't JSON-safe
-        # without coercion. from_dict re-derives the structured forms
-        # from raw text on load, so stringified paths recover losslessly
-        # via the parser.
-        profile_blob = json.dumps(normalized.to_dict(), default=str)
         updated_at = datetime.now().astimezone().isoformat()
+
+        # Read + decide + write inside one transaction so the persona_id
+        # read and the INSERT OR REPLACE are atomic. /ship Step 9 caught
+        # a TOCTOU: a concurrent ``set_persona_ownership(agent, new)`` call
+        # between an outside-transaction SELECT and the INSERT would let
+        # the stale ``current_persona_id`` overwrite the just-set value.
+        # Moving the SELECT inside ``with conn:`` closes the race.
         with conn:
+            # Check current persona_id from the DB for D-PP-8 silent-drop.
+            # For new agents (no row yet) persona_id is implicitly NULL.
+            existing_row = conn.execute(
+                "SELECT persona_id FROM agents WHERE name = ?",
+                (agent_id,),
+            ).fetchone()
+            current_persona_id: str | None = (
+                existing_row["persona_id"] if existing_row is not None else None
+            )
+
+            if current_persona_id is not None:
+                # Agent is externally owned — drop inline persona fields (D6,
+                # D-PP-8). Only emit the warning + zero the fields when at least
+                # one persona field is actually non-empty: when the profile
+                # already has empty persona fields (the normal post-bootstrap
+                # shape for an externally-owned agent), no warning fires and no
+                # replace is needed, preventing spurious "dropped" noise on every
+                # routine save.
+                if (
+                    profile.persona_identity
+                    or profile.persona_soul
+                    or profile.persona_user
+                ):
+                    if agent_id not in self._warned_drop_agents:
+                        _logger.warning(
+                            "agent_profile_save_dropped_persona_fields "
+                            "agent_id=%r dropped_fields=%r",
+                            agent_id,
+                            ["persona_identity", "persona_soul", "persona_user"],
+                        )
+                        self._warned_drop_agents.add(agent_id)
+                    profile = profile.replace(
+                        persona_identity="",
+                        persona_soul="",
+                        persona_user="",
+                    )
+
+            # Re-derive agent_mode from persona_identity — Decision 6.
+            # The profile.agent_mode field is intentionally ignored.
+            derived_mode = parse_agent_mode_text(profile.persona_identity)
+            normalized = profile.replace(agent_mode=derived_mode)
+            # default=str — AgentProfile.tool_config["read_paths"] contains
+            # PosixPath objects from the parser; they aren't JSON-safe
+            # without coercion. from_dict re-derives the structured forms
+            # from raw text on load, so stringified paths recover losslessly
+            # via the parser.
+            profile_blob = json.dumps(normalized.to_dict(), default=str)
+
             conn.execute(
                 "INSERT OR REPLACE INTO agents "
                 "(name, agent_mode, profile_json, updated_at, persona_id) "
