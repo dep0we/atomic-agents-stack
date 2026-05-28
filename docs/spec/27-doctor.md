@@ -171,6 +171,42 @@ without raising.
 **Prevents:** Corrupt frontmatter or a missing `INDEX.md` blowing up
 inside `agent.call()`'s memory load step.
 
+### `persona-backend` *(scope-scoped)*
+
+**Verifies:** Operator-config coherence for the persona backend
+(spec/33). Scope-flat (not agent-scoped) because `list_personas()`
+enumerates the shared `<scope_root>/.personas/` directory.
+
+PASS / WARN / FAIL ladder:
+
+- **PASS** when `ATOMIC_AGENTS_PERSONA_BACKEND` is unset or `filesystem`
+  and `FilesystemPersonaBackend(scope_root)` constructs cleanly +
+  `capabilities()` + `list_personas()` return without raising. Detail
+  carries the capability snapshot (`supports_save`, `supports_clone`,
+  `supports_snapshot`, `supports_subscribe`, `supports_templates`,
+  `durable`) plus the discovered persona count.
+- **PASS** when a non-filesystem `backend_id` is registered, constructs
+  via the URL factory (`ATOMIC_AGENTS_PERSONA_BACKEND_URL`), and the
+  `capabilities()` + `list_personas()` probe succeeds. Detail includes
+  the credential-redacted URL — username AND password stripped from
+  `netloc` so token-as-username URLs (common with managed services) do
+  not leak through error-tracking pipelines.
+- **FAIL** when `ATOMIC_AGENTS_PERSONA_BACKEND` is set to an id not in
+  `list_persona_backends()` (typo or missing package). Echo of the env
+  value is redacted at `://` to prevent credential leaks if an operator
+  pastes a URL into the id env var by mistake.
+- **FAIL** when the registered backend's factory raises during
+  construction (credentials dropped from the surfaced exception text).
+- **WARN** when construction succeeds but `capabilities()` or
+  `list_personas()` raises — the backend is reachable but its probe
+  surface is degraded.
+
+**Prevents:** First-call `BackendNotRegistered` when an agent with a
+`persona.link.md` tries to resolve its shared persona record; silent
+fall-through to the filesystem default when an operator typo'd the env
+var; credential leakage from URL-bearing config into liveness-probe
+output or error-tracking services.
+
 ### `write-paths` *(agent-scoped)*
 
 **Verifies:**
