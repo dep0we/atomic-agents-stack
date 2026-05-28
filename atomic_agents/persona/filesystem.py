@@ -497,7 +497,7 @@ class FilesystemPersonaBackend:
 
     Capabilities: ``supports_save=True, supports_clone=True,
     supports_snapshot=True, supports_subscribe=False, durable=True,
-    supports_templates=False``. Snapshot trio ships in PR 3.
+    supports_templates=False``.
     """
 
     backend_id = "filesystem"
@@ -957,7 +957,7 @@ class FilesystemPersonaBackend:
     def capabilities(self) -> PersonaCapabilities:
         """Return the backend capability snapshot.
 
-        ``supports_snapshot=True`` -- filesystem snapshot trio ships in PR 3.
+        ``supports_snapshot=True`` -- filesystem snapshot trio is implemented.
         ``durable=True`` -- filesystem is a durable storage substrate.
         ``supports_templates=False`` -- template marketplace is v1.1+.
 

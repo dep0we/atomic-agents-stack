@@ -1,8 +1,6 @@
 # spec/33 — PersonaBackend (shared-persona identity layer)
 
-> **Status: RFC.** Locked at PR 4 of #62.
-
-> **Pre-#62 PR 1 amendments (2026-05-26):** Drafted in PR 1 from the /office-hours + /plan-eng-review locked design doc (`~/.gstack/projects/dep0we-atomic-agents-stack/dep0we-main-design-20260522-134508.md`). 7 architectural decisions locked (D1-D7) + 5 supplementary decisions (D1a, D2a, D-ER-1 through D-ER-4) + 1 pre-impl prep amendment (D-PI-1 2026-05-26). Persona exceptions land in `atomic_agents/exceptions.py` (not `persona/types.py`) to prevent cross-module import cycles.
+> **Status:** **LOCKED** at #62 PR 4.
 
 ## Overview
 
@@ -13,11 +11,11 @@ PersonaBackend ships as a **separate Protocol from AgentProfileBackend** on arch
 - **Persona is identity; AgentProfile is configuration.** The two have different lifecycle cadences: persona drifts on soul-evolution timelines; agent config drifts on capability timelines. Bundling them conflates two independent concepts.
 - **Persona is shareable across agents.** One `customer-support-v3` persona record can be referenced by N regional agents. AgentProfile is per-agent by definition.
 - **Fleet-scale and marketplace use cases are persona-centric.** A team running 5 customer-support agents today maintains 5 separate `SOUL.md` files that drift. With PersonaBackend, one canonical persona record serves all 5 agents with consistent identity.
-- **Persona templates are conceptually distinct from agent-config templates.** Operators bring their own model + tools to a persona; the template dimension is about "who this agent is," not "how it acts." The `supports_templates` capability field (D5) retires spec/24 line 436's `TemplateProfileBackend` reservation: templates are PersonaBackend's domain.
+- **Persona templates are conceptually distinct from agent-config templates.** Operators bring their own model + tools to a persona; the template dimension is about "who this agent is," not "how it acts." The `supports_templates` capability field (D5) retires spec/24's former `TemplateProfileBackend` reservation: templates are PersonaBackend's domain.
 
-The composition shape (D1): PersonaBackend is source of truth; AgentProfile fields (`persona_identity` / `persona_soul` / `persona_user`) are denormalized snapshots populated at `load_profile()` time when PersonaBackend owns the agent's persona (signaled by `<agent>/persona.link.md` presence, introduced in PR 3).
+The composition shape (D1): PersonaBackend is source of truth; AgentProfile fields (`persona_identity` / `persona_soul` / `persona_user`) are denormalized snapshots populated at `load_profile()` time when PersonaBackend owns the agent's persona (signaled by `<agent>/persona.link.md` presence).
 
-**The backwards-compatibility promise:** home users with one agent running the legacy three-file layout (`<agent>/persona/{IDENTITY,SOUL,USER}.md`) see zero behavior change through PR 1, PR 2, and PR 3 unless they explicitly create a `persona.link.md` shared-reference. The 166 existing `AtomicAgent(...)` construction sites remain byte-identical.
+**The backwards-compatibility promise:** home users with one agent running the legacy three-file layout (`<agent>/persona/{IDENTITY,SOUL,USER}.md`) see zero behavior change unless they explicitly create a `persona.link.md` shared-reference. The 166 existing `AtomicAgent(...)` construction sites remain byte-identical.
 
 ## Locked decisions (from /office-hours + /plan-eng-review 2026-05-22 and 2026-05-25)
 
@@ -29,12 +27,12 @@ The composition shape (D1): PersonaBackend is source of truth; AgentProfile fiel
 | D2a | Mutual exclusion | `<agent>/persona.link.md` AND `<agent>/persona/IDENTITY.md` coexisting raises `PersonaOwnershipConflict` at `AgentProfileBackend.load_profile()` |
 | D3 | Snapshot composition | `AgentProfileBackend.snapshot/restore` skip persona fields when PersonaBackend owns the agent's persona; persona has its own snapshot history |
 | D4 | Storage namespace | `<scope_root>/.personas/<persona_id>/` (hidden directory mirrors `.snapshots/` pattern; structurally separate from agent namespace) |
-| D5 | TemplateProfileBackend retirement | `supports_templates` capability field on PersonaCapabilities retires spec/24 line 436's `TemplateProfileBackend` reservation; templates are PersonaBackend's domain |
+| D5 | TemplateProfileBackend retirement | `supports_templates` capability field on PersonaCapabilities retires spec/24's former `TemplateProfileBackend` reservation; templates are PersonaBackend's domain |
 | D6 | AgentProfile save discipline | `AgentProfileBackend.save_profile()` ignores `persona_identity/soul/user` when PersonaBackend owns the agent's persona (mirrors spec/24 Decision 6's `agent_mode` pattern) |
 | D7 | A/B persona testing | Deferred to v1.1 as `PolicyBackend.get_effective_persona()` extension; NOT in v1.0 |
-| D-ER-1 | Ownership Protocol method | `AgentProfileBackend.is_persona_externally_owned(agent_id) -> bool` added in PR 2 so the bootstrap path can check ownership without importing PersonaBackend |
+| D-ER-1 | Ownership Protocol method | `AgentProfileBackend.external_persona_ref(agent_id) -> str | None` returns the persona_id when externally owned, None otherwise. D-PP-3 superseded D-ER-1's original boolean signature so the bootstrap path can resolve ownership and load the persona record in a single Protocol call without importing PersonaBackend. |
 | D-ER-2 | `delegate.py` threading | `delegate.py` threads `persona_backend` ONLY when explicitly supplied at the coordinator (mirrors Policy's `_policy_backend_was_explicit` precedent at `agent.py:401`). Default-resolved PersonaBackends do not leak the coordinator's `personas_root` to delegates. See body section "`delegate.py` threading (D-ER-2)" for full rationale. |
-| D-ER-3 | `persona.link.md` parser | Parser (`persona_link_md.py`) lands in PR 2; raises `PersonaLinkInvalid` on malformed YAML, missing `kind:`, unsupported kind, missing `persona_id:`, or invalid `persona_id:` charset |
+| D-ER-3 | `persona.link.md` parser | The `persona_link_md.py` parser raises `PersonaLinkInvalid` on malformed YAML, missing `kind:`, unsupported kind, missing `persona_id:`, or invalid `persona_id:` charset |
 | D-ER-4 | `persona.link.md` format | YAML in a code block; two scalar fields: `kind: shared` + `persona_id: customer-support-v3` |
 | D-PI-1 | Exception placement | Persona exceptions live in `atomic_agents/exceptions.py` (not `persona/types.py`) to prevent cross-module import cycles (`PersonaOwnershipConflict` raised by profile backends; `PersonaLinkInvalid` raised by parser) |
 
@@ -113,13 +111,13 @@ Each field in `PersonaCapabilities` declares what the backend supports. Conforma
 
 - **`supports_clone`**: True if `clone()` is implemented. `FilesystemPersonaBackend` sets this True.
 
-- **`supports_snapshot`**: True if the snapshot trio (`snapshot()`, `restore()`, `list_snapshots()`) is fully implemented. `FilesystemPersonaBackend` sets this **False in PR 1**; the capability flips to True in PR 3 when the filesystem snapshot trio lands. Backends with `supports_snapshot=False` MUST raise `NotImplementedError` on all three snapshot methods.
+- **`supports_snapshot`**: True if the snapshot trio (`snapshot()`, `restore()`, `list_snapshots()`) is fully implemented. `FilesystemPersonaBackend` sets this **True**. Backends with `supports_snapshot=False` MUST raise `NotImplementedError` on all three snapshot methods.
 
 - **`supports_subscribe`**: True if the backend supports change-notification subscriptions (reserved for v1.1+; all v1 backends set False).
 
 - **`durable`**: True if the backend persists records across process restart. Filesystem and database backends are durable; in-memory test-fixture backends are not.
 
-- **`supports_templates`**: True if the backend provides read-only persona templates (e.g., a pip-installable persona marketplace package). **Retires spec/24 line 436's `TemplateProfileBackend` reservation (D5)** -- templates are PersonaBackend's domain because they are persona-centric: operators bring their own model and tools to a persona. All v1.0 backends set this False; the marketplace surface is v1.1+.
+- **`supports_templates`**: True if the backend provides read-only persona templates (e.g., a pip-installable persona marketplace package). **Retires spec/24's `TemplateProfileBackend` reservation (D5)**: templates are PersonaBackend's domain because they are persona-centric (operators bring their own model and tools to a persona). All v1.0 backends set this False; the marketplace surface is v1.1+.
 
 ## D2a: Ownership rule
 
@@ -131,7 +129,7 @@ The `<agent>/persona.link.md` file is the ownership trigger. Its presence signal
 
 - **Both present** (D2a conflict): `AgentProfileBackend.load_profile()` raises `PersonaOwnershipConflict`. Operators must choose one layout: remove `persona.link.md` to keep the legacy layout, or remove `persona/{IDENTITY,SOUL,USER}.md` to use the shared-persona reference.
 
-The `PersonaOwnershipConflict` raise site lands in PR 2 (composition wiring). PR 1 ships only the exception definition. The `is_persona_externally_owned(agent_id) -> bool` Protocol method is added to `AgentProfileBackend` in PR 2 (D-ER-1) so the framework-level bootstrap path can check ownership without importing PersonaBackend.
+`PersonaOwnershipConflict` is raised by the filesystem `AgentProfileBackend.load_profile()` when both files coexist. The SQLite backend uses the silent-drop pattern (D-PP-8) with an `agent_profile_save_dropped_persona_fields` audit event for cross-backend uniformity. The `external_persona_ref(agent_id) -> str | None` Protocol method on `AgentProfileBackend` (D-PP-3, supersedes D-ER-1's original boolean signature) returns the persona_id when externally owned and None otherwise, so the framework-level bootstrap path can resolve ownership and load the persona without importing PersonaBackend.
 
 ## D-ER-4: `persona.link.md` format
 
@@ -154,8 +152,6 @@ The `persona_link_md.py` parser (D-ER-3) raises `PersonaLinkInvalid` when:
 - The `kind:` field is missing or its value is not `"shared"`.
 - The `persona_id:` field is missing.
 - The `persona_id:` value fails the charset pattern.
-
-The parser lands in PR 2. PR 1 ships only the exception definition.
 
 ## `persona_id` charset rule
 
@@ -191,7 +187,7 @@ The `metadata.json` sidecar carries the structured metadata fields that are not 
   "schema_version": 1,
   "version": 1,
   "label": "post-tone-rewrite",
-  "created_at": "2026-05-26T12:00:00Z"
+  "created_at": "2026-05-26T12:00:00"
 }
 ```
 
@@ -264,13 +260,13 @@ The filesystem URL factory handles `filesystem:///absolute/path` URLs. See §"UR
 - `ATOMIC_AGENTS_PERSONA_BACKEND`: backend id string (default `"filesystem"`). Follows the established `ATOMIC_AGENTS_<PRIMITIVE>_BACKEND` pattern.
 - `ATOMIC_AGENTS_PERSONA_BACKEND_URL`: optional `filesystem:///path` URL. When set alongside `ATOMIC_AGENTS_PERSONA_BACKEND=filesystem`, passed directly to `make_filesystem_persona_backend_from_url` to override the default `<scope_root>/.personas` root.
 
-**Constructor kwarg (PR 2):**
+**Constructor kwarg:**
 
-The `AtomicAgent(..., persona_backend=...)` constructor kwarg is wired in PR 2. When supplied, it always wins over the env var (programmatic path beats environment). PR 1 ships only the env var surface; the kwarg threading lands in PR 2.
+The `AtomicAgent(..., persona_backend=...)` constructor kwarg always wins over the env var (programmatic path beats environment).
 
-**Per-runner kwargs (PR 2):**
+**Per-runner kwargs:**
 
-`OutcomeRunner`, `EvalRunner`, and `DreamRunner` gain `persona_backend=...` constructor kwargs in PR 2, threading through to internal sub-agents.
+`OutcomeRunner`, `EvalRunner`, and `DreamRunner` accept `persona_backend=...` constructor kwargs that thread through to internal sub-agents.
 
 ## `delegate.py` threading (D-ER-2)
 
@@ -278,7 +274,7 @@ The `AtomicAgent(..., persona_backend=...)` constructor kwarg is wired in PR 2. 
 
 Rationale: persona is per-agent semantic context. A delegate's persona is the delegate's own identity; it should not inherit from its coordinator's PersonaBackend by accident. This mirrors the Mandate precedent (per-agent scoped, delegate.py deliberately NOT threaded) and is distinct from Policy (fleet-scoped, always threaded) and AgentProfile (fleet-scoped, always threaded). The distinction between explicit-kwarg threading and default-resolved threading is the same boundary PolicyBackend draws: an operator who consciously passes `persona_backend=my_shared_backend` signals intent to share; an operator who relies on the default signals per-agent isolation.
 
-## Snapshot trio shape (PR 3)
+## Snapshot trio shape
 
 ```python
 def snapshot(self, persona_id: str, label: str | None = None) -> str: ...
@@ -286,21 +282,21 @@ def restore(self, persona_id: str, snapshot_id: str) -> None: ...
 def list_snapshots(self, persona_id: str) -> list[PersonaSnapshot]: ...
 ```
 
-PR 1 ships the Protocol methods with `capabilities().supports_snapshot=False`. `FilesystemPersonaBackend` raises `NotImplementedError` on all three. PR 3 implements the trio and flips the capability to True.
+`FilesystemPersonaBackend.capabilities().supports_snapshot=True`. The trio reads from and writes to the nested storage layout described in §"Snapshot storage layout". Backends that declare `supports_snapshot=False` MUST raise `NotImplementedError` on all three methods.
 
 Snapshot ids are backend-issued (monotonic or sortable for chronological ordering). Cross-persona isolation is enforced at the storage layer: a snapshot id from persona A MUST raise `PersonaSnapshotNotFound` when restored to persona B.
 
-## Cross-Protocol composition (PR 2 preview)
+## Cross-Protocol composition
 
-PR 2 wires the full composition path:
+The composition path with `AgentProfileBackend`:
 
-- `AgentProfileBackend.load_profile()` learns to delegate persona reads to `persona_backend.load_persona(persona_id)` when one is configured AND the agent's `persona.link.md` names a `persona_id`. The `is_persona_externally_owned(agent_id) -> bool` Protocol method (D-ER-1) is added to `AgentProfileBackend` in PR 2.
+- `AgentProfileBackend.load_profile()` delegates persona reads to `persona_backend.load_persona(persona_id)` when one is configured AND `external_persona_ref(agent_id)` returns the agent's persona_id (D-PP-3, the architecturally-right Optional[str] signature that superseded D-ER-1's earlier boolean shape).
 
-- `AgentProfileBackend.save_profile()` ignores `profile.persona_identity / soul / user` when `is_persona_externally_owned()` returns True (D2a). Writes go through `persona_backend.save_persona()` only.
+- `AgentProfileBackend.save_profile()` ignores `profile.persona_identity / soul / user` when `external_persona_ref(agent_id)` is not None (D2a, D6). Writes go through `persona_backend.save_persona()` only.
 
-- `AgentProfileBackend.snapshot()` and `.restore()` skip persona fields when PersonaBackend owns the agent's persona (D3). Persona has its own snapshot history via PersonaBackend.
+- `AgentProfileBackend.snapshot()` and `.restore()` skip persona fields when PersonaBackend owns the agent's persona (D3). Persona has its own snapshot history via PersonaBackend. On `restore()` into a now-externally-owned agent whose snapshot still carries persona text, the framework emits a one-time `agent_profile_restore_dropped_persona_fields` warning per `(agent_id, snapshot_id)` via thread-safe per-process dedup (D-PP-13 migration-window event).
 
-The bootstrap path in `AtomicAgent.__init__` (PR 2): reads `agent_profile_backend.load_profile(agent_id)` first, checks `is_persona_externally_owned()`, and if True calls `persona_backend.load_persona(persona_id)` to repopulate the persona fields before system prompt assembly. AgentProfileBackend does NOT import PersonaBackend (D1a) -- the protocols stay decoupled.
+The bootstrap path in `AtomicAgent.__init__`: reads `agent_profile_backend.load_profile(agent_id)` first, then calls `external_persona_ref(agent_id)` to check ownership. When the returned `persona_id` is not None, the bootstrap calls `persona_backend.load_persona(persona_id)` to repopulate the persona fields and re-derives `agent_mode` from the loaded persona text (D-PP-4) before system prompt assembly. AgentProfileBackend does NOT import PersonaBackend (D1a): the protocols stay decoupled.
 
 ## URL factory
 
@@ -320,9 +316,7 @@ Refused formats:
 
 ## Implementer contract for persona backends
 
-**DRAFT -- finalized at PR 4 lock based on what the implementation pins.**
-
-A backend that implements the `PersonaBackend` Protocol commits to the contract below. The reference `FilesystemPersonaBackend` ships in #62 PR 1; future Postgres / SaaS / git adapters slot in via `register_persona_backend(...)` without forking core.
+A backend that implements the `PersonaBackend` Protocol commits to the contract below. The reference `FilesystemPersonaBackend` is the canonical example; future Postgres / SaaS / git adapters slot in via `register_persona_backend(...)` without forking core.
 
 Implementers MUST:
 
@@ -358,12 +352,10 @@ Implementers MUST:
    - `snapshot_id` (str): the snapshot's own id
    - `persona_id` (str): the persona this snapshot belongs to
    - `label` (str | None): operator-supplied label, null when absent
-   - `created_at` (str): ISO 8601 timestamp with timezone
+   - `created_at` (str): ISO 8601 timestamp without timezone suffix (matches the `strftime('%Y-%m-%dT%H%M%S')` format documented above)
 
    Additional keys are permitted; consumers MUST NOT assume they are
    absent.
-
-Mark this section "DRAFT -- finalized at PR 4 lock based on what the implementation pins."
 
 ## Exceptions
 
@@ -374,31 +366,27 @@ All persona exceptions live in `atomic_agents.exceptions` (D-PI-1) and are re-ex
 - `PersonaExists`: `save_persona()` or `clone()` refused to overwrite an existing persona (no-overwrite default; `save_persona(..., overwrite=True)` bypasses this).
 - `PersonaCorrupted`: the persona directory exists but its contents are corrupt or structurally invalid. Raised by `load_persona` when `metadata.json` is unparseable JSON, is missing a required key (`version`, `created_at`), uses an unsupported `schema_version`, or a body file contains non-UTF-8 bytes. Distinct from `PersonaNotFound` -- the record EXISTS but cannot be read.
 - `PersonaSnapshotNotFound`: `restore(persona_id, snapshot_id)` referenced an unknown snapshot or a snapshot belonging to a different persona.
-- `PersonaOwnershipConflict`: both `<agent>/persona.link.md` and `<agent>/persona/IDENTITY.md` exist at agent construction (D2a). Raised by profile backends in PR 2.
-- `PersonaLinkInvalid`: `persona.link.md` is malformed or the `persona_id:` value fails the charset pattern. Raised by the `persona_link_md.py` parser in PR 2 (D-ER-3).
+- `PersonaOwnershipConflict`: both `<agent>/persona.link.md` and `<agent>/persona/IDENTITY.md` exist at agent construction (D2a). Raised by the filesystem `AgentProfileBackend` (per D-PP-8: SQLite uses silent-drop with the `agent_profile_save_dropped_persona_fields` event).
+- `PersonaLinkInvalid`: `persona.link.md` is malformed or the `persona_id:` value fails the charset pattern. Raised by the `persona_link_md.py` parser (D-ER-3).
 
 Cross-module placement matches the convention used by `AgentProfileNotFound`, `ToolNotInRegistry`, etc. `PersonaOwnershipConflict` is raised by profile backends (outside the `persona/` module); `PersonaLinkInvalid` is raised by the parser (outside the `persona/` module). Both would create import cycles if they lived in `persona/types.py`.
 
 ## Spec/24 cross-reference
 
-**spec/24 line 436 `TemplateProfileBackend` reservation is explicitly retired by D5.** The retirement is documented in this spec/33 RFC (PR 1). The actual line removal from spec/24 lands in PR 4 per the design doc. `supports_templates` in `PersonaCapabilities` is the canonical home for "starter personas / canned agent configs" -- templates are persona-centric, not config-centric.
+**spec/24's `TemplateProfileBackend` reservation is retired by D5.** The retirement lock is documented here; the reservation entry has been removed from spec/24 §"Reserved future capabilities". `supports_templates` in `PersonaCapabilities` is the canonical home for "starter personas / canned agent configs": templates are persona-centric, not config-centric.
 
 ## Out of scope
 
-- **`AtomicAgent` wiring** -- shipped in PR 2 (`AtomicAgent(..., persona_backend=...)` kwarg + per-runner kwargs + `doctor.check_persona_backend` + `is_persona_externally_owned()` Protocol method on `AgentProfileBackend`).
-- **Shared-persona consumption** -- shipped in PR 3 (`persona.link.md` parser, shared-persona resolution in `AgentProfileBackend.load_profile()`, persona-only snapshot CLI).
-- **Filesystem snapshot trio implementation** -- shipped in PR 3 (capability flips to `supports_snapshot=True`).
-- **A/B persona testing** -- deferred to v1.1 as `PolicyBackend.get_effective_persona()` extension (D7).
-- **`persona.link.md` parser** -- deferred to PR 2 (D-ER-3). PR 1 ships only the `PersonaLinkInvalid` exception definition.
-- **`AtomicAgent.is_persona_externally_owned()`** -- the `is_persona_externally_owned(agent_id) -> bool` method on `AgentProfileBackend` Protocol (D-ER-1) lands in PR 2.
-- **SQLite `agents.persona_id` column migration** -- schema v1 to v2 migration in `profile/sqlite.py`, forward-only upgrade routine. Ships in PR 2 (D1a).
+- **A/B persona testing** is deferred to v1.1 as a `PolicyBackend.get_effective_persona()` extension (D7). Policy already owns call-time effective-X selection; carving an exception for persona A/B would create two homes for the same shape of decision.
+- **Persona-template marketplace** (`pip install atomic-personas-starters` or a curated GitHub registry) is reserved as a v1.1+ distribution surface. The `supports_templates` capability plus the D5 retirement of spec/24's `TemplateProfileBackend` reservation make the marketplace possible without a forking change.
+- **`AsyncPersonaBackend`** is reserved for HTTP-served deployments at v1.1+. Same Protocol shape; `load_persona` / `save_persona` become `async def`.
 
 ## References
 
 - `docs/spec/03-file-formats.md` -- the embedded-YAML-in-markdown convention `persona.link.md` follows
 - `docs/spec/06-multi-agent-projects.md` -- project-root and scope_root resolution patterns
 - `docs/spec/24-agent-profile-backend.md` -- AgentProfile Protocol; `persona_identity / soul / user` fields; spec/24 Decision 6 (`agent_mode` ignore-on-save pattern that D1+D6 extend)
-- `docs/spec/27-doctor.md` -- extended with `check_persona_backend` in PR 2
+- `docs/spec/27-doctor.md` -- documents `check_persona_backend`
 - `docs/spec/32-policy-backend.md` -- Policy Protocol (sibling; A/B persona deferred to v1.1 PolicyBackend extension per D7)
-- `~/.gstack/projects/dep0we-atomic-agents-stack/dep0we-main-design-20260522-134508.md` -- full architectural rationale, 9 locks (D1-D7 + D1a + D2a + D-ER-1 through D-ER-4 + D-PI-1)
+- `~/.gstack/projects/dep0we-atomic-agents-stack/dep0we-main-design-20260522-134508.md` -- full architectural rationale across the arc: D1-D7, D1a, D2a, D-ER-1 through D-ER-5, D-PI-1, and D-PP-1 through D-PP-13 (pre-impl prep + adversarial-round amendments folded across PR 2 and PR 3)
 - #62 -- the umbrella issue
