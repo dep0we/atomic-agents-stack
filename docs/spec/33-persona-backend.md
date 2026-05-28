@@ -201,6 +201,34 @@ The `metadata.json` sidecar carries the structured metadata fields that are not 
 
 The default `personas_root` is `<scope_root>/.personas/` resolved by `get_default_persona_backend`. For the filesystem backend, the `.personas/` hidden directory keeps `list_agents()` from discovering personas when it skips dot-entries.
 
+## Snapshot storage layout
+
+Persona snapshots live nested inside the persona's own directory under a
+dot-prefixed `.snapshots/` subdirectory:
+
+```
+<personas_root>/<persona_id>/.snapshots/<snapshot_id>/IDENTITY.md
+<personas_root>/<persona_id>/.snapshots/<snapshot_id>/SOUL.md
+<personas_root>/<persona_id>/.snapshots/<snapshot_id>/USER.md
+<personas_root>/<persona_id>/.snapshots/<snapshot_id>/metadata.json
+```
+
+The dot-prefix ensures `list_personas()` (which filters dot-entries when
+walking `<personas_root>/`) does not surface snapshot directories as
+personas.
+
+Cross-persona isolation is enforced geometrically by the path shape: a
+snapshot record always resides under its parent persona's directory, so
+a snapshot_id from persona A cannot reference data under persona B's
+storage. `restore(persona_id, snapshot_id)` MUST additionally verify the
+resolved snapshot path is under `<personas_root>/<persona_id>/` (via
+`resolved.relative_to(persona_dir.resolve())`) as defense-in-depth
+against snapshot_id charset edge cases.
+
+`snapshot()` builds the snapshot directory atomically: all four files
+are written to a sibling temp directory, then the directory is renamed
+into place. The 20-iteration retry bound from MUST #5 applies here too.
+
 ## Registry primitives
 
 Full signatures matching `atomic_agents/persona/backend.py`:
@@ -311,6 +339,27 @@ Implementers MUST:
 6. **Snapshot id determinism.** Backend-issued snapshot ids MUST be monotonic or sortable (supporting `list_snapshots` returning chronological order). Cross-persona isolation MUST be enforced at the storage layer: restoring snapshot `X` from persona A to persona B MUST raise `PersonaSnapshotNotFound`.
 
 7. **`backend_id` property stable across calls.** The property MUST return the same string across calls and MUST match what `list_persona_backends()` registered the class under.
+
+8. **Snapshot id format.** Filesystem backend snapshot ids MUST use the
+   format `snap_<YYYY-MM-DDTHHMMSS+TZ>_<12hex>` where `<12hex>` is
+   `secrets.token_hex(6)` (48-bit random tail). This matches the
+   AgentProfileBackend snapshot id format documented in spec/24
+   Implementer Contract #8. Cross-Protocol uniformity allows a shared
+   path-security validator (`_validate_snapshot_id`) and equivalent
+   collision resistance across both snapshot Protocols. Database-backed
+   and other non-filesystem backends MAY use their native id-generation
+   schemes provided ids remain monotonic or sortable (MUST #6) and
+   collision probability is at least as low as 48-bit random.
+
+   Snapshot `metadata.json` MUST contain the following keys:
+
+   - `snapshot_id` (str): the snapshot's own id
+   - `persona_id` (str): the persona this snapshot belongs to
+   - `label` (str | None): operator-supplied label, null when absent
+   - `created_at` (str): ISO 8601 timestamp with timezone
+
+   Additional keys are permitted; consumers MUST NOT assume they are
+   absent.
 
 Mark this section "DRAFT -- finalized at PR 4 lock based on what the implementation pins."
 
