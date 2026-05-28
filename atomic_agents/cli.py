@@ -645,6 +645,7 @@ def _cmd_persona(args) -> int:
     """
     from .persona.backend import get_default_persona_backend
     from .exceptions import (
+        PersonaError,
         PersonaExists,
         PersonaNotFound,
         PersonaSnapshotNotFound,
@@ -683,6 +684,12 @@ def _cmd_persona(args) -> int:
         return 1
     except NotImplementedError as e:
         print(f"Error: operation not supported by this backend: {e}", file=sys.stderr)
+        return 1
+    except PersonaError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except (OSError, PermissionError) as e:
+        print(f"Error: {e}", file=sys.stderr)
         return 1
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)

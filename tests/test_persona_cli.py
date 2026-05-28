@@ -350,3 +350,78 @@ def test_each_subcommand_nonexistent_persona_clear_error(
         assert "Traceback" not in err, f"Got Python traceback for {argv}: {err!r}"
         # The error message should say something useful
         assert err.strip() != "", f"Expected non-empty stderr for {argv}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 11. OSError and base PersonaError subclasses produce clean errors (no traceback)
+
+
+def test_persona_cli_handles_oserror_gracefully(
+    personas_root, backend, monkeypatch, capsys
+):
+    """OSError from the backend (e.g. disk full) produces exit 1 + 'Error:' on stderr.
+
+    No Python traceback should appear in stderr.
+    """
+    backend.save_persona("alice", _make_persona(identity="Alice."))
+
+    from atomic_agents.persona import filesystem as fs_mod
+
+    def _raise_oserror(*args, **kwargs):
+        raise OSError("[Errno 28] No space left on device")
+
+    monkeypatch.setattr(fs_mod.FilesystemPersonaBackend, "snapshot", _raise_oserror)
+
+    code, out, err = _run(
+        ["persona", "snapshot", "alice"],
+        personas_root,
+        monkeypatch,
+        capsys,
+    )
+
+    assert code != 0, "Expected non-zero exit on OSError"
+    assert "Error:" in err, f"Expected 'Error:' in stderr; got: {err!r}"
+    assert "No space left on device" in err, (
+        f"Expected OSError message in stderr; got: {err!r}"
+    )
+    assert "Traceback (most recent call last):" not in err, (
+        f"Expected no Python traceback in stderr; got: {err!r}"
+    )
+
+
+def test_persona_cli_handles_persona_error_subclass(
+    personas_root, backend, monkeypatch, capsys
+):
+    """A base PersonaError subclass not in the specific-catch list produces exit 1 + 'Error:'.
+
+    Covers PersonaCorrupted, PersonaLinkInvalid, PersonaOwnershipConflict, and
+    any future PersonaError subclass that the specific handlers don't cover.
+    No Python traceback should appear in stderr.
+    """
+    from atomic_agents.exceptions import PersonaError
+    from atomic_agents.persona import filesystem as fs_mod
+
+    def _raise_persona_error(*args, **kwargs):
+        raise PersonaError("group-atomic rename retry limit exceeded")
+
+    monkeypatch.setattr(
+        fs_mod.FilesystemPersonaBackend, "snapshot", _raise_persona_error
+    )
+
+    backend.save_persona("bob", _make_persona(identity="Bob."))
+
+    code, out, err = _run(
+        ["persona", "snapshot", "bob"],
+        personas_root,
+        monkeypatch,
+        capsys,
+    )
+
+    assert code != 0, "Expected non-zero exit on PersonaError"
+    assert "Error:" in err, f"Expected 'Error:' in stderr; got: {err!r}"
+    assert "group-atomic rename retry limit exceeded" in err, (
+        f"Expected PersonaError message in stderr; got: {err!r}"
+    )
+    assert "Traceback (most recent call last):" not in err, (
+        f"Expected no Python traceback in stderr; got: {err!r}"
+    )
