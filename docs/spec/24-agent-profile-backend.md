@@ -42,8 +42,6 @@ atomic_agents/profile/
 
 Mirrors `atomic_agents/locks/{__init__.py, types.py, backend.py, filesystem.py}` and `atomic_agents/logs/{__init__.py, types.py, backend.py, filesystem.py}`. The split into `types.py` separate from `backend.py` matches the precedent — canonical types ship without pulling in the Protocol contract or any reference implementation.
 
-**PR 1 does NOT ship a `renderers.py`** — see §"Decision 1" below for why.
-
 ## Load-bearing design decisions
 
 These decisions are surfaced by reading the actual parser implementations and validated against the prior arc patterns. **Locked at #63 PR 4.** Each has a "Why" that future contributors and alternate backend authors need before changing the shape.
@@ -58,7 +56,7 @@ The `AgentProfile` dataclass carries **both** the structured form (`model_config
 2. **`_tools.py:parse_tools_md`** (line 95-99) strips operator comments after the first separator (` — `, `,`, `(`) and tilde-expands paths. Operators writing `~/scout/data — operator's notes dir` lose the annotation.
 3. **`_roster.py:parse_roster_md`** strips everything after the first separator on each bullet. `editor — proofreads drafts` becomes `editor`.
 
-**`renderers.py` is dropped from PR 1 entirely.** The filesystem backend writes raw text via `_io.atomic_write`. A future canonical render layer (PR 3+ if the SQLite backend needs to export back to markdown for migration) is the right place for renderers, with eyes-open about the loss surface.
+**There is no `renderers.py`.** The filesystem backend writes raw text via `_io.atomic_write`. A future canonical render layer (if a database backend needs to export back to markdown for migration) is the right place for renderers, with eyes-open about the loss surface.
 
 ### Decision 2: Skills are separate Protocol methods, not a profile field
 
@@ -73,14 +71,14 @@ The filesystem reference delegates `list_skills` to `discover_skills()` and `loa
 
 ### Decision 3: Snapshot trio uses `profile.to_dict()` JSON, NOT `shutil.copytree`
 
-**PR 3 shipped (was deferred in PR 1):** `snapshot(agent_id, label)` / `restore(agent_id, snapshot_id)` / `list_snapshots(agent_id)` are implemented on both reference backends. **Both backends declare `supports_snapshot=True`.**
+`snapshot(agent_id, label)` / `restore(agent_id, snapshot_id)` / `list_snapshots(agent_id)` are implemented on both reference backends. **Both backends declare `supports_snapshot=True`.**
 
 The implementation shape is structurally identical across backends — `snapshot()` loads the current `AgentProfile` and serializes `profile.to_dict()` as JSON; `restore()` reconstructs the profile via `AgentProfile.from_dict()` and writes via the backend's normal `save_profile()` path:
 
 - **Filesystem:** writes `<scope_root>/.snapshots/<agent_id>/<snapshot_id>/profile.json` + `metadata.json` via `_io.atomic_write`. The snapshot dir is created with `exist_ok=False` for collision detection.
 - **SQLite:** inserts into a `profile_snapshots` table with columns `(snapshot_id PK, agent_id, label, created_at, profile_json)` and the `idx_snapshots_agent_id` + `idx_snapshots_created_at` indexes.
 
-**Why JSON, not directory copy** (Plan-subagent fix during PR 3 design): `shutil.copytree` is not atomic at the agent level. A crash mid-copy leaves the agent partially snapshotted; restore via `copytree(snapshot_dir, agent_root, dirs_exist_ok=True)` has no good atomicity story either. The JSON shape round-trips through `AgentProfile.to_dict / from_dict` and `restore()` writes via `save_profile()`, which already has the per-file atomic_write discipline. Same shape on both backends; future Postgres / git backends mirror it directly.
+**Why JSON, not directory copy:** `shutil.copytree` is not atomic at the agent level. A crash mid-copy leaves the agent partially snapshotted; restore via `copytree(snapshot_dir, agent_root, dirs_exist_ok=True)` has no good atomicity story either. The JSON shape round-trips through `AgentProfile.to_dict / from_dict` and `restore()` writes via `save_profile()`, which already has the per-file atomic_write discipline. Same shape on both backends; future Postgres / git backends mirror it directly.
 
 **Snapshot ID format:** `snap_<YYYY-MM-DDTHHMMSS>_<12hex>` — timestamp prefix gives free lexicographic-sort fallback, the 12-hex random tail (48-bit entropy via `secrets.token_hex(6)`) eliminates same-second collisions, no colons or timezone offset in the time field for Windows-share portability. Filesystem backend additionally validates the shape via `_validate_snapshot_id` (refuses any operator-supplied path-traversal token) before touching disk; SQLite's `restore()` filters on `snapshot_id` as an opaque string in the WHERE clause.
 
@@ -108,11 +106,11 @@ For cascaded agents (`<system>/projects/<project>/agents/<role>/`), `FilesystemA
 
 **Why:** `parse_agent_mode` reads the `## Operating mode` section of IDENTITY.md prose (`goal.py:186-213`). It's a substring of `persona_identity`, not a separate file or frontmatter key. Database backends MAY persist `agent_mode` as an indexable column for registry queries, but they MUST re-derive on update to avoid divergence. Documented asymmetry is cleaner than dropping the field — DB query patterns want the column.
 
-### Decision 8: Skills are filesystem-only in PR 3 — `supports_skills` capability gates skill content (#63 PR 3)
+### Decision 8: Skills are filesystem-only — `supports_skills` capability gates skill content (#63 PR 3)
 
 `ProfileCapabilities` carries a `supports_skills: bool` field. `FilesystemAgentProfileBackend` declares `True` (walks `<agent>/skills/<name>/SKILL.md`); `SQLiteAgentProfileBackend` declares `False` — `list_skills` returns `[]` for present agents, `load_skill_body` always raises `FileNotFoundError`, and `clone` does not copy skills (there are none to copy).
 
-**Why skills stay filesystem-only in PR 3:** `SkillManifest` carries filesystem-specific `Path` fields (`skill_dir`, `skill_md_path`). Storing skill bodies in the database would require a new `save_skill` Protocol method — a Protocol expansion that PR 3 scope-disciplines away. PR 3's goal is the second reference backend, not the second Protocol surface.
+**Why skills stay filesystem-only in v1.0:** `SkillManifest` carries filesystem-specific `Path` fields (`skill_dir`, `skill_md_path`). Storing skill bodies in the database would require a new `save_skill` Protocol method — a Protocol expansion deferred from v1.0; the v1.0 goal is two reference backends, not a second Protocol surface.
 
 **Conformance test gating:** the parametrized conformance suite checks the capability before exercising skill content. `test_list_skills_returns_metadata`, `test_load_skill_body_returns_body_without_frontmatter`, `test_clone_copies_skills_directory`, and `test_load_skill_body_refuses_skill_name_traversal` all skip with `supports_skills=False`. Empty-skill tests (`test_list_skills_empty`) pass on both backends because non-supporting backends return `[]` from `list_skills`. `test_list_skills_missing_agent_raises_not_found` + `test_load_skill_body_missing_agent_raises_not_found` (GAP-11) pass on both because both backends check agent existence before any skill operation.
 
@@ -178,7 +176,7 @@ class ProfileSnapshot:
 class ProfileCapabilities:
     supports_save: bool        # False for read-only template libraries
     supports_clone: bool
-    supports_snapshot: bool    # False on PR 1 filesystem (Decision 3)
+    supports_snapshot: bool    # True on both reference backends (Decision 3)
     supports_subscribe: bool   # reserved future capability
     durable: bool
 ```
@@ -286,7 +284,7 @@ Conforms to the Protocol with the constructor signature `SQLiteAgentProfileBacke
 
 - **No optional dependency** — stdlib `sqlite3` only.
 - **Schema:** `agents(name PK, agent_mode indexed, profile_json, updated_at)`, `profile_snapshots(snapshot_id PK, agent_id indexed, label, created_at indexed, profile_json)`, `meta(key PK, value)`. Schema version tracked in `meta('schema_version', '1')`; cold-start race mitigated via `INSERT OR IGNORE` (mirrors spec/22's `SQLiteLogBackend` cold-start fix).
-- **JSON blob + indexed scalars** (Decision 1 of PR 3): `AgentProfile.to_dict()` serializes to the `profile_json` column with `default=str` (PosixPath coercion); `agent_mode` is duplicated as an indexed scalar for registry-by-mode queries. `from_dict` re-derives structured fields from raw text on load, so the JSON shape is forward-compatible with new AgentProfile fields without `ALTER TABLE`.
+- **JSON blob + indexed scalars** (Decision 1): `AgentProfile.to_dict()` serializes to the `profile_json` column with `default=str` (PosixPath coercion); `agent_mode` is duplicated as an indexed scalar for registry-by-mode queries. `from_dict` re-derives structured fields from raw text on load, so the JSON shape is forward-compatible with new AgentProfile fields without `ALTER TABLE`.
 - **`save_profile()` re-derives `agent_mode`** from `persona_identity` before writing (Decision 6 — same invariant the filesystem backend enforces via its load-from-disk parser path; SQLite enforces at write time).
 - **Concurrency:** `threading.local` connection pool gives each thread its own `sqlite3.Connection`. WAL journal mode + `synchronous=NORMAL` for multi-process safety on local filesystems. **Network-mounted filesystems (NFS, SMB) NOT supported** — SQLite WAL on NFS is documented-broken upstream.
 - **Snapshot trio:** writes to `profile_snapshots` table; cross-agent isolation enforced at the SQL `WHERE` clause (`WHERE snapshot_id = ? AND agent_id = ?` in `restore()`).
@@ -330,7 +328,7 @@ Profile backend choice is a **deployment-level** decision (the whole framework i
 
 There is no `profile.md` markdown config — the profile backend is the layer that READS the markdown config files; circular.
 
-PR 2 of #63 will expose the choice via TWO paths (parallel to the LogBackend / LockBackend operator surfaces):
+The operator surface exposes the choice via TWO paths (parallel to the LogBackend / LockBackend operator surfaces):
 
 1. **Constructor kwarg** — programmatic operators (Python entry-points wiring the framework into Cloud Run, Kubernetes deployments with custom database connections) pass `AtomicAgent(..., profile_backend=DatabaseAgentProfileBackend(...))` to bypass env-var resolution entirely.
 
@@ -342,64 +340,17 @@ PR 2 of #63 will expose the choice via TWO paths (parallel to the LogBackend / L
 
 The constructor kwarg ALWAYS wins. Operator-config layering: env vars are deployment-level (per-instance, per-host); the kwarg is per-agent-construction. A test that constructs an `AtomicAgent` with an explicit `profile_backend=` bypasses any env vars the deployment may have set.
 
-## What PR 1 did NOT do (now done in PR 2)
+### Implementer note — synchronous load_profile at __init__ blocks construction
 
-PR 1 shipped pure scaffolding — Protocol, filesystem reference impl, conformance suite, DRAFT spec — with **zero call-site changes**. PR 2 wires the bootstrap path.
+`AtomicAgent.__init__` calls `self.profile_backend.load_profile(self.name)` UNCONDITIONALLY and SYNCHRONOUSLY at construction time (`agent.py:308`). For `FilesystemAgentProfileBackend`, this is a handful of file reads — sub-millisecond. For `SQLiteAgentProfileBackend` or a future `DatabaseAgentProfileBackend` on a remote server, this is a network round-trip on every `AtomicAgent()` construction site (production fleet deployments may construct hundreds per process). #63 PR 2 Step 11 adversarial Finding 2 flagged this as a trap shape preview.
 
-## What PR 2 wires
-
-**Core (`atomic_agents/agent.py`):**
-
-- `AtomicAgent.__init__` accepts `profile_backend: AgentProfileBackend | None = None` as a keyword-only kwarg (after `lock_backend` + `log_backend`, mirroring the established pattern). When unset, resolves via `get_default_profile_backend(self.agents_root)` (env-var-aware default). Stored as the **public** `self.profile_backend` for diagnostic + runner reuse, matching `self.lock_backend` / `self.log_backend`.
-- `self._profile = self.profile_backend.load_profile(self.name)` snapshots the agent's config ONCE at init — private cache, not a stable operator surface.
-- `_load_config()` is now a thin adapter reading fields from `self._profile` instead of file reads. **Cascade branch deleted** (Decision 7): `FilesystemAgentProfileBackend.load_profile` handles cascade internally. `self.cascade` is preserved at init for downstream uses (`_load_role_prompt`, `_load_project_layer_text`, `_load_tools_text`, tool-registration paths) — those load call-time content, not init-time config.
-- `_load_persona()` and `_load_goal_text()` read from `self._profile` instead of re-reading the files.
-- `agent_mode` is derived from the profile snapshot's `agent_mode` field (re-derived from `persona_identity` via the profile backend's `goal.parse_agent_mode_text`).
-
-**Cascade unblocker (`atomic_agents/profile/filesystem.py:_agent_root`):**
-
-- Removed the `/` refusal that PR 1 added as overly-restrictive belt-and-suspenders. Cascade agents have multi-segment `agent_id` values like `"muse/projects/the-unfinished/agents/writer"`. The `.resolve() + .relative_to(scope_root)` check is the actual security boundary; it catches `..` traversal after path resolution. All other validations (empty rejection, leading `.` refusal, backslash refusal, explicit `..` refusal) stay. **This unblocks all 9 cascade integration tests under PR 2.**
-
-**Runner threading (`outcome.py`, `eval.py`, `dream.py`):**
-
-- `OutcomeRunner.__init__` adds `profile_backend` kwarg; threaded to internal `AtomicAgent` at `run()`.
-- `EvalRunner.__init__` adds `log_backend` AND `profile_backend` kwargs (Decision 3: fixed the pre-existing `log_backend` drop-trap simultaneously).
-- `DreamRunner.__init__` adds `profile_backend` kwarg; pre-resolves `self._profile = self._profile_backend.load_profile(self.agent_name)` at init. **The Step 11 P1#3 trap**: `DreamRunner` reads `model.md` in TWO call sites — `dream.py:1128` (pipeline) AND `dream.py:672` (`_check_cap` cost-guardrail). PR 2 routes BOTH through the profile backend:
-  - **Site 1** (`__init__:1128`): `self._model = self._profile.model_config["default_model"]` (replaces direct `_model.parse_model_md` read)
-  - **Site 2** (`_check_cap:672`): the function now accepts `model_config: dict | None = None` kwarg (Decision 2 — passing pre-resolved config beats threading `profile_backend` + re-resolving the agent_name from `agent_root`). `DreamRunner.start()` passes `model_config=self._profile.model_config` so the cost-guardrail uses the same source the rest of DreamRunner uses. Legacy fallback (`_model.parse_model_md`) preserved for callers who don't pass `model_config`.
-
-**Doctor (`atomic_agents/doctor.py:check_agent_profile_backend`):**
-
-- New function mirroring `check_log_backend` shape (PASS/WARN/FAIL ladder, URL credential redaction via `urlparse + _replace`, capability + agent-count probe).
-- Wired into `run_doctor()` between `check_log_backend` and `check_memory_backend`.
-- Added `"profile-backend"` to the skip-names tuple so it emits a SKIP entry when no agent is supplied (parity with `memory-backend`).
-
-**Public surface:**
-
-- `atomic_agents.__init__` already exported the AgentProfileBackend surface in PR 1.
-- `outcome.py`, `eval.py`, `dream.py` now import `AgentProfileBackend` (under `TYPE_CHECKING` in dream.py to match existing pattern).
-
-**What PR 2 still does NOT do:**
-
-- No second backend — that's PR 3 (`SQLiteAgentProfileBackend` likely).
-- No `renderers.py` — Decision 1; deferred to PR 3 if a DB backend needs canonical markdown export.
-- No snapshot implementation — Decision 3; lands with PR 3's second backend.
-- No `subscribe` / hot-reload — capability flag reserved; deferred indefinitely.
-- No CLI flag for `--profile-backend` — env var path (`ATOMIC_AGENTS_PROFILE_BACKEND`) covers operator config; CLI flag would add API surface without a use case.
-
-PR 3 shipped the second reference impl (`SQLiteAgentProfileBackend` — registry table + per-agent row + snapshots table) and parametrized the conformance suite. **PR 4 (this PR) locked this spec** and added the `§"Implementer contract for registry-backed backends"` section below.
-
-### PR 3 implementer note — synchronous load_profile at __init__ blocks construction
-
-`AtomicAgent.__init__` calls `self.profile_backend.load_profile(self.name)` UNCONDITIONALLY and SYNCHRONOUSLY at construction time (`agent.py:308`). For `FilesystemAgentProfileBackend`, this is a handful of file reads — sub-millisecond. For a future `SQLiteAgentProfileBackend` or `DatabaseAgentProfileBackend` on a remote server, this is a network round-trip on every `AtomicAgent()` construction site (96 existing test sites today; production fleet deployments may construct hundreds per process). #63 PR 2 Step 11 adversarial Finding 2 flagged this as a PR 3 trap shape preview.
-
-PR 3 backend implementers MUST EITHER (a) ensure `load_profile` completes within a sub-second budget under typical network conditions, OR (b) propose a Protocol extension that allows lazy-loading (e.g., a `lazy_load_profile` flag on the backend, or a `@cached_property` shape inside `AtomicAgent`). The latter is a Protocol change and would land via PR 3's spec-doc updates, not as a code-only addition.
+Backend implementers MUST EITHER (a) ensure `load_profile` completes within a sub-second budget under typical network conditions, OR (b) propose a Protocol extension that allows lazy-loading (e.g., a `lazy_load_profile` flag on the backend, or a `@cached_property` shape inside `AtomicAgent`). The latter is a Protocol change and would land via spec-doc updates, not as a code-only addition.
 
 Filesystem-default operators see no impact; this affects the deployment surface for non-filesystem backends.
 
 ### Known gaps deferred to follow-up issues (post-lock)
 
-The #63 arc spans four PRs and ships locked. These two filesystem-backend rough edges were surfaced by PR 1 Step 11 adversarial review and tracked as follow-up issues — they are out of scope for the locked spec but documented here for future implementer awareness:
+These two filesystem-backend rough edges were surfaced by #63 PR 1 Step 11 adversarial review and tracked as follow-up issues — they are out of scope for the locked spec but documented here for future implementer awareness:
 
 - **`clone()` TOCTOU race** — two concurrent `clone(source, target)` calls can both pass the `exists(target)` check before either writes, then both proceed and the second silently overwrites the first. `clone()`'s contract promises `AgentProfileExists` for an existing target, but the guarantee is window-wide rather than atomic. Single-host typical deployments rarely trip this; Cloud Run / Kubernetes multi-replica deployments will. Fix shape: replace the check-then-mkdir pattern with `os.mkdir(target_root, mode=0o755)` which raises `FileExistsError` atomically as the sentinel.
 
@@ -439,7 +390,7 @@ These are not committed in the locked v1.0 surface but are reserved in the names
 
 ## Conformance test surface
 
-The conformance suite (PR 4 lock — parametrized across both reference backends):
+The conformance suite (parametrized across both reference backends):
 
 - `tests/test_profile_protocol_conformance.py` — **46 tests × 2 backends = ~92 parametrized invocations** (with capability-gated skips for skill-content tests on SQLite and filesystem-shape tests on SQLite). Parametrized via a `backend_factory` fixture; third-party backends import the `BACKEND_FACTORIES` list to verify their own conformance. Tests cover: Protocol surface, every load/save edge case, round-trip raw byte preservation, MCP `$VAR` preservation (Decision 1), `agent_mode` derivation asymmetry (Decision 6), `list_agents` filtering, `exists` correctness, skill listing + body loading (gated on `supports_skills`), skill_name path-traversal refusal (Step 9.1 multi-specialist finding F-A, gated), `from_dict` narrow except (Step 9.1 finding F-B), clone + overrides + skills directory copy (gated), capability parity for snapshot trio, `AgentProfile.to_dict / from_dict` round-trip, list_skills/load_skill_body on missing agent (GAP-11), **9 snapshot conformance tests** (round-trip, list-empty, chronological ordering, label preservation, restore-unknown, cross-agent isolation, snapshot_id uniqueness — added in #63 PR 3 — plus two path-traversal refusal tests added in PR 3 Step 11 adversarial F-3 fix).
 - `tests/test_profile_filesystem_backend.py` — 23 filesystem-specific tests: on-disk path mapping (matches `agent.py:_load_config` expectations exactly), hidden-directory exclusion, path-traversal refusal, atomic save (no .tmp leftovers), registry resolution, `get_default_profile_backend` env-var dispatch + credential redaction + long-value truncation, cascade carve-out (load picks up role layer; save writes instance-layer only — Decision 5; cascade floor judges.md does NOT materialize ghost instance shadow — Step 11 adversarial finding P1#1), `from_dict` raises loudly when judges_config is dict-shape without raw text (Step 11 finding P1#2).

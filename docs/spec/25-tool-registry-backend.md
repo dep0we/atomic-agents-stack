@@ -33,7 +33,7 @@ atomic_agents/registry/
 
 Mirrors `atomic_agents/profile/{__init__.py, types.py, backend.py, filesystem.py}` and `atomic_agents/logs/{__init__.py, types.py, backend.py, filesystem.py}`. The split into `types.py` separate from `backend.py` matches the precedent — canonical types ship without pulling in the Protocol contract or any reference implementation.
 
-The package name is `registry` (not `tools` — that's the existing in-memory dispatch module — nor `tool_registry` — single-word + lowercased package names match the established `profile` / `logs` / `locks` pattern). The PR 3 sibling for the alternate backend lands at `atomic_agents/registry/sqlite.py` alongside the filesystem reference.
+The package name is `registry` (not `tools` — that's the existing in-memory dispatch module — nor `tool_registry` — single-word + lowercased package names match the established `profile` / `logs` / `locks` pattern). The SQLite sibling for the alternate backend lives at `atomic_agents/registry/sqlite.py` alongside the filesystem reference.
 
 ## Load-bearing design decisions
 
@@ -65,10 +65,10 @@ The pattern parallels `AgentProfileBackend.load_profile` → fields-on-the-profi
 
 1. The issue body was written before spec/24 locked. The locked spec/24 owns per-agent skill listing — flipping it now means re-opening a locked spec.
 2. Spec/18's progressive-disclosure principle (CLAUDE.md §6) is a per-agent property — "what this agent declares it knows about" is identity-layer, not catalog-layer. The catalog is upstream of identity.
-3. Keeping the catalog surface reserved (not shipped) means PR 1 stays scope-disciplined; future expansion has a clean landing pad in `ToolRegistryCapabilities.supports_skills_catalog`.
+3. Keeping the catalog surface reserved (not shipped) keeps the v1.0 surface scope-disciplined; future expansion has a clean landing pad in `ToolRegistryCapabilities.supports_skills_catalog`.
 4. A future SaaS deployment will need BOTH — `AgentProfileBackend` answering "what does this agent currently know about?" AND `ToolRegistryBackend` answering "what's available to teach this agent?" Merging the two now means picking a wrong shape and re-doing it later.
 
-**Operator-facing consequence:** today operators copy `tools/<name>.{md,py}` + `skills/<name>/SKILL.md` into the agent dir manually; PR 1 lifts the `tools/` discovery to a Protocol; skills/ discovery still walks the filesystem via `discover_skills(agent_root)` until a future ToolRegistryBackend ships catalog skills. Both home and SaaS shapes work in both regimes.
+**Operator-facing consequence:** today operators copy `tools/<name>.{md,py}` + `skills/<name>/SKILL.md` into the agent dir manually; ToolRegistryBackend lifts the `tools/` discovery to a Protocol; skills/ discovery still walks the filesystem via `discover_skills(agent_root)` until a future ToolRegistryBackend ships catalog skills. Both home and SaaS shapes work in both regimes.
 
 ### Decision 3: MCP server discovery stays in its own module — `MCPServerSpec` is NOT a `ToolRef`
 
@@ -80,15 +80,15 @@ MCP servers are **processes** with subprocess lifecycle, env-var-resolved creden
 
 **Reserved future:** a separate `MCPServerRegistryBackend` Protocol could land in its own arc when the SaaS-tenancy story actually needs it. Documented here in §"Out of scope" + a forward-pointer in spec/19 (existing MCP spec) so future readers find the carve-out. The successor issue [#201](https://github.com/dep0we/atomic-agents-stack/issues/201) tracks the carve-out.
 
-**Why:** Layers compose; they don't merge (CLAUDE.md §3). The `AgentProfileBackend` already snapshots `mcp_servers: list[MCPServerSpec]` on `AgentProfile` from `mcp_md_raw`; PR 2 wiring routes the MCP pool's `_specs` from `self._profile.mcp_servers` (already in place after #63 PR 2 at `agent.py:2018` + `agent.py:2337`). No additional indirection needed; the Profile backend covers the per-agent MCP server list; the eventual MCP-registry layer covers the cross-agent install/audit story.
+**Why:** Layers compose; they don't merge (CLAUDE.md §3). The `AgentProfileBackend` already snapshots `mcp_servers: list[MCPServerSpec]` on `AgentProfile` from `mcp_md_raw`; the MCP pool's `_specs` are routed from `self._profile.mcp_servers` (in place after #63 PR 2 at `agent.py:2018` + `agent.py:2337`). No additional indirection needed; the Profile backend covers the per-agent MCP server list; the eventual MCP-registry layer covers the cross-agent install/audit story.
 
 ### Decision 4: Version field on `ToolRef` ships now, semantics deferred behind capability flag
 
-`ToolRef.version: str | None = None` ships in PR 1's canonical types. `FilesystemToolRegistryBackend` always sets `version=None` (filesystem layout has no version semantics today). `ToolRegistryBackend.load_tool(name: str) -> ToolDefinition` does NOT accept a `version` parameter — adding it pre-emptively would lock a wrong shape (which of pip-style / npm-style / git-style wins?). `ToolRegistryCapabilities.supports_versioning: bool` reserves the field.
+`ToolRef.version: str | None = None` is part of the canonical types. `FilesystemToolRegistryBackend` always sets `version=None` (filesystem layout has no version semantics today). `ToolRegistryBackend.load_tool(name: str) -> ToolDefinition` does NOT accept a `version` parameter — adding it pre-emptively would lock a wrong shape (which of pip-style / npm-style / git-style wins?). `ToolRegistryCapabilities.supports_versioning: bool` reserves the field.
 
 Documented here in §"Reserved future capabilities" with **pip-style** as the default-target when the flag lands. Rationale: matches the framework's pip-shaped Python ecosystem position. npm-style multi-version-coexistence is explicitly documented as out-of-scope (operators wanting it use multiple registries scoped per-agent, which already works through the per-agent backend instance pattern).
 
-**Why ship the field now, not later:** `to_dict / from_dict` round-trip preservation requires the field on the canonical type from PR 1 — adding it in PR 3 would break the JSON shape forward-compat (same lesson as spec/24 Decision 1's `mcp_md_raw` preservation discipline). Cheap to add now (one Optional field on a frozen dataclass); expensive to retrofit later.
+**Why the field ships upfront:** `to_dict / from_dict` round-trip preservation requires the field on the canonical type from the first release — adding it later would break the JSON shape forward-compat (same lesson as spec/24 Decision 1's `mcp_md_raw` preservation discipline). Cheap to add upfront (one Optional field on a frozen dataclass); expensive to retrofit later.
 
 ### Decision 5: `ToolRef` is metadata-only; `load_tool` materializes the handler
 
@@ -108,9 +108,9 @@ NO `handler`, NO `input_schema`. `list_tools()` returns enough to **advertise** 
 - `SkillManifest` → `load_skill_body()` separation (locked in spec/24 Decision 2).
 - The framework's "pay context tokens for capability awareness, not capability content" principle (CLAUDE.md §6).
 
-**Why:** the filesystem reference impl walks `tools/<name>.md` for metadata (cheap, just markdown parsing) and ONLY runs `importlib.util.spec_from_file_location` when `load_tool(name)` is called. **The lazy/eager distinction is at the BACKEND layer — not the wiring layer.** PR 2 of #64 wired `AtomicAgent.__init__` to call BOTH `list_tools()` AND `load_tool(name)` for every backend ref at construction time, so handler-module imports fire on every agent construction (not lazily on first dispatch). Operators with side-effecting top-level code in `<agent>/tools/<name>.py` see the side effect at agent construction. This is acceptable in the filesystem-trust-boundary model (operators own `<agent>/tools/`); a future capability flag `lazy_handler_import: bool` MAY ship to support fully-lazy dispatch for backends serving untrusted catalogs (PyPI / SaaS / HTTP).
+**Why:** the filesystem reference impl walks `tools/<name>.md` for metadata (cheap, just markdown parsing) and ONLY runs `importlib.util.spec_from_file_location` when `load_tool(name)` is called. **The lazy/eager distinction is at the BACKEND layer — not the wiring layer.** `AtomicAgent.__init__` calls BOTH `list_tools()` AND `load_tool(name)` for every backend ref at construction time, so handler-module imports fire on every agent construction (not lazily on first dispatch). Operators with side-effecting top-level code in `<agent>/tools/<name>.py` see the side effect at agent construction. This is acceptable in the filesystem-trust-boundary model (operators own `<agent>/tools/`); a future capability flag `lazy_handler_import: bool` MAY ship to support fully-lazy dispatch for backends serving untrusted catalogs (PyPI / SaaS / HTTP).
 
-A 50-tool agent under filesystem still pays no Python import cost on `list_tools()` alone (frontmatter parsing only) — the eager import happens via the wiring loop's per-ref `load_tool(name)` call. The current `agent.py` did NOT load tool implementations from `tools/<name>.py` at all before #64 — custom tools were registered programmatically by the operator. PR 1 shipped the filesystem reference to ALSO discover + materialize `tools/<name>.py` modules in the spirit of the issue's "tools/<name>.md descriptor + tools/<name>.py implementation" framing. **The filesystem backend behaves as a no-op when `tools/` dir is empty or absent** (the wiring loop iterates zero times — every existing 96 `AtomicAgent(...)` test site has no `tools/` directory and sees byte-identical pre-#64 behavior).
+A 50-tool agent under filesystem still pays no Python import cost on `list_tools()` alone (frontmatter parsing only) — the eager import happens via the wiring loop's per-ref `load_tool(name)` call. The pre-#64 `agent.py` did NOT load tool implementations from `tools/<name>.py` at all — custom tools were registered programmatically by the operator. The filesystem reference ALSO discovers + materializes `tools/<name>.py` modules in the spirit of the issue's "tools/<name>.md descriptor + tools/<name>.py implementation" framing. **The filesystem backend behaves as a no-op when `tools/` dir is empty or absent** (the wiring loop iterates zero times — agents with no `tools/` directory see byte-identical pre-#64 behavior).
 
 ### Decision 6: `ToolRegistryBackend.validate(name)` is a static check, NOT a live invocation
 
@@ -123,7 +123,7 @@ The issue body lists `validate(name)` as an optional capability — "sandbox che
 
 Soft warnings cover the hygiene issues that don't break dispatch: missing description, missing classification (the runtime falls back to `external_side_effect` per spec/28).
 
-**Why:** running operator handlers as a side-effect of `validate()` violates least-astonishment — `validate` is an audit-time call, not a runtime call. The runtime safety story is `ToolRegistry.execute()` and the judge layer (spec/28), which is the right place for sandboxed dispatch. Decisions about sandbox process model (subprocess? container? wasm?) are too unsettled to lock in #64 PR 1.
+**Why:** running operator handlers as a side-effect of `validate()` violates least-astonishment — `validate` is an audit-time call, not a runtime call. The runtime safety story is `ToolRegistry.execute()` and the judge layer (spec/28), which is the right place for sandboxed dispatch. Decisions about sandbox process model (subprocess? container? wasm?) are too unsettled to lock in v1.0.
 
 ### Decision 7: `install` / `uninstall` are capability-gated, ABSENT from filesystem backend
 
@@ -133,10 +133,10 @@ Filesystem backend declares `supports_install=False`. `install(source, version)`
 
 ### Decision 8: `ToolNameCollision` semantics survive the indirection — backend tools register AFTER operator tools, with `allow_overwrite=False`
 
-The legacy `ToolNameCollision` (raised by `ToolRegistry.register()` with default `allow_overwrite=False`) keeps its semantics. PR 2 wiring path:
+The legacy `ToolNameCollision` (raised by `ToolRegistry.register()` with default `allow_overwrite=False`) keeps its semantics. Wiring path:
 
 1. `AtomicAgent.__init__` calls `self.tool_registry_backend = tool_registry_backend or get_default_tool_registry_backend(self.agent_root)`.
-2. After in-memory `self.tool_registry = tools if tools is not None else ToolRegistry()` is constructed (agent.py:243), PR 2 inserts a loop: `for ref in self.tool_registry_backend.list_tools(): td = self.tool_registry_backend.load_tool(ref.name); self.tool_registry.register(td)`.
+2. After in-memory `self.tool_registry = tools if tools is not None else ToolRegistry()` is constructed (agent.py:243), the framework runs: `for ref in self.tool_registry_backend.list_tools(): td = self.tool_registry_backend.load_tool(ref.name); self.tool_registry.register(td)`.
 3. If the operator ALSO passes `tools=ToolRegistry()` with pre-registered tools, the order is: operator's tools register first (operator intent wins on collisions), then backend tools register with `allow_overwrite=False` (collisions surface loudly as `ToolNameCollision`).
 4. MCP discovery at agent.py:2337 — unchanged. MCP tools register with `allow_overwrite=True` (existing semantics). MCP tool names ALWAYS namespace as `server__tool`, so collisions with backend-loaded tools are vanishingly rare and indicate a real conflict.
 
@@ -242,7 +242,7 @@ class ToolRegistryBackend(Protocol):
 - MUST raise `ToolDescriptorInvalid` when the descriptor can't be parsed.
 - MUST raise `ToolHandlerImportFailed` when the handler module can't be imported.
 - MUST validate `name` against path-traversal at the API boundary BEFORE any disk access (spec/25 MUST #1 — locked at PR 4).
-- Handlers MUST be re-importable across `load_tool` calls. The filesystem reference impl does NOT populate `sys.modules` — each `load_tool` call produces a fresh module via `importlib.util.spec_from_file_location` + `exec_module`. Operators with side-effecting top-level code in their handler module see the side effect re-fire on every `load_tool`. Backends MAY opt to cache (insert into `sys.modules` under a deterministic qualname), but MUST NOT cache the returned `ToolDefinition` instance — callers may mutate fields before registering. PR 2 wires `load_tool` exactly once per agent construction, so re-import overhead lands only on agent re-construction.
+- Handlers MUST be re-importable across `load_tool` calls. The filesystem reference impl does NOT populate `sys.modules` — each `load_tool` call produces a fresh module via `importlib.util.spec_from_file_location` + `exec_module`. Operators with side-effecting top-level code in their handler module see the side effect re-fire on every `load_tool`. Backends MAY opt to cache (insert into `sys.modules` under a deterministic qualname), but MUST NOT cache the returned `ToolDefinition` instance — callers may mutate fields before registering. The framework calls `load_tool` exactly once per agent construction, so re-import overhead lands only on agent re-construction.
 
 ### `validate` semantics
 
@@ -259,7 +259,7 @@ class ToolRegistryBackend(Protocol):
 
 ### `list_skills_catalog` / `load_skill_catalog_body` semantics
 
-- Reserved (Decision 2). Both reference backends in PR 1 raise `NotImplementedError`.
+- Reserved (Decision 2). Both reference backends raise `NotImplementedError`.
 - Future PyPI / git / company-internal-HTTP backends flip `supports_skills_catalog=True` in their own arc.
 
 ### `capabilities` semantics
@@ -316,7 +316,7 @@ Conforms to the Protocol with the constructor signature `SQLiteToolRegistryBacke
 - **`handlers_root`**: constructor kwarg (default `db_path.parent / "handlers"`). Created with `mkdir(parents=True, exist_ok=True)` on first install. Layout: `<handlers_root>/<agent_scope>/<name>.py` — per-scope subdir for cross-scope isolation at the filesystem layer too (defense in depth — even if a future migration drops the agent_scope SQL filter, the per-scope subdir keeps handler files separated).
 - **`install(source, version=None)` semantics**:
   - `source` is a filesystem path to a directory containing `<name>.md` (descriptor) + `<name>.py` (handler module).
-  - `version` MUST be `None` when `supports_versioning=False` (which PR 3 declares); the column accepts non-NULL values for forward compatibility but PR 3 rejects them at the call site with `ValueError` (plan-subagent Risk L — capability honesty).
+  - `version` MUST be `None` when `supports_versioning=False` (which SQLite declares); the column accepts non-NULL values for forward compatibility but the backend rejects them at the call site with `ValueError` (plan-subagent Risk L — capability honesty).
   - Handler source path is resolved + validated under the source directory (no path-traversal via name).
   - Handler .py file is copied into `<handlers_root>/<agent_scope>/<name>.py` via `_io.atomic_write`.
   - INSERT INTO tools ON CONFLICT(agent_scope, name) DO NOTHING — if `cursor.rowcount == 0`, raises `ToolAlreadyInstalled`. Atomic at the storage layer (plan-subagent Risk D).
@@ -328,14 +328,12 @@ Conforms to the Protocol with the constructor signature `SQLiteToolRegistryBacke
 - **Schema migration**: when a future arc bumps schema_version, the open path mirrors `profile/sqlite.py` — raises `RuntimeError` with the expected-vs-found versions and a migration-required note. No auto-migration; operators run an explicit migrate command (successor issue tracked).
 - **Capabilities**: `supports_install=True, supports_uninstall=True, supports_versioning=False (column exists but not dispatched on — plan-subagent Risk L), supports_sandbox_validate=False, supports_skills_catalog=False, durable=True (False for :memory:)`.
 
-PR 3 ships plan-subagent-vetted before implementation (3 SEVERE risks caught pre-impl, including the base64-exec design rejection); Step 11 adversarial is mandatory post-implementation (#63 PR 3 caught 6 P0/P1 findings including a REPRODUCED cross-agent path-traversal).
-
 ## Exception surface
 
 - `ToolNotInRegistry` — `load_tool(name)` called with an unknown name. Distinct from `ToolNotRegistered` (in-memory dispatch miss).
 - `ToolDescriptorInvalid` — descriptor (frontmatter) cannot be parsed.
 - `ToolHandlerImportFailed` — handler module cannot be imported, or lacks the `handler` callable.
-- `ToolAlreadyInstalled` — `install(source)` collided on tool name (PR 3+).
+- `ToolAlreadyInstalled` — `install(source)` collided on tool name.
 - `BackendNotRegistered` — operator-pinned backend_id isn't in the registry.
 - `ValueError` — invalid tool name (path separator, empty, parent-dir token, leading `.`), or `install(version=X)` against a backend without versioning support.
 - `NotImplementedError` — capability-gated method on a backend that doesn't support it.
@@ -367,23 +365,19 @@ Tool-registry backend choice is a **deployment-level** decision (the whole frame
 
 There is no `tool_registry.md` markdown config — the tool-registry backend is the layer that LOADS tools; circular.
 
-PR 2 of #64 exposes the choice via TWO paths (parallel to the LogBackend / LockBackend / ProfileBackend operator surfaces):
+The operator surface exposes the choice via TWO paths (parallel to the LogBackend / LockBackend / ProfileBackend operator surfaces):
 
 1. **Constructor kwarg** — programmatic operators (Python entry-points wiring the framework into Cloud Run, Kubernetes deployments with custom database connections) pass `AtomicAgent(..., tool_registry_backend=SQLiteToolRegistryBackend(...))` to bypass env-var resolution entirely.
 
 2. **Environment variables** — deployment-config operators (Docker, launchd, Cloud Run env, systemd units) set:
-   - `ATOMIC_AGENTS_TOOL_REGISTRY_BACKEND` — backend id (default `filesystem`). Recognized in PR 1: `filesystem`. PR 3 adds `sqlite`.
-   - `ATOMIC_AGENTS_TOOL_REGISTRY_BACKEND_URL` — connection / path string for non-filesystem backends. SQLite shape (PR 3): `sqlite:///absolute/path/to/tools.db?agent_scope=<name>`.
+   - `ATOMIC_AGENTS_TOOL_REGISTRY_BACKEND` — backend id (default `filesystem`). Recognized: `filesystem`, `sqlite`.
+   - `ATOMIC_AGENTS_TOOL_REGISTRY_BACKEND_URL` — connection / path string for non-filesystem backends. SQLite shape: `sqlite:///absolute/path/to/tools.db?agent_scope=<name>`.
 
    **Credential safety**: `get_default_tool_registry_backend` sanitizes the `ATOMIC_AGENTS_TOOL_REGISTRY_BACKEND` value before echoing it in error messages — strips anything following `://` and truncates at 32 chars — so an operator who accidentally pastes a URL credential into the BACKEND env var (instead of `..._URL`) does not see the credential echoed in the resulting `BackendNotRegistered` exception text. Mirrors the fixes from `logs/__init__.py:316`, `profile/__init__.py:_redact_for_error_message`, and the same shape in this module's `__init__.py`.
 
 The constructor kwarg ALWAYS wins. Operator-config layering: env vars are deployment-level (per-instance, per-host); the kwarg is per-agent-construction. A test that constructs an `AtomicAgent` with an explicit `tool_registry_backend=` bypasses any env vars the deployment may have set.
 
-## What landed across the arc
-
-PR 1 shipped pure scaffolding — Protocol, `FilesystemToolRegistryBackend` reference impl, conformance suite, DRAFT spec — with **zero call-site changes**. PR 2 wired the bootstrap path: `AtomicAgent.__init__` accepts `tool_registry_backend: ToolRegistryBackend | None = None` (keyword-only) and threads it through `OutcomeRunner` / `EvalRunner` / `DreamRunner`; `doctor.check_tool_registry_backend` lands as a new coherence check. PR 3 shipped `SQLiteToolRegistryBackend` with `supports_install=True` / `supports_uninstall=True` flipped + parametrized conformance across both backends + hybrid storage shape (metadata in SQL + handler bodies on disk). PR 4 (this PR) locks the spec and adds §"Implementer contract for registry-backed tool backends".
-
-What stayed reserved (per Decision 2 / 4 / 6 / 7):
+## Reserved at lock (per Decision 2 / 4 / 6 / 7)
 
 - **No skill catalog yet.** `list_skills_catalog` / `load_skill_catalog_body` raise `NotImplementedError` on both reference backends; `supports_skills_catalog=False` on both. The capability flag is reserved for future PyPI / git / company-internal-HTTP backends.
 - **No sandboxed validation.** `validate()` stays static-only on both backends; `supports_sandbox_validate=False`. Sandboxed validation is a reserved capability flag (process model TBD).
@@ -396,15 +390,15 @@ What stayed reserved (per Decision 2 / 4 / 6 / 7):
 - **MCP server unification.** A separate `MCPServerRegistryBackend` Protocol is the right shape for SaaS-tenancy MCP server discovery; tracked as a successor issue, not part of #64. (Decision 3.)
 - **Sandboxed execution as default.** `validate()` is static-only; sandboxed validation is a reserved capability flag (`supports_sandbox_validate`). The process model (subprocess / container / wasm) is too unsettled to lock in #64. (Decision 6.)
 - **npm-style multi-version coexistence.** Versioning, when it lands, is pip-style (one-version-per-agent, resolved at install). Operators wanting multi-version use per-agent backend instances with different version pins. (Decision 4.)
-- **Tool-removal from in-memory `ToolRegistry` after `uninstall`.** PR 2 wiring runs the backend → in-memory bridge only at agent construction. Hot uninstall during a running call is a future capability (would require the `subscribe` shape reserved on `ProfileBackend`); not in #64.
+- **Tool-removal from in-memory `ToolRegistry` after `uninstall`.** The framework runs the backend → in-memory bridge only at agent construction. Hot uninstall during a running call is a future capability (would require the `subscribe` shape reserved on `ProfileBackend`); not in #64.
 
 ## Known gaps deferred to follow-up issues
 
-These rough edges in the PR 1 filesystem reference surfaced during Step 11 adversarial review and are tracked here for future implementer awareness. They are NOT blocking for the locked v1.0 surface (PR 4) but should be addressed in follow-up arcs:
+These rough edges in the filesystem reference surfaced during #64 PR 1 Step 11 adversarial review and are tracked here for future implementer awareness. They are NOT blocking for the locked v1.0 surface but should be addressed in follow-up arcs:
 
 - **Symlink resolution under `tools/` is unconstrained.** `FilesystemToolRegistryBackend._import_handler` (and `_parse_descriptor`) does not enforce that `<agent>/tools/<name>.{py,md}` resolves under `tools_dir`. An operator (or, in a future shared-filesystem multi-tenant deployment, a co-tenant) placing a symlink at `tools/foo.py` pointing outside `tools/` causes the handler to load from the symlink target. This is by-design for single-tenant operators who legitimately symlink shared tool modules from a fleet-wide path — refusing symlinks would break that workflow. A future `supports_symlink_refusal=True` capability flag (or a more direct `strict_path_scoping` operator config) is the right shape when SaaS multi-tenant deployments need defense-in-depth here. Tracked in [#202](https://github.com/dep0we/atomic-agents-stack/issues/202).
 
-- **TOCTOU between `list_tools()` and `load_tool(name)` + redundant-parse perf gap.** PR 2's wiring loop (`for ref in backend.list_tools(): td = backend.load_tool(ref.name); registry.register(td)`) re-reads each descriptor from disk inside `load_tool` — if an operator (or concurrent process) swaps the descriptor between the two calls, the in-memory registry holds metadata from version A while dispatch routes through handler code from version B. At N=50 tools the redundant parse wastes ~3 ms per agent construction (~60 μs per tool, measured by Step 9.1 perf specialist on PR 2). PR 2 did NOT implement the fix — re-targeted to a successor follow-up issue. Fix shape: internal `_iter_parsed()` helper returning `(ref, parsed_descriptor)` pairs + a `load_tool(name, parsed=...)` overload threaded through the wiring loop. Tracked in [#203](https://github.com/dep0we/atomic-agents-stack/issues/203).
+- **TOCTOU between `list_tools()` and `load_tool(name)` + redundant-parse perf gap.** The wiring loop (`for ref in backend.list_tools(): td = backend.load_tool(ref.name); registry.register(td)`) re-reads each descriptor from disk inside `load_tool` — if an operator (or concurrent process) swaps the descriptor between the two calls, the in-memory registry holds metadata from version A while dispatch routes through handler code from version B. At N=50 tools the redundant parse wastes ~3 ms per agent construction (~60 μs per tool, measured by #64 PR 2 Step 9.1 perf specialist). Fix shape: internal `_iter_parsed()` helper returning `(ref, parsed_descriptor)` pairs + a `load_tool(name, parsed=...)` overload threaded through the wiring loop. Tracked in [#203](https://github.com/dep0we/atomic-agents-stack/issues/203).
 - **Handler module re-import on every agent construction in the same process.** `FilesystemToolRegistryBackend._import_handler` uses `importlib.util.spec_from_file_location` which does NOT populate `sys.modules` — each `load_tool` call re-executes the handler module's top-level code. For runner-loop deployments (`EvalRunner` constructing one agent per golden test row, `OutcomeRunner` per iteration) this is `N_tools × N_invocations` re-executions per batch. Operators with module-level resource setup (`session = requests.Session()` at top-level) pay session construction once per agent build. Fix shape: `(handler_path, mtime)` memoization cache in `_import_handler`. Tracked in [#204](https://github.com/dep0we/atomic-agents-stack/issues/204).
 
 - **`ValueError` from `_validate_tool_name` escapes the `AtomicAgentsError` hierarchy.** Operators catching `except AtomicAgentsError` won't catch path-traversal refusal from `load_tool` / `uninstall`. Matches the precedent in `FilesystemAgentProfileBackend._agent_root` (also raises bare `ValueError`) — consistent across sibling Protocol backends. Future arc may introduce a tagged `BackendInputInvalid(AtomicAgentsError, ValueError)` multi-inherit class and migrate both backends together; the parity matters more than the hierarchy purity in v1. Tracked in [#205](https://github.com/dep0we/atomic-agents-stack/issues/205).
@@ -452,14 +446,14 @@ These are NOT committed in the locked v1.0 surface but are reserved in the names
 
 ## Conformance test surface
 
-The conformance suite (PR 4 lock — parametrized across both reference backends):
+The conformance suite (parametrized across both reference backends):
 
 - `tests/test_tool_registry_protocol_conformance.py` — **43 conformance test functions parametrized via `BACKEND_FACTORIES`** running across filesystem + SQLite, with capability-gated skips. 18 invocations skip across the matrix (10 filesystem-shape tests skip on SQLite when the test asserts a filesystem-specific behavior; 8 `supports_uninstall=False` path-traversal + idempotent-uninstall variants skip on filesystem). `_capability_parity_install` is rewritten as a real install + verify-in-`list_tools` round-trip after PR 3 Step 11's "tautology" CRITICAL finding. Tests cover: Protocol surface, `backend_id` stability, `capabilities()` shape, `list_tools` empty/populated/lexicographic, `load_tool` returns `ToolDefinition` with callable handler, `load_tool` raises `ToolNotInRegistry` for missing, `validate` static (does NOT execute handler), `validate` reports import + descriptor errors, capability parity for `supports_install` / `supports_uninstall` / `supports_versioning`, classification round-trip on `ToolRef`, version field round-trip (None on both reference backends; field shape is forward-compat), descriptor frontmatter validation, descriptor handler-module-not-found, descriptor handler-not-callable refused at install time (PR 3 Step 11 testing CRITICAL fix), path-traversal on tool name refused at the API boundary, source attribution populated, integration with existing `ToolNameCollision`. The conformance helper `make_tool_in_backend(backend, ...)` uses each backend's Protocol surface for setup (filesystem writes `.md`+`.py` to disk; SQLite calls `install()`) so backend-specific factory differences don't leak into the conformance tests — plan-subagent Risk J from PR 3.
 - `tests/test_tool_registry_filesystem_backend.py` — **35 filesystem-specific test functions**: on-disk descriptor parsing, hidden-file exclusion, `tools/` absent → empty list, `tools/__init__.py` ignored, `tools/_helper.py` ignored, handler module re-import semantics, `validate()` warnings vs errors, registry resolution via `register_tool_registry_backend`, `get_default_tool_registry_backend` env-var dispatch + invalid backend_id + credential redaction + truncation, source field shows descriptor's filesystem path, plus Step 11 regression coverage (256 KB descriptor size cap defending against YAML alias-bomb DoS, control-character refusal in tool names defending against log injection, empty/null frontmatter rejection, `agent_root=''` / `agent_root='.'` refusal at construction, `chmod-000 tools/` treated as empty rather than `PermissionError`-crashing every agent construction).
 - `tests/test_tool_registry_sqlite_backend.py` — **52 SQLite-specific tests**: schema creation + version row + idempotent cold-start race (Risk B / spec MUST #5), multi-process WAL race resolved by `PRAGMA busy_timeout=5000` before WAL pragma (PR 3 Step 11 P1 REPRODUCED 3/5 fix), WAL journal mode probe, in-memory `RuntimeWarning` + non-durable + single-threaded `check_same_thread=True`, install round-trip + duplicate-install raises `ToolAlreadyInstalled`, install rejects non-callable handler at install time (PR 3 Step 11 testing CRITICAL fix), install rejects non-None version when `supports_versioning=False` (plan-subagent Risk L), uninstall idempotency, install TOCTOU race regression (winner's handler file survives — PR 3 Step 11 P1 REPRODUCED 50/50 fix), cross-scope isolation (agent A install doesn't appear for agent B list / load / uninstall), URL parsing (`?agent_scope=` query param + refused netloc / non-sqlite scheme / fragments / duplicate query params / unknown query params), URL factory credential redaction (PR 3 Step 11 P1 — postgres URLs no longer leak passwords in `ValueError` messages), `:memory:` `handlers_root` defaults to per-instance tempdir (PR 3 Step 11 P2), `handlers_root` refuses `<= 1`-component paths (PR 3 Step 11 P2 root-write defense), constructor parent-dir creation, registry resolution + env-var dispatch.
 - `tests/test_tool_registry_integration.py` — **20 wiring tests**: `AtomicAgent.tool_registry_backend` public attribute, kwarg override beats env var, backend tools register into `agent.tool_registry`, operator-passed `tools=` wins on collisions, runner threading via monkeypatch on OutcomeRunner / EvalRunner / DreamRunner (catches the kwarg-drop trap from #61/#63 PR 2 prior arcs), delegate non-threading verified by monkeypatch (delegate.py deliberately does NOT thread tool_registry_backend — per-agent scoping per spec/25 Decision 9), doctor PASS / WARN / FAIL paths + capability snapshot + tool-count probe + URL credential redaction, per-agent `tools/` isolation, fault-injection regressions (chmod-000 tools/, control-char filename, broken-handler module).
 
-Across the arc the full suite went 1750 → **1953 passing** + 34 skipped on Python 3.11/3.12 under full CI extras (`uv sync --extra dev --extra openai --extra validation --extra redis`). The 4 test files above contribute 43 + 35 + 52 + 20 = **150 functions** that parametrize to **221 invocations** (conformance ×2 backends, path-traversal-input fan-out on uninstall, etc.); 18 skip on capability gates (10 filesystem-shape tests skip on SQLite, 8 `supports_uninstall=False` variants skip on filesystem), 203 pass — which is exactly the +203 arc delta. PR 4 ships no test additions; the lock pins the contract via these tests.
+Across the arc the full suite went 1750 → **1953 passing** + 34 skipped on Python 3.11/3.12 under full CI extras (`uv sync --extra dev --extra openai --extra validation --extra redis`). The 4 test files above contribute 43 + 35 + 52 + 20 = **150 functions** that parametrize to **221 invocations** (conformance ×2 backends, path-traversal-input fan-out on uninstall, etc.); 18 skip on capability gates (10 filesystem-shape tests skip on SQLite, 8 `supports_uninstall=False` variants skip on filesystem), 203 pass — which is exactly the +203 arc delta.
 
 ## Related
 
