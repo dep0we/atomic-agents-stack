@@ -153,6 +153,22 @@ class SQLiteAgentProfileBackend:
         # agent_profile_save_dropped_persona_fields warning so the
         # log event fires at most once per agent per backend instance.
         self._warned_drop_agents: set[str] = set()
+        # Per-pair dedup for D-PP-13 migration-window restore event.
+        # Mirrors the save-side ``_warned_drop_agents`` set above.
+        # Keyed on ``(agent_id, snapshot_id)`` tuples so the event fires
+        # at most once per (agent, snapshot) pair per process.
+        #
+        # The lock serializes the check+add so two threads concurrently
+        # calling restore() with the same (agent_id, snapshot_id) emit
+        # exactly one warning instead of two. Only the membership mutation
+        # is inside the lock; _logger.warning() is thread-safe and called
+        # outside to keep the critical section short.
+        #
+        # Note: the save-side D-PP-8 dedup (_warned_drop_agents) ships in
+        # PR 2 with a different shape and has NOT been retrofitted here --
+        # that asymmetry is intentional and documented in follow-up #291.
+        self._warned_restore_drop: set[tuple[str, str]] = set()
+        self._warned_restore_drop_lock = threading.Lock()
 
         # Detect :memory: sentinel — string equality, NOT Path coercion
         # (Path(':memory:') would create a real file named ':memory:').
@@ -613,8 +629,25 @@ class SQLiteAgentProfileBackend:
             f"{secrets.token_hex(6)}"
         )
         created_at = datetime.now().astimezone().isoformat()
+        # D3 snapshot composition (#62 PR 3): when the agent's persona is
+        # externally owned, drop persona fields from the snapshot blob.
+        # PersonaBackend owns the persona history; AgentProfile snapshots
+        # become "config snapshots" that carry only the non-persona fields.
+        # Internally-owned agents keep persona fields — their persona IS
+        # the AgentProfile.
+        from dataclasses import replace as _dc_replace
+
+        snap_profile = profile
+        if self.external_persona_ref(agent_id) is not None:
+            snap_profile = _dc_replace(
+                profile,
+                persona_identity="",
+                persona_soul="",
+                persona_user="",
+            )
+
         # default=str — see save_profile for the Path-coercion rationale.
-        profile_blob = json.dumps(profile.to_dict(), default=str)
+        profile_blob = json.dumps(snap_profile.to_dict(), default=str)
 
         conn = self._get_conn()
         with conn:
@@ -654,6 +687,36 @@ class SQLiteAgentProfileBackend:
             raise SnapshotNotFound(
                 f"snapshot {snapshot_id!r} profile_json is corrupt: {exc}"
             ) from exc
+
+        # D-PP-13 migration-window event: snapshot was taken before the
+        # agent's persona was migrated to PersonaBackend, so the snapshot
+        # blob carries non-empty persona fields. Detect + emit once, then
+        # drop the fields so save_profile doesn't re-write them.
+        _PERSONA_FIELDS = ["persona_identity", "persona_soul", "persona_user"]
+        snap_has_persona = any(profile_dict.get(f) for f in _PERSONA_FIELDS)
+        if snap_has_persona and self.external_persona_ref(agent_id) is not None:
+            pair = (agent_id, snapshot_id)
+            # Lock only the check+add so two concurrent restore() calls on
+            # the same (agent_id, snapshot_id) emit exactly one warning.
+            # _logger.warning is thread-safe; it runs outside the lock to
+            # keep the critical section short.
+            with self._warned_restore_drop_lock:
+                if pair not in self._warned_restore_drop:
+                    emit_event = True
+                    self._warned_restore_drop.add(pair)
+                else:
+                    emit_event = False
+            if emit_event:
+                _logger.warning(
+                    "agent_profile_restore_dropped_persona_fields "
+                    "agent_id=%s snapshot_id=%s dropped_fields=%s",
+                    agent_id,
+                    snapshot_id,
+                    _PERSONA_FIELDS,
+                )
+            for field in _PERSONA_FIELDS:
+                profile_dict[field] = ""
+
         restored_profile = AgentProfile.from_dict(profile_dict)
         self.save_profile(agent_id, restored_profile)
 

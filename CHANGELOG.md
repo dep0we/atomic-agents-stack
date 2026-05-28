@@ -49,7 +49,15 @@ CHANGELOG entry.
 
 ## [Unreleased]
 
+### Added
+
+- **Persona snapshot/restore lifecycle.** Operators can version a shared persona record, roll back to an earlier version, list the persona's history, and clone a persona as the starting point for a new one ([#62](https://github.com/dep0we/atomic-agents-stack/issues/62) — PersonaBackend arc PR 3 of 4). The new `atomic-agents persona` CLI exposes the full surface: `list`, `show`, `snapshot --label "..."`, `list-snapshots`, `restore`, `clone`. Each subcommand operates against the configured PersonaBackend, defaulting to filesystem under `<scope_root>/.personas/`. Snapshot records live nested inside the persona's own directory at `<personas_root>/<persona_id>/.snapshots/<snapshot_id>/` so removing a persona removes its history cleanly. Snapshot IDs follow the AgentProfile shape `snap_<timestamp>_<12hex>` (48-bit entropy) for cross-Protocol uniformity. `FilesystemPersonaBackend.capabilities().supports_snapshot` flips from `False` to `True` with this release. Closes prep issues [#287](https://github.com/dep0we/atomic-agents-stack/issues/287), [#288](https://github.com/dep0we/atomic-agents-stack/issues/288), [#289](https://github.com/dep0we/atomic-agents-stack/issues/289), [#290](https://github.com/dep0we/atomic-agents-stack/issues/290).
+
 ### Changed
+
+- **AgentProfile snapshots drop persona text for externally-owned agents** ([#62](https://github.com/dep0we/atomic-agents-stack/issues/62) PR 3, D3). When an agent's persona is owned by PersonaBackend (signaled by `persona.link.md` on filesystem, or non-null `agents.persona_id` on SQLite), `AgentProfileBackend.snapshot()` now writes empty strings into `persona_identity`, `persona_soul`, `persona_user`. The persona has its own snapshot history via `PersonaBackend.snapshot/restore`; AgentProfile snapshots become config-only snapshots for externally-owned agents. Internally-owned agents see byte-identical behavior. Applies to both `FilesystemAgentProfileBackend` and `SQLiteAgentProfileBackend`.
+
+- **AgentProfile.restore warns when dropping persona text on the migration window** ([#62](https://github.com/dep0we/atomic-agents-stack/issues/62) PR 3, D-PP-13). When restoring a pre-PersonaBackend snapshot (carrying non-empty persona text) into an agent that is NOW externally owned, the framework drops the snapshot's persona text and emits a one-time `agent_profile_restore_dropped_persona_fields` warning per `(agent_id, snapshot_id)` pair via stdlib logging. Operators wanting the snapshot's persona to win can first remove `persona.link.md` (reverting to legacy ownership), then restore. Dedup uses a thread-safe per-process set.
 
 #### BREAKING
 
@@ -64,6 +72,24 @@ CHANGELOG entry.
   **Why:** PR 3b's log-only soak window closed the verification gap (operators saw which surfaces their `policy.md` would deny without action-blocking on misconfigured fleet rules). PR 4 turns the lock — the four-PR arc closes the "operator with a fleet" cliff that motivated the entire #89 arc, and the framework's status flips from "eight backend protocols shipped" to **"nine backend protocols shipped"**.
 
 - **spec/32 LOCKED.** `docs/spec/32-policy-backend.md` flipped from RFC to LOCKED at PR 4 of #89. The §"Out of scope" PR 4 deliverable line is removed (no longer out of scope — this PR did it). §"`enforced` field semantics" amended to document the new default (`true` for non-cap surfaces unless `ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP=false`). §"Policy decision event schema" now lists `model_from_per_call_override`. New §"Per-call dedup invariant" documents the #273 dedup contract. The 7 normative MUSTs in §"Implementer contract for policy backends" are now final — the provisional footnote is removed. SaaS / Postgres / org-admin-console adapters have a frozen contract to target.
+
+### Fixed
+
+- **Skills lookup on externally-owned agents** ([#62](https://github.com/dep0we/atomic-agents-stack/issues/62) PR 3, D-PP-12). `FilesystemAgentProfileBackend.list_skills()` and `load_skill_body()` now recognize agents whose persona is externally owned (with `persona.link.md`, no local `persona/IDENTITY.md`). Previously these methods raised `AgentProfileNotFound` because their agent-dir sentinel check predated the D-PP-1 fix from PR 2 that taught `load_profile`, `list_agents`, and `exists` about the shared-persona layout. Completes the D-PP-1 sweep.
+
+- **Snapshot history survives concurrent `save_persona` under contention** ([#62](https://github.com/dep0we/atomic-agents-stack/issues/62) PR 3 Round 1 adversarial). `FilesystemPersonaBackend._save_persona_group_atomic` now merges the backup directory's `.snapshots/` subtree into the new persona directory entry-by-entry instead of via a single-directory rename. A concurrent `snapshot()` call landing between the persona-dir-replace and the snapshots-restore steps no longer destroys the entire snapshot history with only a warning log. 48-bit-entropy snapshot IDs make filename collisions during the merge probabilistically impossible.
+
+- **`list_snapshots` refuses symlinked entries pointing outside the persona dir** ([#62](https://github.com/dep0we/atomic-agents-stack/issues/62) PR 3 Round 1 adversarial). Defense-in-depth path-confinement check now matches `restore()`'s guard. Operator-edit-mistakes or hostile filesystem manipulation can no longer surface bogus persona snapshots from outside `<personas_root>/<persona_id>/`.
+
+- **`atomic-agents persona` CLI catches `PersonaError` subclasses + `OSError` / `PermissionError`** ([#62](https://github.com/dep0we/atomic-agents-stack/issues/62) PR 3 Round 2 adversarial). Operators on a full disk, read-only filesystem, or under group-atomic-rename retry exhaustion now see a one-line `Error: <message>` on stderr with exit 1 instead of a Python traceback. Covers `PersonaCorrupted`, `PersonaLinkInvalid`, `PersonaOwnershipConflict`, and any future `PersonaError` subclass.
+
+- **Migration-window event dedup is now atomic under concurrent restore** ([#62](https://github.com/dep0we/atomic-agents-stack/issues/62) PR 3 Round 1 adversarial). `AgentProfileBackend.restore`'s `_warned_restore_drop` check + add is wrapped in a `threading.Lock` per backend instance, restoring the "exactly once per `(agent_id, snapshot_id)` per process" promise D-PP-13 stated. Save-side D-PP-8 dedup keeps its existing shape; the asymmetry is documented + filed as follow-up [#291](https://github.com/dep0we/atomic-agents-stack/issues/291).
+
+### Documentation
+
+- **spec/33 (Persona Backend RFC) gains snapshot-layout + ID-format sections** ([#62](https://github.com/dep0we/atomic-agents-stack/issues/62) PR 3, D-PP-10 + D-PP-11). New §"Snapshot storage layout" documents the nested `<personas_root>/<persona_id>/.snapshots/<snapshot_id>/` shape. New Implementer Contract MUST #8 documents the `snap_<YYYY-MM-DDTHHMMSS>_<12hex>` format and `metadata.json` schema, matching spec/24 Implementer Contract #8 for cross-Protocol uniformity.
+
+- **spec/24 Implementer Contract #8 + the line 85 example drop a stale `+TZ` annotation** ([#62](https://github.com/dep0we/atomic-agents-stack/issues/62) PR 3 Round 2 adversarial) that diverged from the actual `strftime('%Y-%m-%dT%H%M%S')` implementation across all three snapshot Protocols (AgentProfile filesystem + sqlite, Persona filesystem). Line 85 example also corrected from `<6hex>` to `<12hex>` to match the 48-bit entropy budget. Eliminates cross-Protocol drift; future Postgres / SaaS adapters reading spec/24 now mirror the actual format.
 
 ### Added
 

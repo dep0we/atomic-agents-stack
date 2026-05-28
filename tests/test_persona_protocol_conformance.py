@@ -60,6 +60,8 @@ from typing import Iterator
 
 import pytest
 
+from atomic_agents.persona.types import PersonaSnapshot
+
 from atomic_agents.exceptions import BackendNotRegistered
 from atomic_agents.persona.backend import (
     get_default_persona_backend,
@@ -810,3 +812,221 @@ def test_backend_is_runtime_checkable_protocol_instance(backend_factory) -> None
 
     with backend_factory() as backend:
         assert isinstance(backend, PersonaBackend)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Conformance tests for supports_snapshot=True backends (filesystem only in v1)
+# These tests SKIP when capabilities().supports_snapshot is False.
+
+
+def test_snapshot_creates_retrievable_record(backend_factory) -> None:
+    """``snapshot()`` returns a snapshot_id; ``list_snapshots()`` returns a
+    record with that id.
+
+    SKIP when ``capabilities().supports_snapshot`` is False (mock backend).
+    """
+    persona = _make_persona(identity="Original body.", version=1)
+    with backend_factory() as backend:
+        if not backend.capabilities().supports_snapshot:
+            pytest.skip("backend does not support snapshot")
+        backend.save_persona("my-persona", persona)
+        snap_id = backend.snapshot("my-persona")
+        snaps = backend.list_snapshots("my-persona")
+
+    assert isinstance(snap_id, str)
+    assert snap_id
+    snap_ids = [s.snapshot_id for s in snaps]
+    assert snap_id in snap_ids
+
+
+def test_snapshot_returns_PersonaSnapshot_with_correct_fields(
+    backend_factory,
+) -> None:
+    """``list_snapshots()`` returns ``PersonaSnapshot`` instances with correct
+    ``snapshot_id``, ``persona_id``, ``label``, and ``created_at`` fields.
+
+    SKIP when ``capabilities().supports_snapshot`` is False.
+    """
+    persona = _make_persona()
+    with backend_factory() as backend:
+        if not backend.capabilities().supports_snapshot:
+            pytest.skip("backend does not support snapshot")
+        backend.save_persona("p", persona)
+        snap_id = backend.snapshot("p", label="my-label")
+        snaps = backend.list_snapshots("p")
+
+    assert len(snaps) == 1
+    snap = snaps[0]
+    assert isinstance(snap, PersonaSnapshot)
+    assert snap.snapshot_id == snap_id
+    assert snap.persona_id == "p"
+    assert snap.label == "my-label"
+    assert snap.created_at
+
+
+def test_restore_reverts_persona_body(backend_factory) -> None:
+    """``restore()`` reverts the persona to the snapshot state.
+
+    Save v1, snapshot it, save v2, restore from snapshot; load should
+    return v1 body bytes.
+
+    SKIP when ``capabilities().supports_snapshot`` is False.
+    """
+    v1 = _make_persona(identity="Version 1 body.", version=1)
+    v2 = _make_persona(identity="Version 2 body.", version=2)
+    with backend_factory() as backend:
+        if not backend.capabilities().supports_snapshot:
+            pytest.skip("backend does not support snapshot")
+        backend.save_persona("p", v1)
+        snap_id = backend.snapshot("p")
+        backend.save_persona("p", v2, overwrite=True)
+        backend.restore("p", snap_id)
+        loaded = backend.load_persona("p")
+
+    assert loaded.identity == "Version 1 body."
+
+
+def test_list_snapshots_returns_chronological_order(backend_factory) -> None:
+    """``list_snapshots()`` returns snapshots in ascending ``created_at`` order.
+
+    Takes 3 snapshots; verifies the returned list is sorted by ``created_at``
+    (ISO-8601 lexicographic order equals chronological order for tz-aware
+    timestamps).
+
+    SKIP when ``capabilities().supports_snapshot`` is False.
+    """
+    persona = _make_persona()
+    with backend_factory() as backend:
+        if not backend.capabilities().supports_snapshot:
+            pytest.skip("backend does not support snapshot")
+        backend.save_persona("p", persona)
+        backend.snapshot("p", label="first")
+        backend.snapshot("p", label="second")
+        backend.snapshot("p", label="third")
+        snaps = backend.list_snapshots("p")
+
+    assert len(snaps) == 3
+    created_ats = [s.created_at for s in snaps]
+    assert created_ats == sorted(created_ats), (
+        f"list_snapshots not in chronological order: {created_ats}"
+    )
+
+
+def test_list_snapshots_returns_empty_when_no_snapshots(backend_factory) -> None:
+    """``list_snapshots()`` returns ``[]`` when no snapshots exist for the persona.
+
+    SKIP when ``capabilities().supports_snapshot`` is False.
+    """
+    persona = _make_persona()
+    with backend_factory() as backend:
+        if not backend.capabilities().supports_snapshot:
+            pytest.skip("backend does not support snapshot")
+        backend.save_persona("p", persona)
+        snaps = backend.list_snapshots("p")
+
+    assert snaps == []
+
+
+def test_cross_persona_snapshot_isolation(backend_factory) -> None:
+    """A snapshot_id from persona A raises ``PersonaSnapshotNotFound`` when
+    restored to persona B (cross-persona isolation, D-PP-10).
+
+    SKIP when ``capabilities().supports_snapshot`` is False.
+    """
+    from atomic_agents.exceptions import PersonaSnapshotNotFound
+
+    persona = _make_persona()
+    with backend_factory() as backend:
+        if not backend.capabilities().supports_snapshot:
+            pytest.skip("backend does not support snapshot")
+        backend.save_persona("persona-a", persona)
+        backend.save_persona("persona-b", persona)
+        snap_id_a = backend.snapshot("persona-a")
+        with pytest.raises(PersonaSnapshotNotFound):
+            backend.restore("persona-b", snap_id_a)
+
+
+def test_snapshot_label_round_trips(backend_factory) -> None:
+    """The ``label`` supplied to ``snapshot()`` round-trips through
+    ``list_snapshots()``.
+
+    SKIP when ``capabilities().supports_snapshot`` is False.
+    """
+    persona = _make_persona()
+    with backend_factory() as backend:
+        if not backend.capabilities().supports_snapshot:
+            pytest.skip("backend does not support snapshot")
+        backend.save_persona("p", persona)
+        backend.snapshot("p", label="my-snapshot-label")
+        snaps = backend.list_snapshots("p")
+
+    assert len(snaps) == 1
+    assert snaps[0].label == "my-snapshot-label"
+
+
+def test_snapshot_null_label_round_trips(backend_factory) -> None:
+    """When ``label=None`` is supplied to ``snapshot()``, ``list_snapshots()``
+    returns ``label=None`` for that snapshot.
+
+    SKIP when ``capabilities().supports_snapshot`` is False.
+    """
+    persona = _make_persona()
+    with backend_factory() as backend:
+        if not backend.capabilities().supports_snapshot:
+            pytest.skip("backend does not support snapshot")
+        backend.save_persona("p", persona)
+        backend.snapshot("p", label=None)
+        snaps = backend.list_snapshots("p")
+
+    assert len(snaps) == 1
+    assert snaps[0].label is None
+
+
+def test_snapshot_of_nonexistent_persona_raises_PersonaNotFound(
+    backend_factory,
+) -> None:
+    """``snapshot()`` raises ``PersonaNotFound`` when the persona does not exist.
+
+    SKIP when ``capabilities().supports_snapshot`` is False.
+    """
+    from atomic_agents.exceptions import PersonaNotFound
+
+    with backend_factory() as backend:
+        if not backend.capabilities().supports_snapshot:
+            pytest.skip("backend does not support snapshot")
+        with pytest.raises(PersonaNotFound):
+            backend.snapshot("no-such-persona")
+
+
+def test_list_snapshots_of_nonexistent_persona_raises_PersonaNotFound(
+    backend_factory,
+) -> None:
+    """``list_snapshots()`` raises ``PersonaNotFound`` when the persona does not exist.
+
+    SKIP when ``capabilities().supports_snapshot`` is False.
+    """
+    from atomic_agents.exceptions import PersonaNotFound
+
+    with backend_factory() as backend:
+        if not backend.capabilities().supports_snapshot:
+            pytest.skip("backend does not support snapshot")
+        with pytest.raises(PersonaNotFound):
+            backend.list_snapshots("no-such-persona")
+
+
+def test_restore_unknown_snapshot_raises_PersonaSnapshotNotFound(
+    backend_factory,
+) -> None:
+    """``restore()`` with an unknown snapshot_id raises ``PersonaSnapshotNotFound``.
+
+    SKIP when ``capabilities().supports_snapshot`` is False.
+    """
+    from atomic_agents.exceptions import PersonaSnapshotNotFound
+
+    persona = _make_persona()
+    with backend_factory() as backend:
+        if not backend.capabilities().supports_snapshot:
+            pytest.skip("backend does not support snapshot")
+        backend.save_persona("p", persona)
+        with pytest.raises(PersonaSnapshotNotFound):
+            backend.restore("p", "snap_2026-01-01T000000_000000000000")

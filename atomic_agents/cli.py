@@ -9,6 +9,12 @@ Usage:
     atomic-agents bundle <agent> [--if-stale | --refresh] [options]
     atomic-agents doctor [--agent <name>] [--json] [--no-mcp]
     atomic-agents review --backend <kimi> [options]
+    atomic-agents persona list
+    atomic-agents persona show <persona_id>
+    atomic-agents persona snapshot <persona_id> [--label "..."]
+    atomic-agents persona list-snapshots <persona_id>
+    atomic-agents persona restore <persona_id> <snapshot_id>
+    atomic-agents persona clone <source_id> <target_id>
 
 Subcommands:
     run     — Run an agent against a work item
@@ -19,6 +25,7 @@ Subcommands:
     bundle  — Pre-render the cascade into one file for skill-mode loads (spec/26)
     doctor  — Preflight checks before scheduling an agent run
     review  — Cross-family adversarial code review (CLAUDE.md rule #11)
+    persona — Manage persona records (list, show, snapshot, restore, clone)
 """
 
 from __future__ import annotations
@@ -31,7 +38,12 @@ from ._platform import get_agents_root
 from .memory.filesystem import FilesystemBackend
 from .memory.backend import WritePolicy
 from .exceptions import AtomicAgentsError, VersionNotFound
-from .skills import discover_skills, validate_skill_manifest
+from .skills import validate_skill_manifest
+
+# Persona exceptions -- imported lazily inside handlers to avoid
+# slowing down the hot path for agents that don't use persona subcommands.
+# PersonaNotFound, PersonaExists, PersonaSnapshotNotFound re-exported
+# from atomic_agents.persona so CLI handlers can catch them by name.
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -226,6 +238,53 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
 
+    # ── persona subcommand group ──────────────────────────────────────────
+    persona_cmd = sub.add_parser(
+        "persona",
+        help="Manage persona records (list, show, snapshot, restore, clone)",
+    )
+    persona_sub = persona_cmd.add_subparsers(dest="persona_cmd", required=True)
+
+    # persona list
+    persona_sub.add_parser("list", help="List all persona_ids")
+
+    # persona show <persona_id>
+    persona_show = persona_sub.add_parser(
+        "show", help="Print IDENTITY, SOUL, and USER bodies plus metadata"
+    )
+    persona_show.add_argument("persona_id", help="persona identifier")
+
+    # persona snapshot <persona_id> [--label "..."]
+    persona_snapshot = persona_sub.add_parser(
+        "snapshot", help="Create a snapshot of a persona and print the snapshot_id"
+    )
+    persona_snapshot.add_argument("persona_id", help="persona identifier")
+    persona_snapshot.add_argument(
+        "--label", default=None, help="optional human-readable label for this snapshot"
+    )
+
+    # persona list-snapshots <persona_id>
+    persona_list_snaps = persona_sub.add_parser(
+        "list-snapshots", help="List snapshots for a persona in chronological order"
+    )
+    persona_list_snaps.add_argument("persona_id", help="persona identifier")
+
+    # persona restore <persona_id> <snapshot_id>
+    persona_restore = persona_sub.add_parser(
+        "restore", help="Restore a persona to a previously captured snapshot"
+    )
+    persona_restore.add_argument("persona_id", help="persona identifier")
+    persona_restore.add_argument("snapshot_id", help="snapshot identifier to restore")
+
+    # persona clone <source_id> <target_id>
+    persona_clone = persona_sub.add_parser(
+        "clone", help="Copy a persona record to a new persona_id"
+    )
+    persona_clone.add_argument("source_id", help="persona to clone from")
+    persona_clone.add_argument(
+        "target_id", help="destination persona_id (must not exist)"
+    )
+
     args = parser.parse_args(argv)
 
     # `review` is a host-only subcommand — no agents-root needed (operates on
@@ -237,6 +296,11 @@ def main(argv: list[str] | None = None) -> int:
         except AtomicAgentsError as e:
             print(f"Error: {e}", file=sys.stderr)
             return 1
+
+    # `persona` is a host-only subcommand that resolves its own scope_root
+    # from the cwd. It does not need agents-root.
+    if args.cmd == "persona":
+        return _cmd_persona(args)
 
     agents_root = (
         Path(args.agents_root).expanduser().resolve()
@@ -565,6 +629,136 @@ def _cmd_doctor(args) -> int:
         sys.stdout.write(doctor_module.render_human(results))
 
     return doctor_module.overall_exit_code(results)
+
+
+def _cmd_persona(args) -> int:
+    """Dispatch persona subcommands.
+
+    All persona subcommands resolve the PersonaBackend via
+    ``get_default_persona_backend(scope_root)`` where ``scope_root`` is cwd.
+    The ``ATOMIC_AGENTS_PERSONA_BACKEND`` env var is already wired inside
+    ``get_default_persona_backend``; no CLI-side handling is needed.
+
+    Exit codes: 0 on success, 1 on any error (PersonaNotFound,
+    PersonaExists, PersonaSnapshotNotFound, NotImplementedError, etc.).
+    Errors go to stderr; normal output goes to stdout.
+    """
+    from .persona.backend import get_default_persona_backend
+    from .exceptions import (
+        PersonaError,
+        PersonaExists,
+        PersonaNotFound,
+        PersonaSnapshotNotFound,
+    )
+
+    scope_root = Path.cwd()
+    try:
+        backend = get_default_persona_backend(scope_root)
+    except Exception as e:  # noqa: BLE001
+        print(f"Error: failed to resolve persona backend: {e}", file=sys.stderr)
+        return 1
+
+    persona_cmd = args.persona_cmd
+
+    try:
+        if persona_cmd == "list":
+            return _persona_list(backend)
+        elif persona_cmd == "show":
+            return _persona_show(backend, args.persona_id)
+        elif persona_cmd == "snapshot":
+            return _persona_snapshot(backend, args.persona_id, args.label)
+        elif persona_cmd == "list-snapshots":
+            return _persona_list_snapshots(backend, args.persona_id)
+        elif persona_cmd == "restore":
+            return _persona_restore(backend, args.persona_id, args.snapshot_id)
+        elif persona_cmd == "clone":
+            return _persona_clone(backend, args.source_id, args.target_id)
+    except PersonaNotFound as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except PersonaExists as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except PersonaSnapshotNotFound as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except NotImplementedError as e:
+        print(f"Error: operation not supported by this backend: {e}", file=sys.stderr)
+        return 1
+    except PersonaError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except (OSError, PermissionError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _persona_list(backend) -> int:
+    """List all persona_ids known to the backend."""
+    ids = backend.list_personas()
+    if not ids:
+        print("No personas found.")
+        return 0
+    for pid in ids:
+        print(pid)
+    return 0
+
+
+def _persona_show(backend, persona_id: str) -> int:
+    """Print IDENTITY, SOUL, and USER bodies plus metadata for a persona."""
+    persona = backend.load_persona(persona_id)
+    print(f"persona_id: {persona_id}")
+    print(f"version:    {persona.version}")
+    print(f"created_at: {persona.created_at}")
+    if persona.label is not None:
+        print(f"label:      {persona.label}")
+    print()
+    print("--- IDENTITY ---")
+    print(persona.identity)
+    print()
+    print("--- SOUL ---")
+    print(persona.soul)
+    print()
+    print("--- USER ---")
+    print(persona.user)
+    return 0
+
+
+def _persona_snapshot(backend, persona_id: str, label: str | None) -> int:
+    """Create a snapshot and print the snapshot_id."""
+    snapshot_id = backend.snapshot(persona_id, label=label)
+    print(snapshot_id)
+    return 0
+
+
+def _persona_list_snapshots(backend, persona_id: str) -> int:
+    """List snapshots in chronological order (oldest first)."""
+    snapshots = backend.list_snapshots(persona_id)
+    if not snapshots:
+        print(f"No snapshots found for persona {persona_id!r}.")
+        return 0
+    for snap in snapshots:
+        label_part = f"  label={snap.label!r}" if snap.label is not None else ""
+        print(f"{snap.snapshot_id}  {snap.created_at}{label_part}")
+    return 0
+
+
+def _persona_restore(backend, persona_id: str, snapshot_id: str) -> int:
+    """Restore a persona to a previously captured snapshot."""
+    backend.restore(persona_id, snapshot_id)
+    print(f"Restored persona {persona_id!r} from snapshot {snapshot_id!r}.")
+    return 0
+
+
+def _persona_clone(backend, source_id: str, target_id: str) -> int:
+    """Clone a persona record to a new persona_id."""
+    backend.clone(source_id, target_id)
+    print(f"Cloned persona {source_id!r} -> {target_id!r}.")
+    return 0
 
 
 if __name__ == "__main__":

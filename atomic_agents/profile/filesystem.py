@@ -45,9 +45,11 @@ writer wins, but neither caller sees a partially-written file.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import secrets
 import shutil
+import threading
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -84,6 +86,9 @@ from .types import (
     ProfileCapabilities,
     ProfileSnapshot,
 )
+
+
+_logger = logging.getLogger(__name__)
 
 
 # Hidden directory prefix — ``list_agents()`` skips entries starting with
@@ -138,6 +143,22 @@ class FilesystemAgentProfileBackend:
                 f"or is not a directory: {scope}"
             )
         self._scope_root = scope
+        # Per-pair dedup for D-PP-13 migration-window restore event.
+        # Mirrors the save-side ``_warned_drop_agents`` set in sqlite.py
+        # (D-PP-8). Keyed on ``(agent_id, snapshot_id)`` tuples so the
+        # event fires at most once per (agent, snapshot) pair per process.
+        #
+        # The lock serializes the check+add so two threads concurrently
+        # calling restore() with the same (agent_id, snapshot_id) emit
+        # exactly one warning instead of two. Only the membership mutation
+        # is inside the lock; _logger.warning() is thread-safe and called
+        # outside to keep the critical section short.
+        #
+        # Note: the save-side D-PP-8 dedup (_warned_drop_agents) ships in
+        # PR 2 with a different shape and has NOT been retrofitted here --
+        # that asymmetry is intentional and documented in follow-up #291.
+        self._warned_restore_drop: set[tuple[str, str]] = set()
+        self._warned_restore_drop_lock = threading.Lock()
 
     @property
     def scope_root(self) -> Path:
@@ -676,7 +697,7 @@ class FilesystemAgentProfileBackend:
     def list_skills(self, agent_id: str) -> list[SkillManifest]:
         """Discover ``<agent_root>/skills/*/SKILL.md`` and return manifests."""
         agent_root = self._agent_root(agent_id)
-        if not (agent_root / _IDENTITY_RELATIVE).is_file():
+        if not self._is_agent_dir(agent_root):
             raise AgentProfileNotFound(f"agent {agent_id!r} not found at {agent_root}")
         return discover_skills(agent_root)
 
@@ -696,7 +717,7 @@ class FilesystemAgentProfileBackend:
         """
         _validate_skill_name(skill_name)
         agent_root = self._agent_root(agent_id)
-        if not (agent_root / _IDENTITY_RELATIVE).is_file():
+        if not self._is_agent_dir(agent_root):
             raise AgentProfileNotFound(f"agent {agent_id!r} not found at {agent_root}")
         skill_dir = agent_root / "skills" / skill_name
         skill_md = skill_dir / SKILL_ENTRY_POINT
@@ -817,6 +838,21 @@ class FilesystemAgentProfileBackend:
         snapshots_dir = self._scope_root / ".snapshots" / agent_id / snapshot_id
         snapshots_dir.mkdir(parents=True, exist_ok=False)
 
+        # D3 snapshot composition (#62 PR 3): when the agent's persona is
+        # externally owned, drop persona fields from the snapshot blob.
+        # PersonaBackend owns the persona history; AgentProfile snapshots
+        # become "config snapshots" that carry only the non-persona fields.
+        # Internally-owned agents (legacy three-file layout) keep persona
+        # fields in the snapshot — their persona IS the AgentProfile.
+        snap_profile = profile
+        if self.external_persona_ref(agent_id) is not None:
+            snap_profile = replace(
+                profile,
+                persona_identity="",
+                persona_soul="",
+                persona_user="",
+            )
+
         # Atomic per-file writes via _io.atomic_write. The directory
         # is created above; the metadata + profile files are written
         # individually with fsync+rename atomicity.
@@ -824,7 +860,7 @@ class FilesystemAgentProfileBackend:
         # PosixPath objects from the parser; from_dict re-derives the
         # structured forms from raw text on restore, so stringified
         # paths round-trip losslessly via the parser.
-        profile_blob = json.dumps(profile.to_dict(), indent=2, default=str)
+        profile_blob = json.dumps(snap_profile.to_dict(), indent=2, default=str)
         atomic_write(snapshots_dir / "profile.json", profile_blob)
         metadata = {
             "snapshot_id": snapshot_id,
@@ -927,6 +963,35 @@ class FilesystemAgentProfileBackend:
             raise SnapshotNotFound(
                 f"snapshot {snapshot_id!r} profile unreadable: {exc}"
             ) from exc
+
+        # D-PP-13 migration-window event: snapshot was taken before the
+        # agent's persona was migrated to PersonaBackend, so the snapshot
+        # blob carries non-empty persona fields. Detect + emit once, then
+        # drop the fields so save_profile doesn't re-write them.
+        _PERSONA_FIELDS = ["persona_identity", "persona_soul", "persona_user"]
+        snap_has_persona = any(profile_dict.get(f) for f in _PERSONA_FIELDS)
+        if snap_has_persona and self.external_persona_ref(agent_id) is not None:
+            pair = (agent_id, snapshot_id)
+            # Lock only the check+add so two concurrent restore() calls on
+            # the same (agent_id, snapshot_id) emit exactly one warning.
+            # _logger.warning is thread-safe; it runs outside the lock to
+            # keep the critical section short.
+            with self._warned_restore_drop_lock:
+                if pair not in self._warned_restore_drop:
+                    emit_event = True
+                    self._warned_restore_drop.add(pair)
+                else:
+                    emit_event = False
+            if emit_event:
+                _logger.warning(
+                    "agent_profile_restore_dropped_persona_fields "
+                    "agent_id=%s snapshot_id=%s dropped_fields=%s",
+                    agent_id,
+                    snapshot_id,
+                    _PERSONA_FIELDS,
+                )
+            for field in _PERSONA_FIELDS:
+                profile_dict[field] = ""
 
         # Reconstruct AgentProfile from the JSON dict + write via the
         # existing atomic save path.
