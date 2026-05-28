@@ -157,7 +157,18 @@ class SQLiteAgentProfileBackend:
         # Mirrors the save-side ``_warned_drop_agents`` set above.
         # Keyed on ``(agent_id, snapshot_id)`` tuples so the event fires
         # at most once per (agent, snapshot) pair per process.
+        #
+        # The lock serializes the check+add so two threads concurrently
+        # calling restore() with the same (agent_id, snapshot_id) emit
+        # exactly one warning instead of two. Only the membership mutation
+        # is inside the lock; _logger.warning() is thread-safe and called
+        # outside to keep the critical section short.
+        #
+        # Note: the save-side D-PP-8 dedup (_warned_drop_agents) ships in
+        # PR 2 with a different shape and has NOT been retrofitted here --
+        # that asymmetry is intentional and documented in follow-up #291.
         self._warned_restore_drop: set[tuple[str, str]] = set()
+        self._warned_restore_drop_lock = threading.Lock()
 
         # Detect :memory: sentinel — string equality, NOT Path coercion
         # (Path(':memory:') would create a real file named ':memory:').
@@ -685,7 +696,17 @@ class SQLiteAgentProfileBackend:
         snap_has_persona = any(profile_dict.get(f) for f in _PERSONA_FIELDS)
         if snap_has_persona and self.external_persona_ref(agent_id) is not None:
             pair = (agent_id, snapshot_id)
-            if pair not in self._warned_restore_drop:
+            # Lock only the check+add so two concurrent restore() calls on
+            # the same (agent_id, snapshot_id) emit exactly one warning.
+            # _logger.warning is thread-safe; it runs outside the lock to
+            # keep the critical section short.
+            with self._warned_restore_drop_lock:
+                if pair not in self._warned_restore_drop:
+                    emit_event = True
+                    self._warned_restore_drop.add(pair)
+                else:
+                    emit_event = False
+            if emit_event:
                 _logger.warning(
                     "agent_profile_restore_dropped_persona_fields "
                     "agent_id=%s snapshot_id=%s dropped_fields=%s",
@@ -693,7 +714,6 @@ class SQLiteAgentProfileBackend:
                     snapshot_id,
                     _PERSONA_FIELDS,
                 )
-                self._warned_restore_drop.add(pair)
             for field in _PERSONA_FIELDS:
                 profile_dict[field] = ""
 

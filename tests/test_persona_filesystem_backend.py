@@ -1107,3 +1107,129 @@ def test_atomic_rename_rollback_on_crash_mid_write(tmp_path: Path) -> None:
             if d.is_dir() and d.name.startswith("snap_")
         ]
         assert completed == [], f"Unexpected completed snapshot dirs found: {completed}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P1 race: save_persona overwrite preserves snapshots when target already has
+# a .snapshots/ entry (concurrent snapshot() between replace steps)
+
+
+def test_save_persona_overwrite_preserves_snapshots_when_target_has_pre_existing_snapshots_dir(
+    tmp_path: Path,
+) -> None:
+    """save_persona(overwrite=True) merges backup .snapshots/ entries individually
+    into the new persona dir, so a concurrent snapshot() entry that already
+    exists in the new dir does not destroy the backup's snapshot history.
+
+    Simulates the race manually:
+    1. Create persona 'alice' and take a real snapshot via snapshot(). Capture its id.
+    2. Manually create a fake .snapshots/ entry in alice's current dir BEFORE calling
+       save_persona -- this simulates Thread B writing a snapshot between the
+       persona-dir-replace step (tmp -> alice) and the .snapshots restore step.
+    3. Call save_persona('alice', modified, overwrite=True).
+    4. Assert BOTH the real snapshot AND the fake entry survive in list_snapshots().
+    """
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    original = _make_persona(identity="Original body.")
+    backend.save_persona("alice", original)
+
+    # Step 1: take a real snapshot and capture its id.
+    snapshot_id_a = backend.snapshot("alice")
+
+    # Step 2: inject a fake future snapshot directory into alice/.snapshots/
+    # to simulate Thread B's concurrent snapshot() mid-race.
+    fake_snap_id = "snap_2099-01-01T000000_aabbccddee00"
+    fake_snap_dir = tmp_path / "alice" / ".snapshots" / fake_snap_id
+    fake_snap_dir.mkdir(parents=True, exist_ok=True)
+    # A real snapshot has metadata.json + body files. The fake just needs a
+    # metadata.json so list_snapshots() counts it (body parse fails -> skipped).
+    import json as _json
+
+    (fake_snap_dir / "metadata.json").write_text(
+        _json.dumps(
+            {
+                "snapshot_id": fake_snap_id,
+                "persona_id": "alice",
+                "label": "fake-concurrent",
+                "created_at": "2099-01-01T00:00:00+00:00",
+                "schema_version": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    # Body files required for list_snapshots() to include the entry.
+    (fake_snap_dir / "IDENTITY.md").write_text("Fake identity.", encoding="utf-8")
+    (fake_snap_dir / "SOUL.md").write_text("Fake soul.", encoding="utf-8")
+    (fake_snap_dir / "USER.md").write_text("Fake user.", encoding="utf-8")
+
+    # Step 3: overwrite alice with a modified persona.
+    modified = _make_persona(identity="Modified body.", version=2)
+    backend.save_persona("alice", modified, overwrite=True)
+
+    # Step 4: both snapshots must survive.
+    snapshots = backend.list_snapshots("alice")
+    snap_ids = {s.snapshot_id for s in snapshots}
+    assert snapshot_id_a in snap_ids, (
+        f"Real snapshot {snapshot_id_a!r} was lost after overwrite save; "
+        f"found: {snap_ids}"
+    )
+    assert fake_snap_id in snap_ids, (
+        f"Concurrent snapshot {fake_snap_id!r} was lost after overwrite save; "
+        f"found: {snap_ids}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P2: list_snapshots skips symlinked entries that escape the snapshots root
+
+
+def test_list_snapshots_skips_symlinks_escaping_personas_root(tmp_path: Path) -> None:
+    """list_snapshots() skips entries whose resolved path escapes .snapshots/.
+
+    Creates a persona 'alice' with one legitimate snapshot, then injects an evil
+    symlink under .snapshots/ pointing to /tmp (or tmp_path itself to avoid
+    needing /tmp to exist with content). The evil entry must NOT appear in the
+    list_snapshots() result.
+    """
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    backend.save_persona("alice", _make_persona(identity="Legit body."))
+    legit_snap_id = backend.snapshot("alice")
+
+    # Create a directory outside the persona root that could hold attacker data.
+    evil_target = tmp_path / "evil-outside-personas"
+    evil_target.mkdir()
+    (evil_target / "metadata.json").write_text(
+        '{"snapshot_id": "snap_EVIL", "persona_id": "alice", '
+        '"label": null, "created_at": "2099-01-01T00:00:00+00:00", '
+        '"schema_version": 1}',
+        encoding="utf-8",
+    )
+    (evil_target / "IDENTITY.md").write_text("Evil identity.", encoding="utf-8")
+    (evil_target / "SOUL.md").write_text("Evil soul.", encoding="utf-8")
+    (evil_target / "USER.md").write_text("Evil user.", encoding="utf-8")
+
+    # Plant a symlink inside alice/.snapshots/ that points to the evil dir.
+    snapshots_root = tmp_path / "alice" / ".snapshots"
+    evil_link = snapshots_root / "snap_EVIL_SYMLINK"
+    evil_link.symlink_to(evil_target)
+
+    snapshots = backend.list_snapshots("alice")
+    snap_ids = [s.snapshot_id for s in snapshots]
+
+    # The legitimate snapshot must be present.
+    assert legit_snap_id in snap_ids, (
+        f"Legitimate snapshot {legit_snap_id!r} missing from list_snapshots(); "
+        f"got {snap_ids}"
+    )
+    # The symlinked entry must NOT appear.
+    assert "snap_EVIL" not in snap_ids, (
+        f"Evil symlinked snapshot appeared in list_snapshots(): {snap_ids}"
+    )
+    assert len(snapshots) == 1, (
+        f"Expected exactly 1 snapshot (the legitimate one), got {len(snapshots)}: "
+        f"{snap_ids}"
+    )

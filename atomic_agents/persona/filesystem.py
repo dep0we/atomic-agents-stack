@@ -400,25 +400,45 @@ def _save_persona_group_atomic(
                         shutil.rmtree(backup, ignore_errors=True)
                     continue
                 # Snapshot preservation (D-PP-10): if the backup has a
-                # .snapshots/ dir, move it into the new persona dir so
-                # snapshot history survives overwrite saves.
+                # .snapshots/ dir, merge its entries individually into the
+                # new persona dir so snapshot history survives overwrite saves.
+                #
+                # A single-dir rename (the previous approach) races with a
+                # concurrent snapshot() that may have placed a .snapshots/
+                # entry in the new persona_dir between the persona-dir-replace
+                # step and this restore step. That concurrent entry causes
+                # rename() to fail with ENOTEMPTY (macOS/Linux), and the
+                # old code logged a warning + proceeded -- step 4 (rmtree of
+                # backup) then destroyed the entire snapshot history.
+                #
+                # Fix: move each backup snapshot entry individually into the
+                # target. The 48-bit entropy on snapshot_ids (D-PP-11) makes
+                # collisions with a concurrent snapshot's just-written entry
+                # probabilistically impossible (~6e-8 at 4K snapshots/sec).
                 backup_snapshots = backup / ".snapshots"
                 if backup_snapshots.is_dir():
-                    try:
-                        backup_snapshots.rename(persona_dir / ".snapshots")
-                    except OSError:
-                        # Best-effort: if the rename fails (e.g. concurrent
-                        # snapshot writer placed a .snapshots dir in the new
-                        # persona_dir), log and continue. The new-dir winner
-                        # wins; the backup snapshots are lost. This race is
-                        # not safety-critical -- snapshot ids include 48-bit
-                        # entropy so duplicate snapshot_ids are astronomically
-                        # unlikely.
-                        _logger.warning(
-                            "snapshot preservation rename failed for persona "
-                            "%r; .snapshots from backup may be lost",
-                            persona_id,
-                        )
+                    target_snapshots = persona_dir / ".snapshots"
+                    target_snapshots.mkdir(exist_ok=True)
+                    for entry in backup_snapshots.iterdir():
+                        dest = target_snapshots / entry.name
+                        if dest.exists():
+                            # Same snapshot_id already in target -- should not
+                            # happen under 48-bit entropy. Log and skip to
+                            # preserve the invariant "snapshots are never
+                            # destroyed by save_persona".
+                            _logger.warning(
+                                "save_persona_group_atomic_snapshot_collision "
+                                "backup=%s target=%s",
+                                entry,
+                                dest,
+                            )
+                            continue
+                        try:
+                            entry.rename(dest)
+                        except OSError:
+                            # Cross-device or filesystem-specific error.
+                            # Fall back to shutil.move for robustness.
+                            shutil.move(str(entry), str(dest))
                 shutil.rmtree(backup, ignore_errors=True)
                 return
             elif persona_dir.is_file():
@@ -895,6 +915,14 @@ class FilesystemPersonaBackend:
         results: list[PersonaSnapshot] = []
         for entry in snapshots_root.iterdir():
             if not entry.is_dir():
+                continue
+            # Path-scope check: defense-in-depth against symlinks or other
+            # filesystem conditions that cause an entry to resolve outside
+            # the snapshots root. Matches the guard already present in
+            # restore(). Entries escaping the root are silently skipped.
+            try:
+                entry.resolve().relative_to(snapshots_root.resolve())
+            except (ValueError, OSError):
                 continue
             metadata_path = entry / "metadata.json"
             if not metadata_path.is_file():

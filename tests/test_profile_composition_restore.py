@@ -408,6 +408,58 @@ def test_cross_window_external_to_external_persona_stays_empty(backend, tmp_path
 
 
 # ──────────────────────────────────────────────────────────────────
+# P2 threading: D-PP-13 dedup is safe under concurrent same-pair restore
+
+
+def test_migration_event_threading_safe_under_concurrent_same_pair_restore(
+    tmp_path, caplog
+):
+    """10 threads concurrently calling restore() on the same (agent, snapshot) pair
+    emit exactly one D-PP-13 warning -- not one per thread.
+
+    Uses a threading.Barrier to align thread starts so the race window is reliably
+    exercised. Tests the filesystem backend only; SQLite :memory: mode is
+    intentionally single-threaded (check_same_thread=True), so this test does
+    not parametrize across both backends.
+    """
+    import threading
+
+    backend = FilesystemAgentProfileBackend(tmp_path)
+    _make_externally_owned(backend, tmp_path, "thr-agent")
+    _inject_snapshot_with_persona(
+        backend,
+        tmp_path,
+        "thr-agent",
+        "snap_threading_test",
+    )
+
+    n_threads = 10
+    barrier = threading.Barrier(n_threads)
+    errors: list[Exception] = []
+
+    def _restore_one() -> None:
+        try:
+            barrier.wait()
+            backend.restore("thr-agent", "snap_threading_test")
+        except Exception as exc:
+            errors.append(exc)
+
+    with caplog.at_level(logging.WARNING):
+        threads = [threading.Thread(target=_restore_one) for _ in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    assert not errors, f"Threads raised exceptions: {errors}"
+    count = caplog.text.count("agent_profile_restore_dropped_persona_fields")
+    assert count == 1, (
+        f"Expected exactly 1 D-PP-13 warning emission across {n_threads} concurrent "
+        f"restores of the same pair; got {count}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
 # D3 cross-window restore: snapshot externally, restore internally -> fields empty
 
 

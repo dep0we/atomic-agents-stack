@@ -341,15 +341,17 @@ Implementers MUST:
 7. **`backend_id` property stable across calls.** The property MUST return the same string across calls and MUST match what `list_persona_backends()` registered the class under.
 
 8. **Snapshot id format.** Filesystem backend snapshot ids MUST use the
-   format `snap_<YYYY-MM-DDTHHMMSS+TZ>_<12hex>` where `<12hex>` is
+   format `snap_<YYYY-MM-DDTHHMMSS>_<12hex>` where `<12hex>` is
    `secrets.token_hex(6)` (48-bit random tail). This matches the
    AgentProfileBackend snapshot id format documented in spec/24
-   Implementer Contract #8. Cross-Protocol uniformity allows a shared
-   path-security validator (`_validate_snapshot_id`) and equivalent
-   collision resistance across both snapshot Protocols. Database-backed
-   and other non-filesystem backends MAY use their native id-generation
-   schemes provided ids remain monotonic or sortable (MUST #6) and
-   collision probability is at least as low as 48-bit random.
+   Implementer Contract #8. The timestamp component uses
+   `strftime('%Y-%m-%dT%H%M%S')` without a timezone suffix, matching the
+   project-wide AgentProfile convention. Cross-Protocol uniformity allows
+   a shared path-security validator (`_validate_snapshot_id`) and
+   equivalent collision resistance across both snapshot Protocols.
+   Database-backed and other non-filesystem backends MAY use their native
+   id-generation schemes provided ids remain monotonic or sortable (MUST
+   #6) and collision probability is at least as low as 48-bit random.
 
    Snapshot `metadata.json` MUST contain the following keys:
 
