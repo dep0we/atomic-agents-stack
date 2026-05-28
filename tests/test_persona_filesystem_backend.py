@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import re
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -805,3 +807,303 @@ def test_load_persona_raises_when_any_required_file_missing(
 
     with pytest.raises(PersonaNotFound):
         backend.load_persona("partial")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Snapshot trio -- filesystem-specific tests (D-PP-10 + D-PP-11)
+
+_SNAP_ID_PATTERN = re.compile(r"^snap_\d{4}-\d{2}-\d{2}T\d{6}[+\-\d:]*_[0-9a-f]{12}$")
+
+
+def test_snapshot_id_format_matches_spec(tmp_path: Path) -> None:
+    """The snapshot_id returned by ``snapshot()`` matches the
+    ``snap_<YYYY-MM-DDTHHMMSS+TZ>_<12hex>`` format (D-PP-11)."""
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    backend.save_persona("p", _make_persona())
+    snap_id = backend.snapshot("p")
+
+    assert _SNAP_ID_PATTERN.match(snap_id), (
+        f"snapshot_id {snap_id!r} does not match expected format "
+        f"snap_<timestamp>_<12hex>"
+    )
+
+
+def test_snapshot_storage_layout_creates_correct_files(tmp_path: Path) -> None:
+    """After ``snapshot()``, the snapshot directory contains IDENTITY.md,
+    SOUL.md, USER.md, and metadata.json under
+    ``<personas_root>/<persona_id>/.snapshots/<snapshot_id>/`` (D-PP-10)."""
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    backend.save_persona("p", _make_persona(identity="Snapped body."))
+    snap_id = backend.snapshot("p")
+
+    snap_dir = tmp_path / "p" / ".snapshots" / snap_id
+    assert snap_dir.is_dir(), f"snapshot dir {snap_dir} does not exist"
+    assert (snap_dir / "IDENTITY.md").exists()
+    assert (snap_dir / "SOUL.md").exists()
+    assert (snap_dir / "USER.md").exists()
+    assert (snap_dir / "metadata.json").exists()
+
+
+def test_snapshot_metadata_json_schema(tmp_path: Path) -> None:
+    """The snapshot ``metadata.json`` contains the required fields per D-PP-11:
+    ``{snapshot_id, persona_id, label, created_at}``."""
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    backend.save_persona("p", _make_persona())
+    snap_id = backend.snapshot("p", label="my-label")
+
+    snap_dir = tmp_path / "p" / ".snapshots" / snap_id
+    meta = json.loads((snap_dir / "metadata.json").read_text(encoding="utf-8"))
+
+    assert meta["snapshot_id"] == snap_id
+    assert meta["persona_id"] == "p"
+    assert meta["label"] == "my-label"
+    assert meta["created_at"]
+
+
+def test_snapshot_dot_snapshots_not_in_list_personas(tmp_path: Path) -> None:
+    """The ``.snapshots`` directory is NOT returned by ``list_personas()`` (D-PP-10:
+    dot-prefix filter skips it)."""
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    backend.save_persona("p", _make_persona())
+    backend.snapshot("p")
+
+    personas = backend.list_personas()
+    assert personas == ["p"], (
+        f"list_personas() returned {personas!r}; expected only ['p']"
+    )
+
+
+def test_snapshot_of_nonexistent_persona_raises_PersonaNotFound(
+    tmp_path: Path,
+) -> None:
+    """``snapshot()`` of a persona that does not exist raises ``PersonaNotFound``."""
+    from atomic_agents.exceptions import PersonaNotFound
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    with pytest.raises(PersonaNotFound, match="no-such-persona"):
+        backend.snapshot("no-such-persona")
+
+
+def test_restore_of_nonexistent_snapshot_raises_PersonaSnapshotNotFound(
+    tmp_path: Path,
+) -> None:
+    """``restore()`` with a snapshot_id that does not exist raises
+    ``PersonaSnapshotNotFound``."""
+    from atomic_agents.exceptions import PersonaSnapshotNotFound
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    backend.save_persona("p", _make_persona())
+    with pytest.raises(PersonaSnapshotNotFound):
+        backend.restore("p", "snap_2026-01-01T000000_000000000000")
+
+
+def test_list_snapshots_on_persona_with_no_snapshots_returns_empty(
+    tmp_path: Path,
+) -> None:
+    """``list_snapshots()`` returns ``[]`` when no snapshots have been taken
+    for the persona."""
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    backend.save_persona("p", _make_persona())
+    result = backend.list_snapshots("p")
+
+    assert result == []
+
+
+def test_list_snapshots_ordering_is_monotonic_by_created_at(
+    tmp_path: Path,
+) -> None:
+    """``list_snapshots()`` returns snapshots in ascending ``created_at`` order."""
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    backend.save_persona("p", _make_persona())
+
+    snap_ids = []
+    for _ in range(3):
+        snap_ids.append(backend.snapshot("p"))
+        # Brief pause so timestamps are distinct (snapshot IDs include entropy
+        # so they are unique, but created_at ordering requires time to pass).
+        time.sleep(0.01)
+
+    snaps = backend.list_snapshots("p")
+    assert len(snaps) == 3
+    created_ats = [s.created_at for s in snaps]
+    assert created_ats == sorted(created_ats), (
+        f"list_snapshots not in chronological order: {created_ats}"
+    )
+
+
+def test_restore_restores_body_bytes_exactly(tmp_path: Path) -> None:
+    """``restore()`` restores the persona body bytes byte-for-byte from the
+    snapshot."""
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    original = _make_persona(
+        identity="Exact identity text.",
+        soul="Exact soul text.",
+        user="Exact user text.",
+        version=5,
+        label="original-label",
+    )
+    backend.save_persona("p", original)
+    snap_id = backend.snapshot("p")
+
+    # Overwrite with something different.
+    updated = _make_persona(
+        identity="Changed identity.",
+        soul="Changed soul.",
+        user="Changed user.",
+        version=6,
+    )
+    backend.save_persona("p", updated, overwrite=True)
+
+    # Restore and verify bytes are exactly what was snapshotted.
+    backend.restore("p", snap_id)
+    loaded = backend.load_persona("p")
+
+    assert loaded.identity == "Exact identity text."
+    assert loaded.soul == "Exact soul text."
+    assert loaded.user == "Exact user text."
+
+
+def test_snapshot_preserves_prior_metadata_fields(tmp_path: Path) -> None:
+    """The snapshot captures all persona metadata fields (version, label,
+    created_at); ``list_snapshots()`` returns a ``PersonaSnapshot`` whose
+    ``persona`` field carries those original values."""
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    persona = _make_persona(
+        version=7,
+        label="pre-snapshot-label",
+        created_at="2026-01-15T08:00:00+00:00",
+    )
+    backend.save_persona("p", persona)
+    backend.snapshot("p", label="snap-label")
+
+    snaps = backend.list_snapshots("p")
+    assert len(snaps) == 1
+    snap = snaps[0]
+    assert snap.label == "snap-label"
+    assert snap.persona.version == 7
+    assert snap.persona.label == "pre-snapshot-label"
+    assert snap.persona.created_at == "2026-01-15T08:00:00+00:00"
+
+
+def test_idempotent_restore_twice_yields_same_state(tmp_path: Path) -> None:
+    """Restoring from the same snapshot twice is idempotent: the persona state
+    after the second restore equals the state after the first restore."""
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    backend.save_persona("p", _make_persona(identity="V1 body.", version=1))
+    snap_id = backend.snapshot("p")
+
+    backend.save_persona(
+        "p", _make_persona(identity="V2 body.", version=2), overwrite=True
+    )
+
+    backend.restore("p", snap_id)
+    first_restore = backend.load_persona("p")
+
+    backend.restore("p", snap_id)
+    second_restore = backend.load_persona("p")
+
+    assert first_restore.identity == second_restore.identity
+    assert first_restore.soul == second_restore.soul
+    assert first_restore.user == second_restore.user
+
+
+def test_cross_persona_isolation_snapshot_id_from_a_raises_for_b(
+    tmp_path: Path,
+) -> None:
+    """A snapshot_id from persona A raises ``PersonaSnapshotNotFound`` when
+    used with persona B (cross-persona isolation, D-PP-10)."""
+    from atomic_agents.exceptions import PersonaSnapshotNotFound
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    backend.save_persona("persona-a", _make_persona(identity="A body."))
+    backend.save_persona("persona-b", _make_persona(identity="B body."))
+
+    snap_id_a = backend.snapshot("persona-a")
+
+    with pytest.raises(PersonaSnapshotNotFound):
+        backend.restore("persona-b", snap_id_a)
+
+
+def test_restore_path_confinement_invalid_snapshot_id_raises(
+    tmp_path: Path,
+) -> None:
+    """``restore()`` with a malformed snapshot_id raises ``PersonaSnapshotNotFound``
+    before any filesystem access (path-traversal defense via charset validator)."""
+    from atomic_agents.exceptions import PersonaSnapshotNotFound
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    backend.save_persona("p", _make_persona())
+
+    with pytest.raises(PersonaSnapshotNotFound):
+        backend.restore("p", "../../../etc/passwd")
+
+    with pytest.raises(PersonaSnapshotNotFound):
+        backend.restore("p", "not-a-valid-snap-id")
+
+    with pytest.raises(PersonaSnapshotNotFound):
+        backend.restore("p", "")
+
+
+def test_atomic_rename_rollback_on_crash_mid_write(tmp_path: Path) -> None:
+    """A simulated crash during the temp-dir rename leaves no partial state
+    under ``.snapshots/``; the persona record is unchanged.
+
+    Monkeypatches ``Path.rename`` to raise ``OSError`` on every attempt inside
+    the snapshot() call. Verifies that ``.snapshots/`` is not created (or
+    remains empty) and the persona is still loadable.
+    """
+    from atomic_agents.exceptions import PersonaError
+    from atomic_agents.persona.filesystem import FilesystemPersonaBackend
+
+    backend = FilesystemPersonaBackend(tmp_path)
+    backend.save_persona("p", _make_persona(identity="Safe body."))
+
+    real_rename = Path.rename
+    call_count = [0]
+
+    def _always_fail_rename(self, target):
+        # Allow renames not targeting .snapshots/ (e.g. internal tmp cleanup).
+        if ".snapshots" in str(target):
+            call_count[0] += 1
+            raise OSError("Simulated snapshot rename failure")
+        return real_rename(self, target)
+
+    with patch.object(Path, "rename", _always_fail_rename):
+        with pytest.raises((OSError, PersonaError)):
+            backend.snapshot("p")
+
+    # Persona must still be loadable and unchanged.
+    loaded = backend.load_persona("p")
+    assert loaded.identity == "Safe body."
+
+    # No complete snapshot dir should exist (temp dirs auto-cleaned on exit).
+    snapshots_root = tmp_path / "p" / ".snapshots"
+    if snapshots_root.exists():
+        completed = [
+            d
+            for d in snapshots_root.iterdir()
+            if d.is_dir() and d.name.startswith("snap_")
+        ]
+        assert completed == [], f"Unexpected completed snapshot dirs found: {completed}"
