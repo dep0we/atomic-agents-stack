@@ -168,8 +168,17 @@ Start at [`docs/README.md`](docs/README.md) for the spec entry point. The locked
 - [13 — Research integrity](docs/spec/13-research-integrity.md) — citations + factual accuracy
 - [14-19](docs/spec/) — capture markers, delegation, dreams, skills, MCP, alternative-runtime contracts
 - [20 — Memory backend protocol](docs/spec/20-memory-backend.md) — the protocol-pattern moat
+- [21 — Lock backend protocol](docs/spec/21-lock-backend.md) — multi-host lock primitive; filesystem + Redis reference impls
+- [22 — Log backend protocol](docs/spec/22-log-backend.md) — JSONL + SQLite reference impls; indexed query / aggregate / retention
+- [24 — AgentProfile backend protocol](docs/spec/24-agent-profile-backend.md) — agent registry primitive; filesystem + SQLite reference impls
+- [25 — ToolRegistry backend protocol](docs/spec/25-tool-registry-backend.md) — tool catalog primitive; install / uninstall capability
 - [26 — Cascade bundle](docs/spec/26-cascade-bundle.md) — pre-rendered cascade for skill-mode loads (DRAFT)
 - [27 — Doctor](docs/spec/27-doctor.md) — preflight verification
+- [28 — Judge layer](docs/spec/28-judge-layer.md) — pre-action validation; ESCALATE + REVISE state machines
+- [29 — Mandates](docs/spec/29-mandates.md) — durable revocable scoped authority; reservation pattern + crash recovery
+- [30 — Responsibility audit](docs/spec/30-responsibility-audit.md) — per-action accountability trail (DRAFT)
+- [31 — LLM backend protocol](docs/spec/31-llm-backend.md) — provider routing; Anthropic + OpenAI + Moonshot reference impls
+- [32 — Policy backend protocol](docs/spec/32-policy-backend.md) — fleet-wide `policy.md`; cost-cap MIN composition + allowlist enforcement
 - [33 — PersonaBackend Protocol](docs/spec/33-persona-backend.md) — persona ownership, snapshot/restore, `persona.link.md` format
 
 Each spec doc is locked when the implementation matches and tests pass. Spec changes that imply implementation changes get filed as GitHub issues. **Spec docs separate shipped behavior from explicit future / deferred boundaries** — sections that describe behavior not yet implemented are explicitly marked as such, not silently aspirational.
@@ -195,7 +204,7 @@ The framework is moving toward swappable backends layer by layer. The shape: a P
 | `CorpusBackend` | Planned | Wiki/raw corpus at GB scale + semantic search | [`#65`](https://github.com/dep0we/atomic-agents-stack/issues/65) |
 | `MCPServerRegistryBackend` | Planned | Catalog + install/audit for MCP servers (MCP equivalent of ToolRegistry) | [`#201`](https://github.com/dep0we/atomic-agents-stack/issues/201) |
 
-**v1 direction:** a home user runs filesystem-everything today. An organization runs the same agent definitions over Postgres / Redis / SQLite-Datadog / behind an HTTP service once the remaining three protocols ship. v1.0 closes when those three land + their conformance suites pin the contract. See [`docs/architecture.md`](docs/architecture.md) for the mental model, [`docs/TENSIONS.md`](docs/TENSIONS.md) for architectural tensions this scaling story has to survive, and [`ROADMAP.md`](ROADMAP.md) for the full backlog beyond v1.0.
+**v1 direction:** a home user runs filesystem-everything today. An organization runs the same agent definitions over Postgres / Redis / SQLite-Datadog / behind an HTTP service once the remaining two protocols ship. v1.0 closes when those two land + their conformance suites pin the contract. See [`docs/architecture.md`](docs/architecture.md) for the mental model, [`docs/TENSIONS.md`](docs/TENSIONS.md) for architectural tensions this scaling story has to survive, and [`ROADMAP.md`](ROADMAP.md) for the full backlog beyond v1.0.
 
 ---
 
