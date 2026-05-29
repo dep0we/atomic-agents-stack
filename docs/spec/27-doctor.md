@@ -383,14 +383,6 @@ managed-service URLs into CI logs.
 
 ### `mandate-backend` *(scope-scoped)*
 
-> **Implementation status (2026-05-28):** The `check_mandate_backend`
-> function is documented in this spec but not yet implemented in
-> `atomic_agents/doctor.py`. The gap is tracked at
-> [#235](https://github.com/dep0we/atomic-agents-stack/issues/235).
-> The contract below describes what the check ships when #235 lands;
-> operators relying on it today will not see this check fire from
-> `atomic-agents doctor`.
-
 **Verifies:** Operator-config coherence for the MandateBackend
 (spec/29). Scope-shape mirrors `check_policy_backend` —
 mandate descriptors live at `<scope_root>/mandates.md` (project scope)
@@ -420,6 +412,11 @@ PASS / WARN / FAIL ladder:
 - **FAIL** when the registered backend's factory raises during
   construction (credentials dropped from the surfaced exception
   text).
+- **WARN** when construction succeeds but `mandates.md` is absent at
+  `scope_root` — no operator-granted authorities exist at this scope.
+  Informational so the operator knows they haven't authored mandates
+  yet (not a failure — pre-#124 deployments and single-agent home
+  users naturally hit this path).
 - **WARN** when construction succeeds but `capabilities()` /
   `list_mandates()` raises — backend reachable but its probe surface
   is degraded (e.g. SaaS adapter responds to handshake but state
