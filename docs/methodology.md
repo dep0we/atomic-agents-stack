@@ -9,11 +9,12 @@ The shape of the project so far (snapshot at the time of original capture,
 2026-05-09): 4 published tags (v0.1.0 retroactive, v0.9.0 retroactive,
 v0.10.0, v0.13.0), ~70 merged PRs, ~1327 tests, no production rollback
 events. Three backend protocols shipped at that point (MemoryBackend,
-LLMBackend, JudgeBackend); today nine are shipped (MemoryBackend,
+LLMBackend, JudgeBackend); today ten are shipped (MemoryBackend,
 LLMBackend, JudgeBackend, LockBackend, LogBackend, AgentProfileBackend,
-ToolRegistryBackend, MandateBackend, PolicyBackend) with parametrized
-conformance suites and 2401+ tests — see the empirical record table below
-for arc-by-arc evidence of how the methodology held across them.
+ToolRegistryBackend, MandateBackend, PolicyBackend, PersonaBackend) with
+parametrized conformance suites and 2686+ tests — see the empirical
+record table below for arc-by-arc evidence of how the methodology held
+across them.
 
 ---
 
@@ -67,6 +68,9 @@ The empirical record across recent arcs:
 | #61 LogBackend | #185–#188 | Skipped | Every PR | P0 cross-agent log isolation (`LogQuery.agent_name` filter) REPRODUCED; P0 cold-start schema race REPRODUCED via concurrent backend init |
 | #63 AgentProfileBackend | #192–#195 | Skipped | Every PR | F-3 cross-agent path-traversal in `list_snapshots`/`restore` REPRODUCED; F-8 48-bit snapshot id entropy budget; 6 P0/P1 across the arc |
 | #64 ToolRegistryBackend | #197–#199, #206 | Skipped | Every PR | **12 P0/P1 REPRODUCED across PRs 1-3** — REPRODUCED YAML alias-bomb DoS at 33 GB RSS, REPRODUCED control-char log-injection, REPRODUCED `chmod-000 tools/` blocks every agent, REPRODUCED TOCTOU install race 50/50, REPRODUCED multi-process WAL race 3/5, REPRODUCED URL credential leak. PR 4 docs-only added 11 findings + 1 new successor issue (#207) across 2 rounds (the docs-only P1 numerical drift is excluded from the 12-count). |
+| #124 MandateBackend | PRs #213–#221 + PR 4 | Skipped (standing rule) | Every PR | Plan-subagent: 13 SEVERE + 9 HIGH across 5 prep passes; Round 2 caught silent budget bypass via missing `mandate_id` on cost events; PR 3b second-pass amendments caught Step 8 vs Step 9 precedence inversion + cache leak on BLOCK paths |
+| #89 PolicyBackend | PRs #234–#277 | Skipped | Every PR | PR 4 BREAKING default flip caught real adversarial finding around empty-string env var coerce-to-True; #273 dedup invariant (one event per `(tool_name, call)` for log-only tool-allowlist denials); #274 `model_from_per_call_override` audit field so callers detect silent fleet-config-wins overrides |
+| #62 PersonaBackend | PRs #280, #286, #293, #294 | Skipped | Every PR | PR 4 Round 1 caught phantom test file `tests/test_agent_profile_persona_composition.py` in canonical lock-paragraph (2 sites in CLAUDE.md); MUST #8 `created_at` timezone-wording drift; Round 2 caught the public **repo-root** `ROADMAP.md` drift that prep + Round 1 both missed (lesson: when a brief says "update X", grep the repo for X first); Step 18 doc-release subagent itself shipped a miscount caught in follow-up commit |
 
 That's five consecutive arcs with Codex skipped and the Opus subagent doing
 the load-bearing review — every arc produced multiple P0 / P1 findings from

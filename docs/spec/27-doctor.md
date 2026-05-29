@@ -163,6 +163,49 @@ mtime exceeds `stale_seconds` (default 300s), the message includes a
 holding the lock — `cron`-shaped deployments would otherwise pile up
 silently.
 
+### `lock-backend` *(scope-scoped)*
+
+**Verifies:** Operator-config coherence for the LockBackend (spec/21).
+Distinct from the `locks` check above: `locks` runs the POSIX-flock
+held-state probe through whatever backend is configured; `lock-backend`
+verifies that the operator's configured backend (`ATOMIC_AGENTS_LOCK_BACKEND`
+and `ATOMIC_AGENTS_LOCK_BACKEND_URL`) actually constructs and is reachable.
+Both checks reuse `get_default_lock_backend(agent_root)` so doctor's verdict
+and the runtime's first-acquire behaviour cannot diverge.
+
+PASS / WARN / FAIL ladder:
+
+- **PASS** when `ATOMIC_AGENTS_LOCK_BACKEND` is unset or `filesystem` —
+  today's deployment shape, no extras required. Detail carries
+  `backend_id: filesystem`.
+- **PASS** when a non-filesystem `backend_id` (e.g. `redis`) constructs
+  via the URL factory AND the lightweight `is_held("")` probe returns.
+  Detail includes the credential-redacted URL — `urlparse` + `_replace`
+  strips the password from `netloc` so `redis://user:password@host` does
+  not leak through CI logs or telemetry.
+- **FAIL** when `ATOMIC_AGENTS_LOCK_BACKEND` is set to an id not in
+  `list_lock_backends()` (with `redis` treated as known via lazy
+  resolution).
+- **FAIL** when a non-filesystem `backend_id` is selected but
+  `ATOMIC_AGENTS_LOCK_BACKEND_URL` is unset.
+- **FAIL** when the registered backend's optional extra isn't installed
+  (`ImportError` surfaces with the `pip install 'atomic-agents-stack[<id>]'`
+  fix hint).
+- **FAIL** when the factory raises for any other reason during
+  construction.
+- **WARN** when construction succeeds but the `is_held("")` reachability
+  probe raises — backend is configured but not reachable from this host
+  (matches `check_provider_keys`' don't-crash-on-optional-infra rule;
+  the runtime will fail at first acquire if the backend is truly down).
+
+**Prevents:** First-call `BackendNotRegistered` when an agent's
+reservation pattern tries to acquire a lock from an unregistered
+backend, and silent fall-through to the filesystem default when an
+operator typo'd `ATOMIC_AGENTS_LOCK_BACKEND` — a typo would otherwise
+let a multi-host Cloud Run / Kubernetes deployment pile up concurrent
+runs against the same agent because filesystem flock doesn't span
+hosts.
+
 ### `memory-backend` *(agent-scoped)*
 
 **Verifies:** `FilesystemBackend(<agent>, "memory").stats()` returns
@@ -170,6 +213,45 @@ without raising.
 
 **Prevents:** Corrupt frontmatter or a missing `INDEX.md` blowing up
 inside `agent.call()`'s memory load step.
+
+### `log-backend` *(scope-scoped)*
+
+**Verifies:** Operator-config coherence for the LogBackend (spec/22).
+Mirrors `check_lock_backend`'s shape — both checks reuse the framework's
+`get_default_log_backend(agent_root)` factory so doctor's verdict and
+the runtime's first-`append()` behaviour cannot diverge.
+
+PASS / WARN / FAIL ladder:
+
+- **PASS** when `ATOMIC_AGENTS_LOG_BACKEND` is unset or `filesystem`
+  and `FilesystemLogBackend(agent_root).stats()` returns. Detail
+  carries `backend_id: filesystem` + the `LogStats` snapshot
+  (`total_records`, `records_today`, `records_this_month`,
+  `size_bytes`).
+- **PASS** when a non-filesystem `backend_id` (e.g. `sqlite`)
+  constructs via the URL factory AND `stats()` returns. Detail
+  includes the credential-redacted URL plus the same `LogStats`
+  snapshot — schema-version health is implicit in the probe (SQLite
+  raises if the schema is behind the expected version).
+- **FAIL** when `ATOMIC_AGENTS_LOG_BACKEND` is set to an id not in
+  `list_log_backends()` (which is now authoritative for `sqlite` per
+  #61 PR 3 — no lazy forward-pointer reserved-id list).
+- **FAIL** when the registered backend's factory raises during
+  construction. The verbatim exception text is dropped (connection
+  errors from backend constructors commonly embed the full URL with
+  credentials) — the `fix_hint` points the operator at DEBUG logging
+  for the unredacted exception.
+- **WARN** when construction succeeds but `stats()` raises — backend
+  reachable but schema-degraded or transient I/O error. Same
+  credential-redaction rule applies to the probe-error path.
+
+**Prevents:** First-`append()` `BackendNotRegistered` when an agent
+records its run metadata to an unregistered backend; silent
+fall-through to JSONL-on-disk when an operator typo'd
+`ATOMIC_AGENTS_LOG_BACKEND` (would defeat the dashboard-perf win on
+multi-replica deployments that pinned SQLite for indexed queries);
+URL credential leakage from `redis://user:pw@host`-shaped envs into
+CI logs or error-tracking pipelines.
 
 ### `persona-backend` *(scope-scoped)*
 
@@ -206,6 +288,211 @@ PASS / WARN / FAIL ladder:
 fall-through to the filesystem default when an operator typo'd the env
 var; credential leakage from URL-bearing config into liveness-probe
 output or error-tracking services.
+
+### `agent-profile-backend` *(scope-scoped)*
+
+**Verifies:** Operator-config coherence for the AgentProfileBackend
+(spec/24). Scoped at `agents_root` (not `agent_root`) because the
+profile backend is the scope-flat layer that holds ALL agents —
+`list_agents()` enumerates siblings under the root. Doctor reports
+this check under the `profile-backend` name in `CheckResult.name` for
+historical consistency with #63 PR 2's wire-up.
+
+PASS / WARN / FAIL ladder:
+
+- **PASS** when `ATOMIC_AGENTS_PROFILE_BACKEND` is unset or
+  `filesystem` and `FilesystemAgentProfileBackend(agents_root)`
+  constructs cleanly + `capabilities()` + `list_agents()` return.
+  Detail carries the capability snapshot (`supports_save`,
+  `supports_clone`, `supports_snapshot`, `supports_subscribe`,
+  `supports_skills`, `durable`) plus the discovered `agent_count`.
+- **PASS** when a non-filesystem `backend_id` (e.g. `sqlite`) is
+  registered, constructs via the URL factory
+  (`ATOMIC_AGENTS_PROFILE_BACKEND_URL`; when `=sqlite` without URL,
+  defaults to `<scope_root>/.profile.db`), and the `capabilities()`
+  + `list_agents()` probe succeeds. Detail includes the
+  credential-redacted URL — username AND password stripped from
+  `netloc` so token-as-username URLs (Upstash-shaped `ghp_TOKEN@host`,
+  PlanetScale `API_KEY@host`) do not leak.
+- **FAIL** when `ATOMIC_AGENTS_PROFILE_BACKEND` is set to an id not
+  in `list_profile_backends()`.
+- **FAIL** when the registered backend's factory raises during
+  construction (verbatim exception text dropped — connection errors
+  commonly embed credential-bearing URLs).
+- **WARN** when construction succeeds but `capabilities()` /
+  `list_agents()` raises — backend reachable but its probe surface
+  is degraded.
+
+**Prevents:** First-call `BackendNotRegistered` when an agent's
+bootstrap path tries to load its profile from an unregistered
+backend; silent fall-through to the filesystem default when an
+operator typo'd `ATOMIC_AGENTS_PROFILE_BACKEND` (would defeat the
+SaaS-shape migration that motivated #63 — a fleet of agents would
+keep reading per-agent directory state instead of the operator's
+Postgres / SQLite registry).
+
+### `tool-registry-backend` *(scope-scoped)*
+
+**Verifies:** Operator-config coherence for the ToolRegistryBackend
+(spec/25). Scoped at `agent_root` because the filesystem reference
+is per-agent-rooted (`<agent>/tools/<name>.md` belongs to ONE agent),
+distinct from `agent-profile-backend` which sits at the scope-flat
+`agents_root` layer. Doctor reuses
+`get_default_tool_registry_backend(agent_root)` so the verdict and
+the runtime's first-`load_tool` behaviour cannot diverge.
+
+PASS / WARN / FAIL ladder:
+
+- **PASS** when `ATOMIC_AGENTS_TOOL_REGISTRY_BACKEND` is unset or
+  `filesystem` and `FilesystemToolRegistryBackend(agent_root)`
+  constructs cleanly + `capabilities()` + `list_tools()` return.
+  Detail carries the capability snapshot (`supports_install`,
+  `supports_uninstall`, `supports_versioning`,
+  `supports_sandbox_validate`, `supports_skills_catalog`, `durable`)
+  plus the discovered `tool_count` (0 is the typical case — most
+  agents don't ship a `tools/` dir, that's not a failure mode).
+- **PASS** when a non-filesystem `backend_id` (e.g. `sqlite`)
+  registers, constructs via the URL factory
+  (`ATOMIC_AGENTS_TOOL_REGISTRY_BACKEND_URL`;
+  `sqlite:///path?agent_scope=<name>`; when `=sqlite` without URL,
+  defaults to `<agent_root>/.tools.db` with
+  `agent_scope=<agent_root.name>`), and the `capabilities()` +
+  `list_tools()` probe succeeds. Detail includes the
+  credential-redacted URL.
+- **FAIL** when `ATOMIC_AGENTS_TOOL_REGISTRY_BACKEND` is set to an
+  id not in `list_tool_registry_backends()`. The echoed env value is
+  redacted at `://` (`scheme://...`) and truncated at 32 chars —
+  defends against operators accidentally pasting a credential-bearing
+  URL into the id env var.
+- **FAIL** when the registered backend's factory raises during
+  construction (verbatim exception text dropped to prevent
+  credential leak; `fix_hint` points at DEBUG logging for the
+  unredacted exception).
+- **WARN** when construction succeeds but `capabilities()` /
+  `list_tools()` raises — backend reachable but its probe surface
+  is degraded.
+
+**Prevents:** First-`load_tool` `BackendNotRegistered` when an agent
+calls a registered tool from an unregistered backend; silent
+fall-through to filesystem when an operator typo'd
+`ATOMIC_AGENTS_TOOL_REGISTRY_BACKEND` (a future PyPI / git / SaaS
+adapter pinned in production would be bypassed and the agent would
+silently read the empty / outdated `<agent>/tools/` dir);
+credential leakage from `agent_scope=<name>` query strings or
+managed-service URLs into CI logs.
+
+### `mandate-backend` *(scope-scoped)*
+
+> **Implementation status (2026-05-28):** The `check_mandate_backend`
+> function is documented in this spec but not yet implemented in
+> `atomic_agents/doctor.py`. The gap is tracked at
+> [#235](https://github.com/dep0we/atomic-agents-stack/issues/235).
+> The contract below describes what the check ships when #235 lands;
+> operators relying on it today will not see this check fire from
+> `atomic-agents doctor`.
+
+**Verifies:** Operator-config coherence for the MandateBackend
+(spec/29). Scope-shape mirrors `check_policy_backend` —
+mandate descriptors live at `<scope_root>/mandates.md` (project scope)
+or `<scope_root>/<agent>/mandates.md` (agent scope); doctor probes the
+operator-configured backend resolves cleanly without invoking the
+`MandateCheck` judge specialist.
+
+PASS / WARN / FAIL ladder:
+
+- **PASS** when `ATOMIC_AGENTS_MANDATE_BACKEND` is unset or
+  `filesystem` and `FilesystemMandateBackend(scope_root)`
+  constructs cleanly + `capabilities()` returns + `list_mandates(scope)`
+  returns. Detail carries the capability snapshot
+  (`supports_revocation`,
+  `supports_external_state_change_notification`, `durable`,
+  `supports_crash_recovery`) plus the discovered `mandate_count`.
+- **PASS** when a non-filesystem `backend_id` is registered,
+  constructs via the URL factory
+  (`ATOMIC_AGENTS_MANDATE_BACKEND_URL`), and the `capabilities()` +
+  `list_mandates()` probe succeeds. Detail includes the
+  credential-redacted URL — username AND password stripped from
+  `netloc` so token-as-username managed-service URLs do not leak.
+- **FAIL** when `ATOMIC_AGENTS_MANDATE_BACKEND` is set to an id not
+  in `list_mandate_backends()`. The echoed env value is redacted at
+  `://` to prevent credential leaks if an operator pasted a URL into
+  the id env var by mistake.
+- **FAIL** when the registered backend's factory raises during
+  construction (credentials dropped from the surfaced exception
+  text).
+- **WARN** when construction succeeds but `capabilities()` /
+  `list_mandates()` raises — backend reachable but its probe surface
+  is degraded (e.g. SaaS adapter responds to handshake but state
+  table is unreachable).
+
+**Prevents:** First-`MandateCheck` `BackendNotRegistered` when an
+agent under a mandate-aware judge tries to validate an action against
+its authority record; silent fall-through to filesystem when an
+operator typo'd `ATOMIC_AGENTS_MANDATE_BACKEND` (would defeat the
+durable-authorization story — a procurement mandate pinned in
+Postgres would be bypassed and the agent would read stale or
+non-existent filesystem state, allowing actions that have been
+revoked in the operator's source of truth); credential leakage from
+URL-bearing config into liveness-probe output or error-tracking
+services.
+
+### `policy-backend` *(scope-scoped)*
+
+**Verifies:** Operator-config coherence for the PolicyBackend
+(spec/32). Scope-scoped at the fleet root — `<scope_root>/policy.md`
+declares fleet-default cost caps, tool allowlists, MCP server
+allowlists, and model selection that apply across all agents under
+the root. When a `cascade` is supplied, doctor also warns when a
+`FilesystemPolicyBackend` is scoped at `agents_root` instead of
+`cascade.project_root` (the runtime auto-corrects this; doctor
+surfaces it before production traffic hits the wrong scope per #236
+fix).
+
+PASS / WARN / FAIL ladder:
+
+- **PASS** when `ATOMIC_AGENTS_POLICY_BACKEND` is unset or
+  `filesystem` and `FilesystemPolicyBackend(scope_root)` constructs
+  cleanly + `capabilities()` returns AND `policy.md` exists. Detail
+  carries the capability snapshot (`cache_ttl_s`, `durable`),
+  `policy_md_exists: true`, and the resolved `policy.md` path.
+- **PASS** when a non-filesystem `backend_id` is registered,
+  constructs via the URL factory, the `capabilities()` probe
+  succeeds, AND `policy.md` exists. Detail includes the
+  credential-redacted URL (`urlparse` + `_replace` strips username
+  AND password from `netloc` — covers token-as-username managed
+  services).
+- **FAIL** when `ATOMIC_AGENTS_POLICY_BACKEND` is set to an id not
+  in `list_policy_backends()`.
+- **FAIL** when the registered backend's factory raises during
+  construction (verbatim exception text dropped to prevent
+  credential leak; `fix_hint` points at DEBUG logging for the
+  unredacted exception).
+- **WARN** when construction succeeds but `policy.md` is absent —
+  every agent operates in no-opinion mode. Informational so the
+  operator knows they haven't authored fleet policy yet (not a
+  failure — pre-#89 deployments naturally hit this path).
+- **WARN** when a `FilesystemPolicyBackend` is scoped at
+  `agents_root` in a cascade layout instead of
+  `cascade.project_root` (cascade-scope mismatch — runtime
+  auto-corrects via re-resolution; doctor surfaces the mismatch so
+  an explicit `policy_backend=` kwarg with the wrong scope is
+  caught at install time).
+- **WARN** when construction succeeds but the `capabilities()`
+  probe raises — backend reachable but its probe surface is
+  degraded.
+
+**Prevents:** First-`agent.call()` `BackendNotRegistered` when an
+operator pinned a non-filesystem PolicyBackend (Postgres / SaaS /
+org-admin-console) but the registry doesn't have it; silent
+fall-through to filesystem when an operator typo'd
+`ATOMIC_AGENTS_POLICY_BACKEND` (would defeat the cross-agent
+configuration story — fleet-default cost caps from the operator's
+canonical Postgres `policy.md` would be bypassed and each agent
+would silently revert to its per-agent `model.md` cap); cascade-shape
+scope mismatch where the operator-supplied backend reads from
+`agents_root` while the cascade-resolved Policy lookup is keyed
+against `project_root`; URL credential leakage into liveness-probe
+output.
 
 ### `write-paths` *(agent-scoped)*
 

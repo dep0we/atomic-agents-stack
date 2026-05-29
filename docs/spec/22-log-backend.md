@@ -100,10 +100,10 @@ class RunRecord:
 ``RunRecord.to_dict()`` flattens ``extra`` into top-level keys and
 places ``ts`` first — preserving today's on-disk line shape
 (``{"ts": "...", **record}`` from ``agent.py:3425``) byte-for-byte.
-This is the **load-bearing PR 2 invariant**: the JSONL written through
+This is a **load-bearing invariant**: the JSONL written through
 the backend reads identically through the legacy
-``dashboard/costs._record_from_dict`` parser, so PR 2 can route writes
-through the backend without first rewiring the readers.
+``dashboard/costs._record_from_dict`` parser, so the backend routes writes
+without first rewiring the readers.
 
 ``RunRecord.from_dict()`` is permissive: unknown keys land in ``extra``;
 required keys with missing values use sensible empty defaults. This
@@ -129,7 +129,7 @@ pre-``cost_source`` records; pre-``mandate_id`` records).
 * ``other`` — fallback bucket for primitive-derivation misses
 
 Backends MUST accept arbitrary strings — the closed set is
-documentation, not enforcement. PR 2 derives ``primitive`` from the
+documentation, not enforcement. ``primitive`` is derived from the
 legacy ``trigger`` string via a small mapping function with an
 ``"other"`` fallback.
 
@@ -153,8 +153,8 @@ class LogQuery:
 All fields are optional. Only-set fields contribute predicates;
 ``None`` fields are not consulted. Mirrors the
 ``_costs.sum_cost_for_period`` filter shape (``source`` +
-``mandate_id`` as AND-filters, omitted-when-None) which PR 2 will
-re-route through ``query``.
+``mandate_id`` as AND-filters, omitted-when-None) which is
+re-routed through ``query``.
 
 ``cost_source`` has a backward-compatibility special case: records
 with ``cost_source is None`` are treated as ``"actor"`` for filter
@@ -219,8 +219,8 @@ claims ``supports_retention=True`` MUST implement
 native primitives.
 
 * ``supports_aggregation_pushdown`` — ``FilesystemLogBackend=False``
-  (in-memory after ``query()``). ``SQLiteLogBackend`` (PR 3) = ``True``.
-* ``supports_streaming`` — reserved. ``False`` for both PR 1 reference
+  (in-memory after ``query()``). ``SQLiteLogBackend`` = ``True``.
+* ``supports_streaming`` — reserved. ``False`` for both reference
   backends. A Datadog-class backend with GB-spanning query windows
   would set this ``True`` and yield ``RunRecord`` objects.
 * ``supports_retention`` — ``True`` when ``delete_older_than`` is
@@ -260,8 +260,8 @@ A backend implementing ``append`` MUST:
    ``tool_calls``) on the top-level ``agent.call()`` write routinely
    exceed 4 KB. Operators with deployments that generate >4 KB records
    on shared NFS or with multiple processes appending to the same day
-   file SHOULD select a transaction-backed backend (``SQLiteLogBackend``
-   in PR 3, future Postgres/Datadog impls). Filesystem-default
+   file SHOULD select a transaction-backed backend (``SQLiteLogBackend``,
+   future Postgres/Datadog impls). Filesystem-default
    deployments on a single host accept the bound; the failure mode is
    silent partial-line append observable as ``json.JSONDecodeError``
    skips in ``query()``.
@@ -409,7 +409,7 @@ A ``logs.md`` markdown config would only make sense if multiple log
 backends were registered simultaneously and an agent author wanted to
 pin one — an unlikely scenario; log backend is operator's call.
 
-PR 2 of #61 will expose the choice via TWO paths (parallel to the
+The operator surface exposes the choice via TWO paths (parallel to the
 LockBackend operator surface in spec/21 §"Operator surface — NOT a
 ``locks.md`` config"):
 
@@ -422,16 +422,12 @@ LockBackend operator surface in spec/21 §"Operator surface — NOT a
 2. **Environment variables** — deployment-config operators (Docker,
    launchd, Cloud Run env, gizmo systemd units) set:
    - ``ATOMIC_AGENTS_LOG_BACKEND`` — backend id (default
-     ``filesystem``). PR 1 supports ``filesystem``; PR 3 adds
-     ``sqlite``.
+     ``filesystem``). Recognized: ``filesystem``, ``sqlite``.
    - ``ATOMIC_AGENTS_LOG_BACKEND_URL`` — connection / path string for
-     non-filesystem backends. The concrete URL format is settled by
-     each backend at its PR (PR 3 commits ``SQLiteLogBackend``'s
-     format; future Datadog / Loki impls settle theirs). PR 1
-     reserves the env var name but does NOT pin any URL schema —
-     operators on Cloud Run who set the var ahead of PR 3 SHOULD
-     consult the backend's spec section for the exact format before
-     deploying.
+     non-filesystem backends. ``SQLiteLogBackend``'s URL format is
+     committed; future Datadog / Loki impls settle theirs. Operators
+     on Cloud Run consult the backend's spec section for the exact
+     format before deploying.
 
    Credential safety: ``get_default_log_backend`` sanitizes the
    ``ATOMIC_AGENTS_LOG_BACKEND`` value before echoing it in error
@@ -452,35 +448,7 @@ per-agent-construction. A test that constructs an ``AtomicAgent``
 with an explicit ``log_backend=`` bypasses any env vars the
 deployment may have set.
 
-## What PR 1 does NOT do
-
-PR 1 ships pure scaffolding — Protocol, filesystem reference impl,
-tests, DRAFT spec. **Zero call-site changes.** The 27+
-``self._log({...})`` sites in ``agent.py``,
-``outcome._append_iteration_log``, ``eval._write_run_log``, the four
-dashboard / cost-walker readers (``dashboard/costs.py``,
-``_costs.py``, ``dream.py``, ``dashboard/quality.py``) — all untouched.
-
-PR 2 wires:
-
-* ``agent._log()`` becomes a thin wrapper that builds a ``RunRecord``
-  from the dict literal (unknown keys → ``extra``) and calls
-  ``self.log_backend.append(record)``. The 27 call sites stay verbatim.
-* The dashboard / cost / dream / quality readers route through
-  ``self.log_backend.query(LogQuery(...))`` instead of walking
-  month dirs directly.
-* ``AtomicAgent.__init__`` accepts an optional
-  ``log_backend: LogBackend | None`` constructor kwarg that, when set,
-  bypasses ``get_default_log_backend``.
-* ``doctor.check_log_backend`` coherence check validates operator
-  config (env var → registry lookup → backend reachability).
-
-PR 3 ships ``SQLiteLogBackend`` (stdlib ``sqlite3``; no optional
-extra needed) and parametrizes the conformance suite across both
-backends. PR 4 locks this spec and adds the
-``§"Implementer contract for queryable backends"`` section below.
-
-## Implementer contract for queryable backends (#61 PR 4)
+## Implementer contract for queryable backends
 
 A backend that claims ``LogCapabilities.supports_aggregation_pushdown=True`` is committing to the indexed-query + native-aggregate pattern documented above. Concretely, **implementers MUST**:
 
@@ -504,7 +472,7 @@ The reference ``SQLiteLogBackend`` implementation in ``atomic_agents/logs/sqlite
 
 ## Reserved future capabilities
 
-These are not committed in PR 1 but are reserved in the namespace so
+These are not committed in v1.0 but are reserved in the namespace so
 future expansions don't need a breaking Protocol change:
 
 * ``AsyncLogBackend`` — async variant for HTTP-served deployments.
@@ -520,7 +488,7 @@ future expansions don't need a breaking Protocol change:
 
 ## Conformance test surface
 
-The conformance suite (PR 4 lock):
+The conformance suite:
 
 * ``tests/test_log_protocol_conformance.py`` — 46 tests parametrized
   via a ``backend_factory`` fixture across both reference backends

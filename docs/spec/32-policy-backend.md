@@ -2,10 +2,6 @@
 
 **Status:** LOCKED at #89 PR 4 (2026-05-22). The shipped reference implementation matches this spec; the parametrized conformance suite pins the Protocol contract; the four arc PRs have shipped (#234 scaffolding, #237 wiring, #244 cost-cap consumption, #276 non-cap log-only) and PR 4 flipped `ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP` to enforce by default. SaaS / Postgres / org-admin-console adapters can target the frozen surface from day 1.
 
-> **Pre-#89 PR 1 amendments (2026-05-19):** Drafted in PR 1 from the /office-hours + /plan-eng-review locked design doc (`~/.gstack/projects/dep0we-atomic-agents-stack/dep0we-main-design-20260519-084540.md`). 11 architectural decisions locked + 14 plan-subagent prep findings folded.
->
-> **PR 4 amendments (2026-05-22):** Flipped `ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP` default to `true` (non-cap surfaces enforce by default). Added `PolicyDecision.model_from_per_call_override` for per-call kwarg audit (#274). Documented per-call dedup invariant for tool-allowlist emissions (#273). Locked the 7 MUSTs in §"Implementer contract" — provisional footnote removed.
-
 ## Overview
 
 `PolicyBackend` is the ninth open Protocol in the protocol-pattern series (Memory, LLM, Judge, Lock, Log, AgentProfile, ToolRegistry, Mandate, **Policy**). Each Protocol decouples one storage / dispatch axis so the framework's core stays small and alternate implementations drop in without forking.
@@ -179,7 +175,7 @@ effective_deny  = (fleet.deny  | agent.deny)
 is_allowed(x) = x not in effective_deny AND (effective_allow is empty OR x in effective_allow)
 ```
 
-`MandateCheck` (spec/29) steps 7-8 consume the PRE-COMPOSED effective caps so Policy and Mandate cost-cap checks share the same arithmetic. Landed in PR 3a — PR 1 + 2 shipped only the contract.
+`MandateCheck` (spec/29) steps 7-8 consume the PRE-COMPOSED effective caps so Policy and Mandate cost-cap checks share the same arithmetic.
 
 ### Denying-layer resolution
 
@@ -215,7 +211,7 @@ SaaS / Postgres / org-admin-console adapters with linearizable state get exact-c
 
 The `policy_decision` event family is the unified audit-trail event for Policy + Mandate denials and Policy model overrides. SaaS / Postgres adapters target this schema from day 1; the field set is frozen for v1.
 
-PR 1 ships the schema as the `PolicyDecision` frozen dataclass in `atomic_agents.policy.types`. PR 3 emits instances via `LogBackend.append(record)`.
+The schema lives as the `PolicyDecision` frozen dataclass in `atomic_agents.policy.types`; instances are emitted via `LogBackend.append(record)`.
 
 ```python
 @dataclass(frozen=True)
@@ -260,7 +256,7 @@ class PolicyDecision:
 **`enforced` field semantics:**
 
 - `enforced=True`: the denial or override blocked / altered the action. Cost-cap denials set `enforced=True` when `cap_action="skip"` (the default — the call is blocked outright). For `cap_action ∈ {"alert", "fallback"}` the call proceeds (alert logs a warning + continues; fallback substitutes a cheaper model + continues) and the cost-cap event records `enforced=False` so the audit trail truthfully reflects whether money was actually spent. Operators reading `LogQuery(primitive="policy_decision", enforced=True)` for billing-incident attribution see only the actually-blocked events.
-- `enforced=False`: log-only mode — the denial or override was recorded in the audit trail but the action proceeded. Non-cap surfaces (tools / MCP / model) set `enforced=value_of_ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP`. **The env-var default flipped from `false` to `true` at PR 4 (this lock)** — operators authoring `policy.md` see tool / MCP / model surfaces enforce by default. To opt back into log-only mode, set `ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP=false` explicitly.
+- `enforced=False`: log-only mode — the denial or override was recorded in the audit trail but the action proceeded. Non-cap surfaces (tools / MCP / model) set `enforced=value_of_ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP`. **The env-var default is `true` (flipped from `false` at #89 PR 4)** — operators authoring `policy.md` see tool / MCP / model surfaces enforce by default. To opt back into log-only mode, set `ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP=false` explicitly.
 
 **Per-call dedup invariant (#273):** the tool-allowlist consumption site emits at most one `policy_decision(axis="tool_allowlist")` event per `(tool_name, call)`. In log-only mode the LLM does not see refusals and may re-attempt a denied tool every iteration; without dedup the audit log records N events per denied tool per call. The framework tracks emitted denials in a per-call set reset at `agent.call()` entry. MCP discovery emits at most once per server per call by construction (single discovery loop) and does not need the same set. Model-selection emissions are bounded by the once-per-call comparison check.
 
@@ -272,7 +268,7 @@ The accepted charset for `agent_name` at the API boundary is `[a-zA-Z0-9_.+@-]+`
 
 ## Implementer contract for policy backends
 
-A backend that implements the `PolicyBackend` Protocol commits to the contract below. The reference `FilesystemPolicyBackend` (markdown + embedded YAML, mtime+size cache) ships in #89 PR 1; future Postgres / SaaS / org-admin-console adapters slot in via `register_policy_backend(...)` without forking core. Mirrors the spec/22/24/25/29 Implementer contract patterns; Policy has fewer MUSTs (7) because Policy has no state, no reservations, and no lifecycle events beyond `policy_decision`.
+A backend that implements the `PolicyBackend` Protocol commits to the contract below. The reference `FilesystemPolicyBackend` (markdown + embedded YAML, mtime+size cache) is the only reference impl in v1; future Postgres / SaaS / org-admin-console adapters slot in via `register_policy_backend(...)` without forking core. Mirrors the spec/22/24/25/29 Implementer contract patterns; Policy has fewer MUSTs (7) because Policy has no state, no reservations, and no lifecycle events beyond `policy_decision`.
 
 **Implementers MUST:**
 
@@ -282,13 +278,13 @@ A backend that implements the `PolicyBackend` Protocol commits to the contract b
 
 3. **Fresh re-read with `cache_ttl_s`-bounded staleness.** The backend's `capabilities().cache_ttl_s` value is a contract — operators read it via `doctor.check_policy_backend` and size fleet-cap headroom accordingly. Backends declaring `cache_ttl_s=0` MUST observe operator edits at filesystem-granularity (the reference filesystem backend's `(mtime_ns, st_size)` composite key). Backends declaring `cache_ttl_s=N>0` MUST refresh internally within N seconds. Backends declaring `cache_ttl_s=None` make no staleness contract (the backend is authoritative on every read).
 
-4. **Construction is side-effect-free.** Backend `__init__` MUST NOT stat the filesystem, query a database, call an external API, or read any environment variable. The first method call performs lazy initialization. Malformed operator config MUST surface on the first method call, NOT at construction. This preserves the framework's byte-identical-construction promise for the 115 existing `AtomicAgent(...)` test sites under PR 1's "no consumption" scope and PR 2's "wired but unconsumed" scope. The URL factory (e.g., `make_filesystem_policy_backend_from_url`) MUST NOT validate path existence at construction either.
+4. **Construction is side-effect-free.** Backend `__init__` MUST NOT stat the filesystem, query a database, call an external API, or read any environment variable. The first method call performs lazy initialization. Malformed operator config MUST surface on the first method call, NOT at construction. This preserves the framework's byte-identical-construction promise for the 115 existing `AtomicAgent(...)` test sites. The URL factory (e.g., `make_filesystem_policy_backend_from_url`) MUST NOT validate path existence at construction either.
 
 5. **Capability honesty.** `capabilities() -> PolicyCapabilities` is a contract, not a hint. Backends declaring a capability MUST implement the corresponding behavior such that the parametrized conformance suite's capability-gated tests pass. Backends declaring `False` get the capability-specific tests skipped (not silently passed). Conformance tests gate on the flag; backends that lie produce silent failures rather than loud refusals.
 
 6. **URL credential redaction in factory `ValueError` sites.** The URL factory and `get_default_policy_backend` error paths MUST NOT echo raw URL credentials. The reference uses a `_redact_url` / `_redact_for_error_message` helper that strips after `://` and truncates. Operators may accidentally paste `postgres://user:password@host/db` into `ATOMIC_AGENTS_POLICY_BACKEND` or pass a credentialed URL to the factory; the error message MUST be safe to surface in `doctor` output and CI logs.
 
-7. **`PolicyDecision` event schema compliance.** Backends emitting `policy_decision` events (PR 3 onwards) MUST use the schema in §"Policy decision event schema" above without extending field semantics. Custom backend-specific fields MAY be added in an `extra` dict if needed for backend-internal debugging, but the canonical fields keep their canonical semantics. SaaS adapters MUST emit events that the dashboard's `policy_decision` filter can parse uniformly.
+7. **`PolicyDecision` event schema compliance.** Backends emitting `policy_decision` events MUST use the schema in §"Policy decision event schema" above without extending field semantics. Custom backend-specific fields MAY be added in an `extra` dict if needed for backend-internal debugging, but the canonical fields keep their canonical semantics. SaaS adapters MUST emit events that the dashboard's `policy_decision` filter can parse uniformly.
 
 The reference `FilesystemPolicyBackend` implementation in `atomic_agents/policy/filesystem.py` is the canonical example of this contract. Future Postgres / SaaS / org-admin-console adapters should mirror its shape; the conformance suite (`tests/test_policy_protocol_conformance.py`) parametrizes across registered backends so the contract is verified by the same tests that pin `get_effective_caps` / `is_tool_allowed` / `is_mcp_server_allowed` / `get_effective_model` / `capabilities` semantics.
 
@@ -296,8 +292,6 @@ The reference `FilesystemPolicyBackend` implementation in `atomic_agents/policy/
 
 This spec describes the **what** and the **where**. It does not pin:
 
-- **AtomicAgent wiring** — shipped in PR 2 of #89 (`AtomicAgent(..., policy_backend=...)` kwarg + per-runner kwargs + `doctor.check_policy_backend` + delegate threading per D1).
-- **Consumption logic** — shipped in PR 3a / PR 3b of #89 (`_check_cost_guardrails` MIN composition, `MandateCheck` steps 7-9 pre-composed cap consumption, tool dispatch site, MCP discovery site, model-selection site, and `policy_decision` event emission). PR 4 (this lock) flipped the `ATOMIC_AGENTS_POLICY_ENFORCE_NONCAP` default from `false` to `true` so non-cap surfaces enforce by default. Cost caps have always enforced immediately (PR 3a) and ignore this flag.
 - **Strict-mode capability flag** (D4 locked "don't expose in v1"). If compliance-shaped deployments demand explicit strict-mode audit posture later, retrofit `PolicyCapabilities.strict_mode` as an additive change.
 - **`is_model_allowed(model_name) -> bool`** — model-selection allowlist semantics deferred. Current `get_effective_model() -> str | None` covers the override case; allowlist is additive.
 - **Spec-defined model-compatibility families** — `get_effective_model()` override compatibility is operator-owned (D9 fold #2); framework does not enforce.
@@ -313,8 +307,8 @@ This spec describes the **what** and the **where**. It does not pin:
 - `docs/spec/17-tools.md` — `tools.md` (per-agent tool allowlists composed with Policy)
 - `docs/spec/19-mcp.md` — `mcp.md` (per-agent MCP server lists composed with Policy)
 - `docs/spec/22-log-backend.md` — `LogBackend` (the `policy_decision` event family flows here)
-- `docs/spec/27-doctor.md` — extended with `check_policy_backend` in PR 2
-- `docs/spec/28-judge-layer.md` — judge layer (MandateCheck consumes pre-composed caps in PR 3)
+- `docs/spec/27-doctor.md` — extended with `check_policy_backend`
+- `docs/spec/28-judge-layer.md` — judge layer (MandateCheck consumes pre-composed caps)
 - `docs/spec/29-mandates.md` — Mandate primitive (sibling boundary; both denials emit the unified `policy_decision` event)
 - `~/.gstack/projects/dep0we-atomic-agents-stack/dep0we-main-design-20260519-084540.md` — locked scope-design + /plan-eng-review output with 11 decisions + 14 plan-subagent prep findings
 - #89 — the umbrella issue

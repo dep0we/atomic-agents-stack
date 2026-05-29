@@ -7,7 +7,7 @@
 > Pre-implementation design amendments (recorded 2026-05-17, pre-PR-1; preserved as historical record of how the spec reached its final shape):
 > - `MandateBackend` Protocol added (§"Implementer contract for mandate backends" below) — the framework ships mandates via a Protocol seam from day 1, with `FilesystemMandateBackend` as the only reference impl in v1. Future SaaS / mobile / Slack-bot adapters slot in via `register_mandate_backend(...)` without forking core (per /office-hours Option 2 decision: build the seam upfront, don't retrofit later).
 > - `target_extractor` is a named per-agent registry, NOT a `Callable` field on `ToolDefinition` (per /plan-eng-review finding — `Callable` fields cannot satisfy spec/25 MUST #4 Tier B round-trip).
-> - State persistence is a `MandateBackend.read_state`/`write_state` Protocol contract (NOT a filesystem-path contract). State carries `schema_version: 1` from PR 3a onward.
+> - State persistence is a `MandateBackend.read_state`/`write_state` Protocol contract (NOT a filesystem-path contract). State carries `schema_version: 1`.
 > - Suspicious-rebind throttle (60s default) closes the source-hash-before-state edit window for prompt-injection-style threats.
 > - `BLOCK` reason naming is forever-stable; PR/version identifiers do NOT leak into JSONL audit reasons.
 > - `mandate_cap_exceeded_block` events carry `contributing_reservation_ids` + `reconcile_cli_hint` so operators see WHY they're blocked, not just THAT they are.
@@ -423,11 +423,7 @@ The state shape extends per §"Lifecycle event deduplication" below:
 }
 ```
 
-PR 3a writes `schema_version: 1` with `throttles` present (empty `{}` when no throttle active). PR 3b extends with a separate `"reservation_orphans"` key under the same `schema_version: 1` (backward-compatible additive). Schema bump to 2 only if a field type changes. Operator-edited revoke that lands cleanly removes the corresponding entry from `throttles` on next state read (transition-only dedup logic).
-
-### Validation step split between PR 3a and PR 3b (implementation discipline)
-
-Per the #124 PR 3 split decision (/office-hours + /plan-eng-review 2026-05-17): PR 3a ships validation steps 1-6 (existence, source hash, state, tool allowlist, target allowlist, time window). PR 3b ships validation steps 7-9 (token budget, external budget, escalation thresholds). **Step 9 belongs in PR 3b** because escalation thresholds operate on the projected costs from steps 7+8 — step 9 cannot evaluate without 7+8 in place. PR 3a stubs steps 7-9 to fail-closed: any mandate with a `*_budget_usd` cap returns `BLOCK` with reason `mandate_budget_check_unavailable` (NOT `mandate_budget_check_unavailable_in_3a` — JSONL audit reasons are forever-stable and MUST NOT leak PR identifiers). The temporary cause is documented in the PR 3a CHANGELOG entry; the reason field stays stable across the eventual 3b unlock.
+State carries `schema_version: 1`. `throttles` is always present (empty `{}` when no throttle active) and `"reservation_orphans"` is a separate key under the same `schema_version: 1` (backward-compatible additive). Schema bump to 2 only if a field type changes. Operator-edited revoke that lands cleanly removes the corresponding entry from `throttles` on next state read (transition-only dedup logic).
 
 ### BLOCK reason naming discipline (general)
 
@@ -637,7 +633,7 @@ Every mandate state transition writes a JSONL event tied to the agent's run log 
 | `mandate_reservation` / `_committed` / `_rolled_back` / `_expired` / `_committed_on_recovery` / `_external_unverified` | Per cost reservation pattern above | per-event fields documented above |
 | `mandate_id_collision` | Load-time collision between project-root and per-agent files (per-agent entry refused) | `mandate_id`, both source paths, resolution outcome |
 | `mandate_unconstrained_loaded` | A mandate with `constraints.unconstrained: true` is loaded | `mandate_id`, `unconstrained_justification` (operator-supplied) |
-| `mandate_action_verified` | Post-action verification (PR 3b) — fires for action classes `external_side_effect` + `irreversible` after tool handler returns. Target extracted from the tool result matches the `target_canonical` recorded at proposal time, OR pre-extraction returned None AND post-extraction yields a target inside `constraints.allowed_targets`. | `mandate_id`, `proposal_id`, `tool_name`, `target_canonical_at_proposal: str \| null`, `target_canonical_at_execution: str \| null`, `verification_status: "match"`, `ts` |
+| `mandate_action_verified` | Post-action verification — fires for action classes `external_side_effect` + `irreversible` after tool handler returns. Target extracted from the tool result matches the `target_canonical` recorded at proposal time, OR pre-extraction returned None AND post-extraction yields a target inside `constraints.allowed_targets`. | `mandate_id`, `proposal_id`, `tool_name`, `target_canonical_at_proposal: str \| null`, `target_canonical_at_execution: str \| null`, `verification_status: "match"`, `ts` |
 | `mandate_action_diverged` | Post-action verification — pre-extraction yielded a target, post-extraction yielded a different target. Surfaces actor mis-execution (deliberate or accidental). | Same fields as `mandate_action_verified`; `verification_status: "diverged"`; doctor surfaces via `check_mandate_action_divergence`. |
 | `mandate_action_verification_unavailable` | Post-action verification — pre AND post extraction both returned None (no extractor matched the tool's argument shape, in either direction). Best-effort no-op event so audit readers see "the framework tried but couldn't compare." Common for tools without a registered `target_extractor_id` + no heuristic match. | Same fields; `verification_status: "unavailable"`. Plan-subagent PR 3b Risk I — pre-decided shape so implementer doesn't ad-hoc this and pick the wrong default. |
 
@@ -669,7 +665,7 @@ State shape (returned by `read_state`, accepted by `write_state`):
 }
 ```
 
-**`schema_version: 1` is mandatory from PR 3a onward.** PR 3b extends the state shape with reservation-orphan fields; readers MUST consult `schema_version` and treat unknown versions as a forward-incompat error (raise `MandateStateSchemaUnsupported`). This mirrors the spec/22/24/25 schema_version discipline — silent migrations are the failure shape `INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1')` closes everywhere else.
+**`schema_version: 1` is mandatory.** The state shape carries reservation-orphan fields under the same `schema_version: 1`; readers MUST consult `schema_version` and treat unknown versions as a forward-incompat error (raise `MandateStateSchemaUnsupported`). This mirrors the spec/22/24/25 schema_version discipline — silent migrations are the failure shape `INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1')` closes everywhere else.
 
 On each load:
 
@@ -762,7 +758,7 @@ The `mandate_source_hash` field is added to spec/28's `ProposalBinding`-equivale
 
 ### Concurrent state writes — eventual-consistency boundary
 
-The lifecycle event dedup pattern (`read_state → compute transitions → write_state`) is a read-modify-write that the `MandateBackend` Protocol does NOT atomically guard at the protocol level. Within a single agent process, PR 3a serializes via a `threading.Lock` on the `MandateCheck` instance's per-scope state computation (cheap; matches the framework's "JSONL append is atomic enough" pattern). Across agent processes sharing a project-root mandate, concurrent state writes can race — one transition may be lost. This is documented as an eventual-consistency limitation; the doctor's `check_mandate_state_inconsistent_followed_by_revoked` surfaces sequences where a later read recovers the missed transition. Operators needing strict cross-process atomicity at the state-file layer must use a SQL-backed `MandateBackend` (post-#124 arc) or accept the limitation. Plan-subagent PR 3a Risk D.
+The lifecycle event dedup pattern (`read_state → compute transitions → write_state`) is a read-modify-write that the `MandateBackend` Protocol does NOT atomically guard at the protocol level. Within a single agent process, the framework serializes via a `threading.Lock` on the `MandateCheck` instance's per-scope state computation (cheap; matches the framework's "JSONL append is atomic enough" pattern). Across agent processes sharing a project-root mandate, concurrent state writes can race — one transition may be lost. This is documented as an eventual-consistency limitation; the doctor's `check_mandate_state_inconsistent_followed_by_revoked` surfaces sequences where a later read recovers the missed transition. Operators needing strict cross-process atomicity at the state-file layer must use a SQL-backed `MandateBackend` (post-#124 arc) or accept the limitation. Plan-subagent PR 3a Risk D.
 
 ## Operator CLI
 
@@ -811,7 +807,7 @@ This means: even a malicious actor with a write-capable tool cannot edit `mandat
 
 ## Implementer contract for mandate backends
 
-A backend that implements the `MandateBackend` Protocol commits to the contract below. The reference `FilesystemMandateBackend` (markdown + JSON state) ships in #124 PR 1; future SaaS / database / mobile / Slack-bot adapters slot in via `register_mandate_backend(...)` without forking core. Mirrors the spec/22/24/25 Implementer contract patterns.
+A backend that implements the `MandateBackend` Protocol commits to the contract below. The reference `FilesystemMandateBackend` (markdown + JSON state) is the only reference impl in v1; future SaaS / database / mobile / Slack-bot adapters slot in via `register_mandate_backend(...)` without forking core. Mirrors the spec/22/24/25 Implementer contract patterns.
 
 **Implementers MUST:**
 

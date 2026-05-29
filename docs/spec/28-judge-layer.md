@@ -6,15 +6,15 @@
 >
 > Related backends: PolicyBackend (#89), LLMBackend (#87), LogBackend (#61)
 
-## Lock criterion (PR 4)
+## Lock criterion
 
-Per CLAUDE.md rule #10 ("the spec is the product"), spec/28 locks when:
+Per CLAUDE.md rule #10 ("the spec is the product"), spec/28 is locked because:
 
 1. A reference implementation ships in the codebase (`atomic_agents/judge/`).
 2. A conformance suite asserts the documented invariants (`tests/test_judge_protocol_conformance.py`, ~37 tests covering the invariants enumerated in §"Conformance suite" below).
-3. Drift between spec and shipped behavior is folded into the canonical text (PR 4 stripped the per-PR-lock-in markers PR 3a/3b/3c accumulated).
+3. Drift between spec and shipped behavior is folded into the canonical text.
 
-The original RFC convention (`Status: **RFC**` banner + "RFC vs locked spec" preface) is removed at lock. Drift from the locked spec is a follow-up issue per rule #10, not a spec edit.
+The original RFC convention (`Status: **RFC**` banner + "RFC vs locked spec" preface) was removed at lock. Drift from the locked spec is a follow-up issue per rule #10, not a spec edit.
 
 ## Overview
 
@@ -280,7 +280,7 @@ Revise is the empirically most-useful outcome for production failure modes that 
 
 The `validation:` top-level field in `judges.md` gates how the framework validates amended `tool_arguments` before executing the bound action. The gate is on the parsed config — NOT on whether `jsonschema` happens to be importable in the runtime — so operators with the package pulled in by an unrelated dependency do not see strict validation kick in without explicit opt-in.
 
-**Modes.** Two values ship in PR 5b; `audit` and `paranoid` namespaces are reserved (see below):
+**Modes.** Two values are accepted; `audit` and `paranoid` namespaces are reserved (see below):
 
 | `validation:` | Behavior                                                                                                                                                                                                                  |
 |---------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -376,7 +376,7 @@ The framework writes PENDING; the operator (or an authorized service) writes a r
 
 If two resolution blocks are present, the *first* one (top-down in file order) wins; the file's `state` field is the authoritative state. Operators editing concurrently are responsible for not stomping each other; the framework does not attempt to merge conflicting resolutions. The doctor (`spec/27`) gains `check_escalation_conflicts` to surface files with multiple resolution blocks.
 
-**Operator-revise semantics (PR 3c).** When the operator writes `### Revised by <op>`, the framework parses the embedded `amendment:` YAML block into a `ProposalAmendment`, applies it to the PENDING file's `ActionProposal`, re-validates (tool registered, args dict-shaped, args_hash recomputes, write-path enforcement), and **gates on the recomputed classification** (NOT the original). For `high_risk` actions the framework runs a fresh judgment cycle through the ensemble before executing. For non-`high_risk` actions, schema/policy validation alone is sufficient. The `re_judged: bool` audit field on the executed event reports whether the ensemble re-ran. **`re_judged` is framework-set, not operator-supplied** — operators express intent via the amendment; the framework decides whether re-judge is needed based on the AMENDED class. This means an operator who swaps `tool_name` to upgrade `reversible_write` → `high_risk` (or `delete_files` etc.) cannot skip the re-judge by phrasing the original proposal as a lower class.
+**Operator-revise semantics.** When the operator writes `### Revised by <op>`, the framework parses the embedded `amendment:` YAML block into a `ProposalAmendment`, applies it to the PENDING file's `ActionProposal`, re-validates (tool registered, args dict-shaped, args_hash recomputes, write-path enforcement), and **gates on the recomputed classification** (NOT the original). For `high_risk` actions the framework runs a fresh judgment cycle through the ensemble before executing. For non-`high_risk` actions, schema/policy validation alone is sufficient. The `re_judged: bool` audit field on the executed event reports whether the ensemble re-ran. **`re_judged` is framework-set, not operator-supplied** — operators express intent via the amendment; the framework decides whether re-judge is needed based on the AMENDED class. This means an operator who swaps `tool_name` to upgrade `reversible_write` → `high_risk` (or `delete_files` etc.) cannot skip the re-judge by phrasing the original proposal as a lower class.
 
 If the framework's re-judge returns BLOCK, the action is refused; the audit record carries `enforcement_action="operator_revise_executed"` with `re_judged: true` on the re-judge event chain but **no `escalation_operator_revise_executed` audit line** for the action itself (refusal is the outcome). Invalid amendments (missing YAML block, malformed YAML, unknown fields, tool not registered) emit `enforcement_action="operator_revise_invalid_amendment"` and refuse execution.
 
@@ -823,7 +823,7 @@ auto_decide_after_seconds: 86400
 # Single-policy form (applied to every ActionClass):
 fallback_on_timeout: block
 
-# OR per-class form (PR 5a of #112) — ``default`` is REQUIRED:
+# OR per-class form — ``default`` is REQUIRED:
 # fallback_on_timeout:
 #   default: block
 #   high_risk: block
@@ -923,28 +923,28 @@ Each judgment writes a JSONL line to the run log, carrying `parent_run_id` linki
 
 `raw_outcome` is what the judge returned. `enforcement_action` is what the framework did with that outcome — they differ on `read_audit_mode` (judge can return BLOCK but framework executes), on operator escalation overrides, and on failure_policy resolutions. This lets the dashboard count "judge would have blocked but read-audit bypassed" distinctly from "judge allowed and we executed" — which Round 2 caught as indistinguishable in the v1 audit shape.
 
-**Enforcement-action enum.** The v1 spec listed five values (`audit_bypass`, `block_executed`, `allow_executed`, `revise_executed`, `escalate_pending`). Reference-implementation work since extended the enum:
+**Enforcement-action enum.** The full set of values:
 
-- `allow_pending_next_judge` (PR 2b ensemble) — a judge in a multi-judge ensemble ALLOWed, but subsequent judges have not yet voted. Promoted to `allow_executed` on the LAST event when the ensemble's overall verdict is ALLOW. Intermediate ALLOWs stay `allow_pending_next_judge`.
-- `approved_executed` (PR 3b) — operator wrote `### Approved by <op>` to a PENDING file; framework re-verified `tool_definition_hash`; executed the bound action.
-- `approved_stale_tool_definition` (PR 3b) — operator wrote Approved but the tool's `input_schema` / handler changed since PENDING-write. Refused execution; PENDING file preserved.
-- `denied` (PR 3b) — operator wrote `### Denied by <op>` to a PENDING file. No execution.
-- `redacted` (PR 3b) — operator wrote `### Redacted by <op>` to a PENDING file (body redacted, frontmatter preserved). No execution.
-- `auto_decided_block` / `auto_decided_allow` (PR 3b) — `auto_decide_after_seconds` elapsed; framework applied `fallback_on_timeout` policy from `judges.md`. The CAS write detects operator-edit races and defers to the operator on conflict.
-- `proposal_body_tampered` (PR 3b) — operator edited the `## Proposal` body of a PENDING file between write and resolution. Framework recomputes `arguments_hash` from the body's tool_arguments and refuses execution on mismatch. Action is treated as denied; PENDING file preserved in audit trail.
-- `revise_pending_second_judgment` (PR 3c) — a judge in the ensemble returned `Judgment(outcome=REVISE, amendment=...)`; the framework has built the amended proposal and is about to recurse with `revise_iteration=1`. This event records the FIRST judgment's REVISE intent. The second-judgment event chain follows and replaces this with `revise_executed` (action ran) or `revise_loop_exhausted_blocked` (second judgment also REVISEd).
-- `revise_invalid_amendment` (PR 3c) — judge advertised REVISE but the amendment failed validation (no `amendment` payload, unknown tool, args not a dict, args_hash recompute failed, write-path violation). Action refused; second judgment NOT run.
-- `revise_loop_exhausted_blocked` (PR 3c) — the second judgment returned REVISE again. Per spec/28:276, `max_revise_iterations=1`. Action refused; reason carries `revise_loop_exhausted`.
-- `operator_revise_executed` (PR 3c) — operator wrote `### Revised by <op>` to a PENDING file with an embedded amendment YAML. Framework parsed + validated + (for high_risk) re-judged → executed. Audit field `re_judged: bool` records whether the re-judge ran (true on high_risk, false on lower classes).
-- `operator_revise_invalid_amendment` (PR 3c) — operator's Revised block had no embedded amendment YAML, malformed YAML, unknown fields, or the amendment failed validation. Action refused.
+- `allow_pending_next_judge` — a judge in a multi-judge ensemble ALLOWed, but subsequent judges have not yet voted. Promoted to `allow_executed` on the LAST event when the ensemble's overall verdict is ALLOW. Intermediate ALLOWs stay `allow_pending_next_judge`.
+- `approved_executed` — operator wrote `### Approved by <op>` to a PENDING file; framework re-verified `tool_definition_hash`; executed the bound action.
+- `approved_stale_tool_definition` — operator wrote Approved but the tool's `input_schema` / handler changed since PENDING-write. Refused execution; PENDING file preserved.
+- `denied` — operator wrote `### Denied by <op>` to a PENDING file. No execution.
+- `redacted` — operator wrote `### Redacted by <op>` to a PENDING file (body redacted, frontmatter preserved). No execution.
+- `auto_decided_block` / `auto_decided_allow` — `auto_decide_after_seconds` elapsed; framework applied `fallback_on_timeout` policy from `judges.md`. The CAS write detects operator-edit races and defers to the operator on conflict.
+- `proposal_body_tampered` — operator edited the `## Proposal` body of a PENDING file between write and resolution. Framework recomputes `arguments_hash` from the body's tool_arguments and refuses execution on mismatch. Action is treated as denied; PENDING file preserved in audit trail.
+- `revise_pending_second_judgment` — a judge in the ensemble returned `Judgment(outcome=REVISE, amendment=...)`; the framework has built the amended proposal and is about to recurse with `revise_iteration=1`. This event records the FIRST judgment's REVISE intent. The second-judgment event chain follows and replaces this with `revise_executed` (action ran) or `revise_loop_exhausted_blocked` (second judgment also REVISEd).
+- `revise_invalid_amendment` — judge advertised REVISE but the amendment failed validation (no `amendment` payload, unknown tool, args not a dict, args_hash recompute failed, write-path violation). Action refused; second judgment NOT run.
+- `revise_loop_exhausted_blocked` — the second judgment returned REVISE again. Per spec/28:276, `max_revise_iterations=1`. Action refused; reason carries `revise_loop_exhausted`.
+- `operator_revise_executed` — operator wrote `### Revised by <op>` to a PENDING file with an embedded amendment YAML. Framework parsed + validated + (for high_risk) re-judged → executed. Audit field `re_judged: bool` records whether the re-judge ran (true on high_risk, false on lower classes).
+- `operator_revise_invalid_amendment` — operator's Revised block had no embedded amendment YAML, malformed YAML, unknown fields, or the amendment failed validation. Action refused.
 
-**`synthesis_source`** (PR 3b) — set when the framework, not a real judge, produced the ESCALATE outcome. Values: `"class_policy"` (operator's `class_policy.<X>=escalate` fired without ensemble), `"failure_policy"` (a judge raised an exception mapped to escalate via `failure_policy`), `null` (a real judge returned ESCALATE). This lets dashboards distinguish judge-driven escalations from framework-synthesized ones.
+**`synthesis_source`** — set when the framework, not a real judge, produced the ESCALATE outcome. Values: `"class_policy"` (operator's `class_policy.<X>=escalate` fired without ensemble), `"failure_policy"` (a judge raised an exception mapped to escalate via `failure_policy`), `null` (a real judge returned ESCALATE). This lets dashboards distinguish judge-driven escalations from framework-synthesized ones.
 
-**`triggered_by`** (PR 3b) — populated for failure_policy synthesis only. Value: `"failure_policy:<ExceptionName>"`. Operators auditing a stall caused by `JudgeUnavailable: backend timeout` see exactly which exception class drove the escalate.
+**`triggered_by`** — populated for failure_policy synthesis only. Value: `"failure_policy:<ExceptionName>"`. Operators auditing a stall caused by `JudgeUnavailable: backend timeout` see exactly which exception class drove the escalate.
 
-**`escalation_queue_id`** (PR 3b) — populated when the event's outcome is `escalate` or when a resolution event links back to a PENDING file. Equals the `proposal_id` (which doubles as the queue key — the framework does not mint a separate ID).
+**`escalation_queue_id`** — populated when the event's outcome is `escalate` or when a resolution event links back to a PENDING file. Equals the `proposal_id` (which doubles as the queue key — the framework does not mint a separate ID).
 
-**`Response.deferred` semantics** (PR 3b). `agent.call()` returns `Response(deferred=True, escalation_queue_ids=[id1, id2, ...])` when any tool_use in the actor's assistant turn produces an ESCALATE outcome. The list (not a singular id) accommodates the case where one turn proposes multiple actions, of which two or more escalate. ALLOWed tool_uses in the same turn still execute and their results land in `Response.tool_calls`; the multi-turn loop terminates immediately after the iteration (no follow-up LLM call to close out the partial state). Operator resolution of the PENDING file does NOT replay the result to the original actor — execution is terminal, with `cost_source="actor"` keeping the spend on the proposing run's ledger.
+**`Response.deferred` semantics.** `agent.call()` returns `Response(deferred=True, escalation_queue_ids=[id1, id2, ...])` when any tool_use in the actor's assistant turn produces an ESCALATE outcome. The list (not a singular id) accommodates the case where one turn proposes multiple actions, of which two or more escalate. ALLOWed tool_uses in the same turn still execute and their results land in `Response.tool_calls`; the multi-turn loop terminates immediately after the iteration (no follow-up LLM call to close out the partial state). Operator resolution of the PENDING file does NOT replay the result to the original actor — execution is terminal, with `cost_source="actor"` keeping the spend on the proposing run's ledger.
 
 The parent run record rolls up judgments inline (same shape as `helper_provenance`, `delegations`, `tool_calls`), so a single read of the agent's run record shows everything the actor and judge did, together.
 
@@ -1040,9 +1040,9 @@ These are *genuinely* below the threshold of needing resolution before implement
 1. **Should there be a per-tool budget override?** Today `judges.md` declares an agent-level budget. Operators may want a per-class budget (`high_risk` gets $X/month; everything else shares $Y). **Tentative**: per-class budgets in `judges.md` v2.
 2. **How does the judge interact with the dream pipeline?** Dreams run outside `agent.call()` and may produce capture markers without the runtime's tool-use loop. **Tentative**: dream pipeline reuses the same `judge_captures` switch from `judges.md`; the dream runner respects it identically to the live runtime.
 
-## Conformance status (PR 4)
+## Conformance status
 
-`tests/test_judge_protocol_conformance.py` ships ~37 tests covering the invariants enumerated in §"Conformance suite" above plus the PR 3a/3b/3c state-machine additions. The suite parametrizes over the two shipped JudgeBackends:
+`tests/test_judge_protocol_conformance.py` ships ~37 tests covering the invariants enumerated in §"Conformance suite" above plus the ESCALATE + REVISE state-machine additions. The suite parametrizes over the two shipped JudgeBackends:
 
 - `PolicyJudge` (rule engine; offline; runs every invariant except the LLM-only canary).
 - `LLMJudgeBackend` wired to a deterministic `_StubLLMBackend` (offline; runs every invariant including the UUID-canary serialization assertion for `JudgeRuntimeConfig` non-leakage).
@@ -1052,7 +1052,7 @@ Coverage map:
 - **Framework-side** (run once): hash determinism + sensitivity, project-floor non-relaxable, atomic-snapshot semantics, ESCALATE state machine (O_EXCL sidecar, body integrity, strict resolution-block parser, auto-decide CAS), REVISE state machine (`amend_proposal` recomputes classification, `JudgeAmendedProposalRejected` on schema-invalid).
 - **Per-backend** (parametrized): Protocol surface (`isinstance`), `evaluate` idempotency, `policy_version` changes on policy change, `policy_version` is non-sentinel, `judge_id` stable, `close()` idempotent, `supports_read_audit` + `supports_specialist_composition` return bools, `supported_outcomes` returns the canonical set.
 - **LLM-only**: latency-bounded timeout → `JudgeUnavailable`; concurrent-call connection-state integrity; UUID-canary assertion that `JudgeRuntimeConfig` fields never appear in the serialized LLM prompt.
-- **Deferred** (filed as follow-up issues): judge_budget_counter live state (not implemented). Full JSON-Schema validation of amended `tool_arguments` ships in PR 5b under the opt-in `[validation]` extra — see [Schema validation](#schema-validation) above for the parser surface, exception taxonomy, and load-time gating semantics.
+- **Deferred** (filed as follow-up issues): judge_budget_counter live state (not implemented). Full JSON-Schema validation of amended `tool_arguments` is gated behind the opt-in `[validation]` extra — see [Schema validation](#schema-validation) above for the parser surface, exception taxonomy, and load-time gating semantics.
 
 The conformance suite is reusable by third-party `JudgeBackend` implementations: importing the fixtures + invariant tests into a downstream package exercises any registered backend.
 
