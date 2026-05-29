@@ -151,9 +151,9 @@ def run_doctor(
     if agent_name is None:
         # Order matches run_doctor()'s actual execution sequence below
         # (lock-backend → log-backend → profile-backend →
-        # tool-registry-backend → policy-backend → memory-backend) so
-        # contributors adding a scope-level backend check see the SKIP
-        # enumeration mirror reality.
+        # tool-registry-backend → mandate-backend → policy-backend →
+        # memory-backend) so contributors adding a scope-level backend
+        # check see the SKIP enumeration mirror reality.
         for n in (
             "vault",
             "provider-keys",
@@ -162,6 +162,7 @@ def run_doctor(
             "locks",
             "profile-backend",
             "tool-registry-backend",
+            "mandate-backend",
             "policy-backend",
             "memory-backend",
             "write-paths",
@@ -217,6 +218,7 @@ def run_doctor(
     results.append(check_log_backend(agent_root))
     results.append(check_agent_profile_backend(resolved_root))
     results.append(check_tool_registry_backend(agent_root))
+    results.append(check_mandate_backend(resolved_root))
     # Pass cascade so check_policy_backend can warn when the backend is
     # scoped to agents_root instead of cascade.project_root (fix #236).
     results.append(check_policy_backend(resolved_root, cascade=cascade))
@@ -1670,6 +1672,260 @@ def check_tool_registry_backend(agent_root: Path) -> CheckResult:
         message=(
             f"{backend_id} backend ok ({tool_count} tool"
             f"{'' if tool_count == 1 else 's'} discovered)"
+        ),
+        detail=detail,
+    )
+
+
+def check_mandate_backend(scope_root: Path) -> CheckResult:
+    """Operator-config coherence check for the mandate backend (#124 PR 2).
+
+    Validates that ``ATOMIC_AGENTS_MANDATE_BACKEND`` (plus
+    ``ATOMIC_AGENTS_MANDATE_BACKEND_URL`` when non-filesystem) is
+    correctly configured. Scoped at ``scope_root`` (not ``agent_root``)
+    because the mandate backend is two-tier scope-aware — project-level
+    ``<scope_root>/mandates.md`` plus per-agent ``<scope_root>/<agent>/mandates.md``.
+    The doctor check verifies the backend constructs and probes cleanly at
+    scope_root; the actual two-tier descriptor resolution at runtime is the
+    backend's job via the ``scope`` parameter on ``list_mandates``.
+
+    The check passes ``scope="project:doctor"`` as the lightweight probe
+    so it inspects project-root mandates only and never recurses into
+    per-agent dirs (per ``atomic_agents/mandate/filesystem.py::_mandates_path``
+    — project-kind scope discards the name component and resolves to
+    ``<scope_root>/mandates.md``).
+
+    PASS / WARN / FAIL ladder mirrors ``check_policy_backend`` /
+    ``check_persona_backend``:
+
+    * unset / ``filesystem`` → PASS with capability snapshot
+      (``supports_revocation``, ``supports_external_state_change_notification``,
+      ``durable``, ``supports_crash_recovery``) + ``mandate_count`` +
+      ``mandates_md_exists`` indicator. When ``mandates.md`` is absent at
+      ``scope_root``, emits WARN — agents under this scope have no
+      operator-granted authorities; this is informational so the operator
+      knows they haven't authored mandates yet (mirrors Policy's
+      ``policy_md_exists`` no-opinion WARN).
+    * unknown backend_id (typo in ``ATOMIC_AGENTS_MANDATE_BACKEND``) → FAIL
+      with the echoed env value redacted at ``://`` to prevent credential
+      leak if an operator pasted a URL into the id env var by mistake.
+    * non-filesystem id reachable + ``capabilities()`` / ``list_mandates()``
+      probe ok → PASS with capability snapshot + redacted URL in detail.
+    * non-filesystem id construction failure → FAIL (credentials dropped
+      from exception text to prevent leak in error-tracking services);
+      ``capabilities()`` / ``list_mandates()`` probe failure → WARN.
+
+    URL credential redaction follows the same urlparse + ``_replace``
+    pattern as ``check_policy_backend`` / ``check_persona_backend`` —
+    strips password AND username from netloc (covers token-as-username
+    URLs common with managed services).
+    """
+    from .exceptions import BackendNotRegistered
+    from .mandate import (
+        get_default_mandate_backend,
+        list_mandate_backends,
+    )
+
+    backend_id = (
+        os.environ.get("ATOMIC_AGENTS_MANDATE_BACKEND", "filesystem").strip().lower()
+    )
+
+    mandates_md_path = scope_root / "mandates.md"
+    # Project-root probe scope — name component is informational for
+    # project kind; the backend reads <scope_root>/mandates.md regardless
+    # of the trailing name (spec/29 + filesystem._mandates_path).
+    probe_scope = "project:doctor"
+
+    if backend_id == "filesystem":
+        try:
+            backend = get_default_mandate_backend(scope_root)
+            caps = backend.capabilities()
+            mandates = backend.list_mandates(probe_scope)
+        except Exception as exc:
+            return CheckResult(
+                name="mandate-backend",
+                status=FAIL,
+                message=(
+                    f"filesystem mandate backend probe raised "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                fix_hint=(
+                    f"Check that {scope_root} is readable and any "
+                    f"existing {mandates_md_path} parses cleanly. "
+                    "See docs/spec/29-mandates.md."
+                ),
+            )
+        mandates_md_exists = mandates_md_path.exists()
+        mandate_count = len(mandates)
+        detail: dict[str, Any] = {
+            "backend_id": "filesystem",
+            "supports_revocation": caps.supports_revocation,
+            "supports_external_state_change_notification": (
+                caps.supports_external_state_change_notification
+            ),
+            "durable": caps.durable,
+            "supports_crash_recovery": caps.supports_crash_recovery,
+            "mandate_count": mandate_count,
+            "mandates_md_exists": mandates_md_exists,
+            "resolved_path": str(mandates_md_path),
+        }
+        if not mandates_md_exists:
+            return CheckResult(
+                name="mandate-backend",
+                status=WARN,
+                message=(
+                    "filesystem backend ok but mandates.md absent — "
+                    "no operator-granted authorities at this scope"
+                ),
+                fix_hint=(
+                    f"Create {mandates_md_path} to declare operator-granted "
+                    "scoped authorities (durable, revocable). "
+                    "See docs/spec/29-mandates.md."
+                ),
+                detail=detail,
+            )
+        return CheckResult(
+            name="mandate-backend",
+            status=PASS,
+            message=(
+                f"filesystem backend ok ({mandate_count} mandate"
+                f"{'' if mandate_count == 1 else 's'} discovered)"
+            ),
+            detail=detail,
+        )
+
+    # Non-filesystem id selected — verify it's known to the registry
+    # BEFORE invoking the factory (lazy registrations of future
+    # backends — Postgres, SaaS, Slack-bot — slot in via list_mandate_backends).
+    known_ids = set(list_mandate_backends())
+    if backend_id not in known_ids:
+        # Redact the echoed value: if an operator accidentally pastes a
+        # credential-bearing URL into ATOMIC_AGENTS_MANDATE_BACKEND
+        # (instead of ATOMIC_AGENTS_MANDATE_BACKEND_URL), it carries a
+        # password. Strip anything past "://" and truncate at 32 chars —
+        # same shape as the redaction in check_persona_backend /
+        # check_tool_registry_backend.
+        from .mandate.backend import _redact_for_error_message as _redact_mid
+
+        safe_id = _redact_mid(backend_id)
+        return CheckResult(
+            name="mandate-backend",
+            status=FAIL,
+            message=(
+                f"ATOMIC_AGENTS_MANDATE_BACKEND={safe_id!r} is not "
+                f"a known backend. Known: {sorted(known_ids)}"
+            ),
+            fix_hint=(
+                "Set ATOMIC_AGENTS_MANDATE_BACKEND to one of the known "
+                "ids, or unset to use the filesystem default."
+            ),
+        )
+
+    # URL credential redaction — same urlparse + _replace pattern as
+    # check_policy_backend / check_persona_backend / check_log_backend.
+    # Redacts when EITHER password OR username is present — covers
+    # token-as-username URLs common with managed services.
+    url = os.environ.get("ATOMIC_AGENTS_MANDATE_BACKEND_URL")
+    safe_url: str | None = None
+    if url:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        if parsed.password or parsed.username:
+            netloc = parsed.hostname or ""
+            if parsed.port:
+                netloc = f"{netloc}:{parsed.port}"
+            safe_url = parsed._replace(netloc=netloc).geturl()
+        else:
+            safe_url = url
+
+    try:
+        backend = get_default_mandate_backend(scope_root)
+    except BackendNotRegistered:
+        return CheckResult(
+            name="mandate-backend",
+            status=FAIL,
+            message=f"mandate backend {backend_id!r} not registered",
+            fix_hint=(
+                f"The {backend_id!r} backend is reserved but its lazy "
+                "resolver failed. Unset ATOMIC_AGENTS_MANDATE_BACKEND to "
+                "use the filesystem default."
+            ),
+        )
+    except Exception:
+        # Drop the verbatim exception message — connection errors from
+        # backend constructors commonly embed the full URL with credentials.
+        return CheckResult(
+            name="mandate-backend",
+            status=FAIL,
+            message=f"mandate backend {backend_id!r} construction failed",
+            fix_hint=(
+                "Check ATOMIC_AGENTS_MANDATE_BACKEND and "
+                "ATOMIC_AGENTS_MANDATE_BACKEND_URL for typos. Run with "
+                "DEBUG logging to see the full exception."
+            ),
+        )
+
+    # Probe via capabilities() + list_mandates() — both lightweight,
+    # verify the backend is reachable + schema-healthy. Match the
+    # WARN-on-unreachable-probe pattern from sister checks.
+    try:
+        caps = backend.capabilities()
+        mandates = backend.list_mandates(probe_scope)
+    except Exception:
+        return CheckResult(
+            name="mandate-backend",
+            status=WARN,
+            message=(
+                f"operator-pinned backend {backend_id!r} configured "
+                "but capabilities() / list_mandates() probe failed"
+            ),
+            fix_hint=(
+                "Verify ATOMIC_AGENTS_MANDATE_BACKEND_URL is correct + "
+                "the backend is reachable from this host. Doctor warns "
+                "instead of failing — the framework runtime will fail "
+                "at first MandateCheck if the backend is truly down."
+            ),
+        )
+
+    mandates_md_exists = mandates_md_path.exists()
+    mandate_count = len(mandates)
+    detail = {
+        "backend_id": backend_id,
+        "supports_revocation": caps.supports_revocation,
+        "supports_external_state_change_notification": (
+            caps.supports_external_state_change_notification
+        ),
+        "durable": caps.durable,
+        "supports_crash_recovery": caps.supports_crash_recovery,
+        "mandate_count": mandate_count,
+        "mandates_md_exists": mandates_md_exists,
+        "resolved_path": str(mandates_md_path),
+    }
+    if safe_url is not None:
+        detail["url"] = safe_url
+
+    if not mandates_md_exists:
+        return CheckResult(
+            name="mandate-backend",
+            status=WARN,
+            message=(
+                f"{backend_id} backend ok but mandates.md absent — "
+                "no operator-granted authorities at this scope"
+            ),
+            fix_hint=(
+                f"Create {mandates_md_path} to declare operator-granted "
+                "scoped authorities (durable, revocable). "
+                "See docs/spec/29-mandates.md."
+            ),
+            detail=detail,
+        )
+    return CheckResult(
+        name="mandate-backend",
+        status=PASS,
+        message=(
+            f"{backend_id} backend ok ({mandate_count} mandate"
+            f"{'' if mandate_count == 1 else 's'} discovered)"
         ),
         detail=detail,
     )
