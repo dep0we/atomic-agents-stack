@@ -15,6 +15,11 @@ Usage:
     atomic-agents persona list-snapshots <persona_id>
     atomic-agents persona restore <persona_id> <snapshot_id>
     atomic-agents persona clone <source_id> <target_id>
+    atomic-agents corpus list --corpus wiki [--agent-root PATH]
+    atomic-agents corpus show NAME --corpus wiki [--agent-root PATH]
+    atomic-agents corpus query TEXT --corpus wiki [--top-k N] [--agent-root PATH]
+    atomic-agents corpus version NAME --corpus wiki [--agent-root PATH]
+    atomic-agents corpus restore NAME VERSION_ID --corpus wiki [--agent-root PATH]
 
 Subcommands:
     run     — Run an agent against a work item
@@ -26,6 +31,7 @@ Subcommands:
     doctor  — Preflight checks before scheduling an agent run
     review  — Cross-family adversarial code review (CLAUDE.md rule #11)
     persona — Manage persona records (list, show, snapshot, restore, clone)
+    corpus  — Inspect and manage corpus pages (list, show, query, version, restore)
 """
 
 from __future__ import annotations
@@ -285,6 +291,86 @@ def main(argv: list[str] | None = None) -> int:
         "target_id", help="destination persona_id (must not exist)"
     )
 
+    # ── corpus subcommand group ───────────────────────────────────────────
+    corpus_cmd = sub.add_parser(
+        "corpus",
+        help="Inspect and manage corpus pages (list, show, query, version, restore)",
+    )
+    corpus_sub = corpus_cmd.add_subparsers(dest="corpus_cmd", required=True)
+
+    # corpus list --corpus wiki [--agent-root PATH]
+    corpus_list = corpus_sub.add_parser(
+        "list", help="List all pages in the given corpus"
+    )
+    corpus_list.add_argument(
+        "--corpus", required=True, choices=["wiki", "raw"], help="corpus to query"
+    )
+    corpus_list.add_argument(
+        "--agent-root",
+        default=None,
+        help="override ATOMIC_AGENTS_AGENT_ROOT (default: $ATOMIC_AGENTS_AGENT_ROOT or cwd)",
+    )
+
+    # corpus show NAME --corpus wiki [--agent-root PATH]
+    corpus_show = corpus_sub.add_parser(
+        "show", help="Read and display a single corpus page"
+    )
+    corpus_show.add_argument("name", help="page name stem (e.g. avalanche-vs-snowball)")
+    corpus_show.add_argument(
+        "--corpus", required=True, choices=["wiki", "raw"], help="corpus to query"
+    )
+    corpus_show.add_argument(
+        "--agent-root",
+        default=None,
+        help="override ATOMIC_AGENTS_AGENT_ROOT (default: $ATOMIC_AGENTS_AGENT_ROOT or cwd)",
+    )
+
+    # corpus query TEXT --corpus wiki [--top-k N] [--agent-root PATH]
+    corpus_query = corpus_sub.add_parser(
+        "query", help="Search the corpus and list matching pages"
+    )
+    corpus_query.add_argument("text", help="search text")
+    corpus_query.add_argument(
+        "--corpus", required=True, choices=["wiki", "raw"], help="corpus to query"
+    )
+    corpus_query.add_argument(
+        "--top-k", type=int, default=10, help="maximum number of results (default: 10)"
+    )
+    corpus_query.add_argument(
+        "--agent-root",
+        default=None,
+        help="override ATOMIC_AGENTS_AGENT_ROOT (default: $ATOMIC_AGENTS_AGENT_ROOT or cwd)",
+    )
+
+    # corpus version NAME --corpus wiki [--agent-root PATH]
+    corpus_version = corpus_sub.add_parser(
+        "version", help="List all versions of a corpus page"
+    )
+    corpus_version.add_argument("name", help="page name stem")
+    corpus_version.add_argument(
+        "--corpus", required=True, choices=["wiki", "raw"], help="corpus to query"
+    )
+    corpus_version.add_argument(
+        "--agent-root",
+        default=None,
+        help="override ATOMIC_AGENTS_AGENT_ROOT (default: $ATOMIC_AGENTS_AGENT_ROOT or cwd)",
+    )
+
+    # corpus restore NAME VERSION_ID --corpus wiki [--agent-root PATH]
+    corpus_restore = corpus_sub.add_parser(
+        "restore", help="Restore a corpus page to a specific version"
+    )
+    corpus_restore.add_argument("name", help="page name stem")
+    corpus_restore.add_argument("version_id", help="version identifier (backend_id)")
+    corpus_restore.add_argument(
+        "--corpus", required=True, choices=["wiki", "raw"], help="corpus to query"
+    )
+    corpus_restore.add_argument(
+        "--agent-root",
+        default=None,
+        help="override ATOMIC_AGENTS_AGENT_ROOT (default: $ATOMIC_AGENTS_AGENT_ROOT or cwd)",
+    )
+
     args = parser.parse_args(argv)
 
     # `review` is a host-only subcommand — no agents-root needed (operates on
@@ -301,6 +387,11 @@ def main(argv: list[str] | None = None) -> int:
     # from the cwd. It does not need agents-root.
     if args.cmd == "persona":
         return _cmd_persona(args)
+
+    # `corpus` resolves its own agent_root from --agent-root or env var / cwd.
+    # It does not use the agents-root / agent-name hierarchy.
+    if args.cmd == "corpus":
+        return _cmd_corpus(args)
 
     agents_root = (
         Path(args.agents_root).expanduser().resolve()
@@ -758,6 +849,164 @@ def _persona_clone(backend, source_id: str, target_id: str) -> int:
     """Clone a persona record to a new persona_id."""
     backend.clone(source_id, target_id)
     print(f"Cloned persona {source_id!r} -> {target_id!r}.")
+    return 0
+
+
+def _resolve_corpus_agent_root(args) -> Path:
+    """Resolve the agent_root for corpus subcommands.
+
+    Resolution order (mirrors persona subcommand's scope_root pattern):
+    1. ``--agent-root`` CLI flag (explicit wins).
+    2. ``ATOMIC_AGENTS_AGENT_ROOT`` env var.
+    3. Current working directory (``Path.cwd()``).
+    """
+    import os
+
+    if args.agent_root is not None:
+        return Path(args.agent_root).expanduser().resolve()
+    env_val = os.environ.get("ATOMIC_AGENTS_AGENT_ROOT")
+    if env_val:
+        return Path(env_val).expanduser().resolve()
+    return Path.cwd()
+
+
+def _cmd_corpus(args) -> int:
+    """Dispatch corpus subcommands.
+
+    All corpus subcommands instantiate ``FilesystemCorpusBackend(agent_root)``
+    directly (PR 1 filesystem-only path). The env-var resolver
+    ``get_default_corpus_backend`` is wired at PR 3; PR 1 uses direct
+    instantiation.
+
+    Exit codes: 0 on success, 1 on any error (CorpusError, OSError,
+    PermissionError, etc.). Errors go to stderr; normal output to stdout.
+    Zero LLM calls — pure local I/O.
+    """
+    from .corpus.filesystem import FilesystemCorpusBackend
+    from .exceptions import CorpusError
+
+    agent_root = _resolve_corpus_agent_root(args)
+    backend = FilesystemCorpusBackend(agent_root)
+    corpus_cmd = args.corpus_cmd
+
+    try:
+        if corpus_cmd == "list":
+            return _corpus_list(backend, args.corpus)
+        elif corpus_cmd == "show":
+            return _corpus_show(backend, args.name, args.corpus)
+        elif corpus_cmd == "query":
+            return _corpus_query(backend, args.text, args.corpus, args.top_k)
+        elif corpus_cmd == "version":
+            return _corpus_version(backend, args.name, args.corpus)
+        elif corpus_cmd == "restore":
+            return _corpus_restore(
+                backend, args.name, args.version_id, args.corpus, agent_root
+            )
+    except CorpusError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except (OSError, PermissionError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _corpus_list(backend, corpus: str) -> int:
+    """List all pages in the given corpus, one per line."""
+    refs = backend.list_pages(corpus)
+    if not refs:
+        print(f"No pages in {corpus}.")
+        return 0
+    for ref in refs:
+        ts = ref.last_modified.strftime("%Y-%m-%dT%H:%M:%SZ")
+        print(f"{ref.name}  ({ref.byte_size} bytes, {ts})")
+    return 0
+
+
+def _corpus_show(backend, name: str, corpus: str) -> int:
+    """Read and display a single corpus page (frontmatter header + body)."""
+    page = backend.read_page(name, corpus)
+    if page is None:
+        print(f"Page not found: {name}", file=sys.stderr)
+        return 1
+    ref = page.ref
+    # Print a frontmatter header block above the body
+    print(f"--- {name} ({corpus}) ---")
+    print(f"title:         {ref.title}")
+    if page.description is not None:
+        print(f"description:   {page.description}")
+    if page.type is not None:
+        print(f"type:          {page.type}")
+    if page.captured is not None:
+        print(f"captured:      {page.captured}")
+    if page.tags:
+        print(f"tags:          {', '.join(str(t) for t in page.tags)}")
+    if page.provenance is not None:
+        print(f"provenance:    {page.provenance}")
+    if page.confidence is not None:
+        print(f"confidence:    {page.confidence}")
+    if page.pinned:
+        print(f"pinned:        true")
+    ts = ref.last_modified.strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"last_modified: {ts}")
+    print(f"byte_size:     {ref.byte_size}")
+    print()
+    print(page.body)
+    return 0
+
+
+def _corpus_query(backend, text: str, corpus: str, top_k: int) -> int:
+    """Run a query against the corpus and print matching pages."""
+    refs = backend.query(text, corpus, top_k=top_k)
+    if not refs:
+        print(f"No matches for {text!r}")
+        return 0
+    for ref in refs:
+        print(f"{ref.name}  ({ref.byte_size} bytes)")
+    return 0
+
+
+def _corpus_version(backend, name: str, corpus: str) -> int:
+    """List all versions of a corpus page, newest first."""
+    version_refs = backend.list_versions(name, corpus)
+    if not version_refs:
+        print(f"No versions for {name!r}")
+        return 0
+    for vref in version_refs:
+        # backend_id format: "<corpus>/<stem>/<YYYYMMDDTHHMMSSffffffZ>_<8hex>.md"
+        # Parse a human-readable timestamp from the version filename portion
+        parts = vref.backend_id.split("/")
+        version_filename = parts[-1] if parts else vref.backend_id
+        # Strip .md suffix for display; timestamp is the prefix before "_"
+        version_stem = (
+            version_filename[:-3]
+            if version_filename.endswith(".md")
+            else version_filename
+        )
+        timestamp_part = (
+            version_stem.split("_")[0] if "_" in version_stem else version_stem
+        )
+        print(f"{vref.backend_id}  ({timestamp_part})")
+    return 0
+
+
+def _corpus_restore(
+    backend,
+    name: str,
+    version_id: str,
+    corpus: str,
+    agent_root: Path,
+) -> int:
+    """Restore a corpus page to a specific version."""
+    from .memory.backend import VersionRef
+
+    policy = WritePolicy(write_paths=[agent_root])
+    version_ref = VersionRef(backend_id=version_id)
+    backend.restore_version(name, corpus, version_ref, policy)
+    print(f"Restored {name!r} to version {version_id!r}")
     return 0
 
 
