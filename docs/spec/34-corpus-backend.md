@@ -774,16 +774,16 @@ Items considered and explicitly deferred, with rationale.
   - `atomic_write` usage (write fault injection verifies no partial state)
   - path-traversal refusal via `safe_resolve_under`
 
-**PR 2 (~35 total):**
+**PR 2 (~46 actual, 35 estimated):**
 
-SQLite-specific tests in `tests/test_corpus_sqlite_backend.py`. Covers:
+SQLite-specific tests in `tests/test_corpus_sqlite_backend.py`. The 11 tests above the original estimate cover Round 1 and Round 2 adversarial fix regressions (transaction discipline, FTS5 rollback, compensation logic, `top_k` validation, schema mismatch detection, `bool` input guard). Covers:
 - CRUD across both corpora
 - FTS5 query happy path / empty result / special-char input (FTS5 parse error handling)
 - Versioning under the hybrid storage shape (SQL row + on-disk body)
 - `read_version` when SQL row exists but body file missing (raises `CorpusVersionNotFound`)
 - WAL race under multi-thread contention (after `PRAGMA busy_timeout=5000` fix)
 - Cold-start under multi-process concurrent init (idempotent `INSERT OR IGNORE`)
-- URL factory + credential redaction across all 5 `ValueError` sites
+- URL factory + credential redaction across all 6 `ValueError` sites
 - corpus discriminator isolation (`WHERE corpus = ?` on every query)
 - Hybrid-storage half-failure (INSERT-first + atomic_write-on-success-only)
 
@@ -799,7 +799,7 @@ Wiring + regression tests in new and modified test files. Includes the 5 IRON RU
 
 Plus: per-runner kwargs, delegate threading (`_corpus_backend_was_explicit` flag), env var override, doctor PASS/WARN/FAIL, page-count cliff WARN, CLI SQLite-path activation.
 
-**Total arc: ~100 tests** (PR 1 ~35 + PR 2 ~35 + PR 3 ~30). This is the post-eng-review corrected count; the original ~70 estimate in issue #65 excluded PR 3 wiring tests.
+**Total arc: ~111 tests** (PR 1 ~35 + PR 2 ~46 actual + PR 3 ~30). The PR 2 overage relative to the original ~35 estimate is from adversarial fix regressions added in Round 1 and Round 2 reviews. The original arc estimate in issue #65 was ~70, which excluded PR 3 wiring tests; this is the post-eng-review corrected count updated with the PR 2 as-delivered figure.
 
 ---
 
