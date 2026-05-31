@@ -74,4 +74,5 @@ dev = [
     # ruff for lint + format. Dev-only; CI runs pytest, not ruff,
     # but contributors run `uv run ruff check` locally before /ship.
     "ruff>=0.15.13",
+    "pytest-cov>=7.1.0",
 ]

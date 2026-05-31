@@ -571,3 +571,137 @@ class PersonaCorrupted(PersonaError):
     its data cannot be interpreted. Operators need to repair or remove the
     corrupt record before the persona is usable.
     """
+
+
+# ──────────────────────────────────────────────────────────────────
+# CorpusBackend exceptions (spec/34 -- issue #65 PR 1 of 4)
+#
+# CorpusError and its subclasses live here (not in corpus/types.py)
+# per pre-impl prep finding M2 (Subagent 1, 2026-05-29): exception
+# hierarchy MUST mirror the PersonaError / JudgeError base-class pattern
+# with cross-module placement. CorpusBackendNotRegistered is raised by
+# get_corpus_backend(); CorpusInvalidName is raised by the filesystem
+# reference impl's _validate_corpus_name() at API boundary.
+
+
+class CorpusError(AtomicAgentsError):
+    """Base class for CorpusBackend subsystem errors (spec/34).
+
+    All CorpusBackend reference implementations raise subclasses of this
+    exception; operators may ``except CorpusError`` to catch the entire
+    corpus failure surface without enumerating individual subtypes.
+    Subclasses cover page-not-found, collision, precondition-failed,
+    version-not-found, invalid-name, backend-registry, embedding-provider,
+    and structural-corruption scenarios.
+    """
+
+
+class CorpusPageNotFound(CorpusError):
+    """``CorpusBackend.read_page(name, corpus)`` was called with a name
+    that does not exist in the specified corpus.
+
+    Raised by filesystem and SQLite reference impls when no page file or
+    SQL row matches ``(name, corpus)``. Also raised by
+    ``restore_version(name, corpus, version_ref, policy)`` and
+    ``snapshot(name, corpus)`` when the named page has been deleted before
+    the versioning operation completes.
+
+    Distinct from ``CorpusVersionNotFound`` -- this exception means the
+    current page itself is absent; the version history may still exist.
+    """
+
+
+class CorpusPageExists(CorpusError):
+    """``CorpusBackend.write_page()`` Case 4 collision: the page exists,
+    its content differs from the proposed write, and no
+    ``expected_content_sha256`` was supplied.
+
+    The backend refuses silent overwrites by default. Operators who want
+    to update an existing page must supply ``expected_content_sha256``
+    matching the current on-disk SHA-256 to opt into the CAS (compare-
+    and-swap) overwrite path. Without it, the backend raises this
+    exception so concurrent or accidental overwrites surface loudly
+    rather than destroying content silently.
+    """
+
+
+class CorpusPreconditionFailed(CorpusError):
+    """``CorpusBackend.write_page()`` Case 4 collision: the page exists,
+    its content differs, ``expected_content_sha256`` was provided, but the
+    supplied hash does not match the current on-disk content hash.
+
+    Mirrors ``MemoryPreconditionFailed`` at the equivalent CAS boundary in
+    MemoryBackend (spec/20:318). Indicates a concurrent write landed
+    between the caller's read and its write attempt; the caller should
+    re-read the page, re-derive the hash, and retry. The ``actual_sha256``
+    of the current on-disk content is included in the exception message to
+    assist triage.
+    """
+
+
+class CorpusVersionNotFound(CorpusError):
+    """``CorpusBackend.read_version(version_ref)`` could not access the
+    version body for the supplied ``VersionRef``.
+
+    Raised by the SQLite reference impl when the SQL snapshot row exists
+    but the on-disk body file is missing or unreadable under the hybrid
+    storage shape (SQL stores metadata; bodies live on disk). Also raised
+    by the filesystem reference impl when the ``.versions/`` snapshot file
+    has been externally deleted. The SQL row existing without a body is an
+    independent failure mode distinct from a page-not-found condition.
+    """
+
+
+class CorpusInvalidName(CorpusError):
+    """A ``name`` or ``corpus`` parameter failed charset or path-traversal
+    validation at the CorpusBackend API boundary.
+
+    Raised by ``_validate_corpus_name()`` in the filesystem reference impl
+    when ``name`` contains path-traversal sequences (``..``, ``/``),
+    control characters, a leading dot, or characters outside the allowed
+    charset ``[a-zA-Z0-9_.+@-]+`` (per pre-impl prep finding S1 --
+    mirrors Persona's ``_validate_persona_id`` pattern verbatim). Also
+    raised when ``corpus`` is not one of the allowed ``Literal["wiki",
+    "raw"]`` values.
+    """
+
+
+class CorpusBackendNotRegistered(CorpusError):
+    """``get_corpus_backend(backend_id)`` was called with an id that has
+    not been registered via ``register_corpus_backend(backend_id, cls)``.
+
+    Raised when operator config (``ATOMIC_AGENTS_CORPUS_BACKEND`` env var
+    or constructor kwarg) names a backend string that no implementation
+    has registered. Distinct from a page-not-found condition -- this
+    exception means the REGISTRY does not know the backend; the corpus
+    storage itself has not been contacted.
+    """
+
+
+class CorpusEmbeddingProviderUnavailable(CorpusError):
+    """The configured embedding provider is not reachable for a backend
+    that advertises ``supports_semantic_search=True``.
+
+    Raised by ``CorpusBackend.query()`` when the semantic-search code
+    path cannot contact the embedding provider (network failure, auth
+    error, missing or unreachable model). Reserved in v1.0 for the
+    ``PgvectorCorpusBackend`` implementation shipping in the coordinated
+    #258 Postgres-adapter family release alongside ``PgvectorMemoryBackend``;
+    filesystem and SQLite reference impls never raise it because both
+    advertise ``supports_semantic_search=False``.
+    """
+
+
+class CorpusCorrupted(CorpusError):
+    """A corpus page exists on disk or in the SQL store but its contents
+    are structurally invalid and cannot be interpreted.
+
+    Raised by ``FilesystemCorpusBackend.read_page()`` when the page file
+    is present but contains malformed YAML frontmatter (parse error,
+    missing delimiters, non-dict root), non-UTF-8 bytes, or a
+    ``schema_version`` value this release does not support. Also raised
+    by ``SQLiteCorpusBackend.read_page()`` when the on-disk body file
+    exists but cannot be parsed. Distinct from ``CorpusPageNotFound`` --
+    the page EXISTS but its data cannot be interpreted without operator
+    intervention.
+    """
