@@ -36,6 +36,7 @@ Subcommands:
 
 from __future__ import annotations
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -860,8 +861,6 @@ def _resolve_corpus_agent_root(args) -> Path:
     2. ``ATOMIC_AGENTS_AGENT_ROOT`` env var.
     3. Current working directory (``Path.cwd()``).
     """
-    import os
-
     if args.agent_root is not None:
         return Path(args.agent_root).expanduser().resolve()
     env_val = os.environ.get("ATOMIC_AGENTS_AGENT_ROOT")
@@ -874,9 +873,8 @@ def _cmd_corpus(args) -> int:
     """Dispatch corpus subcommands.
 
     All corpus subcommands instantiate ``FilesystemCorpusBackend(agent_root)``
-    directly (PR 1 filesystem-only path). The env-var resolver
-    ``get_default_corpus_backend`` is wired at PR 3; PR 1 uses direct
-    instantiation.
+    directly. Env-var resolution lives in
+    ``atomic_agents/corpus/__init__.py:get_default_corpus_backend``.
 
     Exit codes: 0 on success, 1 on any error (CorpusError, OSError,
     PermissionError, etc.). Errors go to stderr; normal output to stdout.

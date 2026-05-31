@@ -13,8 +13,10 @@ Per spec/34 §"Test coverage" + design doc + prep finding S2 (sample data parsin
 
 from __future__ import annotations
 
+import hashlib
 import re
 import shutil
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -25,6 +27,7 @@ from atomic_agents.corpus.filesystem import (
 )
 from atomic_agents.memory.backend import VersionRef, WritePolicy
 from atomic_agents.exceptions import (
+    CorpusCorrupted,
     CorpusInvalidName,
     CorpusPageNotFound,
     CorpusVersionNotFound,
@@ -591,3 +594,195 @@ def test_query_raw_skips_nested_subdirectories(tmp_path: Path) -> None:
         f"Nested 'beta' (raw/nested/beta.md) must NOT appear in query results; "
         f"got {names!r}"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX 1 (CRITICAL C1): CorpusCorrupted coverage
+
+
+def test_read_page_raises_corpus_corrupted_on_malformed_yaml(tmp_path: Path) -> None:
+    """read_page raises CorpusCorrupted when the wiki file has broken YAML frontmatter.
+
+    A file with unclosed bracket syntax in frontmatter must raise CorpusCorrupted,
+    not silently return None or propagate a raw yaml.YAMLError.
+    """
+    wiki_dir = tmp_path / "wiki"
+    wiki_dir.mkdir()
+    bad_fm_content = "---\nkey: [unclosed bracket\n---\nbody text here\n"
+    (wiki_dir / "broken-page.md").write_text(bad_fm_content, encoding="utf-8")
+
+    backend = FilesystemCorpusBackend(tmp_path)
+
+    with pytest.raises(CorpusCorrupted):
+        backend.read_page("broken-page", "wiki")
+
+
+def test_read_page_raises_corpus_corrupted_on_non_utf8_bytes(tmp_path: Path) -> None:
+    """read_page raises CorpusCorrupted when the wiki file contains non-UTF-8 bytes.
+
+    A file written with raw non-UTF-8 bytes must raise CorpusCorrupted, not
+    silently return None or propagate a raw UnicodeDecodeError.
+    """
+    wiki_dir = tmp_path / "wiki"
+    wiki_dir.mkdir()
+    bad_bytes = b"\xff\xfe" + b"invalid utf-8 content"
+    (wiki_dir / "non-utf8-page.md").write_bytes(bad_bytes)
+
+    backend = FilesystemCorpusBackend(tmp_path)
+
+    with pytest.raises(CorpusCorrupted):
+        backend.read_page("non-utf8-page", "wiki")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX 2 (MEDIUM AD10): write_page policy violation must not create orphan snapshot
+
+
+def test_write_page_policy_violation_does_not_create_orphan_snapshot(
+    tmp_path: Path,
+) -> None:
+    """A WritePolicy violation on CAS overwrite must not leave a snapshot file.
+
+    Regression test for the guard-order bug: previously, _take_snapshot was
+    called before _enforce_corpus_write_policy, so a policy violation left
+    a phantom snapshot entry in .versions/<stem>/.
+
+    After the fix (traversal guard + policy guard BEFORE snapshot), a
+    WritePathViolation leaves the .versions/<stem>/ directory either absent
+    or unchanged.
+    """
+    wiki_dir = tmp_path / "wiki"
+    wiki_dir.mkdir(parents=True, exist_ok=True)
+
+    backend = FilesystemCorpusBackend(tmp_path)
+    permissive_policy = WritePolicy(write_paths=[tmp_path])
+
+    # Case 1: initial write OK
+    backend.write_page(
+        name="guarded-page",
+        content="Initial content.",
+        corpus="wiki",
+        policy=permissive_policy,
+    )
+
+    # Get the current on-disk SHA for CAS
+    page_path = wiki_dir / "guarded-page.md"
+    existing_sha = hashlib.sha256(page_path.read_bytes()).hexdigest()
+
+    # Build a restrictive policy that excludes the wiki dir
+    unrelated = tmp_path / "other-dir"
+    unrelated.mkdir()
+    restrictive_policy = WritePolicy(write_paths=[unrelated])
+
+    # CAS overwrite with restrictive policy — must raise WritePathViolation
+    with pytest.raises(WritePathViolation):
+        backend.write_page(
+            name="guarded-page",
+            content="New content that should never land.",
+            corpus="wiki",
+            policy=restrictive_policy,
+            expected_content_sha256=existing_sha,
+        )
+
+    # Assert NO new snapshot was created
+    versions_dir = wiki_dir / ".versions" / "guarded-page"
+    if versions_dir.exists():
+        snapshot_files = [f for f in versions_dir.iterdir() if f.is_file()]
+        assert snapshot_files == [], (
+            f"Policy violation must not leave orphan snapshots in {versions_dir}; "
+            f"found: {snapshot_files}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX 3 (MEDIUM AD10): Date round-trip through _page_to_frontmatter_dict
+
+
+def test_restore_version_preserves_date_field_types(tmp_path: Path) -> None:
+    """restore_version must preserve date fields as date objects, not strings.
+
+    Regression test for the .isoformat() call in _page_to_frontmatter_dict:
+    previously, date objects were serialized to strings before being passed
+    to python-frontmatter, so PyYAML wrote a quoted string instead of an
+    unquoted ISO date literal. After the fix, date objects pass through
+    directly and round-trip as datetime.date.
+    """
+    wiki_dir = tmp_path / "wiki"
+    wiki_dir.mkdir(parents=True, exist_ok=True)
+
+    backend = FilesystemCorpusBackend(tmp_path)
+    policy = WritePolicy(write_paths=[tmp_path])
+
+    # Write a page with a date object in `captured`
+    captured_date = date(2026, 4, 22)
+    backend.write_page(
+        name="dated-page",
+        content="Body text.",
+        corpus="wiki",
+        policy=policy,
+        frontmatter={"captured": captured_date, "name": "Dated Page"},
+    )
+
+    # Snapshot the page
+    version_ref = backend.snapshot("dated-page", "wiki")
+
+    # Overwrite with different content so restore is exercised on Case 3 path
+    page_path = wiki_dir / "dated-page.md"
+    current_sha = hashlib.sha256(page_path.read_bytes()).hexdigest()
+    backend.write_page(
+        name="dated-page",
+        content="Updated body — different content.",
+        corpus="wiki",
+        policy=policy,
+        expected_content_sha256=current_sha,
+    )
+
+    # Restore from the snapshot
+    backend.restore_version("dated-page", "wiki", version_ref, policy)
+
+    # Read back and assert captured is still a date object, not a string
+    page = backend.read_page("dated-page", "wiki")
+    assert page is not None, "read_page returned None after restore_version"
+    assert isinstance(page.captured, date), (
+        f"captured should be datetime.date after restore_version round-trip; "
+        f"got {type(page.captured)!r} with value {page.captured!r}"
+    )
+    assert page.captured == captured_date, (
+        f"captured date value changed after round-trip: "
+        f"expected {captured_date!r}, got {page.captured!r}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX 8 (INFO Testing 4): restore_version when live page was deleted
+
+
+def test_restore_version_recreates_page_when_live_deleted(tmp_path: Path) -> None:
+    """restore_version recreates the page when the live file has been deleted.
+
+    After a snapshot, if the live page is externally deleted, restore_version
+    must write the page fresh (Case 1 path via write_page) rather than failing.
+    """
+    wiki_dir = tmp_path / "wiki"
+    wiki_dir.mkdir(parents=True, exist_ok=True)
+
+    backend = FilesystemCorpusBackend(tmp_path)
+    policy = WritePolicy(write_paths=[tmp_path])
+
+    backend.write_page("deleted-page", "Original content.", "wiki", policy)
+    version_ref = backend.snapshot("deleted-page", "wiki")
+
+    # Manually delete the live page file
+    page_path = wiki_dir / "deleted-page.md"
+    page_path.unlink()
+    assert not page_path.exists(), "Test setup: live page file should be deleted"
+
+    # restore_version should recreate it
+    backend.restore_version("deleted-page", "wiki", version_ref, policy)
+
+    # Assert the page is back
+    page = backend.read_page("deleted-page", "wiki")
+    assert page is not None, (
+        "restore_version must recreate the live page when it was deleted"
+    )
+    assert "Original content." in page.body

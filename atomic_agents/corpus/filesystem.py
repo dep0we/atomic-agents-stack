@@ -67,7 +67,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import parse_qs, urlparse
 
-import frontmatter
+import frontmatter as _fm
 
 from .types import CorpusCapabilities, CorpusPage, CorpusRef, CorpusStats
 from ..memory.backend import VersionRef, WritePolicy
@@ -280,7 +280,7 @@ def _parse_frontmatter_to_page(
         ) from exc
 
     try:
-        post = frontmatter.loads(raw)
+        post = _fm.loads(raw)
     except Exception as exc:  # frontmatter can raise yaml.YAMLError etc.
         raise CorpusCorrupted(
             f"corpus page {name!r} in {corpus!r} has malformed frontmatter "
@@ -359,8 +359,8 @@ def _build_page_content(
     """
     if not extra_frontmatter:
         return content
-    post = frontmatter.Post(content, **extra_frontmatter)
-    result = frontmatter.dumps(post)
+    post = _fm.Post(content, **extra_frontmatter)
+    result = _fm.dumps(post)
     if not result.endswith("\n"):
         result += "\n"
     return result
@@ -521,7 +521,7 @@ class FilesystemCorpusBackend:
                 try:
                     stat = entry.stat()
                     raw = entry.read_text(encoding="utf-8")
-                    post = frontmatter.loads(raw)
+                    post = _fm.loads(raw)
                     meta = post.metadata
                     body = post.content
                 except Exception:
@@ -607,7 +607,7 @@ class FilesystemCorpusBackend:
             if entry.suffix.lower() == ".md":
                 try:
                     raw = entry.read_text(encoding="utf-8")
-                    post = frontmatter.loads(raw)
+                    post = _fm.loads(raw)
                     meta = post.metadata
                     body = post.content
                     if "title" in meta:
@@ -768,6 +768,10 @@ class FilesystemCorpusBackend:
         on_disk_content = _build_page_content(content, frontmatter)
         incoming_sha = _sha256_hex(on_disk_content)
 
+        _cas_overwrite = (
+            False  # True when Case 3 validated; snapshot fires after guards
+        )
+
         if page_path.is_file():
             # Page exists -- determine which case applies
             existing_content = page_path.read_text(encoding="utf-8")
@@ -806,11 +810,12 @@ class FilesystemCorpusBackend:
                     f"re-read and retry."
                 )
 
-            # Case 3: valid CAS -- snapshot existing then write new content
-            _take_snapshot(page_path, corpus_dir)
+            # Case 3 CAS validated -- defer snapshot until after guards pass
+            _cas_overwrite = True
 
-        # Case 1 (fresh write) or Case 3 (CAS overwrite after snapshot)
-        # Verify write path is within corpus_dir (path-traversal guard)
+        # Case 1 (fresh write) or Case 3 (CAS overwrite): guard BEFORE snapshot
+        # so a policy violation never creates a phantom audit entry in .versions/.
+        # Verify write path is within agent_root (path-traversal guard)
         try:
             safe_resolve_under(page_path, self._agent_root)
         except Exception as exc:
@@ -825,6 +830,10 @@ class FilesystemCorpusBackend:
         # allowed write_paths declared in the policy.
         if policy.write_paths:
             _enforce_corpus_write_policy(page_path, policy)
+
+        # Case 3: guards passed -- now safe to snapshot the existing page
+        if _cas_overwrite:
+            _take_snapshot(page_path, corpus_dir)
 
         atomic_write(page_path, on_disk_content)
 
@@ -938,7 +947,7 @@ class FilesystemCorpusBackend:
         # Guard against path traversal via crafted backend_id components.
         try:
             safe_resolve_under(version_path, self._agent_root)
-        except PathTraversalError as exc:
+        except (PathTraversalError, OSError) as exc:
             raise CorpusVersionNotFound(
                 f"VersionRef {backend_id!r} resolves outside agent_root and is "
                 f"not accessible: {exc}"
@@ -962,7 +971,7 @@ class FilesystemCorpusBackend:
         # Parse as a CorpusPage (re-use frontmatter parsing; version snapshots
         # are full markdown files identical in format to live pages)
         try:
-            post = frontmatter.loads(raw)
+            post = _fm.loads(raw)
         except Exception as exc:
             raise CorpusVersionNotFound(
                 f"version snapshot file for {stem!r} in {corpus!r} "
@@ -1193,7 +1202,7 @@ class FilesystemCorpusBackend:
             try:
                 stat = entry.stat()
                 raw = entry.read_text(encoding="utf-8")
-                post = frontmatter.loads(raw)
+                post = _fm.loads(raw)
                 meta = post.metadata
                 body = post.content
             except Exception:
@@ -1375,7 +1384,7 @@ def _extract_title_from_content(content: str, fallback_name: str) -> str:
     for the first ``# Heading``, then falls back to ``fallback_name``.
     """
     try:
-        post = frontmatter.loads(content)
+        post = _fm.loads(content)
         meta = post.metadata
         body = post.content
         if "title" in meta:
@@ -1405,17 +1414,9 @@ def _page_to_frontmatter_dict(page: CorpusPage) -> dict:
     if page.type is not None:
         fm["type"] = page.type
     if page.captured is not None:
-        fm["captured"] = (
-            page.captured.isoformat()
-            if isinstance(page.captured, date)
-            else page.captured
-        )
+        fm["captured"] = page.captured
     if page.last_seen is not None:
-        fm["last_seen"] = (
-            page.last_seen.isoformat()
-            if isinstance(page.last_seen, date)
-            else page.last_seen
-        )
+        fm["last_seen"] = page.last_seen
     if page.sources is not None:
         fm["sources"] = page.sources
     if page.provenance is not None:
@@ -1431,11 +1432,7 @@ def _page_to_frontmatter_dict(page: CorpusPage) -> dict:
     if page.schema_version is not None:
         fm["schema_version"] = page.schema_version
     if page.expires_at is not None:
-        fm["expires_at"] = (
-            page.expires_at.isoformat()
-            if isinstance(page.expires_at, date)
-            else page.expires_at
-        )
+        fm["expires_at"] = page.expires_at
     if page.supersedes is not None:
         fm["supersedes"] = page.supersedes
     if page.superseded_by is not None:
@@ -1546,20 +1543,3 @@ def make_filesystem_corpus_backend_from_url(url: str) -> FilesystemCorpusBackend
 
     # Step 9: construct (side-effect-free per spec/34 MUST #2)
     return FilesystemCorpusBackend(Path(path))
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Auto-registration helper (called by atomic_agents/corpus/__init__.py)
-
-
-def _bootstrap_filesystem() -> None:
-    """Register FilesystemCorpusBackend as the 'filesystem' backend.
-
-    Called once at module import by ``atomic_agents/corpus/__init__.py``
-    (per spec/34 D9 -- dominant 6-of-10 __init__.py placement precedent).
-    Idempotent: silently replaces on collision (matches the 10-arc precedent).
-    """
-    # Imported lazily to avoid circular imports at module load time.
-    from . import _registry
-
-    _registry.register_corpus_backend("filesystem", FilesystemCorpusBackend)

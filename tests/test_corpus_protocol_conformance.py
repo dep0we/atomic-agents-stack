@@ -463,6 +463,10 @@ def test_render_index_summary_with_index_returns_content(
 
     result = corpus_backend.render_index_summary("wiki")
     assert isinstance(result, str)
+    assert result, (
+        "render_index_summary must return a non-empty string when INDEX.md exists; "
+        f"got {result!r}"
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -683,7 +687,9 @@ _INVALID_NAMES = [
 
 
 @pytest.mark.parametrize("bad_name", _INVALID_NAMES)
-def test_invalid_name_raises_corpus_invalid_name(corpus_backend, bad_name: str) -> None:
+def test_invalid_name_raises_corpus_invalid_name(
+    corpus_backend, bad_name: str, write_policy
+) -> None:
     """Path-traversal, control characters, and leading dots raise ``CorpusInvalidName``.
 
     The charset check MUST fire BEFORE any storage access (spec/34 implementer
@@ -692,6 +698,9 @@ def test_invalid_name_raises_corpus_invalid_name(corpus_backend, bad_name: str) 
     """
     with pytest.raises(CorpusInvalidName):
         corpus_backend.read_page(bad_name, "wiki")
+
+    with pytest.raises(CorpusInvalidName):
+        corpus_backend.write_page(bad_name, "body", "wiki", write_policy)
 
 
 def test_invalid_corpus_type_raises_corpus_invalid_name(corpus_backend) -> None:
@@ -935,3 +944,21 @@ def test_stats_raw_corpus_reflects_written_pages(corpus_backend, write_policy) -
     assert st.total_bytes > 0
     assert isinstance(st.last_update, datetime)
     assert isinstance(st.most_recent, list)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FIX 7 (INFO Testing 3): snapshot of non-existent page
+
+
+def test_snapshot_nonexistent_page_raises_corpus_page_not_found(
+    corpus_backend, write_policy
+) -> None:
+    """``snapshot()`` raises ``CorpusPageNotFound`` when the page does not exist.
+
+    Capability-gated: skips on backends that declare ``supports_versioning=False``.
+    """
+    if not corpus_backend.capabilities.supports_versioning:
+        pytest.skip("backend does not support versioning")
+
+    with pytest.raises(CorpusPageNotFound):
+        corpus_backend.snapshot("does_not_exist", "wiki")
