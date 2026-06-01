@@ -488,13 +488,13 @@ When `ATOMIC_AGENTS_CORPUS_BACKEND=sqlite` is set without a URL, the default res
 
 The `AtomicAgent(..., corpus_backend=...)` constructor kwarg always wins over the env var (programmatic path beats environment).
 
-**Per-runner kwargs (PR 3):**
+**Per-runner kwargs (PR 3 -- implemented):**
 
-`OutcomeRunner`, `EvalRunner`, and `DreamRunner` accept `corpus_backend=...` constructor kwargs that thread through to internal sub-agents.
+`OutcomeRunner`, `EvalRunner`, and `DreamRunner` accept `corpus_backend=...` constructor kwargs that thread through to internal sub-agents. Implemented in #65 PR 3 of 4: `OutcomeRunner` threads at `outcome.py:255`, `EvalRunner` at `eval.py:363`, `DreamRunner` stores as `self._corpus_backend` (no internal `AtomicAgent` construction site in v1).
 
-**`delegate.py` threading (PR 3):**
+**`delegate.py` threading (PR 3 -- implemented):**
 
-`delegate.py` threads `corpus_backend` ONLY when the operator supplied it explicitly via the `AtomicAgent(..., corpus_backend=...)` kwarg (`_corpus_backend_was_explicit` flag tracked at `agent.py` construction). Default-resolved backends do not leak the coordinator's `agent_root` to delegates. Mirrors PersonaBackend's `D-ER-2` pattern (spec/33 §"`delegate.py` threading"). Corpus is per-agent semantic context — distinct from fleet-scoped Policy + AgentProfile, which always thread. Operators who want a shared corpus backend across a coordinator and its delegates pass `corpus_backend=` explicitly.
+`delegate.py` threads `corpus_backend` ONLY when the operator supplied it explicitly via the `AtomicAgent(..., corpus_backend=...)` kwarg (`_corpus_backend_was_explicit` flag tracked at `agent.py` construction). Default-resolved backends do not leak the coordinator's `agent_root` to delegates. Mirrors PersonaBackend's `D-ER-2` pattern (spec/33 §"`delegate.py` threading"). Corpus is per-agent semantic context -- distinct from fleet-scoped Policy + AgentProfile, which always thread. Operators who want a shared corpus backend across a coordinator and its delegates pass `corpus_backend=` explicitly. Implemented in #65 PR 3 of 4.
 
 ---
 
@@ -803,7 +803,9 @@ Plus: per-runner kwargs, delegate threading (`_corpus_backend_was_explicit` flag
 
 ---
 
-## Call-site migration reference (PR 3)
+## Call-site migration reference (PR 3 -- implemented in #65 PR 3 of 4)
+
+The wiring contract described in this section is implemented. Both call sites migrated; the 5 IRON RULE regression assertions in `tests/test_corpus_migration_regression.py` pin the byte-identity guarantees. The `_source_paths` row remains deferred to v1.1 as documented.
 
 | File | Function (line) | Current pattern | New pattern |
 |------|-----------------|-----------------|-------------|
