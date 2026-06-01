@@ -120,7 +120,7 @@ For cascaded agents (`<system>/projects/<project>/agents/<role>/`), `FilesystemA
 
 `_load_indexes()` (`agent.py:2031`) reads `wiki/INDEX.md` for system-prompt assembly, but this is memory-layer state, not identity-layer config. Memory is already abstracted via `MemoryBackend` (spec/20).
 
-**Why:** scope discipline. `AgentProfile` is the identity/config layer; including wiki content would conflate config with memory state and create two backends with overlapping write responsibilities. Memory backend stays the source of truth for `wiki/`, `memory/`, `journal/`. Profile backend stays for `persona/`, config files, skills.
+**Why:** scope discipline. `AgentProfile` is the identity/config layer; including wiki content would conflate config with memory state and create two backends with overlapping write responsibilities. Memory backend stays the source of truth for `memory/` and `journal/`. Profile backend stays for `persona/`, config files, skills. When `CorpusBackend` is registered (spec/34, locked at #65 PR 4 of 4), it becomes the source of truth for `wiki/` and `raw/`; `MemoryBackend` retains exclusive ownership of `memory/` and `journal/`.
 
 ## Canonical types
 

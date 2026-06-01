@@ -1,12 +1,6 @@
 # spec/34 — CorpusBackend Protocol
 
-> **Status:** RFC (Request for Comments) — ships with PR 1 of issue #65. Will be LOCKED at PR 4 after operator-facing surfaces ship.
->
-> **Shipping plan across the arc:**
-> - **PR 1** — Protocol scaffolding + dataclasses + exception hierarchy + `FilesystemCorpusBackend` reference impl + versioning layout + backend registry + this RFC spec (draft Implementer Contract with provisional MUSTs) + ~25 parametrized conformance tests + ~10 fs-specific tests + `atomic-agents corpus` CLI subcommands (filesystem path only).
-> - **PR 2** — `SQLiteCorpusBackend` with FTS5 (SQLite full-text-search, stdlib) + hybrid storage shape (metadata in SQL, bodies on disk) + URL factory + WAL race fix + ~35 SQLite-specific tests. CLI SQLite path activates here.
-> - **PR 3** — Wiring through `AtomicAgent`, per-runner kwargs on `OutcomeRunner` / `EvalRunner` / `DreamRunner`, delegate threading, `ATOMIC_AGENTS_CORPUS_BACKEND` env var + constructor kwarg, `doctor.check_corpus_backend` with PASS/WARN/FAIL ladder + page-count performance cliff WARN, call-site migration (`agent.py:2937-2939` + `bundle.py:_render_memory_breakpoint`), IRON RULE regression suite for all 5 migration assertions. ~30 wiring tests.
-> - **PR 4** — spec/34 LOCK (RFC banner dropped, Implementer Contract finalized at N MUSTs, per-PR markers folded). Status flip to "Eleven of twelve backend protocols shipped." CLAUDE.md architecture diagram + 11th lock-paragraph. README backend-protocols table row flipped to Shipped. Both ROADMAPs refreshed (repo-root + vault). CHANGELOG arc-closer entry.
+> **Status:** LOCKED. CorpusBackend is the eleventh backend protocol locked in the atomic-agents-stack series.
 
 ---
 
@@ -14,7 +8,7 @@
 
 `CorpusBackend` is the **eleventh** open Protocol in the protocol-pattern series (Memory, LLM, Judge, Lock, Log, AgentProfile, ToolRegistry, Mandate, Policy, Persona, **Corpus**). It abstracts `<agent>/wiki/` (Atomic Wiki — distilled knowledge in the Karpathy style) and `<agent>/raw/` (source documents — PDFs, transcripts, operator-ingested content) behind a Protocol so the framework's core stays small and alternate storage substrates (SQLite-FTS5, Postgres, pgvector) drop in without forking.
 
-`AtomicAgent` exposes `agent.corpus: CorpusBackend`. Call-site code stops touching wiki or raw paths directly once PR 3 lands.
+`AtomicAgent` exposes `agent.corpus: CorpusBackend`. Call-site code stops touching wiki or raw paths directly.
 
 **The problem this closes.** Today, `agent.py:2937-2939` reads `wiki/INDEX.md` with a bare `Path.read_text()`. `bundle.py:295-303 + 497-510` does the same for rendering. There is no Protocol between the agent and the corpus. For the home user with one agent and a handful of wiki pages, the direct walk is fine. For the operator with a 10K-page wiki or hundreds of MB of raw documents, keyword grep over an unindexed filesystem takes seconds per query. The GB-scale unlock is `SQLiteCorpusBackend` with FTS5: `O(log N)` indexed full-text query, stdlib dependency, no Postgres operator burden.
 
@@ -42,7 +36,7 @@
 | D10 | `query()` precedence rule | Semantic MUST win over FTS when both flags are True. Explicitly documented (finding A2). Prevents ambiguous behavior on Postgres backends that have both pgvector AND tsquery. |
 | D11 | `write_page()` 4-case behavior table | Fresh write / content-identical idempotent no-op / explicit overwrite via CAS / collision raises. Mirrors MemoryBackend `write_note` idempotency + CAS discipline. Finding CQ1 from /plan-eng-review 2026-05-29. |
 | D12 | `read_page` returns `None`, `read_version` raises | `read_page(name, corpus) -> CorpusPage | None` is the common-path "does this page exist?" query. `read_version(version_ref) -> CorpusPage` raises `CorpusVersionNotFound` because a missing version body indicates an unexpected infrastructure failure (SQL row exists but on-disk body file is gone under the hybrid storage shape), not a routine presence check. Matches MemoryBackend precedent: `read_note` returns None; `read_version` raises. |
-| D13 | `bundle.py:_source_paths` migration deferred to v1.1 | The function returns filesystem paths for staleness tracking. SQLite backends synthesize the INDEX from page metadata and have no equivalent path to return. v1.0 keeps the direct path check. Follow-up issue filed at PR 4. |
+| D13 | `bundle.py:_source_paths` migration deferred to v1.1 | The function returns filesystem paths for staleness tracking. SQLite backends synthesize the INDEX from page metadata and have no equivalent path to return. v1.0 keeps the direct path check. Follow-up issue filed at #314. |
 
 ---
 
@@ -393,7 +387,7 @@ Versioning mirrors MemoryBackend's `.versions/` pattern (spec/20:228-233). Cross
 
 `<YYYYMMDDTHHMMSSffffffZ>_<8hex>` snapshot file name format matches `memory/filesystem.py`'s `_version_filename` helper verbatim (prep-pass checklist item 6). `FilesystemCorpusBackend` MUST copy that helper, not reinvent it.
 
-**SQLite hybrid layout (PR 2):**
+**SQLite hybrid layout:**
 
 SQL stores metadata and FTS5 index. Page bodies and version snapshots live on disk under `<content_root>/<agent_scope>/<corpus>/` following the same path structure as the filesystem reference. This keeps the SQL store small and version snapshot listing to a simple `glob` without a JOIN. The INSERT-first + `atomic_write`-on-success-only atomicity pattern from ToolRegistryBackend (spec/25, #64 PR 3 precedent) prevents orphan SQL rows on disk-write failure.
 
@@ -488,13 +482,13 @@ When `ATOMIC_AGENTS_CORPUS_BACKEND=sqlite` is set without a URL, the default res
 
 The `AtomicAgent(..., corpus_backend=...)` constructor kwarg always wins over the env var (programmatic path beats environment).
 
-**Per-runner kwargs (PR 3 -- implemented):**
+**Per-runner kwargs:**
 
-`OutcomeRunner`, `EvalRunner`, and `DreamRunner` accept `corpus_backend=...` constructor kwargs that thread through to internal sub-agents. Implemented in #65 PR 3 of 4: `OutcomeRunner` threads at `outcome.py:255`, `EvalRunner` at `eval.py:363`, `DreamRunner` stores as `self._corpus_backend` (no internal `AtomicAgent` construction site in v1).
+`OutcomeRunner`, `EvalRunner`, and `DreamRunner` accept `corpus_backend=...` constructor kwargs that thread through to internal sub-agents. `OutcomeRunner` threads at `outcome.py:255`, `EvalRunner` at `eval.py:363`, `DreamRunner` stores as `self._corpus_backend` (no internal `AtomicAgent` construction site in v1).
 
-**`delegate.py` threading (PR 3 -- implemented):**
+**`delegate.py` threading:**
 
-`delegate.py` threads `corpus_backend` ONLY when the operator supplied it explicitly via the `AtomicAgent(..., corpus_backend=...)` kwarg (`_corpus_backend_was_explicit` flag tracked at `agent.py` construction). Default-resolved backends do not leak the coordinator's `agent_root` to delegates. Mirrors PersonaBackend's `D-ER-2` pattern (spec/33 §"`delegate.py` threading"). Corpus is per-agent semantic context -- distinct from fleet-scoped Policy + AgentProfile, which always thread. Operators who want a shared corpus backend across a coordinator and its delegates pass `corpus_backend=` explicitly. Implemented in #65 PR 3 of 4.
+`delegate.py` threads `corpus_backend` ONLY when the operator supplied it explicitly via the `AtomicAgent(..., corpus_backend=...)` kwarg (`_corpus_backend_was_explicit` flag tracked at `agent.py` construction). Default-resolved backends do not leak the coordinator's `agent_root` to delegates. Mirrors PersonaBackend's `D-ER-2` pattern (spec/33 §"`delegate.py` threading"). Corpus is per-agent semantic context -- distinct from fleet-scoped Policy + AgentProfile, which always thread. Operators who want a shared corpus backend across a coordinator and its delegates pass `corpus_backend=` explicitly.
 
 ---
 
@@ -569,7 +563,7 @@ All page writes and all version snapshot writes go through `_io.atomic_write`. N
 
 ---
 
-## `SQLiteCorpusBackend` storage layout (PR 2)
+## `SQLiteCorpusBackend` storage layout
 
 ```python
 SQLiteCorpusBackend(
@@ -682,27 +676,27 @@ Implementation checklist (sourced from prep-pass SEVERE S1):
 
 A backend that implements the `CorpusBackend` Protocol commits to the contract below. The reference `FilesystemCorpusBackend` is the canonical example; `SQLiteCorpusBackend` is the second reference impl; future Postgres / pgvector / SaaS adapters slot in via `register_corpus_backend(...)` without forking core.
 
-**This contract is provisional at PR 1 RFC and will be finalized at PR 4 LOCK.** The MUST count follows the 7-8 MUST range of prior arcs (spec/22: 7, spec/24: 8, spec/25: 8, spec/29: 8, spec/32: 7, spec/33: 8). The nine categories enumerated here map to the finalized MUSTs at PR 4.
+The MUST count follows the 7-8 MUST range of prior arcs (spec/22: 7, spec/24: 8, spec/25: 8, spec/29: 8, spec/32: 7, spec/33: 8). CorpusBackend locks at 9 because the FTS5 / semantic / substring `query()` precedence rule is an additional cross-cutting contract that prior arcs without a capability-gated query path did not require.
 
 Implementers MUST:
 
-1. **`name` and `corpus` charset validation at API boundary.** Every Protocol method that accepts `name` validates it against `[a-zA-Z0-9_.+@-]+` BEFORE any storage or dict access. Reject path-traversal tokens (`..`, `/`, `\`), control characters (`\x00`-`\x1f`, `\x7f`), newlines, leading dots, and empty strings — raise `CorpusInvalidName`. Every method that accepts `corpus` validates `corpus in ("wiki", "raw")` — raise `ValueError` otherwise. The validation is at the API boundary, not inside storage helpers; callers that bypass it violate the contract. Reference: `_validate_corpus_name` + `_validate_corpus_type` in `corpus/filesystem.py`.
+1. **`name` and `corpus` charset validation at API boundary.** Every Protocol method that accepts `name` validates it against `[a-zA-Z0-9_.+@-]+` BEFORE any storage or dict access. Reject path-traversal tokens (`..`, `/`, `\`), control characters (`\x00`-`\x1f`, `\x7f`), newlines, leading dots, and empty strings; raise `CorpusInvalidName`. Every method that accepts `corpus` validates `corpus in ("wiki", "raw")`; raise `ValueError` otherwise. The validation is at the API boundary, not inside storage helpers; callers that bypass it violate the contract. Reference: `_validate_corpus_name` + `_validate_corpus_type` in `corpus/filesystem.py`.
 
-2. **Side-effect-free construction.** Backend `__init__` MUST NOT stat the filesystem, query a database, call an external API, or read any environment variable. The first method call performs lazy initialization. Malformed operator config surfaces on the first method call, not at construction. Preserves the framework's byte-identical-construction promise for the 166 existing `AtomicAgent(...)` test sites. Profile's "validate existence" pattern is the WRONG precedent here — corpus directories may legitimately not exist on fresh agents.
+2. **Side-effect-free construction.** Backend `__init__` MUST NOT stat the filesystem, query a database, call an external API, or read any environment variable. The first method call performs lazy initialization. Malformed operator config surfaces on the first method call, not at construction. Preserves the framework's byte-identical-construction promise for the existing `AtomicAgent(...)` test sites. Profile's "validate existence" pattern is the WRONG precedent here; corpus directories may legitimately not exist on fresh agents.
 
-3. **Capability honesty.** `capabilities -> CorpusCapabilities` is a contract, not a hint. Backends declaring `supports_versioning=False` MUST raise `NotImplementedError` on `list_versions`, `read_version`, `restore_version`, and `snapshot`. Backends declaring `supports_full_text_search=True` MUST use indexed FTS (FTS5 / tsquery / equivalent) in `query()` when `supports_semantic_search` is False. Backends that advertise a flag True but do not implement the corresponding behavior produce silent failures rather than loud refusals; conformance tests gate on capability flags.
+3. **Capability honesty.** `capabilities -> CorpusCapabilities` is a contract, not a hint. Backends declaring `supports_versioning=False` MUST raise `NotImplementedError` on `list_versions`, `read_version`, `restore_version`, and `snapshot`. Backends declaring `supports_full_text_search=True` MUST use indexed FTS (FTS5 / tsquery / equivalent) in `query()` when `supports_semantic_search` is False. `embedding_provider` MUST be `None` when `supports_semantic_search=False`. Backends that advertise a flag True but do not implement the corresponding behavior produce silent failures rather than loud refusals; conformance tests gate on capability flags.
 
-4. **`query()` capability precedence rule (finding A2).** When `supports_semantic_search=True`, the backend MUST use embedding-vector cosine match and MUST NOT exercise FTS infrastructure on that code path, even if `supports_full_text_search` is also True. When `supports_semantic_search=False` and `supports_full_text_search=True`, the backend MUST use indexed full-text search. When both are False, the backend MUST fall back to case-insensitive substring + frontmatter-tag match, ordered by match count. No caller-choice override in v1.0; v1.1+ may add a `mode` kwarg if operators surface a need.
+4. **`query()` capability precedence rule.** When `supports_semantic_search=True`, the backend MUST use embedding-vector cosine match and MUST NOT exercise FTS infrastructure on that code path, even if `supports_full_text_search` is also True. When `supports_semantic_search=False` and `supports_full_text_search=True`, the backend MUST use indexed full-text search. When both are False, the backend MUST fall back to case-insensitive substring + frontmatter-tag match, ordered by match count. No caller-choice override in v1.0; v1.1+ may add a `mode` kwarg if operators surface a need.
 
-5. **`write_page()` 4-case behavior table (finding CQ1).** (a) Fresh write: page does not exist — write via `_io.atomic_write`, update INDEX-equivalent. (b) Content-identical idempotent no-op: page exists, body + frontmatter SHA-256 unchanged — no-op, safe for re-delivery. (c) Explicit overwrite via CAS: page exists, content differs, `expected_content_sha256` matches current hash — snapshot if `supports_versioning=True`, write new content, update INDEX-equivalent. (d) Collision: page exists, content differs, `expected_content_sha256` is None — raise `CorpusPageExists`; content differs, hash supplied but mismatched — raise `CorpusPreconditionFailed`. CAS via `expected_content_sha256` is the ONLY safe overwrite path; silent overwrite without operator intent is refused by default.
+5. **`write_page()` 4-case behavior table.** (a) Fresh write: page does not exist, write via `_io.atomic_write`, update INDEX-equivalent. (b) Content-identical idempotent no-op: page exists, body + frontmatter SHA-256 unchanged, no-op, safe for re-delivery. (c) Explicit overwrite via CAS: page exists, content differs, `expected_content_sha256` matches current hash, snapshot if `supports_versioning=True`, write new content, update INDEX-equivalent. (d) Collision: page exists, content differs, `expected_content_sha256` is None, raise `CorpusPageExists`; content differs, hash supplied but mismatched, raise `CorpusPreconditionFailed`. CAS via `expected_content_sha256` is the ONLY safe overwrite path; silent overwrite without operator intent is refused by default.
 
-6. **URL credential redaction across all `ValueError` sites in factory functions.** URL factories and `get_default_corpus_backend` error paths MUST NOT echo raw URL credentials. The reference uses `_redact_url` from `persona/filesystem.py:177-197` that strips after `://` and truncates. Operators may accidentally paste `postgres://user:password@host/db` into env vars; the error message MUST NOT echo the password. Reference: 6 `ValueError` sites in `make_sqlite_corpus_backend_from_url` (non-sqlite scheme, netloc present, fragment present, duplicate query parameter, unknown query parameter, empty or root-only path) following the ToolRegistryBackend precedent.
+6. **URL credential redaction across all operator-facing error paths.** URL factories, `get_default_corpus_backend`, and `doctor.check_corpus_backend` error paths MUST NOT echo raw URL credentials. The reference impls use `_redact_url` (filesystem factory) and `_redact_for_error_message` (corpus/__init__.py) helpers that strip credentials after `://` and truncate. Operators may accidentally paste `postgres://user:password@host/db` into env vars; the error message MUST NOT echo the password. The SQLite URL factory covers 6 `ValueError` sites (non-sqlite scheme, netloc present, fragment present, duplicate query parameter, unknown query parameter, empty or root-only path), all redacted.
 
 7. **Cross-corpus isolation at storage layer.** `wiki` and `raw` corpora are fully independent. SQLite backends MUST include `WHERE corpus = ?` (or equivalent) on every query; no `wiki` query may touch `raw` rows and vice versa. Filesystem backends enforce isolation geometrically via separate subdirectories. A conformance test verifies that writing a page to `corpus="wiki"` does not make it visible via `corpus="raw"` and vice versa.
 
 8. **Snapshot id determinism and cross-page isolation.** Backend-issued `VersionRef` tokens MUST be monotonic or sortable, supporting `list_versions` returning chronological order. Cross-page isolation MUST be enforced at the storage layer: a `VersionRef` issued for page A MUST raise `CorpusVersionNotFound` when passed to `read_version` or `restore_version` in the context of page B. The `<YYYYMMDDTHHMMSSffffffZ>_<8hex>.md` filesystem version filename format (from `memory/filesystem.py:_version_filename`) provides this guarantee geometrically via the `<page-stem>/` subdirectory.
 
-9. **`backend_id` property stable across calls.** The property MUST return the same string across calls and MUST match what `list_corpus_backends()` registered the class under. Backends with `backend_id="filesystem"` re-registered under `"sqlite"` violate conformance.
+9. **`backend_id` property stable across calls; `close()` idempotent.** The `backend_id` property MUST return the same string across calls and MUST match what `list_corpus_backends()` registered the class under. Backends with `backend_id="filesystem"` re-registered under `"sqlite"` violate conformance. `close()` is a method-level contract documented at `corpus/backend.py:388-389` and MUST be idempotent: calling it twice MUST NOT raise. Database backends that hold connection pools MUST guard teardown on a `_closed` flag or equivalent.
 
 ---
 
@@ -725,7 +719,7 @@ Decisions locked across the office-hours session (2026-05-29), /plan-eng-review 
 | S4 | Regression suite for PR 3 | Zero test coverage exists today on the `wiki/INDEX.md` read path; all 9 existing wiki-touching integration tests create an empty `wiki/` dir and assert nothing about INDEX content. PR 3 IRON RULE regression suite is load-bearing for silent-corruption prevention. |
 | S5 | `atomic_write` non-negotiable | Every page write + version snapshot write via `_io.atomic_write`. Never `target.write_text()` directly. |
 | D-RC-1 | `read_page` vs `read_version` None/raise convention | `read_page` returns `None` (routine presence check). `read_version` raises `CorpusVersionNotFound` (unexpected infrastructure failure — SQL row exists but body file gone). Matches MemoryBackend's `read_note` vs `read_version` convention. Documented in Protocol contract so conformance test authors don't disagree. |
-| D-RC-2 | `bundle.py:_source_paths` deferred | Filesystem-only function; SQLite has no wiki/INDEX.md path to return. v1.0 keeps the direct path check. Follow-up issue filed at PR 4. |
+| D-RC-2 | `bundle.py:_source_paths` deferred | Filesystem-only function; SQLite has no wiki/INDEX.md path to return. v1.0 keeps the direct path check. Follow-up issue filed at #314. |
 
 ---
 
@@ -743,7 +737,7 @@ Items considered and explicitly deferred, with rationale.
 | `resolve_links(page) -> list[CorpusRef]` Protocol method | Wiki pages reference each other (`[[other-page]]`). Link resolution lives in the agent layer (consumer-side), not the Protocol. Keeps the Protocol surface tight. |
 | Multi-modal corpus pages (PDFs binary, images, audio transcripts) | All pages are markdown text in v1.0. Binary substrate is a v1.1+ scope expansion via a new capability flag. |
 | Dream-distillation pipeline `write_page()` integration | No current framework-side wiki writes exist. `write_page()` ships in PR 1 for future-state use. The distillation pipeline migration is a separate arc. |
-| `bundle.py:_source_paths` migration to Protocol | Filesystem-only function; SQLite has no equivalent path to track. Deferred to v1.1 with a follow-up issue filed at PR 4 (D13). |
+| `bundle.py:_source_paths` migration to Protocol | Filesystem-only function; SQLite has no equivalent path to track. Deferred to v1.1 with a follow-up issue filed at #314 (D13). |
 | MCPServerRegistryBackend (#201) | Separate arc; v1.0 closes when this AND #65 ship. |
 
 ---
@@ -803,7 +797,7 @@ Plus: per-runner kwargs, delegate threading (`_corpus_backend_was_explicit` flag
 
 ---
 
-## Call-site migration reference (PR 3 -- implemented in #65 PR 3 of 4)
+## Call-site migration reference
 
 The wiring contract described in this section is implemented. Both call sites migrated; the 5 IRON RULE regression assertions in `tests/test_corpus_migration_regression.py` pin the byte-identity guarantees. The `_source_paths` row remains deferred to v1.1 as documented.
 
@@ -812,7 +806,7 @@ The wiring contract described in this section is implemented. Both call sites mi
 | `agent.py` | `AtomicAgent.__init__` (2937-2939) | `wiki_index.read_text()` direct `Path` read | `self.corpus.render_index_summary(corpus="wiki")` when `self.corpus_backend is not None`, else fall back to the direct read. Single `if self.corpus_backend is None:` branch. |
 | `agent.py` | `AtomicAgent` prompt assembly (3058-3059) | uses already-read `self._wiki_index_text` | unchanged (the read happens upstream at lines 2937-2939) |
 | `bundle.py` | `_render_memory_breakpoint(instance_root)` at line 494 | `wiki_dir / "INDEX.md"` direct path read at line 497 | function signature gains `corpus_backend: CorpusBackend | None = None`; when not None, calls `corpus_backend.render_index_summary(corpus="wiki")`; when None, falls back to the direct path. Callers thread the parameter through. Note: this is NOT a `getattr` pattern — `bundle.py`'s call path has no `AtomicAgent` instance; the parameter is explicit. |
-| `bundle.py` | `_source_paths(agent_root)` at line 266 | `wiki_dir / "INDEX.md"` appended to path list at line 295 | **Deferred to v1.1.** SQLite backends have no `wiki/INDEX.md` file path to track. v1.0 keeps the direct path check. Follow-up issue filed at PR 4. |
+| `bundle.py` | `_source_paths(agent_root)` at line 266 | `wiki_dir / "INDEX.md"` appended to path list at line 295 | **Deferred to v1.1.** SQLite backends have no `wiki/INDEX.md` file path to track. v1.0 keeps the direct path check. Follow-up issue filed at #314. |
 
 **What does NOT need migration:** `dashboard/memory.py` does not touch wiki at all (verified). `agent.py:721` (`self._wiki_index_text: str = ""`): unchanged (it buffers the read result; the new read happens upstream at 2937-2939). `migrate.py:233 + 595-606`: references wiki/raw paths as part of vault migration utilities — those stay outside CorpusBackend (migrate is a one-shot operator tool).
 
@@ -844,29 +838,10 @@ No failure mode is both silent AND lacking planned coverage. Every failure eithe
 
 ---
 
-## PR 4 documentation-update checklist
-
-Sourced from /plan-subagent Subagent 4. Each PR 4 implementer ticks these off.
-
-- `docs/spec/34-corpus-backend.md` — Drop RFC banner; add LOCKED status; finalize N MUSTs.
-- `docs/spec/24-agent-profile-backend.md:123` — Update Decision 7 to acknowledge CorpusBackend ownership of wiki/raw: "CorpusBackend, when registered, becomes the source of truth for `wiki/` and `raw/` per spec/34; MemoryBackend retains ownership of `memory/` and `journal/`."
-- `docs/spec/26-cascade-bundle.md:94, 245` — Cross-reference spec/34 (DRAFT spec; updates freely).
-- `docs/spec/01-anatomy.md:351-371` — Add CorpusBackend cross-reference paragraph.
-- `docs/spec/04-runtime-assembly.md:42` — Note step [7] routes through `corpus_backend.render_index_summary("wiki")` when registered.
-- `docs/spec/02-atomic-memory.md:38-49` — Add CorpusBackend cross-reference paragraph.
-- `docs/spec/31-llm-backend.md:11` — Add `(spec/34)` link after "Corpus" in the Protocol list.
-- `docs/spec/27-doctor.md` — Insert `### corpus-backend` entry between `tool-registry-backend` and `mandate-backend`.
-- `CLAUDE.md` — 4 edits: architecture diagram flip (`Corpus 🟡` to `Corpus ✅`), 11th lock-paragraph, Design Principles §2 update, "Where things live" table count update.
-- `README.md` — 6 edits: backend-protocols table row, spec list addition, 4 status-counter updates.
-- `ROADMAP.md` (repo-root) — Status paragraph + table row.
-- `ROADMAP.md` (vault) — `last_review` date + status paragraph + table entry.
-
----
-
 ## References
 
 - `docs/spec/20-memory-backend.md` — MemoryBackend Protocol; the template this arc follows. `VersionRef`, `WritePolicy`, `.versions/` layout, and the `read_note` None vs `read_version` raise convention all originate here.
-- `docs/spec/24-agent-profile-backend.md` — Decision 7 (to be updated at PR 4); Implementer Contract MUST count range; snapshot id entropy budget.
+- `docs/spec/24-agent-profile-backend.md` — Decision 7 (updated at #65 PR 4 of 4); Implementer Contract MUST count range; snapshot id entropy budget.
 - `docs/spec/25-tool-registry-backend.md` — INSERT-first + atomic_write-on-success-only atomicity pattern for hybrid storage; `PRAGMA busy_timeout=5000` before WAL pragma precedent; URL factory + credential redaction across 5 `ValueError` sites.
 - `docs/spec/27-doctor.md` — PASS/WARN/FAIL ladder shape; page-count cliff WARN precedent from LogBackend.
 - `docs/spec/32-policy-backend.md` — `_policy_backend_was_explicit` precedent for explicit-only delegate threading; `policy_decision(axis="cost_cap")` event schema unchanged.
