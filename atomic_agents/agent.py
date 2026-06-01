@@ -2989,6 +2989,12 @@ class AtomicAgent:
             # the auto-resolve. Tests in test_corpus_migration_regression.py
             # force corpus_backend=None post-construction to exercise this
             # branch's byte-identity and OSError soft-degrade guarantees.
+            # Round 3 finding R3-F1: this branch does NOT catch
+            # UnicodeDecodeError. The Protocol path handles it inside
+            # FilesystemCorpusBackend.render_index_summary (see
+            # corpus/filesystem.py:699-715). If this branch is ever
+            # re-activated for production, add a UnicodeDecodeError catch
+            # matching the Protocol path's partial-content soft-degrade.
             wiki_index = self.agent_root / "wiki" / "INDEX.md"
             if wiki_index.exists():
                 try:
