@@ -698,7 +698,23 @@ class FilesystemCorpusBackend:
 
         try:
             return index_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            # Non-UTF-8 bytes in wiki/INDEX.md (Latin-1 import, BOM, mixed
+            # encodings). Match bundle.py:_safe_read_text behavior exactly:
+            # re-read with errors="replace" so operators get partial content
+            # plus a visible warning comment, NOT a silent empty string.
+            # Round 2 finding F3: returning "" silently lost wiki body
+            # content where the legacy bundle path preserved it. The
+            # CHANGELOG claim "matches the pre-#65 behavior" now holds.
+            body = index_path.read_text(encoding="utf-8", errors="replace")
+            return (
+                f"<!-- WARNING: {index_path.name} contained non-UTF-8 bytes; "
+                f"replaced. -->\n{body}"
+            )
         except OSError:
+            # File-system-level failure (permission denied, NFS handle stale,
+            # ENOENT race between is_file check and read). No partial content
+            # available to surface; soft-degrade to empty string.
             return ""
 
     # ── Write operations ──────────────────────────────────────────────────

@@ -197,25 +197,95 @@ def get_default_corpus_backend(agent_root: Path) -> CorpusBackend:
     SQLite / Postgres / pgvector backends plug in via the same key
     without operators having to relearn the env vocabulary.
 
+    An empty string (or whitespace-only) value for
+    ``ATOMIC_AGENTS_CORPUS_BACKEND`` is treated as "not set" and falls
+    back to the filesystem default. This guards against shell
+    ``export ATOMIC_AGENTS_CORPUS_BACKEND=`` accidents without masking
+    an accidental URL paste -- the doctor (Stream E) surfaces the case
+    where ``ATOMIC_AGENTS_CORPUS_BACKEND_URL`` is set but
+    ``ATOMIC_AGENTS_CORPUS_BACKEND`` is unset, emitting a WARN so the
+    operator can correct the misconfiguration.
+
     The ``agent_root`` parameter is honored by the filesystem backend
-    (wiki/ and raw/ subdirs live under that path); future distributed
-    backends ignore it in favor of the table-prefix or key-prefix
-    scoping inherent to their storage.
+    (wiki/ and raw/ subdirs live under that path) and by the sqlite
+    backend when no URL is supplied (db path defaults to
+    ``<agent_root>/.corpus.db``). Future distributed backends ignore it
+    in favor of the table-prefix or key-prefix scoping inherent to
+    their storage.
 
     For programmatic operators who want to construct the backend
     themselves (custom database connection, custom path, etc.), the
     ``AtomicAgent(..., corpus_backend=...)`` constructor kwarg (wired
     in PR 3) bypasses this factory entirely.
 
-    See spec/34 for the full env-var reference + the env-var-vs-kwarg
-    trade-off rationale.
+    See spec/34 §"Operator override surface" for the full env-var
+    reference + the env-var-vs-kwarg trade-off rationale.
     """
-    raw_backend_id = (
-        os.environ.get("ATOMIC_AGENTS_CORPUS_BACKEND", "filesystem").strip().lower()
-    )
+    raw_backend_id = os.environ.get("ATOMIC_AGENTS_CORPUS_BACKEND", "").strip().lower()
+
+    # Change 2: empty string (or whitespace-only) treated as "not set";
+    # falls through to the filesystem branch below. Matches the shell
+    # ``export ATOMIC_AGENTS_CORPUS_BACKEND=`` accident case.
+    if not raw_backend_id:
+        raw_backend_id = "filesystem"
 
     if raw_backend_id == "filesystem":
+        # Change 3: filesystem URL support (spec/34 line 472 parity).
+        # When ATOMIC_AGENTS_CORPUS_BACKEND_URL is set alongside
+        # ATOMIC_AGENTS_CORPUS_BACKEND=filesystem, route through the URL
+        # factory so operators can supply a non-default agent_root path.
+        # When no URL is set, use the legacy direct construction -- this
+        # preserves byte-identical pre-#65 behavior for all existing agents.
+        url = os.environ.get("ATOMIC_AGENTS_CORPUS_BACKEND_URL", "").strip()
+        if url:
+            return make_filesystem_corpus_backend_from_url(url)
         return FilesystemCorpusBackend(agent_root)
+
+    # Change 1: SQLite branch (spec/34 §"Operator override surface").
+    # Mirrors profile/__init__.py:227-235 exactly. When no URL is set,
+    # defaults to sqlite:///<agent_root>/.corpus.db?agent_scope=<agent_root.name>
+    # so single-host operators get a working default by flipping ONE env var.
+    if raw_backend_id == "sqlite":
+        url = os.environ.get("ATOMIC_AGENTS_CORPUS_BACKEND_URL", "").strip()
+        if not url:
+            # Build the default URL from agent_root. Require a non-empty
+            # name component -- a root path (e.g., Path("/")) has an empty
+            # name and would produce a meaningless agent_scope.
+            if not agent_root.name:
+                raise CorpusBackendNotRegistered(
+                    f"ATOMIC_AGENTS_CORPUS_BACKEND=sqlite default requires "
+                    f"agent_root with a non-empty name (got {agent_root}). "
+                    f"Set ATOMIC_AGENTS_CORPUS_BACKEND_URL to override."
+                )
+            # URL-encode agent_root.name so names containing URL metacharacters
+            # (spaces, +, &, ?, =) don't silently corrupt the agent_scope or
+            # raise ValueError from the URL factory's query-parameter parser.
+            # Without quote_plus, an agent named "my+agent" would have its
+            # agent_scope decoded as "my agent" (parse_qsl interprets + as
+            # space), causing cross-scope contamination with another agent
+            # genuinely named "my agent".
+            from urllib.parse import quote_plus
+
+            db_path = agent_root / ".corpus.db"
+            url = f"sqlite:///{db_path}?agent_scope={quote_plus(agent_root.name)}"
+        try:
+            return make_sqlite_corpus_backend_from_url(url)
+        except CorpusBackendNotRegistered:
+            raise
+        except Exception as e:
+            # Broad catch (mirrors doctor.check_corpus_backend) so any
+            # construction failure becomes a clean operator-facing
+            # CorpusBackendNotRegistered with the URL remedy. Covers OSError /
+            # PermissionError (read-only mount, non-existent parent dir),
+            # ValueError (malformed URL, invalid agent_scope charset), and
+            # sqlite3.OperationalError (db locked at first connection, WAL
+            # transition failure on NFS) without leaking raw library exceptions.
+            raise CorpusBackendNotRegistered(
+                f"ATOMIC_AGENTS_CORPUS_BACKEND=sqlite: cannot create db "
+                f"(cause: {type(e).__name__}: {e!s}). Set "
+                f"ATOMIC_AGENTS_CORPUS_BACKEND_URL=sqlite:///path/to/corpus.db "
+                f"to use a different path."
+            ) from e
 
     # Unknown backend_id -- surface a fail-fast error with the FULL
     # known-id list so operators can spot the typo. Credential safety:

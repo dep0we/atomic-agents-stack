@@ -381,6 +381,64 @@ silently read the empty / outdated `<agent>/tools/` dir);
 credential leakage from `agent_scope=<name>` query strings or
 managed-service URLs into CI logs.
 
+### `corpus-backend` *(agent-scoped)*
+
+**Verifies:** Operator-config coherence for the CorpusBackend (spec/34).
+Agent-scoped because the filesystem reference impl is per-agent-rooted
+(`<agent_root>/wiki/` and `<agent_root>/raw/` belong to one agent),
+matching the `tool-registry-backend` scoping shape. Doctor reuses
+`get_default_corpus_backend(agent_root)` so the verdict and the runtime's
+first-`render_index_summary()` behaviour cannot diverge. Lands as the 12th
+`check_*_backend` entry in `doctor.py` in #65 PR 3 of 4.
+
+PASS / WARN / FAIL ladder:
+
+- **PASS** when `ATOMIC_AGENTS_CORPUS_BACKEND` is unset or `filesystem`
+  and `FilesystemCorpusBackend(agent_root)` constructs cleanly +
+  `capabilities()` + `stats(corpus="wiki")` + `stats(corpus="raw")` all
+  return without raising. Detail carries the capability snapshot
+  (`backend_id`, `supports_full_text_search`, `supports_semantic_search`,
+  `supports_versioning`, `embedding_provider`) plus `wiki_page_count` and
+  `raw_page_count` from the stats probe.
+- **PASS** when a non-filesystem `backend_id` (e.g. `sqlite`) is
+  registered, constructs via the URL factory
+  (`ATOMIC_AGENTS_CORPUS_BACKEND_URL`; when `=sqlite` without URL,
+  defaults to `<agent_root>/.corpus.db` with
+  `agent_scope=<agent_root.name>`), and the `capabilities()` + both
+  `stats()` probes succeed. Detail includes the credential-redacted URL
+  via `_redact_for_error_message`.
+- **FAIL** when `ATOMIC_AGENTS_CORPUS_BACKEND` is set to an id not in
+  `list_corpus_backends()`. The echoed env value is redacted at `://` to
+  prevent credential leaks if an operator pastes a URL into the id env var
+  by mistake.
+- **FAIL** when the registered backend's factory raises during
+  construction (verbatim exception text dropped to prevent credential
+  leak; `fix_hint` points at DEBUG logging for the unredacted exception).
+- **FAIL** when construction succeeds but either `stats()` probe raises
+  (backend reachable but schema-degraded or transient I/O error on the
+  corpus path).
+- **WARN** on the page-count cliff: any corpus whose `stats().page_count`
+  exceeds ~1000 pages on a backend that advertises
+  `supports_full_text_search=False`. The hint reads: "Set
+  `ATOMIC_AGENTS_CORPUS_BACKEND=sqlite` for indexed query performance.
+  Filesystem keyword grep at this scale can take seconds per query." This
+  is a `FilesystemCorpusBackend`-specific cliff; `SQLiteCorpusBackend`
+  with FTS5 does not trigger it.
+- **WARN** when `ATOMIC_AGENTS_CORPUS_BACKEND_URL` is set but
+  `ATOMIC_AGENTS_CORPUS_BACKEND` is not. The URL was used with the
+  default backend resolution. The message says "Set
+  `ATOMIC_AGENTS_CORPUS_BACKEND` explicitly to make the binding clear"
+  so operators do not have to debug which backend is active.
+
+**Prevents:** First-call `CorpusBackendNotRegistered` when `AtomicAgent`
+default-resolves a corpus backend at construction; silent fall-through to
+filesystem when an operator typo'd `ATOMIC_AGENTS_CORPUS_BACKEND` (would
+defeat the FTS5 indexed-search win for operators who pinned SQLite for
+large wiki corpora); page-count performance cliff surfaced before
+production traffic reveals it at query time; URL credential leakage from
+`sqlite:///path?agent_scope=<name>`-shaped envs into CI logs or
+error-tracking pipelines.
+
 ### `mandate-backend` *(scope-scoped)*
 
 **Verifies:** Operator-config coherence for the MandateBackend

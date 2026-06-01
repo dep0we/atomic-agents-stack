@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from .logs import LogBackend
     from .policy import PolicyBackend
     from .persona import PersonaBackend
+    from .corpus import CorpusBackend
 
 _log = logging.getLogger(__name__)
 
@@ -129,6 +130,7 @@ class OutcomeRunner:
         mandate_backend: "MandateBackend | None" = None,
         policy_backend: "PolicyBackend | None" = None,
         persona_backend: "PersonaBackend | None" = None,
+        corpus_backend: "CorpusBackend | None" = None,
     ):
         self.agents_root = Path(agents_root) if agents_root else get_agents_root()
         self.agent_name = agent_name
@@ -179,6 +181,15 @@ class OutcomeRunner:
         # ``get_default_persona_backend`` resolution (env var → filesystem
         # default).
         self._persona_backend = persona_backend
+        # spec/34 PR 3 — CorpusBackend forwarding. Same threading discipline
+        # as ``_persona_backend`` (#62 PR 2 / #62 PR 2 PersonaBackend,
+        # #63 PR 2 AgentProfileBackend). Without this, an operator pinning a
+        # custom corpus backend would silently drop it at the
+        # OutcomeRunner→AtomicAgent boundary.
+        # ``None`` means: defer to the agent's own
+        # ``get_default_corpus_backend`` resolution (env var → filesystem
+        # default).
+        self._corpus_backend = corpus_backend
 
         if not self.agent_root.exists():
             raise AtomicAgentsError(
@@ -263,6 +274,7 @@ class OutcomeRunner:
             mandate_backend=self._mandate_backend,
             policy_backend=self._policy_backend,
             persona_backend=self._persona_backend,
+            corpus_backend=self._corpus_backend,
         )
 
         # Resolve judge model: explicit > cross-family via eval config > pick_judge_model fallback
