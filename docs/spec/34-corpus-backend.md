@@ -767,6 +767,11 @@ Items considered and explicitly deferred, with rationale.
   - `_validate_corpus_type` refuses unknown corpus values
   - `atomic_write` usage (write fault injection verifies no partial state)
   - path-traversal refusal via `safe_resolve_under`
+- 4 registry primitive tests in `tests/test_corpus_registry.py`:
+  - `register_corpus_backend` / `unregister_corpus_backend` round-trip and collision-replace semantics
+  - `get_corpus_backend` raises `CorpusBackendNotRegistered` on unknown id
+  - `list_corpus_backends` returns ids in lexicographic order
+  - `get_default_corpus_backend` honors the `ATOMIC_AGENTS_CORPUS_BACKEND` env var
 
 **PR 2 (~46 actual, 35 estimated):**
 
