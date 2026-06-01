@@ -55,6 +55,10 @@ from .filesystem import (
     FilesystemCorpusBackend,
     make_filesystem_corpus_backend_from_url,
 )
+from .sqlite import (
+    SQLiteCorpusBackend,
+    make_sqlite_corpus_backend_from_url,
+)
 from .types import (
     CorpusCapabilities,
     CorpusPage,
@@ -74,8 +78,10 @@ __all__ = [
     "CorpusStats",
     # Reference implementations
     "FilesystemCorpusBackend",
+    "SQLiteCorpusBackend",
     # URL factories
     "make_filesystem_corpus_backend_from_url",
+    "make_sqlite_corpus_backend_from_url",
     # Registry
     "register_corpus_backend",
     "unregister_corpus_backend",
@@ -146,10 +152,11 @@ def list_corpus_backends() -> list[str]:
     return sorted(_registry.keys())
 
 
-# Register the built-in filesystem backend at import time. Matches the
-# Log + Lock + Profile registry pattern -- the default is always
+# Register the built-in backends at import time. Matches the
+# Log + Lock + Profile registry pattern -- the defaults are always
 # available without an extra resolution step.
 register_corpus_backend("filesystem", FilesystemCorpusBackend)
+register_corpus_backend("sqlite", SQLiteCorpusBackend)
 
 
 # ────────────────────────────────────────────────────────────────────

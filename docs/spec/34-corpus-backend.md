@@ -586,27 +586,79 @@ Schema:
 
 ```sql
 pages (
-    agent_scope TEXT NOT NULL,
-    corpus      TEXT NOT NULL CHECK (corpus IN ('wiki', 'raw')),
-    name        TEXT NOT NULL,
-    title       TEXT,
-    body_path   TEXT NOT NULL,       -- relative path to on-disk body file
-    byte_size   INTEGER,
-    last_modified REAL,              -- Unix timestamp
+    agent_scope   TEXT NOT NULL,
+    corpus        TEXT NOT NULL CHECK (corpus IN ('wiki', 'raw')),
+    name          TEXT NOT NULL,
+    title         TEXT,
+    body_path     TEXT NOT NULL,       -- absolute path to on-disk body file
+    byte_size     INTEGER,
+    last_modified REAL,                -- Unix timestamp (REAL for fractional seconds)
+    -- Typed date columns: stored as ISO strings, re-parsed on read
+    captured      TEXT,                -- date | None; date.fromisoformat() on read
+    last_seen     TEXT,                -- date | None
+    expires_at    TEXT,                -- date | None
+    ingested_at   TEXT,                -- datetime | None; datetime.fromisoformat() on read
+    pinned        INTEGER DEFAULT 0,   -- bool; 0=False, 1=True
+    -- Full YAML frontmatter dict serialized as JSON (for FTS5 indexing;
+    -- CorpusPage is reconstructed from typed columns, NOT from this blob)
     frontmatter_json TEXT,
     PRIMARY KEY (agent_scope, corpus, name)
 )
 
-pages_fts USING fts5 (name, body, frontmatter_json, content=pages)
+-- FTS5 virtual table with unicode61 tokenizer. External-content mode
+-- backed by pages. Body text is maintained explicitly in write_page (after
+-- the disk write succeeds) rather than via triggers alone, so the on-disk
+-- page body is searchable (not just frontmatter).
+-- External-content FTS5 with manual maintenance via direct INSERT in write_page.
+pages_fts USING fts5 (
+    name, body, frontmatter_json,
+    content=pages,
+    tokenize='unicode61'
+)
+
+-- External-content triggers maintain FTS structural integrity.
+-- write_page explicitly upserts FTS with the real body text after disk write,
+-- so the body is searchable. Triggers insert '' for body (triggers cannot
+-- read external filesystem files); the explicit FTS upsert corrects this.
+CREATE TRIGGER pages_ai AFTER INSERT ON pages BEGIN
+    INSERT INTO pages_fts(rowid, name, body, frontmatter_json)
+    VALUES (new.rowid, new.name, '', new.frontmatter_json);
+END;
+
+CREATE TRIGGER pages_ad AFTER DELETE ON pages BEGIN
+    INSERT INTO pages_fts(pages_fts, rowid, name, body, frontmatter_json)
+    VALUES ('delete', old.rowid, old.name, '', old.frontmatter_json);
+END;
+
+CREATE TRIGGER pages_au AFTER UPDATE ON pages BEGIN
+    INSERT INTO pages_fts(pages_fts, rowid, name, body, frontmatter_json)
+    VALUES ('delete', old.rowid, old.name, '', old.frontmatter_json);
+    INSERT INTO pages_fts(rowid, name, body, frontmatter_json)
+    VALUES (new.rowid, new.name, '', new.frontmatter_json);
+END;
 
 meta (key TEXT PRIMARY KEY, value TEXT)   -- schema_version tracking
 ```
 
-Cross-corpus isolation: every query includes `WHERE corpus = ?`. Two corpora sharing the same `agent_scope` are fully isolated at the SQL layer.
+Cross-corpus isolation: every query includes `WHERE agent_scope = ? AND corpus = ?` (double discriminator). Two corpora sharing the same `agent_scope` are fully isolated at the SQL layer. Two `agent_scope` values sharing the same db file are fully isolated.
 
-`PRAGMA busy_timeout=5000` is set BEFORE `PRAGMA journal_mode=WAL` (resolves the multi-process WAL race; same fix as ToolRegistryBackend #64 PR 3 and LogBackend #61). Cold-start init uses idempotent `INSERT OR IGNORE` for `meta` rows (multi-replica safe; same as ProfileBackend precedent).
+`PRAGMA busy_timeout=5000` is set BEFORE `PRAGMA journal_mode=WAL` (resolves the multi-process WAL race; same fix as ToolRegistryBackend #64 PR 3 and LogBackend #61). The WAL transition itself runs inside a 7-attempt exponential-backoff retry loop (same shape as the #208 fix in `logs/sqlite.py`) because even with `busy_timeout` set, `PRAGMA journal_mode=WAL` can surface `database is locked` immediately when N processes race the very first transition on a fresh file. Cold-start init uses idempotent `INSERT OR IGNORE` for `meta` rows (multi-replica safe; same as ProfileBackend precedent).
 
-URL factory: `make_sqlite_corpus_backend_from_url("sqlite:///path/to/corpus.db?agent_scope=<name>")`. Credentials redacted from all `ValueError` sites via `_redact_url` (H2 from prep-pass; mirrors `persona/filesystem.py:177-197`).
+**`write_page` transaction discipline (Round 1 adversarial, C1-C3):** The entire read-validate-UPSERT-FTS sequence inside `write_page` runs under a single `BEGIN IMMEDIATE` transaction. IMMEDIATE takes a reserved lock at BEGIN, serializing concurrent writers and eliminating the TOCTOU window between the existence check and the UPSERT. The FTS5 explicit upsert (replacing the trigger-inserted empty-body row with real body text) is INSIDE this transaction, not after it. If FTS upsert raises, the whole transaction rolls back: no SQL row lands, and `atomic_write` (which runs after COMMIT) never fires. `supports_full_text_search=True` means writes index successfully or they fail loudly; silent FTS degradation is not acceptable.
+
+The snapshot on CAS overwrite (`_sqlite_take_snapshot`) is called with the old body content as a string (read from disk before the UPSERT fires), not with the new body path. This ensures the auto-snapshot captures the pre-overwrite state. The `atomic_write` for the body runs after COMMIT. If `atomic_write` fails, a compensating transaction restores prior SQL+FTS state: DELETE for a fresh write (Case 1); `INSERT ... ON CONFLICT(agent_scope, corpus, name) DO UPDATE SET ...` of the prior row + FTS restore for a CAS overwrite (Case 3). The `ON CONFLICT DO UPDATE` shape (matching the initial UPSERT) preserves the SQLite rowid, keeping the FTS5 rowid stable across the compensation. If `atomic_write` raised after the rename completed (rare: post-rename parent-directory fsync failure), the new body is on disk and the SQL row is preserved with the new metadata; a WARNING is logged and the original error is re-raised so the caller knows the durability guarantee was weakened.
+
+**Future metadata-only mutations and the FTS5 trigger gap.** The three pages-table triggers (`pages_ai`, `pages_au`, `pages_ad`) write `body=''` to `pages_fts` on every INSERT/UPDATE/DELETE because triggers cannot read filesystem files. Only `write_page` currently follows the trigger with an explicit FTS5 upsert that inserts the real body text. Any future code path that mutates the `pages` table (a `pin_page`, `rename_page`, or partial metadata update) without immediately upserting `pages_fts` with the real body will silently overwrite the FTS body index with empty content, causing `query()` to miss that page's body content. PR 3+ authors adding metadata-only mutations must extend the explicit FTS upsert to those paths.
+
+**Typed column reconstruction on read:** `read_page` reconstructs `CorpusPage` from the typed SQL columns (`captured`, `last_seen`, `expires_at`, `ingested_at`, `pinned`) and the on-disk body file. It does NOT reconstruct from `json.loads(frontmatter_json)` for typed fields. `frontmatter_json` is for FTS5 indexing and extra-frontmatter round-trip only.
+
+URL factory: `make_sqlite_corpus_backend_from_url("sqlite:///path/to/corpus.db?agent_scope=<name>")`. Credentials redacted from all 6 `ValueError` sites via `_redact_url`:
+1. Non-sqlite scheme
+2. netloc present
+3. Fragment present
+4. Duplicate query parameter
+5. Unknown query parameter (anything besides `agent_scope`)
+6. Empty or root-only path
 
 ---
 
@@ -644,7 +696,7 @@ Implementers MUST:
 
 5. **`write_page()` 4-case behavior table (finding CQ1).** (a) Fresh write: page does not exist — write via `_io.atomic_write`, update INDEX-equivalent. (b) Content-identical idempotent no-op: page exists, body + frontmatter SHA-256 unchanged — no-op, safe for re-delivery. (c) Explicit overwrite via CAS: page exists, content differs, `expected_content_sha256` matches current hash — snapshot if `supports_versioning=True`, write new content, update INDEX-equivalent. (d) Collision: page exists, content differs, `expected_content_sha256` is None — raise `CorpusPageExists`; content differs, hash supplied but mismatched — raise `CorpusPreconditionFailed`. CAS via `expected_content_sha256` is the ONLY safe overwrite path; silent overwrite without operator intent is refused by default.
 
-6. **URL credential redaction across all `ValueError` sites in factory functions.** URL factories and `get_default_corpus_backend` error paths MUST NOT echo raw URL credentials. The reference uses `_redact_url` from `persona/filesystem.py:177-197` that strips after `://` and truncates. Operators may accidentally paste `postgres://user:password@host/db` into env vars; the error message MUST NOT echo the password. Reference: 5 `ValueError` sites in `make_sqlite_corpus_backend_from_url` following the ToolRegistryBackend precedent.
+6. **URL credential redaction across all `ValueError` sites in factory functions.** URL factories and `get_default_corpus_backend` error paths MUST NOT echo raw URL credentials. The reference uses `_redact_url` from `persona/filesystem.py:177-197` that strips after `://` and truncates. Operators may accidentally paste `postgres://user:password@host/db` into env vars; the error message MUST NOT echo the password. Reference: 6 `ValueError` sites in `make_sqlite_corpus_backend_from_url` (non-sqlite scheme, netloc present, fragment present, duplicate query parameter, unknown query parameter, empty or root-only path) following the ToolRegistryBackend precedent.
 
 7. **Cross-corpus isolation at storage layer.** `wiki` and `raw` corpora are fully independent. SQLite backends MUST include `WHERE corpus = ?` (or equivalent) on every query; no `wiki` query may touch `raw` rows and vice versa. Filesystem backends enforce isolation geometrically via separate subdirectories. A conformance test verifies that writing a page to `corpus="wiki"` does not make it visible via `corpus="raw"` and vice versa.
 
@@ -722,16 +774,16 @@ Items considered and explicitly deferred, with rationale.
   - `atomic_write` usage (write fault injection verifies no partial state)
   - path-traversal refusal via `safe_resolve_under`
 
-**PR 2 (~35 total):**
+**PR 2 (~46 actual, 35 estimated):**
 
-SQLite-specific tests in `tests/test_corpus_sqlite_backend.py`. Covers:
+SQLite-specific tests in `tests/test_corpus_sqlite_backend.py`. The 11 tests above the original estimate cover Round 1 and Round 2 adversarial fix regressions (transaction discipline, FTS5 rollback, compensation logic, `top_k` validation, schema mismatch detection, `bool` input guard). Covers:
 - CRUD across both corpora
 - FTS5 query happy path / empty result / special-char input (FTS5 parse error handling)
 - Versioning under the hybrid storage shape (SQL row + on-disk body)
 - `read_version` when SQL row exists but body file missing (raises `CorpusVersionNotFound`)
 - WAL race under multi-thread contention (after `PRAGMA busy_timeout=5000` fix)
 - Cold-start under multi-process concurrent init (idempotent `INSERT OR IGNORE`)
-- URL factory + credential redaction across all 5 `ValueError` sites
+- URL factory + credential redaction across all 6 `ValueError` sites
 - corpus discriminator isolation (`WHERE corpus = ?` on every query)
 - Hybrid-storage half-failure (INSERT-first + atomic_write-on-success-only)
 
@@ -747,7 +799,7 @@ Wiring + regression tests in new and modified test files. Includes the 5 IRON RU
 
 Plus: per-runner kwargs, delegate threading (`_corpus_backend_was_explicit` flag), env var override, doctor PASS/WARN/FAIL, page-count cliff WARN, CLI SQLite-path activation.
 
-**Total arc: ~100 tests** (PR 1 ~35 + PR 2 ~35 + PR 3 ~30). This is the post-eng-review corrected count; the original ~70 estimate in issue #65 excluded PR 3 wiring tests.
+**Total arc: ~111 tests** (PR 1 ~35 + PR 2 ~46 actual + PR 3 ~30). The PR 2 overage relative to the original ~35 estimate is from adversarial fix regressions added in Round 1 and Round 2 reviews. The original arc estimate in issue #65 was ~70, which excluded PR 3 wiring tests; this is the post-eng-review corrected count updated with the PR 2 as-delivered figure.
 
 ---
 

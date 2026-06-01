@@ -30,6 +30,7 @@ from atomic_agents.corpus.types import (
     CorpusStats,
 )
 from atomic_agents.corpus.filesystem import FilesystemCorpusBackend
+from atomic_agents.corpus.sqlite import SQLiteCorpusBackend
 from atomic_agents.memory.backend import WritePolicy, VersionRef
 from atomic_agents.exceptions import (
     CorpusInvalidName,
@@ -84,21 +85,29 @@ def _make_content(
 # Fixtures
 
 
-@pytest.fixture(params=["filesystem"])
-def corpus_backend(request, tmp_path: Path) -> FilesystemCorpusBackend:
+@pytest.fixture(params=["filesystem", "sqlite"])
+def corpus_backend(request, tmp_path: Path):
     """Parametrized over registered CorpusBackend implementations.
 
-    PR 2 adds ``"sqlite"`` to ``params`` and an ``elif`` branch here; every
-    test in this module then runs against both backends automatically.
-
-    Uses a subdirectory per-backend-id to keep filesystem state isolated
-    when multiple backends are tested in the same session.
+    Both filesystem and sqlite backends are exercised against every test in
+    this module. Uses a subdirectory per-backend-id to keep filesystem state
+    isolated when multiple backends are tested in the same session.
     """
     if request.param == "filesystem":
         agent_root = tmp_path / f"agent-{request.node.name[:32]}"
         agent_root.mkdir(exist_ok=True)
-        return FilesystemCorpusBackend(agent_root)
-    raise NotImplementedError(f"unknown backend param: {request.param!r}")
+        backend = FilesystemCorpusBackend(agent_root)
+        yield backend
+    elif request.param == "sqlite":
+        backend = SQLiteCorpusBackend(
+            db_path=tmp_path / "corpus.db",
+            agent_scope="test-agent",
+            content_root=tmp_path / "content",
+        )
+        yield backend
+        backend.close()
+    else:
+        raise NotImplementedError(f"unknown backend param: {request.param!r}")
 
 
 @pytest.fixture
