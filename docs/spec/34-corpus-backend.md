@@ -50,8 +50,6 @@ atomic_agents/corpus/
 ├── types.py           # CorpusCapabilities, CorpusRef, CorpusPage, CorpusStats
 │                      # VersionRef + WritePolicy re-used from MemoryBackend
 └── filesystem.py      # FilesystemCorpusBackend (default reference impl)
-
-# SQLite ships in PR 2:
 └── sqlite.py          # SQLiteCorpusBackend (FTS5 reference impl)
 ```
 
@@ -230,7 +228,7 @@ class CorpusBackend(Protocol):
     # exists but has no INDEX.md analog (raw corpora typically have no
     # INDEX; the empty-string contract lets callers branch on truthiness
     # the same way they branch on the legacy direct-read pattern).
-    # This is the primary migration target for agent.py:2937-2939 (PR 3).
+    # This is the primary migration target for agent.py:2937-2939.
 
     # ─── Write operations ─────────────────────────────────────────────
 
@@ -815,9 +813,9 @@ The wiring contract described in this section is implemented. Both call sites mi
 
 **What does NOT need migration:** `dashboard/memory.py` does not touch wiki at all (verified). `agent.py:721` (`self._wiki_index_text: str = ""`): unchanged (it buffers the read result; the new read happens upstream at 2937-2939). `migrate.py:233 + 595-606`: references wiki/raw paths as part of vault migration utilities — those stay outside CorpusBackend (migrate is a one-shot operator tool).
 
-**Crucial fact:** there are NO writes to `<agent>/wiki/` or `<agent>/raw/` in the framework code today. Dream output writes to `dream_dir/report.md` (a separate output directory); operator additions are manual file edits. PR 3's call-site migration scope is writes of `render_index_summary` only — not write_page migrations, because there are no write sites to migrate.
+**Crucial fact:** there are NO writes to `<agent>/wiki/` or `<agent>/raw/` in the framework code today. Dream output writes to `dream_dir/report.md` (a separate output directory); operator additions are manual file edits. The call-site migration scope is reads through `render_index_summary` only, not `write_page` migrations, because there are no write sites to migrate.
 
-Both fallback shapes preserve byte-identical pre-#65 behavior. The PR 3 IRON RULE regression suite (5 explicit assertions above) is the enforcement mechanism.
+Both fallback shapes preserve byte-identical pre-#65 behavior. The IRON RULE regression suite (5 explicit assertions above) is the enforcement mechanism.
 
 ---
 

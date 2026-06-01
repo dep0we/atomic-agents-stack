@@ -147,11 +147,11 @@ class CorpusBackend(Protocol):
         ``FilesystemCorpusBackend``; raw corpora typically have no INDEX
         equivalent. The empty-string contract lets callers branch on truthiness
         the same way they branch on the legacy ``wiki_index.read_text()``
-        direct-read pattern, so the PR 3 call-site migration at
+        direct-read pattern, so the call-site migration at
         ``agent.py:2937-2939`` and ``bundle.py:_render_memory_breakpoint`` is
         a single ``if self.corpus_backend is None:`` branch.
 
-        This is the primary migration target for ``agent.py:2937-2939`` (PR 3).
+        This is the primary migration target for ``agent.py:2937-2939``.
         """
         ...
 

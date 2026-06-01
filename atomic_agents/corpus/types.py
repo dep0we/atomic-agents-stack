@@ -190,9 +190,9 @@ class CorpusPage:
     # ── Raw-side fields ───────────────────────────────────────────────────
     # Per issue #65's stated schema. Wiki pages typically don't carry these;
     # raw docs typically do. NOTE: no sample raw-doc frontmatter exists in
-    # docs/samples/caldwell/raw/ (Subagent 2 HIGH H4 -- raw-side field shape
-    # is a design assumption until real raw sample data is added at PR 1 prep
-    # or contributed by operators). Accept as provisional for v1.0.
+    # docs/samples/caldwell/raw/; the raw-side field shape is locked at v1.0
+    # against issue #65's stated schema. Operator-contributed raw sample data
+    # could surface refinements for v1.1.
 
     source_url: str | None = None  # provenance URL for ingested content
     mime_type: str | None = None  # original document MIME type (e.g. "application/pdf")
