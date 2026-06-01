@@ -69,6 +69,10 @@ from .persona import (
     PersonaBackend,
     get_default_persona_backend,
 )
+from .corpus import (
+    CorpusBackend,
+    get_default_corpus_backend,
+)
 from .logs.types import (
     PRIMITIVE_AGENT_CALL,
     PRIMITIVE_CAPTURE,
@@ -252,9 +256,16 @@ class AtomicAgent:
     # PR 2). Without this, static analysis would narrow
     # ``agent.persona_backend`` to the concrete
     # ``FilesystemPersonaBackend`` default rather than treating it as any
-    # ``PersonaBackend`` Protocol implementer — breaking the
+    # ``PersonaBackend`` Protocol implementer -- breaking the
     # operator-pinned-SaaS/Postgres/git-backed case PR 3 forward.
     persona_backend: PersonaBackend
+    # Same class-level annotation rationale for ``corpus_backend`` (#65
+    # PR 3). Without this, static analysis would narrow
+    # ``agent.corpus_backend`` to the concrete
+    # ``FilesystemCorpusBackend`` default rather than treating it as any
+    # ``CorpusBackend`` Protocol implementer -- breaking the
+    # operator-pinned-SQLite/pgvector case PR 3 forward.
+    corpus_backend: CorpusBackend
     """The main agent runtime.
 
     Responsible for:
@@ -281,6 +292,7 @@ class AtomicAgent:
         mandate_backend: MandateBackend | None = None,
         policy_backend: PolicyBackend | None = None,
         persona_backend: PersonaBackend | None = None,
+        corpus_backend: CorpusBackend | None = None,
     ):
         self.name = name
         self.trigger = trigger
@@ -436,6 +448,21 @@ class AtomicAgent:
         # Saved on self so delegate() can consult it without re-checking
         # the constructor kwarg (the kwarg is no longer in scope there).
         self._persona_backend_was_explicit = _persona_backend_was_explicit
+
+        # ── CorpusBackend resolution (#65 PR 3) ──────────────────────────
+        # Mirrors PersonaBackend's _persona_backend_was_explicit pattern.
+        # Corpus is per-agent semantic context (wiki + raw), NOT fleet-scoped
+        # like Policy or AgentProfile. Default-resolved backends do NOT thread
+        # to delegates (D-ER-2 corollary). Operators wanting a shared corpus
+        # across a coordinator and delegates pass corpus_backend= explicitly.
+        _corpus_backend_was_explicit = corpus_backend is not None
+        if corpus_backend is None:
+            self.corpus_backend = get_default_corpus_backend(self.agent_root)
+        else:
+            self.corpus_backend = corpus_backend
+        # Saved on self so delegate() can consult it without re-checking
+        # the constructor kwarg (the kwarg is no longer in scope there).
+        self._corpus_backend_was_explicit = _corpus_backend_was_explicit
 
         # ── Mandate crash recovery + reservation managers (#124 PR 3b) ──────
         # Per spec/29 §"Crash recovery for reservations" + plan-subagent
@@ -2934,9 +2961,30 @@ class AtomicAgent:
         summary = self.memory.render_index_summary()
         if summary and summary.strip() != "# Memory Index\n":
             self._memory_index_text = summary
-        wiki_index = self.agent_root / "wiki" / "INDEX.md"
-        if wiki_index.exists():
-            self._wiki_index_text = wiki_index.read_text(encoding="utf-8")
+        if self.corpus_backend is not None:
+            # Route through Protocol when corpus_backend is registered.
+            # Protocol method returns content verbatim (byte-identical to
+            # the legacy direct read for the readable-file case).
+            self._wiki_index_text = self.corpus_backend.render_index_summary(
+                corpus="wiki"
+            )
+        else:
+            # Legacy direct-read fallback. Catches OSError to soft-degrade
+            # gracefully when wiki/INDEX.md exists but is unreadable
+            # (matching the Protocol path's behavior). Logs a warning so
+            # the degraded state is observable to operators.
+            wiki_index = self.agent_root / "wiki" / "INDEX.md"
+            if wiki_index.exists():
+                try:
+                    self._wiki_index_text = wiki_index.read_text(encoding="utf-8")
+                except OSError as exc:
+                    _logger.warning(
+                        "wiki_index_unreadable agent_root=%s path=%s cause=%s",
+                        self.agent_root,
+                        wiki_index,
+                        exc,
+                    )
+                    self._wiki_index_text = ""
 
     def _load_pinned_notes(self) -> None:
         if not (self.agent_root / "memory").exists():
@@ -4577,6 +4625,8 @@ class AtomicAgent:
         }
         if self._persona_backend_was_explicit:
             _delegate_kwargs["persona_backend"] = self.persona_backend
+        if self._corpus_backend_was_explicit:
+            _delegate_kwargs["corpus_backend"] = self.corpus_backend
         target_agent = AtomicAgent(**_delegate_kwargs)
 
         start = time.time()
