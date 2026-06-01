@@ -33,9 +33,17 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import _cascade
 from ._io import atomic_write
+
+if TYPE_CHECKING:
+    # Imported under TYPE_CHECKING to avoid circular imports -- bundle.py is
+    # loaded early and corpus may not yet be available in all import paths.
+    # All runtime references use the string annotation "CorpusBackend | None".
+    # (PR 3 wiring)
+    from .corpus.backend import CorpusBackend
 
 
 SECTION_SEPARATOR = "\n\n═══════════════════════════\n\n"
@@ -106,6 +114,7 @@ def render_bundle(
     cache_dir: Path | None = None,
     extra_files: list[Path] | None = None,
     if_stale: bool = False,
+    corpus_backend: "CorpusBackend | None" = None,
 ) -> BundleResult:
     """Render the cascade for *agent_root* into a single bundled file.
 
@@ -163,7 +172,7 @@ def render_bundle(
                     source_count=sum(1 for p in sources if p.is_file()),
                 )
 
-    sections = _render_sections(agent_root, all_extras)
+    sections = _render_sections(agent_root, all_extras, corpus_backend=corpus_backend)
     header = _render_header(agent_root, sources)
     body = SECTION_SEPARATOR.join(s for s in sections if s)
     content = header + "\n\n" + body + "\n\n<!-- end bundle -->\n"
@@ -263,6 +272,7 @@ def _collect_extras(
 # Source enumeration (for staleness tracking)
 
 
+# TODO(v1.1): _source_paths returns filesystem paths for staleness tracking. SQLite backends have no equivalent path to track. See #65 PR 4 follow-up issue (to be filed at arc closer).
 def _source_paths(agent_root: Path) -> list[Path]:
     """Enumerate every cascade source file whose mtime should drive staleness."""
     paths: list[Path] = []
@@ -350,12 +360,20 @@ def _staleness_paths(agent_root: Path) -> list[Path]:
 # Section rendering
 
 
-def _render_sections(agent_root: Path, extras: list[Path]) -> list[str]:
+def _render_sections(
+    agent_root: Path,
+    extras: list[Path],
+    corpus_backend: "CorpusBackend | None" = None,
+) -> list[str]:
     """Build the ordered list of bundle sections per spec/04 + spec/06.
 
     Section headers mirror spec/04 §"Cache breakpoints" so a future caller
     that wants to map sections back to Anthropic prompt-cache breakpoints
     can parse them.
+
+    ``corpus_backend`` is threaded to ``_render_memory_breakpoint`` so PR 3
+    wiring can route wiki INDEX reads through the Protocol when available.
+    Defaults to ``None`` for full backward compatibility.
     """
     cascade = _cascade.detect_cascade(agent_root)
     sections: list[str] = ["# === BREAKPOINT 1: Stable cascade ==="]
@@ -371,7 +389,9 @@ def _render_sections(agent_root: Path, extras: list[Path]) -> list[str]:
             sections.append(_render_file_section(p, label=f"Extra · {p.name}"))
 
     instance_root = cascade.instance_root if cascade else agent_root
-    sections.extend(_render_memory_breakpoint(instance_root))
+    sections.extend(
+        _render_memory_breakpoint(instance_root, corpus_backend=corpus_backend)
+    )
     sections.extend(_render_recent_notes_breakpoint(instance_root))
     sections.extend(_render_journal_breakpoint(instance_root))
 
@@ -491,8 +511,30 @@ def _render_flat(agent_root: Path) -> list[str]:
     return out
 
 
-def _render_memory_breakpoint(instance_root: Path) -> list[str]:
-    """Render memory INDEX + pinned + wiki INDEX (BP1 trailing or BP2)."""
+def _render_wiki_index_section(label: str, path: Path, content: str) -> str:
+    """Render wiki INDEX content into the standard bundle section format.
+
+    Both the corpus_backend Protocol path and the legacy direct-read path
+    call this helper so the output is byte-for-byte identical regardless of
+    which path produced the content. Matches ``_render_file_section``'s
+    ``## {label}\\n`{path}`\\n\\n{body}`` shape exactly. The ``path`` is
+    always derivable from ``instance_root`` (``instance_root / "wiki" /
+    "INDEX.md"``) regardless of whether the content arrived through the
+    Protocol or a direct file read. (PR 3 wiring; IRON RULE assertion 4)
+    """
+    return f"## {label}\n`{path}`\n\n{content}"
+
+
+def _render_memory_breakpoint(
+    instance_root: Path,
+    corpus_backend: "CorpusBackend | None" = None,
+) -> list[str]:
+    """Render memory INDEX + pinned + wiki INDEX (BP1 trailing or BP2).
+
+    ``corpus_backend`` threads the CorpusBackend Protocol for wiki INDEX
+    reads when available (PR 3 wiring). When ``None``, falls back to the
+    legacy direct-file read via ``_render_file_section``.
+    """
     memory_dir = instance_root / "memory"
     wiki_dir = instance_root / "wiki"
 
@@ -506,8 +548,27 @@ def _render_memory_breakpoint(instance_root: Path) -> list[str]:
     if pinned:
         out.append("## Memory · Pinned atomic notes\n\n" + "\n\n---\n\n".join(pinned))
 
-    if (wiki_dir / "INDEX.md").is_file():
-        out.append(_render_file_section(wiki_dir / "INDEX.md", label="Wiki · INDEX.md"))
+    # Wiki INDEX: route through CorpusBackend Protocol when available (PR 3
+    # wiring). Both branches call _render_wiki_index_section with the same
+    # logical path so output is byte-identical between corpus_backend=None
+    # and corpus_backend=FilesystemCorpusBackend(...) (IRON RULE assertion 4).
+    # Both branches apply .strip() to match _render_file_section's
+    # _safe_read_text(...).strip() behavior. Skip the section when the
+    # content is empty (no file or empty file), matching the existing
+    # "skip empty wiki" behavior.
+    wiki_label = "Wiki · INDEX.md"
+    wiki_path = wiki_dir / "INDEX.md"
+    if corpus_backend is not None:
+        wiki_content = corpus_backend.render_index_summary(corpus="wiki").strip()
+        if wiki_content:
+            out.append(_render_wiki_index_section(wiki_label, wiki_path, wiki_content))
+    else:
+        if wiki_path.is_file():
+            wiki_content = _safe_read_text(wiki_path).strip()
+            if wiki_content:
+                out.append(
+                    _render_wiki_index_section(wiki_label, wiki_path, wiki_content)
+                )
 
     if out:
         return ["# === BREAKPOINT 2: Weekly (INDEXes + pinned) ==="] + out
