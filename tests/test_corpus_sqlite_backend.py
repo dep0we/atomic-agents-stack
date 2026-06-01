@@ -1,4 +1,4 @@
-"""SQLite-specific tests for SQLiteCorpusBackend (spec/34 PR 2 of 4).
+"""SQLite-specific tests for SQLiteCorpusBackend (spec/34).
 
 These tests cover behaviors that are specific to the SQLite backend and cannot
 be exercised via the parametrized conformance suite. The conformance suite

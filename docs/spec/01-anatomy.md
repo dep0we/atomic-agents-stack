@@ -370,6 +370,8 @@ sources:
 
 `raw/` holds original ingested documents — unedited. The Wiki is *derivative*; raw is *primary*. Lets you re-derive the wiki, audit claims, or detect drift.
 
+**CorpusBackend (spec/34).** When registered, `CorpusBackend` becomes the storage abstraction for `wiki/` and `raw/`. The filesystem default (`FilesystemCorpusBackend`) preserves the layout described above byte-for-byte. `SQLiteCorpusBackend` with FTS5 provides O(log N) indexed full-text query for operators with large corpora (10K+ pages or hundreds of MB of raw documents). See spec/34 for the Protocol contract and the 9-MUST Implementer Contract.
+
 ---
 
 ## journal/

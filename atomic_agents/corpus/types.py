@@ -1,6 +1,6 @@
 """Canonical dataclasses for the CorpusBackend Protocol (spec/34).
 
-Four dataclasses define the corpus substrate contract (issue #65, PR 1 of 4):
+Four dataclasses define the corpus substrate contract (issue #65, spec/34):
 
 - ``CorpusCapabilities`` -- frozen capability advertisement for a backend
   instance; conformance tests assert claim-vs-behavior parity.
@@ -20,12 +20,9 @@ import ``CorpusPageNotFound``, ``CorpusPageExists``, and their siblings
 without creating cross-module import cycles.
 
 No Protocol definition lives here. The ``CorpusBackend`` Protocol is in
-``atomic_agents/corpus/backend.py`` (PR 1, File 2 of 3).
+``atomic_agents/corpus/backend.py``.
 
-Scaffolding PR (#65 PR 1 of 4): no call site routes through the Protocol
-yet. ``AtomicAgent.__init__`` is unchanged. PR 3 wires the bootstrap path;
-these types exist so PR 1's ``FilesystemCorpusBackend`` + conformance suite
-have a stable contract to build against.
+
 """
 
 from __future__ import annotations
@@ -66,7 +63,7 @@ class CorpusCapabilities:
     ``supports_versioning``: True if the snapshot trio
         (``snapshot`` / ``restore_version`` / ``list_versions``) is fully
         implemented. ``FilesystemCorpusBackend`` and ``SQLiteCorpusBackend``
-        both set this True in PR 1 / PR 2 respectively.
+        both set this True.
 
     ``supports_streaming_iteration``: True if the backend prefers chunked
         iteration for ``list_pages()`` over in-memory collection. The

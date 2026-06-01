@@ -8,7 +8,7 @@
 
 `atomic_agents/_llm.py` used procedural dispatch (`if model.startswith(...)`) for LLM provider routing. Adding a fourth provider (Gemini, Bedrock, Ollama) meant editing core. The `LLMBackend` Protocol replaces that with the same protocol-pattern shape PR #57 established for `MemoryBackend`: a Protocol contract, canonical types that decouple the agent from provider shapes, a registry, and reference implementations.
 
-The shape is the same as the rest of the protocol-pattern series alongside Lock, Log, Persona, AgentProfile, ToolRegistry, and Corpus protocols. The agent runtime — `agent.call()`, the cost gates, the multi-turn tool loop — talks to LLM providers only through canonical types. Backends translate at their own boundaries. Third-party packages implementing the Protocol drop in without forking core.
+The shape is the same as the rest of the protocol-pattern series alongside Lock, Log, Persona, AgentProfile, ToolRegistry, and Corpus (spec/34) protocols. The agent runtime — `agent.call()`, the cost gates, the multi-turn tool loop — talks to LLM providers only through canonical types. Backends translate at their own boundaries. Third-party packages implementing the Protocol drop in without forking core.
 
 The framework ships three reference backends. Operators wanting Gemini, Vertex, Bedrock, vLLM-local, etc., either configure a fourth `OpenAICompatibleLLMBackend` instance or ship a 200-line third-party `atomic-agents-<provider>` package satisfying the Protocol. The framework's own surface stays small and auditable.
 

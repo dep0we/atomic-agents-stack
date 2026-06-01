@@ -8,7 +8,7 @@ ToolRegistryBackend (#64, shipped), MandateBackend (#124, shipped),
 PolicyBackend (#89, shipped), and PersonaBackend (#62, shipped).
 See ``docs/spec/34-corpus-backend.md`` for the prose contract.
 
-Public surface (scaffolding PR -- no behavior change today):
+Public surface:
 
     from atomic_agents.corpus import (
         # Protocol contract
@@ -31,7 +31,7 @@ operator-pin string like ``"filesystem"`` or ``"sqlite"``). Like the
 Log + Lock + Profile registries it stores backend *classes*, not
 instances -- corpus backends are constructed per agent scope and the
 registry's job is to let an operator pick "filesystem vs sqlite vs
-pgvector" for a deployment. The caller (``AtomicAgent.__init__`` in PR 3)
+pgvector" for a deployment. The caller (``AtomicAgent.__init__``)
 instantiates the chosen class with its scope-specific args.
 
 Thread-safety: registration is expected at import time (one-shot from
@@ -159,32 +159,24 @@ register_corpus_backend("filesystem", FilesystemCorpusBackend)
 register_corpus_backend("sqlite", SQLiteCorpusBackend)
 
 
-# ────────────────────────────────────────────────────────────────────
-# PR 3 wiring contract -- PRE-PR-3 state (describes what WILL be wired
-# by PR 3; today, in PR 1 scaffolding, none of these call sites exist).
-#
-# Wired by #65 PR 3:
-#   1. ``AtomicAgent.__init__`` accepts ``corpus_backend:
-#      CorpusBackend | None``; if unset, calls
-#      ``get_default_corpus_backend(self.agent_root)``. Public
-#      ``self.corpus_backend`` mirrors ``self.log_backend`` /
-#      ``self.profile_backend``.
-#   2. ``agent.py:2937-2939`` wiki-index read routes through
-#      ``self.corpus_backend.render_index_summary("wiki")`` instead
-#      of the raw ``Path.read_text()`` call.
-#   3. ``bundle.py:_render_memory_breakpoint`` routes through
-#      ``corpus_backend.render_index_summary("wiki")``.
-#   4. ``DreamRunner``, ``OutcomeRunner``, ``EvalRunner`` accept
-#      ``corpus_backend=`` kwarg and thread it to the internal
-#      ``AtomicAgent`` instance.
-#   5. ``doctor.check_corpus_backend`` validates operator config and
-#      reports backend stats (page count cliff WARN at ~1000 pages
-#      without FTS per plan-eng-review 2026-05-29 finding P1);
-#      URL-credential-redacted error messages.
+# Wiring contract (all items below landed in #65 PR 3, locked at #65 PR 4):
+#   - AtomicAgent.__init__ accepts the corpus_backend kwarg + resolves the default
+#     via get_default_corpus_backend(self.agent_root) when not supplied.
+#   - OutcomeRunner, EvalRunner, DreamRunner all accept corpus_backend per-runner
+#     kwargs (OutcomeRunner threads at outcome.py:255, EvalRunner at eval.py:363,
+#     DreamRunner stores as self._corpus_backend for API parity).
+#   - delegate.py threads corpus_backend ONLY when supplied explicitly via the
+#     AtomicAgent constructor kwarg (_corpus_backend_was_explicit flag tracking).
+#   - ATOMIC_AGENTS_CORPUS_BACKEND env var + optional ATOMIC_AGENTS_CORPUS_BACKEND_URL
+#     resolve via get_default_corpus_backend.
+#   - doctor.check_corpus_backend lands with PASS/WARN/FAIL ladder + page-count cliff.
+#   - agent.py:_load_indexes() routes wiki/INDEX.md through render_index_summary("wiki").
+#   - bundle.py:_render_memory_breakpoint accepts corpus_backend parameter.
 #
 # DEFERRED (intentional):
-#   - ``SQLiteCorpusBackend`` with FTS5 -- PR 2 scope.
-#   - Semantic search (pgvector, embedding provider) -- PR 2+ scope.
+#   - Semantic search (pgvector, embedding provider): ships in the coordinated #258
+#     Postgres-adapter family release alongside PgvectorMemoryBackend so semantic-
+#     search coverage stays symmetric across both substrates.
 
 
 def get_default_corpus_backend(agent_root: Path) -> CorpusBackend:
@@ -215,8 +207,7 @@ def get_default_corpus_backend(agent_root: Path) -> CorpusBackend:
 
     For programmatic operators who want to construct the backend
     themselves (custom database connection, custom path, etc.), the
-    ``AtomicAgent(..., corpus_backend=...)`` constructor kwarg (wired
-    in PR 3) bypasses this factory entirely.
+    ``AtomicAgent(..., corpus_backend=...)`` constructor kwarg bypasses this factory entirely.
 
     See spec/34 §"Operator override surface" for the full env-var
     reference + the env-var-vs-kwarg trade-off rationale.
