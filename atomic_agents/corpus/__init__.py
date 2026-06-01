@@ -257,14 +257,32 @@ def get_default_corpus_backend(agent_root: Path) -> CorpusBackend:
                     f"agent_root with a non-empty name (got {agent_root}). "
                     f"Set ATOMIC_AGENTS_CORPUS_BACKEND_URL to override."
                 )
+            # URL-encode agent_root.name so names containing URL metacharacters
+            # (spaces, +, &, ?, =) don't silently corrupt the agent_scope or
+            # raise ValueError from the URL factory's query-parameter parser.
+            # Without quote_plus, an agent named "my+agent" would have its
+            # agent_scope decoded as "my agent" (parse_qsl interprets + as
+            # space), causing cross-scope contamination with another agent
+            # genuinely named "my agent".
+            from urllib.parse import quote_plus
+
             db_path = agent_root / ".corpus.db"
-            url = f"sqlite:///{db_path}?agent_scope={agent_root.name}"
+            url = f"sqlite:///{db_path}?agent_scope={quote_plus(agent_root.name)}"
         try:
             return make_sqlite_corpus_backend_from_url(url)
-        except (OSError, PermissionError) as e:
+        except CorpusBackendNotRegistered:
+            raise
+        except Exception as e:
+            # Broad catch (mirrors doctor.check_corpus_backend) so any
+            # construction failure becomes a clean operator-facing
+            # CorpusBackendNotRegistered with the URL remedy. Covers OSError /
+            # PermissionError (read-only mount, non-existent parent dir),
+            # ValueError (malformed URL, invalid agent_scope charset), and
+            # sqlite3.OperationalError (db locked at first connection, WAL
+            # transition failure on NFS) without leaking raw library exceptions.
             raise CorpusBackendNotRegistered(
                 f"ATOMIC_AGENTS_CORPUS_BACKEND=sqlite: cannot create db "
-                f"(cause: {e!s}). Set "
+                f"(cause: {type(e).__name__}: {e!s}). Set "
                 f"ATOMIC_AGENTS_CORPUS_BACKEND_URL=sqlite:///path/to/corpus.db "
                 f"to use a different path."
             ) from e

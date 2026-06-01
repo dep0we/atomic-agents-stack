@@ -2443,8 +2443,9 @@ def check_corpus_backend(agent_root: Path) -> CheckResult:
       WARN -- filesystem keyword grep at large scale can take seconds per
       query; plan-eng-review 2026-05-29 finding P1).
     * ``ATOMIC_AGENTS_CORPUS_BACKEND_URL`` is set in the environment but
-      ``ATOMIC_AGENTS_CORPUS_BACKEND`` is unset (or resolves to
-      ``"filesystem"``); the URL is being silently ignored.
+      ``ATOMIC_AGENTS_CORPUS_BACKEND`` is unset. The URL is being interpreted
+      with the implicit filesystem default rather than an operator-stated
+      backend binding; surfaces the implicit-default state for clarity.
 
     **PASS** when ALL of the above FAIL / WARN conditions are clear.
 
@@ -2579,9 +2580,22 @@ def check_corpus_backend(agent_root: Path) -> CheckResult:
             )
 
     # Build capability snapshot. wiki_stats and raw_stats are guaranteed
-    # non-None here (both probes succeeded).
-    assert wiki_stats is not None
-    assert raw_stats is not None
+    # non-None here (both probes succeeded). Defensive conditional rather
+    # than bare assert: assert is disabled in optimized Python builds and
+    # would crash with AssertionError if a future refactor moves the
+    # probe loop or adds a conditional-return before this point. Returning
+    # CheckResult(FAIL) preserves the always-returns-CheckResult contract.
+    if wiki_stats is None or raw_stats is None:
+        return CheckResult(
+            name="corpus-backend",
+            status=FAIL,
+            message=(
+                "Internal error: stats probe completed without setting both "
+                "wiki_stats and raw_stats. This indicates a logic error in "
+                "check_corpus_backend. Report this with the stack trace."
+            ),
+            detail={"backend_id": backend_id},
+        )
 
     detail: dict[str, Any] = {
         "backend_id": backend_id,
@@ -2604,14 +2618,16 @@ def check_corpus_backend(agent_root: Path) -> CheckResult:
             status=WARN,
             message=(
                 "ATOMIC_AGENTS_CORPUS_BACKEND_URL is set but "
-                "ATOMIC_AGENTS_CORPUS_BACKEND is not. The URL is being ignored. "
-                "Set ATOMIC_AGENTS_CORPUS_BACKEND=sqlite (or the relevant "
-                "backend id) to activate the URL."
+                "ATOMIC_AGENTS_CORPUS_BACKEND is not. The URL was used with "
+                "the default backend resolution. Set ATOMIC_AGENTS_CORPUS_BACKEND "
+                "explicitly to make the binding clear."
             ),
             fix_hint=(
-                "Set ATOMIC_AGENTS_CORPUS_BACKEND=sqlite (or the relevant "
-                "backend id) to activate the URL. If you intended to use the "
-                "filesystem backend, unset ATOMIC_AGENTS_CORPUS_BACKEND_URL."
+                "Set ATOMIC_AGENTS_CORPUS_BACKEND=<backend_id> (e.g., "
+                "filesystem or sqlite) to declare the backend explicitly. "
+                "The URL is honored by both backends; this WARN exists to "
+                "surface implicit-default operator configuration, not silent "
+                "ignore."
             ),
             detail=detail,
         )

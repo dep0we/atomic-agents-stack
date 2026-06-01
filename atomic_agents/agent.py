@@ -2962,17 +2962,33 @@ class AtomicAgent:
         if summary and summary.strip() != "# Memory Index\n":
             self._memory_index_text = summary
         if self.corpus_backend is not None:
-            # Route through Protocol when corpus_backend is registered.
-            # Protocol method returns content verbatim (byte-identical to
-            # the legacy direct read for the readable-file case).
-            self._wiki_index_text = self.corpus_backend.render_index_summary(
-                corpus="wiki"
-            )
+            # Route through Protocol. After PR 3 default-resolution at
+            # __init__, this is the common production path. Broad except
+            # mirrors the legacy direct-read soft-degrade so a transient
+            # backend failure (OSError, UnicodeDecodeError, sqlite3.*,
+            # CorpusError, or any custom-backend exception) does not crash
+            # agent construction. The empty wiki section is observable via
+            # the logged warning marker wiki_index_unreadable.
+            try:
+                self._wiki_index_text = self.corpus_backend.render_index_summary(
+                    corpus="wiki"
+                )
+            except Exception as exc:
+                _logger.warning(
+                    "wiki_index_unreadable backend=%s agent_root=%s cause=%s",
+                    type(self.corpus_backend).__name__,
+                    self.agent_root,
+                    exc,
+                )
+                self._wiki_index_text = ""
         else:
-            # Legacy direct-read fallback. Catches OSError to soft-degrade
-            # gracefully when wiki/INDEX.md exists but is unreadable
-            # (matching the Protocol path's behavior). Logs a warning so
-            # the degraded state is observable to operators.
+            # Legacy direct-read fallback. NOTE: after PR 3, this branch is
+            # unreachable in production because AtomicAgent.__init__ always
+            # default-resolves corpus_backend via get_default_corpus_backend.
+            # Retained as a safety net for any future refactor that removes
+            # the auto-resolve. Tests in test_corpus_migration_regression.py
+            # force corpus_backend=None post-construction to exercise this
+            # branch's byte-identity and OSError soft-degrade guarantees.
             wiki_index = self.agent_root / "wiki" / "INDEX.md"
             if wiki_index.exists():
                 try:

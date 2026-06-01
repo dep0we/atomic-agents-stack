@@ -698,7 +698,11 @@ class FilesystemCorpusBackend:
 
         try:
             return index_path.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
+            # UnicodeDecodeError covers wiki/INDEX.md with non-UTF-8 bytes
+            # (Latin-1, BOM, mixed encodings). The legacy bundle path used
+            # _safe_read_text which catches this; we match that soft-degrade
+            # so the Protocol path stays at parity with the pre-#65 behavior.
             return ""
 
     # ── Write operations ──────────────────────────────────────────────────

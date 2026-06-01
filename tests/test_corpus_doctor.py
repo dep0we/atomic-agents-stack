@@ -194,11 +194,9 @@ def test_check_corpus_backend_warns_url_without_backend_id(
     # Use a filesystem:// URL so get_default_corpus_backend can construct the
     # backend successfully (it falls back to filesystem when the backend id is
     # unset, then routes through make_filesystem_corpus_backend_from_url).
-    # The WARN fires AFTER successful construction -- the doctor detects that
-    # ATOMIC_AGENTS_CORPUS_BACKEND_URL is set but ATOMIC_AGENTS_CORPUS_BACKEND
-    # is unset (meaning the URL would be silently ignored for non-filesystem
-    # backends like sqlite). Using a filesystem:// URL exercises the real WARN
-    # path without making the construction fail first.
+    # The WARN fires AFTER successful construction -- the doctor surfaces the
+    # implicit-default state so operators know their config relies on the
+    # default backend resolution rather than an explicit binding.
     monkeypatch.setenv(
         "ATOMIC_AGENTS_CORPUS_BACKEND_URL",
         f"filesystem://{tmp_path}",
@@ -208,7 +206,14 @@ def test_check_corpus_backend_warns_url_without_backend_id(
     result = check_corpus_backend(tmp_path)
 
     assert result.status == WARN
-    assert "URL is being ignored" in result.message
+    # The WARN names the implicit-default behavior + tells the operator to
+    # set the backend explicitly. Match a substring rather than the full
+    # verbatim text so wording adjustments don't break the test.
+    assert "ATOMIC_AGENTS_CORPUS_BACKEND_URL is set" in result.message
+    assert "ATOMIC_AGENTS_CORPUS_BACKEND is not" in result.message
+    assert (
+        "default backend resolution" in result.message or "explicitly" in result.message
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
