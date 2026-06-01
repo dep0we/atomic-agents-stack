@@ -152,8 +152,9 @@ def run_doctor(
         # Order matches run_doctor()'s actual execution sequence below
         # (lock-backend → log-backend → profile-backend →
         # tool-registry-backend → mandate-backend → policy-backend →
-        # memory-backend) so contributors adding a scope-level backend
-        # check see the SKIP enumeration mirror reality.
+        # corpus-backend → memory-backend) so contributors adding a
+        # scope-level backend check see the SKIP enumeration mirror
+        # reality.
         for n in (
             "vault",
             "provider-keys",
@@ -164,6 +165,7 @@ def run_doctor(
             "tool-registry-backend",
             "mandate-backend",
             "policy-backend",
+            "corpus-backend",
             "memory-backend",
             "write-paths",
         ):
@@ -223,6 +225,7 @@ def run_doctor(
     # scoped to agents_root instead of cascade.project_root (fix #236).
     results.append(check_policy_backend(resolved_root, cascade=cascade))
     results.append(check_persona_backend(resolved_root))
+    results.append(check_corpus_backend(agent_root))
     results.append(check_memory_backend(agent_root))
     results.append(check_write_paths(tools_data, agent_root=agent_root))
 
@@ -2404,6 +2407,252 @@ def check_persona_backend(scope_root: Path) -> CheckResult:
         message=(
             f"{backend_id} backend ok ({persona_count} persona"
             f"{'' if persona_count == 1 else 's'} discovered)"
+        ),
+        detail=detail,
+    )
+
+
+def check_corpus_backend(agent_root: Path) -> CheckResult:
+    """Operator-config coherence check for the corpus backend (#65 PR 3).
+
+    Validates that ``ATOMIC_AGENTS_CORPUS_BACKEND`` (plus
+    ``ATOMIC_AGENTS_CORPUS_BACKEND_URL`` when non-filesystem) is correctly
+    configured. Scoped at ``agent_root`` because the corpus backend is
+    per-agent -- ``wiki/`` and ``raw/`` live directly under ``agent_root``,
+    not under a shared scope root.
+
+    This is the most feature-rich doctor check in the codebase because
+    it has a PASS / WARN / FAIL ladder with multiple WARN conditions.
+
+    PASS / WARN / FAIL ladder (spec/34 PR 3 + plan-eng-review finding P1
+    for the page-count cliff):
+
+    **FAIL** when ANY of:
+
+    * ``get_default_corpus_backend(agent_root)`` raises (e.g.,
+      ``CorpusBackendNotRegistered``, malformed env var, sqlite path
+      unwritable).
+    * ``stats(corpus="wiki")`` or ``stats(corpus="raw")`` raises
+      (capability missing or backend corrupted).
+
+    **WARN** when ANY of:
+
+    * ``supports_full_text_search=False`` AND
+      ``stats(corpus="wiki").page_count > 1000`` OR
+      ``stats(corpus="raw").page_count > 1000`` (the page-count cliff
+      WARN -- filesystem keyword grep at large scale can take seconds per
+      query; plan-eng-review 2026-05-29 finding P1).
+    * ``ATOMIC_AGENTS_CORPUS_BACKEND_URL`` is set in the environment but
+      ``ATOMIC_AGENTS_CORPUS_BACKEND`` is unset (or resolves to
+      ``"filesystem"``); the URL is being silently ignored.
+
+    **PASS** when ALL of the above FAIL / WARN conditions are clear.
+
+    Capability snapshot included in ``detail`` (per Subagent 2
+    recommendation -- capability fields are provider names, not
+    credentials; no redaction needed):
+
+    * ``backend_id`` -- e.g. ``"filesystem"`` or ``"sqlite"``
+    * ``supports_full_text_search``
+    * ``supports_semantic_search``
+    * ``supports_versioning``
+    * ``embedding_provider``
+    * ``wiki_page_count`` (when probe succeeds)
+    * ``raw_page_count`` (when probe succeeds)
+
+    URL credential redaction follows the same urlparse + ``_replace``
+    pattern as sister checks -- strips password AND username from netloc
+    (covers token-as-username URLs common with managed services).
+    """
+    from .corpus import get_default_corpus_backend, list_corpus_backends
+    from .exceptions import CorpusBackendNotRegistered
+
+    raw_backend_id = os.environ.get("ATOMIC_AGENTS_CORPUS_BACKEND", "").strip().lower()
+    # Empty-string treated as "not set" -- matches get_default_corpus_backend
+    # fallback logic in corpus/__init__.py.
+    backend_id = raw_backend_id if raw_backend_id else "filesystem"
+
+    # WARN condition: ATOMIC_AGENTS_CORPUS_BACKEND_URL is set but
+    # ATOMIC_AGENTS_CORPUS_BACKEND is unset (resolves to filesystem), which
+    # means the URL is silently ignored by get_default_corpus_backend unless
+    # ATOMIC_AGENTS_CORPUS_BACKEND=filesystem is also set explicitly. Detect
+    # the mismatch here so operators learn about the misconfiguration before
+    # a production run.
+    url_env = os.environ.get("ATOMIC_AGENTS_CORPUS_BACKEND_URL", "").strip()
+    url_without_backend = bool(url_env) and not raw_backend_id
+
+    # URL credential redaction for detail dict -- same urlparse + _replace
+    # pattern as check_mandate_backend / check_persona_backend /
+    # check_policy_backend / check_log_backend. Redacts when EITHER password
+    # OR username is present (covers token-as-username URLs common with
+    # managed services).
+    safe_url: str | None = None
+    if url_env:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url_env)
+        if parsed.password or parsed.username:
+            netloc = parsed.hostname or ""
+            if parsed.port:
+                netloc = f"{netloc}:{parsed.port}"
+            safe_url = parsed._replace(netloc=netloc).geturl()
+        else:
+            safe_url = url_env
+
+    # Step 1: construct the backend. Any exception here is a hard FAIL --
+    # the operator cannot use the corpus at all.
+    try:
+        backend = get_default_corpus_backend(agent_root)
+    except CorpusBackendNotRegistered as exc:
+        # Redact the verbatim exception for the same reason as sister checks:
+        # connection errors from backend constructors can embed the full URL
+        # with credentials in the exception text.
+        from .corpus import _redact_for_error_message as _redact_cid
+
+        safe_exc = _redact_cid(str(exc))
+        return CheckResult(
+            name="corpus-backend",
+            status=FAIL,
+            message=(
+                f"Could not construct CorpusBackend (cause: {safe_exc}). "
+                "Check ATOMIC_AGENTS_CORPUS_BACKEND and "
+                "ATOMIC_AGENTS_CORPUS_BACKEND_URL environment variables."
+            ),
+            fix_hint=(
+                "Set ATOMIC_AGENTS_CORPUS_BACKEND to one of the known ids "
+                f"({sorted(list_corpus_backends())}), or unset to use the "
+                "filesystem default."
+            ),
+        )
+    except Exception as exc:
+        # Drop the verbatim exception message -- connection errors from
+        # backend constructors commonly embed the full URL with credentials.
+        return CheckResult(
+            name="corpus-backend",
+            status=FAIL,
+            message=(
+                f"Could not construct CorpusBackend (cause: {type(exc).__name__}). "
+                "Check ATOMIC_AGENTS_CORPUS_BACKEND and "
+                "ATOMIC_AGENTS_CORPUS_BACKEND_URL environment variables."
+            ),
+            fix_hint=(
+                "Check ATOMIC_AGENTS_CORPUS_BACKEND and "
+                "ATOMIC_AGENTS_CORPUS_BACKEND_URL for typos. Run with "
+                "DEBUG logging to see the full exception."
+            ),
+        )
+
+    caps = backend.capabilities
+
+    # Step 2: probe both corpora via stats(). Any exception here is a hard
+    # FAIL -- the backend is constructed but the core stats interface is
+    # broken, indicating corruption or misconfiguration.
+    wiki_stats = None
+    raw_stats = None
+    for corpus_name in ("wiki", "raw"):
+        try:
+            if corpus_name == "wiki":
+                wiki_stats = backend.stats(corpus_name)
+            else:
+                raw_stats = backend.stats(corpus_name)
+        except Exception as exc:
+            return CheckResult(
+                name="corpus-backend",
+                status=FAIL,
+                message=(
+                    f"CorpusBackend constructed but stats({corpus_name!r}) failed "
+                    f"(cause: {type(exc).__name__}). Backend may be corrupted or "
+                    "misconfigured."
+                ),
+                fix_hint=(
+                    "Verify the corpus directories (wiki/ and raw/) under "
+                    f"{agent_root} are readable. Run with DEBUG logging to see "
+                    "the full exception."
+                ),
+                detail={
+                    "backend_id": backend_id,
+                    "supports_full_text_search": caps.supports_full_text_search,
+                    "supports_semantic_search": caps.supports_semantic_search,
+                    "supports_versioning": caps.supports_versioning,
+                    "embedding_provider": caps.embedding_provider,
+                },
+            )
+
+    # Build capability snapshot. wiki_stats and raw_stats are guaranteed
+    # non-None here (both probes succeeded).
+    assert wiki_stats is not None
+    assert raw_stats is not None
+
+    detail: dict[str, Any] = {
+        "backend_id": backend_id,
+        "supports_full_text_search": caps.supports_full_text_search,
+        "supports_semantic_search": caps.supports_semantic_search,
+        "supports_versioning": caps.supports_versioning,
+        "embedding_provider": caps.embedding_provider,
+        "wiki_page_count": wiki_stats.page_count,
+        "raw_page_count": raw_stats.page_count,
+    }
+    if safe_url is not None:
+        detail["url"] = safe_url
+
+    # Step 3: check WARN conditions. Emit the first WARN triggered --
+    # URL-without-backend takes precedence because it represents a silent
+    # misconfiguration that will affect ALL corpora regardless of scale.
+    if url_without_backend:
+        return CheckResult(
+            name="corpus-backend",
+            status=WARN,
+            message=(
+                "ATOMIC_AGENTS_CORPUS_BACKEND_URL is set but "
+                "ATOMIC_AGENTS_CORPUS_BACKEND is not. The URL is being ignored. "
+                "Set ATOMIC_AGENTS_CORPUS_BACKEND=sqlite (or the relevant "
+                "backend id) to activate the URL."
+            ),
+            fix_hint=(
+                "Set ATOMIC_AGENTS_CORPUS_BACKEND=sqlite (or the relevant "
+                "backend id) to activate the URL. If you intended to use the "
+                "filesystem backend, unset ATOMIC_AGENTS_CORPUS_BACKEND_URL."
+            ),
+            detail=detail,
+        )
+
+    # Page-count cliff WARN (plan-eng-review 2026-05-29 finding P1):
+    # when supports_full_text_search=False, filesystem keyword grep at
+    # large scale can take seconds per query. Probe BOTH corpora.
+    PAGE_COUNT_CLIFF = 1000
+    if not caps.supports_full_text_search:
+        for corpus_name, page_count in (
+            ("wiki", wiki_stats.page_count),
+            ("raw", raw_stats.page_count),
+        ):
+            if page_count > PAGE_COUNT_CLIFF:
+                return CheckResult(
+                    name="corpus-backend",
+                    status=WARN,
+                    message=(
+                        f"Large corpus detected ({page_count} pages, "
+                        f"{corpus_name!r} corpus). Set "
+                        "ATOMIC_AGENTS_CORPUS_BACKEND=sqlite for indexed query "
+                        "performance. Filesystem keyword grep at this scale can "
+                        "take seconds per query."
+                    ),
+                    fix_hint=(
+                        "Set ATOMIC_AGENTS_CORPUS_BACKEND=sqlite to activate "
+                        "SQLite FTS5 indexed search. See docs/spec/34-corpus-backend.md."
+                    ),
+                    detail=detail,
+                )
+
+    # All PASS -- backend healthy, no WARN conditions triggered.
+    wiki_count = wiki_stats.page_count
+    raw_count = raw_stats.page_count
+    return CheckResult(
+        name="corpus-backend",
+        status=PASS,
+        message=(
+            f"{backend_id} backend ok "
+            f"(wiki: {wiki_count} page{'' if wiki_count == 1 else 's'}, "
+            f"raw: {raw_count} page{'' if raw_count == 1 else 's'})"
         ),
         detail=detail,
     )
