@@ -21,7 +21,9 @@ def _write_log(agents_root: Path, agent: str, when: date, records: list[dict]) -
     path = log_dir / f"{when.isoformat()}.jsonl"
     lines = []
     for rec in records:
-        rec.setdefault("ts", datetime.combine(when, datetime.min.time()).isoformat())
+        rec.setdefault(
+            "ts", datetime.combine(when, datetime.min.time()).astimezone().isoformat()
+        )
         rec.setdefault("trigger", "cron")
         rec.setdefault("model", "claude-opus-4-7-20260101")
         rec.setdefault("input_tokens", 1000)
@@ -104,11 +106,21 @@ def test_render_handles_empty_agents_root(tmp_path):
 
 def test_render_agent_includes_helper_savings_when_present(tmp_path):
     today = date.today()
-    _write_log(tmp_path, "alice", today, [
-        {"trigger": "cron", "model": "claude-opus-4-7-20260101", "cost_usd": 0.10},
-        {"trigger": "helper", "model": "claude-haiku-4-5-20251001", "cost_usd": 0.001,
-         "input_tokens": 1000, "output_tokens": 50},
-    ])
+    _write_log(
+        tmp_path,
+        "alice",
+        today,
+        [
+            {"trigger": "cron", "model": "claude-opus-4-7-20260101", "cost_usd": 0.10},
+            {
+                "trigger": "helper",
+                "model": "claude-haiku-4-5-20251001",
+                "cost_usd": 0.001,
+                "input_tokens": 1000,
+                "output_tokens": 50,
+            },
+        ],
+    )
     data = aggregate_agent(tmp_path, "alice", today=today)
     out_path = render_agent(tmp_path, data)
     html = out_path.read_text()
