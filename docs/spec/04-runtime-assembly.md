@@ -25,6 +25,8 @@ Every Atomic Agent runtime — cron job, Claude skill, openclaw gateway, anythin
 
 This order is **mandatory**. Every runtime must follow it. The order is what gives Atomic Agents their cross-runtime equivalence — the same agent behaves the same way whether driven by cron or skill or openclaw because the system prompt is built identically.
 
+**CorpusBackend integration (spec/34).** When `CorpusBackend` is registered (locked at #65 PR 4 of 4), step [7] routes through `corpus_backend.render_index_summary("wiki")` instead of a bare `Path.read_text()` on `wiki/INDEX.md`. The assembled context is identical; the Protocol seam makes the storage substrate swappable. Operators with `ATOMIC_AGENTS_CORPUS_BACKEND=sqlite` see the same INDEX rendering at O(log N) query cost instead of unindexed filesystem scan.
+
 **Step [3.5] — goal context**: For reactive agents (most agents), this step is skipped. For goal-driven agents, the active `goal.md` is loaded between persona and tools/memory — placed there so the goal becomes part of the agent's "anchored context" that shapes everything below it. For hybrid agents, the runtime decides per invocation: skill triggers skip step [3.5] (reactive mode); cron triggers load it (goal-driven mode). See [12-goals-and-intent](12-goals-and-intent.md) for the full goal-driven mechanics.
 
 ---

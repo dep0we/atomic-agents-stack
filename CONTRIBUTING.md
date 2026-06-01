@@ -44,7 +44,7 @@ Run the full suite before pushing:
 uv run pytest
 ```
 
-2401 tests today; CI runs Python 3.11 + 3.12. New backend protocols add ~25 conformance tests + ~10 implementation-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol.
+2937 tests today; CI runs Python 3.11 + 3.12. New backend protocols add ~25 conformance tests + ~10 implementation-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol.
 
 ### Review
 

@@ -91,7 +91,7 @@ Bundles are derived state. Per CLAUDE.md rule #2, protocols exist for storage pr
 
 **Future composition.** When `PersonaBackend` (#62) ships, the persona section of the bundle should route through it instead of reading the filesystem directly. That's a small follow-up: replace the persona-file reads in `bundle._render_cascaded` with `persona_backend.load_persona(agent_id)` calls. The bundle's public interface (`render_bundle`, `BundleResult`, the cache layout, the CLI flags) stays stable. Bundle file format stays stable.
 
-Similarly, when `CorpusBackend` ships (#65), wiki INDEX rendering can route through it. None of these compositions require a bundle protocol — they're implementation-internal edits to `bundle.py`.
+Similarly, now that `CorpusBackend` has shipped (spec/34, locked at #65 PR 4 of 4), wiki INDEX rendering routes through `corpus_backend.render_index_summary("wiki")` per the `bundle.py` composition note in spec/34. None of these compositions require a bundle protocol — they're implementation-internal edits to `bundle.py`.
 
 The non-decision: we are NOT creating `BundleBackend` for alternate cache substrates (SQLite-backed bundle storage, S3-backed, etc.). The bundle cache is local-disk-per-operator-machine by design (Decision 1).
 
@@ -242,7 +242,7 @@ The bundle contains your full cascade in canonical spec/04 + spec/06 order.
 | Future protocol | What it changes in the bundle | What stays |
 | --- | --- | --- |
 | `PersonaBackend` (#62) | Persona section reads route through `persona_backend.load_persona(agent_id)` instead of direct filesystem reads | Bundle format, CLI flags, cache layout, section ordering |
-| `CorpusBackend` (#65) | Wiki INDEX rendering routes through the corpus backend's INDEX accessor | Bundle format |
+| `CorpusBackend` (spec/34, locked at #65 PR 4) | Wiki INDEX rendering routes through the corpus backend's `render_index_summary("wiki")` accessor | Bundle format |
 | `PolicyBackend` (#89) | Project `policy/*` concatenation routes through the policy backend | Bundle format |
 | `MCPServerRegistryBackend` (#201) | Not relevant — bundle doesn't include MCP server registration content |  |
 

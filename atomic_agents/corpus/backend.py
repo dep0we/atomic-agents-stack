@@ -11,15 +11,8 @@ PDFs, transcripts, operator-ingested content) behind a Protocol so the
 framework core stays small and alternate storage substrates (SQLite-FTS5,
 Postgres, pgvector) drop in without forking.
 
-Shipping plan (issue #65):
-
-- **PR 1** (this file) -- Protocol scaffolding: ``CorpusBackend`` Protocol +
-  dataclasses (``types.py``) + exception hierarchy (``exceptions.py``) +
-  ``FilesystemCorpusBackend`` reference impl (``filesystem.py``) + backend
-  registry (``__init__.py``) + ``spec/34`` RFC + conformance suite.
-- **PR 2** -- ``SQLiteCorpusBackend`` with FTS5 + hybrid storage shape.
-- **PR 3** -- Wiring through ``AtomicAgent`` + call-site migration.
-- **PR 4** -- spec/34 LOCK; RFC banner dropped; Implementer Contract finalized.
+All four PRs of issue #65 have shipped. spec/34 is locked. The 9-MUST Implementer
+Contract is final. See ``docs/spec/34-corpus-backend.md`` for the normative contract.
 
 ``VersionRef`` and ``WritePolicy`` are re-used verbatim from
 ``atomic_agents/memory/backend.py`` for cross-Protocol uniformity (Premise P7).
@@ -154,11 +147,11 @@ class CorpusBackend(Protocol):
         ``FilesystemCorpusBackend``; raw corpora typically have no INDEX
         equivalent. The empty-string contract lets callers branch on truthiness
         the same way they branch on the legacy ``wiki_index.read_text()``
-        direct-read pattern, so the PR 3 call-site migration at
+        direct-read pattern, so the call-site migration at
         ``agent.py:2937-2939`` and ``bundle.py:_render_memory_breakpoint`` is
         a single ``if self.corpus_backend is None:`` branch.
 
-        This is the primary migration target for ``agent.py:2937-2939`` (PR 3).
+        This is the primary migration target for ``agent.py:2937-2939``.
         """
         ...
 
