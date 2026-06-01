@@ -2474,11 +2474,12 @@ def check_corpus_backend(agent_root: Path) -> CheckResult:
     backend_id = raw_backend_id if raw_backend_id else "filesystem"
 
     # WARN condition: ATOMIC_AGENTS_CORPUS_BACKEND_URL is set but
-    # ATOMIC_AGENTS_CORPUS_BACKEND is unset (resolves to filesystem), which
-    # means the URL is silently ignored by get_default_corpus_backend unless
-    # ATOMIC_AGENTS_CORPUS_BACKEND=filesystem is also set explicitly. Detect
-    # the mismatch here so operators learn about the misconfiguration before
-    # a production run.
+    # ATOMIC_AGENTS_CORPUS_BACKEND is unset. The URL IS honored by
+    # get_default_corpus_backend (routes through the filesystem factory at
+    # corpus/__init__.py:239), but the backend binding is implicit; an
+    # operator reading the env config cannot tell which backend is active
+    # without reading the source. Surfacing the implicit-default state
+    # lets operators make their config explicit.
     url_env = os.environ.get("ATOMIC_AGENTS_CORPUS_BACKEND_URL", "").strip()
     url_without_backend = bool(url_env) and not raw_backend_id
 
@@ -2594,7 +2595,16 @@ def check_corpus_backend(agent_root: Path) -> CheckResult:
                 "wiki_stats and raw_stats. This indicates a logic error in "
                 "check_corpus_backend. Report this with the stack trace."
             ),
-            detail={"backend_id": backend_id},
+            detail={
+                # Capability snapshot from caps is already available at this
+                # point; include it so the operator has context to debug
+                # without re-running the doctor. Round 2 finding F5.
+                "backend_id": backend_id,
+                "supports_full_text_search": caps.supports_full_text_search,
+                "supports_semantic_search": caps.supports_semantic_search,
+                "supports_versioning": caps.supports_versioning,
+                "embedding_provider": caps.embedding_provider,
+            },
         )
 
     detail: dict[str, Any] = {

@@ -243,3 +243,60 @@ def test_agent_load_indexes_oserror_returns_empty_with_warning(
         "Expected a log record containing 'wiki_index_unreadable'; "
         f"got records: {[r.message for r in caplog.records]}"
     )
+
+
+# ── Test 6 ────────────────────────────────────────────────────────────────────
+
+
+def test_agent_load_indexes_protocol_path_exception_soft_degrades(
+    tmp_path: pathlib.Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Round 2 finding F6: Protocol-path broad except branch coverage.
+
+    When a custom CorpusBackend's render_index_summary raises an unexpected
+    exception (sqlite3.OperationalError on db lock, CorpusError from a buggy
+    implementer, AttributeError from a typo, etc.), agent.py:_load_indexes
+    must soft-degrade to "" with a logged warning rather than crash agent
+    construction. Mirrors the Test 5 OSError soft-degrade on the legacy
+    direct-read path; this test exercises the corresponding Protocol-path
+    boundary added in the Round 1 fix commit.
+    """
+    import sqlite3
+
+    agents_root = tmp_path / "agents"
+    agent_root = _make_agent_root(tmp_path)
+    _make_wiki_fixture(agent_root)
+
+    class _RaisingCorpusBackend:
+        """Minimal CorpusBackend stub whose render_index_summary raises."""
+
+        backend_id = "test-raising"
+
+        def render_index_summary(self, corpus: str) -> str:
+            raise sqlite3.OperationalError("simulated db locked")
+
+    agent = AtomicAgent(name="test-agent", agents_root=agents_root)
+
+    # Force Protocol path with a backend that raises on render_index_summary.
+    agent._wiki_index_text = ""
+    agent.corpus_backend = _RaisingCorpusBackend()  # type: ignore[assignment]
+
+    with caplog.at_level(logging.WARNING):
+        agent._load_indexes()
+
+    assert agent._wiki_index_text == ""
+    assert any(
+        "wiki_index_unreadable" in record.message for record in caplog.records
+    ), (
+        "Expected a log record containing 'wiki_index_unreadable' on the "
+        f"Protocol path; got records: {[r.message for r in caplog.records]}"
+    )
+    # The log warning must name the backend class so operators know which
+    # custom backend produced the failure.
+    assert any(
+        "_RaisingCorpusBackend" in record.message for record in caplog.records
+    ), (
+        "Expected a log record naming the offending backend class; "
+        f"got records: {[r.message for r in caplog.records]}"
+    )
