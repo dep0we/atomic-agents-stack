@@ -872,19 +872,20 @@ def _resolve_corpus_agent_root(args) -> Path:
 def _cmd_corpus(args) -> int:
     """Dispatch corpus subcommands.
 
-    All corpus subcommands instantiate ``FilesystemCorpusBackend(agent_root)``
-    directly. Env-var resolution lives in
-    ``atomic_agents/corpus/__init__.py:get_default_corpus_backend``.
+    Instantiates the operator-pinned backend via
+    ``get_default_corpus_backend(agent_root)``, which reads
+    ``ATOMIC_AGENTS_CORPUS_BACKEND`` (default ``"filesystem"``) so the CLI
+    surface honours the same env-var override as the runtime.
 
     Exit codes: 0 on success, 1 on any error (CorpusError, OSError,
     PermissionError, etc.). Errors go to stderr; normal output to stdout.
-    Zero LLM calls — pure local I/O.
+    Zero LLM calls -- pure local I/O.
     """
-    from .corpus.filesystem import FilesystemCorpusBackend
+    from .corpus import get_default_corpus_backend
     from .exceptions import CorpusError
 
     agent_root = _resolve_corpus_agent_root(args)
-    backend = FilesystemCorpusBackend(agent_root)
+    backend = get_default_corpus_backend(agent_root)
     corpus_cmd = args.corpus_cmd
 
     try:
