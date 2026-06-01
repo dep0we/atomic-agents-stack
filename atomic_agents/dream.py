@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     from .mandate import MandateBackend
     from .policy import PolicyBackend
     from .persona import PersonaBackend
+    from .corpus import CorpusBackend
 
 import frontmatter
 
@@ -1172,6 +1173,7 @@ class DreamRunner:
         mandate_backend: "MandateBackend | None" = None,
         policy_backend: "PolicyBackend | None" = None,
         persona_backend: "PersonaBackend | None" = None,
+        corpus_backend: "CorpusBackend | None" = None,
     ):
         self.agents_root = Path(agents_root)
         self.agent_name = agent_name
@@ -1294,6 +1296,17 @@ class DreamRunner:
         # construction site via
         # ``AtomicAgent(..., persona_backend=self._persona_backend)``.
         self._persona_backend = persona_backend
+        # spec/34 PR 3 — CorpusBackend stored for API parity with
+        # OutcomeRunner / EvalRunner. DreamRunner currently makes raw
+        # LLM calls (``_llm.call_*``) without dispatching agent tools
+        # — there is no internal ``AtomicAgent`` construction site to
+        # thread through in v1; kwarg exists for API parity with
+        # OutcomeRunner and EvalRunner. Future dream pipelines that
+        # construct an internal AtomicAgent (e.g., for self-reflection
+        # cycles) will thread the stored backend at that construction
+        # site via
+        # ``AtomicAgent(..., corpus_backend=self._corpus_backend)``.
+        self._corpus_backend = corpus_backend
 
         # Resolve model: explicit kwarg > profile.model_config default.
         # PR 2 Decision 2: pre-resolved model_config is also passed to
