@@ -948,3 +948,97 @@ def test_non_utf8_source_does_not_crash(tmp_path):
     # The bundle survives + flags the bad encoding via a header comment
     assert "Canon" in text
     assert "non-UTF-8" in text or "�" in text  # replacement char or warning
+
+
+# ──────────────────────────────────────────────────────────────────
+# PR 3 / #65 CorpusBackend wiring
+
+
+def test_render_bundle_threads_corpus_backend_to_wiki_index_section(tmp_path):
+    """End-to-end: render_bundle(corpus_backend=...) surfaces wiki INDEX content.
+
+    PR 3 / #65 wires FilesystemCorpusBackend through a 3-level call chain:
+    render_bundle -> _render_sections -> _render_memory_breakpoint. Without
+    this, a break at any level would silently drop wiki INDEX content from the
+    bundle when a corpus_backend is supplied.
+
+    IRON RULE: the corpus_backend=None (legacy) path and the
+    corpus_backend=FilesystemCorpusBackend(...) (Protocol) path must produce
+    byte-identical output for the same agent_root. This assertion is the
+    bundle-side guard for that invariant.
+    """
+    from atomic_agents.corpus.filesystem import FilesystemCorpusBackend
+
+    agents_root, agent_root = _build_cascaded(tmp_path)
+    wiki_dir = agent_root / "wiki"
+    wiki_dir.mkdir(parents=True, exist_ok=True)
+    wiki_body = "# Wiki INDEX\n\nKnown canon: memory orb, the boy, the Showrunner."
+    (wiki_dir / "INDEX.md").write_text(wiki_body, encoding="utf-8")
+
+    cache_dir = tmp_path / "cache"
+
+    # Protocol path: corpus_backend supplied explicitly.
+    result_protocol = bundle.render_bundle(
+        agent_root,
+        agents_root=agents_root,
+        cache_dir=cache_dir,
+        corpus_backend=FilesystemCorpusBackend(agent_root),
+    )
+    text_protocol = result_protocol.path.read_text(encoding="utf-8")
+
+    assert "Wiki · INDEX.md" in text_protocol, (
+        "wiki INDEX section header missing from bundle rendered via corpus_backend"
+    )
+    assert "memory orb, the boy, the Showrunner" in text_protocol, (
+        "wiki INDEX body content missing from bundle rendered via corpus_backend"
+    )
+
+    # Wipe the cache so we get a fresh render for the fallback path.
+    result_protocol.path.unlink()
+
+    # Fallback path: no corpus_backend kwarg (legacy direct-read).
+    result_legacy = bundle.render_bundle(
+        agent_root,
+        agents_root=agents_root,
+        cache_dir=cache_dir,
+    )
+    text_legacy = result_legacy.path.read_text(encoding="utf-8")
+
+    # IRON RULE byte-identity guard (PR 3 / #65 IRON RULE assertion 4).
+    assert text_protocol == text_legacy, (
+        "IRON RULE violated: corpus_backend Protocol path and legacy direct-read "
+        "path produced different bundle output for the same agent_root. "
+        "Diff hint: check _render_wiki_index_section in bundle.py."
+    )
+
+
+def test_source_paths_v11_deferral_returns_direct_wiki_path(tmp_path):
+    """Pin the v1.1 deferral: _source_paths returns the direct wiki/INDEX.md path.
+
+    PR 3 / #65 explicitly defers Protocol-routing for _source_paths. In v1.0
+    _source_paths returns filesystem paths for staleness tracking; it does NOT
+    route through CorpusBackend.render_index_summary(). This test pins that
+    decision mechanically.
+
+    v1.1 deferral: a future refactor that prematurely routes _source_paths
+    through the Protocol would cause this test to fail, alerting the contributor
+    that the v1.1 follow-up issue needs to land first (see #65 PR 4 TODO comment
+    in bundle.py).
+    """
+    from atomic_agents.bundle import _source_paths
+
+    agents_root, agent_root = _build_flat(tmp_path)
+    wiki_dir = agent_root / "wiki"
+    wiki_dir.mkdir(parents=True, exist_ok=True)
+    (wiki_dir / "INDEX.md").write_text(
+        "# Wiki INDEX\n\nSome content.", encoding="utf-8"
+    )
+
+    paths = _source_paths(agent_root)
+
+    expected = agent_root / "wiki" / "INDEX.md"
+    assert expected in paths, (
+        f"_source_paths did not include wiki/INDEX.md ({expected}). "
+        "If _source_paths was refactored to route through CorpusBackend, "
+        "the v1.1 follow-up issue (#65 PR 4) must land first."
+    )

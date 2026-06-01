@@ -43,7 +43,9 @@ def _build_full_cascade_layout(
     # Layer 2: project
     project_dir = system_root / "projects" / project
     project_dir.mkdir(parents=True)
-    (project_dir / "canon.md").write_text("## World\nThe Unfinished is set in 1920s Vienna.")
+    (project_dir / "canon.md").write_text(
+        "## World\nThe Unfinished is set in 1920s Vienna."
+    )
     (project_dir / "style_guide.md").write_text("Use Oxford commas. Avoid em dashes.")
     (project_dir / "goal.md").write_text("Finish Act II by Q3 2026.")
     policy_dir = project_dir / "policy"
@@ -57,9 +59,16 @@ def _build_full_cascade_layout(
     persona_dir.mkdir(parents=True)
     (persona_dir / "IDENTITY.md").write_text("# Identity\nWriter on The Unfinished.")
     (persona_dir / "SOUL.md").write_text("# Soul\nDrawn to characters in transition.")
-    (persona_dir / "USER.md").write_text("# User\nThe operator owns the project vision.")
+    (persona_dir / "USER.md").write_text(
+        "# User\nThe operator owns the project vision."
+    )
     (instance_dir / "memory").mkdir()
     (instance_dir / "wiki").mkdir()
+    # PR 3 / #65: seed wiki/INDEX.md so corpus_backend=None fallback path is testable.
+    (instance_dir / "wiki" / "INDEX.md").write_text(
+        "# Wiki Index\n\nSee [[notes-on-vienna]] for background.\n",
+        encoding="utf-8",
+    )
     (instance_dir / "journal").mkdir()
     (instance_dir / "log").mkdir()
 
@@ -91,10 +100,10 @@ def test_cascade_config_uses_role_tools_md(tmp_path):
 
 def test_cascade_config_instance_tools_md_replaces_role(tmp_path):
     agents_root = _build_full_cascade_layout(tmp_path)
-    instance = agents_root / "muse" / "projects" / "the-unfinished" / "agents" / "writer"
-    (instance / "tools.md").write_text(
-        "## Read paths\n- ~/instance-only/\n"
+    instance = (
+        agents_root / "muse" / "projects" / "the-unfinished" / "agents" / "writer"
     )
+    (instance / "tools.md").write_text("## Read paths\n- ~/instance-only/\n")
     agent = AtomicAgent(
         name="muse/projects/the-unfinished/agents/writer",
         agents_root=agents_root,
@@ -106,10 +115,10 @@ def test_cascade_config_instance_tools_md_replaces_role(tmp_path):
 
 def test_cascade_config_override_md_appends_to_role(tmp_path):
     agents_root = _build_full_cascade_layout(tmp_path)
-    instance = agents_root / "muse" / "projects" / "the-unfinished" / "agents" / "writer"
-    (instance / "tools.override.md").write_text(
-        "## Hard NOs\n- never delete drafts\n"
+    instance = (
+        agents_root / "muse" / "projects" / "the-unfinished" / "agents" / "writer"
     )
+    (instance / "tools.override.md").write_text("## Hard NOs\n- never delete drafts\n")
     agent = AtomicAgent(
         name="muse/projects/the-unfinished/agents/writer",
         agents_root=agents_root,
@@ -143,6 +152,11 @@ def test_cascade_assembled_prompt_contains_all_layers(tmp_path):
     assert "Third person past" in prompt
     assert "End each chapter" in prompt
 
+    # PR 3 / #65: wiki/INDEX.md content must appear in the assembled prompt.
+    # Guard against silent regression on the corpus_backend=None fallback path.
+    assert "# wiki/INDEX.md" in prompt, "wiki INDEX section header missing"
+    assert "See [[notes-on-vienna]]" in prompt, "wiki INDEX body content missing"
+
 
 def test_cascade_assembled_prompt_order_matches_spec_06(tmp_path):
     agents_root = _build_full_cascade_layout(tmp_path)
@@ -165,6 +179,12 @@ def test_cascade_assembled_prompt_order_matches_spec_06(tmp_path):
     assert role_idx < persona_idx < tools_idx
     assert tools_idx < canon_idx < goal_idx < style_idx < policy_idx
 
+    # PR 3 / #65: wiki/INDEX section ordering per spec/04 step [10-13].
+    # Wiki INDEX comes after memory/INDEX in the assembled prompt.
+    wiki_idx = prompt.index("# wiki/INDEX.md")
+    memory_idx = prompt.index("# memory/INDEX.md")
+    assert memory_idx < wiki_idx, "wiki/INDEX must follow memory/INDEX"
+
 
 def test_single_agent_layout_still_works_no_cascade(tmp_path):
     """Backwards compat: a plain single-agent folder behaves exactly as before."""
@@ -174,7 +194,9 @@ def test_single_agent_layout_still_works_no_cascade(tmp_path):
     persona_dir.mkdir(parents=True)
     (persona_dir / "IDENTITY.md").write_text("# Identity\nCaldwell.")
     (agent_dir / "tools.md").write_text("## Read paths\n- ~/docs/\n")
-    (agent_dir / "model.md").write_text("## Default model\nclaude-sonnet-4-6-20260101\n")
+    (agent_dir / "model.md").write_text(
+        "## Default model\nclaude-sonnet-4-6-20260101\n"
+    )
     (agent_dir / "memory").mkdir()
     (agent_dir / "log").mkdir()
 
@@ -216,10 +238,10 @@ def test_cascade_with_no_optional_project_files_still_assembles(tmp_path):
 
 def test_cascade_instance_model_md_overrides_role(tmp_path):
     agents_root = _build_full_cascade_layout(tmp_path)
-    instance = agents_root / "muse" / "projects" / "the-unfinished" / "agents" / "writer"
-    (instance / "model.md").write_text(
-        "## Default model\nclaude-haiku-4-5-20251001\n"
+    instance = (
+        agents_root / "muse" / "projects" / "the-unfinished" / "agents" / "writer"
     )
+    (instance / "model.md").write_text("## Default model\nclaude-haiku-4-5-20251001\n")
     agent = AtomicAgent(
         name="muse/projects/the-unfinished/agents/writer",
         agents_root=agents_root,
