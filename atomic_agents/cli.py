@@ -20,6 +20,8 @@ Usage:
     atomic-agents corpus query TEXT --corpus wiki [--top-k N] [--agent-root PATH]
     atomic-agents corpus version NAME --corpus wiki [--agent-root PATH]
     atomic-agents corpus restore NAME VERSION_ID --corpus wiki [--agent-root PATH]
+    atomic-agents init <name> [--from-template advisor] [--agents-root PATH]
+    atomic-agents init --list-templates
 
 Subcommands:
     run     — Run an agent against a work item
@@ -32,6 +34,7 @@ Subcommands:
     review  — Cross-family adversarial code review (CLAUDE.md rule #11)
     persona — Manage persona records (list, show, snapshot, restore, clone)
     corpus  — Inspect and manage corpus pages (list, show, query, version, restore)
+    init    — Scaffold a new agent in under 10 minutes (interactive wizard)
 """
 
 from __future__ import annotations
@@ -372,6 +375,42 @@ def main(argv: list[str] | None = None) -> int:
         help="override ATOMIC_AGENTS_AGENT_ROOT (default: $ATOMIC_AGENTS_AGENT_ROOT or cwd)",
     )
 
+    # ── init subcommand ───────────────────────────────────────────────────
+    init_cmd = sub.add_parser(
+        "init",
+        help="Scaffold a new agent in under 10 minutes",
+        description=(
+            "Walk through ~7 questions and produce a working home-user agent. "
+            "Use --from-template to skip the interview, or --list-templates "
+            "to enumerate available starter templates."
+        ),
+    )
+    init_cmd.add_argument(
+        "agent_name",
+        nargs="?",
+        default=None,
+        help="agent name (folder under agents-root); omit when using --list-templates",
+    )
+    init_cmd.add_argument(
+        "--from-template",
+        dest="from_template",
+        default=None,
+        choices=["advisor"],
+        help="skip Q&A; scaffold from a starter template",
+    )
+    init_cmd.add_argument(
+        "--list-templates",
+        dest="list_templates",
+        action="store_true",
+        help="list available starter templates and exit",
+    )
+    init_cmd.add_argument(
+        "--agents-root",
+        dest="agents_root",
+        default=None,
+        help="override ATOMIC_AGENTS_ROOT",
+    )
+
     args = parser.parse_args(argv)
 
     # `review` is a host-only subcommand — no agents-root needed (operates on
@@ -393,6 +432,11 @@ def main(argv: list[str] | None = None) -> int:
     # It does not use the agents-root / agent-name hierarchy.
     if args.cmd == "corpus":
         return _cmd_corpus(args)
+
+    # `init` resolves its own agents_root from --agents-root or env var.
+    # It does not use the agents-root / agent-name hierarchy.
+    if args.cmd == "init":
+        return _cmd_init(args)
 
     agents_root = (
         Path(args.agents_root).expanduser().resolve()
@@ -1007,6 +1051,18 @@ def _corpus_restore(
     backend.restore_version(name, corpus, version_ref, policy)
     print(f"Restored {name!r} to version {version_id!r}")
     return 0
+
+
+def _cmd_init(args) -> int:
+    """Dispatch the `atomic-agents init` subcommand.
+
+    Lazy-imports the init wizard module so rich and other wizard-only deps
+    do not load for non-init invocations. Matches the lazy-import pattern at
+    cli.py:703 (_cmd_doctor) and cli.py:738 (_cmd_persona).
+    """
+    from .init import run_init
+
+    return run_init(args)
 
 
 if __name__ == "__main__":
