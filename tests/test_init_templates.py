@@ -219,3 +219,251 @@ def test_safe_substitute_handles_dollar_in_answers() -> None:
     assert "test-agent" in rendered, (
         "Substituted value for agent_name should appear in rendered output"
     )
+
+
+# ---------------------------------------------------------------------------
+# Helpers for researcher / writer template tests
+# ---------------------------------------------------------------------------
+
+
+def _read_template_for(template_name: str, relpath: str) -> str:
+    """Read a template file from the named template tree via importlib.resources."""
+    base = resources.files("atomic_agents.init") / "templates" / template_name
+    parts = relpath.split("/")
+    node = base
+    for part in parts:
+        node = node / part
+    return node.read_text(encoding="utf-8")
+
+
+def _all_template_relpaths_for(template_name: str) -> list[str]:
+    """Return all relative file paths in the named template tree."""
+    base = resources.files("atomic_agents.init") / "templates" / template_name
+    results: list[str] = []
+
+    def _walk(node: object, parts: list[str]) -> None:
+        for child in node.iterdir():  # type: ignore[attr-defined]
+            child_parts = parts + [child.name]
+            try:
+                list(child.iterdir())  # type: ignore[attr-defined]
+                is_dir = True
+            except (NotADirectoryError, OSError):
+                is_dir = False
+            if is_dir:
+                _walk(child, child_parts)
+            else:
+                results.append("/".join(child_parts))
+
+    _walk(base, [])
+    return results
+
+
+_REQUIRED_FILES = [
+    "persona/IDENTITY.md",
+    "persona/SOUL.md",
+    "persona/USER.md",
+    "tools.md",
+    "model.md",
+    "memory/INDEX.md",
+    "wiki/INDEX.md",
+]
+
+
+# ---------------------------------------------------------------------------
+# Tests 1-2: required files present
+# ---------------------------------------------------------------------------
+
+
+def test_researcher_template_has_all_required_files() -> None:
+    """All seven required template files must be present in the researcher tree."""
+    base = resources.files("atomic_agents.init") / "templates" / "researcher"
+    for relpath in _REQUIRED_FILES:
+        parts = relpath.split("/")
+        node = base
+        for part in parts:
+            node = node / part
+        assert node.is_file(), f"Missing required researcher template file: {relpath}"
+
+
+def test_writer_template_has_all_required_files() -> None:
+    """All seven required template files must be present in the writer tree."""
+    base = resources.files("atomic_agents.init") / "templates" / "writer"
+    for relpath in _REQUIRED_FILES:
+        parts = relpath.split("/")
+        node = base
+        for part in parts:
+            node = node / part
+        assert node.is_file(), f"Missing required writer template file: {relpath}"
+
+
+# ---------------------------------------------------------------------------
+# Tests 3-4: no em dashes
+# ---------------------------------------------------------------------------
+
+
+def test_researcher_template_no_em_dashes() -> None:
+    """No researcher template file should contain an em dash character (U+2014)."""
+    for relpath in _all_template_relpaths_for("researcher"):
+        content = _read_template_for("researcher", relpath)
+        assert "—" not in content, (
+            f"Em dash found in researcher template file: {relpath}"
+        )
+
+
+def test_writer_template_no_em_dashes() -> None:
+    """No writer template file should contain an em dash character (U+2014)."""
+    for relpath in _all_template_relpaths_for("writer"):
+        content = _read_template_for("writer", relpath)
+        assert "—" not in content, f"Em dash found in writer template file: {relpath}"
+
+
+# ---------------------------------------------------------------------------
+# Tests 5-7: schema headers match actual template h2 headers
+# ---------------------------------------------------------------------------
+
+
+def _assert_schema_matches_template(template_name: str) -> None:
+    """For each file in TEMPLATE_SECTION_SCHEMA[template_name], verify that the
+    extracted h2 headers from the actual template file are a superset of the
+    schema headers (every schema header is present in the file).
+    """
+    from atomic_agents.init.wizard import _extract_h2_headers
+
+    schema = C.TEMPLATE_SECTION_SCHEMA[template_name]
+    for relpath, expected_headers in schema.items():
+        content = _read_template_for(template_name, relpath)
+        extracted = _extract_h2_headers(content)
+        extracted_set = set(extracted)
+        expected_set = set(expected_headers)
+        missing = expected_set - extracted_set
+        assert not missing, (
+            f"Template {template_name}/{relpath} is missing schema h2 headers: "
+            f"{sorted(missing)}. Extracted: {sorted(extracted_set)}"
+        )
+
+
+def test_researcher_schema_matches_actual_files() -> None:
+    """Every h2 header in TEMPLATE_SECTION_SCHEMA['researcher'] must appear in the file."""
+    _assert_schema_matches_template("researcher")
+
+
+def test_writer_schema_matches_actual_files() -> None:
+    """Every h2 header in TEMPLATE_SECTION_SCHEMA['writer'] must appear in the file."""
+    _assert_schema_matches_template("writer")
+
+
+def test_advisor_schema_matches_actual_files() -> None:
+    """Every h2 header in TEMPLATE_SECTION_SCHEMA['advisor'] must appear in the file."""
+    _assert_schema_matches_template("advisor")
+
+
+# ---------------------------------------------------------------------------
+# Tests 8-9: Operating mode section in IDENTITY.md
+# ---------------------------------------------------------------------------
+
+
+def test_researcher_identity_has_operating_mode_section() -> None:
+    """researcher IDENTITY.md must have '## Operating mode' and mention 'hybrid'."""
+    content = _read_template_for("researcher", "persona/IDENTITY.md")
+    assert "## Operating mode" in content, (
+        "researcher IDENTITY.md missing '## Operating mode' section"
+    )
+    assert "hybrid" in content, (
+        "researcher IDENTITY.md must mention 'hybrid' in the Operating mode section"
+    )
+
+
+def test_writer_identity_has_operating_mode_section() -> None:
+    """writer IDENTITY.md must have '## Operating mode' and mention 'reactive'."""
+    content = _read_template_for("writer", "persona/IDENTITY.md")
+    assert "## Operating mode" in content, (
+        "writer IDENTITY.md missing '## Operating mode' section"
+    )
+    assert "reactive" in content, (
+        "writer IDENTITY.md must mention 'reactive' in the Operating mode section"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 10: writer model.md defaults to Sonnet, not Opus
+# ---------------------------------------------------------------------------
+
+
+def test_writer_model_md_defaults_sonnet() -> None:
+    """writer model.md default model must be claude-sonnet-4-6, not claude-opus-4-7."""
+    content = _read_template_for("writer", "model.md")
+    assert "claude-sonnet-4-6" in content, (
+        "writer model.md must default to claude-sonnet-4-6 (P2 lock)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 11: writer tools.md has drafts/ and revisions/ paths
+# ---------------------------------------------------------------------------
+
+
+def test_writer_tools_md_has_drafts_and_revisions_paths() -> None:
+    """writer tools.md must reference both 'drafts/' and 'revisions/' write paths."""
+    content = _read_template_for("writer", "tools.md")
+    assert "drafts/" in content, (
+        "writer tools.md must contain 'drafts/' in the Write paths section"
+    )
+    assert "revisions/" in content, (
+        "writer tools.md must contain 'revisions/' in the Write paths section"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 12: researcher IDENTITY.md has Research integrity section
+# ---------------------------------------------------------------------------
+
+
+def test_researcher_identity_has_research_integrity_section() -> None:
+    """researcher IDENTITY.md must contain a '## Research integrity' section."""
+    content = _read_template_for("researcher", "persona/IDENTITY.md")
+    assert "## Research integrity" in content, (
+        "researcher IDENTITY.md missing '## Research integrity' section"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 13: researcher tools.md has raw/ in Read paths
+# ---------------------------------------------------------------------------
+
+
+def test_researcher_tools_md_has_raw_read_path() -> None:
+    """researcher tools.md must reference 'raw/' in the Read paths section."""
+    content = _read_template_for("researcher", "tools.md")
+    assert "raw/" in content, (
+        "researcher tools.md must contain 'raw/' in the Read paths section"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests 14-15: constants completeness
+# ---------------------------------------------------------------------------
+
+
+def test_template_preset_defaults_all_three_present() -> None:
+    """TEMPLATE_PRESET_DEFAULTS must contain advisor, researcher, and writer keys,
+    all mapping to PRESET_CAUTIOUS.
+    """
+    for template_name in ("advisor", "researcher", "writer"):
+        assert template_name in C.TEMPLATE_PRESET_DEFAULTS, (
+            f"TEMPLATE_PRESET_DEFAULTS missing key: {template_name}"
+        )
+        assert C.TEMPLATE_PRESET_DEFAULTS[template_name] == C.PRESET_CAUTIOUS, (
+            f"TEMPLATE_PRESET_DEFAULTS['{template_name}'] must be PRESET_CAUTIOUS"
+        )
+
+
+def test_template_section_schema_all_three_populated() -> None:
+    """TEMPLATE_SECTION_SCHEMA must have advisor, researcher, and writer, each with 7 files."""
+    for template_name in ("advisor", "researcher", "writer"):
+        assert template_name in C.TEMPLATE_SECTION_SCHEMA, (
+            f"TEMPLATE_SECTION_SCHEMA missing key: {template_name}"
+        )
+        file_count = len(C.TEMPLATE_SECTION_SCHEMA[template_name])
+        assert file_count == 7, (
+            f"TEMPLATE_SECTION_SCHEMA['{template_name}'] has {file_count} files, expected 7"
+        )

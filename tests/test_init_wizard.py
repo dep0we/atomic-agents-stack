@@ -695,3 +695,506 @@ def test_run_init_resolves_agents_root_once(monkeypatch, tmp_path):
     assert len(call_count) <= 1, (
         f"get_agents_root() was called {len(call_count)} times; expected at most 1"
     )
+
+
+# ---------------------------------------------------------------------------
+# J. Section detection state machine (_extract_h2_headers)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_h2_headers_skips_yaml_frontmatter():
+    """YAML frontmatter block is skipped; only headers after closing --- are returned."""
+    content = "---\nfoo: bar\n## not a header\n---\n## Real Header\n"
+    result = W._extract_h2_headers(content)
+    assert result == ["Real Header"]
+
+
+def test_extract_h2_headers_skips_code_fences():
+    """Headers inside triple-backtick fences are NOT returned."""
+    content = "## Outside\n```\n## Inside fence (skip)\n```\n## After\n"
+    result = W._extract_h2_headers(content)
+    assert result == ["Outside", "After"]
+
+
+def test_extract_h2_headers_skips_html_comments():
+    """Headers inside HTML comment blocks are NOT returned."""
+    content = "<!--\n## hidden\n-->\n## Visible\n"
+    result = W._extract_h2_headers(content)
+    assert result == ["Visible"]
+
+
+def test_extract_h2_headers_strips_trailing_atx_markers():
+    """Trailing closing hashes on an ATX header are stripped from the returned text."""
+    content = "## My Header ##\n"
+    result = W._extract_h2_headers(content)
+    assert result == ["My Header"]
+
+
+# ---------------------------------------------------------------------------
+# K. Add-to-it dispatch + detection (_detect_sections, _check_stale_staging_dirs)
+# ---------------------------------------------------------------------------
+
+
+def _write_advisor_scaffold(root: Path) -> None:
+    """Write a valid advisor scaffold under root using TEMPLATE_SECTION_SCHEMA headers."""
+    schema = C.TEMPLATE_SECTION_SCHEMA["advisor"]
+    for relpath, headers in schema.items():
+        target = root / relpath
+        target.parent.mkdir(parents=True, exist_ok=True)
+        body = "\n".join(f"## {h}\n\nContent.\n" for h in headers)
+        target.write_text(body, encoding="utf-8")
+
+
+def test_detect_sections_advisor_happy_path(tmp_path):
+    """A valid advisor scaffold passes section detection with success=True."""
+    agent_dir = tmp_path / "my-advisor"
+    agent_dir.mkdir()
+    _write_advisor_scaffold(agent_dir)
+
+    success, per_file_headers, failed_files = W._detect_sections(agent_dir, "advisor")
+
+    assert success is True
+    assert failed_files == []
+    # Every file in the schema should appear in per_file_headers.
+    for relpath in C.TEMPLATE_SECTION_SCHEMA["advisor"]:
+        assert relpath in per_file_headers, f"{relpath} not in per_file_headers"
+        assert len(per_file_headers[relpath]) > 0
+
+
+def test_detect_sections_fails_when_header_renamed(tmp_path):
+    """Renaming a required header causes detection to return success=False."""
+    agent_dir = tmp_path / "my-advisor"
+    agent_dir.mkdir()
+    _write_advisor_scaffold(agent_dir)
+
+    # Replace "Mission" with "Purpose" in persona/IDENTITY.md.
+    identity_path = agent_dir / "persona" / "IDENTITY.md"
+    original = identity_path.read_text(encoding="utf-8")
+    modified = original.replace("## Mission\n", "## Purpose\n")
+    identity_path.write_text(modified, encoding="utf-8")
+
+    success, per_file_headers, failed_files = W._detect_sections(agent_dir, "advisor")
+
+    assert success is False
+    assert "persona/IDENTITY.md" in failed_files
+
+
+def test_detect_sections_missing_file_tracked_separately(tmp_path):
+    """A missing file is NOT counted as a detection failure; it is a backfill case."""
+    agent_dir = tmp_path / "my-advisor"
+    agent_dir.mkdir()
+    _write_advisor_scaffold(agent_dir)
+
+    # Remove memory/INDEX.md to simulate a missing template-owned file.
+    (agent_dir / "memory" / "INDEX.md").unlink()
+
+    success, per_file_headers, failed_files = W._detect_sections(agent_dir, "advisor")
+
+    assert success is True, "Missing file should be treated as backfill, not failure"
+    assert "memory/INDEX.md" not in failed_files
+    # per_file_headers still contains the relpath (as empty list per implementation).
+    assert "memory/INDEX.md" in per_file_headers
+    assert per_file_headers["memory/INDEX.md"] == []
+
+
+def test_check_stale_staging_dirs_finds_glob(tmp_path):
+    """A leftover .new.* sibling is detected and returned."""
+    agent_dir = tmp_path / "my-agent"
+    agent_dir.mkdir()
+    staging = tmp_path / "my-agent.new.20260101T000000_000000Z"
+    staging.mkdir()
+
+    console = _FakeConsole()
+    # Operator confirms deletion so the function returns True.
+    result = W._check_stale_staging_dirs(agent_dir, console, _confirm_factory(True))
+
+    assert result is True
+    # The staging dir should have been deleted by the function.
+    assert not staging.exists()
+
+
+def test_check_stale_staging_dirs_empty_when_none(tmp_path):
+    """No stale staging dirs means _check_stale_staging_dirs returns True immediately."""
+    agent_dir = tmp_path / "my-agent"
+    agent_dir.mkdir()
+
+    console = _FakeConsole()
+    prompt_called = []
+
+    class WatchConfirm:
+        @classmethod
+        def ask(cls, *a, **kw):
+            prompt_called.append(True)
+            return False
+
+    result = W._check_stale_staging_dirs(agent_dir, console, WatchConfirm)
+
+    assert result is True
+    assert not prompt_called, (
+        "Confirm.ask should not be called when no staging dirs exist"
+    )
+
+
+# ---------------------------------------------------------------------------
+# L. Staging-dir commit + rollback (_commit_add_to_it)
+# ---------------------------------------------------------------------------
+
+
+def test_commit_add_to_it_success_rmtrees_bak(tmp_path):
+    """On success, staged content appears in agent_dir and the backup is removed."""
+    agent_dir = tmp_path / "my-agent"
+    agent_dir.mkdir()
+    (agent_dir / "original.txt").write_text("old content")
+
+    staging_dir = tmp_path / "my-agent.new.20260101T000000_000000Z"
+    staging_dir.mkdir()
+    (staging_dir / "new-file.txt").write_text("staged content")
+
+    console = _FakeConsole()
+    W._commit_add_to_it(agent_dir, staging_dir, console)
+
+    # Staged content should be at agent_dir.
+    assert (agent_dir / "new-file.txt").exists()
+    assert (agent_dir / "new-file.txt").read_text() == "staged content"
+
+    # No backup should remain.
+    bak_dirs = list(tmp_path.glob("my-agent.bak.*"))
+    assert not bak_dirs, f"Backup dirs not cleaned up: {bak_dirs}"
+
+
+def test_commit_add_to_it_failure_restores_original(tmp_path, monkeypatch):
+    """When the staging rename fails, the original agent_dir content is restored."""
+    agent_dir = tmp_path / "my-agent"
+    agent_dir.mkdir()
+    sentinel = agent_dir / "original.txt"
+    sentinel.write_text("preserved content")
+
+    staging_dir = tmp_path / "my-agent.new.20260101T000000_000000Z"
+    staging_dir.mkdir()
+    (staging_dir / "new-file.txt").write_text("staged content")
+
+    # Track how many times rename is called; fail on the second call (staging -> agent).
+    rename_calls = []
+    original_rename = Path.rename
+
+    def _flaky_rename(self, target):
+        rename_calls.append((self, target))
+        if len(rename_calls) == 2:
+            raise OSError("Simulated rename failure")
+        return original_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", _flaky_rename)
+
+    with pytest.raises(OSError):
+        W._commit_add_to_it(agent_dir, staging_dir, console=_FakeConsole())
+
+    # Original content must be restored.
+    assert agent_dir.exists(), "agent_dir must be restored after failure"
+    assert sentinel.exists(), "original sentinel file must be restored"
+    assert sentinel.read_text() == "preserved content"
+
+
+def test_commit_add_to_it_ki_safe(tmp_path, monkeypatch):
+    """KeyboardInterrupt during staging rename restores agent_dir and re-raises."""
+    agent_dir = tmp_path / "my-agent"
+    agent_dir.mkdir()
+    (agent_dir / "original.txt").write_text("preserved")
+
+    staging_dir = tmp_path / "my-agent.new.20260101T000000_000000Z"
+    staging_dir.mkdir()
+
+    rename_calls = []
+    original_rename = Path.rename
+
+    def _ki_on_second(self, target):
+        rename_calls.append((self, target))
+        if len(rename_calls) == 2:
+            raise KeyboardInterrupt
+        return original_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", _ki_on_second)
+
+    with pytest.raises(KeyboardInterrupt):
+        W._commit_add_to_it(agent_dir, staging_dir, console=_FakeConsole())
+
+    # agent_dir must be restored.
+    assert agent_dir.exists(), "agent_dir must be restored after KeyboardInterrupt"
+    assert (agent_dir / "original.txt").read_text() == "preserved"
+
+
+# ---------------------------------------------------------------------------
+# M. CRLF + BOM normalization (_render_diff_preview)
+# ---------------------------------------------------------------------------
+
+
+def test_render_diff_preview_normalizes_crlf(tmp_path):
+    """Existing file with CRLF and staged file with LF (same logical content) shows no diff."""
+    agent_dir = tmp_path / "my-agent"
+    agent_dir.mkdir()
+    staging_dir = tmp_path / "my-agent.new.ts"
+    staging_dir.mkdir()
+
+    shared_content = "## Hello\n\nWorld.\n"
+    crlf_content = shared_content.replace("\n", "\r\n")
+
+    (agent_dir / "notes.md").write_bytes(crlf_content.encode("utf-8"))
+    (staging_dir / "notes.md").write_text(shared_content, encoding="utf-8")
+
+    console = _FakeConsole()
+    files_changed, ins, dels = W._render_diff_preview(agent_dir, staging_dir, console)
+
+    assert files_changed == 0, (
+        "CRLF normalization should make CRLF vs LF files show as identical"
+    )
+
+
+def test_render_diff_preview_strips_utf8_bom(tmp_path):
+    """Existing file with UTF-8 BOM and staged file without (same text) shows no diff."""
+    agent_dir = tmp_path / "my-agent"
+    agent_dir.mkdir()
+    staging_dir = tmp_path / "my-agent.new.ts"
+    staging_dir.mkdir()
+
+    shared_content = "## Hello\n\nWorld.\n"
+    bom_bytes = b"\xef\xbb\xbf" + shared_content.encode("utf-8")
+
+    (agent_dir / "notes.md").write_bytes(bom_bytes)
+    (staging_dir / "notes.md").write_text(shared_content, encoding="utf-8")
+
+    console = _FakeConsole()
+    files_changed, ins, dels = W._render_diff_preview(agent_dir, staging_dir, console)
+
+    assert files_changed == 0, (
+        "UTF-8 BOM normalization should make BOM vs non-BOM files show as identical"
+    )
+
+
+# ---------------------------------------------------------------------------
+# N. Polish item tests
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_handoff_split_run_doctor_failure(monkeypatch, tmp_path):
+    """When run_doctor raises, _doctor_handoff prints 'Doctor inconclusive' and returns True."""
+    import types as _types_mod
+
+    fake_doctor = _types_mod.SimpleNamespace(
+        run_doctor=lambda **kw: (_ for _ in ()).throw(RuntimeError("doctor exploded")),
+        overall_exit_code=lambda results: 0,
+        render_human=lambda results: "ok",
+    )
+
+    monkeypatch.setattr("atomic_agents.init.wizard.doctor", fake_doctor, raising=False)
+
+    # Import doctor inside wizard lazily; patch the module attribute.
+    import atomic_agents.init.wizard as _wiz
+
+    original = None
+    import importlib
+    import atomic_agents.doctor as _doc_real
+
+    def _patched_run_doctor(**kwargs):
+        raise RuntimeError("doctor exploded")
+
+    monkeypatch.setattr(_doc_real, "run_doctor", _patched_run_doctor)
+
+    console = _FakeConsole()
+    result = _wiz._doctor_handoff("my-agent", tmp_path, console)
+
+    assert result is True
+    assert "inconclusive" in console.out.getvalue().lower()
+
+
+def test_doctor_handoff_split_render_failure(monkeypatch, tmp_path):
+    """When render_human raises, output contains a 'could not render' notice."""
+    import atomic_agents.doctor as _doc_real
+
+    fake_result = types.SimpleNamespace(status="pass")
+
+    def _ok_run_doctor(**kwargs):
+        return [fake_result]
+
+    def _ok_exit_code(results):
+        return 0
+
+    def _bad_render(results):
+        raise RuntimeError("renderer crashed")
+
+    monkeypatch.setattr(_doc_real, "run_doctor", _ok_run_doctor)
+    monkeypatch.setattr(_doc_real, "overall_exit_code", _ok_exit_code)
+    monkeypatch.setattr(_doc_real, "render_human", _bad_render)
+
+    console = _FakeConsole()
+    import atomic_agents.init.wizard as _wiz
+
+    result = _wiz._doctor_handoff("my-agent", tmp_path, console)
+
+    output = console.out.getvalue().lower()
+    assert "could not render" in output or "render" in output
+
+
+def test_from_template_length_check_fires_before_regex(monkeypatch, tmp_path, capsys):
+    """A 100-character name triggers MSG_INVALID_NAME_TOO_LONG before MSG_INVALID_NAME_CHARSET."""
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    monkeypatch.delenv("ATOMIC_AGENTS_PERSONA_BACKEND_URL", raising=False)
+
+    long_name = "a" * 100
+    args = _make_args(
+        agent_name=long_name, from_template="advisor", agents_root=str(tmp_path)
+    )
+    rc = W.run_init(args)
+
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert C.MSG_INVALID_NAME_TOO_LONG in captured.err
+    assert C.MSG_INVALID_NAME_CHARSET not in captured.err
+
+
+def test_types_helper_returns_empty_when_mod_none():
+    """W._types(None, 'Foo', 'Bar') returns () so isinstance(..., ()) is always False."""
+    result = W._types(None, "Foo", "Bar")
+    assert result == ()
+    assert isinstance(Exception(), result) is False
+
+
+def test_translate_oserror_enoent_specific_message(tmp_path):
+    """ENOENT OSError is translated to a message mentioning 'disappeared'."""
+    import errno as _errno
+
+    e = OSError(_errno.ENOENT, "No such file or directory", str(tmp_path / "agent"))
+    msg = W._translate_oserror(e, tmp_path / "agent")
+
+    assert "disappeared" in msg.lower()
+
+
+def test_walk_traversable_iterative_no_recursion_limit():
+    """_walk_traversable returns at least 7 files for the advisor template."""
+    from importlib import resources as _resources
+
+    template_pkg_path = _resources.files("atomic_agents.init") / "templates" / "advisor"
+    results = W._walk_traversable(template_pkg_path, [])
+
+    assert len(results) >= 7, (
+        f"Expected at least 7 files in advisor template, got {len(results)}"
+    )
+
+
+def test_backup_timestamps_use_microseconds(tmp_path, monkeypatch):
+    """The backup path produced by _collision_overwrite_backup_restore contains a microsecond suffix."""
+    agent_dir = tmp_path / "my-agent"
+    agent_dir.mkdir()
+    (agent_dir / "file.txt").write_text("original")
+
+    backup_paths: list[Path] = []
+    original_rename = Path.rename
+
+    def _spy_rename(self, target):
+        backup_paths.append(Path(target))
+        return original_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", _spy_rename)
+
+    import re as _re
+
+    def _write_func():
+        agent_dir.mkdir(parents=True, exist_ok=True)
+
+    W._collision_overwrite_backup_restore(agent_dir, _write_func)
+
+    assert backup_paths, "rename was never called"
+    bak_name = backup_paths[0].name
+    # Timestamp format: YYYYMMDDTHHMMSS_FFFFFFZ (6-digit microseconds).
+    assert _re.search(r"\.bak\.\d{8}T\d{6}_\d{6}Z$", bak_name), (
+        f"Backup name '{bak_name}' does not contain microsecond timestamp"
+    )
+
+
+def test_persona_backend_warning_shows_redacted_url(monkeypatch):
+    """URL with credentials is displayed with credentials stripped in the warning."""
+    monkeypatch.setenv(
+        "ATOMIC_AGENTS_PERSONA_BACKEND_URL", "https://user:pass@example.com/api"
+    )
+    console = _FakeConsole()
+    # Operator declines; we only care about the printed output.
+    W._persona_backend_check(console, _confirm_factory(False))
+
+    output = console.out.getvalue()
+    assert "https://example.com/api" in output
+    assert "user:pass" not in output
+
+
+# ---------------------------------------------------------------------------
+# O. Per-template preset dispatch (_default_template_vars)
+# ---------------------------------------------------------------------------
+
+
+def test_default_template_vars_advisor_uses_cautious():
+    """advisor template defaults to PRESET_CAUTIOUS for all four autonomy variables."""
+    vars_map = W._default_template_vars(name="x", template_name="advisor")
+
+    expected_preset = C.AUTONOMY_PRESETS[C.PRESET_CAUTIOUS]
+    assert (
+        vars_map[C.TEMPLATE_VAR_AUTONOMY_READ_ONLY]
+        == expected_preset[C.ACTION_CLASS_READ_ONLY]
+    )
+    assert (
+        vars_map[C.TEMPLATE_VAR_AUTONOMY_REVERSIBLE_WRITE]
+        == expected_preset[C.ACTION_CLASS_REVERSIBLE_WRITE]
+    )
+    assert (
+        vars_map[C.TEMPLATE_VAR_AUTONOMY_EXTERNAL_SIDE_EFFECT]
+        == expected_preset[C.ACTION_CLASS_EXTERNAL_SIDE_EFFECT]
+    )
+    assert (
+        vars_map[C.TEMPLATE_VAR_AUTONOMY_HIGH_RISK]
+        == expected_preset[C.ACTION_CLASS_HIGH_RISK]
+    )
+    assert vars_map[C.TEMPLATE_VAR_AUTONOMY_PRESET_LABEL] == C.PRESET_CAUTIOUS
+
+
+def test_default_template_vars_researcher_uses_cautious():
+    """researcher template defaults to PRESET_CAUTIOUS for all four autonomy variables."""
+    vars_map = W._default_template_vars(name="x", template_name="researcher")
+
+    expected_preset = C.AUTONOMY_PRESETS[C.PRESET_CAUTIOUS]
+    assert (
+        vars_map[C.TEMPLATE_VAR_AUTONOMY_READ_ONLY]
+        == expected_preset[C.ACTION_CLASS_READ_ONLY]
+    )
+    assert (
+        vars_map[C.TEMPLATE_VAR_AUTONOMY_REVERSIBLE_WRITE]
+        == expected_preset[C.ACTION_CLASS_REVERSIBLE_WRITE]
+    )
+    assert (
+        vars_map[C.TEMPLATE_VAR_AUTONOMY_EXTERNAL_SIDE_EFFECT]
+        == expected_preset[C.ACTION_CLASS_EXTERNAL_SIDE_EFFECT]
+    )
+    assert (
+        vars_map[C.TEMPLATE_VAR_AUTONOMY_HIGH_RISK]
+        == expected_preset[C.ACTION_CLASS_HIGH_RISK]
+    )
+    assert vars_map[C.TEMPLATE_VAR_AUTONOMY_PRESET_LABEL] == C.PRESET_CAUTIOUS
+
+
+def test_default_template_vars_writer_uses_cautious():
+    """writer template defaults to PRESET_CAUTIOUS for all four autonomy variables."""
+    vars_map = W._default_template_vars(name="x", template_name="writer")
+
+    expected_preset = C.AUTONOMY_PRESETS[C.PRESET_CAUTIOUS]
+    assert (
+        vars_map[C.TEMPLATE_VAR_AUTONOMY_READ_ONLY]
+        == expected_preset[C.ACTION_CLASS_READ_ONLY]
+    )
+    assert (
+        vars_map[C.TEMPLATE_VAR_AUTONOMY_REVERSIBLE_WRITE]
+        == expected_preset[C.ACTION_CLASS_REVERSIBLE_WRITE]
+    )
+    assert (
+        vars_map[C.TEMPLATE_VAR_AUTONOMY_EXTERNAL_SIDE_EFFECT]
+        == expected_preset[C.ACTION_CLASS_EXTERNAL_SIDE_EFFECT]
+    )
+    assert (
+        vars_map[C.TEMPLATE_VAR_AUTONOMY_HIGH_RISK]
+        == expected_preset[C.ACTION_CLASS_HIGH_RISK]
+    )
+    assert vars_map[C.TEMPLATE_VAR_AUTONOMY_PRESET_LABEL] == C.PRESET_CAUTIOUS

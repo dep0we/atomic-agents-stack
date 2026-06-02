@@ -13,6 +13,9 @@ Coverage:
     4. RateLimitError during test call -- graceful exit 0 with message.
     5. APIConnectionError during test call -- graceful exit 0 with message.
     6. Operator declines test call -- exit 0 without invoking AtomicAgent.call.
+    7. from-template researcher -- exit 0, researcher-specific content written.
+    8. from-template writer -- exit 0, writer-specific content written.
+    9. from-template works without API key (P3 lock test).
 """
 
 from __future__ import annotations
@@ -332,4 +335,132 @@ def test_smoke_test_call_decline_exits_0(monkeypatch, tmp_path):
     assert call_invocations == [], (
         "AtomicAgent.call should not be invoked when operator declines the test call; "
         f"got {call_invocations!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 7: from-template researcher -- researcher-specific content written
+# ---------------------------------------------------------------------------
+
+
+def test_smoke_from_template_researcher_happy_path(monkeypatch, tmp_path):
+    """From-template researcher scaffolds files with researcher-specific content."""
+    _patch_common(monkeypatch, tmp_path, confirm_returns=True)
+    monkeypatch.setattr("atomic_agents.agent.AtomicAgent.call", _fake_call_ok)
+
+    exit_code = cli_module.main(
+        [
+            "init",
+            "test-agent",
+            "--from-template",
+            "researcher",
+            "--agents-root",
+            str(tmp_path),
+        ]
+    )
+
+    assert exit_code == 0
+
+    identity_path = tmp_path / "test-agent" / "persona" / "IDENTITY.md"
+    assert identity_path.exists(), f"Expected IDENTITY.md at {identity_path}"
+
+    content = identity_path.read_text(encoding="utf-8")
+    # Researcher template contains these markers (visible in the raw template).
+    assert (
+        "curiosity" in content.lower()
+        or "Research integrity" in content
+        or "investigation" in content.lower()
+    ), f"Expected researcher-specific markers in IDENTITY.md; got:\n{content[:500]}"
+
+
+# ---------------------------------------------------------------------------
+# Test 8: from-template writer -- writer-specific content written
+# ---------------------------------------------------------------------------
+
+
+def test_smoke_from_template_writer_happy_path(monkeypatch, tmp_path):
+    """From-template writer scaffolds files with writer-specific content."""
+    _patch_common(monkeypatch, tmp_path, confirm_returns=True)
+    monkeypatch.setattr("atomic_agents.agent.AtomicAgent.call", _fake_call_ok)
+
+    exit_code = cli_module.main(
+        [
+            "init",
+            "test-agent",
+            "--from-template",
+            "writer",
+            "--agents-root",
+            str(tmp_path),
+        ]
+    )
+
+    assert exit_code == 0
+
+    identity_path = tmp_path / "test-agent" / "persona" / "IDENTITY.md"
+    assert identity_path.exists(), f"Expected IDENTITY.md at {identity_path}"
+
+    content = identity_path.read_text(encoding="utf-8")
+    # Writer template contains these markers (visible in the raw template).
+    assert (
+        "voice" in content.lower()
+        or "drafts" in content.lower()
+        or "the agent IS the writer" in content
+    ), f"Expected writer-specific markers in IDENTITY.md; got:\n{content[:500]}"
+
+
+# ---------------------------------------------------------------------------
+# Test 9: from-template works without API key (P3 lock test)
+# ---------------------------------------------------------------------------
+
+
+def test_smoke_from_template_works_without_api_key(monkeypatch, tmp_path):
+    """--from-template does not require an API key at scaffold time (P3 lock).
+
+    Per spec/35 MUST 7 amendment (P3 lock): --from-template writes file content
+    only and does not make LLM calls. An AtomicAgentsError from _get_key must
+    not prevent the scaffold from succeeding (exit 0).
+    """
+    from atomic_agents.exceptions import AtomicAgentsError
+
+    # TTY guard must pass for run_init to proceed.
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    # _get_key raises -- simulates no API key configured anywhere.
+    def _raising_get_key(env_vars=None, keychain_name=None, config_key=None):
+        raise AtomicAgentsError("No API key found")
+
+    monkeypatch.setattr("atomic_agents._llm._get_key", _raising_get_key)
+
+    # Doctor and AtomicAgent.call still mocked so we exercise the scaffold path.
+    from atomic_agents.doctor import CheckResult, PASS
+
+    passing_result = CheckResult(name="env", status=PASS, message="ok")
+    _patch_doctor(monkeypatch, results=[passing_result], exit_code=0)
+
+    monkeypatch.setattr(
+        "rich.prompt.Confirm.ask",
+        lambda *a, **kw: True,
+    )
+    monkeypatch.setattr("atomic_agents.agent.AtomicAgent.call", _fake_call_ok)
+
+    exit_code = cli_module.main(
+        [
+            "init",
+            "test",
+            "--from-template",
+            "advisor",
+            "--agents-root",
+            str(tmp_path),
+        ]
+    )
+
+    assert exit_code == 0, (
+        "--from-template should exit 0 even when _get_key raises; "
+        f"got exit_code={exit_code}"
+    )
+
+    identity_path = tmp_path / "test" / "persona" / "IDENTITY.md"
+    assert identity_path.exists(), (
+        f"Scaffold files should be written even without an API key; "
+        f"IDENTITY.md not found at {identity_path}"
     )
