@@ -1,6 +1,6 @@
 """atomic-agents init wizard. Scaffolds a working home-user agent in under 10 minutes.
 
-See docs/spec/35-init-wizard.md for the 14 normative MUSTs this module satisfies.
+See docs/spec/35-init-wizard.md for the 15 normative MUSTs this module satisfies.
 """
 
 from __future__ import annotations
@@ -237,11 +237,24 @@ def _from_template(
     # collision check and _write_scaffold's overwrite branch.
     existing = agent_dir.exists()
 
-    # Collision check.
+    # Collision check: three-option when template is known (can offer Add-to-it).
     if existing:
-        overwrite = _check_collision(agent_dir, console, Confirm)
-        if not overwrite:
+        branch, existing_headers = _check_collision(
+            agent_dir, console, Prompt, Confirm, template_name=template_name
+        )
+        if branch == "cancel":
             return 0
+        if branch == "add_to_it":
+            return _add_to_it(
+                agent_dir=agent_dir,
+                agents_root=agents_root,
+                template_name=template_name,
+                console=console,
+                Prompt=Prompt,
+                Confirm=Confirm,
+                existing_headers=existing_headers,
+            )
+        # branch == "overwrite": fall through to _write_scaffold below.
 
     # Build a minimal set of template vars using safe defaults for this template.
     default_vars = _default_template_vars(name, template_name)
@@ -316,10 +329,14 @@ def _interactive(
     existing = agent_dir.exists()
 
     # Collision check before any further prompts.
+    # Interactive path has no template_name so only Overwrite/Cancel are offered.
     if existing:
-        overwrite = _check_collision(agent_dir, console, Confirm)
-        if not overwrite:
+        branch, _headers = _check_collision(
+            agent_dir, console, Prompt, Confirm, template_name=None
+        )
+        if branch == "cancel":
             return 0
+        # branch == "overwrite": fall through.
 
     # Q2: mission
     mission = _ask_q2_mission(console, Prompt)
@@ -836,21 +853,210 @@ def _detect_sections(
 
 
 # ---------------------------------------------------------------------------
-# Add-to-it: diff preview
+# Add-to-it: section-level merge helpers
+# ---------------------------------------------------------------------------
+
+
+def _split_sections(content: str) -> list[tuple[str | None, str]]:
+    """Split markdown content into a list of (header, body) blocks.
+
+    The first block uses None as the header (content before the first h2).
+    Subsequent blocks use the h2 header string as the key and include the
+    header line itself at the start of the body string.
+
+    Only ATX-style h2 headers split blocks. h3+ headers inside a block are
+    kept verbatim as part of that block's body.
+
+    Code fences, HTML comments, and YAML frontmatter are tracked via the same
+    state machine used in _extract_h2_headers so we do not split on
+    header-shaped lines inside those regions.
+    """
+    lines = content.splitlines(keepends=True)
+    blocks: list[tuple[str | None, str]] = []
+    current_header: str | None = None
+    current_lines: list[str] = []
+
+    # Skip YAML frontmatter.
+    start = 0
+    if lines and lines[0].strip() == "---":
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "---":
+                start = i + 1
+                break
+
+    in_fence = False
+    in_comment = False
+
+    for line in lines[start:]:
+        stripped = line.strip()
+
+        # Toggle code-fence state.
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            current_lines.append(line)
+            continue
+
+        # Track HTML comment state.
+        if "<!--" in stripped:
+            in_comment = True
+        if "-->" in stripped:
+            in_comment = False
+            current_lines.append(line)
+            continue
+
+        if in_fence or in_comment:
+            current_lines.append(line)
+            continue
+
+        # ATX h2: new section boundary.
+        m = re.match(r"^##\s+(.+?)(?:\s+#+)?\s*$", line)
+        if m:
+            # Flush the current block.
+            blocks.append((current_header, "".join(current_lines)))
+            current_header = m.group(1).strip()
+            current_lines = [line]
+        else:
+            current_lines.append(line)
+
+    # Flush the final block.
+    blocks.append((current_header, "".join(current_lines)))
+    return blocks
+
+
+def _join_sections(blocks: list[tuple[str | None, str]]) -> str:
+    """Reassemble section blocks into a single string."""
+    return "".join(body for _, body in blocks)
+
+
+def _render_file_to_string(
+    template_name: str, rel_parts: list[str], vars: dict[str, str]
+) -> str:
+    """Render a single template file to a string (does NOT write to disk).
+
+    Uses the same importlib.resources path as _render_files but returns the
+    rendered string rather than writing it.
+    """
+    from importlib import resources as _resources
+
+    node: Any = _resources.files("atomic_agents.init") / "templates" / template_name
+    for part in rel_parts:
+        node = node / part
+    raw = node.read_text(encoding="utf-8")
+    return string.Template(raw).safe_substitute(vars)
+
+
+def _compute_merged_content(
+    agent_dir: Path,
+    template_name: str,
+    fresh_vars: dict[str, str],
+) -> dict[str, str]:
+    """Compute merged file content for every schema-owned file.
+
+    For each file in TEMPLATE_SECTION_SCHEMA[template_name]:
+    - If the file is missing from agent_dir: return fresh-rendered content
+      (backfill).
+    - Otherwise: split existing and fresh content into section blocks; merge
+      by keeping existing content for orphan sections, while replacing
+      schema-owned sections with fresh content so Q&A answers (mission,
+      voice, comm_prefs, etc.) are applied.
+
+    Operator data directories (memory/, journal/, log/, raw/) are never
+    touched. This function only operates on files explicitly listed in the
+    schema.
+
+    Returns a dict mapping file relpath (str) -> merged content string.
+    """
+    schema = C.TEMPLATE_SECTION_SCHEMA.get(template_name, {})
+    merged: dict[str, str] = {}
+
+    for relpath, schema_headers in schema.items():
+        target = agent_dir / relpath
+        schema_header_set = set(schema_headers)
+
+        # Compute relative path parts for the template walk.
+        rel_parts = relpath.replace("\\", "/").split("/")
+
+        # Render fresh content from template.
+        fresh_text = _render_file_to_string(template_name, rel_parts, fresh_vars)
+
+        if not target.exists():
+            # Missing file: backfill entirely from template.
+            merged[relpath] = fresh_text
+            continue
+
+        # Read and normalize existing file.
+        try:
+            existing_raw = target.read_text(encoding="utf-8-sig")
+        except OSError:
+            # If we cannot read the existing file, fall back to fresh content.
+            merged[relpath] = fresh_text
+            continue
+        existing_text = existing_raw.replace("\r\n", "\n").replace("\r", "\n")
+
+        # Split both into section blocks.
+        existing_blocks = _split_sections(existing_text)
+        fresh_blocks = _split_sections(fresh_text)
+
+        # Build lookup map: header -> body string (from fresh render).
+        fresh_body_map: dict[str | None, str] = {h: body for h, body in fresh_blocks}
+
+        # Assemble merged blocks preserving original order from existing.
+        # Append any schema-owned blocks present only in fresh (new template
+        # sections added since the agent was created).
+        merged_blocks: list[tuple[str | None, str]] = []
+        existing_headers_seen: set[str | None] = set()
+
+        for header, existing_body in existing_blocks:
+            existing_headers_seen.add(header)
+            if header is None:
+                # Preamble before first h2: always keep existing.
+                merged_blocks.append((None, existing_body))
+            elif header in schema_header_set:
+                # Schema-owned section: use fresh content so Q&A answers
+                # (mission, voice, comm_prefs, etc.) are updated.
+                fresh_body = fresh_body_map.get(header)
+                if fresh_body is not None:
+                    merged_blocks.append((header, fresh_body))
+                else:
+                    # Template removed this section; preserve existing.
+                    merged_blocks.append((header, existing_body))
+            else:
+                # Orphan section (operator-authored): preserve verbatim.
+                merged_blocks.append((header, existing_body))
+
+        # Backfill: schema-owned sections in fresh that do not exist in
+        # existing (new template sections). Append at end.
+        for header, fresh_body in fresh_blocks:
+            if (
+                header is not None
+                and header in schema_header_set
+                and header not in existing_headers_seen
+            ):
+                merged_blocks.append((header, fresh_body))
+
+        merged[relpath] = _join_sections(merged_blocks)
+
+    return merged
+
+
+# ---------------------------------------------------------------------------
+# Add-to-it: diff preview (file-level merge; no staging dir)
 # ---------------------------------------------------------------------------
 
 
 def _render_diff_preview(
     agent_dir: Path,
-    staging_dir: Path,
+    merged_content: dict[str, str],
     console: Any,
-    missing_files: list[str] | None = None,
 ) -> tuple[int, int, int]:
-    """Render a unified diff preview between existing files and staged files.
+    """Render a unified diff preview between existing files and merged content.
+
+    merged_content maps file relpath (str) -> new merged content string.
+    Files absent from the existing agent_dir are labeled [new file] and show
+    full new content.
 
     Reads existing files with utf-8-sig + CRLF normalization (A9).
-    Staged files are always LF (written by _render_files).
-    Missing-file backfills are labeled [new file] and show full new content.
+    Merged content is always LF (produced by section reassembly).
 
     Returns (files_changed, total_insertions, total_deletions) for the summary
     line.
@@ -858,40 +1064,28 @@ def _render_diff_preview(
     import difflib
 
     is_dumb = getattr(console, "is_dumb_terminal", False)
-    missing_set = set(missing_files or [])
+    if not is_dumb:
+        from rich.syntax import Syntax  # noqa: PLC0415
 
     files_changed = 0
     total_ins = 0
     total_del = 0
 
-    # Walk the staged directory to find all files.
-    for staged_path in sorted(staging_dir.rglob("*")):
-        if not staged_path.is_file():
-            continue
+    for relpath_str in sorted(merged_content.keys()):
+        merged_text = merged_content[relpath_str]
+        merged_lines = merged_text.splitlines(keepends=True)
+        existing_path = agent_dir / relpath_str
 
-        try:
-            rel = staged_path.relative_to(staging_dir)
-        except ValueError:
-            continue
-
-        relpath_str = str(rel)
-        existing_path = agent_dir / rel
-
-        staged_text = staged_path.read_text(encoding="utf-8")
-        staged_lines = staged_text.splitlines(keepends=True)
-
-        if relpath_str in missing_set or not existing_path.exists():
+        if not existing_path.exists():
             # New file backfill: show full content with [new file] label.
             console.print(f"[bold]--- [new file] {relpath_str} ---[/bold]")
-            diff_text = "".join(f"+{line}" for line in staged_lines)
+            diff_text = "".join(f"+{line}" for line in merged_lines)
             if is_dumb:
                 console.print(diff_text)
             else:
-                from rich.syntax import Syntax
-
-                console.print(Syntax(diff_text, language="diff"))
+                console.print(Syntax(diff_text, language="diff"))  # noqa: F821
             files_changed += 1
-            total_ins += len(staged_lines)
+            total_ins += len(merged_lines)
             continue
 
         try:
@@ -904,7 +1098,7 @@ def _render_diff_preview(
         diff = list(
             difflib.unified_diff(
                 existing_lines,
-                staged_lines,
+                merged_lines,
                 fromfile=f"a/{relpath_str}",
                 tofile=f"b/{relpath_str}",
             )
@@ -917,9 +1111,7 @@ def _render_diff_preview(
         if is_dumb:
             console.print(diff_text)
         else:
-            from rich.syntax import Syntax
-
-            console.print(Syntax(diff_text, language="diff"))
+            console.print(Syntax(diff_text, language="diff"))  # noqa: F821
 
         files_changed += 1
         total_ins += sum(
@@ -938,88 +1130,40 @@ def _render_diff_preview(
 
 
 # ---------------------------------------------------------------------------
-# Add-to-it: staging-dir commit (A5 reversal pattern)
+# Add-to-it: per-file atomic commit (no staging dir)
 # ---------------------------------------------------------------------------
 
 
-def _commit_add_to_it(agent_dir: Path, staging_dir: Path, console: Any) -> None:
-    """Commit the staged scaffold into agent_dir using the A5 reversal pattern.
-
-    Steps:
-    1. Compute a backup path: <agent_dir>.bak.<UTC-ISO-microsecond>
-    2. Atomically rename agent_dir to bak_path (backup)
-    3. Atomically rename staging_dir to agent_dir (commit)
-    4. On success: rmtree the backup
-    5. On any failure between steps 2 and 3: rename bak back, leave staging,
-       print error, re-raise
-
-    Wrapped in try/except BaseException so KeyboardInterrupt during the
-    rename window is handled: if KI lands after step 2 but before step 3,
-    the outer KI handler will find agent_dir absent + bak present + staging
-    present and can complete restoration.
-    """
-    import shutil
-
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
-    bak_path = agent_dir.parent / f"{agent_dir.name}.bak.{ts}"
-
-    # Step 1+2: backup.
-    agent_dir.rename(bak_path)
-    try:
-        # Step 3: commit.
-        staging_dir.rename(agent_dir)
-    except BaseException as e:
-        # Restore backup; leave staging in place for diagnostics.
-        try:
-            bak_path.rename(agent_dir)
-        except OSError:
-            pass
-        if isinstance(e, KeyboardInterrupt):
-            raise
-        raise OSError(
-            f"Failed to rename staging dir to {agent_dir}; backup restored from {bak_path}. "
-            f"Staging dir left at {staging_dir} for manual inspection."
-        ) from e
-    else:
-        # Success: remove backup.
-        shutil.rmtree(bak_path, ignore_errors=True)
-
-
-# ---------------------------------------------------------------------------
-# Add-to-it: stale staging dir recovery (M9)
-# ---------------------------------------------------------------------------
-
-
-def _check_stale_staging_dirs(
+def _commit_merges(
     agent_dir: Path,
+    merged_content: dict[str, str],
     console: Any,
-    Confirm: Any,
-) -> bool:
-    """Scan for leftover staging directories from a previous run.
+) -> tuple[list[str], list[str]]:
+    """Commit merged content by writing each file via atomic_write.
 
-    If any <agent_dir>.new.* siblings are found, offer to delete them.
-    Returns True if safe to proceed (none found, or operator approved deletion).
-    Returns False if operator declined (exit cleanly).
+    Iterates through merged_content in sorted order and calls
+    _io.atomic_write for each file. Returns (committed, failed) lists of
+    relpaths.
+
+    _io.atomic_write (tmp + fsync + rename) provides per-file atomicity: a
+    crash mid-write leaves either the old file or the new file intact, never
+    a half-written file. There is no transactional all-or-nothing guarantee
+    across multiple files; each file commits independently.
     """
-    import shutil
+    committed: list[str] = []
+    failed: list[str] = []
 
-    stale = sorted(agent_dir.parent.glob(f"{agent_dir.name}.new.*"))
-    if not stale:
-        return True
+    for relpath_str in sorted(merged_content.keys()):
+        content = merged_content[relpath_str]
+        target = agent_dir / relpath_str
+        try:
+            _io.atomic_write(target, content)
+            committed.append(relpath_str)
+        except (OSError, PathTraversalError) as e:
+            console.print(f"[red]Failed to write {relpath_str}: {e}[/red]")
+            failed.append(relpath_str)
 
-    for stale_path in stale:
-        msg = C.MSG_STAGING_DIR_EXISTS.format(path=stale_path)
-        console.print(f"\n[yellow]{msg}[/yellow]")
-        do_delete = Confirm.ask(
-            "Delete it and continue?",
-            console=console,
-            default=True,
-        )
-        if not do_delete:
-            return False
-        shutil.rmtree(stale_path, ignore_errors=True)
-
-    return True
+    return committed, failed
 
 
 # ---------------------------------------------------------------------------
@@ -1034,43 +1178,20 @@ def _add_to_it(
     console: Any,
     Prompt: Any,
     Confirm: Any,
-    Table: Any,
     existing_headers: dict[str, list[str]] | None,
 ) -> int:
-    """Add-to-it merge flow: detect sections, render staged scaffold, diff, commit.
+    """Add-to-it merge flow: compute section-level merges, diff, commit per-file.
 
-    Runs section detection if not already provided via existing_headers.
-    On detection failure, offers Overwrite or Cancel only (fail-closed).
-    On success, renders the new scaffold to a staging dir, shows a diff,
-    and asks the operator to confirm before committing.
+    existing_headers is the per_file_headers map from _check_collision's
+    pre-flight _detect_sections call; it is informational only here.
+
+    Operator data directories (memory/, journal/, log/, raw/) are never
+    touched: _compute_merged_content only operates on files listed in
+    TEMPLATE_SECTION_SCHEMA[template_name].
 
     Returns an exit code (0 success, 1 error).
     """
-    import shutil
-
-    # Stale staging dir recovery before creating a new one.
-    if not _check_stale_staging_dirs(agent_dir, console, Confirm):
-        return 0
-
-    # Run section detection.
-    success, per_file_headers, failed_files = _detect_sections(agent_dir, template_name)
-
-    if not success:
-        failed_list = ", ".join(failed_files)
-        console.print(
-            f"\n[yellow]{C.MSG_SECTION_DETECTION_FAILED.format(template=template_name, files=failed_list)}[/yellow]"
-        )
-        do_overwrite = Confirm.ask(
-            "Overwrite the existing folder instead?",
-            console=console,
-            default=False,
-        )
-        if not do_overwrite:
-            return 0
-        # Fall through to a standard overwrite via _write_scaffold.
-        return None  # type: ignore[return-value]  # caller interprets None as "do overwrite"
-
-    # Identify files missing entirely (will be backfilled from template).
+    # Identify missing schema files for the backfill notice.
     schema = C.TEMPLATE_SECTION_SCHEMA.get(template_name, {})
     missing_files = [
         relpath for relpath in schema if not (agent_dir / relpath).exists()
@@ -1081,25 +1202,19 @@ def _add_to_it(
             f"\n[dim]{C.MSG_MISSING_FILE_BACKFILL.format(files=missing_list)}[/dim]"
         )
 
-    # Build template vars from defaults (no Q&A re-run for add-to-it).
-    default_vars = _default_template_vars(agent_dir.name, template_name)
+    # Build fresh template vars for the merge.
+    fresh_vars = _default_template_vars(agent_dir.name, template_name)
 
-    # Create staging directory.
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
-    staging_dir = agent_dir.parent / f"{agent_dir.name}.new.{ts}"
-
+    # Compute section-level merged content for each schema-owned file.
     try:
-        _render_files(staging_dir, template_name, default_vars)
-        _create_empty_dirs(staging_dir)
-    except BaseException as e:
-        shutil.rmtree(staging_dir, ignore_errors=True)
-        if isinstance(e, KeyboardInterrupt):
-            raise
-        raise
+        merged_content = _compute_merged_content(agent_dir, template_name, fresh_vars)
+    except Exception as e:  # noqa: BLE001
+        console.print(f"[red]Failed to compute merged content: {e}[/red]")
+        return 1
 
     # Show diff preview.
     console.print("\n[bold]Preview of changes:[/bold]\n")
-    _render_diff_preview(agent_dir, staging_dir, console, missing_files=missing_files)
+    _render_diff_preview(agent_dir, merged_content, console)
 
     # Confirm before committing.
     do_commit = Confirm.ask(
@@ -1108,14 +1223,18 @@ def _add_to_it(
         default=True,
     )
     if not do_commit:
-        shutil.rmtree(staging_dir, ignore_errors=True)
         console.print("No changes made.")
         return 0
 
-    try:
-        _commit_add_to_it(agent_dir, staging_dir, console)
-    except (OSError, PathTraversalError) as e:
-        console.print(f"[red]{e}[/red]")
+    committed, failed = _commit_merges(agent_dir, merged_content, console)
+
+    if failed:
+        console.print(
+            f"[yellow]Partial update: {len(committed)} file(s) written, "
+            f"{len(failed)} file(s) failed. "
+            f"Written: {', '.join(committed)}. "
+            f"Failed: {', '.join(failed)}.[/yellow]"
+        )
         return 1
 
     console.print(
@@ -1129,22 +1248,74 @@ def _add_to_it(
 # ---------------------------------------------------------------------------
 
 
-def _check_collision(agent_dir: Path, console: Any, Confirm: Any) -> bool:
-    """Detect existing scaffold. Offer Overwrite/Cancel (default Cancel).
+def _check_collision(
+    agent_dir: Path,
+    console: Any,
+    Prompt: Any,
+    Confirm: Any,
+    template_name: str | None = None,
+) -> tuple[str, dict[str, list[str]] | None]:
+    """Detect existing scaffold and ask what to do.
 
-    Returns True if the operator chose to overwrite.
+    Returns (branch, existing_headers) where branch is one of:
+      "fresh"      -- agent_dir does not exist; no prompt shown.
+      "overwrite"  -- operator chose to replace everything.
+      "add_to_it"  -- operator chose section-level merge (only when template_name given).
+      "cancel"     -- operator chose to leave the folder untouched.
+
+    existing_headers is populated only on the add_to_it branch; it is the
+    per_file_headers map from _detect_sections, so the caller can pass it
+    directly to _add_to_it.
+
+    When template_name is None (interactive Q&A path), add_to_it is not offered
+    because there is no section schema to merge against.
     """
+    if not agent_dir.exists():
+        return ("fresh", None)
+
     console.print(
-        f"\n[yellow]A folder named '{agent_dir.name}' already exists at "
-        f"{agent_dir}.[/yellow]"
+        f"\n[yellow]A folder named [bold]{agent_dir.name}[/bold] already exists at "
+        f"[bold]{agent_dir}[/bold].[/yellow]"
     )
-    return bool(
-        Confirm.ask(
-            "Overwrite it?",
+
+    if template_name is None:
+        # No template available; only Overwrite or Cancel.
+        choice = Prompt.ask(
+            "What do you want to do?",
+            choices=["overwrite", "cancel"],
+            default="cancel",
             console=console,
-            default=False,
         )
+        return (choice, None)
+
+    choice = Prompt.ask(
+        "What do you want to do? "
+        "[overwrite]=replace everything fresh, "
+        "[add_to_it]=merge new answers into existing files (preserves your memory, journal, and operator-authored sections), "
+        "[cancel]=leave the existing folder untouched",
+        choices=["overwrite", "add_to_it", "cancel"],
+        default="cancel",
+        console=console,
     )
+
+    if choice == "add_to_it":
+        # Pre-detect sections so the caller knows if Add-to-it is viable.
+        ok, headers, failed = _detect_sections(agent_dir, template_name)
+        if not ok:
+            failed_list = ", ".join(failed)
+            console.print(
+                f"[yellow]{C.MSG_SECTION_DETECTION_FAILED.format(template=template_name, files=failed_list)}[/yellow]"
+            )
+            fallback = Prompt.ask(
+                "What do you want to do?",
+                choices=["overwrite", "cancel"],
+                default="cancel",
+                console=console,
+            )
+            return (fallback, None)
+        return ("add_to_it", headers)
+
+    return (choice, None)
 
 
 def _collision_overwrite_backup_restore(
@@ -1333,7 +1504,11 @@ def _doctor_handoff(agent_name: str, agents_root: Path, console: Any) -> bool:
     try:
         exit_code = doctor.overall_exit_code(results)
     except Exception:  # noqa: BLE001
-        exit_code = -1  # unknown
+        console.print(
+            "[yellow]Doctor verdict unclear (overall_exit_code raised). Run "
+            f"[bold]atomic-agents doctor --agent {agent_name}[/bold] to verify.[/yellow]"
+        )
+        return True  # allow test-call prompt; doctor was inconclusive, not failed
 
     try:
         console.print(doctor.render_human(results))

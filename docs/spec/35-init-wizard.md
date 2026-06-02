@@ -169,8 +169,15 @@ matches the framework minimum.)
 ## Recovery flow
 
 **Collision detection.** If `<agent_dir>` already exists when the wizard
-attempts to write, it offers: "A folder named `<name>` already exists. Overwrite
-it? [y/N]" Default is N (Cancel). Cancel exits status 0 with no changes.
+attempts to write, it presents three choices:
+
+- **[overwrite]** -- replace the entire folder with a fresh scaffold.
+- **[add_to_it]** -- merge new answers into existing files, preserving
+  operator-authored sections and data directories. Only offered when a
+  known template was used (the `--from-template` path). The interactive Q&A
+  path offers only [overwrite] and [cancel] because there is no section
+  schema to merge against.
+- **[cancel]** (default) -- leave the folder untouched and exit status 0.
 
 **Overwrite branch uses the backup+restore pattern.** On Overwrite:
 
@@ -180,6 +187,36 @@ it? [y/N]" Default is N (Cancel). Cancel exits status 0 with no changes.
 3. On success: `shutil.rmtree(<agent_dir>.bak.<UTC-ISO>)` removes the backup.
 4. On any write failure: rename the `.bak` directory back to `<agent_dir>` and
    exit with a plain-English error citing the path and reason.
+
+**Add-to-it path.** On Add-to-it, the wizard uses file-level atomic merging
+rather than a staging directory:
+
+1. Section detection runs against the template's
+   `constants.TEMPLATE_SECTION_SCHEMA`. If any schema-required h2 header is
+   missing from an existing file, detection fails and the wizard falls back to
+   [overwrite] or [cancel] only (fail-closed).
+2. Missing template-owned files are announced and will be backfilled from the
+   template.
+3. For each schema-owned file, the wizard renders a fresh copy from the
+   template and merges it with the existing file:
+   - Schema-owned h2 sections are replaced with fresh content (so Q&A
+     answers such as mission, voice, comm_prefs are applied).
+   - Operator-authored orphan sections (h2 headers not in the schema) are
+     preserved verbatim in their original relative position.
+   - h3+ subsections inside any h2 block are preserved verbatim as part of
+     their containing block's body.
+   - The preamble (content before the first h2) is always kept from the
+     existing file.
+4. A unified diff preview is shown before any file is written.
+5. On operator confirmation, each file is written via `_io.atomic_write`
+   (tmp + fsync + rename). Each file commits independently; a crash
+   mid-write leaves either the old file or the new file intact (per-file
+   atomicity from `atomic_write`), never a half-written file.
+6. Operator data directories -- `memory/`, `journal/`, `log/`, `raw/` -- are
+   never touched. The merge only operates on files explicitly listed in
+   `constants.TEMPLATE_SECTION_SCHEMA[template_name]`.
+7. If any files fail to write, the wizard prints a partial-update warning
+   listing which files succeeded and which failed, and exits status 1.
 
 `OSError` from any `mkdir` or `atomic_write` call is caught and translated to
 plain English per `constants.MSG_OSERROR_HEADER` and
@@ -263,7 +300,7 @@ at the top. Tiebreaker for ambiguous order: alphabetical by issue number.
 
 ---
 
-## Implementer Contract -- 14 normative MUSTs
+## Implementer Contract -- 15 normative MUSTs
 
 1. The wizard MUST validate `agent_name` against `constants.AGENT_NAME_REGEX`
    AND refuse names in `constants.RESERVED_AGENT_NAMES` before any filesystem
@@ -287,26 +324,22 @@ at the top. Tiebreaker for ambiguous order: alphabetical by issue number.
    `atomic_agents._io.safe_resolve_under(child, agent_dir)` before passing it
    to `atomic_write`. On a fresh-write failure (no pre-existing scaffold to
    restore), the wizard MUST clean up the partial `agent_dir` it created so
-   the operator sees either a complete scaffold or none of one. The Add-to-it
-   path additionally requires the wizard to render new scaffold content into a
-   sibling staging directory `<agent_dir>.new.<UTC-ISO-microsecond>` before any
-   rename of the existing agent_dir. Staging-dir creation MUST use
-   `mkdir(parents=True, exist_ok=False)` so a stale staging dir from a prior
-   crashed run fails fast and triggers operator recovery.
+   the operator sees either a complete scaffold or none of one.
 
 5. Recovery atomicity: The collision Overwrite branch MUST use the
    backup+restore pattern: atomic rename to `<agent_dir>.bak.<UTC-ISO-microsecond>`,
-   write all files, success rmtree the `.bak`, failure rename `.bak` back. The
-   collision Add-to-it branch MUST use the staging-dir commit pattern: render
-   the new scaffold under `<agent_dir>.new.<UTC-ISO-microsecond>` while leaving
-   the existing `agent_dir` untouched; display a unified diff preview between
-   existing and staged content; on operator confirmation, atomically rename
-   `agent_dir` to `<agent_dir>.bak.<UTC-ISO-microsecond>` then rename
-   `<agent_dir>.new` to `agent_dir`, on success rmtree the `.bak`. On operator
-   decline or any failure between staging-dir creation and commit-rename, rmtree
-   the staging-dir and leave `agent_dir` untouched. The KeyboardInterrupt handler
-   MUST detect a half-committed state (`agent_dir` absent + `agent_dir.bak.*`
-   present + `agent_dir.new.*` present) and complete the restoration before exit.
+   write all files, success rmtree the `.bak`, failure rename `.bak` back.
+   The collision Add-to-it branch MUST use the file-level atomic pattern:
+   compute merged content for each schema-owned file; display a unified diff
+   preview between existing and merged content; on operator confirmation, write
+   each file via `_io.atomic_write` (tmp + fsync + rename) directly into
+   `agent_dir` in sorted relpath order. On operator decline, no files are
+   written. On write failure mid-commit, already-written files are committed
+   (per-file atomicity from `atomic_write`); not-yet-written files are left as
+   their existing versions; the wizard prints a partial-update warning listing
+   committed and failed relpaths and exits status 1. Operator data directories
+   (`memory/`, `journal/`, `log/`, `raw/`) MUST NOT be written or moved
+   during the Add-to-it path.
 
 6. The wizard MUST warn before any mkdir or file write when
    `ATOMIC_AGENTS_PERSONA_BACKEND_URL` is set non-empty. Decline MUST exit 0

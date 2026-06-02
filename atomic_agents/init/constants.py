@@ -386,11 +386,6 @@ MSG_SECTION_DETECTION_FAILED: Final = (
     "that did not match: {files}."
 )
 
-MSG_STAGING_DIR_EXISTS: Final = (
-    "Found a leftover staging folder from a previous run at {path}. "
-    "Delete it and continue? (recommended Yes if no other wizard is currently running)"
-)
-
 MSG_MISSING_FILE_BACKFILL: Final = (
     "Some template-owned files were missing and will be backfilled from the template: {files}. "
     "Review the diff preview below to see what will be created."
@@ -427,9 +422,6 @@ DEFAULT_MONTHLY_CAP_USD: Final = 7.00
 
 # Work item sent to the agent during the opt-in test call.
 TEST_CALL_WORK_ITEM: Final = "Hello, can you tell me about yourself?"
-
-# Default test call timeout in seconds.
-TEST_CALL_TIMEOUT_S: Final = 30
 
 
 def redact_url_credentials(url: str) -> str:

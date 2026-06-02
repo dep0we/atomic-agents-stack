@@ -375,7 +375,7 @@ def test_collision_overwrite_failure_restores_backup(tmp_path):
 
 
 def test_collision_cancel_returns_zero_no_changes(monkeypatch, tmp_path):
-    """When operator chooses Cancel (default), _check_collision returns False.
+    """When operator chooses Cancel, _check_collision returns ("cancel", None).
 
     The wizard must then return 0 without touching the filesystem.
     """
@@ -384,9 +384,13 @@ def test_collision_cancel_returns_zero_no_changes(monkeypatch, tmp_path):
     (agent_dir / "existing.txt").write_text("untouched")
 
     console = _FakeConsole()
-    # Confirm.ask returns False (Cancel is the default).
-    overwrite = W._check_collision(agent_dir, console, _confirm_factory(False))
-    assert overwrite is False
+    # Prompt.ask returns "cancel".
+    Prompt = _prompt_sequence("cancel")
+    branch, headers = W._check_collision(
+        agent_dir, console, Prompt, _confirm_factory(False), template_name=None
+    )
+    assert branch == "cancel"
+    assert headers is None
 
     # Filesystem is unchanged.
     assert (agent_dir / "existing.txt").read_text() == "untouched"
@@ -797,151 +801,129 @@ def test_detect_sections_missing_file_tracked_separately(tmp_path):
     assert per_file_headers["memory/INDEX.md"] == []
 
 
-def test_check_stale_staging_dirs_finds_glob(tmp_path):
-    """A leftover .new.* sibling is detected and returned."""
-    agent_dir = tmp_path / "my-agent"
-    agent_dir.mkdir()
-    staging = tmp_path / "my-agent.new.20260101T000000_000000Z"
-    staging.mkdir()
-
-    console = _FakeConsole()
-    # Operator confirms deletion so the function returns True.
-    result = W._check_stale_staging_dirs(agent_dir, console, _confirm_factory(True))
-
-    assert result is True
-    # The staging dir should have been deleted by the function.
-    assert not staging.exists()
-
-
-def test_check_stale_staging_dirs_empty_when_none(tmp_path):
-    """No stale staging dirs means _check_stale_staging_dirs returns True immediately."""
+def test_commit_merges_writes_all_files(tmp_path):
+    """_commit_merges calls atomic_write for each file and returns (committed, [])."""
     agent_dir = tmp_path / "my-agent"
     agent_dir.mkdir()
 
+    merged_content = {
+        "persona/IDENTITY.md": "# ID\n\n## Mission\n\nTest mission.\n",
+        "model.md": "# Model\n\nclaude-opus-4-7\n",
+    }
+
     console = _FakeConsole()
-    prompt_called = []
+    committed, failed = W._commit_merges(agent_dir, merged_content, console)
 
-    class WatchConfirm:
-        @classmethod
-        def ask(cls, *a, **kw):
-            prompt_called.append(True)
-            return False
+    assert failed == []
+    assert set(committed) == {"persona/IDENTITY.md", "model.md"}
+    assert (agent_dir / "persona" / "IDENTITY.md").read_text() == merged_content[
+        "persona/IDENTITY.md"
+    ]
+    assert (agent_dir / "model.md").read_text() == merged_content["model.md"]
 
-    result = W._check_stale_staging_dirs(agent_dir, console, WatchConfirm)
 
-    assert result is True
-    assert not prompt_called, (
-        "Confirm.ask should not be called when no staging dirs exist"
+def test_commit_merges_partial_on_oserror(tmp_path, monkeypatch):
+    """When a file write fails mid-commit, committed files are present and failed is reported."""
+    agent_dir = tmp_path / "my-agent"
+    agent_dir.mkdir()
+
+    write_calls: list[str] = []
+    original_aw = W._io.atomic_write
+
+    def _flaky(target, content, encoding="utf-8"):
+        write_calls.append(str(target))
+        if "model.md" in str(target):
+            raise OSError("Simulated write failure")
+        return original_aw(target, content, encoding=encoding)
+
+    monkeypatch.setattr("atomic_agents.init.wizard._io.atomic_write", _flaky)
+
+    merged_content = {
+        "model.md": "model content",
+        "persona/IDENTITY.md": "id content",
+    }
+
+    console = _FakeConsole()
+    committed, failed = W._commit_merges(agent_dir, merged_content, console)
+
+    # persona/IDENTITY.md sorts before model.md; model.md fails
+    assert "persona/IDENTITY.md" in committed
+    assert "model.md" in failed
+
+
+# ---------------------------------------------------------------------------
+# L. Per-file atomic commit (_commit_merges) -- additional edge-case tests
+# ---------------------------------------------------------------------------
+
+
+def test_commit_merges_empty_map_returns_empty_lists(tmp_path):
+    """_commit_merges with an empty merged_content dict writes nothing."""
+    agent_dir = tmp_path / "my-agent"
+    agent_dir.mkdir()
+
+    console = _FakeConsole()
+    committed, failed = W._commit_merges(agent_dir, {}, console)
+
+    assert committed == []
+    assert failed == []
+
+
+def test_commit_merges_creates_parent_dirs(tmp_path):
+    """_commit_merges creates intermediate directories via atomic_write."""
+    agent_dir = tmp_path / "my-agent"
+    agent_dir.mkdir()
+
+    merged_content = {
+        "persona/IDENTITY.md": "## Who I am\n\nTest.\n",
+    }
+
+    console = _FakeConsole()
+    committed, failed = W._commit_merges(agent_dir, merged_content, console)
+
+    assert failed == []
+    assert committed == ["persona/IDENTITY.md"]
+    assert (agent_dir / "persona" / "IDENTITY.md").exists()
+
+
+def test_commit_merges_oserror_reported_in_failed(tmp_path, monkeypatch):
+    """When atomic_write raises OSError, the relpath appears in failed, not committed."""
+    agent_dir = tmp_path / "my-agent"
+    agent_dir.mkdir()
+
+    monkeypatch.setattr(
+        "atomic_agents.init.wizard._io.atomic_write",
+        lambda *a, **kw: (_ for _ in ()).throw(OSError("disk full")),
     )
 
-
-# ---------------------------------------------------------------------------
-# L. Staging-dir commit + rollback (_commit_add_to_it)
-# ---------------------------------------------------------------------------
-
-
-def test_commit_add_to_it_success_rmtrees_bak(tmp_path):
-    """On success, staged content appears in agent_dir and the backup is removed."""
-    agent_dir = tmp_path / "my-agent"
-    agent_dir.mkdir()
-    (agent_dir / "original.txt").write_text("old content")
-
-    staging_dir = tmp_path / "my-agent.new.20260101T000000_000000Z"
-    staging_dir.mkdir()
-    (staging_dir / "new-file.txt").write_text("staged content")
-
+    merged_content = {"tools.md": "content"}
     console = _FakeConsole()
-    W._commit_add_to_it(agent_dir, staging_dir, console)
+    committed, failed = W._commit_merges(agent_dir, merged_content, console)
 
-    # Staged content should be at agent_dir.
-    assert (agent_dir / "new-file.txt").exists()
-    assert (agent_dir / "new-file.txt").read_text() == "staged content"
-
-    # No backup should remain.
-    bak_dirs = list(tmp_path.glob("my-agent.bak.*"))
-    assert not bak_dirs, f"Backup dirs not cleaned up: {bak_dirs}"
-
-
-def test_commit_add_to_it_failure_restores_original(tmp_path, monkeypatch):
-    """When the staging rename fails, the original agent_dir content is restored."""
-    agent_dir = tmp_path / "my-agent"
-    agent_dir.mkdir()
-    sentinel = agent_dir / "original.txt"
-    sentinel.write_text("preserved content")
-
-    staging_dir = tmp_path / "my-agent.new.20260101T000000_000000Z"
-    staging_dir.mkdir()
-    (staging_dir / "new-file.txt").write_text("staged content")
-
-    # Track how many times rename is called; fail on the second call (staging -> agent).
-    rename_calls = []
-    original_rename = Path.rename
-
-    def _flaky_rename(self, target):
-        rename_calls.append((self, target))
-        if len(rename_calls) == 2:
-            raise OSError("Simulated rename failure")
-        return original_rename(self, target)
-
-    monkeypatch.setattr(Path, "rename", _flaky_rename)
-
-    with pytest.raises(OSError):
-        W._commit_add_to_it(agent_dir, staging_dir, console=_FakeConsole())
-
-    # Original content must be restored.
-    assert agent_dir.exists(), "agent_dir must be restored after failure"
-    assert sentinel.exists(), "original sentinel file must be restored"
-    assert sentinel.read_text() == "preserved content"
-
-
-def test_commit_add_to_it_ki_safe(tmp_path, monkeypatch):
-    """KeyboardInterrupt during staging rename restores agent_dir and re-raises."""
-    agent_dir = tmp_path / "my-agent"
-    agent_dir.mkdir()
-    (agent_dir / "original.txt").write_text("preserved")
-
-    staging_dir = tmp_path / "my-agent.new.20260101T000000_000000Z"
-    staging_dir.mkdir()
-
-    rename_calls = []
-    original_rename = Path.rename
-
-    def _ki_on_second(self, target):
-        rename_calls.append((self, target))
-        if len(rename_calls) == 2:
-            raise KeyboardInterrupt
-        return original_rename(self, target)
-
-    monkeypatch.setattr(Path, "rename", _ki_on_second)
-
-    with pytest.raises(KeyboardInterrupt):
-        W._commit_add_to_it(agent_dir, staging_dir, console=_FakeConsole())
-
-    # agent_dir must be restored.
-    assert agent_dir.exists(), "agent_dir must be restored after KeyboardInterrupt"
-    assert (agent_dir / "original.txt").read_text() == "preserved"
+    assert committed == []
+    assert "tools.md" in failed
+    assert "disk full" in console.out.getvalue()
 
 
 # ---------------------------------------------------------------------------
-# M. CRLF + BOM normalization (_render_diff_preview)
+# M. CRLF + BOM normalization (_render_diff_preview with merged_content map)
 # ---------------------------------------------------------------------------
 
 
 def test_render_diff_preview_normalizes_crlf(tmp_path):
-    """Existing file with CRLF and staged file with LF (same logical content) shows no diff."""
+    """Existing file with CRLF and merged content with LF shows no diff."""
     agent_dir = tmp_path / "my-agent"
     agent_dir.mkdir()
-    staging_dir = tmp_path / "my-agent.new.ts"
-    staging_dir.mkdir()
 
     shared_content = "## Hello\n\nWorld.\n"
     crlf_content = shared_content.replace("\n", "\r\n")
 
     (agent_dir / "notes.md").write_bytes(crlf_content.encode("utf-8"))
-    (staging_dir / "notes.md").write_text(shared_content, encoding="utf-8")
 
+    merged_content = {"notes.md": shared_content}
     console = _FakeConsole()
-    files_changed, ins, dels = W._render_diff_preview(agent_dir, staging_dir, console)
+    files_changed, ins, dels = W._render_diff_preview(
+        agent_dir, merged_content, console
+    )
 
     assert files_changed == 0, (
         "CRLF normalization should make CRLF vs LF files show as identical"
@@ -949,20 +931,20 @@ def test_render_diff_preview_normalizes_crlf(tmp_path):
 
 
 def test_render_diff_preview_strips_utf8_bom(tmp_path):
-    """Existing file with UTF-8 BOM and staged file without (same text) shows no diff."""
+    """Existing file with UTF-8 BOM and merged content without BOM shows no diff."""
     agent_dir = tmp_path / "my-agent"
     agent_dir.mkdir()
-    staging_dir = tmp_path / "my-agent.new.ts"
-    staging_dir.mkdir()
 
     shared_content = "## Hello\n\nWorld.\n"
     bom_bytes = b"\xef\xbb\xbf" + shared_content.encode("utf-8")
 
     (agent_dir / "notes.md").write_bytes(bom_bytes)
-    (staging_dir / "notes.md").write_text(shared_content, encoding="utf-8")
 
+    merged_content = {"notes.md": shared_content}
     console = _FakeConsole()
-    files_changed, ins, dels = W._render_diff_preview(agent_dir, staging_dir, console)
+    files_changed, ins, dels = W._render_diff_preview(
+        agent_dir, merged_content, console
+    )
 
     assert files_changed == 0, (
         "UTF-8 BOM normalization should make BOM vs non-BOM files show as identical"
@@ -1198,3 +1180,43 @@ def test_default_template_vars_writer_uses_cautious():
         == expected_preset[C.ACTION_CLASS_HIGH_RISK]
     )
     assert vars_map[C.TEMPLATE_VAR_AUTONOMY_PRESET_LABEL] == C.PRESET_CAUTIOUS
+
+
+def test_detect_sections_orphan_h2_preserved_in_extraction(tmp_path):
+    """Operator-added orphan h2 sections (not in schema) are tolerated and tracked.
+
+    Per spec/35 MUST 15: orphan sections preserve verbatim. The detection step
+    must succeed (superset check) when an operator's existing file contains
+    schema headers PLUS extra h2 sections.
+    """
+    agent_dir = tmp_path / "orphan-test"
+    persona_dir = agent_dir / "persona"
+    persona_dir.mkdir(parents=True)
+
+    # Write IDENTITY.md with the advisor schema headers PLUS a custom orphan.
+    schema = C.TEMPLATE_SECTION_SCHEMA["advisor"]
+    content = "# IDENTITY\n\n"
+    for header in schema["persona/IDENTITY.md"]:
+        content += f"## {header}\n\nplaceholder content under {header}\n\n"
+    content += "## My Custom Section\n\noperator-authored content here\n\n"
+    (persona_dir / "IDENTITY.md").write_text(content, encoding="utf-8")
+
+    # Write the other 6 files with just the schema h2s, no orphans.
+    for relpath in [
+        "persona/SOUL.md",
+        "persona/USER.md",
+        "tools.md",
+        "model.md",
+        "memory/INDEX.md",
+        "wiki/INDEX.md",
+    ]:
+        p = agent_dir / relpath
+        p.parent.mkdir(parents=True, exist_ok=True)
+        body = "\n".join(f"## {h}\n\n" for h in schema[relpath])
+        p.write_text(body, encoding="utf-8")
+
+    ok, per_file_headers, failed = W._detect_sections(agent_dir, "advisor")
+
+    assert ok is True
+    assert "My Custom Section" in per_file_headers["persona/IDENTITY.md"]
+    assert failed == []
