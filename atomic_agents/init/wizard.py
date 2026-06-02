@@ -8,8 +8,10 @@ from __future__ import annotations
 # Standard library imports only at module-top. rich is lazy-imported inside run_init
 # per CLAUDE.md aesthetic and adversarial review discipline.
 import os
+import re
 import string
 import sys
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,6 +19,30 @@ from typing import Any
 from .. import _io, _llm, _platform
 from ..exceptions import PathTraversalError
 from . import constants as C
+
+
+# ---------------------------------------------------------------------------
+# _types helper: lazy-import a tuple of exception types for isinstance dispatch
+# ---------------------------------------------------------------------------
+
+
+def _types(mod: Any, *names: str) -> tuple:
+    """Return a tuple of types from ``mod`` suitable for ``isinstance`` dispatch.
+
+    Looks up each name on ``mod`` via ``getattr``. Names that resolve to ``None``
+    or that are absent on the module are replaced with ``()`` so the tuple stays
+    valid as the second argument to ``isinstance``. This makes exception dispatch
+    safe when an optional SDK is unavailable. Also tolerates ``mod=None`` gracefully.
+
+    Example:
+        isinstance(e, _types(anthropic_mod, "RateLimitError", "AuthenticationError"))
+    """
+    result = []
+    for name in names:
+        t = getattr(mod, name, None)
+        if t is not None:
+            result.append(t)
+    return tuple(result)
 
 
 # ---------------------------------------------------------------------------
@@ -54,34 +80,43 @@ def run_init(args: Any) -> int:
 
     console = Console()
 
-    # --list-templates writes nothing, so the persona-backend guard is skipped
-    # per spec/35: the guard applies when files would be written.
-    if args.list_templates:
-        return _cmd_list_templates(console)
+    try:
+        # --list-templates writes nothing, so the persona-backend guard is skipped
+        # per spec/35: the guard applies when files would be written.
+        if args.list_templates:
+            return _cmd_list_templates(console)
 
-    # Resolve agents_root once at entry (MUST H6 / M9).
-    agents_root = _resolve_agents_root(args)
+        # Resolve agents_root once at entry (MUST H6 / M9).
+        agents_root = _resolve_agents_root(args)
 
-    # MUST 7: API key pre-flight via _get_key (env vars + Keychain + keys.json).
-    if not _api_key_preflight():
-        print(C.MSG_NO_PROVIDER_KEY, file=sys.stderr)
-        return 1
+        # MUST 6: persona-backend warning before any mkdir or file write.
+        if not _persona_backend_check(console, Confirm):
+            return 0  # decline = clean exit, zero files written
 
-    # MUST 6: persona-backend warning before any mkdir or file write.
-    if not _persona_backend_check(console, Confirm):
-        return 0  # decline = clean exit, zero files written
+        if args.from_template:
+            return _from_template(
+                args.from_template,
+                args.agent_name,
+                agents_root,
+                console,
+                Prompt,
+                Confirm,
+            )
 
-    if args.from_template:
-        return _from_template(
-            args.from_template,
-            args.agent_name,
-            agents_root,
-            console,
-            Prompt,
-            Confirm,
+        # MUST 7: API key pre-flight via _get_key (env vars + Keychain + keys.json).
+        # Carved out of --from-template and --list-templates per spec/35 MUST 7 amendment
+        # (P3 lock): those paths write file content only and do not make LLM calls.
+        if not _api_key_preflight():
+            print(C.MSG_NO_PROVIDER_KEY, file=sys.stderr)
+            return 1
+
+        return _interactive(
+            args.agent_name, agents_root, console, Prompt, Confirm, Table
         )
 
-    return _interactive(args.agent_name, agents_root, console, Prompt, Confirm, Table)
+    except KeyboardInterrupt:
+        console.print("\nCanceled. No files were written.")
+        return 130  # 128 + SIGINT
 
 
 # ---------------------------------------------------------------------------
@@ -121,10 +156,15 @@ def _persona_backend_check(console: Any, Confirm: Any) -> bool:
     Returns True if safe to proceed, False if the operator declined.
     --list-templates callers skip this because no files are written.
     """
-    if not os.environ.get("ATOMIC_AGENTS_PERSONA_BACKEND_URL", "").strip():
+    raw_value = os.environ.get("ATOMIC_AGENTS_PERSONA_BACKEND_URL", "").strip()
+    if not raw_value:
         return True  # No custom backend set; safe to proceed.
 
-    console.print(f"\n[yellow]{C.MSG_PERSONA_BACKEND_WARNING}[/yellow]\n")
+    redacted = C.redact_url_credentials(raw_value)
+    console.print(
+        f"\n[yellow]{C.MSG_PERSONA_BACKEND_WARNING} "
+        f"(configured backend: {redacted})[/yellow]\n"
+    )
     proceed = Confirm.ask(
         "Continue anyway and write per-agent persona files?",
         console=console,
@@ -139,16 +179,16 @@ def _persona_backend_check(console: Any, Confirm: Any) -> bool:
 
 
 def _cmd_list_templates(console: Any) -> int:
-    """Print the available template names and a one-line description."""
-    console.print("\nAvailable templates:\n")
+    """List the starter templates available via --from-template."""
+    console.print("[bold]Available starter templates:[/bold]")
     console.print(
-        "  [bold]advisor[/bold]  -- General-purpose personal advisor. "
-        "Good starting point for most home-user agents."
+        "  advisor    Caldwell-shaped general-purpose agent (Cautious autonomy)"
     )
-    console.print()
     console.print(
-        "Run `atomic-agents init <name> --from-template advisor` to scaffold "
-        "without the Q&A wizard.\n"
+        "  researcher Curiosity-first investigator (Cautious autonomy; source-grounded)"
+    )
+    console.print(
+        "  writer     Voice-first content agent (Cautious autonomy; Sonnet default)"
     )
     return 0
 
@@ -167,7 +207,7 @@ def _from_template(
     Confirm: Any,
 ) -> int:
     """Non-interactive scaffold: validate name, check collision, write defaults."""
-    known_templates = {"advisor"}
+    known_templates = {"advisor", "researcher", "writer"}
     if template_name not in known_templates:
         console.print(
             f"[red]Unknown template '{template_name}'.[/red] "
@@ -178,6 +218,10 @@ def _from_template(
     # Q1 name validation still required (MUST 1).
     if agent_name:
         name = agent_name.strip()
+        # Symmetric length check before regex (R2-L1).
+        if len(name) > C.AGENT_NAME_MAX_LEN:
+            print(C.MSG_INVALID_NAME_TOO_LONG, file=sys.stderr)
+            return 2
         if name in C.RESERVED_AGENT_NAMES:
             console.print(C.MSG_INVALID_NAME_RESERVED)
             return 2
@@ -199,8 +243,8 @@ def _from_template(
         if not overwrite:
             return 0
 
-    # Build a minimal set of template vars using safe defaults.
-    default_vars = _default_template_vars(name)
+    # Build a minimal set of template vars using safe defaults for this template.
+    default_vars = _default_template_vars(name, template_name)
 
     return _write_scaffold(
         agent_dir=agent_dir,
@@ -214,15 +258,21 @@ def _from_template(
     )
 
 
-def _default_template_vars(name: str) -> dict[str, str]:
-    """Minimal defaults for --from-template (no Q&A)."""
-    preset = C.AUTONOMY_PRESETS[C.PRESET_CAUTIOUS]
+def _default_template_vars(name: str, template_name: str) -> dict[str, str]:
+    """Minimal defaults for --from-template (no Q&A).
+
+    Looks up the preset for the given template from TEMPLATE_PRESET_DEFAULTS,
+    then applies the matching AUTONOMY_PRESETS entry to populate the four
+    autonomy_* variables (A2 lock).
+    """
+    preset_label = C.TEMPLATE_PRESET_DEFAULTS.get(template_name, C.PRESET_CAUTIOUS)
+    preset = C.AUTONOMY_PRESETS[preset_label]
     return {
         C.TEMPLATE_VAR_AGENT_NAME: name,
         C.TEMPLATE_VAR_MISSION: "(Configure in persona/IDENTITY.md after setup.)",
         C.TEMPLATE_VAR_SCOPE_IN: "- (Add in-scope work items here.)",
         C.TEMPLATE_VAR_SCOPE_OUT: "- (Add out-of-scope refusals here.)",
-        C.TEMPLATE_VAR_AUTONOMY_PRESET_LABEL: C.PRESET_CAUTIOUS,
+        C.TEMPLATE_VAR_AUTONOMY_PRESET_LABEL: preset_label,
         C.TEMPLATE_VAR_AUTONOMY_READ_ONLY: preset[C.ACTION_CLASS_READ_ONLY],
         C.TEMPLATE_VAR_AUTONOMY_REVERSIBLE_WRITE: preset[
             C.ACTION_CLASS_REVERSIBLE_WRITE
@@ -598,7 +648,7 @@ def _render_files(
     written: list[Path] = []
 
     # Walk the template tree. importlib.resources Traversable objects support
-    # iterdir() recursively. We walk depth-first.
+    # iterdir() recursively. We walk depth-first via deque (L1 depth-limited).
     for source_file, rel_parts in _walk_traversable(template_pkg_path, []):
         # Determine the target path under agent_dir.
         rel_path = str(Path(*rel_parts))
@@ -623,17 +673,38 @@ def _render_files(
 
 
 def _walk_traversable(
-    node: Any,
-    parts: list[str],
+    root: Any,
+    root_parts: list[str],
 ) -> list[tuple[Any, list[str]]]:
-    """Recursively walk a Traversable, yielding (file_node, [relative, parts])."""
+    """Walk a Traversable depth-first using an explicit deque (L1 depth cap).
+
+    Uses a deque instead of recursion to avoid deep call stacks on unusually
+    nested template trees. Logs a warning and stops if the walk exceeds
+    C.MAX_TEMPLATE_DEPTH levels.
+    """
     results = []
-    for child in node.iterdir():
-        child_parts = parts + [child.name]
-        if _traversable_is_dir(child):
-            results.extend(_walk_traversable(child, child_parts))
+    # Stack entries: (node, parts, depth)
+    stack: deque[tuple[Any, list[str], int]] = deque()
+    stack.append((root, root_parts, 0))
+
+    while stack:
+        node, parts, depth = stack.popleft()
+        if _traversable_is_dir(node):
+            if depth > C.MAX_TEMPLATE_DEPTH:
+                import warnings
+
+                warnings.warn(
+                    f"Template tree exceeds MAX_TEMPLATE_DEPTH={C.MAX_TEMPLATE_DEPTH}; "
+                    f"stopping walk at {parts}. Review the template for deep nesting.",
+                    stacklevel=2,
+                )
+                continue
+            for child in node.iterdir():
+                stack.append((child, parts + [child.name], depth + 1))
         else:
-            results.append((child, child_parts))
+            if parts:  # skip the root node itself if it happens to be a file
+                results.append((node, parts))
+
     return results
 
 
@@ -649,6 +720,408 @@ def _traversable_is_dir(node: Any) -> bool:
             return True
         except (NotADirectoryError, OSError):
             return False
+
+
+# ---------------------------------------------------------------------------
+# Section detection for Add-to-it merge contract (spec/35 MUST 15)
+# ---------------------------------------------------------------------------
+
+
+def _extract_h2_headers(text: str) -> list[str]:
+    """Extract ATX-style h2 header strings from markdown text.
+
+    Parser state machine handles:
+    - YAML frontmatter: skipped when the first line is ``---`` (up to the next ``---``)
+    - Code fences: lines inside `` ``` `` or ``~~~`` delimiters are not scanned
+    - HTML comments: lines inside ``<!--`` ... ``-->`` are not scanned
+    - Trailing closing hashes on ATX headers are stripped
+
+    Setext-style h2 headers (underline with ``------``) are NOT supported per
+    spec/35 MUST 15. Operators with setext files must convert to ATX before
+    using Add-to-it.
+
+    Returns a list of stripped header strings in document order.
+    """
+    headers: list[str] = []
+    lines = text.splitlines()
+
+    # Skip YAML frontmatter: if the first non-empty line is ``---``, skip until
+    # the next ``---`` closing delimiter.
+    start = 0
+    if lines and lines[0].strip() == "---":
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "---":
+                start = i + 1
+                break
+
+    in_fence = False
+    in_comment = False
+
+    for line in lines[start:]:
+        stripped = line.strip()
+
+        # Toggle code-fence state on ``` or ~~~ delimiters.
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+
+        # Track HTML comment state (single-line or multi-line).
+        if "<!--" in stripped:
+            in_comment = True
+        if "-->" in stripped:
+            in_comment = False
+            continue
+
+        if in_fence or in_comment:
+            continue
+
+        # ATX h2: ``## Header text`` with optional trailing ``##``.
+        m = re.match(r"^##\s+(.+?)(?:\s+#+)?\s*$", line)
+        if m:
+            headers.append(m.group(1).strip())
+
+    return headers
+
+
+def _detect_sections(
+    agent_dir: Path,
+    template_name: str,
+) -> tuple[bool, dict[str, list[str]] | None, list[str]]:
+    """Detect whether existing files match the template's section schema.
+
+    Reads each file listed in C.TEMPLATE_SECTION_SCHEMA[template_name], extracts
+    h2 headers using the state-machine parser, and checks that each file's headers
+    are a SUPERSET of the schema's expected headers (operator-added orphan sections
+    are allowed; schema-required headers must be present).
+
+    Returns:
+        (success, per_file_headers, failed_files)
+
+        success=True when all schema files pass the superset check.
+        per_file_headers maps file relpath to extracted h2 header list (or None
+          for a missing file that will be backfilled).
+        failed_files lists relpaths whose headers did not satisfy the schema.
+    """
+    schema = C.TEMPLATE_SECTION_SCHEMA.get(template_name, {})
+    per_file_headers: dict[str, list[str]] = {}
+    failed_files: list[str] = []
+
+    for relpath, required_headers in schema.items():
+        target = agent_dir / relpath
+        if not target.exists():
+            # Missing file: treat as backfill path (MUST 15); record as None.
+            per_file_headers[relpath] = []
+            # Missing files do NOT count as failures; they will be backfilled.
+            continue
+
+        try:
+            raw = target.read_text(encoding="utf-8-sig")
+        except OSError:
+            failed_files.append(relpath)
+            per_file_headers[relpath] = []
+            continue
+
+        # Normalize CRLF/CR to LF (A9).
+        normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
+        found = _extract_h2_headers(normalized)
+        per_file_headers[relpath] = found
+
+        # Superset check: all required headers must appear in the found set.
+        found_set = set(found)
+        if not set(required_headers).issubset(found_set):
+            failed_files.append(relpath)
+
+    success = len(failed_files) == 0
+    return success, per_file_headers, failed_files
+
+
+# ---------------------------------------------------------------------------
+# Add-to-it: diff preview
+# ---------------------------------------------------------------------------
+
+
+def _render_diff_preview(
+    agent_dir: Path,
+    staging_dir: Path,
+    console: Any,
+    missing_files: list[str] | None = None,
+) -> tuple[int, int, int]:
+    """Render a unified diff preview between existing files and staged files.
+
+    Reads existing files with utf-8-sig + CRLF normalization (A9).
+    Staged files are always LF (written by _render_files).
+    Missing-file backfills are labeled [new file] and show full new content.
+
+    Returns (files_changed, total_insertions, total_deletions) for the summary
+    line.
+    """
+    import difflib
+
+    is_dumb = getattr(console, "is_dumb_terminal", False)
+    missing_set = set(missing_files or [])
+
+    files_changed = 0
+    total_ins = 0
+    total_del = 0
+
+    # Walk the staged directory to find all files.
+    for staged_path in sorted(staging_dir.rglob("*")):
+        if not staged_path.is_file():
+            continue
+
+        try:
+            rel = staged_path.relative_to(staging_dir)
+        except ValueError:
+            continue
+
+        relpath_str = str(rel)
+        existing_path = agent_dir / rel
+
+        staged_text = staged_path.read_text(encoding="utf-8")
+        staged_lines = staged_text.splitlines(keepends=True)
+
+        if relpath_str in missing_set or not existing_path.exists():
+            # New file backfill: show full content with [new file] label.
+            console.print(f"[bold]--- [new file] {relpath_str} ---[/bold]")
+            diff_text = "".join(f"+{line}" for line in staged_lines)
+            if is_dumb:
+                console.print(diff_text)
+            else:
+                from rich.syntax import Syntax
+
+                console.print(Syntax(diff_text, language="diff"))
+            files_changed += 1
+            total_ins += len(staged_lines)
+            continue
+
+        try:
+            existing_raw = existing_path.read_text(encoding="utf-8-sig")
+        except OSError:
+            existing_raw = ""
+        existing_text = existing_raw.replace("\r\n", "\n").replace("\r", "\n")
+        existing_lines = existing_text.splitlines(keepends=True)
+
+        diff = list(
+            difflib.unified_diff(
+                existing_lines,
+                staged_lines,
+                fromfile=f"a/{relpath_str}",
+                tofile=f"b/{relpath_str}",
+            )
+        )
+        if not diff:
+            continue
+
+        console.print(f"[bold]--- {relpath_str} ---[/bold]")
+        diff_text = "".join(diff)
+        if is_dumb:
+            console.print(diff_text)
+        else:
+            from rich.syntax import Syntax
+
+            console.print(Syntax(diff_text, language="diff"))
+
+        files_changed += 1
+        total_ins += sum(
+            1 for line in diff if line.startswith("+") and not line.startswith("+++")
+        )
+        total_del += sum(
+            1 for line in diff if line.startswith("-") and not line.startswith("---")
+        )
+
+    console.print(
+        f"\n{files_changed} files changed, "
+        f"{total_ins} insertion(s)(+), "
+        f"{total_del} deletion(s)(-)\n"
+    )
+    return files_changed, total_ins, total_del
+
+
+# ---------------------------------------------------------------------------
+# Add-to-it: staging-dir commit (A5 reversal pattern)
+# ---------------------------------------------------------------------------
+
+
+def _commit_add_to_it(agent_dir: Path, staging_dir: Path, console: Any) -> None:
+    """Commit the staged scaffold into agent_dir using the A5 reversal pattern.
+
+    Steps:
+    1. Compute a backup path: <agent_dir>.bak.<UTC-ISO-microsecond>
+    2. Atomically rename agent_dir to bak_path (backup)
+    3. Atomically rename staging_dir to agent_dir (commit)
+    4. On success: rmtree the backup
+    5. On any failure between steps 2 and 3: rename bak back, leave staging,
+       print error, re-raise
+
+    Wrapped in try/except BaseException so KeyboardInterrupt during the
+    rename window is handled: if KI lands after step 2 but before step 3,
+    the outer KI handler will find agent_dir absent + bak present + staging
+    present and can complete restoration.
+    """
+    import shutil
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    bak_path = agent_dir.parent / f"{agent_dir.name}.bak.{ts}"
+
+    # Step 1+2: backup.
+    agent_dir.rename(bak_path)
+    try:
+        # Step 3: commit.
+        staging_dir.rename(agent_dir)
+    except BaseException as e:
+        # Restore backup; leave staging in place for diagnostics.
+        try:
+            bak_path.rename(agent_dir)
+        except OSError:
+            pass
+        if isinstance(e, KeyboardInterrupt):
+            raise
+        raise OSError(
+            f"Failed to rename staging dir to {agent_dir}; backup restored from {bak_path}. "
+            f"Staging dir left at {staging_dir} for manual inspection."
+        ) from e
+    else:
+        # Success: remove backup.
+        shutil.rmtree(bak_path, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Add-to-it: stale staging dir recovery (M9)
+# ---------------------------------------------------------------------------
+
+
+def _check_stale_staging_dirs(
+    agent_dir: Path,
+    console: Any,
+    Confirm: Any,
+) -> bool:
+    """Scan for leftover staging directories from a previous run.
+
+    If any <agent_dir>.new.* siblings are found, offer to delete them.
+    Returns True if safe to proceed (none found, or operator approved deletion).
+    Returns False if operator declined (exit cleanly).
+    """
+    import shutil
+
+    stale = sorted(agent_dir.parent.glob(f"{agent_dir.name}.new.*"))
+    if not stale:
+        return True
+
+    for stale_path in stale:
+        msg = C.MSG_STAGING_DIR_EXISTS.format(path=stale_path)
+        console.print(f"\n[yellow]{msg}[/yellow]")
+        do_delete = Confirm.ask(
+            "Delete it and continue?",
+            console=console,
+            default=True,
+        )
+        if not do_delete:
+            return False
+        shutil.rmtree(stale_path, ignore_errors=True)
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Add-to-it: main flow
+# ---------------------------------------------------------------------------
+
+
+def _add_to_it(
+    agent_dir: Path,
+    agents_root: Path,
+    template_name: str,
+    console: Any,
+    Prompt: Any,
+    Confirm: Any,
+    Table: Any,
+    existing_headers: dict[str, list[str]] | None,
+) -> int:
+    """Add-to-it merge flow: detect sections, render staged scaffold, diff, commit.
+
+    Runs section detection if not already provided via existing_headers.
+    On detection failure, offers Overwrite or Cancel only (fail-closed).
+    On success, renders the new scaffold to a staging dir, shows a diff,
+    and asks the operator to confirm before committing.
+
+    Returns an exit code (0 success, 1 error).
+    """
+    import shutil
+
+    # Stale staging dir recovery before creating a new one.
+    if not _check_stale_staging_dirs(agent_dir, console, Confirm):
+        return 0
+
+    # Run section detection.
+    success, per_file_headers, failed_files = _detect_sections(agent_dir, template_name)
+
+    if not success:
+        failed_list = ", ".join(failed_files)
+        console.print(
+            f"\n[yellow]{C.MSG_SECTION_DETECTION_FAILED.format(template=template_name, files=failed_list)}[/yellow]"
+        )
+        do_overwrite = Confirm.ask(
+            "Overwrite the existing folder instead?",
+            console=console,
+            default=False,
+        )
+        if not do_overwrite:
+            return 0
+        # Fall through to a standard overwrite via _write_scaffold.
+        return None  # type: ignore[return-value]  # caller interprets None as "do overwrite"
+
+    # Identify files missing entirely (will be backfilled from template).
+    schema = C.TEMPLATE_SECTION_SCHEMA.get(template_name, {})
+    missing_files = [
+        relpath for relpath in schema if not (agent_dir / relpath).exists()
+    ]
+    if missing_files:
+        missing_list = ", ".join(missing_files)
+        console.print(
+            f"\n[dim]{C.MSG_MISSING_FILE_BACKFILL.format(files=missing_list)}[/dim]"
+        )
+
+    # Build template vars from defaults (no Q&A re-run for add-to-it).
+    default_vars = _default_template_vars(agent_dir.name, template_name)
+
+    # Create staging directory.
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    staging_dir = agent_dir.parent / f"{agent_dir.name}.new.{ts}"
+
+    try:
+        _render_files(staging_dir, template_name, default_vars)
+        _create_empty_dirs(staging_dir)
+    except BaseException as e:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        if isinstance(e, KeyboardInterrupt):
+            raise
+        raise
+
+    # Show diff preview.
+    console.print("\n[bold]Preview of changes:[/bold]\n")
+    _render_diff_preview(agent_dir, staging_dir, console, missing_files=missing_files)
+
+    # Confirm before committing.
+    do_commit = Confirm.ask(
+        "Apply these changes?",
+        console=console,
+        default=True,
+    )
+    if not do_commit:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        console.print("No changes made.")
+        return 0
+
+    try:
+        _commit_add_to_it(agent_dir, staging_dir, console)
+    except (OSError, PathTraversalError) as e:
+        console.print(f"[red]{e}[/red]")
+        return 1
+
+    console.print(
+        f"\n[green]Agent '{agent_dir.name}' updated at {agent_dir}.[/green]\n"
+    )
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -678,7 +1151,7 @@ def _collision_overwrite_backup_restore(
     agent_dir: Path,
     write_func: Any,
 ) -> None:
-    """Atomically rename existing agent_dir to .bak.<UTC-ISO>, write, cleanup (MUST 5).
+    """Atomically rename existing agent_dir to .bak.<UTC-ISO-microsecond>, write, cleanup (MUST 5).
 
     Steps:
     1. Rename agent_dir to .bak.<timestamp> (atomic mv on POSIX).
@@ -689,17 +1162,19 @@ def _collision_overwrite_backup_restore(
     """
     import shutil
 
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
     backup_path = agent_dir.parent / f"{agent_dir.name}.bak.{ts}"
 
     agent_dir.rename(backup_path)  # POSIX atomic mv
     try:
         write_func()
-    except Exception:
+    except BaseException as e:
         # Restore on failure: remove any partial new dir, rename backup back.
         if agent_dir.exists():
             shutil.rmtree(agent_dir, ignore_errors=True)
         backup_path.rename(agent_dir)
+        if isinstance(e, KeyboardInterrupt):
+            raise
         raise
     else:
         # Success: remove backup.
@@ -727,6 +1202,13 @@ def _create_empty_dirs(agent_dir: Path) -> None:
 
 def _translate_oserror(e: OSError, path: Path) -> str:
     """Format a plain-English error string from an OSError (T-EX1)."""
+    import errno as _errno
+
+    if e.errno == _errno.ENOENT:
+        return (
+            f"The folder at {path} disappeared between collision check and overwrite. "
+            "Re-run the wizard with a fresh state."
+        )
     header = C.MSG_OSERROR_HEADER.format(path=path, reason=e.strerror or str(e))
     return f"{header}\n{C.MSG_OSERROR_FIX}"
 
@@ -766,10 +1248,12 @@ def _write_scaffold(
         else:
             try:
                 _do_write()
-            except Exception:
+            except BaseException as e:
                 # H4: clean up any partial directory on fresh-write failure
                 # so the operator is not left with a broken half-written scaffold.
                 shutil.rmtree(agent_dir, ignore_errors=True)
+                if isinstance(e, KeyboardInterrupt):
+                    raise
                 raise
     except PathTraversalError as e:
         # R2-H1: C1's safe_resolve_under raises PathTraversalError, which is NOT
@@ -809,7 +1293,7 @@ def _write_scaffold(
 
 
 # ---------------------------------------------------------------------------
-# Doctor handoff
+# Doctor handoff (R2-M2 split try/except per M11 enhancement)
 # ---------------------------------------------------------------------------
 
 
@@ -821,40 +1305,51 @@ def _doctor_handoff(agent_name: str, agents_root: Path, console: Any) -> bool:
 
     If doctor itself fails unexpectedly, returns True and advises the operator
     to run doctor manually. The scaffold is ready; doctor is a diagnostic aid.
+
+    Split try/except structure (R2-M2 / M11): run_doctor, overall_exit_code, and
+    render_human each have independent exception handlers so a failure in one
+    does not suppress output from the others.
     """
     from .. import doctor
 
     console.print("\n[bold]Running doctor to verify the new agent...[/bold]\n")
+
     try:
         results = doctor.run_doctor(
             agent_name=agent_name,
             agents_root=agents_root,
             skip_mcp=False,
         )
-        console.print(doctor.render_human(results))
     except Exception:  # noqa: BLE001
         agent_dir = agents_root / agent_name
         console.print(
-            f"Doctor inconclusive. Your agent is scaffolded at `{agent_dir}`. "
-            f"Run `atomic-agents doctor --agent {agent_name}` whenever you want to verify."
+            "[yellow]Doctor inconclusive. Your agent is scaffolded at [bold]"
+            f"{agent_dir}[/bold]. Run "
+            f"[bold]atomic-agents doctor --agent {agent_name}[/bold] "
+            "to verify when convenient.[/yellow]"
         )
-        return True
+        return True  # allow test-call prompt; doctor was inconclusive, not failed
 
-    exit_code = doctor.overall_exit_code(results)
+    try:
+        exit_code = doctor.overall_exit_code(results)
+    except Exception:  # noqa: BLE001
+        exit_code = -1  # unknown
 
-    # If any results are SKIP, surface the preamble (H5 lock).
-    skip_status = getattr(doctor, "SKIP", "skip")
-    has_skips = any(
-        getattr(r, "status", "").lower() == skip_status.lower()
-        if isinstance(skip_status, str)
-        else getattr(r, "status", None) == skip_status
-        for r in results
-    )
-    if exit_code == 0 and has_skips:
+    try:
+        console.print(doctor.render_human(results))
+    except Exception:  # noqa: BLE001
         console.print(
-            "[dim]Skipped checks are normal for a new agent "
-            "(MCP, logs, and write-paths are configured later).[/dim]\n"
+            f"[yellow]Doctor ran but I could not render the report; exit_code={exit_code}. "
+            f"Run [bold]atomic-agents doctor --agent {agent_name}[/bold] to see the details.[/yellow]"
         )
+
+    if exit_code == 0:
+        # Print preamble if any SKIP results (H5 lock).
+        if any(r.status == "skip" for r in results):
+            console.print(
+                "[dim]Skipped checks are normal for a new agent "
+                "(MCP, logs, write-paths configured later).[/dim]"
+            )
 
     return exit_code == 0
 
@@ -889,14 +1384,14 @@ def _test_call(
 ) -> int:
     """Opt-in test call with full exception catalog (MUST 9). Always exits 0.
 
-    Uses isinstance checks via lazy imports so the dispatch is correct even when
-    the SDK is vendored or pinned to an unusual version.
+    Uses _types() helper for isinstance dispatch so the dispatch is correct
+    even when the SDK is vendored or pinned to an unusual version.
     """
     from ..agent import AtomicAgent
     from ..exceptions import AtomicAgentsError
 
-    # Lazy SDK imports for isinstance dispatch. Fall back to None when unavailable
-    # so getattr(mod, "ClassName", ()) returns () and isinstance never crashes.
+    # Lazy SDK imports for isinstance dispatch via _types(). Fall back to None
+    # when unavailable so _types() returns () and isinstance never crashes.
     try:
         import anthropic as _anthropic_mod
     except ImportError:
@@ -925,28 +1420,20 @@ def _test_call(
             text = getattr(response, "text", str(response))
             console.print(text)
     except Exception as e:  # noqa: BLE001
-        if _anthropic_mod and isinstance(
-            e, getattr(_anthropic_mod, "RateLimitError", ())
-        ):
+        if _anthropic_mod and isinstance(e, _types(_anthropic_mod, "RateLimitError")):
             console.print(
                 f"[yellow]{C.MSG_TEST_CALL_RATE_LIMIT.format(agent_name=agent_name)}[/yellow]"
             )
         elif _anthropic_mod and isinstance(
-            e, getattr(_anthropic_mod, "AuthenticationError", ())
+            e, _types(_anthropic_mod, "AuthenticationError")
         ):
             console.print(f"[yellow]{C.MSG_TEST_CALL_AUTH_ERROR}[/yellow]")
         elif (
             _anthropic_mod
-            and isinstance(e, getattr(_anthropic_mod, "APIConnectionError", ()))
+            and isinstance(e, _types(_anthropic_mod, "APIConnectionError"))
         ) or (
             _httpx_mod
-            and isinstance(
-                e,
-                (
-                    getattr(_httpx_mod, "ConnectError", ()),
-                    getattr(_httpx_mod, "TimeoutException", ()),
-                ),
-            )
+            and isinstance(e, _types(_httpx_mod, "ConnectError", "TimeoutException"))
         ):
             console.print(f"[yellow]{C.MSG_TEST_CALL_NETWORK}[/yellow]")
         elif isinstance(e, AtomicAgentsError):
