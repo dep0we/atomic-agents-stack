@@ -81,6 +81,201 @@ AUTONOMY_PRESETS: Final = {
     },
 }
 
+# Per-template autonomy preset defaults. Used by _default_template_vars in wizard.py
+# when --from-template is invoked without going through the interactive Q&A.
+# All three templates default to Cautious per the design decisions:
+# - advisor: Cautious is the home-user-safe default per PR 1
+# - researcher: Cautious because web search APIs are classified read_only
+#   (spec/28 amended in PR 2), so the rare outbound action (email a summary)
+#   correctly escalates rather than going through judge_required overhead
+# - writer: Cautious because publishing is a high-stakes external action that
+#   the operator must approve per draft
+TEMPLATE_PRESET_DEFAULTS: Final[dict[str, str]] = {
+    "advisor": PRESET_CAUTIOUS,
+    "researcher": PRESET_CAUTIOUS,
+    "writer": PRESET_CAUTIOUS,
+}
+
+# Section schema for Add-to-it recovery merge per spec/35 MUST 15.
+# Maps template name -> file relpath -> ordered list of exact h2 header strings.
+# The wizard's section-detection state machine compares an existing file's
+# extracted h2 headers against this schema. When they match, the wizard
+# offers Add-to-it. When they don't match, the wizard fails closed and
+# offers Overwrite or Cancel only.
+TEMPLATE_SECTION_SCHEMA: Final[dict[str, dict[str, list[str]]]] = {
+    "advisor": {
+        "persona/IDENTITY.md": [
+            "Who I am",
+            "Mission",
+            "Scope",
+            "Operating doctrine",
+            "Operating mode",
+            "Autonomy ladder",
+            "What I'm NOT (the bright lines)",
+        ],
+        "persona/SOUL.md": [
+            "Voice",
+            "Posture",
+            "Evolution discipline",
+            "Things I have learned about this operator",
+        ],
+        "persona/USER.md": [
+            "Role and context",
+            "Communication preferences",
+            "Things to avoid",
+            "Supporting professionals (when to recommend outside help)",
+        ],
+        "tools.md": [
+            "Read paths",
+            "Write paths (own folder ONLY)",
+            "External APIs",
+            "Hard NOs (absolute, no exceptions)",
+            "Soft NOs (require explicit operator override)",
+            "Read budget",
+            "Tool failure behavior",
+        ],
+        "model.md": [
+            "Default model",
+            "Fallback",
+            "Token budget",
+            "Prompt caching strategy",
+            "Cost guardrail",
+            "Research integrity",
+        ],
+        "memory/INDEX.md": [
+            "Critical Feedback",
+            "Locked Decisions",
+            "User Profile",
+            "Active Projects",
+            "Reference",
+            "Recently Promoted to Persona",
+            "Archive (superseded)",
+        ],
+        "wiki/INDEX.md": [
+            "Background and context",
+            "Reference material",
+            "How wiki pages cite sources",
+        ],
+    },
+    "researcher": {
+        "persona/IDENTITY.md": [
+            "Who I am",
+            "Mission",
+            "Scope",
+            "Operating doctrine",
+            "Operating mode",
+            "Research integrity",
+            "Autonomy ladder",
+            "What I'm NOT (the bright lines)",
+        ],
+        "persona/SOUL.md": [
+            "Voice",
+            "Posture",
+            "Evolution discipline",
+            "Things I have learned about this operator",
+        ],
+        "persona/USER.md": [
+            "Role and context",
+            "Communication preferences",
+            "Things to avoid",
+            "Supporting professionals (when to recommend outside help)",
+        ],
+        "tools.md": [
+            "Read paths",
+            "Write paths (own folder ONLY)",
+            "External APIs",
+            "Hard NOs (absolute, no exceptions)",
+            "Soft NOs (require explicit operator override)",
+            "Read budget",
+            "Tool failure behavior",
+        ],
+        "model.md": [
+            "Default model",
+            "Fallback",
+            "Token budget",
+            "Prompt caching strategy",
+            "Cost guardrail",
+            "Research integrity",
+        ],
+        "memory/INDEX.md": [
+            "Critical Feedback",
+            "Research Conclusions",
+            "User Profile",
+            "Active Investigations",
+            "Reference",
+            "Recently Promoted to Persona",
+            "Archive (superseded)",
+        ],
+        "wiki/INDEX.md": [
+            "Source citations",
+            "Pending distillation",
+            "Background and context",
+            "Reference material",
+            "How wiki pages cite sources",
+        ],
+    },
+    "writer": {
+        "persona/IDENTITY.md": [
+            "Who I am",
+            "Mission",
+            "Scope",
+            "Operating doctrine",
+            "Operating mode",
+            "Autonomy ladder",
+            "What I'm NOT (the bright lines)",
+        ],
+        "persona/SOUL.md": [
+            "Voice",
+            "Posture",
+            "Evolution discipline",
+            "Things I have learned about this operator",
+        ],
+        "persona/USER.md": [
+            "Role and context",
+            "Communication preferences",
+            "Things to avoid",
+            "Revision and consistency preferences",
+            "Supporting professionals (when to recommend outside help)",
+        ],
+        "tools.md": [
+            "Read paths",
+            "Write paths (own folder ONLY)",
+            "External APIs",
+            "Hard NOs (absolute, no exceptions)",
+            "Soft NOs (require explicit operator override)",
+            "Read budget",
+            "Tool failure behavior",
+        ],
+        "model.md": [
+            "Default model",
+            "Fallback",
+            "Token budget",
+            "Prompt caching strategy",
+            "Cost guardrail",
+            "Research integrity",
+        ],
+        "memory/INDEX.md": [
+            "Critical Feedback",
+            "Locked Decisions",
+            "User Profile",
+            "Active Projects",
+            "Reference",
+            "Recently Promoted to Persona",
+            "Archive (superseded)",
+        ],
+        "wiki/INDEX.md": [
+            "Background and context",
+            "Reference material",
+            "How wiki pages cite sources",
+        ],
+    },
+}
+
+# Maximum directory depth the template walk will traverse. Defensive cap
+# against future template trees that ship deeply nested structures.
+# Current advisor template is 3 levels deep (templates/<name>/persona/IDENTITY.md).
+MAX_TEMPLATE_DEPTH: Final[int] = 16
+
 # ---------------------------------------------------------------------------
 # agent_name validation
 # ---------------------------------------------------------------------------
@@ -143,8 +338,9 @@ ANTHROPIC_CONFIG_KEY: Final = "anthropic"
 
 MSG_NO_TTY: Final = (
     "This command needs an interactive terminal. For non-interactive use, run "
-    "`atomic-agents init <name> --from-template advisor` to scaffold a Caldwell-shaped "
-    "agent. See `atomic-agents init --list-templates` for other options."
+    "`atomic-agents init <name> --from-template <template>` to scaffold from a "
+    "starter template. See `atomic-agents init --list-templates` for the "
+    "available templates."
 )
 
 # NOTE: this constant carries the help message printed when the pre-flight
@@ -183,6 +379,23 @@ MSG_PERSONA_BACKEND_WARNING: Final = (
     "but your custom backend will not see them as a shared persona."
 )
 
+MSG_SECTION_DETECTION_FAILED: Final = (
+    "Your existing files don't match the {template} template's expected structure. "
+    "Add to it can't safely merge without that structure match. Choose Overwrite "
+    "to replace everything, or Cancel to leave your files untouched. The files "
+    "that did not match: {files}."
+)
+
+MSG_STAGING_DIR_EXISTS: Final = (
+    "Found a leftover staging folder from a previous run at {path}. "
+    "Delete it and continue? (recommended Yes if no other wizard is currently running)"
+)
+
+MSG_MISSING_FILE_BACKFILL: Final = (
+    "Some template-owned files were missing and will be backfilled from the template: {files}. "
+    "Review the diff preview below to see what will be created."
+)
+
 # Opt-in test call exception messages.
 MSG_TEST_CALL_RATE_LIMIT: Final = (
     "The API is busy right now. Wait a minute and try: "
@@ -217,3 +430,26 @@ TEST_CALL_WORK_ITEM: Final = "Hello, can you tell me about yourself?"
 
 # Default test call timeout in seconds.
 TEST_CALL_TIMEOUT_S: Final = 30
+
+
+def redact_url_credentials(url: str) -> str:
+    """Drop user:password@ from URL netloc; keep scheme + host + path visible.
+
+    Used in the persona-backend warning to show operators which backend is
+    configured without leaking credentials. The existing _redact_for_error_message
+    pattern in persona/mandate/corpus backends strips everything after ://,
+    which hides the host entirely; that defeats the operator-decision goal.
+
+    Examples:
+      https://user:pass@example.com/api -> https://example.com/api
+      redis://example.com:6379           -> redis://example.com:6379
+      file:///local/path                 -> file:///local/path
+    """
+    from urllib.parse import urlparse, urlunparse
+
+    parsed = urlparse(url)
+    if "@" in parsed.netloc:
+        netloc = parsed.netloc.split("@", 1)[1]
+    else:
+        netloc = parsed.netloc
+    return urlunparse(parsed._replace(netloc=netloc))
