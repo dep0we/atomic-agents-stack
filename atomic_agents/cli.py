@@ -34,7 +34,7 @@ Subcommands:
     review  — Cross-family adversarial code review (CLAUDE.md rule #11)
     persona — Manage persona records (list, show, snapshot, restore, clone)
     corpus  — Inspect and manage corpus pages (list, show, query, version, restore)
-    init    — Scaffold a new agent in under 10 minutes (interactive wizard)
+    init    : Scaffold a new agent in under 10 minutes (interactive wizard)
 """
 
 from __future__ import annotations

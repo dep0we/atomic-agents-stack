@@ -164,6 +164,9 @@ MSG_INVALID_NAME_CHARSET: Final = (
     "Names use letters, numbers, and dashes only, with no leading or trailing dash. "
     "Maximum 64 characters. Please try again."
 )
+MSG_INVALID_NAME_TOO_LONG: Final = (
+    "Names must be 64 characters or shorter. Please try again."
+)
 MSG_INVALID_NAME_RESERVED: Final = (
     "That name is reserved by a built-in command. Please choose a different name."
 )

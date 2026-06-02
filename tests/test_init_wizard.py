@@ -591,6 +591,39 @@ def test_render_files_writes_through_atomic_write(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_from_template_works_in_non_tty(monkeypatch, tmp_path):
+    """--from-template proceeds normally even when stdin is not a TTY (MUST 11).
+
+    The non-TTY guard only fires for the interactive Q&A path.
+    """
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("atomic_agents._llm._get_key", lambda **kw: "sk-ant-fake")
+    monkeypatch.delenv("ATOMIC_AGENTS_PERSONA_BACKEND_URL", raising=False)
+
+    # Stub heavy downstream calls so the test does not hit the filesystem or LLM.
+    monkeypatch.setattr(
+        "atomic_agents.init.wizard._from_template",
+        lambda *a, **kw: 0,
+    )
+
+    args = _make_args(
+        agent_name="my-advisor", from_template="advisor", agents_root=str(tmp_path)
+    )
+    rc = W.run_init(args)
+    # Must NOT return 2 (non-TTY rejection) -- any non-2 is acceptable here.
+    assert rc != 2
+
+
+def test_from_template_requires_agent_name(capsys):
+    """--from-template without an agent name returns exit code 2 with a plain-English error."""
+    args = _make_args(from_template="advisor", agent_name=None)
+    rc = W.run_init(args)
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert "--from-template" in captured.err
+    assert "agent name" in captured.err.lower()
+
+
 def test_run_init_resolves_agents_root_once(monkeypatch, tmp_path):
     """run_init must call get_agents_root AT MOST once regardless of code path taken."""
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)

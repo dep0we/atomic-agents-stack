@@ -270,9 +270,11 @@ at the top. Tiebreaker for ambiguous order: alphabetical by issue number.
    side effect.
 
 2. The wizard MUST reject non-interactive terminals via `sys.stdin.isatty()`
-   BEFORE importing `rich` or instantiating any `Console`, on every
-   `run_init()` invocation path including `--from-template` and
-   `--list-templates`.
+   BEFORE importing `rich` or instantiating any `Console`, on the interactive
+   Q&A path. The `--from-template` and `--list-templates` paths are CI-friendly
+   and MUST NOT require an interactive terminal (they are the documented
+   non-interactive escape hatches). The non-TTY error message MUST name
+   `--from-template <name>` as the alternative.
 
 3. The wizard MUST catch `OSError` on every filesystem side effect (`mkdir` AND
    every `atomic_write` call) and translate it to a plain-English message per
@@ -280,7 +282,12 @@ at the top. Tiebreaker for ambiguous order: alphabetical by issue number.
    MUST NOT propagate.
 
 4. The wizard MUST use `atomic_agents._io.atomic_write` for every file write.
-   Direct `open(..., "w")` is forbidden.
+   Direct `open(..., "w")` is forbidden. The wizard MUST also validate every
+   path component derived from operator-controlled input through
+   `atomic_agents._io.safe_resolve_under(child, agent_dir)` before passing it
+   to `atomic_write`. On a fresh-write failure (no pre-existing scaffold to
+   restore), the wizard MUST clean up the partial `agent_dir` it created so
+   the operator sees either a complete scaffold or none of one.
 
 5. The collision Overwrite branch MUST use the backup+restore pattern: atomic
    rename to `<agent_dir>.bak.<UTC-ISO>`, write all files, success rmtree the
@@ -293,26 +300,38 @@ at the top. Tiebreaker for ambiguous order: alphabetical by issue number.
 7. The wizard MUST resolve the Anthropic API key via
    `atomic_agents._llm._get_key(env_vars=constants.ANTHROPIC_ENV_VARS,
    keychain_name=constants.ANTHROPIC_KEYCHAIN_NAME,
-   config_key=constants.ANTHROPIC_CONFIG_KEY)` at pre-flight, NOT a direct
-   environment variable read.
+   config_key=constants.ANTHROPIC_CONFIG_KEY)` at pre-flight on the paths that
+   may invoke the LLM (interactive Q&A and `--from-template`). The
+   `--list-templates` path MUST NOT require an API key (it writes no files and
+   makes no LLM calls).
 
 8. The wizard MUST call `atomic_agents.doctor.run_doctor()` on the new agent
    and MUST block the test-call prompt when
    `doctor.overall_exit_code(results) != 0`.
 
-9. The opt-in test call MUST catch the exception catalog:
-   `anthropic.RateLimitError`, `anthropic.AuthenticationError`,
-   `anthropic.APIConnectionError` (plus `httpx.ConnectError`,
-   `httpx.TimeoutException`), `AtomicAgentsError`, generic `Exception`
-   fallback. Every exception path MUST exit status 0.
+9. The opt-in test call MUST catch the exception catalog via `isinstance`
+   checks (NOT class-name string matching, which misses subclasses): lazy-
+   import `anthropic` and `httpx` inside the `try` block; then check
+   `isinstance(e, anthropic.RateLimitError)`, `isinstance(e,
+   anthropic.AuthenticationError)`, `isinstance(e,
+   (anthropic.APIConnectionError, httpx.ConnectError,
+   httpx.TimeoutException))`, then `isinstance(e, AtomicAgentsError)`, with a
+   generic `Exception` fallback. Every exception path MUST exit status 0.
 
 10. The IDENTITY.md Autonomy section MUST use `constants.ACTION_CLASSES` and
     `constants.POLICIES` verbatim. The shorthand strings (`audit`, `judge`)
     MUST NOT appear.
 
-11. Both `--from-template <name>` and `--list-templates` paths MUST honor the
-    entry guards from MUST 2 (non-TTY) and MUST 6 (persona-backend warning,
-    except `--list-templates` which writes no files).
+11. Entry guards by invocation path:
+    - Interactive Q&A: MUST 1 (name validation), MUST 2 (non-TTY rejection),
+      MUST 6 (persona-backend warning before write), MUST 7 (API key
+      pre-flight).
+    - `--from-template <name>`: MUST 1 (name validation), MUST 6 (persona-
+      backend warning before write), MUST 7 (API key pre-flight). Non-TTY is
+      permitted. `agent_name` MUST be supplied; the wizard MUST refuse with a
+      clear error if `--from-template` is given without `agent_name`.
+    - `--list-templates`: no entry guards (read-only enumeration; no files
+      written, no LLM calls, no name required).
 
 12. CHANGELOG `[Unreleased]` MUST interleave newest-arc-at-top with
     alphabetical-by-issue-number tiebreaker on conflict.

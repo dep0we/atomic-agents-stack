@@ -29,13 +29,24 @@ def run_init(args: Any) -> int:
     args has: agent_name (Optional[str]), from_template (Optional[str]),
     list_templates (bool), agents_root (Optional[str]).
     """
-    # MUST 2: non-TTY guard BEFORE any rich import or Console init.
-    # Applies to every path: interactive, --from-template, and --list-templates.
-    if not sys.stdin.isatty():
+    # MUST 11: --from-template requires an agent name (non-interactive path).
+    # Check before any rich import so error is cheap and clear.
+    if args.from_template and not args.agent_name:
+        print(
+            "--from-template requires an agent name. "
+            "Run `atomic-agents init <name> --from-template advisor`.",
+            file=sys.stderr,
+        )
+        return 2
+
+    # MUST 2: non-TTY guard for the interactive Q&A path.
+    # --from-template and --list-templates do not require an interactive terminal
+    # and are carved out here before any rich import.
+    if not args.from_template and not args.list_templates and not sys.stdin.isatty():
         print(C.MSG_NO_TTY, file=sys.stderr)
         return 2
 
-    # MUST 14: lazy import rich here, after the TTY gate.
+    # MUST 14: lazy import rich here, after the non-TTY + arg-validation gates.
     from rich.console import Console
     from rich.prompt import Confirm, Prompt
     from rich.table import Table
@@ -99,7 +110,7 @@ def _api_key_preflight() -> bool:
             config_key=C.ANTHROPIC_CONFIG_KEY,
         )
         return True
-    except (AtomicAgentsError, Exception):  # noqa: BLE001
+    except AtomicAgentsError:  # noqa: BLE001
         return False
 
 
@@ -177,8 +188,12 @@ def _from_template(
 
     agent_dir = agents_root / name
 
+    # H6: capture existing ONCE to eliminate the TOCTOU window between
+    # collision check and _write_scaffold's overwrite branch.
+    existing = agent_dir.exists()
+
     # Collision check.
-    if agent_dir.exists():
+    if existing:
         overwrite = _check_collision(agent_dir, console, Confirm)
         if not overwrite:
             return 0
@@ -194,7 +209,7 @@ def _from_template(
         agents_root=agents_root,
         console=console,
         Confirm=Confirm,
-        existing=agent_dir.exists(),
+        existing=existing,
     )
 
 
@@ -245,8 +260,12 @@ def _interactive(
 
     agent_dir = agents_root / name
 
+    # H6: capture existing ONCE to eliminate the TOCTOU window between
+    # collision check and _write_scaffold's overwrite branch.
+    existing = agent_dir.exists()
+
     # Collision check before any further prompts.
-    if agent_dir.exists():
+    if existing:
         overwrite = _check_collision(agent_dir, console, Confirm)
         if not overwrite:
             return 0
@@ -292,7 +311,7 @@ def _interactive(
         agents_root=agents_root,
         console=console,
         Confirm=Confirm,
-        existing=agent_dir.exists(),
+        existing=existing,
     )
 
 
@@ -317,6 +336,9 @@ def _ask_q1_name(console: Any, Prompt: Any, default: str | None = None) -> str:
         name = (raw or "").strip()
         if not name:
             console.print("[yellow]Please enter a name.[/yellow]")
+            continue
+        if len(name) > C.AGENT_NAME_MAX_LEN:
+            console.print(f"[red]{C.MSG_INVALID_NAME_TOO_LONG}[/red]")
             continue
         if name in C.RESERVED_AGENT_NAMES:
             console.print(f"[red]{C.MSG_INVALID_NAME_RESERVED}[/red]")
@@ -578,7 +600,12 @@ def _render_files(
     # iterdir() recursively. We walk depth-first.
     for source_file, rel_parts in _walk_traversable(template_pkg_path, []):
         # Determine the target path under agent_dir.
-        target = agent_dir.joinpath(*rel_parts)
+        rel_path = str(Path(*rel_parts))
+
+        # MUST 4 (defense-in-depth): validate the resolved target stays inside
+        # agent_dir even though importlib.resources is trusted today.
+        # safe_resolve_under raises PathTraversalError on any escape attempt.
+        target = _io.safe_resolve_under(rel_path, agent_dir)
 
         # Read raw template content.
         raw = source_file.read_text(encoding="utf-8")
@@ -724,6 +751,8 @@ def _write_scaffold(
     and translated to plain English (MUST 3). Returns 0 on success, 1 on error.
     """
 
+    import shutil
+
     def _do_write() -> None:
         # MUST 3 / MUST 4: render_files uses atomic_write; OSError propagates up.
         _render_files(agent_dir, template_name, vars)
@@ -734,7 +763,13 @@ def _write_scaffold(
             # MUST 5: backup+restore on overwrite.
             _collision_overwrite_backup_restore(agent_dir, _do_write)
         else:
-            _do_write()
+            try:
+                _do_write()
+            except Exception:
+                # H4: clean up any partial directory on fresh-write failure
+                # so the operator is not left with a broken half-written scaffold.
+                shutil.rmtree(agent_dir, ignore_errors=True)
+                raise
     except OSError as e:
         console.print(f"[red]{_translate_oserror(e, agent_dir)}[/red]")
         return 1
@@ -772,16 +807,27 @@ def _doctor_handoff(agent_name: str, agents_root: Path, console: Any) -> bool:
 
     Returns True if overall_exit_code is 0 (test-call prompt is safe to offer),
     False if any check FAILed (test-call prompt is suppressed, per MUST 8).
+
+    If doctor itself fails unexpectedly, returns True and advises the operator
+    to run doctor manually. The scaffold is ready; doctor is a diagnostic aid.
     """
     from .. import doctor
 
     console.print("\n[bold]Running doctor to verify the new agent...[/bold]\n")
-    results = doctor.run_doctor(
-        agent_name=agent_name,
-        agents_root=agents_root,
-        skip_mcp=False,
-    )
-    console.print(doctor.render_human(results))
+    try:
+        results = doctor.run_doctor(
+            agent_name=agent_name,
+            agents_root=agents_root,
+            skip_mcp=False,
+        )
+        console.print(doctor.render_human(results))
+    except Exception:  # noqa: BLE001
+        agent_dir = agents_root / agent_name
+        console.print(
+            f"Doctor inconclusive. Your agent is scaffolded at `{agent_dir}`. "
+            f"Run `atomic-agents doctor --agent {agent_name}` whenever you want to verify."
+        )
+        return True
 
     exit_code = doctor.overall_exit_code(results)
 
@@ -815,8 +861,6 @@ def _maybe_test_call(
     Confirm: Any,
 ) -> None:
     """Offer the opt-in test call and run it if the operator accepts."""
-    from rich.prompt import Confirm as _Confirm
-
     do_test = Confirm.ask(
         "Want to try a test call now?",
         console=console,
@@ -834,11 +878,22 @@ def _test_call(
 ) -> int:
     """Opt-in test call with full exception catalog (MUST 9). Always exits 0.
 
-    Identifies Anthropic SDK exception classes by __name__ to avoid a hard
-    import dependency on a specific SDK version.
+    Uses isinstance checks via lazy imports so the dispatch is correct even when
+    the SDK is vendored or pinned to an unusual version.
     """
     from ..agent import AtomicAgent
     from ..exceptions import AtomicAgentsError
+
+    # Lazy SDK imports for isinstance dispatch. Fall back to None when unavailable
+    # so getattr(mod, "ClassName", ()) returns () and isinstance never crashes.
+    try:
+        import anthropic as _anthropic_mod
+    except ImportError:
+        _anthropic_mod = None
+    try:
+        import httpx as _httpx_mod
+    except ImportError:
+        _httpx_mod = None
 
     console.print(
         f"\n[bold]Sending a test message to '{agent_name}'...[/bold]\n"
@@ -859,21 +914,35 @@ def _test_call(
             text = getattr(response, "text", str(response))
             console.print(text)
     except Exception as e:  # noqa: BLE001
-        cls_name = type(e).__name__
-
-        if cls_name == "RateLimitError":
+        if _anthropic_mod and isinstance(
+            e, getattr(_anthropic_mod, "RateLimitError", ())
+        ):
             console.print(
                 f"[yellow]{C.MSG_TEST_CALL_RATE_LIMIT.format(agent_name=agent_name)}[/yellow]"
             )
-        elif cls_name == "AuthenticationError":
+        elif _anthropic_mod and isinstance(
+            e, getattr(_anthropic_mod, "AuthenticationError", ())
+        ):
             console.print(f"[yellow]{C.MSG_TEST_CALL_AUTH_ERROR}[/yellow]")
-        elif cls_name in ("APIConnectionError", "ConnectError", "TimeoutException"):
+        elif (
+            _anthropic_mod
+            and isinstance(e, getattr(_anthropic_mod, "APIConnectionError", ()))
+        ) or (
+            _httpx_mod
+            and isinstance(
+                e,
+                (
+                    getattr(_httpx_mod, "ConnectError", ()),
+                    getattr(_httpx_mod, "TimeoutException", ()),
+                ),
+            )
+        ):
             console.print(f"[yellow]{C.MSG_TEST_CALL_NETWORK}[/yellow]")
         elif isinstance(e, AtomicAgentsError):
             console.print(f"[yellow]Atomic Agents error: {e}[/yellow]")
         else:
             console.print(
-                f"[yellow]{C.MSG_TEST_CALL_GENERIC_FALLBACK.format(error_type=cls_name, error_msg=str(e), path=str(agent_dir))}[/yellow]"
+                f"[yellow]{C.MSG_TEST_CALL_GENERIC_FALLBACK.format(error_type=type(e).__name__, error_msg=str(e), path=str(agent_dir))}[/yellow]"
             )
 
     return 0  # always 0 on the opt-in path; scaffold already succeeded

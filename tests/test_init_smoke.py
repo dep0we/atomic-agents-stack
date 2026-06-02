@@ -225,10 +225,11 @@ def test_smoke_test_call_rate_limit_graceful_exit_0(monkeypatch, tmp_path, capsy
     """RateLimitError during test call prints the rate-limit message and exits 0."""
     _patch_common(monkeypatch, tmp_path, confirm_returns=True)
 
-    class FakeRateLimitError(Exception):
-        pass
+    import anthropic as _anthropic
 
-    FakeRateLimitError.__name__ = "RateLimitError"
+    class FakeRateLimitError(_anthropic.RateLimitError):
+        def __init__(self, message):
+            Exception.__init__(self, message)
 
     def raising_rate_limit(self, work_item, **kwargs):
         raise FakeRateLimitError("Too many requests")
@@ -266,10 +267,11 @@ def test_smoke_test_call_network_error_graceful_exit_0(monkeypatch, tmp_path, ca
     """APIConnectionError during test call prints the network message and exits 0."""
     _patch_common(monkeypatch, tmp_path, confirm_returns=True)
 
-    class FakeAPIConnectionError(Exception):
-        pass
+    import anthropic as _anthropic
 
-    FakeAPIConnectionError.__name__ = "APIConnectionError"
+    class FakeAPIConnectionError(_anthropic.APIConnectionError):
+        def __init__(self, message):
+            Exception.__init__(self, message)
 
     def raising_network(self, work_item, **kwargs):
         raise FakeAPIConnectionError("Network unreachable")
