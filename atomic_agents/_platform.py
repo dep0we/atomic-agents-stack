@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-DEFAULT_AGENTS_ROOT = Path.home() / "docs" / "agents"
+DEFAULT_AGENTS_ROOT = (Path.home() / "docs" / "agents").expanduser().resolve()
 
 
 def get_agents_root() -> Path:
