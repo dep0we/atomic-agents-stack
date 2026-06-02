@@ -586,6 +586,48 @@ def test_render_files_writes_through_atomic_write(tmp_path, monkeypatch):
         assert f in write_calls, f"{f} was not written through atomic_write"
 
 
+def test_render_files_uses_safe_resolve_under(tmp_path, monkeypatch):
+    """Every rendered file MUST pass through _io.safe_resolve_under (C1, MUST 4).
+
+    Verifies the path-traversal validation gate added in Round 1.
+    """
+    agent_dir = tmp_path / "srt-test"
+    resolve_calls: list[Path] = []
+    original_resolver = W._io.safe_resolve_under
+
+    def _spy_resolver(child, root):
+        resolve_calls.append(Path(root) / Path(str(child)))
+        return original_resolver(child, root)
+
+    monkeypatch.setattr(
+        "atomic_agents.init.wizard._io.safe_resolve_under", _spy_resolver
+    )
+
+    vars_map = {
+        C.TEMPLATE_VAR_AGENT_NAME: "srt-test",
+        C.TEMPLATE_VAR_MISSION: "m",
+        C.TEMPLATE_VAR_SCOPE_IN: "si",
+        C.TEMPLATE_VAR_SCOPE_OUT: "so",
+        C.TEMPLATE_VAR_AUTONOMY_PRESET_LABEL: C.PRESET_CAUTIOUS,
+        C.TEMPLATE_VAR_AUTONOMY_READ_ONLY: C.POLICY_BYPASS,
+        C.TEMPLATE_VAR_AUTONOMY_REVERSIBLE_WRITE: C.POLICY_ALLOW_WITH_AUDIT,
+        C.TEMPLATE_VAR_AUTONOMY_EXTERNAL_SIDE_EFFECT: C.POLICY_ESCALATE,
+        C.TEMPLATE_VAR_AUTONOMY_HIGH_RISK: C.POLICY_ESCALATE,
+        C.TEMPLATE_VAR_VOICE: "v",
+        C.TEMPLATE_VAR_COMM_PREFS: "cp",
+        C.TEMPLATE_VAR_HARD_REFUSALS: "hr",
+    }
+
+    written = W._render_files(agent_dir, "advisor", vars_map)
+
+    # Every rendered file must have had its target validated by safe_resolve_under.
+    assert len(written) > 0, "no files written"
+    assert len(resolve_calls) >= len(written), (
+        f"safe_resolve_under called {len(resolve_calls)} times for "
+        f"{len(written)} files; expected at least one call per file"
+    )
+
+
 # ---------------------------------------------------------------------------
 # I. agents_root single-resolution (M9, H6)
 # ---------------------------------------------------------------------------

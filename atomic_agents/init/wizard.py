@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import _io, _llm, _platform
+from ..exceptions import PathTraversalError
 from . import constants as C
 
 
@@ -770,6 +771,16 @@ def _write_scaffold(
                 # so the operator is not left with a broken half-written scaffold.
                 shutil.rmtree(agent_dir, ignore_errors=True)
                 raise
+    except PathTraversalError as e:
+        # R2-H1: C1's safe_resolve_under raises PathTraversalError, which is NOT
+        # an OSError. Defense-in-depth: this only fires if a template ever ships
+        # a malicious relative path; templates are static today so this branch
+        # is for future-proofing the contract per MUST 4.
+        console.print(
+            f"[red]Internal error: path validation refused a template file "
+            f"({e}). This is a wizard bug; please file an issue.[/red]"
+        )
+        return 1
     except OSError as e:
         console.print(f"[red]{_translate_oserror(e, agent_dir)}[/red]")
         return 1
