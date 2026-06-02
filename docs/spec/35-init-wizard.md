@@ -380,9 +380,11 @@ at the top. Tiebreaker for ambiguous order: alphabetical by issue number.
       MUST 6 (persona-backend warning before write), MUST 7 (API key
       pre-flight).
     - `--from-template <name>`: MUST 1 (name validation), MUST 6 (persona-
-      backend warning before write), MUST 7 (API key pre-flight). Non-TTY is
-      permitted. `agent_name` MUST be supplied; the wizard MUST refuse with a
-      clear error if `--from-template` is given without `agent_name`.
+      backend warning before write). Non-TTY is permitted per MUST 2 carve-out;
+      API key pre-flight is skipped per MUST 7 carve-out (doctor catches missing
+      credential later at first run). `agent_name` MUST be supplied; the wizard
+      MUST refuse with a clear error if `--from-template` is given without
+      `agent_name`.
     - `--list-templates`: no entry guards (read-only enumeration; no files
       written, no LLM calls, no name required). `--list-templates` MUST
       enumerate exactly the templates named in the `--from-template` argparse
@@ -407,7 +409,8 @@ at the top. Tiebreaker for ambiguous order: alphabetical by issue number.
     argument, plus the subparser declaration and dispatch wiring).
 
 15. Section-detection contract for Add-to-it: The wizard MUST detect existing
-    template-owned sections via ATX-style h2 header match (`^##\s+(.+)$`)
+    template-owned sections via ATX-style h2 header match (the parser tolerates
+    trailing closing-hash markers and trailing whitespace per ATX convention)
     against `constants.TEMPLATE_SECTION_SCHEMA[template_name][file_relpath]`.
     The section-detection parser MUST skip header-shaped lines inside code
     fences (delimited by ` ``` ` or `~~~`), HTML comments (HTML comment
