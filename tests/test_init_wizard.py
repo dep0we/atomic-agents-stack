@@ -375,7 +375,7 @@ def test_collision_overwrite_failure_restores_backup(tmp_path):
 
 
 def test_collision_cancel_returns_zero_no_changes(monkeypatch, tmp_path):
-    """When operator chooses Cancel (default), _check_collision returns False.
+    """When operator chooses Cancel, _check_collision returns ("cancel", None).
 
     The wizard must then return 0 without touching the filesystem.
     """
@@ -384,9 +384,13 @@ def test_collision_cancel_returns_zero_no_changes(monkeypatch, tmp_path):
     (agent_dir / "existing.txt").write_text("untouched")
 
     console = _FakeConsole()
-    # Confirm.ask returns False (Cancel is the default).
-    overwrite = W._check_collision(agent_dir, console, _confirm_factory(False))
-    assert overwrite is False
+    # Prompt.ask returns "cancel".
+    Prompt = _prompt_sequence("cancel")
+    branch, headers = W._check_collision(
+        agent_dir, console, Prompt, _confirm_factory(False), template_name=None
+    )
+    assert branch == "cancel"
+    assert headers is None
 
     # Filesystem is unchanged.
     assert (agent_dir / "existing.txt").read_text() == "untouched"
@@ -695,3 +699,945 @@ def test_run_init_resolves_agents_root_once(monkeypatch, tmp_path):
     assert len(call_count) <= 1, (
         f"get_agents_root() was called {len(call_count)} times; expected at most 1"
     )
+
+
+# ---------------------------------------------------------------------------
+# J. Section detection state machine (_extract_h2_headers)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_h2_headers_skips_yaml_frontmatter():
+    """YAML frontmatter block is skipped; only headers after closing --- are returned."""
+    content = "---\nfoo: bar\n## not a header\n---\n## Real Header\n"
+    result = W._extract_h2_headers(content)
+    assert result == ["Real Header"]
+
+
+def test_extract_h2_headers_skips_code_fences():
+    """Headers inside triple-backtick fences are NOT returned."""
+    content = "## Outside\n```\n## Inside fence (skip)\n```\n## After\n"
+    result = W._extract_h2_headers(content)
+    assert result == ["Outside", "After"]
+
+
+def test_extract_h2_headers_skips_html_comments():
+    """Headers inside HTML comment blocks are NOT returned."""
+    content = "<!--\n## hidden\n-->\n## Visible\n"
+    result = W._extract_h2_headers(content)
+    assert result == ["Visible"]
+
+
+def test_extract_h2_headers_strips_trailing_atx_markers():
+    """Trailing closing hashes on an ATX header are stripped from the returned text."""
+    content = "## My Header ##\n"
+    result = W._extract_h2_headers(content)
+    assert result == ["My Header"]
+
+
+# ---------------------------------------------------------------------------
+# K. Add-to-it dispatch + detection (_detect_sections, _check_collision)
+# ---------------------------------------------------------------------------
+
+
+def _write_advisor_scaffold(root: Path) -> None:
+    """Write a valid advisor scaffold under root using TEMPLATE_SECTION_SCHEMA headers."""
+    schema = C.TEMPLATE_SECTION_SCHEMA["advisor"]
+    for relpath, headers in schema.items():
+        target = root / relpath
+        target.parent.mkdir(parents=True, exist_ok=True)
+        body = "\n".join(f"## {h}\n\nContent.\n" for h in headers)
+        target.write_text(body, encoding="utf-8")
+
+
+def test_detect_sections_advisor_happy_path(tmp_path):
+    """A valid advisor scaffold passes section detection with success=True."""
+    agent_dir = tmp_path / "my-advisor"
+    agent_dir.mkdir()
+    _write_advisor_scaffold(agent_dir)
+
+    success, per_file_headers, failed_files = W._detect_sections(agent_dir, "advisor")
+
+    assert success is True
+    assert failed_files == []
+    # Every file in the schema should appear in per_file_headers.
+    for relpath in C.TEMPLATE_SECTION_SCHEMA["advisor"]:
+        assert relpath in per_file_headers, f"{relpath} not in per_file_headers"
+        assert len(per_file_headers[relpath]) > 0
+
+
+def test_detect_sections_fails_when_header_renamed(tmp_path):
+    """Renaming a required header causes detection to return success=False."""
+    agent_dir = tmp_path / "my-advisor"
+    agent_dir.mkdir()
+    _write_advisor_scaffold(agent_dir)
+
+    # Replace "Mission" with "Purpose" in persona/IDENTITY.md.
+    identity_path = agent_dir / "persona" / "IDENTITY.md"
+    original = identity_path.read_text(encoding="utf-8")
+    modified = original.replace("## Mission\n", "## Purpose\n")
+    identity_path.write_text(modified, encoding="utf-8")
+
+    success, per_file_headers, failed_files = W._detect_sections(agent_dir, "advisor")
+
+    assert success is False
+    assert "persona/IDENTITY.md" in failed_files
+
+
+def test_detect_sections_missing_file_tracked_separately(tmp_path):
+    """A missing file is NOT counted as a detection failure; it is a backfill case."""
+    agent_dir = tmp_path / "my-advisor"
+    agent_dir.mkdir()
+    _write_advisor_scaffold(agent_dir)
+
+    # Remove memory/INDEX.md to simulate a missing template-owned file.
+    (agent_dir / "memory" / "INDEX.md").unlink()
+
+    success, per_file_headers, failed_files = W._detect_sections(agent_dir, "advisor")
+
+    assert success is True, "Missing file should be treated as backfill, not failure"
+    assert "memory/INDEX.md" not in failed_files
+    # per_file_headers still contains the relpath (as empty list per implementation).
+    assert "memory/INDEX.md" in per_file_headers
+    assert per_file_headers["memory/INDEX.md"] == []
+
+
+def test_commit_merges_writes_all_files(tmp_path):
+    """_commit_merges calls atomic_write for each file and returns (committed, [])."""
+    agent_dir = tmp_path / "my-agent"
+    agent_dir.mkdir()
+
+    merged_content = {
+        "persona/IDENTITY.md": "# ID\n\n## Mission\n\nTest mission.\n",
+        "model.md": "# Model\n\nclaude-opus-4-7\n",
+    }
+
+    console = _FakeConsole()
+    committed, failed = W._commit_merges(agent_dir, merged_content, console)
+
+    assert failed == []
+    assert set(committed) == {"persona/IDENTITY.md", "model.md"}
+    assert (agent_dir / "persona" / "IDENTITY.md").read_text() == merged_content[
+        "persona/IDENTITY.md"
+    ]
+    assert (agent_dir / "model.md").read_text() == merged_content["model.md"]
+
+
+def test_commit_merges_partial_on_oserror(tmp_path, monkeypatch):
+    """When a file write fails mid-commit, committed files are present and failed is reported."""
+    agent_dir = tmp_path / "my-agent"
+    agent_dir.mkdir()
+
+    write_calls: list[str] = []
+    original_aw = W._io.atomic_write
+
+    def _flaky(target, content, encoding="utf-8"):
+        write_calls.append(str(target))
+        if "model.md" in str(target):
+            raise OSError("Simulated write failure")
+        return original_aw(target, content, encoding=encoding)
+
+    monkeypatch.setattr("atomic_agents.init.wizard._io.atomic_write", _flaky)
+
+    merged_content = {
+        "model.md": "model content",
+        "persona/IDENTITY.md": "id content",
+    }
+
+    console = _FakeConsole()
+    committed, failed = W._commit_merges(agent_dir, merged_content, console)
+
+    # persona/IDENTITY.md sorts before model.md; model.md fails
+    assert "persona/IDENTITY.md" in committed
+    assert "model.md" in failed
+
+
+# ---------------------------------------------------------------------------
+# L. Per-file atomic commit (_commit_merges) -- additional edge-case tests
+# ---------------------------------------------------------------------------
+
+
+def test_commit_merges_empty_map_returns_empty_lists(tmp_path):
+    """_commit_merges with an empty merged_content dict writes nothing."""
+    agent_dir = tmp_path / "my-agent"
+    agent_dir.mkdir()
+
+    console = _FakeConsole()
+    committed, failed = W._commit_merges(agent_dir, {}, console)
+
+    assert committed == []
+    assert failed == []
+
+
+def test_commit_merges_creates_parent_dirs(tmp_path):
+    """_commit_merges creates intermediate directories via atomic_write."""
+    agent_dir = tmp_path / "my-agent"
+    agent_dir.mkdir()
+
+    merged_content = {
+        "persona/IDENTITY.md": "## Who I am\n\nTest.\n",
+    }
+
+    console = _FakeConsole()
+    committed, failed = W._commit_merges(agent_dir, merged_content, console)
+
+    assert failed == []
+    assert committed == ["persona/IDENTITY.md"]
+    assert (agent_dir / "persona" / "IDENTITY.md").exists()
+
+
+def test_commit_merges_oserror_reported_in_failed(tmp_path, monkeypatch):
+    """When atomic_write raises OSError, the relpath appears in failed, not committed."""
+    agent_dir = tmp_path / "my-agent"
+    agent_dir.mkdir()
+
+    monkeypatch.setattr(
+        "atomic_agents.init.wizard._io.atomic_write",
+        lambda *a, **kw: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    merged_content = {"tools.md": "content"}
+    console = _FakeConsole()
+    committed, failed = W._commit_merges(agent_dir, merged_content, console)
+
+    assert committed == []
+    assert "tools.md" in failed
+    assert "disk full" in console.out.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# M. CRLF + BOM normalization (_render_diff_preview with merged_content map)
+# ---------------------------------------------------------------------------
+
+
+def test_render_diff_preview_normalizes_crlf(tmp_path):
+    """Existing file with CRLF and merged content with LF shows no diff."""
+    agent_dir = tmp_path / "my-agent"
+    agent_dir.mkdir()
+
+    shared_content = "## Hello\n\nWorld.\n"
+    crlf_content = shared_content.replace("\n", "\r\n")
+
+    (agent_dir / "notes.md").write_bytes(crlf_content.encode("utf-8"))
+
+    merged_content = {"notes.md": shared_content}
+    console = _FakeConsole()
+    files_changed = W._render_diff_preview(agent_dir, merged_content, console)
+
+    assert files_changed == 0, (
+        "CRLF normalization should make CRLF vs LF files show as identical"
+    )
+
+
+def test_render_diff_preview_strips_utf8_bom(tmp_path):
+    """Existing file with UTF-8 BOM and merged content without BOM shows no diff."""
+    agent_dir = tmp_path / "my-agent"
+    agent_dir.mkdir()
+
+    shared_content = "## Hello\n\nWorld.\n"
+    bom_bytes = b"\xef\xbb\xbf" + shared_content.encode("utf-8")
+
+    (agent_dir / "notes.md").write_bytes(bom_bytes)
+
+    merged_content = {"notes.md": shared_content}
+    console = _FakeConsole()
+    files_changed = W._render_diff_preview(agent_dir, merged_content, console)
+
+    assert files_changed == 0, (
+        "UTF-8 BOM normalization should make BOM vs non-BOM files show as identical"
+    )
+
+
+# ---------------------------------------------------------------------------
+# N. Polish item tests
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_handoff_split_run_doctor_failure(monkeypatch, tmp_path):
+    """When run_doctor raises, _doctor_handoff prints 'Doctor inconclusive' and returns True."""
+    import types as _types_mod
+
+    fake_doctor = _types_mod.SimpleNamespace(
+        run_doctor=lambda **kw: (_ for _ in ()).throw(RuntimeError("doctor exploded")),
+        overall_exit_code=lambda results: 0,
+        render_human=lambda results: "ok",
+    )
+
+    monkeypatch.setattr("atomic_agents.init.wizard.doctor", fake_doctor, raising=False)
+
+    # Import doctor inside wizard lazily; patch the module attribute.
+    import atomic_agents.init.wizard as _wiz
+
+    original = None
+    import importlib
+    import atomic_agents.doctor as _doc_real
+
+    def _patched_run_doctor(**kwargs):
+        raise RuntimeError("doctor exploded")
+
+    monkeypatch.setattr(_doc_real, "run_doctor", _patched_run_doctor)
+
+    console = _FakeConsole()
+    result = _wiz._doctor_handoff("my-agent", tmp_path, console)
+
+    assert result is True
+    assert "inconclusive" in console.out.getvalue().lower()
+
+
+def test_doctor_handoff_split_render_failure(monkeypatch, tmp_path):
+    """When render_human raises, output contains a 'could not render' notice."""
+    import atomic_agents.doctor as _doc_real
+
+    fake_result = types.SimpleNamespace(status="pass")
+
+    def _ok_run_doctor(**kwargs):
+        return [fake_result]
+
+    def _ok_exit_code(results):
+        return 0
+
+    def _bad_render(results):
+        raise RuntimeError("renderer crashed")
+
+    monkeypatch.setattr(_doc_real, "run_doctor", _ok_run_doctor)
+    monkeypatch.setattr(_doc_real, "overall_exit_code", _ok_exit_code)
+    monkeypatch.setattr(_doc_real, "render_human", _bad_render)
+
+    console = _FakeConsole()
+    import atomic_agents.init.wizard as _wiz
+
+    result = _wiz._doctor_handoff("my-agent", tmp_path, console)
+
+    output = console.out.getvalue().lower()
+    assert "could not render" in output or "render" in output
+
+
+def test_from_template_length_check_fires_before_regex(monkeypatch, tmp_path, capsys):
+    """A 100-character name triggers MSG_INVALID_NAME_TOO_LONG before MSG_INVALID_NAME_CHARSET."""
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    monkeypatch.delenv("ATOMIC_AGENTS_PERSONA_BACKEND_URL", raising=False)
+
+    long_name = "a" * 100
+    args = _make_args(
+        agent_name=long_name, from_template="advisor", agents_root=str(tmp_path)
+    )
+    rc = W.run_init(args)
+
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert C.MSG_INVALID_NAME_TOO_LONG in captured.err
+    assert C.MSG_INVALID_NAME_CHARSET not in captured.err
+
+
+def test_types_helper_returns_empty_when_mod_none():
+    """W._types(None, 'Foo', 'Bar') returns () so isinstance(..., ()) is always False."""
+    result = W._types(None, "Foo", "Bar")
+    assert result == ()
+    assert isinstance(Exception(), result) is False
+
+
+def test_translate_oserror_enoent_specific_message(tmp_path):
+    """ENOENT OSError is translated to a message mentioning 'disappeared'."""
+    import errno as _errno
+
+    e = OSError(_errno.ENOENT, "No such file or directory", str(tmp_path / "agent"))
+    msg = W._translate_oserror(e, tmp_path / "agent")
+
+    assert "disappeared" in msg.lower()
+
+
+def test_walk_traversable_iterative_no_recursion_limit():
+    """_walk_traversable returns at least 7 files for the advisor template."""
+    from importlib import resources as _resources
+
+    template_pkg_path = _resources.files("atomic_agents.init") / "templates" / "advisor"
+    results = W._walk_traversable(template_pkg_path, [])
+
+    assert len(results) >= 7, (
+        f"Expected at least 7 files in advisor template, got {len(results)}"
+    )
+
+
+def test_backup_timestamps_use_microseconds(tmp_path, monkeypatch):
+    """The backup path produced by _collision_overwrite_backup_restore contains a microsecond suffix."""
+    agent_dir = tmp_path / "my-agent"
+    agent_dir.mkdir()
+    (agent_dir / "file.txt").write_text("original")
+
+    backup_paths: list[Path] = []
+    original_rename = Path.rename
+
+    def _spy_rename(self, target):
+        backup_paths.append(Path(target))
+        return original_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", _spy_rename)
+
+    import re as _re
+
+    def _write_func():
+        agent_dir.mkdir(parents=True, exist_ok=True)
+
+    W._collision_overwrite_backup_restore(agent_dir, _write_func)
+
+    assert backup_paths, "rename was never called"
+    bak_name = backup_paths[0].name
+    # Timestamp format: YYYYMMDDTHHMMSS_FFFFFFZ (6-digit microseconds).
+    assert _re.search(r"\.bak\.\d{8}T\d{6}_\d{6}Z$", bak_name), (
+        f"Backup name '{bak_name}' does not contain microsecond timestamp"
+    )
+
+
+def test_persona_backend_warning_shows_redacted_url(monkeypatch):
+    """URL with credentials is displayed with credentials stripped in the warning."""
+    monkeypatch.setenv(
+        "ATOMIC_AGENTS_PERSONA_BACKEND_URL", "https://user:pass@example.com/api"
+    )
+    console = _FakeConsole()
+    # Operator declines; we only care about the printed output.
+    W._persona_backend_check(console, _confirm_factory(False))
+
+    output = console.out.getvalue()
+    assert "https://example.com/api" in output
+    assert "user:pass" not in output
+
+
+# ---------------------------------------------------------------------------
+# O. Per-template preset dispatch (_default_template_vars)
+# ---------------------------------------------------------------------------
+
+
+def test_default_template_vars_advisor_uses_cautious():
+    """advisor template defaults to PRESET_CAUTIOUS for all four autonomy variables."""
+    vars_map = W._default_template_vars(name="x", template_name="advisor")
+
+    expected_preset = C.AUTONOMY_PRESETS[C.PRESET_CAUTIOUS]
+    assert (
+        vars_map[C.TEMPLATE_VAR_AUTONOMY_READ_ONLY]
+        == expected_preset[C.ACTION_CLASS_READ_ONLY]
+    )
+    assert (
+        vars_map[C.TEMPLATE_VAR_AUTONOMY_REVERSIBLE_WRITE]
+        == expected_preset[C.ACTION_CLASS_REVERSIBLE_WRITE]
+    )
+    assert (
+        vars_map[C.TEMPLATE_VAR_AUTONOMY_EXTERNAL_SIDE_EFFECT]
+        == expected_preset[C.ACTION_CLASS_EXTERNAL_SIDE_EFFECT]
+    )
+    assert (
+        vars_map[C.TEMPLATE_VAR_AUTONOMY_HIGH_RISK]
+        == expected_preset[C.ACTION_CLASS_HIGH_RISK]
+    )
+    assert vars_map[C.TEMPLATE_VAR_AUTONOMY_PRESET_LABEL] == C.PRESET_CAUTIOUS
+
+
+def test_default_template_vars_researcher_uses_cautious():
+    """researcher template defaults to PRESET_CAUTIOUS for all four autonomy variables."""
+    vars_map = W._default_template_vars(name="x", template_name="researcher")
+
+    expected_preset = C.AUTONOMY_PRESETS[C.PRESET_CAUTIOUS]
+    assert (
+        vars_map[C.TEMPLATE_VAR_AUTONOMY_READ_ONLY]
+        == expected_preset[C.ACTION_CLASS_READ_ONLY]
+    )
+    assert (
+        vars_map[C.TEMPLATE_VAR_AUTONOMY_REVERSIBLE_WRITE]
+        == expected_preset[C.ACTION_CLASS_REVERSIBLE_WRITE]
+    )
+    assert (
+        vars_map[C.TEMPLATE_VAR_AUTONOMY_EXTERNAL_SIDE_EFFECT]
+        == expected_preset[C.ACTION_CLASS_EXTERNAL_SIDE_EFFECT]
+    )
+    assert (
+        vars_map[C.TEMPLATE_VAR_AUTONOMY_HIGH_RISK]
+        == expected_preset[C.ACTION_CLASS_HIGH_RISK]
+    )
+    assert vars_map[C.TEMPLATE_VAR_AUTONOMY_PRESET_LABEL] == C.PRESET_CAUTIOUS
+
+
+def test_default_template_vars_writer_uses_cautious():
+    """writer template defaults to PRESET_CAUTIOUS for all four autonomy variables."""
+    vars_map = W._default_template_vars(name="x", template_name="writer")
+
+    expected_preset = C.AUTONOMY_PRESETS[C.PRESET_CAUTIOUS]
+    assert (
+        vars_map[C.TEMPLATE_VAR_AUTONOMY_READ_ONLY]
+        == expected_preset[C.ACTION_CLASS_READ_ONLY]
+    )
+    assert (
+        vars_map[C.TEMPLATE_VAR_AUTONOMY_REVERSIBLE_WRITE]
+        == expected_preset[C.ACTION_CLASS_REVERSIBLE_WRITE]
+    )
+    assert (
+        vars_map[C.TEMPLATE_VAR_AUTONOMY_EXTERNAL_SIDE_EFFECT]
+        == expected_preset[C.ACTION_CLASS_EXTERNAL_SIDE_EFFECT]
+    )
+    assert (
+        vars_map[C.TEMPLATE_VAR_AUTONOMY_HIGH_RISK]
+        == expected_preset[C.ACTION_CLASS_HIGH_RISK]
+    )
+    assert vars_map[C.TEMPLATE_VAR_AUTONOMY_PRESET_LABEL] == C.PRESET_CAUTIOUS
+
+
+def test_detect_sections_orphan_h2_preserved_in_extraction(tmp_path):
+    """Operator-added orphan h2 sections (not in schema) are tolerated and tracked.
+
+    Per spec/35 MUST 15: orphan sections preserve verbatim. The detection step
+    must succeed (superset check) when an operator's existing file contains
+    schema headers PLUS extra h2 sections.
+    """
+    agent_dir = tmp_path / "orphan-test"
+    persona_dir = agent_dir / "persona"
+    persona_dir.mkdir(parents=True)
+
+    # Write IDENTITY.md with the advisor schema headers PLUS a custom orphan.
+    schema = C.TEMPLATE_SECTION_SCHEMA["advisor"]
+    content = "# IDENTITY\n\n"
+    for header in schema["persona/IDENTITY.md"]:
+        content += f"## {header}\n\nplaceholder content under {header}\n\n"
+    content += "## My Custom Section\n\noperator-authored content here\n\n"
+    (persona_dir / "IDENTITY.md").write_text(content, encoding="utf-8")
+
+    # Write the other 6 files with just the schema h2s, no orphans.
+    for relpath in [
+        "persona/SOUL.md",
+        "persona/USER.md",
+        "tools.md",
+        "model.md",
+        "memory/INDEX.md",
+        "wiki/INDEX.md",
+    ]:
+        p = agent_dir / relpath
+        p.parent.mkdir(parents=True, exist_ok=True)
+        body = "\n".join(f"## {h}\n\n" for h in schema[relpath])
+        p.write_text(body, encoding="utf-8")
+
+    ok, per_file_headers, failed = W._detect_sections(agent_dir, "advisor")
+
+    assert ok is True
+    assert "My Custom Section" in per_file_headers["persona/IDENTITY.md"]
+    assert failed == []
+
+
+# ---------------------------------------------------------------------------
+# M4. Add-to-it: detection-failure fallback to cancel
+# ---------------------------------------------------------------------------
+
+
+def test_check_collision_add_to_it_falls_back_to_cancel_on_detection_failure(
+    tmp_path,
+):
+    """When add_to_it is chosen but section detection fails, fallback prompt
+    is shown and 'cancel' branch is returned with existing_headers=None."""
+    import io as _io_mod
+
+    from rich.console import Console
+
+    agent_dir = tmp_path / "my-advisor"
+    agent_dir.mkdir()
+    # Build a valid advisor scaffold via _render_files.
+    vars_map = W._default_template_vars("my-advisor", "advisor")
+    W._render_files(agent_dir, "advisor", vars_map)
+
+    # Now corrupt IDENTITY.md by removing the Mission h2 so detection fails.
+    identity_path = agent_dir / "persona" / "IDENTITY.md"
+    original = identity_path.read_text(encoding="utf-8")
+    # Remove the first ## Mission line and the paragraph after it.
+    import re as _re
+
+    corrupted = _re.sub(r"## Mission\n\n[^\n]*\n", "", original)
+    identity_path.write_text(corrupted, encoding="utf-8")
+
+    # Mock Prompt: first call returns "add_to_it", second call returns "cancel".
+    call_sequence = ["add_to_it", "cancel"]
+    call_index = [0]
+
+    class _MockPrompt:
+        @staticmethod
+        def ask(question, choices=None, default=None, console=None):
+            val = call_sequence[call_index[0]]
+            call_index[0] += 1
+            return val
+
+    console = Console(file=_io_mod.StringIO())
+
+    branch, existing_headers = W._check_collision(
+        agent_dir,
+        console=console,
+        Prompt=_MockPrompt,
+        Confirm=None,
+        template_name="advisor",
+    )
+
+    assert branch == "cancel"
+    assert existing_headers is None
+    # Confirm the detection-failed message appeared.
+    output = console.file.getvalue()
+    # MSG_SECTION_DETECTION_FAILED substring is present in console output.
+    # Use a portion that won't be split by rich line-wrapping.
+    assert "existing files don't match the advisor template" in output
+
+
+# ---------------------------------------------------------------------------
+# M5. _compute_merged_content + _split_sections/_join_sections round-trip tests
+# ---------------------------------------------------------------------------
+
+
+def test_split_join_sections_round_trip_byte_identical():
+    """_split_sections + _join_sections must reproduce the original bytes exactly."""
+    content = (
+        "# Title\n\nsome preamble text\n\n"
+        "## Section One\n\nBody one.\n\n"
+        "## Section Two\n\n"
+        "```python\n"
+        "## not a header\n"
+        "print('hello')\n"
+        "```\n\n"
+        "<!-- ## also not a header -->\n\n"
+        "## Section Three\n\nBody three.\n"
+    )
+    blocks = W._split_sections(content)
+    reconstructed = W._join_sections(blocks)
+    assert content == reconstructed
+
+
+def test_compute_merged_content_preserves_preamble_verbatim(tmp_path):
+    """Custom preamble text before the first h2 is preserved verbatim after merge."""
+    agent_dir = tmp_path / "my-advisor"
+    agent_dir.mkdir()
+    vars_map = W._default_template_vars("my-advisor", "advisor")
+    W._render_files(agent_dir, "advisor", vars_map)
+
+    # Insert a custom preamble before the first h2 in IDENTITY.md.
+    identity_path = agent_dir / "persona" / "IDENTITY.md"
+    original = identity_path.read_text(encoding="utf-8")
+    preamble = "<!-- custom preamble: operator-added -->\n\n"
+    # Find the first h2 and insert preamble before it.
+    first_h2 = original.index("\n## ")
+    modified = original[: first_h2 + 1] + preamble + original[first_h2 + 1 :]
+    identity_path.write_text(modified, encoding="utf-8")
+
+    fresh_vars = W._default_template_vars("my-advisor", "advisor")
+    merged = W._compute_merged_content(agent_dir, "advisor", fresh_vars)
+
+    assert "persona/IDENTITY.md" in merged
+    assert "<!-- custom preamble: operator-added -->" in merged["persona/IDENTITY.md"]
+
+
+def test_compute_merged_content_appends_new_h3_from_fresh_template(tmp_path):
+    """When the existing file lacks an h3 subsection that the fresh template has
+    inside a schema h2, the merged result appends the new h3 at the end of that
+    schema h2 block."""
+    agent_dir = tmp_path / "my-advisor"
+    agent_dir.mkdir()
+
+    # Build a minimal scaffold: IDENTITY.md with a schema h2 but NO h3.
+    schema = C.TEMPLATE_SECTION_SCHEMA["advisor"]
+    for relpath, headers in schema.items():
+        target = agent_dir / relpath
+        target.parent.mkdir(parents=True, exist_ok=True)
+        body = "\n".join(f"## {h}\n\nExisting content.\n" for h in headers)
+        target.write_text(body, encoding="utf-8")
+
+    # Render the fresh template which may have h3s inside some schema h2s.
+    # We simulate a fresh template having a NEW h3 by injecting one into the
+    # fresh_text produced by _render_file_to_string via monkeypatching the
+    # underlying template rendering.
+    identity_rel = "persona/IDENTITY.md"
+    first_header = schema[identity_rel][0]
+
+    # Manually modify the IDENTITY.md on disk to include an h3 that the fresh
+    # template does NOT have (so it is treated as orphan h3, preserved).
+    existing_path = agent_dir / identity_rel
+    existing_body = existing_path.read_text(encoding="utf-8")
+    with_h3 = existing_body.replace(
+        f"## {first_header}\n\nExisting content.\n",
+        f"## {first_header}\n\nExisting content.\n\n### My Subsection\n\nsubsection body\n",
+    )
+    existing_path.write_text(with_h3, encoding="utf-8")
+
+    fresh_vars = W._default_template_vars("my-advisor", "advisor")
+    merged = W._compute_merged_content(agent_dir, "advisor", fresh_vars)
+
+    # The existing h3 subsection should be preserved in the merged output.
+    result = merged.get(identity_rel, "")
+    assert "### My Subsection" in result
+    assert "subsection body" in result
+
+
+def test_compute_merged_content_preserves_orphan_h2_in_position(tmp_path):
+    """An orphan h2 inserted between two schema h2s is preserved in position,
+    not appended at the end."""
+    agent_dir = tmp_path / "my-advisor"
+    agent_dir.mkdir()
+    vars_map = W._default_template_vars("my-advisor", "advisor")
+    W._render_files(agent_dir, "advisor", vars_map)
+
+    identity_path = agent_dir / "persona" / "IDENTITY.md"
+    original = identity_path.read_text(encoding="utf-8")
+
+    # Find two consecutive schema h2s and insert an orphan between them.
+    schema_headers = C.TEMPLATE_SECTION_SCHEMA["advisor"]["persona/IDENTITY.md"]
+    # Use the first two headers to find an insertion point.
+    h1 = schema_headers[0]
+    h2 = schema_headers[1]
+    marker = f"## {h2}\n"
+    orphan_block = "## My Notes\n\noperator notes here\n\n"
+    modified = original.replace(marker, orphan_block + marker, 1)
+    identity_path.write_text(modified, encoding="utf-8")
+
+    fresh_vars = W._default_template_vars("my-advisor", "advisor")
+    merged = W._compute_merged_content(agent_dir, "advisor", fresh_vars)
+
+    result = merged.get("persona/IDENTITY.md", "")
+    assert "## My Notes" in result
+    assert "operator notes here" in result
+
+    # The orphan must appear BEFORE the second schema h2 (h2 marker) in the text.
+    orphan_pos = result.index("## My Notes")
+    second_h2_pos = result.index(f"## {h2}")
+    assert orphan_pos < second_h2_pos, (
+        "Orphan section should appear before the second schema h2, not at the end"
+    )
+
+
+
+# ---------------------------------------------------------------------------
+# R2-A. Round 2 Fix-A: h3-aware merge (C1), duplicate h2 (H1),
+#        setext detection (M2), HTML-comment tightening (M3),
+#        and _render_diff_preview exception guard (M1).
+# ---------------------------------------------------------------------------
+
+
+def test_compute_merged_content_h3_preserves_operator_subsection_under_schema_h2(
+    tmp_path,
+):
+    """C1 regression: an operator-added ### subsection under a schema h2 block
+    is preserved verbatim after Add-to-it merge.
+
+    Per spec/35 MUST 15 additive-merge contract: h3+ subsections present in the
+    existing file MUST be preserved verbatim in original order.
+    """
+    agent_dir = tmp_path / "my-advisor"
+    persona_dir = agent_dir / "persona"
+    persona_dir.mkdir(parents=True)
+
+    existing_content = (
+        "## Mission\n"
+        "\n"
+        "Operator preamble text.\n"
+        "\n"
+        "### Operator-added subsection\n"
+        "\n"
+        "This operator-authored content MUST survive the merge.\n"
+        "\n"
+    )
+    (persona_dir / "IDENTITY.md").write_text(existing_content, encoding="utf-8")
+
+    schema = C.TEMPLATE_SECTION_SCHEMA["advisor"]
+    for relpath, headers in schema.items():
+        if relpath == "persona/IDENTITY.md":
+            continue
+        p = agent_dir / relpath
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("".join(f"## {h}\n\n" for h in headers), encoding="utf-8")
+
+    fresh_vars = W._default_template_vars("my-advisor", "advisor")
+    merged = W._compute_merged_content(agent_dir, "advisor", fresh_vars)
+
+    result = merged.get("persona/IDENTITY.md", "")
+    assert "### Operator-added subsection" in result, (
+        "Operator h3 subsection must be preserved by additive merge"
+    )
+    assert "This operator-authored content MUST survive the merge." in result, (
+        "Operator h3 body text must be preserved by additive merge"
+    )
+
+
+def test_compute_merged_content_h3_appends_new_template_subsection_at_end(
+    tmp_path,
+):
+    """C1: a fresh-template h3 not present in existing is appended at end of
+    the schema h2 block.
+
+    Per spec/35 MUST 15: h3+ subsections in the fresh template not present in
+    the existing file MUST be appended at the end of the schema h2 block.
+    """
+    import unittest.mock as _mock
+
+    agent_dir = tmp_path / "my-advisor"
+    persona_dir = agent_dir / "persona"
+    persona_dir.mkdir(parents=True)
+
+    existing_content = (
+        "## Mission\n\nExisting preamble.\n\n### Existing h3\n\nExisting h3 body.\n\n"
+    )
+    (persona_dir / "IDENTITY.md").write_text(existing_content, encoding="utf-8")
+
+    schema = C.TEMPLATE_SECTION_SCHEMA["advisor"]
+    for relpath, headers in schema.items():
+        if relpath == "persona/IDENTITY.md":
+            continue
+        p = agent_dir / relpath
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("".join(f"## {h}\n\n" for h in headers), encoding="utf-8")
+
+    original_render = W._render_file_to_string
+
+    def _patched_render(template_name, rel_parts, vars):
+        if rel_parts == ["persona", "IDENTITY.md"]:
+            return (
+                "## Mission\n"
+                "\n"
+                "Fresh preamble (not used by additive merge).\n"
+                "\n"
+                "### Existing h3\n"
+                "\n"
+                "Existing h3 body.\n"
+                "\n"
+                "### Brand new template h3\n"
+                "\n"
+                "Brand new h3 body from template.\n"
+                "\n"
+            )
+        return original_render(template_name, rel_parts, vars)
+
+    with _mock.patch.object(W, "_render_file_to_string", side_effect=_patched_render):
+        fresh_vars = W._default_template_vars("my-advisor", "advisor")
+        merged = W._compute_merged_content(agent_dir, "advisor", fresh_vars)
+
+    result = merged.get("persona/IDENTITY.md", "")
+    assert "### Brand new template h3" in result, (
+        "New template h3 must be appended when operator file does not have it"
+    )
+    assert "Brand new h3 body from template." in result, (
+        "New template h3 body must be appended"
+    )
+    assert result.index("### Existing h3") < result.index(
+        "### Brand new template h3"
+    ), "Existing h3 should appear before newly-appended template h3"
+
+
+def test_detect_sections_fails_on_duplicate_schema_h2(tmp_path):
+    """H1: a file with the same schema h2 header appearing twice causes section
+    detection to fail and routes the file to failed_files.
+
+    Per spec/35 MUST 15: files containing duplicate schema h2 headers MUST cause
+    section detection to fail and route to overwrite/cancel.
+    """
+    agent_dir = tmp_path / "dup-h2"
+    persona_dir = agent_dir / "persona"
+    persona_dir.mkdir(parents=True)
+
+    schema = C.TEMPLATE_SECTION_SCHEMA["advisor"]
+    first_header = schema["persona/IDENTITY.md"][0]
+    content = "".join(f"## {h}\n\n" for h in schema["persona/IDENTITY.md"])
+    content += f"## {first_header}\n\nduplicate section body.\n\n"
+    (persona_dir / "IDENTITY.md").write_text(content, encoding="utf-8")
+
+    for relpath, headers in schema.items():
+        if relpath == "persona/IDENTITY.md":
+            continue
+        p = agent_dir / relpath
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("".join(f"## {h}\n\n" for h in headers), encoding="utf-8")
+
+    success, _per_file, failed_files = W._detect_sections(agent_dir, "advisor")
+
+    assert success is False
+    assert "persona/IDENTITY.md" in failed_files, (
+        "File with duplicate schema h2 must appear in failed_files"
+    )
+
+
+def test_detect_sections_fails_on_setext_h2(tmp_path):
+    """M2: a file containing a Setext-style heading causes section detection to
+    fail and routes the file to failed_files.
+
+    Per spec/35 MUST 15: files containing Setext-style headings MUST cause
+    section detection to fail and route to overwrite/cancel.
+    """
+    agent_dir = tmp_path / "setext-agent"
+    persona_dir = agent_dir / "persona"
+    persona_dir.mkdir(parents=True)
+
+    schema = C.TEMPLATE_SECTION_SCHEMA["advisor"]
+    setext_content = "Some Header\n-----------\n\nBody under the setext heading.\n\n"
+    for h in schema["persona/IDENTITY.md"]:
+        setext_content += f"## {h}\n\n"
+    (persona_dir / "IDENTITY.md").write_text(setext_content, encoding="utf-8")
+
+    for relpath, headers in schema.items():
+        if relpath == "persona/IDENTITY.md":
+            continue
+        p = agent_dir / relpath
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("".join(f"## {h}\n\n" for h in headers), encoding="utf-8")
+
+    success, _per_file, failed_files = W._detect_sections(agent_dir, "advisor")
+
+    assert success is False
+    assert "persona/IDENTITY.md" in failed_files, (
+        "File with Setext heading must appear in failed_files"
+    )
+
+
+def test_extract_h2_headers_ignores_inline_code_html_comment():
+    """M3: an inline ``<!--`` that does not start the line does NOT trigger the
+    HTML-comment state machine.
+
+    The tightened parser only toggles on lines whose stripped form starts with
+    ``<!--``, so documentation prose containing ``<!--`` inline must not
+    suppress subsequent h2 headers.
+    """
+    content = (
+        "Some prose with inline <!-- comment syntax documented here.\n## Real Header\n"
+    )
+    result = W._extract_h2_headers(content)
+    assert "Real Header" in result, (
+        "h2 after inline <!-- must NOT be suppressed; only line-start <!-- toggles"
+    )
+
+
+def test_render_diff_preview_handles_exception_gracefully(tmp_path):
+    """M1: when _render_diff_preview_inner raises, _render_diff_preview catches
+    the exception, prints a fallback file list, and returns -1.
+
+    Satisfies MUST 3 (no stack traces propagate to operator).
+    """
+    import unittest.mock as _mock
+    from io import StringIO
+
+    agent_dir = tmp_path / "exc-agent"
+    agent_dir.mkdir()
+
+    merged_content = {
+        "persona/IDENTITY.md": "## Mission\n\nTest.\n",
+        "persona/SOUL.md": "## Voice\n\nTest.\n",
+    }
+
+    class _CapturingConsole:
+        def __init__(self):
+            self.out = StringIO()
+            self.is_dumb_terminal = True
+
+        def print(self, *args, **kwargs):
+            self.out.write(" ".join(str(a) for a in args) + "\n")
+
+    console = _CapturingConsole()
+
+    with _mock.patch.object(
+        W,
+        "_render_diff_preview_inner",
+        side_effect=RuntimeError("simulated rendering failure"),
+    ):
+        result = W._render_diff_preview(agent_dir, merged_content, console)
+
+    assert result == -1, "_render_diff_preview must return -1 on inner exception"
+    output = console.out.getvalue()
+    assert "Preview rendering failed" in output, (
+        "Fallback message must be printed on exception"
+    )
+    assert "persona/IDENTITY.md" in output, (
+        "Fallback file list must include all relpaths"
+    )
+    assert "persona/SOUL.md" in output, "Fallback file list must include all relpaths"

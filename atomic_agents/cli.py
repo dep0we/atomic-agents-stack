@@ -395,8 +395,8 @@ def main(argv: list[str] | None = None) -> int:
         "--from-template",
         dest="from_template",
         default=None,
-        choices=["advisor"],
-        help="skip Q&A; scaffold from a starter template",
+        choices=["advisor", "researcher", "writer"],
+        help="skip Q&A; scaffold from a starter template (advisor, researcher, or writer)",
     )
     init_cmd.add_argument(
         "--list-templates",

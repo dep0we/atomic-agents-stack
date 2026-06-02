@@ -7,6 +7,11 @@ threading.
 
 The wizard's actual logic lives in atomic_agents.init.wizard -- those tests are in
 test_init_wizard.py. This file tests the CLI plumbing only.
+
+PR 2 additions:
+    - --list-templates enumerates all three template names.
+    - --from-template researcher and writer are accepted by argparse.
+    - Invalid --from-template values are still rejected (argparse exit 2).
 """
 
 from __future__ import annotations
@@ -78,7 +83,7 @@ def test_init_help_mentions_advisor_choice(capsys):
 def test_init_invalid_template_choice_exits_2(capsys):
     """Passing an unknown --from-template value causes argparse to exit 2."""
     with pytest.raises(SystemExit) as exc_info:
-        cli_module.main(["init", "foo", "--from-template", "researcher"])
+        cli_module.main(["init", "foo", "--from-template", "unknown-template"])
     assert exc_info.value.code == 2
 
 
@@ -216,3 +221,86 @@ def test_init_mentioned_in_cli_module_docstring():
     """The cli.py module docstring's Usage section references 'atomic-agents init'."""
     docstring = cli_module.__doc__ or ""
     assert "atomic-agents init" in docstring
+
+
+# ---------------------------------------------------------------------------
+# PR 2: --list-templates enumerates all three templates
+# ---------------------------------------------------------------------------
+
+
+def test_init_list_templates_enumerates_all_three():
+    """_cmd_list_templates prints all three template names to the console.
+
+    Called directly on the wizard function so no CLI dispatch is required.
+    All three names (advisor, researcher, writer) must appear in the output.
+    """
+    import io
+
+    from rich.console import Console
+
+    from atomic_agents.init.wizard import _cmd_list_templates
+
+    buf = io.StringIO()
+    console = Console(file=buf, highlight=False)
+    exit_code = _cmd_list_templates(console)
+
+    assert exit_code == 0
+
+    output = buf.getvalue()
+    assert "advisor" in output, (
+        f"'advisor' not found in list-templates output:\n{output}"
+    )
+    assert "researcher" in output, (
+        f"'researcher' not found in list-templates output:\n{output}"
+    )
+    assert "writer" in output, f"'writer' not found in list-templates output:\n{output}"
+
+
+# ---------------------------------------------------------------------------
+# PR 2: researcher and writer choices accepted by argparse
+# ---------------------------------------------------------------------------
+
+
+def test_init_from_template_researcher_choice_accepted(monkeypatch):
+    """--from-template researcher is accepted by argparse (choices list includes it)."""
+    captured = {}
+
+    def fake_run_init(args):
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr("atomic_agents.init.run_init", fake_run_init)
+    cli_module.main(["init", "my-r", "--from-template", "researcher"])
+    assert captured["args"].from_template == "researcher"
+    assert captured["args"].agent_name == "my-r"
+
+
+def test_init_from_template_writer_choice_accepted(monkeypatch):
+    """--from-template writer is accepted by argparse (choices list includes it)."""
+    captured = {}
+
+    def fake_run_init(args):
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr("atomic_agents.init.run_init", fake_run_init)
+    cli_module.main(["init", "my-w", "--from-template", "writer"])
+    assert captured["args"].from_template == "writer"
+    assert captured["args"].agent_name == "my-w"
+
+
+# ---------------------------------------------------------------------------
+# PR 2: invalid template names still rejected by argparse
+# ---------------------------------------------------------------------------
+
+
+def test_init_from_template_invalid_choice_still_rejected():
+    """Passing an unrecognised --from-template value causes argparse to exit 2.
+
+    This protects against accidentally opening the choices list to arbitrary
+    template names. The existing test_init_invalid_template_choice_exits_2 covers
+    the same contract; this test documents the PR-2-specific regression expectation.
+    """
+    with pytest.raises(SystemExit) as exc_info:
+        cli_module.main(["init", "my-x", "--from-template", "unknown-template"])
+    assert exc_info.value.code == 2

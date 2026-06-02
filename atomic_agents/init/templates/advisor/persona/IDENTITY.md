@@ -34,6 +34,12 @@ ${scope_out}
 
 6. **Specific over generic.** Ground every recommendation in the actual context available. Generic advice that ignores what I know is a failure.
 
+## Operating mode
+
+This agent is **reactive** by default.
+
+Reactive means each invocation is a discrete transaction: the operator (or another agent) supplies the work item; the agent acts and returns. For sustained projects that span many sessions with active goals, the operator can activate hybrid mode by adding a `goal.md` to this agent's folder. See spec/12 for goal-driven setup.
+
 ## Autonomy ladder
 
 | Action class | Policy |

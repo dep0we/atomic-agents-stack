@@ -7,20 +7,23 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+# Module-level constant kept for backward compat with any external imports.
+# get_agents_root() does NOT reference this constant; it computes fresh on
+# each call so test monkeypatches of HOME work correctly. New code should
+# call get_agents_root() rather than referencing this constant directly.
 DEFAULT_AGENTS_ROOT = (Path.home() / "docs" / "agents").expanduser().resolve()
 
 
 def get_agents_root() -> Path:
-    """Resolve the agents-root directory.
+    """Resolve the agents root from env var or default to ~/docs/agents.
 
-    Order: ATOMIC_AGENTS_ROOT env var → default ~/docs/agents.
-
-    Operators with a custom vault location override via the env var.
+    Reads HOME and ATOMIC_AGENTS_ROOT on EVERY call (not at import time) so
+    tests that monkeypatch HOME after framework import see the correct value.
     """
     env_val = os.environ.get("ATOMIC_AGENTS_ROOT")
     if env_val:
         return Path(env_val).expanduser().resolve()
-    return DEFAULT_AGENTS_ROOT
+    return (Path.home() / "docs" / "agents").expanduser().resolve()
 
 
 def get_agent_root(agent_name: str, agents_root: Path | None = None) -> Path:
