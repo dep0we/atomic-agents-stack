@@ -337,9 +337,12 @@ at the top. Tiebreaker for ambiguous order: alphabetical by issue number.
    written. On write failure mid-commit, already-written files are committed
    (per-file atomicity from `atomic_write`); not-yet-written files are left as
    their existing versions; the wizard prints a partial-update warning listing
-   committed and failed relpaths and exits status 1. Operator data directories
-   (`memory/`, `journal/`, `log/`, `raw/`) MUST NOT be written or moved
-   during the Add-to-it path.
+   committed and failed relpaths and exits status 1. Operator-authored memory
+   notes (under `memory/` except `INDEX.md`), journal entries (`journal/*.jsonl`),
+   log files (`log/`), and raw documents (`raw/`) MUST NOT be touched during
+   Add-to-it. Schema-owned scaffolding files (`memory/INDEX.md`, `wiki/INDEX.md`)
+   ARE rewritten through the normal Add-to-it merge pattern because they are
+   template-owned routing/structure files.
 
 6. The wizard MUST warn before any mkdir or file write when
    `ATOMIC_AGENTS_PERSONA_BACKEND_URL` is set non-empty. Decline MUST exit 0
@@ -407,18 +410,30 @@ at the top. Tiebreaker for ambiguous order: alphabetical by issue number.
     template-owned sections via ATX-style h2 header match (`^##\s+(.+)$`)
     against `constants.TEMPLATE_SECTION_SCHEMA[template_name][file_relpath]`.
     The section-detection parser MUST skip header-shaped lines inside code
-    fences (delimited by ` ``` ` or `~~~`), HTML comments (delimited by `<!--`
-    and `-->`), and YAML frontmatter (delimited by `---` at file top).
-    Setext-style h2 headers (text followed by `------` underline) are NOT
-    supported; operators with setext-converted files MUST convert to ATX before
-    Add-to-it. When section-detection fails (file structure does not match
-    schema), the wizard MUST fail closed by offering Overwrite or Cancel only.
-    When a template-owned file is missing entirely, the wizard MUST backfill it
-    from the template; the diff-preview MUST label backfilled files as
-    `[new file]` and show full new content. Operator-authored h2 sections not
-    in the schema (orphan sections) and operator-authored h3+ subsections under
-    known h2 sections MUST be preserved verbatim in the rendered output, in
-    their original relative position.
+    fences (delimited by ` ``` ` or `~~~`), HTML comments (HTML comment
+    toggle MUST trigger only on lines whose stripped form starts with `<!--`
+    and ends with `-->` respectively, to avoid false positives from inline-code
+    documentation of HTML comment syntax), and YAML frontmatter (delimited by
+    `---` at file top). Files containing Setext-style headings (a line of only
+    `=` or `-` characters following a non-empty text line) MUST cause section
+    detection to fail and route to overwrite/cancel; operators MUST convert to
+    ATX (`## Header`) before using Add-to-it. Files containing duplicate schema
+    h2 headers (the same `## Header` appearing twice in one file) MUST cause
+    section detection to fail and route to overwrite/cancel. When
+    section-detection fails (file structure does not match schema), the wizard
+    MUST fail closed by offering Overwrite or Cancel only. When a
+    template-owned file is missing entirely, the wizard MUST backfill it from
+    the template; the diff-preview MUST label backfilled files as `[new file]`
+    and show full new content. Operator-authored h2 sections not in the schema
+    (orphan sections) MUST be preserved verbatim including all h3+ subsections.
+    For existing schema h2 blocks (Add-to-it merge of a block already in the
+    file), the merge MUST be ADDITIVE: (a) the existing preamble between the
+    `## Header` line and the first `###` MUST be preserved verbatim (operator
+    filled this in; fresh template preamble is used only for missing-h2
+    backfill cases); (b) h3+ subsections present in the existing file MUST be
+    preserved verbatim in original order; (c) h3+ subsections in the fresh
+    template not present in the existing file MUST be appended at the end of
+    the schema h2 block.
 
 ---
 

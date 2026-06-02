@@ -115,7 +115,7 @@ def run_init(args: Any) -> int:
         )
 
     except KeyboardInterrupt:
-        console.print("\nCanceled. No files were written.")
+        console.print("\nCanceled.")
         return 130  # 128 + SIGINT
 
 
@@ -773,6 +773,7 @@ def _extract_h2_headers(text: str) -> list[str]:
 
     in_fence = False
     in_comment = False
+    prev_stripped = ""
 
     for line in lines[start:]:
         stripped = line.strip()
@@ -780,17 +781,44 @@ def _extract_h2_headers(text: str) -> list[str]:
         # Toggle code-fence state on ``` or ~~~ delimiters.
         if stripped.startswith("```") or stripped.startswith("~~~"):
             in_fence = not in_fence
+            prev_stripped = stripped
             continue
 
         # Track HTML comment state (single-line or multi-line).
-        if "<!--" in stripped:
+        # Only toggle on lines whose stripped form starts with ``<!--``
+        # (tightening: avoids false positives from inline-code documentation of
+        # HTML comment syntax, e.g. ``See <!-- note --> for details``).
+        if stripped.startswith("<!--"):
             in_comment = True
-        if "-->" in stripped:
+        # Only toggle off when the stripped line ends with ``-->``
+        # (symmetric tightening to avoid false-negatives from inline ``-->``).
+        if stripped.endswith("-->"):
             in_comment = False
+            prev_stripped = stripped
             continue
 
         if in_fence or in_comment:
+            prev_stripped = stripped
             continue
+
+        # Setext-style h2 detection: a line of only ``-`` chars (2+) immediately
+        # after a non-empty content line is a setext h2 heading. Fail closed per
+        # spec/35 MUST 15 -- the file will be added to failed_files by the caller.
+        # A bare ``---`` thematic break is distinguished from a setext underline by
+        # requiring the preceding line to be non-empty and not itself a heading-like
+        # delimiter (``---`` after blank or ``---`` line is a thematic break, not
+        # setext). Using 2+ chars and a non-empty prev line is the CommonMark rule.
+        if (
+            re.match(r"^-{2,}$", stripped)
+            and prev_stripped
+            and not prev_stripped.startswith("#")
+            and not re.match(r"^[-=]{3,}$", prev_stripped)
+        ):
+            # Return a sentinel that the caller (_detect_sections) checks for.
+            headers.append("__SETEXT_HEADING_DETECTED__")
+            return headers
+
+        prev_stripped = stripped
 
         # ATX h2: ``## Header text`` with optional trailing ``##``.
         m = re.match(r"^##\s+(.+?)(?:\s+#+)?\s*$", line)
@@ -841,6 +869,28 @@ def _detect_sections(
         # Normalize CRLF/CR to LF (A9).
         normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
         found = _extract_h2_headers(normalized)
+
+        # M2: Setext-style heading sentinel means fail closed.
+        if "__SETEXT_HEADING_DETECTED__" in found:
+            failed_files.append(relpath)
+            per_file_headers[relpath] = []
+            continue
+
+        # H1: Duplicate schema h2 headers in a single file -- fail closed.
+        # Operator copy-paste errors produce duplicates that the merge algorithm
+        # cannot resolve safely; route to overwrite/cancel so the operator decides.
+        seen_in_file: set[str] = set()
+        has_duplicate = False
+        for h in found:
+            if h in seen_in_file:
+                has_duplicate = True
+                break
+            seen_in_file.add(h)
+        if has_duplicate:
+            failed_files.append(relpath)
+            per_file_headers[relpath] = []
+            continue
+
         per_file_headers[relpath] = found
 
         # Superset check: all required headers must appear in the found set.
@@ -896,10 +946,11 @@ def _split_sections(content: str) -> list[tuple[str | None, str]]:
             current_lines.append(line)
             continue
 
-        # Track HTML comment state.
-        if "<!--" in stripped:
+        # Track HTML comment state (line-start match only -- same tightening as
+        # _extract_h2_headers so both state machines are consistent).
+        if stripped.startswith("<!--"):
             in_comment = True
-        if "-->" in stripped:
+        if stripped.endswith("-->"):
             in_comment = False
             current_lines.append(line)
             continue
@@ -926,6 +977,95 @@ def _split_sections(content: str) -> list[tuple[str | None, str]]:
 def _join_sections(blocks: list[tuple[str | None, str]]) -> str:
     """Reassemble section blocks into a single string."""
     return "".join(body for _, body in blocks)
+
+
+def _split_h3_subsections(body: str) -> tuple[str, list[tuple[str, str]]]:
+    """Split the body text of a schema h2 block into a preamble and h3 sub-blocks.
+
+    ``body`` is the full text of one h2 block as returned by ``_split_sections``,
+    INCLUDING the opening ``## Header`` line at the start.
+
+    Returns ``(preamble, [(h3_header_line, h3_body), ...])``.
+
+    - ``preamble`` is everything from the start of ``body`` up to (but not
+      including) the first ``### `` line.  It includes the ``## Header`` line
+      itself plus any content between the h2 and the first h3.
+    - Each h3 tuple is ``(full_header_line_including_newline, body_text)``.
+
+    Uses the same state machine as ``_split_sections`` but matching ``^### ``
+    instead of ``^## `` so code fences, HTML comments, and YAML frontmatter are
+    respected.
+    """
+    lines = body.splitlines(keepends=True)
+    preamble_lines: list[str] = []
+    h3_blocks: list[tuple[str, str]] = []
+    current_h3_header: str | None = None
+    current_h3_lines: list[str] = []
+
+    in_fence = False
+    in_comment = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            if current_h3_header is None:
+                preamble_lines.append(line)
+            else:
+                current_h3_lines.append(line)
+            continue
+
+        if stripped.startswith("<!--"):
+            in_comment = True
+        if stripped.endswith("-->"):
+            in_comment = False
+            if current_h3_header is None:
+                preamble_lines.append(line)
+            else:
+                current_h3_lines.append(line)
+            continue
+
+        if in_fence or in_comment:
+            if current_h3_header is None:
+                preamble_lines.append(line)
+            else:
+                current_h3_lines.append(line)
+            continue
+
+        m = re.match(r"^###\s+(.+?)(?:\s+#+)?\s*$", line)
+        if m:
+            if current_h3_header is None:
+                # First h3: flush preamble, nothing to push yet.
+                pass
+            else:
+                # Flush previous h3 block.
+                h3_blocks.append((current_h3_header, "".join(current_h3_lines)))
+            current_h3_header = m.group(1).strip()
+            current_h3_lines = [line]
+        else:
+            if current_h3_header is None:
+                preamble_lines.append(line)
+            else:
+                current_h3_lines.append(line)
+
+    # Flush the final h3 block if any.
+    if current_h3_header is not None:
+        h3_blocks.append((current_h3_header, "".join(current_h3_lines)))
+
+    return "".join(preamble_lines), h3_blocks
+
+
+def _join_h3_subsections(preamble: str, h3_blocks: list[tuple[str, str]]) -> str:
+    """Reassemble a preamble and h3 sub-blocks into a single body string.
+
+    Inverse of ``_split_h3_subsections``.  The preamble already contains the
+    opening ``## Header`` line; h3 bodies already contain their ``### Header``
+    lines.  This is a simple concatenation.
+    """
+    parts = [preamble]
+    parts.extend(body for _, body in h3_blocks)
+    return "".join(parts)
 
 
 def _render_file_to_string(
@@ -956,9 +1096,22 @@ def _compute_merged_content(
     - If the file is missing from agent_dir: return fresh-rendered content
       (backfill).
     - Otherwise: split existing and fresh content into section blocks; merge
-      by keeping existing content for orphan sections, while replacing
-      schema-owned sections with fresh content so Q&A answers (mission,
-      voice, comm_prefs, etc.) are applied.
+      using an ADDITIVE strategy for existing schema h2 blocks.
+
+    ADDITIVE merge for existing schema h2 blocks (spec/35 MUST 15):
+    - The existing preamble (text between ## Header line and first ###) is
+      preserved verbatim -- the operator already filled this in.
+    - h3+ subsections present in existing are preserved verbatim in original
+      order.
+    - h3+ subsections in the fresh template that are NOT in existing are
+      appended at the end of the block (template added a new h3 the operator
+      has not seen yet).
+    - Schema-owned h2 blocks MISSING from existing are backfilled entirely
+      from the fresh template (operator never had this section).
+
+    Preamble before first h2: preserved verbatim.
+    Orphan h2 sections (operator-authored, not in schema): preserved verbatim
+      including all h3+ subsections.
 
     Operator data directories (memory/, journal/, log/, raw/) are never
     touched. This function only operates on files explicitly listed in the
@@ -993,7 +1146,7 @@ def _compute_merged_content(
             continue
         existing_text = existing_raw.replace("\r\n", "\n").replace("\r", "\n")
 
-        # Split both into section blocks.
+        # Split both into h2 section blocks.
         existing_blocks = _split_sections(existing_text)
         fresh_blocks = _split_sections(fresh_text)
 
@@ -1012,20 +1165,42 @@ def _compute_merged_content(
                 # Preamble before first h2: always keep existing.
                 merged_blocks.append((None, existing_body))
             elif header in schema_header_set:
-                # Schema-owned section: use fresh content so Q&A answers
-                # (mission, voice, comm_prefs, etc.) are updated.
+                # Schema-owned section: ADDITIVE h3-aware merge.
+                # Operator preamble wins; existing h3s preserved in order;
+                # new template h3s appended at end.
                 fresh_body = fresh_body_map.get(header)
                 if fresh_body is not None:
-                    merged_blocks.append((header, fresh_body))
+                    existing_preamble, existing_h3s = _split_h3_subsections(
+                        existing_body
+                    )
+                    _fresh_preamble, fresh_h3s = _split_h3_subsections(fresh_body)
+
+                    # Operator preamble wins for existing schema h2 blocks.
+                    merged_preamble = existing_preamble
+
+                    # Preserve all existing h3 blocks in original order.
+                    merged_h3s: list[tuple[str, str]] = list(existing_h3s)
+                    existing_h3_names = {name for name, _ in existing_h3s}
+
+                    # Append fresh h3 blocks not yet seen by operator.
+                    for h3_name, h3_body in fresh_h3s:
+                        if h3_name not in existing_h3_names:
+                            merged_h3s.append((h3_name, h3_body))
+
+                    merged_block_body = _join_h3_subsections(
+                        merged_preamble, merged_h3s
+                    )
+                    merged_blocks.append((header, merged_block_body))
                 else:
                     # Template removed this section; preserve existing.
                     merged_blocks.append((header, existing_body))
             else:
-                # Orphan section (operator-authored): preserve verbatim.
+                # Orphan section (operator-authored): preserve verbatim
+                # including any h3+ subsections.
                 merged_blocks.append((header, existing_body))
 
         # Backfill: schema-owned sections in fresh that do not exist in
-        # existing (new template sections). Append at end.
+        # existing (new template sections). Use fresh content entirely.
         for header, fresh_body in fresh_blocks:
             if (
                 header is not None
@@ -1048,7 +1223,7 @@ def _render_diff_preview(
     agent_dir: Path,
     merged_content: dict[str, str],
     console: Any,
-) -> tuple[int, int, int]:
+) -> int:
     """Render a unified diff preview between existing files and merged content.
 
     merged_content maps file relpath (str) -> new merged content string.
@@ -1058,8 +1233,32 @@ def _render_diff_preview(
     Reads existing files with utf-8-sig + CRLF normalization (A9).
     Merged content is always LF (produced by section reassembly).
 
-    Returns (files_changed, total_insertions, total_deletions) for the summary
-    line.
+    Returns files_changed count (int). Returns -1 on any exception (sentinel:
+    "preview failed, caller should proceed to Confirm regardless"; satisfies
+    MUST 3 -- no stack traces propagate to operator).
+    """
+    try:
+        return _render_diff_preview_inner(agent_dir, merged_content, console)
+    except Exception as e:  # noqa: BLE001
+        etype = type(e).__name__
+        console.print(
+            f"[yellow]Preview rendering failed: {etype}. "
+            "Falling back to file list.[/yellow]"
+        )
+        for relpath_str in sorted(merged_content.keys()):
+            console.print(f"  {relpath_str}")
+        return -1
+
+
+def _render_diff_preview_inner(
+    agent_dir: Path,
+    merged_content: dict[str, str],
+    console: Any,
+) -> int:
+    """Inner implementation of _render_diff_preview (called via exception-guarded wrapper).
+
+    Do NOT call this directly -- use _render_diff_preview so MUST 3 exception
+    handling is always in place.
     """
     import difflib
 
@@ -1126,7 +1325,7 @@ def _render_diff_preview(
         f"{total_ins} insertion(s)(+), "
         f"{total_del} deletion(s)(-)\n"
     )
-    return files_changed, total_ins, total_del
+    return files_changed
 
 
 # ---------------------------------------------------------------------------
@@ -1152,13 +1351,27 @@ def _commit_merges(
     """
     committed: list[str] = []
     failed: list[str] = []
+    pending: list[str] = sorted(merged_content.keys())
 
-    for relpath_str in sorted(merged_content.keys()):
+    for relpath_str in pending:
         content = merged_content[relpath_str]
         target = agent_dir / relpath_str
         try:
             _io.atomic_write(target, content)
             committed.append(relpath_str)
+        except KeyboardInterrupt:
+            # Print a summary of what landed before raising so the outer handler
+            # can stay generic ("Canceled.").
+            remaining = [r for r in pending if r not in committed and r != relpath_str]
+            console.print(
+                f"\n[yellow]Canceled mid-commit. "
+                f"Wrote {len(committed)} of {len(pending)} file(s) before cancel. "
+                f"Written: {', '.join(committed) if committed else 'none'}. "
+                f"Pending (not written): "
+                f"{', '.join([relpath_str] + remaining) if remaining or relpath_str else 'none'}."
+                f"[/yellow]"
+            )
+            raise
         except (OSError, PathTraversalError) as e:
             console.print(f"[red]Failed to write {relpath_str}: {e}[/red]")
             failed.append(relpath_str)
@@ -1185,9 +1398,12 @@ def _add_to_it(
     existing_headers is the per_file_headers map from _check_collision's
     pre-flight _detect_sections call; it is informational only here.
 
-    Operator data directories (memory/, journal/, log/, raw/) are never
-    touched: _compute_merged_content only operates on files listed in
-    TEMPLATE_SECTION_SCHEMA[template_name].
+    Operator-authored memory notes (under memory/ except INDEX.md), journal
+    entries (journal/*.jsonl), log files (log/), and raw documents (raw/) are
+    never touched: _compute_merged_content only operates on files listed in
+    TEMPLATE_SECTION_SCHEMA[template_name]. Schema-owned scaffolding files
+    (memory/INDEX.md, wiki/INDEX.md) ARE rewritten through the normal merge
+    pattern because they are template-owned routing/structure files.
 
     Returns an exit code (0 success, 1 error).
     """
@@ -1214,7 +1430,14 @@ def _add_to_it(
 
     # Show diff preview.
     console.print("\n[bold]Preview of changes:[/bold]\n")
-    _render_diff_preview(agent_dir, merged_content, console)
+    files_changed = _render_diff_preview(agent_dir, merged_content, console)
+
+    # If the preview computed successfully and showed zero changes, skip Confirm.
+    if files_changed == 0:
+        console.print(
+            "[green]No changes to apply. Existing scaffold is up to date.[/green]"
+        )
+        return 0
 
     # Confirm before committing.
     do_commit = Confirm.ask(
