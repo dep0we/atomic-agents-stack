@@ -250,7 +250,7 @@ def test_run_init_non_tty_does_not_import_rich(monkeypatch, tmp_path):
 
 
 def test_api_key_preflight_uses_get_key(monkeypatch, tmp_path, capsys):
-    """When _get_key raises AtomicAgentsError, run_init exits 1 with MSG_NO_API_KEY."""
+    """When _get_key raises AtomicAgentsError, run_init exits 1 with MSG_NO_PROVIDER_KEY."""
     from atomic_agents.exceptions import AtomicAgentsError
 
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
@@ -271,7 +271,7 @@ def test_api_key_preflight_uses_get_key(monkeypatch, tmp_path, capsys):
 
     assert rc == 1
     captured = capsys.readouterr()
-    assert C.MSG_NO_API_KEY in captured.err
+    assert C.MSG_NO_PROVIDER_KEY in captured.err
 
 
 def test_api_key_preflight_passes_when_key_available(monkeypatch, tmp_path):

@@ -53,7 +53,7 @@ keychain_name=constants.ANTHROPIC_KEYCHAIN_NAME,
 config_key=constants.ANTHROPIC_CONFIG_KEY)`, which checks environment
 variables, macOS Keychain, and `~/.config/atomic_agents/keys.json` in that
 order. If all three sources are empty, the wizard prints
-`constants.MSG_NO_API_KEY` to stderr and exits 1 with no files written.
+`constants.MSG_NO_PROVIDER_KEY` to stderr and exits 1 with no files written.
 
 **Persona-backend warning.** If `ATOMIC_AGENTS_PERSONA_BACKEND_URL` is set to a
 non-empty value, the wizard prints `constants.MSG_PERSONA_BACKEND_WARNING` and

@@ -64,7 +64,7 @@ def run_init(args: Any) -> int:
 
     # MUST 7: API key pre-flight via _get_key (env vars + Keychain + keys.json).
     if not _api_key_preflight():
-        print(C.MSG_NO_API_KEY, file=sys.stderr)
+        print(C.MSG_NO_PROVIDER_KEY, file=sys.stderr)
         return 1
 
     # MUST 6: persona-backend warning before any mkdir or file write.
