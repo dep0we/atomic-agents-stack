@@ -287,11 +287,26 @@ at the top. Tiebreaker for ambiguous order: alphabetical by issue number.
    `atomic_agents._io.safe_resolve_under(child, agent_dir)` before passing it
    to `atomic_write`. On a fresh-write failure (no pre-existing scaffold to
    restore), the wizard MUST clean up the partial `agent_dir` it created so
-   the operator sees either a complete scaffold or none of one.
+   the operator sees either a complete scaffold or none of one. The Add-to-it
+   path additionally requires the wizard to render new scaffold content into a
+   sibling staging directory `<agent_dir>.new.<UTC-ISO-microsecond>` before any
+   rename of the existing agent_dir. Staging-dir creation MUST use
+   `mkdir(parents=True, exist_ok=False)` so a stale staging dir from a prior
+   crashed run fails fast and triggers operator recovery.
 
-5. The collision Overwrite branch MUST use the backup+restore pattern: atomic
-   rename to `<agent_dir>.bak.<UTC-ISO>`, write all files, success rmtree the
-   `.bak`, failure rename back.
+5. Recovery atomicity: The collision Overwrite branch MUST use the
+   backup+restore pattern: atomic rename to `<agent_dir>.bak.<UTC-ISO-microsecond>`,
+   write all files, success rmtree the `.bak`, failure rename `.bak` back. The
+   collision Add-to-it branch MUST use the staging-dir commit pattern: render
+   the new scaffold under `<agent_dir>.new.<UTC-ISO-microsecond>` while leaving
+   the existing `agent_dir` untouched; display a unified diff preview between
+   existing and staged content; on operator confirmation, atomically rename
+   `agent_dir` to `<agent_dir>.bak.<UTC-ISO-microsecond>` then rename
+   `<agent_dir>.new` to `agent_dir`, on success rmtree the `.bak`. On operator
+   decline or any failure between staging-dir creation and commit-rename, rmtree
+   the staging-dir and leave `agent_dir` untouched. The KeyboardInterrupt handler
+   MUST detect a half-committed state (`agent_dir` absent + `agent_dir.bak.*`
+   present + `agent_dir.new.*` present) and complete the restoration before exit.
 
 6. The wizard MUST warn before any mkdir or file write when
    `ATOMIC_AGENTS_PERSONA_BACKEND_URL` is set non-empty. Decline MUST exit 0
@@ -300,10 +315,12 @@ at the top. Tiebreaker for ambiguous order: alphabetical by issue number.
 7. The wizard MUST resolve the Anthropic API key via
    `atomic_agents._llm._get_key(env_vars=constants.ANTHROPIC_ENV_VARS,
    keychain_name=constants.ANTHROPIC_KEYCHAIN_NAME,
-   config_key=constants.ANTHROPIC_CONFIG_KEY)` at pre-flight on the paths that
-   may invoke the LLM (interactive Q&A and `--from-template`). The
-   `--list-templates` path MUST NOT require an API key (it writes no files and
-   makes no LLM calls).
+   config_key=constants.ANTHROPIC_CONFIG_KEY)` at pre-flight on the interactive
+   Q&A path. The `--from-template <name>` and `--list-templates` paths MUST NOT
+   require an API key at scaffold time because templates write file content only
+   with no LLM call. The opt-in test call at end of `--from-template` still
+   requires the key; when absent, the test-call prompt is skipped with a
+   one-line notice.
 
 8. The wizard MUST call `atomic_agents.doctor.run_doctor()` on the new agent
    and MUST block the test-call prompt when
@@ -331,7 +348,10 @@ at the top. Tiebreaker for ambiguous order: alphabetical by issue number.
       permitted. `agent_name` MUST be supplied; the wizard MUST refuse with a
       clear error if `--from-template` is given without `agent_name`.
     - `--list-templates`: no entry guards (read-only enumeration; no files
-      written, no LLM calls, no name required).
+      written, no LLM calls, no name required). `--list-templates` MUST
+      enumerate exactly the templates named in the `--from-template` argparse
+      choices list. The enumeration MUST stay in sync with `--from-template`
+      choices across all PRs that add or remove templates.
 
 12. CHANGELOG `[Unreleased]` MUST interleave newest-arc-at-top with
     alphabetical-by-issue-number tiebreaker on conflict.
@@ -349,6 +369,23 @@ at the top. Tiebreaker for ambiguous order: alphabetical by issue number.
     Total additions MUST stay under 60 lines (the natural cost of multi-line
     argparse `add_argument` calls with operator-facing help text on every
     argument, plus the subparser declaration and dispatch wiring).
+
+15. Section-detection contract for Add-to-it: The wizard MUST detect existing
+    template-owned sections via ATX-style h2 header match (`^##\s+(.+)$`)
+    against `constants.TEMPLATE_SECTION_SCHEMA[template_name][file_relpath]`.
+    The section-detection parser MUST skip header-shaped lines inside code
+    fences (delimited by ` ``` ` or `~~~`), HTML comments (delimited by `<!--`
+    and `-->`), and YAML frontmatter (delimited by `---` at file top).
+    Setext-style h2 headers (text followed by `------` underline) are NOT
+    supported; operators with setext-converted files MUST convert to ATX before
+    Add-to-it. When section-detection fails (file structure does not match
+    schema), the wizard MUST fail closed by offering Overwrite or Cancel only.
+    When a template-owned file is missing entirely, the wizard MUST backfill it
+    from the template; the diff-preview MUST label backfilled files as
+    `[new file]` and show full new content. Operator-authored h2 sections not
+    in the schema (orphan sections) and operator-authored h3+ subsections under
+    known h2 sections MUST be preserved verbatim in the rendered output, in
+    their original relative position.
 
 ---
 

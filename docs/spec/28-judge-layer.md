@@ -705,10 +705,17 @@ Four classes, declared per-tool in `tools.md` (custom tools) or `mcp.md` (MCP to
 
 | Class | Examples | Default judge policy |
 |---|---|---|
-| `read_only` | `read_file`, `search_notes`, `list_directory` | Bypass judge; no proposal required |
+| `read_only` | `read_file`, `search_notes`, `list_directory`, web search (HTTP GET) | Bypass judge; no proposal required |
 | `reversible_write` | `write_note(staged)`, `create_draft` | Judge optional; default-allow with audit |
 | `external_side_effect` | `send_email`, `post_message`, `create_pr` | Judge required; default policy is judge-decides |
 | `high_risk` | `delete_files`, `force_push`, `production_deploy` | Judge required; default policy is escalate |
+
+**Action class definitions:**
+
+- `read_only` -- Reading files, searching notes, listing directories, querying external read-only APIs (HTTP GET that does not change external state, like web search). Action is auditable but does not change persistent state.
+- `reversible_write` -- Writing notes, drafting documents, staging work; the change can be undone via a restore path.
+- `external_side_effect` -- Sending email, posting messages, creating pull requests; visible to the world outside the agent's vault.
+- `high_risk` -- Deleting files, force-pushing code, deploying to production; irreversible or operationally consequential.
 
 Class is the strongest input to outcome selection. Tools without an explicit class default to `external_side_effect` (safest classification for "we don't know"). Operators promote unknowns to `read_only` after observing them, via `tools.md` or `mcp.md`.
 
