@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     from .policy import PolicyBackend
     from .persona import PersonaBackend
     from .corpus import CorpusBackend
+    from .mcp_registry import MCPServerRegistryBackend
 
 import frontmatter
 
@@ -1174,6 +1175,7 @@ class DreamRunner:
         policy_backend: "PolicyBackend | None" = None,
         persona_backend: "PersonaBackend | None" = None,
         corpus_backend: "CorpusBackend | None" = None,
+        mcp_server_registry_backend: "MCPServerRegistryBackend | None" = None,
     ):
         self.agents_root = Path(agents_root)
         self.agent_name = agent_name
@@ -1307,6 +1309,17 @@ class DreamRunner:
         # site via
         # ``AtomicAgent(..., corpus_backend=self._corpus_backend)``.
         self._corpus_backend = corpus_backend
+        # spec/36 PR 2 -- MCPServerRegistryBackend stored for API parity with
+        # OutcomeRunner / EvalRunner. DreamRunner currently makes raw
+        # LLM calls (``_llm.call_*``) without dispatching agent tools
+        # -- there is no internal ``AtomicAgent`` construction site to
+        # thread through in v1. The kwarg exists so an operator wiring
+        # multiple runners uses ONE signature shape across all runners.
+        # Future dream pipelines that construct an internal AtomicAgent
+        # (e.g., for self-reflection cycles) will thread the stored backend
+        # at that construction site via
+        # ``AtomicAgent(..., mcp_server_registry_backend=self._mcp_server_registry_backend)``.
+        self._mcp_server_registry_backend = mcp_server_registry_backend
 
         # Resolve model: explicit kwarg > profile.model_config default.
         # PR 2 Decision 2: pre-resolved model_config is also passed to
