@@ -8,7 +8,7 @@ conformance suite:
 - mcp.md parse semantics
 - MCPServerRef.source field population
 - Default LockBackend construction
-- load_all_mcp_servers delegation to _default_load_all
+- load_all_mcp_servers single-read-parse behavior (#201 PR 2 ENOENT fix)
 
 Per spec/36, prep finding B-F6, and the filesystem-specific test shape in
 test_corpus_filesystem_backend.py.
@@ -16,7 +16,6 @@ test_corpus_filesystem_backend.py.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from textwrap import dedent
 from unittest.mock import MagicMock, patch
@@ -29,7 +28,6 @@ from atomic_agents.mcp_registry import (
     MCPRegistryUnavailable,
     MCPServerNotInRegistry,
 )
-from atomic_agents.mcp_registry.backend import _default_load_all
 from atomic_agents.mcp_registry.types import ValidationResult
 from atomic_agents.mcp import MCPServerSpec, parse_mcp_md_text
 from atomic_agents.exceptions import MCPServerConnectFailed
@@ -368,11 +366,16 @@ def test_malformed_section_no_command_skipped_silently(tmp_path: Path) -> None:
     assert "no-command-server" not in names
 
 
-def test_load_all_mcp_servers_delegates_to_default_load_all(tmp_path: Path) -> None:
-    """load_all_mcp_servers delegates to _default_load_all.
+def test_load_all_mcp_servers_returns_specs_via_single_read_parse(
+    tmp_path: Path,
+) -> None:
+    """load_all_mcp_servers returns fully materialized specs via single read-parse.
 
-    spec/36 MUST 10 / prep finding Theme 4. Verified by patching _default_load_all
-    in the backend module and asserting it was called.
+    PR 2 replaces the _default_load_all delegation with a direct single
+    read-parse so parse failures (MCPRegistryDescriptorInvalid) and transient
+    OSError (MCPRegistryUnavailable) propagate correctly to the fail-closed
+    wiring in agent.py:__init__. Verified by asserting output correctness
+    (behavior contract) rather than patching internals.
     """
     agent_root = tmp_path / "delegation-agent"
     agent_root.mkdir()
@@ -380,24 +383,11 @@ def test_load_all_mcp_servers_delegates_to_default_load_all(tmp_path: Path) -> N
     _write_mcp_md_from_specs(agent_root, [spec])
     backend = FilesystemMCPServerRegistryBackend(agent_root, [])
 
-    call_count = {"n": 0}
-    original = _default_load_all
+    result = backend.load_all_mcp_servers()
 
-    def tracking_default_load_all(b):
-        call_count["n"] += 1
-        return original(b)
-
-    with patch(
-        "atomic_agents.mcp_registry.filesystem._default_load_all",
-        side_effect=tracking_default_load_all,
-    ):
-        result = backend.load_all_mcp_servers()
-
-    assert call_count["n"] == 1, (
-        "load_all_mcp_servers must delegate to _default_load_all"
-    )
     assert len(result) == 1
     assert result[0].name == "delegate-server"
+    assert isinstance(result[0], MCPServerSpec)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

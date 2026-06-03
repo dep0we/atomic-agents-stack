@@ -166,6 +166,7 @@ def run_doctor(
             "mandate-backend",
             "policy-backend",
             "corpus-backend",
+            "mcp-server-registry-backend",
             "memory-backend",
             "write-paths",
         ):
@@ -226,6 +227,7 @@ def run_doctor(
     results.append(check_policy_backend(resolved_root, cascade=cascade))
     results.append(check_persona_backend(resolved_root))
     results.append(check_corpus_backend(agent_root))
+    results.append(check_mcp_server_registry_backend(agent_root))
     results.append(check_memory_backend(agent_root))
     results.append(check_write_paths(tools_data, agent_root=agent_root))
 
@@ -2681,6 +2683,123 @@ def check_corpus_backend(agent_root: Path) -> CheckResult:
             f"raw: {raw_count} page{'' if raw_count == 1 else 's'})"
         ),
         detail=detail,
+    )
+
+
+def check_mcp_server_registry_backend(agent_root: Path) -> CheckResult:
+    """Operator-config coherence check for the MCP server registry backend (#201 PR 2).
+
+    Validates that ``ATOMIC_AGENTS_MCP_SERVER_REGISTRY_BACKEND`` (plus
+    ``ATOMIC_AGENTS_MCP_SERVER_REGISTRY_BACKEND_URL`` when non-filesystem)
+    is correctly configured:
+
+    * unset / empty / ``filesystem`` → PASS (today's filesystem-default
+      deployment shape -- no extras needed, no URL needed).
+    * unknown backend_id (typo or pasted credential) → FAIL with credential-
+      redacted echo + list of registered ids. Uses ``_redact_for_error_message``
+      from ``mcp_registry/__init__.py`` (handles ``://`` URL heuristic AND
+      ``user:pass@host`` DSN heuristic AND length truncation -- distinct from
+      the inline truncation in ``check_tool_registry_backend`` which misses
+      DSN-style values).
+    * transient probe failure → WARN (matches ``check_provider_keys`` pattern;
+      doctor does not crash on optional infrastructure).
+
+    Reads ``backend.capabilities`` (property, not method). Detail dict
+    includes all 5 capability fields plus ``mcp_server_count`` from
+    ``list_mcp_servers()`` (NOT ``load_all_mcp_servers``, which materializes
+    resolved env values).
+
+    Mirrors the operator-coherence layer pattern of ``check_lock_backend``
+    and ``check_tool_registry_backend``. ``run_doctor`` then exercises the
+    backend through the agent's actual construction path.
+    """
+    import os
+
+    from .mcp_registry import (
+        MCPRegistryError,
+        MCPRegistryUnavailable,
+        _redact_for_error_message,
+        get_default_mcp_server_registry_backend,
+        list_mcp_server_registry_backends,
+    )
+
+    raw = (
+        os.environ.get("ATOMIC_AGENTS_MCP_SERVER_REGISTRY_BACKEND", "").strip().lower()
+    )
+    backend_id = raw if raw else "filesystem"
+    available = list_mcp_server_registry_backends()
+
+    if backend_id not in available:
+        safe_id = _redact_for_error_message(raw)
+        return CheckResult(
+            name="mcp-server-registry-backend",
+            status=FAIL,
+            message=(
+                f"ATOMIC_AGENTS_MCP_SERVER_REGISTRY_BACKEND={safe_id!r} is "
+                f"not a known backend. Available: {available}"
+            ),
+            fix_hint=(
+                f"Set ATOMIC_AGENTS_MCP_SERVER_REGISTRY_BACKEND to one of "
+                f"{available}, or unset it to use the filesystem default."
+            ),
+            detail={"safe_backend_id": safe_id, "available_backends": available},
+        )
+
+    try:
+        backend = get_default_mcp_server_registry_backend(agent_root, [])
+    except MCPRegistryError as exc:
+        safe = _redact_for_error_message(str(exc))
+        return CheckResult(
+            name="mcp-server-registry-backend",
+            status=FAIL,
+            message=f"failed to construct {backend_id!r} backend",
+            fix_hint=f"check the env vars: {safe}",
+            detail={"backend_id": backend_id},
+        )
+
+    try:
+        refs = backend.list_mcp_servers()
+    except MCPRegistryUnavailable:
+        return CheckResult(
+            name="mcp-server-registry-backend",
+            status=WARN,
+            message=(
+                f"operator-pinned backend {backend_id!r} configured but "
+                f"list_mcp_servers() probe failed"
+            ),
+            fix_hint=(
+                "Verify the catalog is reachable. Doctor warns instead of "
+                "failing; the framework runtime will fail at first list or "
+                "load if the backend is truly down."
+            ),
+            detail={"backend_id": backend_id},
+        )
+    except Exception as exc:
+        return CheckResult(
+            name="mcp-server-registry-backend",
+            status=FAIL,
+            message=(f"backend {backend_id!r} probe raised {type(exc).__name__}"),
+            fix_hint="See logs for the exception details.",
+            detail={"backend_id": backend_id},
+        )
+
+    caps = backend.capabilities
+    return CheckResult(
+        name="mcp-server-registry-backend",
+        status=PASS,
+        message=(
+            f"{backend_id} backend ok "
+            f"({len(refs)} MCP server{'s' if len(refs) != 1 else ''} mounted)"
+        ),
+        detail={
+            "backend_id": backend.backend_id,
+            "supports_install": caps.supports_install,
+            "supports_uninstall": caps.supports_uninstall,
+            "supports_capability_handshake": caps.supports_capability_handshake,
+            "supports_audit": caps.supports_audit,
+            "durable": caps.durable,
+            "mcp_server_count": len(refs),
+        },
     )
 
 

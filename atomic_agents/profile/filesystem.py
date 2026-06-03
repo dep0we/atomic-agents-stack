@@ -384,6 +384,12 @@ class FilesystemAgentProfileBackend:
                 mcp_servers = []
         else:
             mcp_servers = []
+        # Sort lexicographically by name (locked decision Q1 from PR 2 prep).
+        # Aligns this path with FilesystemMCPServerRegistryBackend.list_mcp_servers()
+        # which already sorts (mcp_registry/filesystem.py). spec/36 MUST 5
+        # applies to all backends consistently; the pre-#201 declaration order
+        # was an implementation detail of parse_mcp_md_text, not a contract.
+        mcp_servers = sorted(mcp_servers, key=lambda s: s.name)
 
         # ── persona/IDENTITY.md, SOUL.md, USER.md — raw text ──
         # When persona.link.md is present (link_present is True), the
@@ -444,6 +450,7 @@ class FilesystemAgentProfileBackend:
             judges_md_raw=judges_md_raw,
             roster_md_raw=roster_md_raw,
             mcp_md_raw=mcp_md_raw,
+            mcp_servers_resolved=[],  # populated by framework integration layer in agent.py
         )
 
     # ────────────────────────────────────────────────────────────

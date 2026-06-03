@@ -39,7 +39,7 @@ Two design decisions that shape the dataclass shape:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from ..exceptions import MCPServerConnectFailed
@@ -145,6 +145,21 @@ class AgentProfile:
             preserves ``$VAR_NAME`` env-var references verbatim;
             saving from this string never bakes resolved secrets into
             the on-disk file.
+        mcp_servers_resolved: List of ``MCPServerSpec`` instances
+            populated by the framework integration layer in
+            ``agent.py:__init__`` via ``dataclasses.replace()`` AFTER
+            ``load_profile()`` returns and BEFORE ``_load_config()``
+            builds the AgentConfig. The source is
+            ``MCPServerRegistryBackend.load_all_mcp_servers()``, making
+            this field substrate-agnostic by construction. Backends MUST
+            NOT populate this field; they own ``mcp_servers`` only.
+            Default is ``[]``.
+
+            This field is always serialized as ``[]`` in ``to_dict()``
+            to keep resolved MCP env secrets out of snapshot JSON files
+            on disk. It re-populates from the registry backend at next
+            agent construction. See spec/36 Decision 9 and spec/24 D1
+            addendum (#201 PR 2 of 5).
     """
 
     # Required identity
@@ -173,6 +188,16 @@ class AgentProfile:
     roster_md_raw: str
     mcp_md_raw: str
 
+    # Resolved MCP server specs from the registry backend (#201 PR 2 of 5).
+    # Populated by the framework integration layer in agent.py:__init__ via
+    # dataclasses.replace() AFTER load_profile() returns. Backends do NOT
+    # populate this field (layer separation per spec/24 Decision 7).
+    # The field is always serialized as [] in to_dict() (locked decision Q2
+    # from prep pass) to keep resolved MCP secrets out of snapshot files on
+    # disk. It re-populates from the registry backend at next agent
+    # construction. spec/36 Decision 9; spec/24 D1 addendum.
+    mcp_servers_resolved: list[MCPServerSpec] = field(default_factory=list)
+
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a plain dict suitable for ``json.dumps`` /
         database column storage.
@@ -199,6 +224,13 @@ class AgentProfile:
             "judges_config": _judges_config_to_dict(self.judges_config),
             "roster": list(self.roster),
             "mcp_servers": [_mcp_spec_to_dict(s) for s in self.mcp_servers],
+            # Always serialize as [] (locked decision Q2 from PR 2 prep
+            # pass). The field is a framework-populated runtime transient;
+            # serializing real values would write resolved MCP env secrets
+            # into snapshot JSON files on disk, which contradicts spec/24
+            # Decision 1's intent. The field re-populates from the
+            # registry backend at next agent construction.
+            "mcp_servers_resolved": [],
             "persona_identity": self.persona_identity,
             "persona_soul": self.persona_soul,
             "persona_user": self.persona_user,
@@ -342,9 +374,26 @@ class AgentProfile:
                 # Env-var unresolvable in this process — fall back to
                 # the dict's structured form (best-effort). Raw text
                 # is preserved for write-back regardless.
-                mcp_servers = list(d.get("mcp_servers") or [])
+                # Use _mcp_spec_from_dict to reconstruct MCPServerSpec
+                # instances (fixes the pre-existing latent bug where
+                # the fallback path returned raw dicts instead of
+                # MCPServerSpec instances).
+                mcp_servers = [
+                    _mcp_spec_from_dict(s) for s in (d.get("mcp_servers") or [])
+                ]
         else:
-            mcp_servers = list(d.get("mcp_servers") or [])
+            mcp_servers = [_mcp_spec_from_dict(s) for s in (d.get("mcp_servers") or [])]
+
+        # mcp_servers_resolved is a runtime transient populated by
+        # agent.py:__init__. The to_dict() path always emits [] for
+        # security (locked Q2). When deserializing a dict that DOES
+        # contain the field (e.g. a future un-clamped snapshot or a
+        # direct test dict), reconstruct MCPServerSpec instances via
+        # _mcp_spec_from_dict for correctness. In normal operation
+        # this will always be an empty list.
+        mcp_servers_resolved = [
+            _mcp_spec_from_dict(s) for s in (d.get("mcp_servers_resolved") or [])
+        ]
 
         return cls(
             name=name,
@@ -364,6 +413,7 @@ class AgentProfile:
             judges_md_raw=judges_md_raw,
             roster_md_raw=roster_md_raw,
             mcp_md_raw=mcp_md_raw,
+            mcp_servers_resolved=mcp_servers_resolved,
         )
 
     def replace(self, **changes: Any) -> "AgentProfile":
@@ -564,3 +614,24 @@ def _mcp_spec_to_dict(spec: MCPServerSpec) -> dict[str, Any]:
         "transport": spec.transport,
         "description": spec.description,
     }
+
+
+def _mcp_spec_from_dict(d: dict) -> MCPServerSpec:
+    """Reconstruct ``MCPServerSpec`` from a dict produced by ``_mcp_spec_to_dict``.
+
+    Used by ``AgentProfile.from_dict`` for both ``mcp_servers`` and
+    ``mcp_servers_resolved``. Closes a pre-existing latent bug where the
+    ``mcp_servers`` fallback path returned raw dicts instead of
+    ``MCPServerSpec`` instances.
+
+    Extra keys in ``d`` are silently ignored for forward-compatibility.
+    Missing optional keys fall back to ``MCPServerSpec`` field defaults.
+    """
+    return MCPServerSpec(
+        name=d["name"],
+        command=d["command"],
+        args=list(d.get("args", [])),
+        env=dict(d.get("env", {})),
+        transport=d.get("transport", "stdio"),
+        description=d.get("description", ""),
+    )
