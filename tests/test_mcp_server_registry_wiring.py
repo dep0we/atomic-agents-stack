@@ -26,6 +26,7 @@ import pytest
 
 from atomic_agents import AtomicAgent
 from atomic_agents.mcp_registry import (
+    MCPRegistryDescriptorInvalid,
     MCPRegistryUnavailable,
     MCPServerRegistryBackend,
 )
@@ -595,3 +596,89 @@ def test_profile_mcp_servers_resolved_empty_when_no_mcp_md(
     resolved = getattr(agent._profile, "mcp_servers_resolved", None)
     assert resolved is not None
     assert resolved == []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 21. Descriptor-invalid propagation (from cross-model review army)
+#
+# The fail-closed wrapper at agent.py:585 was broadened from
+# ``except MCPRegistryUnavailable`` to ``except MCPRegistryError`` so
+# permanent descriptor errors (malformed mcp.md) propagate with backend_id
+# context, not just transient unreachability. Testing C3 and Adversarial F1
+# both flagged the missing test for this propagation path.
+
+
+def test_fail_closed_wraps_mcp_registry_descriptor_invalid(
+    tmp_path: pathlib.Path,
+) -> None:
+    """MCPRegistryDescriptorInvalid from load_all_mcp_servers propagates as itself.
+
+    The fail-closed wrapper preserves exception type via ``type(exc)(...)``
+    so callers can still ``except MCPRegistryDescriptorInvalid`` for parse
+    errors. The wrapped message adds the backend_id context.
+    """
+    _make_agent_root(tmp_path)
+    backend = _make_mock_backend()
+    backend.backend_id = "filesystem"
+    backend.load_all_mcp_servers.side_effect = MCPRegistryDescriptorInvalid(
+        "mcp.md section 'github' missing required 'command:' field"
+    )
+    with pytest.raises(MCPRegistryDescriptorInvalid) as excinfo:
+        AtomicAgent(
+            name="test-agent",
+            agents_root=tmp_path / "agents",
+            mcp_server_registry_backend=backend,
+        )
+    # Re-raised message includes backend_id context.
+    assert "filesystem" in str(excinfo.value)
+    # Original cause preserved via ``raise ... from exc``.
+    assert isinstance(excinfo.value.__cause__, MCPRegistryDescriptorInvalid)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 22. Empty resolved list is authoritative (Codex HIGH + Adversarial F2)
+#
+# Triple-confirmed cross-model finding. When the registry backend returns
+# an empty list, the framework MUST NOT fall back to config.mcp_servers
+# (which carries any stale mcp.md specs). The agent.py code path was
+# changed from `... or self.config.mcp_servers` to `if/else` so empty is
+# respected as the authoritative answer.
+
+
+def test_empty_resolved_list_does_not_fall_back_to_mcp_md(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Backend returning [] is authoritative even when mcp.md has servers.
+
+    Pre-fix: ``... or self.config.mcp_servers`` resurrected stale mcp.md
+    entries. Post-fix: ``if hasattr ...`` branches respect the empty list
+    as the operator's pinned-catalog answer.
+    """
+    agent_root = _make_agent_root(tmp_path)
+    # mcp.md declares one server. Without the fix this would be picked up.
+    _write_mcp_md(
+        agent_root,
+        dedent(
+            """\
+            ## stale-server
+            command: nonexistent-binary
+
+            args:
+              - --legacy
+            """
+        ),
+    )
+    # Backend returns [] (operator pinned empty catalog).
+    backend = _make_mock_backend(specs=[])
+    agent = AtomicAgent(
+        name="test-agent",
+        agents_root=tmp_path / "agents",
+        mcp_server_registry_backend=backend,
+    )
+    # Profile field is empty (authoritative).
+    resolved = getattr(agent._profile, "mcp_servers_resolved", None)
+    assert resolved == [], "backend returning [] must populate empty list on profile"
+    # Pool stays None — agent.call() not invoked here, but the consumption
+    # site at agent.py:3367 now uses the resolved list ([]) and skips the
+    # pool spin-up. The stale-server from mcp.md is NOT in the resolved list.
+    assert agent.mcp_pool is None

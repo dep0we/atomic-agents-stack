@@ -74,6 +74,7 @@ from .corpus import (
     get_default_corpus_backend,
 )
 from .mcp_registry import (
+    MCPRegistryError,
     MCPRegistryUnavailable,
     MCPServerRegistryBackend,
     _redact_for_error_message as _redact_mcp_registry_url,
@@ -582,10 +583,17 @@ class AtomicAgent:
             _materialized_mcp_specs = (
                 self.mcp_server_registry_backend.load_all_mcp_servers()
             )
-        except MCPRegistryUnavailable as exc:
-            raise MCPRegistryUnavailable(
-                f"[{self.mcp_server_registry_backend.backend_id}] catalog unreachable at "
-                f"agent construction: {_redact_mcp_registry_url(str(exc))}"
+        except MCPRegistryError as exc:
+            # Catch MCPRegistryError broadly (covers MCPRegistryUnavailable,
+            # MCPRegistryDescriptorInvalid, MCPRegistryAuthRequired). Re-raise
+            # preserving the original exception type so callers can distinguish
+            # transient (Unavailable) from permanent (DescriptorInvalid).
+            _safe_backend_id = getattr(
+                self.mcp_server_registry_backend, "backend_id", "unknown"
+            )
+            raise type(exc)(
+                f"[{_safe_backend_id}] catalog probe failed at agent "
+                f"construction: {_redact_mcp_registry_url(str(exc))}"
             ) from exc
         # Populate mcp_servers_resolved on the profile via replace().
         # Stream 2 adds the mcp_servers_resolved field to AgentProfile; this
@@ -3364,10 +3372,24 @@ class AtomicAgent:
             # substrate-agnostic spec list. AgentConfig.mcp_servers stays as
             # self._profile.mcp_servers (the filesystem-parse path) for backward
             # compat on existing log/audit consumers.
-            _resolved_mcp_specs = list(
-                getattr(self._profile, "mcp_servers_resolved", None)
-                or self.config.mcp_servers
-            )
+            #
+            # IMPORTANT: an empty resolved list is AUTHORITATIVE, not a
+            # missing-field signal. If the registry backend genuinely returns
+            # [] (e.g., operator pinned an HTTP catalog that lists zero MCP
+            # servers for this agent_scope), we MUST NOT fall back to
+            # config.mcp_servers (which may carry stale mcp.md specs). Cross-
+            # model review (Codex + Claude adversarial + plan-subagent prep
+            # pass) all flagged the `... or self.config.mcp_servers` fallback
+            # as the highest-priority issue: it lets the framework launch
+            # subprocesses the backend explicitly removed. The check below
+            # uses `hasattr` to distinguish "field missing entirely" from
+            # "field present but empty" -- the field is added in this same
+            # PR's Stream 2, so post-merge this always uses the resolved
+            # path.
+            if hasattr(self._profile, "mcp_servers_resolved"):
+                _resolved_mcp_specs = list(self._profile.mcp_servers_resolved)
+            else:
+                _resolved_mcp_specs = list(self.config.mcp_servers)
             if _resolved_mcp_specs and self.mcp_pool is None:
                 # ── #89 PR 3b: Policy MCP-allowlist consultation ────────
                 # Consult Policy on each declared server. Emit a

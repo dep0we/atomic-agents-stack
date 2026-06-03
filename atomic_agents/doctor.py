@@ -2713,8 +2713,6 @@ def check_mcp_server_registry_backend(agent_root: Path) -> CheckResult:
     and ``check_tool_registry_backend``. ``run_doctor`` then exercises the
     backend through the agent's actual construction path.
     """
-    import os
-
     from .mcp_registry import (
         MCPRegistryError,
         MCPRegistryUnavailable,
@@ -2722,6 +2720,7 @@ def check_mcp_server_registry_backend(agent_root: Path) -> CheckResult:
         get_default_mcp_server_registry_backend,
         list_mcp_server_registry_backends,
     )
+    from .mcp_registry.backend import MCPRegistryDescriptorInvalid
 
     raw = (
         os.environ.get("ATOMIC_AGENTS_MCP_SERVER_REGISTRY_BACKEND", "").strip().lower()
@@ -2778,9 +2777,57 @@ def check_mcp_server_registry_backend(agent_root: Path) -> CheckResult:
         return CheckResult(
             name="mcp-server-registry-backend",
             status=FAIL,
-            message=(f"backend {backend_id!r} probe raised {type(exc).__name__}"),
+            message=(
+                f"backend {backend_id!r} probe raised {type(exc).__name__}: {exc}"
+            ),
             fix_hint="See logs for the exception details.",
             detail={"backend_id": backend_id},
+        )
+
+    # Predict agent-construction success: AtomicAgent.__init__ calls
+    # load_all_mcp_servers() at construction (spec/36 framework invariant).
+    # list_mcp_servers() above swallows parse errors and returns [], so a
+    # malformed mcp.md would PASS doctor but crash construction. Probe
+    # load_all_mcp_servers() here to catch descriptor errors that
+    # list_mcp_servers() hides. WARN on transient (already caught above);
+    # FAIL on permanent descriptor invalidity.
+    try:
+        backend.load_all_mcp_servers()
+    except MCPRegistryDescriptorInvalid as exc:
+        return CheckResult(
+            name="mcp-server-registry-backend",
+            status=FAIL,
+            message=(
+                f"{backend_id!r} backend has malformed descriptor: "
+                f"{_redact_for_error_message(str(exc))}"
+            ),
+            fix_hint=(
+                "Fix the descriptor (mcp.md sections require 'command:'). "
+                "Doctor probes this to predict agent construction; without "
+                "the fix every AtomicAgent for this agent will fail at "
+                "construction with MCPRegistryDescriptorInvalid."
+            ),
+            detail={"backend_id": backend_id, "mcp_server_count": len(refs)},
+        )
+    except MCPRegistryUnavailable:
+        # Transient failure during materialization; the list path already
+        # returned successfully so the backend is reachable but a server
+        # spec resolution (env var, validation) failed transiently. Treat
+        # as WARN, not FAIL: an operator may resolve by exporting the
+        # missing env var.
+        return CheckResult(
+            name="mcp-server-registry-backend",
+            status=WARN,
+            message=(
+                f"backend {backend_id!r} list ok but load_all_mcp_servers() "
+                f"raised transient failure (env var or validation)"
+            ),
+            fix_hint=(
+                "Verify required env vars are set in the doctor process. "
+                "Agent construction will fail with the same error until "
+                "resolved."
+            ),
+            detail={"backend_id": backend_id, "mcp_server_count": len(refs)},
         )
 
     caps = backend.capabilities

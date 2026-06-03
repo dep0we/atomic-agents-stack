@@ -365,9 +365,7 @@ class FilesystemMCPServerRegistryBackend:
                 )
                 continue
             resolved_env = _resolve_env_vars(spec.env, spec.name)
-            from dataclasses import replace as _dc_replace
-
-            materialized_spec = _dc_replace(spec, env=resolved_env)
+            materialized_spec = replace(spec, env=resolved_env)
             if self._read_paths:
                 validate_mcp_server_args(materialized_spec, self._read_paths)
             materialized.append(materialized_spec)
