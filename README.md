@@ -282,7 +282,7 @@ Same pattern for OpenAI (`atomic-agents-openai`) and Moonshot (`atomic-agents-mo
 ## Repository structure
 
 - `atomic_agents/` — the Python package (runtime in `agent.py`; backend protocols in `memory/`, `_llm.py`, `_locks.py`, `_costs.py`, etc.; CLI in `cli.py`; preflight in `doctor.py`)
-- `tests/` 3153 tests collected (3101 passing + 52 skipped), Python 3.11 + 3.12 matrix
+- `tests/` 3199 tests collected (3141 passing + 58 skipped), Python 3.11 + 3.12 matrix
 - `docs/` — [spec entry point](docs/README.md), [`architecture.md`](docs/architecture.md), [`spec/`](docs/spec/) (31 locked docs + 4 RFCs/DRAFTs), [`deployment/`](docs/deployment/) (8 operator runbooks), [`samples/caldwell/`](docs/samples/caldwell/) (complete worked example), [`GOVERNANCE.md`](docs/GOVERNANCE.md), [`TENSIONS.md`](docs/TENSIONS.md), [`methodology.md`](docs/methodology.md)
 - `extras/` — operational templates (Claude Code skill wrappers, macOS LaunchAgent plists, cron examples)
 
@@ -313,4 +313,4 @@ Before opening a PR, read [`CLAUDE.md`](CLAUDE.md) (the project's design ethos a
 
 ## Status
 
-**v0.13.0, alpha.** Core runtime stable. 3153 tests collected (3101 passing + 52 skipped) on Python 3.11 / 3.12. Eleven of twelve backend protocols shipped (see the backend protocols table above); `MCPServerRegistryBackend` planned. The surface stabilizes at v1.0. Pre-1.0 — Minor releases may contain breaking changes (see [`docs/deployment/versioning.md`](docs/deployment/versioning.md)). Single-maintainer project; reference implementation anyone can use, fork, or extend.
+**v0.13.0, alpha.** Core runtime stable. 3199 tests collected (3141 passing + 58 skipped) on Python 3.11 / 3.12. Eleven of twelve backend protocols shipped (see the backend protocols table above); `MCPServerRegistryBackend` planned. The surface stabilizes at v1.0. Pre-1.0 — Minor releases may contain breaking changes (see [`docs/deployment/versioning.md`](docs/deployment/versioning.md)). Single-maintainer project; reference implementation anyone can use, fork, or extend.
