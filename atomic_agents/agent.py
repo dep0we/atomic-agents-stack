@@ -73,6 +73,13 @@ from .corpus import (
     CorpusBackend,
     get_default_corpus_backend,
 )
+from .mcp_registry import (
+    MCPRegistryError,
+    MCPRegistryUnavailable,
+    MCPServerRegistryBackend,
+    _redact_for_error_message as _redact_mcp_registry_url,
+    get_default_mcp_server_registry_backend,
+)
 from .logs.types import (
     PRIMITIVE_AGENT_CALL,
     PRIMITIVE_CAPTURE,
@@ -266,6 +273,13 @@ class AtomicAgent:
     # ``CorpusBackend`` Protocol implementer -- breaking the
     # operator-pinned-SQLite/pgvector case PR 3 forward.
     corpus_backend: CorpusBackend
+    # Same class-level annotation rationale for ``mcp_server_registry_backend``
+    # (#201 PR 2). Without this, static analysis would narrow
+    # ``agent.mcp_server_registry_backend`` to the concrete
+    # ``FilesystemMCPServerRegistryBackend`` default rather than treating
+    # it as any ``MCPServerRegistryBackend`` Protocol implementer --
+    # breaking the operator-pinned-HTTP/SaaS case PR 4 forward.
+    mcp_server_registry_backend: MCPServerRegistryBackend
     """The main agent runtime.
 
     Responsible for:
@@ -293,6 +307,7 @@ class AtomicAgent:
         policy_backend: PolicyBackend | None = None,
         persona_backend: PersonaBackend | None = None,
         corpus_backend: CorpusBackend | None = None,
+        mcp_server_registry_backend: MCPServerRegistryBackend | None = None,
     ):
         self.name = name
         self.trigger = trigger
@@ -527,6 +542,65 @@ class AtomicAgent:
                 persona_user=_persona.user,
                 agent_mode=parse_agent_mode_text(_persona.identity),  # re-derive
             )
+
+        # ── MCPServerRegistryBackend resolution (#201 PR 2 of 5) ──────────────
+        # Mirrors PersonaBackend's _persona_backend_was_explicit pattern at
+        # agent.py:443-450 and CorpusBackend's at agent.py:458-465. MCP catalog
+        # is per-agent semantic context (per spec/36 Decision 1); delegate
+        # threading is explicit-only.
+        #
+        # Unlike other backends, the default-resolution factory needs read_paths
+        # from self._profile.tool_config['read_paths'], which is only available
+        # after profile load. The resolution therefore happens here in __init__
+        # AFTER profile load and BEFORE _load_config() is called, rather than
+        # inside _load_config() (which is a pure reader of self._profile).
+        # This is spec/36 line 599 corrected (the spec text says _load_config()
+        # but the actual right place is __init__; spec doc gets a one-sentence
+        # amendment in this same PR).
+        _mcp_server_registry_backend_was_explicit = (
+            mcp_server_registry_backend is not None
+        )
+        read_paths_for_mcp_registry = self._profile.tool_config.get("read_paths", [])
+        if mcp_server_registry_backend is None:
+            self.mcp_server_registry_backend = get_default_mcp_server_registry_backend(
+                self.agent_root,
+                read_paths_for_mcp_registry,
+            )
+        else:
+            self.mcp_server_registry_backend = mcp_server_registry_backend
+        # Saved on self so delegate() can consult it without re-checking the
+        # constructor kwarg (the kwarg is no longer in scope there).
+        self._mcp_server_registry_backend_was_explicit = (
+            _mcp_server_registry_backend_was_explicit
+        )
+
+        # Probe + augment profile per spec/36 framework-level invariant (line
+        # 520-522). NO try/except around load_all_mcp_servers -- fail-closed:
+        # MCPRegistryUnavailable propagates. The wrapper below adds the
+        # backend_id + redacted URL context for operator-facing messages per
+        # spec/36 MUST 4 + line 522.
+        try:
+            _materialized_mcp_specs = (
+                self.mcp_server_registry_backend.load_all_mcp_servers()
+            )
+        except MCPRegistryError as exc:
+            # Catch MCPRegistryError broadly (covers MCPRegistryUnavailable,
+            # MCPRegistryDescriptorInvalid, MCPRegistryAuthRequired). Re-raise
+            # preserving the original exception type so callers can distinguish
+            # transient (Unavailable) from permanent (DescriptorInvalid).
+            _safe_backend_id = getattr(
+                self.mcp_server_registry_backend, "backend_id", "unknown"
+            )
+            raise type(exc)(
+                f"[{_safe_backend_id}] catalog probe failed at agent "
+                f"construction: {_redact_mcp_registry_url(str(exc))}"
+            ) from exc
+        # Populate mcp_servers_resolved on the profile via replace().
+        # Stream 2 adds the mcp_servers_resolved field to AgentProfile; this
+        # replace() call is a no-op on the field until Stream 2 merges.
+        self._profile = self._profile.replace(
+            mcp_servers_resolved=_materialized_mcp_specs,
+        )
 
         # Per-agent target extractor registry (spec/29 §"Target extraction",
         # #124 PR 3a). MUST initialize BEFORE tool_registry loading below so
@@ -3291,7 +3365,32 @@ class AtomicAgent:
             # Only spin up when mcp.md declares servers and pool not yet live.
             # Discover tools and register them into the tool registry before
             # the first LLM call so the model sees the full tool list.
-            if self.config.mcp_servers and self.mcp_pool is None:
+            #
+            # Per spec/36 framework invariant (line 520): MCPClientPool consumes
+            # mcp_servers_resolved (the materialized list from the registry
+            # backend, populated in __init__ via replace()). This is the
+            # substrate-agnostic spec list. AgentConfig.mcp_servers stays as
+            # self._profile.mcp_servers (the filesystem-parse path) for backward
+            # compat on existing log/audit consumers.
+            #
+            # IMPORTANT: an empty resolved list is AUTHORITATIVE, not a
+            # missing-field signal. If the registry backend genuinely returns
+            # [] (e.g., operator pinned an HTTP catalog that lists zero MCP
+            # servers for this agent_scope), we MUST NOT fall back to
+            # config.mcp_servers (which may carry stale mcp.md specs). Cross-
+            # model review (Codex + Claude adversarial + plan-subagent prep
+            # pass) all flagged the `... or self.config.mcp_servers` fallback
+            # as the highest-priority issue: it lets the framework launch
+            # subprocesses the backend explicitly removed. The check below
+            # uses `hasattr` to distinguish "field missing entirely" from
+            # "field present but empty" -- the field is added in this same
+            # PR's Stream 2, so post-merge this always uses the resolved
+            # path.
+            if hasattr(self._profile, "mcp_servers_resolved"):
+                _resolved_mcp_specs = list(self._profile.mcp_servers_resolved)
+            else:
+                _resolved_mcp_specs = list(self.config.mcp_servers)
+            if _resolved_mcp_specs and self.mcp_pool is None:
                 # ── #89 PR 3b: Policy MCP-allowlist consultation ────────
                 # Consult Policy on each declared server. Emit a
                 # policy_decision event (axis=mcp_allowlist) per denied
@@ -3299,7 +3398,7 @@ class AtomicAgent:
                 # default) all configured servers still connect; in
                 # enforcement mode denied servers are filtered out before
                 # the pool spins up so we don't pay the subprocess cost.
-                effective_mcp_specs = self.config.mcp_servers
+                effective_mcp_specs = _resolved_mcp_specs
                 pol_snap = self._policy_snapshot_this_call
                 if pol_snap is not None and pol_snap.mcp_allow_fn is not None:
                     from .policy.types import (
@@ -3308,7 +3407,7 @@ class AtomicAgent:
                     )
 
                     allowed_specs = []
-                    for _spec in self.config.mcp_servers:
+                    for _spec in _resolved_mcp_specs:
                         if pol_snap.mcp_allow_fn(_spec.name):
                             allowed_specs.append(_spec)
                             continue
@@ -4649,6 +4748,10 @@ class AtomicAgent:
             _delegate_kwargs["persona_backend"] = self.persona_backend
         if self._corpus_backend_was_explicit:
             _delegate_kwargs["corpus_backend"] = self.corpus_backend
+        if self._mcp_server_registry_backend_was_explicit:
+            _delegate_kwargs["mcp_server_registry_backend"] = (
+                self.mcp_server_registry_backend
+            )
         target_agent = AtomicAgent(**_delegate_kwargs)
 
         start = time.time()

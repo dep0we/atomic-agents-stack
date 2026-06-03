@@ -34,7 +34,6 @@ from .backend import (
     MCPRegistryDescriptorInvalid,
     MCPRegistryUnavailable,
     MCPServerNotInRegistry,
-    _default_load_all,
 )
 from .types import MCPServerRef, MCPServerRegistryCapabilities, ValidationResult
 
@@ -170,13 +169,15 @@ class FilesystemMCPServerRegistryBackend:
 
         try:
             content = mcp_md.read_text(encoding="utf-8")
-        except OSError as exc:
-            _logger.warning(
-                "FilesystemMCPServerRegistryBackend: cannot read %s: %s",
-                mcp_md,
-                exc,
-            )
+        except FileNotFoundError:
+            # ENOENT: race between exists() check above and read; treat as absent.
             return []
+        except OSError as exc:
+            # Non-ENOENT (PermissionError, IsADirectoryError, etc.): transient
+            # configuration error. Mirror load_mcp_server's MCPRegistryUnavailable
+            # path (filesystem.py lines for load_mcp_server) for symmetry and to
+            # surface the failure to PR 2's fail-closed wiring in agent.py:__init__.
+            raise MCPRegistryUnavailable(f"cannot read {mcp_md}: {exc}") from exc
 
         try:
             specs = parse_mcp_md_text(
@@ -315,14 +316,63 @@ class FilesystemMCPServerRegistryBackend:
     def load_all_mcp_servers(self) -> list[MCPServerSpec]:
         """Return all mounted ``MCPServerSpec`` instances in bulk.
 
-        Delegates to ``_default_load_all`` per prep-pass Theme 4. This
-        preserves MUST 10 consistency automatically: the output is
-        semantically equivalent to ``[load_mcp_server(ref.name) for ref in
-        list_mcp_servers()]`` by construction.
+        Reads mcp.md once and parses, then resolves env vars per spec
+        (Decision 7). Distinct from the default ``_default_load_all`` (which
+        iterates ``list_mcp_servers`` then calls ``load_mcp_server`` per ref)
+        because that pattern masks transient and parse failures:
+        ``list_mcp_servers`` used to catch all OSError before the PR 2 fix.
+        The single read-parse here maps:
+          - ENOENT: empty list (correct -- "no mcp.md is not a probe failure")
+          - Other OSError: MCPRegistryUnavailable (transient)
+          - Parse error: MCPRegistryDescriptorInvalid (permanent descriptor problem)
+          - Env-var unresolvable: MCPServerConnectFailed per spec/19
 
-        HTTP backend overrides this with a single bulk GET at PR 4.
+        PR 2 framework-level fail-closed semantic (spec/36) depends on these
+        distinct exceptions surfacing correctly.
         """
-        return _default_load_all(self)
+        mcp_md = self._agent_root / "mcp.md"
+        if not mcp_md.exists():
+            return []
+
+        try:
+            content = mcp_md.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return []
+        except OSError as exc:
+            raise MCPRegistryUnavailable(f"cannot read {mcp_md}: {exc}") from exc
+
+        try:
+            specs = parse_mcp_md_text(
+                content,
+                mcp_md_path=mcp_md,
+                read_paths=None,
+                resolve_env=False,
+            )
+        except Exception as exc:
+            raise MCPRegistryDescriptorInvalid(
+                f"mcp.md at {mcp_md} could not be parsed: {exc}"
+            ) from exc
+
+        materialized = []
+        for spec in specs:
+            try:
+                _validate_server_name(spec.name)
+            except ValueError:
+                _logger.warning(
+                    "FilesystemMCPServerRegistryBackend: skipping malformed "
+                    "section name %r in mcp.md (failed charset validation)",
+                    spec.name,
+                )
+                continue
+            resolved_env = _resolve_env_vars(spec.env, spec.name)
+            materialized_spec = replace(spec, env=resolved_env)
+            if self._read_paths:
+                validate_mcp_server_args(materialized_spec, self._read_paths)
+            materialized.append(materialized_spec)
+
+        # Sort lexicographically per MUST 5 (consistent with list_mcp_servers).
+        materialized.sort(key=lambda s: s.name)
+        return materialized
 
     def validate(self, name: str) -> ValidationResult:
         """Static check of the named server descriptor.

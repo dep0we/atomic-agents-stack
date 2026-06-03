@@ -24,6 +24,7 @@ from .exceptions import (
     NotInRoster,
     SelfDelegationError,
 )
+from .mcp_registry import MCPRegistryError
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -35,10 +36,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--target", required=True, help="target agent name")
     parser.add_argument("--work-item", required=True, help="work item text")
     parser.add_argument(
-        "--critical", action="store_true",
+        "--critical",
+        action="store_true",
         help="bypass cost guardrails (still logged)",
     )
-    parser.add_argument("--agents-root", default=None, help="override ATOMIC_AGENTS_ROOT")
+    parser.add_argument(
+        "--agents-root", default=None, help="override ATOMIC_AGENTS_ROOT"
+    )
 
     args = parser.parse_args(argv)
     agents_root = (
@@ -58,7 +62,12 @@ def main(argv: list[str] | None = None) -> int:
             work_item=args.work_item,
             critical=args.critical,
         )
-    except (NotInRoster, SelfDelegationError, CostGuardrailBlocked) as e:
+    except (
+        NotInRoster,
+        SelfDelegationError,
+        CostGuardrailBlocked,
+        MCPRegistryError,
+    ) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
     except AtomicAgentsError as e:

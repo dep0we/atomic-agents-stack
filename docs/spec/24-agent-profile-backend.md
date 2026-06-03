@@ -58,6 +58,16 @@ The `AgentProfile` dataclass carries **both** the structured form (`model_config
 
 **There is no `renderers.py`.** The filesystem backend writes raw text via `_io.atomic_write`. A future canonical render layer (if a database backend needs to export back to markdown for migration) is the right place for renderers, with eyes-open about the loss surface.
 
+**D1 addendum (#201 PR 2 of 5):** In addition to `mcp_servers` (the declared server set parsed from mcp.md, or the equivalent for the active profile backend), `AgentProfile` carries a sibling field `mcp_servers_resolved: list[MCPServerSpec]` with a default of `[]`.
+
+This field is populated by the framework integration layer in `agent.py:__init__` via `dataclasses.replace()` AFTER `load_profile()` returns and BEFORE `_load_config()` builds the AgentConfig. The source is `MCPServerRegistryBackend.load_all_mcp_servers()` (spec/36 Decision 9 framework invariant), making the field substrate-agnostic by construction. Backends MUST NOT populate this field themselves; they own `mcp_servers` (their substrate's parse output) only.
+
+For backward compatibility, `mcp_md_raw` and `mcp_servers` remain the canonical filesystem-backend write-back fields. The Decision 1 invariant (no resolved secrets in `mcp_md_raw`) stays intact.
+
+**Snapshot serialization (PR 2 locked):** `AgentProfile.to_dict()` always emits `"mcp_servers_resolved": []` regardless of the field's runtime value. The field is a framework-populated runtime transient that re-populates from the registry backend at next agent construction. Serializing real values would write resolved MCP `env` secrets into snapshot JSON files on disk, contradicting the security intent of Decision 1's raw-text shadow design. Audit of "what specs ran at time T" flows through agent.call() logs (which can redact appropriately), not through snapshots.
+
+**SQLite schema (PR 2 verified):** The new field rides through the existing `profile_json` blob column via `to_dict()`/`from_dict()`. Zero schema migration required. Schema version stays at v2 (the persona migration version from #62). Backward compat: old profiles loaded with `from_dict()` get `mcp_servers_resolved=[]` via the field's `default_factory=list` since the JSON dict lacks the key.
+
 ### Decision 2: Skills are separate Protocol methods, not a profile field
 
 `AgentProfileBackend.list_skills(agent_id)` and `load_skill_body(agent_id, skill_name)` are separate Protocol methods. `AgentProfile` does NOT carry a `skills: list[SkillManifest]` field.

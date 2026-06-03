@@ -207,7 +207,7 @@ uv run pytest                            # full suite
 uv run pytest tests/test_<module>.py -v  # one module
 ```
 
-Run `uv run pytest --collect-only -q | tail -1` for the live test count (last refresh: 3,153 tests collected, 2026-06-03). New backend protocols add ~25 conformance + ~10 impl-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol — the conformance suite is what keeps the protocol honest.
+Run `uv run pytest --collect-only -q | tail -1` for the live test count (last refresh: 3,199 tests collected, 2026-06-03). New backend protocols add ~25 conformance + ~10 impl-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol — the conformance suite is what keeps the protocol honest.
 
 ### Releases + SemVer
 
@@ -341,7 +341,7 @@ These are not forbidden forever — they're explicitly deferred with rationale. 
 
 ## Status
 
-**v0.13.0, alpha, PUBLIC.** Core runtime stable. Test suite: run `uv run pytest --collect-only -q | tail -1` for the live count (last refresh: 3,153 tests collected, 2026-06-03). Capability-gated skips fall into four buckets — ToolRegistry conformance (filesystem-shape + `supports_uninstall=False` variants), AgentProfile (skill-content + filesystem-shape on SQLite), cross-process Redis (require real Redis instead of fakeredis), and judge-conformance dispatch (LLM-only + PolicyJudge concurrent-evaluate). Full CI runs against `uv sync --extra dev --extra openai --extra validation --extra redis`. **Eleven backend protocols shipped**:
+**v0.13.0, alpha, PUBLIC.** Core runtime stable. Test suite: run `uv run pytest --collect-only -q | tail -1` for the live count (last refresh: 3,199 tests collected, 2026-06-03). Capability-gated skips fall into four buckets — ToolRegistry conformance (filesystem-shape + `supports_uninstall=False` variants), AgentProfile (skill-content + filesystem-shape on SQLite), cross-process Redis (require real Redis instead of fakeredis), and judge-conformance dispatch (LLM-only + PolicyJudge concurrent-evaluate). Full CI runs against `uv sync --extra dev --extra openai --extra validation --extra redis`. **Eleven backend protocols shipped**:
 
 - **MemoryBackend** (PR #57) — filesystem reference impl + conformance suite.
 - **LLMBackend** (#87) — Anthropic + OpenAI + Moonshot reference impls, registered at framework import; conformance suite parametrizes across all three.
