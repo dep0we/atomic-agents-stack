@@ -210,10 +210,9 @@ def test_eval_runner_accepts_mcp_kwarg(tmp_path: pathlib.Path) -> None:
     (evals_dir / "rubric.md").write_text(
         dedent("""\
             ---
-            threshold: 0.8
-            criteria:
-              quality:
-                weight: 1.0
+            threshold_pass: 4.0
+            weights:
+              quality: 100
             ---
             # Rubric
         """),
@@ -246,10 +245,9 @@ def test_eval_runner_threads_mcp_kwarg_to_internal_agent(
     (evals_dir / "rubric.md").write_text(
         dedent("""\
             ---
-            threshold: 0.8
-            criteria:
-              quality:
-                weight: 1.0
+            threshold_pass: 4.0
+            weights:
+              quality: 100
             ---
             # Rubric
         """),
