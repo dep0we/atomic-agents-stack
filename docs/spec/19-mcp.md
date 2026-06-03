@@ -1,7 +1,7 @@
 # spec/19 — MCP (Model Context Protocol) Client Support
 
 > Status: **implemented** (PR feat/mcp-support; fixes in PR fix/mcp-review-findings)
-> Cross-links: spec/17 (custom tools — MCP composes with this), [MCP official spec](https://spec.modelcontextprotocol.io/)
+> Cross-links: spec/17 (custom tools — MCP composes with this), [MCP official spec](https://spec.modelcontextprotocol.io/), [spec/36](36-mcp-server-registry-backend.md) (MCPServerRegistryBackend — catalog + install/audit for MCP servers, the MCP equivalent of the ToolRegistry pattern; DRAFT, tracking [#201](https://github.com/dep0we/atomic-agents-stack/issues/201))
 
 ## Why MCP
 
