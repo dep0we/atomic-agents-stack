@@ -40,6 +40,7 @@ from .tools import ToolDefinition
 
 _logger = logging.getLogger(__name__)
 
+
 # Detect path-shaped args. A path-shaped arg is one that:
 #   - starts with /  (absolute POSIX path)
 #   - starts with ~  (home-relative path)
@@ -80,6 +81,7 @@ def _is_path_shaped(arg: str) -> bool:
 
 # ──────────────────────────────────────────────────────────────────
 # Data classes
+
 
 @dataclass
 class MCPServerSpec:
@@ -123,6 +125,7 @@ class MCPToolMeta:
 # ──────────────────────────────────────────────────────────────────
 # MCPClientPool
 
+
 class MCPClientPool:
     """Per-agent pool of connected MCP server clients.
 
@@ -153,19 +156,24 @@ class MCPClientPool:
             if spec.transport != "stdio":
                 _logger.warning(
                     "MCP server %r: transport %r not supported in v1 (stdio only). Skipping.",
-                    spec.name, spec.transport,
+                    spec.name,
+                    spec.transport,
                 )
                 continue
             try:
                 conn = _connect_sync(spec)
                 self._connected[spec.name] = conn
-                _logger.debug("MCP server %r connected (%d tools)", spec.name, len(conn.tools))
+                _logger.debug(
+                    "MCP server %r connected (%d tools)", spec.name, len(conn.tools)
+                )
             except MCPServerConnectFailed as e:
                 _logger.warning("MCP server %r failed to connect: %s", spec.name, e)
             except Exception as e:
                 _logger.warning(
                     "MCP server %r unexpected error during connect: %s: %s",
-                    spec.name, type(e).__name__, e,
+                    spec.name,
+                    type(e).__name__,
+                    e,
                 )
 
     def disconnect_all(self) -> None:
@@ -219,14 +227,19 @@ class MCPClientPool:
                 if "properties" not in input_schema:
                     input_schema["properties"] = {}
 
-                description = tool.description or f"MCP tool '{tool.name}' from server '{server_name}'."
+                description = (
+                    tool.description
+                    or f"MCP tool '{tool.name}' from server '{server_name}'."
+                )
 
-                definitions.append(ToolDefinition(
-                    name=qualified,
-                    description=description,
-                    input_schema=input_schema,
-                    handler=handler,
-                ))
+                definitions.append(
+                    ToolDefinition(
+                        name=qualified,
+                        description=description,
+                        input_schema=input_schema,
+                        handler=handler,
+                    )
+                )
 
         return definitions
 
@@ -237,6 +250,7 @@ class MCPClientPool:
 
 # ──────────────────────────────────────────────────────────────────
 # Internal connection state
+
 
 class _ServerConnection:
     """Holds live connection state for one server.
@@ -258,8 +272,8 @@ class _ServerConnection:
 
     def __init__(self, spec: MCPServerSpec, tools: list) -> None:
         self.spec = spec
-        self.tools = tools          # list[mcp.types.Tool]
-        self._process: Any = None   # subprocess.Popen, set by _connect_sync
+        self.tools = tools  # list[mcp.types.Tool]
+        self._process: Any = None  # subprocess.Popen, set by _connect_sync
 
 
 def _connect_sync(spec: MCPServerSpec) -> _ServerConnection:
@@ -407,14 +421,23 @@ def _extract_content_value(content: list) -> Any:
 # ──────────────────────────────────────────────────────────────────
 # mcp.md parser
 
+
 def parse_mcp_md(path: Path, read_paths: list | None = None) -> list[MCPServerSpec]:
     """Parse <agent>/mcp.md into a list of MCPServerSpec.
 
-    Empty list if file doesn't exist (agent has no MCP servers — that's fine).
+    Empty list if file doesn't exist (agent has no MCP servers -- that's fine).
 
     read_paths: if provided, path-shaped args are validated against these roots
         via validate_mcp_server_args(). PathTraversalError is raised if any arg
         resolves outside all declared read_paths.
+
+    This function always resolves $VAR env references (resolve_env=True).
+    Callers that need lazy resolution (e.g., FilesystemMCPServerRegistryBackend,
+    which resolves at load_mcp_server time per spec/36 Decision 7) MUST call
+    parse_mcp_md_text() directly with resolve_env=False. The asymmetry is
+    intentional: parse_mcp_md is the public convenience path for callers that
+    want a ready-to-use spec list; parse_mcp_md_text is the knob-bearing path
+    for callers that need deferred resolution.
     """
     if not path.exists():
         return []
@@ -429,6 +452,8 @@ def parse_mcp_md_text(
     text: str,
     mcp_md_path: Path | None = None,
     read_paths: list | None = None,
+    *,
+    resolve_env: bool = True,
 ) -> list[MCPServerSpec]:
     """Parse mcp.md content into a list of MCPServerSpec.
 
@@ -454,12 +479,21 @@ def parse_mcp_md_text(
     - transport: "stdio" (default; only supported value in v1)
     - description: human-readable note
 
-    Raises MCPServerConnectFailed when an env var reference cannot be resolved.
+    Raises MCPServerConnectFailed when an env var reference cannot be resolved
+    (only when resolve_env=True).
 
     read_paths: if provided, each parsed spec is immediately passed to
         validate_mcp_server_args(). Path-shaped args (starting with /, ~, ./, ../,
         or containing ..) that resolve outside all declared read_paths raise
         PathTraversalError, named with the offending server and arg.
+
+    resolve_env: when True (default), $VAR references in env: lines are
+        resolved against os.environ immediately, raising MCPServerConnectFailed
+        on unresolvable references. When False, $VAR strings are kept as-is in
+        the returned specs (raw strings like "$GITHUB_PAT"). Pass False when
+        deferring resolution to a later call site (e.g.,
+        FilesystemMCPServerRegistryBackend.load_mcp_server resolves at
+        materialization time per spec/36 Decision 7).
     """
     if not text or not text.strip():
         return []
@@ -471,7 +505,7 @@ def parse_mcp_md_text(
     def _flush() -> None:
         if current_name is None:
             return
-        spec = _build_spec(current_name, current_fields)
+        spec = _build_spec(current_name, current_fields, resolve_env=resolve_env)
         if spec is not None:
             specs.append(spec)
 
@@ -516,6 +550,7 @@ def parse_mcp_md_text(
             except Exception as exc:
                 # Re-raise with server name context for clarity
                 from .exceptions import PathTraversalError
+
                 if isinstance(exc, PathTraversalError):
                     raise PathTraversalError(
                         f"mcp.md server '{spec.name}': {exc}",
@@ -527,25 +562,65 @@ def parse_mcp_md_text(
     return specs
 
 
-def _build_spec(name: str, fields: dict[str, list[str]]) -> MCPServerSpec | None:
+def _resolve_env_vars(env: dict[str, str], server_name: str) -> dict[str, str]:
+    """Resolve $VAR references in env dict against os.environ.
+
+    Raises MCPServerConnectFailed with the spec/19-documented message shape
+    on unresolvable references. Used by _build_spec (when resolve_env=True)
+    and FilesystemMCPServerRegistryBackend.load_mcp_server (which calls it
+    after a resolve_env=False parse so that resolution happens at
+    load_mcp_server time per spec/36 Decision 7).
+
+    Sharing this helper between the two call sites ensures the error message
+    shape is canonical -- a second inline implementation would risk diverging.
+    """
+    resolved: dict[str, str] = {}
+    for key, val in env.items():
+        if val.startswith("$"):
+            var_name = val[1:]
+            resolved_val = os.environ.get(var_name)
+            if resolved_val is None:
+                raise MCPServerConnectFailed(
+                    f"mcp.md server '{server_name}': env var '${var_name}' not set. "
+                    f"Set {var_name} in the environment before running this agent."
+                )
+            resolved[key] = resolved_val
+        else:
+            resolved[key] = val
+    return resolved
+
+
+def _build_spec(
+    name: str,
+    fields: dict[str, list[str]],
+    *,
+    resolve_env: bool = True,
+) -> MCPServerSpec | None:
     """Build an MCPServerSpec from parsed key/value lines.
 
     Returns None (and logs a warning) if the section has no command.
-    Raises MCPServerConnectFailed for unresolvable env var references.
+    Raises MCPServerConnectFailed for unresolvable env var references
+    (only when resolve_env=True).
+
+    resolve_env: when True (default), $VAR references are resolved via
+        _resolve_env_vars. When False, the raw string (e.g., "$GITHUB_PAT")
+        is stored as-is in the returned spec's env dict. Callers passing
+        False are responsible for resolving at the appropriate later boundary.
     """
     command_lines = fields.get("command", [])
     if not command_lines:
-        _logger.warning("mcp.md section %r has no 'command:' key — skipping", name)
+        _logger.warning("mcp.md section %r has no 'command:' key -- skipping", name)
         return None
 
     command = command_lines[0].strip()
 
-    # Args — comma-separated on one line
+    # Args -- comma-separated on one line
     args: list[str] = []
     for args_line in fields.get("args", []):
         args.extend(part.strip() for part in args_line.split(",") if part.strip())
 
-    # Env — one or more KEY=$VAR or KEY=value pairs, one per line
+    # Env -- one or more KEY=$VAR or KEY=value pairs, one per line.
+    # Build the raw dict first (no resolution yet), then resolve when asked.
     env: dict[str, str] = {}
     for env_line in fields.get("env", []):
         for pair in env_line.split(","):
@@ -555,17 +630,10 @@ def _build_spec(name: str, fields: dict[str, list[str]]) -> MCPServerSpec | None
             env_key, _, env_val = pair.partition("=")
             env_key = env_key.strip()
             env_val = env_val.strip()
-            if env_val.startswith("$"):
-                var_name = env_val[1:]
-                resolved = os.environ.get(var_name)
-                if resolved is None:
-                    raise MCPServerConnectFailed(
-                        f"mcp.md server '{name}': env var '${var_name}' not set. "
-                        f"Set {var_name} in the environment before running this agent."
-                    )
-                env[env_key] = resolved
-            else:
-                env[env_key] = env_val
+            env[env_key] = env_val
+
+    if resolve_env:
+        env = _resolve_env_vars(env, name)
 
     transport_lines = fields.get("transport", [])
     transport = transport_lines[0].strip() if transport_lines else "stdio"
@@ -585,6 +653,7 @@ def _build_spec(name: str, fields: dict[str, list[str]]) -> MCPServerSpec | None
 
 # ──────────────────────────────────────────────────────────────────
 # Path-traversal check for MCP server args
+
 
 def validate_mcp_server_args(
     spec: MCPServerSpec,

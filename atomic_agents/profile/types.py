@@ -332,6 +332,10 @@ class AgentProfile:
             # matters because (a) future callers may pass read_paths
             # via from_dict, (b) other unexpected exceptions (yaml
             # errors, OSError) should NOT be silently swallowed.
+            # IMPORTANT: this caller MUST keep the default `resolve_env=True` because
+            # callers consuming `AgentProfile.mcp_servers` expect resolved values. Do
+            # NOT pass `resolve_env=False` here -- the AgentProfile snapshot semantic
+            # (spec/24 D1) requires resolved env vars.
             try:
                 mcp_servers = parse_mcp_md_text(mcp_md_raw)
             except MCPServerConnectFailed:
