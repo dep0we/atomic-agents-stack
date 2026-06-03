@@ -375,6 +375,70 @@ def main(argv: list[str] | None = None) -> int:
         help="override ATOMIC_AGENTS_AGENT_ROOT (default: $ATOMIC_AGENTS_AGENT_ROOT or cwd)",
     )
 
+    # ── mcp-registry subcommand group ────────────────────────────────────
+    mcp_registry_cmd = sub.add_parser(
+        "mcp-registry",
+        help="Inspect mounted MCP servers (list, show, validate, refresh-capabilities)",
+        description=(
+            "Read-only inspection of the MCP server registry for an agent. "
+            "Uses the filesystem backend by default (reads <agent-root>/mcp.md). "
+            "Override with ATOMIC_AGENTS_MCP_SERVER_REGISTRY_BACKEND env var. "
+            "Install and uninstall subcommands are deferred to PR 3."
+        ),
+    )
+    mcp_registry_sub = mcp_registry_cmd.add_subparsers(
+        dest="mcp_registry_cmd", required=True
+    )
+
+    # mcp-registry list [--agent-root PATH]
+    mcp_registry_list = mcp_registry_sub.add_parser(
+        "list",
+        help="List all mounted MCP servers (name, description, transport)",
+    )
+    mcp_registry_list.add_argument(
+        "--agent-root",
+        default=None,
+        help="override ATOMIC_AGENTS_AGENT_ROOT (default: $ATOMIC_AGENTS_AGENT_ROOT or cwd)",
+    )
+
+    # mcp-registry show <name> [--agent-root PATH]
+    mcp_registry_show = mcp_registry_sub.add_parser(
+        "show",
+        help="Show full spec for a named MCP server",
+    )
+    mcp_registry_show.add_argument("name", help="MCP server name")
+    mcp_registry_show.add_argument(
+        "--agent-root",
+        default=None,
+        help="override ATOMIC_AGENTS_AGENT_ROOT (default: $ATOMIC_AGENTS_AGENT_ROOT or cwd)",
+    )
+
+    # mcp-registry validate <name> [--agent-root PATH]
+    mcp_registry_validate = mcp_registry_sub.add_parser(
+        "validate",
+        help="Static validation of a named MCP server descriptor",
+    )
+    mcp_registry_validate.add_argument("name", help="MCP server name")
+    mcp_registry_validate.add_argument(
+        "--agent-root",
+        default=None,
+        help="override ATOMIC_AGENTS_AGENT_ROOT (default: $ATOMIC_AGENTS_AGENT_ROOT or cwd)",
+    )
+
+    # mcp-registry refresh-capabilities [--agent-root PATH]
+    mcp_registry_refresh = mcp_registry_sub.add_parser(
+        "refresh-capabilities",
+        help=(
+            "Print current backend capabilities (filesystem backend has no remote "
+            "dependency; HTTP backend at PR 4 re-probes the catalog server)"
+        ),
+    )
+    mcp_registry_refresh.add_argument(
+        "--agent-root",
+        default=None,
+        help="override ATOMIC_AGENTS_AGENT_ROOT (default: $ATOMIC_AGENTS_AGENT_ROOT or cwd)",
+    )
+
     # ── init subcommand ───────────────────────────────────────────────────
     init_cmd = sub.add_parser(
         "init",
@@ -432,6 +496,10 @@ def main(argv: list[str] | None = None) -> int:
     # It does not use the agents-root / agent-name hierarchy.
     if args.cmd == "corpus":
         return _cmd_corpus(args)
+
+    # `mcp-registry` resolves its own agent_root from --agent-root or env var / cwd.
+    if args.cmd == "mcp-registry":
+        return _cmd_mcp_registry(args)
 
     # `init` resolves its own agents_root from --agents-root or env var.
     # It does not use the agents-root / agent-name hierarchy.
@@ -1063,6 +1131,188 @@ def _cmd_init(args) -> int:
     from .init import run_init
 
     return run_init(args)
+
+
+def _resolve_mcp_registry_agent_root(args) -> Path:
+    """Resolve agent_root for mcp-registry subcommands.
+
+    Resolution order mirrors the corpus subcommand pattern:
+    1. ``--agent-root`` CLI flag (explicit wins).
+    2. ``ATOMIC_AGENTS_AGENT_ROOT`` env var.
+    3. Current working directory (``Path.cwd()``).
+    """
+    if args.agent_root is not None:
+        return Path(args.agent_root).expanduser().resolve()
+    env_val = os.environ.get("ATOMIC_AGENTS_AGENT_ROOT")
+    if env_val:
+        return Path(env_val).expanduser().resolve()
+    return Path.cwd()
+
+
+def _cmd_mcp_registry(args) -> int:
+    """Dispatch mcp-registry subcommands.
+
+    Instantiates the operator-pinned backend via
+    ``get_default_mcp_server_registry_backend(agent_root, read_paths)``,
+    which reads ``ATOMIC_AGENTS_MCP_SERVER_REGISTRY_BACKEND`` (default
+    ``"filesystem"``) so the CLI surface honours the same env-var override
+    as the runtime.
+
+    Exit codes: 0 on success, 1 on any error. Errors go to stderr;
+    normal output to stdout. Zero LLM calls -- pure local I/O.
+
+    Install and uninstall subcommands are deferred to PR 3.
+    """
+    from .mcp_registry import (
+        MCPRegistryAuthRequired,
+        MCPRegistryDescriptorInvalid,
+        MCPRegistryUnavailable,
+        MCPServerNotInRegistry,
+        get_default_mcp_server_registry_backend,
+    )
+    from .exceptions import MCPServerConnectFailed
+
+    agent_root = _resolve_mcp_registry_agent_root(args)
+
+    # Empty read_paths means the CLI skips path-traversal validation. This is
+    # consistent with the read-only inspection use case (mcp-registry show/validate/
+    # list); install/uninstall in PR 3 will require non-empty read_paths from agent
+    # runtime context.
+    try:
+        backend = get_default_mcp_server_registry_backend(agent_root, [])
+    except Exception as e:
+        print(f"Error: failed to resolve MCP registry backend: {e}", file=sys.stderr)
+        return 1
+
+    sub_cmd = args.mcp_registry_cmd
+
+    try:
+        if sub_cmd == "list":
+            return _mcp_registry_list(backend)
+        elif sub_cmd == "show":
+            return _mcp_registry_show(backend, args.name)
+        elif sub_cmd == "validate":
+            return _mcp_registry_validate(backend, args.name)
+        elif sub_cmd == "refresh-capabilities":
+            return _mcp_registry_refresh_capabilities(backend)
+    except MCPServerConnectFailed as e:
+        print(f"Error: env var not resolved: {e}", file=sys.stderr)
+        return 1
+    except MCPRegistryDescriptorInvalid as e:
+        print(f"Error: MCP server descriptor is invalid: {e}", file=sys.stderr)
+        return 1
+    except MCPRegistryAuthRequired as e:
+        print(
+            f"Error: authentication required for MCP registry backend: {e}",
+            file=sys.stderr,
+        )
+        return 1
+    except MCPRegistryUnavailable as e:
+        print(
+            f"Error: MCP registry backend temporarily unavailable: {e}",
+            file=sys.stderr,
+        )
+        return 1
+    except MCPServerNotInRegistry as e:
+        print(f"Error: MCP server not found: {e}", file=sys.stderr)
+        return 1
+    except ValueError as e:
+        print(f"Error: invalid server name: {e}", file=sys.stderr)
+        return 1
+    except (OSError, PermissionError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _mcp_registry_list(backend) -> int:
+    """List all mounted MCP servers as a table: name / description / transport."""
+    refs = backend.list_mcp_servers()
+    if not refs:
+        print("No MCP servers registered.")
+        return 0
+    name_w = max(len(r.name) for r in refs)
+    transport_w = max(len(r.transport) for r in refs)
+    header = f"{'NAME':<{name_w}}  {'TRANSPORT':<{transport_w}}  DESCRIPTION"
+    print(header)
+    print("-" * len(header))
+    for ref in refs:
+        desc = ref.description or ""
+        print(f"{ref.name:<{name_w}}  {ref.transport:<{transport_w}}  {desc}")
+    return 0
+
+
+def _mcp_registry_show(backend, name: str) -> int:
+    """Show the full MCPServerSpec for a named server as a formatted table.
+
+    We print the unresolved $VAR refs from mcp.md, NOT the resolved values
+    from load_mcp_server, to avoid leaking secrets to stdout.
+    """
+    # Call load_mcp_server first for validation: name charset check, path-traversal
+    # check, and confirmation that the server exists in the catalog. We discard the
+    # resolved spec's env (which has real secret values) and re-read raw mcp.md.
+    spec = backend.load_mcp_server(name)
+
+    # Re-parse mcp.md with resolve_env=False to get unresolved $VAR refs.
+    # This is the safe display path: operators see the wiring ($VAR names)
+    # without the resolved values being emitted to stdout.
+    unresolved_env: dict[str, str] | None = None
+    mcp_md = backend._agent_root / "mcp.md"
+    try:
+        from .mcp import parse_mcp_md_text
+
+        content = mcp_md.read_text(encoding="utf-8")
+        raw_specs = parse_mcp_md_text(content, resolve_env=False, read_paths=None)
+        for raw_spec in raw_specs:
+            if raw_spec.name == name:
+                unresolved_env = raw_spec.env
+                break
+    except Exception:
+        # If re-reading mcp.md fails (file gone between load and re-read),
+        # do NOT fall back to printing resolved values. Warn on stderr instead.
+        if spec.env:
+            print(
+                f"<env hidden: {len(spec.env)} entries; re-read of mcp.md failed>",
+                file=sys.stderr,
+            )
+
+    print(f"name:        {spec.name}")
+    print(f"command:     {spec.command}")
+    if spec.args:
+        print(f"args:        {' '.join(spec.args)}")
+    display_env = unresolved_env if unresolved_env is not None else {}
+    if display_env:
+        print("env:")
+        for k, v in display_env.items():
+            print(f"  {k}: {v}")
+    print(f"transport:   {spec.transport}")
+    if spec.description:
+        print(f"description: {spec.description}")
+    return 0
+
+
+def _mcp_registry_validate(backend, name: str) -> int:
+    """Run a static validation check on a named server descriptor."""
+    result = backend.validate(name)
+    status = "OK" if result.ok else "FAIL"
+    print(f"validate {name!r}: {status}")
+    for err in result.errors:
+        print(f"  ERROR:   {err}")
+    for warn in result.warnings:
+        print(f"  WARNING: {warn}")
+    return 0 if result.ok else 1
+
+
+def _mcp_registry_refresh_capabilities(backend) -> int:
+    """Re-probe backend capabilities and print the current view."""
+    caps = backend.refresh_capabilities()
+    print(f"backend_id:                    {backend.backend_id}")
+    print(f"supports_install:              {caps.supports_install}")
+    print(f"supports_uninstall:            {caps.supports_uninstall}")
+    print(f"supports_capability_handshake: {caps.supports_capability_handshake}")
+    print(f"supports_audit:                {caps.supports_audit}")
+    print(f"durable:                       {caps.durable}")
+    return 0
 
 
 if __name__ == "__main__":

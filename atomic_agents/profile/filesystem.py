@@ -369,6 +369,10 @@ class FilesystemAgentProfileBackend:
         # at load time. Pre-#63-PR-1-review-pass this was ``except
         # Exception`` which swallowed both — Step 9 pre-landing review
         # finding F-3.
+        # IMPORTANT: this caller MUST keep the default `resolve_env=True` because
+        # callers consuming `AgentProfile.mcp_servers` expect resolved values. Do
+        # NOT pass `resolve_env=False` here -- the AgentProfile snapshot semantic
+        # (spec/24 D1) requires resolved env vars.
         if mcp_md_raw:
             try:
                 mcp_servers = parse_mcp_md_text(

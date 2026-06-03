@@ -127,7 +127,7 @@ This is the slot in the AI-agent-tooling landscape `atomic-agents-stack` occupie
 | **Audit trail** | JSONL per run with `parent_run_id` rollups; helper + delegate + tool + capture lines all link back | Dashboards in Letta UI / cloud | Mem0 dashboards | LangSmith (hosted) | Build it |
 | **Cost guardrails** | First-class — daily / monthly caps, threshold warnings, fallback action, `critical=True` override, tree-cap across delegates | Per their pricing model | Per their pricing model | Not built into core OSS | Build it |
 | **Multi-agent coordination** | Role × project cascade defined in spec/06 | Multi-agent shared memory blocks | Agent-shared memory pools | LangGraph: graph-based orchestration (more flexible) | Build it |
-| **Numbered, locked spec** | 31 locked docs in `docs/spec/` (+ 2 RFCs) | API + concept docs | API + concept docs | API reference + concept docs | None |
+| **Numbered, locked spec** | 31 locked docs in `docs/spec/` (+ 4 RFCs/DRAFTs in progress) | API + concept docs | API + concept docs | API reference + concept docs | None |
 | **Reference runtime** | Python, macOS / Linux primary | Python (server) + multi-language clients | Python (OSS) + multi-language clients | Python + JavaScript | Whatever |
 
 **Where the alternatives win:**
@@ -141,7 +141,7 @@ This is the slot in the AI-agent-tooling landscape `atomic-agents-stack` occupie
 
 - **Markdown-source-of-truth, human-editable.** Operators can edit persona / tools / memory from any text editor or Obsidian without a vendor app.
 - **No required server.** The framework is "files + Python." A complete agent runs on a laptop with zero infrastructure.
-- **Spec-level file layout.** 31 numbered docs lock the contract (plus 2 RFCs in progress); conformance is testable; alternate implementations are possible.
+- **Spec-level file layout.** 31 numbered docs lock the contract (plus 4 RFCs/DRAFTs in progress); conformance is testable; alternate implementations are possible.
 - **Crash-safe writes by default.** `temp file + fsync + rename + parent-dir fsync` for every mutation; an interrupted run leaves recoverable artifacts, not corruption.
 - **Cost story is structural, not bolted on.** Daily / monthly caps + tree-cap for delegations + per-call cost reservation for helper batches + a `critical=True` override that's part of the API, not a per-vendor workaround.
 
@@ -181,6 +181,8 @@ Start at [`docs/README.md`](docs/README.md) for the spec entry point. The locked
 - [32 — Policy backend protocol](docs/spec/32-policy-backend.md) — fleet-wide `policy.md`; cost-cap MIN composition + allowlist enforcement
 - [33 — PersonaBackend Protocol](docs/spec/33-persona-backend.md) — persona ownership, snapshot/restore, `persona.link.md` format
 - [34 — CorpusBackend Protocol](docs/spec/34-corpus-backend.md) — wiki/raw corpus protocol; filesystem + SQLite (FTS5) reference impls; GB-scale indexed full-text search
+- [35 — init wizard](docs/spec/35-init-wizard.md) — `atomic-agents init` on-ramp; template scaffolding + Add-to-it merge; CI-friendly `--from-template` (RFC)
+- [36 — MCPServerRegistryBackend Protocol](docs/spec/36-mcp-server-registry-backend.md) — MCP server catalog + install/audit; `FilesystemMCPServerRegistryBackend` reference impl; `atomic-agents mcp-registry` CLI (DRAFT, PR 1 of 5)
 
 Each spec doc is locked when the implementation matches and tests pass. Spec changes that imply implementation changes get filed as GitHub issues. **Spec docs separate shipped behavior from explicit future / deferred boundaries** — sections that describe behavior not yet implemented are explicitly marked as such, not silently aspirational.
 
@@ -205,7 +207,7 @@ The framework is moving toward swappable backends layer by layer. The shape: a P
 | `CorpusBackend` | ✅ Shipped | Filesystem + SQLite (FTS5) reference impls; per-agent `wiki/` + `raw/`; `render_index_summary(corpus)` Protocol method; closes the GB-scale wiki cliff via O(log N) indexed full-text query | [`spec/34`](docs/spec/34-corpus-backend.md) |
 | `MCPServerRegistryBackend` | Planned | Catalog + install/audit for MCP servers (MCP equivalent of ToolRegistry) | [`#201`](https://github.com/dep0we/atomic-agents-stack/issues/201) |
 
-**v1 direction:** a home user runs filesystem-everything today. An organization runs the same agent definitions over Postgres / Redis / SQLite-Datadog / behind an HTTP service once the remaining two protocols ship. v1.0 closes when MCPServerRegistry lands + its conformance suite pins the contract. See [`docs/architecture.md`](docs/architecture.md) for the mental model, [`docs/TENSIONS.md`](docs/TENSIONS.md) for architectural tensions this scaling story has to survive, and [`ROADMAP.md`](ROADMAP.md) for the full backlog beyond v1.0.
+**v1 direction:** a home user runs filesystem-everything today. An organization runs the same agent definitions over Postgres / Redis / SQLite-Datadog / behind an HTTP service once the remaining protocol ships. v1.0 closes when MCPServerRegistry lands + its conformance suite pins the contract. See [`docs/architecture.md`](docs/architecture.md) for the mental model, [`docs/TENSIONS.md`](docs/TENSIONS.md) for architectural tensions this scaling story has to survive, and [`ROADMAP.md`](ROADMAP.md) for the full backlog beyond v1.0.
 
 ---
 
@@ -280,8 +282,8 @@ Same pattern for OpenAI (`atomic-agents-openai`) and Moonshot (`atomic-agents-mo
 ## Repository structure
 
 - `atomic_agents/` — the Python package (runtime in `agent.py`; backend protocols in `memory/`, `_llm.py`, `_locks.py`, `_costs.py`, etc.; CLI in `cli.py`; preflight in `doctor.py`)
-- `tests/` 2937 tests collected (2889 passing + 48 skipped), Python 3.11 + 3.12 matrix
-- `docs/` — [spec entry point](docs/README.md), [`architecture.md`](docs/architecture.md), [`spec/`](docs/spec/) (31 locked docs + 2 RFCs), [`deployment/`](docs/deployment/) (8 operator runbooks), [`samples/caldwell/`](docs/samples/caldwell/) (complete worked example), [`GOVERNANCE.md`](docs/GOVERNANCE.md), [`TENSIONS.md`](docs/TENSIONS.md), [`methodology.md`](docs/methodology.md)
+- `tests/` 3153 tests collected (3101 passing + 52 skipped), Python 3.11 + 3.12 matrix
+- `docs/` — [spec entry point](docs/README.md), [`architecture.md`](docs/architecture.md), [`spec/`](docs/spec/) (31 locked docs + 4 RFCs/DRAFTs), [`deployment/`](docs/deployment/) (8 operator runbooks), [`samples/caldwell/`](docs/samples/caldwell/) (complete worked example), [`GOVERNANCE.md`](docs/GOVERNANCE.md), [`TENSIONS.md`](docs/TENSIONS.md), [`methodology.md`](docs/methodology.md)
 - `extras/` — operational templates (Claude Code skill wrappers, macOS LaunchAgent plists, cron examples)
 
 ---
@@ -311,4 +313,4 @@ Before opening a PR, read [`CLAUDE.md`](CLAUDE.md) (the project's design ethos a
 
 ## Status
 
-**v0.13.0, alpha.** Core runtime stable. 2937 tests collected (2889 passing + 48 skipped) on Python 3.11 / 3.12. Eleven of twelve backend protocols shipped (see the backend protocols table above); `MCPServerRegistryBackend` planned. The surface stabilizes at v1.0. Pre-1.0 — Minor releases may contain breaking changes (see [`docs/deployment/versioning.md`](docs/deployment/versioning.md)). Single-maintainer project; reference implementation anyone can use, fork, or extend.
+**v0.13.0, alpha.** Core runtime stable. 3153 tests collected (3101 passing + 52 skipped) on Python 3.11 / 3.12. Eleven of twelve backend protocols shipped (see the backend protocols table above); `MCPServerRegistryBackend` planned. The surface stabilizes at v1.0. Pre-1.0 — Minor releases may contain breaking changes (see [`docs/deployment/versioning.md`](docs/deployment/versioning.md)). Single-maintainer project; reference implementation anyone can use, fork, or extend.
