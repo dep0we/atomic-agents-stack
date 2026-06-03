@@ -322,6 +322,10 @@ class SQLiteAgentProfileBackend:
             raise AgentProfileNotFound(
                 f"agent {agent_id!r} profile_json is corrupt: {exc}"
             ) from exc
+        # mcp_servers_resolved rides through the profile_json blob via
+        # to_dict()/from_dict(). No schema change needed per locked design
+        # (Decision 1 of #63 PR 3 + #201 PR 2 prep pass verification).
+        # Schema version stays at v2 (the persona migration version from #62).
         return AgentProfile.from_dict(profile_dict)
 
     # ────────────────────────────────────────────────────────────
