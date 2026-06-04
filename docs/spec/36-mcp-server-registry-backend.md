@@ -485,6 +485,127 @@ Constructed from the URL family via `make_http_mcp_server_registry_backend_from_
 
 ---
 
+### HTTP wire format (PR 4)
+
+All HTTP endpoints accept and return JSON with snake_case keys. Every request includes `?agent_scope=<scope>` to identify the per-agent catalog partition.
+
+**MCPServerSpec field contract (catalog server authors).** Each server entry in the wire format has the following fields:
+
+| Field | Required | Type | Default | Notes |
+|---|---|---|---|---|
+| `name` | YES | string | (none) | MUST match charset `[a-zA-Z0-9_.+@-]+`; framework refuses path-traversal / newlines / control chars at parse boundary (MUST 1 + defense-in-depth against catalog injection) |
+| `command` | YES | string | (none) | The executable for the MCP server subprocess |
+| `args` | optional | list of strings | `[]` | Command-line arguments |
+| `env` | optional | object mapping string to string | `{}` | Environment variables; `$VAR` references resolved client-side at materialization (MUST 8) |
+| `transport` | optional | string | `"stdio"` | Only `"stdio"` supported at v1.0 |
+| `description` | optional | string | `""` | Operator-readable note |
+
+**MCPServerRef field contract** (lightweight listing form returned by `GET /mcp-servers`):
+
+| Field | Required | Type | Default | Notes |
+|---|---|---|---|---|
+| `name` | YES | string | (none) | Same charset rule as MCPServerSpec |
+| `description` | optional | string | `""` | Same as MCPServerSpec |
+| `transport` | optional | string | `"stdio"` | Same as MCPServerSpec |
+| `version` | optional | string OR null | `null` | Reserved; empty string is normalized to `null` for round-trip stability |
+| `source` | optional | string | `""` | Backend-specific origin marker; for HTTP responses the framework sets this from the raw catalog URL on receipt (operators should not populate it server-side) |
+
+Extra keys on either shape are silently ignored for forward-compatibility with future wire format extensions.
+
+**GET /mcp-servers?agent_scope=scope**
+
+Returns the set of servers mounted for the given scope. Response shape:
+
+```json
+{
+  "servers": [
+    {"name": "github", "description": "GitHub repo access", "transport": "stdio", "version": null, "source": ""},
+    {"name": "filesystem-tools", "description": "", "transport": "stdio", "version": null, "source": ""}
+  ]
+}
+```
+
+**GET /mcp-servers?agent_scope=scope&expand=spec**
+
+Returns the full `MCPServerSpec` shape for every mounted server. Used by `load_all_mcp_servers()` to eliminate N+1 round trips. Response shape:
+
+```json
+{
+  "servers": [
+    {"name": "github", "command": "npx", "args": ["-y", "@mcp/github"], "env": {"GITHUB_TOKEN": "$GITHUB_PAT"}, "transport": "stdio", "description": ""},
+    {"name": "filesystem-tools", "command": "npx", "args": ["-y", "@mcp/fs", "/data"], "env": {}, "transport": "stdio", "description": ""}
+  ]
+}
+```
+
+**GET /mcp-servers/name?agent_scope=scope**
+
+Returns the full `MCPServerSpec` for a single mounted server. Response shape is the same as one entry from the `expand=spec` list above. Returns 404 when the name is not mounted for the scope.
+
+**GET /mcp-servers/name/validate?agent_scope=scope**
+
+Returns a static validation result. Response shape:
+
+```json
+{"ok": true, "errors": [], "warnings": ["command 'npx' not found on catalog server PATH"]}
+```
+
+Returns 404 when the catalog server does not implement this endpoint (tier-1 servers are not required to). The HTTP backend returns `ValidationResult(ok=False, errors=["...does not implement /validate..."])` on 404 rather than raising.
+
+**GET /capabilities**
+
+Optional. Returns the catalog server's tier advertisement. Response shape:
+
+```json
+{"tier": 2, "supports_install": true, "supports_uninstall": true, "supports_audit": false, "wire_version": "1.0"}
+```
+
+Returns 404 when the catalog server does not implement capability advertisement. Absence implies at most tier 2 (tier 3 is only detectable via this endpoint).
+
+---
+
+### Tier negotiation (PR 4)
+
+The HTTP backend runs the following deterministic probe sequence on the first non-construction call. The probe fires outside any lock; the cache write happens inside `_capabilities_lock`.
+
+**Step 1:** `GET /capabilities`. If 200, parse the response body; the server's reported tier is authoritative. Values from this endpoint win over any inference.
+
+**Step 2:** If `GET /capabilities` returns 404 (endpoint absent), fall through to step 3. If it returns any other non-200 status, handle per the exception table below (401 raises `MCPRegistryAuthRequired`; 5xx raises `MCPRegistryUnavailable`; other 4xx raises `MCPRegistryUnavailable`). Non-404 4xx responses MUST NOT silently fall back to OPTIONS.
+
+**Step 3:** `OPTIONS /mcp-servers`. Parse the `Allow` response header using set-membership: `allowed = {m.strip().upper() for m in allow_header.split(",")}`. Tier inference: `{"GET", "POST", "DELETE"}.issubset(allowed)` implies tier 2 (read-write). GET-only implies tier 1 (read-only). Extra methods (HEAD, OPTIONS) do not affect inference.
+
+**Step 4:** If `OPTIONS /mcp-servers` returns 404 or 405, default to tier 1 (read-only). This is the conservative fallback; operators can call `refresh_capabilities()` after confirming their catalog server supports more.
+
+**Step 5:** Any network error, timeout, or 5xx at any probe step raises `MCPRegistryUnavailable`. The failure is cached for `probe_failure_cache_s` seconds; subsequent calls within the cache window raise immediately without re-probing. Explicit `refresh_capabilities()` always bypasses the failure cache.
+
+**Probe failure cache:** prevents thrashing when the catalog server is unreachable. With the 60-second default, sustained outage produces roughly 5 probes per 5 minutes rather than 30+. `request_timeout_s` (default 10s) is the per-request timeout; `probe_failure_cache_s` (default 60s) is the failure-window timeout. The two are deliberately separate.
+
+---
+
+### Capability handshake (PR 4)
+
+The `supports_capability_handshake` flag distinguishes the HTTP backend from the filesystem backend. It is `True` on `HTTPMCPServerRegistryBackend` and `False` on `FilesystemMCPServerRegistryBackend`.
+
+Two levels of capability:
+
+**Static (class-level):** what the backend's class is capable of. `HTTPMCPServerRegistryBackend` supports capability negotiation by definition (`supports_capability_handshake=True`); this is constant regardless of probe state.
+
+**Runtime (probe-dependent):** what the connected catalog server actually allows. `supports_install` and `supports_uninstall` reflect the tier negotiation result after the first successful probe. Before the first probe, the `capabilities` property returns a conservative pre-probe default (all write capabilities `False`).
+
+The `capabilities` property returns the runtime view. Callers should use `backend.capabilities.supports_install` (property, not method call) to check before invoking write operations. Conformance tests assert claim-vs-behavior parity (MUST 3) so the runtime value is trustworthy.
+
+---
+
+### Per-scope filtering (PR 4)
+
+Catalog servers MUST filter by `agent_scope` server-side. The `agent_scope` query parameter is included on every HTTP request: `?agent_scope=<scope>`. A catalog server that returns the org-wide catalog from `GET /mcp-servers?agent_scope=<scope>` (ignoring the scope parameter) is non-conformant with MUST 5.
+
+The scope is hardcoded from the `HTTPMCPServerRegistryBackend` constructor; no API method accepts a scope override. This mirrors the `SQLiteToolRegistryBackend` pattern where the scope is a constructor argument, not a per-call parameter.
+
+Scope isolation is the catalog server's responsibility at the storage layer. The framework's HTTP backend does not perform any client-side filtering; it passes the scope and trusts the catalog server to filter correctly.
+
+---
+
 ## Exception surface
 
 All exceptions live in `atomic_agents/exceptions.py` and are re-exported from `atomic_agents.mcp_registry` for ergonomic access (per the PersonaBackend D-PI-1 precedent).
@@ -498,6 +619,24 @@ All exceptions live in `atomic_agents/exceptions.py` and are re-exported from `a
 - `ValueError`: invalid server name (path separator, empty, parent-dir token, leading `.`, control chars).
 - `NotImplementedError`: capability-gated method on a backend that doesn't support it at runtime.
 - `MCPServerConnectFailed`: re-raised from `load_mcp_server` when env-var resolution fails (matches existing spec/19 exception; not a new exception class).
+
+**HTTP backend exception mapping (PR 4).** Every `httpx` exception is caught and mapped before escaping `http.py`. `httpx.InvalidURL` requires a separate `except` clause because it does NOT inherit from `httpx.HTTPError`.
+
+| httpx exception | Maps to | Condition |
+|---|---|---|
+| `httpx.HTTPStatusError` (401) | `MCPRegistryAuthRequired` | Auth required; no token provided. |
+| `httpx.HTTPStatusError` (404 on /mcp-servers/name) | `MCPServerNotInRegistry` | Named server absent from catalog. |
+| `httpx.HTTPStatusError` (404 on /mcp-servers collection) | `MCPRegistryUnavailable` | Tier-1 server must implement GET /mcp-servers. |
+| `httpx.HTTPStatusError` (5xx) | `MCPRegistryUnavailable` | Server-side transient failure. |
+| `httpx.HTTPStatusError` (other 4xx) | `MCPRegistryUnavailable` | Conservative; non-404 4xx MUST NOT silently fall back. |
+| `httpx.LocalProtocolError` | `MCPRegistryDescriptorInvalid` | Client sent invalid HTTP (framework bug). |
+| `httpx.DecodingError` | `MCPRegistryDescriptorInvalid` | Response body cannot be decoded. |
+| `httpx.TimeoutException` (all variants) | `MCPRegistryUnavailable` | Connection or read timeout. |
+| `httpx.NetworkError` (all variants) | `MCPRegistryUnavailable` | DNS failure, connection refused, dropped mid-response. |
+| `httpx.ProtocolError` (all variants) | `MCPRegistryUnavailable` | Protocol-level HTTP error. |
+| `httpx.HTTPError` (catch-all) | `MCPRegistryUnavailable` | Any other httpx subclass. |
+| `httpx.InvalidURL` (separate clause) | `ValueError` | Operator config error; not a transient catalog failure. |
+| `json.JSONDecodeError` | `MCPRegistryDescriptorInvalid` | Response body is not valid JSON. |
 
 ---
 
@@ -535,6 +674,14 @@ The operator surface exposes the choice via TWO paths (parallel to `LogBackend` 
    - `ATOMIC_AGENTS_MCP_SERVER_REGISTRY_BACKEND`: backend id (default `filesystem`). Recognized: `filesystem`, `http`.
    - `ATOMIC_AGENTS_MCP_SERVER_REGISTRY_BACKEND_URL`: connection string for non-filesystem backends. HTTP shape: `https://catalog.example.com/?agent_scope=<scope>`.
    - `ATOMIC_AGENTS_MCP_SERVER_REGISTRY_AUTH_TOKEN`: bearer token for HTTP (optional; absence means unauthenticated requests).
+
+**Default factory `http` branch (PR 4).** When `ATOMIC_AGENTS_MCP_SERVER_REGISTRY_BACKEND=http`, `get_default_mcp_server_registry_backend` lazily imports `make_http_mcp_server_registry_backend_from_url` from `atomic_agents.mcp_registry.http` and reads `ATOMIC_AGENTS_MCP_SERVER_REGISTRY_BACKEND_URL` (required). If that env var is absent or empty, raises `BackendNotRegistered` with an operator-readable message naming the required variable and expected URL format. The lazy import means filesystem operators never pay the `httpx` import cost.
+
+```sh
+export ATOMIC_AGENTS_MCP_SERVER_REGISTRY_BACKEND=http
+export ATOMIC_AGENTS_MCP_SERVER_REGISTRY_BACKEND_URL="https://catalog.example.com/?agent_scope=my-agent"
+export ATOMIC_AGENTS_MCP_SERVER_REGISTRY_AUTH_TOKEN="token123"   # optional
+```
 
 **Credential safety:** `get_default_mcp_server_registry_backend` sanitizes the BACKEND env var before echoing in error messages (strips anything following `://` and truncates at 32 chars). Mirrors the redaction helper from `logs/__init__.py:316` and `profile/__init__.py:_redact_for_error_message`.
 

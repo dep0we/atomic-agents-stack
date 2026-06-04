@@ -18,6 +18,11 @@ Coverage:
     MUST 10 -- load_all_mcp_servers consistency (~5 tests)
 
 Per spec/36 and prep notes B-F4, B-F5, B-F6, B-F7, B-F8.
+
+HTTP backend parametrize added at PR 4 (prep notes E-F1, E-F3). The
+backend_factory and populated_backend fixtures each grow an "http" branch
+that constructs HTTPMCPServerRegistryBackend with an httpx.MockTransport
+so capability tests do not cascade-fail due to real network calls.
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ from pathlib import Path
 from textwrap import dedent
 from unittest.mock import patch
 
+import httpx
 import pytest
 
 from atomic_agents.mcp_registry import (
@@ -36,6 +42,7 @@ from atomic_agents.mcp_registry import (
     MCPServerRegistryCapabilities,
 )
 from atomic_agents.mcp_registry.backend import _default_load_all
+from atomic_agents.mcp_registry.http import HTTPMCPServerRegistryBackend
 from atomic_agents.mcp_registry.types import MCPServerRef
 from atomic_agents.mcp import MCPServerSpec, parse_mcp_md_text
 from atomic_agents.exceptions import MCPServerConnectFailed
@@ -90,6 +97,85 @@ def make_mcp_md(agent_root: Path, specs: list[MCPServerSpec]) -> Path:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# HTTP MockTransport helpers (prep notes E-F9)
+
+
+def _default_mock_transport(
+    extra_servers: list[dict] | None = None,
+) -> httpx.MockTransport:
+    """Return an httpx.MockTransport that responds successfully to the full probe
+    sequence and returns an optionally populated server catalog.
+
+    Used by ``backend_factory`` and ``populated_backend`` HTTP branches so that
+    capability probe tests do not cascade-fail with MCPRegistryUnavailable.
+
+    ``extra_servers`` is a list of wire-format server dicts (same shape as what
+    a catalog server returns in ``{"servers": [...]}``) that the transport will
+    serve on the list and bulk endpoints.
+    """
+    servers = extra_servers or []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path.rstrip("/")
+        query = str(request.url.query)
+        method = request.method
+
+        if method == "OPTIONS":
+            # OPTIONS probe for tier negotiation (Decision 4 step 2).
+            return httpx.Response(200, headers={"Allow": "GET"})
+
+        if path.endswith("/capabilities"):
+            return httpx.Response(
+                200,
+                json={
+                    "tier": 1,
+                    "supports_install": False,
+                    "supports_uninstall": False,
+                    "supports_audit": False,
+                    "wire_version": "1.0.0",
+                },
+            )
+
+        # Exact /mcp-servers collection endpoint (list or bulk; expand=spec query toggles).
+        if path.endswith("/mcp-servers"):
+            if "expand" in query:
+                # Bulk endpoint: GET /mcp-servers?expand=spec returns full specs.
+                return httpx.Response(200, json={"servers": servers})
+            # Plain list endpoint: GET /mcp-servers returns refs (metadata only).
+            refs = [
+                {
+                    "name": s["name"],
+                    "description": s.get("description", ""),
+                    "transport": s.get("transport", "stdio"),
+                }
+                for s in servers
+            ]
+            return httpx.Response(200, json={"servers": refs})
+
+        # Validate endpoint: GET /mcp-servers/<name>/validate
+        if path.endswith("/validate") and "/mcp-servers/" in path:
+            name = path.rsplit("/", 2)[-2]
+            for s in servers:
+                if s["name"] == name:
+                    return httpx.Response(
+                        200, json={"ok": True, "errors": [], "warnings": []}
+                    )
+            return httpx.Response(404, json={"error": "not found"})
+
+        # Per-name endpoint: GET /mcp-servers/<name> returns the single spec.
+        if "/mcp-servers/" in path:
+            name = path.rsplit("/", 1)[-1]
+            for s in servers:
+                if s["name"] == name:
+                    return httpx.Response(200, json=s)
+            return httpx.Response(404, json={"error": "not found"})
+
+        return httpx.Response(404, json={"error": "not found"})
+
+    return httpx.MockTransport(_handler)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Fixtures
 
 
@@ -101,38 +187,76 @@ def tmp_agent_root(tmp_path: Path) -> Path:
     return root
 
 
-@pytest.fixture(params=["filesystem"])
+@pytest.fixture(params=["filesystem", "http"])
 def backend_factory(request, tmp_path: Path):
     """Parametrized fixture that returns a constructed backend instance.
 
-    HTTP backend joins at PR 4 via an additional params entry:
-        params=["filesystem", "http"]
-    with an ``elif request.param == "http":`` branch here.
+    Parametrized across "filesystem" and "http" backends. The HTTP branch
+    uses an httpx.MockTransport that responds successfully to the full
+    Decision 4 probe sequence so capability tests do not cascade-fail.
+    Per prep notes E-F3.
     """
     if request.param == "filesystem":
         agent_root = tmp_path / "agent-for-backend"
         agent_root.mkdir()
         return FilesystemMCPServerRegistryBackend(agent_root, [])
+    elif request.param == "http":
+        transport = _default_mock_transport()
+        client = httpx.Client(transport=transport)
+        return HTTPMCPServerRegistryBackend(
+            catalog_url="http://catalog.example.invalid",
+            agent_scope="test-scope",
+            _http_client=client,
+        )
     raise ValueError(f"Unknown backend param: {request.param!r}")
 
 
-@pytest.fixture
-def populated_backend(tmp_path: Path):
-    """Backend pre-populated with 3 specs in mcp.md.
+@pytest.fixture(params=["filesystem", "http"])
+def populated_backend(request, tmp_path: Path):
+    """Backend pre-populated with 3 specs.
 
     Used for MUST 10 consistency tests. Returns (backend, specs) so tests can
     reference the specs used for population.
+
+    Parametrized across "filesystem" and "http" backends (prep notes E-F1).
+    The HTTP branch provides a MockTransport serving the same 3 servers
+    consistently across GET /mcp-servers, GET /mcp-servers?expand=spec,
+    and GET /mcp-servers/<name> endpoints.
     """
-    agent_root = tmp_path / "populated-agent"
-    agent_root.mkdir()
     specs = [
         _make_mcp_spec("alpha-server", description="First server"),
         _make_mcp_spec("beta-server", description="Second server"),
         _make_mcp_spec("gamma-server", description="Third server"),
     ]
-    make_mcp_md(agent_root, specs)
-    backend = FilesystemMCPServerRegistryBackend(agent_root, [])
-    return backend, specs
+
+    if request.param == "filesystem":
+        agent_root = tmp_path / "populated-agent"
+        agent_root.mkdir()
+        make_mcp_md(agent_root, specs)
+        backend = FilesystemMCPServerRegistryBackend(agent_root, [])
+        return backend, specs
+    elif request.param == "http":
+        # Wire format: each spec becomes a dict compatible with the HTTP wire shape.
+        wire_servers = [
+            {
+                "name": s.name,
+                "command": s.command,
+                "args": s.args,
+                "env": s.env,
+                "transport": s.transport,
+                "description": s.description,
+            }
+            for s in specs
+        ]
+        transport = _default_mock_transport(extra_servers=wire_servers)
+        client = httpx.Client(transport=transport)
+        backend = HTTPMCPServerRegistryBackend(
+            catalog_url="http://catalog.example.invalid",
+            agent_scope="test-scope",
+            _http_client=client,
+        )
+        return backend, specs
+    raise ValueError(f"Unknown backend param: {request.param!r}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────

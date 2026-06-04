@@ -33,6 +33,7 @@ dependencies = [
 openai = ["openai>=1.30"]
 validation = ["jsonschema>=4.0"]
 redis = ["redis>=5.0,<8.0"]
+http = ["httpx>=0.27"]
 dev = [
     "pytest>=8.0",
 ]
