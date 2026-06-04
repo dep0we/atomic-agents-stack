@@ -83,7 +83,7 @@ def _is_path_shaped(arg: str) -> bool:
 # Data classes
 
 
-@dataclass
+@dataclass(repr=False)
 class MCPServerSpec:
     """Declaration of an MCP server an agent may connect to.
 
@@ -97,6 +97,10 @@ class MCPServerSpec:
         env:         extra env vars (resolved from agent's env at parse time)
         transport:   only "stdio" supported in v1
         description: operator-readable note
+
+    Note on repr: ``env`` is redacted in the repr because it may contain
+    resolved secret values (API tokens, passwords) after ``load_mcp_server``
+    resolution. Use ``to_dict()`` if you need the full values for serialization.
     """
 
     name: str
@@ -105,6 +109,25 @@ class MCPServerSpec:
     env: dict[str, str] = field(default_factory=dict)
     transport: str = "stdio"
     description: str = ""
+
+    def __repr__(self) -> str:
+        """Return a repr that redacts env to prevent secret leakage in logs and error messages.
+
+        The ``env`` dict may contain resolved secret values after
+        ``load_mcp_server()`` resolution. Including them in repr would leak
+        secrets into tracebacks, log lines, and operator-facing error messages.
+        The count of env entries is shown for debuggability without exposing values.
+        """
+        return (
+            f"MCPServerSpec("
+            f"name={self.name!r}, "
+            f"command={self.command!r}, "
+            f"args={self.args!r}, "
+            f"env=<{len(self.env)} entries; redacted>, "
+            f"transport={self.transport!r}, "
+            f"description={self.description!r}"
+            f")"
+        )
 
     def to_dict(self) -> dict:
         """Serialize to a JSON-safe plain dict.

@@ -51,6 +51,14 @@ class MCPServerRef:
     ``source``: backend-specific origin marker. Filesystem backend sets
         ``source="mcp.md#section:<name>"``; HTTP backend sets
         ``source="<catalog_url>/mcp-servers/<name>"``.
+
+        **Operator security note (HTTP backend).** The ``source`` field may
+        contain the raw catalog URL including any embedded credentials (e.g.,
+        ``https://user:pass@catalog/...``). Operators logging, persisting, or
+        displaying MCPServerRef objects MUST redact this field before output.
+        Use ``atomic_agents.mcp_registry._redact_for_error_message(ref.source)``
+        to strip credentials. The raw URL is preserved per spec/36 line 228 to
+        support downstream navigation use cases that need to fetch the resource.
     """
 
     name: str

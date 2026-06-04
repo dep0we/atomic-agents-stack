@@ -1622,3 +1622,745 @@ def test_mcp_server_ref_source_uses_raw_catalog_url_not_redacted() -> None:
     assert refs[0].source == "https://catalog.example.com/mcp-servers/test-server", (
         f"source must be raw catalog URL; got {refs[0].source!r}"
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# j) PR 5 write-path tests
+#
+# Covers: HTTP install/uninstall happy paths, 409 collision, 405 mid-session
+# tier regression state machine, capability gate, spec.to_dict() env-value
+# warning, auth header consistency on write requests, MUST 4 credential
+# redaction in error paths, and the conservative-default regression guard.
+#
+# All use httpx.MockTransport (established pattern from sections a-i above).
+# Source findings: A-F5, A-F7, B-F2, B-F3, B-F4, C-F7, C-F8, D-PR5-1 through
+# D-PR5-7.
+
+
+def _make_tier2_backend(
+    transport: httpx.MockTransport,
+    catalog_url: str = "http://catalog.example.invalid",
+    agent_scope: str = "test-scope",
+    auth_token: str | None = None,
+) -> HTTPMCPServerRegistryBackend:
+    """Helper: backend that has already probed a tier-2 catalog.
+
+    Calls list_mcp_servers() once to force the probe, so subsequent tests
+    can rely on capabilities.supports_install being True.
+    """
+    client = httpx.Client(transport=transport)
+    backend = HTTPMCPServerRegistryBackend(
+        catalog_url=catalog_url,
+        agent_scope=agent_scope,
+        auth_token=auth_token,
+        probe_failure_cache_s=0.5,
+        _http_client=client,
+    )
+    # Force the capability probe.
+    backend.list_mcp_servers()
+    return backend
+
+
+def _tier2_capabilities_response() -> dict:
+    """Tier-2 capabilities body (supports_install and supports_uninstall True)."""
+    return _capabilities_response(
+        tier=2,
+        supports_install=True,
+        supports_uninstall=True,
+    )
+
+
+def test_install_post_201_returns_mcp_server_ref() -> None:
+    """install() on a tier-2 catalog returns an MCPServerRef on HTTP 201.
+
+    D-PR5-6: MCPServerRef constructed from input spec (not 201 body parse).
+    source = f"{catalog_url}/mcp-servers/{name}" per spec/36.
+    """
+    from atomic_agents.mcp_registry.types import MCPServerRef
+
+    spec = MCPServerSpec(
+        name="new-server",
+        command="python3",
+        args=["-m", "new_server"],
+        env={"TOKEN": "$MY_TOKEN"},
+        transport="stdio",
+        description="A new MCP server.",
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if "/capabilities" in path:
+            return httpx.Response(200, json=_tier2_capabilities_response())
+        if request.method == "OPTIONS":
+            return httpx.Response(200, headers={"Allow": "GET, POST, DELETE"})
+        if request.method == "POST" and "/mcp-servers" in path:
+            return httpx.Response(
+                201,
+                json={
+                    "name": spec.name,
+                    "description": spec.description,
+                    "transport": spec.transport,
+                    "version": None,
+                    "source": f"http://catalog.example.invalid/mcp-servers/{spec.name}",
+                },
+            )
+        return httpx.Response(200, json={"servers": []})
+
+    backend = _make_tier2_backend(httpx.MockTransport(_handler))
+    ref = backend.install(spec)
+    assert isinstance(ref, MCPServerRef), f"Expected MCPServerRef; got {type(ref)!r}"
+    assert ref.name == spec.name
+    assert ref.source == f"http://catalog.example.invalid/mcp-servers/{spec.name}"
+
+
+def test_install_post_409_raises_already_installed() -> None:
+    """install() raises MCPServerAlreadyInstalled when catalog returns HTTP 409.
+
+    D-PR5-2: 409 collision maps to MCPServerAlreadyInstalled, not
+    MCPRegistryUnavailable. A 409 means the name is permanently taken at the
+    catalog; the caller must use a different name or uninstall first.
+    """
+    from atomic_agents.mcp_registry import MCPServerAlreadyInstalled
+
+    spec = MCPServerSpec(
+        name="existing-server",
+        command="echo",
+        args=[],
+        env={},
+        transport="stdio",
+        description="",
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if "/capabilities" in path:
+            return httpx.Response(200, json=_tier2_capabilities_response())
+        if request.method == "OPTIONS":
+            return httpx.Response(200, headers={"Allow": "GET, POST, DELETE"})
+        if request.method == "POST" and "/mcp-servers" in path:
+            return httpx.Response(409, json={"error": "server already installed"})
+        return httpx.Response(200, json={"servers": []})
+
+    backend = _make_tier2_backend(httpx.MockTransport(_handler))
+    with pytest.raises(MCPServerAlreadyInstalled):
+        backend.install(spec)
+
+
+def test_install_405_triggers_tier_regression_raises_not_implemented() -> None:
+    """POST /mcp-servers returning 405 triggers tier regression + NotImplementedError.
+
+    D-PR5-3: mid-session regression handler re-probes, updates cache to tier-1,
+    raises NotImplementedError with operator-readable message.
+
+    State machine: probe tier-2 -> install called -> 405 -> re-probe -> tier-1
+    -> NotImplementedError. Verify _cached_capabilities updated to tier-1 after.
+    """
+    probe_count: list[int] = [0]
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        method = request.method
+        # Capabilities probe: first call returns tier-2; subsequent return tier-1.
+        if "/capabilities" in path:
+            probe_count[0] += 1
+            if probe_count[0] == 1:
+                return httpx.Response(200, json=_tier2_capabilities_response())
+            # Re-probe after 405: now tier-1.
+            return httpx.Response(
+                200,
+                json=_capabilities_response(
+                    tier=1, supports_install=False, supports_uninstall=False
+                ),
+            )
+        if method == "OPTIONS":
+            return httpx.Response(200, headers={"Allow": "GET, POST, DELETE"})
+        if method == "POST" and "/mcp-servers" in path:
+            # Simulate mid-session demotion: catalog now refuses writes.
+            return httpx.Response(405, json={"error": "method not allowed"})
+        return httpx.Response(200, json={"servers": []})
+
+    spec = MCPServerSpec(
+        name="tier-regression-server",
+        command="echo",
+        args=[],
+        env={},
+        transport="stdio",
+        description="",
+    )
+    backend = _make_tier2_backend(httpx.MockTransport(_handler))
+    # At this point capabilities.supports_install should be True (tier-2 probed).
+    assert backend.capabilities.supports_install is True
+
+    with pytest.raises(NotImplementedError) as exc_info:
+        backend.install(spec)
+
+    # Error message must be operator-readable and use safe URL.
+    msg = str(exc_info.value)
+    assert "tier" in msg.lower() or "install" in msg.lower(), (
+        f"Tier regression message must name the operation or tier change; got: {msg!r}"
+    )
+    # Capability cache must be updated to reflect tier-1 after re-probe.
+    assert backend.capabilities.supports_install is False, (
+        "After 405 + tier-1 re-probe, supports_install must be False in cache."
+    )
+
+
+def test_install_405_reprobe_fails_raises_unavailable() -> None:
+    """POST 405 + failed re-probe raises MCPRegistryUnavailable, not NotImplementedError.
+
+    D-PR5-4: if refresh_capabilities() itself fails during recovery, the
+    handler must raise MCPRegistryUnavailable with 'Capability cache may be
+    stale' in the message. NOT NotImplementedError -- the catalog state is
+    unknown, not definitely tier-1.
+    """
+    probe_count: list[int] = [0]
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        method = request.method
+        if "/capabilities" in path:
+            probe_count[0] += 1
+            if probe_count[0] == 1:
+                return httpx.Response(200, json=_tier2_capabilities_response())
+            # Re-probe after 405 fails with a 503.
+            return httpx.Response(503, json={"error": "service unavailable"})
+        if method == "OPTIONS":
+            return httpx.Response(200, headers={"Allow": "GET, POST, DELETE"})
+        if method == "POST" and "/mcp-servers" in path:
+            return httpx.Response(405, json={"error": "method not allowed"})
+        return httpx.Response(200, json={"servers": []})
+
+    spec = MCPServerSpec(
+        name="reprobe-fail-server",
+        command="echo",
+        args=[],
+        env={},
+        transport="stdio",
+        description="",
+    )
+    backend = _make_tier2_backend(httpx.MockTransport(_handler))
+    with pytest.raises(MCPRegistryUnavailable) as exc_info:
+        backend.install(spec)
+    msg = str(exc_info.value)
+    assert "stale" in msg.lower() or "405" in msg or "unavailable" in msg.lower(), (
+        f"MCPRegistryUnavailable from reprobe failure must mention stale cache or 405; got: {msg!r}"
+    )
+
+
+def test_install_405_reprobe_returns_tier2_inconsistent_server() -> None:
+    """POST 405 + re-probe still tier-2: trust the 405, raise NotImplementedError.
+
+    Pre-dispatch correction #6 / B-F3: if re-probe returns tier-2 (server still
+    claims write support) but the POST returned 405 (server refused the write),
+    the implementation must trust the original 405 and raise NotImplementedError
+    with an 'inconsistent server' message. No silent retry.
+    """
+    probe_count: list[int] = [0]
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        method = request.method
+        if "/capabilities" in path:
+            probe_count[0] += 1
+            # Both initial probe and re-probe return tier-2.
+            return httpx.Response(200, json=_tier2_capabilities_response())
+        if method == "OPTIONS":
+            return httpx.Response(200, headers={"Allow": "GET, POST, DELETE"})
+        if method == "POST" and "/mcp-servers" in path:
+            # Inconsistent: claims tier-2 but refuses POST.
+            return httpx.Response(405, json={"error": "method not allowed"})
+        return httpx.Response(200, json={"servers": []})
+
+    spec = MCPServerSpec(
+        name="inconsistent-server",
+        command="echo",
+        args=[],
+        env={},
+        transport="stdio",
+        description="",
+    )
+    backend = _make_tier2_backend(httpx.MockTransport(_handler))
+    with pytest.raises(NotImplementedError) as exc_info:
+        backend.install(spec)
+    msg = str(exc_info.value)
+    assert "inconsistent" in msg.lower() or "405" in msg, (
+        f"NotImplementedError for inconsistent server must mention inconsistent or 405; got: {msg!r}"
+    )
+
+
+def test_uninstall_delete_204_returns_none() -> None:
+    """uninstall() returns None on HTTP 204 (no JSONDecodeError).
+
+    D-PR5-7: HTTP 204 has no body. The implementation must NOT call resp.json()
+    after 204 -- that would raise JSONDecodeError. After raise_for_status()
+    on 204 (a no-op), return None immediately.
+    """
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        method = request.method
+        if "/capabilities" in path:
+            return httpx.Response(200, json=_tier2_capabilities_response())
+        if method == "OPTIONS":
+            return httpx.Response(200, headers={"Allow": "GET, POST, DELETE"})
+        if method == "DELETE" and "/mcp-servers/" in path:
+            return httpx.Response(204, content=b"")
+        return httpx.Response(200, json={"servers": []})
+
+    backend = _make_tier2_backend(httpx.MockTransport(_handler))
+    result = backend.uninstall("some-server")
+    assert result is None, f"uninstall() must return None on 204; got {result!r}"
+
+
+def test_uninstall_absent_name_idempotent_returns_none() -> None:
+    """uninstall() on an absent name returns None (idempotent, MUST 9).
+
+    The catalog server returns 204 for absent names (DELETE is idempotent).
+    The client must treat this the same as a successful uninstall.
+    """
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        method = request.method
+        if "/capabilities" in path:
+            return httpx.Response(200, json=_tier2_capabilities_response())
+        if method == "OPTIONS":
+            return httpx.Response(200, headers={"Allow": "GET, POST, DELETE"})
+        if method == "DELETE" and "/mcp-servers/" in path:
+            # Catalog returns 204 regardless of whether the name existed.
+            return httpx.Response(204, content=b"")
+        return httpx.Response(200, json={"servers": []})
+
+    backend = _make_tier2_backend(httpx.MockTransport(_handler))
+    result = backend.uninstall("nonexistent-server")
+    assert result is None, (
+        "MUST 9: uninstall on absent name must return None (idempotent no-op)"
+    )
+
+
+def test_uninstall_405_triggers_tier_regression() -> None:
+    """DELETE /mcp-servers/<name> returning 405 triggers tier regression handler.
+
+    Same state machine as POST 405 but for the uninstall path (D-PR5-3).
+    After 405 + tier-1 re-probe, NotImplementedError raised; cache updated.
+    """
+    probe_count: list[int] = [0]
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        method = request.method
+        if "/capabilities" in path:
+            probe_count[0] += 1
+            if probe_count[0] == 1:
+                return httpx.Response(200, json=_tier2_capabilities_response())
+            return httpx.Response(
+                200,
+                json=_capabilities_response(
+                    tier=1, supports_install=False, supports_uninstall=False
+                ),
+            )
+        if method == "OPTIONS":
+            return httpx.Response(200, headers={"Allow": "GET, POST, DELETE"})
+        if method == "DELETE" and "/mcp-servers/" in path:
+            return httpx.Response(405, json={"error": "method not allowed"})
+        return httpx.Response(200, json={"servers": []})
+
+    backend = _make_tier2_backend(httpx.MockTransport(_handler))
+    assert backend.capabilities.supports_uninstall is True
+
+    with pytest.raises(NotImplementedError):
+        backend.uninstall("some-server")
+
+    assert backend.capabilities.supports_uninstall is False, (
+        "After DELETE 405 + tier-1 re-probe, supports_uninstall must be False in cache."
+    )
+
+
+def test_install_capability_gate_no_network_call_when_tier1() -> None:
+    """install() raises NotImplementedError WITHOUT making a POST when tier-1 probed.
+
+    D-PR5-1: the capability check happens AFTER probe but BEFORE the POST request.
+    A tier-1 catalog must never receive a POST from this backend.
+    """
+    post_count: list[int] = [0]
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        method = request.method
+        if "/capabilities" in path:
+            return httpx.Response(
+                200,
+                json=_capabilities_response(
+                    tier=1, supports_install=False, supports_uninstall=False
+                ),
+            )
+        if method == "OPTIONS":
+            return httpx.Response(200, headers={"Allow": "GET"})
+        if method == "POST":
+            post_count[0] += 1
+            return httpx.Response(201, json={})
+        return httpx.Response(200, json={"servers": []})
+
+    backend = _make_tier2_backend(httpx.MockTransport(_handler))
+    # Capability is False after tier-1 probe.
+    assert backend.capabilities.supports_install is False
+
+    spec = MCPServerSpec(
+        name="gate-test-server",
+        command="echo",
+        args=[],
+        env={},
+        transport="stdio",
+        description="",
+    )
+    with pytest.raises(NotImplementedError):
+        backend.install(spec)
+
+    assert post_count[0] == 0, (
+        f"Capability gate must block POST; got {post_count[0]} POST call(s)."
+    )
+
+
+def test_install_env_literal_value_raises_value_error() -> None:
+    """install() raises ValueError when any env value is a literal (not $VAR).
+
+    D-PR5-5 upgraded to v1.0 Decision A: literal env values are rejected at
+    the API boundary with ValueError BEFORE any network call. This prevents
+    the load_mcp_server -> install pipeline from accidentally exfiltrating
+    resolved secrets to the catalog server's request body.
+    """
+    spec = MCPServerSpec(
+        name="resolved-env-server",
+        command="echo",
+        args=[],
+        env={"API_KEY": "sk-live-abc123"},  # literal, not $VAR
+        transport="stdio",
+        description="",
+    )
+
+    # We don't need a real mock transport because the check fires before any I/O.
+    # Use a tier-2 backend for correctness, but the ValueError must come first.
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        method = request.method
+        if "/capabilities" in path:
+            return httpx.Response(200, json=_tier2_capabilities_response())
+        if method == "OPTIONS":
+            return httpx.Response(200, headers={"Allow": "GET, POST, DELETE"})
+        return httpx.Response(200, json={"servers": []})
+
+    backend = _make_tier2_backend(httpx.MockTransport(_handler))
+
+    with pytest.raises(ValueError) as exc_info:
+        backend.install(spec)
+
+    err = str(exc_info.value)
+    # Error message must name the server and the offending key.
+    assert "resolved-env-server" in err, f"Expected server name in error; got: {err!r}"
+    assert "API_KEY" in err, f"Expected env key name in error; got: {err!r}"
+
+
+def test_install_env_dollar_var_refs_accepted() -> None:
+    """install() accepts spec.env with $VAR references and proceeds to POST.
+
+    Confirms that the Decision A gate does NOT block well-formed $VAR env refs.
+    """
+    from atomic_agents.mcp_registry.types import MCPServerRef
+
+    spec = MCPServerSpec(
+        name="dollar-env-server",
+        command="echo",
+        args=[],
+        env={"API_KEY": "$API_KEY"},  # $VAR form -- accepted
+        transport="stdio",
+        description="",
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        method = request.method
+        if "/capabilities" in path:
+            return httpx.Response(200, json=_tier2_capabilities_response())
+        if method == "OPTIONS":
+            return httpx.Response(200, headers={"Allow": "GET, POST, DELETE"})
+        if method == "POST" and "/mcp-servers" in path:
+            return httpx.Response(
+                201,
+                json={
+                    "name": spec.name,
+                    "description": "",
+                    "transport": "stdio",
+                    "version": None,
+                    "source": f"http://catalog.example.invalid/mcp-servers/{spec.name}",
+                },
+            )
+        return httpx.Response(200, json={"servers": []})
+
+    backend = _make_tier2_backend(httpx.MockTransport(_handler))
+    # Must NOT raise; proceeds to POST and returns MCPServerRef.
+    ref = backend.install(spec)
+    assert isinstance(ref, MCPServerRef), f"Expected MCPServerRef; got {type(ref)!r}"
+    assert ref.name == spec.name
+
+
+def test_install_env_empty_dict_accepted() -> None:
+    """install() accepts spec.env={} (empty dict -- no values to check).
+
+    Decision A gate only rejects non-empty literal values. An empty env dict
+    has no values to inspect and must not raise.
+    """
+    from atomic_agents.mcp_registry.types import MCPServerRef
+
+    spec = MCPServerSpec(
+        name="empty-env-server",
+        command="echo",
+        args=[],
+        env={},
+        transport="stdio",
+        description="",
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        method = request.method
+        if "/capabilities" in path:
+            return httpx.Response(200, json=_tier2_capabilities_response())
+        if method == "OPTIONS":
+            return httpx.Response(200, headers={"Allow": "GET, POST, DELETE"})
+        if method == "POST" and "/mcp-servers" in path:
+            return httpx.Response(
+                201,
+                json={
+                    "name": spec.name,
+                    "description": "",
+                    "transport": "stdio",
+                    "version": None,
+                    "source": f"http://catalog.example.invalid/mcp-servers/{spec.name}",
+                },
+            )
+        return httpx.Response(200, json={"servers": []})
+
+    backend = _make_tier2_backend(httpx.MockTransport(_handler))
+    ref = backend.install(spec)
+    assert isinstance(ref, MCPServerRef)
+
+
+def test_install_env_empty_string_value_accepted() -> None:
+    """install() accepts spec.env with an empty-string value.
+
+    The gate condition is ``value and not value.startswith('$')``. An empty
+    string is falsy, so it is treated as "no value" and must not raise.
+    """
+    from atomic_agents.mcp_registry.types import MCPServerRef
+
+    spec = MCPServerSpec(
+        name="empty-val-env-server",
+        command="echo",
+        args=[],
+        env={"X": ""},  # empty string -- falsy, accepted
+        transport="stdio",
+        description="",
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        method = request.method
+        if "/capabilities" in path:
+            return httpx.Response(200, json=_tier2_capabilities_response())
+        if method == "OPTIONS":
+            return httpx.Response(200, headers={"Allow": "GET, POST, DELETE"})
+        if method == "POST" and "/mcp-servers" in path:
+            return httpx.Response(
+                201,
+                json={
+                    "name": spec.name,
+                    "description": "",
+                    "transport": "stdio",
+                    "version": None,
+                    "source": f"http://catalog.example.invalid/mcp-servers/{spec.name}",
+                },
+            )
+        return httpx.Response(200, json={"servers": []})
+
+    backend = _make_tier2_backend(httpx.MockTransport(_handler))
+    ref = backend.install(spec)
+    assert isinstance(ref, MCPServerRef)
+
+
+def test_install_auth_header_present_on_post() -> None:
+    """With auth_token set, every POST /mcp-servers includes Authorization header.
+
+    Mirrors the PR 4 GET path discipline: auth_token must be injected on
+    every outbound request including write paths.
+    """
+    captured_headers: list[dict] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        method = request.method
+        if "/capabilities" in path:
+            return httpx.Response(200, json=_tier2_capabilities_response())
+        if method == "OPTIONS":
+            return httpx.Response(200, headers={"Allow": "GET, POST, DELETE"})
+        if method == "POST" and "/mcp-servers" in path:
+            captured_headers.append(dict(request.headers))
+            return httpx.Response(
+                201,
+                json={
+                    "name": "auth-test",
+                    "description": "",
+                    "transport": "stdio",
+                    "version": None,
+                    "source": "http://catalog.example.invalid/mcp-servers/auth-test",
+                },
+            )
+        return httpx.Response(200, json={"servers": []})
+
+    spec = MCPServerSpec(
+        name="auth-test",
+        command="echo",
+        args=[],
+        env={},
+        transport="stdio",
+        description="",
+    )
+    backend = _make_tier2_backend(
+        httpx.MockTransport(_handler),
+        auth_token="test-bearer-token-xyz",
+    )
+    backend.install(spec)
+
+    assert captured_headers, "POST request must have been made"
+    for headers in captured_headers:
+        auth = headers.get("authorization", "")
+        assert "test-bearer-token-xyz" in auth, (
+            f"Authorization header must contain the auth token; got: {auth!r}"
+        )
+
+
+def test_uninstall_auth_header_present_on_delete() -> None:
+    """With auth_token set, every DELETE /mcp-servers/<name> includes Authorization.
+
+    Auth discipline must be symmetric: reads AND writes both carry the token.
+    """
+    captured_headers: list[dict] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        method = request.method
+        if "/capabilities" in path:
+            return httpx.Response(200, json=_tier2_capabilities_response())
+        if method == "OPTIONS":
+            return httpx.Response(200, headers={"Allow": "GET, POST, DELETE"})
+        if method == "DELETE" and "/mcp-servers/" in path:
+            captured_headers.append(dict(request.headers))
+            return httpx.Response(204, content=b"")
+        return httpx.Response(200, json={"servers": []})
+
+    backend = _make_tier2_backend(
+        httpx.MockTransport(_handler),
+        auth_token="delete-bearer-token-abc",
+    )
+    backend.uninstall("some-server")
+
+    assert captured_headers, "DELETE request must have been made"
+    for headers in captured_headers:
+        auth = headers.get("authorization", "")
+        assert "delete-bearer-token-abc" in auth, (
+            f"Authorization header must contain the auth token; got: {auth!r}"
+        )
+
+
+def test_must4_install_error_message_does_not_contain_credentials() -> None:
+    """install() error messages must not echo URL-embedded credentials.
+
+    MUST 4 (D-PR5-11): _safe_catalog_url must be used in all install/uninstall
+    error paths, not _catalog_url. This ensures that an operator who accidentally
+    embeds credentials in the catalog URL does not see them in exception messages.
+    """
+    from atomic_agents.mcp_registry import MCPServerAlreadyInstalled
+
+    spec = MCPServerSpec(
+        name="cred-test-server",
+        command="echo",
+        args=[],
+        env={},
+        transport="stdio",
+        description="",
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        method = request.method
+        if "/capabilities" in path:
+            return httpx.Response(200, json=_tier2_capabilities_response())
+        if method == "OPTIONS":
+            return httpx.Response(200, headers={"Allow": "GET, POST, DELETE"})
+        if method == "POST" and "/mcp-servers" in path:
+            return httpx.Response(409, json={"error": "already exists"})
+        return httpx.Response(200, json={"servers": []})
+
+    client = httpx.Client(transport=httpx.MockTransport(_handler))
+    backend = HTTPMCPServerRegistryBackend(
+        catalog_url="https://user:s3cr3t-cred@catalog.example.com",
+        agent_scope="test-scope",
+        _http_client=client,
+    )
+    backend.list_mcp_servers()  # force probe
+
+    with pytest.raises(MCPServerAlreadyInstalled) as exc_info:
+        backend.install(spec)
+
+    msg = str(exc_info.value)
+    assert "s3cr3t-cred" not in msg, (
+        f"MUST 4: credentials must not appear in MCPServerAlreadyInstalled message; got: {msg!r}"
+    )
+
+
+# Regression guard: this assertion MUST remain False at PR 5.
+# PR 5 flip applies to post-probe result only, NOT the pre-probe default.
+# See B-F11 and Decision 6 from the PR 5 prep notes.
+# If this test is changed to assert True, the pre-probe conservative default
+# has been incorrectly modified -- a regression per C-F7.
+def test_capabilities_before_first_probe_still_conservative_after_pr5() -> None:
+    """Pre-probe conservative default remains False/False at PR 5.
+
+    This assertion MUST remain False at PR 5. PR 5 flip applies to post-probe
+    result, not pre-probe default. See B-F11 and Decision 6.
+
+    The D-PR5-8 discipline: do NOT modify the pre-probe conservative default
+    (http.py lines that set the conservative False/False before first probe).
+    The capability flip at PR 5 is about what tier-2+ servers report at runtime,
+    not about the static pre-probe constant.
+
+    Per C-F7 from prep notes: this guard prevents a future implementer from
+    accidentally changing the pre-probe default and silently breaking MUST 3's
+    False-branch on backends that haven't been probed yet.
+    """
+    call_count: list[int] = [0]
+
+    def _counting_handler(request: httpx.Request) -> httpx.Response:
+        call_count[0] += 1
+        return httpx.Response(200, json=_tier2_capabilities_response())
+
+    transport = httpx.MockTransport(_counting_handler)
+    client = httpx.Client(transport=transport)
+    backend = HTTPMCPServerRegistryBackend(
+        catalog_url="http://catalog.example.invalid",
+        agent_scope="test-scope",
+        _http_client=client,
+    )
+
+    # Read capabilities WITHOUT calling list_mcp_servers / load_mcp_server first.
+    caps = backend.capabilities
+
+    # This MUST be False pre-probe even on a tier-2 capable catalog.
+    # B-F11: conservative pre-probe default is load-bearing.
+    assert caps.supports_install is False, (
+        "REGRESSION GUARD (C-F7): pre-probe conservative default must be False. "
+        "If this fails, the pre-probe default was accidentally changed. "
+        "The PR 5 capability flip applies only to post-probe tier-2 results."
+    )
+    assert call_count[0] == 0, (
+        "Reading capabilities property must not trigger a probe network call."
+    )

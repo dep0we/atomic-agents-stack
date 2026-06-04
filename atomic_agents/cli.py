@@ -1297,6 +1297,12 @@ def _cmd_mcp_registry(args) -> int:
     except MCPRegistryError as e:
         print(f"Error: MCP registry error: {e}", file=sys.stderr)
         return 1
+    except NotImplementedError as e:
+        print(
+            f"Error: operation not supported by this backend: {e}",
+            file=sys.stderr,
+        )
+        return 1
     except ValueError as e:
         print(f"Error: invalid server name: {e}", file=sys.stderr)
         return 1
