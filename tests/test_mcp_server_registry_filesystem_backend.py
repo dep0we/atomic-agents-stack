@@ -689,31 +689,9 @@ def test_malformed_mcp_md_raises_descriptor_invalid(tmp_path: Path) -> None:
         backend.load_mcp_server("malformed-server")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Install/uninstall stubs (deferred to PR 3)
-
-
-@pytest.mark.skip(
-    reason="install/uninstall land in PR 3 alongside LockBackend integration"
-)
-def test_atomic_install_collision_via_concurrent_threads(tmp_path: Path) -> None:
-    """Atomic install collision via concurrent threads.
-
-    Deferred to PR 3 when FilesystemMCPServerRegistryBackend.install ships
-    with LockBackend integration and atomic mcp.md write semantics.
-    """
-    pass
-
-
-@pytest.mark.skip(
-    reason="install/uninstall land in PR 3 alongside LockBackend integration"
-)
-def test_lock_file_acquired_during_install(tmp_path: Path) -> None:
-    """Lock file (.mcp_registry.lock) is acquired during install.
-
-    Deferred to PR 3 when LockBackend integration lands.
-    """
-    pass
+# Install/uninstall tests now live in test_mcp_server_registry_filesystem_install.py
+# (added at PR 3). The placeholder skip-marked stubs that were here have been
+# removed per Stream E finding E10 -- real tests replace them.
 
 
 # ──────────────────────────────────────────────────────────────────────────────
