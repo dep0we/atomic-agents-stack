@@ -32,6 +32,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+from ..exceptions import AtomicAgentsError
 from .types import MCPServerRegistryCapabilities, MCPServerRef, ValidationResult
 
 if TYPE_CHECKING:
@@ -42,12 +43,14 @@ if TYPE_CHECKING:
 # Exception classes
 
 
-class MCPRegistryError(Exception):
+class MCPRegistryError(AtomicAgentsError):
     """Base class for MCPServerRegistry subsystem errors (spec/36).
 
     All MCPServerRegistry reference implementations raise subclasses of this
     exception. Operators may ``except MCPRegistryError`` to catch the entire
-    MCP registry error family.
+    MCP registry error family. Inherits from ``AtomicAgentsError`` so
+    framework-wide catch-alls (``except AtomicAgentsError``) see registry
+    failures automatically (spec/36 Decision 4 / prep finding E12).
     """
 
 
