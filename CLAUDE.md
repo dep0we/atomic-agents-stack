@@ -292,7 +292,7 @@ If the project ever needs to optimize differently, `docs/methodology.md` is the 
 | Doc | Purpose |
 |-----|---------|
 | `docs/architecture.md` | Mental model in diagrams. Read first. |
-| `docs/spec/01-...33-persona-backend.md` | Locked spec (33 docs today, 31 locked + 2 drafts at spec/26 (cascade bundle) and spec/30 (responsibility audit)). The product. |
+| `docs/spec/01-...36-mcp-server-registry-backend.md` | Locked spec (35 docs today, 31 locked + 4 drafts at spec/26 (cascade bundle), spec/30 (responsibility audit), spec/35 (init wizard), and spec/36 (MCPServerRegistryBackend)). The product. |
 | `docs/implementation/` | Build guides per runtime (cron, Claude skill, dashboard) |
 | `docs/deployment/versioning.md`, `upgrading.md` | SemVer + operator runbook |
 | `docs/deployment/release-runbook.md` | Maintainer `/ship` runbook: two-mode workflow + manual surface check |
