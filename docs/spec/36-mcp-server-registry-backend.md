@@ -352,33 +352,94 @@ FilesystemMCPServerRegistryBackend(
     read_paths: list[Path],
     *,
     lock_backend: LockBackend | None = None,
+    install_lock_timeout: float = 30.0,
 )
 ```
 
 - `agent_root` is the agent's directory. mcp.md lives at `<agent_root>/mcp.md`.
 - `agent_root` MAY not exist at construction (matches `FilesystemToolRegistryBackend` precedent). `list_mcp_servers()` returns `[]` for missing / empty mcp.md.
 - `read_paths` is the list of paths the agent declares it may read (from `tools.md`). Used by `load_mcp_server(name)` to apply path-traversal validation (per Decision 8).
-- `lock_backend` (per MUST 9): if absent, defaults to `FilesystemLockBackend(agent_root / ".mcp_registry.lock")`. The default lock file `.mcp_registry.lock` is **distinct** from the agent's main `.lock` (which the runtime acquires inside `agent.call()` for cost-cap and run-id serialization); the two locks never overlap and cannot deadlock even on non-reentrant `LockBackend` implementations. Operators passing a custom `lock_backend` MUST scope it to `.mcp_registry.lock` (or an equivalent registry-specific resource), NOT the agent's main lock; the docstring on the constructor parameter calls this out explicitly.
+- `lock_backend` (per MUST 9): if absent, defaults to `get_default_lock_backend(agent_root)` from `atomic_agents.locks` (respects the `ATOMIC_AGENTS_LOCK_BACKEND` env var so multi-host operators on Cloud Run / Kubernetes pinning `=redis` get a `RedisLockBackend` automatically; single-host operators get `FilesystemLockBackend(agent_root)`). The lock is acquired with `name="mcp_registry"` which the filesystem backend maps to `<agent_root>/.mcp_registry.lock`. This lock file is **distinct** from the agent's main `.lock` (which the runtime acquires inside `agent.call()` for cost-cap and run-id serialization); the two locks never overlap and cannot deadlock even on non-reentrant `LockBackend` implementations. Operators passing a custom `lock_backend` MUST scope it to a registry-specific resource, NOT the agent's main lock; the docstring on the constructor parameter calls this out explicitly and names the failure mode (passing the same backend used for `agent.call()` raises `LockBusy` whenever `agent.call()` is in flight, because both operations would compete for the same lock resource).
+- `install_lock_timeout` (per MUST 9): seconds to wait for the registry lock during `install` and `uninstall` before raising `MCPRegistryUnavailable`. Default 30 seconds matches typical operator-CLI patience. CI pipelines that want fail-fast set `install_lock_timeout=0.0`; NFS-mounted deployments with slow filesystems may raise it. The kwarg is per-instance and immutable post-construction (mirrors the `apply_staging_lock_timeout` precedent on `FilesystemBackend` per spec/21).
 - Reuses `parse_mcp_md_text()` from `atomic_agents/mcp.py:432` with the new `resolve_env=False` parameter (per Decision 7's implementation note); the backend resolves `$VAR` references itself at `load_mcp_server(name)` time.
 - `name` validated against path-traversal at API boundary: refuses `/`, `\\`, `..`, leading `.`, control chars, newlines.
 
-**`install(spec)` atomicity (PR 3):**
+#### Install / uninstall semantics (PR 3)
 
-1. `lock_backend.acquire("mcp_registry", timeout=30)` (per spec/21's `acquire(name="", timeout=0.0)` signature at `locks/backend.py:82`).
-2. Read current mcp.md.
-3. Parse with `parse_mcp_md_text(content, resolve_env=False)`.
-4. Check name collision; if present, release lock and raise `MCPServerAlreadyInstalled`.
-5. Append new `## <name>` section to the markdown.
-6. `_io.atomic_write` the merged content back (temp + fsync + rename + parent dir fsync).
-7. Release lock via the returned `LockHandle.release()` (the spec/21 idiom).
+The PR 3 write paths implement MUST 9 (atomicity + idempotency) through a strict read-modify-write critical section guarded by the `LockBackend` lease. Both `install(spec)` and `uninstall(name)` follow the same shape with one branch difference.
 
-Crash between steps 1 and 6 leaves the original mcp.md intact; crash between 6 and 7 leaves the new content with a stale lock (lease expiry per spec/21's `LockLost` discipline handles recovery).
+**Common preamble (both methods).** Validate `name` (or `spec.name`) charset at the API boundary per MUST 1 via `_validate_server_name(...)` BEFORE acquiring the lock or touching the filesystem. Refuses path-traversal tokens, control chars, newlines, leading dot, empty string. Raises `ValueError` cheaply for invalid input without contending for the lock.
 
-**`uninstall(name)` atomicity (PR 3):** same shape; idempotent. Missing-name case completes steps 1-3, observes the name is absent, releases the lock, returns without raising.
+**Critical section (steps 2-7, wrapped in the lock).** Use the spec/21 context-manager idiom so every exit path (success, collision, parse error, atomic_write failure, lease loss) releases the lock cleanly:
+
+```python
+try:
+    handle = self._lock_backend.acquire("mcp_registry", timeout=self._install_lock_timeout)
+except LockBusy as exc:
+    raise MCPRegistryUnavailable(
+        f"mcp_registry lock contention: {exc}"
+    ) from exc
+
+with handle:
+    # Step 2: read current mcp.md (FileNotFoundError -> treat as empty)
+    # Step 3: parse with parse_mcp_md_text(content, resolve_env=False)
+    # Step 4: dual-probe collision check (install) OR absent-name early-return (uninstall)
+    # Step 5: check_lock_lost(handle) -- raises LockLost if a lease-backed lock expired mid-critical-section
+    # Step 6: render mutated spec list via render_mcp_md_full(updated_specs)
+    # Step 7: _io.atomic_write(mcp_md, rendered_content)
+```
+
+The outer `try/except LockBusy` translates the lock-timeout to `MCPRegistryUnavailable` so the framework's fail-closed wrapper at `agent.py:__init__` catches it as `MCPRegistryError`. The `with handle:` block guarantees `backend.release(handle)` runs on every path including exceptions.
+
+**Step 4 (install) -- dual-probe collision detection.** A single check against the parsed-spec list misses malformed sections (`## name` header present but `command:` absent, which `_build_spec` silently skips with a warning). The install MUST check BOTH the parsed-name set AND a raw H2 regex scan against the file content:
+
+```python
+h2_names = set(re.findall(r"^## (\S+)", content, re.MULTILINE))
+parsed_names = {s.name for s in specs}
+if spec.name in h2_names or spec.name in parsed_names:
+    raise MCPServerAlreadyInstalled(
+        f"MCP server {spec.name!r} is already in mcp.md."
+    )
+```
+
+The exception message MUST contain ONLY `spec.name`, never the full spec repr (env values could leak through `repr(spec)` if the spec was constructed with literal env values; the operator-visible error message is operator input, not framework-resolved values).
+
+**Step 4 (uninstall) -- absent-name idempotency.** If `name` is not present in either the parsed-name set or the H2 regex scan, the uninstall is a no-op: log at DEBUG, skip the `atomic_write` (avoids unnecessary mtime bump), exit the `with` block (releases lock), return `None`. No exception is raised. There is no pre-lock fast-path; the lock MUST be acquired before reading mcp.md, because a concurrent `install` could add the name between an unlocked check and the subsequent read.
+
+**Step 5 -- mid-critical-section lease check.** Before the `atomic_write`, call `check_lock_lost(handle)` from `atomic_agents.locks`. This is a no-op on filesystem (no heartbeat / TTL: POSIX `fcntl.flock` releases automatically on process death), but for lease-backed backends (`RedisLockBackend`) it raises `LockLost` if the lease expired mid-critical-section (Redis network blip). The implementation MUST catch `LockLost` and re-raise as `MCPRegistryUnavailable` so the framework treats it as a transient failure.
+
+**Step 6 -- full-file render.** The "append new section" phrasing in MUST 9 is conceptual; the implementation does a full read-modify-write. The renderer `render_mcp_md_full(specs)` from `atomic_agents/mcp.py` produces a complete mcp.md content string from the mutated spec list (install: existing specs + new spec; uninstall: existing specs minus removed). The renderer's round-trip property: `parse_mcp_md_text(render_mcp_md_full(specs), resolve_env=False) == specs`. The renderer writes `$VAR` references verbatim (never resolved values; resolved env never persists to disk per Decision 7).
+
+**MCPServerRef projection on install return.** `install(spec) -> MCPServerRef` projects `name`, `description` (single-line, newlines stripped), `transport` from the input spec; `version=None`; `source=f"mcp.md#section:{name}"`. The Ref carries no `command`, no `args`, no `env`, so the CLI handler can safely echo the Ref without secret-leak risk.
+
+**uninstall return.** `uninstall(name) -> None`. Both the present-and-removed path and the absent-no-op path return `None`. Matches `SQLiteToolRegistryBackend.uninstall` precedent.
+
+**Crash safety analysis.** All crash points produce recoverable state:
+- Crash before step 7 atomic_write (lock held, file unchanged): lock released by OS on process death (filesystem) or by lease expiry (Redis); next install retries cleanly.
+- Crash during atomic_write (rename incomplete): temp file `.mcp.md.<random>.tmp` left in `agent_root`; mcp.md still has original content (atomic rename guarantee). `cleanup_stale_tempfiles(agent_root)` from `_io.py` handles the orphan; PR 3 calls this from `FilesystemMCPServerRegistryBackend.__init__` as a side-effect-free recovery sweep.
+- Crash after atomic_write (rename committed, lock held): mcp.md has new content; stale lock released as above. Correct on-disk state.
+
+#### LockBackend integration (PR 3)
+
+**Default factory routes through `get_default_lock_backend`.** When the constructor receives `lock_backend=None`, the backend lazily resolves the default via `atomic_agents.locks.get_default_lock_backend(agent_root)`. This respects `ATOMIC_AGENTS_LOCK_BACKEND` (env var that the agent's main lock already respects), so operators on Cloud Run / Kubernetes pinning `=redis` automatically get `RedisLockBackend` for registry writes too. Single-host operators get `FilesystemLockBackend(agent_root)`. The framework convention is consistent across the agent's main lock and the registry lock.
+
+**Context-manager idiom is the canonical release pattern.** `LockHandle` (per spec/21) implements `__enter__` and `__exit__`; `__exit__` invokes `backend.release(handle)` on every path including exceptions. The 7-step critical section MUST be wrapped in `with handle:` (NOT bare `try/finally` with `handle.release()` because `LockHandle` is a frozen dataclass without a `release()` method; release is a backend method, not a handle method).
+
+**`install_lock_timeout` is the operator knob.** Constructor kwarg with 30s default. Tests use `install_lock_timeout=0.0` for fail-fast assertions. CI pipelines that want immediate failure on contention set it to a low value. NFS-mounted deployments with slow filesystems raise it.
+
+**`LockBusy` translates to `MCPRegistryUnavailable` inside install/uninstall.** The `acquire()` call may raise `LockBusy` from spec/21 after the timeout elapses. The implementation catches it at the boundary and re-raises as `MCPRegistryUnavailable` so the CLI's exception handler + the framework's fail-closed wrapper at `agent.py:__init__` (both catch `MCPRegistryError`) handle it cleanly. Raw `LockBusy` escaping to either layer would bypass operator-readable error messages.
+
+**`check_lock_lost(handle)` discipline.** Called before the `atomic_write` step. No-op for filesystem (`supports_lease=False`); raises `LockLost` for lease-backed backends if the lease expired mid-critical-section. Caught and re-raised as `MCPRegistryUnavailable`. This closes the Redis-network-blip corruption window where two installs could both believe they hold the lock.
+
+**Custom `lock_backend` operator surface.** Operators passing a custom `lock_backend` MUST scope it to a registry-specific resource (`.mcp_registry.lock` namespace) NOT the agent's main lock. Passing the agent's main lock backend causes install/uninstall to raise `LockBusy` (translated to `MCPRegistryUnavailable`) whenever `agent.call()` is in flight, because both operations would compete for `<agent_root>/.lock`. The constructor docstring names this failure mode explicitly.
+
+**Multi-host pinning via env var.** Operators on Cloud Run / Kubernetes set `ATOMIC_AGENTS_LOCK_BACKEND=redis` + `ATOMIC_AGENTS_LOCK_BACKEND_URL=redis://...`. The default factory routes correctly without per-construction operator config. Redis keys are scoped per `agent_root` for cross-agent isolation (spec/21 §"Operator surface").
+
+**Non-reentrant by default.** `FilesystemLockBackend` and `RedisLockBackend` both report `supports_reentrancy=False`. A caller that pre-acquires `acquire("mcp_registry", ...)` externally and then calls `backend.install(spec)` gets `LockBusy` on the internal acquire attempt. Operators wanting batch install should call `install(spec)` sequentially (each call is individually atomic) rather than wrapping in an external acquire.
 
 **`validate(name)`:** runs descriptor parses; `command` exists on PATH (warn if absent; do not fail validation since the agent's PATH at run time may differ); `transport` value recognized; `$VAR` refs resolve against current `os.environ` (warn if not).
 
-**Capabilities (PR 1/2):** `supports_install=False, supports_uninstall=False, supports_capability_handshake=False, supports_audit=False, durable=True`. Flips to `supports_install=True, supports_uninstall=True` at PR 3 when the methods land. Static; no runtime probe required.
+**Capabilities (PR 3+):** `supports_install=True, supports_uninstall=True, supports_capability_handshake=False, supports_audit=False, durable=True`. At PR 3 the install / uninstall methods land and the capability flags flip True (was False at PR 1/2 per Decision 5 evolution table). Static; no runtime probe required.
 
 **`list_mcp_servers()`** MUST call `parse_mcp_md_text(content, resolve_env=False, read_paths=None)` with `read_paths=None` explicitly, NOT `self._read_paths`. Passing `self._read_paths` at list time triggers `validate_mcp_server_args` at parse time and violates Decision 8's "validation at `load_mcp_server` boundary" invariant (prep notes Theme 3).
 
@@ -562,7 +623,7 @@ The MUST count is 10 because the static-vs-dynamic capability distinction (Decis
 
 **MUST 8: Env-var resolution semantics on MCPServerSpec.** `$VAR` references in `MCPServerSpec.env` values MUST be resolved against the client process environment at `load_mcp_server(name)` time. Unresolvable references MUST raise `MCPServerConnectFailed` (the existing spec/19 exception; not a new exception class). This applies to ALL backends regardless of storage substrate: HTTP catalog servers MAY store unresolved `$VAR` strings, and the framework's HTTP client MUST resolve at materialization.
 
-**MUST 9: Install / uninstall atomicity.** Concurrent `install(spec)` calls for the same server name MUST produce exactly one winner; the others MUST raise `MCPServerAlreadyInstalled`. Filesystem implementations MUST acquire a `LockBackend` (spec/21) lease around the read-modify-write critical section in `install` and `uninstall` (read mcp.md, parse, check name collision, write back); the `_io.atomic_write` discipline ensures crash-safety on the individual write, while the lock serializes concurrent callers. The lock acquisition uses the spec/21 signature: `lock_handle = lock_backend.acquire("mcp_registry", timeout=30)`; release via `lock_handle.release()`. HTTP implementations rely on the catalog server's transactional storage and translate HTTP 409 to `MCPServerAlreadyInstalled`. `uninstall(name)` MUST be idempotent (no exception when the name is absent).
+**MUST 9: Install / uninstall atomicity.** Concurrent `install(spec)` calls for the same server name MUST produce exactly one winner; the others MUST raise `MCPServerAlreadyInstalled`. Filesystem implementations MUST acquire a `LockBackend` (spec/21) lease around the read-modify-write critical section in `install` and `uninstall` (read mcp.md, parse, check name collision via dual-probe across raw H2 regex and parsed-name set, write back via the renderer); the `_io.atomic_write` discipline ensures crash-safety on the individual write, while the lock serializes concurrent callers. The lock acquisition uses the spec/21 context-manager idiom: `with lock_backend.acquire("mcp_registry", timeout=self._install_lock_timeout) as handle:` wrapping the critical section. Implementations MUST catch `LockBusy` from `acquire` and re-raise as `MCPRegistryUnavailable` so the framework's fail-closed wrapper at `agent.py:__init__` (catches `MCPRegistryError`) sees a coherent exception type. Implementations MUST call `check_lock_lost(handle)` from `atomic_agents.locks` immediately before the `atomic_write` step; for lease-backed backends (`RedisLockBackend`) this raises `LockLost` if the lease expired mid-critical-section, which MUST be re-raised as `MCPRegistryUnavailable`. HTTP implementations rely on the catalog server's transactional storage and translate HTTP 409 to `MCPServerAlreadyInstalled`. `uninstall(name)` MUST be idempotent (no exception when the name is absent). There is no pre-lock fast-path for absent names on `uninstall`; the lock MUST be acquired before reading mcp.md, because a concurrent `install` could add the name between an unlocked check and the subsequent read. Absent-name uninstall MAY skip the `atomic_write` step (mtime preservation), but MUST still hold the lock for the read-and-check critical section.
 
 **MUST 10: `load_all_mcp_servers()` consistency.** The output of `load_all_mcp_servers()` MUST be semantically equivalent to `[load_mcp_server(ref.name) for ref in list_mcp_servers()]` for any given backend state. Backends MAY optimize the bulk implementation (HTTP backend uses single bulk GET via `?expand=spec`; SQLite backend can use a single SELECT) but MUST preserve the equivalence guarantee. The conformance suite asserts: for every registered backend, `set(load_all_mcp_servers())` equals `set([load_mcp_server(ref.name) for ref in list_mcp_servers()])` across populated and empty catalog states.
 
