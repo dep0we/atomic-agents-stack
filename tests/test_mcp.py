@@ -47,6 +47,7 @@ from atomic_agents.tools import ToolDefinition, ToolRegistry
 # ──────────────────────────────────────────────────────────────────
 # Helpers
 
+
 def _make_spec(
     name: str = "test-server",
     command: str = "npx",
@@ -82,9 +83,7 @@ def _build_minimal_agent_dir(tmp_path: Path, name: str = "test-agent") -> Path:
     (agent_dir / "tools.md").write_text(
         f"## Read paths\n- ~/docs/\n\n## Write paths\n- {agent_dir}/\n"
     )
-    (agent_dir / "model.md").write_text(
-        "## Default model\nclaude-haiku-4-5-20251001\n"
-    )
+    (agent_dir / "model.md").write_text("## Default model\nclaude-haiku-4-5-20251001\n")
     (agent_dir / "memory").mkdir()
     (agent_dir / "log").mkdir()
     return agent_dir
@@ -92,6 +91,7 @@ def _build_minimal_agent_dir(tmp_path: Path, name: str = "test-agent") -> Path:
 
 # ──────────────────────────────────────────────────────────────────
 # parse_mcp_md_text — basic parsing
+
 
 def test_parse_mcp_md_empty_returns_empty_list():
     assert parse_mcp_md_text("") == []
@@ -208,6 +208,7 @@ def test_parse_mcp_md_non_path_args_not_validated(tmp_path):
 # ──────────────────────────────────────────────────────────────────
 # MCPClientPool — connect, discover, dispatch
 
+
 def test_mcp_client_pool_connect_failure_doesnt_block_others(tmp_path):
     """One server failing connect still lets others connect successfully."""
     specs = [
@@ -298,6 +299,7 @@ def test_mcp_disconnect_all_idempotent(tmp_path):
 # ──────────────────────────────────────────────────────────────────
 # AtomicAgent integration
 
+
 def test_agent_loads_mcp_servers_from_config(tmp_path):
     """Agent with mcp.md has config.mcp_servers populated."""
     agent_dir = _build_minimal_agent_dir(tmp_path)
@@ -363,7 +365,9 @@ def test_agent_call_lazy_inits_pool_on_first_call_when_servers_declared(tmp_path
     mock_pool.disconnect_all = MagicMock()
 
     with patch("atomic_agents._llm.call_llm", return_value=raw):
-        with patch("atomic_agents.agent.MCPClientPool", return_value=mock_pool) as pool_cls:
+        with patch(
+            "atomic_agents.agent.MCPClientPool", return_value=mock_pool
+        ) as pool_cls:
             agent.call("Do something.")
 
     pool_cls.assert_called_once()
@@ -430,11 +434,13 @@ def test_mcp_tool_invocation_routes_through_registry_and_loop(tmp_path):
     # Second LLM call: model uses the result and returns final text
     tool_use_raw = _make_raw_response(
         text="Let me check the time.",
-        tool_uses=[{
-            "name": "time__get_current_time",
-            "id": "tu_001",
-            "input": {},
-        }],
+        tool_uses=[
+            {
+                "name": "time__get_current_time",
+                "id": "tu_001",
+                "input": {},
+            }
+        ],
     )
     final_raw = _make_raw_response("The current time is 2026-05-07T12:00:00Z.")
 
@@ -454,6 +460,7 @@ def test_mcp_tool_invocation_routes_through_registry_and_loop(tmp_path):
 
 # ──────────────────────────────────────────────────────────────────
 # Helpers for agent tests
+
 
 def _stub_anthropic():
     """Ensure `anthropic` doesn't need to be installed for agent init."""
@@ -484,6 +491,7 @@ def _make_raw_response(
 
 # M1 — env merges with parent environment
 
+
 def test_mcp_env_merges_with_parent_environment(monkeypatch):
     """Merged env passed to StdioServerParameters includes parent PATH + spec.env vars.
 
@@ -504,7 +512,9 @@ def test_mcp_env_merges_with_parent_environment(monkeypatch):
     captured_envs: list[dict] = []
 
     # Build a fake mcp SDK that captures the StdioServerParameters env kwarg.
-    fake_params_cls = MagicMock(side_effect=lambda **kw: (captured_envs.append(kw.get("env", {})), kw)[1])
+    fake_params_cls = MagicMock(
+        side_effect=lambda **kw: (captured_envs.append(kw.get("env", {})), kw)[1]
+    )
 
     async def fake_list_tools_flow():
         result = MagicMock()
@@ -512,16 +522,30 @@ def test_mcp_env_merges_with_parent_environment(monkeypatch):
         return result
 
     class _FakeSession:
-        def __init__(self, *args, **kwargs): pass
-        async def __aenter__(self): return self
-        async def __aexit__(self, *_): pass
-        async def initialize(self): pass
-        async def list_tools(self): return await fake_list_tools_flow()
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            pass
+
+        async def initialize(self):
+            pass
+
+        async def list_tools(self):
+            return await fake_list_tools_flow()
 
     class _FakeStdioClient:
-        def __init__(self, params): pass
-        async def __aenter__(self): return (MagicMock(), MagicMock())
-        async def __aexit__(self, *_): pass
+        def __init__(self, params):
+            pass
+
+        async def __aenter__(self):
+            return (MagicMock(), MagicMock())
+
+        async def __aexit__(self, *_):
+            pass
 
     # Build a fake mcp module hierarchy
     fake_mcp = types.ModuleType("mcp")
@@ -539,13 +563,17 @@ def test_mcp_env_merges_with_parent_environment(monkeypatch):
 
     import asyncio
 
-    with patch.dict(sys.modules, {
-        "mcp": fake_mcp,
-        "mcp.client": fake_mcp_client,
-        "mcp.client.stdio": fake_mcp_stdio,
-        "mcp.client.session": fake_mcp_session_mod,
-    }):
+    with patch.dict(
+        sys.modules,
+        {
+            "mcp": fake_mcp,
+            "mcp.client": fake_mcp_client,
+            "mcp.client.stdio": fake_mcp_stdio,
+            "mcp.client.session": fake_mcp_session_mod,
+        },
+    ):
         from atomic_agents.mcp import _async_connect_and_list as _acal
+
         asyncio.run(_acal(spec))
 
     # Exactly one StdioServerParameters call should have been made
@@ -635,8 +663,7 @@ def test_agent_load_config_blocks_path_traversal_via_mcp_md(tmp_path):
     # Write a mcp.md with a path-traversal arg outside tools.md read_paths.
     # tools.md declares read_paths: ~/docs/ — ../../etc/passwd escapes that.
     (agent_dir / "mcp.md").write_text(
-        "# MCP servers\n\n## evil\ncommand: npx\n"
-        "args: -y, @mcp/srv, ../../etc/passwd\n"
+        "# MCP servers\n\n## evil\ncommand: npx\nargs: -y, @mcp/srv, ../../etc/passwd\n"
     )
 
     _stub_anthropic()
@@ -795,9 +822,132 @@ def test_mcp_pool_not_initialized_when_cost_cap_skips_call(tmp_path):
 
     # Patch _check_cost_guardrails to always return allow=False (skip)
     from atomic_agents.types import CostCheckResult
-    with patch.object(agent, "_check_cost_guardrails", return_value=CostCheckResult(allow=False, reason="daily cap hit")):
+
+    with patch.object(
+        agent,
+        "_check_cost_guardrails",
+        return_value=CostCheckResult(allow=False, reason="daily cap hit"),
+    ):
         with patch("atomic_agents.agent.MCPClientPool", mock_pool_cls):
             agent.call("Do something.")
 
     # MCPClientPool should never have been instantiated
     mock_pool_cls.assert_not_called()
+
+
+# ──────────────────────────────────────────────────────────────────
+# render_mcp_md_section / render_mcp_md_full round-trip tests (PR 3)
+
+
+def test_render_mcp_md_section_round_trip_basic():
+    """Render a spec with all 6 fields then parse it back; fields must match."""
+    from atomic_agents.mcp import render_mcp_md_section
+
+    spec = MCPServerSpec(
+        name="github",
+        command="npx",
+        args=["-y", "@modelcontextprotocol/server-github"],
+        env={"GITHUB_PAT": "$GITHUB_PAT"},
+        transport="stdio",
+        description="GitHub repo and issue access",
+    )
+    rendered = render_mcp_md_section(spec)
+    parsed = parse_mcp_md_text(rendered, resolve_env=False)
+
+    assert len(parsed) == 1
+    result = parsed[0]
+    assert result.name == spec.name
+    assert result.command == spec.command
+    assert result.args == spec.args
+    assert result.env == spec.env
+    assert result.transport == spec.transport
+    assert result.description == spec.description
+
+
+def test_render_mcp_md_section_env_not_resolved():
+    """$VAR references in env must survive the render-parse round-trip verbatim."""
+    from atomic_agents.mcp import render_mcp_md_section
+
+    spec = MCPServerSpec(
+        name="myserver",
+        command="node",
+        args=["server.js"],
+        env={"GITHUB_PAT": "$GITHUB_PAT"},
+        transport="stdio",
+        description="",
+    )
+    rendered = render_mcp_md_section(spec)
+    # Render with resolve_env=False so $VAR stays raw.
+    parsed = parse_mcp_md_text(rendered, resolve_env=False)
+
+    assert len(parsed) == 1
+    # The $VAR reference must NOT have been resolved to an os.environ value.
+    assert parsed[0].env.get("GITHUB_PAT") == "$GITHUB_PAT"
+
+
+def test_render_mcp_md_section_strips_description_newlines():
+    """Description containing newlines: only the first line appears after round-trip."""
+    from atomic_agents.mcp import render_mcp_md_section
+
+    spec = MCPServerSpec(
+        name="multiline-desc",
+        command="python",
+        args=["-m", "myserver"],
+        env={},
+        transport="stdio",
+        description="line1\nline2\nline3",
+    )
+    rendered = render_mcp_md_section(spec)
+    parsed = parse_mcp_md_text(rendered, resolve_env=False)
+
+    assert len(parsed) == 1
+    # Only the first line survives the round-trip.
+    assert parsed[0].description == "line1"
+
+
+def test_render_mcp_md_full_round_trip():
+    """Render a 3-spec list as a full mcp.md file then parse all 3 back."""
+    from atomic_agents.mcp import render_mcp_md_full
+
+    specs = [
+        MCPServerSpec(
+            name="alpha",
+            command="npx",
+            args=["-y", "@mcp/alpha"],
+            env={},
+            transport="stdio",
+            description="Alpha server",
+        ),
+        MCPServerSpec(
+            name="beta",
+            command="python",
+            args=["-m", "beta_server"],
+            env={"BETA_KEY": "$BETA_KEY"},
+            transport="stdio",
+            description="",
+        ),
+        MCPServerSpec(
+            name="gamma",
+            command="node",
+            args=["gamma.js", "--port", "9000"],
+            env={},
+            transport="stdio",
+            description="Gamma description",
+        ),
+    ]
+    rendered = render_mcp_md_full(specs)
+
+    # Must start with the H1 header.
+    assert rendered.startswith("# MCP servers\n")
+
+    parsed = parse_mcp_md_text(rendered, resolve_env=False)
+    assert len(parsed) == 3
+
+    # All names must round-trip (order-independent check via set).
+    assert {s.name for s in parsed} == {"alpha", "beta", "gamma"}
+
+    # Spot-check fields on each parsed spec.
+    by_name = {s.name: s for s in parsed}
+    assert by_name["alpha"].args == ["-y", "@mcp/alpha"]
+    assert by_name["beta"].env == {"BETA_KEY": "$BETA_KEY"}
+    assert by_name["gamma"].description == "Gamma description"

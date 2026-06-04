@@ -20,6 +20,8 @@ Usage:
     atomic-agents corpus query TEXT --corpus wiki [--top-k N] [--agent-root PATH]
     atomic-agents corpus version NAME --corpus wiki [--agent-root PATH]
     atomic-agents corpus restore NAME VERSION_ID --corpus wiki [--agent-root PATH]
+    atomic-agents mcp-registry install <name> --command <cmd> [options]
+    atomic-agents mcp-registry uninstall <name>
     atomic-agents init <name> [--from-template advisor] [--agents-root PATH]
     atomic-agents init --list-templates
 
@@ -40,6 +42,7 @@ Subcommands:
 from __future__ import annotations
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -378,12 +381,13 @@ def main(argv: list[str] | None = None) -> int:
     # ── mcp-registry subcommand group ────────────────────────────────────
     mcp_registry_cmd = sub.add_parser(
         "mcp-registry",
-        help="Inspect mounted MCP servers (list, show, validate, refresh-capabilities)",
+        help="Inspect and manage MCP servers (list, show, validate, install, uninstall, refresh-capabilities)",
         description=(
-            "Read-only inspection of the MCP server registry for an agent. "
+            "Inspect and manage the MCP server registry for an agent. "
             "Uses the filesystem backend by default (reads <agent-root>/mcp.md). "
             "Override with ATOMIC_AGENTS_MCP_SERVER_REGISTRY_BACKEND env var. "
-            "Install and uninstall subcommands are deferred to PR 3."
+            "Read-only subcommands: list, show, validate, refresh-capabilities. "
+            "Write subcommands (PR 3+): install, uninstall."
         ),
     )
     mcp_registry_sub = mcp_registry_cmd.add_subparsers(
@@ -434,6 +438,66 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     mcp_registry_refresh.add_argument(
+        "--agent-root",
+        default=None,
+        help="override ATOMIC_AGENTS_AGENT_ROOT (default: $ATOMIC_AGENTS_AGENT_ROOT or cwd)",
+    )
+
+    # mcp-registry install <name> --command <cmd> [options]
+    mcp_registry_install = mcp_registry_sub.add_parser(
+        "install",
+        help="Install a new MCP server into the registry (write path; PR 3+)",
+    )
+    mcp_registry_install.add_argument(
+        "name", help="MCP server name (charset: [a-zA-Z0-9_.+@-]+)"
+    )
+    mcp_registry_install.add_argument(
+        "--command",
+        required=True,
+        help="executable for the MCP server (e.g., npx, docker, uv)",
+    )
+    mcp_registry_install.add_argument(
+        "--args",
+        default="",
+        help=(
+            "comma-separated args for the executable. Example: "
+            "--args -y,@modelcontextprotocol/server-github. Default: none."
+        ),
+    )
+    mcp_registry_install.add_argument(
+        "--env",
+        default="",
+        help=(
+            "comma-separated KEY=$VAR pairs. Use env-var references "
+            "(KEY=$VAR_NAME), NOT literal values, to avoid storing secrets in "
+            "mcp.md plaintext. Example: GITHUB_PAT=$GITHUB_PAT,LOG_LEVEL=$LOG_LEVEL. "
+            "Default: none."
+        ),
+    )
+    mcp_registry_install.add_argument(
+        "--description",
+        default="",
+        help="operator-readable description (single line). Default: empty.",
+    )
+    mcp_registry_install.add_argument(
+        "--transport",
+        default="stdio",
+        choices=["stdio"],
+        help="MCP server transport protocol (only 'stdio' is supported in v1.0; default: stdio)",
+    )
+    mcp_registry_install.add_argument(
+        "--agent-root",
+        default=None,
+        help="override ATOMIC_AGENTS_AGENT_ROOT (default: $ATOMIC_AGENTS_AGENT_ROOT or cwd)",
+    )
+
+    # mcp-registry uninstall <name> [--agent-root PATH]
+    mcp_registry_uninstall = mcp_registry_sub.add_parser(
+        "uninstall",
+        help="Remove an MCP server from the registry (write path; PR 3+). Idempotent.",
+    )
+    mcp_registry_uninstall.add_argument("name", help="MCP server name to remove")
+    mcp_registry_uninstall.add_argument(
         "--agent-root",
         default=None,
         help="override ATOMIC_AGENTS_AGENT_ROOT (default: $ATOMIC_AGENTS_AGENT_ROOT or cwd)",
@@ -1060,7 +1124,7 @@ def _corpus_show(backend, name: str, corpus: str) -> int:
     if page.confidence is not None:
         print(f"confidence:    {page.confidence}")
     if page.pinned:
-        print(f"pinned:        true")
+        print("pinned:        true")
     ts = ref.last_modified.strftime("%Y-%m-%dT%H:%M:%SZ")
     print(f"last_modified: {ts}")
     print(f"byte_size:     {ref.byte_size}")
@@ -1160,13 +1224,13 @@ def _cmd_mcp_registry(args) -> int:
 
     Exit codes: 0 on success, 1 on any error. Errors go to stderr;
     normal output to stdout. Zero LLM calls -- pure local I/O.
-
-    Install and uninstall subcommands are deferred to PR 3.
     """
     from .mcp_registry import (
         MCPRegistryAuthRequired,
         MCPRegistryDescriptorInvalid,
+        MCPRegistryError,
         MCPRegistryUnavailable,
+        MCPServerAlreadyInstalled,
         MCPServerNotInRegistry,
         get_default_mcp_server_registry_backend,
     )
@@ -1175,9 +1239,8 @@ def _cmd_mcp_registry(args) -> int:
     agent_root = _resolve_mcp_registry_agent_root(args)
 
     # Empty read_paths means the CLI skips path-traversal validation. This is
-    # consistent with the read-only inspection use case (mcp-registry show/validate/
-    # list); install/uninstall in PR 3 will require non-empty read_paths from agent
-    # runtime context.
+    # consistent with the inspection use case (mcp-registry show/validate/list);
+    # install/uninstall write directly to mcp.md without needing read_paths.
     try:
         backend = get_default_mcp_server_registry_backend(agent_root, [])
     except Exception as e:
@@ -1195,8 +1258,23 @@ def _cmd_mcp_registry(args) -> int:
             return _mcp_registry_validate(backend, args.name)
         elif sub_cmd == "refresh-capabilities":
             return _mcp_registry_refresh_capabilities(backend)
+        elif sub_cmd == "install":
+            return _mcp_registry_install(
+                backend,
+                args.name,
+                args.command,
+                args.args,
+                args.env,
+                args.description,
+                args.transport,
+            )
+        elif sub_cmd == "uninstall":
+            return _mcp_registry_uninstall(backend, args.name)
     except MCPServerConnectFailed as e:
         print(f"Error: env var not resolved: {e}", file=sys.stderr)
+        return 1
+    except MCPServerAlreadyInstalled as e:
+        print(f"Error: MCP server already installed: {e}", file=sys.stderr)
         return 1
     except MCPRegistryDescriptorInvalid as e:
         print(f"Error: MCP server descriptor is invalid: {e}", file=sys.stderr)
@@ -1215,6 +1293,9 @@ def _cmd_mcp_registry(args) -> int:
         return 1
     except MCPServerNotInRegistry as e:
         print(f"Error: MCP server not found: {e}", file=sys.stderr)
+        return 1
+    except MCPRegistryError as e:
+        print(f"Error: MCP registry error: {e}", file=sys.stderr)
         return 1
     except ValueError as e:
         print(f"Error: invalid server name: {e}", file=sys.stderr)
@@ -1312,6 +1393,147 @@ def _mcp_registry_refresh_capabilities(backend) -> int:
     print(f"supports_capability_handshake: {caps.supports_capability_handshake}")
     print(f"supports_audit:                {caps.supports_audit}")
     print(f"durable:                       {caps.durable}")
+    return 0
+
+
+def _parse_env_flag(raw: str) -> dict[str, str]:
+    """Parse comma-separated K=V pairs from --env flag.
+
+    Rules per spec/36 + Stream D finding D-F2:
+    - Empty input -> {}.
+    - Split on ',' for entries; split on FIRST '=' for each entry (values
+      may contain '=').
+    - Empty key raises ValueError with a clear message.
+    - Empty value is valid (results in empty string).
+    - An entry with no '=' raises ValueError.
+
+    Note: this parser does NOT support comma-containing values. Operators
+    needing such values must edit mcp.md directly or split into multiple
+    registrations.
+    """
+    if not raw:
+        return {}
+    result: dict[str, str] = {}
+    for pair in raw.split(","):
+        if "=" not in pair:
+            raise ValueError(
+                f"--env entry {pair!r} is missing '='. "
+                f"Expected format: KEY=$VAR_NAME or KEY=value"
+            )
+        key, val = pair.split("=", 1)  # split on FIRST '=' only
+        if not key:
+            raise ValueError(
+                f"--env entry {pair!r} has an empty key. Expected format: KEY=$VAR_NAME"
+            )
+        result[key] = val
+    return result
+
+
+def _parse_args_flag(raw: str) -> list[str]:
+    """Parse comma-separated args from --args flag.
+
+    Rules per Stream D finding D-F3:
+    - Empty input -> [].
+    - Each entry is stripped of leading/trailing whitespace.
+    - Empty entries after stripping are silently dropped.
+    """
+    if not raw:
+        return []
+    return [a.strip() for a in raw.split(",") if a.strip()]
+
+
+def _mcp_registry_install(
+    backend,
+    name: str,
+    command: str,
+    args_raw: str,
+    env_raw: str,
+    description: str,
+    transport: str,
+) -> int:
+    """Install a new MCP server. Per Stream D findings D-F1/D-F4/D-F5/D-F9."""
+    from .mcp import MCPServerSpec
+
+    # Parse args / env at CLI boundary (raises ValueError on bad shape; caught above).
+    args_list = _parse_args_flag(args_raw)
+    env_dict = _parse_env_flag(env_raw)
+
+    # Defense-in-depth: refuse newlines in --command, --args, --env at the CLI
+    # boundary so operators see a clean, named-flag error before the renderer's
+    # ValueError fires. Newlines in these fields would create phantom H2 sections
+    # in mcp.md that bypass collision detection and name validation.
+    if "\n" in command:
+        print(
+            "Error: --command must not contain newline characters.",
+            file=sys.stderr,
+        )
+        return 1
+    for i, arg in enumerate(args_list):
+        if "\n" in arg:
+            print(
+                f"Error: --args item at index {i} must not contain newline characters.",
+                file=sys.stderr,
+            )
+            return 1
+    for env_key, env_val in env_dict.items():
+        if "\n" in env_key or "\n" in env_val:
+            print(
+                f"Error: --env {env_key!r} key or value must not contain newline "
+                f"characters.",
+                file=sys.stderr,
+            )
+            return 1
+
+    # Stream D finding D-F9 + Stream B finding B-10 + Security finding:
+    # refuse description with H2-looking content (catches both '## ' and '##\t'
+    # to match the renderer's re.match(r'^##\s', line) guard).
+    if description and any(
+        re.match(r"^##\s", line) for line in description.splitlines()
+    ):
+        print(
+            "Error: --description must not contain lines starting with '## ' "
+            "(H2 headers delimit server sections in mcp.md).",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Stream D finding D-F1 (decision 3 = WARN + proceed, v1.0 contract):
+    # warn on env values that do not look like $VAR references. Literal values
+    # land on disk plaintext.
+    for env_key, env_val in env_dict.items():
+        if not env_val.startswith("$"):
+            print(
+                f"Warning: --env {env_key}=<value> does not look like an env-var "
+                f"reference (expected $VAR_NAME). Literal values are stored "
+                f"unredacted in mcp.md. Use --env {env_key}=$SOME_VAR_NAME to "
+                f"store the reference instead.",
+                file=sys.stderr,
+            )
+
+    spec = MCPServerSpec(
+        name=name,
+        command=command,
+        args=args_list,
+        env=env_dict,
+        transport=transport,
+        description=description,
+    )
+
+    # Install. backend.install may raise (caught by outer handler).
+    ref = backend.install(spec)
+
+    # Stream D finding D-F4: success output prints ONLY the Ref.name.
+    # NEVER echo env / command / args / spec repr / load_mcp_server result.
+    print(f"Installed MCP server {ref.name!r}.")
+    return 0
+
+
+def _mcp_registry_uninstall(backend, name: str) -> int:
+    """Uninstall an MCP server. Idempotent. Per Stream D finding D-F10."""
+    backend.uninstall(name)
+    # Idempotent: print neutral message that is valid for both present-removed
+    # and absent-no-op paths.
+    print(f"Uninstalled MCP server {name!r} (or was not present).")
     return 0
 
 

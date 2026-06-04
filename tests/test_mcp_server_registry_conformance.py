@@ -22,7 +22,6 @@ Per spec/36 and prep notes B-F4, B-F5, B-F6, B-F7, B-F8.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from textwrap import dedent
 from unittest.mock import patch
@@ -37,7 +36,7 @@ from atomic_agents.mcp_registry import (
     MCPServerRegistryCapabilities,
 )
 from atomic_agents.mcp_registry.backend import _default_load_all
-from atomic_agents.mcp_registry.types import MCPServerRef, ValidationResult
+from atomic_agents.mcp_registry.types import MCPServerRef
 from atomic_agents.mcp import MCPServerSpec, parse_mcp_md_text
 from atomic_agents.exceptions import MCPServerConnectFailed
 
@@ -269,20 +268,21 @@ def test_capability_honesty_install(backend_factory) -> None:
 
     spec/36 MUST 3 -- capability honesty. Branches on reported value; never
     hardcodes the expected bool (B-F4 from prep notes).
+
+    True-branch tightened per Stream E finding E5 (P0): when supports_install=True,
+    install() MUST return an MCPServerRef on a fresh backend with a valid spec.
+    The old broad 'except Exception: pass' masked real failures.
     """
     caps = backend_factory.capabilities
     dummy_spec = _make_mcp_spec("test-install-server")
     if caps.supports_install:
-        # Method MUST NOT raise NotImplementedError when capability is True.
-        try:
-            backend_factory.install(dummy_spec)
-        except NotImplementedError:
-            pytest.fail(
-                "capabilities.supports_install=True but install() raised NotImplementedError"
-            )
-        except Exception:
-            # Any other exception (MCPServerAlreadyInstalled, etc.) is acceptable.
-            pass
+        # MUST 3: install must NOT raise NotImplementedError; on a fresh
+        # backend with valid spec it must return MCPServerRef.
+        ref = backend_factory.install(dummy_spec)
+        assert isinstance(ref, MCPServerRef), (
+            f"install() with supports_install=True must return MCPServerRef; "
+            f"got {type(ref)!r}"
+        )
     else:
         # Method MUST raise NotImplementedError when capability is False.
         with pytest.raises(NotImplementedError):
@@ -293,17 +293,19 @@ def test_capability_honesty_uninstall(backend_factory) -> None:
     """capabilities.supports_uninstall claim matches uninstall() behavior.
 
     spec/36 MUST 3 -- capability honesty.
+
+    True-branch tightened per Stream E finding E4 (P1) + C10: when
+    supports_uninstall=True, uninstalling an absent name MUST be a no-op
+    (MUST 9 idempotency) and must return None.
     """
     caps = backend_factory.capabilities
     if caps.supports_uninstall:
-        try:
-            backend_factory.uninstall("nonexistent-server")
-        except NotImplementedError:
-            pytest.fail(
-                "capabilities.supports_uninstall=True but uninstall() raised NotImplementedError"
-            )
-        except Exception:
-            pass
+        # MUST 9: absent name is a no-op, no exception of any kind.
+        result = backend_factory.uninstall("definitely-not-in-registry")
+        assert result is None, (
+            "uninstall() on absent name with supports_uninstall=True must return None "
+            "(idempotent no-op per MUST 9)"
+        )
     else:
         with pytest.raises(NotImplementedError):
             backend_factory.uninstall("nonexistent-server")
@@ -712,11 +714,17 @@ def test_load_all_ordering_parity(populated_backend) -> None:
 
 
 def test_load_all_consistency_with_default_load_all(populated_backend) -> None:
-    """load_all_mcp_servers() output is byte-identical to _default_load_all(backend).
+    """load_all_mcp_servers() output is semantically equivalent to _default_load_all.
 
-    spec/36 MUST 10 -- default-impl delegation parity.
-    The filesystem backend delegates to _default_load_all; this test pins that
-    the output is equivalent to calling the helper directly.
+    spec/36 MUST 10 -- load_all consistency.
+    The filesystem backend uses a custom single-read-parse (NOT _default_load_all);
+    this test asserts the output is semantically equivalent to the helper,
+    satisfying MUST 10.
+
+    Docstring corrected per Stream E finding E2 (P2): the previous docstring
+    claimed filesystem "delegates to _default_load_all" which is false.
+    filesystem.py lines 316-375 implement a custom single-read-parse loop that
+    avoids N+1 load calls and surfaces ENOENT / OSError / parse errors distinctly.
     """
     backend, _ = populated_backend
     via_method = backend.load_all_mcp_servers()
@@ -753,6 +761,116 @@ def test_load_all_consistency_under_list_ordering(tmp_path: Path) -> None:
 
     assert [r.name for r in refs] == [s.name for s in all_specs]
     assert [s.name for s in all_specs] == sorted(s.name for s in all_specs)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MUST 9 -- Install / uninstall atomicity (new tests, PR 3)
+
+
+def test_must9_install_atomicity_concurrent_same_name(backend_factory) -> None:
+    """Concurrent install of the same server name: exactly one winner.
+
+    spec/36 MUST 9 -- concurrent install atomicity. N=3 threads all call
+    install(same_spec); exactly 1 must succeed; the others must raise
+    MCPServerAlreadyInstalled or MCPRegistryUnavailable (lock contention).
+    Guarded on capability flag so HTTP backend at PR 4 (supports_install=False)
+    skips automatically.
+
+    Stream E finding E3 (P1).
+    """
+    import concurrent.futures
+
+    from atomic_agents.mcp_registry import (
+        MCPServerAlreadyInstalled,
+        MCPRegistryUnavailable,
+    )
+
+    caps = backend_factory.capabilities
+    if not caps.supports_install:
+        pytest.skip("backend does not support install; skipping MUST 9 atomicity test")
+
+    spec = _make_mcp_spec("concurrent-conformance-server")
+    successes: list[bool] = []
+    failures: list[bool] = []
+
+    def _try() -> None:
+        try:
+            backend_factory.install(spec)
+            successes.append(True)
+        except (MCPServerAlreadyInstalled, MCPRegistryUnavailable):
+            failures.append(True)
+
+    n = 3
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as pool:
+        futs = [pool.submit(_try) for _ in range(n)]
+        for fut in futs:
+            fut.result()
+
+    assert len(successes) == 1, (
+        f"MUST 9: exactly 1 concurrent install winner; got {len(successes)}"
+    )
+    assert len(successes) + len(failures) == n
+
+
+def test_must9_uninstall_absent_name_is_noop(backend_factory) -> None:
+    """uninstall() on an absent name is a no-op (returns None, no exception).
+
+    spec/36 MUST 9 -- uninstall idempotency. Guarded on capability flag so
+    HTTP backend at PR 4 (supports_uninstall=False) skips automatically.
+
+    Stream E finding E4 (P1) + C11.
+    """
+    caps = backend_factory.capabilities
+    if not caps.supports_uninstall:
+        pytest.skip(
+            "backend does not support uninstall; skipping MUST 9 idempotency test"
+        )
+
+    result = backend_factory.uninstall("absolutely-not-in-registry-conformance")
+    assert result is None, (
+        "MUST 9: uninstall on absent name must return None (idempotent no-op)"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MUST 10 -- Post-install consistency (new test, PR 3)
+
+
+def test_must10_post_install_consistency(backend_factory) -> None:
+    """After install(), load_all_mcp_servers() and list_mcp_servers() are consistent.
+
+    spec/36 MUST 10 -- load_all consistency must hold after write operations.
+    Verifies that every name from list_mcp_servers() is loadable via
+    load_mcp_server() and that set(load_all_mcp_servers()) equals the
+    per-name load iteration.
+    Guarded on capability flag so HTTP backend at PR 4 skips automatically.
+
+    Stream E finding E6 (P1).
+    """
+    caps = backend_factory.capabilities
+    if not caps.supports_install:
+        pytest.skip(
+            "backend does not support install; skipping MUST 10 post-install test"
+        )
+
+    spec = _make_mcp_spec("must10-consistency-server", command="echo")
+    backend_factory.install(spec)
+
+    refs = backend_factory.list_mcp_servers()
+    all_specs = backend_factory.load_all_mcp_servers()
+
+    ref_names = {r.name for r in refs}
+    spec_names = {s.name for s in all_specs}
+
+    assert ref_names == spec_names, (
+        f"MUST 10: list_mcp_servers names {ref_names!r} must equal "
+        f"load_all_mcp_servers names {spec_names!r} after install"
+    )
+
+    # Every name from list must be individually loadable.
+    for ref in refs:
+        loaded = backend_factory.load_mcp_server(ref.name)
+        assert loaded.name == ref.name
 
 
 # ──────────────────────────────────────────────────────────────────────────────

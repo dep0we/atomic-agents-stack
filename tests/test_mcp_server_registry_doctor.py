@@ -186,11 +186,12 @@ def test_doctor_pass_capability_snapshot_includes_all_fields(
     }
     assert expected_keys.issubset(result.detail.keys())
     # Capability values come from FilesystemMCPServerRegistryBackend
-    # capabilities at PR 2 baseline: install/uninstall False (filesystem
-    # writes ship at PR 3), capability_handshake False (HTTP only),
-    # audit False, durable True.
-    assert result.detail["supports_install"] is False
-    assert result.detail["supports_uninstall"] is False
+    # capabilities at PR 3+ baseline: install/uninstall True (filesystem
+    # writes shipped at PR 3 per spec/36 Decision 5 capability evolution
+    # table), capability_handshake False (HTTP only), audit False,
+    # durable True.
+    assert result.detail["supports_install"] is True
+    assert result.detail["supports_uninstall"] is True
     assert result.detail["supports_capability_handshake"] is False
     assert result.detail["supports_audit"] is False
     assert result.detail["durable"] is True

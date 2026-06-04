@@ -21,8 +21,11 @@ See ``docs/spec/36-mcp-server-registry-backend.md`` (DRAFT at PR 1; LOCKED at PR
 for the normative contract.
 
 The module-level ``_default_load_all`` helper is the canonical default
-implementation for ``load_all_mcp_servers()``. Filesystem backend delegates to
-it directly (PR 1). HTTP backend overrides with a single bulk GET at PR 4.
+implementation for ``load_all_mcp_servers()``. The filesystem backend overrides
+``load_all_mcp_servers()`` with a custom single-read-parse for better exception
+mapping (distinguishing ENOENT from transient OSError, and surfacing parse errors
+as MCPRegistryDescriptorInvalid). ``_default_load_all`` is the fallback for
+backends that do not override ``load_all_mcp_servers()``.
 Backends overriding MUST preserve the MUST 10 consistency guarantee: the output
 must be semantically equivalent to
 ``[load_mcp_server(ref.name) for ref in list_mcp_servers()]``.
@@ -32,6 +35,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+from ..exceptions import AtomicAgentsError
 from .types import MCPServerRegistryCapabilities, MCPServerRef, ValidationResult
 
 if TYPE_CHECKING:
@@ -42,12 +46,14 @@ if TYPE_CHECKING:
 # Exception classes
 
 
-class MCPRegistryError(Exception):
+class MCPRegistryError(AtomicAgentsError):
     """Base class for MCPServerRegistry subsystem errors (spec/36).
 
     All MCPServerRegistry reference implementations raise subclasses of this
     exception. Operators may ``except MCPRegistryError`` to catch the entire
-    MCP registry error family.
+    MCP registry error family. Inherits from ``AtomicAgentsError`` so
+    framework-wide catch-alls (``except AtomicAgentsError``) see registry
+    failures automatically (spec/36 Decision 4 / prep finding E12).
     """
 
 

@@ -652,6 +652,130 @@ def _build_spec(
 
 
 # ──────────────────────────────────────────────────────────────────
+# mcp.md serializers
+
+
+def render_mcp_md_section(spec: MCPServerSpec) -> str:
+    """Render a single MCPServerSpec as an mcp.md H2 section string.
+
+    Round-trip property: parsing the output with
+    ``parse_mcp_md_text(render_mcp_md_section(spec), resolve_env=False)``
+    returns a spec equal to the input field-for-field (after env resolution
+    on the re-parsed result).
+
+    env values are written verbatim. $VAR references are NEVER resolved here
+    per spec/36 Decision 7: resolved values must not persist to disk.
+
+    Raises:
+        ValueError: if spec.command is empty or None.
+        ValueError: if spec.command, any spec.args item, any spec.env key,
+            or any spec.env value contains a newline character (newline
+            injection would create phantom H2 sections the parser reads as
+            separate server declarations, bypassing collision detection).
+        ValueError: if spec.description contains a line starting with '## '
+            or '##\t' (H2 injection defense per Stream D finding D-F9 +
+            Stream B B-10 + security finding on tab-separated H2).
+    """
+    if not spec.command:
+        raise ValueError(
+            f"MCP server {spec.name!r}: cannot render section without a command. "
+            f"Set spec.command to a non-empty executable name."
+        )
+
+    # Newline injection guard: a newline in command/args/env would let an API
+    # caller write a line that the parser reads as a new H2 section header,
+    # creating a phantom server entry that bypasses collision detection and
+    # name validation.  Reject BEFORE any output is written.
+    if "\n" in spec.command:
+        raise ValueError(
+            f"MCP server {spec.name!r}: spec.command must not contain newline "
+            f"characters (newline injection creates phantom mcp.md sections)."
+        )
+    for i, arg in enumerate(spec.args):
+        if "\n" in arg:
+            raise ValueError(
+                f"MCP server {spec.name!r}: spec.args[{i}] must not contain "
+                f"newline characters (newline injection creates phantom mcp.md "
+                f"sections)."
+            )
+    for env_key, env_val in spec.env.items():
+        if "\n" in env_key:
+            raise ValueError(
+                f"MCP server {spec.name!r}: env key {env_key!r} must not contain "
+                f"newline characters (newline injection creates phantom mcp.md "
+                f"sections)."
+            )
+        if "\n" in env_val:
+            raise ValueError(
+                f"MCP server {spec.name!r}: env value for {env_key!r} must not "
+                f"contain newline characters (newline injection creates phantom "
+                f"mcp.md sections)."
+            )
+
+    # Guard against H2 injection via description. A description containing a
+    # line that starts with '## ' or '##\t' would make the parser treat it as
+    # a new section header, breaking the round-trip property.
+    if spec.description:
+        for line in spec.description.splitlines():
+            if re.match(r"^##\s", line):
+                raise ValueError(
+                    f"MCP server {spec.name!r}: description contains a line that "
+                    f"starts with '## ' (H2 injection). Strip or replace the "
+                    f"offending line before rendering."
+                )
+
+    lines: list[str] = [f"## {spec.name}"]
+    lines.append(f"command: {spec.command}")
+
+    # args: only written when non-empty; comma+space separator.
+    if spec.args:
+        lines.append("args: " + ", ".join(spec.args))
+
+    # env: one line per key-value pair, sorted by key for determinism.
+    # Values are written as-is (no $VAR resolution) per Decision 7.
+    if spec.env:
+        for key in sorted(spec.env):
+            lines.append(f"env: {key}={spec.env[key]}")
+
+    # transport: only written when non-default (parser defaults to "stdio").
+    if spec.transport and spec.transport != "stdio":
+        lines.append(f"transport: {spec.transport}")
+
+    # description: first line only (newlines stripped to single line).
+    if spec.description:
+        first_line = spec.description.splitlines()[0].strip()
+        if first_line:
+            lines.append(f"description: {first_line}")
+
+    # Section ends with a trailing newline.
+    return "\n".join(lines) + "\n"
+
+
+def render_mcp_md_full(specs: list[MCPServerSpec]) -> str:
+    """Render a full mcp.md file from a list of MCPServerSpec objects.
+
+    Always prefixes the ``# MCP servers`` H1 header. An empty list yields
+    just the H1 header (preserves the file's identity for downstream
+    watchers that detect content changes by diffing).
+
+    Round-trip property: parsing the output with
+    ``parse_mcp_md_text(render_mcp_md_full(specs), resolve_env=False)``
+    returns a list structurally equal to the input list (field-for-field
+    after env resolution).
+
+    Raises:
+        ValueError: if any spec.command is empty/None (propagated from
+            render_mcp_md_section).
+    """
+    header = "# MCP servers\n"
+    if not specs:
+        return header
+
+    sections = "\n".join(render_mcp_md_section(spec) for spec in specs)
+    return header + "\n" + sections
+
+
+# ──────────────────────────────────────────────────────────────────
 # Path-traversal check for MCP server args
 
 
@@ -672,7 +796,6 @@ def validate_mcp_server_args(
     This is best-effort — we can't know what every MCP server treats as a path.
     The obvious path-shaped cases get caught here.
     """
-    from ._io import safe_resolve_under
     from .exceptions import PathTraversalError
 
     if not agent_read_paths:

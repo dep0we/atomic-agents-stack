@@ -124,11 +124,41 @@ def cleanup_stale_tempfiles(directory: Path) -> list[Path]:
     """Find and delete leftover .tmp files from crashed writes.
 
     Run as part of lint or startup. Returns the list of files cleaned.
+
+    Note: this uses rglob which scans the entire directory tree recursively.
+    Prefer cleanup_stale_tempfiles_for_file when the target file is known;
+    that function is scoped to siblings of a specific file rather than the
+    full tree.
     """
     cleaned = []
     if not directory.exists():
         return cleaned
     for path in directory.rglob(".*.tmp"):
+        try:
+            path.unlink()
+            cleaned.append(path)
+        except FileNotFoundError:
+            pass
+    return cleaned
+
+
+def cleanup_stale_tempfiles_for_file(target: Path) -> list[Path]:
+    """Delete leftover .tmp files from crashed atomic_write calls for target.
+
+    Scoped to the parent directory of target, matching only tempfiles that
+    atomic_write would have created for this specific file. The pattern is
+    `.<name>.<random>.tmp` (the same pattern atomic_write uses when creating
+    the temporary file next to the destination).
+
+    Returns the list of files removed. Ignores FileNotFoundError races
+    (another process may have already cleaned the same file).
+
+    Use inside a lock so cleanup is serialized with the install/uninstall
+    operation that follows.
+    """
+    cleaned = []
+    pattern = f".{target.name}.*.tmp"
+    for path in target.parent.glob(pattern):
         try:
             path.unlink()
             cleaned.append(path)
