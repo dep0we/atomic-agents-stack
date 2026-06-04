@@ -42,6 +42,7 @@ Subcommands:
 from __future__ import annotations
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -1457,9 +1458,38 @@ def _mcp_registry_install(
     args_list = _parse_args_flag(args_raw)
     env_dict = _parse_env_flag(env_raw)
 
-    # Stream D finding D-F9 + Stream B finding B-10: refuse description with
-    # H2-looking content (would inject a phantom section into mcp.md).
-    if description and any(line.startswith("## ") for line in description.splitlines()):
+    # Defense-in-depth: refuse newlines in --command, --args, --env at the CLI
+    # boundary so operators see a clean, named-flag error before the renderer's
+    # ValueError fires. Newlines in these fields would create phantom H2 sections
+    # in mcp.md that bypass collision detection and name validation.
+    if "\n" in command:
+        print(
+            "Error: --command must not contain newline characters.",
+            file=sys.stderr,
+        )
+        return 1
+    for i, arg in enumerate(args_list):
+        if "\n" in arg:
+            print(
+                f"Error: --args item at index {i} must not contain newline characters.",
+                file=sys.stderr,
+            )
+            return 1
+    for env_key, env_val in env_dict.items():
+        if "\n" in env_key or "\n" in env_val:
+            print(
+                f"Error: --env {env_key!r} key or value must not contain newline "
+                f"characters.",
+                file=sys.stderr,
+            )
+            return 1
+
+    # Stream D finding D-F9 + Stream B finding B-10 + Security finding:
+    # refuse description with H2-looking content (catches both '## ' and '##\t'
+    # to match the renderer's re.match(r'^##\s', line) guard).
+    if description and any(
+        re.match(r"^##\s", line) for line in description.splitlines()
+    ):
         print(
             "Error: --description must not contain lines starting with '## ' "
             "(H2 headers delimit server sections in mcp.md).",
@@ -1467,8 +1497,9 @@ def _mcp_registry_install(
         )
         return 1
 
-    # Stream D finding D-F1 (decision 3 = WARN): warn on env values that do not
-    # look like $VAR references. Literal values land on disk plaintext.
+    # Stream D finding D-F1 (decision 3 = WARN + proceed, v1.0 contract):
+    # warn on env values that do not look like $VAR references. Literal values
+    # land on disk plaintext.
     for env_key, env_val in env_dict.items():
         if not env_val.startswith("$"):
             print(

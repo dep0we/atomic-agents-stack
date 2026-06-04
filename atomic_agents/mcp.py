@@ -668,8 +668,13 @@ def render_mcp_md_section(spec: MCPServerSpec) -> str:
 
     Raises:
         ValueError: if spec.command is empty or None.
+        ValueError: if spec.command, any spec.args item, any spec.env key,
+            or any spec.env value contains a newline character (newline
+            injection would create phantom H2 sections the parser reads as
+            separate server declarations, bypassing collision detection).
         ValueError: if spec.description contains a line starting with '## '
-            (H2 injection defense per Stream D finding D-F9 + Stream B B-10).
+            or '##\t' (H2 injection defense per Stream D finding D-F9 +
+            Stream B B-10 + security finding on tab-separated H2).
     """
     if not spec.command:
         raise ValueError(
@@ -677,9 +682,39 @@ def render_mcp_md_section(spec: MCPServerSpec) -> str:
             f"Set spec.command to a non-empty executable name."
         )
 
+    # Newline injection guard: a newline in command/args/env would let an API
+    # caller write a line that the parser reads as a new H2 section header,
+    # creating a phantom server entry that bypasses collision detection and
+    # name validation.  Reject BEFORE any output is written.
+    if "\n" in spec.command:
+        raise ValueError(
+            f"MCP server {spec.name!r}: spec.command must not contain newline "
+            f"characters (newline injection creates phantom mcp.md sections)."
+        )
+    for i, arg in enumerate(spec.args):
+        if "\n" in arg:
+            raise ValueError(
+                f"MCP server {spec.name!r}: spec.args[{i}] must not contain "
+                f"newline characters (newline injection creates phantom mcp.md "
+                f"sections)."
+            )
+    for env_key, env_val in spec.env.items():
+        if "\n" in env_key:
+            raise ValueError(
+                f"MCP server {spec.name!r}: env key {env_key!r} must not contain "
+                f"newline characters (newline injection creates phantom mcp.md "
+                f"sections)."
+            )
+        if "\n" in env_val:
+            raise ValueError(
+                f"MCP server {spec.name!r}: env value for {env_key!r} must not "
+                f"contain newline characters (newline injection creates phantom "
+                f"mcp.md sections)."
+            )
+
     # Guard against H2 injection via description. A description containing a
-    # line that starts with '## ' would make the parser treat it as a new
-    # section header, breaking the round-trip property.
+    # line that starts with '## ' or '##\t' would make the parser treat it as
+    # a new section header, breaking the round-trip property.
     if spec.description:
         for line in spec.description.splitlines():
             if re.match(r"^##\s", line):

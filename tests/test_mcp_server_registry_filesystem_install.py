@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 
+from atomic_agents.locks.filesystem import FilesystemLockBackend
 from atomic_agents.mcp_registry import (
     FilesystemMCPServerRegistryBackend,
     MCPRegistryUnavailable,
@@ -211,7 +212,7 @@ def test_install_empty_command_raises(tmp_path: Path) -> None:
     backend = _fresh_backend(agent_root)
     spec = _make_spec("ok-name", command="")
 
-    with pytest.raises((ValueError, Exception)):
+    with pytest.raises(ValueError):
         backend.install(spec)
 
 
@@ -320,9 +321,10 @@ def test_uninstall_absent_name_is_noop(tmp_path: Path) -> None:
 
 
 def test_uninstall_idempotent_double_call(tmp_path: Path) -> None:
-    """install() then uninstall() twice; second uninstall must not raise.
+    """install() then uninstall() twice; second uninstall must not raise and returns None.
 
-    spec/36 MUST 9 -- uninstall idempotency for double-call.
+    spec/36 MUST 9 -- uninstall idempotency for double-call; absent-name path
+    returns None per the spec contract.
     """
     agent_root = tmp_path / "idempotent-agent"
     agent_root.mkdir()
@@ -330,7 +332,8 @@ def test_uninstall_idempotent_double_call(tmp_path: Path) -> None:
     backend.install(_make_spec("idempotent-server"))
 
     backend.uninstall("idempotent-server")
-    backend.uninstall("idempotent-server")  # must not raise
+    result2 = backend.uninstall("idempotent-server")  # must not raise
+    assert result2 is None
 
 
 def test_install_uninstall_install_cycle(tmp_path: Path) -> None:
@@ -435,6 +438,45 @@ def test_install_concurrent_different_names_all_win(tmp_path: Path) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 7b. Lock timeout test (spec/36 MUST 9 -- LockBusy -> MCPRegistryUnavailable)
+
+
+def test_install_lock_timeout_zero_under_contention(tmp_path: Path) -> None:
+    """install() with install_lock_timeout=0.0 and a held lock raises MCPRegistryUnavailable.
+
+    spec/36 MUST 9 -- the LockBusy -> MCPRegistryUnavailable translation is
+    the contract. This test pins it so a future regression is visible.
+
+    Strategy: share a single FilesystemLockBackend between the test harness and
+    the backend. The test acquires "mcp_registry" first. The backend's install()
+    then tries to re-acquire via the same backend instance; FilesystemLockBackend
+    is non-reentrant so it raises LockBusy immediately (regardless of timeout),
+    which install() translates to MCPRegistryUnavailable.
+    """
+    agent_root = tmp_path / "timeout-agent"
+    agent_root.mkdir()
+
+    # One shared lock backend instance.
+    lock_backend = FilesystemLockBackend(agent_root)
+
+    # Acquire the registry lock from the test harness (timeout=5 is generous).
+    handle = lock_backend.acquire("mcp_registry", timeout=5)
+
+    try:
+        backend = FilesystemMCPServerRegistryBackend(
+            agent_root,
+            read_paths=[],
+            lock_backend=lock_backend,
+            install_lock_timeout=0.0,
+        )
+
+        with pytest.raises(MCPRegistryUnavailable):
+            backend.install(_make_spec("timeout-server"))
+    finally:
+        handle.__exit__(None, None, None)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 8. CLI handler tests
 
 
@@ -469,10 +511,11 @@ def test_cli_install_success_output_does_not_echo_env(
 
 
 def test_cli_install_warns_on_literal_env_value(tmp_path: Path, capsys) -> None:
-    """_mcp_registry_install warns on stderr when --env value lacks $ prefix.
+    """_mcp_registry_install warns on stderr and exits 0 when --env value lacks $ prefix.
 
-    Stream D finding D-F1 (decision 3 = WARN): literal values land on disk
-    plaintext; the CLI warns the operator.
+    Stream D finding D-F1 (decision 3 = WARN + proceed): literal values land
+    on disk plaintext; the CLI warns the operator but continues (exit 0).
+    This is the v1.0 contract per decision 3.
     """
     from atomic_agents.cli import _mcp_registry_install
 
@@ -480,7 +523,7 @@ def test_cli_install_warns_on_literal_env_value(tmp_path: Path, capsys) -> None:
     agent_root.mkdir()
     backend = _fresh_backend(agent_root)
 
-    _mcp_registry_install(
+    exit_code = _mcp_registry_install(
         backend,
         "warn-server",
         "echo",
@@ -490,7 +533,8 @@ def test_cli_install_warns_on_literal_env_value(tmp_path: Path, capsys) -> None:
         "stdio",
     )
 
-    # Install may succeed or fail depending on backend impl; but the WARN must fire.
+    # WARN + proceed is the v1.0 contract per decision 3.
+    assert exit_code == 0
     captured = capsys.readouterr()
     assert "Warning" in captured.err or "warning" in captured.err.lower()
     assert "literal" in captured.err or "KEY" in captured.err

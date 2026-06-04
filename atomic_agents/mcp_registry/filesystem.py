@@ -5,12 +5,10 @@ behind the ``MCPServerRegistryBackend`` Protocol contract (spec/36). Each agent
 has its own ``<agent_root>/mcp.md`` file; the backend is scoped per-agent via
 ``agent_root``.
 
-Read paths only at PR 1. Install and uninstall ship in PR 3 alongside the
-``LockBackend`` lease integration (per spec/36 D5 + D6 PR cadence).
-
-Constructor signature stability: ``lock_backend`` is accepted but unused at PR 1
-so PR 3 callers can pass the kwarg without breaking PR 1 callers. This matches
-the spec/36 §"FilesystemMCPServerRegistryBackend" constructor note.
+Implements the full MCPServerRegistryBackend Protocol including atomic
+install/uninstall via LockBackend (spec/36 MUST 9). The lock is acquired
+before any read-modify-write on mcp.md, and stale tempfiles from crashed
+prior installs are cleaned up inside the lock before reading.
 """
 
 from __future__ import annotations
@@ -24,12 +22,14 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .._io import atomic_write, cleanup_stale_tempfiles
+from .._io import atomic_write, cleanup_stale_tempfiles_for_file
 from ..exceptions import LockBusy, LockLost
+from ..locks import check_lock_lost, get_default_lock_backend
 from ..mcp import (
     MCPServerSpec,
     _resolve_env_vars,
     parse_mcp_md_text,
+    render_mcp_md_full,
     validate_mcp_server_args,
 )
 from .backend import (
@@ -86,12 +86,16 @@ def _validate_server_name(name: str) -> None:
 class FilesystemMCPServerRegistryBackend:
     """``mcp.md``-backed implementation of ``MCPServerRegistryBackend`` (spec/36).
 
-    Reads ``<agent_root>/mcp.md`` for server declarations. Covers the read
-    path only at PR 1 (list, load, load_all, validate, capabilities,
-    refresh_capabilities, close). Install and uninstall land in PR 3 with the
-    ``LockBackend`` lease integration.
+    Reads and writes ``<agent_root>/mcp.md`` for server declarations. Supports
+    the full MCPServerRegistryBackend Protocol: list, load, load_all, validate,
+    install, uninstall, capabilities, refresh_capabilities, close.
 
-    Constructor:
+    Install and uninstall use LockBackend lease acquisition around every
+    read-modify-write on mcp.md (spec/36 MUST 9). Stale tempfiles from
+    prior crashed installs accumulate until the next install or uninstall;
+    cleanup is performed inside the lock before reading mcp.md.
+
+    Constructor parameters:
 
     ``agent_root``: the agent's directory. ``mcp.md`` lives at
         ``<agent_root>/mcp.md``. MAY not exist at construction -- MUST 2
@@ -102,12 +106,15 @@ class FilesystemMCPServerRegistryBackend:
         path-traversal check (Decision 8 of spec/36). Captured at construction;
         NOT applied at ``list_mcp_servers()`` time (list is metadata-only).
 
-    ``lock_backend``: reserved for PR 3 (install/uninstall atomicity via
-        ``LockBackend.acquire("mcp_registry", timeout=30)``). Accepted but
-        unused at PR 1 so PR 3 callers can pass the kwarg without a constructor
-        change. Operators passing a custom ``lock_backend`` MUST scope it to a
-        registry-specific resource (e.g., ``.mcp_registry.lock``), NOT the
-        agent's main ``.lock`` file.
+    ``lock_backend``: the LockBackend to use for install/uninstall atomicity.
+        When None (the default), the backend is resolved lazily at first use
+        via ``get_default_lock_backend(agent_root)``, which honors the
+        ``ATOMIC_AGENTS_LOCK_BACKEND`` env var. Operators passing a custom
+        ``lock_backend`` MUST scope it to a registry-specific resource (e.g.,
+        ``.mcp_registry.lock``), NOT the agent's main ``.lock`` file.
+
+    ``install_lock_timeout``: seconds to wait for the mcp_registry lock before
+        raising MCPRegistryUnavailable. Defaults to 30.0.
     """
 
     def __init__(
@@ -124,19 +131,6 @@ class FilesystemMCPServerRegistryBackend:
         self._read_paths = read_paths
         self._lock_backend = lock_backend  # may be None; resolved lazily at first use
         self._install_lock_timeout = install_lock_timeout
-
-        # Recovery sweep: clean up orphan temp files from prior crashed installs.
-        # cleanup_stale_tempfiles is side-effect-free in the MUST 2 sense (it does
-        # not open catalog data; it only removes leftover .tmp artifacts from
-        # atomic_write crashes). Per Stream B finding B-7.
-        try:
-            cleanup_stale_tempfiles(self._agent_root)
-        except OSError:
-            # cleanup is best-effort; failure here must not block construction.
-            _logger.warning(
-                "cleanup_stale_tempfiles failed during construction; continuing",
-                exc_info=True,
-            )
 
     # ─── Capability advertisement ─────────────────────────────────────────
 
@@ -499,11 +493,22 @@ class FilesystemMCPServerRegistryBackend:
 
         Callers that pass ``lock_backend=`` at construction bypass this
         entirely and always get their custom backend.
+
+        Raises:
+            MCPRegistryUnavailable: if the lock backend cannot be resolved
+                (e.g., ATOMIC_AGENTS_LOCK_BACKEND is set to an unknown value,
+                a required optional dependency is missing, or the URL is
+                malformed). Wraps any exception from get_default_lock_backend
+                so the CLI's existing MCPRegistryError catch-all handles it
+                cleanly instead of surfacing a raw Python traceback.
         """
         if self._lock_backend is None:
-            from ..locks import get_default_lock_backend
-
-            self._lock_backend = get_default_lock_backend(self._agent_root)
+            try:
+                self._lock_backend = get_default_lock_backend(self._agent_root)
+            except Exception as exc:
+                raise MCPRegistryUnavailable(
+                    f"could not resolve lock backend: {exc}"
+                ) from exc
         return self._lock_backend
 
     # ─── Capability-gated lifecycle (PR 3) ───────────────────────────────
@@ -555,6 +560,18 @@ class FilesystemMCPServerRegistryBackend:
         with handle:
             mcp_md = self._agent_root / "mcp.md"
 
+            # Cleanup stale tempfiles from prior crashed installs inside the
+            # lock so cleanup is serialized with this install operation. Scoped
+            # to siblings of mcp.md (not recursive) to avoid touching unrelated
+            # files elsewhere under agent_root (MUST 2 spirit).
+            try:
+                cleanup_stale_tempfiles_for_file(mcp_md)
+            except OSError:
+                _logger.warning(
+                    "cleanup_stale_tempfiles_for_file failed in install; continuing",
+                    exc_info=True,
+                )
+
             # Read current mcp.md content. FileNotFoundError means no servers
             # installed yet; treat as empty for the cold-start case.
             try:
@@ -591,17 +608,17 @@ class FilesystemMCPServerRegistryBackend:
             # Lease check before write: no-op for filesystem (no heartbeat);
             # raises LockLost for Redis when the lease has expired mid-install.
             try:
-                from ..locks import check_lock_lost
-
                 check_lock_lost(handle)
             except LockLost as exc:
                 raise MCPRegistryUnavailable(
                     f"mcp_registry lock lease expired mid-install: {exc}"
                 ) from exc
+            except Exception as exc:
+                raise MCPRegistryUnavailable(
+                    f"mcp_registry lock state check failed mid-install: {exc}"
+                ) from exc
 
             # Render the updated file (existing specs + new spec).
-            from ..mcp import render_mcp_md_full
-
             updated = list(specs) + [spec]
             rendered = render_mcp_md_full(updated)
 
@@ -663,6 +680,16 @@ class FilesystemMCPServerRegistryBackend:
         with handle:
             mcp_md = self._agent_root / "mcp.md"
 
+            # Cleanup stale tempfiles from prior crashed installs inside the
+            # lock so cleanup is serialized with this uninstall operation.
+            try:
+                cleanup_stale_tempfiles_for_file(mcp_md)
+            except OSError:
+                _logger.warning(
+                    "cleanup_stale_tempfiles_for_file failed in uninstall; continuing",
+                    exc_info=True,
+                )
+
             try:
                 content = mcp_md.read_text(encoding="utf-8")
             except FileNotFoundError:
@@ -698,17 +725,17 @@ class FilesystemMCPServerRegistryBackend:
 
             # Lease check before write.
             try:
-                from ..locks import check_lock_lost
-
                 check_lock_lost(handle)
             except LockLost as exc:
                 raise MCPRegistryUnavailable(
                     f"mcp_registry lock lease expired mid-uninstall: {exc}"
                 ) from exc
+            except Exception as exc:
+                raise MCPRegistryUnavailable(
+                    f"mcp_registry lock state check failed mid-uninstall: {exc}"
+                ) from exc
 
             # Render the file with the named spec removed.
-            from ..mcp import render_mcp_md_full
-
             updated = [s for s in specs if s.name != name]
             rendered = render_mcp_md_full(updated)
 
