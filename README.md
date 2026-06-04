@@ -182,7 +182,7 @@ Start at [`docs/README.md`](docs/README.md) for the spec entry point. The locked
 - [33 — PersonaBackend Protocol](docs/spec/33-persona-backend.md) — persona ownership, snapshot/restore, `persona.link.md` format
 - [34 — CorpusBackend Protocol](docs/spec/34-corpus-backend.md) — wiki/raw corpus protocol; filesystem + SQLite (FTS5) reference impls; GB-scale indexed full-text search
 - [35 — init wizard](docs/spec/35-init-wizard.md) — `atomic-agents init` on-ramp; template scaffolding + Add-to-it merge; CI-friendly `--from-template` (RFC)
-- [36 — MCPServerRegistryBackend Protocol](docs/spec/36-mcp-server-registry-backend.md) — MCP server catalog + install/audit; `FilesystemMCPServerRegistryBackend` reference impl; `atomic-agents mcp-registry` CLI (DRAFT, PR 3 of 5)
+- [36 — MCPServerRegistryBackend Protocol](docs/spec/36-mcp-server-registry-backend.md) — MCP server catalog + install/audit; `FilesystemMCPServerRegistryBackend` reference impl; `HTTPMCPServerRegistryBackend` reference impl with tier-1/2/3 capability negotiation; `atomic-agents mcp-registry` CLI (DRAFT, PR 4 of 5)
 
 Each spec doc is locked when the implementation matches and tests pass. Spec changes that imply implementation changes get filed as GitHub issues. **Spec docs separate shipped behavior from explicit future / deferred boundaries** — sections that describe behavior not yet implemented are explicitly marked as such, not silently aspirational.
 
@@ -282,7 +282,7 @@ Same pattern for OpenAI (`atomic-agents-openai`) and Moonshot (`atomic-agents-mo
 ## Repository structure
 
 - `atomic_agents/` — the Python package (runtime in `agent.py`; backend protocols in `memory/`, `_llm.py`, `_locks.py`, `_costs.py`, etc.; CLI in `cli.py`; preflight in `doctor.py`)
-- `tests/` 3,232 tests collected, Python 3.11 + 3.12 matrix
+- `tests/` 3,307 tests collected, Python 3.11 + 3.12 matrix
 - `docs/` — [spec entry point](docs/README.md), [`architecture.md`](docs/architecture.md), [`spec/`](docs/spec/) (31 locked docs + 4 RFCs/DRAFTs), [`deployment/`](docs/deployment/) (8 operator runbooks), [`samples/caldwell/`](docs/samples/caldwell/) (complete worked example), [`GOVERNANCE.md`](docs/GOVERNANCE.md), [`TENSIONS.md`](docs/TENSIONS.md), [`methodology.md`](docs/methodology.md)
 - `extras/` — operational templates (Claude Code skill wrappers, macOS LaunchAgent plists, cron examples)
 
@@ -313,4 +313,4 @@ Before opening a PR, read [`CLAUDE.md`](CLAUDE.md) (the project's design ethos a
 
 ## Status
 
-**v0.13.0, alpha.** Core runtime stable. 3,232 tests collected on Python 3.11 / 3.12. Eleven of twelve backend protocols shipped (see the backend protocols table above); `MCPServerRegistryBackend` in progress (PR 3 of 5). The surface stabilizes at v1.0. Pre-1.0 — Minor releases may contain breaking changes (see [`docs/deployment/versioning.md`](docs/deployment/versioning.md)). Single-maintainer project; reference implementation anyone can use, fork, or extend.
+**v0.13.0, alpha.** Core runtime stable. 3,307 tests collected on Python 3.11 / 3.12. Eleven of twelve backend protocols shipped (see the backend protocols table above); `MCPServerRegistryBackend` in progress (PR 4 of 5). The surface stabilizes at v1.0. Pre-1.0 — Minor releases may contain breaking changes (see [`docs/deployment/versioning.md`](docs/deployment/versioning.md)). Single-maintainer project; reference implementation anyone can use, fork, or extend.

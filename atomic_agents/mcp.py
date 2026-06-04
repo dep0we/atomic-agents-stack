@@ -106,6 +106,48 @@ class MCPServerSpec:
     transport: str = "stdio"
     description: str = ""
 
+    def to_dict(self) -> dict:
+        """Serialize to a JSON-safe plain dict.
+
+        Note: ``env`` may contain resolved values (the ``$VAR_NAME``
+        references in source ``mcp.md`` are resolved to literal env-var
+        values at load time). Callers serializing to a shared log or audit
+        backend SHOULD treat the ``env`` field as sensitive. The raw text
+        on the profile (``mcp_md_raw``) is the safe-to-ship form.
+
+        Returns a fresh dict every call; callers may mutate freely.
+        """
+        return {
+            "name": self.name,
+            "command": self.command,
+            "args": list(self.args),
+            "env": dict(self.env),
+            "transport": self.transport,
+            "description": self.description,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MCPServerSpec":
+        """Reconstruct an ``MCPServerSpec`` from a dict produced by ``to_dict()``.
+
+        Required keys (``name``, ``command``) raise ``KeyError`` if absent.
+        Optional keys (``args``, ``env``, ``transport``, ``description``) fall
+        back to field defaults. Extra keys in ``d`` are silently ignored for
+        forward-compatibility with future wire format extensions.
+
+        Applies copy-constructor discipline: ``args`` and ``env`` values are
+        copied out of ``d`` to prevent callers from accidentally sharing
+        mutable state with the dict passed in.
+        """
+        return cls(
+            name=d["name"],
+            command=d["command"],
+            args=list(d.get("args", [])),
+            env=dict(d.get("env", {})),
+            transport=d.get("transport", "stdio"),
+            description=d.get("description", ""),
+        )
+
 
 @dataclass
 class MCPToolMeta:

@@ -79,12 +79,17 @@ class MCPServerRef:
 
         Extra keys in ``d`` are silently ignored for forward-compatibility.
         Missing optional keys fall back to field defaults.
+
+        Version normalization (A-F5): the wire format treats empty string and
+        absent key as equivalent to ``None`` for the ``version`` field. This
+        keeps round-trips byte-identical when catalog servers omit the field
+        or send an explicit ``""``.
         """
         return cls(
             name=d["name"],
             description=d.get("description", ""),
             transport=d.get("transport", "stdio"),
-            version=d.get("version"),
+            version=d.get("version") or None,
             source=d.get("source", ""),
         )
 

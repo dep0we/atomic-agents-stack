@@ -596,42 +596,32 @@ def _escalation_to_dict(e: Any) -> dict[str, Any]:
 
 
 def _mcp_spec_to_dict(spec: MCPServerSpec) -> dict[str, Any]:
-    """``MCPServerSpec`` → JSON-safe dict.
+    """``MCPServerSpec`` -> JSON-safe dict.
+
+    Thin wrapper around ``MCPServerSpec.to_dict()`` (promoted to a public
+    class method at PR 4, D-PR4-2). Kept here for backward compatibility
+    with any internal callers; delegates to the class method so logic lives
+    in one place.
 
     Note: ``env`` contains parser-resolved values (the ``$VAR_NAME``
     references in the source ``mcp.md`` are resolved to their literal
     env-var values at parse time). Database backends serializing this
-    SHOULD treat the ``env`` field as sensitive — do NOT log it in
-    cleartext, do NOT include it in audit shipped to third-party log
-    backends. The raw text on the profile (``mcp_md_raw``) is the
-    safe-to-ship form.
+    SHOULD treat the ``env`` field as sensitive. The raw text on the
+    profile (``mcp_md_raw``) is the safe-to-ship form.
     """
-    return {
-        "name": spec.name,
-        "command": spec.command,
-        "args": list(spec.args),
-        "env": dict(spec.env),
-        "transport": spec.transport,
-        "description": spec.description,
-    }
+    return spec.to_dict()
 
 
 def _mcp_spec_from_dict(d: dict) -> MCPServerSpec:
     """Reconstruct ``MCPServerSpec`` from a dict produced by ``_mcp_spec_to_dict``.
 
+    Thin wrapper around ``MCPServerSpec.from_dict()`` (promoted to a public
+    class method at PR 4, D-PR4-2). Kept here for backward compatibility
+    with any internal callers.
+
     Used by ``AgentProfile.from_dict`` for both ``mcp_servers`` and
     ``mcp_servers_resolved``. Closes a pre-existing latent bug where the
     ``mcp_servers`` fallback path returned raw dicts instead of
     ``MCPServerSpec`` instances.
-
-    Extra keys in ``d`` are silently ignored for forward-compatibility.
-    Missing optional keys fall back to ``MCPServerSpec`` field defaults.
     """
-    return MCPServerSpec(
-        name=d["name"],
-        command=d["command"],
-        args=list(d.get("args", [])),
-        env=dict(d.get("env", {})),
-        transport=d.get("transport", "stdio"),
-        description=d.get("description", ""),
-    )
+    return MCPServerSpec.from_dict(d)

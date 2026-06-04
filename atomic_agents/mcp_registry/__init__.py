@@ -200,13 +200,30 @@ def get_default_mcp_server_registry_backend(
     if raw_backend_id == "filesystem":
         return FilesystemMCPServerRegistryBackend(agent_root, read_paths)
 
+    elif raw_backend_id == "http":
+        # Lazy import: filesystem operators do not pay the httpx import cost.
+        from .http import make_http_mcp_server_registry_backend_from_url
+
+        url = os.environ.get(
+            "ATOMIC_AGENTS_MCP_SERVER_REGISTRY_BACKEND_URL", ""
+        ).strip()
+        if not url:
+            raise BackendNotRegistered(
+                "ATOMIC_AGENTS_MCP_SERVER_REGISTRY_BACKEND=http requires "
+                "ATOMIC_AGENTS_MCP_SERVER_REGISTRY_BACKEND_URL to be set. "
+                "Expected format: https://<host>[:port]/?agent_scope=<name>"
+            )
+        return make_http_mcp_server_registry_backend_from_url(url)
+
     # Unknown backend_id. Sanitize before echoing in the error message to
     # prevent credential leaks when operators accidentally paste a URL into
     # ATOMIC_AGENTS_MCP_SERVER_REGISTRY_BACKEND instead of the _URL variable.
+    known_ids = {"filesystem", "http"}
     safe_backend_id = _redact_for_error_message(raw_backend_id)
     raise BackendNotRegistered(
         f"ATOMIC_AGENTS_MCP_SERVER_REGISTRY_BACKEND={safe_backend_id!r} is not a "
-        f"known backend. Available: {list_mcp_server_registry_backends()}. "
+        f"known backend. Known: {sorted(known_ids)}. "
+        f"Available registered: {list_mcp_server_registry_backends()}. "
         f"Unset the env var to use the filesystem default."
     )
 
