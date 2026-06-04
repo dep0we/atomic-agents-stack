@@ -1,7 +1,9 @@
 # spec/19 — MCP (Model Context Protocol) Client Support
 
 > Status: **implemented** (PR feat/mcp-support; fixes in PR fix/mcp-review-findings)
-> Cross-links: spec/17 (custom tools — MCP composes with this), [MCP official spec](https://spec.modelcontextprotocol.io/), [spec/36](36-mcp-server-registry-backend.md) (MCPServerRegistryBackend — catalog + install/audit for MCP servers, the MCP equivalent of the ToolRegistry pattern; DRAFT, tracking [#201](https://github.com/dep0we/atomic-agents-stack/issues/201))
+> Cross-links: spec/17 (custom tools — MCP composes with this), [MCP official spec](https://spec.modelcontextprotocol.io/), [spec/36](36-mcp-server-registry-backend.md) (MCPServerRegistryBackend — catalog + install/audit for MCP servers, the MCP equivalent of the ToolRegistry pattern; LOCKED at #201 PR 5, v1.0.0)
+>
+> **spec/19 addendum (spec/36 PR 1):** `parse_mcp_md_text()` gained an optional `resolve_env: bool = True` parameter so backends can parse with `resolve_env=False` and perform env-var resolution themselves at `load_mcp_server` time (per spec/36 Decision 7). Existing callers with the default `True` observe byte-identical behavior. The `$VAR` resolution timing contract is now: direct `parse_mcp_md` callers resolve at parse time (existing behavior preserved); `MCPServerRegistryBackend` implementations resolve at `load_mcp_server(name)` time (spec/36 MUST 8).
 
 ## Why MCP
 

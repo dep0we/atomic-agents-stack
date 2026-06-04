@@ -35,6 +35,7 @@ from atomic_agents.locks import (
 # ──────────────────────────────────────────────────────────────────
 # Helpers
 
+
 def _build_minimal_agent_dir(tmp_path: Path, name: str = "test") -> Path:
     """Construct the minimal on-disk shape AtomicAgent.__init__ requires."""
     agent_dir = tmp_path / name
@@ -42,12 +43,9 @@ def _build_minimal_agent_dir(tmp_path: Path, name: str = "test") -> Path:
     (agent_dir / "persona").mkdir()
     (agent_dir / "persona" / "IDENTITY.md").write_text("# Identity\n")
     (agent_dir / "tools.md").write_text(
-        "## Write paths\n- memory/\n\n"
-        "## Read-only paths\n(none)\n"
+        "## Write paths\n- memory/\n\n## Read-only paths\n(none)\n"
     )
-    (agent_dir / "model.md").write_text(
-        "## Default model\nclaude-haiku-4-5-20251001\n"
-    )
+    (agent_dir / "model.md").write_text("## Default model\nclaude-haiku-4-5-20251001\n")
     (agent_dir / "memory").mkdir()
     return agent_dir
 
@@ -65,12 +63,15 @@ def test_agent_has_public_lock_backend_attribute(tmp_path, monkeypatch):
 
     agent = AtomicAgent(name="test")
 
-    assert hasattr(agent, "lock_backend"), \
+    assert hasattr(agent, "lock_backend"), (
         "AtomicAgent must expose ``lock_backend`` as a public attribute"
-    assert isinstance(agent.lock_backend, LockBackend), \
+    )
+    assert isinstance(agent.lock_backend, LockBackend), (
         "agent.lock_backend must satisfy the LockBackend Protocol"
-    assert isinstance(agent.lock_backend, FilesystemLockBackend), \
+    )
+    assert isinstance(agent.lock_backend, FilesystemLockBackend), (
         "default agent.lock_backend is FilesystemLockBackend per spec/21"
+    )
 
 
 def test_agent_lock_backend_scoped_to_agent_root(tmp_path, monkeypatch):
@@ -108,8 +109,9 @@ def test_agent_call_propagates_non_lockbusy_acquire_failure(tmp_path, monkeypatc
     # PermissionError (or any OSError) before entering the flock loop
     # (e.g., on a read-only filesystem, on a directory where the
     # operator lacks permission to create the .lock file).
-    with _patch.object(agent.lock_backend, "acquire",
-                       side_effect=PermissionError("simulated EACCES")):
+    with _patch.object(
+        agent.lock_backend, "acquire", side_effect=PermissionError("simulated EACCES")
+    ):
         with pytest.raises(PermissionError):
             agent.call("test work item")
     # No NameError reached the test runner; the propagation path is clean.
@@ -212,9 +214,7 @@ def test_dream_start_wraps_lockbusy_with_chaining_at_callsite(tmp_path, monkeypa
         )
     finally:
         child.join(timeout=5)
-        assert child.exitcode == 0, (
-            f"child crashed with exitcode {child.exitcode}"
-        )
+        assert child.exitcode == 0, f"child crashed with exitcode {child.exitcode}"
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -359,7 +359,7 @@ def test_legacy_agentlock_emits_deprecation_warning(tmp_path):
     dep_warns = [w for w in recorded if issubclass(w.category, DeprecationWarning)]
     assert len(dep_warns) == 1
     assert "FilesystemLockBackend" in str(dep_warns[0].message)
-    assert "v1.0" in str(dep_warns[0].message)
+    assert "v1.1" in str(dep_warns[0].message)
     # Lock is constructed but not yet acquired; releasing without acquire is safe
     lock.release()
 

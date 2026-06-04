@@ -1,6 +1,6 @@
 # spec/36: MCPServerRegistryBackend Protocol
 
-> **Status:** DRAFT. Not locked until PR 5. Lock happens when HTTP write paths ship and the conformance suite covers all 10 MUSTs across both reference implementations.
+> **Status:** LOCKED at PR 5 (v1.0.0). HTTP write paths shipped; conformance suite covers all 10 MUSTs across both reference implementations.
 
 ---
 
@@ -140,6 +140,8 @@ The backend's `capabilities` property returns the **runtime view** reflecting wh
 
 **Mid-session tier regression (cached capability stale).** If a tier-2 server later regresses to tier 1 (e.g., admin disables writes), the backend's cached capability is stale. Behavior contract: a stale `supports_install=True` followed by a `POST /mcp-servers` that returns 405 from the now-tier-1 server triggers an inline re-probe (one extra round-trip), updates the cached capabilities, and raises `NotImplementedError` to the caller (consistent with how a statically-False capability behaves). No silent retry; the operator-facing error message names the tier change explicitly.
 
+**Edge case: re-probe returns tier 2 after a 405.** If the re-probe after a 405 still returns tier 2 (the server claims write support despite having returned 405), the backend MUST trust the original 405 and raise `NotImplementedError` with an "inconsistent server" message. NO retry or second attempt. The operator must investigate the catalog server. Rationale: adding a silent retry loop in this case creates an unbounded retry hazard when the catalog server is in a transitional or misconfigured state. The safe default is fail-loud with clear operator direction.
+
 **Why:** the wire-format-divergence risk vs. upstream MCP ecosystem registry-protocol discussions becomes manageable when the framework's HTTP backend can adapt across multiple server shapes. When upstream MCP ships a registry protocol, it slots in as another tier (tier 4+) without breaking tiers 1-3. spec/36 v1.0 documents the spectrum; future tiers are additive, not revisions. This is the structural escape hatch, not just a soft mitigation.
 
 ### Decision 5: Unified install path across all backends, with capability flags that evolve as methods land
@@ -149,7 +151,7 @@ Both reference implementations target `supports_install=True` as the **eventual 
 | Backend | PR 1 | PR 2 | PR 3 | PR 4 | PR 5 |
 |---|---|---|---|---|---|
 | `FilesystemMCPServerRegistryBackend.capabilities.supports_install` | False (no install method yet) | False (still no method) | **True (method lands)** | True | True |
-| `HTTPMCPServerRegistryBackend.capabilities.supports_install` | n/a | n/a | n/a | **False static class default** (read-only mode at PR 4) | **True static class default** (dynamic per tier) |
+| `HTTPMCPServerRegistryBackend.capabilities.supports_install` | n/a | n/a | n/a | **False static class default** (read-only mode at PR 4) | **True after successful tier-2+ negotiation; static pre-probe default stays conservative False/False per B-F11; tier-1 negotiated outcome stays False/False (a tier-1 catalog does not support writes)** |
 
 ```
 atomic-agents mcp-registry install github  # works on filesystem from PR 3 onward
@@ -225,6 +227,8 @@ class MCPServerRef:
 
 `MCPServerRef.to_dict()` / `from_dict()` round-trip is byte-shape preserving for every field. The Ref carries metadata only; it does NOT include `command` / `args` / `env` (those are part of the materialized `MCPServerSpec` from spec/19, returned by `load_mcp_server(name)`). This lazy/eager distinction matches `ToolRegistryBackend` Decision 5.
 
+**Operator note: MCPServerRef.source contains the raw catalog URL.** If the operator embedded credentials in `catalog_url` (e.g., `https://user:pass@host/`), they appear in `source` verbatim. Downstream consumers (CLI output, audit log persistence, dashboard rendering) MUST redact this field before display or storage. Use `_redact_for_error_message(ref.source)` from `atomic_agents.mcp_registry`. The raw URL form is intentional for navigation use cases.
+
 **Projection from `MCPServerSpec`:** `install(spec) -> MCPServerRef` constructs the returned Ref by projecting `name`, `description`, `transport` from the input `MCPServerSpec`; `version` defaults to None; `source` is set by the backend (e.g., filesystem returns `source=f"mcp.md#section:{name}"`; HTTP returns `source=f"{catalog_url}/mcp-servers/{name}"`). The projection is mechanical; the conformance suite asserts the round-trip.
 
 ### `MCPServerRegistryCapabilities`
@@ -294,7 +298,6 @@ Backends MAY override for performance; HTTP backend overrides with a single bulk
 
 `refresh_capabilities()` is on the Protocol surface (not HTTP-backend-specific) so the CLI does not duck-check. Filesystem implementation: returns the cached static `MCPServerRegistryCapabilities` instance (no-op refresh; static capabilities don't change). HTTP implementation: re-runs the capability probe sequence (bypassing any cache) and returns the updated runtime view.
 
-<!-- TODO: extract Behavior contracts section at LOCK (PR 5) -->
 
 ### `list_mcp_servers` semantics
 
@@ -483,6 +486,56 @@ Constructed from the URL family via `make_http_mcp_server_registry_backend_from_
 
 **Capabilities:** dynamic per tier. Default class-level at PR 4: `supports_install=False, supports_uninstall=False, supports_capability_handshake=True, supports_audit=False, durable=True`. At PR 5: `supports_install=True, supports_uninstall=True` (dynamic per tier at runtime). Runtime values may differ from class defaults based on tier negotiation.
 
+#### Install / uninstall semantics (HTTP) (PR 5)
+
+The PR 5 write paths for the HTTP backend implement MUST 9 (atomicity + idempotency) by delegating transactional responsibility to the catalog server's storage layer. The HTTP backend does NOT acquire a `LockBackend` lease; cross-process atomicity is the catalog server's concern (per the "Out of scope" section: "Cross-process catalog locking. The HTTP catalog server owns transactionality at the storage layer").
+
+**Common preamble (both methods).** Validate `name` (or `spec.name`) charset via `_validate_server_name` BEFORE any network call. Raise `ValueError` cheaply for invalid input. Then call `_ensure_probed()` to populate the runtime capability cache. Then check the relevant capability flag.
+
+**Capability gate.** The gate ordering is: `_ensure_probed()` first, THEN check `capabilities.supports_install` (resp. `supports_uninstall`). This order is mandatory because the pre-probe conservative default is `False` (see `capabilities` property). A naive "check capability then probe" ordering would always raise `NotImplementedError` on the first install call regardless of server tier, because the conservative pre-probe default is always `False`.
+
+**Env-var input contract for install().** `install(spec)` requires `spec.env` to contain ONLY unresolved `$VAR` references (the form an operator types when authoring a spec, not the form returned by `load_mcp_server()`). Literal env values are rejected at the API boundary with `ValueError` before any network call. This protects against the `load_mcp_server -> install` pipeline accidentally sending resolved secrets to the catalog server in the POST body. Callers MUST pass raw `$VAR` references; if they need to copy a spec from another backend, they must first restore the unresolved env shape (typically by re-reading the source mcp.md or by re-constructing the spec with `$VAR` placeholders).
+
+**`install(spec)` -- POST semantics.**
+
+1. Validate `spec.name` charset (MUST 1). Raise `ValueError` on invalid.
+2. **Env-var input contract (Decision A, v1.0).** Iterate `spec.env`. For any value that is non-empty and does not start with `$`, raise `ValueError` with a message naming the server name and the offending key. This check runs BEFORE `_ensure_probed()`, BEFORE the capability gate, BEFORE any network call. It is pure input validation at the API boundary.
+3. Call `_ensure_probed()` to populate capability cache.
+4. Check `capabilities.supports_install`. If `False`, raise `NotImplementedError` with a tier-1 message naming the catalog URL.
+5. POST `spec.to_dict()` to `/mcp-servers?agent_scope=<scope>` with auth headers.
+6. On HTTP 405: call `_handle_tier_regression("install")` (see below). This never returns normally.
+7. On HTTP 409: raise `MCPServerAlreadyInstalled` naming the server.
+8. On HTTP 201: project and return `MCPServerRef` from the input `spec` (NOT from parsing the 201 response body; see D-PR5-6). The 201 body is informational only.
+
+**`uninstall(name)` -- DELETE semantics.**
+
+1. Validate `name` charset (MUST 1). Raise `ValueError` on invalid.
+2. Call `_ensure_probed()` to populate capability cache.
+3. Check `capabilities.supports_uninstall`. If `False`, raise `NotImplementedError`.
+4. DELETE `/mcp-servers/<name>?agent_scope=<scope>` with auth headers.
+5. On HTTP 405: call `_handle_tier_regression("uninstall")`. This never returns normally.
+6. On HTTP 204: return `None`. Do NOT call `resp.json()` on a 204 response (empty body).
+
+**Idempotency.** The catalog server returns 204 whether the name exists or not. No special handling for the absent-name case; 204 on absence is the contract (per MUST 9: "uninstall MUST be idempotent").
+
+**MCPServerRef projection on install return (D-PR5-6).** `install(spec) -> MCPServerRef` constructs the Ref by projecting `name`, `description` (first line only, newlines stripped), `transport` from the input spec; `version=None`; `source=f"{self._catalog_url}/mcp-servers/{spec.name}"`. The 201 response body is NOT parsed for Ref construction. This avoids defense-in-depth gaps where a malformed 201 body would cause `KeyError` or `TypeError`.
+
+**No LockBackend lease.** The HTTP backend does NOT call `check_lock_lost`. There is no `LockHandle` for HTTP write operations. The catalog server's own storage layer (SQL transaction, MVCC, or equivalent) provides atomicity. This is structurally equivalent to the SQLiteToolRegistryBackend pattern: the database engine serializes concurrent writers; the framework does not add a second lock layer.
+
+**Concurrent thundering-herd 405 behavior.** Multiple concurrent callers may each observe a 405 on the same POST or DELETE after a mid-session tier regression. Each caller independently triggers `_handle_tier_regression`. Each re-probe is a separate network round trip (probes run outside the lock per D-PR4-3). Each caller raises `NotImplementedError` independently. Last-writer-wins on the capability cache update inside `_capabilities_lock`; all callers converge to the correct tier after the first re-probe lands. No retry, no coordination between concurrent callers. This is the intended behavior.
+
+**Fail-late carve-out (MUST 3 compatibility).** The tier-regression handler raises `NotImplementedError` DYNAMICALLY after a 405, even when the capability cache at method-call-entry reported `supports_install=True`. This is compatible with MUST 3 because the capability was `True` at call entry (honesty at introspection time). The dynamic downgrade is a mid-session server state change, not a capability lie at introspection time. Conformance tests SHOULD add a docstring note for MUST 3: "Tier-regression handler raises NotImplementedError dynamically AFTER 405; this fail-late state is COMPATIBLE with MUST 3 (cap was True at call entry)."
+
+**`_handle_tier_regression(operation)` helper.** A dedicated `-> NoReturn` method on the backend class (not routed through `_handle_http_error` because it needs access to `self` for re-probing). Steps:
+
+1. Call `self.refresh_capabilities()` OUTSIDE any lock (D-PR4-3 discipline).
+2. On `(MCPRegistryUnavailable, MCPRegistryAuthRequired)` from `refresh_capabilities()`: re-raise as `MCPRegistryUnavailable` with message: `f"catalog server at {self._safe_catalog_url} returned 405 on {operation} and re-probe failed: {original_exc}. Capability cache may be stale."`.
+3. After re-probe succeeds: read `capabilities.supports_install` (for `operation="install"`) or `capabilities.supports_uninstall` (for `operation="uninstall"`) from the updated cache.
+4. If re-probe STILL returns tier 2 (the contradictory case): raise `NotImplementedError` with an "inconsistent server" message: `f"catalog server at {self._safe_catalog_url} returned 405 on {operation} but re-probe still reports tier 2. Inconsistent catalog server state; operator investigation required."`.
+5. Otherwise: raise `NotImplementedError` with the standard tier-regression message naming the previous-tier to new-tier transition and the operation name.
+
+ALL operator-facing messages in this helper MUST use `self._safe_catalog_url`, never `self._catalog_url` (MUST 4 URL credential redaction).
+
 ---
 
 ### HTTP wire format (PR 4)
@@ -616,7 +669,7 @@ All exceptions live in `atomic_agents/exceptions.py` and are re-exported from `a
 - `MCPRegistryAuthRequired`: HTTP 401 without `auth_token`. Operators set the env var or constructor kwarg.
 - `MCPRegistryDescriptorInvalid`: mcp.md parse failure (filesystem); HTTP response body invalid JSON (HTTP).
 - `BackendNotRegistered`: operator-pinned `backend_id` isn't in the registry. Matches every prior arc's `BackendNotRegistered` shape.
-- `ValueError`: invalid server name (path separator, empty, parent-dir token, leading `.`, control chars).
+- `ValueError`: invalid server name (path separator, empty, parent-dir token, leading `.`, control chars). Also raised by `install()` when `spec.env` contains literal values (likely resolved secrets); callers MUST pass unresolved `$VAR` refs.
 - `NotImplementedError`: capability-gated method on a backend that doesn't support it at runtime.
 - `MCPServerConnectFailed`: re-raised from `load_mcp_server` when env-var resolution fails (matches existing spec/19 exception; not a new exception class).
 
@@ -628,7 +681,10 @@ All exceptions live in `atomic_agents/exceptions.py` and are re-exported from `a
 | `httpx.HTTPStatusError` (404 on /mcp-servers/name) | `MCPServerNotInRegistry` | Named server absent from catalog. |
 | `httpx.HTTPStatusError` (404 on /mcp-servers collection) | `MCPRegistryUnavailable` | Tier-1 server must implement GET /mcp-servers. |
 | `httpx.HTTPStatusError` (5xx) | `MCPRegistryUnavailable` | Server-side transient failure. |
+| `httpx.HTTPStatusError` (409 on POST /mcp-servers) | `MCPServerAlreadyInstalled` | Server name collision; catalog server already has this name for this scope. |
+| `httpx.HTTPStatusError` (405 on POST or DELETE /mcp-servers) | triggers `_handle_tier_regression` -> `NotImplementedError` | Mid-session tier regression: catalog server was tier 2 but is now tier 1. Re-probe fires before raising. |
 | `httpx.HTTPStatusError` (other 4xx) | `MCPRegistryUnavailable` | Conservative; non-404 4xx MUST NOT silently fall back. |
+| HTTP 204 on DELETE /mcp-servers | success; return `None` | Idempotent uninstall; 204 returned whether name was present or absent. |
 | `httpx.LocalProtocolError` | `MCPRegistryDescriptorInvalid` | Client sent invalid HTTP (framework bug). |
 | `httpx.DecodingError` | `MCPRegistryDescriptorInvalid` | Response body cannot be decoded. |
 | `httpx.TimeoutException` (all variants) | `MCPRegistryUnavailable` | Connection or read timeout. |
@@ -831,7 +887,7 @@ The MUST count is 10 because the static-vs-dynamic capability distinction (Decis
 
 **Spec:** `docs/spec/36-mcp-server-registry-backend.md`: add §"HTTP wire format" + §"Tier negotiation" + §"Capability handshake" + §"Per-scope filtering" (catalog server MUST filter by `agent_scope` server-side; non-conformant catalog servers that return org-wide listings are out of spec).
 
-**Expected test count delta:** +31. Total after PR 4: approximately 3078.
+**Expected test count delta:** +31. Total after PR 4: approximately 3,307 (actual post-PR-4 count).
 
 ### PR 5: HTTP install/uninstall + tier-3 audit + spec/36 LOCKED + v1.0 RELEASE candidate
 
@@ -847,7 +903,7 @@ The MUST count is 10 because the static-vs-dynamic capability distinction (Decis
 - `CLAUDE.md`: add 12th backend lock-paragraph.
 - `~/ObsidianVault/Atomic Agents/ROADMAP.md`: flip MCPServerRegistry row; append the Tier 2 backend-protocol scaling roadmap closer.
 
-**Expected test count delta:** +10. Total after PR 5: approximately 3088.
+**Expected test count delta:** +12 to +18. Total after PR 5: approximately 3,319-3,325 tests collected (base: 3,307 post-PR-4 actual).
 
 **After merge:**
 - `/land-and-deploy` verification on main-branch CI green on merge commit.
@@ -871,7 +927,7 @@ Items 1-3 from the design doc (package name `mcp_registry`, bearer header for HT
 
 - All 5 PRs ship through formal `/ship` Skill end-to-end (extending the streak from 7 to 12 consecutive clean ships post-#285-revert).
 - `/land-and-deploy` verification on each PR's merge commit with main-branch CI green.
-- Test count grows approximately 151 total across the arc (PR 1: +60, PR 2: +35, PR 3: +15, PR 4: +31, PR 5: +10). Final count approximately 3088 tests collected.
+- Test count grows approximately 153-169 total across the arc (PR 1: +60, PR 2: +35, PR 3: +15, PR 4: +31, PR 5: +12 to +18). Final count approximately 3,319-3,325 tests collected (base: 3,307 post-PR-4).
 - spec/36 LOCK at PR 5 passes adversarial review (Opus subagent, 2-5 rounds per CLAUDE.md §11).
 - v1.0 RELEASE cuts after PR 5 lands. CHANGELOG `[Unreleased]` converts to `[v1.0.0]`. PyPI publishes.
 

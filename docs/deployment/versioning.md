@@ -148,6 +148,22 @@ verbatim — ready to paste into the next release's CHANGELOG entry.
 
 ---
 
+## Protocol surface breaking-change policy
+
+The Backend Protocol surface (the methods declared on each `Protocol` class) has its own SemVer rules after v1.0.
+
+**Adding a new required method to any Backend Protocol is a Major bump.**
+Existing third-party implementations (operators who wrote their own `CorpusBackend` or `LockBackend` etc.) will fail Protocol conformance checks at construction time if they have not added the new method. This is a breaking change for implementers, even though existing callers still work.
+
+**Adding a new optional capability method with a `False` default is a Minor bump.**
+If the new method has a default implementation (typically `return False` for `capabilities.supports_X` and `raise NotImplementedError` for the method body), implementers who do not override it advertise `False` capability -- which is protocol-compliant. Callers that check `capabilities.supports_X` before calling the method will not break. This is the established pattern for `install`, `uninstall`, `supports_audit`, and similar optional surfaces.
+
+**Removing or renaming any Backend Protocol method is always a Major bump**, even if no existing conformance test exercises it.
+
+This policy applies to all twelve v1.0 Backend Protocols: MemoryBackend, LLMBackend, JudgeBackend, LockBackend, LogBackend, AgentProfileBackend, ToolRegistryBackend, MandateBackend, PolicyBackend, PersonaBackend, CorpusBackend, MCPServerRegistryBackend.
+
+---
+
 ## What this policy does NOT cover
 
 - **PyPI publishing** — separate concern, tracked elsewhere. The release

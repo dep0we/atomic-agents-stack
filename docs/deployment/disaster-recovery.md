@@ -449,7 +449,7 @@ with FilesystemLockBackend(agent_root).acquire("", timeout=30):
 ```
 
 The legacy `from atomic_agents._locks import AgentLock` import continues to
-work as a deprecation shim (sunset planned for v1.0) — if you have older
+work as a deprecation shim (sunset planned for v1.1 (deferred from v1.0 per #201 PR 5 release decision)) — if you have older
 runbooks or scripts pinned to that path, they'll keep working but emit
 `DeprecationWarning` on import.
 
