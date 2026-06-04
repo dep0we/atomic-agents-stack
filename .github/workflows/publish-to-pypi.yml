@@ -1,0 +1,56 @@
+# Publish atomic-agents-stack to PyPI.
+#
+# Triggered on tag pushes matching strict 3-component SemVer (e.g. v1.0.0, v1.1.0, v2.0.1).
+# The pattern v[0-9]+.[0-9]+.[0-9]+ matches exactly these forms and rejects pre-release
+# tags (v1.0.0-rc1, v1.0.0-beta) or partial-version tags (v1.0) that could trigger
+# accidental publishes.
+#
+# IMPORTANT: The first publish to PyPI must be done manually (see
+# docs/deployment/release-runbook.md ##TestPyPI smoke). This workflow
+# automates v1.0.1 onward once the project exists on PyPI and the
+# UV_PUBLISH_TOKEN secret has been added to the repository settings.
+#
+# Required GitHub Actions secret:
+#   UV_PUBLISH_TOKEN  -- PyPI API token with upload scope for this project.
+#                       Set at: Settings > Secrets and variables > Actions.
+#                       Store the token value in Apple Passwords under
+#                       "pypi-atomic-agents-stack" for recovery.
+
+name: Publish to PyPI
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+jobs:
+  publish:
+    name: Build and publish to PyPI
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+
+      - name: Build wheel and sdist
+        run: uv build
+
+      - name: Validate metadata and README rendering
+        run: uv tool run twine check dist/*
+
+      - name: Publish to PyPI
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.UV_PUBLISH_TOKEN }}
+        run: uv publish
