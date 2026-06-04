@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "atomic-agents-stack"
-version = "0.13.0"
+version = "1.0.0"
 description = "Spec + reference implementation for vault-native, multi-runtime AI agents"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -14,7 +14,7 @@ authors = [
 ]
 keywords = ["ai", "agents", "llm", "anthropic", "claude", "openai", "framework"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.11",
@@ -77,4 +77,11 @@ dev = [
     # but contributors run `uv run ruff check` locally before /ship.
     "ruff>=0.15.13",
     "pytest-cov>=7.1.0",
+    # twine for pre-publish metadata validation (twine check dist/*).
+    # Required for the v1.0.0 release ceremony and all future PyPI publishes.
+    # Use alongside `uv build` before `uv publish`.
+    "twine>=6.0",
 ]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["tests/", "docs/", "extras/", ".claude/", ".github/"]

@@ -1,11 +1,12 @@
 """HTTPMCPServerRegistryBackend -- HTTP-catalog reference implementation.
 
-Implements the full MCPServerRegistryBackend read paths (list, load, load_all,
-validate, capabilities, refresh_capabilities, close) against a JSON-over-HTTPS
-catalog server conforming to spec/36 Decision 4's three-tier wire contract.
+Implements the full MCPServerRegistryBackend Protocol (list, load, load_all,
+validate, install, uninstall, capabilities, refresh_capabilities, close)
+against a JSON-over-HTTPS catalog server conforming to spec/36 Decision 4's
+three-tier wire contract.
 
-Install/uninstall stubs raise ``NotImplementedError`` at PR 4; write paths
-ship at PR 5.
+Write paths (install, uninstall) ship at PR 5 with full tier-gating, mid-session
+tier regression handling, 409 collision mapping, and 204 idempotent delete.
 
 Wire format (spec/36 PR 4 amendments):
     GET /mcp-servers?agent_scope=<scope>
@@ -34,13 +35,14 @@ import re
 import threading
 import time
 from dataclasses import replace
-from typing import Any
+from typing import Any, Literal, NoReturn
 from urllib.parse import urlencode
 
 from .backend import (
     MCPRegistryAuthRequired,
     MCPRegistryDescriptorInvalid,
     MCPRegistryUnavailable,
+    MCPServerAlreadyInstalled,
     MCPServerNotInRegistry,
 )
 from .types import MCPServerRef, MCPServerRegistryCapabilities, ValidationResult
@@ -379,6 +381,8 @@ def _handle_http_error(
     *,
     url: str,
     expect_404_means_not_found_for_name: str | None = None,
+    expect_409_means_collision: bool = False,
+    installed_server_name: str | None = None,
 ) -> None:
     """Translate an ``httpx`` exception into the appropriate MCPRegistry exception.
 
@@ -391,6 +395,13 @@ def _handle_http_error(
         expect_404_means_not_found_for_name: When set to a server name string,
             a 404 ``HTTPStatusError`` raises ``MCPServerNotInRegistry`` for that
             name instead of ``MCPRegistryUnavailable``.
+        expect_409_means_collision: When True, a 409 ``HTTPStatusError`` raises
+            ``MCPServerAlreadyInstalled`` instead of ``MCPRegistryUnavailable``.
+            Pass True only from ``install()`` paths where the catalog server's 409
+            semantics mean "this name already exists in this scope".
+        installed_server_name: When set alongside ``expect_409_means_collision``,
+            the server name is included in the ``MCPServerAlreadyInstalled``
+            message per spec/36 §Install/uninstall semantics (HTTP).
     """
     httpx = _get_httpx()
 
@@ -412,12 +423,20 @@ def _handle_http_error(
                 f"catalog server at {url} returned unexpected 404; "
                 f"the catalog server may be misconfigured (status={status})."
             ) from exc
+        if status == 409 and expect_409_means_collision:
+            # 409 on POST /mcp-servers means name collision (MUST 9 atomicity).
+            # The catalog server already has an entry for this name+scope pair.
+            raise MCPServerAlreadyInstalled(
+                f"MCP server {installed_server_name!r} is already installed at catalog {url} (HTTP 409). "
+                f"Uninstall it first or choose a different name."
+            ) from exc
         if status >= 500:
             raise MCPRegistryUnavailable(
                 f"catalog server at {url} returned HTTP {status} (server error)."
             ) from exc
-        # Other 4xx (400, 403, 409, 422, etc.) surface as Unavailable
-        # per prep notes B-F8: do NOT silently fall back on non-404 4xx.
+        # Other 4xx (400, 403, 409 without the collision flag, 422, etc.)
+        # surface as Unavailable per prep notes B-F8: do NOT silently fall back
+        # on non-404 4xx.
         raise MCPRegistryUnavailable(
             f"catalog server at {url} returned unexpected HTTP {status}."
         ) from exc
@@ -486,10 +505,12 @@ def _handle_http_error(
 class HTTPMCPServerRegistryBackend:
     """HTTP-catalog implementation of ``MCPServerRegistryBackend`` (spec/36).
 
-    Reads from a JSON-over-HTTPS catalog server conforming to spec/36 Decision 4.
-    Supports the full read path: ``list_mcp_servers``, ``load_mcp_server``,
-    ``load_all_mcp_servers``, ``validate``, ``capabilities``,
-    ``refresh_capabilities``, ``close``. Install/uninstall ship at PR 5.
+    Implements the full MCPServerRegistryBackend Protocol against a
+    JSON-over-HTTPS catalog server conforming to spec/36 Decision 4's
+    three-tier wire contract. Supports: ``list_mcp_servers``,
+    ``load_mcp_server``, ``load_all_mcp_servers``, ``validate``,
+    ``install``, ``uninstall``, ``capabilities``, ``refresh_capabilities``,
+    ``close``.
 
     Tier negotiation (lazy probe on first non-construction call):
         Step 1: ``GET /capabilities`` -> 200 parses tier from body.
@@ -1040,23 +1061,319 @@ class HTTPMCPServerRegistryBackend:
 
         return _parse_validation_result(data, url=url)
 
-    # ─── Capability-gated write stubs (PR 5) ─────────────────────────────
+    # ─── Capability-gated write paths (PR 5) ─────────────────────────────
+
+    def _handle_tier_regression(
+        self, operation: Literal["install", "uninstall"]
+    ) -> NoReturn:
+        """Handle a mid-session tier regression (405 on POST or DELETE).
+
+        Called when a previously-tier-2 catalog server returns 405 on a
+        write operation, indicating it has regressed to tier 1 (read-only).
+
+        Steps:
+        1. Re-probe the catalog server's capabilities (outside any lock, per
+           D-PR4-3 thundering-herd discipline).
+        2. On re-probe failure: re-raise as MCPRegistryUnavailable with a
+           "capability cache may be stale" message (D-PR5-4).
+        3. If re-probe still returns tier 2 despite the 405: raise
+           NotImplementedError with an "inconsistent server" message (spec/36
+           edge case clarification, pre-dispatch correction #6).
+        4. Otherwise: raise NotImplementedError naming the tier transition and
+           the operation (D-PR5-3).
+
+        Concurrent thundering-herd 405 behavior (B-F5): multiple concurrent
+        callers may each observe a 405 on the same operation after a
+        regression. Each triggers this helper independently. Each re-probe is
+        a separate network round trip (probes run outside the lock). Each
+        caller raises NotImplementedError independently. Last-writer-wins on
+        the cache update inside _capabilities_lock; all callers converge to
+        the correct tier after the first re-probe lands.
+
+        Fail-late carve-out (B-F9): this helper raises NotImplementedError
+        DYNAMICALLY after a 405, even when capabilities.supports_install was
+        True at method-call-entry. This is compatible with MUST 3 because the
+        capability was True at introspection time. The dynamic downgrade is a
+        mid-session server state change, not a capability lie.
+
+        MUST: ALL operator-facing messages use self._safe_catalog_url, NEVER
+        self._catalog_url (MUST 4 URL credential redaction).
+        """
+        url = self._safe_catalog_url
+        try:
+            new_caps = self.refresh_capabilities()
+        except (
+            MCPRegistryUnavailable,
+            MCPRegistryAuthRequired,
+            MCPRegistryDescriptorInvalid,
+        ) as original_exc:
+            raise MCPRegistryUnavailable(
+                f"catalog server at {url} returned 405 on {operation} "
+                f"and re-probe failed: {original_exc}. "
+                f"Capability cache may be stale."
+            ) from original_exc
+
+        # Check the relevant flag after re-probe.
+        still_supports = (
+            new_caps.supports_install
+            if operation == "install"
+            else new_caps.supports_uninstall
+        )
+
+        if still_supports:
+            # Contradictory: server claims tier 2 but returned 405. Fail loud.
+            raise NotImplementedError(
+                f"catalog server at {url} returned 405 on {operation} "
+                f"but re-probe still reports {operation} supported (tier 2). "
+                f"Inconsistent catalog server state; operator investigation required. "
+                f"Do NOT retry; investigate the catalog server."
+            )
+
+        # Normal regression: server is now tier 1.
+        raise NotImplementedError(
+            f"catalog server at {url} previously reported tier 2 "
+            f"({operation} supported) but is now reporting tier 1 (read-only). "
+            f"The {operation} capability cache has been refreshed; "
+            f"{operation} is no longer available on this catalog. "
+            f"Operator action required."
+        )
 
     def install(self, spec: MCPServerSpec) -> MCPServerRef:
-        """Not implemented at PR 4. Ships at PR 5.
+        """Install a new MCP server into the catalog via HTTP POST.
 
-        Raises ``NotImplementedError`` unconditionally at this PR.
+        Requires a tier-2+ catalog server (``capabilities.supports_install``
+        must be True after probing). The capability gate fires after
+        ``_ensure_probed()``; the pre-probe conservative default is False so
+        the order is: probe first, THEN check the gate (D-PR5-1).
+
+        install() requires MCPServerSpec.env to contain ONLY unresolved
+        ``$VAR`` references. Literal values are rejected with ``ValueError``.
+        This prevents accidentally exfiltrating secrets via
+        ``load_mcp_server -> install`` pipelines.
+
+        Args:
+            spec: MCPServerSpec to install. MUST contain unresolved ``$VAR``
+                env references (the "as typed by the operator" form, e.g.
+                ``env={'API_KEY': '$YOUR_API_KEY_ENV_VAR'}``). If you loaded
+                the spec from ``load_mcp_server()``, the env values are already
+                resolved to literal strings; passing such a spec to install()
+                raises ``ValueError`` at the API boundary to prevent the
+                resolved secrets from reaching the catalog server's request
+                body. Pass a spec with raw ``$VAR`` references instead (D-PR5-5
+                upgraded from warn to refuse at v1.0 Decision A).
+
+        Returns:
+            MCPServerRef projected from the input spec (name, description,
+            transport). The 201 response body is informational only and is NOT
+            parsed for the Ref (D-PR5-6). The returned
+            ``MCPServerRef.source`` field uses the raw catalog URL (not
+            credential-redacted) so the Ref is usable as a navigation URL per
+            spec/36 line 228. Operators logging or persisting the Ref MUST
+            redact ``source`` before output to avoid leaking embedded
+            credentials.
+
+        Raises:
+            ValueError: env contains literal values (likely resolved secrets);
+                callers MUST pass unresolved $VAR refs. Also raised for invalid
+                spec.name charset.
+            NotImplementedError: catalog server is tier 1 (does not support
+                install) either statically or after a mid-session tier
+                regression (405 + re-probe).
+            MCPServerAlreadyInstalled: HTTP 409 from catalog server (name
+                collision for this scope).
+            MCPRegistryUnavailable: network error, server 5xx, or re-probe
+                failure during tier regression recovery.
+            MCPRegistryAuthRequired: HTTP 401 (token missing or invalid).
         """
-        # TODO(PR5): wire HTTP POST /mcp-servers write path with tier gating.
-        raise NotImplementedError("HTTP install/uninstall ships at PR 5")
+        # MUST 1: charset validation before any I/O.
+        _validate_server_name(spec.name)
+
+        # D-PR5-5 (v1.0 Decision A: upgraded from warn to refuse).
+        # Input validation: reject literal env values BEFORE any I/O.
+        # This is the earliest possible gate -- before _ensure_probed(), before
+        # the capability check, before any network call.
+        for key, value in spec.env.items():
+            if value and not value.startswith("$"):
+                raise ValueError(
+                    f"install() requires unresolved $VAR references in MCPServerSpec.env, "
+                    f"but env value for {key!r} on server {spec.name!r} is the literal {value!r}. "
+                    f"If you loaded this spec from load_mcp_server(), env values are resolved "
+                    f"client-side per spec/36 Decision 7. Pass a spec with raw $VAR refs "
+                    f"(e.g., env={{'API_KEY': '$YOUR_API_KEY_ENV_VAR'}}) so the catalog server "
+                    f"never sees real secret values. See spec/36 §'Install / uninstall semantics (HTTP)'."
+                )
+
+        # D-PR5-1: probe first, THEN check capability gate.
+        self._ensure_probed()
+
+        # Capability gate (D-PR5-1, D-PR5-8).
+        # NOTE: do NOT modify the pre-probe conservative default (lines 833-839)
+        # or the tier-1 fallback constants (lines 692-700). The "flag flip"
+        # applies only to the runtime view after successful tier-2+ negotiation.
+        if not self.capabilities.supports_install:
+            raise NotImplementedError(
+                f"catalog server at {self._safe_catalog_url} does not support "
+                f"install (tier 1 read-only catalog). "
+                f"Use a tier-2+ catalog or the filesystem backend."
+            )
+
+        httpx = _get_httpx()
+        client = self._get_client()
+        url = self._safe_catalog_url
+
+        query = urlencode({"agent_scope": self._agent_scope})
+        request_url = f"{self._catalog_url}/mcp-servers?{query}"
+
+        # Note on exception ordering: NotImplementedError is a subclass of
+        # RuntimeError in Python. Tier-regression handling raises
+        # NotImplementedError; calling it from inside a try/except that catches
+        # RuntimeError would silently swallow the NotImplementedError into the
+        # MCPRegistryUnavailable path. The 405 check and regression handler are
+        # therefore outside the httpx exception block.
+        try:
+            resp = client.post(
+                request_url,
+                json=spec.to_dict(),
+                headers=self._auth_headers(),
+            )
+        except (
+            httpx.LocalProtocolError,
+            httpx.DecodingError,
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.ProtocolError,
+            httpx.HTTPError,
+            httpx.InvalidURL,
+            RuntimeError,
+        ) as exc:
+            _handle_http_error(exc, url=url)
+
+        # 405 check OUTSIDE the httpx except block to prevent NotImplementedError
+        # from being re-caught by the RuntimeError branch above.
+        if resp.status_code == 405:
+            # Mid-session tier regression: server was tier 2 but returned 405.
+            self._handle_tier_regression("install")  # raises NoReturn
+
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            _handle_http_error(
+                exc,
+                url=url,
+                expect_409_means_collision=True,
+                installed_server_name=spec.name,
+            )
+
+        # Fix 9 (P2): reject non-201 2xx success codes (202/200/203 etc. are
+        # not the wire contract for install; raise rather than silently succeed).
+        if resp.status_code != 201:
+            raise MCPRegistryUnavailable(
+                f"catalog server at {url} returned unexpected HTTP "
+                f"{resp.status_code} on install (expected 201)."
+            )
+
+        # D-PR5-6: project MCPServerRef from input spec (NOT from 201 body).
+        # The 201 response body is informational; parsing it would create a
+        # defense-in-depth gap when a malformed body causes KeyError/TypeError.
+        # client CONSTRUCTS the Ref; it does not parse it from the server.
+        description_first_line = (
+            spec.description.splitlines()[0].strip() if spec.description else ""
+        )
+        return MCPServerRef(
+            name=spec.name,
+            description=description_first_line,
+            transport=spec.transport,
+            version=None,
+            source=f"{self._catalog_url}/mcp-servers/{spec.name}",
+        )
 
     def uninstall(self, name: str) -> None:
-        """Not implemented at PR 4. Ships at PR 5.
+        """Remove an MCP server from the catalog via HTTP DELETE. Idempotent.
 
-        Raises ``NotImplementedError`` unconditionally at this PR.
+        The catalog server returns 204 whether the name exists or not (per
+        MUST 9 idempotency). No special handling for absent names; 204 is 204.
+
+        Args:
+            name: MCP server name to uninstall.
+
+        Returns:
+            None on both the present-and-removed path AND the absent-no-op path.
+
+        Raises:
+            ValueError: invalid name charset.
+            NotImplementedError: catalog server is tier 1 (does not support
+                uninstall) either statically or after a mid-session tier
+                regression (405 + re-probe).
+            MCPRegistryUnavailable: network error, server 5xx, or re-probe
+                failure during tier regression recovery.
+            MCPRegistryAuthRequired: HTTP 401 (token missing or invalid).
         """
-        # TODO(PR5): wire HTTP DELETE /mcp-servers/<name> write path with tier gating.
-        raise NotImplementedError("HTTP install/uninstall ships at PR 5")
+        # MUST 1: charset validation before any I/O.
+        _validate_server_name(name)
+
+        # D-PR5-1: probe first, THEN check capability gate.
+        self._ensure_probed()
+
+        # Capability gate (D-PR5-1, D-PR5-8).
+        if not self.capabilities.supports_uninstall:
+            raise NotImplementedError(
+                f"catalog server at {self._safe_catalog_url} does not support "
+                f"uninstall (tier 1 read-only catalog). "
+                f"Use a tier-2+ catalog or the filesystem backend."
+            )
+
+        httpx = _get_httpx()
+        client = self._get_client()
+        url = self._safe_catalog_url
+
+        query = urlencode({"agent_scope": self._agent_scope})
+        request_url = f"{self._catalog_url}/mcp-servers/{name}?{query}"
+
+        # Note on exception ordering: NotImplementedError is a subclass of
+        # RuntimeError in Python. Tier-regression handling raises
+        # NotImplementedError; calling it from inside a try/except that catches
+        # RuntimeError would silently swallow the NotImplementedError into the
+        # MCPRegistryUnavailable path. The 405 check and regression handler are
+        # therefore outside the httpx exception block.
+        try:
+            resp = client.delete(
+                request_url,
+                headers=self._auth_headers(),
+            )
+        except (
+            httpx.LocalProtocolError,
+            httpx.DecodingError,
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.ProtocolError,
+            httpx.HTTPError,
+            httpx.InvalidURL,
+            RuntimeError,
+        ) as exc:
+            _handle_http_error(exc, url=url)
+
+        # 405 check OUTSIDE the httpx except block to prevent NotImplementedError
+        # from being re-caught by the RuntimeError branch above.
+        if resp.status_code == 405:
+            # Mid-session tier regression: server was tier 2 but returned 405.
+            self._handle_tier_regression("uninstall")  # raises NoReturn
+
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            _handle_http_error(exc, url=url)
+
+        # Fix 9 (P2): reject non-204 2xx success codes (202/200/203 etc. are
+        # not the wire contract for uninstall; raise rather than silently succeed).
+        if resp.status_code != 204:
+            raise MCPRegistryUnavailable(
+                f"catalog server at {url} returned unexpected HTTP "
+                f"{resp.status_code} on uninstall (expected 204)."
+            )
+
+        # D-PR5-7: 204 response has no body; do not call resp.json().
+        # resp.raise_for_status() is a no-op for 204.
+        return None
 
     # ─── Lifecycle ────────────────────────────────────────────────────────
 

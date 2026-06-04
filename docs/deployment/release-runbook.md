@@ -200,6 +200,83 @@ Before merging any `/ship`-produced PR, verify these surfaces match what shipped
 
 ---
 
+## Pre-publish smoke
+
+Run this sequence BEFORE pushing the git tag. A wheel with a broken entry point or unrendered README is the version forever on PyPI.
+
+```bash
+# 1. Build wheel + sdist.
+uv build
+
+# 2. Validate metadata and README rendering.
+uv tool run twine check dist/*
+
+# 3. Clean-venv install -- confirms the wheel installs from scratch with no dev deps.
+python -m venv /tmp/smoke-venv && /tmp/smoke-venv/bin/pip install dist/*.whl
+
+# 4. Verify CLI entry point is wired.
+/tmp/smoke-venv/bin/atomic-agents --version
+
+# 5. Verify doctor runs.
+/tmp/smoke-venv/bin/atomic-agents doctor
+
+# 6. Version assertion -- catches wheel-built-before-version-bumped errors.
+/tmp/smoke-venv/bin/python -c "import atomic_agents; assert atomic_agents.__version__ == '1.0.0', f'Expected 1.0.0, got {atomic_agents.__version__}'"
+```
+
+If any step fails, fix before pushing the tag. The smoke must run on the actual built artifacts (not `uv run`), because `uv run` uses the live source tree.
+
+---
+
+## TestPyPI smoke
+
+For the first publish ever to PyPI and for any release where the README or metadata changes significantly, publish to TestPyPI first.
+
+**Why**: TestPyPI is separate from real PyPI; mistakes there do not affect production installs. It catches metadata rendering issues (e.g., README not rendering as Markdown, missing classifiers, broken long description) before they become permanent.
+
+```bash
+# Publish to TestPyPI (separate token required -- see Apple Passwords).
+uv publish --publish-url https://test.pypi.org/legacy/ --token <TESTPYPI_TOKEN>
+
+# Verify the project page renders correctly at:
+#   https://test.pypi.org/project/atomic-agents-stack/
+
+# Install from TestPyPI (uses real PyPI as fallback for dependencies).
+pip install \
+  --index-url https://test.pypi.org/simple/ \
+  --extra-index-url https://pypi.org/simple/ \
+  atomic-agents-stack
+
+# Run smoke: atomic-agents --version + doctor
+atomic-agents --version
+atomic-agents doctor
+```
+
+Only after TestPyPI clears, publish to real PyPI:
+
+```bash
+uv publish --token <PYPI_TOKEN>
+```
+
+Both tokens (TestPyPI + PyPI) must be in Apple Passwords under `pypi-atomic-agents-stack-testpypi` and `pypi-atomic-agents-stack` respectively before the first publish.
+
+---
+
+## Rollback contract (yank semantics)
+
+PyPI does not allow deleting or replacing a released version. If v1.0.0 has a critical bug post-publish:
+
+1. **File v1.0.1 immediately** with the fix.
+2. **Yank v1.0.0** on PyPI:
+   - Via the PyPI web UI: go to the release page, click "Options", select "Yank this release", enter a reason.
+   - Or via uv (if supported): `uv publish --yank "Critical bug: <description>" --token <PYPI_TOKEN>`.
+
+**What yank does**: marks v1.0.0 as "not recommended for new installs." `pip install atomic-agents-stack` will skip it. `pip install atomic-agents-stack==1.0.0` still works for operators who have pinned it. The version history page still shows the yanked release with a warning banner.
+
+**Do NOT** delete and republish. PyPI permanent history prevents true deletion, and attempting it creates confusion. The yank + v1.0.1 path is the correct recovery.
+
+---
+
 ## Post-merge
 
 For release-cut PRs only:

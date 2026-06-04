@@ -6,9 +6,10 @@ import path so existing call sites and operator runbooks keep working,
 but every public symbol here emits ``DeprecationWarning`` and delegates
 to ``atomic_agents.locks.FilesystemLockBackend`` under the hood.
 
-# SUNSET v1.0
+# SUNSET v1.1
 Per CLAUDE.md rule #14 ("Backward compatibility by default"), this shim
-is planned for removal in the v1.0 release. New code MUST import from
+is planned for removal in the v1.1 release (sunset deferred from v1.0
+per the #201 PR 5 release decision). New code MUST import from
 ``atomic_agents.locks`` directly. Existing code should migrate via the
 mechanical substitution:
 
@@ -40,7 +41,7 @@ from .locks.filesystem import FilesystemLockBackend
 from .locks.types import LockHandle
 
 
-# SUNSET v1.0
+# SUNSET v1.1
 class AgentLock:
     """DEPRECATED: thin wrapper over ``FilesystemLockBackend.acquire("")``.
 
@@ -48,7 +49,7 @@ class AgentLock:
     ``AgentLock(agent_root, wait_seconds=...)`` while delegating the
     actual acquire/release to the new Protocol-shaped backend.
 
-    Sunset planned for v1.0 — new code should construct
+    Sunset planned for v1.1; new code should construct
     ``FilesystemLockBackend(agent_root).acquire("", timeout=...)``
     directly.
     """
@@ -62,7 +63,7 @@ class AgentLock:
         warnings.warn(
             "atomic_agents._locks.AgentLock is deprecated; use "
             "atomic_agents.locks.FilesystemLockBackend instead. "
-            "See docs/spec/21-lock-backend.md. Sunset planned for v1.0.",
+            "See docs/spec/21-lock-backend.md. Sunset planned for v1.1.",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -110,7 +111,7 @@ class AgentLock:
             self._handle = None
 
 
-# SUNSET v1.0
+# SUNSET v1.1
 @contextlib.contextmanager
 def acquire(agent_root: Path, wait_seconds: float = 0.0):
     """DEPRECATED: contextmanager wrapper for ``AgentLock``.
@@ -119,14 +120,14 @@ def acquire(agent_root: Path, wait_seconds: float = 0.0):
     ``acquire(agent_root, wait_seconds)`` shape. Emits a
     ``DeprecationWarning`` and delegates to ``AgentLock``.
 
-    Sunset planned for v1.0 — new code should use
+    Sunset planned for v1.1; new code should use
     ``with FilesystemLockBackend(agent_root).acquire("",
     timeout=wait_seconds) as handle: ...`` directly.
     """
     warnings.warn(
         "atomic_agents._locks.acquire() is deprecated; use "
         "atomic_agents.locks.FilesystemLockBackend instead. "
-        "Sunset planned for v1.0.",
+        "Sunset planned for v1.1.",
         DeprecationWarning,
         stacklevel=2,
     )
