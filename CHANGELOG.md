@@ -52,6 +52,7 @@ CHANGELOG entry.
 ### Documentation
 
 - Post-v1.0 staleness sweep: `ROADMAP.md`, `docs/deployment/programmatic.md`, and `docs/spec/31-llm-backend.md` updated to reflect the v1.0 release (twelfth backend protocol shipped, MCPServerRegistryBackend added to lists, status copy flipped from future-tense to PyPI-install present-tense, spec/31 status line refreshed from "v0.13 era" to "v1.0"). Closes the three stragglers an audit found after the PR #334 v1.0 release sweep.
+- Slimmed `CLAUDE.md` from 88k → 30k chars to clear the Claude Code 40k-char prompt budget. Extracted the per-protocol detail (the wall-of-text "What this is" paragraph and the bullet-per-backend Status block) into a new `docs/protocols-shipped.md` that owns the full reference impls / capabilities / operator overrides / doctor checks / Implementer Contracts / cliff-closed narrative for all twelve shipped backends. `CLAUDE.md` keeps the design ethos + a compact 12-row Status table that points to the detail file. Matches the framework's own "progressive disclosure" principle (rule 6 — load metadata in-prompt; lazy-load content).
 
 ## [1.0.0] - 2026-06-04
 
