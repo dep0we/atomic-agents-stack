@@ -1,6 +1,6 @@
 # 31 — LLMBackend Protocol
 
-**Status:** locked (spec matches implementation as of v0.13 era).
+**Status:** locked (spec matches implementation as of v1.0).
 **Origin:** [#87](https://github.com/dep0we/atomic-agents-stack/issues/87).
 **Shipped across four PRs:** PR 1 (canonical types + Protocol contract + registry primitives), PR 2 (`AnthropicLLMBackend` + Claude dispatch routing), PR 2.5 (`agent.py` tool-dispatch refactor to canonical types), PR 3 (`OpenAICompatibleLLMBackend` + `MoonshotLLMBackend` + registry-only dispatch + `model.md` `provider:` parser).
 

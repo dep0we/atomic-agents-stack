@@ -6,15 +6,15 @@ For shipped work, see [CHANGELOG.md](CHANGELOG.md). For the framework's design s
 
 ---
 
-## v1.0 — remaining backend protocols
+## v1.0 — backend protocols shipped
 
-The framework's protocol-pattern scaling story closes at v1.0. **Eleven of twelve** backend protocols have shipped: `MemoryBackend`, `LLMBackend`, `JudgeBackend`, `LockBackend`, `LogBackend`, `AgentProfileBackend`, `ToolRegistryBackend`, `MandateBackend`, `PolicyBackend`, `PersonaBackend`, `CorpusBackend`. One remains.
+The framework's protocol-pattern scaling story closed at v1.0 on 2026-06-05. **Twelve of twelve** backend protocols have shipped: `MemoryBackend`, `LLMBackend`, `JudgeBackend`, `LockBackend`, `LogBackend`, `AgentProfileBackend`, `ToolRegistryBackend`, `MandateBackend`, `PolicyBackend`, `PersonaBackend`, `CorpusBackend`, `MCPServerRegistryBackend`. All twelve have locked specs, reference implementations, and parametrized conformance suites.
 
 | Issue | Backend | Status | What it unblocks |
 |-------|---------|--------|------------------|
-| [#201](https://github.com/dep0we/atomic-agents-stack/issues/201) | `MCPServerRegistryBackend` | Planned | Catalog + install/audit for MCP servers (the MCP equivalent of the ToolRegistry pattern) |
+| [#201](https://github.com/dep0we/atomic-agents-stack/issues/201) | `MCPServerRegistryBackend` | Shipped (v1.0.0) | Catalog + install/audit for MCP servers (the MCP equivalent of the ToolRegistry pattern) |
 
-**v1.0 ships when the remaining backend lands + its conformance suite pins the contract.** Same agent definitions, same `agent.call()` flow, same audit trail — different backends registered.
+**v1.0.0 is live on PyPI:** `pip install atomic-agents-stack`. Same agent definitions, same `agent.call()` flow, same audit trail; different backends registered.
 
 ---
 
