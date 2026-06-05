@@ -724,15 +724,15 @@ public surface) is internal. Specifically:
 
 The protocol pattern from
 [`spec/20-memory-backend.md`](../spec/20-memory-backend.md) is the
-template every backend follows. Eleven backend protocols have shipped
-(`MemoryBackend`, `LLMBackend`, `JudgeBackend`, `LockBackend`,
+template every backend follows. Twelve backend protocols have shipped
+at v1.0 (`MemoryBackend`, `LLMBackend`, `JudgeBackend`, `LockBackend`,
 `LogBackend`, `AgentProfileBackend`, `ToolRegistryBackend`,
-`MandateBackend`, `PolicyBackend`, `PersonaBackend`, `CorpusBackend`);
-one remains for v1.0 (`MCPServerRegistryBackend`). Each ships with a
+`MandateBackend`, `PolicyBackend`, `PersonaBackend`, `CorpusBackend`,
+`MCPServerRegistryBackend`). Each ships with a
 filesystem reference impl, a conformance suite, an operator override
 env var + constructor kwarg, a `doctor.check_<backend>` coherence
 check, and a numbered spec doc (`spec/20`, `21`, `22`, `24`, `25`,
-`28`, `29`, `31`, `32`, `33`, `34`). Future SaaS / Postgres / git adapters
+`28`, `29`, `31`, `32`, `33`, `34`, `36`). Future SaaS / Postgres / git adapters
 register via the matching `register_<backend>_backend()` entry point
 without forking core.
 

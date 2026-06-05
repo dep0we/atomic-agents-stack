@@ -49,6 +49,10 @@ CHANGELOG entry.
 
 ## [Unreleased]
 
+### Documentation
+
+- Post-v1.0 staleness sweep: `ROADMAP.md`, `docs/deployment/programmatic.md`, and `docs/spec/31-llm-backend.md` updated to reflect the v1.0 release (twelfth backend protocol shipped, MCPServerRegistryBackend added to lists, status copy flipped from future-tense to PyPI-install present-tense, spec/31 status line refreshed from "v0.13 era" to "v1.0"). Closes the three stragglers an audit found after the PR #334 v1.0 release sweep.
+
 ## [1.0.0] - 2026-06-04
 
 ### Added
