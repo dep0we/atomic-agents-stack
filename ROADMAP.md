@@ -22,9 +22,13 @@ The framework's protocol-pattern scaling story closed at v1.0 on 2026-06-05. **T
 
 Higher-leverage moves that change what the framework *is*, not just what backends it supports. Ordered with the throughline (home user → org fleet) in mind.
 
-### Multi-tenant deployment shape
+### HTTP / MCP serving surface
 
-`atomic-agents serve` runs as an HTTP service exposing an MCP-compatible API. A team or family shares one agent fleet without each person running their own framework. Auth, scoping, audit logging, rate limits. The move that turns the framework into **infrastructure** — matches the "home user with one agent and an org with a fleet experience the same framework" throughline.
+`atomic-agents serve` runs as a thin HTTP wrapper exposing `agent.call()` and the MCP server protocol, suitable for Cloud Run, GKE, Fly.io, or any containerized environment. Tracked at [#342](https://github.com/dep0we/atomic-agents-stack/issues/342).
+
+Perimeter concerns (auth, rate limits, audit logging, TLS) are intentionally pushed to the operator's chosen infrastructure layer (Cloud IAP, Cloud Armor, Cloud Logging on GCP; equivalent on other platforms). The framework owns the agent loop; the operator owns the perimeter. This division keeps the wrapper small and avoids competing with infrastructure that already does these jobs better.
+
+Pairs with the GCP delivery push tracked in [milestone v1.5](https://github.com/dep0we/atomic-agents-stack/milestone/1): [#258](https://github.com/dep0we/atomic-agents-stack/issues/258) Postgres adapters, [#339](https://github.com/dep0we/atomic-agents-stack/issues/339) GCP deployment blueprint, [#340](https://github.com/dep0we/atomic-agents-stack/issues/340) SecretBackend, [#341](https://github.com/dep0we/atomic-agents-stack/issues/341) OpenTelemetry export, [#70](https://github.com/dep0we/atomic-agents-stack/issues/70) cost alert dispatch.
 
 ### Semantic memory retrieval
 
