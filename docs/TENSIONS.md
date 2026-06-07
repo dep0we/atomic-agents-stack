@@ -58,15 +58,32 @@ The MCP integration already documents this tension in spec/19: `asyncio.run()` p
 - `atomic_agents/agent.py` — `call()`, `delegate()`, `helper_call_parallel()` (line 1094), `delegate_parallel()` (line 1385).
 - `atomic_agents/mcp.py:317-360` — `_make_tool_handler` uses `asyncio.run()` per call, which spawns a fresh subprocess per invocation.
 
+**Decision recorded — Hybrid Option C (2026-06-07, issue #342):**
+
+The decision for #342 (`atomic-agents serve`) is **Option C: hybrid adapter now, async-first rebuild explicitly deferred**.
+
+- The Starlette ASGI app dispatches each HTTP request by running `agent.call()` in a shared module-level `ThreadPoolExecutor` (`loop.run_in_executor(_get_executor(), ...)` in `_runner.py`). The `/doctor` route uses the default executor (`run_in_executor(None, ...)`); both satisfy MUST 9. This keeps `asyncio.run()` calls inside the MCP sync bridge legal — they land in a non-async thread where a fresh event loop can start. The Starlette worker loop is not blocked.
+- The adapter (`atomic_agents/serve/_runner.py`) is the single central sync→async bridge for `call()`. Every HTTP-triggered agent call goes through it.
+- The async-first rebuild (Option B) is explicitly deferred. The written deferral, not the wrapper, is the load-bearing deliverable — future contributors reading this entry know the decision and its triggers.
+
+**Async-first rebuild triggers (named and measurable):**
+- **Trigger A:** MCP tool calls per session sustained above 20 per call under concurrent HTTP load (indicates the per-call `asyncio.run()` + subprocess re-spawn overhead is dominating latency).
+- **Trigger B:** The serve layer sustains >50 concurrent HTTP requests with measured thread-pool saturation (P95 queue wait > 500ms) — indicates the thread-pool cap is real, not theoretical.
+- **Trigger C:** A real operator files a production complaint about MCP tool latency attributable to the sync bridge (not noise).
+
+Meeting any one trigger is sufficient to justify the async-first rebuild. Until then, the hybrid adapter is the correct architecture.
+
+**Sub-trigger B clarification (post-#342):** Sub-trigger B fires only when a multi-concurrent-request scenario requires thread-pool-saturating throughput — NOT when #342 first ships. Issue #342 is a thin wrapper / single-tenant deployment pattern (one wrapper per tenant), so concurrent load at the thread-pool-saturation threshold is not expected at initial shipment. The trigger is written so operators know exactly when to re-open the rebuild question.
+
 **When this bites:**
 - **Sub-trigger A — MCP perf:** if/when MCP becomes the dominant tool surface (per ROADMAP framing, this is likely by end of 2026). Per-call `asyncio.run()` + subprocess re-spawn is the hotspot.
-- **Sub-trigger B — multi-tenant:** the moment ROADMAP #5 (`atomic-agents serve`) starts. Decision point: async-first refactor *before* writing the HTTP layer, or wrap-and-iterate *after*.
+- **Sub-trigger B — concurrent HTTP:** when the serve layer hits thread-pool saturation under real concurrent load (see thresholds above).
 
 **What to watch for:**
 - MCP tool calls per session creeping up (today: a handful; an org with rich MCP would see 50-200).
 - Anyone proposing async functions in the codebase — that's the leak point. Better to make the call deliberately than absorb it ad-hoc.
 
-**Related:** ROADMAP #5 (multi-tenant), spec/19 §"v1 deferrals", `mcp.py:14-26` deferral comments.
+**Related:** Issue #342 (thin HTTP wrapper — the decision arc), ROADMAP #5 (multi-tenant), spec/19 §"v1 deferrals", `mcp.py:14-26` deferral comments, `docs/spec/37-serve.md`.
 
 ---
 
@@ -313,6 +330,7 @@ The MCP integration already documents this tension in spec/19: `asyncio.run()` p
 | Date | Tension | Decision / change | Reasoning |
 |------|---------|-------------------|-----------|
 | 2026-05-09 | All | Captured to TENSIONS.md | Initial review of agent.py + mcp.py + tools.py + cascade + execution layers + observability. |
+| 2026-06-07 | T2 | Hybrid Option C — thread-pool adapter now, async-first rebuild deferred with named triggers | Issue #342 (thin HTTP wrapper). Decision rationale: ships org shape today without async refactor; keeps both home and org shapes first-class; written deferral with measurable triggers is the load-bearing deliverable. See T2 "Decision recorded" block above. |
 
 ---
 
