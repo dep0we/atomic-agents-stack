@@ -34,6 +34,10 @@ openai = ["openai>=1.30"]
 validation = ["jsonschema>=4.0"]
 redis = ["redis>=5.0,<8.0"]
 http = ["httpx>=0.27"]
+# serve extra — thin HTTP wrapper for Cloud Run / containerized environments.
+# Starlette (ASGI framework) + uvicorn (ASGI server). Opt-in only; base package
+# import does not load these. See docs/spec/37-serve.md and atomic_agents/serve/.
+serve = ["starlette>=0.27", "uvicorn>=0.20"]
 dev = [
     "pytest>=8.0",
 ]
