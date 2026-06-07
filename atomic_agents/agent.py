@@ -22,6 +22,7 @@ from dataclasses import asdict
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
+from uuid import uuid4
 
 if TYPE_CHECKING:
     from .llm.types import LLMToolDefinition  # noqa: F401 — used in str type hints
@@ -154,6 +155,11 @@ RECENT_JOURNAL_DEFAULT = 1
 
 _PRIMITIVE_BY_TRIGGER: dict[str, str] = {
     "agent_call": PRIMITIVE_AGENT_CALL,
+    # HTTP-served calls (trigger='http', set by atomic_agents.serve) map to the
+    # same agent_call primitive — they are agent invocations over a different
+    # transport surface, not a different class of compute primitive.
+    # spec/22 §"Canonical primitive taxonomy" + spec/37 §"Audit record shape".
+    "http": PRIMITIVE_AGENT_CALL,
     "outcome_iteration": PRIMITIVE_OUTCOME_ITERATION,
     "dream": PRIMITIVE_DREAM,
     "eval": PRIMITIVE_EVAL,
@@ -313,6 +319,12 @@ class AtomicAgent:
         self.trigger = trigger
         self.agents_root = agents_root or get_agents_root()
         self.agent_root = self.agents_root / name
+        # Track whether the caller pinned a specific run_id (outcome, eval, dream
+        # loops pin run_id so agent_call records correlate with the outer loop's
+        # records). When pinned, call() MUST NOT overwrite — the explicit id is
+        # the audit correlation anchor. spec/37 MUST 8 applies only to unpinned
+        # (HTTP / skill / manual / cron) callers that need a fresh id each call.
+        self._run_id_pinned: bool = run_id is not None
         self.run_id = run_id or self._generate_run_id()
         # Custom tool registry (spec/17). Empty registry = no custom tools.
         self.tool_registry = tools if tools is not None else ToolRegistry()
@@ -1230,7 +1242,10 @@ class AtomicAgent:
 
     @staticmethod
     def _generate_run_id() -> str:
-        return f"run-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
+        # Append a uuid4 fragment to guarantee uniqueness under concurrent HTTP
+        # load where two requests can execute this line in the same microsecond.
+        # spec/37 MUST 8 — unique run_id per call(), including concurrent calls.
+        return f"run-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}-{uuid4().hex[:8]}"
 
     @staticmethod
     def _capture_tool_definitions(model: str) -> "list[LLMToolDefinition] | None":
@@ -3227,11 +3242,20 @@ class AtomicAgent:
         temperature: float | None = None,
         write_captures: bool = True,
         parent_remaining_headroom_usd: float | None = None,
+        caller_identity: str | None = None,
     ) -> Response:
         """Make the LLM call. Returns a Response with captures populated.
 
         critical=True bypasses cost guardrails (still logged with critical: true).
         write_captures=False extracts but doesn't persist captures (dry-run mode).
+
+        caller_identity: optional string identifying the HTTP caller (e.g. the value
+            of the X-Goog-IAP-JWT-Assertion header extracted by the serve layer).
+            When set, the value is written into the JSONL run record under
+            ``http_caller`` (in ``extra``) so the audit trail answers "who called
+            this agent at time T?" without requiring cross-reference with
+            perimeter logs. The serve layer sets this; all other callers leave it
+            None (zero behavioral change). See spec/37 §"Audit record shape".
 
         ``model_override``: per-call model selection that supersedes ``model.md``'s
         default. Policy's ``get_effective_model`` (when set) takes precedence over
@@ -3267,6 +3291,23 @@ class AtomicAgent:
         if not self._persona_text:
             self.load()
 
+        # Reset run_id BEFORE acquiring the lock so that the lock_busy audit
+        # record (if the lock is held by another call) carries a unique run_id
+        # for this invocation, not the previous call's id. spec/37 MUST 8 —
+        # "each call() invocation MUST produce a unique run_id". For long-lived
+        # cached instances the run_id must be fresh even on the refused path.
+        #
+        # Exception: when the constructor received an explicit run_id (e.g.
+        # OutcomeRunner pins run_id='outcome-...' so that agent_call JSONL
+        # records correlate with outcome_iteration records that reference the
+        # same id), we MUST NOT overwrite — the pin is the audit-trail anchor.
+        # CLAUDE.md principle 5. The per-request construction path in the serve
+        # layer (serve/_runner.py) constructs a fresh agent per request, so
+        # MUST 8's HTTP conformance is satisfied by construction, not by this
+        # reset, for that path.
+        if not self._run_id_pinned:
+            self.run_id = self._generate_run_id()
+
         # Acquire agent lock via the bound LockBackend. Empty name maps
         # to ``<agent_root>/.lock`` on the filesystem backend — preserves
         # the legacy on-disk artifact so doctor + external scripts keep
@@ -3276,20 +3317,31 @@ class AtomicAgent:
         # except-clauses working unchanged (see ``atomic_agents.
         # exceptions.AgentLockBusy = LockBusy``).
         try:
-            lock_handle = self.lock_backend.acquire(
-                "", timeout=30 if self.trigger == "skill" else 0
-            )
+            # Lock timeout by trigger:
+            # - 'skill': 30s — skill-mode callers queue behind each other (expected
+            #   sequential use by a Claude Code session; 30s is generous but bounded).
+            # - 'http': 30s — HTTP callers also queue; returning LockBusy immediately
+            #   (timeout=0) under any realistic concurrent load (two simultaneous pings)
+            #   would make the server flaky. The serve layer serialises concurrent
+            #   requests per agent through this timeout. spec/37 §"Concurrency contract".
+            # - All others (manual, cron, api): 0 — CLI / cron callers fail-fast on
+            #   lock contention; they are not expected to queue.
+            _lock_timeout = 30 if self.trigger in ("skill", "http") else 0
+            lock_handle = self.lock_backend.acquire("", timeout=_lock_timeout)
         except LockBusy as e:
-            self._log(
-                {
-                    "trigger": self.trigger,
-                    "model": self.config.default_model,
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "status": "lock_busy",
-                    "summary": str(e),
-                }
-            )
+            _lock_busy_record: dict = {
+                "trigger": self.trigger,
+                "model": self.config.default_model,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "status": "lock_busy",
+                "summary": str(e),
+            }
+            # spec/37 MUST 7: include caller identity in refused-path records too,
+            # so the audit trail can attribute lock-busy events to an HTTP caller.
+            if caller_identity is not None:
+                _lock_busy_record["http_caller"] = caller_identity
+            self._log(_lock_busy_record)
             raise
 
         # Track MCP tool names registered this call so we can clean them up in
@@ -3315,6 +3367,10 @@ class AtomicAgent:
                 self._mandate_check._policy_effective_caps = (
                     self._policy_snapshot_this_call.effective_caps
                 )
+            # run_id was already reset before lock acquisition (see above) so
+            # it is unique for this invocation even on the cost-skip and lock_busy
+            # paths. The per-run accumulators below are still reset here (inside
+            # the lock) so no parallel call can race them.
             # Reset helper-provenance rollup for this run (spec/13 Layer 3)
             self._helpers_this_run = []
             # Reset delegation rollup for this run
@@ -3347,16 +3403,19 @@ class AtomicAgent:
                 parent_remaining_headroom_usd=parent_remaining_headroom_usd,
             )
             if not check.allow:
-                self._log(
-                    {
-                        "trigger": self.trigger,
-                        "model": self.config.default_model,
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                        "status": "skipped",
-                        "summary": f"Skipped: {check.reason}",
-                    }
-                )
+                _skip_record: dict = {
+                    "trigger": self.trigger,
+                    "model": self.config.default_model,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "status": "skipped",
+                    "summary": f"Skipped: {check.reason}",
+                }
+                # spec/37 MUST 7: include caller identity on the cost-skip path
+                # so audit can attribute refused HTTP calls to their principals.
+                if caller_identity is not None:
+                    _skip_record["http_caller"] = caller_identity
+                self._log(_skip_record)
                 return Response.skipped_response(
                     check.reason, self.config.default_model
                 )
@@ -3626,20 +3685,26 @@ class AtomicAgent:
                             tool_calls=all_tool_call_results,
                             tool_iterations=iteration_count - 1,
                         )
-                        self._log(
-                            {
-                                "trigger": self.trigger,
-                                "model": model,
-                                "input_tokens": total_input_tokens,
-                                "output_tokens": total_output_tokens,
-                                "cost_usd": total_cost,
-                                "cost_source": "actor",
-                                "latency_ms": latency_ms,
-                                "status": "skipped",
-                                "summary": skip_reason,
-                                "run_id": self.run_id,
-                            }
-                        )
+                        _mid_loop_skip: dict = {
+                            "trigger": self.trigger,
+                            "model": model,
+                            "input_tokens": total_input_tokens,
+                            "output_tokens": total_output_tokens,
+                            "cost_usd": total_cost,
+                            "cost_source": "actor",
+                            "latency_ms": latency_ms,
+                            "status": "skipped",
+                            "summary": skip_reason,
+                            "run_id": self.run_id,
+                        }
+                        # spec/37 MUST 7: include http_caller on ALL HTTP-triggered
+                        # terminal records, including this mid-loop cost-cap path.
+                        # The pre-loop cost-skip (3398-3401) and lock_busy (3325-3327)
+                        # paths already inject it; this is the fourth terminal parent
+                        # record that must also carry it.
+                        if caller_identity is not None:
+                            _mid_loop_skip["http_caller"] = caller_identity
+                        self._log(_mid_loop_skip)
                         return response
 
                 iter_start = time.time()
@@ -4213,6 +4278,17 @@ class AtomicAgent:
                 log_record["critical"] = True
             if all_parse_failures:
                 log_record["capture_parse_failures"] = len(all_parse_failures)
+            # Identity-in-audit-trail: write the perimeter-asserted (unverified-by-
+            # framework) caller identity into the permanent run record. The framework
+            # reads the raw identity header value and passes it through — it MUST NOT
+            # verify or decode it (spec/37 MUST 6). The field name ``http_caller`` is
+            # canonical per spec/37 §"Audit record shape". Home-user callers pass
+            # None (field omitted); org HTTP callers pass the identity header value
+            # extracted at the serve boundary. RunRecord.from_dict routes unknown
+            # keys to extra{} so this field survives round-trips without a schema
+            # change to RunRecord. spec/37 MUST 7.
+            if caller_identity is not None:
+                log_record["http_caller"] = caller_identity
             # Round 1 Finding 1 fix: tag the agent_call cost event with
             # mandate_id + proposal_id when at least one mandate cite
             # committed this call. _sum_prior_token_cost queries by
