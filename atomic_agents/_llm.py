@@ -11,9 +11,6 @@ API keys loaded via _platform.get_api_key().
 
 from __future__ import annotations
 import logging
-import os
-import time
-from typing import Any
 
 from .exceptions import AtomicAgentsError
 
@@ -74,7 +71,10 @@ def call_llm(
 
     canonical_tools = _to_canonical_tool_defs(tools)
     cache_directives = (
-        [CacheDirective(breakpoint_id=f"breakpoint_{i}") for i in cache_control_breakpoints]
+        [
+            CacheDirective(breakpoint_id=f"breakpoint_{i}")
+            for i in cache_control_breakpoints
+        ]
         if cache_control_breakpoints
         else None
     )
@@ -116,6 +116,7 @@ def _to_canonical_tool_defs(tools):
     if not tools:
         return None
     from .llm.types import LLMToolDefinition
+
     out = []
     for t in tools:
         if isinstance(t, LLMToolDefinition):
@@ -123,21 +124,24 @@ def _to_canonical_tool_defs(tools):
         elif isinstance(t, dict):
             if t.get("type") == "function" and isinstance(t.get("function"), dict):
                 fn = t["function"]
-                out.append(LLMToolDefinition(
-                    name=fn["name"],
-                    description=fn.get("description", ""),
-                    input_schema=fn.get("parameters", {}),
-                ))
+                out.append(
+                    LLMToolDefinition(
+                        name=fn["name"],
+                        description=fn.get("description", ""),
+                        input_schema=fn.get("parameters", {}),
+                    )
+                )
             else:
-                out.append(LLMToolDefinition(
-                    name=t["name"],
-                    description=t.get("description", ""),
-                    input_schema=t.get("input_schema", {}),
-                ))
+                out.append(
+                    LLMToolDefinition(
+                        name=t["name"],
+                        description=t.get("description", ""),
+                        input_schema=t.get("input_schema", {}),
+                    )
+                )
         else:
             raise TypeError(
-                f"tool item must be LLMToolDefinition or dict; got "
-                f"{type(t).__name__}"
+                f"tool item must be LLMToolDefinition or dict; got {type(t).__name__}"
             )
     return out
 
@@ -158,16 +162,43 @@ def _extract_openai_tool_calls(msg):
     OpenAI-family backend owns its own provider translation).
     """
     from .llm.openai_compat import OpenAICompatibleLLMBackend
+
     return OpenAICompatibleLLMBackend._extract_openai_tool_calls(msg)
 
 
-# The key-resolution helpers below are retained — ``doctor.py:501``
-# imports ``_get_key`` directly, and the per-provider thin wrappers
-# preserve a stable public surface for any operator who pinned to
-# ``from atomic_agents._llm import _get_anthropic_key`` etc.
+# ──────────────────────────────────────────────────────────────────────────────
+# Key-resolution helpers — superseded by SecretBackend (spec/37, issue #340).
+#
+# The credential cascade (env vars → Keychain → keys.json) now lives in
+# ``atomic_agents.secret_backend.FilesystemSecretBackend``.  All six live
+# callers have been rewired to route through the backend: five via these thin
+# redirect wrappers (``_get_key`` and friends — doctor.py check_provider_keys,
+# init/wizard.py, llm/openai_compat.py, llm/anthropic.py, judge/llm.py), and
+# ``eval._provider_available`` directly via
+# ``get_default_secret_backend().has()`` (eval.py:~953).  External importers
+# of ``_get_key`` / ``_get_anthropic_key`` etc. continue to work unchanged
+# because the wrappers are preserved.
+#
+# Implementation note: ``_get_key`` calls ``get_default_secret_backend()``
+# (the env-var-driven factory) rather than constructing ``FilesystemSecretBackend``
+# directly.  This ensures that an operator who sets
+# ``ATOMIC_AGENTS_SECRET_BACKEND=gcp`` gets the configured backend for ALL
+# resolution paths — runtime AND doctor — not just the top-level factory.
+# The ``_get_anthropic_key`` / ``_get_openai_key`` / ``_get_moonshot_key``
+# wrappers forward the full legacy (env_vars, keychain_name, config_key) triple
+# to ``_get_key``, which routes it to FilesystemSecretBackend.resolve_with_spec
+# verbatim (so every alias and the caller-supplied keychain/config_key are
+# honored).  Only when the configured backend lacks ``resolve_with_spec`` does
+# ``_get_key`` fall back to ``backend.get(env_vars[0])`` using the primary
+# env-var name.
 
 
 def _get_anthropic_key() -> str:
+    """Resolve the Anthropic API key via the registered SecretBackend.
+
+    Thin redirect wrapper. Routes through ``_get_key`` which calls the backend.
+    Preserved for callers that imported ``_get_anthropic_key`` directly.
+    """
     return _get_key(
         env_vars=["ATOMIC_AGENTS_ANTHROPIC_KEY", "ANTHROPIC_API_KEY"],
         keychain_name="atomic-agents-anthropic",
@@ -176,6 +207,11 @@ def _get_anthropic_key() -> str:
 
 
 def _get_openai_key() -> str:
+    """Resolve the OpenAI API key via the registered SecretBackend.
+
+    Thin redirect wrapper. Routes through ``_get_key`` which calls the backend.
+    Preserved for callers that imported ``_get_openai_key`` directly.
+    """
     return _get_key(
         env_vars=["ATOMIC_AGENTS_OPENAI_KEY", "OPENAI_API_KEY"],
         keychain_name="atomic-agents-openai",
@@ -184,6 +220,11 @@ def _get_openai_key() -> str:
 
 
 def _get_moonshot_key() -> str:
+    """Resolve the Moonshot API key via the registered SecretBackend.
+
+    Thin redirect wrapper. Routes through ``_get_key`` which calls the backend.
+    Preserved for callers that imported ``_get_moonshot_key`` directly.
+    """
     return _get_key(
         env_vars=["ATOMIC_AGENTS_MOONSHOT_KEY", "MOONSHOT_API_KEY"],
         keychain_name="atomic-agents-moonshot",
@@ -192,47 +233,75 @@ def _get_moonshot_key() -> str:
 
 
 def _get_key(env_vars: list[str], keychain_name: str, config_key: str) -> str:
-    """Look up an API key in this order: env vars → Keychain → ~/.config/atomic_agents/keys.json.
+    """Thin redirect wrapper — delegates to the registered SecretBackend (spec/37).
 
-    Per spec/04 secrets handling. If none of the sources have the key, raise.
+    Previously: contained the full env → Keychain → keys.json cascade inline.
+    Now: calls ``get_default_secret_backend().resolve_with_spec(...)`` so the
+    backend is the single source of truth for credential resolution.
+
+    The full ``(env_vars, keychain_name, config_key)`` triple is forwarded to
+    ``FilesystemSecretBackend.resolve_with_spec``, which probes every env-var
+    alias and uses the caller-supplied keychain service name and keys.json key
+    verbatim. This preserves backward compatibility for custom
+    ``OpenAICompatibleLLMBackend`` registrations whose ``KeySpec`` carries a
+    non-default keychain_name or config_file_key.
+
+    For backends that do not expose ``resolve_with_spec`` (future alternate
+    implementations), falls back to ``backend.get(env_vars[0])`` so the public
+    Protocol method is still exercised.
+
+    Raises ``AtomicAgentsError`` when the key cannot be resolved via any source
+    (constructed directly on the ``resolve_with_spec`` path; chained from the
+    underlying ``SecretError`` on the public-Protocol fallback path), preserving
+    the same exception type callers expect from the old implementation.
+    Raises ``SecretBackendNotRegistered`` (an ``AtomicAgentsError`` subclass)
+    unchanged when ``get_default_secret_backend()`` raises it, so operators
+    get a diagnostic "backend not registered" message rather than a misleading
+    "No API key found" message.
     """
-    # Source 1: environment variables
-    for var in env_vars:
-        val = os.environ.get(var)
-        if val:
-            return val
-
-    # Source 2: macOS Keychain (Mac only)
-    if os.uname().sysname == "Darwin":
-        import subprocess
-        try:
-            result = subprocess.run(
-                ["security", "find-generic-password",
-                 "-a", os.environ.get("USER", ""),
-                 "-s", keychain_name, "-w"],
-                capture_output=True, text=True, check=True,
-            )
-            val = result.stdout.strip()
-            if val:
-                return val
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            pass
-
-    # Source 3: ~/.config/atomic_agents/keys.json
-    import json
-    from pathlib import Path
-    config_path = Path.home() / ".config" / "atomic_agents" / "keys.json"
-    if config_path.exists():
-        try:
-            keys = json.loads(config_path.read_text())
-            val = keys.get(config_key)
-            if val:
-                return val
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    raise AtomicAgentsError(
-        f"No API key found for {config_key}. Set one of {env_vars}, "
-        f"add to Keychain as '{keychain_name}', or configure "
-        f"~/.config/atomic_agents/keys.json"
+    from .secret_backend import (
+        SecretBackendNotRegistered,
+        SecretError,
+        get_default_secret_backend,
     )
+
+    try:
+        backend = get_default_secret_backend()
+    except SecretBackendNotRegistered as exc:
+        # Backend mis-configured (e.g., ATOMIC_AGENTS_SECRET_BACKEND=gcp not yet
+        # installed). Surface the backend error directly — it is already an
+        # AtomicAgentsError subclass with a diagnostic message, so re-raising it
+        # gives the operator a clear "backend not registered" error rather than
+        # a misleading "No API key found" message.
+        raise exc
+
+    # Prefer resolve_with_spec when available: it probes all env_var aliases and
+    # uses the caller-supplied keychain_name/config_key exactly, preserving the
+    # original _get_key contract for custom KeySpecs.
+    if hasattr(backend, "resolve_with_spec"):
+        val = backend.resolve_with_spec(env_vars, keychain_name, config_key)
+        if val is not None:
+            return val
+        raise AtomicAgentsError(
+            f"No API key found for {config_key}. Set one of {env_vars}, "
+            f"add to Keychain as '{keychain_name}', or configure "
+            f"~/.config/atomic_agents/keys.json"
+        )
+
+    # Fallback for alternate SecretBackend implementations that expose only the
+    # public Protocol surface (get/get_optional/has/locate). Uses primary env var
+    # as the canonical key name; aliases in env_vars[1:] are not probed because
+    # the Protocol has no multi-alias resolution method.
+    if not env_vars:
+        raise AtomicAgentsError(
+            f"No env var names supplied for {config_key}; "
+            f"cannot resolve via Protocol-only backend."
+        )
+    try:
+        return backend.get(env_vars[0])
+    except SecretError as exc:
+        raise AtomicAgentsError(
+            f"No API key found for {config_key}. Set one of {env_vars}, "
+            f"add to Keychain as '{keychain_name}', or configure "
+            f"~/.config/atomic_agents/keys.json"
+        ) from exc

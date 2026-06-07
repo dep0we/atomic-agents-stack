@@ -150,23 +150,34 @@ def run_doctor(
 
     if agent_name is None:
         # Order matches run_doctor()'s actual execution sequence below
-        # (lock-backend → log-backend → profile-backend →
+        # (lock-backend → locks → log-backend → profile-backend →
         # tool-registry-backend → mandate-backend → policy-backend →
-        # corpus-backend → memory-backend) so contributors adding a
-        # scope-level backend check see the SKIP enumeration mirror
-        # reality.
+        # persona-backend → corpus-backend →
+        # mcp-server-registry-backend → secret-backend →
+        # memory-backend) so contributors adding a scope-level backend
+        # check see the SKIP enumeration mirror reality.
+        #
+        # Note: ``secret-backend`` is deployment-scoped (check_secret_backend
+        # takes no agent_root), but it is grouped here for output consistency
+        # with the other backend checks.  An operator running without --agent
+        # sees a uniform "all backend checks require --agent" summary rather
+        # than a mix of PASS/FAIL and SKIP entries.
         for n in (
             "vault",
             "provider-keys",
             "model",
             "mcp",
+            "lock-backend",
             "locks",
+            "log-backend",
             "profile-backend",
             "tool-registry-backend",
             "mandate-backend",
             "policy-backend",
+            "persona-backend",
             "corpus-backend",
             "mcp-server-registry-backend",
+            "secret-backend",
             "memory-backend",
             "write-paths",
         ):
@@ -228,6 +239,7 @@ def run_doctor(
     results.append(check_persona_backend(resolved_root))
     results.append(check_corpus_backend(agent_root))
     results.append(check_mcp_server_registry_backend(agent_root))
+    results.append(check_secret_backend())
     results.append(check_memory_backend(agent_root))
     results.append(check_write_paths(tools_data, agent_root=agent_root))
 
@@ -2846,6 +2858,79 @@ def check_mcp_server_registry_backend(agent_root: Path) -> CheckResult:
             "supports_audit": caps.supports_audit,
             "durable": caps.durable,
             "mcp_server_count": len(refs),
+        },
+    )
+
+
+def check_secret_backend() -> CheckResult:
+    """SecretBackend resolves and the configured backend instantiates cleanly.
+
+    Probes the registered backend via ``get_default_secret_backend()`` and
+    verifies that capability advertisement is structurally valid.  Does NOT
+    call ``get()`` for any specific key (that is ``check_provider_keys``'s
+    job) -- this check confirms only that the backend machinery is wired up.
+
+    Doctor dual-probe lesson (MEMORY.md): ``has()`` can pass even when
+    ``get()`` fails.  This check probes the backend construction and
+    capability surface, not key resolution.  Key resolution is validated by
+    ``check_provider_keys`` which routes through the same backend via
+    ``_get_key()``.
+
+    ATOMIC_AGENTS_SECRET_BACKEND_URL is redacted before echo to avoid
+    leaking credentials in doctor output.
+    """
+    from .secret_backend import SecretError, get_default_secret_backend
+    from .secret_backend import _redact_for_error_message
+
+    raw_backend_id = (
+        os.environ.get("ATOMIC_AGENTS_SECRET_BACKEND", "").strip().lower()
+        or "filesystem"
+    )
+    raw_url = os.environ.get("ATOMIC_AGENTS_SECRET_BACKEND_URL", "")
+    safe_backend_id = _redact_for_error_message(raw_backend_id)
+    safe_url = _redact_for_error_message(raw_url) if raw_url else "(not set)"
+
+    try:
+        backend = get_default_secret_backend()
+    except SecretError as e:
+        return CheckResult(
+            name="secret-backend",
+            status=FAIL,
+            message=(
+                f"failed to instantiate secret backend "
+                f"(ATOMIC_AGENTS_SECRET_BACKEND={safe_backend_id!r}, "
+                f"ATOMIC_AGENTS_SECRET_BACKEND_URL={safe_url}): {e}"
+            ),
+            fix_hint=(
+                "Unset ATOMIC_AGENTS_SECRET_BACKEND to use the filesystem default, "
+                "or set it to a registered backend id (currently: 'filesystem'). "
+                "If using ATOMIC_AGENTS_SECRET_BACKEND=gcp, the GCP backend ships "
+                "at PR 2 of issue #340."
+            ),
+            detail={"backend_id": safe_backend_id, "error": str(e)},
+        )
+    except Exception as e:
+        return CheckResult(
+            name="secret-backend",
+            status=FAIL,
+            message=f"secret backend raised unexpected error: {type(e).__name__}: {e}",
+            detail={"backend_id": safe_backend_id, "error_type": type(e).__name__},
+        )
+
+    caps = backend.capabilities
+    return CheckResult(
+        name="secret-backend",
+        status=PASS,
+        message=(
+            f"secret backend '{backend.backend_id}' ready "
+            f"(supports_rotation={caps.supports_rotation}, "
+            f"persists_plaintext={caps.persists_plaintext})"
+        ),
+        detail={
+            "backend_id": backend.backend_id,
+            "supports_rotation": caps.supports_rotation,
+            "supports_audit_logging": caps.supports_audit_logging,
+            "persists_plaintext": caps.persists_plaintext,
         },
     )
 
