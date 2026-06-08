@@ -6,7 +6,9 @@
 
 ## Origin
 
-Carved out from the credential-resolution pattern established in spec/01 (secrets handling) and formalized as the thirteenth backend protocol. Filed as [#340](https://github.com/dep0we/atomic-agents-stack/issues/340) after v1.0.0 shipped the twelve core protocols. Numbered 37; the spec/23 gap is intentional history: spec/23 was scoped and then superseded before a spec was written. spec/38 is this document. Gap numbering is honest history per the project convention (CLAUDE.md §10: spec docs are not aspirational).
+Carved out from the credential-resolution pattern established in spec/01 (secrets handling) and formalized as the thirteenth backend protocol. Filed as [#340](https://github.com/dep0we/atomic-agents-stack/issues/340) after v1.0.0 shipped the twelve core protocols. Originally drafted as spec/37, then renumbered to spec/38 on merge after spec/37 was assigned to the `atomic-agents serve` runtime ([#342](https://github.com/dep0we/atomic-agents-stack/issues/342)), which landed first. (Separately, the spec/23 slot is an intentional gap: spec/23 was scoped and then superseded before a spec was written.) Both the renumber and the gap are kept as honest history per the project convention (CLAUDE.md §10: spec docs are not aspirational).
+
+**Divergence from issue #340's acceptance sketch.** Issue #340 sketched `FilesystemSecretBackend` as reading from a `.env` file or a vault-relative `secrets/` directory. This spec deliberately supersedes that sketch: MUST 2 below prohibits vault-relative credential paths entirely (machine-scoped sources only), because vault portability must not carry credentials — a vault synced to a shared repo or object store would otherwise leak its keys. `.env` support is not vault-relative either and is deferred to [#361](https://github.com/dep0we/atomic-agents-stack/issues/361). The issue's acceptance text has been reconciled to match this spec (CLAUDE.md §10/§13).
 
 **Cross-links:**
 - spec/01. Agent anatomy. Secrets-handling convention: env vars → Keychain → keys.json.
@@ -19,7 +21,7 @@ Carved out from the credential-resolution pattern established in spec/01 (secret
 ## Shipping plan (2 PRs)
 
 - **PR 1.** Protocol scaffold + dataclasses + capability advertisement + `FilesystemSecretBackend` reference impl + spec/38 DRAFT + `_get_key()` supersede + all 6 live caller rewires + `check_secret_backend()` doctor check + `atomic-agents secrets check/which/validate` CLI + a full conformance suite plus filesystem-specific and CLI tests.
-- **PR 2.** `GCPSecretManagerBackend` reference impl + `gcp` extra + spec/38 LOCKED.
+- **PR 2.** `GCPSecretManagerBackend` reference impl + `gcp` extra + the `docs/deployment/` env-var→SecretBackend migration guide (issue #340 acceptance criterion; its natural home is alongside GCP, where backend migration first becomes operator-relevant) + spec/38 LOCKED.
 
 ---
 

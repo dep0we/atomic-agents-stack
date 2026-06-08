@@ -412,6 +412,68 @@ def test_get_key_fallback_branch_secret_not_found_wraps_as_atomic_agents_error()
     )
 
 
+def test_get_key_fallback_branch_wraps_value_error_as_atomic_agents_error():
+    """_get_key() fallback branch wraps a charset ValueError as AtomicAgentsError.
+
+    A Protocol-only backend's get() enforces the [A-Z0-9_]+ charset boundary
+    (MUST 1) and raises ValueError for a custom KeySpec whose env_vars[0] is
+    lowercase/non-POSIX. The fallback path MUST honor the documented
+    "_get_key always raises AtomicAgentsError" contract and wrap that
+    ValueError (chained), not leak a bare ValueError to callers. The
+    resolve_with_spec path skips charset validation, so this divergence only
+    bites Protocol-only backends — but the exception TYPE contract must hold
+    for both.
+    """
+
+    class _ProtocolOnlyStrictBackend:
+        """Stub whose get() validates the charset like the real Protocol boundary."""
+
+        backend_id = "protocol-only-strict-stub"
+
+        def get(self, key: str) -> str:
+            from atomic_agents.secret_backend.backend import _validate_key
+
+            _validate_key(key)  # raises ValueError for a lowercase key
+            return "unreachable"
+
+        def get_optional(self, key: str) -> str | None:
+            return None
+
+        def has(self, key: str) -> bool:
+            return False
+
+        def locate(self, key: str):
+            return None
+
+        @property
+        def capabilities(self):
+            from atomic_agents.secret_backend.types import SecretCapabilities
+
+            return SecretCapabilities(
+                supports_rotation=False,
+                supports_audit_logging=False,
+                persists_plaintext=False,
+            )
+
+    stub = _ProtocolOnlyStrictBackend()
+
+    with patch(
+        "atomic_agents.secret_backend.get_default_secret_backend",
+        return_value=stub,
+    ):
+        with pytest.raises(AtomicAgentsError) as exc_info:
+            _get_key(
+                env_vars=["my_llm_primary_key"],  # lowercase → ValueError in get()
+                keychain_name="my-llm",
+                config_key="myllm",
+            )
+
+    # Must NOT be a bare ValueError; must be AtomicAgentsError chained from it.
+    assert isinstance(exc_info.value.__cause__, ValueError), (
+        "fallback branch must chain the ValueError via 'raise ... from exc'"
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Factory and registry
 
@@ -476,6 +538,69 @@ def test_filesystem_registered_at_import():
 # ─────────────────────────────────────────────────────────────────────────────
 # Filesystem-specific Protocol surface (moved from conformance file to avoid
 # GCP breakage when params=["filesystem","gcp"] is extended in PR 2)
+
+
+def test_keys_json_path_is_machine_scoped():
+    """_KEYS_JSON_PATH MUST resolve under the machine home directory, never
+    under any vault or agent root (spec/38 MUST 2: vault portability would
+    carry credentials).
+
+    Filesystem-specific: ``_KEYS_JSON_PATH`` is an internal constant of the
+    filesystem backend; alternate backends (GCP) have no such path, so this
+    MUST-2 assertion lives here, not in the parametrized conformance file.
+    """
+    from pathlib import Path
+    from atomic_agents.secret_backend import filesystem as _fs_module
+
+    keys_path = _fs_module._KEYS_JSON_PATH
+    home = Path.home()
+    assert str(keys_path).startswith(str(home)), (
+        f"_KEYS_JSON_PATH {keys_path!r} is not under the machine home "
+        f"dir {home!r}. Credentials must be machine-scoped, not vault-relative."
+    )
+
+
+def test_keys_json_path_not_relative_to_cwd():
+    """_KEYS_JSON_PATH must be absolute — never derived from cwd or a vault
+    root (spec/38 MUST 2).
+    """
+    from atomic_agents.secret_backend import filesystem as _fs_module
+
+    keys_path = _fs_module._KEYS_JSON_PATH
+    assert keys_path.is_absolute(), (
+        f"_KEYS_JSON_PATH {keys_path!r} must be absolute so it cannot be "
+        f"confused with a vault-relative path."
+    )
+
+
+def test_keys_json_path_uses_expanduser():
+    """_KEYS_JSON_PATH must expand the home dir via Path.home() or equivalent,
+    not use a literal path (spec/38 MUST 2 — machine-scoped, portable).
+    """
+    from pathlib import Path
+    from atomic_agents.secret_backend import filesystem as _fs_module
+
+    keys_path = _fs_module._KEYS_JSON_PATH
+    home_str = str(Path.home())
+    assert str(keys_path).startswith(home_str), (
+        f"_KEYS_JSON_PATH {keys_path!r} must begin with the expanded home "
+        f"dir ({home_str!r}), not a literal '~' or relative path."
+    )
+
+
+def test_locate_source_label_uses_env_prefix(monkeypatch):
+    """FilesystemSecretBackend.locate() labels an env-var hit ``env:<NAME>``.
+
+    Filesystem-specific: the ``env:``/``keychain:``/``config:`` source-label
+    scheme is a filesystem-backend convention. The backend-agnostic contract
+    (source never contains the value) is asserted in the conformance file.
+    """
+    backend = FilesystemSecretBackend()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-some-value")
+    ref = backend.locate("ANTHROPIC_API_KEY")
+    assert ref is not None
+    assert ref.source.startswith("env:")
+    assert "ANTHROPIC_API_KEY" in ref.source
 
 
 def test_filesystem_backend_id_is_filesystem():

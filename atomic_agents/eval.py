@@ -941,6 +941,16 @@ def _provider_available(model_id: str) -> bool:
     (env → Keychain → keys.json); that logic now lives in
     ``FilesystemSecretBackend`` and is activated via ``get_default_secret_backend()``.
     """
+    # Canonical key name: the UPSTREAM provider env var (e.g. ANTHROPIC_API_KEY),
+    # passed to backend.has(). For the FilesystemSecretBackend this resolves
+    # identically to _llm._get_key()'s resolution (its _resolve / resolve_with_spec
+    # probe the full alias list, of which this name is a member), so this path and
+    # the runtime LLM path agree. NOTE for PR 2: an alternate Protocol-only backend
+    # that does NOT do multi-alias resolution could probe a DIFFERENT name here than
+    # _get_key's fallback (which uses env_vars[0], the ATOMIC_AGENTS_-prefixed alias).
+    # If the GCP backend lands without multi-alias resolution, route both paths
+    # through a single key-name helper so doctor/eval availability and runtime
+    # resolution cannot disagree.
     if model_id.startswith("claude-"):
         primary_env_var = "ANTHROPIC_API_KEY"
     elif model_id.startswith("gpt-"):

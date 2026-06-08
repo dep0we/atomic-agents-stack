@@ -173,6 +173,15 @@ def get_default_secret_backend() -> SecretBackend:
         return cls()
 
     elif raw_backend_id == "gcp":
+        # By design, this branch does NOT consult ``_registry`` even though
+        # ``register_secret_backend("gcp", …)`` is accepted: per-backend
+        # construction args (here the ATOMIC_AGENTS_SECRET_BACKEND_URL handling)
+        # are hardcoded per id, so registering an id is necessary but not
+        # sufficient to activate it via this factory. The registry is consulted
+        # only for the filesystem override (above) and by the conformance suite.
+        # This mirrors the mcp_registry factory precedent (its http branch is
+        # likewise hardcoded). PR 2 replaces this raise-branch with real
+        # GCPSecretManagerBackend construction.
         # GCP Secret Manager backend ships at PR 2.
         # Reserve the URL env var now so operators who configure it early get
         # a clear error message naming both the URL var and the install step.

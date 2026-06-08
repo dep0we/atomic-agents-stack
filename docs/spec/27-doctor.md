@@ -549,6 +549,84 @@ scope mismatch where the operator-supplied backend reads from
 against `project_root`; URL credential leakage into liveness-probe
 output.
 
+### `mcp-server-registry-backend` *(agent-scoped)*
+
+**Verifies:** Operator-config coherence for the MCPServerRegistryBackend
+(spec/36). Agent-scoped because the filesystem reference impl reads from
+`<agent_root>/mcp.md`. Doctor reuses `get_default_mcp_server_registry_backend(agent_root)`
+so the verdict and the runtime's `AtomicAgent.__init__` wiring cannot diverge.
+Lands as the 13th `check_*_backend` entry in `doctor.py` in #201 PR 2.
+
+Uses the dual-probe pattern (MEMORY.md `feedback_doctor_dual_probe_pattern`):
+probes both `list_mcp_servers()` (lightweight) and `load_all_mcp_servers()`
+(full parse + env-var resolution) because the lightweight list operation
+swallows parse errors that the heavy `load_all_mcp_servers` raises — a
+false PASS would cause `agent.call()` to crash at runtime.
+
+PASS / WARN / FAIL ladder:
+
+- **PASS** when `list_mcp_servers()` + `load_all_mcp_servers()` both succeed.
+  Detail carries the full capability snapshot (`supports_install`,
+  `supports_uninstall`, `supports_capability_handshake`, `supports_audit`,
+  `durable`) plus `mcp_server_count`.
+- **WARN** on transient `MCPRegistryUnavailable` — backend reachable but
+  catalog temporarily unreachable (HTTP catalog outage or a stale lock).
+- **FAIL** when `ATOMIC_AGENTS_MCP_SERVER_REGISTRY_BACKEND` is set to an
+  unregistered id. The echoed env value is redacted via
+  `_redact_for_error_message` (credential-URL heuristic) per MUST 4.
+- **FAIL** when backend construction raises (verbatim exception text dropped
+  to prevent credential leak in catalog URL).
+- **FAIL** when `load_all_mcp_servers()` raises after `list_mcp_servers()`
+  succeeded — closes the dual-probe false-PASS gap.
+
+**Prevents:** First-`agent.call()` `MCPRegistryError` when `AtomicAgent.__init__`
+calls `backend.load_all_mcp_servers()` against a malformed `mcp.md`; silent
+fall-through to empty MCP pool when an operator typo'd
+`ATOMIC_AGENTS_MCP_SERVER_REGISTRY_BACKEND_URL`; URL credential leakage from
+the catalog URL into doctor output or CI logs.
+
+---
+
+### `secret-backend` *(deployment-scoped)*
+
+**Verifies:** Operator-config coherence for the SecretBackend (spec/38).
+Deployment-scoped (not per-agent) — secrets are flat per-deployment, not
+per-agent. Doctor probes via `get_default_secret_backend()` so the verdict
+and the runtime's `_get_key()` behaviour cannot diverge. Lands as the 14th
+`check_*_backend` entry in `doctor.py` in #340 PR 1. Grouped with
+agent-scoped backend checks for output consistency; the agent-free way to
+verify the secret backend is `atomic-agents secrets validate`. An explicit
+no-agent / `--deployment` doctor mode is tracked in [#371](https://github.com/dep0we/atomic-agents-stack/issues/371).
+
+Does NOT call `get()` for any specific key — that is `check_provider_keys`'s
+job. This check confirms only that the backend machinery is wired up and
+capability advertisement is structurally valid. Key resolution is validated
+by `check_provider_keys` which routes through `_get_key()` → `SecretBackend`.
+
+PASS / WARN / FAIL ladder:
+
+- **PASS** when `get_default_secret_backend()` returns a backend instance +
+  `backend.capabilities` is a structurally valid `SecretCapabilities`. Detail
+  carries `backend_id`, `supports_rotation`, `supports_audit_logging`,
+  `persists_plaintext`.
+- **FAIL** when `ATOMIC_AGENTS_SECRET_BACKEND` is set to an unregistered id.
+  `fix_hint` tells the operator to unset the env var to use the filesystem
+  default, or to install the appropriate extra (e.g. `gcp` extra at PR 2).
+  `ATOMIC_AGENTS_SECRET_BACKEND` and `ATOMIC_AGENTS_SECRET_BACKEND_URL`
+  are both redacted via `_redact_for_error_message` before echo.
+- **FAIL** when backend construction raises an unexpected exception (detail
+  carries `error_type` for triage; verbatim message not surfaced to avoid
+  leaking credential fragments).
+- **SKIP** when no `--agent` is supplied (grouped with agent-scoped checks
+  for output consistency).
+
+**Prevents:** First-`_get_key()` `SecretBackendNotRegistered` when an
+operator sets `ATOMIC_AGENTS_SECRET_BACKEND=gcp` before the GCP extra ships
+(PR 2); silent fall-through to filesystem when an operator typo'd the env var;
+credential leakage from the backend URL into doctor output.
+
+---
+
 ### `write-paths` *(agent-scoped)*
 
 **Verifies:**

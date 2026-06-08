@@ -161,7 +161,9 @@ def run_doctor(
         # takes no agent_root), but it is grouped here for output consistency
         # with the other backend checks.  An operator running without --agent
         # sees a uniform "all backend checks require --agent" summary rather
-        # than a mix of PASS/FAIL and SKIP entries.
+        # than a mix of PASS/FAIL and SKIP entries.  The agent-free way to
+        # verify the secret backend is ``atomic-agents secrets validate``; an
+        # explicit no-agent/--deployment doctor mode is tracked in #371.
         for n in (
             "vault",
             "provider-keys",

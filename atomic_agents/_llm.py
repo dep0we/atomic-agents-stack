@@ -175,7 +175,7 @@ def _extract_openai_tool_calls(msg):
 # redirect wrappers (``_get_key`` and friends — doctor.py check_provider_keys,
 # init/wizard.py, llm/openai_compat.py, llm/anthropic.py, judge/llm.py), and
 # ``eval._provider_available`` directly via
-# ``get_default_secret_backend().has()`` (eval.py:~953).  External importers
+# ``get_default_secret_backend().has()``.  External importers
 # of ``_get_key`` / ``_get_anthropic_key`` etc. continue to work unchanged
 # because the wrappers are preserved.
 #
@@ -299,7 +299,13 @@ def _get_key(env_vars: list[str], keychain_name: str, config_key: str) -> str:
         )
     try:
         return backend.get(env_vars[0])
-    except SecretError as exc:
+    except (SecretError, ValueError) as exc:
+        # SecretError: the key resolved to nothing on a Protocol-only backend.
+        # ValueError: env_vars[0] failed the Protocol's _validate_key charset
+        # boundary (e.g. a custom KeySpec with a lowercase/non-POSIX env name).
+        # Both are wrapped as AtomicAgentsError so the Protocol-only path honors
+        # the same "_get_key always raises AtomicAgentsError" contract as the
+        # resolve_with_spec path (which deliberately skips charset validation).
         raise AtomicAgentsError(
             f"No API key found for {config_key}. Set one of {env_vars}, "
             f"add to Keychain as '{keychain_name}', or configure "
