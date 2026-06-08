@@ -98,10 +98,11 @@ def test_redact_dsn_strips_password():
 
     url = "postgresql://alice:secretpassword@db.example.com:5432/mydb"
     redacted = _redact_dsn(url)
+    # Exact-match pins the full redacted form (password -> ***, username/host/db/port
+    # all preserved). Stronger than substring `in` checks, and avoids the
+    # py/incomplete-url-substring-sanitization pattern CodeQL flags on `host in url`.
+    assert redacted == "postgresql://alice:***@db.example.com:5432/mydb"
     assert "secretpassword" not in redacted
-    assert "alice" in redacted
-    assert "db.example.com" in redacted
-    assert "mydb" in redacted
 
 
 def test_redact_dsn_url_without_password_unchanged():
@@ -110,8 +111,9 @@ def test_redact_dsn_url_without_password_unchanged():
 
     url = "postgresql://localhost:5432/mydb"
     redacted = _redact_dsn(url)
-    # No password to strip — URL should still be returned safely.
-    assert "localhost" in redacted
+    # No password to strip — URL returned unchanged. Exact-match (not a host
+    # substring check) avoids the py/incomplete-url-substring-sanitization pattern.
+    assert redacted == "postgresql://localhost:5432/mydb"
 
 
 def test_redact_dsn_fallback_for_malformed():
