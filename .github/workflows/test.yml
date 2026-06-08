@@ -25,6 +25,30 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
 
+    # Postgres service container for PostgresLogBackend conformance tests
+    # (#258 PR 1). The conformance suite (test_log_protocol_conformance.py)
+    # and backend-specific tests (test_log_postgres_backend.py) gate on
+    # ATOMIC_AGENTS_TEST_POSTGRES_URL — when set, they run against real
+    # Postgres; without it they skip (for local dev without Postgres).
+    # The mock-cursor tests in test_log_postgres_backend.py are labeled
+    # NON-CONFORMANCE and always run regardless of the env var.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test_atomic_agents
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      ATOMIC_AGENTS_TEST_POSTGRES_URL: "postgresql://postgres:test@localhost:5432/test_atomic_agents"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -45,7 +69,7 @@ jobs:
         # tests in test_judge_revise_jsonschema.py and the strict
         # end-to-end tests in test_agent_judge_revise_dispatch.py
         # exercise the real jsonschema dependency.
-        run: uv sync --extra dev --extra openai --extra validation --extra redis --extra http --python ${{ matrix.python-version }}
+        run: uv sync --extra dev --extra openai --extra validation --extra redis --extra http --extra postgres --python ${{ matrix.python-version }}
 
       - name: Run tests
         run: uv run --python ${{ matrix.python-version }} pytest -v --tb=short

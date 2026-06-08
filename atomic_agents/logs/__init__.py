@@ -164,16 +164,19 @@ def get_log_backend(backend_id: str) -> type:
     backend; ``cls(db_path)`` for a future ``SQLiteLogBackend``).
 
     The error message includes the FULL known-id list (eager registry +
-    lazy ``"sqlite"`` forward-pointer) — same shape as
+    the lazy ``"postgres"`` forward-pointer) — same shape as
     ``get_default_log_backend`` to keep both raise sites consistent.
+    Note: ``sqlite`` is eagerly registered (not a forward-pointer).
     """
     if backend_id not in _registry:
-        # ``sqlite`` was a forward-pointer in PR 1/PR 2; eagerly
-        # registered in PR 3. The known-id list comes directly from
-        # the registry — no union needed.
+        # ``postgres`` is lazy-resolved (never eagerly registered) so it
+        # won't appear in _registry.keys() at startup. Include it as a
+        # forward-pointer in the error message so an operator who types
+        # ``postgre`` sees ``postgres`` in the Available list — same
+        # Step-11-adversarial-P0-3 mitigation from the locks arc.
+        known_ids = sorted(set(_registry.keys()) | {"postgres"})
         raise BackendNotRegistered(
-            f"No LogBackend registered under {backend_id!r}. "
-            f"Available: {sorted(_registry.keys())}"
+            f"No LogBackend registered under {backend_id!r}. Available: {known_ids}"
         )
     return _registry[backend_id]
 
@@ -184,8 +187,9 @@ def list_log_backends() -> list[str]:
 
 
 # Register the built-in filesystem backend at import time. Matches the
-# Lock registry pattern (``atomic_agents/locks/__init__.py:139``) —
-# the default is always available without an extra resolution step.
+# Lock registry pattern (the eager FilesystemLockBackend registration in
+# ``atomic_agents/locks/__init__.py``) — the default is always available
+# without an extra resolution step.
 register_log_backend("filesystem", FilesystemLogBackend)
 
 
@@ -270,9 +274,9 @@ def get_default_log_backend(scope_root: Path) -> LogBackend:
     See spec/22 §"Operator surface" for the full env-var reference +
     the env-var-vs-kwarg trade-off rationale.
     """
-    raw_backend_id = os.environ.get(
-        "ATOMIC_AGENTS_LOG_BACKEND", "filesystem"
-    ).strip().lower()
+    raw_backend_id = (
+        os.environ.get("ATOMIC_AGENTS_LOG_BACKEND", "filesystem").strip().lower()
+    )
 
     if raw_backend_id == "filesystem":
         return FilesystemLogBackend(scope_root)
@@ -290,10 +294,39 @@ def get_default_log_backend(scope_root: Path) -> LogBackend:
             return SQLiteLogBackend(scope_root / ".logs.db")
         return make_sqlite_backend_from_url(url)
 
+    if raw_backend_id == "postgres":
+        # Lazy import — avoids loading psycopg[binary] (optional extra)
+        # at framework startup when the operator hasn't selected it.
+        # The asymmetry with SQLite (eager) is principled: SQLite is
+        # stdlib (zero install cost); psycopg is a C extension that
+        # requires a pip extra. Mirror the Redis lazy-import pattern in
+        # ``get_default_lock_backend()`` (locks/__init__.py).
+        from .postgres import make_postgres_backend_from_url  # noqa: PLC0415
+
+        url = os.environ.get("ATOMIC_AGENTS_LOG_BACKEND_URL")
+        if not url:
+            raise ValueError(
+                "ATOMIC_AGENTS_LOG_BACKEND=postgres requires "
+                "ATOMIC_AGENTS_LOG_BACKEND_URL to be set "
+                "(e.g., postgresql://user:password@host:5432/dbname)."
+            )
+        # Lazy-register so the forward-pointer is always in the known-ids
+        # list even before first use. Guard against double-registration
+        # (benign write-write race in CPython due to GIL, but avoids the
+        # spurious "replacing registered" DEBUG log on concurrent init).
+        if "postgres" not in _registry:
+            from .postgres import PostgresLogBackend  # noqa: PLC0415
+
+            register_log_backend("postgres", PostgresLogBackend)
+        return make_postgres_backend_from_url(url)
+
     # Unknown backend_id — surface a fail-fast error with the FULL
     # known-id list so operators can spot the typo. Includes the
-    # lazy-resolved ``"sqlite"`` (now registered in PR 3) so the
-    # error message remains stable as the registry evolves.
+    # lazy-resolved ``"postgres"`` forward-pointer (not yet in the
+    # eager registry at startup) so an operator who types ``postgre``
+    # sees ``postgres`` in the Available list — same Step-11-adversarial-
+    # P0-3 mitigation that fixed ``redis`` in ``get_default_lock_backend()``'s
+    # known-ids union (locks/__init__.py).
     #
     # Credential safety: ``raw_backend_id`` is sanitized before
     # interpolation in case an operator accidentally pastes a URL
@@ -301,14 +334,14 @@ def get_default_log_backend(scope_root: Path) -> LogBackend:
     # instead of ``ATOMIC_AGENTS_LOG_BACKEND_URL``. Without the sanitize
     # the credential lands in exception text that may be logged by
     # exception handlers, WSGI middleware, or error-tracking services.
-    # Same fix applies to ``locks/__init__.py:194`` per the systemic
-    # gap Step 9.1 security specialist surfaced.
+    # Same fix applies to ``get_default_lock_backend()`` in
+    # ``locks/__init__.py`` per the systemic gap Step 9.1 security
+    # specialist surfaced.
     safe_backend_id = _redact_for_error_message(raw_backend_id)
-    # ``sqlite`` is eagerly registered as of PR 3; no forward-pointer
-    # union needed.
+    known_ids = sorted(set(list_log_backends()) | {"postgres"})
     raise BackendNotRegistered(
         f"ATOMIC_AGENTS_LOG_BACKEND={safe_backend_id!r} is not a known "
-        f"backend. Available: {list_log_backends()}. Unset the env var "
+        f"backend. Available: {known_ids}. Unset the env var "
         f"to use the filesystem default."
     )
 

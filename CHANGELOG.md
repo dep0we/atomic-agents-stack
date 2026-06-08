@@ -51,6 +51,7 @@ CHANGELOG entry.
 
 ### Added
 
+- `PostgresLogBackend` — the first Postgres reference implementation of a backend protocol, conforming to the locked `LogBackend` Protocol (spec/22). Opt-in `atomic-agents-stack[postgres]` extra (psycopg 3); bounded connection pool with an operator-tunable ceiling; advisory-lock cold-start schema init for multi-replica safety; full DSN credential redaction; `cost_usd`/`latency_ms` stored as `DOUBLE PRECISION` for cross-backend value parity with the SQLite/filesystem backends. Establishes the Postgres adapter pattern the remaining five backends will copy ([#258](https://github.com/dep0we/atomic-agents-stack/issues/258)).
 - `atomic-agents serve` CLI subcommand — thin HTTP wrapper exposing `agent.call()` over four routes (`POST /agents/<name>/call`, `GET /agents/<name>/healthz`, `GET /agents/<name>/doctor`, `GET /agents`) for Cloud Run, GKE, Fly.io, Render, and any containerized environment ([#342](https://github.com/dep0we/atomic-agents-stack/issues/342)).
 - `atomic-agents-stack[serve]` optional extra (`starlette` + `uvicorn`). Base-package import pays zero cost — Starlette is never imported unless the extra is installed. (MUST 1.)
 - Single-agent mode (`atomic-agents serve <name>`) scopes all four routes to the named agent; other agents return HTTP 404. `--all` mode serves every agent in the vault. Exactly one of `<agent>` or `--all` is required; providing both (or neither) exits with a clear error. (spec/37 §"CLI".)

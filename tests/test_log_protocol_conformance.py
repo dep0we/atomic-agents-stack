@@ -43,7 +43,8 @@ What this suite asserts:
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -79,10 +80,49 @@ def _sqlite_factory(scope_root: Path) -> LogBackend:
     return SQLiteLogBackend(scope_root / "logs.db")
 
 
+# Postgres factory — conditional on ATOMIC_AGENTS_TEST_POSTGRES_URL.
+# When the env var is set (CI service container), the conformance suite
+# runs against real Postgres. Without it, the Postgres factory is absent
+# from BACKEND_FACTORIES and tests skip (for local dev without Postgres).
+# The mock-cursor tests in test_log_postgres_backend.py are separate and
+# labeled NON-CONFORMANCE — they must NOT appear here.
+_POSTGRES_URL = os.environ.get("ATOMIC_AGENTS_TEST_POSTGRES_URL")
+_POSTGRES_AVAILABLE = False
+
+if _POSTGRES_URL:
+    try:
+        import psycopg as _psycopg  # noqa: F401
+
+        _POSTGRES_AVAILABLE = True
+    except ImportError:
+        pass
+
+
+def _postgres_factory(scope_root: Path) -> LogBackend:
+    """Real Postgres conformance factory — only added to BACKEND_FACTORIES when
+    ATOMIC_AGENTS_TEST_POSTGRES_URL is set and psycopg is installed.
+
+    The factory returns a backend pointing at the shared Postgres database.
+    Per-test isolation is handled by the ``postgres_truncate`` autouse fixture
+    below, which TRUNCATEs run_records (RESTART IDENTITY) before each
+    Postgres-parametrized test; meta is preserved so every test exercises the
+    warm schema_version validation read path in _ensure_schema().  The
+    ``backend`` fixture also calls backend.close() on teardown to release the
+    server-side connection after each test.
+    """
+    from atomic_agents.logs.postgres import PostgresLogBackend
+
+    assert _POSTGRES_URL is not None
+    return PostgresLogBackend(_POSTGRES_URL)
+
+
 BACKEND_FACTORIES: list[tuple[str, BackendFactory]] = [
     ("filesystem", _filesystem_factory),
     ("sqlite", _sqlite_factory),
 ]
+
+if _POSTGRES_AVAILABLE:
+    BACKEND_FACTORIES.append(("postgres", _postgres_factory))
 
 
 @pytest.fixture(params=BACKEND_FACTORIES, ids=lambda p: p[0])
@@ -91,10 +131,80 @@ def backend_factory(request) -> BackendFactory:
     return request.param[1]
 
 
+@pytest.fixture(autouse=True)
+def postgres_truncate(backend_factory, request):
+    """Truncate run_records (RESTART IDENTITY) before each Postgres conformance test.
+
+    Filesystem and SQLite backends get per-test isolation for free via a
+    fresh tmp_path each time.  Postgres points at a shared database, so
+    rows accumulate across tests without explicit cleanup.  This fixture
+    TRUNCATEs run_records (RESTART IDENTITY to reset the BIGSERIAL counter —
+    keeps same-ts insertion-order tests deterministic) before each test that
+    uses the Postgres factory.
+
+    meta is intentionally NOT truncated: the schema_version row must persist
+    across tests so every test exercises the warm version-validation read path
+    in _ensure_schema(), not just the cold-start INSERT path.  Truncating meta
+    would silently route every test through INSERT ON CONFLICT DO NOTHING and
+    never test the SELECT/validate branch — leaving the schema-mismatch
+    refusal path (postgres.py:_ensure_schema version check) unverified against
+    real Postgres.
+
+    autouse=True — runs for every test in this module.  The guard
+    ``_is_postgres`` skips the TRUNCATE for filesystem and SQLite tests so
+    there is zero overhead for those backends.
+    """
+    # Determine whether this test is using the Postgres factory.
+    # backend_factory is a callable; compare by identity to _postgres_factory.
+    _is_postgres = backend_factory is _postgres_factory and _POSTGRES_URL is not None
+    if not _is_postgres:
+        yield
+        return
+
+    import psycopg  # already confirmed importable when _POSTGRES_AVAILABLE
+
+    conn = psycopg.connect(_POSTGRES_URL, autocommit=True)
+    try:
+        # On a fresh CI database the tables may not exist yet (the backend
+        # creates them lazily on first connection).  Guard against
+        # UndefinedTable — the per-test ``backend`` fixture will create the
+        # schema when the backend is constructed.
+        #
+        # Truncate ONLY run_records (RESTART IDENTITY to reset the BIGSERIAL
+        # counter — keeps same-ts insertion-order tests deterministic).
+        # meta is intentionally NOT truncated: the schema_version row must
+        # persist across tests so every test exercises the warm version-
+        # validation read path in _ensure_schema(), not just the cold-start
+        # INSERT path.  Truncating meta would silently route every test
+        # through INSERT ON CONFLICT DO NOTHING and never test the
+        # SELECT/validate branch — leaving the schema-mismatch refusal path
+        # (postgres.py:_ensure_schema version check) unverified against real
+        # Postgres.
+        try:
+            conn.execute("TRUNCATE run_records RESTART IDENTITY")
+        except psycopg.errors.UndefinedTable:
+            # Tables do not exist yet — the subsequent backend fixture will
+            # create them.  Nothing to truncate; this is not an error.
+            pass
+    finally:
+        conn.close()
+
+    yield
+    # No post-test cleanup needed — next test's pre-truncate handles it.
+
+
 @pytest.fixture
-def backend(backend_factory, tmp_path) -> LogBackend:
-    """A backend rooted at a per-test tmp_path."""
-    return backend_factory(tmp_path)
+def backend(backend_factory, tmp_path):
+    """A backend rooted at a per-test tmp_path; closed on teardown."""
+    b = backend_factory(tmp_path)
+    yield b
+    # Close the backend after each test to release connections (no-op for
+    # filesystem/sqlite which don't hold network connections).
+    if hasattr(b, "close"):
+        try:
+            b.close()
+        except Exception:
+            pass
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -268,12 +378,20 @@ def test_query_filters_by_model(backend):
     a broken model WHERE clause would pass all conformance tests
     without this.
     """
-    backend.append(_make_record(
-        model="claude-opus-4-7", ts=_ts_at(2026, 5, 15, 10), run_id="opus",
-    ))
-    backend.append(_make_record(
-        model="claude-haiku-4-5", ts=_ts_at(2026, 5, 15, 11), run_id="haiku",
-    ))
+    backend.append(
+        _make_record(
+            model="claude-opus-4-7",
+            ts=_ts_at(2026, 5, 15, 10),
+            run_id="opus",
+        )
+    )
+    backend.append(
+        _make_record(
+            model="claude-haiku-4-5",
+            ts=_ts_at(2026, 5, 15, 11),
+            run_id="haiku",
+        )
+    )
     out = backend.query(LogQuery(model="claude-opus-4-7"))
     assert len(out) == 1
     assert out[0].run_id == "opus"
@@ -290,9 +408,7 @@ def test_query_until_is_inclusive(backend):
     ts_after = _ts_at(2026, 5, 15, 13)
     backend.append(_make_record(ts=ts_exact, run_id="at_boundary"))
     backend.append(_make_record(ts=ts_after, run_id="after_boundary"))
-    out = backend.query(
-        LogQuery(until=datetime(2026, 5, 15, 12, tzinfo=timezone.utc))
-    )
+    out = backend.query(LogQuery(until=datetime(2026, 5, 15, 12, tzinfo=timezone.utc)))
     assert len(out) == 1
     assert out[0].run_id == "at_boundary"
 
@@ -303,9 +419,7 @@ def test_query_since_is_inclusive(backend):
     ts_exact = _ts_at(2026, 5, 15, 12)
     backend.append(_make_record(ts=ts_before, run_id="before_boundary"))
     backend.append(_make_record(ts=ts_exact, run_id="at_boundary"))
-    out = backend.query(
-        LogQuery(since=datetime(2026, 5, 15, 12, tzinfo=timezone.utc))
-    )
+    out = backend.query(LogQuery(since=datetime(2026, 5, 15, 12, tzinfo=timezone.utc)))
     assert len(out) == 1
     assert out[0].run_id == "at_boundary"
 
@@ -332,12 +446,18 @@ def test_query_filter_sub_second_precision(backend):
     pins full ISO-8601 precision.
     """
     base = datetime(2026, 5, 15, 12, 0, 0, tzinfo=timezone.utc)
-    backend.append(_make_record(
-        ts=(base.replace(microsecond=100_000)).isoformat(), run_id="early",
-    ))
-    backend.append(_make_record(
-        ts=(base.replace(microsecond=900_000)).isoformat(), run_id="late",
-    ))
+    backend.append(
+        _make_record(
+            ts=(base.replace(microsecond=100_000)).isoformat(),
+            run_id="early",
+        )
+    )
+    backend.append(
+        _make_record(
+            ts=(base.replace(microsecond=900_000)).isoformat(),
+            run_id="late",
+        )
+    )
     out = backend.query(LogQuery(since=base.replace(microsecond=500_000)))
     assert len(out) == 1
     assert out[0].run_id == "late"
@@ -345,9 +465,15 @@ def test_query_filter_sub_second_precision(backend):
 
 def test_query_filters_by_cost_source(backend):
     """Legacy records without cost_source count as 'actor' for backward compat."""
-    backend.append(_make_record(cost_source="actor", ts=_ts_at(2026, 5, 15, 10), run_id="actor1"))
-    backend.append(_make_record(cost_source="judge", ts=_ts_at(2026, 5, 15, 11), run_id="judge1"))
-    backend.append(_make_record(cost_source=None, ts=_ts_at(2026, 5, 15, 12), run_id="legacy"))
+    backend.append(
+        _make_record(cost_source="actor", ts=_ts_at(2026, 5, 15, 10), run_id="actor1")
+    )
+    backend.append(
+        _make_record(cost_source="judge", ts=_ts_at(2026, 5, 15, 11), run_id="judge1")
+    )
+    backend.append(
+        _make_record(cost_source=None, ts=_ts_at(2026, 5, 15, 12), run_id="legacy")
+    )
     out_actor = backend.query(LogQuery(cost_source="actor"))
     assert {r.run_id for r in out_actor} == {"actor1", "legacy"}
     out_judge = backend.query(LogQuery(cost_source="judge"))
@@ -364,9 +490,21 @@ def test_query_filters_by_mandate_id(backend):
 
 
 def test_query_filters_by_parent_run_id(backend):
-    backend.append(_make_record(parent_run_id="parent-x", run_id="child-1", ts=_ts_at(2026, 5, 15, 10)))
-    backend.append(_make_record(parent_run_id="parent-x", run_id="child-2", ts=_ts_at(2026, 5, 15, 11)))
-    backend.append(_make_record(parent_run_id="parent-y", run_id="child-3", ts=_ts_at(2026, 5, 15, 12)))
+    backend.append(
+        _make_record(
+            parent_run_id="parent-x", run_id="child-1", ts=_ts_at(2026, 5, 15, 10)
+        )
+    )
+    backend.append(
+        _make_record(
+            parent_run_id="parent-x", run_id="child-2", ts=_ts_at(2026, 5, 15, 11)
+        )
+    )
+    backend.append(
+        _make_record(
+            parent_run_id="parent-y", run_id="child-3", ts=_ts_at(2026, 5, 15, 12)
+        )
+    )
     out = backend.query(LogQuery(parent_run_id="parent-x"))
     assert {r.run_id for r in out} == {"child-1", "child-2"}
 
@@ -378,15 +516,27 @@ def test_query_filters_by_agent_name_isolates_explicit_agent_records(backend):
     Postgres file across agents) MUST isolate cross-agent records.
     Alice's reads MUST NOT include bob's explicitly-stamped records.
     """
-    backend.append(_make_record(
-        agent_name="alice", run_id="a1", ts=_ts_at(2026, 5, 15, 10),
-    ))
-    backend.append(_make_record(
-        agent_name="bob", run_id="b1", ts=_ts_at(2026, 5, 15, 11),
-    ))
-    backend.append(_make_record(
-        agent_name="alice", run_id="a2", ts=_ts_at(2026, 5, 15, 12),
-    ))
+    backend.append(
+        _make_record(
+            agent_name="alice",
+            run_id="a1",
+            ts=_ts_at(2026, 5, 15, 10),
+        )
+    )
+    backend.append(
+        _make_record(
+            agent_name="bob",
+            run_id="b1",
+            ts=_ts_at(2026, 5, 15, 11),
+        )
+    )
+    backend.append(
+        _make_record(
+            agent_name="alice",
+            run_id="a2",
+            ts=_ts_at(2026, 5, 15, 12),
+        )
+    )
     out = backend.query(LogQuery(agent_name="alice"))
     assert {r.run_id for r in out} == {"a1", "a2"}
     out_bob = backend.query(LogQuery(agent_name="bob"))
@@ -403,15 +553,27 @@ def test_query_filters_by_agent_name_lenient_on_missing(backend):
     preserves backward compat without weakening cross-agent isolation
     for explicitly-stamped records.
     """
-    backend.append(_make_record(
-        agent_name=None, run_id="legacy", ts=_ts_at(2026, 5, 15, 10),
-    ))
-    backend.append(_make_record(
-        agent_name="alice", run_id="explicit_alice", ts=_ts_at(2026, 5, 15, 11),
-    ))
-    backend.append(_make_record(
-        agent_name="bob", run_id="explicit_bob", ts=_ts_at(2026, 5, 15, 12),
-    ))
+    backend.append(
+        _make_record(
+            agent_name=None,
+            run_id="legacy",
+            ts=_ts_at(2026, 5, 15, 10),
+        )
+    )
+    backend.append(
+        _make_record(
+            agent_name="alice",
+            run_id="explicit_alice",
+            ts=_ts_at(2026, 5, 15, 11),
+        )
+    )
+    backend.append(
+        _make_record(
+            agent_name="bob",
+            run_id="explicit_bob",
+            ts=_ts_at(2026, 5, 15, 12),
+        )
+    )
     out = backend.query(LogQuery(agent_name="alice"))
     # Legacy record matches (no agent_name) AND alice's explicit
     # records match. Bob's explicit records are excluded.
@@ -487,15 +649,27 @@ def test_aggregate_count_by_primitive(backend):
 
 
 def test_aggregate_sum_cost_by_model(backend):
-    backend.append(_make_record(
-        model="claude-opus-4-7", cost_usd=0.5, ts=_ts_at(2026, 5, 15, 10),
-    ))
-    backend.append(_make_record(
-        model="claude-opus-4-7", cost_usd=1.0, ts=_ts_at(2026, 5, 15, 11),
-    ))
-    backend.append(_make_record(
-        model="claude-haiku-4-5", cost_usd=0.01, ts=_ts_at(2026, 5, 15, 12),
-    ))
+    backend.append(
+        _make_record(
+            model="claude-opus-4-7",
+            cost_usd=0.5,
+            ts=_ts_at(2026, 5, 15, 10),
+        )
+    )
+    backend.append(
+        _make_record(
+            model="claude-opus-4-7",
+            cost_usd=1.0,
+            ts=_ts_at(2026, 5, 15, 11),
+        )
+    )
+    backend.append(
+        _make_record(
+            model="claude-haiku-4-5",
+            cost_usd=0.01,
+            ts=_ts_at(2026, 5, 15, 12),
+        )
+    )
     result = backend.aggregate(
         LogQuery(),
         LogAggregate(group_by=("model",), metric="sum_cost_usd"),
@@ -516,12 +690,20 @@ def test_aggregate_unknown_metric_raises_value_error(backend):
 
 def test_aggregate_avg_latency_handles_none_bucket(backend):
     """avg_latency_ms over all-None bucket returns None, not 0.0 or crash."""
-    backend.append(_make_record(
-        primitive="cost_warning", latency_ms=None, ts=_ts_at(2026, 5, 15, 10),
-    ))
-    backend.append(_make_record(
-        primitive="cost_warning", latency_ms=None, ts=_ts_at(2026, 5, 15, 11),
-    ))
+    backend.append(
+        _make_record(
+            primitive="cost_warning",
+            latency_ms=None,
+            ts=_ts_at(2026, 5, 15, 10),
+        )
+    )
+    backend.append(
+        _make_record(
+            primitive="cost_warning",
+            latency_ms=None,
+            ts=_ts_at(2026, 5, 15, 11),
+        )
+    )
     result = backend.aggregate(
         LogQuery(),
         LogAggregate(group_by=("primitive",), metric="avg_latency_ms"),
@@ -574,9 +756,7 @@ def test_delete_older_than_strictly_before(backend):
     boundary = _ts_at(2026, 5, 15, 12)
     backend.append(_make_record(ts=boundary, run_id="at_boundary"))
     backend.append(_make_record(ts=_ts_at(2026, 1, 1), run_id="before"))
-    deleted = backend.delete_older_than(
-        datetime(2026, 5, 15, 12, tzinfo=timezone.utc)
-    )
+    deleted = backend.delete_older_than(datetime(2026, 5, 15, 12, tzinfo=timezone.utc))
     assert deleted == 1
     remaining = backend.query(LogQuery())
     assert {r.run_id for r in remaining} == {"at_boundary"}
@@ -584,9 +764,7 @@ def test_delete_older_than_strictly_before(backend):
 
 def test_delete_older_than_empty_backend_returns_zero(backend):
     """delete on empty backend MUST return 0 without raising."""
-    deleted = backend.delete_older_than(
-        datetime(2026, 1, 1, tzinfo=timezone.utc)
-    )
+    deleted = backend.delete_older_than(datetime(2026, 1, 1, tzinfo=timezone.utc))
     assert deleted == 0
 
 
@@ -633,10 +811,12 @@ def test_append_accepts_arbitrary_primitive(backend):
     """Spec: 'Backends MUST accept arbitrary strings — the closed set
     is documentation, not enforcement.' Pins that a backend validating
     primitive against PRIMITIVE_* constants would fail conformance."""
-    backend.append(_make_record(
-        primitive="my_custom_primitive",
-        ts=_ts_at(2026, 5, 15, 10),
-    ))
+    backend.append(
+        _make_record(
+            primitive="my_custom_primitive",
+            ts=_ts_at(2026, 5, 15, 10),
+        )
+    )
     out = backend.tail(1)
     assert out[0].primitive == "my_custom_primitive"
 
@@ -647,12 +827,18 @@ def test_append_accepts_arbitrary_primitive(backend):
 
 def test_aggregate_sum_input_tokens_returns_int(backend):
     """sum_input_tokens MUST return int (not float)."""
-    backend.append(_make_record(
-        input_tokens=100, ts=_ts_at(2026, 5, 15, 10),
-    ))
-    backend.append(_make_record(
-        input_tokens=200, ts=_ts_at(2026, 5, 15, 11),
-    ))
+    backend.append(
+        _make_record(
+            input_tokens=100,
+            ts=_ts_at(2026, 5, 15, 10),
+        )
+    )
+    backend.append(
+        _make_record(
+            input_tokens=200,
+            ts=_ts_at(2026, 5, 15, 11),
+        )
+    )
     result = backend.aggregate(
         LogQuery(),
         LogAggregate(group_by=(), metric="sum_input_tokens"),
@@ -662,12 +848,18 @@ def test_aggregate_sum_input_tokens_returns_int(backend):
 
 
 def test_aggregate_sum_output_tokens_returns_int(backend):
-    backend.append(_make_record(
-        output_tokens=50, ts=_ts_at(2026, 5, 15, 10),
-    ))
-    backend.append(_make_record(
-        output_tokens=75, ts=_ts_at(2026, 5, 15, 11),
-    ))
+    backend.append(
+        _make_record(
+            output_tokens=50,
+            ts=_ts_at(2026, 5, 15, 10),
+        )
+    )
+    backend.append(
+        _make_record(
+            output_tokens=75,
+            ts=_ts_at(2026, 5, 15, 11),
+        )
+    )
     result = backend.aggregate(
         LogQuery(),
         LogAggregate(group_by=(), metric="sum_output_tokens"),
@@ -699,9 +891,7 @@ def test_capabilities_retention_claim_matches_behavior(backend):
     if caps.supports_retention:
         backend.append(_make_record(ts=_ts_at(2026, 5, 15, 10)))
         # MUST NOT raise NotImplementedError when the claim is True.
-        backend.delete_older_than(
-            datetime(2026, 1, 1, tzinfo=timezone.utc)
-        )
+        backend.delete_older_than(datetime(2026, 1, 1, tzinfo=timezone.utc))
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -716,11 +906,173 @@ def test_append_preserves_empty_string_optional_fields(backend):
     Treating empty string as missing was the silent-data-loss failure
     mode the Step 11 adversarial review caught.
     """
-    backend.append(_make_record(
-        trigger="",
-        agent_name="",
-        ts=_ts_at(2026, 5, 15, 10),
-    ))
+    backend.append(
+        _make_record(
+            trigger="",
+            agent_name="",
+            ts=_ts_at(2026, 5, 15, 10),
+        )
+    )
     out = backend.tail(1)
     assert out[0].trigger == ""
     assert out[0].agent_name == ""
+
+
+# ──────────────────────────────────────────────────────────────────
+# Aggregate — multi-field group_by with extra-resolved fields
+
+
+def test_aggregate_two_extra_fields_group_by(backend):
+    """aggregate() with two extra-resolved (JSONB) group_by fields MUST return
+    correct keys and values.
+
+    Pins the P1 regression where Postgres's unaliased JSONB expressions
+    (``(extra->>'field')``) both get the generated column name ``?column?``.
+    With psycopg ``dict_row``, duplicate names collapse — the second key
+    overwrites the first, leaving only one entry in the row dict instead
+    of two, so ``row_vals[len(group_exprs)]`` raised IndexError and the
+    surviving key was wrong.
+
+    The fix (deterministic aliases g0/g1/metric) is verified by this test
+    running against the real Postgres backend in CI and against the
+    SQLite/Filesystem backends locally (which were already correct).
+    """
+    backend.append(
+        _make_record(
+            ts=_ts_at(2026, 5, 15, 10),
+            extra={"zone": "us-east", "env": "prod"},
+        )
+    )
+    backend.append(
+        _make_record(
+            ts=_ts_at(2026, 5, 15, 11),
+            extra={"zone": "us-east", "env": "prod"},
+        )
+    )
+    backend.append(
+        _make_record(
+            ts=_ts_at(2026, 5, 15, 12),
+            extra={"zone": "eu-west", "env": "staging"},
+        )
+    )
+    result = backend.aggregate(
+        LogQuery(),
+        LogAggregate(group_by=("zone", "env"), metric="count"),
+    )
+    # Two distinct (zone, env) buckets — keys are text from extra ->> operator.
+    assert len(result) == 2
+    assert result[("us-east", "prod")] == 2
+    assert result[("eu-west", "staging")] == 1
+
+
+def test_aggregate_extra_field_key_type_divergence(backend):
+    """aggregate() group_by on an extra (JSONB/JSON) field has a KNOWN, accepted
+    cross-backend key-TYPE divergence — pinned here so it can't drift silently
+    into a parity claim (tracked by #366).
+
+    The Postgres ``->>`` JSONB accessor always yields TEXT; the Filesystem and
+    SQLite backends return the value's NATIVE Python type (``json_extract`` /
+    dict round-trip). String-valued extra fields are identical across all
+    backends (text either way) — which is exactly why the string-only
+    test_aggregate_two_extra_fields_group_by above never surfaced this.
+
+    The divergence — and whether the documented ``str(k)`` operator mitigation
+    actually bridges it — differs by JSON value class. This test pins BOTH the
+    NUMERIC case (``str(k)``-bridgeable) and the BOOLEAN case (NOT bridgeable:
+    three distinct string forms across backends), because a divergence
+    enumeration that pins only numeric would let the spec assert a parity
+    (``str(k)`` portability) that silently fails for booleans. See #366 for the
+    divergence and remediation options.
+
+    Per-backend key shapes for the SAME data (verified against real PG + SQLite):
+      * numeric {'iteration': 1} → ('1',) postgres / (1,) fs+sqlite — str(k) bridges
+      * boolean {'flag': True}   → ('true',) postgres / (1,) sqlite / (True,) fs
+        — str(k) does NOT bridge: 'true' != '1' != 'True'
+    """
+    # ── Numeric arm: str(k)-bridgeable divergence ────────────────────────────
+    backend.append(_make_record(ts=_ts_at(2026, 5, 15, 10), extra={"iteration": 0}))
+    backend.append(_make_record(ts=_ts_at(2026, 5, 15, 11), extra={"iteration": 1}))
+    backend.append(_make_record(ts=_ts_at(2026, 5, 15, 12), extra={"iteration": 1}))
+    result = backend.aggregate(
+        LogQuery(),
+        LogAggregate(group_by=("iteration",), metric="count"),
+    )
+    # Normalize keys to str — the cross-backend-stable view FOR NUMERICS (the
+    # divergence is in key TYPE, not in key string-form or in the counts).
+    by_str = {str(k[0]): v for k, v in result.items()}
+    assert by_str["0"] == 1
+    assert by_str["1"] == 2
+    # Pin the divergence DIRECTION per backend — not a permissive (int|str)
+    # union, which would stay green if Postgres regressed to int keys or
+    # fs/sqlite regressed to str keys (the exact silent drift this test exists to
+    # catch). The Postgres JSONB ``->>`` accessor always yields TEXT; the
+    # Filesystem/SQLite backends return the value's NATIVE Python type.
+    is_postgres = backend.backend_id == "postgres"
+    for raw_key in result:
+        assert isinstance(raw_key, tuple) and len(raw_key) == 1
+        elem = raw_key[0]
+        if is_postgres:
+            assert isinstance(elem, str), (
+                f"postgres ->> must yield TEXT keys; got {type(elem).__name__} "
+                f"{elem!r} (regression: a CAST/normalization crept in?)"
+            )
+            # bool is a subclass of int but not str — guard against a stray bool.
+            assert elem in ("0", "1"), raw_key
+        else:
+            assert isinstance(elem, int) and not isinstance(elem, bool), (
+                f"fs/sqlite must return NATIVE int keys; got "
+                f"{type(elem).__name__} {elem!r} (regression: stringified?)"
+            )
+            assert elem in (0, 1), raw_key
+
+    # ── Boolean arm: str(k)-UNbridgeable divergence (three distinct forms) ────
+    # This is the case the spec's str(k) mitigation does NOT cover, so it is
+    # pinned explicitly rather than left to imply portability that doesn't hold.
+    backend.append(_make_record(ts=_ts_at(2026, 5, 16, 10), extra={"flag": True}))
+    backend.append(_make_record(ts=_ts_at(2026, 5, 16, 11), extra={"flag": True}))
+    backend.append(_make_record(ts=_ts_at(2026, 5, 16, 12), extra={"flag": False}))
+    # Scope to the boolean records via `since` so the earlier numeric records
+    # (no `flag` field) do not add a NULL bucket and confuse the key assertions.
+    bool_result = backend.aggregate(
+        LogQuery(since=datetime(2026, 5, 16, 0, tzinfo=timezone.utc)),
+        LogAggregate(group_by=("flag",), metric="count"),
+    )
+    # Counts are correct on EVERY backend regardless of key shape.
+    counts = sorted(bool_result.values())
+    assert counts == [1, 2], bool_result
+    # Pin the per-backend boolean key shape. bool is a subclass of int, so the
+    # fs (native bool) and sqlite (int) cases must be distinguished by exact
+    # type, not value membership.
+    for raw_key in bool_result:
+        assert isinstance(raw_key, tuple) and len(raw_key) == 1
+        elem = raw_key[0]
+        if is_postgres:
+            # JSONB ->> emits the JSON text literal — NOT '1'/'0', NOT 'True'.
+            assert isinstance(elem, str) and elem in ("true", "false"), (
+                f"postgres bool ->> must yield 'true'/'false'; got "
+                f"{type(elem).__name__} {elem!r}"
+            )
+        elif backend.backend_id == "sqlite":
+            # json_extract yields an int (1/0) for a JSON boolean.
+            assert isinstance(elem, int) and not isinstance(elem, bool), (
+                f"sqlite bool json_extract must yield int 1/0; got "
+                f"{type(elem).__name__} {elem!r}"
+            )
+            assert elem in (0, 1), raw_key
+        else:
+            # Filesystem round-trips the native Python bool.
+            assert isinstance(elem, bool), (
+                f"fs bool must round-trip native bool; got "
+                f"{type(elem).__name__} {elem!r}"
+            )
+    # The mitigation gap is real: str(k) does not collapse these to one form.
+    # (Asserted only off-postgres where we can compute the fs/sqlite str forms
+    # without a live PG; the postgres form is pinned as 'true'/'false' above and
+    # str('true') == 'true' != '1'/'True', so the three-way gap holds.)
+    if not is_postgres:
+        bool_str_keys = {str(k[0]) for k in bool_result}
+        # fs yields {'True','False'}; sqlite yields {'1','0'} — neither equals
+        # postgres's {'true','false'}, so no single str(k) view is portable.
+        assert bool_str_keys & {"true", "false"} == set(), (
+            f"unexpected postgres-shaped bool keys off-postgres: {bool_str_keys}"
+        )

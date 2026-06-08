@@ -350,7 +350,7 @@ These are not forbidden forever — they're explicitly deferred with rationale. 
 | 2 | LLMBackend | #87 | Anthropic + OpenAI + Moonshot |
 | 3 | JudgeBackend | #112 PR 4 | PolicyJudge + LLMJudgeBackend |
 | 4 | LockBackend | #60 PR 4 | Filesystem + Redis |
-| 5 | LogBackend | #61 PR 4 | Filesystem + SQLite |
+| 5 | LogBackend | #61 PR 4 | Filesystem + SQLite + Postgres |
 | 6 | AgentProfileBackend | #63 PR 4 | Filesystem + SQLite |
 | 7 | ToolRegistryBackend | #64 PR 4 | Filesystem + SQLite |
 | 8 | PolicyBackend | #89 PR 4 | Filesystem |
