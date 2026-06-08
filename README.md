@@ -29,7 +29,7 @@ Your AI agent's persona, memory, and audit trail live in someone else's database
 
 Concretely: INDEX.md routing layer. Persona in `IDENTITY.md` / `SOUL.md` / `USER.md`. Typed atomic notes. Audit trail as JSONL. Cost guardrails in markdown config. Crash-safe writes (temp + fsync + rename + parent-dir fsync — a power loss never leaves a half-written note). Schema migrations are scripts you read before running. The runtime is stateless — point cron, launchd, a Claude Code skill, or embedded Python at the folder.
 
-That's what `atomic-agents-stack` defines, in locked spec docs (plus active RFCs), with a Python reference implementation, 3,390+ tests, and a Caldwell sample shipping 5 days of real JSONL run logs, a rendered cost dashboard, evals across happy / edge / adversarial / decline categories, and a helper-pattern day showing ~76% cost savings vs. all-Opus.
+That's what `atomic-agents-stack` defines, in locked spec docs (plus active RFCs), with a Python reference implementation, 3,534+ tests, and a Caldwell sample shipping 5 days of real JSONL run logs, a rendered cost dashboard, evals across happy / edge / adversarial / decline categories, and a helper-pattern day showing ~76% cost savings vs. all-Opus.
 
 A home user with one agent and an org with a fleet experience the same framework — graceful, coherent, self-explanatory at every scale.
 
@@ -196,6 +196,7 @@ Start at [`docs/README.md`](https://github.com/dep0we/atomic-agents-stack/blob/m
 - [35: init wizard](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/spec/35-init-wizard.md): `atomic-agents init` on-ramp; template scaffolding + Add-to-it merge; CI-friendly `--from-template` (RFC)
 - [36: MCPServerRegistryBackend Protocol](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/spec/36-mcp-server-registry-backend.md): MCP server catalog + install/uninstall; `FilesystemMCPServerRegistryBackend` + `HTTPMCPServerRegistryBackend` reference impls with tier-1/2/3 capability negotiation; `atomic-agents mcp-registry` CLI (LOCKED, PR 5 of 5 v1.0)
 - [37: atomic-agents serve](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/spec/37-serve.md): thin HTTP wrapper exposing `agent.call()` over four routes; Cloud Run / GKE / Fly.io / Render; identity header pass-through; DRAFT (#342)
+- [38: SecretBackend Protocol](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/spec/38-secret-backend.md): credential resolution abstraction; `FilesystemSecretBackend` (env → Keychain → keys.json); `atomic-agents secrets` CLI; GCP backend at PR 2; DRAFT (#340)
 
 Each spec doc is locked when the implementation matches and tests pass. Spec changes that imply implementation changes get filed as GitHub issues. **Spec docs separate shipped behavior from explicit future / deferred boundaries** — sections that describe behavior not yet implemented are explicitly marked as such, not silently aspirational.
 
@@ -219,8 +220,9 @@ The framework is moving toward swappable backends layer by layer. The shape: a P
 | `PersonaBackend` | ✅ Shipped | Filesystem reference impl at `<scope_root>/.personas/<persona_id>/`; `persona.link.md` ownership trigger; snapshot trio nested under each persona's directory; `atomic-agents persona` CLI; AgentProfile composition with migration-window restore event | [`spec/33`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/spec/33-persona-backend.md) |
 | `CorpusBackend` | ✅ Shipped | Filesystem + SQLite (FTS5) reference impls; per-agent `wiki/` + `raw/`; `render_index_summary(corpus)` Protocol method; closes the GB-scale wiki cliff via O(log N) indexed full-text query | [`spec/34`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/spec/34-corpus-backend.md) |
 | `MCPServerRegistryBackend` | ✅ Shipped | Filesystem + HTTP reference impls with tier-1/2/3 capability negotiation; install/uninstall write paths; `atomic-agents mcp-registry` CLI; closes the v1.0 Protocol surface | [`spec/36`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/spec/36-mcp-server-registry-backend.md) |
+| `SecretBackend` | 🔄 In progress (DRAFT, PR 1 of 2) | Credential resolution abstraction; `FilesystemSecretBackend` (env → Keychain → keys.json); `atomic-agents secrets` CLI; GCP Secret Manager backend at PR 2 | [`spec/38`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/spec/38-secret-backend.md) |
 
-**v1 direction:** a home user runs filesystem-everything today. An organization runs the same agent definitions over Postgres / Redis / SQLite-Datadog / behind an HTTP service. v1.0 is here: all 12 backend protocols shipped, conformance suites pin the contracts. See [`docs/architecture.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/architecture.md) for the mental model, [`docs/TENSIONS.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/TENSIONS.md) for architectural tensions this scaling story has to survive, and [`ROADMAP.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/ROADMAP.md) for the full backlog beyond v1.0.
+**v1 direction:** a home user runs filesystem-everything today. An organization runs the same agent definitions over Postgres / Redis / SQLite-Datadog / behind an HTTP service. v1.0 is here: all 12 backend protocols shipped and locked, conformance suites pin the contracts. A thirteenth, `SecretBackend` (#340), is in progress for v1.5 (PR 1 of 2 — filesystem impl + DRAFT spec). See [`docs/architecture.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/architecture.md) for the mental model, [`docs/TENSIONS.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/TENSIONS.md) for architectural tensions this scaling story has to survive, and [`ROADMAP.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/ROADMAP.md) for the full backlog beyond v1.0.
 
 ---
 
@@ -296,7 +298,7 @@ Same pattern for OpenAI (`atomic-agents-openai`) and Moonshot (`atomic-agents-mo
 ## Repository structure
 
 - `atomic_agents/` — the Python package (runtime in `agent.py`; backend protocols in `memory/`, `_llm.py`, `_locks.py`, `_costs.py`, etc.; CLI in `cli.py`; preflight in `doctor.py`)
-- `tests/` 3,390+ tests collected, Python 3.11 + 3.12 matrix
+- `tests/` 3,534+ tests collected, Python 3.11 + 3.12 matrix
 - `docs/`: [spec entry point](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/README.md), [`architecture.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/architecture.md), [`spec/`](https://github.com/dep0we/atomic-agents-stack/tree/main/docs/spec/) (32 locked docs + 4 RFCs/DRAFTs), [`deployment/`](https://github.com/dep0we/atomic-agents-stack/tree/main/docs/deployment/) (9 operator runbooks), [`samples/caldwell/`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/samples/caldwell/) (complete worked example), [`GOVERNANCE.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/GOVERNANCE.md), [`TENSIONS.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/TENSIONS.md), [`methodology.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/methodology.md)
 - `extras/` — operational templates (Claude Code skill wrappers, macOS LaunchAgent plists, cron examples)
 
@@ -327,4 +329,4 @@ Before opening a PR, read [`CLAUDE.md`](https://github.com/dep0we/atomic-agents-
 
 ## Status
 
-**v1.0.0, stable.** Core runtime stable. Twelve of twelve backend protocols shipped (see the backend protocols table above); `MCPServerRegistryBackend` LOCKED at PR 5 v1.0. The Protocol surface is now stable per SemVer Major. See [`docs/deployment/versioning.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/deployment/versioning.md) for the breaking-change policy. Single-maintainer project; reference implementation anyone can use, fork, or extend.
+**v1.0.0, stable.** Core runtime stable. Twelve of twelve backend protocols shipped and locked at v1.0 (see the backend protocols table above); `MCPServerRegistryBackend` LOCKED at PR 5 v1.0. A thirteenth, `SecretBackend` (#340), is in progress for v1.5 (PR 1 of 2 merged — filesystem impl + DRAFT spec/38; GCP Secret Manager backend at PR 2). The v1.0 Protocol surface is stable per SemVer Major. See [`docs/deployment/versioning.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/deployment/versioning.md) for the breaking-change policy. Single-maintainer project; reference implementation anyone can use, fork, or extend.

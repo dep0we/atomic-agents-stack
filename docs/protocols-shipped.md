@@ -1,6 +1,6 @@
 # Backend protocols shipped
 
-Twelve backend protocols are locked for v1.0. Each section captures the reference implementations shipped, the operator override surface, the doctor coherence check, the Implementer Contract location, and the architectural cliff the protocol closes.
+Twelve backend protocols are locked for v1.0. A thirteenth, SecretBackend (#340), is in progress for v1.5 — its PR-1 section (filesystem reference impl + DRAFT spec/38) is included below; the spec LOCKs and the GCP Secret Manager backend land at PR 2. Each section captures the reference implementations shipped, the operator override surface, the doctor coherence check, the Implementer Contract location, and the architectural cliff the protocol closes.
 
 This file is the canonical reference for what the framework's storage seam looks like today. CLAUDE.md links here instead of inlining the detail so the session prompt stays under its char budget.
 
@@ -297,6 +297,22 @@ Capability flag evolution: PR 1-4 static False/False on HTTP (unconditional NIE 
 Test count ~3,319-3,325 at PR 5 (delta +12 to +18 vs post-PR-4 3,307).
 
 **Closes the v1.0 Protocol surface**: operators with a managed MCP catalog or a private HTTP catalog registry can now install/uninstall MCP servers from the same `agent.call()` flow as home-user filesystem operators.
+
+---
+
+## SecretBackend (#340, DRAFT spec/38, PR 1 of 2 — the thirteenth)
+
+The first backend protocol added after the v1.0 twelve. Abstracts credential resolution behind a Protocol so alternate secret substrates (GCP Secret Manager, AWS Secrets Manager, HashiCorp Vault) drop in without forking.
+
+PR 1 ships `FilesystemSecretBackend` — resolves env vars → macOS Keychain → `~/.config/atomic_agents/keys.json` in a fixed, non-configurable priority; credentials are machine-scoped, never vault-relative (spec/38 MUST 2). The `atomic_agents/secret_backend/` package carries the `@runtime_checkable SecretBackend` Protocol + `SecretError` / `SecretNotFound` / `SecretBackendNotRegistered` hierarchy (`backend.py`), the `SecretRef` + `SecretCapabilities` frozen dataclasses (`types.py`), and the registry + `get_default_secret_backend()` factory (`__init__.py`). Package named `secret_backend/` (not `secrets/`) to avoid shadowing the stdlib `secrets` module.
+
+`_get_key()` is **superseded**: the credential cascade now lives in the backend; all six live callers route through it, with `_get_key()` / `_get_anthropic_key()` / `_get_openai_key()` / `_get_moonshot_key()` kept as thin redirect wrappers so doctor and runtime resolve credentials through one code path.
+
+Operator surface: `atomic-agents secrets check <KEY>` (present/absent + source label, never the value), `secrets which <KEY>` (source label only), `secrets validate` (capability snapshot). `ATOMIC_AGENTS_SECRET_BACKEND` (default `filesystem`) + `ATOMIC_AGENTS_SECRET_BACKEND_URL` (reserved for the GCP backend) env vars. `doctor.check_secret_backend()` validates backend instantiation + capability honesty.
+
+DRAFT spec/38 ships 9 normative MUSTs (charset validation, machine-scoped sources, capability honesty, no value in exceptions, no value in `locate()`, no value in CLI output, empty-string-as-absent, `has()` delegation, no caching). Spec LOCK + the GCP Secret Manager reference impl land at PR 2.
+
+**Closes the credential-portability cliff:** the same agent runs on a laptop (Keychain / keys.json) and behind a fleet HTTP service (GCP Secret Manager, PR 2) with no code change — only the registered secret backend differs.
 
 ---
 
