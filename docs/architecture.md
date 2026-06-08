@@ -195,7 +195,7 @@ The agent can call back during the conversation to load specific atomic notes or
                             └──────────────────┘
 ```
 
-The vault is the only persistent state. The runtime is stateless — kill it, restart it, switch from cron to skill to openclaw, the agent is the same agent.
+The vault is the only persistent state. The runtime is stateless — kill it, restart it, switch from cron to skill to openclaw to an HTTP service (`atomic-agents serve`, spec/37), the agent is the same agent.
 
 ---
 

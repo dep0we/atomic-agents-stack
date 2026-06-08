@@ -64,9 +64,11 @@ its run record to `~/agents/caldwell/log/YYYY-MM/YYYY-MM-DD.jsonl`.
 
 If `agents_root` is omitted, `AtomicAgent` reads `ATOMIC_AGENTS_ROOT`
 from the environment (defaulting to `~/docs/agents`). The `trigger=`
-field is one of `cron`, `skill`, `manual`, `api`, or `delegate` — it
+field is one of `cron`, `skill`, `manual`, `api`, `http`, or `delegate` — it
 appears verbatim in the log record and influences lock-wait behaviour
-(`skill` waits up to 30s for the agent lock; others fail fast).
+(`skill` and `http` wait up to 30s for the agent lock; others fail fast).
+`http` is set by the `atomic-agents serve` HTTP wrapper (spec/37); operators
+pass the others directly.
 
 For a runnable sample agent, see [`docs/samples/caldwell/`](../samples/caldwell/).
 The same `name="caldwell"` example in the test suite is
