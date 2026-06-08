@@ -1160,13 +1160,12 @@ def check_log_backend(agent_root: Path) -> CheckResult:
             },
         )
 
-    # ``sqlite`` is the forward-pointer name — PR 3 will register it.
-    # Treat it as a known id alongside the eagerly-registered backends
-    # so doctor's known-id list matches ``get_default_log_backend``'s
-    # error message (same Step-11-adversarial-P0-3 mitigation).
-    # ``sqlite`` is eagerly registered as of #61 PR 3; the registry's
-    # own list is authoritative.
-    known_ids = set(list_log_backends())
+    # ``postgres`` is lazy-resolved (never eagerly registered) so it won't
+    # appear in list_log_backends() at startup. Include it as a forward-
+    # pointer so an operator who types ``ATOMIC_AGENTS_LOG_BACKEND=postgre``
+    # sees ``postgres`` in doctor's Known list — same Step-11-adversarial-
+    # P0-3 mitigation that fixed the locks arc (check_lock_backend:1005).
+    known_ids = set(list_log_backends()) | {"postgres"}
     if backend_id not in known_ids:
         return CheckResult(
             name="log-backend",
@@ -1207,10 +1206,12 @@ def check_log_backend(agent_root: Path) -> CheckResult:
     try:
         backend = get_default_log_backend(agent_root)
     except BackendNotRegistered:
-        # PR 3 registered "sqlite"; any remaining BackendNotRegistered
-        # path here means the operator typed an id whose lazy resolver
-        # raised. Surface the known-id list (already done above at the
-        # eager-registry check) — fall through to the failure path.
+        # "sqlite" is eagerly registered; a BackendNotRegistered here means
+        # a registered-but-lazy resolver raised after passing the known-id
+        # check above (e.g. a third-party backend whose factory raised).
+        # The 'postgres' branch in get_default_log_backend never raises
+        # BackendNotRegistered — it raises ValueError (missing URL) or
+        # returns a backend — so 'postgres' is not an example of this path.
         return CheckResult(
             name="log-backend",
             status=FAIL,
@@ -1242,6 +1243,10 @@ def check_log_backend(agent_root: Path) -> CheckResult:
     # Probe with stats() — verifies schema health + reachability.
     # Match check_lock_backend's WARN-on-unreachable pattern: doctor
     # never crashes on missing/unreachable optional infrastructure.
+    # Always close the backend in a finally block: no-op for filesystem/
+    # sqlite (no close() method), releases the psycopg connection for
+    # postgres (per postgres.py docstring: operators MUST call close() in
+    # teardown to release server-side connections).
     try:
         stats = backend.stats()
     except Exception:
@@ -1262,6 +1267,12 @@ def check_log_backend(agent_root: Path) -> CheckResult:
                 "truly down."
             ),
         )
+    finally:
+        if hasattr(backend, "close"):
+            try:
+                backend.close()
+            except Exception:
+                pass
 
     detail: dict[str, Any] = {
         "backend_id": backend_id,
