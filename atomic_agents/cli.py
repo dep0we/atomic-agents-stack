@@ -503,6 +503,49 @@ def main(argv: list[str] | None = None) -> int:
         help="override ATOMIC_AGENTS_AGENT_ROOT (default: $ATOMIC_AGENTS_AGENT_ROOT or cwd)",
     )
 
+    # ── secrets subcommand group ─────────────────────────────────────────
+    # Secrets are flat per-deployment (NOT per-agent) so no --agent-root arg.
+    # Observability only: check presence, show source, validate. Never prints
+    # secret values (spec/38 secrecy MUSTs 4-6).
+    secrets_cmd = sub.add_parser(
+        "secrets",
+        help="Inspect credential resolution (check presence, show source, validate)",
+        description=(
+            "Read-only observability for credential resolution. "
+            "Shows where a key resolves from (env var, Keychain, keys.json) "
+            "without printing the value. "
+            "Uses the registered SecretBackend (default: filesystem). "
+            "Override with ATOMIC_AGENTS_SECRET_BACKEND env var."
+        ),
+    )
+    secrets_sub = secrets_cmd.add_subparsers(dest="secrets_cmd", required=True)
+
+    # secrets check <KEY>
+    secrets_check = secrets_sub.add_parser(
+        "check",
+        help="Check whether a key is present (exit 0) or absent (exit 1)",
+    )
+    secrets_check.add_argument(
+        "key",
+        help="key name to check (e.g., ANTHROPIC_API_KEY); must match [A-Z0-9_]+",
+    )
+
+    # secrets which <KEY>
+    secrets_which = secrets_sub.add_parser(
+        "which",
+        help="Show which source a key resolves from (never prints the value)",
+    )
+    secrets_which.add_argument(
+        "key",
+        help="key name to locate (e.g., ANTHROPIC_API_KEY); must match [A-Z0-9_]+",
+    )
+
+    # secrets validate
+    secrets_sub.add_parser(
+        "validate",
+        help="Validate the configured secret backend instantiates cleanly",
+    )
+
     # ── init subcommand ───────────────────────────────────────────────────
     init_cmd = sub.add_parser(
         "init",
@@ -628,6 +671,10 @@ def main(argv: list[str] | None = None) -> int:
     # `mcp-registry` resolves its own agent_root from --agent-root or env var / cwd.
     if args.cmd == "mcp-registry":
         return _cmd_mcp_registry(args)
+
+    # `secrets` is deployment-scoped (not per-agent). No path resolution needed.
+    if args.cmd == "secrets":
+        return _cmd_secrets(args)
 
     # `init` resolves its own agents_root from --agents-root or env var.
     # It does not use the agents-root / agent-name hierarchy.
@@ -1253,6 +1300,65 @@ def _corpus_restore(
     backend.restore_version(name, corpus, version_ref, policy)
     print(f"Restored {name!r} to version {version_id!r}")
     return 0
+
+
+def _cmd_secrets(args) -> int:
+    """Dispatch secrets subcommands: check, which, validate.
+
+    Secrets are flat per-deployment (not per-agent) so no agent_root is
+    needed or accepted. All subcommands are read-only observability:
+    they never print secret values (spec/38 secrecy MUSTs 4-6).
+
+    Exit codes: 0 on success / key present, 1 on failure / key absent.
+    """
+    from .secret_backend import SecretError, get_default_secret_backend
+
+    sub_cmd = args.secrets_cmd
+
+    try:
+        backend = get_default_secret_backend()
+    except SecretError as e:
+        print(f"Error: failed to instantiate secret backend: {e}", file=sys.stderr)
+        return 1
+
+    if sub_cmd == "check":
+        key = args.key
+        try:
+            present = backend.has(key)
+        except ValueError as e:
+            print(f"Error: invalid key name: {e}", file=sys.stderr)
+            return 1
+        if present:
+            print(f"{key}: present")
+            return 0
+        else:
+            print(f"{key}: absent")
+            return 1
+
+    elif sub_cmd == "which":
+        key = args.key
+        try:
+            ref = backend.locate(key)
+        except ValueError as e:
+            print(f"Error: invalid key name: {e}", file=sys.stderr)
+            return 1
+        if ref is None:
+            print(f"{key}: absent (not found in any source)")
+            return 1
+        # Print only the source label — NEVER the resolved value (spec/38 MUST 6).
+        print(f"{key}: {ref.source}")
+        return 0
+
+    elif sub_cmd == "validate":
+        caps = backend.capabilities
+        print(f"backend_id:             {backend.backend_id}")
+        print(f"supports_rotation:      {caps.supports_rotation}")
+        print(f"supports_audit_logging: {caps.supports_audit_logging}")
+        print(f"persists_plaintext:     {caps.persists_plaintext}")
+        return 0
+
+    print(f"Error: unknown secrets subcommand: {sub_cmd}", file=sys.stderr)
+    return 1
 
 
 def _cmd_init(args) -> int:

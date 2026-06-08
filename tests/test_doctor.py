@@ -445,14 +445,29 @@ def test_run_doctor_no_agent_skips_agent_checks(tmp_path):
     results = run_doctor(agent_name=None, agents_root=tmp_path)
     names = {r.name for r in results}
     assert "env" in names and "python" in names
-    # All agent-scoped checks should be SKIP
+    # All agent-scoped checks should be SKIP. Enumerate EVERY agent-scoped
+    # check name — including each backend check — so that a future drift where a
+    # backend check is added to run_doctor's execution sequence but forgotten in
+    # the no-agent SKIP enumeration (doctor.py) fails this test loudly. This is
+    # the exact class of bug that previously let lock-backend / log-backend /
+    # persona-backend silently fall out of the SKIP list.
     skipped = {r.name for r in results if r.status == SKIP}
     assert {
         "vault",
         "provider-keys",
         "model",
         "mcp",
+        "lock-backend",
         "locks",
+        "log-backend",
+        "profile-backend",
+        "tool-registry-backend",
+        "mandate-backend",
+        "policy-backend",
+        "persona-backend",
+        "corpus-backend",
+        "mcp-server-registry-backend",
+        "secret-backend",
         "memory-backend",
         "write-paths",
     } <= skipped

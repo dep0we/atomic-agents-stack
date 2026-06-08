@@ -935,70 +935,50 @@ def _extract_sections(markdown_body: str) -> dict[str, str]:
 def _provider_available(model_id: str) -> bool:
     """Check if the provider for a model has a configured API key.
 
-    Doesn't actually call the API — just checks key sources in priority order.
+    Delegates to the registered SecretBackend (spec/38) so this function and
+    the runtime LLM backends always route through the same credential
+    resolution path. Previously contained an inline three-source cascade
+    (env → Keychain → keys.json); that logic now lives in
+    ``FilesystemSecretBackend`` and is activated via ``get_default_secret_backend()``.
     """
-    import os
-
+    # Canonical key name: the UPSTREAM provider env var (e.g. ANTHROPIC_API_KEY),
+    # passed to backend.has(). For the FilesystemSecretBackend this resolves
+    # identically to _llm._get_key()'s resolution (its _resolve / resolve_with_spec
+    # probe the full alias list, of which this name is a member), so this path and
+    # the runtime LLM path agree. NOTE for PR 2: an alternate Protocol-only backend
+    # that does NOT do multi-alias resolution could probe a DIFFERENT name here than
+    # _get_key's fallback (which uses env_vars[0], the ATOMIC_AGENTS_-prefixed alias).
+    # If the GCP backend lands without multi-alias resolution, route both paths
+    # through a single key-name helper so doctor/eval availability and runtime
+    # resolution cannot disagree.
     if model_id.startswith("claude-"):
-        env_vars = ["ATOMIC_AGENTS_ANTHROPIC_KEY", "ANTHROPIC_API_KEY"]
-        keychain = "atomic-agents-anthropic"
-        config_key = "anthropic"
+        primary_env_var = "ANTHROPIC_API_KEY"
     elif model_id.startswith("gpt-"):
-        env_vars = ["ATOMIC_AGENTS_OPENAI_KEY", "OPENAI_API_KEY"]
-        keychain = "atomic-agents-openai"
-        config_key = "openai"
+        primary_env_var = "OPENAI_API_KEY"
     elif model_id.startswith("moonshot/"):
-        env_vars = ["ATOMIC_AGENTS_MOONSHOT_KEY", "MOONSHOT_API_KEY"]
-        keychain = "atomic-agents-moonshot"
-        config_key = "moonshot"
+        primary_env_var = "MOONSHOT_API_KEY"
     else:
         return False
 
-    # Source 1: env vars
-    for var in env_vars:
-        if os.environ.get(var):
-            return True
+    from .secret_backend import SecretError, get_default_secret_backend
 
-    # Source 2: macOS Keychain
-    if os.uname().sysname == "Darwin":
-        import subprocess
-
-        try:
-            result = subprocess.run(
-                [
-                    "security",
-                    "find-generic-password",
-                    "-a",
-                    os.environ.get("USER", ""),
-                    "-s",
-                    keychain,
-                    "-w",
-                ],
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=2,
-            )
-            if result.stdout.strip():
-                return True
-        except (
-            FileNotFoundError,
-            subprocess.CalledProcessError,
-            subprocess.TimeoutExpired,
-        ):
-            pass
-
-    # Source 3: config file
-    config_path = Path.home() / ".config" / "atomic_agents" / "keys.json"
-    if config_path.exists():
-        try:
-            keys = json.loads(config_path.read_text())
-            if keys.get(config_key):
-                return True
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    return False
+    try:
+        backend = get_default_secret_backend()
+        return backend.has(primary_env_var)
+    except SecretError:
+        # SecretBackendNotRegistered (mis-configured backend), SecretNotFound,
+        # or any other secret-subsystem error: treat as key-not-available so
+        # eval model-fallback selection skips this provider. Operators who
+        # mis-set ATOMIC_AGENTS_SECRET_BACKEND will see the diagnostic via
+        # ``atomic-agents doctor`` (check_secret_backend FAIL), not silently
+        # here.
+        _log.warning(
+            "_provider_available(%r): SecretBackend error — treating provider "
+            "as unavailable. Run 'atomic-agents doctor' for diagnostics.",
+            model_id,
+            exc_info=True,
+        )
+        return False
 
 
 # ──────────────────────────────────────────────────────────────────

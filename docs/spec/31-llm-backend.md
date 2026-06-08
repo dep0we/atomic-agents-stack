@@ -288,6 +288,8 @@ OpenAICompatibleLLMBackend(
 
 `KeySpec` carries the three sources `_llm._get_key` tries: env vars (first non-empty wins), macOS Keychain by name, `~/.config/atomic_agents/keys.json` by key. Matches spec/01 secrets-handling.
 
+> **As of spec/38 (issue #340):** key resolution routes through the registered `SecretBackend`. `FilesystemSecretBackend` preserves the env vars → Keychain → keys.json order. `_llm._get_key()` is now a thin redirect wrapper that calls `get_default_secret_backend().resolve_with_spec(env_vars, keychain_name, config_key)`, forwarding the full `KeySpec` triple so every env-var alias plus the caller-supplied keychain service name and `keys.json` key are honored (preserving backward compatibility for custom `OpenAICompatibleLLMBackend` registrations with non-default `keychain_name`/`config_file_key`). Backends that do not expose `resolve_with_spec` (future alternate implementations) fall back to `SecretBackend.get(env_vars[0])`; note that `resolve_with_spec` is an internal `FilesystemSecretBackend` method, not part of the public Protocol surface. `KeySpec` is retained as a construction convenience type but no longer contains key-resolution logic; `_resolve_key()` in `OpenAICompatibleLLMBackend` delegates through `_get_key()` (which routes to `resolve_with_spec`). See spec/38 §"Lookup order".
+
 `make_openai_backend()` ships an OpenAI-direct instance (matches `gpt-*` model ids, OpenAI default endpoint, framework's `ATOMIC_AGENTS_OPENAI_KEY` / `OPENAI_API_KEY` env vars).
 
 ### `MoonshotLLMBackend` (`atomic_agents/llm/moonshot.py`)
