@@ -63,3 +63,10 @@ _dashboard/
 
 # Operator-private working files — not committed
 temp/
+
+# Session/runtime artifacts — keep build branches showing only framework code so /ship runs clean
+# end-to-end (these never belong in a feature PR). The arc dev-harness (.claude/workflows/ +
+# .claude/skills/arc/) is intentionally TRACKED — it is project tooling, not runtime noise.
+.gstack/
+.context/
+.claude/worktrees/
