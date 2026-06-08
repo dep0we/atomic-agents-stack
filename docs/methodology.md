@@ -155,6 +155,22 @@ agent-dispatch path. Skip for one-line atomic-primitive fixes (e.g., the
 
 ---
 
+## The arc workflow — decision-first autonomous build loop
+
+The methods above (review in rounds, plan-subagent prep, verify-before-claim) were run by hand per PR. The **arc workflow** (`.claude/workflows/arc-*.js` + the `/arc` router skill) encodes them as deterministic multi-agent orchestration, so a build runs the same whether watched or not — the goal being to continue development at this quality bar without per-step supervision.
+
+Three phases, two human gates:
+
+- **`arc-discovery`** reads an issue and surfaces every decision fork, classifying each by *materiality tier* against a fixed checklist. **Tier A** (touches a Protocol, a spec MUST, a public/operator surface, a cost gate, the audit shape, the home/org throughline, or adds a dependency or concept) escalates to the maintainer. **Tier B** the agent may decide, but only with a written justification tied to a named principle. **Tier C** is mechanical. A dual-classifier resolves ambiguity *upward* — if either pass says Tier A, it is Tier A. Every Tier A fork gets a two-voice adversarial panel: a project-grounded Opus advisor and a cross-family Codex skeptic, both prompted to attack the easy path, then a translator renders the fork as a plain-language decision the maintainer rules on. Zero code changes.
+- **`arc-execute`** takes the rulings as fixed constraints and builds: parallel prep fan-out → implement → adversarial review **in rounds** (five lenses including a dedicated shortcut-hunter) → doc-release sweep. If the implementer hits a *new* Tier A fork nobody ruled on, it halts and returns it rather than deciding silently.
+- **`arc-finish`** drives an existing-but-unconverged build to a clean state with an Opus holistic-fix loop (plan the whole fix-set together → apply → self-verify against the failure class) plus sticky-finding root-cause escalation.
+
+**The convergence gate is "zero blocking," not "zero findings."** Findings and shortcuts both carry a severity; the gate blocks on P0/P1 only. P2s (rot-someday comments, edges no code path hits) are reported in the PR body for the merge review, never chased — chasing zero on hard backends (URL-parse edge tails) is an asymptote. The build goes autonomous to a PR with no blocking issues plus a transparent findings list; the maintainer's merge review adjudicates the rest. The two human gates are deliberate: **decisions** (Tier A, ruled before the build) and **merge** (the irreversible action). Everything between is automated.
+
+Finalization hands off to `/ship` end-to-end — the harness never hand-rolls commit/push/PR (the one time it did, #342, shipped without `/ship`'s doc-sync and left documentation drift). Model split follows the project rule: planning and judgment (discovery, advisors, review lenses) on Opus, cross-family skepticism on Codex, mechanical work and coding (translation, prep, implement, fix) on the cheaper tier. Session and runtime artifacts are gitignored so a build branch shows only framework code.
+
+---
+
 ## Verify before claim — empirically
 
 When Codex says "your docs are wrong about this CLI flag," reproduce the
