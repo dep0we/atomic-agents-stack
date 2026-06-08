@@ -187,8 +187,9 @@ def list_log_backends() -> list[str]:
 
 
 # Register the built-in filesystem backend at import time. Matches the
-# Lock registry pattern (``atomic_agents/locks/__init__.py:139``) —
-# the default is always available without an extra resolution step.
+# Lock registry pattern (the eager FilesystemLockBackend registration in
+# ``atomic_agents/locks/__init__.py``) — the default is always available
+# without an extra resolution step.
 register_log_backend("filesystem", FilesystemLogBackend)
 
 
@@ -299,7 +300,7 @@ def get_default_log_backend(scope_root: Path) -> LogBackend:
         # The asymmetry with SQLite (eager) is principled: SQLite is
         # stdlib (zero install cost); psycopg is a C extension that
         # requires a pip extra. Mirror the Redis lazy-import pattern in
-        # locks/__init__.py:171.
+        # ``get_default_lock_backend()`` (locks/__init__.py).
         from .postgres import make_postgres_backend_from_url  # noqa: PLC0415
 
         url = os.environ.get("ATOMIC_AGENTS_LOG_BACKEND_URL")
@@ -324,7 +325,8 @@ def get_default_log_backend(scope_root: Path) -> LogBackend:
     # lazy-resolved ``"postgres"`` forward-pointer (not yet in the
     # eager registry at startup) so an operator who types ``postgre``
     # sees ``postgres`` in the Available list — same Step-11-adversarial-
-    # P0-3 mitigation that fixed ``redis`` in locks/__init__.py:191.
+    # P0-3 mitigation that fixed ``redis`` in ``get_default_lock_backend()``'s
+    # known-ids union (locks/__init__.py).
     #
     # Credential safety: ``raw_backend_id`` is sanitized before
     # interpolation in case an operator accidentally pastes a URL
@@ -332,8 +334,9 @@ def get_default_log_backend(scope_root: Path) -> LogBackend:
     # instead of ``ATOMIC_AGENTS_LOG_BACKEND_URL``. Without the sanitize
     # the credential lands in exception text that may be logged by
     # exception handlers, WSGI middleware, or error-tracking services.
-    # Same fix applies to ``locks/__init__.py:194`` per the systemic
-    # gap Step 9.1 security specialist surfaced.
+    # Same fix applies to ``get_default_lock_backend()`` in
+    # ``locks/__init__.py`` per the systemic gap Step 9.1 security
+    # specialist surfaced.
     safe_backend_id = _redact_for_error_message(raw_backend_id)
     known_ids = sorted(set(list_log_backends()) | {"postgres"})
     raise BackendNotRegistered(

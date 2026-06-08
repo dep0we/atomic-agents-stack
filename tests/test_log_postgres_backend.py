@@ -7,9 +7,11 @@ Module-level comment:
     verified via BACKEND_FACTORIES in test_log_protocol_conformance.py
     using a real Postgres service container (ATOMIC_AGENTS_TEST_POSTGRES_URL).
 
-    Tests marked with ``pytest.mark.postgres`` require a real Postgres
-    instance. They run in CI (service container sets ATOMIC_AGENTS_TEST_POSTGRES_URL)
-    and are skipped locally when the env var is absent.
+    Tests decorated with ``@requires_postgres`` (a ``skipif`` on the
+    ``ATOMIC_AGENTS_TEST_POSTGRES_URL`` env var) require a real Postgres
+    instance. They run in CI (the service container sets that env var) and
+    skip locally when it is absent. There is no ``pytest.mark.postgres``
+    marker — ``@requires_postgres`` is the actual gate.
 
     All other tests in this file use mocking and run unconditionally.
 """
@@ -189,6 +191,231 @@ def test_redact_dsn_query_string_uses_literal_asterisks():
     )
 
 
+def test_redact_dsn_preserves_path_valued_params_unencoded():
+    """_redact_dsn must keep preserved TLS path values readable — NOT percent-
+    encode the slashes into '%2F' mush.
+
+    sslkey/sslcert/sslrootcert are deliberately excluded from redaction so an
+    operator debugging a TLS failure can read the path. Running the preserved
+    value through ``urlencode`` with too-narrow a safe set re-mangles the
+    slashes, defeating the exact diagnostic intent the exclusion exists to
+    serve (same urlencode-mangling class as the '***' marker, on a different
+    character). ``safe='*/'`` preserves both.
+    """
+    from atomic_agents.logs.postgres import _redact_dsn
+
+    url = (
+        "postgresql://user:topsecret@host/db"
+        "?sslmode=require&sslkey=/etc/ssl/client.key&password=anothersecret"
+    )
+    redacted = _redact_dsn(url)
+    # Preserved path reads verbatim — no percent-encoding of slashes.
+    assert "sslkey=/etc/ssl/client.key" in redacted, redacted
+    assert "%2F" not in redacted, f"path slashes must not be encoded: {redacted!r}"
+    # Credentials are still redacted in both positions.
+    assert "topsecret" not in redacted, "netloc password must be redacted"
+    assert "anothersecret" not in redacted, "query-string password must be redacted"
+    assert redacted.count("***") >= 2, f"both credentials must show '***': {redacted!r}"
+
+
+def test_redact_dsn_unencoded_slash_in_password():
+    """_redact_dsn must NOT leak a password that contains a raw (un-percent-
+    encoded) '/'.
+
+    Regression guard: ``urlparse`` follows RFC-3986 and treats the first
+    unencoded '/' as the start of the path, so ``parsed.password`` silently
+    becomes None and a netloc-password-only redaction would emit the credential
+    verbatim. The textual userinfo redaction (split authority on the last '@',
+    mask everything after the first ':' in the userinfo) catches this regardless
+    of percent-encoding.
+
+    Covers both the scheme-error path (non-postgres scheme reaches _redact_dsn
+    via the friendly error) and the would-be connect path.
+    """
+    from atomic_agents.logs.postgres import _redact_dsn
+
+    # Raw '/' in the password — the exact urlparse mis-parse case.
+    url = "mysql://user:p/a$$w@host/db"
+    redacted = _redact_dsn(url)
+    assert "p/a$$w" not in redacted, (
+        f"raw-slash password leaked into redacted output: {redacted!r}"
+    )
+    assert "***" in redacted, f"redaction marker missing: {redacted!r}"
+    assert "user" in redacted, f"username should be preserved: {redacted!r}"
+
+    # Postgres scheme, raw '/' in password, with a port present — the variant
+    # the SHORTCUT finding showed could raise an uncaught 'Port could not be
+    # cast' from urlparse.port. _redact_dsn must still not leak and not crash.
+    url_port = "postgresql://user:p/a$$w@host:5432/db"
+    redacted_port = _redact_dsn(url_port)
+    assert "p/a$$w" not in redacted_port, (
+        f"raw-slash password leaked with port present: {redacted_port!r}"
+    )
+    assert "***" in redacted_port
+
+
+def test_init_rejects_unencoded_slash_password_with_redacted_error():
+    """Constructing with a raw '/' in the password must raise the friendly,
+    REDACTED malformed-URL ValueError — never an uncaught 'Port could not be
+    cast to integer value', and never with the credential in the message.
+
+    Without the construction-time guard, urlparse drops the password (None) and
+    the backend would silently connect with an empty password → confusing auth
+    failure later. We refuse loudly instead.
+    """
+    from atomic_agents.logs.postgres import PostgresLogBackend
+
+    with pytest.raises(ValueError) as excinfo:
+        PostgresLogBackend("postgresql://user:p/a$$w@host:5432/db")
+    msg = str(excinfo.value)
+    assert "p/a$$w" not in msg, f"credential leaked into error message: {msg!r}"
+    assert "percent-encode" in msg.lower() or "malformed" in msg.lower(), msg
+
+
+def test_redact_dsn_unencoded_hash_or_question_in_password():
+    """_redact_dsn must NOT leak a password that contains a raw '#' or '?'.
+
+    Round-3 regression guard: the round-2 fix handled a raw '/' in the password
+    but the netloc redaction still skipped redaction entirely when a '?' or '#'
+    appeared before the '@' (it was assumed to be a query/fragment delimiter).
+    A '#' or '?' INSIDE the password is before the '@', so the credential leaked
+    verbatim. ``urlparse`` mis-isolates all three characters identically; the
+    textual userinfo split (last '@' after '://', mask after the first ':') must
+    catch every one of them.
+    """
+    from atomic_agents.logs.postgres import _redact_dsn
+
+    for pw in ("pa#ss", "pa?ss", "Xy9#Kq2mZ!vL", "S3cr?tWord"):
+        url = f"postgresql://user:{pw}@host:5432/db"
+        redacted = _redact_dsn(url)
+        assert pw not in redacted, (
+            f"password with special char leaked: pw={pw!r} redacted={redacted!r}"
+        )
+        assert "***" in redacted, f"redaction marker missing: {redacted!r}"
+
+    # A PORT-LESS query-string '@' with no userinfo password is left intact:
+    # the textual userinfo split sees no ':' before the '@', so nothing is
+    # masked. NOTE: this is NOT a general "over-redaction only fires when a
+    # password is present" invariant — add an explicit port (host:5432) and the
+    # ':' in 'host:5432' DOES sit before the query '@', so _redact_dsn
+    # over-masks it ('postgresql://host:***@b'). That over-redaction of a
+    # non-secret is the documented security-first stance and is harmless; the
+    # functional line we must NOT cross is __init__ REFUSING such a valid URL
+    # (covered by test_init_accepts_credentialless_url_with_port_and_query_at).
+    safe = _redact_dsn("postgresql://host/db?application_name=a@b")
+    assert "application_name" in safe, safe
+
+
+def test_init_rejects_hash_or_question_password_without_fragment_leak():
+    """Constructing with a raw '#'/'?' in the password must raise the friendly,
+    REDACTED ValueError — and must NOT echo even a FRAGMENT of the password.
+
+    Round-3 regression guard: before the fix, '#'/'?' passwords fell through the
+    credential-isolation check (which clamped the authority on '?'/'#') into the
+    ``parsed.port`` path, whose stdlib ValueError text echoes the leading run of
+    the password (e.g. "Port could not be cast … as 'Xy9'"). Interpolating that
+    exc into the message partially leaked the credential. The construction guard
+    must now fire first and the port-error message must never include exc text.
+    """
+    from atomic_agents.logs.postgres import PostgresLogBackend
+
+    for pw in ("pa#ss", "Xy9#Kq2mZ", "S3cr?tWord", "pre?post"):
+        with pytest.raises(ValueError) as excinfo:
+            PostgresLogBackend(f"postgresql://user:{pw}@host:5432/db")
+        msg = str(excinfo.value)
+        assert pw not in msg, f"full credential leaked: pw={pw!r} msg={msg!r}"
+        # No password fragment up to the first special char may survive either.
+        leading = pw.split("#")[0].split("?")[0]
+        # The fragment must not appear in the port-error tail. The friendly
+        # rejection message contains no exc text at all, so any occurrence would
+        # be a leak (guard against the leading fragment ≥ 3 chars to avoid
+        # incidental matches like 'a' inside 'password').
+        if len(leading) >= 3:
+            assert leading not in msg, (
+                f"password fragment leaked into error: frag={leading!r} msg={msg!r}"
+            )
+        assert "percent-encode" in msg.lower() or "malformed" in msg.lower(), msg
+
+
+def test_init_accepts_credentialless_url_with_port_and_query_at():
+    """A VALID credential-less DSN that has both an explicit port and an '@' in a
+    query value must CONSTRUCT successfully — it is not a malformed password.
+
+    Regression guard: the prior password-detection heuristic fired on
+    ``parsed.password is None`` + ``rfind('@')`` finding a ':' before the last
+    '@'. With an explicit port the ':' in 'host:5432' sits before the query '@',
+    so a legitimate URL like
+    ``postgresql://host:5432/db?application_name=a@b`` was wrongly REFUSED. The
+    fix gates detection on ``parsed.port`` actually raising (the only signal that
+    urlparse genuinely mis-isolated the authority); a clean port parse means the
+    None password is the truth, not a parse failure.
+
+    Both the ported and port-less forms must construct, and the parsed
+    components must reflect the real (credential-less) authority — the query '@'
+    must not have been mis-read as a userinfo separator.
+    """
+    from atomic_agents.logs.postgres import PostgresLogBackend
+
+    for url, expected_port in (
+        ("postgresql://host:5432/db?application_name=a@b", 5432),
+        ("postgresql://host/db?application_name=a@b", 5432),  # default
+    ):
+        backend = PostgresLogBackend(url)
+        assert backend._host == "host", url
+        assert backend._port == expected_port, url
+        assert backend._dbname == "db", url
+        assert backend._user == "", url
+        assert backend._password == "", url
+
+
+def test_init_still_rejects_special_char_password_with_port():
+    """The targeted percent-encode message must still fire for a real password
+    that contains an unencoded special char, EVEN with an explicit port present —
+    the port-gated restructure must not weaken the leak guard for actual
+    credentials. Mirrors the no-leak assertions of the round-3 guard.
+    """
+    from atomic_agents.logs.postgres import PostgresLogBackend
+
+    for pw in ("pa/ss", "pa?ss", "pa#ss", "Xy9#Kq2mZ"):
+        with pytest.raises(ValueError) as excinfo:
+            PostgresLogBackend(f"postgresql://user:{pw}@host:5432/db")
+        msg = str(excinfo.value)
+        assert pw not in msg, f"credential leaked: pw={pw!r} msg={msg!r}"
+        assert "malformed" in msg.lower() or "percent-encode" in msg.lower(), msg
+
+
+def test_init_rejects_digit_leading_special_char_password_no_silent_construct():
+    """Round-5 P1 regression: a password that STARTS WITH DIGITS followed by an
+    unencoded '/' makes ``parsed.port`` cast the digit prefix as a VALID port and
+    NOT raise — so the round-4 port-gated detection never fired and the backend
+    SILENTLY CONSTRUCTED with garbage components (username as host, password
+    prefix as port, credentials dropped). The fix adds a second detection arm:
+    after a clean port parse, an unencoded '@' in ``parsed.path`` means urlparse
+    mis-isolated a special-char password.
+
+    These URLs MUST refuse (not silently construct), with the actionable
+    percent-encode message and no credential leak. Covers the digit-leading
+    shape AND the double-'@' shape (``user:p@ss/word@host/db``) where the first
+    '@' is consumed by urlparse into a partial userinfo.
+    """
+    from atomic_agents.logs.postgres import PostgresLogBackend
+
+    # (url, distinctive secret fragment that must NOT survive redaction). The
+    # fragments are deliberately not substrings of the static message text
+    # ("password", "percent-encode", "encoded", etc.) to avoid false positives.
+    cases = (
+        ("postgresql://user:5432/myS3cretPw@dbhost:5432/mydb", "myS3cretPw"),
+        ("postgresql://user:12345/h1ddenCreds@host/db", "h1ddenCreds"),
+        ("postgresql://user:p@ssZZ/qqWord@host:5432/db", "qqWord"),
+    )
+    for url, secret in cases:
+        with pytest.raises(ValueError) as excinfo:
+            PostgresLogBackend(url)
+        msg = str(excinfo.value)
+        assert secret not in msg, f"credential leaked: {secret!r} in {msg!r}"
+        assert "malformed" in msg.lower() or "percent-encode" in msg.lower(), msg
+
+
 def test_backend_rejects_non_postgres_scheme():
     """PostgresLogBackend must reject non-postgresql:// schemes immediately."""
     from atomic_agents.logs.postgres import PostgresLogBackend
@@ -298,6 +525,224 @@ def test_broken_connection_triggers_reconnect():
     assert psycopg_mock.connect.called, "_get_conn must reconnect when conn is broken"
     assert conn is good_conn, "_get_conn must return the fresh connection"
     assert backend._tls.conn is good_conn, "Thread-local must be updated to new conn"
+
+
+def _bare_backend():
+    """Build a PostgresLogBackend with stubbed connection params, no real connect."""
+    from atomic_agents.logs.postgres import PostgresLogBackend
+
+    backend = PostgresLogBackend.__new__(PostgresLogBackend)
+    backend._host = "localhost"
+    backend._port = 5432
+    backend._dbname = "test"
+    backend._user = "u"
+    backend._password = "p"
+    backend._safe_url = "postgresql://u:***@localhost/test"
+    backend._tls = threading.local()
+    return backend
+
+
+def test_append_transparent_reconnect_on_not_yet_flagged_drop():
+    """P1 regression: the FIRST write after a server-side termination (not yet
+    reflected in conn.closed/broken) must NOT abort the agent run.
+
+    The framework's _log() path calls append() WITHOUT a try/except, so a raw
+    connection-level error propagating out of append() takes down the whole
+    agent.call(). _run_with_reconnect() must catch the connection-level error,
+    rebuild the connection, and retry the INSERT once — so a single transient
+    drop costs zero records and zero failed runs.
+
+    A genuine statement-level error must still propagate (no retry), and a
+    persistent connection failure (both attempts fail) must re-raise.
+    """
+    psycopg_mock = MagicMock()
+
+    class OperationalError(Exception):
+        pass
+
+    psycopg_mock.OperationalError = OperationalError
+    psycopg_mock.Error = Exception
+
+    # append() does `import psycopg.types.json as _pj` and calls _pj.Jsonb(...).
+    # Provide a stub submodule so the import resolves and Jsonb is callable.
+    psycopg_types_mock = MagicMock()
+    psycopg_json_mock = MagicMock()
+    psycopg_json_mock.Jsonb = lambda v: v
+    psycopg_types_mock.json = psycopg_json_mock
+
+    module_patch = {
+        "psycopg": psycopg_mock,
+        "psycopg.types": psycopg_types_mock,
+        "psycopg.types.json": psycopg_json_mock,
+    }
+    with patch.dict(sys.modules, module_patch):
+        # ── Case 1: connection-level drop on first execute → retry succeeds ──
+        backend = _bare_backend()
+        dead_conn = MagicMock()
+        dead_conn.closed = 0  # NOT flagged dead — the exact P1 scenario.
+        dead_conn.broken = False
+        dead_conn.execute.side_effect = OperationalError(
+            "terminating connection due to administrator command"
+        )
+        fresh_conn = MagicMock()
+        fresh_conn.closed = 0
+        fresh_conn.broken = False
+        fresh_conn.execute.return_value = MagicMock()
+
+        conns = iter([dead_conn, fresh_conn])
+        backend._get_conn = lambda: next(conns)  # type: ignore[assignment]
+
+        # Must NOT raise — the retry against fresh_conn succeeds.
+        backend.append(_make_record(run_id="reconnect_ok"))
+        assert fresh_conn.execute.called, "retry must run the INSERT on a fresh conn"
+        assert fresh_conn.commit.called, "retry must commit the INSERT"
+
+        # ── Case 2: statement-level error must NOT be retried ──
+        backend2 = _bare_backend()
+        only_conn = MagicMock()
+        only_conn.closed = 0
+        only_conn.broken = False
+
+        class ProgrammingError(Exception):  # not a connection error
+            pass
+
+        psycopg_mock.OperationalError = OperationalError
+        only_conn.execute.side_effect = ProgrammingError("bad column")
+        get_calls = {"n": 0}
+
+        def _one_conn():
+            get_calls["n"] += 1
+            return only_conn
+
+        backend2._get_conn = _one_conn  # type: ignore[assignment]
+        with pytest.raises(ProgrammingError):
+            backend2.append(_make_record(run_id="stmt_err"))
+        # _get_conn called once by append's pre-check + once inside the wrapper;
+        # the key assertion is that NO retry happened (no third call).
+        assert get_calls["n"] <= 2, "statement-level error must not trigger a retry"
+
+        # ── Case 3: persistent connection failure → re-raise after one retry ──
+        backend3 = _bare_backend()
+
+        def _always_dead():
+            c = MagicMock()
+            c.closed = 0
+            c.broken = False
+            c.execute.side_effect = OperationalError("server still down")
+            return c
+
+        backend3._get_conn = _always_dead  # type: ignore[assignment]
+        with pytest.raises(OperationalError):
+            backend3.append(_make_record(run_id="persistent_down"))
+
+
+def test_append_does_not_retry_on_commit_phase_drop():
+    """P1 audit-integrity: a connection-level drop at commit() must NOT be
+    retried — the INSERT may already be committed server-side and only the ack
+    lost on the wire (restart/failover/blip during commit). Retrying would
+    issue a SECOND INSERT and silently DOUBLE the audit row (run_records has no
+    uniqueness column) and double-count cost.
+
+    Contract: when execute() SUCCEEDS but commit() raises a connection-level
+    error, append() must (a) issue the INSERT exactly once — no second execute
+    against a fresh connection — and (b) re-raise the original connection error
+    (the row's persistence is unknown; the caller must not assume it landed).
+
+    Contrast with test_append_transparent_reconnect_on_not_yet_flagged_drop's
+    Case 1, where the drop happens at execute() (row provably NOT persisted) and
+    a one-shot retry IS the correct, safe behavior.
+    """
+    psycopg_mock = MagicMock()
+
+    class OperationalError(Exception):
+        pass
+
+    psycopg_mock.OperationalError = OperationalError
+    psycopg_mock.Error = Exception
+
+    psycopg_types_mock = MagicMock()
+    psycopg_json_mock = MagicMock()
+    psycopg_json_mock.Jsonb = lambda v: v
+    psycopg_types_mock.json = psycopg_json_mock
+
+    module_patch = {
+        "psycopg": psycopg_mock,
+        "psycopg.types": psycopg_types_mock,
+        "psycopg.types.json": psycopg_json_mock,
+    }
+    with patch.dict(sys.modules, module_patch):
+        backend = _bare_backend()
+
+        # First connection: execute() SUCCEEDS, commit() raises a
+        # connection-level error (the lost-commit-ack scenario).
+        committed_conn = MagicMock()
+        committed_conn.closed = 0
+        committed_conn.broken = False
+        committed_conn.execute.return_value = MagicMock()
+        committed_conn.commit.side_effect = OperationalError(
+            "server closed the connection unexpectedly (ack lost after commit)"
+        )
+
+        # A would-be fresh connection — must NEVER be used: if the wrapper
+        # retried, it would INSERT a second, duplicate row here.
+        forbidden_conn = MagicMock()
+        forbidden_conn.closed = 0
+        forbidden_conn.broken = False
+
+        # append() calls _get_conn() twice on the no-drop path: once in its
+        # pre-check (to confirm psycopg is importable) and once inside
+        # _run_with_reconnect. Both must return the SAME committed_conn so the
+        # INSERT-then-failing-commit happens on the connection under test. Any
+        # THIRD call would be a retry — it must hit forbidden_conn, which we
+        # assert is never executed against.
+        get_calls = {"n": 0}
+
+        def _conn_provider():
+            get_calls["n"] += 1
+            return committed_conn if get_calls["n"] <= 2 else forbidden_conn
+
+        backend._get_conn = _conn_provider  # type: ignore[assignment]
+
+        # The commit-level connection error must propagate (the row's fate is
+        # unknown; the caller must not silently swallow it) and must NOT trigger
+        # a retry.
+        with pytest.raises(OperationalError):
+            backend.append(_make_record(run_id="commit_ack_lost"))
+
+        assert committed_conn.execute.call_count == 1, (
+            "INSERT must be issued exactly once — no retry past the commit point"
+        )
+        assert not forbidden_conn.execute.called, (
+            "a commit-phase drop must NOT retry the INSERT on a fresh "
+            "connection — that would DOUBLE the audit row"
+        )
+
+
+def test_close_is_idempotent():
+    """close() must be safe to call multiple times (spec/22 MUST 7 lifecycle).
+
+    First call closes the cached connection and nulls the thread-local; every
+    subsequent call is a no-op that neither raises nor re-closes — and a close()
+    on a backend that never opened a connection is also a no-op.
+    """
+    backend = _bare_backend()
+
+    # close() with no connection ever opened — must not raise.
+    backend.close()
+    assert getattr(backend._tls, "conn", None) is None
+
+    # Seed a connection, close once, then close again twice more.
+    conn = MagicMock()
+    backend._tls.conn = conn
+    backend.close()
+    assert conn.close.call_count == 1, "first close() must close the live conn once"
+    assert getattr(backend._tls, "conn", None) is None
+
+    backend.close()
+    backend.close()
+    assert conn.close.call_count == 1, (
+        "subsequent close() calls must be no-ops (idempotent), not re-close"
+    )
 
 
 def test_non_operational_error_at_connect_is_redacted():
@@ -1231,9 +1676,17 @@ def test_postgres_cost_usd_double_precision_round_trip(pg_backend):
     """
     from atomic_agents.logs import LogQuery
 
-    # 0.00123456789 has 9 significant digits — distinguishable at double
-    # precision (~1e-17 relative error) but truncated at single precision
-    # (~4e-8 relative error, i.e. rounds to 0.001234568).
+    # 0.00123456789 has 9 significant digits. Two related single-precision
+    # error figures, both far above the 1e-12 tolerance below:
+    #   * ~4.94e-11 — the pure float4 round-trip error in Python
+    #     (struct.unpack('f', struct.pack('f', 0.00123456789))).
+    #   * ~9e-11    — the OBSERVED end-to-end Postgres REAL round-trip error
+    #     (binary REAL column -> text -> Python float8), measured against a live
+    #     Postgres 16; ~2x the struct figure because the actual path it
+    #     documents involves the REAL column representation, not just the cast.
+    # The 1e-12 tolerance sits safely below BOTH, so the guard holds regardless
+    # of which figure is "true" for the path. Double precision (float8 / DOUBLE
+    # PRECISION) round-trips this value with ~1e-17 absolute error.
     cost = 0.00123456789
     latency = 9876543.21  # 9 sig digits; single precision rounds to 9876543.0
     run_id = "precision_" + datetime.now(timezone.utc).isoformat()
@@ -1242,10 +1695,13 @@ def test_postgres_cost_usd_double_precision_round_trip(pg_backend):
     out = pg_backend.query(LogQuery(run_id=run_id))
     assert len(out) == 1
     got = out[0]
-    # Absolute tolerance 1e-10 is far tighter than single-precision error (~5e-10
-    # for this value) but comfortably within double-precision error (~1e-17).
-    # This assertion passes only if the column is DOUBLE PRECISION (float8).
-    assert abs(got.cost_usd - cost) < 1e-10, (
+    # Tolerance 1e-12 sits BELOW the single-precision error (~4.94e-11 struct /
+    # ~9e-11 end-to-end Postgres REAL) and far ABOVE the double-precision error
+    # (~1e-17): this assertion FAILS if the column is REAL (float4) and PASSES
+    # only if it is DOUBLE PRECISION (float8). A looser tolerance (e.g. 1e-10 >
+    # 9e-11) would vacuously pass even on REAL, providing no guard for the cost
+    # ledger column — the exact silent-truncation gap this test exists to prevent.
+    assert abs(got.cost_usd - cost) < 1e-12, (
         f"cost_usd round-trip precision loss: stored {cost}, got {got.cost_usd}. "
         "DDL must use DOUBLE PRECISION, not REAL (which is single-precision in Postgres)."
     )

@@ -1164,7 +1164,8 @@ def check_log_backend(agent_root: Path) -> CheckResult:
     # appear in list_log_backends() at startup. Include it as a forward-
     # pointer so an operator who types ``ATOMIC_AGENTS_LOG_BACKEND=postgre``
     # sees ``postgres`` in doctor's Known list — same Step-11-adversarial-
-    # P0-3 mitigation that fixed the locks arc (check_lock_backend:1005).
+    # P0-3 mitigation that fixed the locks arc (the known_ids union with the
+    # lazy ``redis`` id in ``check_lock_backend``).
     known_ids = set(list_log_backends()) | {"postgres"}
     if backend_id not in known_ids:
         return CheckResult(

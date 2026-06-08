@@ -963,3 +963,116 @@ def test_aggregate_two_extra_fields_group_by(backend):
     assert len(result) == 2
     assert result[("us-east", "prod")] == 2
     assert result[("eu-west", "staging")] == 1
+
+
+def test_aggregate_extra_field_key_type_divergence(backend):
+    """aggregate() group_by on an extra (JSONB/JSON) field has a KNOWN, accepted
+    cross-backend key-TYPE divergence — pinned here so it can't drift silently
+    into a parity claim (tracked by #366).
+
+    The Postgres ``->>`` JSONB accessor always yields TEXT; the Filesystem and
+    SQLite backends return the value's NATIVE Python type (``json_extract`` /
+    dict round-trip). String-valued extra fields are identical across all
+    backends (text either way) — which is exactly why the string-only
+    test_aggregate_two_extra_fields_group_by above never surfaced this.
+
+    The divergence — and whether the documented ``str(k)`` operator mitigation
+    actually bridges it — differs by JSON value class. This test pins BOTH the
+    NUMERIC case (``str(k)``-bridgeable) and the BOOLEAN case (NOT bridgeable:
+    three distinct string forms across backends), because a divergence
+    enumeration that pins only numeric would let the spec assert a parity
+    (``str(k)`` portability) that silently fails for booleans. See #366 for the
+    divergence and remediation options.
+
+    Per-backend key shapes for the SAME data (verified against real PG + SQLite):
+      * numeric {'iteration': 1} → ('1',) postgres / (1,) fs+sqlite — str(k) bridges
+      * boolean {'flag': True}   → ('true',) postgres / (1,) sqlite / (True,) fs
+        — str(k) does NOT bridge: 'true' != '1' != 'True'
+    """
+    # ── Numeric arm: str(k)-bridgeable divergence ────────────────────────────
+    backend.append(_make_record(ts=_ts_at(2026, 5, 15, 10), extra={"iteration": 0}))
+    backend.append(_make_record(ts=_ts_at(2026, 5, 15, 11), extra={"iteration": 1}))
+    backend.append(_make_record(ts=_ts_at(2026, 5, 15, 12), extra={"iteration": 1}))
+    result = backend.aggregate(
+        LogQuery(),
+        LogAggregate(group_by=("iteration",), metric="count"),
+    )
+    # Normalize keys to str — the cross-backend-stable view FOR NUMERICS (the
+    # divergence is in key TYPE, not in key string-form or in the counts).
+    by_str = {str(k[0]): v for k, v in result.items()}
+    assert by_str["0"] == 1
+    assert by_str["1"] == 2
+    # Pin the divergence DIRECTION per backend — not a permissive (int|str)
+    # union, which would stay green if Postgres regressed to int keys or
+    # fs/sqlite regressed to str keys (the exact silent drift this test exists to
+    # catch). The Postgres JSONB ``->>`` accessor always yields TEXT; the
+    # Filesystem/SQLite backends return the value's NATIVE Python type.
+    is_postgres = backend.backend_id == "postgres"
+    for raw_key in result:
+        assert isinstance(raw_key, tuple) and len(raw_key) == 1
+        elem = raw_key[0]
+        if is_postgres:
+            assert isinstance(elem, str), (
+                f"postgres ->> must yield TEXT keys; got {type(elem).__name__} "
+                f"{elem!r} (regression: a CAST/normalization crept in?)"
+            )
+            # bool is a subclass of int but not str — guard against a stray bool.
+            assert elem in ("0", "1"), raw_key
+        else:
+            assert isinstance(elem, int) and not isinstance(elem, bool), (
+                f"fs/sqlite must return NATIVE int keys; got "
+                f"{type(elem).__name__} {elem!r} (regression: stringified?)"
+            )
+            assert elem in (0, 1), raw_key
+
+    # ── Boolean arm: str(k)-UNbridgeable divergence (three distinct forms) ────
+    # This is the case the spec's str(k) mitigation does NOT cover, so it is
+    # pinned explicitly rather than left to imply portability that doesn't hold.
+    backend.append(_make_record(ts=_ts_at(2026, 5, 16, 10), extra={"flag": True}))
+    backend.append(_make_record(ts=_ts_at(2026, 5, 16, 11), extra={"flag": True}))
+    backend.append(_make_record(ts=_ts_at(2026, 5, 16, 12), extra={"flag": False}))
+    # Scope to the boolean records via `since` so the earlier numeric records
+    # (no `flag` field) do not add a NULL bucket and confuse the key assertions.
+    bool_result = backend.aggregate(
+        LogQuery(since=datetime(2026, 5, 16, 0, tzinfo=timezone.utc)),
+        LogAggregate(group_by=("flag",), metric="count"),
+    )
+    # Counts are correct on EVERY backend regardless of key shape.
+    counts = sorted(bool_result.values())
+    assert counts == [1, 2], bool_result
+    # Pin the per-backend boolean key shape. bool is a subclass of int, so the
+    # fs (native bool) and sqlite (int) cases must be distinguished by exact
+    # type, not value membership.
+    for raw_key in bool_result:
+        assert isinstance(raw_key, tuple) and len(raw_key) == 1
+        elem = raw_key[0]
+        if is_postgres:
+            # JSONB ->> emits the JSON text literal — NOT '1'/'0', NOT 'True'.
+            assert isinstance(elem, str) and elem in ("true", "false"), (
+                f"postgres bool ->> must yield 'true'/'false'; got "
+                f"{type(elem).__name__} {elem!r}"
+            )
+        elif backend.backend_id == "sqlite":
+            # json_extract yields an int (1/0) for a JSON boolean.
+            assert isinstance(elem, int) and not isinstance(elem, bool), (
+                f"sqlite bool json_extract must yield int 1/0; got "
+                f"{type(elem).__name__} {elem!r}"
+            )
+            assert elem in (0, 1), raw_key
+        else:
+            # Filesystem round-trips the native Python bool.
+            assert isinstance(elem, bool), (
+                f"fs bool must round-trip native bool; got "
+                f"{type(elem).__name__} {elem!r}"
+            )
+    # The mitigation gap is real: str(k) does not collapse these to one form.
+    # (Asserted only off-postgres where we can compute the fs/sqlite str forms
+    # without a live PG; the postgres form is pinned as 'true'/'false' above and
+    # str('true') == 'true' != '1'/'True', so the three-way gap holds.)
+    if not is_postgres:
+        bool_str_keys = {str(k[0]) for k in bool_result}
+        # fs yields {'True','False'}; sqlite yields {'1','0'} — neither equals
+        # postgres's {'true','false'}, so no single str(k) view is portable.
+        assert bool_str_keys & {"true", "false"} == set(), (
+            f"unexpected postgres-shaped bool keys off-postgres: {bool_str_keys}"
+        )
