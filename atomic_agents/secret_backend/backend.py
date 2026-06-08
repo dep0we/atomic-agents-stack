@@ -1,4 +1,4 @@
-"""SecretBackend Protocol -- the contract every secret backend satisfies (spec/37).
+"""SecretBackend Protocol -- the contract every secret backend satisfies (spec/38).
 
 ``SecretBackend`` abstracts credential resolution behind a Protocol so the
 framework's core stays small and alternate secret substrates (GCP Secret
@@ -88,7 +88,7 @@ def _validate_key(key: str) -> None:
 
 
 class SecretError(AtomicAgentsError):
-    """Base class for SecretBackend subsystem errors (spec/37).
+    """Base class for SecretBackend subsystem errors (spec/38).
 
     All SecretBackend reference implementations raise subclasses of this
     exception. Operators may ``except SecretError`` to catch the entire
@@ -108,7 +108,7 @@ class SecretNotFound(SecretError):
 
     The error message names the key and the sources that were searched so
     operators can triage which source to fix. The message MUST NOT include
-    the resolved value under any circumstances (spec/37 secrecy MUST 4).
+    the resolved value under any circumstances (spec/38 secrecy MUST 4).
 
     Example:
         No secret found for key 'ANTHROPIC_API_KEY'. Sources tried (in order):
@@ -134,7 +134,7 @@ class SecretBackendNotRegistered(SecretError):
 
 @runtime_checkable
 class SecretBackend(Protocol):
-    """Contract every secret backend implementation must satisfy (spec/37).
+    """Contract every secret backend implementation must satisfy (spec/38).
 
     Implementations MUST NOT subclass this Protocol -- it is structural.
     Implementations satisfy it by exposing the methods below with the
@@ -150,11 +150,11 @@ class SecretBackend(Protocol):
     are machine-scoped, not agent-scoped. An agent that runs on a machine has
     access to that machine's secrets, regardless of which agent it is.
 
-    No list_secrets() method is present (spec/37 explicit deferral). Add
+    No list_secrets() method is present (spec/38 explicit deferral). Add
     list_secrets() to the Protocol only when a ``atomic-agents secrets list``
     CLI subcommand has a shipped spec that documents the disclosure model.
 
-    No get_all() method returns plaintext values in bulk (spec/37 security).
+    No get_all() method returns plaintext values in bulk (spec/38 security).
     """
 
     # ─── Capability advertisement ─────────────────────────────────────────
@@ -198,7 +198,7 @@ class SecretBackend(Protocol):
         MUST NOT return empty string (empty/whitespace values are treated as
         absent -- same semantics as the original ``_get_key()`` ``if val:`` check).
         MUST NOT include the resolved value in any exception message
-        (spec/37 secrecy MUST 4).
+        (spec/38 secrecy MUST 4).
         """
         ...
 
@@ -221,7 +221,7 @@ class SecretBackend(Protocol):
         Strictly equivalent to ``get_optional(key) is not None``. Backends
         MUST implement ``has()`` as a delegation to ``get_optional()`` (not
         a separate resolution ladder) to guarantee ``has()`` and ``get()``
-        never disagree on a key's presence (spec/37 MUST 8).
+        never disagree on a key's presence (spec/38 MUST 8).
 
         MUST raise ``ValueError`` if ``key`` does not match ``[A-Z0-9_]+``.
         """
@@ -236,7 +236,7 @@ class SecretBackend(Protocol):
 
         MUST raise ``ValueError`` if ``key`` does not match ``[A-Z0-9_]+``.
         MUST NOT include the resolved value in the returned ``SecretRef``
-        (spec/37 secrecy MUST 5). The ``source`` field names the location only.
+        (spec/38 secrecy MUST 5). The ``source`` field names the location only.
         Returns None if the key is absent (parallel to ``get_optional()``
         returning None).
         """

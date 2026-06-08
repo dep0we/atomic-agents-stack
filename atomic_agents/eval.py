@@ -935,7 +935,7 @@ def _extract_sections(markdown_body: str) -> dict[str, str]:
 def _provider_available(model_id: str) -> bool:
     """Check if the provider for a model has a configured API key.
 
-    Delegates to the registered SecretBackend (spec/37) so this function and
+    Delegates to the registered SecretBackend (spec/38) so this function and
     the runtime LLM backends always route through the same credential
     resolution path. Previously contained an inline three-source cascade
     (env → Keychain → keys.json); that logic now lives in

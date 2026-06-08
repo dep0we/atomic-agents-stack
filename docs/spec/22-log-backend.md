@@ -422,7 +422,7 @@ LockBackend operator surface in spec/21 §"Operator surface — NOT a
 2. **Environment variables** — deployment-config operators (Docker,
    launchd, Cloud Run env, gizmo systemd units) set:
    - ``ATOMIC_AGENTS_LOG_BACKEND`` — backend id (default
-     ``filesystem``). Recognized: ``filesystem``, ``sqlite``.
+     ``filesystem``). Recognized: ``filesystem``, ``sqlite``, ``postgres``.
    - ``ATOMIC_AGENTS_LOG_BACKEND_URL`` — connection / path string for
      non-filesystem backends. ``SQLiteLogBackend``'s URL format is
      committed; future Datadog / Loki impls settle theirs. Operators
@@ -464,11 +464,159 @@ A backend that claims ``LogCapabilities.supports_aggregation_pushdown=True`` is 
 
 6. **Aggregation pushdown — ``group_by`` resolution**. ``group_by`` field names that match canonical ``RunRecord`` columns MUST resolve to direct column references in the native ``GROUP BY``. Field names that resolve only through ``record.extra`` MAY raise ``NotImplementedError`` when the backend's primitive doesn't support JSON-extraction (e.g., a backend without a SQL JSON1 equivalent). When the backend does support JSON extraction, the implementer MUST validate ``group_by`` identifiers against an allowlist of safe identifiers (alphanumeric + underscore, ASCII-only) before interpolating into the native query — the reference ``SQLiteLogBackend`` does this at ``sqlite.py:aggregate()``. Operators wanting ``extra``-field group_bys on a pushdown backend that doesn't support JSON extraction MUST either canonicalize the field by promoting it to ``RunRecord`` (Protocol expansion, semver minor) or use the filesystem reference for that query.
 
-7. **Connection / handle management**. Backends MUST be safe to construct, use, and abandon without explicit ``close()``. A ``release()``-equivalent method is not part of the Protocol because the framework's call-site lifecycle (one ``LogBackend`` instance per ``AtomicAgent`` for the agent's full life) doesn't have a deterministic teardown point. Backends with limited connection pools (Postgres, HTTP) MUST use ``threading.local`` or a connection-pool library that handles thread-life-tied cleanup automatically. The reference ``SQLiteLogBackend`` uses ``threading.local`` for per-thread connections; the WAL journal mode lets the kernel reclaim connections on thread exit without explicit close.
+7. **Connection / handle management**. Backends MUST be safe to construct, use, and abandon without their data being corrupted or a single abandoned instance leaking unbounded resources within one process lifetime — a ``release()``-equivalent method is not part of the Protocol because the framework's call-site lifecycle (one ``LogBackend`` instance per ``AtomicAgent`` for the agent's full life) doesn't have a deterministic teardown point. Backends with limited connection pools (Postgres, HTTP) MUST scope connections per-thread (e.g. ``threading.local``) or use a connection-pool library. **Two cases:** (a) backends whose driver connections ARE reclaimed by the kernel/runtime on thread exit (e.g. the reference ``SQLiteLogBackend`` under WAL journal mode) need no explicit close; (b) backends whose driver connections are NOT reclaimed on thread exit (e.g. psycopg, whose ``threading.local`` connections persist until ``close()`` or GC ``__del__``) MUST expose a ``close()`` method AND their implementer documentation MUST state that operators with churning worker-thread pools call ``close()`` in teardown to avoid accumulating server-side connections. The reference ``PostgresLogBackend`` is a case-(b) backend (see the non-normative "Connection pool and thread safety" notes below, and the bounded ``psycopg_pool.ConnectionPool`` successor issue #365 for the fleet-scale answer that removes the operator-teardown dependency).
 
 8. **Multi-tenant scoping (deferred to the implementer)**. The Protocol's per-backend ``scope_root`` (passed to the constructor) is the framework's default isolation primitive. Operators who pin a single shared backend across multiple agents rely on ``LogQuery.agent_name`` filtering at the read boundary. Backends with native multi-tenant capabilities (Postgres row-level security, Datadog org tags) MAY enforce additional isolation; the Protocol does not require it but the implementer documentation MUST surface whatever guarantees the backend provides.
 
 The reference ``SQLiteLogBackend`` implementation in ``atomic_agents/logs/sqlite.py`` is the canonical example of this contract. Future Postgres / Datadog / Loki / Cloud Logging adapters should mirror its shape; the conformance suite (``tests/test_log_protocol_conformance.py``) parametrizes across every registered backend so the contract is verified by the same tests that pin ``append`` / ``query`` / ``aggregate`` / ``delete_older_than`` / ``stats`` semantics.
+
+### Postgres implementation notes (non-normative)
+
+These notes are non-normative — they do not extend the MUST count or the spec's
+LOCKED status. They document implementation choices that conform to the existing
+8-MUST Implementer Contract and serve as a reference for the ``PostgresLogBackend``
+implementation in ``atomic_agents/logs/postgres.py`` (Issue #258, PR 1 of N).
+
+**Column types (Postgres-specific)**
+
+| SQLite column          | Postgres equivalent                           | Rationale                                   |
+|------------------------|-----------------------------------------------|---------------------------------------------|
+| ``id INTEGER AUTOINCREMENT`` | ``id BIGSERIAL PRIMARY KEY``           | Postgres has no AUTOINCREMENT keyword       |
+| ``ts TEXT NOT NULL``   | ``ts TEXT NOT NULL``                          | ISO-8601 lex ordering; same TEXT approach   |
+| ``cost_usd REAL`` / ``latency_ms REAL`` | ``cost_usd DOUBLE PRECISION`` / ``latency_ms DOUBLE PRECISION`` | SQLite ``REAL`` is float8 (8-byte double); Postgres ``REAL`` is float4 (4-byte single, ~7 sig digits). ``DOUBLE PRECISION`` (float8) preserves cross-backend value fidelity for cost accounting. |
+| ``extra TEXT NOT NULL DEFAULT '{}'`` | ``extra JSONB NOT NULL DEFAULT '{}'::jsonb`` | Enables ``->>`` operator; no json_extract |
+| ``fallback INTEGER``   | ``fallback BOOLEAN``                          | Postgres native boolean type               |
+| ``critical INTEGER``   | ``critical BOOLEAN``                          | Postgres native boolean type               |
+
+**Cold-start race mitigation (MUST 4)**
+
+The Postgres equivalent of SQLite's ``INSERT OR IGNORE`` is two layers:
+
+1. ``SELECT pg_advisory_xact_lock(key)`` at the start of the schema-init
+   transaction. The xact-scoped variant (not session-scoped) auto-releases on
+   COMMIT/ROLLBACK — no explicit release, no pool-recycle leak.
+2. ``INSERT INTO meta ... ON CONFLICT (key) DO NOTHING`` — idempotent
+   schema_version row insert. Losing the race is a no-op.
+
+The advisory lock key is a stable ``int8`` derived from
+``hashlib.sha256(b"atomic-agents-log-schema-v1").digest()[:8]`` (struct big-endian
+signed int64) so all processes target the same key without coordination.
+
+**psycopg 3 paramstyle**
+
+psycopg 3 uses ``%s`` positional placeholders (paramstyle ``'pyformat'``), NOT
+``?`` (paramstyle ``'qmark'`` — that is sqlite3). Every parameterized statement
+in ``postgres.py`` uses ``%s``. The ``ANY(%s)`` idiom with a list parameter is
+the idiomatic Postgres IN-list pattern (avoids N-placeholder string construction).
+
+**JSONB extra column — aggregation**
+
+The SQLite ``json_extract(extra, '$.FIELD')`` expression becomes ``(extra->>'FIELD')``
+in Postgres (JSONB text accessor). The SQL injection guard (alphanumeric + underscore
+allowlist) applies identically. ``(extra->>'FIELD')`` returns TEXT for all values;
+callers needing numeric aggregation on extra fields must CAST explicitly.
+
+**Known cross-backend divergence — extra-field group_by KEY TYPE (#366).**
+This is a real, accepted gap in v1.0, called out here rather than left implied:
+``aggregate(group_by=(<extra-field>,))`` returns dict keys of a DIFFERENT TYPE
+depending on the registered backend. Postgres ``->>`` always yields TEXT; the
+Filesystem and SQLite reference backends return the value's NATIVE Python type
+(``json_extract`` / dict round-trip). The divergence — and whether the
+documented ``str(k)`` mitigation actually bridges it — is per JSON value class
+for the SAME data:
+
+| extra value class | Postgres key | SQLite key | Filesystem key | `str(k)` bridges? |
+|---|---|---|---|---|
+| numeric `{'iteration': 1}` | `('1',)` | `(1,)` | `(1,)` | **Yes** — `str(1) == '1'` |
+| float `{'ratio': 1.5}` | `('1.5',)` | `(1.5,)` | `(1.5,)` | **Yes** — `str(1.5) == '1.5'` |
+| string `{'env': 'prod'}` | `('prod',)` | `('prod',)` | `('prod',)` | n/a — identical |
+| **boolean** `{'flag': True}` | `('true',)` | `(1,)` | `(True,)` | **No** — `'true' != '1' != 'True'` |
+
+So the general "the same records produce the same stats regardless of which
+backend is registered" property holds for canonical-column group_bys and for
+string extra fields, and is RECOVERABLE via ``str(k)`` for numeric and float
+extra fields — but does NOT hold for booleans, where the three backends yield
+three distinct string forms (Postgres emits the JSON text literal ``'true'``,
+SQLite's ``json_extract`` returns an int, Filesystem round-trips a Python
+``bool``) that no single coercion reconciles. ``->>`` cannot know the operator's
+intended type, so a blind CAST would be a guess; the divergence is pinned by
+``test_aggregate_extra_field_key_type_divergence`` in the conformance suite
+(which forces it to be a deliberate edit, not silent drift) and tracked for
+remediation by #366. Dashboards grouping on a NUMERIC or FLOAT extra field MUST
+coerce keys with ``str(k)`` to stay backend-portable until #366 lands; BOOLEAN
+extra fields are NOT backend-portable for group_by under any coercion until #366
+lands.
+
+No GIN index on ``extra`` is created — hot append path (27+ ``_log()`` calls per
+``agent.call()``); speculative GIN would double write latency. File a successor
+issue with a concrete benchmark requirement if JSON-path query performance becomes
+load-bearing.
+
+**Connection pool and thread safety**
+
+``threading.local`` with individual ``psycopg.connect()`` calls — one TCP
+connection per OS thread per ``PostgresLogBackend`` instance. psycopg 3
+connections are NOT thread-safe; per-thread connections are required.
+``max_connections_used = N_instances × max_threads_per_instance``. Keep this
+below ``Postgres max_connections - 5`` (reserved for admin connections). A
+bounded ``psycopg_pool.ConnectionPool`` layer for fleet operators is successor
+issue #365.
+
+Unlike SQLite (WAL lets the kernel reclaim per-thread connections on thread
+exit), psycopg connections held via ``threading.local`` are NOT released on
+thread exit — they persist until ``backend.close()`` is called or GC runs
+``__del__``. Operators with churning worker-thread pools MUST call ``close()``
+in teardown/shutdown to avoid accumulating server-side connections; the bounded
+``psycopg_pool.ConnectionPool`` successor issue #365 is the fleet-scale answer.
+This is exactly the case-(b) carve-out in the normative Implementer Contract
+MUST 7 above — ``PostgresLogBackend`` is a case-(b) backend, so it exposes
+``close()`` and this paragraph is the implementer documentation MUST 7 requires.
+
+**Three-layer credential redaction**
+
+This is the first credentialed-URL backend; every future Postgres/Redis/Loki
+adapter copies this contract:
+
+(A) ``_redact_dsn(url)`` strips credentials from any logged/echoed URL.
+(B) Connections opened with explicit keyword args (``host=``, ``port=``,
+    ``dbname=``, ``user=``, ``password=``) — psycopg never builds a DSN
+    string that it can echo internally. ``psycopg`` logger suppressed to
+    ``WARNING`` at backend construction.
+(C) Credentials come only via ``ATOMIC_AGENTS_LOG_BACKEND_URL`` parsed at
+    construction; the full raw URL string is not retained (only the redacted
+    ``_safe_url`` is stored). Note: the password component IS stored as the
+    ``_password`` instance attribute for driver use — ``__dict__`` / debugger
+    introspection can expose it. Wrap in a ``SecretStr`` with a custom
+    ``__repr__`` if repr-level protection is required.
+
+**Capability values**
+
+``streaming=False`` — mirrors SQLite. Reserved; file a successor issue with a
+named trigger if a streaming path (Datadog-class GB query windows) becomes
+needed. ``durable=True``, ``supports_aggregation_pushdown=True``,
+``supports_retention=True``.
+
+**size_bytes in stats()**
+
+Always ``None``. Postgres stores data remotely; no local file to stat. The spec
+allows ``None`` for backends without a disk shape. Operators who want storage
+size can query ``pg_total_relation_size('run_records')`` via psql directly.
+
+**Conformance test count update**
+
+After adding ``PostgresLogBackend`` to ``BACKEND_FACTORIES``, the conformance
+suite produces 48 × 3 = 144 parametrized invocations in CI (was 48 × 2 = 96
+locally). Verified: ``uv run pytest tests/test_log_protocol_conformance.py
+--collect-only -q`` reports 96 collected (48 tests × 2 local backends).
+The Postgres factory is gated on ``ATOMIC_AGENTS_TEST_POSTGRES_URL`` env var
+so it runs in CI (service container sets the var) and skips locally without
+Postgres. ``tests/test_log_postgres_backend.py`` holds 53 Postgres-specific tests:
+mock-cursor tests that pin internal SQL generation and connection lifecycle
+(run unconditionally), plus real-DB integration tests gated on
+``ATOMIC_AGENTS_TEST_POSTGRES_URL`` that exercise Protocol semantics against a
+live service container (skipped locally). The conformance contract itself is
+verified by the 48 parametrized conformance tests in
+``tests/test_log_protocol_conformance.py``, not by this file.
 
 ## Reserved future capabilities
 
@@ -490,12 +638,14 @@ future expansions don't need a breaking Protocol change:
 
 The conformance suite:
 
-* ``tests/test_log_protocol_conformance.py`` — 46 tests parametrized
-  via a ``backend_factory`` fixture across both reference backends
-  (``FilesystemLogBackend`` + ``SQLiteLogBackend``). 92 total test
-  invocations (46 × 2). Third-party backends import the
-  ``BACKEND_FACTORIES`` list to verify their own conformance against
-  the same contract. Tests cover: Protocol surface, append semantics
+* ``tests/test_log_protocol_conformance.py`` — 48 tests parametrized
+  via a ``backend_factory`` fixture across the reference backends
+  (``FilesystemLogBackend`` + ``SQLiteLogBackend`` locally; plus
+  ``PostgresLogBackend`` in CI when ``ATOMIC_AGENTS_TEST_POSTGRES_URL``
+  is set). 96 local invocations (48 × 2); 144 in CI (48 × 3).
+  Third-party backends import the ``BACKEND_FACTORIES`` list to verify
+  their own conformance against the same contract. Tests cover:
+  Protocol surface, append semantics
   (persist / no-dedup / no-mutate / empty-string round-trip /
   arbitrary primitive), every query filter (run_id, primitive
   single/tuple, status, model, since/until inclusive boundary,
@@ -505,16 +655,17 @@ The conformance suite:
   LAST, zero, more-than-total, negative-raises, empty-backend),
   aggregate (count, sum_cost_usd, sum_input_tokens int-type,
   sum_output_tokens int-type, unknown-metric ValueError,
-  avg_latency None-bucket, empty group_by), retention (removes
-  old records, idempotent, strictly-before boundary, empty-backend,
-  rejects naive datetime), stats (with records, empty backend),
-  capabilities (type + behavior parity).
+  avg_latency None-bucket, empty group_by, two-extra-field group_by,
+  numeric-extra-field key-type divergence #366),
+  retention (removes old records, idempotent, strictly-before boundary,
+  empty-backend, rejects naive datetime), stats (with records, empty
+  backend), capabilities (type + behavior parity).
 * ``tests/test_log_filesystem_backend.py`` — 22 filesystem-specific
   tests (on-disk path mapping, byte-for-byte legacy reader compat,
   ``atomic_append_jsonl`` integration, retention rewrite atomicity,
   multi-file tail walk, ``extra``-field aggregation, registry
   resolution, URL credential redaction).
-* ``tests/test_log_sqlite_backend.py`` — 31 SQLite-specific tests
+* ``tests/test_log_sqlite_backend.py`` — 33 SQLite-specific tests
   (schema creation + version tracking + version-mismatch refusal +
   cold-start race idempotency, six indexes, WAL journal mode,
   round-trip preserves every RunRecord field with extra JSON,
@@ -525,6 +676,22 @@ The conformance suite:
   RuntimeWarning, _CANONICAL_COLUMNS derivation from
   RunRecord.__dataclass_fields__, empty-string round-trip
   preservation, registry resolution).
+* ``tests/test_log_postgres_backend.py`` — 53 Postgres-specific tests
+  (mock-cursor tests for SQL generation, schema init cold-start race,
+  advisory lock, credential redaction including query-string credentials,
+  unencoded TLS-path preservation, and unencoded-slash / unencoded-hash /
+  unencoded-question-mark-in-password (no-leak / no-crash, in both the
+  _redact_dsn output and the construction-time ValueError), a credential-less
+  URL carrying an '@' in a query value constructs (port-gated detection, not
+  refused) while a real special-char password with an explicit port is still
+  rejected without leak, threading.local
+  isolation, JSONB extra-field round-trip, aggregate JSONB ->> operator,
+  cost_usd DOUBLE PRECISION round-trip guard, URL parsing edge cases,
+  make_postgres_backend_from_url, close() idempotency lifecycle,
+  transparent one-shot reconnect on a not-yet-flagged connection drop,
+  at-most-once append (NO retry on a commit-phase connection drop, so a
+  lost-commit-ack never doubles an audit row), doctor known-id recognition,
+  registry resolution, schema-version-mismatch real-Postgres refusal).
 * ``tests/test_log_integration.py`` — 19 wiring integration tests
   pinning ``AtomicAgent.log_backend`` public attribute + kwarg
   override, primitive derivation from legacy trigger, byte-for-byte
@@ -532,8 +699,29 @@ The conformance suite:
   DreamRunner kwarg threading, sum_cost routing, dashboard load_runs
   routing, count_provenance wiring, doctor PASS/FAIL/URL-redaction.
 
-Total: 124 LogBackend-arc tests + 92 parametrized invocations =
-**216 test runs** verifying the Protocol contract.
+Total: 127 LogBackend-arc tests + 96 local parametrized invocations =
+**223 local test runs** (144 CI parametrized invocations when Postgres
+service container is active).
+
+<!-- Census arithmetic — recompute from `--collect-only`, do not hand-increment:
+     non-conformance arc tests = filesystem 22 + sqlite 33 + postgres 53 +
+     integration 19 = 127.
+     conformance term = 96 = 48 unique funcs x 2 local backends (fs + sqlite).
+     local total = 127 + 96 = 223.
+     CI conformance = 48 x 3 backends (fs + sqlite + postgres) = 144 when the
+     Postgres service container provides ATOMIC_AGENTS_TEST_POSTGRES_URL.
+     Verify (local, Postgres-absent — clamp the env var so the count is
+     deterministic; the conformance file parametrizes the postgres backend at
+     COLLECTION time, so an exported ATOMIC_AGENTS_TEST_POSTGRES_URL changes the
+     conformance term 96 -> 144 and the total 223 -> 271):
+     `env -u ATOMIC_AGENTS_TEST_POSTGRES_URL uv run pytest
+     tests/test_log_protocol_conformance.py
+     tests/test_log_filesystem_backend.py tests/test_log_sqlite_backend.py
+     tests/test_log_postgres_backend.py tests/test_log_integration.py
+     --collect-only -q | tail -1` -> 223 collected.
+     CI/Postgres-present (URL exported): the same command -> 271 collected
+     (127 arc tests + 144 conformance invocations). -->
+
 
 ## Related
 

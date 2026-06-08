@@ -47,8 +47,8 @@ SQLite WAL on NFS is documented-broken by upstream — file-level
 locks don't propagate across NFS clients reliably, producing
 corruption under concurrent writes. Operators with shared-storage
 deployments needing log durability across multiple hosts should
-use a Postgres backend (future PR) or accept the operator-pinned
-SQLite-on-local-disk per-replica deployment shape.
+use the PostgresLogBackend (see atomic_agents/logs/postgres.py, Issue #258)
+or accept the operator-pinned SQLite-on-local-disk per-replica deployment shape.
 
 Cross-agent isolation: when an operator pins ``ATOMIC_AGENTS_LOG_
 BACKEND_URL=sqlite:///shared.db`` to share a single db across
@@ -150,11 +150,27 @@ _CREATE_INDEXES = [
 # Canonical RunRecord field names in INSERT order (matches the
 # CREATE TABLE column order minus ``id``).
 _INSERT_COLUMNS = (
-    "ts", "run_id", "primitive", "status", "summary", "model",
-    "input_tokens", "output_tokens", "cost_usd", "cost_source",
-    "latency_ms", "cache_hit_tokens", "cache_miss_tokens",
-    "mandate_id", "parent_run_id", "parent_agent", "trigger",
-    "agent_name", "fallback", "critical", "extra",
+    "ts",
+    "run_id",
+    "primitive",
+    "status",
+    "summary",
+    "model",
+    "input_tokens",
+    "output_tokens",
+    "cost_usd",
+    "cost_source",
+    "latency_ms",
+    "cache_hit_tokens",
+    "cache_miss_tokens",
+    "mandate_id",
+    "parent_run_id",
+    "parent_agent",
+    "trigger",
+    "agent_name",
+    "fallback",
+    "critical",
+    "extra",
 )
 
 # Precomputed INSERT statement — built once at module load instead of
@@ -218,9 +234,7 @@ class SQLiteLogBackend:
         # SQLite idiom — pay the lock-serialization cost in tests for
         # the convenience of zero on-disk state.
         if self._in_memory:
-            self._shared_conn = sqlite3.connect(
-                ":memory:", check_same_thread=False
-            )
+            self._shared_conn = sqlite3.connect(":memory:", check_same_thread=False)
             # Row factory — caller-friendly column access by name.
             # Matches the on-disk path's setting; without it,
             # _row_to_record's ``row["extra"]`` access fails.
@@ -278,7 +292,7 @@ class SQLiteLogBackend:
                         or attempt == 6
                     ):
                         raise
-                    time.sleep(0.05 * (2 ** attempt))
+                    time.sleep(0.05 * (2**attempt))
             # ``synchronous=NORMAL`` trades a tiny power-loss window
             # for ~3x write throughput vs ``FULL`` — same trade-off
             # Postgres ``synchronous_commit=local`` makes. Acceptable
@@ -318,9 +332,7 @@ class SQLiteLogBackend:
             "INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)",
             ("schema_version", str(_SCHEMA_VERSION)),
         )
-        cur = conn.execute(
-            "SELECT value FROM meta WHERE key = 'schema_version'"
-        )
+        cur = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'")
         row = cur.fetchone()
         # Row MUST exist after INSERT OR IGNORE — either we inserted
         # or another process did. Defensive check for the impossible
@@ -472,10 +484,7 @@ class SQLiteLogBackend:
             group_clause = ""
             select_cols = metric_expr
 
-        sql = (
-            f"SELECT {select_cols} FROM run_records "
-            f"{where_sql} {group_clause}"
-        )
+        sql = f"SELECT {select_cols} FROM run_records {where_sql} {group_clause}"
         conn = self._get_conn()
         rows = conn.execute(sql, params).fetchall()
 
@@ -553,7 +562,9 @@ class SQLiteLogBackend:
         today_start = datetime.combine(today, dt_time.min).astimezone().isoformat()
         today_end = datetime.combine(today, dt_time.max).astimezone().isoformat()
         first_of_month = today.replace(day=1)
-        month_start = datetime.combine(first_of_month, dt_time.min).astimezone().isoformat()
+        month_start = (
+            datetime.combine(first_of_month, dt_time.min).astimezone().isoformat()
+        )
 
         row = conn.execute(
             """
@@ -705,8 +716,12 @@ class SQLiteLogBackend:
             status=row["status"] if row["status"] is not None else "",
             summary=row["summary"] if row["summary"] is not None else "",
             model=row["model"] if row["model"] is not None else "n/a",
-            input_tokens=int(row["input_tokens"]) if row["input_tokens"] is not None else 0,
-            output_tokens=int(row["output_tokens"]) if row["output_tokens"] is not None else 0,
+            input_tokens=int(row["input_tokens"])
+            if row["input_tokens"] is not None
+            else 0,
+            output_tokens=int(row["output_tokens"])
+            if row["output_tokens"] is not None
+            else 0,
             cost_usd=row["cost_usd"],
             cost_source=row["cost_source"],
             latency_ms=row["latency_ms"],
@@ -778,14 +793,13 @@ def make_sqlite_backend_from_url(url: str) -> SQLiteLogBackend:
             "SQLiteLogBackend(:memory:) is non-persistent — all records "
             "are lost on process exit. Use sqlite:///absolute/path/to/db "
             "for durable logging in production.",
-            RuntimeWarning, stacklevel=2,
+            RuntimeWarning,
+            stacklevel=2,
         )
         return SQLiteLogBackend(":memory:")
     parsed = urlparse(url)
     if parsed.scheme != "sqlite":
-        raise ValueError(
-            f"SQLite URL must start with 'sqlite://'; got {url!r}"
-        )
+        raise ValueError(f"SQLite URL must start with 'sqlite://'; got {url!r}")
     # Reject netloc-bearing URLs explicitly — ``sqlite://host/path``
     # is ambiguous (was it a typo for sqlite:///path? sqlite://host:
     # path?). Operators who mistype three slashes as two get a clear
@@ -804,7 +818,5 @@ def make_sqlite_backend_from_url(url: str) -> SQLiteLogBackend:
     # Reject empty or root-only paths — ``sqlite:///`` parses to
     # parsed.path == "/", which is not a usable db file path.
     if not path_str or path_str == "/":
-        raise ValueError(
-            f"SQLite URL has no path component; got {url!r}"
-        )
+        raise ValueError(f"SQLite URL has no path component; got {url!r}")
     return SQLiteLogBackend(Path(path_str))

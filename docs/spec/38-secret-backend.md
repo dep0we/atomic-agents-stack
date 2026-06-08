@@ -1,4 +1,4 @@
-# spec/37: SecretBackend Protocol
+# spec/38: SecretBackend Protocol
 
 > **Status:** DRAFT at PR 1 (issue #340). Conformance suite covers all MUSTs for `FilesystemSecretBackend`. GCP Secret Manager backend ships at PR 2.
 
@@ -6,7 +6,7 @@
 
 ## Origin
 
-Carved out from the credential-resolution pattern established in spec/01 (secrets handling) and formalized as the thirteenth backend protocol. Filed as [#340](https://github.com/dep0we/atomic-agents-stack/issues/340) after v1.0.0 shipped the twelve core protocols. Numbered 37; the spec/23 gap is intentional history: spec/23 was scoped and then superseded before a spec was written. spec/37 is this document. Gap numbering is honest history per the project convention (CLAUDE.md §10: spec docs are not aspirational).
+Carved out from the credential-resolution pattern established in spec/01 (secrets handling) and formalized as the thirteenth backend protocol. Filed as [#340](https://github.com/dep0we/atomic-agents-stack/issues/340) after v1.0.0 shipped the twelve core protocols. Numbered 37; the spec/23 gap is intentional history: spec/23 was scoped and then superseded before a spec was written. spec/38 is this document. Gap numbering is honest history per the project convention (CLAUDE.md §10: spec docs are not aspirational).
 
 **Cross-links:**
 - spec/01. Agent anatomy. Secrets-handling convention: env vars → Keychain → keys.json.
@@ -18,8 +18,8 @@ Carved out from the credential-resolution pattern established in spec/01 (secret
 
 ## Shipping plan (2 PRs)
 
-- **PR 1.** Protocol scaffold + dataclasses + capability advertisement + `FilesystemSecretBackend` reference impl + spec/37 DRAFT + `_get_key()` supersede + all 6 live caller rewires + `check_secret_backend()` doctor check + `atomic-agents secrets check/which/validate` CLI + a full conformance suite plus filesystem-specific and CLI tests.
-- **PR 2.** `GCPSecretManagerBackend` reference impl + `gcp` extra + spec/37 LOCKED.
+- **PR 1.** Protocol scaffold + dataclasses + capability advertisement + `FilesystemSecretBackend` reference impl + spec/38 DRAFT + `_get_key()` supersede + all 6 live caller rewires + `check_secret_backend()` doctor check + `atomic-agents secrets check/which/validate` CLI + a full conformance suite plus filesystem-specific and CLI tests.
+- **PR 2.** `GCPSecretManagerBackend` reference impl + `gcp` extra + spec/38 LOCKED.
 
 ---
 

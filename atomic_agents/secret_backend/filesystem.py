@@ -1,4 +1,4 @@
-"""FilesystemSecretBackend -- reference implementation of SecretBackend (spec/37).
+"""FilesystemSecretBackend -- reference implementation of SecretBackend (spec/38).
 
 Resolves credentials from three machine-scoped sources in fixed priority order:
 
@@ -7,7 +7,7 @@ Resolves credentials from three machine-scoped sources in fixed priority order:
     Source 3: ``~/.config/atomic_agents/keys.json`` (JSON dict keyed by config_key)
 
 All three sources are machine-scoped. No vault-relative paths are used.
-Credentials MUST NOT travel with the vault (spec/37 MUST 2).
+Credentials MUST NOT travel with the vault (spec/38 MUST 2).
 
 The lookup order is fixed and not operator-configurable. New sources are
 appended at the bottom; the existing order is preserved for backward
@@ -66,7 +66,7 @@ _ENV_VAR_TO_KEYCHAIN: dict[str, str] = {
     for var in env_vars
 }
 
-# Machine-scoped config file path -- NEVER vault-relative (spec/37 MUST 2).
+# Machine-scoped config file path -- NEVER vault-relative (spec/38 MUST 2).
 _KEYS_JSON_PATH = Path.home() / ".config" / "atomic_agents" / "keys.json"
 
 
@@ -177,7 +177,7 @@ class FilesystemSecretBackend:
     order. Each ``get()`` call re-resolves from live sources (no caching) for
     rotation awareness and thread safety.
 
-    Machine-scoped sources only -- never vault-relative (spec/37 MUST 2).
+    Machine-scoped sources only -- never vault-relative (spec/38 MUST 2).
     Credentials MUST NOT be stored in or resolved relative to the agent vault
     root, because vault portability would carry credentials with the agent.
 
@@ -361,7 +361,7 @@ class FilesystemSecretBackend:
         return empty/whitespace.
 
         The error message names the key and sources tried, NEVER the resolved
-        value (spec/37 secrecy MUST 4).
+        value (spec/38 secrecy MUST 4).
         """
         _validate_key(key)
         val, _source = self._resolve(key)
@@ -393,7 +393,7 @@ class FilesystemSecretBackend:
         """Return a ``SecretRef`` describing where ``key`` resolves, or None.
 
         MUST NOT include the resolved value in the returned ``SecretRef``
-        (spec/37 secrecy MUST 5). The ``source`` field names the location only.
+        (spec/38 secrecy MUST 5). The ``source`` field names the location only.
         """
         _validate_key(key)
         _val, source = self._resolve(key)

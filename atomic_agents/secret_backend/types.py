@@ -1,6 +1,6 @@
-"""Canonical dataclasses for the SecretBackend Protocol (spec/37).
+"""Canonical dataclasses for the SecretBackend Protocol (spec/38).
 
-Two dataclasses define the secret backend substrate contract (issue #340, spec/37):
+Two dataclasses define the secret backend substrate contract (issue #340, spec/38):
 
 - ``SecretRef`` -- lightweight resolution token returned by ``locate()``;
   carries source metadata, never the resolved secret value.
@@ -29,7 +29,7 @@ class SecretRef:
 
     Carries metadata about where a secret was found. Does NOT include the
     resolved value -- the value is returned separately by ``get()`` /
-    ``get_optional()``. This separation enforces the spec/37 secrecy clauses:
+    ``get_optional()``. This separation enforces the spec/38 secrecy clauses:
     source metadata is safe to log; secret values are not.
 
     Fields:
@@ -43,7 +43,7 @@ class SecretRef:
         - ``"config:~/.config/atomic_agents/keys.json:anthropic"`` — found in keys.json
 
         MUST NOT include the resolved credential value. Names the source
-        location only (spec/37 MUST 5).
+        location only (spec/38 MUST 5).
 
     ``present``: True if the key was found at this source, False otherwise.
         Always True for refs returned by ``locate()`` when the key exists.

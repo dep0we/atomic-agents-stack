@@ -1,4 +1,4 @@
-"""Protocol conformance tests for SecretBackend (spec/37).
+"""Protocol conformance tests for SecretBackend (spec/38).
 
 ~25 conformance tests that exercise every MUST clause against every registered
 SecretBackend implementation.
@@ -135,7 +135,7 @@ def test_locate_raises_value_error_on_invalid_key(backend):
 
 def test_keys_json_path_is_machine_scoped():
     """_KEYS_JSON_PATH MUST resolve under the machine home directory, never
-    under any vault or agent root (spec/37 MUST 2: vault portability would
+    under any vault or agent root (spec/38 MUST 2: vault portability would
     carry credentials).
     """
     keys_path = _fs_module._KEYS_JSON_PATH
@@ -149,7 +149,7 @@ def test_keys_json_path_is_machine_scoped():
 
 def test_keys_json_path_not_relative_to_cwd():
     """_KEYS_JSON_PATH must be absolute — never derived from cwd or a vault
-    root (spec/37 MUST 2).
+    root (spec/38 MUST 2).
     """
     keys_path = _fs_module._KEYS_JSON_PATH
     assert keys_path.is_absolute(), (
@@ -160,7 +160,7 @@ def test_keys_json_path_not_relative_to_cwd():
 
 def test_keys_json_path_uses_expanduser():
     """_KEYS_JSON_PATH must expand the home dir via Path.home() or equivalent,
-    not use a literal path (spec/37 MUST 2 — machine-scoped, portable).
+    not use a literal path (spec/38 MUST 2 — machine-scoped, portable).
     """
     # Path.home() expands ~ correctly; verify the path starts with the
     # actual home dir rather than a literal tilde or the cwd.
@@ -177,7 +177,7 @@ def test_keys_json_path_uses_expanduser():
 
 
 def test_capabilities_is_property(backend):
-    """capabilities MUST be a @property, not a plain method (spec/37 MUST 3)."""
+    """capabilities MUST be a @property, not a plain method (spec/38 MUST 3)."""
     assert isinstance(type(backend).capabilities, property), (
         "backend.capabilities must be a @property — "
         "call sites use backend.capabilities.supports_rotation syntax"

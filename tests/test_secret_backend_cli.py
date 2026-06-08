@@ -1,4 +1,4 @@
-"""CLI integration tests for ``atomic-agents secrets`` subcommands (spec/37).
+"""CLI integration tests for ``atomic-agents secrets`` subcommands (spec/38).
 
 Invokes ``atomic_agents.cli.main(argv=[...])`` directly with explicit argv.
 Uses ``capsys`` for stdout/stderr capture. No --agent-root needed: secrets
@@ -51,7 +51,7 @@ def test_secrets_check_absent_exits_1(capsys, monkeypatch):
 
 
 def test_secrets_check_never_prints_value(capsys, monkeypatch):
-    """check <KEY> MUST NOT print the resolved secret value (spec/37 MUST 6).
+    """check <KEY> MUST NOT print the resolved secret value (spec/38 MUST 6).
 
     ``check`` reports present/absent via ``has()`` only; it MUST NOT call
     ``get()`` or ``get_optional()`` (which return the actual credential).
@@ -131,7 +131,7 @@ def test_secrets_which_absent_exits_1(capsys):
 
 
 def test_secrets_which_never_prints_value(capsys, monkeypatch):
-    """which <KEY> MUST NOT print the secret value — only source label (spec/37 MUST 6).
+    """which <KEY> MUST NOT print the secret value — only source label (spec/38 MUST 6).
 
     The mock backend's get/get_optional are primed to return the real secret so
     that a regression calling a value-returning method would cause the assertion
@@ -187,7 +187,7 @@ def test_secrets_validate_prints_capabilities(capsys, monkeypatch):
 
 
 def test_secrets_validate_never_prints_secret(capsys, monkeypatch):
-    """validate MUST NOT print any credential value (spec/37 MUST 6)."""
+    """validate MUST NOT print any credential value (spec/38 MUST 6)."""
     secret = "sk-ant-validate-should-not-leak"
     monkeypatch.setenv("ANTHROPIC_API_KEY", secret)
     monkeypatch.delenv("ATOMIC_AGENTS_SECRET_BACKEND", raising=False)

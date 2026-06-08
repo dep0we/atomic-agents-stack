@@ -506,7 +506,7 @@ def main(argv: list[str] | None = None) -> int:
     # ── secrets subcommand group ─────────────────────────────────────────
     # Secrets are flat per-deployment (NOT per-agent) so no --agent-root arg.
     # Observability only: check presence, show source, validate. Never prints
-    # secret values (spec/37 secrecy MUSTs 4-6).
+    # secret values (spec/38 secrecy MUSTs 4-6).
     secrets_cmd = sub.add_parser(
         "secrets",
         help="Inspect credential resolution (check presence, show source, validate)",
@@ -582,6 +582,70 @@ def main(argv: list[str] | None = None) -> int:
         help="override ATOMIC_AGENTS_ROOT",
     )
 
+    # ── serve subcommand ──────────────────────────────────────────────────
+    serve_cmd = sub.add_parser(
+        "serve",
+        help="Start the HTTP serve wrapper (requires atomic-agents-stack[serve])",
+        description=(
+            "Expose agent.call() over HTTP for Cloud Run, GKE, Fly.io, Render, "
+            "or any containerized environment. The framework owns the agent loop; "
+            "the operator's infrastructure owns auth, rate limiting, and TLS. "
+            "See docs/spec/37-serve.md and docs/deployment/ for deployment guides."
+        ),
+    )
+    serve_cmd.add_argument(
+        "agent",
+        nargs="?",
+        default=None,
+        help=(
+            "agent name to serve (serves a single agent). "
+            "Omit with --all to serve all agents in the vault."
+        ),
+    )
+    serve_cmd.add_argument(
+        "--all",
+        dest="serve_all",
+        action="store_true",
+        help="serve all agents found in agents-root (mutually exclusive with <agent>)",
+    )
+    serve_cmd.add_argument(
+        "--host",
+        default=None,
+        help=(
+            "bind address (default: 127.0.0.1; override from "
+            "ATOMIC_AGENTS_SERVE_HOST env var or serve.md). "
+            "Use 0.0.0.0 for Cloud Run (requires --allow-no-auth or serve.md "
+            "'## Allow No Auth' when your perimeter is in place)."
+        ),
+    )
+    serve_cmd.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help=(
+            "bind port (default: 8000; override from "
+            "ATOMIC_AGENTS_SERVE_PORT env var or serve.md)"
+        ),
+    )
+    serve_cmd.add_argument(
+        "--allow-no-auth",
+        dest="allow_no_auth",
+        action="store_true",
+        help=(
+            "Explicitly allow serving without a perimeter auth layer. "
+            "Required when binding to a non-loopback address. "
+            "Only use after your perimeter (IAP, ALB, Cloudflare Access, "
+            "Tailscale Serve, etc.) is in place. "
+            'See docs/spec/37-serve.md §"No-auth default".'
+        ),
+    )
+    serve_cmd.add_argument(
+        "--agents-root",
+        dest="agents_root",
+        default=None,
+        help="override ATOMIC_AGENTS_ROOT",
+    )
+
     args = parser.parse_args(argv)
 
     # `review` is a host-only subcommand — no agents-root needed (operates on
@@ -616,6 +680,12 @@ def main(argv: list[str] | None = None) -> int:
     # It does not use the agents-root / agent-name hierarchy.
     if args.cmd == "init":
         return _cmd_init(args)
+
+    # `serve` resolves its own agents_root from --agents-root or env var.
+    # Lazy-imports the serve module so Starlette/uvicorn are not imported
+    # on every CLI invocation (spec/37 MUST 1 — progressive disclosure).
+    if args.cmd == "serve":
+        return _cmd_serve(args)
 
     agents_root = (
         Path(args.agents_root).expanduser().resolve()
@@ -1237,7 +1307,7 @@ def _cmd_secrets(args) -> int:
 
     Secrets are flat per-deployment (not per-agent) so no agent_root is
     needed or accepted. All subcommands are read-only observability:
-    they never print secret values (spec/37 secrecy MUSTs 4-6).
+    they never print secret values (spec/38 secrecy MUSTs 4-6).
 
     Exit codes: 0 on success / key present, 1 on failure / key absent.
     """
@@ -1275,7 +1345,7 @@ def _cmd_secrets(args) -> int:
         if ref is None:
             print(f"{key}: absent (not found in any source)")
             return 1
-        # Print only the source label — NEVER the resolved value (spec/37 MUST 6).
+        # Print only the source label — NEVER the resolved value (spec/38 MUST 6).
         print(f"{key}: {ref.source}")
         return 0
 
@@ -1647,6 +1717,18 @@ def _mcp_registry_uninstall(backend, name: str) -> int:
     # and absent-no-op paths.
     print(f"Uninstalled MCP server {name!r} (or was not present).")
     return 0
+
+
+def _cmd_serve(args) -> int:
+    """Dispatch the `atomic-agents serve` subcommand.
+
+    Lazy-imports the serve module so Starlette + uvicorn are not imported for
+    any other CLI invocation. Matches the lazy-import pattern from _cmd_init.
+    spec/37 MUST 1 (Starlette is opt-in; base import never loads it).
+    """
+    from .serve import run_serve  # noqa: PLC0415 -- intentional lazy import
+
+    return run_serve(args)
 
 
 if __name__ == "__main__":

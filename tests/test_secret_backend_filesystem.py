@@ -1,4 +1,4 @@
-"""Filesystem-specific tests for FilesystemSecretBackend (spec/37).
+"""Filesystem-specific tests for FilesystemSecretBackend (spec/38).
 
 ~10 tests covering the three-source cascade order, Darwin-only Keychain branch,
 keys.json path construction, _get_key redirect wrapper behavior, factory
@@ -495,7 +495,7 @@ def test_filesystem_capabilities_values():
 
 def test_resolve_with_spec_does_not_accept_agent_root():
     """resolve_with_spec must not accept an agent_root parameter — all
-    resolution sources are machine-scoped (spec/37 MUST 2).
+    resolution sources are machine-scoped (spec/38 MUST 2).
 
     Filesystem-specific test: resolve_with_spec is an INTERNAL helper on
     FilesystemSecretBackend, not part of the SecretBackend Protocol.  It is
@@ -529,7 +529,7 @@ def test_resolve_with_spec_accepts_non_posix_env_var_name():
 
     This test pins the divergence as deliberate.  If normalisation is ever
     applied to resolve_with_spec, this test must be updated and the change
-    must be documented as a breaking spec/37 amendment.
+    must be documented as a breaking spec/38 amendment.
     """
     from atomic_agents.secret_backend.backend import _validate_key
     from atomic_agents.secret_backend import SecretNotFound

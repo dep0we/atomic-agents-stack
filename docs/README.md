@@ -14,7 +14,7 @@ A complete answer to: *"How do I build an AI agent (Caldwell, agent-a, agent-b, 
 
 - *has a stable, evolvable identity?*
 - *remembers what it learns across sessions and across years?*
-- *runs the same way whether triggered by a cron job, a Claude skill, or an interactive harness like openclaw?*
+- *runs the same way whether triggered by a cron job, a Claude skill, an interactive harness like openclaw, or an HTTP request to `atomic-agents serve` on Cloud Run?*
 - *gets better over time without rewrites?*
 - *stays portable across model upgrades and platform changes?"*
 

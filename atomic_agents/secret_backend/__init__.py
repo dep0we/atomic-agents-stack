@@ -1,4 +1,4 @@
-"""SecretBackend Protocol and registry (spec/37, issue #340).
+"""SecretBackend Protocol and registry (spec/38, issue #340).
 
 Package name is secret_backend/ (not secrets/) to avoid shadowing the Python
 stdlib secrets module (cryptographic random generation). Mirrors mcp_registry/
@@ -10,7 +10,7 @@ JudgeBackend (#112), LockBackend (#60), LogBackend (#61),
 AgentProfileBackend (#63), ToolRegistryBackend (#64), MandateBackend (#124),
 PolicyBackend (#89), PersonaBackend (#62), CorpusBackend (#65), and
 MCPServerRegistryBackend (#201).
-See ``docs/spec/37-secret-backend.md`` (DRAFT at PR 1) for the prose contract.
+See ``docs/spec/38-secret-backend.md`` (DRAFT at PR 1) for the prose contract.
 
 Public surface:
 
@@ -157,7 +157,7 @@ def get_default_secret_backend() -> SecretBackend:
     LOCK and MCP_SERVER_REGISTRY shipped their _URL companion in the scaffold
     PR. Backend ids: ``"filesystem"`` (shipped), ``"gcp"`` (PR 2).
 
-    See spec/37 §"Operator surface" for the full env-var reference.
+    See spec/38 §"Operator surface" for the full env-var reference.
     """
     raw_backend_id = os.environ.get("ATOMIC_AGENTS_SECRET_BACKEND", "").strip().lower()
 

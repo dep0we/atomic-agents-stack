@@ -167,7 +167,7 @@ def _extract_openai_tool_calls(msg):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Key-resolution helpers — superseded by SecretBackend (spec/37, issue #340).
+# Key-resolution helpers — superseded by SecretBackend (spec/38, issue #340).
 #
 # The credential cascade (env vars → Keychain → keys.json) now lives in
 # ``atomic_agents.secret_backend.FilesystemSecretBackend``.  All six live
@@ -233,7 +233,7 @@ def _get_moonshot_key() -> str:
 
 
 def _get_key(env_vars: list[str], keychain_name: str, config_key: str) -> str:
-    """Thin redirect wrapper — delegates to the registered SecretBackend (spec/37).
+    """Thin redirect wrapper — delegates to the registered SecretBackend (spec/38).
 
     Previously: contained the full env → Keychain → keys.json cascade inline.
     Now: calls ``get_default_secret_backend().resolve_with_spec(...)`` so the

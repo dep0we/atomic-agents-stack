@@ -207,7 +207,7 @@ uv run pytest                            # full suite
 uv run pytest tests/test_<module>.py -v  # one module
 ```
 
-Run `uv run pytest --collect-only -q | tail -1` for the live test count (last refresh: 3,307 tests collected, 2026-06-04). New backend protocols add ~25 conformance + ~10 impl-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol — the conformance suite is what keeps the protocol honest.
+Run `uv run pytest --collect-only -q | tail -1` for the live test count (last refresh: 3,401 tests collected, 2026-06-07). New backend protocols add ~25 conformance + ~10 impl-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol — the conformance suite is what keeps the protocol honest.
 
 ### Releases + SemVer
 
@@ -293,7 +293,7 @@ If the project ever needs to optimize differently, `docs/methodology.md` is the 
 |-----|---------|
 | `docs/architecture.md` | Mental model in diagrams. Read first. |
 | `docs/protocols-shipped.md` | Per-protocol summary of the twelve shipped backends — reference impls, capabilities, operator overrides, doctor checks, Implementer Contracts, and the cliff each closes. |
-| `docs/spec/01-...36-mcp-server-registry-backend.md` | Locked spec (35 docs today, 32 locked + 3 drafts at spec/26 (cascade bundle), spec/30 (responsibility audit), and spec/35 (init wizard)). The product. |
+| `docs/spec/01-...37-serve.md` | Locked spec (36 docs today, 32 locked + 4 RFCs/DRAFTs at spec/26 (cascade bundle), spec/30 (responsibility audit), spec/35 (init wizard), and spec/37 (serve)). The product. |
 | `docs/implementation/` | Build guides per runtime (cron, Claude skill, dashboard) |
 | `docs/deployment/versioning.md`, `upgrading.md` | SemVer + operator runbook |
 | `docs/deployment/release-runbook.md` | Maintainer `/ship` runbook: two-mode workflow + manual surface check |
@@ -342,7 +342,7 @@ These are not forbidden forever — they're explicitly deferred with rationale. 
 
 ## Status
 
-**v1.0.0, stable, PUBLIC.** Core runtime stable. Test suite: run `uv run pytest --collect-only -q | tail -1` for the live count (last refresh: ~3,319-3,325 tests collected, 2026-06-04). Full CI runs against `uv sync --extra dev --extra openai --extra validation --extra redis`. **Twelve backend protocols shipped** — see `docs/protocols-shipped.md` for the per-protocol summary (reference impls, capabilities, operator overrides, doctor checks, Implementer Contracts, and what cliff each closes):
+**v1.0.0, stable, PUBLIC.** Core runtime stable. Test suite: run `uv run pytest --collect-only -q | tail -1` for the live count (last refresh: 3,401 tests collected, 2026-06-07). Full CI runs against `uv sync --extra dev --extra openai --extra validation --extra redis`. **Twelve backend protocols shipped** — see `docs/protocols-shipped.md` for the per-protocol summary (reference impls, capabilities, operator overrides, doctor checks, Implementer Contracts, and what cliff each closes):
 
 | # | Protocol | Issue / Lock | Reference impls |
 |---|----------|--------------|-----------------|
@@ -350,7 +350,7 @@ These are not forbidden forever — they're explicitly deferred with rationale. 
 | 2 | LLMBackend | #87 | Anthropic + OpenAI + Moonshot |
 | 3 | JudgeBackend | #112 PR 4 | PolicyJudge + LLMJudgeBackend |
 | 4 | LockBackend | #60 PR 4 | Filesystem + Redis |
-| 5 | LogBackend | #61 PR 4 | Filesystem + SQLite |
+| 5 | LogBackend | #61 PR 4 | Filesystem + SQLite + Postgres |
 | 6 | AgentProfileBackend | #63 PR 4 | Filesystem + SQLite |
 | 7 | ToolRegistryBackend | #64 PR 4 | Filesystem + SQLite |
 | 8 | PolicyBackend | #89 PR 4 | Filesystem |
