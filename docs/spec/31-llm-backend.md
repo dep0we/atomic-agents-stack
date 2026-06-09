@@ -10,7 +10,7 @@
 
 The shape is the same as the rest of the protocol-pattern series alongside Lock, Log, Persona, AgentProfile, ToolRegistry, and Corpus (spec/34) protocols. The agent runtime — `agent.call()`, the cost gates, the multi-turn tool loop — talks to LLM providers only through canonical types. Backends translate at their own boundaries. Third-party packages implementing the Protocol drop in without forking core.
 
-The framework ships three reference backends. Operators wanting Gemini, Vertex, Bedrock, vLLM-local, etc., either configure a fourth `OpenAICompatibleLLMBackend` instance or ship a 200-line third-party `atomic-agents-<provider>` package satisfying the Protocol. The framework's own surface stays small and auditable.
+The framework ships four reference backends (Anthropic, OpenAI, Moonshot, and Vertex Gemini). Operators wanting Bedrock, vLLM-local, or other providers either configure an `OpenAICompatibleLLMBackend` instance or ship a 200-line third-party `atomic-agents-<provider>` package satisfying the Protocol. The framework's own surface stays small and auditable.
 
 LiteLLM-in-core was considered and rejected (see [the issue body](https://github.com/dep0we/atomic-agents-stack/issues/87) for the six-reason rationale). LiteLLM as a community-maintained third-party `atomic-agents-litellm` adapter is welcome.
 
@@ -24,7 +24,8 @@ atomic_agents/llm/
 ├── backend.py         # SyncLLMBackend Protocol + _RawLLMResponse
 ├── anthropic.py       # AnthropicLLMBackend reference implementation
 ├── openai_compat.py   # OpenAICompatibleLLMBackend (config-driven; OpenAI direct)
-└── moonshot.py        # make_moonshot_backend factory over openai_compat
+├── moonshot.py        # make_moonshot_backend factory over openai_compat
+└── vertex_gemini.py   # VertexGeminiLLMBackend reference implementation (issue #345)
 ```
 
 Mirrors `atomic_agents/memory/{__init__.py, backend.py, filesystem.py}`. The new piece is `types.py` — memory's canonical types live inline in `backend.py` because they're simpler.
@@ -219,7 +220,7 @@ from atomic_agents.llm import (
 )
 ```
 
-The registry is process-local module state keyed by `provider_id`. Lazy default initialization: the framework's three reference backends register on the first `find_backend_for_model` call rather than at module import. Module-import-time registration was the original plan but it broke a timing-sensitive multiprocessing test (the `anthropic` import added ~300ms to subprocess startup).
+The registry is process-local module state keyed by `provider_id`. Lazy default initialization: the framework's four reference backends register on the first `find_backend_for_model` call rather than at module import. Module-import-time registration was the original plan but it broke a timing-sensitive multiprocessing test (the `anthropic` import added ~300ms to subprocess startup).
 
 Third-party packages register at their own import time, typically:
 
@@ -297,6 +298,21 @@ OpenAICompatibleLLMBackend(
 `make_moonshot_backend()` factory configures `OpenAICompatibleLLMBackend` with Moonshot's specifics: matches `moonshot/*` model ids, strips the prefix before SDK call, region-aware `base_url` (`ATOMIC_AGENTS_MOONSHOT_BASE_URL` → `MOONSHOT_BASE_URL` → `https://api.moonshot.cn/v1` default).
 
 The `base_url` is resolved once at backend construction (lazy on first `find_backend_for_model` lookup), not per-call. Operators who want to override after that initial lookup must restart the process or set the env var before importing `atomic_agents`.
+
+### `VertexGeminiLLMBackend` (`atomic_agents/llm/vertex_gemini.py`)
+
+First-party backend for Gemini models accessed through Google Cloud's Vertex AI endpoint. Ships in issue [#345](https://github.com/dep0we/atomic-agents-stack/issues/345).
+
+- `provider_id = "vertex-gemini"`
+- `supports_model(m)` → any `m.startswith("vertex/gemini-")` (scoped to `gemini-` not bare `vertex/` to leave room for the upcoming `vertex/claude-*` backend without prefix collision).
+- Capability table (per-family, honest): tools=True, tool_results=True for flash/pro families; cache_control=**False** for all Vertex Gemini models (Vertex context caching uses a separate resource-based API incompatible with the `CacheDirective` pattern — tracked in [#377](https://github.com/dep0we/atomic-agents-stack/issues/377)); streaming=False (deferred to `StreamingLLMBackend`); vision=**False** for all Vertex Gemini models (the models are multimodal, but `_messages_to_genai_contents` has no image-block translation path yet — advertising vision=True with no behavior behind it would violate conformance rule 4; flips to True per-family once image translation lands, tracked in [#376](https://github.com/dep0we/atomic-agents-stack/issues/376)); per-family `max_input_tokens` / `max_output_tokens` from Vertex docs.
+- `pricing(model_id)` delegates to `_costs.PRICING` keyed under the full `vertex/` prefix (e.g., `vertex/gemini-2.0-flash`) — exactly matching what operators write in `model.md`. Supported entries: `vertex/gemini-2.5-flash`, `vertex/gemini-2.5-pro`, `vertex/gemini-2.0-flash`, `vertex/gemini-2.0-flash-lite`.
+- `count_tokens(...)` uses char/3 heuristic (conservative-pessimistic; Gemini's sentencepiece tokenizer is denser than GPT's BPE — 3 chars/token is safer than 4).
+- `call(...)` uses `google.genai.Client(vertexai=True).models.generate_content()`. Key translation differences from Anthropic/OpenAI: system prompt via `GenerateContentConfig.system_instruction` (NOT a message in the contents list); tool definitions via `FunctionDeclaration` objects; token counts from `response.usage_metadata.prompt_token_count` / `candidates_token_count`. On Vertex AI, thinking/reasoning tokens are reported separately in `usage_metadata.thoughts_token_count` and are NOT included in `candidates_token_count`, so they are added to `output_tokens` — without this addition the `gemini-2.5-flash` / `gemini-2.5-pro` thinking models under-count output (and under-charge) by the entire reasoning volume. Synthetic call IDs are minted from the response part index (`call_<part_index>`) because the SDK does not issue stable IDs; they are NOT guaranteed contiguous-from-zero (an interleaved text part shifts the index), and `format_tool_results` echoes the same id verbatim via `tu.id` rather than re-minting. `cache_hit_tokens` is always 0.
+- `format_tool_results(...)` builds **two** messages mirroring the Anthropic/OpenAI two-turn pattern — a `model`-role echo turn carrying interim `assistant_text` plus one `function_call` part per non-`atomic_capture` tool_use, followed by a `user`-role turn with one `function_response` part per result. The model-role echo is required: Vertex requires every `function_response` to be immediately preceded by its matching `function_call` in history, else iteration 2 of a tool loop is rejected `400 INVALID_ARGUMENT`. (Differs from OpenAI's N `role:tool` messages; differs from Anthropic's tool_result blocks.)
+- Auth: Application Default Credentials (ADC) only in PR 1. Express-mode API-key auth deferred to [#378](https://github.com/dep0we/atomic-agents-stack/issues/378). Operators set `GOOGLE_CLOUD_PROJECT` (required on dev machines; auto-resolved on Cloud Run / GKE) and optionally `GOOGLE_CLOUD_LOCATION` (default: `us-central1`).
+- `doctor check_vertex_credentials()` resolves ADC + mints an OAuth token via `credentials.refresh(Request())` — proves credentials are usable without a billable LLM call.
+- Optional dependency: `google-genai>=1.0` (`[vertex]` extra in pyproject.toml).
 
 ## Tool definition / tool result translation
 

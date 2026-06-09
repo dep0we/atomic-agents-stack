@@ -16,7 +16,7 @@ Filesystem reference impl + conformance suite. The Protocol-pattern template eve
 
 ## LLMBackend (#87)
 
-Anthropic + OpenAI + Moonshot reference impls, registered at framework import; conformance suite parametrizes across all three.
+Anthropic + OpenAI + Moonshot + Vertex Gemini reference impls, registered lazily on the first `find_backend_for_model` lookup (not at module import — spec/31; Vertex Gemini behind the optional `[vertex]` extra, skipped with a DEBUG log when `google-genai` is absent); conformance suite parametrizes across all four.
 
 ---
 
