@@ -1,0 +1,55 @@
+# Cloud Armor security policy — rate limiting + basic WAF
+#
+# Apply to the load balancer backend service in front of Cloud Run + IAP.
+# This policy runs BEFORE IAP, so unauthenticated flood traffic is blocked
+# at the edge before reaching the IAP authentication layer.
+#
+# Apply:
+#   gcloud compute backend-services update <your-agent-name>-backend \
+#     --global \
+#     --security-policy <policy-name>
+#
+# The rules below are a starting point. Tune thresholds for your traffic
+# profile; agent.call() can take 5-120s so per-IP burst allowances should
+# account for legitimate concurrent users, not just bots.
+
+rules:
+  # Rule 1000: rate limit per IP — blocks burst traffic before IAP.
+  # Tune count + interval for your expected interactive usage.
+  - priority: 1000
+    description: "Rate limit: 20 requests per minute per IP"
+    match:
+      versionedExpr: SRC_IPS_V1
+      config:
+        srcIpRanges:
+          - "*"
+    action: rate_based_ban
+    rateLimitOptions:
+      conformAction: allow
+      exceedAction: deny(429)
+      enforceOnKey: IP
+      rateLimitThreshold:
+        count: 20
+        intervalSec: 60
+      banDurationSec: 300
+
+  # Rule 2000: block XSS-pattern request payloads via a preconfigured WAF
+  # signature. Preconfigured WAF rules run on the standard Cloud Armor tier
+  # (Managed Protection Plus / Adaptive Protection is a separate, paid
+  # IP-threat-intelligence feature — not required for this rule).
+  - priority: 2000
+    description: "Block XSS-pattern request payloads (preconfigured WAF)"
+    match:
+      expr:
+        expression: "evaluatePreconfiguredWaf('xss-v33-stable')"
+    action: deny(403)
+
+  # Rule 3000: allow all other traffic (passes to IAP for authentication).
+  - priority: 3000
+    description: "Default allow — IAP handles authentication"
+    match:
+      versionedExpr: SRC_IPS_V1
+      config:
+        srcIpRanges:
+          - "*"
+    action: allow

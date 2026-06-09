@@ -1,0 +1,79 @@
+# Cloud Scheduler jobs — scheduled triggers for atomic-agents on Cloud Run
+#
+# Cloud Scheduler authenticates to Cloud Run using an OIDC token
+# (Authorization: Bearer <token>), NOT the X-Goog-IAP-JWT-Assertion header
+# that the serve layer reads for caller identity. As a result, scheduler-
+# triggered calls have NO http_caller field in the JSONL audit record.
+#
+# To distinguish scheduled runs from interactive runs in a compliance audit:
+# filter on trigger=http combined with the absence of http_caller, or
+# correlate with Cloud Scheduler execution logs in Cloud Logging.
+#
+# PREREQUISITE: The Cloud Scheduler service account must have
+# roles/run.invoker on the specific Cloud Run service:
+#
+#   gcloud run services add-iam-policy-binding <your-agent-name> \
+#     --member=serviceAccount:SCHEDULER_SA@PROJECT.iam.gserviceaccount.com \
+#     --role=roles/run.invoker \
+#     --region=REGION
+#
+# If the scheduler job logs 403, verify the service account has
+# roles/run.invoker on THIS specific Cloud Run service (not just project-level).
+#
+# INGRESS RECONCILIATION (important): cloudrun-service.yaml and iap-setup.md set
+# run.googleapis.com/ingress = internal-and-cloud-load-balancing, which BLOCKS
+# direct requests to the run.app service URL — including Cloud Scheduler's OIDC
+# call below. With that ingress lock you have two options:
+#   (a) Route Scheduler through the external load balancer / IAP instead of the
+#       run.app URL. The request then carries the IAP identity header, so the
+#       "no http_caller" note above no longer holds for scheduled runs — they
+#       WOULD carry the IAP-asserted identity. Configure IAP to allow the
+#       scheduler service account principal.
+#   (b) Relax ingress to "all" (or "internal-and-cloud-load-balancing" plus an
+#       allow rule that admits Scheduler) ONLY if you accept direct run.app
+#       reachability. Not recommended when IAP is your perimeter.
+# As written below, the direct-run.app-URL path assumes ingress permits it;
+# pick one topology and keep cloudrun-service.yaml, iap-setup.md, and this file
+# consistent.
+
+jobs:
+  - name: projects/<your-project-id>/locations/<region>/jobs/<your-agent-name>-daily
+    description: "Daily run of <your-agent-name>"
+    schedule: "0 9 * * *"
+    timeZone: "America/Chicago"
+
+    httpTarget:
+      uri: "https://YOUR_CLOUD_RUN_SERVICE_URL/agents/<your-agent-name>/call"
+      httpMethod: POST
+      headers:
+        Content-Type: "application/json"
+      body: "eyJ3b3JrX2l0ZW0iOiAiRGFpbHkgcnVuIn0="
+      # Body is base64-encoded JSON: {"work_item": "Daily run"}
+      # work_item is the required request field (spec/37 §request shape);
+      # there is no "prompt" alias — an absent/empty work_item returns HTTP 422.
+      # Encode your own: echo -n '{"work_item": "..."}' | base64
+
+      oidcToken:
+        serviceAccountEmail: "SCHEDULER_SA@<your-project-id>.iam.gserviceaccount.com"
+        # audience MUST match your Cloud Run service URL exactly.
+        # Copy from Cloud Run console > Service URL. No trailing slash.
+        # A mismatch causes HTTP 401 on every trigger (silent config error).
+        audience: "https://YOUR_CLOUD_RUN_SERVICE_URL"
+
+    retryConfig:
+      # If agent.call() takes longer than the schedule interval, Cloud Run
+      # returns HTTP 503 LockBusy and Cloud Scheduler retries. Set retryCount=0
+      # or increase the schedule interval to prevent thundering-herd duplicate
+      # trigger attempts against the same agent lock.
+      retryCount: 0
+      # Set maxDoublings and minBackoffDuration if you prefer retries with
+      # backoff over no-retry. Ensure minBackoffDuration exceeds the expected
+      # agent.call() runtime to avoid concurrent trigger pile-up.
+      # minBackoffDuration: "300s"
+      # maxDoublings: 1
+
+    # Do not set min-instances=0 on the Cloud Run service while scheduler
+    # triggers are active without confirming that the healthz endpoint responds
+    # within the scheduler HTTP timeout. A cold start during the scheduler
+    # window means the first invocation may time out before the instance warms,
+    # triggering retries before the first run completes.

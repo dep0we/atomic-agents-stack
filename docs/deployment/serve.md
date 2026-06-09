@@ -205,8 +205,10 @@ CMD ["sh", "-c", "atomic-agents serve myagent --host 0.0.0.0 --port ${PORT:-8080
 Put IAP in front of the Cloud Run service so `--allow-no-auth` is safe — IAP
 handles authentication before traffic reaches the container.
 
-A complete `cloudbuild.yaml` + Cloud Run service definition is out of scope
-here; see the GCP documentation for IAP-protected Cloud Run services.
+For a complete Cloud Run service definition, IAP setup, Cloud Scheduler
+triggers, and observability config, see
+[`extras/gcp/`](../../extras/gcp/README.md) — the GCP-as-harness reference
+deployment.
 
 ---
 
