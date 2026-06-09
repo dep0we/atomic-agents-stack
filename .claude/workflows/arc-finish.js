@@ -38,6 +38,24 @@ const SHORTCUT_SCHEMA = {
   } } },
 }
 
+// Tier A governing-doc tripwire — same hard rule as arc-execute: a convergence
+// pass must NEVER amend a CLAUDE.md principle / TENSIONS.md entry unattended,
+// even while fixing findings. Deterministic halt, not implementer self-report.
+const TRIPWIRE_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['tripped', 'paths', 'detail'],
+  properties: {
+    tripped: { type: 'boolean' },
+    paths: { type: 'array', items: { type: 'string' } },
+    detail: { type: 'string' },
+  },
+}
+async function governingDocTripwire(stage) {
+  return await agent(
+    `Tier A GUARDRAIL CHECK for issue ${ISSUE} (deterministic — judge only whether a governing doc was touched, not whether the change is good). Read only; edit/revert nothing. Run \`git --no-pager diff ${BASE} -- docs/TENSIONS.md CLAUDE.md\`. Set \`tripped:true\` if docs/TENSIONS.md changed at all, OR CLAUDE.md changed inside its governing region (throughline, "## Design principles", any "### N." principle incl. Principle #1, or the aesthetic rules). A change ONLY to CLAUDE.md's status / backend-count / "Where things live" tables is routine doc-accounting — NOT a trip. Report offending paths + a one-line detail.`,
+    { schema: TRIPWIRE_SCHEMA, label: `tripwire:${stage}`, phase: 'Review', model: 'sonnet' },
+  )
+}
+
 phase('Review')
 let round = 0
 let lastFixDiff = SEED.length
@@ -57,6 +75,10 @@ affected tests and confirm they pass AND actually exercise the changed code path
 test that invokes the real surface, not just imports it). For any item you judge already-resolved, verify it against the
 current code (\`git diff ${BASE}\`) before dismissing it.
 KNOWN-OPEN: ${JSON.stringify(SEED, null, 2)}
+HARD RULE — NO EXCEPTIONS: never edit a governing doc to satisfy a finding. Do not touch docs/TENSIONS.md, and do not edit
+CLAUDE.md's throughline, "## Design principles" section, any "### N." principle, or the aesthetic rules (the status /
+backend-count table is fine). If a finding seems to require amending a principle, leave it unfixed and say so in your summary —
+that is the maintainer's call, shipped as its own docs PR; this run will halt on it.
 Return a one-line description of the diff you produced.`,
     { label: 'seed-fix', phase: 'Review', model: 'opus' },
   )
@@ -127,6 +149,10 @@ BLOCKING (P0/P1) findings — all must be fixed: ${JSON.stringify(blocking, null
 BLOCKING (P0/P1) shortcuts — non-negotiable, all must be fixed: ${JSON.stringify(blockingShortcuts, null, 2)}
 NON-BLOCKING P2s (findings + shortcuts) — fix if cheap, fine to skip: ${JSON.stringify(p2s, null, 2)}
 
+HARD RULE — NO EXCEPTIONS: do not resolve any finding by editing a governing doc. Never touch docs/TENSIONS.md, and never
+edit CLAUDE.md's throughline, "## Design principles" section, any "### N." principle, or the aesthetic rules (status /
+backend-count table is fine). If the right fix appears to be amending a principle, leave it and flag it — this run halts on
+governing-doc edits and returns them to the maintainer.
 Return a one-line description of the diff you produced (becomes the next round's review focus).`,
     { label: `fix:r${round}`, phase: 'Review', model: 'opus' },
   )
@@ -147,9 +173,30 @@ phase('DocSweep')
 const sweep = await agent(
   `Run a /document-release-style sweep for issue ${ISSUE}: scan README "What's shipped" tables, CHANGELOG [Unreleased],
 spec docs, CLAUDE.md status block, and package metadata for stale markers, count drift, or claims that no longer match the
-branch. Return concrete FIX_NOW items with their fixes, and apply them.`,
+branch. Return concrete FIX_NOW items with their fixes, and apply them. HARD RULE: do not edit CLAUDE.md design principles /
+throughline / aesthetic rules or docs/TENSIONS.md — status / backend-count tables only.`,
   { schema: FINDINGS_SCHEMA, label: 'doc-sweep', phase: 'DocSweep', model: 'sonnet' },
 )
+
+// Deterministic governing-doc tripwire before declaring pr-ready — catches any
+// principle/TENSIONS edit introduced by the seed-fix, a round-fix, or the sweep.
+const finTrip = await governingDocTripwire('pre-pr-ready')
+if (finTrip?.tripped) {
+  log(`HALT: governing-doc tripwire fired (${(finTrip.paths || []).join(', ')}) — a framework-principle/TENSIONS edit must be the maintainer's, shipped as its own docs PR. NOT pr-ready.`)
+  return {
+    issue: ISSUE, status: 'blocked-on-decision', rounds: roundLog, reportedP2s,
+    newTierAForks: [{
+      title: 'Convergence pass edited a governing doc (CLAUDE.md principle / TENSIONS.md) — must be maintainer-ruled',
+      why: finTrip.detail || 'governing-doc tripwire',
+      options: [
+        'Maintainer rules the change; it ships as its own docs PR (decision content may be sound — separate from the autonomy boundary)',
+        'Revert the governing-doc edit from this branch and re-run',
+      ],
+    }],
+    tripwire: finTrip,
+    note: 'Converged on findings but a governing-doc edit tripped the Tier A guardrail. NOTHING merged.',
+  }
+}
 
 return {
   issue: ISSUE, status: 'pr-ready', converged: true, rounds: roundLog,
