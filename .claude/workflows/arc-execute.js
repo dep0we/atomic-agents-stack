@@ -100,6 +100,39 @@ const SHORTCUT_SCHEMA = {
   },
 }
 
+// Tier A governing-doc tripwire. A bot must NEVER author a framework-principle
+// amendment unattended (the #345 build wrote a CLAUDE.md Principle #1 / TENSIONS
+// T15 amendment + filed an issue WITHOUT halting — the judgment-based halt missed
+// it). This makes the halt deterministic: any edit to a governing doc forces a
+// halt-and-return regardless of what the implementer self-reported. The decision
+// content may be sound — that is not the point; a Tier A governing-doc change is
+// the maintainer's to rule, shipped as its own docs PR.
+const TRIPWIRE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['tripped', 'paths', 'detail'],
+  properties: {
+    tripped: { type: 'boolean' },
+    paths: { type: 'array', items: { type: 'string' } },
+    detail: { type: 'string' },
+  },
+}
+
+async function governingDocTripwire(stage) {
+  return await agent(
+    `Tier A GUARDRAIL CHECK for issue ${ISSUE} (deterministic — do NOT judge whether any change is good; only whether it touches a governing doc). Read only; edit/revert nothing. Diff against the base branch \`main\` so the check catches changes whether the build committed them or left them uncommitted in the working tree. Run:
+  git --no-pager diff main --stat
+  git --no-pager diff main -- docs/TENSIONS.md
+  git --no-pager diff main -- CLAUDE.md
+Set \`tripped: true\` if EITHER holds:
+  (1) docs/TENSIONS.md has ANY change (new/edited tension, ledger row, date, cross-ref), OR
+  (2) CLAUDE.md changed inside its GOVERNING region — the throughline, the "## Design principles" section, any "### N." principle (esp. Principle #1 "the vault is the source of truth"), or the aesthetic rules.
+A change ONLY to CLAUDE.md's status / backend-count table or the "Where things live" table is routine doc-accounting — that is NOT a trip; set tripped:false for those.
+Report the offending paths + a one-line detail of what region changed.`,
+    { schema: TRIPWIRE_SCHEMA, label: `tripwire:${stage}`, phase: 'Implement', model: 'sonnet' },
+  )
+}
+
 // ---- Phase 1: prep fan-out ---------------------------------------------
 phase('Prep')
 const prep = (await parallel(PREP_DIMENSIONS.map(d => () =>
@@ -128,7 +161,13 @@ surface goes unrun. A green suite that never executes the new code path is NOT a
 adversarial reviewer will expose. Run \`uv run pytest\` on your new tests AND confirm they actually invoke the new code.
 CRITICAL: if you hit a NEW material decision (anything matching a Tier A tripwire) that the maintainer did NOT rule on, DO NOT
 decide it. Stop work on that thread, leave it unimplemented, and record it in newTierAForks. A silent material decision
-is a worse outcome than an incomplete branch.`,
+is a worse outcome than an incomplete branch.
+HARD RULE — NO EXCEPTIONS: you may NEVER edit a governing doc. Do not touch docs/TENSIONS.md, and do not edit CLAUDE.md's
+throughline, "## Design principles" section, any "### N." principle, or the aesthetic rules. (Updating CLAUDE.md's
+status / backend-count table is fine — that is routine doc-accounting.) If the work seems to require amending a principle or
+recording a tension, that is the single most Tier A decision possible: STOP, leave it unwritten, and record it in
+newTierAForks for the maintainer to rule and ship as its own docs PR. Amending the framework's governing docs unattended is
+never acceptable, even when the change looks correct.`,
   { schema: IMPL_SCHEMA, label: 'implement', phase: 'Implement', model: 'sonnet' },
 )
 
@@ -136,6 +175,28 @@ is a worse outcome than an incomplete branch.`,
 if (impl?.newTierAForks?.length) {
   log(`HALT: implementer hit ${impl.newTierAForks.length} unforeseen Tier A fork(s) — returning to the maintainer, no merge.`)
   return { issue: ISSUE, status: 'blocked-on-decision', newTierAForks: impl.newTierAForks, impl }
+}
+
+// Deterministic governing-doc tripwire — does NOT rely on the implementer self-reporting.
+// Catches the failure where the build amended a CLAUDE.md principle / TENSIONS.md entry
+// without flagging it (the #345 gap). Halt-and-return for the maintainer regardless.
+const implTrip = await governingDocTripwire('post-implement')
+if (implTrip?.tripped) {
+  log(`HALT: governing-doc tripwire fired (${(implTrip.paths || []).join(', ')}) — a framework-principle/TENSIONS edit must be the maintainer's, shipped as its own docs PR.`)
+  return {
+    issue: ISSUE,
+    status: 'blocked-on-decision',
+    newTierAForks: [{
+      title: 'Build edited a governing doc (CLAUDE.md principle / TENSIONS.md) — must be maintainer-ruled',
+      why: implTrip.detail || 'governing-doc tripwire',
+      options: [
+        'Maintainer rules the change; it ships as its own docs PR (decision content may be sound — that is separate from the autonomy boundary)',
+        'Revert the governing-doc edit from this branch and proceed with the rest of the build',
+      ],
+    }],
+    tripwire: implTrip,
+    impl,
+  }
 }
 
 // ---- Phase 3: adversarial review IN ROUNDS (rule 11) --------------------
