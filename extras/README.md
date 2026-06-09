@@ -11,6 +11,7 @@ Everything here is **portable** — no hardcoded paths, no host-specific assumpt
 | [`claude-code-skills/`](claude-code-skills/) | SKILL.md files for [Claude Code](https://claude.com/claude-code) | Anyone running agents from inside Claude Code |
 | [`launchd/`](launchd/) | macOS LaunchAgent `.plist` templates | macOS users who want agents to run on schedule |
 | [`cron/`](cron/) | Crontab examples + a portable shell wrapper | Linux users (or macOS users who prefer cron over launchd) |
+| [`gcp/`](gcp/) | Cloud Run + IAP + Cloud Scheduler reference deployment | Operators deploying to Google Cloud (GCP-as-harness pattern) |
 
 ## Prerequisites
 
@@ -24,6 +25,7 @@ All of these assume:
 - **"I want to run an agent on a schedule."** → [`launchd/`](launchd/) on macOS, [`cron/`](cron/) on Linux.
 - **"I want to run agent commands from Claude Code."** → [`claude-code-skills/`](claude-code-skills/), copy the skills you want into `~/.claude/skills/`.
 - **"I want to bake this into my CI."** → look at `claude-code-skills/atomic-agents-eval/SKILL.md` — the underlying CLI invocations work in any CI runner.
+- **"I want to deploy an agent to Google Cloud."** → [`gcp/`](gcp/) — Cloud Run + IAP + Cloud Scheduler reference deployment (GCP-as-harness pattern).
 
 ## Versioning
 

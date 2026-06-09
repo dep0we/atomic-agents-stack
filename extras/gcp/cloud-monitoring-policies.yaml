@@ -1,0 +1,115 @@
+# Cloud Monitoring alert policies for atomic-agents-stack on Cloud Run
+#
+# IMPORTANT: The JSONL audit trail (run_id, cost_usd, status, etc.) lives in
+# the LogBackend (Cloud SQL or persistent disk), NOT in Cloud Logging.
+# Cloud Run forwards only stdout/stderr to Cloud Logging; the framework's
+# _log() path writes to log_backend.append() with no Python logger call.
+#
+# These policies use Cloud Run request-count metrics (HTTP response codes),
+# NOT log-based metrics on JSONL fields. Log-based JSONL filters will never
+# fire against Cloud Logging for this deployment.
+#
+# See extras/gcp/cloud-logging-config.md for the full explanation.
+#
+# Field-name authority for RunRecord fields: docs/spec/22-log-backend.md
+# §"RunRecord — the unit of work".
+
+# ── 1. Cost guardrail breach (HTTP 402) ─────────────────────────────────────
+# Signal path: agent.call() returns Response(skipped=True) →
+# serve layer returns HTTP 402 (spec/37 §"Skipped response (HTTP 402)") →
+# Cloud Run request_count metric records response_code=402.
+#
+# Filter: resource.type="cloud_run_revision" AND response_code=402.
+# Reference: spec/37 §"Skipped response (HTTP 402)".
+#
+# If you use PostgresLogBackend (#258), you can also query Cloud SQL directly
+# for RunRecord.status = "skipped" to see cost_usd and the skip reason. The
+# authoritative, prefix-independent filter is status = 'skipped' (both skip
+# paths set it). There is no skip_reason column; the reason is embedded in the
+# "summary" text, and the text differs by skip site: "Skipped: <reason>" for a
+# pre-loop skip, "cost cap hit at iteration N: <reason>" for a mid-loop skip.
+# Do NOT filter summary by a "Skipped:" prefix or you will drop the mid-loop
+# record (the run that burned real tokens THEN hit the cap). The HTTP 402
+# response body additionally exposes the reason under the "reason" JSON key
+# (sourced from the Response.skip_reason attribute in the serve layer).
+# See cloud-logging-config.md §"Querying the JSONL audit trail" for detail.
+- displayName: "Cost guardrail breach — HTTP 402"
+  combiner: OR
+  conditions:
+    - displayName: "Cloud Run 402 response rate"
+      conditionThreshold:
+        filter: >
+          resource.type = "cloud_run_revision"
+          AND resource.labels.service_name = "<your-agent-name>"
+          AND metric.type = "run.googleapis.com/request_count"
+          AND metric.labels.response_code = "402"
+        comparison: COMPARISON_GT
+        thresholdValue: 0
+        duration: 60s
+        aggregations:
+          - alignmentPeriod: 60s
+            perSeriesAligner: ALIGN_SUM
+  alertStrategy:
+    notificationRateLimit:
+      period: 3600s
+  # Attach a notification channel (email, PagerDuty, etc.) via the GCP console.
+  # notificationChannels: []
+
+# ── 2. Agent error rate (HTTP 500) ───────────────────────────────────────────
+- displayName: "Agent error — HTTP 500"
+  combiner: OR
+  conditions:
+    - displayName: "Cloud Run 500 response rate"
+      conditionThreshold:
+        filter: >
+          resource.type = "cloud_run_revision"
+          AND resource.labels.service_name = "<your-agent-name>"
+          AND metric.type = "run.googleapis.com/request_count"
+          AND metric.labels.response_code = "500"
+        comparison: COMPARISON_GT
+        thresholdValue: 0
+        duration: 60s
+        aggregations:
+          - alignmentPeriod: 60s
+            perSeriesAligner: ALIGN_SUM
+
+# ── 3. Lock busy / double-trigger (HTTP 503) ─────────────────────────────────
+# HTTP 503 means the agent lock was held when the request arrived (LockBusy).
+# Common cause: Cloud Scheduler fires while a previous run is still in flight.
+# See cloudscheduler-jobs.yaml.example §retryConfig for the fix.
+- displayName: "Agent lock busy — HTTP 503"
+  combiner: OR
+  conditions:
+    - displayName: "Cloud Run 503 response rate"
+      conditionThreshold:
+        filter: >
+          resource.type = "cloud_run_revision"
+          AND resource.labels.service_name = "<your-agent-name>"
+          AND metric.type = "run.googleapis.com/request_count"
+          AND metric.labels.response_code = "503"
+        comparison: COMPARISON_GT
+        thresholdValue: 5
+        duration: 300s
+        aggregations:
+          - alignmentPeriod: 60s
+            perSeriesAligner: ALIGN_SUM
+
+# ── 4. Instance count deviation from 1 ───────────────────────────────────────
+# v0 must run exactly 1 instance (persistent disk ReadWriteOnce constraint).
+# Alert if the instance count drops to 0 (scale-to-zero misconfiguration,
+# container crash loop) or rises above 1 (max-instances misconfiguration).
+- displayName: "Instance count out of v0 range (expected: 1)"
+  combiner: OR
+  conditions:
+    - displayName: "Instance count != 1"
+      conditionThreshold:
+        filter: >
+          resource.type = "cloud_run_revision"
+          AND resource.labels.service_name = "<your-agent-name>"
+          AND metric.type = "run.googleapis.com/container/instance_count"
+        comparison: COMPARISON_NE
+        thresholdValue: 1
+        duration: 120s
+        aggregations:
+          - alignmentPeriod: 60s
+            perSeriesAligner: ALIGN_MEAN
