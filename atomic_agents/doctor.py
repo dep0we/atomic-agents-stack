@@ -87,6 +87,15 @@ _PROVIDER_KEYS = {
         "moonshot",
         "openai",  # _llm._call_moonshot reuses the openai SDK with a base_url
     ),
+    # Vertex AI — ADC auth, not a string API key. check_provider_keys routes
+    # vertex-gemini to check_vertex_credentials() rather than _get_key().
+    # sdk_module="google.genai" triggers the [vertex] extra import check first.
+    "vertex-gemini": (
+        None,  # no Keychain entry — ADC, not a key secret
+        [],  # no env vars for the key itself (GOOGLE_CLOUD_PROJECT is project config)
+        None,  # no keys.json entry
+        "google.genai",  # [vertex] optional extra
+    ),
 }
 
 
@@ -494,9 +503,10 @@ def _provider_for_model(model_id: str) -> str | None:
     """Map a model id to its provider name.
 
     Convention follows _costs.PRICING keys:
-        claude-*       → anthropic
-        gpt-*          → openai
-        moonshot/*     → moonshot
+        claude-*           → anthropic
+        gpt-*              → openai
+        moonshot/*         → moonshot
+        vertex/gemini-*    → vertex-gemini
 
     Returns None for ids that don't match any known provider prefix.
     """
@@ -508,6 +518,10 @@ def _provider_for_model(model_id: str) -> str | None:
         return "openai"
     if model_id.startswith("moonshot/"):
         return "moonshot"
+    # vertex/gemini-* → vertex-gemini (scoped to gemini- to avoid collision
+    # with future vertex/claude-* which will be a separate backend)
+    if model_id.startswith("vertex/gemini-"):
+        return "vertex-gemini"
     return None
 
 
@@ -558,14 +572,21 @@ def _check_one_provider_key(provider: str) -> CheckResult:
         try:
             __import__(sdk_module)
         except ImportError as e:
-            extra = "openai" if sdk_module == "openai" else sdk_module
+            # Map sdk_module import name → pyproject.toml optional-extra name
+            _sdk_to_extra = {"openai": "openai", "google.genai": "vertex"}
+            # Map sdk_module import name → PyPI distribution name (the import
+            # path and the pip name diverge for google.genai → google-genai;
+            # copy-pasting the import path into `pip install` 404s).
+            _sdk_to_pip = {"openai": "openai", "google.genai": "google-genai"}
+            extra = _sdk_to_extra.get(sdk_module, sdk_module)
+            pip_name = _sdk_to_pip.get(sdk_module, sdk_module)
             return CheckResult(
                 name=f"provider-keys[{provider}]",
                 status=FAIL,
                 message=f"{provider} requires the {sdk_module!r} package, which is not installed",
                 fix_hint=(
                     f"Install the optional extra: uv add 'atomic-agents-stack[{extra}]'\n"
-                    f"  Or: pip install {sdk_module}"
+                    f"  Or: pip install {pip_name}"
                 ),
                 detail={
                     "provider": provider,
@@ -573,6 +594,11 @@ def _check_one_provider_key(provider: str) -> CheckResult:
                     "underlying_error": str(e),
                 },
             )
+
+    # Vertex AI uses ADC (Application Default Credentials) rather than an API
+    # key string. Route to the dedicated credential check instead of _get_key().
+    if provider == "vertex-gemini":
+        return check_vertex_credentials()
 
     # Reuse the production resolver so the doctor verdict and runtime
     # behaviour can never disagree on key resolution.
@@ -608,6 +634,152 @@ def _check_one_provider_key(provider: str) -> CheckResult:
     )
 
 
+def check_vertex_credentials() -> CheckResult:
+    """Verify that Vertex AI Application Default Credentials (ADC) are usable.
+
+    Closes the false-PASS gap (credentials object != usable credentials):
+    calls ``credentials.refresh(Request())`` to mint an access token — a
+    metadata-server round-trip that proves ADC actually works without making
+    a billable LLM generation call.
+
+    This check is intentionally NOT a generate_content() or count_tokens()
+    call — those are billable LLM operations and doctor must never trigger
+    unguarded LLM cost (CLAUDE.md rule #4: every code path that calls an
+    LLM has a cost gate; doctor runs outside agent.call() and has no gate).
+
+    WARN (not FAIL) when GOOGLE_CLOUD_PROJECT is absent: on Cloud Run / GKE
+    the project is resolved from the metadata server automatically. The absence
+    of the env var does not mean ADC is broken on those platforms.
+    """
+    # Step 1: SDK import check (google-genai = [vertex] extra)
+    try:
+        import google.genai  # noqa: F401 — confirms [vertex] extra installed
+    except ImportError as e:
+        return CheckResult(
+            name="provider-keys[vertex-gemini]",
+            status=FAIL,
+            message="google-genai SDK not installed (required for vertex-gemini)",
+            fix_hint=(
+                "Install the [vertex] extra:\n"
+                "  uv add 'atomic-agents-stack[vertex]'\n"
+                "  Or: pip install google-genai"
+            ),
+            detail={"missing_sdk": "google.genai", "underlying_error": str(e)},
+        )
+
+    # Step 2: ADC resolution — does a credentials object exist at all?
+    # Import submodules into local names to avoid attribute-lookup issues when
+    # sys.modules is patched in tests (google.auth vs google module attribute).
+    try:
+        import google.auth as _gauth
+        import google.auth.exceptions as _gauth_exc
+        import google.auth.transport.requests as _gauth_requests
+    except ImportError as e:
+        return CheckResult(
+            name="provider-keys[vertex-gemini]",
+            status=FAIL,
+            message=f"google-auth not installed: {e}",
+            fix_hint=(
+                "Install the [vertex] extra:\n"
+                "  uv add 'atomic-agents-stack[vertex]'\n"
+                "  Or: pip install google-auth google-genai"
+            ),
+            detail={"underlying_error": str(e)},
+        )
+
+    try:
+        project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+        credentials, detected_project = _gauth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+    except _gauth_exc.DefaultCredentialsError as e:
+        return CheckResult(
+            name="provider-keys[vertex-gemini]",
+            status=FAIL,
+            message="Vertex AI ADC credentials not found",
+            fix_hint=(
+                "Run one of:\n"
+                "  gcloud auth application-default login    (local dev)\n"
+                "  Set GOOGLE_APPLICATION_CREDENTIALS to a service account key file\n"
+                "  Deploy to Cloud Run / GKE with a service account attached\n"
+                "Also set: export GOOGLE_CLOUD_PROJECT='<your-gcp-project-id>'"
+            ),
+            detail={"underlying_error": str(e)},
+        )
+    except Exception as e:
+        return CheckResult(
+            name="provider-keys[vertex-gemini]",
+            status=FAIL,
+            message=f"Vertex AI ADC resolution failed: {type(e).__name__}: {e}",
+            fix_hint=(
+                "Run: gcloud auth application-default login\n"
+                "And set: export GOOGLE_CLOUD_PROJECT='<your-gcp-project-id>'"
+            ),
+            detail={"underlying_error": str(e)},
+        )
+
+    # Step 3: Token mint — proves the credentials object is actually usable,
+    # not just that one was constructed. Uses credentials.refresh() which hits
+    # the OAuth metadata server (not a Vertex generation endpoint — not billable).
+    try:
+        request = _gauth_requests.Request()
+        credentials.refresh(request)
+    except _gauth_exc.TransportError as e:
+        return CheckResult(
+            name="provider-keys[vertex-gemini]",
+            status=FAIL,
+            message=f"Vertex AI ADC token refresh failed (network error): {e}",
+            fix_hint=(
+                "Check network connectivity to Google's OAuth endpoint.\n"
+                "On GCE/Cloud Run this is automatic; on dev machines ensure\n"
+                "you have run: gcloud auth application-default login"
+            ),
+            detail={"underlying_error": str(e)},
+        )
+    except Exception as e:
+        return CheckResult(
+            name="provider-keys[vertex-gemini]",
+            status=FAIL,
+            message=f"Vertex AI ADC token refresh failed: {type(e).__name__}: {e}",
+            fix_hint=(
+                "Re-authenticate: gcloud auth application-default login\n"
+                "Or check that your service account key file is valid."
+            ),
+            detail={"underlying_error": str(e)},
+        )
+
+    # Step 4: Project env var check — WARN only (not FAIL) because Cloud Run /
+    # GKE auto-resolves the project from the metadata server.
+    effective_project = project or detected_project
+    detail: dict = {
+        "provider": "vertex-gemini",
+        "project": effective_project,
+        "token_valid": True,
+    }
+    if not project:
+        return CheckResult(
+            name="provider-keys[vertex-gemini]",
+            status=WARN,
+            message=(
+                "Vertex AI ADC token minted successfully, but GOOGLE_CLOUD_PROJECT "
+                "env var is not set"
+            ),
+            fix_hint=(
+                "On dev machines, set: export GOOGLE_CLOUD_PROJECT='<your-gcp-project-id>'\n"
+                "On Cloud Run / GKE, the project is resolved from the metadata server "
+                "automatically — this warning can be ignored in those environments."
+            ),
+            detail=detail,
+        )
+
+    return CheckResult(
+        name="provider-keys[vertex-gemini]",
+        status=PASS,
+        message=f"Vertex AI ADC credentials valid; project={effective_project!r}",
+        detail=detail,
+    )
+
+
 def check_model(model_data: dict) -> CheckResult:
     """default_model is in PRICING; if guardrails enabled, caps are non-zero."""
     default_model = model_data.get("default_model", "")
@@ -622,14 +794,28 @@ def check_model(model_data: dict) -> CheckResult:
             ),
         )
     if default_model not in PRICING:
+        # Provider-specific fix_hint: vertex/* model ids get ADC instructions,
+        # not API-key or PRICING-list instructions.
+        if default_model.startswith("vertex/"):
+            fix = (
+                f"The model {default_model!r} is not in the pricing table. "
+                "Add it to atomic_agents/_costs.py PRICING under the 'vertex/' prefix "
+                "with current rates from https://cloud.google.com/vertex-ai/pricing. "
+                "Known Vertex Gemini entries: "
+                + ", ".join(
+                    k for k in sorted(PRICING.keys()) if k.startswith("vertex/")
+                )
+            )
+        else:
+            fix = (
+                f"Use one of {sorted(PRICING.keys())}, or add {default_model!r} "
+                "to atomic_agents/_costs.py PRICING with current rates."
+            )
         return CheckResult(
             name="model",
             status=FAIL,
             message=f"default_model {default_model!r} is not in the pricing table",
-            fix_hint=(
-                f"Use one of {sorted(PRICING.keys())}, or add {default_model!r} "
-                "to atomic_agents/_costs.py PRICING with current rates."
-            ),
+            fix_hint=fix,
             detail={"default_model": default_model},
         )
 

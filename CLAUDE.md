@@ -348,7 +348,7 @@ These are not forbidden forever — they're explicitly deferred with rationale. 
 | # | Protocol | Issue / Lock | Reference impls |
 |---|----------|--------------|-----------------|
 | 1 | MemoryBackend | #57 | Filesystem |
-| 2 | LLMBackend | #87 | Anthropic + OpenAI + Moonshot |
+| 2 | LLMBackend | #87 | Anthropic + OpenAI + Moonshot + Vertex Gemini |
 | 3 | JudgeBackend | #112 PR 4 | PolicyJudge + LLMJudgeBackend |
 | 4 | LockBackend | #60 PR 4 | Filesystem + Redis |
 | 5 | LogBackend | #61 PR 4 | Filesystem + SQLite + Postgres |

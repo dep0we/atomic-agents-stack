@@ -455,7 +455,7 @@ flowchart TB
             <dt><strong>MemoryBackend</strong> — atomic notes, INDEX, wiki, capture</dt>
             <dd>Default: filesystem. Future: Postgres + pgvector for semantic search at scale.</dd>
             <dt><strong>LLMBackend</strong> — the language-model call itself</dt>
-            <dd>Three reference impls register at framework import: Anthropic, OpenAI (direct), Moonshot. Third-party Gemini / Bedrock / Vertex / vLLM-local backends can register without forking core.</dd>
+            <dd>Four reference impls register lazily on the first model lookup (not at module import): Anthropic, OpenAI (direct), Moonshot, Vertex Gemini (optional [vertex] extra). Third-party Bedrock / vLLM-local backends can register without forking core.</dd>
             <dt><strong>JudgeBackend</strong> — the safety layer from Section 3</dt>
             <dd>PolicyJudge (rule engine, microseconds, always-on) + LLMJudgeBackend (slower, smarter, lazy-skipped if no key resolves).</dd>
             <dt><strong>LockBackend</strong> — prevents two copies of the same agent from clobbering each other</dt>
