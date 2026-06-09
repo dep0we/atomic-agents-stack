@@ -38,7 +38,7 @@ When you can't tell whether a design move helps both — stop, name the tradeoff
        Skills (lazy)        Evals              Helper provenance
        MCP (external)       Tuning             Delegation rollup
        Memory (Notes+Wiki)  Goals              Cost tracking
-       Journal              Delegation (tree-cap)
+       Journal              Delegation (tree-cap) OTel tracing seam 🟡
                             Helpers (cheap parallel)
                                 │
                   Backend Protocols (the moat)
@@ -208,7 +208,7 @@ uv run pytest                            # full suite
 uv run pytest tests/test_<module>.py -v  # one module
 ```
 
-Run `uv run pytest --collect-only -q | tail -1` for the live test count (last refresh: 3,534 tests collected, 2026-06-08). New backend protocols add ~25 conformance + ~10 impl-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol — the conformance suite is what keeps the protocol honest.
+Run `uv run pytest --collect-only -q | tail -1` for the live test count (last refresh: 3,558 tests collected, 2026-06-08). New backend protocols add ~25 conformance + ~10 impl-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol — the conformance suite is what keeps the protocol honest.
 
 ### Releases + SemVer
 
@@ -294,7 +294,7 @@ If the project ever needs to optimize differently, `docs/methodology.md` is the 
 |-----|---------|
 | `docs/architecture.md` | Mental model in diagrams. Read first. |
 | `docs/protocols-shipped.md` | Per-protocol summary of the twelve shipped backends — reference impls, capabilities, operator overrides, doctor checks, Implementer Contracts, and the cliff each closes. |
-| `docs/spec/01-...38-secret-backend.md` | Locked spec (37 docs today, 32 locked + 5 RFCs/DRAFTs at spec/26 (cascade bundle), spec/30 (responsibility audit), spec/35 (init wizard), spec/37 (serve), and spec/38 (secret-backend)). The product. |
+| `docs/spec/01-...39-otel-export.md` | Locked spec (38 docs today, 32 locked + 6 RFCs/DRAFTs at spec/26 (cascade bundle), spec/30 (responsibility audit), spec/35 (init wizard), spec/37 (serve), spec/38 (secret-backend), and spec/39 (otel-export)). The product. |
 | `docs/implementation/` | Build guides per runtime (cron, Claude skill, dashboard) |
 | `docs/deployment/versioning.md`, `upgrading.md` | SemVer + operator runbook |
 | `docs/deployment/release-runbook.md` | Maintainer `/ship` runbook: two-mode workflow + manual surface check |
@@ -343,7 +343,7 @@ These are not forbidden forever — they're explicitly deferred with rationale. 
 
 ## Status
 
-**v1.0.0, stable, PUBLIC.** Core runtime stable. Test suite: run `uv run pytest --collect-only -q | tail -1` for the live count (last refresh: 3,534 tests collected, 2026-06-08). Full CI runs against `uv sync --extra dev --extra openai --extra validation --extra redis`. **Twelve backend protocols locked at v1.0; SecretBackend (#340), the thirteenth, in progress for v1.5 (PR 1 of 2)** — see `docs/protocols-shipped.md` for the per-protocol summary (reference impls, capabilities, operator overrides, doctor checks, Implementer Contracts, and what cliff each closes):
+**v1.0.0, stable, PUBLIC.** Core runtime stable. Test suite: run `uv run pytest --collect-only -q | tail -1` for the live count (last refresh: 3,558 tests collected, 2026-06-08). Full CI runs against `uv sync --extra dev --extra openai --extra validation --extra redis`. **Twelve backend protocols locked at v1.0; SecretBackend (#340), the thirteenth, in progress for v1.5 (PR 1 of 2)** — see `docs/protocols-shipped.md` for the per-protocol summary (reference impls, capabilities, operator overrides, doctor checks, Implementer Contracts, and what cliff each closes):
 
 | # | Protocol | Issue / Lock | Reference impls |
 |---|----------|--------------|-----------------|
