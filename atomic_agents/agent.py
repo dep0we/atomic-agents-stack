@@ -33,7 +33,7 @@ _logger = logging.getLogger(__name__)
 
 import frontmatter
 
-from . import _capture, _cascade, _costs, _llm
+from . import _capture, _cascade, _costs, _llm, tracing as _tracing
 from ._io import safe_resolve_under
 from .memory.filesystem import FilesystemBackend
 from .memory.backend import WritePolicy
@@ -3308,6 +3308,182 @@ class AtomicAgent:
         if not self._run_id_pinned:
             self.run_id = self._generate_run_id()
 
+        # ── OTel instrumentation seam (spec/39 MUST 1 / MUST 3) ─────────────
+        # Span opened AFTER run_id reset so atomic_agents.run_id carries the
+        # correct fresh id for this invocation.
+        #
+        # Teardown discipline (spec/39 MUST 3: span MUST be ended on ALL exit
+        # paths). We use start_span + context.attach rather than
+        # start_as_current_span to avoid re-indenting the entire method body.
+        # That manual pattern means WE own end()+detach(). Teardown has TWO
+        # finalize sites, both calling the idempotent `_finalize_call_span()`:
+        #   (1) the lock-acquire except clauses below, for the lock_busy and
+        #       non-LockBusy acquire failures that raise BEFORE the body try is
+        #       entered (so they can never reach the body finally), and
+        #   (2) the body `try/finally`, for every path that reaches the body —
+        #       normal return, exception, pre-loop cost-skip, mid-loop cost-cap.
+        # The `_span_ended` flag makes `_finalize_call_span()` a no-op if a path
+        # already finalized, so the early-exit paths that set their own outcome
+        # attributes do NOT double-end.
+        #
+        # PR 1 scope note: only the parent atomic_agents.call span is emitted.
+        # Child spans (llm, tool, helper, delegate) are deferred to a later PR of
+        # this arc — see docs/spec/39-otel-export.md §Scope.
+        #
+        # The accumulators below are declared up-front (NameError guard) so the
+        # finalizer can always read them regardless of where an exception fires —
+        # including BEFORE the body try is entered (a lock-acquire failure) and
+        # AFTER real LLM spend (a raise mid/post-loop, which carries the true
+        # partial spend because the loop re-syncs these per iteration). spec/39
+        # MUST 1.
+        _call_total_cost: float = 0.0
+        _call_input_tokens: int = 0
+        _call_output_tokens: int = 0
+        _call_tool_iterations: int = 0
+        _call_model: str = self.config.default_model
+        _call_response: "Response | None" = None
+        _span_ended: bool = False
+
+        # Open the agent.call span. spec/39 MUST 3: the OPEN path is as
+        # non-throwing as the finalizer. Once a host process installs a real SDK
+        # provider, start_span() runs every SpanProcessor.on_start synchronously
+        # and the set_attribute calls run under SpanLimits — any can raise. This
+        # block sits BEFORE the lock acquire and BEFORE the body try/finally, so
+        # an unguarded fault here would crash call() before ANY agent_call audit
+        # JSONL line is written (Principle 5 — audit trail is structural) and a
+        # tracing-infra fault would abort the real invocation. On failure we fall
+        # back to a non-recording sentinel span + a None context token so the rest
+        # of call() proceeds and _finalize_call_span() no-ops safely.
+        # Exception (not BaseException) so KeyboardInterrupt / SystemExit still
+        # propagate, mirroring the finalizer.
+        _call_ctx_token: object | None = None
+        try:
+            _call_span = _tracing.get_tracer().start_span(_tracing.SPAN_AGENT_CALL)
+            _call_ctx_token = _tracing._otel_ctx.attach(
+                _tracing._otel_trace.set_span_in_context(_call_span)
+            )
+            _call_span.set_attribute(_tracing.ATTR_AGENT_NAME, self.name)
+            _call_span.set_attribute(_tracing.ATTR_TRIGGER, self.trigger)
+            _call_span.set_attribute(_tracing.ATTR_RUN_ID, self.run_id)
+            _call_span.set_attribute(_tracing.ATTR_MODEL, self.config.default_model)
+        except Exception:
+            _logger.warning(
+                "atomic_agents tracing: failed to open call span "
+                "(swallowed; spec/39 MUST 3)",
+                exc_info=True,
+            )
+            # If start_span succeeded but a later step raised, _call_span is a real
+            # span that was never ended; detach any token we managed to attach and
+            # end it before falling back, so neither leaks (spec/39 MUST 3).
+            if _call_ctx_token is not None:
+                _tracing.safe_span_op(
+                    lambda: _tracing._otel_ctx.detach(_call_ctx_token),
+                    "detach call span context (open-fault cleanup)",
+                )
+                _call_ctx_token = None
+            _local_span = locals().get("_call_span")
+            if _local_span is not None:
+                _tracing.safe_span_op(
+                    _local_span.end, "end call span (open-fault cleanup)"
+                )
+            # Non-recording sentinel: get_current_span() with no active span
+            # returns OTel's INVALID_SPAN (is_recording() == False), whose
+            # set_attribute / set_status / record_exception / end are all no-ops.
+            _call_span = _tracing._otel_trace.INVALID_SPAN
+            _span_ended = True  # nothing left to end; finalizer is a no-op
+
+        def _finalize_call_span(
+            *,
+            outcome: str | None = None,
+            error: BaseException | None = None,
+        ) -> None:
+            """End the agent.call span + detach the context token exactly once.
+
+            Single owner of span teardown (spec/39 MUST 3). Idempotent via the
+            enclosing `_span_ended` flag so the early-exit paths (which set their
+            own outcome attributes before returning) do not double-end when the
+            outer finally also fires. Wrapped so a tracing failure can never mask
+            the real return value or in-flight exception.
+            """
+            nonlocal _span_ended
+            if _span_ended:
+                return
+            _span_ended = True
+            try:
+                if error is not None:
+                    # In-flight exception → error outcome + ERROR status (spec/39
+                    # MUST 8: error has top precedence).
+                    _call_span.set_attribute(
+                        _tracing.ATTR_OUTCOME, _tracing.OUTCOME_ERROR
+                    )
+                    _call_span.set_status(
+                        _tracing.StatusCode.ERROR,
+                        description=type(error).__name__,
+                    )
+                    _call_span.record_exception(error)
+                else:
+                    # No exception: prefer an explicit outcome (early-exit paths),
+                    # otherwise derive from the returned Response (skipped >
+                    # deferred > ok, spec/39 MUST 8). Note: an early-exit path may
+                    # have already set ERROR status (e.g. cost-skip MUST 9); we do
+                    # NOT clear it here — only set the outcome attribute.
+                    resolved = outcome
+                    if resolved is None and _call_response is not None:
+                        resolved = _tracing._derive_outcome(_call_response)
+                    if resolved is not None:
+                        _call_span.set_attribute(_tracing.ATTR_OUTCOME, resolved)
+                # Cost/token/iteration attributes from the accumulators. These
+                # are always safe to read — declared above before any code that
+                # could raise (spec/39 MUST 1: cost recorded on all paths).
+                _call_span.set_attribute(_tracing.ATTR_COST_USD, _call_total_cost)
+                _call_span.set_attribute(_tracing.ATTR_INPUT_TOKENS, _call_input_tokens)
+                _call_span.set_attribute(
+                    _tracing.ATTR_OUTPUT_TOKENS, _call_output_tokens
+                )
+                _call_span.set_attribute(
+                    _tracing.ATTR_TOOL_ITERATIONS, _call_tool_iterations
+                )
+                _call_span.set_attribute(_tracing.ATTR_MODEL, _call_model)
+            except Exception:
+                # spec/39 MUST 3 — the finalizer MUST be genuinely non-throwing.
+                # When a host process installs a real SDK TracerProvider, the
+                # span becomes a recording span: set_attribute / set_status /
+                # record_exception can then raise (custom SpanProcessor,
+                # SpanLimits, or an in-flight exception whose __str__/__repr__
+                # misbehaves). If that propagated it would (a) abort the body
+                # finally before lock release → LEAKED AGENT LOCK (Principle 8),
+                # and (b) replace a refusal exception (lock_busy) with a tracing
+                # RuntimeError, breaking the documented refusal contract. Swallow
+                # + log so a tracing-library fault can never mask the real return
+                # value or in-flight exception. BaseException is intentionally
+                # NOT caught here so KeyboardInterrupt / SystemExit still
+                # propagate; the inner finally below still ends + detaches the
+                # span on those paths.
+                _logger.warning(
+                    "atomic_agents tracing: failed to finalize call span",
+                    exc_info=True,
+                )
+            finally:
+                # detach + end must run even if attribute-setting raised, so the
+                # span is never leaked and the context token is never orphaned
+                # (spec/39 MUST 3). BOTH calls are individually non-throwing: on a
+                # real host-provider recording span, span.end() invokes the host
+                # SpanProcessor's on_end synchronously (a misbehaving / full-queue
+                # BatchSpanProcessor can raise) and context.detach() can raise on a
+                # foreign/stale token in some OTel versions. If either propagated
+                # it would abort the body finally BEFORE the lock release at the
+                # end of call() — leaking the agent lock so every subsequent call
+                # returns LockBusy (Principle 8). Guard each independently so a
+                # fault in one still runs the other. (_call_ctx_token is None only
+                # on the open-fault sentinel path, where _span_ended short-circuits
+                # us out before reaching here — but guard anyway for safety.)
+                if _call_ctx_token is not None:
+                    _tracing.safe_span_op(
+                        lambda: _tracing._otel_ctx.detach(_call_ctx_token),
+                        "detach call span context",
+                    )
+                _tracing.safe_span_op(_call_span.end, "end call span")
+
         # Acquire agent lock via the bound LockBackend. Empty name maps
         # to ``<agent_root>/.lock`` on the filesystem backend — preserves
         # the legacy on-disk artifact so doctor + external scripts keep
@@ -3342,6 +3518,29 @@ class AtomicAgent:
             if caller_identity is not None:
                 _lock_busy_record["http_caller"] = caller_identity
             self._log(_lock_busy_record)
+            # spec/39 MUST 3: end span on lock_busy path. This path raises BEFORE
+            # the body try/finally is entered, so it finalizes its own span here.
+            # lock_busy is a refusal, not a crash: mark ERROR status explicitly,
+            # then let _finalize_call_span() set the outcome attribute + detach +
+            # end idempotently.
+            # spec/39 MUST 3: route through the non-throwing helper. The lock is
+            # NOT held yet here, so a fault would not leak it — but it would
+            # replace the real LockBusy refusal with a tracing error, breaking the
+            # documented refusal contract. Keep the seam uniformly non-throwing.
+            _tracing.safe_span_op(
+                lambda: _call_span.set_status(
+                    _tracing.StatusCode.ERROR, description="lock_busy"
+                ),
+                "set lock_busy status",
+            )
+            _finalize_call_span(outcome=_tracing.OUTCOME_LOCK_BUSY)
+            raise
+        except BaseException as _acq_exc:
+            # spec/39 MUST 3: a NON-LockBusy acquire failure (e.g. PermissionError
+            # on a read-only filesystem) also raises BEFORE the body try/finally
+            # is entered, so it must finalize the span here or the span leaks.
+            # Mark error + end + detach, then re-raise unchanged.
+            _finalize_call_span(error=_acq_exc)
             raise
 
         # Track MCP tool names registered this call so we can clean them up in
@@ -3416,9 +3615,26 @@ class AtomicAgent:
                 if caller_identity is not None:
                     _skip_record["http_caller"] = caller_identity
                 self._log(_skip_record)
-                return Response.skipped_response(
+                # spec/39 MUST 9: cost-skip carries OUTCOME_SKIPPED + ERROR
+                # status. _call_total_cost stays 0.0 (no LLM call was made), so
+                # the body finally records cost_usd=0.0. We set ERROR status here
+                # (the finalizer only sets ERROR status for in-flight exceptions);
+                # the returned skipped Response makes the finalizer derive
+                # OUTCOME_SKIPPED, and the body finally owns detach + end.
+                # spec/39 MUST 3: non-throwing — the body finally would still
+                # release the lock here (the except below catches a propagating
+                # tracing fault), but a fault would mask the skipped Response with
+                # a tracing error. Keep the seam uniformly non-throwing.
+                _tracing.safe_span_op(
+                    lambda: _call_span.set_status(
+                        _tracing.StatusCode.ERROR, description="cost_cap"
+                    ),
+                    "set cost_cap status (pre-loop skip)",
+                )
+                _call_response = Response.skipped_response(
                     check.reason, self.config.default_model
                 )
+                return _call_response
 
             # MCP client pool — lazy init (spec/19).
             # Only spin up when mcp.md declares servers and pool not yet live.
@@ -3705,7 +3921,26 @@ class AtomicAgent:
                         if caller_identity is not None:
                             _mid_loop_skip["http_caller"] = caller_identity
                         self._log(_mid_loop_skip)
-                        return response
+                        # spec/39 MUST 1 / MUST 9: mid-loop cost-cap. Sync the
+                        # span accumulators from the local loop accumulators so
+                        # the body finally records the true partial spend (NOT
+                        # 0.0). Set ERROR status here; the returned skipped
+                        # Response makes the finalizer derive OUTCOME_SKIPPED, and
+                        # the body finally owns detach + end.
+                        _call_total_cost = total_cost
+                        _call_input_tokens = total_input_tokens
+                        _call_output_tokens = total_output_tokens
+                        _call_tool_iterations = iteration_count - 1
+                        _call_model = model
+                        # spec/39 MUST 3: non-throwing seam (see pre-loop skip).
+                        _tracing.safe_span_op(
+                            lambda: _call_span.set_status(
+                                _tracing.StatusCode.ERROR, description="cost_cap"
+                            ),
+                            "set cost_cap status (mid-loop)",
+                        )
+                        _call_response = response
+                        return _call_response
 
                 iter_start = time.time()
                 raw = _llm.call_llm(
@@ -3734,6 +3969,20 @@ class AtomicAgent:
                 # Track in-flight spend so mid-loop cap checks see the running
                 # total before the parent log line is written. (fix R2-A1)
                 accumulated_loop_cost_usd += iter_cost
+                # spec/39 MUST 1: sync the span accumulators from the loop-local
+                # totals at the END of every iteration, immediately after the
+                # spend lands. This is what makes a raise that fires AFTER real
+                # LLM spend (a tool dispatch, a mandate check, capture write /
+                # extract, or Response assembly raising mid/post-loop) carry the
+                # true partial spend into the error span instead of 0.0. The
+                # success / cost-skip / mid-loop-cap paths re-sync to their exact
+                # final values below; this per-iteration sync is the floor that
+                # guarantees the error path is never under-reported.
+                _call_total_cost = total_cost
+                _call_input_tokens = total_input_tokens
+                _call_output_tokens = total_output_tokens
+                _call_tool_iterations = iteration_count
+                _call_model = model
                 if iter_cost_fallback:
                     cost_fallback = True
 
@@ -4328,9 +4577,34 @@ class AtomicAgent:
                 log_record["tool_iterations_maxed"] = True
             self._log(log_record)
 
-            return response
+            # spec/39 MUST 1: sync the span accumulators from the final loop
+            # accumulators on the success path so the body finally records the
+            # true cost / token / iteration totals and derives OUTCOME_OK from
+            # the returned Response.
+            _call_total_cost = total_cost
+            _call_input_tokens = total_input_tokens
+            _call_output_tokens = total_output_tokens
+            _call_tool_iterations = iteration_count
+            _call_model = model
+            _call_response = response
+            return _call_response
+
+        except BaseException as _call_exc:
+            # spec/39 MUST 3 / MUST 8: any exception propagating out of the body
+            # marks the span error (top outcome precedence) and ends it. The
+            # accumulators carry whatever partial spend was synced before the
+            # raise (0.0 if it fired before the loop). Re-raise unchanged — the
+            # finalizer never swallows the real exception.
+            _finalize_call_span(error=_call_exc)
+            raise
 
         finally:
+            # spec/39 MUST 3: the SINGLE owner of span end + context detach for
+            # every exit path that reaches this body (normal return, the
+            # cost-skip / mid-loop early returns, and exceptions via the except
+            # above). Idempotent — a no-op if the except clause already
+            # finalized. Runs FIRST so the span is closed before lock release.
+            _finalize_call_span()
             # Tear down MCP pool after each call so subprocesses don't linger.
             # disconnect_all() is idempotent — safe to call even if connect_all()
             # was never reached (e.g. if an exception occurred before it).
