@@ -8,9 +8,33 @@ For the Protocol-pattern template every backend follows, read `docs/spec/20-memo
 
 ---
 
-## MemoryBackend (#57)
+## MemoryBackend (#57, operator override surface added at #382 PR 1)
 
-Filesystem reference impl + conformance suite. The Protocol-pattern template every later backend follows.
+`FilesystemBackend(agent_root, *, lock_backend=None)` reference impl — the Protocol-pattern template every later backend follows. All memory reads and writes go through `MemoryBackend`; call-site code never touches disk paths directly.
+
+**Protocol conformance:** `tests/test_memory_protocol_conformance.py` (26 named behavioral tests, parameterized fixture accepts any `MemoryBackend` impl) + `tests/test_memory_filesystem_backend.py` (10 filesystem-specific tests — `.versions/` layout, INDEX.md format, path enforcement, staging lifecycle).
+
+**Operator override surface** (added in #382 PR 1 — mirrors LockBackend / LogBackend):
+
+- `ATOMIC_AGENTS_MEMORY_BACKEND` env var (default `"filesystem"`) — unknown ids fail-fast at agent construction with `BackendNotRegistered` + full known-id list; no silent fallback.
+- `AtomicAgent(..., memory_backend=...)` constructor kwarg — always wins over env var.
+- `get_default_memory_backend(agent_root, *, lock_backend=None)` public factory exported from `atomic_agents.memory` — one selection seam for all state-writing construction sites (`agent.py`, `dream.py`, `tuning.py`, `_capture.py`, `_versioning.py`).
+- Uniform construction contract: every registered `MemoryBackend` MUST accept `(agent_root: Path, *, lock_backend=None)` — normative spec/20 MUST + registry conformance test.
+- `lock_backend` threading: factory threads through to registered backend so `apply_staging` and `agent.call()` share the same lock backend instance.
+- **Delegate threading deliberately absent**: memory is per-agent state (each agent owns its own `memory/` directory). `delegate()` never threads the coordinator's memory backend to children — each child resolves independently via the process-global env selection (distinct from fleet-scoped persona/corpus backends which are threaded). Cross-agent memory sharing is a Tier A design fork; the kwarg escape hatch on each agent's own construction is the expressible path.
+- `DreamRunner` guards against non-filesystem backends at construction (`NotImplementedError` rather than silent failure at apply time). Routing through a backend-agnostic staging-adopt path deferred to [#396](https://github.com/dep0we/atomic-agents-stack/issues/396).
+- `ATOMIC_AGENTS_MEMORY_BACKEND_URL` companion var deferred to [#258](https://github.com/dep0we/atomic-agents-stack/issues/258).
+
+**Doctor checks** (two-check pair mirrors LockBackend):
+
+- `check_memory_backend_config` — coherence: known id, constructs for non-filesystem ids. Doctor-reuses-factory invariant.
+- `check_memory_backend` — liveness: factory resolves and `stats()` returns.
+
+**Override tests:** `tests/test_memory_operator_override.py` (29 tests — factory env-var path, kwarg-wins, lock threading, registry helpers, uniform construction contract + registry conformance, doctor coherence + liveness checks including registered-backend PASS).
+
+**Implementer Contract:** 7 MUSTs in spec/20 §"Implementer Contract" — uniform construction, `lock_backend` threading, impl identifiability, write-4-case semantics, `WritePolicy` enforcement, atomic writes, capability advertisement.
+
+**Closes:** the memory config→backend wiring seam (T5; gates Phase 2 Postgres/pgvector scale-out). Default stays filesystem; zero behavior change for existing deployments.
 
 ---
 
