@@ -240,7 +240,9 @@ The layer is **fully opt-in**. Existing deployments see no judge invocation unti
 
 ## Deployment shapes
 
-Nine operator runbooks for the common deployment paths. Pick the one that matches what you're doing:
+For a full cloud reference deployment, see [`extras/gcp/`](https://github.com/dep0we/atomic-agents-stack/tree/main/extras/gcp/): a Cloud Run + IAP + Cloud Scheduler reference deployment — the GCP-as-harness pattern (one service per customer, persistent disk for v0 filesystem state, Redis locks, Cloud Monitoring).
+
+Nine operator runbooks under `docs/deployment/` cover the common deployment paths. Pick the one that matches what you're doing:
 
 - [`docs/deployment/obsidian.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/deployment/obsidian.md): running the framework against an Obsidian-synced vault: ignore patterns, `.versions/` trade-offs, sync race conditions, conflict copy recovery
 - [`docs/deployment/programmatic.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/deployment/programmatic.md): embedding in Python: the `Agent` + `call()` public surface, the complete public exception table, three worked examples
@@ -301,7 +303,7 @@ Same pattern for OpenAI (`atomic-agents-openai`) and Moonshot (`atomic-agents-mo
 - `atomic_agents/` — the Python package (runtime in `agent.py`; backend protocols in `memory/`, `_llm.py`, `_locks.py`, `_costs.py`, etc.; CLI in `cli.py`; preflight in `doctor.py`)
 - `tests/` 3,558+ tests collected, Python 3.11 + 3.12 matrix
 - `docs/`: [spec entry point](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/README.md), [`architecture.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/architecture.md), [`spec/`](https://github.com/dep0we/atomic-agents-stack/tree/main/docs/spec/) (32 locked docs + 6 RFCs/DRAFTs), [`deployment/`](https://github.com/dep0we/atomic-agents-stack/tree/main/docs/deployment/) (9 operator runbooks), [`samples/caldwell/`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/samples/caldwell/) (complete worked example), [`GOVERNANCE.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/GOVERNANCE.md), [`TENSIONS.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/TENSIONS.md), [`methodology.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/methodology.md)
-- `extras/` — operational templates (Claude Code skill wrappers, macOS LaunchAgent plists, cron examples)
+- `extras/` — operational templates (Claude Code skill wrappers, macOS LaunchAgent plists, cron examples, GCP Cloud Run + IAP reference deployment)
 
 ---
 
