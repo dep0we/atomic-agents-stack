@@ -25,7 +25,10 @@ Checks (one CheckResult per check unless noted):
     locks           Agent's .lock file is not currently held by another
                     process. (flock releases on death; lingering files are
                     normal — only an actively-held lock is suspicious.)
-    memory-backend  FilesystemBackend resolves and stats() returns.
+    memory-backend-config  ATOMIC_AGENTS_MEMORY_BACKEND coherence check (known
+                            id; for non-default ids, also confirms the backend
+                            constructs. filesystem needs no extras).
+    memory-backend  Operator-configured MemoryBackend resolves and stats() returns.
     write-paths     Each tools.md write_paths entry exists and is writable.
 
 Exit code mapping (set by the CLI, not this module):
@@ -163,8 +166,8 @@ def run_doctor(
         # tool-registry-backend → mandate-backend → policy-backend →
         # persona-backend → corpus-backend →
         # mcp-server-registry-backend → secret-backend →
-        # memory-backend) so contributors adding a scope-level backend
-        # check see the SKIP enumeration mirror reality.
+        # memory-backend-config → memory-backend) so contributors adding
+        # a scope-level backend check see the SKIP enumeration mirror reality.
         #
         # Note: ``secret-backend`` is deployment-scoped (check_secret_backend
         # takes no agent_root), but it is grouped here for output consistency
@@ -189,6 +192,7 @@ def run_doctor(
             "corpus-backend",
             "mcp-server-registry-backend",
             "secret-backend",
+            "memory-backend-config",
             "memory-backend",
             "write-paths",
         ):
@@ -251,6 +255,9 @@ def run_doctor(
     results.append(check_corpus_backend(agent_root))
     results.append(check_mcp_server_registry_backend(agent_root))
     results.append(check_secret_backend())
+    # memory-backend-config (coherence) runs before memory-backend (liveness),
+    # mirroring the check_lock_backend → check_locks ordering (#60 PR 3).
+    results.append(check_memory_backend_config(agent_root))
     results.append(check_memory_backend(agent_root))
     results.append(check_write_paths(tools_data, agent_root=agent_root))
 
@@ -3135,21 +3142,139 @@ def check_secret_backend() -> CheckResult:
     )
 
 
+def check_memory_backend_config(agent_root: Path) -> CheckResult:
+    """Operator-config coherence check for the memory backend (#382 PR 1).
+
+    Validates that ``ATOMIC_AGENTS_MEMORY_BACKEND`` is correctly configured:
+
+    * unset / ``filesystem`` → PASS (default; no extras needed)
+    * unknown backend_id (typo) → FAIL with the registered backend list
+
+    This is the operator-coherence layer; ``check_memory_backend`` then runs
+    the actual liveness probe through the configured backend.  Both checks
+    reuse ``get_default_memory_backend`` internally so doctor's verdict and
+    the runtime's behavior cannot diverge (doctor-reuses-factory invariant,
+    per MEMORY.md feedback_doctor_dual_probe_pattern).
+
+    Mirrors the ``check_lock_backend`` / ``check_locks`` pair shape.
+    """
+    # Lazy import — the memory package registers defaults at import time;
+    # importing inside the function body ensures _register_defaults() has run
+    # before any registry query, regardless of module import order.
+    from .memory import (
+        get_default_memory_backend,
+        list_backends,
+        _LAZY_BACKEND_IDS,
+    )
+
+    backend_id = (
+        os.environ.get("ATOMIC_AGENTS_MEMORY_BACKEND", "filesystem").strip().lower()
+    )
+
+    if backend_id == "filesystem":
+        return CheckResult(
+            name="memory-backend-config",
+            status=PASS,
+            message="filesystem backend (default; no extra needed)",
+            detail={"backend_id": "filesystem"},
+        )
+
+    # Check whether the backend_id is known.
+    known_ids = sorted(set(list_backends()) | _LAZY_BACKEND_IDS)
+    if backend_id not in known_ids:
+        raw = os.environ.get("ATOMIC_AGENTS_MEMORY_BACKEND", "")
+        return CheckResult(
+            name="memory-backend-config",
+            status=FAIL,
+            message=(
+                f"ATOMIC_AGENTS_MEMORY_BACKEND={raw!r} is not a known backend. "
+                f"Known: {known_ids}"
+            ),
+            fix_hint=(
+                "Set ATOMIC_AGENTS_MEMORY_BACKEND to one of the known ids, "
+                "or unset to use the filesystem default."
+            ),
+        )
+
+    # Registered non-filesystem backend — construct it through the factory
+    # (which dispatches via the registry), confirming it is actually
+    # constructable, not merely present in list_backends().  Close it
+    # immediately: a future connection-backed backend (#258) would open a
+    # connection/pool per doctor run that must be released — the MemoryBackend
+    # Protocol defines close() for exactly this.
+    _config_backend = None
+    try:
+        _config_backend = get_default_memory_backend(agent_root)
+    except Exception as exc:
+        return CheckResult(
+            name="memory-backend-config",
+            status=FAIL,
+            message=f"memory backend construction failed: {exc}",
+            fix_hint=(
+                f"Check ATOMIC_AGENTS_MEMORY_BACKEND={backend_id!r} and any "
+                f"required connection env vars."
+            ),
+        )
+    finally:
+        if _config_backend is not None and hasattr(_config_backend, "close"):
+            try:
+                _config_backend.close()
+            except Exception:
+                pass
+
+    return CheckResult(
+        name="memory-backend-config",
+        status=PASS,
+        message=f"{backend_id!r} backend configured",
+        detail={"backend_id": backend_id},
+    )
+
+
 def check_memory_backend(agent_root: Path) -> CheckResult:
-    """FilesystemBackend resolves and stats() returns successfully."""
+    """Operator-configured MemoryBackend resolves and stats() returns successfully.
+
+    Routes through ``get_default_memory_backend`` (the operator-config factory)
+    so the liveness probe hits the SAME backend the runtime constructs — not
+    always FilesystemBackend regardless of ``ATOMIC_AGENTS_MEMORY_BACKEND``.
+    Mirrors the ``check_locks`` / ``get_default_lock_backend`` pattern
+    (doctor-reuses-factory invariant, MEMORY.md feedback_doctor_dual_probe_pattern).
+    """
+    # Filesystem-shaped precheck: the on-disk memory/ dir must exist for the
+    # filesystem reference impl. This precheck is ONLY correct for the
+    # filesystem default — a future non-filesystem backend (#258 Postgres/
+    # pgvector) may legitimately have no local memory/ dir, so we skip the
+    # guard and let the factory + stats() probe be authoritative for any
+    # non-filesystem selection. (Without this gate the liveness check would
+    # spuriously FAIL a healthy non-local backend, contradicting the
+    # doctor-reuses-factory invariant.)
+    backend_id = (
+        os.environ.get("ATOMIC_AGENTS_MEMORY_BACKEND", "filesystem").strip().lower()
+    )
     memory_dir = agent_root / "memory"
-    if not memory_dir.exists():
+    if backend_id == "filesystem" and not memory_dir.exists():
         return CheckResult(
             name="memory-backend",
             status=FAIL,
             message=f"memory/ directory missing at {memory_dir}",
             fix_hint=f"Create it: mkdir -p {memory_dir} && touch {memory_dir}/INDEX.md",
         )
+    backend = None
     try:
-        from .memory.filesystem import FilesystemBackend
+        from .memory import get_default_memory_backend
+        from .exceptions import BackendNotRegistered
 
-        backend = FilesystemBackend(agent_root, "memory")
+        backend = get_default_memory_backend(agent_root)
         stats = backend.stats()
+    except BackendNotRegistered as e:
+        return CheckResult(
+            name="memory-backend",
+            status=FAIL,
+            message=f"memory backend not registered: {e}",
+            fix_hint=(
+                "Unset ATOMIC_AGENTS_MEMORY_BACKEND or set it to a registered "
+                "backend id. See check_memory_backend_config for details."
+            ),
+        )
     except Exception as e:
         return CheckResult(
             name="memory-backend",
@@ -3160,10 +3285,19 @@ def check_memory_backend(agent_root: Path) -> CheckResult:
                 "See docs/spec/02-atomic-memory.md."
             ),
         )
+    finally:
+        # Release any connection/pool a future connection-backed backend (#258)
+        # opened; harmless for the filesystem default. Protocol defines close().
+        if backend is not None and hasattr(backend, "close"):
+            try:
+                backend.close()
+            except Exception:
+                pass
+    backend_class_name = type(backend).__name__
     return CheckResult(
         name="memory-backend",
         status=PASS,
-        message=f"FilesystemBackend ok ({stats.total_notes} notes)",
+        message=f"{backend_class_name} ok ({stats.total_notes} notes)",
         detail={
             "total_notes": stats.total_notes,
             "by_type": stats.by_type,

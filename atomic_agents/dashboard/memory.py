@@ -9,6 +9,7 @@ Pure Python, no LLM calls.
 from __future__ import annotations
 import html
 import json
+import logging
 import os
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -18,11 +19,15 @@ from typing import Any
 from .costs import discover_agents
 from ._shared import page_shell, truncate
 from .._io import atomic_write
-from ..memory.filesystem import FilesystemBackend
+from ..memory import get_default_memory_backend
+from ..exceptions import BackendNotRegistered
+
+_logger = logging.getLogger(__name__)
 
 # Try to import python-frontmatter; if not available, use a simple fallback.
 try:
     import frontmatter as _frontmatter
+
     _HAS_FRONTMATTER = True
 except ImportError:
     _HAS_FRONTMATTER = False
@@ -34,6 +39,7 @@ _KNOWN_TYPES = ("user", "feedback", "project", "decision", "reference")
 
 # ──────────────────────────────────────────────────────────────────
 # Data structures
+
 
 @dataclass
 class NoteTypeCount:
@@ -47,14 +53,21 @@ class NoteTypeCount:
 
     @property
     def total(self) -> int:
-        return self.user + self.feedback + self.project + self.decision + self.reference + self.other
+        return (
+            self.user
+            + self.feedback
+            + self.project
+            + self.decision
+            + self.reference
+            + self.other
+        )
 
 
 @dataclass
 class StalenessCandidate:
     agent: str
     note: str
-    last_seen: str | None   # ISO date from frontmatter
+    last_seen: str | None  # ISO date from frontmatter
     days_since: int | None
     pinned: bool
 
@@ -62,15 +75,15 @@ class StalenessCandidate:
 @dataclass
 class OrphanNote:
     agent: str
-    note: str   # filename in memory/ but absent from INDEX.md
+    note: str  # filename in memory/ but absent from INDEX.md
 
 
 @dataclass
 class VersionChurnEntry:
     agent: str
-    note: str           # note filename (stem.md)
+    note: str  # note filename (stem.md)
     snapshot_count: int
-    last_mutated: str   # ISO ts (derived from newest snapshot filename)
+    last_mutated: str  # ISO ts (derived from newest snapshot filename)
 
 
 @dataclass
@@ -90,7 +103,7 @@ class AgentMemorySize:
     agent: str
     live_bytes: int
     versions_bytes: int
-    ratio: float   # versions / live (>1 means more in history than live)
+    ratio: float  # versions / live (>1 means more in history than live)
 
 
 @dataclass
@@ -107,6 +120,7 @@ class MemoryData:
 
 # ──────────────────────────────────────────────────────────────────
 # Aggregation
+
 
 def aggregate_memory(
     agents_root: Path,
@@ -135,8 +149,29 @@ def aggregate_memory(
         if not memory_dir.exists():
             continue
 
-        # Use FilesystemBackend for all memory reads (protocol-compliant)
-        backend = FilesystemBackend(agent_root, "memory")
+        # Route through the factory so the dashboard honours the operator's
+        # backend selection (ATOMIC_AGENTS_MEMORY_BACKEND). A config typo
+        # degrades this one agent row instead of crashing the whole tab,
+        # leaving a log breadcrumb so a silently-missing row is diagnosable
+        # (no swallowed-exception-with-no-log; Principle #5 audit trail).
+        try:
+            backend = get_default_memory_backend(agent_root)
+        except BackendNotRegistered as exc:
+            _logger.warning(
+                "memory dashboard: skipping agent %r: unknown "
+                "ATOMIC_AGENTS_MEMORY_BACKEND (%s)",
+                agent,
+                exc,
+            )
+            continue
+        except Exception:
+            _logger.debug(
+                "memory dashboard: skipping agent %r: memory backend "
+                "construction failed",
+                agent,
+                exc_info=True,
+            )
+            continue
         stats = backend.stats()
 
         # Note counts by type
@@ -147,10 +182,7 @@ def aggregate_memory(
         counts.decision = stats.by_type.get("decision", 0)
         counts.reference = stats.by_type.get("reference", 0)
         # Any type not in the known set goes to "other"
-        counts.other = sum(
-            v for k, v in stats.by_type.items()
-            if k not in _KNOWN_TYPES
-        )
+        counts.other = sum(v for k, v in stats.by_type.items() if k not in _KNOWN_TYPES)
 
         if counts.total > 0:
             note_counts.append(counts)
@@ -162,14 +194,18 @@ def aggregate_memory(
             days_since: int | None = None
             if ref.last_seen is not None:
                 days_since = (today - ref.last_seen).days
-            stale_notes.append(StalenessCandidate(
-                agent=agent,
-                note=ref.name,
-                last_seen=ref.last_seen.isoformat() if ref.last_seen else None,
-                days_since=days_since,
-                pinned=ref.pinned,
-            ))
-        all_stale.extend(sorted(stale_notes, key=lambda x: x.days_since or 0, reverse=True))
+            stale_notes.append(
+                StalenessCandidate(
+                    agent=agent,
+                    note=ref.name,
+                    last_seen=ref.last_seen.isoformat() if ref.last_seen else None,
+                    days_since=days_since,
+                    pinned=ref.pinned,
+                )
+            )
+        all_stale.extend(
+            sorted(stale_notes, key=lambda x: x.days_since or 0, reverse=True)
+        )
 
         # Orphans via backend.list_orphans()
         orphan_refs = backend.list_orphans()
@@ -183,23 +219,27 @@ def aggregate_memory(
             mutation_dt = backend.last_mutation_at(note_name)
             if mutation_dt is not None:
                 last_mutated = mutation_dt.strftime("%Y%m%dT%H%M%S")
-            all_churn.append(VersionChurnEntry(
-                agent=agent,
-                note=note_name,
-                snapshot_count=snapshot_count,
-                last_mutated=last_mutated,
-            ))
+            all_churn.append(
+                VersionChurnEntry(
+                    agent=agent,
+                    note=note_name,
+                    snapshot_count=snapshot_count,
+                    last_mutated=last_mutated,
+                )
+            )
 
         # Memory size via backend.stats()
         live_bytes = stats.live_bytes
         versions_bytes = stats.version_history_bytes
         ratio = versions_bytes / live_bytes if live_bytes > 0 else 0.0
-        memory_sizes.append(AgentMemorySize(
-            agent=agent,
-            live_bytes=live_bytes,
-            versions_bytes=versions_bytes,
-            ratio=round(ratio, 2),
-        ))
+        memory_sizes.append(
+            AgentMemorySize(
+                agent=agent,
+                live_bytes=live_bytes,
+                versions_bytes=versions_bytes,
+                ratio=round(ratio, 2),
+            )
+        )
 
         # Dream history (no backend method — direct manifest scan)
         dreams_dir = agent_root / "dreams"
@@ -214,16 +254,18 @@ def aggregate_memory(
                     data = json.loads(manifest_path.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError):
                     continue
-                dream_history.append(DreamHistoryEntry(
-                    ts=data.get("started_at", ""),
-                    agent=agent,
-                    dream_id=data.get("dream_id", dream_dir.name),
-                    status=data.get("status", "unknown"),
-                    consolidations=len(data.get("consolidated", [])),
-                    promotions=len(data.get("promoted", [])),
-                    marked_stale=len(data.get("marked_stale", [])),
-                    applied=bool(data.get("applied_at")),
-                ))
+                dream_history.append(
+                    DreamHistoryEntry(
+                        ts=data.get("started_at", ""),
+                        agent=agent,
+                        dream_id=data.get("dream_id", dream_dir.name),
+                        status=data.get("status", "unknown"),
+                        consolidations=len(data.get("consolidated", [])),
+                        promotions=len(data.get("promoted", [])),
+                        marked_stale=len(data.get("marked_stale", [])),
+                        applied=bool(data.get("applied_at")),
+                    )
+                )
 
     # Sort version churn by snapshot count desc, take top N
     all_churn.sort(key=lambda x: x.snapshot_count, reverse=True)
@@ -309,6 +351,7 @@ def _dir_size(path: Path, exclude_subdirs: bool = False) -> int:
 # ──────────────────────────────────────────────────────────────────
 # Rendering
 
+
 def render_memory(agents_root: Path, data: MemoryData) -> Path:
     """Write _dashboard/memory.html and return the path."""
     out_dir = agents_root / "_dashboard"
@@ -339,8 +382,8 @@ def _render_memory_template(data: MemoryData, has_goals: bool = True) -> str:
         rows = []
         for c in sorted(data.note_counts, key=lambda x: x.total, reverse=True):
             rows.append(
-                f'<tr>'
-                f'<td>{html.escape(c.agent)}</td>'
+                f"<tr>"
+                f"<td>{html.escape(c.agent)}</td>"
                 f'<td class="right num">{c.user}</td>'
                 f'<td class="right num">{c.feedback}</td>'
                 f'<td class="right num">{c.project}</td>'
@@ -348,17 +391,17 @@ def _render_memory_template(data: MemoryData, has_goals: bool = True) -> str:
                 f'<td class="right num">{c.reference}</td>'
                 f'<td class="right num">{c.other}</td>'
                 f'<td class="right num"><strong>{c.total}</strong></td>'
-                f'</tr>'
+                f"</tr>"
             )
         counts_table = (
-            '<table>'
-            '<thead><tr><th>Agent</th>'
+            "<table>"
+            "<thead><tr><th>Agent</th>"
             '<th class="right">User</th><th class="right">Feedback</th>'
             '<th class="right">Project</th><th class="right">Decision</th>'
             '<th class="right">Reference</th><th class="right">Other</th>'
             '<th class="right">Total</th></tr></thead>'
-            f'<tbody>{"".join(rows)}</tbody>'
-            '</table>'
+            f"<tbody>{''.join(rows)}</tbody>"
+            "</table>"
         )
     else:
         counts_table = '<p class="empty-note">No memory notes found across agents.</p>'
@@ -367,23 +410,25 @@ def _render_memory_template(data: MemoryData, has_goals: bool = True) -> str:
     thresh = data.staleness_threshold_days
     if data.staleness_candidates:
         rows = []
-        for s in sorted(data.staleness_candidates, key=lambda x: x.days_since or 0, reverse=True):
+        for s in sorted(
+            data.staleness_candidates, key=lambda x: x.days_since or 0, reverse=True
+        ):
             days_str = f"{s.days_since}d" if s.days_since is not None else "—"
             color = "var(--error)" if (s.days_since or 0) > 180 else "var(--warn)"
             rows.append(
-                f'<tr>'
-                f'<td>{html.escape(s.agent)}</td>'
-                f'<td>{html.escape(s.note)}</td>'
+                f"<tr>"
+                f"<td>{html.escape(s.agent)}</td>"
+                f"<td>{html.escape(s.note)}</td>"
                 f'<td class="num">{html.escape(s.last_seen or "—")}</td>'
                 f'<td class="right num" style="color: {color}">{days_str}</td>'
-                f'</tr>'
+                f"</tr>"
             )
         stale_table = (
-            '<table>'
-            '<thead><tr><th>Agent</th><th>Note</th>'
+            "<table>"
+            "<thead><tr><th>Agent</th><th>Note</th>"
             '<th>Last seen</th><th class="right">Age</th></tr></thead>'
-            f'<tbody>{"".join(rows)}</tbody>'
-            '</table>'
+            f"<tbody>{''.join(rows)}</tbody>"
+            "</table>"
         )
         stale_count = len(data.staleness_candidates)
         stale_intro = f'<p class="muted" style="margin-bottom: 12px">Notes last seen &gt; {thresh} days ago, not pinned. Showing up to 5 per agent ({stale_count} total).</p>'
@@ -397,38 +442,40 @@ def _render_memory_template(data: MemoryData, has_goals: bool = True) -> str:
         for o in data.orphan_notes:
             rows.append(
                 f'<tr class="row-warn">'
-                f'<td>{html.escape(o.agent)}</td>'
-                f'<td>{html.escape(o.note)}</td>'
-                f'</tr>'
+                f"<td>{html.escape(o.agent)}</td>"
+                f"<td>{html.escape(o.note)}</td>"
+                f"</tr>"
             )
         orphan_table = (
             '<p class="muted" style="margin-bottom: 12px">These notes exist in memory/ but are not referenced in INDEX.md.</p>'
-            '<table>'
-            '<thead><tr><th>Agent</th><th>Note filename</th></tr></thead>'
-            f'<tbody>{"".join(rows)}</tbody>'
-            '</table>'
+            "<table>"
+            "<thead><tr><th>Agent</th><th>Note filename</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody>"
+            "</table>"
         )
     else:
-        orphan_table = '<p class="empty-note">No orphan notes detected. INDEX.md is in sync.</p>'
+        orphan_table = (
+            '<p class="empty-note">No orphan notes detected. INDEX.md is in sync.</p>'
+        )
 
     # ── Version churn leaders
     if data.version_churn:
         rows = []
         for vc in data.version_churn:
             rows.append(
-                f'<tr>'
-                f'<td>{html.escape(vc.agent)}</td>'
-                f'<td>{html.escape(vc.note)}</td>'
+                f"<tr>"
+                f"<td>{html.escape(vc.agent)}</td>"
+                f"<td>{html.escape(vc.note)}</td>"
                 f'<td class="right num"><strong>{vc.snapshot_count}</strong></td>'
                 f'<td class="num">{html.escape(vc.last_mutated)}</td>'
-                f'</tr>'
+                f"</tr>"
             )
         churn_table = (
-            '<table>'
-            '<thead><tr><th>Agent</th><th>Note</th>'
+            "<table>"
+            "<thead><tr><th>Agent</th><th>Note</th>"
             '<th class="right">Snapshots</th><th>Last mutated</th></tr></thead>'
-            f'<tbody>{"".join(rows)}</tbody>'
-            '</table>'
+            f"<tbody>{''.join(rows)}</tbody>"
+            "</table>"
         )
     else:
         churn_table = '<p class="empty-note">No version history found.</p>'
@@ -443,24 +490,24 @@ def _render_memory_template(data: MemoryData, has_goals: bool = True) -> str:
                 else '<span class="pill neutral">pending</span>'
             )
             rows.append(
-                f'<tr>'
+                f"<tr>"
                 f'<td class="num">{html.escape(d.ts[:16] if d.ts else "—")}</td>'
-                f'<td>{html.escape(d.agent)}</td>'
+                f"<td>{html.escape(d.agent)}</td>"
                 f'<td class="muted">{html.escape(d.dream_id[:20])}</td>'
                 f'<td><span class="pill neutral">{html.escape(d.status)}</span></td>'
                 f'<td class="right num">{d.consolidations}</td>'
                 f'<td class="right num">{d.promotions}</td>'
                 f'<td class="right num">{d.marked_stale}</td>'
-                f'<td>{applied_badge}</td>'
-                f'</tr>'
+                f"<td>{applied_badge}</td>"
+                f"</tr>"
             )
         dreams_table = (
-            '<table>'
-            '<thead><tr><th>Started</th><th>Agent</th><th>Dream ID</th><th>Status</th>'
+            "<table>"
+            "<thead><tr><th>Started</th><th>Agent</th><th>Dream ID</th><th>Status</th>"
             '<th class="right">Consol.</th><th class="right">Promoted</th>'
             '<th class="right">Staled</th><th>Applied</th></tr></thead>'
-            f'<tbody>{"".join(rows)}</tbody>'
-            '</table>'
+            f"<tbody>{''.join(rows)}</tbody>"
+            "</table>"
         )
     else:
         dreams_table = '<p class="empty-note">No dream history found.</p>'
@@ -470,25 +517,27 @@ def _render_memory_template(data: MemoryData, has_goals: bool = True) -> str:
         rows = []
         for ms in sorted(data.memory_sizes, key=lambda x: x.live_bytes, reverse=True):
             ratio_color = (
-                "var(--error)" if ms.ratio > 5
-                else "var(--warn)" if ms.ratio > 2
+                "var(--error)"
+                if ms.ratio > 5
+                else "var(--warn)"
+                if ms.ratio > 2
                 else "var(--good)"
             )
             rows.append(
-                f'<tr>'
-                f'<td>{html.escape(ms.agent)}</td>'
+                f"<tr>"
+                f"<td>{html.escape(ms.agent)}</td>"
                 f'<td class="right num">{_fmt_bytes(ms.live_bytes)}</td>'
                 f'<td class="right num">{_fmt_bytes(ms.versions_bytes)}</td>'
                 f'<td class="right num" style="color: {ratio_color}">{ms.ratio:.1f}×</td>'
-                f'</tr>'
+                f"</tr>"
             )
         size_table = (
-            '<table>'
+            "<table>"
             '<thead><tr><th>Agent</th><th class="right">Live memory</th>'
             '<th class="right">Version history</th>'
             '<th class="right">History/Live ratio</th></tr></thead>'
-            f'<tbody>{"".join(rows)}</tbody>'
-            '</table>'
+            f"<tbody>{''.join(rows)}</tbody>"
+            "</table>"
         )
     else:
         size_table = '<p class="empty-note">No memory directories found.</p>'

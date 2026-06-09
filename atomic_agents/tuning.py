@@ -1086,11 +1086,14 @@ class TuningRunner:
                     except json.JSONDecodeError:
                         continue
 
-        # Memory notes — loaded via FilesystemBackend for consistency.
-        # The backend is stored on ctx so detectors (StaleNoteRecurring) can use
-        # backend methods (list_stale) instead of re-filtering locally.
-        from .memory.filesystem import FilesystemBackend
-        memory_backend = FilesystemBackend(self.agent_root, "memory")
+        # Memory notes — loaded via the operator-configured MemoryBackend for
+        # consistency (routes through get_default_memory_backend so an operator
+        # who sets ATOMIC_AGENTS_MEMORY_BACKEND reads through that backend, not
+        # always filesystem). The backend is stored on ctx so detectors
+        # (StaleNoteRecurring) can use backend methods (list_stale) instead of
+        # re-filtering locally.
+        from .memory import get_default_memory_backend
+        memory_backend = get_default_memory_backend(self.agent_root)
         ctx.memory_backend = memory_backend
         for ref in memory_backend.list_notes(include_archived=True, include_superseded=True):
             note = memory_backend.read_note(ref.name)

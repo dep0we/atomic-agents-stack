@@ -48,7 +48,7 @@ from pathlib import Path
 
 from .agent import AtomicAgent
 from ._platform import get_agents_root
-from .memory.filesystem import FilesystemBackend
+from .memory import get_default_memory_backend
 from .memory.backend import WritePolicy
 from .exceptions import AtomicAgentsError, VersionNotFound
 from .skills import validate_skill_manifest
@@ -900,7 +900,7 @@ def _cmd_version(args, agents_root: Path) -> int:
     if not memory_dir.exists():
         print(f"No memory/ directory found at {memory_dir}", file=sys.stderr)
         return 1
-    backend = FilesystemBackend(agent_root, "memory")
+    backend = get_default_memory_backend(agent_root)
     version_refs = backend.list_versions(args.note_filename)
     if not version_refs:
         print(f"No versions found for {args.note_filename}")
@@ -917,7 +917,7 @@ def _cmd_restore(args, agents_root: Path) -> int:
     if not memory_dir.exists():
         print(f"No memory/ directory found at {memory_dir}", file=sys.stderr)
         return 1
-    backend = FilesystemBackend(agent_root, "memory")
+    backend = get_default_memory_backend(agent_root)
     try:
         vref = backend.resolve_version_token(args.note_filename, args.version_name)
     except VersionNotFound as e:

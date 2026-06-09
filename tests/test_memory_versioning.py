@@ -32,7 +32,11 @@ from atomic_agents._versioning import (
     restore_version,
     snapshot_memory_version,
 )
-from atomic_agents.exceptions import MemoryPreconditionFailed, PathTraversalError, WritePathViolation
+from atomic_agents.exceptions import (
+    MemoryPreconditionFailed,
+    PathTraversalError,
+    WritePathViolation,
+)
 from atomic_agents.types import Capture
 
 
@@ -57,7 +61,11 @@ def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _write_note(tmp_path: Path, filename: str = "feedback_comm_style.md", content: str = "v1 content\n") -> Path:
+def _write_note(
+    tmp_path: Path,
+    filename: str = "feedback_comm_style.md",
+    content: str = "v1 content\n",
+) -> Path:
     path = tmp_path / "memory" / filename
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write(path, content)
@@ -151,6 +159,38 @@ def test_list_versions_empty_when_none(tmp_path):
     assert versions == []
 
 
+def test_list_versions_non_memory_subdir_else_branch(tmp_path):
+    """list_versions else-branch: a non-'memory' subdir routes to FilesystemBackend
+    directly, not through the factory's default 'memory' subdir.
+
+    Creates a note under <root>/notes/.versions/ and calls list_versions against
+    <root>/notes.  The else-branch (memory_dir.name != 'memory') must return the
+    version file under 'notes', not under a 'memory' subdirectory.
+    """
+    agent_root = tmp_path / "agent"
+    notes_dir = agent_root / "notes"
+    notes_dir.mkdir(parents=True)
+
+    note_path = notes_dir / "custom_note.md"
+    atomic_write(note_path, "initial content\n")
+
+    # Snapshot the note to create a .versions entry under notes/.versions/
+    version_path = snapshot_memory_version(note_path)
+    assert version_path is not None
+    assert version_path.exists()
+    # Version must live under the notes subdir, not a "memory" subdir.
+    # Compare path components, not the raw string: the tmp dir name itself
+    # contains the substring "memory" (via "non_memory"), so a naive
+    # substring check would false-positive.
+    assert version_path.is_relative_to(notes_dir)
+    assert "memory" not in version_path.relative_to(agent_root).parts
+
+    # Now exercise the else-branch: notes_dir.name == "notes" (not "memory")
+    versions = list_versions(notes_dir, "custom_note.md")
+    assert len(versions) == 1
+    assert versions[0] == version_path
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # read_version
 
@@ -185,7 +225,7 @@ def test_restore_version_replaces_live_atomic(tmp_path):
     memory_dir = note.parent
 
     v1 = snapshot_memory_version(note)  # snapshot "original"
-    atomic_write(note, "changed\n")     # overwrite live
+    atomic_write(note, "changed\n")  # overwrite live
 
     restored = restore_version(memory_dir, "feedback_comm_style.md", v1)
     assert restored.read_text() == "original\n"
@@ -263,7 +303,9 @@ def test_precondition_match_allows_write(tmp_path):
         sources=["conv_002"],
     )
     result = write_atomic_note(
-        agent_root, merge_cap, write_paths=[memory_dir],
+        agent_root,
+        merge_cap,
+        write_paths=[memory_dir],
         expected_content_sha256=sha,
     )
     assert result == note_path
@@ -287,7 +329,9 @@ def test_precondition_mismatch_raises(tmp_path):
     )
     with pytest.raises(MemoryPreconditionFailed) as exc_info:
         write_atomic_note(
-            agent_root, merge_cap, write_paths=[memory_dir],
+            agent_root,
+            merge_cap,
+            write_paths=[memory_dir],
             expected_content_sha256=stale_sha,
         )
     # actual_sha256 should be in the exception
@@ -304,7 +348,9 @@ def test_precondition_on_nonexistent_note_raises(tmp_path):
     capture = _make_capture()
     with pytest.raises(MemoryPreconditionFailed) as exc_info:
         write_atomic_note(
-            agent_root, capture, write_paths=[memory_dir],
+            agent_root,
+            capture,
+            write_paths=[memory_dir],
             expected_content_sha256="anysha256doesnotmatter",
         )
     assert exc_info.value.actual_sha256 is None
@@ -332,7 +378,9 @@ def test_concurrent_write_simulation_caught_by_precondition(tmp_path):
     merge_a = _make_capture(merge_into="feedback_comm_style.md", sources=["agent_a"])
     with pytest.raises(MemoryPreconditionFailed):
         write_atomic_note(
-            agent_root, merge_a, write_paths=[memory_dir],
+            agent_root,
+            merge_a,
+            write_paths=[memory_dir],
             expected_content_sha256=sha_at_read,
         )
 
@@ -398,7 +446,8 @@ def test_write_atomic_note_respects_read_only_path(tmp_path):
     # memory_dir is both write_path and read_only — read-only wins
     with pytest.raises(WritePathViolation, match="read-only"):
         write_atomic_note(
-            agent_root, capture,
+            agent_root,
+            capture,
             write_paths=[memory_dir],
             read_only_paths=[memory_dir],
         )
@@ -475,7 +524,9 @@ def test_version_creation_logged_to_agent_log(tmp_path):
         sources=["conv_002"],
     )
     write_atomic_note(
-        agent_root, merge_cap, write_paths=[memory_dir],
+        agent_root,
+        merge_cap,
+        write_paths=[memory_dir],
         log_target=log_path,
     )
 
@@ -563,6 +614,7 @@ def test_snapshot_two_in_same_second_have_distinct_paths(tmp_path):
 def test_snapshot_filename_has_microsecond_precision(tmp_path):
     """Version filename must include microseconds (%f) — 6 extra digits after seconds."""
     from atomic_agents._versioning import _version_filename
+
     name = _version_filename("some content")
     # Expected format: YYYYMMDDTHHMMSSffffffZ_<hash>.md
     # The timestamp portion before the underscore should be 22 chars:
@@ -610,7 +662,9 @@ def test_capture_concurrent_write_blocked_by_file_lock(tmp_path):
     def thread_a():
         """Merges first — changes the file content."""
         barrier.wait()  # sync start
-        merge_a = _make_capture(merge_into="feedback_comm_style.md", sources=["agent_a"])
+        merge_a = _make_capture(
+            merge_into="feedback_comm_style.md", sources=["agent_a"]
+        )
         write_atomic_note(agent_root, merge_a, write_paths=[memory_dir])
         results["a"] = "done"
 
@@ -618,9 +672,13 @@ def test_capture_concurrent_write_blocked_by_file_lock(tmp_path):
         """Tries to merge with stale sha — should fail after Thread A writes."""
         barrier.wait()  # sync start
         try:
-            merge_b = _make_capture(merge_into="feedback_comm_style.md", sources=["agent_b"])
+            merge_b = _make_capture(
+                merge_into="feedback_comm_style.md", sources=["agent_b"]
+            )
             write_atomic_note(
-                agent_root, merge_b, write_paths=[memory_dir],
+                agent_root,
+                merge_b,
+                write_paths=[memory_dir],
                 expected_content_sha256=sha_before,
             )
             results["b"] = "ok"
@@ -629,8 +687,10 @@ def test_capture_concurrent_write_blocked_by_file_lock(tmp_path):
 
     ta = threading.Thread(target=thread_a)
     tb = threading.Thread(target=thread_b)
-    ta.start(); tb.start()
-    ta.join(); tb.join()
+    ta.start()
+    tb.start()
+    ta.join()
+    tb.join()
 
     assert results.get("a") == "done"
     # Thread B must have either succeeded (if it got the lock first and a matched)
@@ -660,7 +720,9 @@ def test_restore_version_refuses_dotdot_version_name(tmp_path):
     note = _write_note(tmp_path, content="original\n")
     memory_dir = note.parent
     # Craft a version_path that resolves outside memory_dir/.versions/
-    evil_version_path = memory_dir / ".versions" / ".." / ".." / "persona" / "IDENTITY.md"
+    evil_version_path = (
+        memory_dir / ".versions" / ".." / ".." / "persona" / "IDENTITY.md"
+    )
 
     with pytest.raises(PathTraversalError, match="resolves outside"):
         restore_version(memory_dir, "feedback_comm_style.md", evil_version_path)

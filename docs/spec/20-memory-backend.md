@@ -1,5 +1,7 @@
 # 20 — MemoryBackend Protocol
 
+**Status:** **locked** (spec matches implementation as of #382 PR 1).
+
 How atomic-agents abstracts memory I/O behind a pluggable protocol,
 and what every backend implementation must satisfy.
 
@@ -325,9 +327,14 @@ The built-in `"filesystem"` backend is registered automatically on import.
 ## Deprecation wrappers
 
 `atomic_agents/_capture.py` and `atomic_agents/_versioning.py` remain as
-thin compatibility wrappers that delegate to `FilesystemBackend`. They will
-emit `DeprecationWarning` in v1.0. New code should use `agent.memory`
-directly.
+thin compatibility wrappers. As of #382 PR 1 they delegate through
+`get_default_memory_backend` (honouring `ATOMIC_AGENTS_MEMORY_BACKEND`) rather
+than always constructing `FilesystemBackend`. The post-write path in
+`write_atomic_note` (the returned note path and the `.versions` probe) still
+computes filesystem-shaped paths — correct only because the shims are a
+documented filesystem-era compatibility surface; non-filesystem backends should
+use `agent.memory` directly. They emit `DeprecationWarning`. New code should
+use `agent.memory` directly.
 
 ---
 
@@ -350,9 +357,242 @@ directly.
 
 ---
 
+## Implementer Contract
+
+Every registered `MemoryBackend` implementation MUST satisfy these numbered
+requirements. The conformance test suite (`test_memory_protocol_conformance.py`
++ `test_memory_operator_override.py`) provides machine-checkable assertions for
+the construction and behavioral MUSTs. Coverage today:
+
+- MUST 1 (uniform construction) and the *storage* half of MUST 2 (`lock_backend`
+  is threaded-and-stored on the instance) — directly asserted in
+  `test_memory_operator_override.py`, including a registry-conformance test that
+  iterates every registered backend and checks the keyword-only `lock_backend`
+  signature; that a *supplied* lock_backend instance is the one used is covered
+  by the construction-contract signature test in `test_memory_operator_override.py`.
+  The *behavioral* half of MUST 2 (`apply_staging` acquires through
+  `self._lock_backend`, fail-fast on contention) is exercised by
+  `test_dream.py::test_dream_apply_takes_agent_lock`; that test reconstructs
+  `runner._backend` without threading a custom `lock_backend` (its lock is
+  independently resolved via `get_default_lock_backend()`), so it validates the
+  fail-fast-through-self._lock_backend path but does not prove that a *supplied*
+  lock_backend instance is the one used.
+- MUST 4 (write-4-case) and MUST 5 (`WritePolicy`) — exercised by the
+  parameterized conformance fixture.
+- MUST 3 (impl identifiability), MUST 6 (atomic writes), and MUST 7 (capability
+  advertisement) — review-enforced contracts; there is no backend-agnostic
+  conformance assertion in PR 1 (the filesystem reference impl returns
+  `supports_semantic_search=False` and is covered by
+  `test_memory_filesystem_backend.py`, but the conformance fixture asserts no
+  `supports_semantic_search` / `search()` consistency property across backends).
+
+1. **Uniform construction contract.** Every registered `MemoryBackend` MUST
+   accept `(agent_root: Path, *, lock_backend=None)` as its construction
+   signature — `agent_root` as a positional argument and `lock_backend` as a
+   keyword-only argument with `None` default. The factory
+   `get_default_memory_backend` dispatches via the registry and calls
+   `cls(agent_root, lock_backend=lock_backend)`, so any registered backend
+   must satisfy the same call shape. Implementation-specific extras (e.g.,
+   `FilesystemBackend.memory_subdir`, a positional-or-keyword parameter with a
+   `"memory"` default declared before the `*` marker) are allowed as
+   additional parameters with defaults; they are NOT part of the uniform
+   contract and MUST NOT be required. `lock_backend` itself MUST be
+   keyword-only (after the `*`).
+
+2. **`lock_backend` threading.** When `lock_backend` is supplied and non-None,
+   the backend MUST use it for all locking operations (e.g., `apply_staging`
+   acquires through the supplied lock backend, not an independently-resolved
+   one). This is the mechanism that serialises `apply_staging` against
+   `agent.call()` when the operator pins a Redis lock backend.
+
+3. **Impl identifiability.** The backend MUST be identifiable for diagnostics
+   across Python processes. Doctor identifies the active backend via
+   `type(backend).__name__` (see `check_memory_backend`). A backend MAY also
+   advertise a dedicated impl-level identifier, but it MUST NOT reuse the name
+   `backend_id` — that name already denotes a note/version handle on
+   `NoteRef` / `VersionRef` / `StagedMemory`. (If a stable impl id is wanted
+   later, name it `implementation_id`; tracked as a follow-up in #397, not a
+   current MUST.)
+
+4. **Write-4-case semantics.** `write_note()` MUST implement the four merge
+   cases (merge-into, fresh write, orphan recovery, collision) exactly as
+   documented in §"Merge semantics for `write_note()`".
+
+5. **`WritePolicy` enforcement.** Every mutating operation MUST verify the
+   target path is under `write_paths` and NOT under `read_only_paths`, raising
+   `WritePathViolation` on violation.
+
+6. **Atomic writes.** All writes MUST be atomic (temp-file + fsync + rename or
+   equivalent) so that concurrent reads never observe partial state.
+
+7. **Capability advertisement.** If the backend does not support a capability
+   (e.g., semantic search), `supports_semantic_search` MUST return `False` and
+   `search()` MUST raise `NotImplementedError` or return an empty list
+   consistently.
+
+Note: `memory_subdir` and `apply_staging_lock_timeout` are
+`FilesystemBackend`-specific extras, NOT part of the Implementer Contract.
+Third-party backends MUST NOT be required to accept them.
+
+---
+
+## Operator override surface
+
+Added in #382 PR 1. Mirrors the `LockBackend` (#60 PR 3) / `LogBackend`
+(#61 PR 3) override surface, minus the `_URL` companion var
+(`ATOMIC_AGENTS_MEMORY_BACKEND_URL`), which is deferred to #258 (the first
+memory backend that needs a connection URL — Postgres/pgvector).
+
+### Selection mechanism
+
+Two ways to select the `MemoryBackend` for a deployment:
+
+| Method | Precedence | Use case |
+|--------|------------|----------|
+| `AtomicAgent(..., memory_backend=my_backend)` | **wins** (kwarg-wins rule) | Programmatic / test injection |
+| `ATOMIC_AGENTS_MEMORY_BACKEND=<id>` env var | fallback | Docker, launchd, Cloud Run |
+
+Both are evaluated at `AtomicAgent.__init__` time — the kwarg bypasses the
+env var entirely when set.
+
+### `ATOMIC_AGENTS_MEMORY_BACKEND`
+
+- **Default:** `"filesystem"` (unset = filesystem; zero behavior change for
+  existing deployments)
+- **Value:** a registered backend id string (case-insensitive, stripped)
+- **Fail-fast:** unknown ids raise `BackendNotRegistered` at agent
+  construction time with the full known-id list in the error message — no
+  silent fallback
+
+### `get_default_memory_backend(agent_root, *, lock_backend=None)`
+
+Public factory in `atomic_agents.memory`. Returns a fully-constructed
+`MemoryBackend` instance. Callers must retain it; calling the factory twice
+returns two separate instances.
+
+Key properties:
+- Called lazily from `__init__` / constructor body, never at module import time
+- Threads `lock_backend` through to the resolved backend so `apply_staging`
+  and `agent.call()` share the same lock backend instance
+- Used by `AtomicAgent.__init__`, `DreamRunner.__init__`, tuning context,
+  deprecated shims, CLI commands, and dashboard renderers — one selection
+  seam, no split-brain
+
+### `lock_backend` threading contract
+
+Every call site that resolves a backend VIA THE FACTORY and holds a resolved
+`lock_backend` MUST pass it through:
+
+```python
+# agent.py
+self.memory = get_default_memory_backend(
+    self.agent_root, lock_backend=self.lock_backend
+)
+
+# dream.py — DreamRunner.__init__
+self._backend = get_default_memory_backend(
+    self.agent_root, lock_backend=agent_lock_backend
+)
+```
+
+Two carve-outs: (1) the `memory_backend=` kwarg path on `AtomicAgent.__init__`
+is exempt — the operator owns lock-backend wiring on a backend they built
+themselves; the runtime does not re-thread `self.lock_backend` into it. (2)
+Standalone callers without an agent instance (deprecated shims, CLI, dashboard)
+call `get_default_memory_backend(agent_root)` without a `lock_backend`; the
+factory passes `lock_backend=None`, and the `FilesystemBackend` reference impl
+then resolves one via `ATOMIC_AGENTS_LOCK_BACKEND` internally. This is a
+reference-impl behavior, not a MUST — the Implementer Contract (MUST 2) only
+requires a backend to USE a supplied non-`None` `lock_backend`; third-party
+backends MAY handle `None` differently.
+
+### Per-runner threading
+
+| Runner | `memory_backend=` kwarg | When None |
+|--------|------------------------|-----------|
+| `AtomicAgent` | Yes | factory + env var |
+| `DreamRunner` | Yes (filesystem only — see caveat) | factory + env var |
+| `TuningRunner._build_context` (stores on `AnalysisContext`) | No (routes through factory only) | factory + env var |
+
+DreamRunner caveat. `DreamRunner.apply()` wraps the on-disk dream output
+directory as a `FilesystemStagedMemory` and feeds it to `apply_staging()` — a
+filesystem-shaped staging path. `DreamRunner.__init__` therefore guards: if the
+resolved memory backend is not a `FilesystemBackend` (whether selected via
+`ATOMIC_AGENTS_MEMORY_BACKEND` or injected via `memory_backend=`), it raises
+`NotImplementedError` rather than breaking silently at apply time. Routing
+`apply()` through a backend-agnostic staging-adopt path is tracked in #396.
+
+### Delegate threading
+
+Memory is per-agent **state** (each agent has its own `memory/` directory),
+not fleet-shared **config** like persona/corpus. `AtomicAgent.delegate()`
+therefore **NEVER** threads the coordinator's memory backend to a child — not
+by default, and not even when the operator supplied `memory_backend=`
+explicitly. Each delegate resolves its own per-agent backend via the same
+process/deployment-global `ATOMIC_AGENTS_MEMORY_BACKEND` selection.
+
+This is the deliberate divergence from the persona/corpus delegate-threading
+mirror. For those layers the explicit instance is shared config and sharing it
+is correct. For memory, threading a root-bound `FilesystemBackend` would
+silently route the specialist's writes into the COORDINATOR's `memory/`
+directory — cross-agent state corruption that breaks the per-agent audit trail
+(Principle #5). Heterogeneous and shared-memory fleets remain expressible via
+the `memory_backend=` kwarg on each agent's own construction, not via
+coordinator-to-child threading. Shared-memory delegation, if ever genuinely
+wanted, is a new Tier A design fork to escalate, not a corner decided here.
+
+### Bootstrap-paradox note
+
+Memory backend selection is config-tier (T15): the env var is authoritative
+because reading the vault config file (`model.md`, `tools.md`) requires a
+working runtime, but initialising the runtime requires a backend.
+
+In `AtomicAgent.__init__`, the order is:
+1. `lock_backend` resolved
+2. `log_backend` resolved
+3. other fleet-scoped backends resolved
+4. `_load_config()` called — reads `model.md`, `tools.md`, etc. (no memory reads)
+5. `memory` resolved via factory
+
+`_load_config()` does NOT read from `memory/`, so there is no paradox at the
+current construction order. The env-var-only selection is required by this
+ordering constraint: the factory must not read any vault file to determine
+which backend to construct.
+
+### Doctor checks
+
+Two checks mirror the `check_lock_backend` / `check_locks` pair:
+
+| Check name | Type | What it verifies |
+|------------|------|-----------------|
+| `memory-backend-config` | coherence | `ATOMIC_AGENTS_MEMORY_BACKEND` is a known id AND (for non-filesystem ids) constructs |
+| `memory-backend` | liveness | factory resolves and `stats()` returns |
+
+The liveness check (and the non-filesystem branch of the coherence check)
+route through `get_default_memory_backend` so doctor's verdict and the
+runtime's behavior cannot diverge (doctor-reuses-factory invariant). The
+filesystem-default coherence branch short-circuits to PASS without
+construction (the default needs no extras).
+
+The liveness check first probes the on-disk `memory/` directory — but this is
+a **filesystem-shaped precheck that only runs when the configured backend is
+`filesystem`**. When `ATOMIC_AGENTS_MEMORY_BACKEND` names a non-filesystem
+backend (the #258 Postgres/pgvector case this seam exists to enable), the
+on-disk guard is skipped and the factory + `stats()` probe is authoritative —
+a healthy non-local backend with no local `memory/` dir must not spuriously
+FAIL. Both doctor checks construct the backend through the factory and call
+`close()` on it (when the backend exposes one) so a future connection-backed
+backend does not leak a connection per doctor run.
+
+---
+
 ## Test coverage
 
 - `tests/test_memory_protocol_conformance.py` — 26 named behavioral tests
   (parameterized fixture accepts any `MemoryBackend` implementation)
 - `tests/test_memory_filesystem_backend.py` — 10 filesystem-specific tests
   (`.versions/` layout, INDEX.md format, path enforcement, staging lifecycle)
+- `tests/test_memory_operator_override.py` — operator override surface tests
+  (factory env-var path, kwarg-wins, lock threading, registry helpers,
+  uniform construction contract + registry conformance, doctor coherence +
+  liveness checks including a registered-backend PASS)
