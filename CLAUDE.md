@@ -38,7 +38,7 @@ When you can't tell whether a design move helps both — stop, name the tradeoff
        Skills (lazy)        Evals              Helper provenance
        MCP (external)       Tuning             Delegation rollup
        Memory (Notes+Wiki)  Goals              Cost tracking
-       Journal              Delegation (tree-cap) OTel tracing seam 🟡
+       Journal              Delegation (tree-cap) OTel trace export 🟡 (#341 PR1: call span)
                             Helpers (cheap parallel)
                                 │
                   Backend Protocols (the moat)
