@@ -70,6 +70,8 @@ Anything stateful lives in the agent folder — primarily markdown + JSONL, with
 
 If a feature requires state that *only* exists in a backend, reconsider it. The portability win is load-bearing.
 
+**This rule flexes for backend-swapped deployments** (cloud/enterprise) — see `docs/TENSIONS.md` T15. The short version: "backends are never authoritative" holds for the default filesystem deployment and for *config* (persona/model/tools/goal) in every deployment; *state* run through a swapped backend (Postgres, native cloud store) is authoritative-in-that-deployment, with the canonical vault file *shape* preserved as a tested round-trip export contract (#379) rather than a guaranteed location. Portability is "the file shape is always reconstructable," not "the files are always the truth."
+
 ### 2. Protocols, not subclassing
 
 When a primitive touches storage, it gets a protocol. The template is `docs/spec/20-memory-backend.md` + PR #57: **Protocol + dataclasses + WritePolicy + capability advertisement + filesystem-default + spec doc + ~25 conformance tests + ~10 fs-specific tests**. Apply this shape to LockBackend (#60), LogBackend (#61), PersonaBackend (#62), AgentProfileBackend (#63), ToolRegistryBackend (#64), CorpusBackend (#65), MandateBackend (#124), and any future backend.

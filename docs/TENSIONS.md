@@ -2,7 +2,7 @@
 created: 2026-05-09
 type: tensions
 status: active
-last_review: 2026-05-09
+last_review: 2026-06-09
 ---
 
 # Tensions — Atomic Agents
@@ -137,7 +137,7 @@ Meeting any one trigger is sufficient to justify the async-first rebuild. Until 
 
 **Easy fix when needed:** Add `memory_backend: str = "filesystem"` to `AgentConfig`, parse from `model.md`, route through `get_backend(config.memory_backend)(agent_root=...)` at line 172. Type-annotate as `MemoryBackend`. ~10 line change. Worth doing the moment the second backend has any prototype, not at SaaS-shape time.
 
-**Related:** spec/20-memory-backend §"Backend registry", Issues #60–#65.
+**Related:** spec/20-memory-backend §"Backend registry", Issues #60–#65. **Now an executable issue: #382** (promoted because GCP elastic scale-out Phase 2 depends on it — see #339, T15).
 
 ---
 
@@ -313,6 +313,42 @@ Meeting any one trigger is sufficient to justify the async-first rebuild. Until 
 
 **Related:** ROADMAP §"Letta owns memory-first but they're API-bound", ROADMAP #2 (semantic memory retrieval — would extend this assembly with a vector recall step).
 
+### 🟡 T15. Vault-as-source-of-truth vs. enterprise store-of-record (the authority model)
+
+**One-sentence:** Principle #1 says "the vault files are the source of truth; backends are never authoritative" — but an enterprise GCP/AWS/Azure deployment needs mutable state (logs, memory, goals) to live authoritatively in a real store (Postgres / native cloud DB), because Cloud Run is ephemeral and scale-to-zero, and many concurrent runs can't safely share files.
+
+**Why load-bearing:** This is the decision the entire cloud-delivery story rests on (#339 GCP blueprint, #344 delivery push, and every future AWS/Azure adapter). Get it wrong and one of the two first-class shapes — home-user-on-files or org-fleet-on-cloud — silently becomes a degraded mode, which the throughline explicitly refuses. The naive framings both fail:
+- *"All vault files move into Postgres on deploy"* — collapses the config/state distinction and breaks the markdown-as-config aesthetic (rule #7) and the home==enterprise throughline.
+- *"Files always win; the DB is just an index rebuilt from files"* (call it **Position A**) — keeps principle #1 literally true but forces permanent file↔DB sync machinery, keeps files in the write path (caps enterprise throughput), and multiplies that sync tax once per cloud as AWS/Azure adapters land. It fights the very protocol design.
+
+**The distinction that resolves it:** vault content is two kinds with opposite needs.
+- **Config** (who the agent *is*): `persona/`, `model.md`, `tools.md`, `mcp.md`, `goal.md`, skills. Human-authored, read-mostly, small, version-controlled. **Stays as files everywhere** — on home disk for the home user, baked into the container image (immutable, fast) for cloud. No non-filesystem backend needed; it just has to be present on the runtime's filesystem.
+- **State** (what the agent has *done/learned*): memory notes, JSONL run logs, goal history, outcomes, cost data, locks. Runtime-written, concurrent, unbounded. **Runs through a swappable backend** — filesystem default (home), Postgres + Secret Manager + Cloud Logging (GCP), native stores (AWS/Azure). This is the only part that ever leaves the filesystem, and only at scale.
+
+**Decision recorded — Position B (2026-06-09):**
+
+The registered backend is the **store of record for its own data in that deployment**, and the canonical *vault file shape* is a guaranteed **export/render contract** — not a guaranteed *location*.
+
+- Portability is preserved not by *"files are always the truth"* but by *"the file shape is always reconstructable."* Any backend can render its data back to the canonical vault shape (a memory note, a JSONL line) on demand. Kill a GCP deployment, export, and you have a home-shaped agent again.
+- This is **stronger** portability than Position A, not weaker: it's portability across *stores*, not just across *processes* — exactly what's needed once Atomic Agents has its own home-user runtime AND adapters for ≥2 clouds. The export contract becomes the universal portability primitive **across runtimes and across clouds**; Position A would pay an N-clouds sync tax to achieve less.
+- **This explicitly amends Principle #1.** "Backends are never authoritative" holds for the *default (filesystem) deployment* and for *config in every deployment*. In a backend-swapped deployment, the registered backend IS authoritative for its state, and the file shape is a tested export guarantee. Per the rule itself — when a principle needs to flex, it gets a TENSIONS entry rather than a silent break. This is that entry. (Follow-up: cross-reference this T15 from CLAUDE.md Principle #1.)
+
+**The engineering spine this decision implies (the deliverable that makes B real):** every backend Protocol gains a **canonical-shape export method**, verified by **round-trip conformance** (write to backend → export → byte-equivalent JSONL/markdown). Without that method, B is just "we gave up on portability." With it, B is the portability guarantee. This is a Protocol-surface addition across the existing 13 backends — a tracked, multi-PR body of work, not a one-liner. **Tracked in #379.**
+
+**Where:**
+- Principle #1 in `CLAUDE.md` (the rule being flexed).
+- `agent.py` backend instantiation seams (T5 — the missing config→backend wiring is the same seam this rides on).
+- Future `extras/gcp/` (#339), AWS/Azure blueprints, and the first-party home runtime all consume this contract.
+
+**When this bites:** Now, conceptually — it gates the #339 GCP blueprint design. Concretely, it bites the first time an operator deploys to GCP with Postgres-backed state and then wants their agent back on a laptop (or moved to another cloud). Without the export contract, that round-trip is bespoke per backend.
+
+**What to watch for:**
+- Any cloud adapter that stores state with **no export-to-canonical-shape path** — that's a portability hole, and the moment Position B quietly degrades into "the cloud owns your agent."
+- Marketing/positioning that claims "your agent is portable" before round-trip conformance exists to back it. Same discipline as T6 — don't claim the guarantee before the test enforces it.
+- A config field or state field landing on the wrong side of the config/state line (e.g., mutable runtime state baked into the image, or human-authored config shoved into Postgres). The line is: *who writes it, how often, and does concurrency matter.*
+
+**Related:** Principle #1 (CLAUDE.md), #379 (the export-contract deliverable), #382 (memory config→backend wiring seam — T5 promoted), #383 (protocol-coverage gap: goals/outcomes/journal/cascade), #339 (GCP blueprint), #344 (GCP delivery push), #340 (SecretBackend — first state-leaves-the-filesystem case), #258 (Postgres adapters), T5 (config→backend wiring seam), T13 (migration runner must also become backend-shaped, same root cause), the throughline.
+
 ---
 
 ## Resolved tensions
@@ -331,6 +367,7 @@ Meeting any one trigger is sufficient to justify the async-first rebuild. Until 
 |------|---------|-------------------|-----------|
 | 2026-05-09 | All | Captured to TENSIONS.md | Initial review of agent.py + mcp.py + tools.py + cascade + execution layers + observability. |
 | 2026-06-07 | T2 | Hybrid Option C — thread-pool adapter now, async-first rebuild deferred with named triggers | Issue #342 (thin HTTP wrapper). Decision rationale: ships org shape today without async refactor; keeps both home and org shapes first-class; written deferral with measurable triggers is the load-bearing deliverable. See T2 "Decision recorded" block above. |
+| 2026-06-09 | T15 | Position B — registered backend is store-of-record per deployment; canonical vault *shape* is a guaranteed export contract, not a guaranteed location | Authority model for cloud delivery (#339/#344). Explicitly amends Principle #1: "backends never authoritative" holds for the default/filesystem deployment and for config everywhere; backend-swapped state is authoritative-in-that-deployment with a tested round-trip export. Strengthened by the coming first-party home runtime + AWS/Azure adapters — the export contract is the cross-runtime, cross-cloud portability primitive; Position A would multiply file-sync cost per cloud. Implies a new export method + round-trip conformance across all 13 backends (#379). |
 
 ---
 
