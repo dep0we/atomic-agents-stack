@@ -20,12 +20,14 @@ Public surface (scaffolding PR — no behavior change today):
         find_backend_for_model,
     )
 
-The registry is a process-local dict keyed by ``provider_id``. Threading
-note: registration is expected at import time (one-shot from each backend's
-module); ``find_backend_for_model`` is read-only and safe to call from any
-thread. No lock is needed under that usage; if a future operator mutates
-the registry at runtime from multiple threads, that's their footgun to
-sandbox.
+The registry is a process-local dict keyed by ``provider_id``. The four
+reference backends register lazily on the first ``find_backend_for_model``
+call (via ``_ensure_default_backends``), NOT at module import — eager SDK
+imports added ~300ms to every subprocess spawn (see spec/31). Threading
+note: ``find_backend_for_model`` is read-only after that one-shot lazy
+registration and safe to call from any thread. No lock is needed under that
+usage; if a future operator mutates the registry at runtime from multiple
+threads, that's their footgun to sandbox.
 """
 
 from __future__ import annotations
@@ -64,8 +66,6 @@ __all__ = [
     "iter_registered_backends",
     "find_backend_for_model",
 ]
-
-
 
 
 # Process-local registry. Keyed by ``provider_id`` to enforce the
@@ -188,9 +188,7 @@ def find_backend_for_model(
             f"Registered backends: {sorted(_registry.keys())}"
         )
     if len(matches) > 1:
-        raise AmbiguousBackendError(
-            model, sorted(b.provider_id for b in matches)
-        )
+        raise AmbiguousBackendError(model, sorted(b.provider_id for b in matches))
     return matches[0]
 
 
@@ -198,51 +196,74 @@ _DEFAULTS_REGISTERED = False
 
 
 def _ensure_default_backends() -> None:
-    """Lazily register the reference backends on first registry use.
+    """Lazily register the four reference backends on first registry use.
 
     Each backend's instantiation may raise ``AtomicAgentsError`` when its
-    optional SDK isn't installed (e.g., anthropic, openai). The framework
-    treats missing SDKs as "this backend isn't available in this
-    deployment" — log at DEBUG and continue. The cost gates and doctor
-    surface the actual missing-key / missing-SDK condition when an
+    optional SDK isn't installed (e.g., anthropic, openai, google-genai). The
+    framework treats missing SDKs as "this backend isn't available in this
+    deployment" — log at DEBUG (not WARNING, so a home user who never opted
+    into a provider sees no noise on first call) and continue. The cost gates
+    and doctor surface the actual missing-key / missing-SDK condition when an
     operator tries to use the affected provider.
 
     Called by ``find_backend_for_model`` on every lookup; idempotent via
     the ``_DEFAULTS_REGISTERED`` guard. Lazy registration keeps
-    ``import atomic_agents`` fast — pulling in anthropic at module-import
+    ``import atomic_agents`` fast — pulling in provider SDKs at module-import
     time slows every subprocess spawn (e.g., ``multiprocessing.Process``
     in tests) by ~300ms and broke a timing-sensitive lock acquisition
     test on the introducing PR.
 
-    PR 2 of #87 registers AnthropicLLMBackend here. PR 3 will add
-    OpenAICompatibleLLMBackend + MoonshotLLMBackend factories.
+    Registered backends (all four reference implementations):
+    - AnthropicLLMBackend (claude-* models)
+    - OpenAICompatibleLLMBackend / make_openai_backend (gpt-* models)
+    - make_moonshot_backend (moonshot/* models, reuses OpenAI-compat)
+    - VertexGeminiLLMBackend (vertex/gemini-* models, optional [vertex] extra)
     """
     from ..exceptions import AtomicAgentsError as _AAE
+
     global _DEFAULTS_REGISTERED
     if _DEFAULTS_REGISTERED:
         return
     _DEFAULTS_REGISTERED = True
     # Each backend's instantiation may raise ``ImportError`` (missing
     # optional SDK) or ``AtomicAgentsError`` (framework-specific init
-    # failure). Those are documented expected misses — log at WARNING
-    # and continue with the remaining backends. Any other exception
-    # propagates so real code bugs surface as tracebacks at first
-    # lookup, not as silent ``UnknownModelError``.
+    # failure — every reference backend wraps a missing optional SDK in
+    # ``AtomicAgentsError`` at construction). Those are documented expected
+    # misses for any deployment that didn't opt into that provider's extra —
+    # log at DEBUG (not WARNING) and continue with the remaining backends.
+    # A home user with one Claude agent who never asked for OpenAI / Moonshot
+    # / Vertex must not see a WARNING line on first ``agent.call()`` for an
+    # SDK they never installed — "defaults are right / graceful" per the
+    # aesthetic section. The doctor (``check_provider_keys``) and the cost
+    # gates surface the missing-SDK / missing-key condition loudly at the
+    # point an operator actually selects that provider's model. Any OTHER
+    # exception propagates so real code bugs surface as tracebacks at first
+    # lookup, not as a silent ``UnknownModelError``.
     try:
         from .anthropic import AnthropicLLMBackend
+
         register_llm_backend(AnthropicLLMBackend())
         _logger.debug("registered AnthropicLLMBackend")
     except (ImportError, _AAE) as e:
-        _logger.warning("AnthropicLLMBackend not registered: %s", e)
+        _logger.debug("AnthropicLLMBackend not registered: %s", e)
     try:
         from .openai_compat import make_openai_backend
+
         register_llm_backend(make_openai_backend())
         _logger.debug("registered OpenAILLMBackend")
     except (ImportError, _AAE) as e:
-        _logger.warning("OpenAILLMBackend not registered: %s", e)
+        _logger.debug("OpenAILLMBackend not registered: %s", e)
     try:
         from .moonshot import make_moonshot_backend
+
         register_llm_backend(make_moonshot_backend())
         _logger.debug("registered MoonshotLLMBackend")
     except (ImportError, _AAE) as e:
-        _logger.warning("MoonshotLLMBackend not registered: %s", e)
+        _logger.debug("MoonshotLLMBackend not registered: %s", e)
+    try:
+        from .vertex_gemini import VertexGeminiLLMBackend
+
+        register_llm_backend(VertexGeminiLLMBackend())
+        _logger.debug("registered VertexGeminiLLMBackend")
+    except (ImportError, _AAE) as e:
+        _logger.debug("VertexGeminiLLMBackend not registered: %s", e)

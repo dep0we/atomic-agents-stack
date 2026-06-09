@@ -42,6 +42,7 @@ from atomic_agents.llm.openai_compat import (
     OpenAICompatibleLLMBackend,
     make_openai_backend,
 )
+from atomic_agents.llm.vertex_gemini import VertexGeminiLLMBackend
 from atomic_agents.llm.types import (
     CacheDirective,
     LLMCapabilities,
@@ -61,13 +62,19 @@ def _stub_api_keys(monkeypatch):
     monkeypatch.setenv("ATOMIC_AGENTS_ANTHROPIC_KEY", "fake-key")
     monkeypatch.setenv("ATOMIC_AGENTS_OPENAI_KEY", "fake-key")
     monkeypatch.setenv("ATOMIC_AGENTS_MOONSHOT_KEY", "fake-key")
+    # Vertex: project env var so VertexGeminiLLMBackend constructs without real ADC
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
 
 
-@pytest.fixture(params=[
-    ("anthropic", "claude-haiku-4-5-20251001"),
-    ("openai", "gpt-5"),
-    ("moonshot", "moonshot/kimi-k2.6"),
-], ids=["anthropic", "openai", "moonshot"])
+@pytest.fixture(
+    params=[
+        ("anthropic", "claude-haiku-4-5-20251001"),
+        ("openai", "gpt-5"),
+        ("moonshot", "moonshot/kimi-k2.6"),
+        ("vertex-gemini", "vertex/gemini-2.0-flash"),
+    ],
+    ids=["anthropic", "openai", "moonshot", "vertex-gemini"],
+)
 def backend_and_model(request):
     """Yield ``(backend_instance, sample_model_id)`` for each shipped backend."""
     provider_id, model_id = request.param
@@ -77,6 +84,25 @@ def backend_and_model(request):
         return make_openai_backend(), model_id
     if provider_id == "moonshot":
         return make_moonshot_backend(), model_id
+    if provider_id == "vertex-gemini":
+        # Patch google.genai so VertexGeminiLLMBackend constructs in CI without the SDK
+        fake_google = types.ModuleType("google")
+        fake_genai = types.ModuleType("google.genai")
+        fake_genai_types = types.ModuleType("google.genai.types")
+        fake_genai_client = types.ModuleType("google.genai.client")
+        fake_genai_client.Client = lambda **kw: MagicMock()
+        fake_google.genai = fake_genai
+        with patch.dict(
+            sys.modules,
+            {
+                "google": fake_google,
+                "google.genai": fake_genai,
+                "google.genai.types": fake_genai_types,
+                "google.genai.client": fake_genai_client,
+            },
+        ):
+            backend = VertexGeminiLLMBackend()
+        return backend, model_id
     raise ValueError(f"unknown backend in parametrize: {provider_id}")
 
 
@@ -96,8 +122,13 @@ def test_has_all_seven_protocol_methods(backend_and_model):
     """Belt-and-braces: explicitly assert each method exists by name."""
     backend, _ = backend_and_model
     for method in (
-        "provider_id", "supports_model", "capabilities", "pricing",
-        "count_tokens", "call", "format_tool_results",
+        "provider_id",
+        "supports_model",
+        "capabilities",
+        "pricing",
+        "count_tokens",
+        "call",
+        "format_tool_results",
     ):
         assert hasattr(backend, method), f"missing {method}"
 
@@ -116,13 +147,30 @@ def test_provider_id_is_non_empty_string(backend_and_model):
 
 
 def test_provider_id_unique_across_default_backends():
-    """The three shipped backends must have distinct provider_ids so the
+    """All four shipped backends must have distinct provider_ids so the
     registry's keyed-by-provider_id invariant holds.
     """
     a = AnthropicLLMBackend().provider_id
     o = make_openai_backend().provider_id
     m = make_moonshot_backend().provider_id
-    assert len({a, o, m}) == 3
+    # Construct VertexGeminiLLMBackend with a patched SDK
+    fake_google = types.ModuleType("google")
+    fake_genai = types.ModuleType("google.genai")
+    fake_genai_types = types.ModuleType("google.genai.types")
+    fake_genai_client = types.ModuleType("google.genai.client")
+    fake_genai_client.Client = lambda **kw: MagicMock()
+    fake_google.genai = fake_genai
+    with patch.dict(
+        sys.modules,
+        {
+            "google": fake_google,
+            "google.genai": fake_genai,
+            "google.genai.types": fake_genai_types,
+            "google.genai.client": fake_genai_client,
+        },
+    ):
+        v = VertexGeminiLLMBackend().provider_id
+    assert len({a, o, m, v}) == 4
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -152,8 +200,9 @@ def test_supports_model_rejects_obviously_wrong_id(backend_and_model):
         # Filter false-claims: only assert backends DON'T claim a foreign id
         # when that id genuinely belongs to a different provider.
         if backend.provider_id == "anthropic" and not fid.startswith("claude-"):
-            assert not backend.supports_model(fid), \
+            assert not backend.supports_model(fid), (
                 f"{backend.provider_id} claimed foreign id {fid!r}"
+            )
 
 
 def test_supports_model_is_side_effect_free(backend_and_model):
@@ -231,6 +280,7 @@ def _stub_sdk_for_count_tokens(backend):
     Anthropic exposes ``messages.count_tokens`` which the backend prefers
     over its heuristic. We force the heuristic path so conformance tests
     don't depend on a live SDK call.
+    VertexGeminiLLMBackend uses a char-heuristic with no SDK call — no patch needed.
     """
     if backend.provider_id == "anthropic":
         # Remove count_tokens from the SDK so the backend falls through
@@ -240,9 +290,9 @@ def _stub_sdk_for_count_tokens(backend):
         fake_module = types.SimpleNamespace(Anthropic=lambda api_key: fake_client)
         return patch.dict(sys.modules, {"anthropic": fake_module})
     else:
-        # OpenAI-family backends use tiktoken (or heuristic if absent).
-        # The heuristic path doesn't hit the network — no patch needed.
+        # OpenAI-family and Vertex backends use heuristic (no SDK call).
         from contextlib import nullcontext
+
         return nullcontext()
 
 
@@ -264,7 +314,8 @@ def test_count_tokens_grows_with_more_input(backend_and_model):
     backend, _ = backend_and_model
     with _stub_sdk_for_count_tokens(backend):
         small = backend.count_tokens(
-            system_prompt="s", messages=[{"role": "user", "content": "x"}],
+            system_prompt="s",
+            messages=[{"role": "user", "content": "x"}],
         )
         large = backend.count_tokens(
             system_prompt="s",
@@ -284,6 +335,51 @@ def _stub_sdk_for_backend(backend, response):
         fake_client.messages.create.return_value = response
         fake_module = types.SimpleNamespace(Anthropic=lambda api_key: fake_client)
         return patch.dict(sys.modules, {"anthropic": fake_module}), fake_client
+    elif backend.provider_id == "vertex-gemini":
+        fake_client = MagicMock()
+        fake_client.models.generate_content.return_value = response
+        fake_genai = types.ModuleType("google.genai")
+        # types sub-module with minimal surface for the call() translation
+        fake_types = types.SimpleNamespace(
+            Content=lambda role, parts: types.SimpleNamespace(role=role, parts=parts),
+            Part=lambda **kw: types.SimpleNamespace(**kw),
+            FunctionDeclaration=lambda name, description, parameters: (
+                types.SimpleNamespace(
+                    name=name, description=description, parameters=parameters
+                )
+            ),
+            FunctionResponse=lambda id, name, response: types.SimpleNamespace(
+                id=id, name=name, response=response
+            ),
+            FunctionCall=lambda name, args: types.SimpleNamespace(name=name, args=args),
+            Tool=lambda function_declarations: types.SimpleNamespace(
+                function_declarations=function_declarations
+            ),
+            GenerateContentConfig=lambda **kw: types.SimpleNamespace(**kw),
+        )
+        fake_genai.Client = lambda vertexai=False, project=None, location=None: (
+            fake_client
+        )
+        fake_genai.types = fake_types
+        fake_google = types.ModuleType("google")
+        fake_google.genai = fake_genai
+        fake_genai_types_mod = types.ModuleType("google.genai.types")
+        for k, v in vars(fake_types).items():
+            setattr(fake_genai_types_mod, k, v)
+        fake_genai_client_mod = types.ModuleType("google.genai.client")
+        fake_genai_client_mod.Client = fake_genai.Client
+        return (
+            patch.dict(
+                sys.modules,
+                {
+                    "google": fake_google,
+                    "google.genai": fake_genai,
+                    "google.genai.types": fake_genai_types_mod,
+                    "google.genai.client": fake_genai_client_mod,
+                },
+            ),
+            fake_client,
+        )
     else:
         fake_client = MagicMock()
         fake_client.chat.completions.create.return_value = response
@@ -297,18 +393,41 @@ def _make_response_for_backend(backend, text="ok", tool_use_blocks=None):
         blocks = []
         if text:
             blocks.append(types.SimpleNamespace(type="text", text=text))
-        for tub in (tool_use_blocks or []):
-            blocks.append(types.SimpleNamespace(
-                type="tool_use", id=tub["id"], name=tub["name"], input=tub["input"],
-            ))
+        for tub in tool_use_blocks or []:
+            blocks.append(
+                types.SimpleNamespace(
+                    type="tool_use",
+                    id=tub["id"],
+                    name=tub["name"],
+                    input=tub["input"],
+                )
+            )
         usage = types.SimpleNamespace(
-            input_tokens=10, output_tokens=5,
-            cache_read_input_tokens=0, cache_creation_input_tokens=0,
+            input_tokens=10,
+            output_tokens=5,
+            cache_read_input_tokens=0,
+            cache_creation_input_tokens=0,
         )
         return types.SimpleNamespace(
-            content=blocks, usage=usage,
+            content=blocks,
+            usage=usage,
             model_dump=lambda: {"id": "conformance"},
         )
+    elif backend.provider_id == "vertex-gemini":
+        # Gemini returns candidates[0].content.parts with text / function_call parts
+        # and usage_metadata.prompt_token_count / candidates_token_count.
+        parts = []
+        if text:
+            parts.append(types.SimpleNamespace(text=text, function_call=None))
+        for i, tub in enumerate(tool_use_blocks or []):
+            fc = types.SimpleNamespace(name=tub["name"], args=tub["input"])
+            parts.append(types.SimpleNamespace(text=None, function_call=fc))
+        content = types.SimpleNamespace(parts=parts)
+        candidate = types.SimpleNamespace(content=content)
+        usage_meta = types.SimpleNamespace(
+            prompt_token_count=10, candidates_token_count=5
+        )
+        return types.SimpleNamespace(candidates=[candidate], usage_metadata=usage_meta)
     else:
         tool_calls = None
         if tool_use_blocks:
@@ -316,7 +435,8 @@ def _make_response_for_backend(backend, text="ok", tool_use_blocks=None):
                 types.SimpleNamespace(
                     id=tub["id"],
                     function=types.SimpleNamespace(
-                        name=tub["name"], arguments=json.dumps(tub["input"]),
+                        name=tub["name"],
+                        arguments=json.dumps(tub["input"]),
                     ),
                 )
                 for tub in tool_use_blocks
@@ -333,9 +453,11 @@ def test_call_returns_raw_llm_response(backend_and_model):
     patch_ctx, _ = _stub_sdk_for_backend(backend, response)
     with patch_ctx:
         r = backend.call(
-            model=model, system_prompt="sys",
+            model=model,
+            system_prompt="sys",
             messages=[{"role": "user", "content": "hi"}],
-            max_tokens=100, temperature=1.0,
+            max_tokens=100,
+            temperature=1.0,
         )
     assert isinstance(r, _RawLLMResponse)
     assert r.text == "hello"
@@ -351,18 +473,27 @@ def test_call_normalizes_tool_uses_to_dict_shape(backend_and_model):
     """
     backend, model = backend_and_model
     response = _make_response_for_backend(
-        backend, text="",
+        backend,
+        text="",
         tool_use_blocks=[{"id": "tc_1", "name": "search", "input": {"q": "test"}}],
     )
     patch_ctx, _ = _stub_sdk_for_backend(backend, response)
     with patch_ctx:
         r = backend.call(
-            model=model, system_prompt="sys", messages=[{"role": "user", "content": "hi"}],
-            max_tokens=100, temperature=1.0,
+            model=model,
+            system_prompt="sys",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=100,
+            temperature=1.0,
         )
     assert len(r.tool_uses) == 1
     tu = r.tool_uses[0]
-    assert tu["id"] == "tc_1"
+    # Backends that issue stable provider IDs preserve them (Anthropic, OpenAI).
+    # VertexGeminiLLMBackend mints synthetic IDs (call_0, call_1, ...) because
+    # the Gemini SDK does not assign stable call IDs — assert non-empty string.
+    assert isinstance(tu["id"], str) and len(tu["id"]) > 0
+    if backend.provider_id != "vertex-gemini":
+        assert tu["id"] == "tc_1"
     assert tu["name"] == "search"
     assert isinstance(tu["input"], dict)
     assert tu["input"] == {"q": "test"}
@@ -381,16 +512,22 @@ def test_call_accepts_canonical_tool_definitions(backend_and_model):
     backend, model = backend_and_model
     response = _make_response_for_backend(backend, text="")
     patch_ctx, _ = _stub_sdk_for_backend(backend, response)
-    canonical_tools = [LLMToolDefinition(
-        name="search", description="search",
-        input_schema={"type": "object", "properties": {"q": {"type": "string"}}},
-    )]
+    canonical_tools = [
+        LLMToolDefinition(
+            name="search",
+            description="search",
+            input_schema={"type": "object", "properties": {"q": {"type": "string"}}},
+        )
+    ]
     with patch_ctx:
         # Should not raise — backend translates internally
         backend.call(
-            model=model, system_prompt="sys",
+            model=model,
+            system_prompt="sys",
             messages=[{"role": "user", "content": "hi"}],
-            max_tokens=100, temperature=1.0, tools=canonical_tools,
+            max_tokens=100,
+            temperature=1.0,
+            tools=canonical_tools,
         )
 
 
@@ -444,7 +581,7 @@ def test_format_tool_results_string_content_is_json_encoded(backend_and_model):
     )
     serialized = json.dumps(out)
     # The string `hello` should appear as quoted JSON `\"hello\"` not bare
-    assert '"hello"' in serialized or "\\\"hello\\\"" in serialized
+    assert '"hello"' in serialized or '\\"hello\\"' in serialized
 
 
 def test_format_tool_results_non_json_serializable_falls_back_to_str(backend_and_model):
@@ -469,9 +606,13 @@ def test_format_tool_results_is_error_handled(backend_and_model):
     backend, _ = backend_and_model
     out = backend.format_tool_results(
         tool_uses=[LLMToolUse(id="tc_1", name="t", input={})],
-        tool_results=[LLMToolResult(
-            tool_use_id="tc_1", content="[tool error] boom", is_error=True,
-        )],
+        tool_results=[
+            LLMToolResult(
+                tool_use_id="tc_1",
+                content="[tool error] boom",
+                is_error=True,
+            )
+        ],
     )
     assert isinstance(out, list)
     assert len(out) > 0  # at least one message (error has to be transmitted)

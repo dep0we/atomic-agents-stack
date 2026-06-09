@@ -32,6 +32,7 @@ dependencies = [
 
 [project.optional-dependencies]
 openai = ["openai>=1.30"]
+vertex = ["google-genai>=1.0"]
 validation = ["jsonschema>=4.0"]
 redis = ["redis>=5.0,<8.0"]
 # postgres extra — psycopg 3 binary driver for PostgresLogBackend and future

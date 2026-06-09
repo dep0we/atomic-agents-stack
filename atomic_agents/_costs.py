@@ -22,28 +22,49 @@ CostSource = Literal["actor", "judge", "audit"]
 # USD per 1M tokens — input / output
 PRICING: dict[str, dict[str, float]] = {
     # Anthropic
-    "claude-opus-4-7-20260101":     {"input": 15.0, "output": 75.0},
-    "claude-opus-4-7":              {"input": 15.0, "output": 75.0},  # alias
-    "claude-sonnet-4-6-20260101":   {"input": 3.0,  "output": 15.0},
-    "claude-sonnet-4-6":            {"input": 3.0,  "output": 15.0},
-    "claude-haiku-4-5-20251001":    {"input": 0.80, "output": 4.0},
-    "claude-haiku-4-5":             {"input": 0.80, "output": 4.0},
+    "claude-opus-4-7-20260101": {"input": 15.0, "output": 75.0},
+    "claude-opus-4-7": {"input": 15.0, "output": 75.0},  # alias
+    "claude-sonnet-4-6-20260101": {"input": 3.0, "output": 15.0},
+    "claude-sonnet-4-6": {"input": 3.0, "output": 15.0},
+    "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.0},
+    "claude-haiku-4-5": {"input": 0.80, "output": 4.0},
     # OpenAI (placeholder rates; update when published)
-    "gpt-5":                         {"input": 5.0,  "output": 20.0},
-    "gpt-5-mini":                    {"input": 0.50, "output": 2.0},
-    "gpt-5-nano":                    {"input": 0.10, "output": 0.50},
+    "gpt-5": {"input": 5.0, "output": 20.0},
+    "gpt-5-mini": {"input": 0.50, "output": 2.0},
+    "gpt-5-nano": {"input": 0.10, "output": 0.50},
     # Moonshot (placeholder rates — verify against current Moonshot pricing).
     # Both the api.moonshot.ai (dot-style) and api.moonshot.cn (dash-date-style)
     # endpoints expose distinct model identifiers; cost lookup needs entries
     # for whichever an operator selects via `--model`.
-    "moonshot/moonshot-v1-128k":     {"input": 0.30, "output": 1.20},
-    "moonshot/moonshot-v1-32k":      {"input": 0.30, "output": 1.20},
-    "moonshot/moonshot-v1-8k":       {"input": 0.30, "output": 1.20},
-    "moonshot/kimi-k2.6":            {"input": 0.30, "output": 1.20},  # thinking; .ai
-    "moonshot/kimi-k2.5":            {"input": 0.30, "output": 1.20},  # thinking; .ai
+    "moonshot/moonshot-v1-128k": {"input": 0.30, "output": 1.20},
+    "moonshot/moonshot-v1-32k": {"input": 0.30, "output": 1.20},
+    "moonshot/moonshot-v1-8k": {"input": 0.30, "output": 1.20},
+    "moonshot/kimi-k2.6": {"input": 0.30, "output": 1.20},  # thinking; .ai
+    "moonshot/kimi-k2.5": {"input": 0.30, "output": 1.20},  # thinking; .ai
     "moonshot/kimi-k2-0905-preview": {"input": 0.30, "output": 1.20},  # thinking; .cn
     "moonshot/kimi-k2-0711-preview": {"input": 0.30, "output": 1.20},  # thinking; .cn
-    "moonshot/kimi-2.6":             {"input": 0.30, "output": 1.20},
+    "moonshot/kimi-2.6": {"input": 0.30, "output": 1.20},
+    # Vertex AI — Gemini family (via google-genai SDK with vertexai=True).
+    # IMPORTANT: Keys carry the full ``vertex/`` prefix — matching exactly what
+    # operators write in model.md.  calc_cost() receives the model string as-is
+    # from call() (which passes the prefixed form), so keys MUST match.
+    # Rates from Vertex AI pricing page (verified 2026-06-09).  Vertex pricing
+    # may differ from direct Gemini API pricing; update when Vertex publishes
+    # changes.
+    # NOTE: Unknown vertex/* models (not listed below) fall through to
+    # _fallback_pricing(), which uses the GLOBAL max input/output rates across
+    # PRICING (currently claude-opus at 15/75) — far above any Vertex rate. So an
+    # unpriced Vertex model is costed pessimistically, not cheaply. These entries
+    # do NOT change the fallback sentinel (all are below the existing opus max);
+    # operators wanting accurate cost on a new Vertex model should add an explicit
+    # entry rather than relying on the opus-rate fallback.
+    "vertex/gemini-2.5-flash": {"input": 0.30, "output": 2.50},  # $0.30/$2.50 per 1M
+    "vertex/gemini-2.5-pro": {"input": 1.25, "output": 10.00},  # $1.25/$10.00 per 1M
+    "vertex/gemini-2.0-flash": {"input": 0.10, "output": 0.40},  # $0.10/$0.40 per 1M
+    "vertex/gemini-2.0-flash-lite": {
+        "input": 0.075,
+        "output": 0.30,
+    },  # $0.075/$0.30 per 1M
 }
 
 # Cache hit pricing — Anthropic charges 10% of input rate for cache hits
@@ -65,8 +86,9 @@ def _fallback_pricing() -> dict[str, float]:
     return {"input": max_input, "output": max_output}
 
 
-def calc_cost(model: str, input_tokens: int, output_tokens: int,
-              cache_hit_tokens: int = 0) -> tuple[float, bool]:
+def calc_cost(
+    model: str, input_tokens: int, output_tokens: int, cache_hit_tokens: int = 0
+) -> tuple[float, bool]:
     """Compute USD cost for one LLM call.
 
     Returns (cost_usd, cost_estimated_via_fallback).
@@ -156,6 +178,7 @@ def sum_cost_for_period(
     # the operator surface is consistent across all backend types).
     if backend is not None:
         from .logs.filesystem import FilesystemLogBackend
+
         if not isinstance(backend, FilesystemLogBackend):
             return _sum_via_backend(
                 backend, today, period, source, mandate_id, agent_name
@@ -244,13 +267,15 @@ def _sum_via_backend(
     else:
         raise ValueError(f"unknown period: {period}")
 
-    records = backend.query(LogQuery(
-        since=since_dt,
-        until=until_dt,
-        cost_source=source,
-        mandate_id=mandate_id,
-        agent_name=agent_name,
-    ))
+    records = backend.query(
+        LogQuery(
+            since=since_dt,
+            until=until_dt,
+            cost_source=source,
+            mandate_id=mandate_id,
+            agent_name=agent_name,
+        )
+    )
 
     total = 0.0
     for r in records:
@@ -273,4 +298,5 @@ def load_warning_state(state_path: Path) -> dict:
 def save_warning_state(state_path: Path, state: dict) -> None:
     """Save the warning fired-state. Atomic write via temp+rename."""
     from ._io import atomic_write
+
     atomic_write(state_path, json.dumps(state, indent=2))
