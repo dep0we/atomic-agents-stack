@@ -53,6 +53,10 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .logs import LogBackend
+
+    # NOTE: MemoryBackend is imported unconditionally at runtime below (used by
+    # the isinstance guard in DreamRunner.__init__), so it is intentionally NOT
+    # re-imported here — a TYPE_CHECKING-only re-import would be dead.
     from .profile import AgentProfileBackend
     from .registry import ToolRegistryBackend
     from .mandate import MandateBackend
@@ -74,8 +78,9 @@ from .locks import (
 )
 from ._platform import get_agents_root
 from .exceptions import AtomicAgentsError, DreamInProgress, DreamNotFound
-from .memory.backend import WritePolicy
+from .memory.backend import MemoryBackend, WritePolicy
 from .memory.filesystem import FilesystemBackend, FilesystemStagedMemory
+from .memory import get_default_memory_backend
 from .types import Capture
 
 # Regex for valid dream_id: only the drm_<YYYY-MM-DDTHHMMSS>_<6hex> shape or
@@ -233,7 +238,7 @@ def _read_memory_notes(agent_root: Path) -> list[dict]:
     return notes
 
 
-def _read_memory_notes_via_backend(backend: "FilesystemBackend") -> list[dict]:
+def _read_memory_notes_via_backend(backend: "MemoryBackend") -> list[dict]:
     """Return list of parsed notes from memory/ via MemoryBackend protocol.
 
     Replaces the direct filesystem glob in _read_memory_notes() when a backend
@@ -765,7 +770,7 @@ def _run_pipeline(
     instructions: str,
     model: str,
     critical: bool,
-    backend: FilesystemBackend | None = None,
+    backend: "MemoryBackend | None" = None,
     log_backend: "LogBackend | None" = None,
 ) -> DreamResult:
     """Execute the full dream pipeline. Mutates and returns result."""
@@ -1169,6 +1174,7 @@ class DreamRunner:
         dream_lock_timeout: float = 30.0,
         lock_backend: LockBackend | None = None,
         log_backend: "LogBackend | None" = None,
+        memory_backend: "MemoryBackend | None" = None,
         profile_backend: "AgentProfileBackend | None" = None,
         tool_registry_backend: "ToolRegistryBackend | None" = None,
         mandate_backend: "MandateBackend | None" = None,
@@ -1201,16 +1207,37 @@ class DreamRunner:
             agent_lock_backend = lock_backend
 
         # Memory backend — shared across start/apply/discard calls.
-        # PASS the resolved agent_lock_backend so apply_staging's lock
-        # acquires through the SAME backend instance the agent uses
-        # (Step 11 adversarial P0-1: without this, an operator who
-        # passes ``DreamRunner(..., lock_backend=RedisLockBackend(...))``
-        # with env vars unset gets a Redis dream lock but a filesystem
-        # apply_staging lock — meaningless across hosts, opening a
-        # write-data-race on memory/ during dream apply).
-        self._backend = FilesystemBackend(
-            self.agent_root, "memory", lock_backend=agent_lock_backend
-        )
+        # kwarg-wins: an explicit memory_backend= bypasses env-var resolution.
+        # When None, the factory reads ATOMIC_AGENTS_MEMORY_BACKEND and threads
+        # agent_lock_backend so apply_staging's lock acquires through the SAME
+        # backend instance the agent uses (Step 11 adversarial P0-1: without
+        # this, an operator who passes ``DreamRunner(...,
+        # lock_backend=RedisLockBackend(...))`` with env vars unset gets a
+        # Redis dream lock but a filesystem apply_staging lock — meaningless
+        # across hosts, opening a write-data-race on memory/ during dream
+        # apply).  See spec/20 §"Operator override surface".
+        if memory_backend is None:
+            self._backend: MemoryBackend = get_default_memory_backend(
+                self.agent_root, lock_backend=agent_lock_backend
+            )
+        else:
+            self._backend = memory_backend
+
+        # PR-1 scope guard (#396): DreamRunner.apply() wraps the on-disk dream
+        # output dir as a FilesystemStagedMemory and feeds it to
+        # ``self._backend.apply_staging(...)``. That staging-from-an-existing-
+        # directory path is filesystem-shaped; a non-filesystem backend cannot
+        # consume it. Rather than silently break on apply, fail loud at
+        # construction so the limitation is honest. Routing apply() through a
+        # backend-agnostic staging adopt path is tracked in #396.
+        if not isinstance(self._backend, FilesystemBackend):
+            raise NotImplementedError(
+                "DreamRunner currently requires the filesystem memory backend "
+                "(ATOMIC_AGENTS_MEMORY_BACKEND=filesystem); apply() assumes a "
+                "FilesystemStagedMemory staging area. Non-filesystem memory "
+                "backends are not yet supported for the dream apply path "
+                "(tracked in #396)."
+            )
 
         # Dream lock backend — re-scoped to ``"dreams"`` via the
         # Protocol's ``scope()`` method (#60 PR 3 + spec/21 §"scope()").

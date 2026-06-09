@@ -163,6 +163,7 @@ def canonical_tool_definition():
     ``_capture → llm.types → _llm → _capture``.
     """
     from .llm.types import LLMToolDefinition
+
     return LLMToolDefinition(
         name="atomic_capture",
         description=CAPTURE_TOOL_DESCRIPTION,
@@ -201,7 +202,8 @@ def extract_tool_call_captures(
 
 
 def extract_all_captures(
-    response_text: str, tool_uses: list[dict] | None = None,
+    response_text: str,
+    tool_uses: list[dict] | None = None,
 ) -> tuple[list[Capture], list[tuple[Any, str]]]:
     """Extract captures from BOTH text (Path 2) and tool_use blocks (Path 1).
 
@@ -244,7 +246,12 @@ def extract_captures(response_text: str) -> tuple[list[Capture], list[tuple[str,
             data = json.loads(raw)
             validate_capture(data)
             captures.append(_dict_to_capture(data))
-        except (json.JSONDecodeError, SchemaValidationError, TypeError, ValueError) as e:
+        except (
+            json.JSONDecodeError,
+            SchemaValidationError,
+            TypeError,
+            ValueError,
+        ) as e:
             failures.append((raw, str(e)))
 
     # Deduplicate within a single response (per spec/05 idempotency rule)
@@ -288,25 +295,39 @@ def write_atomic_note(
     """Write a captured atomic note to memory/, then update memory/INDEX.md.
 
     .. deprecated::
-        Use ``FilesystemBackend.write_note()`` (via ``agent.memory.write_note()``)
-        instead. This function will emit a DeprecationWarning in v1.0.
+        Use ``agent.memory.write_note()`` instead. This function emits a
+        DeprecationWarning.
 
-    Delegates to FilesystemBackend.write_note(). The ``today`` parameter is
-    kept for signature compatibility but unused (the backend always uses
-    date.today()). ``log_target``, if provided, receives a JSONL event when a
-    version snapshot is created (for backward compat with tests/callers).
+    Delegates to the operator-configured MemoryBackend via
+    ``get_default_memory_backend()`` (default FilesystemBackend; honours
+    ``ATOMIC_AGENTS_MEMORY_BACKEND``). The post-write ``note_path`` /
+    ``.versions`` probe computes filesystem-shaped paths and is correct only
+    for the filesystem backend. The ``today`` parameter is kept for signature
+    compatibility but unused (the backend always uses ``date.today()``).
+    ``log_target``, if provided, receives a JSONL event when a version
+    snapshot is created (for backward compat with tests/callers).
 
     Returns the path of the written note.
     """
     warnings.warn(
         "write_atomic_note() is deprecated; use agent.memory.write_note() instead.",
-        DeprecationWarning, stacklevel=2,
+        DeprecationWarning,
+        stacklevel=2,
     )
-    from .memory.filesystem import FilesystemBackend, _snapshot
+    from .memory import get_default_memory_backend
+    from .memory.filesystem import _snapshot
     from .memory.backend import WritePolicy
 
+    # Route through the factory so the deprecated shim honours the operator's
+    # backend selection (ATOMIC_AGENTS_MEMORY_BACKEND) even in backward-compat
+    # mode.  No lock_backend kwarg — this is a standalone deprecated function
+    # with no agent instance to thread the backend from; the factory resolves
+    # the lock backend via env var, which is correct for this call context.
+    # The post-write path below (note_path / .versions probe) computes
+    # filesystem-shaped paths; correct only because this is a documented
+    # filesystem-era compat wrapper.
     memory_dir = agent_root / "memory"
-    backend = FilesystemBackend(agent_root, "memory")
+    backend = get_default_memory_backend(agent_root)
     policy = WritePolicy(
         write_paths=write_paths,
         read_only_paths=read_only_paths or [],
@@ -358,11 +379,16 @@ def _log_version_created(
         rel = version_path.relative_to(agent_root)
     except ValueError:
         rel = version_path
-    atomic_append_jsonl(log_target, json.dumps({
-        "trigger": "memory_version_created",
-        "note": note_name,
-        "version_path": str(rel),
-    }))
+    atomic_append_jsonl(
+        log_target,
+        json.dumps(
+            {
+                "trigger": "memory_version_created",
+                "note": note_name,
+                "version_path": str(rel),
+            }
+        ),
+    )
 
 
 def enforce_write_path(

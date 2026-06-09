@@ -16,8 +16,8 @@ Public API:
   redact_version           — replace body with [REDACTED], preserve frontmatter
 
 .. deprecated::
-    All public functions here are compatibility wrappers that will emit
-    DeprecationWarning in v1.0. Use ``agent.memory`` (MemoryBackend) instead.
+    All public functions here are compatibility wrappers that emit
+    DeprecationWarning. Use ``agent.memory`` (MemoryBackend) instead.
     The actual implementations have moved to ``memory.filesystem.FilesystemBackend``.
 """
 
@@ -65,6 +65,7 @@ def snapshot_memory_version(target: Path) -> Path | None:
     """
     # Delegate to filesystem implementation
     from .memory.filesystem import _snapshot
+
     return _snapshot(target)
 
 
@@ -77,16 +78,27 @@ def list_versions(memory_dir: Path, note_filename: str) -> list[Path]:
     """
     warnings.warn(
         "list_versions() is deprecated; use agent.memory.list_versions() instead.",
-        DeprecationWarning, stacklevel=2,
+        DeprecationWarning,
+        stacklevel=2,
     )
-    from .memory.filesystem import FilesystemBackend
+    from .memory import get_default_memory_backend
 
     # Validate path traversal guard (same as before)
     safe_resolve_under(note_filename, memory_dir)
 
-    # Derive agent_root from memory_dir (parent)
+    # Derive agent_root from memory_dir (parent). Route the common case
+    # (default "memory" subdir) through the factory so the deprecated shim
+    # honours the operator's backend selection. The factory always uses the
+    # default subdir, so for a caller that passed a NON-default subdir (e.g.
+    # <root>/notes) we must construct FilesystemBackend directly to preserve
+    # this shim's documented "list versions under THIS memory_dir" contract.
     agent_root = memory_dir.parent
-    backend = FilesystemBackend(agent_root, memory_dir.name)
+    if memory_dir.name == "memory":
+        backend = get_default_memory_backend(agent_root)
+    else:
+        from .memory.filesystem import FilesystemBackend
+
+        backend = FilesystemBackend(agent_root, memory_dir.name)
     refs = backend.list_versions(note_filename)
     # Return as Path objects for backward compat.
     # backend_id is now "<stem>/<version_filename>" — extract just the filename.
@@ -110,7 +122,8 @@ def read_version(version_path: Path) -> tuple[dict, str]:
     """
     warnings.warn(
         "read_version() is deprecated; use agent.memory.read_version() instead.",
-        DeprecationWarning, stacklevel=2,
+        DeprecationWarning,
+        stacklevel=2,
     )
     parsed = frontmatter.load(version_path)
     return dict(parsed.metadata), parsed.content
@@ -128,7 +141,8 @@ def restore_version(
     """
     warnings.warn(
         "restore_version() is deprecated; use agent.memory.restore_version() instead.",
-        DeprecationWarning, stacklevel=2,
+        DeprecationWarning,
+        stacklevel=2,
     )
     # Guard the live-note write target.
     live_note = safe_resolve_under(note_filename, memory_dir)
@@ -146,11 +160,14 @@ def restore_version(
 
     # Optional logging.
     if log_target is not None:
-        _append_log(log_target, {
-            "trigger": "memory_version_restored",
-            "note": note_filename,
-            "restored_from": str(version_path),
-        })
+        _append_log(
+            log_target,
+            {
+                "trigger": "memory_version_restored",
+                "note": note_filename,
+                "restored_from": str(version_path),
+            },
+        )
 
     return live_note
 
@@ -166,17 +183,21 @@ def redact_version(
     """
     warnings.warn(
         "redact_version() is deprecated; use agent.memory.redact_version() instead.",
-        DeprecationWarning, stacklevel=2,
+        DeprecationWarning,
+        stacklevel=2,
     )
     parsed = frontmatter.load(version_path)
     redacted_post = frontmatter.Post(replacement, **parsed.metadata)
     atomic_write(version_path, frontmatter.dumps(redacted_post) + "\n")
 
     if log_target is not None:
-        _append_log(log_target, {
-            "trigger": "memory_version_redacted",
-            "version_path": str(version_path),
-        })
+        _append_log(
+            log_target,
+            {
+                "trigger": "memory_version_redacted",
+                "version_path": str(version_path),
+            },
+        )
 
 
 def _append_log(log_target: Path, data: dict) -> None:

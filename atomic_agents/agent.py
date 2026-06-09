@@ -35,8 +35,8 @@ import frontmatter
 
 from . import _capture, _cascade, _costs, _llm, tracing as _tracing
 from ._io import safe_resolve_under
-from .memory.filesystem import FilesystemBackend
-from .memory.backend import WritePolicy
+from .memory.backend import MemoryBackend, WritePolicy
+from .memory import get_default_memory_backend
 from .mcp import MCPClientPool
 from .locks import (
     LockBackend,
@@ -286,6 +286,13 @@ class AtomicAgent:
     # it as any ``MCPServerRegistryBackend`` Protocol implementer --
     # breaking the operator-pinned-HTTP/SaaS case PR 4 forward.
     mcp_server_registry_backend: MCPServerRegistryBackend
+    # Same class-level annotation rationale for ``memory`` (#382 PR 1).
+    # Without this, static analysis would narrow ``agent.memory`` to the
+    # concrete ``FilesystemBackend`` default rather than treating it as any
+    # ``MemoryBackend`` Protocol implementer — breaking the
+    # operator-pinned-Postgres/custom case when memory_backend= kwarg is
+    # supplied.
+    memory: MemoryBackend
     """The main agent runtime.
 
     Responsible for:
@@ -314,6 +321,7 @@ class AtomicAgent:
         persona_backend: PersonaBackend | None = None,
         corpus_backend: CorpusBackend | None = None,
         mcp_server_registry_backend: MCPServerRegistryBackend | None = None,
+        memory_backend: MemoryBackend | None = None,
     ):
         self.name = name
         self.trigger = trigger
@@ -862,15 +870,34 @@ class AtomicAgent:
         self._init_mandate_reservation_managers()
 
         # Memory backend (spec/20 — routes all memory I/O through the protocol).
-        # Threads the agent's resolved lock_backend so memory.apply_staging
-        # serializes against agent.call() through the SAME backend instance —
-        # operator-pinned Redis backends see consistent locking across the
-        # agent + memory paths instead of two independent backend resolutions.
-        self.memory: FilesystemBackend = FilesystemBackend(
-            agent_root=self.agent_root,
-            memory_subdir="memory",
-            lock_backend=self.lock_backend,
-        )
+        # kwarg-wins: an explicit memory_backend= bypasses env-var resolution
+        # entirely.  When None, the factory reads ATOMIC_AGENTS_MEMORY_BACKEND
+        # and threads the agent's already-resolved lock_backend so
+        # memory.apply_staging serializes against agent.call() through the SAME
+        # lock backend instance — operator-pinned Redis backends see consistent
+        # locking across the agent + memory paths instead of two independent
+        # backend resolutions.
+        #
+        # Bootstrap ordering: the factory is called AFTER _load_config() so
+        # the config parse is complete before we pay any backend I/O; the
+        # factory itself reads no vault files (env-var-only selection) so there
+        # is no chicken-and-egg paradox.  See spec/20 §"Operator override
+        # surface" for the bootstrap-paradox note.
+        #
+        # Delegate threading: memory is per-agent STATE (not fleet-shared
+        # config like persona/corpus), so delegate() does NOT thread this
+        # instance to children even when memory_backend= was supplied — a
+        # root-bound FilesystemBackend would silently route a specialist's
+        # writes into the COORDINATOR's memory/ dir (cross-agent corruption).
+        # Children resolve their own per-agent backend via the same
+        # process/deployment-global env selection. See spec/20 §"Delegate
+        # threading" and ruling delegate-child-threading (#382).
+        if memory_backend is None:
+            self.memory = get_default_memory_backend(
+                self.agent_root, lock_backend=self.lock_backend
+            )
+        else:
+            self.memory = memory_backend
 
     # ────────────────────────────────────────────────────────────────────
     # Mandate crash recovery + reservation managers (#124 PR 3b)
@@ -5102,6 +5129,18 @@ class AtomicAgent:
             _delegate_kwargs["mcp_server_registry_backend"] = (
                 self.mcp_server_registry_backend
             )
+        # Memory is per-agent STATE (each delegate has its own memory/ dir),
+        # so the coordinator's backend is NEVER threaded to the child — not
+        # even when memory_backend= was supplied explicitly. The child
+        # resolves its own per-agent backend via the same process/deployment-
+        # global ATOMIC_AGENTS_MEMORY_BACKEND selection. Threading a root-bound
+        # FilesystemBackend here would silently route the specialist's writes
+        # into the COORDINATOR's memory/ dir (cross-agent corruption). This is
+        # the deliberate divergence from the persona/corpus mirror: those are
+        # fleet-shared CONFIG where sharing is correct; memory is per-agent
+        # STATE where it is not. See spec/20 §"Delegate threading" and ruling
+        # delegate-child-threading (#382). Shared-memory delegation, if ever
+        # wanted, is a new Tier A fork — not a corner to decide here.
         target_agent = AtomicAgent(**_delegate_kwargs)
 
         start = time.time()

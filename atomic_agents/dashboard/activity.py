@@ -9,6 +9,7 @@ Pure Python, no LLM calls.
 from __future__ import annotations
 import html
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass, field
@@ -25,11 +26,15 @@ from ._shared import (
     status_pill,
 )
 from .._io import atomic_write
-from ..memory.filesystem import FilesystemBackend
+from ..memory import get_default_memory_backend
+from ..exceptions import BackendNotRegistered
+
+_logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────
 # Data structures
+
 
 @dataclass
 class ActivityHeadline:
@@ -44,7 +49,7 @@ class ActivityHeadline:
 class LockEntry:
     agent: str
     held_seconds: float
-    is_stale: bool   # held > 5 minutes
+    is_stale: bool  # held > 5 minutes
 
 
 @dataclass
@@ -63,17 +68,18 @@ class DreamEntry:
 class ActivityData:
     generated_at: datetime
     headline: ActivityHeadline
-    recent_runs: list[RunRecord]         # last 50, newest first
-    recent_failures: list[RunRecord]     # failures in last 24h
-    recent_tool_calls: list[RunRecord]   # last 50 with trigger==tool_call
+    recent_runs: list[RunRecord]  # last 50, newest first
+    recent_failures: list[RunRecord]  # failures in last 24h
+    recent_tool_calls: list[RunRecord]  # last 50 with trigger==tool_call
     recent_delegations: list[RunRecord]  # last 50 with trigger==delegate
-    lock_states: list[LockEntry]         # stale locks only (held > 5 min)
-    recent_dreams: list[DreamEntry]      # last 20 dream manifests
-    recent_captures: list[dict]          # last 50 memory file captures (by mtime)
+    lock_states: list[LockEntry]  # stale locks only (held > 5 min)
+    recent_dreams: list[DreamEntry]  # last 20 dream manifests
+    recent_captures: list[dict]  # last 50 memory file captures (by mtime)
 
 
 # ──────────────────────────────────────────────────────────────────
 # Aggregation
+
 
 def aggregate_activity(
     agents_root: Path,
@@ -114,20 +120,21 @@ def aggregate_activity(
 
     # Recent failures (24h) — status != "ok" or trigger ends in "_error"
     recent_failures = [
-        r for r in all_runs_7d
+        r
+        for r in all_runs_7d
         if _ts_aware(r.ts) >= cutoff_24h
         and (r.status not in ("ok",) or r.trigger.endswith("_error"))
     ]
 
     # Recent tool calls (last 50)
-    recent_tool_calls = [
-        r for r in all_runs_7d if r.trigger == "tool_call"
-    ][:max_recent]
+    recent_tool_calls = [r for r in all_runs_7d if r.trigger == "tool_call"][
+        :max_recent
+    ]
 
     # Recent delegations (last 50)
-    recent_delegations = [
-        r for r in all_runs_7d if r.trigger == "delegate"
-    ][:max_recent]
+    recent_delegations = [r for r in all_runs_7d if r.trigger == "delegate"][
+        :max_recent
+    ]
 
     # Lock states — check each agent's .lock file
     lock_states: list[LockEntry] = []
@@ -139,11 +146,13 @@ def aggregate_activity(
                 held_secs = time.time() - mtime
                 is_stale = held_secs > 300  # 5 minutes
                 if is_stale:
-                    lock_states.append(LockEntry(
-                        agent=agent,
-                        held_seconds=held_secs,
-                        is_stale=True,
-                    ))
+                    lock_states.append(
+                        LockEntry(
+                            agent=agent,
+                            held_seconds=held_secs,
+                            is_stale=True,
+                        )
+                    )
             except OSError:
                 pass
 
@@ -228,7 +237,30 @@ def _scan_recent_captures(
         agent_root = agents_root / agent
         if not (agent_root / "memory").exists():
             continue
-        backend = FilesystemBackend(agent_root, "memory")
+        # Route through the factory so the dashboard honours the operator's
+        # backend selection (ATOMIC_AGENTS_MEMORY_BACKEND). A config typo
+        # degrades this one agent row instead of crashing the whole tab,
+        # mirroring dashboard/costs.py load_runs's graceful-skip pattern, but
+        # leaves a log breadcrumb so a silently-missing row is diagnosable
+        # (no swallowed-exception-with-no-log; Principle #5 audit trail).
+        try:
+            backend = get_default_memory_backend(agent_root)
+        except BackendNotRegistered as exc:
+            _logger.warning(
+                "activity dashboard: skipping agent %r: unknown "
+                "ATOMIC_AGENTS_MEMORY_BACKEND (%s)",
+                agent,
+                exc,
+            )
+            continue
+        except Exception:
+            _logger.debug(
+                "activity dashboard: skipping agent %r: memory backend "
+                "construction failed",
+                agent,
+                exc_info=True,
+            )
+            continue
         # Use backend.list_notes() so future non-filesystem backends are supported.
         for ref in backend.list_notes(include_archived=True, include_superseded=True):
             try:
@@ -245,18 +277,24 @@ def _scan_recent_captures(
                 sort_key = mutation_dt.timestamp()
             except OSError:
                 continue
-            files.append((sort_key, {
-                "agent": agent,
-                "filename": ref.name,
-                "mtime": sort_key,
-                "mtime_dt": mutation_dt,
-            }))
+            files.append(
+                (
+                    sort_key,
+                    {
+                        "agent": agent,
+                        "filename": ref.name,
+                        "mtime": sort_key,
+                        "mtime_dt": mutation_dt,
+                    },
+                )
+            )
     files.sort(key=lambda x: x[0], reverse=True)
     return [d for _, d in files[:limit]]
 
 
 # ──────────────────────────────────────────────────────────────────
 # Rendering
+
 
 def render_activity(agents_root: Path, data: ActivityData) -> Path:
     """Write _dashboard/activity.html and return the path."""
@@ -289,7 +327,7 @@ def _render_activity_template(data: ActivityData, has_goals: bool = True) -> str
     <div class="label">Runs last 7d</div>
   </div>
   <div class="kpi">
-    <div class="value" style="color: {'var(--error)' if h.failures_24h else 'var(--good)'}">{h.failures_24h}</div>
+    <div class="value" style="color: {"var(--error)" if h.failures_24h else "var(--good)"}">{h.failures_24h}</div>
     <div class="label">Failures 24h</div>
   </div>
   <div class="kpi">
@@ -311,23 +349,23 @@ def _render_activity_template(data: ActivityData, has_goals: bool = True) -> str
             if r.status not in ("ok",):
                 row_class = ' class="row-error"'
             rows.append(
-                f'<tr{row_class}>'
+                f"<tr{row_class}>"
                 f'<td class="num" title="{ts_abs}">{html.escape(rel)}</td>'
-                f'<td>{html.escape(r.agent)}</td>'
-                f'<td>{html.escape(r.trigger)}</td>'
-                f'<td>{status_pill(r.status)}</td>'
-                f'<td>{html.escape(truncate(r.summary, 80))}</td>'
+                f"<td>{html.escape(r.agent)}</td>"
+                f"<td>{html.escape(r.trigger)}</td>"
+                f"<td>{status_pill(r.status)}</td>"
+                f"<td>{html.escape(truncate(r.summary, 80))}</td>"
                 f'<td class="right num">{dur_str}</td>'
                 f'<td class="right num">{cost_str}</td>'
-                f'</tr>'
+                f"</tr>"
             )
         runs_table = (
-            '<table>'
-            '<thead><tr><th>When</th><th>Agent</th><th>Trigger</th>'
-            '<th>Status</th><th>Summary</th>'
+            "<table>"
+            "<thead><tr><th>When</th><th>Agent</th><th>Trigger</th>"
+            "<th>Status</th><th>Summary</th>"
             '<th class="right">Duration</th><th class="right">Cost</th></tr></thead>'
-            f'<tbody>{"".join(rows)}</tbody>'
-            '</table>'
+            f"<tbody>{''.join(rows)}</tbody>"
+            "</table>"
         )
     else:
         runs_table = '<p class="empty-note">No runs in the last 7 days.</p>'
@@ -340,18 +378,18 @@ def _render_activity_template(data: ActivityData, has_goals: bool = True) -> str
             rows.append(
                 f'<tr class="row-error">'
                 f'<td class="num">{html.escape(rel)}</td>'
-                f'<td>{html.escape(r.agent)}</td>'
-                f'<td>{html.escape(r.trigger)}</td>'
-                f'<td>{status_pill(r.status)}</td>'
-                f'<td>{html.escape(truncate(r.summary, 80))}</td>'
-                f'</tr>'
+                f"<td>{html.escape(r.agent)}</td>"
+                f"<td>{html.escape(r.trigger)}</td>"
+                f"<td>{status_pill(r.status)}</td>"
+                f"<td>{html.escape(truncate(r.summary, 80))}</td>"
+                f"</tr>"
             )
         failures_table = (
-            '<table>'
-            '<thead><tr><th>When</th><th>Agent</th><th>Trigger</th>'
-            '<th>Status</th><th>Summary</th></tr></thead>'
-            f'<tbody>{"".join(rows)}</tbody>'
-            '</table>'
+            "<table>"
+            "<thead><tr><th>When</th><th>Agent</th><th>Trigger</th>"
+            "<th>Status</th><th>Summary</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody>"
+            "</table>"
         )
     else:
         failures_table = '<p class="empty-note">No failures in the last 24 hours.</p>'
@@ -362,18 +400,18 @@ def _render_activity_template(data: ActivityData, has_goals: bool = True) -> str
         for r in data.recent_tool_calls:
             rel = relative_time(r.ts, now)
             rows.append(
-                f'<tr>'
+                f"<tr>"
                 f'<td class="num">{html.escape(rel)}</td>'
-                f'<td>{html.escape(r.agent)}</td>'
-                f'<td>{status_pill(r.status)}</td>'
-                f'<td>{html.escape(truncate(r.summary, 80))}</td>'
-                f'</tr>'
+                f"<td>{html.escape(r.agent)}</td>"
+                f"<td>{status_pill(r.status)}</td>"
+                f"<td>{html.escape(truncate(r.summary, 80))}</td>"
+                f"</tr>"
             )
         tool_calls_table = (
-            '<table>'
-            '<thead><tr><th>When</th><th>Agent</th><th>Status</th><th>Summary</th></tr></thead>'
-            f'<tbody>{"".join(rows)}</tbody>'
-            '</table>'
+            "<table>"
+            "<thead><tr><th>When</th><th>Agent</th><th>Status</th><th>Summary</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody>"
+            "</table>"
         )
     else:
         tool_calls_table = '<p class="empty-note">No tool calls in the last 7 days.</p>'
@@ -385,23 +423,25 @@ def _render_activity_template(data: ActivityData, has_goals: bool = True) -> str
             rel = relative_time(r.ts, now)
             parent = r.parent_agent or "—"
             rows.append(
-                f'<tr>'
+                f"<tr>"
                 f'<td class="num">{html.escape(rel)}</td>'
-                f'<td>{html.escape(r.agent)}</td>'
-                f'<td>{html.escape(parent)}</td>'
-                f'<td>{status_pill(r.status)}</td>'
-                f'<td>{html.escape(truncate(r.summary, 80))}</td>'
-                f'</tr>'
+                f"<td>{html.escape(r.agent)}</td>"
+                f"<td>{html.escape(parent)}</td>"
+                f"<td>{status_pill(r.status)}</td>"
+                f"<td>{html.escape(truncate(r.summary, 80))}</td>"
+                f"</tr>"
             )
         delegations_table = (
-            '<table>'
-            '<thead><tr><th>When</th><th>Agent</th><th>Delegated from</th>'
-            '<th>Status</th><th>Summary</th></tr></thead>'
-            f'<tbody>{"".join(rows)}</tbody>'
-            '</table>'
+            "<table>"
+            "<thead><tr><th>When</th><th>Agent</th><th>Delegated from</th>"
+            "<th>Status</th><th>Summary</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody>"
+            "</table>"
         )
     else:
-        delegations_table = '<p class="empty-note">No delegations in the last 7 days.</p>'
+        delegations_table = (
+            '<p class="empty-note">No delegations in the last 7 days.</p>'
+        )
 
     # ── Recent captures
     if data.recent_captures:
@@ -409,17 +449,17 @@ def _render_activity_template(data: ActivityData, has_goals: bool = True) -> str
         for c in data.recent_captures:
             rel = relative_time(c["mtime_dt"], now)
             rows.append(
-                f'<tr>'
+                f"<tr>"
                 f'<td class="num">{html.escape(rel)}</td>'
-                f'<td>{html.escape(c["agent"])}</td>'
-                f'<td>{html.escape(c["filename"])}</td>'
-                f'</tr>'
+                f"<td>{html.escape(c['agent'])}</td>"
+                f"<td>{html.escape(c['filename'])}</td>"
+                f"</tr>"
             )
         captures_table = (
-            '<table>'
-            '<thead><tr><th>When</th><th>Agent</th><th>File</th></tr></thead>'
-            f'<tbody>{"".join(rows)}</tbody>'
-            '</table>'
+            "<table>"
+            "<thead><tr><th>When</th><th>Agent</th><th>File</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody>"
+            "</table>"
         )
     else:
         captures_table = '<p class="empty-note">No memory captures found.</p>'
@@ -435,24 +475,24 @@ def _render_activity_template(data: ActivityData, has_goals: bool = True) -> str
             )
             status_html = status_pill(d.status)
             rows.append(
-                f'<tr>'
+                f"<tr>"
                 f'<td class="num">{html.escape(d.ts[:16] if d.ts else "—")}</td>'
-                f'<td>{html.escape(d.agent)}</td>'
+                f"<td>{html.escape(d.agent)}</td>"
                 f'<td class="muted">{html.escape(d.dream_id[:20])}</td>'
-                f'<td>{status_html}</td>'
+                f"<td>{status_html}</td>"
                 f'<td class="right num">{d.consolidations}</td>'
                 f'<td class="right num">{d.promotions}</td>'
                 f'<td class="right num">{d.marked_stale}</td>'
-                f'<td>{applied_badge}</td>'
-                f'</tr>'
+                f"<td>{applied_badge}</td>"
+                f"</tr>"
             )
         dreams_table = (
-            '<table>'
-            '<thead><tr><th>Started</th><th>Agent</th><th>Dream ID</th><th>Status</th>'
+            "<table>"
+            "<thead><tr><th>Started</th><th>Agent</th><th>Dream ID</th><th>Status</th>"
             '<th class="right">Consol.</th><th class="right">Promoted</th>'
             '<th class="right">Staled</th><th>Applied</th></tr></thead>'
-            f'<tbody>{"".join(rows)}</tbody>'
-            '</table>'
+            f"<tbody>{''.join(rows)}</tbody>"
+            "</table>"
         )
     else:
         dreams_table = '<p class="empty-note">No dream runs found.</p>'
@@ -464,16 +504,16 @@ def _render_activity_template(data: ActivityData, has_goals: bool = True) -> str
             held_min = lk.held_seconds / 60
             rows.append(
                 f'<tr class="row-error">'
-                f'<td>{html.escape(lk.agent)}</td>'
+                f"<td>{html.escape(lk.agent)}</td>"
                 f'<td class="num" style="color: var(--error)">{held_min:.1f} min</td>'
                 f'<td><span class="pill error">stale</span></td>'
-                f'</tr>'
+                f"</tr>"
             )
         lock_table = (
-            '<table>'
-            '<thead><tr><th>Agent</th><th>Held for</th><th>State</th></tr></thead>'
-            f'<tbody>{"".join(rows)}</tbody>'
-            '</table>'
+            "<table>"
+            "<thead><tr><th>Agent</th><th>Held for</th><th>State</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody>"
+            "</table>"
         )
         lock_panel_style = ""
     else:

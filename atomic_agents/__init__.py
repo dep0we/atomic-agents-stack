@@ -76,6 +76,13 @@ from .locks import (
     get_lock_backend,
     list_lock_backends,
 )
+from .memory import (
+    get_default_memory_backend,
+    register_backend as register_memory_backend,
+    unregister_backend as unregister_memory_backend,
+    get_backend as get_memory_backend,
+    list_backends as list_memory_backends,
+)
 from .profile import (
     AgentProfileBackend,
     AgentProfile,
@@ -215,6 +222,12 @@ __all__ = [
     "unregister_lock_backend",
     "get_lock_backend",
     "list_lock_backends",
+    # MemoryBackend operator override surface (#382 PR 1)
+    "get_default_memory_backend",
+    "register_memory_backend",
+    "unregister_memory_backend",
+    "get_memory_backend",
+    "list_memory_backends",
     # JudgeBackend Protocol surface (spec/28 — #112 PR 1 scaffolding;
     # reference implementations + agent.call() wiring land in PR 2)
     "JudgeBackend",
