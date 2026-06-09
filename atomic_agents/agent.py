@@ -5334,9 +5334,15 @@ class AtomicAgent:
         Uses max_tokens output per helper at the model's output rate. Input
         tokens are omitted from the estimate (conservative in the other direction,
         but output dominates for short prompts against a haiku-class model).
-        Unknown models return 0 — can't estimate, so we don't block.
+
+        Unknown models use the pessimistic fallback rate (highest known output
+        rate across the PRICING table) so that unpriced models — self-hosted,
+        Ollama, vLLM, new provider SKUs — are over-counted rather than silently
+        treated as free, which would bypass the batch reservation guard entirely.
+        Mirrors the pattern in dream.py:_estimate_dream_cost and _costs.calc_cost.
         """
-        output_rate = _costs.PRICING.get(model, {}).get("output", 0.0)
+        pricing = _costs.PRICING.get(model, _costs._fallback_pricing())
+        output_rate = pricing["output"]
         return round(output_rate * max_tokens / 1_000_000 * batch_size, 6)
 
     def _check_batch_reservation(self, reserved_usd: float) -> None:
