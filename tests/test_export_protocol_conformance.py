@@ -1697,17 +1697,17 @@ def test_mandate_roundtrip_allowed_and_blocked_targets(tmp_path) -> None:
     rt = reparsed[0]
     assert rt.mandate_id == "allow-with-targets"
 
+    # Exact set equality (stronger than membership, and avoids the
+    # py/incomplete-url-substring-sanitization CodeQL heuristic that misreads
+    # `"host" in <set>` as URL-substring sanitization — this is set membership).
     allowed_patterns = {tp.pattern for tp in rt.constraints.allowed_targets}
-    assert "api.example.com" in allowed_patterns, (
-        "allowed_targets[0].pattern must survive the round-trip"
-    )
-    assert "*.internal." in allowed_patterns, (
-        "allowed_targets[1].pattern must survive the round-trip"
+    assert allowed_patterns == {"api.example.com", "*.internal."}, (
+        "allowed_targets patterns must survive the round-trip exactly"
     )
 
     blocked_patterns = {tp.pattern for tp in rt.constraints.blocked_targets}
-    assert "evil.example.com" in blocked_patterns, (
-        "blocked_targets[0].pattern must survive the round-trip"
+    assert blocked_patterns == {"evil.example.com"}, (
+        "blocked_targets patterns must survive the round-trip exactly"
     )
 
 
