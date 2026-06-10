@@ -140,10 +140,10 @@ def nav_bar(current: str, has_goals: bool = True) -> str:
     has_goals: if False, the Goals tab is omitted from the nav.
     """
     tabs = [
-        ("cost",     "index.html",    "Cost"),
+        ("cost", "index.html", "Cost"),
         ("activity", "activity.html", "Activity"),
-        ("quality",  "quality.html",  "Quality"),
-        ("memory",   "memory.html",   "Memory"),
+        ("quality", "quality.html", "Quality"),
+        ("memory", "memory.html", "Memory"),
     ]
     if has_goals:
         tabs.append(("goals", "goals.html", "Goals"))
@@ -187,12 +187,13 @@ def truncate(text: str, n: int) -> str:
     """Truncate text to n characters with ellipsis."""
     if len(text) <= n:
         return text
-    return text[:n - 1].rstrip() + "…"
+    return text[: n - 1].rstrip() + "…"
 
 
 def status_pill(status: str) -> str:
     """Return an HTML pill for a run status."""
     import html as _html
+
     s = status.lower()
     if s == "ok":
         cls = "ok"
@@ -205,6 +206,14 @@ def status_pill(status: str) -> str:
     return f'<span class="pill {cls}">{_html.escape(status)}</span>'
 
 
+_CSP = (
+    "default-src 'none'; "
+    "style-src 'unsafe-inline'; "
+    "script-src 'unsafe-inline'; "
+    "connect-src 'self'"
+)
+
+
 def page_shell(
     title: str,
     body: str,
@@ -215,11 +224,13 @@ def page_shell(
     """Wrap body content in the standard page shell (DOCTYPE, head, nav, footer)."""
     from datetime import date
     import html as _html
+
     sub_html = f'<div class="period">{_html.escape(subtitle)}</div>' if subtitle else ""
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="{_CSP}">
 <title>{_html.escape(title)} — Atomic Agents</title>
 <style>{CSS}</style>
 </head>

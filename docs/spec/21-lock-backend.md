@@ -195,6 +195,22 @@ backend = RedisLockBackend(
 )
 ```
 
+The ``redis://localhost`` and ``key_prefix`` values above are illustrative, not a
+secure default. **When the Redis instance is shared (any deployment beyond a
+single trusted host), require all three of:**
+
+* ``rediss://`` (TLS) so lease tokens and key names are not sent in cleartext.
+* **AUTH** — credentials in the URL (``rediss://default:<password>@host:6379/0``)
+  or via the client; an unauthenticated shared Redis lets any reachable client
+  read, take, or delete another deployment's locks.
+* a **distinct ``key_prefix`` per deployment** (for example
+  ``ATOMIC_AGENTS_LOCK_REDIS_KEY_PREFIX=<deployment>:atomic_agents:lock:``) so two
+  deployments sharing one Redis cannot collide on lock keys.
+
+The plain ``redis://localhost`` examples in this spec assume a loopback-only,
+single-tenant Redis. Do not copy them into a shared or network-exposed
+deployment without the hardening above.
+
 The framework's ``get_default_lock_backend(scope_root)`` factory (``atomic_agents/locks/__init__.py``) calls ``make_redis_backend_from_url`` when ``ATOMIC_AGENTS_LOCK_BACKEND=redis`` and ``ATOMIC_AGENTS_LOCK_BACKEND_URL`` is set.
 
 ## Operator surface — NOT a ``locks.md`` config

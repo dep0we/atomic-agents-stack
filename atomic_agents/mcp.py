@@ -79,6 +79,62 @@ def _is_path_shaped(arg: str) -> bool:
     return False
 
 
+def _validate_mcp_tool_name(name: str, server_name: str) -> None:
+    """Reject a server-supplied tool name that could forge a qualified name or
+    inject into log/path contexts.
+
+    Enforces the same charset discipline used by
+    ``registry.filesystem._validate_tool_name`` for operator-defined tools,
+    plus an additional ``__`` (double-underscore) ban that is specific to
+    MCP-discovered names:
+
+    - Empty string
+    - Contains ``__`` (would let a server-chosen name forge a cross-server
+      qualified name, e.g. ``bar__baz`` on server ``foo`` produces
+      ``foo__bar__baz`` which is indistinguishable from server ``foo__bar``
+      offering tool ``baz``)
+    - Contains ``/`` or ``\\`` (path separators)
+    - Starts with ``.`` (hidden-file traversal)
+    - Contains ``..`` (parent-directory traversal)
+    - Contains control characters 0x00-0x1f or DEL 0x7f (log injection)
+
+    Raises ``ValueError`` on any violation.  The ``server_name`` is included
+    in the message so operators can identify the offending server.
+    """
+    if not name:
+        raise ValueError(
+            f"MCP server {server_name!r} supplied an empty tool name — rejected"
+        )
+    if "__" in name:
+        raise ValueError(
+            f"MCP server {server_name!r} supplied tool name {name!r} which "
+            f"contains '__' (double underscore) — rejected to prevent "
+            f"cross-server namespace forgery"
+        )
+    if "/" in name or "\\" in name:
+        raise ValueError(
+            f"MCP server {server_name!r} supplied tool name {name!r} which "
+            f"contains a path separator — rejected"
+        )
+    if name.startswith("."):
+        raise ValueError(
+            f"MCP server {server_name!r} supplied tool name {name!r} which "
+            f"starts with '.' — rejected to prevent hidden-file traversal"
+        )
+    if ".." in name:
+        raise ValueError(
+            f"MCP server {server_name!r} supplied tool name {name!r} which "
+            f"contains '..' — path traversal refused"
+        )
+    for ch in name:
+        if ord(ch) < 0x20 or ord(ch) == 0x7F:
+            raise ValueError(
+                f"MCP server {server_name!r} supplied tool name {name!r} which "
+                f"contains a control character (0x{ord(ch):02x}) — rejected to "
+                f"prevent log injection and path-token splitting"
+            )
+
+
 # ──────────────────────────────────────────────────────────────────
 # Data classes
 
@@ -258,12 +314,50 @@ class MCPClientPool:
         Each tool's name is namespaced as '<server>__<tool>' to avoid collisions.
         Each tool's handler wraps the async call_tool in a sync interface via
         asyncio.run() per call (simple and correct for v1).
+
+        Raises:
+            ValueError: A server-supplied tool.name contains ``__``, path
+                separators, control characters, or other characters that
+                would let a server forge a qualified name colliding with
+                another server's namespace or an operator tool.
+            ValueError: Two servers (or two tools on the same server) produce
+                the same qualified name within this single discovery pass.
         """
         definitions: list[ToolDefinition] = []
+        # Track qualified names emitted in this pass to catch intra-discovery
+        # duplicates (two servers or two tools producing the same qualified
+        # name) before any registration attempt.
+        seen_qualified: dict[str, str] = {}  # qualified_name -> "server_name/tool_name"
 
         for server_name, conn in self._connected.items():
             for tool in conn.tools:
+                # Charset-validate the server-chosen tool.name BEFORE building
+                # the qualified name.  A server must not be able to craft a
+                # tool.name that:
+                #   - contains "__" (would forge a cross-server qualified name,
+                #     e.g. "bar__baz" on server "foo" -> "foo__bar__baz" which
+                #     is indistinguishable from server "foo__bar" tool "baz")
+                #   - contains path separators "/" or "\" (path traversal in
+                #     derived file paths or log messages)
+                #   - contains control characters (log injection)
+                #   - is empty
+                _validate_mcp_tool_name(tool.name, server_name)
+
                 qualified = f"{server_name}__{tool.name}"
+
+                # Intra-discovery duplicate detection.  Two servers or two
+                # tools on the same server producing the same qualified name
+                # must surface loudly here, not silently shadow at registration.
+                prior = seen_qualified.get(qualified)
+                if prior is not None:
+                    raise ValueError(
+                        f"MCP tool name collision within this discovery pass: "
+                        f"qualified name {qualified!r} is produced by both "
+                        f"{prior} and {server_name}/{tool.name}. "
+                        f"Rename one of the conflicting MCP servers or tools."
+                    )
+                seen_qualified[qualified] = f"{server_name}/{tool.name}"
+
                 meta = MCPToolMeta(
                     server_name=server_name,
                     original_name=tool.name,
