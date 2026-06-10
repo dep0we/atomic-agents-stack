@@ -10,7 +10,7 @@ JudgeBackend (#112), LockBackend (#60), LogBackend (#61),
 AgentProfileBackend (#63), ToolRegistryBackend (#64), MandateBackend (#124),
 PolicyBackend (#89), PersonaBackend (#62), CorpusBackend (#65), and
 MCPServerRegistryBackend (#201).
-See ``docs/spec/38-secret-backend.md`` (DRAFT at PR 1) for the prose contract.
+See ``docs/spec/38-secret-backend.md`` (LOCKED at PR 2) for the prose contract.
 
 Public surface:
 
@@ -133,8 +133,8 @@ def list_secret_backends() -> list[str]:
 
 
 # Register the built-in filesystem backend at import time. GCP backend
-# registers itself when ``atomic_agents.secret_backend.gcp`` is imported
-# (ships at PR 2).
+# is constructed on demand via get_default_secret_backend() -- it is NOT
+# registered here because its constructor requires a URL argument.
 register_secret_backend("filesystem", FilesystemSecretBackend)
 
 
@@ -152,10 +152,12 @@ def get_default_secret_backend() -> SecretBackend:
     to the filesystem default. This guards against shell
     ``export ATOMIC_AGENTS_SECRET_BACKEND=`` accidents.
 
-    The ``ATOMIC_AGENTS_SECRET_BACKEND_URL`` companion env var is reserved
-    now (live factory branch reads it + raises a clear error) matching how
-    LOCK and MCP_SERVER_REGISTRY shipped their _URL companion in the scaffold
-    PR. Backend ids: ``"filesystem"`` (shipped), ``"gcp"`` (PR 2).
+    The ``ATOMIC_AGENTS_SECRET_BACKEND_URL`` companion env var is required when
+    ``ATOMIC_AGENTS_SECRET_BACKEND=gcp``: the ``gcp`` branch constructs a
+    ``GCPSecretManagerBackend`` from it via ``make_gcp_secret_backend_from_url``
+    (format ``projects/<project_id>/secrets``), raising
+    ``SecretBackendNotRegistered`` if the URL is unset or the ``[gcp]`` extra is
+    not installed. Backend ids: ``"filesystem"`` (shipped), ``"gcp"`` (shipped).
 
     See spec/38 §"Operator surface" for the full env-var reference.
     """
@@ -173,18 +175,25 @@ def get_default_secret_backend() -> SecretBackend:
         return cls()
 
     elif raw_backend_id == "gcp":
-        # By design, this branch does NOT consult ``_registry`` even though
-        # ``register_secret_backend("gcp", …)`` is accepted: per-backend
-        # construction args (here the ATOMIC_AGENTS_SECRET_BACKEND_URL handling)
-        # are hardcoded per id, so registering an id is necessary but not
-        # sufficient to activate it via this factory. The registry is consulted
-        # only for the filesystem override (above) and by the conformance suite.
-        # This mirrors the mcp_registry factory precedent (its http branch is
-        # likewise hardcoded). PR 2 replaces this raise-branch with real
-        # GCPSecretManagerBackend construction.
-        # GCP Secret Manager backend ships at PR 2.
-        # Reserve the URL env var now so operators who configure it early get
-        # a clear error message naming both the URL var and the install step.
+        # Lazy import: filesystem operators do not pay the google-cloud-secret-manager
+        # import cost. NOTE: the SDK itself is NOT imported at gcp module level --
+        # GCPSecretManagerBackend.__init__ does the SDK presence check. So the
+        # ``from .gcp import ...`` below only fails if the gcp module is itself
+        # broken/absent (rare); the real missing-[gcp]-extra ImportError fires
+        # from make_gcp_secret_backend_from_url() below. BOTH sites are wrapped
+        # so a missing SDK surfaces as SecretBackendNotRegistered (a SecretError
+        # subclass) and never escapes as a raw ImportError. This honors the
+        # fail-closed contract (callers catching SecretError see a clean error)
+        # and gives doctor's `except SecretError` branch the curated [gcp]-extra
+        # fix-hint. Per MEMORY.md feedback_fail_closed_catches_base_error_class.
+        try:
+            from .gcp import make_gcp_secret_backend_from_url
+        except ImportError as e:
+            raise SecretBackendNotRegistered(
+                "ATOMIC_AGENTS_SECRET_BACKEND=gcp requires the [gcp] extra. "
+                "Install: uv add 'atomic-agents-stack[gcp]'"
+            ) from e
+
         url = os.environ.get("ATOMIC_AGENTS_SECRET_BACKEND_URL", "").strip()
         if not url:
             raise SecretBackendNotRegistered(
@@ -192,19 +201,18 @@ def get_default_secret_backend() -> SecretBackend:
                 "ATOMIC_AGENTS_SECRET_BACKEND_URL to be set. "
                 "Expected format: projects/<project_id>/secrets "
                 "(GCP Secret Manager prefix). "
-                "Note: GCPSecretManagerBackend ships at PR 2 of issue #340 -- "
-                "set ATOMIC_AGENTS_SECRET_BACKEND_URL=projects/<proj>/secrets "
-                "and install the gcp extra when that PR lands."
+                "Also install the [gcp] extra: uv add 'atomic-agents-stack[gcp]'"
             )
-        # URL is set but backend is not yet shipped.
-        safe_url = _redact_for_error_message(url)
-        raise SecretBackendNotRegistered(
-            f"ATOMIC_AGENTS_SECRET_BACKEND=gcp with "
-            f"ATOMIC_AGENTS_SECRET_BACKEND_URL={safe_url!r}: "
-            f"GCPSecretManagerBackend is not yet installed. "
-            f"Install the gcp extra when PR 2 of issue #340 lands: "
-            f"uv add 'atomic-agents-stack[gcp]'"
-        )
+        # Wrap the REAL failure site: GCPSecretManagerBackend.__init__ raises
+        # ImportError when the SDK is absent. Re-raise as SecretBackendNotRegistered
+        # so the fail-closed contract holds end to end.
+        try:
+            return make_gcp_secret_backend_from_url(url)
+        except ImportError as e:
+            raise SecretBackendNotRegistered(
+                "ATOMIC_AGENTS_SECRET_BACKEND=gcp requires the [gcp] extra. "
+                "Install: uv add 'atomic-agents-stack[gcp]'"
+            ) from e
 
     # Unknown backend_id. Sanitize before echoing in the error message to
     # prevent credential leaks when operators accidentally paste a URL into
