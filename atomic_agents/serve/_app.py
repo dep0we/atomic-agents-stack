@@ -13,6 +13,7 @@ spec/37 MUST 1.
 from __future__ import annotations
 
 import asyncio
+import json as _json
 import logging
 from pathlib import Path
 
@@ -35,6 +36,7 @@ def make_app(
     agents_root: Path | None = None,
     agent_name: str | None = None,
     identity_header: str = ServeConfig.identity_header,
+    max_body_bytes: int = ServeConfig.max_body_bytes,
 ) -> Starlette:
     """Build and return the Starlette app.
 
@@ -48,9 +50,17 @@ def make_app(
     ``identity_header``: the HTTP header name to read for caller identity
     (default: ``X-Goog-IAP-JWT-Assertion``). Setting it here makes the app
     self-contained for testing and embedding.
+
+    ``max_body_bytes``: maximum request body size in bytes for POST /call.
+    Requests whose Content-Length header exceeds this value are rejected with
+    HTTP 413 before body streaming begins. Bodies without a Content-Length
+    header are also capped at this limit while streaming, so a lying or absent
+    header cannot bypass the guard. Default: 1 MiB (1_048_576 bytes).
+    CWE-770 / Finding #401.
     """
     _agents_root: Path | None = agents_root
     _single_agent: str | None = agent_name
+    _max_body_bytes: int = max_body_bytes
 
     def _root() -> Path:
         return _agents_root or get_agents_root()
@@ -88,9 +98,59 @@ def make_app(
                 status_code=400,
             )
 
+        # Body-size guard (Finding #401 / CWE-770 OOM DoS).
+        #
+        # Stage 1: reject on Content-Length header when present. This is a
+        # fast pre-flight that avoids touching the stream at all when the
+        # caller is honest about the body size.
+        raw_content_length = request.headers.get("content-length")
+        if raw_content_length is not None:
+            try:
+                declared_length = int(raw_content_length)
+            except ValueError:
+                declared_length = 0
+            if declared_length > _max_body_bytes:
+                return JSONResponse(
+                    {
+                        "status": "error",
+                        "error": (
+                            f"Request body too large: {declared_length} bytes "
+                            f"exceeds limit of {_max_body_bytes} bytes"
+                        ),
+                    },
+                    status_code=413,
+                )
+
+        # Stage 2: enforce the cap while streaming the body. Content-Length
+        # can be omitted or set to a lie, so the stream itself must be capped.
+        # Accumulate chunks up to the limit + 1 to detect overflow without
+        # buffering the full oversized body in memory.
+        chunks: list[bytes] = []
+        accumulated = 0
+        async for chunk in request.stream():
+            accumulated += len(chunk)
+            if accumulated > _max_body_bytes:
+                # Drain the rest of the stream so the client connection stays
+                # clean, then return 413. We do NOT buffer the remaining bytes.
+                # Starlette's stream() yields all chunks lazily; breaking here
+                # leaves the stream unconsumed, which is fine for the ASGI
+                # contract (the server closes the connection on 413 anyway).
+                return JSONResponse(
+                    {
+                        "status": "error",
+                        "error": (
+                            f"Request body too large: exceeds limit of "
+                            f"{_max_body_bytes} bytes"
+                        ),
+                    },
+                    status_code=413,
+                )
+            chunks.append(chunk)
+        raw_body = b"".join(chunks)
+
         # Parse JSON body
         try:
-            body = await request.json()
+            body = _json.loads(raw_body)
         except Exception:
             return JSONResponse(
                 {"status": "error", "error": "Request body must be valid JSON"},
@@ -109,6 +169,24 @@ def make_app(
                 {
                     "status": "error",
                     "error": "work_item is required (non-empty string)",
+                },
+                status_code=422,
+            )
+
+        # work_item length cap: mirror the 512-char identity-header cap
+        # (CLAUDE.md principle 4). 32 KiB is generous for any real agent
+        # prompt while preventing a single oversized field from driving
+        # unbounded token spend before the cost guardrail fires.
+        # Finding #401 / CWE-770.
+        _MAX_WORK_ITEM_CHARS = 32_768
+        if len(work_item) > _MAX_WORK_ITEM_CHARS:
+            return JSONResponse(
+                {
+                    "status": "error",
+                    "error": (
+                        f"work_item too long: {len(work_item)} chars "
+                        f"exceeds limit of {_MAX_WORK_ITEM_CHARS}"
+                    ),
                 },
                 status_code=422,
             )
@@ -462,10 +540,16 @@ def make_app(
         loop = asyncio.get_running_loop()
 
         def _run_doctor():
+            # skip_mcp=True: the MCP stdio handshake spawns one subprocess per
+            # MCP server in mcp.md on every request, with no concurrency gate.
+            # Over HTTP this is a local-config diagnostic of little value and a
+            # reliable subprocess-churn DoS vector. healthz covers the liveness
+            # contract (spec/37 MUST 4); the HTTP doctor path does not need MCP
+            # subprocess health to be useful. Finding #404 / CWE-770.
             return doctor_module.run_doctor(
                 agent_name=name,
                 agents_root=root,
-                skip_mcp=False,
+                skip_mcp=True,
             )
 
         try:

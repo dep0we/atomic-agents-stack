@@ -16,6 +16,10 @@ Covers:
 - AtomicAgent.call() tears down pool in finally block
 - AtomicAgent.call() with no MCP servers skips pool init
 - Full integration mock: agent.call() with one MCP tool the model uses
+- #402 regression: MCP tool colliding with pre-existing operator tool raises ToolNameCollision
+- #402 regression: teardown after a call does NOT remove pre-existing operator tools
+- #402 regression: server-chosen tool.name with __ or path separators rejected in discover_tools
+- #402 regression: two servers yielding the same qualified name surface an error
 """
 
 from __future__ import annotations
@@ -41,6 +45,7 @@ from atomic_agents.mcp import (
 from atomic_agents.exceptions import (
     MCPServerConnectFailed,
     PathTraversalError,
+    ToolNameCollision,
 )
 from atomic_agents.tools import ToolDefinition, ToolRegistry
 
@@ -1420,3 +1425,229 @@ args: -y, @mcp/server
     # Exactly one real server spec; 'Allowed commands' is never a spec, and the
     # stray H1 + 'uvx' line don't produce a phantom spec.
     assert [s.name for s in specs] == ["my-server"]
+
+
+# #402 regression tests — MCP tool shadow-then-delete fix
+
+
+# (a) MCP tool colliding with a pre-existing operator tool raises loudly.
+def test_mcp_registration_raises_on_collision_with_operator_tool(tmp_path):
+    """#402 (a): registering an MCP tool whose qualified name matches a
+    pre-existing operator tool must raise ToolNameCollision, not silently
+    overwrite.
+
+    Reproduces the shadow-then-delete pattern:
+      1. Pre-register operator tool named ``github__create_issue``.
+      2. Discover an MCP tool from server ``github`` with tool name
+         ``create_issue`` (qualified: ``github__create_issue``).
+      3. Registration must raise ToolNameCollision.
+    """
+    specs = [_make_spec("github")]
+    pool = MCPClientPool(specs, agents_root=tmp_path)
+
+    mcp_tools = [_make_mcp_tool("create_issue")]
+    pool._connected["github"] = _ServerConnection(spec=specs[0], tools=mcp_tools)
+
+    discovered = pool.discover_tools()
+    assert len(discovered) == 1
+    assert discovered[0].name == "github__create_issue"
+
+    # Pre-register an operator tool with the same qualified name.
+    registry = ToolRegistry()
+    operator_tool = ToolDefinition(
+        name="github__create_issue",
+        description="Operator-registered GitHub issue creator.",
+        input_schema={"type": "object", "properties": {}, "required": []},
+        handler=lambda inp: "operator-result",
+    )
+    registry.register(operator_tool)
+
+    # Attempting to register the MCP tool without allow_overwrite must raise.
+    with pytest.raises(ToolNameCollision, match="github__create_issue"):
+        registry.register(discovered[0])
+
+    # The operator tool must still be intact.
+    assert registry.get("github__create_issue") is operator_tool
+
+
+# (b) Teardown after a call does NOT remove a pre-existing operator tool.
+def test_mcp_teardown_does_not_remove_pre_existing_operator_tool(tmp_path):
+    """#402 (b): the finally-block unregister loop must never remove a tool
+    that existed in the registry BEFORE this call's MCP registration.
+
+    Simulates agent.call() by:
+      1. Pre-populating the registry with an operator tool named ``myop_tool``.
+      2. Registering a fresh MCP tool ``srv__do_thing``.
+      3. Recording only the newly added names in _mcp_registered_names.
+      4. Running teardown (unregister loop).
+      5. Verifying ``myop_tool`` survives and ``srv__do_thing`` is gone.
+    """
+    registry = ToolRegistry()
+
+    operator_tool = ToolDefinition(
+        name="myop_tool",
+        description="Pre-existing operator tool.",
+        input_schema={"type": "object", "properties": {}, "required": []},
+        handler=lambda inp: "op",
+    )
+    registry.register(operator_tool)
+
+    mcp_tool = ToolDefinition(
+        name="srv__do_thing",
+        description="MCP tool registered this call.",
+        input_schema={"type": "object", "properties": {}, "required": []},
+        handler=lambda inp: "mcp",
+    )
+
+    # Snapshot pre-existing names (mirrors agent.py logic).
+    pre_existing = set(registry.list_names())
+    registry.register(mcp_tool)
+    mcp_registered_names = [
+        name for name in [mcp_tool.name] if name not in pre_existing
+    ]
+
+    # Both tools present after registration.
+    assert registry.get("myop_tool") is operator_tool
+    assert registry.get("srv__do_thing") is mcp_tool
+
+    # Teardown: unregister only the newly added names.
+    for name in mcp_registered_names:
+        registry.unregister(name)
+
+    # MCP tool gone; operator tool intact.
+    assert registry.get("srv__do_thing") is None
+    assert registry.get("myop_tool") is operator_tool
+
+
+# (c) Server-chosen tool.name with __ or path separators rejected in discover_tools.
+@pytest.mark.parametrize(
+    "bad_name, description",
+    [
+        ("bar__baz", "double underscore forges cross-server namespace"),
+        ("foo__bar__baz", "multiple double underscores"),
+        ("read/file", "forward slash path separator"),
+        ("read\\file", "backslash path separator"),
+        ("", "empty name"),
+        (".hidden", "leading dot"),
+        ("../traversal", "parent directory traversal"),
+        ("tool\x00name", "NUL control character"),
+        ("tool\nname", "newline control character"),
+        ("tool\x1fname", "unit separator control character"),
+        ("tool\x7fname", "DEL control character"),
+    ],
+)
+def test_discover_tools_rejects_bad_server_tool_name(tmp_path, bad_name, description):
+    """#402 (c): discover_tools() must reject server-supplied tool.name values
+    that contain __, path separators, control characters, or are empty.
+    """
+    specs = [_make_spec("myserver")]
+    pool = MCPClientPool(specs, agents_root=tmp_path)
+
+    bad_tool = _make_mcp_tool(bad_name)
+    pool._connected["myserver"] = _ServerConnection(spec=specs[0], tools=[bad_tool])
+
+    with pytest.raises(ValueError, match="myserver"):
+        pool.discover_tools()
+
+
+# (d) Two servers yielding the same qualified name surface an error.
+def test_discover_tools_raises_on_intra_discovery_duplicate_qualified_name(tmp_path):
+    """#402 (d): if two servers each produce the same qualified name within a
+    single discover_tools() call, a ValueError is raised immediately before
+    any registration attempt.
+
+    Concretely: server ``foo-bar`` with tool ``baz`` and server ``foo`` with
+    tool ``bar__baz`` would both produce qualified name ``foo-bar__baz`` /
+    ``foo__bar__baz`` in the normal flow.  This test uses two servers whose
+    names plus tool names produce the same qualified name string.
+    """
+    spec_a = _make_spec("foo")
+    spec_b = _make_spec("bar")
+    pool = MCPClientPool([spec_a, spec_b], agents_root=tmp_path)
+
+    # Both servers claim a tool named ``common_tool`` ->
+    # foo__common_tool and bar__common_tool are different, so we need
+    # to simulate the collision differently: two connections offering
+    # the same resulting qualified name.  We achieve this by injecting
+    # the _connected dict directly with both servers offering the
+    # same tool name so both produce the same qualified name.
+    # Simpler: patch the server names so server "alpha" + tool "beta"
+    # and server "alpha" (same name) + tool "beta" would collide.
+    # Instead, we directly manipulate pool._connected to have two
+    # entries that will produce the same qualified string.
+    # Use server "x" tool "y" and server "x" tool "y" (same server name injected
+    # under different keys would not happen normally, but we test via a pool
+    # that has two distinct server specs both returning a tool "overlap"):
+    # The easiest correct test: same server name added twice (unreachable via
+    # normal connect_all, but discover_tools must handle it if _connected has it).
+    # Actually the simplest scenario: we test that two DIFFERENT servers
+    # producing the same qualified name is caught.  This can only happen if
+    # server names differ but produce the same prefix when combined with the
+    # tool name.  We cannot forge that without a __-containing server name
+    # (which the parser rejects) -- so the intra-discovery duplicate path is
+    # most naturally triggered by injecting a fake second connection with the
+    # same server name into _connected.
+    spec_dup = _make_spec("dup-server")
+    pool2 = MCPClientPool([spec_dup], agents_root=tmp_path)
+
+    tool_y = _make_mcp_tool("tool_y")
+    # Inject the same server name twice (simulates a race or malicious pool state).
+    # discover_tools iterates self._connected.items(); inject via direct dict access.
+    conn1 = _ServerConnection(spec=spec_dup, tools=[tool_y])
+    conn2 = _ServerConnection(spec=spec_dup, tools=[tool_y])
+    # Python dict cannot have duplicate keys, so we simulate by building a pool
+    # where two distinct connected server names produce the same qualified name.
+    # The only practical way: server "a" with tool "b__c" vs server "a__b" with
+    # tool "c" -- but "b__c" is rejected by _validate_mcp_tool_name, so that
+    # attack is already blocked.  The remaining real-world scenario is two servers
+    # with the EXACT same name, which connect_all prevents (dict key uniqueness).
+    # Conclusion: the intra-discovery duplicate check catches any residual path.
+    # Test it directly via a crafted pool with two connections under different
+    # server keys that happen to produce the same qualified name string via
+    # careful naming (server "ab" + tool "c" vs server "a" + tool that would
+    # collide -- not possible without __ in the tool name, so the charset check
+    # fires first).  Verify the charset check fires first in that case:
+    spec_craft = _make_spec("a")
+    pool3 = MCPClientPool([spec_craft], agents_root=tmp_path)
+    bad_tool_with_sep = _make_mcp_tool("b__c")  # would produce a__b__c
+    pool3._connected["a"] = _ServerConnection(
+        spec=spec_craft, tools=[bad_tool_with_sep]
+    )
+
+    # The __ in the tool name must be caught by charset validation, not by the
+    # intra-discovery duplicate check (charset fires first).
+    with pytest.raises(ValueError, match="__"):
+        pool3.discover_tools()
+
+    # Now test the pure intra-discovery duplicate path by using a pool where
+    # the same qualified name appears from two servers via a monkey-patched
+    # _connected dict.  We use an ordered dict of two entries that both map to
+    # the same qualified name.  This is only reachable via direct pool state
+    # manipulation (not via normal MCP server connection), which is exactly
+    # the paranoid path the guard protects.
+    spec_s1 = _make_spec("s1")
+    spec_s2 = _make_spec("s2")
+    pool4 = MCPClientPool([spec_s1, spec_s2], agents_root=tmp_path)
+
+    # Both have a tool named "overlap" -> s1__overlap and s2__overlap (no collision)
+    # To get a real collision we need the same server name in _connected.
+    # Inject duplicate by building a fresh dict with the same key twice -- not
+    # possible in Python dicts, so instead test the guard via a fake _connected
+    # dict subclass that yields duplicate items.
+    class _DupConn(dict):
+        """Yields duplicate (server_name, conn) pairs to simulate a collision."""
+
+        def items(self_inner):
+            tool_dup = _make_mcp_tool("same_tool")
+            conn_a = _ServerConnection(spec=spec_s1, tools=[tool_dup])
+            conn_b = _ServerConnection(spec=spec_s2, tools=[tool_dup])
+            # Both yield qualified name "dup__same_tool" by faking server names.
+            # To make them produce the same qualified name, we monkey-patch
+            # spec.name inside the iteration.  Instead, yield same server name.
+            yield ("dupserver", conn_a)
+            yield ("dupserver", conn_b)
+
+    pool4._connected = _DupConn()
+
+    with pytest.raises(ValueError, match="collision"):
+        pool4.discover_tools()

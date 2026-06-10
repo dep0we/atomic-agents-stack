@@ -1,3 +1,36 @@
+# cloudrun-service.yaml - atomic-agents-stack on Cloud Run (stateless v0)
+#
+# NOT YET DOGFOODED against the live GCP platform.
+# Claims verified against GCP documentation as of 2026-06-09.
+# See extras/gcp/README.md §External-claim verification status.
+#
+# v0 Cloud Run topology: STATELESS.
+# Cloud Run v2 does not support GCE persistent disk volumes. The original
+# v0 blueprint (issue #339) included gce-persistent-disk volume blocks that
+# do not exist in the Cloud Run v2 Volume schema - the valid types are
+# secret, cloudSqlInstance, emptyDir, nfs, and gcs. None of those satisfy
+# POSIX rename(2) atomicity (TENSIONS.md T4), so Cloud Run v0 is explicitly
+# stateless: mutable state lands in the ephemeral container writable layer
+# and is LOST on container replacement.
+#
+# For a stateful-today deployment with a real ext4/xfs persistent disk, see
+# extras/gcp/compute-vm/ (Compute Engine VM reference).
+#
+# DURABILITY SUMMARY:
+#   Durable today (active in this manifest): Locks (Redis, #60) - the lock
+#                      backend env vars are uncommented below.
+#   Durable when activated: Run logs (PostgresLogBackend, #258) - the log
+#                      backend env vars are COMMENTED OUT below, so the default
+#                      is FilesystemLogBackend writing to the ephemeral
+#                      container layer. Uncomment them to make run logs durable.
+#   Ephemeral today:   Memory | Goals | Outcomes | Journal | Cascade queue |
+#                      Mandate | Policy | Profile | Tool-registry | Corpus
+#   Config (not state): Baked into the container image - never moves.
+#
+# runAsNonRoot: the Dockerfile adds USER 10001 (see extras/gcp/Dockerfile).
+# Cloud Run fully-managed does not enforce runAsNonRoot via the Knative
+# manifest spec; the Dockerfile USER directive is what is effective.
+
 apiVersion: serving.knative.dev/v1
 kind: Service
 metadata:
@@ -11,55 +44,40 @@ spec:
   template:
     metadata:
       annotations:
-        # v0: persistent disk pins us to 1 instance. The disk is a Compute
-        # Engine persistent disk (ext4 or xfs). GCS FUSE, Filestore, NFS, and
-        # RAM-disk mounts are NOT supported — atomic_write (the framework's
-        # crash-safe write primitive at atomic_agents/_io.py) relies on POSIX
-        # rename(2) atomicity, which FUSE-mounted GCS and network filesystems
-        # do not guarantee. See TENSIONS.md T4 and the _io.py docstring.
-        #
-        # min-instances=1 REQUIRED: a persistent disk is lost (or unavailable
-        # until detach/reattach completes) when the instance scales to zero.
-        # Every state surface that is filesystem-only in v0 (memory, goals,
-        # outcomes, mandate, policy, persona-cascade leases, profile,
-        # tool-registry, corpus) would be inaccessible on a cold start if the
-        # disk detached. This constraint lifts in Phase 4 of the scale-out
-        # path (see extras/gcp/README.md §Scale-out path), gated on issue
-        # #379 and removal of all persistent-disk state surfaces.
+        # min-instances=1 recommended: a cold start takes 2-8s before the
+        # healthz probe passes; Cloud Scheduler jobs that fire during this
+        # window see HTTP 503 and retry (risk: duplicate trigger pile-up per
+        # cloudscheduler-jobs.yaml.example §retryConfig). Set to 0 only if
+        # you accept cold-start latency and configure retryCount=0 on all
+        # Scheduler jobs. This constraint is cost vs. availability, not state
+        # durability - Cloud Run v0 is stateless.
         autoscaling.knative.dev/minScale: "1"
-        # max-instances=1 in v0: the persistent disk is ReadWriteOnce. Two
-        # concurrent Cloud Run instances writing the same ext4 volume would
-        # race on atomic_write calls for the same file. Canary deploys with
-        # traffic splits are unsafe while a disk is attached — use 100%
-        # traffic shift only. Constraint lifts in Phase 4.
+        # max-instances=1 in v0: the default FilesystemLockBackend uses
+        # fcntl.flock (single-host advisory locking; atomic_agents/locks/
+        # filesystem.py), which does NOT coordinate across hosts. Two Cloud Run
+        # instances do not share a host or filesystem, so neither sees the
+        # other's lock; concurrent same-agent requests across instances would
+        # race on ephemeral filesystem state (memory/, journal/, etc.) that is
+        # NOT yet backed by any distributed store. (The Redis LockBackend
+        # coordinates across instances, but the ephemeral-state race remains
+        # until those surfaces move to cloud backends.) This constraint lifts
+        # when all mutable surfaces move to multi-writer-safe cloud backends
+        # (Phase 4). For the Compute Engine VM equivalent, see
+        # extras/gcp/compute-vm/.
         autoscaling.knative.dev/maxScale: "1"
 
-        # Cloud Run persistent disk volume reference.
-        #
-        # PLATFORM ALTERNATIVE — KEEP EXACTLY ONE: this annotation is the
-        # fully-managed Cloud Run volume syntax and matches the locked #339 v0
-        # topology. The Knative-native `spec.volumes.gcePersistentDisk` block
-        # near the bottom of this file is the SAME disk for Knative-on-GKE /
-        # Cloud Run for Anthos. Do NOT ship both — delete whichever does not
-        # match your target platform (fully-managed Cloud Run keeps THIS one).
-        run.googleapis.com/volumes: >
-          [{
-            "name": "agent-vault",
-            "gce-persistent-disk": {
-              "pd-name": "<your-disk-name>",
-              "fs-type": "ext4"
-            }
-          }]
     spec:
-      # v0: serialize requests at Cloud Run because the persistent disk and
-      # LockBackend cannot safely serve concurrent same-agent calls from
-      # a single instance. The framework's AgentLock is advisory per-process;
-      # with Cloud Run's default concurrency of 80, concurrent same-agent
-      # requests saturate the bounded serve thread pool (~min(32, cpu_count+4)
-      # per docs/deployment/serve.md §Thread-pool saturation) and park on the
-      # 30s lock timeout. Setting concurrency=1 makes the bottleneck visible
-      # and honest. Raise only after all state moves off the persistent disk
-      # (Phase 4). See TENSIONS.md T2.
+      # containerConcurrency=1: the default FilesystemLockBackend uses
+      # fcntl.flock (atomic_agents/locks/filesystem.py), which serializes
+      # same-agent writers WITHIN a single instance (same host).
+      # With Cloud Run's default concurrency of 80,
+      # 80 concurrent same-agent requests from a single instance queue on the
+      # 30s lock timeout and saturate the bounded serve thread pool
+      # (~min(32, cpu_count+4) per docs/deployment/serve.md
+      # §Thread-pool saturation). Setting concurrency=1 makes the bottleneck
+      # visible and honest - requests queue at Cloud Run, not inside the
+      # container. Raise only after verifying the serving topology handles
+      # concurrent same-agent requests safely (Phase 4+). See TENSIONS.md T2.
       containerConcurrency: 1
 
       containers:
@@ -69,7 +87,7 @@ spec:
           # CMD's `--port ${PORT:-8080}` binds to 8080 and the probe ports below
           # (also 8080) match. Without this pin, Cloud Run MAY inject a
           # different PORT, the app would bind there, and the hardcoded probes
-          # would target a dead port — failing liveness and crash-looping.
+          # would target a dead port - failing liveness and crash-looping.
           # If you change this value, change the probe ports to match.
           ports:
             - containerPort: 8080
@@ -79,8 +97,9 @@ spec:
               cpu: "1"
 
           env:
-            # Agent vault root — mutable state is mounted from the persistent
-            # disk; config is baked into the image.
+            # Agent vault root - all mutable state writes go to this directory.
+            # On stateless Cloud Run v0, this path is on the container's
+            # ephemeral writable layer. State is LOST on container replacement.
             - name: ATOMIC_AGENTS_ROOT
               value: /app/agents
 
@@ -95,11 +114,13 @@ spec:
               #     --set-secrets ATOMIC_AGENTS_LOCK_BACKEND_URL=redis-url:latest
               value: ""  # set via --set-secrets at deploy time
 
-            # Log backend: Postgres/Cloud SQL (issue #258, PR 1 — PostgresLogBackend shipped).
+            # Log backend: Postgres/Cloud SQL (issue #258, PR 1 - PostgresLogBackend shipped).
             # To activate: uncomment the two env vars below and supply the DSN
             # via --set-secrets. Requires atomic-agents-stack[postgres] in the
             # Dockerfile pip line (add "postgres" to the extras list).
-            # Leave unset to use FilesystemLogBackend (JSONL on the persistent disk).
+            # Leave unset to use FilesystemLogBackend (writes to ephemeral
+            # container layer - run logs are LOST on container replacement
+            # when left on the default FilesystemLogBackend).
             # - name: ATOMIC_AGENTS_LOG_BACKEND
             #   value: postgres
             # - name: ATOMIC_AGENTS_LOG_BACKEND_URL
@@ -109,14 +130,14 @@ spec:
             # credentials as Cloud Run env vars. The FilesystemSecretBackend
             # probes env vars first, so injected values are picked up
             # automatically with no ATOMIC_AGENTS_SECRET_BACKEND env var needed.
-            # Example — inject from Secret Manager secret versions:
+            # Example - inject from Secret Manager secret versions:
             #   gcloud run services update ... \
             #     --set-secrets ANTHROPIC_API_KEY=anthropic-api-key:latest
             #
             # Do NOT set ATOMIC_AGENTS_SECRET_BACKEND=gcp. That backend ships
             # at #340 PR 2; setting it today raises SecretBackendNotRegistered
             # when the agent resolves a provider credential (at the first LLM
-            # call). The cost gate is unaffected — it runs before key resolution
+            # call). The cost gate is unaffected - it runs before key resolution
             # and is always honored; the call simply fails closed at dispatch.
 
             # Don't set ATOMIC_AGENTS_SERVE_PORT here. The CMD's `--port` CLI
@@ -127,80 +148,53 @@ spec:
             # `--port ${PORT:-8080}`. See docs/deployment/serve.md §"Cloud Run
             # entrypoint example".
 
-          volumeMounts:
-            # CRITICAL LAYOUT RULE: mount the disk at the MUTABLE-STATE
-            # SUBDIRECTORIES, never at the agent folder root. The agent folder
-            # root holds the baked-in config (model.md, persona/, tools.md,
-            # goal.md, skills/) — mounting a volume at /app/agents/<name> would
-            # SHADOW those baked files, leaving the agent folder effectively
-            # empty on first cold start. healthz Check 3 (model.md present +
-            # parseable, see atomic_agents/serve/_app.py) would then return 503
-            # and the container would crash-loop. The framework hardcodes these
-            # subdirs relative to agent_root (atomic_agents/agent.py), so
-            # mounting them individually keeps config visible while state
-            # persists on disk.
-            #
-            # goal.md is a FILE (config, baked into the image), not a directory,
-            # so it is NOT mounted here.
-            #
-            # Mount layout below uses one subPath per mutable surface. memory/,
-            # log/, journal/ are the MINIMAL common set — NOT the complete set.
-            # You MUST mount every state surface your agent actually writes; the
-            # README "what's on the disk" table is the authoritative v0 list.
-            # Omitting a written surface is SILENT DATA LOSS: that state lands on
-            # the container's ephemeral writable layer and is gone on every cold
-            # start / redeploy, with no error. The remaining v0 surfaces are
-            # listed commented-out below — un-comment the ones your agent writes.
-            #
-            # SUBSTRATE NOTE: the persistent-disk mount mechanism (the
-            # run.googleapis.com/volumes annotation above + per-subPath mounts
-            # here) follows the locked v0 topology in issue #339. Confirm your
-            # target supports gce-persistent-disk volumes and per-subPath mounts
-            # before deploying — fully-managed Cloud Run's volume support
-            # differs from Knative-on-GKE / Cloud Run for Anthos. Whichever
-            # surface you run, the LAYOUT RULE (mount at subdirs, never the agent
-            # root) is what keeps config visible; adapt the volume TYPE to your
-            # platform, not the mount path.
-            - name: agent-vault
-              mountPath: /app/agents/<your-agent-name>/memory
-              subPath: memory
-            - name: agent-vault
-              mountPath: /app/agents/<your-agent-name>/log
-              subPath: log
-            - name: agent-vault
-              mountPath: /app/agents/<your-agent-name>/journal
-              subPath: journal
-            # --- Remaining v0 persistent-disk surfaces (un-comment what your agent writes) ---
-            # Omitting any surface your agent writes = silent data loss on redeploy.
-            # - name: agent-vault
-            #   mountPath: /app/agents/<your-agent-name>/goals
-            #   subPath: goals
-            # - name: agent-vault
-            #   mountPath: /app/agents/<your-agent-name>/outcomes
-            #   subPath: outcomes
-            # - name: agent-vault
-            #   mountPath: /app/agents/<your-agent-name>/dreams
-            #   subPath: dreams
-            # - name: agent-vault
-            #   mountPath: /app/agents/<your-agent-name>/mandate
-            #   subPath: mandate
-            # - name: agent-vault
-            #   mountPath: /app/agents/<your-agent-name>/policy
-            #   subPath: policy
-            # - name: agent-vault            # cascade work-claim leases
-            #   mountPath: /app/agents/<your-agent-name>/.personas
-            #   subPath: .personas
-            # SQLite-backed surfaces (profile / tool-registry / corpus) — mount the
-            # store directory only if you run those backends on the filesystem store:
-            # - name: agent-vault
-            #   mountPath: /app/agents/<your-agent-name>/profile
-            #   subPath: profile
-            # - name: agent-vault
-            #   mountPath: /app/agents/<your-agent-name>/tools
-            #   subPath: tools
-            # - name: agent-vault
-            #   mountPath: /app/agents/<your-agent-name>/corpus
-            #   subPath: corpus
+          # EPHEMERAL STATE ANNOTATIONS (Cloud Run v0, stateless):
+          # The following directories exist in the container image as an empty
+          # skeleton baked in by the Dockerfile COPY. They are writable via the
+          # container's ephemeral writable layer. State written here is LOST on
+          # every container replacement / redeploy / cold start.
+          #
+          # No volumeMounts are configured - Cloud Run v2 does not support GCE
+          # persistent disk volumes. See extras/gcp/README.md
+          # §"Why no disk on v0 Cloud Run" and extras/gcp/compute-vm/ for the
+          # stateful-today alternative.
+          #
+          # Per-surface durability status:
+          #   memory/       EPHEMERAL - the MemoryBackend operator override seam shipped
+          #                 (#382 PR 1), but only filesystem is registered today, so
+          #                 FilesystemMemoryBackend writes here. Durable once the Postgres
+          #                 MemoryBackend adapter ships (#258, Phase 2); until then
+          #                 ATOMIC_AGENTS_MEMORY_BACKEND=postgres fails fast with
+          #                 BackendNotRegistered.
+          #   log/          EPHEMERAL - activate PostgresLogBackend (#258, shipped) to make
+          #                 run logs durable. Default FilesystemLogBackend writes here.
+          #   journal/      EPHEMERAL - no Protocol yet; no cloud adapter possible until
+          #                 #383 ships (Phase 3).
+          #   goals/        EPHEMERAL - no Protocol yet; #383 (Phase 3).
+          #   outcomes/     EPHEMERAL - no Protocol yet; #383 (Phase 3).
+          #   dreams/       EPHEMERAL - operator-triggered dream artifacts
+          #                 (<agent_root>/dreams/<id>/, atomic_agents/dream.py);
+          #                 no Protocol yet; #383 (Phase 3).
+          #   queue/        EPHEMERAL - cascade work-queue (queued/claimed/done/
+          #                 dead-letter); the POSIX-rename work-claim leases live here
+          #                 (atomic_agents/_cascade.py). Present ONLY in multi-agent
+          #                 cascade project deployments, where it lives at
+          #                 project_root/queue/ - NOT a sibling of memory/ under a
+          #                 single agent's folder root. A single-agent
+          #                 "serve <agent-name>" deployment (this manifest's shape) has
+          #                 no queue/ at the agent root. No Protocol yet; #383 + T4 (Phase 3).
+          #   mandate/      EPHEMERAL - Postgres adapter tracked in #258 (Phase 3).
+          #   policy/       EPHEMERAL - Postgres adapter tracked in #258 (Phase 3).
+          #   profile/      EPHEMERAL - Postgres adapter tracked in #258 (Phase 3).
+          #   tools/        EPHEMERAL - Postgres adapter tracked in #258 (Phase 3).
+          #   corpus/       EPHEMERAL - Postgres adapter tracked in #258 (Phase 3).
+          #   .personas/    EPHEMERAL - persona-backend storage (FilesystemPersonaBackend,
+          #                 <root>/.personas/<persona_id>/); gated on the PersonaBackend
+          #                 cloud adapter, #258 (Phase 3). NOT cascade work-claim leases.
+          #
+          # For the LAYOUT RULE (never mount at the agent folder root - see why in
+          # extras/gcp/compute-vm/README.md §CRITICAL LAYOUT RULE), which applies
+          # when mounts are eventually added in Phase 4.
 
           # Probe port MUST equal the declared containerPort above (8080).
           # If you change containerPort, change both probe ports too.
@@ -214,20 +208,14 @@ spec:
             # doctor may spawn MCP subprocesses and probe remote backends.
             # healthz runs filesystem checks only. See docs/deployment/serve.md.
 
-          readinessProbe:
-            httpGet:
-              path: /agents/<your-agent-name>/healthz
-              port: 8080
-            initialDelaySeconds: 5
-            periodSeconds: 10
-
-      # PLATFORM ALTERNATIVE — KEEP EXACTLY ONE: this Knative-native volumes
-      # block targets Knative-on-GKE / Cloud Run for Anthos. It is the SAME
-      # disk as the fully-managed `run.googleapis.com/volumes` annotation above.
-      # The locked #339 v0 topology is fully-managed Cloud Run, which uses the
-      # annotation — delete this block unless you run on Knative/Anthos.
-      volumes:
-        - name: agent-vault
-          gcePersistentDisk:
-            pdName: <your-disk-name>
-            fsType: ext4
+          # NO readinessProbe here on purpose. Cloud Run readiness probes are a
+          # Preview feature: the YAML form REQUIRES the
+          # `run.googleapis.com/launch-stage: BETA` annotation on
+          # spec.template.metadata (and `gcloud beta run deploy --readiness-probe`),
+          # or `gcloud run services replace` rejects/drops the unannotated field.
+          # (Verified: the readinessProbe example mandates that annotation at
+          #  https://cloud.google.com/run/docs/configuring/healthchecks)
+          # A stateless v0 reference only needs the GA livenessProbe above to be
+          # honestly deployable - healthz is already the liveness path. If you want
+          # a readiness probe, add `run.googleapis.com/launch-stage: BETA` to
+          # spec.template.metadata.annotations and deploy with `gcloud beta`.

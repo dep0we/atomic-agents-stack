@@ -51,7 +51,7 @@ test_mcp_server_registry_conformance.py.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -63,26 +63,82 @@ from atomic_agents.secret_backend import (
     SecretRef,
 )
 from atomic_agents.secret_backend.backend import _validate_key
+from atomic_agents.secret_backend.gcp import GCPSecretManagerBackend
+
+
+def _make_gcp_mock_client(*, present_keys: dict[str, bytes] | None = None) -> MagicMock:
+    """Return a mock SecretManagerServiceClient.
+
+    ``present_keys`` maps GCP secret name (lowercased-hyphenated) to payload bytes.
+    Any key not in the dict raises ``google.api_core.exceptions.NotFound``.
+    Default (None) raises NotFound for everything.
+    """
+    import google.api_core.exceptions as _gcp_exc
+
+    present_keys = present_keys or {}
+    client = MagicMock()
+
+    def _access_secret_version(name: str, **kwargs):
+        # Extract the secret name from the resource path: .../secrets/<name>/versions/latest
+        parts = name.rstrip("/").split("/")
+        # parts[-3] = secrets, parts[-2] = secret_name, parts[-1] = versions/... variant
+        # resource path: projects/p/secrets/s/versions/latest -> parts[-3]='secrets', [-2]='s'
+        if len(parts) >= 4:
+            secret_name = parts[-3] if parts[-1] == "latest" else parts[-2]
+            # Prefer the segment right before "versions"
+            try:
+                versions_idx = parts.index("versions")
+                secret_name = parts[versions_idx - 1]
+            except ValueError:
+                pass
+        else:
+            secret_name = name
+
+        if secret_name in present_keys:
+            mock_response = MagicMock()
+            mock_response.payload.data = present_keys[secret_name]
+            return mock_response
+        raise _gcp_exc.NotFound(f"Secret {secret_name!r} not found (mock)")
+
+    client.access_secret_version.side_effect = _access_secret_version
+    return client
+
+
+def _make_gcp_backend_with_key(key: str, value: str) -> GCPSecretManagerBackend:
+    """Return a GCPSecretManagerBackend mock that resolves ``key`` to ``value``."""
+    secret_name = key.lower().replace("_", "-")
+    mock_client = _make_gcp_mock_client(
+        present_keys={secret_name: value.encode("utf-8")}
+    )
+    return GCPSecretManagerBackend(
+        url="projects/test-project/secrets",
+        _client=mock_client,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Fixtures
 
 
-@pytest.fixture(params=["filesystem"])
+@pytest.fixture(params=["filesystem", "gcp"])
 def backend(request) -> SecretBackend:
     """A fresh SecretBackend instance for the parametrized implementation.
 
-    PR 2 extends params to ["filesystem", "gcp"] and adds an elif branch for
-    GCPSecretManagerBackend; every conformance test then runs against both
-    backends automatically.
-
     IMPORTANT: only add tests to this file that EVERY SecretBackend must pass,
     expressed against the public Protocol surface. Filesystem-specific tests
-    belong in test_secret_backend_filesystem.py.
+    belong in test_secret_backend_filesystem.py. GCP-specific tests belong in
+    test_secret_backend_gcp.py.
     """
     if request.param == "filesystem":
         return FilesystemSecretBackend()
+    elif request.param == "gcp":
+        # No keys present by default -- tests that need a live key use monkeypatch
+        # (filesystem) or the make_present fixture mechanism (gcp).
+        mock_client = _make_gcp_mock_client()
+        return GCPSecretManagerBackend(
+            url="projects/test-project/secrets",
+            _client=mock_client,
+        )
     raise ValueError(f"Unknown backend param: {request.param}")
 
 
@@ -93,12 +149,9 @@ def force_absent(request, monkeypatch):
     Returns a callable ``force_absent(*keys)`` -> context manager. Inside the
     context, every named key resolves as absent for whichever backend the
     ``backend`` fixture produced. This keeps absence-dependent Protocol-contract
-    tests (empty/whitespace/absent → SecretNotFound or None) truthful for every
+    tests (empty/whitespace/absent -> SecretNotFound or None) truthful for every
     backend without reaching into any one backend's internals from the test
     body.
-
-    PR 2: add a ``gcp`` branch that patches the GCP client so the named keys
-    resolve as absent there too.
     """
     param = getattr(request, "param", None)
     # The companion ``backend`` fixture is parametrized; mirror its id here.
@@ -127,7 +180,37 @@ def force_absent(request, monkeypatch):
                 ),
             ):
                 yield
-        else:  # pragma: no cover - exercised once a second backend is added
+        elif param == "gcp":
+            # GCP has one source (the Secret Manager API). Forcing absence means
+            # patching the mock client so access_secret_version raises NotFound
+            # for every key. The backend fixture injects a _client seam via
+            # _client_is_injected=True; we patch access_secret_version directly
+            # on the already-injected client object.
+            import google.api_core.exceptions as _gcp_exc
+
+            # Get the backend instance from the test's ``backend`` fixture via the
+            # request node. We need the client from the backend object to patch it.
+            # Use the backend fixture indirectly: inject a fresh all-absent client.
+            # Since the backend fixture already injected _client, we patch it here.
+            backend_instance = request.node.funcargs.get("backend")
+            if backend_instance is not None and hasattr(backend_instance, "_client"):
+                original_side_effect = (
+                    backend_instance._client.access_secret_version.side_effect
+                )
+                backend_instance._client.access_secret_version.side_effect = (
+                    lambda name, **kwargs: (_ for _ in ()).throw(
+                        _gcp_exc.NotFound("forced absent (mock)")
+                    )
+                )
+                try:
+                    yield
+                finally:
+                    backend_instance._client.access_secret_version.side_effect = (
+                        original_side_effect
+                    )
+            else:
+                yield
+        else:
             raise NotImplementedError(
                 f"force_absent has no branch for backend param {param!r}; "
                 f"add one alongside the new 'backend' fixture branch."
@@ -146,15 +229,19 @@ def force_other_sources_absent(request, monkeypatch):
     and suppresses only the *secondary* sources. It is the fixture for MUST-7
     "empty/whitespace value at the primary source is treated as absent" tests:
     the empty value must survive to the backend so the empty-string/whitespace
-    guard is the thing under test — not absence.
+    guard is the thing under test -- not absence.
 
     For filesystem the primary source is the environment, so the named keys'
     env vars are left untouched while Keychain + keys.json are suppressed. (The
     canonical ATOMIC_AGENTS_* aliases ARE deleted so a stray real alias on the
     test runner cannot satisfy Source 1 ahead of the empty value under test.)
 
-    PR 2: add a ``gcp`` branch that suppresses GCP's secondary lookups while
-    leaving the primary client value the test set in place.
+    For GCP, the only source is the Secret Manager API. There are no secondary
+    sources to suppress. The contract "leave the primary source live with its
+    value" reduces to: configure the mock client to return whatever empty/whitespace
+    payload the test has set, so the strip guard fires (not absence). The
+    monkeypatch.setenv calls in the test body have no effect on GCP resolution
+    and are simply ignored for this backend.
     """
     param = getattr(request, "param", None)
     if hasattr(request.node, "callspec"):
@@ -185,13 +272,118 @@ def force_other_sources_absent(request, monkeypatch):
                 ),
             ):
                 yield
-        else:  # pragma: no cover - exercised once a second backend is added
+        elif param == "gcp":
+            # GCP has only one source (Secret Manager API); no secondary sources
+            # to suppress. The contract "leave the primary value live" means:
+            # configure the mock client to return empty bytes (b'' or b'   ')
+            # for the named keys, simulating the empty/whitespace payload case.
+            # This makes the strip guard fire (MUST 7), not the absence path.
+            import google.api_core.exceptions as _gcp_exc
+
+            backend_instance = request.node.funcargs.get("backend")
+            if backend_instance is not None and hasattr(backend_instance, "_client"):
+                original_side_effect = (
+                    backend_instance._client.access_secret_version.side_effect
+                )
+
+                key_secret_names = {k.lower().replace("_", "-") for k in keys}
+
+                def _empty_payload_for_keys(name: str, **kwargs):
+                    parts = name.rstrip("/").split("/")
+                    secret_name = parts[-1]
+                    try:
+                        versions_idx = parts.index("versions")
+                        secret_name = parts[versions_idx - 1]
+                    except ValueError:
+                        pass
+                    if secret_name in key_secret_names:
+                        # Return whitespace-only bytes (not bare b"") so the test
+                        # that exercises "whitespace value treated as absent"
+                        # genuinely drives the .strip() guard for the gcp branch,
+                        # not the empty-bytes path. Both reduce to "absent" via the
+                        # same MUST 7 strip, but staging whitespace keeps the
+                        # test's name/docstring honest for the gcp parametrization.
+                        mock_response = MagicMock()
+                        mock_response.payload.data = b"   \n  "
+                        return mock_response
+                    # Other keys: raise NotFound (they are not under test)
+                    raise _gcp_exc.NotFound(f"Secret {secret_name!r} not found (mock)")
+
+                backend_instance._client.access_secret_version.side_effect = (
+                    _empty_payload_for_keys
+                )
+                try:
+                    yield
+                finally:
+                    backend_instance._client.access_secret_version.side_effect = (
+                        original_side_effect
+                    )
+            else:
+                yield
+        else:
             raise NotImplementedError(
                 f"force_other_sources_absent has no branch for backend param "
                 f"{param!r}; add one alongside the new 'backend' fixture branch."
             )
 
     return _force_other_sources_absent
+
+
+@pytest.fixture
+def make_present(request, monkeypatch):
+    """Backend-agnostic way to inject a live key->value into the active backend.
+
+    Returns a callable ``make_present(key, value)`` that sets up the backend
+    so that ``backend.get(key)`` returns ``value``. For filesystem, sets the
+    env var. For GCP, patches the mock client to return the value.
+
+    Used by tests that need to inject a live key (locate/MUST 5, MUST 8
+    when-present, MUST 9 concurrency) without reaching into backend internals
+    from the test body.
+    """
+    param = getattr(request, "param", None)
+    if hasattr(request.node, "callspec"):
+        param = request.node.callspec.params.get("backend", param)
+
+    def _make_present(key: str, value: str):
+        if param == "filesystem":
+            monkeypatch.setenv(key, value)
+        elif param == "gcp":
+            backend_instance = request.node.funcargs.get("backend")
+            if backend_instance is not None and hasattr(backend_instance, "_client"):
+                secret_name = key.lower().replace("_", "-")
+                existing_se = backend_instance._client.access_secret_version.side_effect
+                # Build a new side_effect that returns the value for this key
+                # and delegates everything else to the prior side_effect.
+                prior_se = existing_se
+
+                def _side_effect_with_key(name: str, **kwargs):
+                    parts = name.rstrip("/").split("/")
+                    sn = parts[-1]
+                    try:
+                        versions_idx = parts.index("versions")
+                        sn = parts[versions_idx - 1]
+                    except ValueError:
+                        pass
+                    if sn == secret_name:
+                        mock_response = MagicMock()
+                        mock_response.payload.data = value.encode("utf-8")
+                        return mock_response
+                    if prior_se is not None:
+                        return prior_se(name, **kwargs)
+                    import google.api_core.exceptions as _gcp_exc
+
+                    raise _gcp_exc.NotFound(f"Secret {sn!r} not found (mock)")
+
+                backend_instance._client.access_secret_version.side_effect = (
+                    _side_effect_with_key
+                )
+        else:
+            raise NotImplementedError(
+                f"make_present has no branch for backend param {param!r}"
+            )
+
+    return _make_present
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -289,11 +481,19 @@ def test_capabilities_flags_are_bools(backend):
 # MUST 4-5: No secret value in exceptions or SecretRef
 
 
-def test_secret_not_found_message_excludes_value(backend, monkeypatch, force_absent):
-    """SecretNotFound message MUST NOT contain the resolved value (MUST 4)."""
-    # The value is set then removed so it exists nowhere; the test guards the
-    # message-construction path against ever embedding a resolved value.
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "SHOULD_NOT_APPEAR")
+def test_secret_not_found_message_excludes_value(
+    backend, monkeypatch, make_present, force_absent
+):
+    """SecretNotFound message MUST NOT contain the resolved value (MUST 4).
+
+    For filesystem: the value is first set via env var then removed by
+    force_absent, so the message-construction path is exercised on a key that
+    had a value.  For GCP: make_present wires a canary value into the mock
+    client; force_absent then patches it to raise NotFound so the
+    SecretNotFound message is built -- that message must never embed the value.
+    """
+    # Stage the canary value in whatever source is appropriate for this backend
+    make_present("ANTHROPIC_API_KEY", "SHOULD_NOT_APPEAR")
     with force_absent("ANTHROPIC_API_KEY"):
         with pytest.raises(SecretNotFound) as exc_info:
             backend.get("ANTHROPIC_API_KEY")
@@ -308,7 +508,7 @@ def test_secret_not_found_message_names_key(backend, force_absent):
     assert "MY_CUSTOM_KEY" in str(exc_info.value)
 
 
-def test_locate_source_excludes_value(backend, monkeypatch):
+def test_locate_source_excludes_value(backend, monkeypatch, make_present):
     """SecretRef.source MUST NOT contain the resolved value (MUST 5).
 
     The source-label *shape* (env:/keychain:/config: prefixes) is
@@ -317,7 +517,7 @@ def test_locate_source_excludes_value(backend, monkeypatch):
     contains the secret value.
     """
     secret_value = "sk-ant-ultra-secret-value-12345"
-    monkeypatch.setenv("ANTHROPIC_API_KEY", secret_value)
+    make_present("ANTHROPIC_API_KEY", secret_value)
     ref = backend.locate("ANTHROPIC_API_KEY")
     assert ref is not None
     assert secret_value not in ref.source
@@ -382,9 +582,9 @@ def test_empty_value_get_optional_returns_none(
 # MUST 8: has() delegates to / agrees with get_optional()
 
 
-def test_has_agrees_with_get_optional_when_present(backend, monkeypatch):
+def test_has_agrees_with_get_optional_when_present(backend, monkeypatch, make_present):
     """has() MUST agree with get_optional() when present — split-brain prevention."""
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "real-key")
+    make_present("ANTHROPIC_API_KEY", "real-key")
     assert backend.has("ANTHROPIC_API_KEY") is True
     assert (backend.get_optional("ANTHROPIC_API_KEY") is not None) is True
 
@@ -413,8 +613,8 @@ def test_has_false_when_absent(backend, force_absent):
 # locate() behavior (MUST 5 secrecy + presence semantics)
 
 
-def test_locate_returns_secret_ref_when_present(backend, monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "some-key")
+def test_locate_returns_secret_ref_when_present(backend, monkeypatch, make_present):
+    make_present("ANTHROPIC_API_KEY", "some-key")
     ref = backend.locate("ANTHROPIC_API_KEY")
     assert ref is not None
     assert isinstance(ref, SecretRef)
@@ -432,11 +632,11 @@ def test_locate_returns_none_when_absent(backend, force_absent):
 # MUST 9: No caching — concurrent calls are safe
 
 
-def test_concurrent_get_calls_consistent(backend, monkeypatch):
+def test_concurrent_get_calls_consistent(backend, monkeypatch, make_present):
     """get() called from multiple threads returns consistent results."""
     import threading
 
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "concurrent-test-key")
+    make_present("ANTHROPIC_API_KEY", "concurrent-test-key")
     results = []
     errors = []
 

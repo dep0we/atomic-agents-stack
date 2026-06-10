@@ -135,3 +135,135 @@ def test_render_agent_handles_no_helpers(tmp_path):
     out_path = render_agent(tmp_path, data)
     html = out_path.read_text()
     assert "No helper calls" in html
+
+
+# ──────────────────────────────────────────────────────────────────
+# XSS regression tests (#400) — run-derived strings must be escaped
+
+
+_XSS_SUMMARY = "<img src=x onerror=alert(document.cookie)>"
+_XSS_AGENT_NAME = 'a"><img src=x onerror=alert(1)>'
+_XSS_TRIGGER = "<script>alert(1)</script>"
+
+_RAW_IMG = "<img src=x"  # present in both payloads; must never appear raw
+
+
+def test_xss_summary_escaped_in_global_dashboard(tmp_path):
+    """summary from a run record must be html-escaped in the global index."""
+    today = date.today()
+    _write_log(
+        tmp_path,
+        "safe-agent",
+        today,
+        [{"cost_usd": 0.10, "summary": _XSS_SUMMARY}],
+    )
+    summary = aggregate_global(tmp_path, today=today)
+    out_path = render_global(tmp_path, summary)
+    content = out_path.read_text()
+
+    assert _RAW_IMG not in content, (
+        "raw <img> XSS payload found unescaped in global index"
+    )
+    assert "&lt;img" in content, "expected html-escaped &lt;img in global index"
+
+
+def test_xss_agent_name_escaped_in_global_dashboard(tmp_path):
+    """agent name with HTML chars must be escaped in href path and link text."""
+    today = date.today()
+    # Filesystem agent dir name uses the XSS payload as the folder name.
+    _write_log(
+        tmp_path,
+        _XSS_AGENT_NAME,
+        today,
+        [{"cost_usd": 0.05}],
+    )
+    summary = aggregate_global(tmp_path, today=today)
+    out_path = render_global(tmp_path, summary)
+    content = out_path.read_text()
+
+    # Raw payload must not appear in link text or href attribute context.
+    assert _RAW_IMG not in content, "raw <img> XSS payload found in agent name link"
+    # The escaped form of the double-quote character must appear instead of raw ".
+    # (urllib.parse.quote encodes the " in the href; html.escape encodes it in text)
+    assert '"><img' not in content, 'href-breaking sequence "><img found unescaped'
+
+
+def test_xss_trigger_escaped_in_per_agent_dashboard(tmp_path):
+    """trigger field from JSONL must be html-escaped in per-agent top-runs table."""
+    today = date.today()
+    _write_log(
+        tmp_path,
+        "safe-agent",
+        today,
+        [{"cost_usd": 0.10, "trigger": _XSS_TRIGGER, "summary": _XSS_SUMMARY}],
+    )
+    data = aggregate_agent(tmp_path, "safe-agent", today=today)
+    out_path = render_agent(tmp_path, data)
+    content = out_path.read_text()
+
+    # The exact payload string must not appear raw (the template's own <script>
+    # block is legitimate and distinct from _XSS_TRIGGER).
+    assert _XSS_TRIGGER not in content, (
+        "raw trigger XSS payload found unescaped in per-agent dashboard"
+    )
+    assert _RAW_IMG not in content, "raw <img> XSS payload found in per-agent dashboard"
+    # Confirm both payloads appear in their html-escaped forms.
+    assert "&lt;script&gt;" in content
+    assert "&lt;img" in content
+
+
+def test_xss_summary_escaped_in_per_agent_dashboard(tmp_path):
+    """summary must be html-escaped in the per-agent top-runs table."""
+    today = date.today()
+    _write_log(
+        tmp_path,
+        "safe-agent",
+        today,
+        [{"cost_usd": 0.10, "summary": _XSS_SUMMARY}],
+    )
+    data = aggregate_agent(tmp_path, "safe-agent", today=today)
+    out_path = render_agent(tmp_path, data)
+    content = out_path.read_text()
+
+    assert _RAW_IMG not in content, (
+        "raw <img> XSS payload found unescaped in per-agent dashboard"
+    )
+    assert "&lt;img" in content, "expected html-escaped &lt;img in per-agent dashboard"
+
+
+def test_xss_agent_name_escaped_in_per_agent_template(tmp_path):
+    """agent name with HTML chars must be escaped in the per-agent page title and h1."""
+    today = date.today()
+    _write_log(
+        tmp_path,
+        _XSS_AGENT_NAME,
+        today,
+        [{"cost_usd": 0.05}],
+    )
+    data = aggregate_agent(tmp_path, _XSS_AGENT_NAME, today=today)
+    out_path = render_agent(tmp_path, data)
+    content = out_path.read_text()
+
+    assert _RAW_IMG not in content, "raw <img> XSS payload found in per-agent title/h1"
+    assert '"><img' not in content, 'unescaped "><img in per-agent page'
+
+
+def test_csp_meta_present_in_global_dashboard(tmp_path):
+    """Global dashboard must include a Content-Security-Policy meta tag."""
+    today = date.today()
+    summary = aggregate_global(tmp_path, today=today)
+    out_path = render_global(tmp_path, summary)
+    content = out_path.read_text()
+
+    assert "Content-Security-Policy" in content
+
+
+def test_csp_meta_present_in_per_agent_dashboard(tmp_path):
+    """Per-agent dashboard must include a Content-Security-Policy meta tag."""
+    today = date.today()
+    _write_log(tmp_path, "alice", today, [{"cost_usd": 0.10}])
+    data = aggregate_agent(tmp_path, "alice", today=today)
+    out_path = render_agent(tmp_path, data)
+    content = out_path.read_text()
+
+    assert "Content-Security-Policy" in content

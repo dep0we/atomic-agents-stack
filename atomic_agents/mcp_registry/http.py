@@ -62,6 +62,13 @@ _DEFAULT_COMMAND_ALLOWLIST: frozenset[str] = frozenset(
     {"npx", "uvx", "python", "python3", "node", "docker"}
 )
 
+# Hard byte ceiling for catalog HTTP responses (CWE-400 / #403).
+# A slow-streaming catalog that never exceeds the per-chunk read-timeout can
+# balloon RSS without bound; this cap enforces termination regardless of how
+# the body arrives.  8 MB is generous for any realistic MCP catalog; operators
+# needing a higher limit can pass max_response_bytes= to the constructor.
+_MAX_CATALOG_RESPONSE_BYTES: int = 8 * 1024 * 1024  # 8 MB
+
 # Module-level lazy reference to the httpx package.
 # Set to the actual ``httpx`` module on first successful import by ``_get_httpx()``.
 _httpx: Any = None
@@ -714,6 +721,14 @@ class HTTPMCPServerRegistryBackend:
         at construction), preserving MUST 2.  Production deployments MUST NOT set
         this to ``True`` for remote catalog servers.
 
+    ``max_response_bytes``: hard byte ceiling applied to every catalog HTTP
+        response body before JSON parsing (default 8 MB; see
+        ``_MAX_CATALOG_RESPONSE_BYTES``). A catalog that streams a body larger
+        than this limit raises ``MCPRegistryDescriptorInvalid`` immediately,
+        preventing unbounded RSS growth from slow-drip oversized responses
+        (CWE-400 / finding #403). A Content-Length check alone is not
+        sufficient because the header is omittable and spoofable.
+
     ``_http_client``: test-only injectable seam (D-PR4-1). When set, the backend
         uses this client instead of constructing a real ``httpx.Client``. Production
         callers MUST NOT pass this parameter.
@@ -728,6 +743,7 @@ class HTTPMCPServerRegistryBackend:
         request_timeout_s: float = 10.0,
         probe_failure_cache_s: float = 60.0,
         allow_http_non_loopback: bool | None = None,
+        max_response_bytes: int = _MAX_CATALOG_RESPONSE_BYTES,
         _http_client: Any = None,
     ) -> None:
         # MUST 2: side-effect-free construction. No httpx import, no network
@@ -762,6 +778,7 @@ class HTTPMCPServerRegistryBackend:
         self._auth_token = auth_token
         self._request_timeout_s = request_timeout_s
         self._probe_failure_cache_s = probe_failure_cache_s
+        self._max_response_bytes = max_response_bytes
         self._http_client_override = _http_client
 
         # Resolve allow_http_non_loopback once at construction (P1: TOCTOU).
@@ -836,6 +853,46 @@ class HTTPMCPServerRegistryBackend:
             return {"Authorization": f"Bearer {self._auth_token}"}
         return {}
 
+    def _read_bounded_json(self, resp: Any) -> Any:
+        """Read response body up to ``_max_response_bytes`` and parse as JSON.
+
+        Reads the raw response content from ``resp.content`` (already buffered
+        by httpx) and raises ``MCPRegistryDescriptorInvalid`` before JSON
+        parsing when the byte count exceeds ``self._max_response_bytes``.
+
+        A Content-Length header check is NOT sufficient because the header is
+        optional and can be spoofed by a compromised or MITM'd catalog server.
+        This method enforces the ceiling on ACTUAL bytes read, closing the
+        slow-drip memory-exhaustion vector (CWE-400 / finding #403).
+
+        Args:
+            resp: An httpx Response object.  Must have already received a
+                  successful status code; the caller is responsible for calling
+                  ``resp.raise_for_status()`` first.
+
+        Returns:
+            The JSON-decoded response body.
+
+        Raises:
+            MCPRegistryDescriptorInvalid: body exceeds ``_max_response_bytes``
+                or the body is not valid JSON.
+        """
+        url = self._safe_catalog_url
+        raw = resp.content  # bytes already buffered by httpx
+        if len(raw) > self._max_response_bytes:
+            raise MCPRegistryDescriptorInvalid(
+                f"catalog server at {url} returned a response body of "
+                f"{len(raw):,} bytes, exceeding the {self._max_response_bytes:,}-byte "
+                f"limit. Refusing to parse. "
+                f"Possible slow-drip memory-exhaustion attack or misconfigured catalog."
+            )
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise MCPRegistryDescriptorInvalid(
+                f"catalog server at {url} returned a response that is not valid JSON: {exc}"
+            ) from exc
+
     # ─── Capability negotiation ────────────────────────────────────────────
 
     def _assert_scheme(self) -> None:
@@ -881,13 +938,7 @@ class HTTPMCPServerRegistryBackend:
         try:
             resp = client.get(caps_url, headers=self._auth_headers())
             if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                except json.JSONDecodeError as exc:
-                    raise MCPRegistryDescriptorInvalid(
-                        f"catalog server at {url} /capabilities response is "
-                        f"not valid JSON: {exc}"
-                    ) from exc
+                data = self._read_bounded_json(resp)
                 return _parse_capabilities_response(data, url=url)
 
             # Step 2: 404 on /capabilities means server doesn't implement it;
@@ -1104,7 +1155,7 @@ class HTTPMCPServerRegistryBackend:
         try:
             resp = client.get(request_url, headers=self._auth_headers())
             resp.raise_for_status()
-            data = resp.json()
+            data = self._read_bounded_json(resp)
         except httpx.HTTPStatusError as exc:
             _handle_http_error(exc, url=url)
         except (
@@ -1117,8 +1168,6 @@ class HTTPMCPServerRegistryBackend:
             httpx.InvalidURL,
             RuntimeError,
         ) as exc:
-            _handle_http_error(exc, url=url)
-        except json.JSONDecodeError as exc:
             _handle_http_error(exc, url=url)
 
         refs = _parse_servers_list_to_refs(data, url=url, source_url=self._catalog_url)
@@ -1149,7 +1198,7 @@ class HTTPMCPServerRegistryBackend:
         try:
             resp = client.get(request_url, headers=self._auth_headers())
             resp.raise_for_status()
-            data = resp.json()
+            data = self._read_bounded_json(resp)
         except httpx.HTTPStatusError as exc:
             _handle_http_error(
                 exc,
@@ -1166,8 +1215,6 @@ class HTTPMCPServerRegistryBackend:
             httpx.InvalidURL,
             RuntimeError,
         ) as exc:
-            _handle_http_error(exc, url=url)
-        except json.JSONDecodeError as exc:
             _handle_http_error(exc, url=url)
 
         raw = _parse_mcp_server_spec_from_dict(data, url=url)
@@ -1196,7 +1243,7 @@ class HTTPMCPServerRegistryBackend:
         try:
             resp = client.get(request_url, headers=self._auth_headers())
             resp.raise_for_status()
-            data = resp.json()
+            data = self._read_bounded_json(resp)
         except httpx.HTTPStatusError as exc:
             _handle_http_error(exc, url=url)
         except (
@@ -1209,8 +1256,6 @@ class HTTPMCPServerRegistryBackend:
             httpx.InvalidURL,
             RuntimeError,
         ) as exc:
-            _handle_http_error(exc, url=url)
-        except json.JSONDecodeError as exc:
             _handle_http_error(exc, url=url)
 
         raw_specs = _parse_servers_list(data, url=url)
@@ -1260,7 +1305,7 @@ class HTTPMCPServerRegistryBackend:
                     warnings=[],
                 )
             resp.raise_for_status()
-            data = resp.json()
+            data = self._read_bounded_json(resp)
         except httpx.HTTPStatusError as exc:
             _handle_http_error(exc, url=url)
         except (
@@ -1273,8 +1318,6 @@ class HTTPMCPServerRegistryBackend:
             httpx.InvalidURL,
             RuntimeError,
         ) as exc:
-            _handle_http_error(exc, url=url)
-        except json.JSONDecodeError as exc:
             _handle_http_error(exc, url=url)
 
         return _parse_validation_result(data, url=url)

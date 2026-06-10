@@ -10,8 +10,10 @@ when the optional Flask server (serve.py) is running.
 """
 
 from __future__ import annotations
+import html
 import json
 import shutil
+import urllib.parse
 from datetime import date
 from pathlib import Path
 
@@ -25,11 +27,12 @@ from .costs import (
     discover_agents,
     to_json_dict,
 )
-from ._shared import nav_bar as _nav_bar, CSS as _SHARED_CSS
+from ._shared import nav_bar as _nav_bar, CSS as _SHARED_CSS, _CSP as _SHARED_CSP
 
 
 # ──────────────────────────────────────────────────────────────────
 # Public entry points
+
 
 def render_all(
     agents_root: Path,
@@ -54,11 +57,11 @@ def render_all(
     now = datetime.now(tz=timezone.utc)
     written: dict = {"global": None, "per_agent": []}
 
-    render_cost    = tab in ("all", "cost")
+    render_cost = tab in ("all", "cost")
     render_activity_tab = tab in ("all", "activity")
-    render_quality_tab  = tab in ("all", "quality")
-    render_memory_tab   = tab in ("all", "memory")
-    render_goals_tab    = tab in ("all", "goals")
+    render_quality_tab = tab in ("all", "quality")
+    render_memory_tab = tab in ("all", "memory")
+    render_goals_tab = tab in ("all", "goals")
 
     if render_cost:
         global_summary = aggregate_global(agents_root, today=today)
@@ -111,7 +114,9 @@ def render_global(agents_root: Path, summary: GlobalSummary) -> Path:
     data_dir = out_dir / "data"
     data_dir.mkdir(exist_ok=True)
     label_safe = summary.period_label.replace(" ", "_").lower()
-    atomic_write(data_dir / f"{label_safe}.json", json.dumps(to_json_dict(summary), indent=2))
+    atomic_write(
+        data_dir / f"{label_safe}.json", json.dumps(to_json_dict(summary), indent=2)
+    )
 
     return out_path
 
@@ -262,12 +267,18 @@ footer {
 def _model_pill_class(model: str) -> str:
     """Map a model id to a CSS class for its pill color."""
     m = model.lower()
-    if "opus" in m: return "opus"
-    if "sonnet" in m: return "sonnet"
-    if "haiku" in m: return "haiku"
-    if m.startswith("gpt"): return "gpt"
-    if "kimi" in m or m.startswith("moonshot"): return "kimi"
-    if m.startswith("local") or "qwen" in m or "llama" in m: return "local"
+    if "opus" in m:
+        return "opus"
+    if "sonnet" in m:
+        return "sonnet"
+    if "haiku" in m:
+        return "haiku"
+    if m.startswith("gpt"):
+        return "gpt"
+    if "kimi" in m or m.startswith("moonshot"):
+        return "kimi"
+    if m.startswith("local") or "qwen" in m or "llama" in m:
+        return "local"
     return "opus"  # fallback color
 
 
@@ -279,19 +290,28 @@ def _model_pill(model: str, label: str | None = None) -> str:
 
 def _short_model_name(model: str) -> str:
     """Compact display name for a model id."""
-    if "opus" in model.lower(): return "Opus"
-    if "sonnet" in model.lower(): return "Sonnet"
-    if "haiku" in model.lower(): return "Haiku"
-    if model.startswith("gpt-5-mini"): return "GPT-5 mini"
-    if model.startswith("gpt-5-nano"): return "GPT-5 nano"
-    if model.startswith("gpt-5"): return "GPT-5"
-    if "kimi" in model.lower(): return "Kimi"
+    if "opus" in model.lower():
+        return "Opus"
+    if "sonnet" in model.lower():
+        return "Sonnet"
+    if "haiku" in model.lower():
+        return "Haiku"
+    if model.startswith("gpt-5-mini"):
+        return "GPT-5 mini"
+    if model.startswith("gpt-5-nano"):
+        return "GPT-5 nano"
+    if model.startswith("gpt-5"):
+        return "GPT-5"
+    if "kimi" in model.lower():
+        return "Kimi"
     return model.split("/")[-1][:24]
 
 
 def _delta_class(pct: float) -> str:
-    if pct > 1: return "up"
-    if pct < -1: return "down"
+    if pct > 1:
+        return "up"
+    if pct < -1:
+        return "down"
     return "neutral"
 
 
@@ -312,26 +332,28 @@ def _render_global_template(s: GlobalSummary, has_goals: bool = True) -> str:
         for a in s.agents:
             models_html = "".join(
                 f'<span class="pill {_model_pill_class(m)}" style="margin-right: 4px;">'
-                f'{_short_model_name(m)}: ${cost:.4f}</span>'
+                f"{_short_model_name(m)}: ${cost:.4f}</span>"
                 for m, cost in a.cost_by_model.items()
             )
+            _name_href = urllib.parse.quote(a.name, safe="")
+            _name_text = html.escape(a.name)
             agent_rows.append(
-                f'<tr>'
-                f'<td><a href="../{a.name}/dashboard.html" style="color: var(--accent); text-decoration: none;">{a.name}</a></td>'
+                f"<tr>"
+                f'<td><a href="../{_name_href}/dashboard.html" style="color: var(--accent); text-decoration: none;">{_name_text}</a></td>'
                 f'<td class="right num">${a.cost_usd:.4f}</td>'
                 f'<td class="right num">{a.runs}</td>'
                 f'<td class="right num">{a.errors}</td>'
                 f'<td class="right num">{a.cache_hit_pct}%</td>'
-                f'<td>{models_html}</td>'
-                f'</tr>'
+                f"<td>{models_html}</td>"
+                f"</tr>"
             )
         agents_table = (
-            '<table>'
+            "<table>"
             '<thead><tr><th>Agent</th><th class="right">Cost</th>'
             '<th class="right">Runs</th><th class="right">Errors</th>'
             '<th class="right">Cache hit</th><th>Models used</th></tr></thead>'
-            f'<tbody>{"".join(agent_rows)}</tbody>'
-            '</table>'
+            f"<tbody>{''.join(agent_rows)}</tbody>"
+            "</table>"
         )
     else:
         agents_table = '<p class="empty-note">No agent activity this period.</p>'
@@ -342,23 +364,23 @@ def _render_global_template(s: GlobalSummary, has_goals: bool = True) -> str:
         for r in s.top_runs:
             ts_short = r.ts.strftime("%b %d · %H:%M")
             top_rows.append(
-                f'<tr>'
+                f"<tr>"
                 f'<td class="num">{ts_short}</td>'
-                f'<td>{r.agent}</td>'
-                f'<td>{r.trigger}</td>'
-                f'<td>{_model_pill(r.model)}</td>'
+                f"<td>{html.escape(r.agent)}</td>"
+                f"<td>{html.escape(r.trigger)}</td>"
+                f"<td>{_model_pill(r.model)}</td>"
                 f'<td class="right num">{r.input_tokens:,} / {r.output_tokens:,}</td>'
                 f'<td class="right num"><strong>${r.cost_usd:.4f}</strong></td>'
-                f'<td>{_truncate(r.summary, 60)}</td>'
-                f'</tr>'
+                f"<td>{html.escape(_truncate(r.summary, 60))}</td>"
+                f"</tr>"
             )
         top_table = (
-            '<table>'
-            '<thead><tr><th>Date</th><th>Agent</th><th>Trigger</th>'
+            "<table>"
+            "<thead><tr><th>Date</th><th>Agent</th><th>Trigger</th>"
             '<th>Model</th><th class="right">Tokens (in / out)</th>'
             '<th class="right">Cost</th><th>Summary</th></tr></thead>'
-            f'<tbody>{"".join(top_rows)}</tbody>'
-            '</table>'
+            f"<tbody>{''.join(top_rows)}</tbody>"
+            "</table>"
         )
     else:
         top_table = '<p class="empty-note">No runs this period.</p>'
@@ -374,11 +396,11 @@ def _render_global_template(s: GlobalSummary, has_goals: bool = True) -> str:
             for p, c in sorted(s.by_provider.items(), key=lambda x: -x[1])
         )
         provider_html = (
-            '<table>'
+            "<table>"
             '<thead><tr><th>Provider</th><th class="right">Cost</th>'
             '<th class="right">% of spend</th></tr></thead>'
-            f'<tbody>{provider_rows}</tbody>'
-            '</table>'
+            f"<tbody>{provider_rows}</tbody>"
+            "</table>"
         )
     else:
         provider_html = '<p class="empty-note">No provider activity.</p>'
@@ -389,7 +411,8 @@ def _render_global_template(s: GlobalSummary, has_goals: bool = True) -> str:
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Atomic Agents — {s.period_label}</title>
+<meta http-equiv="Content-Security-Policy" content="{_SHARED_CSP}">
+<title>Atomic Agents — {html.escape(s.period_label)}</title>
 <style>{CSS}</style>
 </head>
 <body>
@@ -397,7 +420,7 @@ def _render_global_template(s: GlobalSummary, has_goals: bool = True) -> str:
 <header>
   <div>
     <h1>Atomic Agents</h1>
-    <div class="period">{s.period_label} · as of {s.today.isoformat()}</div>
+    <div class="period">{html.escape(s.period_label)} · as of {s.today.isoformat()}</div>
   </div>
   <div>
     <button class="refresh-btn" onclick="refresh()">↻ Refresh</button>
@@ -487,27 +510,27 @@ def _render_model_mix_bar(by_model: dict[str, float], total: float) -> str:
         cls = _model_pill_class(model)
         bar_segs.append(
             f'<div class="model-mix-seg {cls}" style="width: {pct}%" title="{model}: ${cost:.4f}">'
-            f'{label}</div>'
+            f"{label}</div>"
         )
 
     table_rows = []
     for model, cost in items:
         pct = cost / total * 100
         table_rows.append(
-            f'<tr>'
-            f'<td>{_model_pill(model, model)}</td>'
+            f"<tr>"
+            f"<td>{_model_pill(model, model)}</td>"
             f'<td class="right num">${cost:.4f}</td>'
             f'<td class="right num">{pct:.1f}%</td>'
-            f'</tr>'
+            f"</tr>"
         )
 
     return (
         f'<div class="model-mix-bar">{"".join(bar_segs)}</div>'
-        '<table>'
+        "<table>"
         '<thead><tr><th>Model</th><th class="right">Cost</th>'
         '<th class="right">% spend</th></tr></thead>'
-        f'<tbody>{"".join(table_rows)}</tbody>'
-        '</table>'
+        f"<tbody>{''.join(table_rows)}</tbody>"
+        "</table>"
     )
 
 
@@ -528,9 +551,9 @@ def _render_agent_template(d: AgentDashboardData) -> str:
                 f'<div class="day-value">${cost:.3f}</div>'
                 f'<div class="day-stack" style="height: {height}px">'
                 f'<div class="day-seg opus" style="height: {height}px" title="${cost:.4f}"></div>'
-                f'</div>'
+                f"</div>"
                 f'<div class="day-label">{day_short}</div>'
-                f'</div>'
+                f"</div>"
             )
         daily_chart = f'<div class="day-chart">{"".join(day_cols)}</div>'
     else:
@@ -547,24 +570,24 @@ def _render_agent_template(d: AgentDashboardData) -> str:
             if r.trigger == "helper":
                 trigger_pill = '<span class="pill helper">helper</span>'
             else:
-                trigger_pill = r.trigger
+                trigger_pill = html.escape(r.trigger)
             top_rows.append(
-                f'<tr>'
+                f"<tr>"
                 f'<td class="num">{ts_short}</td>'
-                f'<td>{trigger_pill}</td>'
-                f'<td>{_model_pill(r.model)}{tags}</td>'
+                f"<td>{trigger_pill}</td>"
+                f"<td>{_model_pill(r.model)}{tags}</td>"
                 f'<td class="right num">{r.input_tokens:,} / {r.output_tokens:,}</td>'
                 f'<td class="right num"><strong>${r.cost_usd:.4f}</strong></td>'
-                f'<td>{_truncate(r.summary, 60)}</td>'
-                f'</tr>'
+                f"<td>{html.escape(_truncate(r.summary, 60))}</td>"
+                f"</tr>"
             )
         top_table = (
-            '<table>'
-            '<thead><tr><th>Time</th><th>Trigger</th><th>Model</th>'
+            "<table>"
+            "<thead><tr><th>Time</th><th>Trigger</th><th>Model</th>"
             '<th class="right">Tokens (in/out)</th><th class="right">Cost</th>'
-            '<th>Summary</th></tr></thead>'
-            f'<tbody>{"".join(top_rows)}</tbody>'
-            '</table>'
+            "<th>Summary</th></tr></thead>"
+            f"<tbody>{''.join(top_rows)}</tbody>"
+            "</table>"
         )
     else:
         top_table = '<p class="empty-note">No runs this month.</p>'
@@ -576,11 +599,11 @@ def _render_agent_template(d: AgentDashboardData) -> str:
             f'<div class="savings-card">'
             f'<div class="savings-headline">${hs.saved:.4f} saved</div>'
             f'<div class="savings-detail">'
-            f'{hs.helper_calls} helper call{"s" if hs.helper_calls != 1 else ""} cost <strong>${hs.helper_actual_cost:.4f}</strong>. '
-            f'Same work on the parent\'s main model would have cost <strong>${hs.hypothetical_main_cost:.4f}</strong>. '
-            f'That\'s a <strong>{hs.cost_ratio:.1f}×</strong> cost ratio on the helper-handled portion.'
-            f'</div>'
-            f'</div>'
+            f"{hs.helper_calls} helper call{'s' if hs.helper_calls != 1 else ''} cost <strong>${hs.helper_actual_cost:.4f}</strong>. "
+            f"Same work on the parent's main model would have cost <strong>${hs.hypothetical_main_cost:.4f}</strong>. "
+            f"That's a <strong>{hs.cost_ratio:.1f}×</strong> cost ratio on the helper-handled portion."
+            f"</div>"
+            f"</div>"
         )
     else:
         helper_html = '<p class="empty-note">No helper calls this month.</p>'
@@ -592,49 +615,51 @@ def _render_agent_template(d: AgentDashboardData) -> str:
     if d.suggested_caps:
         sc = d.suggested_caps
         caps_html = (
-            f'<p>Based on {sc["based_on_days"]} days of observed usage:</p>'
+            f"<p>Based on {sc['based_on_days']} days of observed usage:</p>"
             f'<ul style="margin-left: 20px; line-height: 1.8;">'
-            f'<li>Average daily: <strong>${sc["avg_daily"]:.4f}</strong></li>'
-            f'<li>P95 daily: <strong>${sc["p95_daily"]:.4f}</strong></li>'
-            f'<li>Projected monthly: <strong>${sc["projected_monthly"]:.4f}</strong></li>'
-            f'</ul>'
+            f"<li>Average daily: <strong>${sc['avg_daily']:.4f}</strong></li>"
+            f"<li>P95 daily: <strong>${sc['p95_daily']:.4f}</strong></li>"
+            f"<li>Projected monthly: <strong>${sc['projected_monthly']:.4f}</strong></li>"
+            f"</ul>"
             f'<p style="margin-top: 12px;">Suggested caps:</p>'
             f'<ul style="margin-left: 20px; line-height: 1.8;">'
-            f'<li>Daily: <strong>${sc["suggested_daily_cap_usd"]:.2f}</strong> (3× avg)</li>'
-            f'<li>Monthly: <strong>${sc["suggested_monthly_cap_usd"]:.2f}</strong> (1.5× projected)</li>'
-            f'</ul>'
+            f"<li>Daily: <strong>${sc['suggested_daily_cap_usd']:.2f}</strong> (3× avg)</li>"
+            f"<li>Monthly: <strong>${sc['suggested_monthly_cap_usd']:.2f}</strong> (1.5× projected)</li>"
+            f"</ul>"
             f'<p class="muted" style="margin-top: 12px;">'
-            f'Set these in <code>model.md</code> under <code>cost_guardrails</code> '
-            f'and flip <code>enabled: true</code>.</p>'
+            f"Set these in <code>model.md</code> under <code>cost_guardrails</code> "
+            f"and flip <code>enabled: true</code>.</p>"
         )
     else:
         caps_html = (
             '<p class="empty-note">'
-            'Need ~14 days of data before suggesting caps. '
-            'Run the agent for a couple of weeks; come back here.'
-            '</p>'
+            "Need ~14 days of data before suggesting caps. "
+            "Run the agent for a couple of weeks; come back here."
+            "</p>"
         )
 
     # Cache savings line
     if d.cache_savings_usd > 0:
-        cache_line = f'You saved <strong>${d.cache_savings_usd:.4f}</strong> this month by prompt caching.'
+        cache_line = f"You saved <strong>${d.cache_savings_usd:.4f}</strong> this month by prompt caching."
     else:
         cache_line = '<span class="muted">No cache hits recorded yet.</span>'
 
+    _agent_name_safe = html.escape(d.name)
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>{d.name} — Atomic Agents</title>
+<meta http-equiv="Content-Security-Policy" content="{_SHARED_CSP}">
+<title>{_agent_name_safe} — Atomic Agents</title>
 <style>{CSS}</style>
 </head>
 <body>
 
 <header>
   <div>
-    <div class="breadcrumb"><a href="../_dashboard/index.html">← All agents</a></div>
-    <h1>{d.name}</h1>
-    <div class="period">{d.period_label} · as of {date.today().isoformat()}</div>
+    <div class="breadcrumb"><a href="../_dashboard/index.html">&#8592; All agents</a></div>
+    <h1>{_agent_name_safe}</h1>
+    <div class="period">{html.escape(d.period_label)} · as of {date.today().isoformat()}</div>
   </div>
   <div>
     <button class="refresh-btn" onclick="refresh()">↻ Refresh</button>
@@ -710,4 +735,4 @@ function fallback() {{ location.reload(); }}
 def _truncate(text: str, n: int) -> str:
     if len(text) <= n:
         return text
-    return text[:n - 1].rstrip() + "…"
+    return text[: n - 1].rstrip() + "…"

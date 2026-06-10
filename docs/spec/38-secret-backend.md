@@ -1,6 +1,6 @@
 # spec/38: SecretBackend Protocol
 
-> **Status:** DRAFT at PR 1 (issue #340). Conformance suite covers all MUSTs for `FilesystemSecretBackend`. GCP Secret Manager backend ships at PR 2.
+> **Status:** LOCKED at PR 2 (issue #340). Conformance suite covers all MUSTs for `FilesystemSecretBackend` and `GCPSecretManagerBackend`. 149 secret-backend tests: 56 conformance (25 parametrized x 2 backends + 6 non-parametrized charset tests) + 49 GCP-specific + 11 CLI + 33 filesystem-specific, plus 8 doctor tests in `test_doctor_gcp_secret_backend.py` (which live in the doctor suite, not counted in the 149) (as of PR 2, 2026-06-09).
 
 ---
 
@@ -20,8 +20,8 @@ Carved out from the credential-resolution pattern established in spec/01 (secret
 
 ## Shipping plan (2 PRs)
 
-- **PR 1.** Protocol scaffold + dataclasses + capability advertisement + `FilesystemSecretBackend` reference impl + spec/38 DRAFT + `_get_key()` supersede + all 6 live caller rewires + `check_secret_backend()` doctor check + `atomic-agents secrets check/which/validate` CLI + a full conformance suite plus filesystem-specific and CLI tests.
-- **PR 2.** `GCPSecretManagerBackend` reference impl + `gcp` extra + the `docs/deployment/` env-var→SecretBackend migration guide (issue #340 acceptance criterion; its natural home is alongside GCP, where backend migration first becomes operator-relevant) + spec/38 LOCKED.
+- **PR 1 (shipped).** Protocol scaffold + dataclasses + capability advertisement + `FilesystemSecretBackend` reference impl + spec/38 DRAFT + `_get_key()` supersede + all 6 live caller rewires + `check_secret_backend()` doctor check + `atomic-agents secrets check/which/validate` CLI + a full conformance suite plus filesystem-specific and CLI tests.
+- **PR 2 (shipped).** `GCPSecretManagerBackend` reference impl + `[gcp]` extra (`google-cloud-secret-manager>=2.16`) + `check_gcp_secret_backend()` doctor check (ADC liveness probe) + `docs/deployment/secret-backend.md` migration guide + conformance fixture extended to `['filesystem', 'gcp']` + 49 GCP-specific tests + spec/38 LOCKED.
 
 ---
 
@@ -44,7 +44,9 @@ atomic_agents/secret_backend/
 ├── types.py           # canonical types: SecretRef, SecretCapabilities
 ├── backend.py         # SecretBackend Protocol contract + exception classes +
 │                      # _validate_key helper
-└── filesystem.py      # FilesystemSecretBackend reference implementation
+├── filesystem.py      # FilesystemSecretBackend reference implementation
+└── gcp.py             # GCPSecretManagerBackend reference implementation +
+                       # make_gcp_secret_backend_from_url factory
 ```
 
 Package name `secret_backend/` (not `secrets/` which would shadow the Python stdlib `secrets` module for cryptographic random generation). Mirrors `mcp_registry/` naming convention (not `mcp/`).
@@ -181,6 +183,11 @@ FilesystemSecretBackend capabilities:
 - `supports_audit_logging=False` — no durable audit trail
 - `persists_plaintext=False` — credential sources (keys.json) are machine-scoped, not vault-portable; no plaintext credential travels with the agent vault
 
+GCPSecretManagerBackend capabilities:
+- `supports_rotation=True`: each `get()` call resolves the `latest` version live; no instance-level value cache (MUST 9)
+- `supports_audit_logging=False`: GCP Cloud Audit Logs for `accessSecretVersion` are operator-configured (IAM Data Access audit log policy), not automatic framework behaviour. Reference: https://cloud.google.com/secret-manager/docs/audit-logging
+- `persists_plaintext=False`: GCP Secret Manager stores AES-256 encrypted payloads in Google-managed KMS; no plaintext credential is stored in any framework file or vault directory
+
 ---
 
 ## Thread safety (implementation guidance; covered by Implementer Contract MUST 9)
@@ -193,6 +200,21 @@ Backend implementations MUST NOT cache resolved values in instance state. Each c
 
 `doctor.check_secret_backend()` probes backend construction and capability advertisement. Key resolution is validated by `check_provider_keys()` which routes through `_get_key()` → backend. Both checks must pass for the "doctor verdict and runtime behaviour can never disagree" invariant (CLAUDE.md methodology §"Self-dogfood the work as it ships"). This is operational guidance for the doctor check implementation, not an additional numbered MUST in the Implementer Contract.
 
+### GCP-specific doctor check: `check_gcp_secret_backend()`
+
+When `ATOMIC_AGENTS_SECRET_BACKEND=gcp`, `check_secret_backend()` delegates to `check_gcp_secret_backend()` for an ADC liveness probe. This mirrors `check_vertex_credentials()` exactly. The probe confirms ADC mints an OAuth token; it does NOT exercise any Secret Manager IAM permission, so a PASS here plus a `PermissionDenied` on a real `get()` are not contradictory (the `secretmanager.secretAccessor` role is verified only on an actual `get()`):
+
+> Step-ordering note: `check_secret_backend()` first constructs the backend via `get_default_secret_backend()`. When the `[gcp]` extra is absent, that construction raises `SecretBackendNotRegistered` (a `SecretError`) and `check_secret_backend()` returns FAIL with the `secret-backend` name *before* the delegation runs. So the SDK-missing case surfaces at backend construction, not inside `check_gcp_secret_backend()` Step 1. Step 1 below still runs (and FAILs the same way) when `check_gcp_secret_backend()` is called directly with the SDK absent.
+
+1. **SDK import check:** `google-cloud-secret-manager` importable; FAIL if the `[gcp]` extra is missing.
+2. **ADC resolution:** `google.auth.default()` resolves a credentials object; FAIL on `DefaultCredentialsError`.
+3. **Token mint:** `credentials.refresh(Request())` mints an OAuth access token (non-billable metadata-server call); FAIL on `TransportError` or other refresh failure.
+4. **Project env var:** WARN (not FAIL) when `GOOGLE_CLOUD_PROJECT` is absent; on Cloud Run / GKE the project is resolved from the metadata server automatically.
+
+> Result-name note: `check_gcp_secret_backend()` emits a `CheckResult` named `secret-backend[gcp]` when called directly. When reached via `check_secret_backend()` delegation, the result is re-stamped with the stable slot name `secret-backend` so an operator keying off check names sees one consistent name across all secret backends; the backend id is carried in the result's `detail["backend_id"]`.
+
+This check is intentionally NOT a `access_secret_version()` call (that is a billable Secret Manager operation and doctor must never trigger unguarded API cost, CLAUDE.md principle 4).
+
 ---
 
 ## Operator surface
@@ -200,9 +222,13 @@ Backend implementations MUST NOT cache resolved values in instance state. Each c
 | Env var | Default | Notes |
 |---------|---------|-------|
 | `ATOMIC_AGENTS_SECRET_BACKEND` | `"filesystem"` | Backend id. Empty/whitespace → filesystem. |
-| `ATOMIC_AGENTS_SECRET_BACKEND_URL` | (unset) | Reserved for GCP backend (PR 2). Factory raises a clear error if `gcp` is set without the URL. |
+| `ATOMIC_AGENTS_SECRET_BACKEND_URL` | (unset) | Required when `ATOMIC_AGENTS_SECRET_BACKEND=gcp`. Format: `projects/<project_id>/secrets`. |
 
-Known backend ids: `"filesystem"` (shipped PR 1), `"gcp"` (PR 2).
+Selectable backend ids (via `ATOMIC_AGENTS_SECRET_BACKEND`): `"filesystem"` (shipped PR 1; registered + default) and `"gcp"` (shipped PR 2; constructed on demand by the factory from `ATOMIC_AGENTS_SECRET_BACKEND_URL`, so it does **not** appear in `list_secret_backends()`, mirroring the redis (LockBackend) / postgres (LogBackend) lazy-construction precedent). The unknown-id error path names both via a hardcoded `known_ids = {"filesystem", "gcp"}` while separately surfacing the registry membership as `Available registered: [...]`.
+
+GCP-specific env vars (no framework default; set by operator):
+- `GOOGLE_CLOUD_PROJECT`: GCP project id for ADC resolution. Absent on Cloud Run / GKE is a WARN (not FAIL); the metadata server resolves the project automatically in those environments.
+- `GOOGLE_APPLICATION_CREDENTIALS`: path to a service account key file. Not required when ADC is configured via `gcloud auth application-default login` or workload identity.
 
 The `_redact_for_error_message()` helper sanitizes `ATOMIC_AGENTS_SECRET_BACKEND` and `ATOMIC_AGENTS_SECRET_BACKEND_URL` before echoing in error messages (URL credential heuristic, matching mcp_registry, logs, corpus factories).
 
@@ -213,7 +239,7 @@ The `_redact_for_error_message()` helper sanitizes `ATOMIC_AGENTS_SECRET_BACKEND
 Implementations satisfy the Protocol structurally (do not subclass). **The nine MUSTs below are the authoritative conformance index.** All MUST references in the prose sections above map 1:1 to this list. Prose sections that provide rationale or implementation guidance (Thread safety, Doctor dual-probe) are labeled accordingly and do not add additional numbered MUSTs.
 
 1. **Key charset** — validate `[A-Z0-9_]+` at the API boundary before any backend access; raise `ValueError` on invalid keys.
-2. **Machine-scoped sources** — MUST NOT resolve any secret from a path relative to the agent vault root; all filesystem sources MUST resolve relative to `os.path.expanduser("~")` or an absolute machine path.
+2. **Machine-scoped sources.** `FilesystemSecretBackend` MUST NOT resolve any secret from a path relative to the agent vault root; all filesystem sources MUST resolve relative to `os.path.expanduser("~")` or an absolute machine path. `GCPSecretManagerBackend` satisfies the machine-scoped intent of this MUST by resolution: Secret Manager is a project-scoped remote store, not a vault-relative path. No vault directory is read or written by the GCP backend.
 3. **Capability honesty** — `capabilities` fields are a contract not a hint; conformance tests assert claim-vs-behavior parity.
 4. **No value in exceptions** — `get()` / `get_optional()` exception messages MUST NOT contain the resolved secret value; only the key name and source names.
 5. **No value in `locate()` output** — `SecretRef.source` MUST NOT contain the resolved credential value.
