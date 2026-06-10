@@ -27,6 +27,12 @@ class ServeConfig:
     host: str = "127.0.0.1"
     port: int = 8000
     allow_no_auth: bool = False
+    # Maximum bytes accepted for a single POST body. Requests that exceed this
+    # limit return HTTP 413 before any JSON parsing. The default (1 MiB) is
+    # generous for any realistic work_item payload and protects the single
+    # Cloud Run instance from OOM DoS via an unbounded body stream.
+    # CWE-770 / Finding #401.
+    max_body_bytes: int = 1 * 1024 * 1024  # 1 MiB
 
 
 # Explicit loopback hostnames recognised in addition to the 127.0.0.0/8 range.
@@ -75,6 +81,14 @@ def _parse_serve_md(text: str) -> ServeConfig:
         elif sn_lower == "allow no auth":
             # Presence of this section (any value or empty) enables no-auth.
             cfg.allow_no_auth = True
+        elif sn_lower == "max body bytes":
+            if body:
+                try:
+                    cfg.max_body_bytes = int(body)
+                except ValueError:
+                    raise ValueError(
+                        f"serve.md '## Max Body Bytes' value is not a valid integer: {body!r}"
+                    ) from None
 
     # Apply env var overrides (highest priority). spec/37 resolution order.
     env_host = os.environ.get("ATOMIC_AGENTS_SERVE_HOST")
