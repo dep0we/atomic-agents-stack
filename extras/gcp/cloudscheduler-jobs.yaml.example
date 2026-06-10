@@ -1,9 +1,14 @@
-# Cloud Scheduler jobs — scheduled triggers for atomic-agents on Cloud Run
+# cloudscheduler-jobs.yaml.example - Cloud Scheduler jobs for atomic-agents
+#
+# NOT YET DOGFOODED against the live GCP platform.
+# Claims verified against GCP documentation as of 2026-06-09.
+# See extras/gcp/README.md §External-claim verification status.
 #
 # Cloud Scheduler authenticates to Cloud Run using an OIDC token
 # (Authorization: Bearer <token>), NOT the X-Goog-IAP-JWT-Assertion header
 # that the serve layer reads for caller identity. As a result, scheduler-
-# triggered calls have NO http_caller field in the JSONL audit record.
+# triggered calls have NO http_caller field in the JSONL audit record when
+# Scheduler calls the run.app URL directly (see INGRESS RECONCILIATION below).
 #
 # To distinguish scheduled runs from interactive runs in a compliance audit:
 # filter on trigger=http combined with the absence of http_caller, or
@@ -20,21 +25,48 @@
 # If the scheduler job logs 403, verify the service account has
 # roles/run.invoker on THIS specific Cloud Run service (not just project-level).
 #
-# INGRESS RECONCILIATION (important): cloudrun-service.yaml and iap-setup.md set
-# run.googleapis.com/ingress = internal-and-cloud-load-balancing, which BLOCKS
-# direct requests to the run.app service URL — including Cloud Scheduler's OIDC
-# call below. With that ingress lock you have two options:
-#   (a) Route Scheduler through the external load balancer / IAP instead of the
-#       run.app URL. The request then carries the IAP identity header, so the
-#       "no http_caller" note above no longer holds for scheduled runs — they
+# INGRESS RECONCILIATION:
+# cloudrun-service.yaml and iap-setup.md set
+# run.googleapis.com/ingress = internal-and-cloud-load-balancing.
+#
+# Per the ingress docs, internal-and-cloud-load-balancing admits two source
+# classes: (1) everything the more restrictive `internal` setting allows, PLUS
+# (2) traffic via an external Application Load Balancer. The Google internal-
+# traffic source list (Cloud Scheduler, Cloud Tasks, Pub/Sub, Eventarc,
+# Workflows, ... when same-project or same VPC-SC perimeter) is defined under the
+# `internal` setting and inherited here as the "(1)" class. So the doc-literal
+# reading is that a same-project Scheduler job hitting the default run.app URL is
+# admitted as internal traffic, and uses OIDC only (NO http_caller in the JSONL
+# audit record).
+# (Verified: the doc enumerates these sources under `internal` and states
+#  internal-and-cloud-load-balancing = "resources allowed by the more restrictive
+#  internal setting" + External ALB, at
+#  https://cloud.google.com/run/docs/securing/ingress)
+#
+# OPERATIONAL CHECK (not a fabricated ambiguity, a real edge): the internal-
+# source recognition is most crisply documented under the bare `internal` value.
+# If same-project Scheduler-to-run.app returns 403/404 on your project under
+# internal-and-cloud-load-balancing, the reliable fixes are (i) use topology (b)
+# below - route Scheduler through the LB/IAP - or (ii) set ingress to bare
+# `internal`. Topology (b) works unconditionally; prefer it if in doubt.
+#
+# Two topology options:
+#   (a) SAME-PROJECT + DEFAULT run.app URL:
+#       Doc-literal: Scheduler reaches Cloud Run directly via internal traffic.
+#       No load balancer needed for scheduled calls.
+#       Audit record: NO http_caller field (OIDC-only, not IAP-asserted).
+#       Audience: the default run.app service URL (no trailing slash).
+#       If this returns 403/404 on your project, switch to (b) or bare `internal`.
+#   (b) CUSTOM DOMAIN or CROSS-PROJECT / VPC-SC perimeter (also the safe default):
+#       Route Scheduler through the external load balancer / IAP instead.
+#       The request then carries the X-Goog-IAP-JWT-Assertion header, so
+#       the "no http_caller" note above no longer applies - scheduled calls
 #       WOULD carry the IAP-asserted identity. Configure IAP to allow the
 #       scheduler service account principal.
-#   (b) Relax ingress to "all" (or "internal-and-cloud-load-balancing" plus an
-#       allow rule that admits Scheduler) ONLY if you accept direct run.app
-#       reachability. Not recommended when IAP is your perimeter.
-# As written below, the direct-run.app-URL path assumes ingress permits it;
-# pick one topology and keep cloudrun-service.yaml, iap-setup.md, and this file
-# consistent.
+#       Audience: the load balancer / custom domain URL (not run.app).
+#
+# Pick one topology and keep cloudrun-service.yaml, iap-setup.md, and this
+# file consistent.
 
 jobs:
   - name: projects/<your-project-id>/locations/<region>/jobs/<your-agent-name>-daily
@@ -50,7 +82,7 @@ jobs:
       body: "eyJ3b3JrX2l0ZW0iOiAiRGFpbHkgcnVuIn0="
       # Body is base64-encoded JSON: {"work_item": "Daily run"}
       # work_item is the required request field (spec/37 §request shape);
-      # there is no "prompt" alias — an absent/empty work_item returns HTTP 422.
+      # there is no "prompt" alias - an absent/empty work_item returns HTTP 422.
       # Encode your own: echo -n '{"work_item": "..."}' | base64
 
       oidcToken:
@@ -58,6 +90,8 @@ jobs:
         # audience MUST match your Cloud Run service URL exactly.
         # Copy from Cloud Run console > Service URL. No trailing slash.
         # A mismatch causes HTTP 401 on every trigger (silent config error).
+        # For topology (a) - same-project + run.app URL: use the run.app URL.
+        # For topology (b) - via LB/IAP: use the load balancer / custom domain URL.
         audience: "https://YOUR_CLOUD_RUN_SERVICE_URL"
 
     retryConfig:

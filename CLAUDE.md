@@ -50,7 +50,7 @@ When you can't tell whether a design move helps both — stop, name the tradeoff
                   Policy ✅ (locked at #89 PR 4)
                   Persona ✅ (locked at #62 PR 4)
                   Corpus ✅ (locked at #65 PR 4)  MCPServerRegistry ✅ (locked at #201 PR 5)
-                  SecretBackend 🟡 (#340 PR 1, DRAFT spec/38 — the 13th, v1.5)
+                  SecretBackend ✅ (#340 PR 2, LOCKED spec/38 — the 13th, v1.5)
                                 │
                   Storage substrate — swappable
                   Filesystem (today)  →  Postgres / pgvector / Redis (later)
@@ -210,7 +210,7 @@ uv run pytest                            # full suite
 uv run pytest tests/test_<module>.py -v  # one module
 ```
 
-Run `uv run pytest --collect-only -q | tail -1` for the live test count (last refresh: 3,671 tests collected, 2026-06-09). New backend protocols add ~25 conformance + ~10 impl-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol — the conformance suite is what keeps the protocol honest.
+Run `uv run pytest --collect-only -q | tail -1` for the live test count (last refresh: 3,840 tests collected, 2026-06-09). New backend protocols add ~25 conformance + ~10 impl-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol — the conformance suite is what keeps the protocol honest.
 
 ### Releases + SemVer
 
@@ -296,7 +296,7 @@ If the project ever needs to optimize differently, `docs/methodology.md` is the 
 |-----|---------|
 | `docs/architecture.md` | Mental model in diagrams. Read first. |
 | `docs/protocols-shipped.md` | Per-protocol summary of the twelve shipped backends — reference impls, capabilities, operator overrides, doctor checks, Implementer Contracts, and the cliff each closes. |
-| `docs/spec/01-...39-otel-export.md` | Locked spec (38 docs today, 32 locked + 6 RFCs/DRAFTs at spec/26 (cascade bundle), spec/30 (responsibility audit), spec/35 (init wizard), spec/37 (serve), spec/38 (secret-backend), and spec/39 (otel-export)). The product. |
+| `docs/spec/01-...39-otel-export.md` | Locked spec (38 docs today, 33 locked + 5 RFCs/DRAFTs at spec/26 (cascade bundle), spec/30 (responsibility audit), spec/35 (init wizard), spec/37 (serve), and spec/39 (otel-export)). The product. |
 | `docs/implementation/` | Build guides per runtime (cron, Claude skill, dashboard) |
 | `docs/deployment/versioning.md`, `upgrading.md` | SemVer + operator runbook |
 | `docs/deployment/release-runbook.md` | Maintainer `/ship` runbook: two-mode workflow + manual surface check |
@@ -345,7 +345,7 @@ These are not forbidden forever — they're explicitly deferred with rationale. 
 
 ## Status
 
-**v1.0.0, stable, PUBLIC.** Core runtime stable. Test suite: run `uv run pytest --collect-only -q | tail -1` for the live count (last refresh: 3,671 tests collected, 2026-06-09). Full CI runs against `uv sync --extra dev --extra openai --extra validation --extra redis`. **Twelve backend protocols locked at v1.0; SecretBackend (#340), the thirteenth, in progress for v1.5 (PR 1 of 2)** — see `docs/protocols-shipped.md` for the per-protocol summary (reference impls, capabilities, operator overrides, doctor checks, Implementer Contracts, and what cliff each closes):
+**v1.0.0, stable, PUBLIC.** Core runtime stable. Test suite: run `uv run pytest --collect-only -q | tail -1` for the live count (last refresh: 3,840 tests collected, 2026-06-09). Full CI runs against `uv sync --extra dev --extra openai --extra validation --extra redis`. **Twelve backend protocols locked at v1.0; SecretBackend (#340), the thirteenth, shipped for v1.5 (both PRs merged, spec/38 LOCKED, Filesystem + GCP Secret Manager reference impls)** — see `docs/protocols-shipped.md` for the per-protocol summary (reference impls, capabilities, operator overrides, doctor checks, Implementer Contracts, and what cliff each closes):
 
 | # | Protocol | Issue / Lock | Reference impls |
 |---|----------|--------------|-----------------|
@@ -361,8 +361,8 @@ These are not forbidden forever — they're explicitly deferred with rationale. 
 | 10 | PersonaBackend | #62 PR 4 | Filesystem |
 | 11 | CorpusBackend | #65 PR 4 | Filesystem + SQLite (FTS5) |
 | 12 | MCPServerRegistryBackend | #201 PR 5 | Filesystem + HTTP (tier-1/2/3) |
-| 13 | SecretBackend | #340 PR 1 (DRAFT) | Filesystem |
+| 13 | SecretBackend | #340 PR 2 (LOCKED) | Filesystem + GCP Secret Manager |
 
-MCP client support shipped (PRs #55 + #56). All twelve backend protocols shipped; v1.0.0 released 2026-06-04. SecretBackend (#340) in progress (PR 1 of 2 merged, GCP backend at PR 2). Single-developer project; reference implementation that anyone can use, fork, or extend.
+MCP client support shipped (PRs #55 + #56). All twelve backend protocols shipped; v1.0.0 released 2026-06-04. SecretBackend (#340) shipped for v1.5 (both PRs merged, spec/38 LOCKED, Filesystem + GCP Secret Manager reference impls). Single-developer project; reference implementation that anyone can use, fork, or extend.
 
 Going forward: **the elegance is the product.** Protect it.

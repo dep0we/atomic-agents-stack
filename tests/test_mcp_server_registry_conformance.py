@@ -175,7 +175,7 @@ def _default_mock_transport(
                     "args": body.get("args", []),
                     "env": body.get("env", {}),
                     "version": None,
-                    "source": f"http://catalog.example.invalid/mcp-servers/{name}",
+                    "source": f"https://catalog.example.invalid/mcp-servers/{name}",
                 }
                 servers.append(new_server)
             # 201 Created with a valid MCPServerRef-shaped body.
@@ -186,7 +186,7 @@ def _default_mock_transport(
                     "description": body.get("description", ""),
                     "transport": body.get("transport", "stdio"),
                     "version": None,
-                    "source": f"http://catalog.example.invalid/mcp-servers/{name}",
+                    "source": f"https://catalog.example.invalid/mcp-servers/{name}",
                 },
             )
 
@@ -282,7 +282,7 @@ def backend_factory(request, tmp_path: Path):
         transport = _default_mock_transport()
         client = httpx.Client(transport=transport)
         return HTTPMCPServerRegistryBackend(
-            catalog_url="http://catalog.example.invalid",
+            catalog_url="https://catalog.example.invalid",
             agent_scope="test-scope",
             _http_client=client,
         )
@@ -329,7 +329,7 @@ def populated_backend(request, tmp_path: Path):
         transport = _default_mock_transport(extra_servers=wire_servers)
         client = httpx.Client(transport=transport)
         backend = HTTPMCPServerRegistryBackend(
-            catalog_url="http://catalog.example.invalid",
+            catalog_url="https://catalog.example.invalid",
             agent_scope="test-scope",
             _http_client=client,
         )

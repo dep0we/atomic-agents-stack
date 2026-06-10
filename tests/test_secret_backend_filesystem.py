@@ -508,19 +508,30 @@ def test_get_default_secret_backend_gcp_no_url_raises():
                 get_default_secret_backend()
 
 
-def test_get_default_secret_backend_gcp_with_url_raises_not_installed():
-    """ATOMIC_AGENTS_SECRET_BACKEND=gcp with URL raises 'not yet installed'."""
-    with patch.dict(
-        "os.environ",
-        {
-            "ATOMIC_AGENTS_SECRET_BACKEND": "gcp",
-            "ATOMIC_AGENTS_SECRET_BACKEND_URL": "projects/myproject/secrets",
-        },
-    ):
-        with pytest.raises(
-            SecretBackendNotRegistered, match="not yet installed|gcp extra"
+def test_get_default_secret_backend_gcp_with_url_raises_when_sdk_absent():
+    """ATOMIC_AGENTS_SECRET_BACKEND=gcp with URL raises when SDK is absent.
+
+    In CI the [gcp] extra IS installed (google-cloud-secret-manager in dev deps),
+    so we simulate SDK absence the realistic way: the gcp module imports fine (it
+    does NOT import the SDK at module level), and the missing-SDK ImportError fires
+    from GCPSecretManagerBackend.__init__. The factory MUST then raise
+    SecretBackendNotRegistered (not a raw ImportError) naming the [gcp] extra
+    (fail-closed contract; MEMORY.md feedback_fail_closed_catches_base_error_class).
+    The assertion is tightened to SecretBackendNotRegistered ONLY so a raw-ImportError
+    regression fails the test.
+    """
+    from tests._gcp_sdk_blocker import block_gcp_sdk
+
+    with block_gcp_sdk():
+        with patch.dict(
+            "os.environ",
+            {
+                "ATOMIC_AGENTS_SECRET_BACKEND": "gcp",
+                "ATOMIC_AGENTS_SECRET_BACKEND_URL": "projects/myproject/secrets",
+            },
         ):
-            get_default_secret_backend()
+            with pytest.raises(SecretBackendNotRegistered, match=r"\[gcp\] extra"):
+                get_default_secret_backend()
 
 
 def test_get_default_secret_backend_unknown_raises():

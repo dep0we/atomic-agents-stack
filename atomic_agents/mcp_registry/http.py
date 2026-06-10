@@ -28,6 +28,7 @@ of this file fires at import time.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -53,6 +54,20 @@ _logger = logging.getLogger(__name__)
 # Charset rule from MUST 1; mirrors filesystem.py and CorpusBackend.
 _NAME_RE = re.compile(r"^[a-zA-Z0-9_.+@-]+$")
 _PATH_TRAVERSAL_TOKENS = frozenset({"..", "."})
+
+# Default command-basename allowlist for the spawn gate (MUST 12).
+# Only bare basenames; path-qualified commands are never in the default set.
+# Operators may extend this via '## Allowed commands' in mcp.md.
+_DEFAULT_COMMAND_ALLOWLIST: frozenset[str] = frozenset(
+    {"npx", "uvx", "python", "python3", "node", "docker"}
+)
+
+# Hard byte ceiling for catalog HTTP responses (CWE-400 / #403).
+# A slow-streaming catalog that never exceeds the per-chunk read-timeout can
+# balloon RSS without bound; this cap enforces termination regardless of how
+# the body arrives.  8 MB is generous for any realistic MCP catalog; operators
+# needing a higher limit can pass max_response_bytes= to the constructor.
+_MAX_CATALOG_RESPONSE_BYTES: int = 8 * 1024 * 1024  # 8 MB
 
 # Module-level lazy reference to the httpx package.
 # Set to the actual ``httpx`` module on first successful import by ``_get_httpx()``.
@@ -117,6 +132,143 @@ def _redact_url_for_error(url: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Transport-security helpers (MUST 11)
+
+
+def _is_loopback_host(hostname: str | None) -> bool:
+    """Return True when ``hostname`` resolves to a loopback address.
+
+    Decision tree (P0 prep finding — must use urlparse().hostname, not netloc):
+    1. ``hostname is None``  → non-loopback (fall to default-deny).
+    2. ``hostname.lower() == 'localhost'`` → loopback (literal string; no DNS
+       resolution — MUST 2 compliant, Principle #12 compliant).
+    3. ``ipaddress.ip_address(hostname).is_loopback`` → loopback if True.
+       Covers full 127.0.0.0/8 block and ``::1`` correctly.
+    4. ``ValueError`` from ipaddress (non-IP string like a bare hostname) →
+       non-loopback (default-deny for unknown hostname forms).
+
+    0.0.0.0 is explicitly NOT loopback (ipaddress classifies it correctly as
+    non-loopback via is_loopback → False). Any hostname with a DNS component
+    (e.g., "my-local-host.example.com") falls to step 4 → non-loopback.
+
+    IMPORTANT: DNS resolution is NEVER performed here — callers who pass a
+    non-literal hostname will get non-loopback. This is intentional; DNS
+    resolution would violate MUST 2 (side-effect-free construction) and
+    Principle #12 (verify before claim; don't speculate about network reachability).
+
+    Args:
+        hostname: The ``urlparse(url).hostname`` result (already lowercased by
+                  urlparse; may be None for malformed URLs like ``http://``).
+
+    Returns:
+        True if the hostname is a loopback address; False otherwise.
+    """
+    if hostname is None:
+        return False
+    # Normalize to lowercase; urlparse already lowercases but be explicit.
+    hostname_lower = hostname.lower()
+    if hostname_lower == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname_lower).is_loopback
+    except ValueError:
+        # Non-IP hostname (e.g., "my.local.dev.example.com") — treat as remote.
+        return False
+
+
+def _assert_scheme_allowed(
+    url: str,
+    *,
+    allow_http_non_loopback: bool = False,
+) -> None:
+    """Assert the catalog URL's scheme is safe for use.
+
+    Three valid paths:
+    1. ``https://`` — always allowed for any host.
+    2. ``http://`` with a loopback host (127.0.0.0/8, ::1, or literal
+       "localhost") — automatically allowed (LOOPBACK-AUTO).
+    3. ``http://`` with a non-loopback host + ``allow_http_non_loopback=True``
+       (ENV OPT-IN) — allowed only when explicitly unlocked.
+
+    Everything else — including non-http/https schemes — raises ``ValueError``
+    with a redacted URL so credentials don't surface in error messages.
+
+    ``0.0.0.0`` is classified as non-loopback by ``_is_loopback_host`` (correct;
+    ipaddress.ip_address('0.0.0.0').is_loopback is False).  Resolved hostnames
+    (anything that requires DNS) are also non-loopback by design.
+
+    Args:
+        url:                   The catalog URL to check (may contain credentials;
+                               they are redacted in any error message via
+                               ``_redact_url_for_error``).
+        allow_http_non_loopback: When True, http:// is permitted for non-loopback
+                               hosts. Callers compute this once at construction
+                               from the constructor kwarg + env var fallback.
+
+    Raises:
+        ValueError: when the URL has a genuinely unsupported scheme (ftp, file,
+                    etc.), when the URL is a non-loopback http:// URL and
+                    ``allow_http_non_loopback`` is False, OR when the URL is
+                    too malformed to classify (fail-closed — see below).
+    """
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(url)
+        scheme = parsed.scheme.lower() if parsed.scheme else ""
+        # Access .hostname inside the try: a malformed netloc (e.g. "http://[")
+        # raises ValueError on the .hostname property, not on urlparse() itself.
+        hostname = parsed.hostname  # None for malformed URLs like "http://"
+    except (ValueError, TypeError):
+        # FAIL CLOSED (Principle #8 / MUST 11): a URL we cannot parse well
+        # enough to classify its host must NOT be granted the non-loopback
+        # exemption. Refuse with a redacted message rather than letting an
+        # unparseable-but-http-looking URL (e.g. "http://[") slip past the
+        # scheme gate to I/O. The spawn gate (MUST 12) still backstops RCE,
+        # but a security scheme gate must default-deny on ambiguity.
+        safe_url = _redact_url_for_error(url)
+        raise ValueError(
+            f"HTTPMCPServerRegistryBackend: catalog URL {safe_url!r} could not "
+            f"be parsed well enough to classify its scheme/host; refusing "
+            f"(fail-closed). Provide a well-formed https:// (or loopback "
+            f"http://) catalog URL."
+        ) from None
+
+    # Path 1 — https always allowed.
+    if scheme == "https":
+        return
+
+    # Paths 2 + 3 — http with host classification.
+    if scheme == "http":
+        # hostname is already lowercased by urlparse; use it for loopback check.
+        if _is_loopback_host(hostname):
+            # LOOPBACK-AUTO: always allowed regardless of opt-in.
+            return
+        if allow_http_non_loopback:
+            # ENV OPT-IN: operator has explicitly unlocked non-loopback http.
+            return
+        # Non-loopback http without opt-in → refuse.
+        safe_url = _redact_url_for_error(url)
+        raise ValueError(
+            f"HTTPMCPServerRegistryBackend: cleartext http:// is refused for "
+            f"non-loopback catalog URL {safe_url!r}. "
+            f"Use https:// for remote catalog servers (recommended), or set "
+            f"ATOMIC_AGENTS_MCP_SERVER_REGISTRY_ALLOW_HTTP=1 to explicitly "
+            f"allow non-loopback http:// (not recommended for production). "
+            f"ATOMIC_AGENTS_MCP_SERVER_REGISTRY_ALLOW_HTTP=1 must be exactly "
+            f"the string '1'; any other value (including 'true' or 'yes') keeps "
+            f"the default-deny behavior."
+        )
+
+    # Unsupported scheme (ftp, file, ws, etc.).
+    safe_url = _redact_url_for_error(url)
+    raise ValueError(
+        f"HTTPMCPServerRegistryBackend catalog URL must start with "
+        f"http:// or https://, got {safe_url!r}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Wire-format parse helpers
 
 
@@ -164,6 +316,24 @@ def _parse_mcp_server_spec_from_dict(d: Any, *, url: str) -> MCPServerSpec:
         raise MCPRegistryDescriptorInvalid(
             f"catalog server at {url} returned a server entry with invalid "
             f"'command' value (must be a string, got {type(command).__name__!r})"
+        )
+
+    # Defense-in-depth early warning (P2): emit a WARNING when the command
+    # basename is not in the default allowlist.  This is NOT a hard reject at
+    # parse time because the operator may have extended the allowlist in mcp.md
+    # (unavailable here).  The authoritative hard block fires at spawn time in
+    # MCPClientPool._check_command_allowlist.
+    _cmd_basename = os.path.basename(command)
+    if _cmd_basename not in _DEFAULT_COMMAND_ALLOWLIST:
+        _logger.warning(
+            "catalog server at %s returned server entry %r with command "
+            "basename %r which is not in the default spawn allowlist %s. "
+            "The command will be blocked at spawn time unless you add it to "
+            "'## Allowed commands' in mcp.md.",
+            url,
+            name,
+            _cmd_basename,
+            sorted(_DEFAULT_COMMAND_ALLOWLIST),
         )
 
     args_raw = d.get("args", [])
@@ -541,6 +711,24 @@ class HTTPMCPServerRegistryBackend:
     ``probe_failure_cache_s``: seconds to cache a probe failure before re-probing
         (default 60.0). Prevents thrashing when the catalog server is unreachable.
 
+    ``allow_http_non_loopback``: when ``True``, allow cleartext ``http://`` for
+        non-loopback catalog hosts (default ``False``).  This value is resolved
+        ONCE at construction time: if ``None``, reads
+        ``ATOMIC_AGENTS_MCP_SERVER_REGISTRY_ALLOW_HTTP`` from ``os.environ``
+        (``"1"`` → True, anything else → False).  The kwarg wins over the env var
+        when provided explicitly (per the env-or-kwarg precedent from
+        ``auth_token``).  Scheme validation fires lazily at first method call (not
+        at construction), preserving MUST 2.  Production deployments MUST NOT set
+        this to ``True`` for remote catalog servers.
+
+    ``max_response_bytes``: hard byte ceiling applied to every catalog HTTP
+        response body before JSON parsing (default 8 MB; see
+        ``_MAX_CATALOG_RESPONSE_BYTES``). A catalog that streams a body larger
+        than this limit raises ``MCPRegistryDescriptorInvalid`` immediately,
+        preventing unbounded RSS growth from slow-drip oversized responses
+        (CWE-400 / finding #403). A Content-Length check alone is not
+        sufficient because the header is omittable and spoofable.
+
     ``_http_client``: test-only injectable seam (D-PR4-1). When set, the backend
         uses this client instead of constructing a real ``httpx.Client``. Production
         callers MUST NOT pass this parameter.
@@ -554,6 +742,8 @@ class HTTPMCPServerRegistryBackend:
         auth_token: str | None = None,
         request_timeout_s: float = 10.0,
         probe_failure_cache_s: float = 60.0,
+        allow_http_non_loopback: bool | None = None,
+        max_response_bytes: int = _MAX_CATALOG_RESPONSE_BYTES,
         _http_client: Any = None,
     ) -> None:
         # MUST 2: side-effect-free construction. No httpx import, no network
@@ -588,7 +778,17 @@ class HTTPMCPServerRegistryBackend:
         self._auth_token = auth_token
         self._request_timeout_s = request_timeout_s
         self._probe_failure_cache_s = probe_failure_cache_s
+        self._max_response_bytes = max_response_bytes
         self._http_client_override = _http_client
+
+        # Resolve allow_http_non_loopback once at construction (P1: TOCTOU).
+        # kwarg wins over env var when provided (env-or-kwarg precedent).
+        if allow_http_non_loopback is not None:
+            self._allow_http_non_loopback: bool = bool(allow_http_non_loopback)
+        else:
+            self._allow_http_non_loopback = (
+                os.environ.get("ATOMIC_AGENTS_MCP_SERVER_REGISTRY_ALLOW_HTTP") == "1"
+            )
 
         # Capability cache state.
         self._cached_capabilities: MCPServerRegistryCapabilities | None = None
@@ -653,7 +853,68 @@ class HTTPMCPServerRegistryBackend:
             return {"Authorization": f"Bearer {self._auth_token}"}
         return {}
 
+    def _read_bounded_json(self, resp: Any) -> Any:
+        """Read response body up to ``_max_response_bytes`` and parse as JSON.
+
+        Reads the raw response content from ``resp.content`` (already buffered
+        by httpx) and raises ``MCPRegistryDescriptorInvalid`` before JSON
+        parsing when the byte count exceeds ``self._max_response_bytes``.
+
+        A Content-Length header check is NOT sufficient because the header is
+        optional and can be spoofed by a compromised or MITM'd catalog server.
+        This method enforces the ceiling on ACTUAL bytes read, closing the
+        slow-drip memory-exhaustion vector (CWE-400 / finding #403).
+
+        Args:
+            resp: An httpx Response object.  Must have already received a
+                  successful status code; the caller is responsible for calling
+                  ``resp.raise_for_status()`` first.
+
+        Returns:
+            The JSON-decoded response body.
+
+        Raises:
+            MCPRegistryDescriptorInvalid: body exceeds ``_max_response_bytes``
+                or the body is not valid JSON.
+        """
+        url = self._safe_catalog_url
+        raw = resp.content  # bytes already buffered by httpx
+        if len(raw) > self._max_response_bytes:
+            raise MCPRegistryDescriptorInvalid(
+                f"catalog server at {url} returned a response body of "
+                f"{len(raw):,} bytes, exceeding the {self._max_response_bytes:,}-byte "
+                f"limit. Refusing to parse. "
+                f"Possible slow-drip memory-exhaustion attack or misconfigured catalog."
+            )
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise MCPRegistryDescriptorInvalid(
+                f"catalog server at {url} returned a response that is not valid JSON: {exc}"
+            ) from exc
+
     # ─── Capability negotiation ────────────────────────────────────────────
+
+    def _assert_scheme(self) -> None:
+        """Re-gate the scheme at resolution time (MUST 11 defense-in-depth).
+
+        Calls ``_assert_scheme_allowed`` with the stored ``_catalog_url`` and
+        the resolved ``_allow_http_non_loopback`` flag.  Called at the top of
+        EVERY public method that issues network I/O — the read paths
+        (``list_mcp_servers``, ``load_mcp_server``, ``load_all_mcp_servers``,
+        ``validate``) AND the write paths (``install``, ``uninstall``) — BEFORE
+        ``_ensure_probed()`` and before any HTTP call, so no cleartext request
+        leaves the process on a non-loopback http:// URL without the explicit
+        opt-in even when the capability cache is already warm.
+
+        Re-validates the catalog URL scheme before making the HTTP call
+        (defense-in-depth; loopback-auto / non-loopback requires HTTPS or
+        explicit opt-in). ValueError on refused schemes uses _redact_url_for_error.
+        """
+        _assert_scheme_allowed(
+            self._catalog_url,
+            allow_http_non_loopback=self._allow_http_non_loopback,
+        )
 
     def _probe_capabilities(self) -> MCPServerRegistryCapabilities:
         """Run the tier-negotiation probe sequence (Decision 4 steps 1-5).
@@ -666,6 +927,8 @@ class HTTPMCPServerRegistryBackend:
         server's tier. Raises ``MCPRegistryUnavailable`` or
         ``MCPRegistryAuthRequired`` on failure.
         """
+        # Re-gate scheme before making any HTTP call (MUST 11 defense-in-depth).
+        self._assert_scheme()
         httpx = _get_httpx()
         client = self._get_client()
         url = self._safe_catalog_url
@@ -675,13 +938,7 @@ class HTTPMCPServerRegistryBackend:
         try:
             resp = client.get(caps_url, headers=self._auth_headers())
             if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                except json.JSONDecodeError as exc:
-                    raise MCPRegistryDescriptorInvalid(
-                        f"catalog server at {url} /capabilities response is "
-                        f"not valid JSON: {exc}"
-                    ) from exc
+                data = self._read_bounded_json(resp)
                 return _parse_capabilities_response(data, url=url)
 
             # Step 2: 404 on /capabilities means server doesn't implement it;
@@ -885,6 +1142,8 @@ class HTTPMCPServerRegistryBackend:
 
         Returns lexicographically sorted list (MUST 5).
         """
+        # Re-gate scheme before any I/O (MUST 11 defense-in-depth).
+        self._assert_scheme()
         self._ensure_probed()
         httpx = _get_httpx()
         client = self._get_client()
@@ -896,7 +1155,7 @@ class HTTPMCPServerRegistryBackend:
         try:
             resp = client.get(request_url, headers=self._auth_headers())
             resp.raise_for_status()
-            data = resp.json()
+            data = self._read_bounded_json(resp)
         except httpx.HTTPStatusError as exc:
             _handle_http_error(exc, url=url)
         except (
@@ -910,8 +1169,6 @@ class HTTPMCPServerRegistryBackend:
             RuntimeError,
         ) as exc:
             _handle_http_error(exc, url=url)
-        except json.JSONDecodeError as exc:
-            _handle_http_error(exc, url=url)
 
         refs = _parse_servers_list_to_refs(data, url=url, source_url=self._catalog_url)
         return sorted(refs, key=lambda r: r.name)
@@ -922,8 +1179,14 @@ class HTTPMCPServerRegistryBackend:
         Validates ``name`` charset BEFORE any network call (MUST 1).
         Raises ``MCPServerNotInRegistry`` on HTTP 404.
         Resolves ``$VAR`` env-var references at call time (MUST 8).
+        Re-validates the catalog URL scheme before making the HTTP call
+        (defense-in-depth; loopback-auto / non-loopback requires HTTPS or
+        explicit opt-in). ValueError on refused schemes uses _redact_url_for_error.
         """
         _validate_server_name(name)
+        # Re-gate scheme at resolution time (MUST 11 defense-in-depth).
+        # Fires before _ensure_probed() so no network I/O occurs on a refused scheme.
+        self._assert_scheme()
         self._ensure_probed()
         httpx = _get_httpx()
         client = self._get_client()
@@ -935,7 +1198,7 @@ class HTTPMCPServerRegistryBackend:
         try:
             resp = client.get(request_url, headers=self._auth_headers())
             resp.raise_for_status()
-            data = resp.json()
+            data = self._read_bounded_json(resp)
         except httpx.HTTPStatusError as exc:
             _handle_http_error(
                 exc,
@@ -953,8 +1216,6 @@ class HTTPMCPServerRegistryBackend:
             RuntimeError,
         ) as exc:
             _handle_http_error(exc, url=url)
-        except json.JSONDecodeError as exc:
-            _handle_http_error(exc, url=url)
 
         raw = _parse_mcp_server_spec_from_dict(data, url=url)
         return _materialize_spec(raw, url)
@@ -969,6 +1230,8 @@ class HTTPMCPServerRegistryBackend:
 
         Returns lexicographically sorted list (MUST 5).
         """
+        # Re-gate scheme before any I/O (MUST 11 defense-in-depth).
+        self._assert_scheme()
         self._ensure_probed()
         httpx = _get_httpx()
         client = self._get_client()
@@ -980,7 +1243,7 @@ class HTTPMCPServerRegistryBackend:
         try:
             resp = client.get(request_url, headers=self._auth_headers())
             resp.raise_for_status()
-            data = resp.json()
+            data = self._read_bounded_json(resp)
         except httpx.HTTPStatusError as exc:
             _handle_http_error(exc, url=url)
         except (
@@ -993,8 +1256,6 @@ class HTTPMCPServerRegistryBackend:
             httpx.InvalidURL,
             RuntimeError,
         ) as exc:
-            _handle_http_error(exc, url=url)
-        except json.JSONDecodeError as exc:
             _handle_http_error(exc, url=url)
 
         raw_specs = _parse_servers_list(data, url=url)
@@ -1016,6 +1277,8 @@ class HTTPMCPServerRegistryBackend:
         except ValueError as exc:
             return ValidationResult(ok=False, errors=[str(exc)], warnings=[])
 
+        # Re-gate scheme before any I/O (MUST 11 defense-in-depth).
+        self._assert_scheme()
         self._ensure_probed()
         httpx = _get_httpx()
         client = self._get_client()
@@ -1042,7 +1305,7 @@ class HTTPMCPServerRegistryBackend:
                     warnings=[],
                 )
             resp.raise_for_status()
-            data = resp.json()
+            data = self._read_bounded_json(resp)
         except httpx.HTTPStatusError as exc:
             _handle_http_error(exc, url=url)
         except (
@@ -1055,8 +1318,6 @@ class HTTPMCPServerRegistryBackend:
             httpx.InvalidURL,
             RuntimeError,
         ) as exc:
-            _handle_http_error(exc, url=url)
-        except json.JSONDecodeError as exc:
             _handle_http_error(exc, url=url)
 
         return _parse_validation_result(data, url=url)
@@ -1188,6 +1449,14 @@ class HTTPMCPServerRegistryBackend:
         # MUST 1: charset validation before any I/O.
         _validate_server_name(spec.name)
 
+        # MUST 11 scheme gate — re-gate BEFORE _ensure_probed() so a refused
+        # scheme blocks even when the capability cache is already warm (a prior
+        # read on a loopback/https URL, or any future code path that warms the
+        # cache without re-probing, would otherwise let the POST proceed
+        # un-gated). install() round-trips with the catalog, so the same MITM
+        # threat that motivates MUST 11 on the read paths applies here.
+        self._assert_scheme()
+
         # D-PR5-5 (v1.0 Decision A: upgraded from warn to refuse).
         # Input validation: reject literal env values BEFORE any I/O.
         # This is the earliest possible gate -- before _ensure_probed(), before
@@ -1311,6 +1580,12 @@ class HTTPMCPServerRegistryBackend:
         # MUST 1: charset validation before any I/O.
         _validate_server_name(name)
 
+        # MUST 11 scheme gate — re-gate BEFORE _ensure_probed() so a refused
+        # scheme blocks even when the capability cache is already warm. Matches
+        # the install()/read-path pattern; uninstall() round-trips with the
+        # catalog (DELETE), so the scheme gate applies here too.
+        self._assert_scheme()
+
         # D-PR5-1: probe first, THEN check capability gate.
         self._ensure_probed()
 
@@ -1410,10 +1685,21 @@ def make_http_mcp_server_registry_backend_from_url(
     """Construct an ``HTTPMCPServerRegistryBackend`` from a catalog URL.
 
     URL family: ``https://<host>[:port]/?agent_scope=<name>``
+    (or ``http://`` for loopback hosts — see scheme gate below).
 
     Reads ``agent_scope`` from the URL query parameter ``agent_scope``
     (default ``"default"`` when absent). Reads the optional bearer token
     from ``ATOMIC_AGENTS_MCP_SERVER_REGISTRY_AUTH_TOKEN`` in the environment.
+    Reads ``ATOMIC_AGENTS_MCP_SERVER_REGISTRY_ALLOW_HTTP`` (``"1"`` → True,
+    anything else → False) to unlock non-loopback http:// for dev scenarios.
+
+    Scheme gate (MUST 11):
+    - ``https://`` → always allowed.
+    - ``http://`` with loopback host (127.0.0.0/8, ::1, literal "localhost")
+      → automatically allowed (LOOPBACK-AUTO; no opt-in needed).
+    - ``http://`` with non-loopback host without opt-in → ``ValueError`` naming
+      ``ATOMIC_AGENTS_MCP_SERVER_REGISTRY_ALLOW_HTTP``.
+    - Any other scheme (ftp, file, …) → ``ValueError``.
 
     Args:
         url: Catalog server base URL. The ``agent_scope`` query parameter, if
@@ -1424,22 +1710,27 @@ def make_http_mcp_server_registry_backend_from_url(
         Configured ``HTTPMCPServerRegistryBackend`` instance.
 
     Raises:
-        ValueError: if the URL is empty or has an unsupported scheme.
+        ValueError: if the URL is empty, has an unsupported scheme, or is a
+                    non-loopback http:// URL without
+                    ``ATOMIC_AGENTS_MCP_SERVER_REGISTRY_ALLOW_HTTP=1``.
     """
     from urllib.parse import urlparse, urlunparse, parse_qs
 
     if not url or not url.strip():
         raise ValueError("HTTPMCPServerRegistryBackend catalog URL must not be empty.")
 
+    # Resolve the env opt-in once so factory-constructed backends inherit
+    # the same behavior as programmatically-constructed ones.
+    allow_http_non_loopback = (
+        os.environ.get("ATOMIC_AGENTS_MCP_SERVER_REGISTRY_ALLOW_HTTP") == "1"
+    )
+
+    # Apply the scheme gate early in the factory so errors surface at
+    # construction time for factory users (programmatic callers get the gate
+    # again at first method call via _assert_scheme, providing defense-in-depth).
+    _assert_scheme_allowed(url, allow_http_non_loopback=allow_http_non_loopback)
+
     parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        # Redact embedded credentials per S-F1: if the operator pastes a URL
-        # like ftp://user:pass@host/ the raw URL must not appear in the error
-        # message. Mirrors the PR 1 P0 redaction discipline.
-        raise ValueError(
-            f"HTTPMCPServerRegistryBackend catalog URL must start with "
-            f"http:// or https://, got {_redact_url_for_error(url)!r}"
-        )
 
     # Extract agent_scope from query params.
     query_params = parse_qs(parsed.query, keep_blank_values=False)
@@ -1468,6 +1759,7 @@ def make_http_mcp_server_registry_backend_from_url(
         catalog_url=catalog_url,
         agent_scope=agent_scope,
         auth_token=auth_token,
+        allow_http_non_loopback=allow_http_non_loopback,
     )
 
 

@@ -79,10 +79,17 @@ MCPClientPool.connect_all()
         → returns list[mcp.types.Tool]
     → failures on individual servers: logged, not fatal
 MCPClientPool.discover_tools()
+    → charset-validates each server-supplied tool.name (rejects __, path
+      separators, control chars); raises ValueError on violation
+    → detects duplicate qualified names within the discovery pass; raises
+      ValueError if two servers/tools produce the same qualified name
     → namespaces each tool as <server>__<tool>
     → wraps async call_tool in sync handler via asyncio.run()
-    → registers ToolDefinition in agent's ToolRegistry (allow_overwrite=True)
-    → names tracked in _mcp_registered_names for cleanup
+    → snapshots pre-existing tool names before registration loop
+    → registers ToolDefinition in agent's ToolRegistry with default
+      refuse-to-overwrite; raises ToolNameCollision on collision with
+      a pre-existing operator tool
+    → only newly-added names tracked in _mcp_registered_names for cleanup
     ↓
 LLM call with full tool list (atomic_capture + custom + MCP tools)
 Multi-turn tool loop (same path as spec/17 custom tools)
@@ -90,8 +97,9 @@ Multi-turn tool loop (same path as spec/17 custom tools)
 finally:
 MCPClientPool.disconnect_all()   ← idempotent
 agent.mcp_pool = None
-for name in _mcp_registered_names:
-    tool_registry.unregister(name)  ← prevents stale tools on next call
+for name in _mcp_registered_names:   ← only names ADDED by this call
+    tool_registry.unregister(name)    ← prevents stale tools; never removes
+                                      ←   pre-existing operator tools (#402)
 ```
 
 **Per-call subprocess lifecycle (v1):** Each `asyncio.run()` invocation in the
@@ -121,15 +129,21 @@ The double-underscore separator prevents collisions with custom tools (which
 use plain snake_case names) and makes the source server obvious to the LLM.
 
 **Collision detection:** `ToolRegistry.register()` raises `ToolNameCollision` by
-default if a name is already registered. MCP registration uses `allow_overwrite=True`
-(to handle re-registration on a second `call()` after reconnect) but a custom tool
-with the same qualified name as an MCP tool — e.g., a custom tool literally named
-`myserver__read_file` — will collide with MCP at registration time and surface loudly.
+default if a name is already registered. MCP registration uses the default
+refuse-to-overwrite, so a pre-existing operator tool whose name matches a
+server-supplied qualified name (e.g., an operator tool named `myserver__read_file`
+matching MCP server `myserver` tool `read_file`) raises `ToolNameCollision` at
+`call()` start rather than silently shadowing the operator tool and then permanently
+deleting it in teardown. Intra-discovery duplicate qualified names (two servers
+producing the same qualified name) surface as `ValueError` from `discover_tools()`
+before any registration attempt.
 
-**Per-call cleanup:** MCP tool names are tracked during each `call()` and
-unregistered from `ToolRegistry` in the `finally` block. This prevents tools from
-stale or failed server connections accumulating across calls on long-lived agent
-instances.
+**Per-call cleanup:** Only the tool names that this `call()` actually added to the
+`ToolRegistry` are tracked in `_mcp_registered_names` and unregistered in the
+`finally` block. Pre-existing operator tools are never removed, even if their name
+happened to match a qualified MCP name (which would have raised `ToolNameCollision`
+during registration, not silently succeeded). This prevents stale tools from failed
+server connections accumulating across calls on long-lived agent instances.
 
 ## Cost Cap Inheritance
 
@@ -153,6 +167,16 @@ or an MCP dispatch.
 connect to. The framework does not sandbox subprocesses beyond what the OS
 provides — the subprocess inherits the agent's UID, environment variables, and
 filesystem permissions. Operators vouch for the servers they declare.
+
+**Spawn gate — command-basename allowlist (spec/36 MUST 12 / GHSA-xhcr-cqfr-m3hv):** `MCPClientPool` validates every `MCPServerSpec.command` basename against an operator-configurable allowlist **before** constructing `StdioServerParameters`. The default allowlist is `{"npx", "uvx", "python", "python3", "node", "docker"}`. If the command basename is not in the allowlist, `connect_all()` raises `MCPCommandNotAllowed` (a subclass of `MCPServerConnectFailed`) and no subprocess is spawned. Operators may replace the default set by adding a `## Allowed commands` section to the agent's `mcp.md`:
+
+```markdown
+## Allowed commands
+npx
+uvx
+```
+
+An empty `## Allowed commands` section is explicit deny-all (not "use default"). The allowlist is resolved once at `MCPClientPool.__init__` time. `MCPCommandNotAllowed` propagates out of `connect_all()` fail-closed — it is NOT soft-skipped or caught by the surrounding `MCPServerConnectFailed` handler.
 
 **Path-traversal best-effort:** When `_load_config()` calls `parse_mcp_md()`, it
 passes the agent's `read_paths` (from `tools.md`). `parse_mcp_md_text` calls
@@ -187,6 +211,7 @@ is raised immediately (fail-loud rather than silently passing an empty value).
 | Exception | When raised |
 |---|---|
 | `MCPServerConnectFailed` | Server subprocess fails to start or initialize; also raised at parse time for unresolvable `$VAR` references. Caught and logged per-server by `connect_all()`; agent continues with other servers. |
+| `MCPCommandNotAllowed` | Command basename is not in the spawn allowlist (spec/36 MUST 12). Subclass of `MCPServerConnectFailed`. Propagates out of `connect_all()` fail-closed — NOT caught by the surrounding handler. Operators add the command to `## Allowed commands` in `mcp.md` to allow it. |
 | `MCPServerNotConfigured` | Code references a server name not in `mcp.md`. |
 | `MCPToolDispatchFailed` | Runtime failure during a tool call (server error, network issue, etc.). Caught by `ToolRegistry.execute()`, recorded in `ToolCallResult.error`. |
 

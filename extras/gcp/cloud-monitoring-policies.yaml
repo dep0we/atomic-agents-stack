@@ -1,9 +1,19 @@
-# Cloud Monitoring alert policies for atomic-agents-stack on Cloud Run
+# cloud-monitoring-policies.yaml - Cloud Monitoring alert policies
+#
+# NOT YET DOGFOODED against the live GCP platform.
+# Claims verified against GCP documentation as of 2026-06-09.
+# See extras/gcp/README.md §External-claim verification status.
 #
 # IMPORTANT: The JSONL audit trail (run_id, cost_usd, status, etc.) lives in
-# the LogBackend (Cloud SQL or persistent disk), NOT in Cloud Logging.
+# the LogBackend (Cloud SQL via PostgresLogBackend, or ephemeral container
+# filesystem via FilesystemLogBackend - JSONL logs are lost on container
+# restart in the ephemeral case; activate PostgresLogBackend for durability),
+# NOT in Cloud Logging.
 # Cloud Run forwards only stdout/stderr to Cloud Logging; the framework's
 # _log() path writes to log_backend.append() with no Python logger call.
+#
+# For the Compute Engine VM path (extras/gcp/compute-vm/), FilesystemLogBackend
+# writes to the persistent disk (durable across reboots).
 #
 # These policies use Cloud Run request-count metrics (HTTP response codes),
 # NOT log-based metrics on JSONL fields. Log-based JSONL filters will never
@@ -12,7 +22,7 @@
 # See extras/gcp/cloud-logging-config.md for the full explanation.
 #
 # Field-name authority for RunRecord fields: docs/spec/22-log-backend.md
-# §"RunRecord — the unit of work".
+# §"RunRecord - the unit of work".
 
 # ── 1. Cost guardrail breach (HTTP 402) ─────────────────────────────────────
 # Signal path: agent.call() returns Response(skipped=True) →
@@ -33,7 +43,7 @@
 # response body additionally exposes the reason under the "reason" JSON key
 # (sourced from the Response.skip_reason attribute in the serve layer).
 # See cloud-logging-config.md §"Querying the JSONL audit trail" for detail.
-- displayName: "Cost guardrail breach — HTTP 402"
+- displayName: "Cost guardrail breach - HTTP 402"
   combiner: OR
   conditions:
     - displayName: "Cloud Run 402 response rate"
@@ -56,7 +66,7 @@
   # notificationChannels: []
 
 # ── 2. Agent error rate (HTTP 500) ───────────────────────────────────────────
-- displayName: "Agent error — HTTP 500"
+- displayName: "Agent error - HTTP 500"
   combiner: OR
   conditions:
     - displayName: "Cloud Run 500 response rate"
@@ -73,11 +83,20 @@
           - alignmentPeriod: 60s
             perSeriesAligner: ALIGN_SUM
 
-# ── 3. Lock busy / double-trigger (HTTP 503) ─────────────────────────────────
-# HTTP 503 means the agent lock was held when the request arrived (LockBusy).
-# Common cause: Cloud Scheduler fires while a previous run is still in flight.
-# See cloudscheduler-jobs.yaml.example §retryConfig for the fix.
-- displayName: "Agent lock busy — HTTP 503"
+# ── 3. Lock busy / double-trigger OR health degradation (HTTP 503) ───────────
+# HTTP 503 has TWO sources on this service and this metric filter counts BOTH:
+#   (a) /call returns 503 LockBusy when a previous run still holds the agent
+#       lock. Common cause: Cloud Scheduler fires while a prior run is in flight
+#       (see cloudscheduler-jobs.yaml.example §retryConfig for the fix).
+#   (b) /healthz returns 503 "degraded" when the agent is unservable: agents_root
+#       not found, agent folder missing, or model.md missing / unreadable
+#       (atomic_agents/serve/_app.py healthz Checks 1-3). A deploy that ships a
+#       broken or missing model.md trips this, NOT lock contention.
+# Because the filter below is response_code = "503" across all routes, it cannot
+# tell these apart. To isolate lock contention from health-probe degradation,
+# scope the filter away from the healthz path (if request metrics expose it) or
+# correlate with the JSONL LockBusy run records before chasing scheduler overlap.
+- displayName: "HTTP 503 - lock busy OR health-probe degraded"
   combiner: OR
   conditions:
     - displayName: "Cloud Run 503 response rate"
@@ -94,20 +113,54 @@
           - alignmentPeriod: 60s
             perSeriesAligner: ALIGN_SUM
 
-# ── 4. Instance count deviation from 1 ───────────────────────────────────────
-# v0 must run exactly 1 instance (persistent disk ReadWriteOnce constraint).
-# Alert if the instance count drops to 0 (scale-to-zero misconfiguration,
-# container crash loop) or rises above 1 (max-instances misconfiguration).
-- displayName: "Instance count out of v0 range (expected: 1)"
+# ── 4. Instance count floor alert (stateless Cloud Run v0) ───────────────────
+# Cloud Run v0 sets containerConcurrency=1 and min-instances=1 (see
+# cloudrun-service.yaml). This alert fires if the instance count drops to 0
+# (min-instances misconfiguration or crash-loop) or rises above 1
+# (max-instances misconfiguration).
+#
+# The single-instance constraint in v0 exists because the default
+# FilesystemLockBackend uses fcntl.flock (single-host advisory locking;
+# atomic_agents/locks/filesystem.py), which does NOT coordinate across hosts.
+# Two Cloud Run instances do not share a host or a filesystem, so neither sees
+# the other's lock; concurrent same-agent requests across instances would race
+# on ephemeral filesystem state (memory/, journal/, etc.) that is not yet backed
+# by any distributed store. (The Redis LockBackend coordinates across instances,
+# but the ephemeral-state race remains until those surfaces move to cloud
+# backends.) This constraint lifts in Phase 4 when all state moves to
+# multi-writer cloud backends.
+#
+# This alert is for the Cloud Run (stateless) topology. For the Compute Engine
+# VM topology (extras/gcp/compute-vm/), the one-instance-per-tenant constraint
+# is enforced at the VM level (single writer per vault root on the persistent
+# disk), and this metric does not apply.
+- displayName: "Instance count deviates from exactly 1 (Cloud Run v0)"
   combiner: OR
   conditions:
-    - displayName: "Instance count != 1"
+    - displayName: "Instance count dropped to 0"
       conditionThreshold:
         filter: >
           resource.type = "cloud_run_revision"
           AND resource.labels.service_name = "<your-agent-name>"
           AND metric.type = "run.googleapis.com/container/instance_count"
-        comparison: COMPARISON_NE
+        comparison: COMPARISON_LT
+        thresholdValue: 1
+        duration: 120s
+        aggregations:
+          - alignmentPeriod: 60s
+            perSeriesAligner: ALIGN_MEAN
+    # Upper-bound condition: instance count > 1 is the SINGLE-WRITER VIOLATION
+    # (two instances on different hosts: flock does not coordinate across hosts,
+    # so they race on ephemeral filesystem state).
+    # Under the re-grounded constraint (lock serialization / single writer per
+    # vault), > 1 is the MORE dangerous case, so this condition is load-bearing.
+    - displayName: "Instance count rose above 1 (max-instances misconfiguration)"
+      conditionThreshold:
+        filter: >
+          resource.type = "cloud_run_revision"
+          AND resource.labels.service_name = "<your-agent-name>"
+          AND metric.type = "run.googleapis.com/container/instance_count"
+        comparison: COMPARISON_GT
         thresholdValue: 1
         duration: 120s
         aggregations:

@@ -70,3 +70,7 @@ temp/
 .gstack/
 .context/
 .claude/worktrees/
+.claude/scheduled_tasks.lock
+
+# NAMING.md — local brand-rename draft; never commit (swept into c2dd337 by accident, removed here)
+NAMING.md

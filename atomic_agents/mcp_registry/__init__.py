@@ -211,7 +211,9 @@ def get_default_mcp_server_registry_backend(
             raise BackendNotRegistered(
                 "ATOMIC_AGENTS_MCP_SERVER_REGISTRY_BACKEND=http requires "
                 "ATOMIC_AGENTS_MCP_SERVER_REGISTRY_BACKEND_URL to be set. "
-                "Expected format: https://<host>[:port]/?agent_scope=<name>"
+                "Expected format: https://<host>[:port]/?agent_scope=<name> "
+                "(or http:// for loopback hosts; non-loopback http:// requires "
+                "ATOMIC_AGENTS_MCP_SERVER_REGISTRY_ALLOW_HTTP=1)"
             )
         return make_http_mcp_server_registry_backend_from_url(url)
 
