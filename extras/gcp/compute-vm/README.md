@@ -50,7 +50,7 @@ Cloud Run-adjacent topology that satisfies POSIX `rename(2)` atomicity today.
     |     |     |- model.md      <- config (baked in by operator)
     |     |     |- tools.md      <- config (baked in by operator)
     |     |     |- goal.md       <- config (baked in by operator)
-    |     |     |- memory/       <- state (durable on disk, ephemeral until #382)
+    |     |     |- memory/       <- state (durable on disk; #382 seam shipped, #258 Postgres adapter moves it off disk)
     |     |     |- log/          <- state (durable on disk; use PostgresLogBackend for query)
     |     |     |- journal/      <- state (durable on disk, no Protocol yet; #383)
     |     |     |- goals/        <- state (durable on disk, no Protocol yet; #383)

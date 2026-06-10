@@ -240,7 +240,7 @@ The layer is **fully opt-in**. Existing deployments see no judge invocation unti
 
 ## Deployment shapes
 
-For a full cloud reference deployment, see [`extras/gcp/`](https://github.com/dep0we/atomic-agents-stack/tree/main/extras/gcp/): a Cloud Run + IAP + Cloud Scheduler reference deployment — the GCP-as-harness pattern (one service per customer, persistent disk for v0 filesystem state, Redis locks, Cloud Monitoring).
+For a full cloud reference deployment, see [`extras/gcp/`](https://github.com/dep0we/atomic-agents-stack/tree/main/extras/gcp/): two reference topologies — a stateless Cloud Run service (Cloud Run v2 does not support persistent disk; ephemeral state until managed backends ship) and a Compute Engine VM with a persistent ext4/xfs disk (stateful-today bridge). Both use IAP + Cloud Scheduler + Redis locks + Cloud Monitoring.
 
 Nine operator runbooks under `docs/deployment/` cover the common deployment paths. Pick the one that matches what you're doing:
 

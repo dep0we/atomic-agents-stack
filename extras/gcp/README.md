@@ -149,7 +149,7 @@ own tracking issues, re-point the rows below.
 | Config (persona, model.md, tools.md, goal.md, skills) | Baked into container image | Never moves - config is immutable per deployment |
 | Run logs | Ephemeral (container writable layer) unless PostgresLogBackend activated; activate with `ATOMIC_AGENTS_LOG_BACKEND=postgres` + `[postgres]` extra (#258, shipped) | Backend shipped; activate PostgresLogBackend to make durable |
 | Locks | Redis `ATOMIC_AGENTS_LOCK_BACKEND=redis` (#60, shipped) | Already shipped |
-| Memory | Ephemeral (container writable layer) - not durable until MemoryBackend cloud adapter ships (#382, Phase 2) | Issue #382 (T5 wiring seam) |
+| Memory | Ephemeral (container writable layer) - the MemoryBackend override seam shipped (#382 PR 1) but only `filesystem` is registered today; durable once the Postgres MemoryBackend adapter ships (#258, Phase 2). Until then `ATOMIC_AGENTS_MEMORY_BACKEND=postgres` fails fast with `BackendNotRegistered`. | Issue #382 (T5 wiring seam, shipped) AND issue #258 (Postgres memory adapter) |
 | Goals | Ephemeral - no Protocol yet; #383 (Phase 3) | Issue #383 |
 | Outcomes | Ephemeral - no Protocol yet; #383 (Phase 3) | Issue #383 |
 | Dreams | Ephemeral - operator-triggered dream artifacts at `<agent_root>/dreams/` (`atomic_agents/dream.py`); no Protocol yet; #383 (Phase 3) | Issue #383 |
@@ -166,7 +166,7 @@ own tracking issues, re-point the rows below.
 | Config | Baked on disk (operator-deployed) | Never moves |
 | Run logs | Persistent disk (FilesystemLogBackend) or PostgresLogBackend | Activate PostgresLogBackend for query |
 | Locks | Redis (recommended) or FilesystemLockBackend | Redis already shipped |
-| Memory | Persistent disk (FilesystemMemoryBackend) | Issue #382 (Phase 2) |
+| Memory | Persistent disk (FilesystemMemoryBackend) | Issue #382 (T5 wiring seam, shipped) AND issue #258 (Postgres memory adapter, Phase 2) |
 | Goals, Outcomes, Journal, Dreams | Persistent disk (no Protocol yet; dreams at `<agent_root>/dreams/`) | Issue #383 (Phase 3) |
 | Cascade queue | Persistent disk (POSIX rename claim) | Issue #383 + TENSIONS.md T4 |
 | Mandate, Policy, Profile, tool-registry, corpus | Persistent disk (Filesystem/SQLite backends) | Issue #258 (Phase 3) |
@@ -174,8 +174,9 @@ own tracking issues, re-point the rows below.
 **Two groups (same for both topologies):**
 
 - **Group A - Protocols exist, cloud adapter can be written once it ships:**
-  logs (#258, shipped), memory (#382), mandate, policy, profile, tool-registry,
-  corpus, persona (#258).
+  logs (#258, shipped), memory (#382 override seam shipped; #258 Postgres
+  adapter pending), mandate, policy, profile, tool-registry, corpus,
+  persona (#258).
 - **Group B - No Protocol yet; Protocol must be authored before any adapter:**
   goals, outcomes, journal, cascade queue. Tracked in #383. The home user
   (filesystem-only) is unaffected; this gate only matters for org-scale

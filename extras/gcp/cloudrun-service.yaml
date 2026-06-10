@@ -160,8 +160,12 @@ spec:
           # stateful-today alternative.
           #
           # Per-surface durability status:
-          #   memory/       EPHEMERAL - not durable until MemoryBackend cloud adapter ships
-          #                 (#382, Phase 2). FilesystemMemoryBackend writes here today.
+          #   memory/       EPHEMERAL - the MemoryBackend operator override seam shipped
+          #                 (#382 PR 1), but only filesystem is registered today, so
+          #                 FilesystemMemoryBackend writes here. Durable once the Postgres
+          #                 MemoryBackend adapter ships (#258, Phase 2); until then
+          #                 ATOMIC_AGENTS_MEMORY_BACKEND=postgres fails fast with
+          #                 BackendNotRegistered.
           #   log/          EPHEMERAL - activate PostgresLogBackend (#258, shipped) to make
           #                 run logs durable. Default FilesystemLogBackend writes here.
           #   journal/      EPHEMERAL - no Protocol yet; no cloud adapter possible until
