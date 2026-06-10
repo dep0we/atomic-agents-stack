@@ -1048,3 +1048,35 @@ def test_call_work_item_over_limit_returns_422(tmp_path: Path):
     assert "work_item" in body["error"]
     assert "too long" in body["error"]
 
+
+# ── Finding #404 — HTTP doctor must not spawn MCP subprocesses (CWE-770) ─────
+
+
+def test_doctor_http_path_skips_mcp_subprocesses(tmp_path: Path):
+    """GET /agents/<name>/doctor on the HTTP path does not spawn MCP subprocesses.
+
+    The fix sets skip_mcp=True on the HTTP doctor path to prevent one subprocess
+    per MCP server per request with no concurrency gate. This test asserts
+    skip_mcp=True is passed to run_doctor by capturing the kwarg.
+    Finding #404 / CWE-770.
+    """
+    import atomic_agents.doctor as doctor_module
+
+    agents_root = _build_agent_root(tmp_path, "testbot")
+
+    captured_calls: list[dict] = []
+
+    def fake_run_doctor(**kwargs: Any):
+        captured_calls.append(dict(kwargs))
+        return []  # empty results list — render_json handles it
+
+    app = make_app(agents_root=agents_root)
+    with patch.object(doctor_module, "run_doctor", side_effect=fake_run_doctor):
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.get("/agents/testbot/doctor")
+
+    assert resp.status_code == 200, f"Expected 200 from /doctor; got {resp.status_code}"
+    assert len(captured_calls) == 1, "run_doctor should have been called exactly once"
+    assert captured_calls[0].get("skip_mcp") is True, (
+        f"HTTP doctor path must pass skip_mcp=True; got: {captured_calls[0]}"
+    )

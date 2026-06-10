@@ -540,10 +540,16 @@ def make_app(
         loop = asyncio.get_running_loop()
 
         def _run_doctor():
+            # skip_mcp=True: the MCP stdio handshake spawns one subprocess per
+            # MCP server in mcp.md on every request, with no concurrency gate.
+            # Over HTTP this is a local-config diagnostic of little value and a
+            # reliable subprocess-churn DoS vector. healthz covers the liveness
+            # contract (spec/37 MUST 4); the HTTP doctor path does not need MCP
+            # subprocess health to be useful. Finding #404 / CWE-770.
             return doctor_module.run_doctor(
                 agent_name=name,
                 agents_root=root,
-                skip_mcp=False,
+                skip_mcp=True,
             )
 
         try:
