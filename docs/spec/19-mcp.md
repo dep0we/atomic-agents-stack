@@ -79,10 +79,17 @@ MCPClientPool.connect_all()
         → returns list[mcp.types.Tool]
     → failures on individual servers: logged, not fatal
 MCPClientPool.discover_tools()
+    → charset-validates each server-supplied tool.name (rejects __, path
+      separators, control chars); raises ValueError on violation
+    → detects duplicate qualified names within the discovery pass; raises
+      ValueError if two servers/tools produce the same qualified name
     → namespaces each tool as <server>__<tool>
     → wraps async call_tool in sync handler via asyncio.run()
-    → registers ToolDefinition in agent's ToolRegistry (allow_overwrite=True)
-    → names tracked in _mcp_registered_names for cleanup
+    → snapshots pre-existing tool names before registration loop
+    → registers ToolDefinition in agent's ToolRegistry with default
+      refuse-to-overwrite; raises ToolNameCollision on collision with
+      a pre-existing operator tool
+    → only newly-added names tracked in _mcp_registered_names for cleanup
     ↓
 LLM call with full tool list (atomic_capture + custom + MCP tools)
 Multi-turn tool loop (same path as spec/17 custom tools)
@@ -90,8 +97,9 @@ Multi-turn tool loop (same path as spec/17 custom tools)
 finally:
 MCPClientPool.disconnect_all()   ← idempotent
 agent.mcp_pool = None
-for name in _mcp_registered_names:
-    tool_registry.unregister(name)  ← prevents stale tools on next call
+for name in _mcp_registered_names:   ← only names ADDED by this call
+    tool_registry.unregister(name)    ← prevents stale tools; never removes
+                                      ←   pre-existing operator tools (#402)
 ```
 
 **Per-call subprocess lifecycle (v1):** Each `asyncio.run()` invocation in the
@@ -121,15 +129,21 @@ The double-underscore separator prevents collisions with custom tools (which
 use plain snake_case names) and makes the source server obvious to the LLM.
 
 **Collision detection:** `ToolRegistry.register()` raises `ToolNameCollision` by
-default if a name is already registered. MCP registration uses `allow_overwrite=True`
-(to handle re-registration on a second `call()` after reconnect) but a custom tool
-with the same qualified name as an MCP tool — e.g., a custom tool literally named
-`myserver__read_file` — will collide with MCP at registration time and surface loudly.
+default if a name is already registered. MCP registration uses the default
+refuse-to-overwrite, so a pre-existing operator tool whose name matches a
+server-supplied qualified name (e.g., an operator tool named `myserver__read_file`
+matching MCP server `myserver` tool `read_file`) raises `ToolNameCollision` at
+`call()` start rather than silently shadowing the operator tool and then permanently
+deleting it in teardown. Intra-discovery duplicate qualified names (two servers
+producing the same qualified name) surface as `ValueError` from `discover_tools()`
+before any registration attempt.
 
-**Per-call cleanup:** MCP tool names are tracked during each `call()` and
-unregistered from `ToolRegistry` in the `finally` block. This prevents tools from
-stale or failed server connections accumulating across calls on long-lived agent
-instances.
+**Per-call cleanup:** Only the tool names that this `call()` actually added to the
+`ToolRegistry` are tracked in `_mcp_registered_names` and unregistered in the
+`finally` block. Pre-existing operator tools are never removed, even if their name
+happened to match a qualified MCP name (which would have raised `ToolNameCollision`
+during registration, not silently succeeded). This prevents stale tools from failed
+server connections accumulating across calls on long-lived agent instances.
 
 ## Cost Cap Inheritance
 
