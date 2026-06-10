@@ -44,7 +44,7 @@ http = ["httpx>=0.27"]
 # serve extra — thin HTTP wrapper for Cloud Run / containerized environments.
 # Starlette (ASGI framework) + uvicorn (ASGI server). Opt-in only; base package
 # import does not load these. See docs/spec/37-serve.md and atomic_agents/serve/.
-serve = ["starlette>=0.27", "uvicorn>=0.20"]
+serve = ["starlette>=1.0.1", "uvicorn>=0.20"]
 # otel extra — OpenTelemetry SDK + OTLP/HTTP exporter for distributed tracing.
 # opentelemetry-api is in core (zero cost when tracing off — the API ships a
 # genuine no-op TracerProvider). The SDK and exporter are opt-in here because
@@ -117,3 +117,15 @@ dev = [
 
 [tool.hatch.build.targets.sdist]
 exclude = ["tests/", "docs/", "extras/", ".claude/", ".github/"]
+
+# Security hygiene floors for transitive dependencies.
+# idna: CVE-2026-45409 (triaged unreachable in this framework; hygiene bump 3.13->3.15).
+# pyjwt: PYSEC-2026-175/177/178/179 (triaged unreachable; bump 2.12.1->2.13.0).
+# These are pulled transitively (idna via httpx/anyio/requests; pyjwt via mcp).
+# constraint-dependencies pins them for the lock without adding them to the
+# user-visible project requirements.
+[tool.uv]
+constraint-dependencies = [
+    "idna>=3.15",
+    "pyjwt>=2.13.0",
+]
