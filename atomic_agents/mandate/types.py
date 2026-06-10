@@ -274,6 +274,12 @@ class Mandate:
     constraints: MandateConstraints
     source_hash: str  # framework-computed canonical hash
     source_path: str | None = None  # backend-specific source attribution
+    prose_scope: str | None = None  # human-readable authority description from
+    # the ``scope:`` YAML field. Distinct from the ``scope`` field above (which
+    # is the agent/project resolution label). Required by the mandates.md parser
+    # at re-parse time; retained here so the canonical-shape export (spec/40)
+    # can reconstruct a re-parseable mandates.md. Defaults to None for backends
+    # / call sites that do not supply it.
 
 
 @dataclass(frozen=True)
@@ -335,6 +341,12 @@ class MandateCapabilities:
     # crash-recovery tests on this flag so capability-gated skips are loud
     # rather than silent.
     supports_crash_recovery: bool = True
+
+    # spec/40 addendum: Exportable Protocol composition.
+    # FilesystemMandateBackend = True (mandate definition export).
+    # Future SQL backends default False until their export impls ship.
+    # Default False so existing instantiation sites without this kwarg keep working.
+    supports_canonical_export: bool = False
 
 
 # ──────────────────────────────────────────────────────────────────────────

@@ -96,3 +96,9 @@ class SecretCapabilities:
     supports_rotation: bool
     supports_audit_logging: bool
     persists_plaintext: bool
+    # spec/40 addendum: Exportable Protocol composition.
+    # FilesystemSecretBackend = True (wiring-map-only export, never plaintext).
+    # GCPSecretBackend = False (deferred; export retrofit is out of scope for
+    # PR1 — see #432).
+    # Default False so existing instantiation sites without this kwarg keep working.
+    supports_canonical_export: bool = False

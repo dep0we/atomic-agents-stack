@@ -74,6 +74,7 @@ _TYPE_TO_SECTION = {
 # ──────────────────────────────────────────────────────────────────
 # FilesystemStagedMemory
 
+
 class FilesystemStagedMemory(StagedMemory):
     """Filesystem-specific staging area for dream-style bulk operations."""
 
@@ -108,7 +109,9 @@ class FilesystemStagedMemory(StagedMemory):
         if policy.write_paths:
             logical_live_target = policy.write_paths[0] / filename
             _enforce_write_path(
-                logical_live_target.resolve(), policy.write_paths, policy.read_only_paths
+                logical_live_target.resolve(),
+                policy.write_paths,
+                policy.read_only_paths,
             )
         target = self.staging_dir / filename
         today = date.today()
@@ -131,6 +134,7 @@ class FilesystemStagedMemory(StagedMemory):
 
 # ──────────────────────────────────────────────────────────────────
 # FilesystemBackend
+
 
 class FilesystemBackend:
     """Default MemoryBackend — reads/writes to the standard vault layout.
@@ -177,11 +181,16 @@ class FilesystemBackend:
         else:
             self._lock_backend = lock_backend
 
+    # ───── Stable backend identifier ────────────────────────────────
+
+    @property
+    def backend_id(self) -> str:
+        """Stable identifier for this backend implementation: ``"filesystem"``."""
+        return "filesystem"
+
     # ───── Internal helpers ─────────────────────────────────────────
 
-    def _enforce(
-        self, target: Path, policy: WritePolicy
-    ) -> None:
+    def _enforce(self, target: Path, policy: WritePolicy) -> None:
         """Raise WritePathViolation if target violates policy."""
         _enforce_write_path(target, policy.write_paths, policy.read_only_paths)
 
@@ -241,9 +250,11 @@ class FilesystemBackend:
         )
         if exclude_pinned:
             all_refs = [r for r in all_refs if not r.pinned]
+
         # Sort by last_seen DESC (None sorts to the end)
         def _sort_key(r: NoteRef):
             return r.last_seen if r.last_seen is not None else date.min
+
         all_refs.sort(key=_sort_key, reverse=True)
         return all_refs[:n]
 
@@ -294,8 +305,11 @@ class FilesystemBackend:
         return orphans
 
     def list_by_type(self, type_name: str) -> list[NoteRef]:
-        return [r for r in self.list_notes(include_archived=True, include_superseded=True)
-                if r.type == type_name]
+        return [
+            r
+            for r in self.list_notes(include_archived=True, include_superseded=True)
+            if r.type == type_name
+        ]
 
     def render_index_summary(self) -> str:
         index_path = self._memory_dir / "INDEX.md"
@@ -428,9 +442,7 @@ class FilesystemBackend:
                 f"Version token {token!r} resolves outside versions directory"
             )
         if not vpath.exists():
-            raise VersionNotFound(
-                f"Version {token!r} not found for note {name!r}"
-            )
+            raise VersionNotFound(f"Version {token!r} not found for note {name!r}")
         # Encode stem + filename in backend_id to avoid ambiguous resolution
         return VersionRef(backend_id=f"{stem}/{token}")
 
@@ -611,13 +623,44 @@ class FilesystemBackend:
     def supports_semantic_search(self) -> bool:
         return False
 
+    @property
+    def supports_canonical_export(self) -> bool:
+        """True — FilesystemBackend implements the Exportable Protocol (spec/40)."""
+        return True
+
+    def export(self, query=None):
+        """Export memory notes as a MemoryExport canonical object (spec/40).
+
+        Args:
+            query: ``MemoryExportQuery | None``. Pass None for unbounded export.
+
+        Returns:
+            ``MemoryExport`` with (Note, raw_bytes) tuples.
+        """
+        from ..export.filesystem import export_memory
+        from ..export.types import MemoryExportQuery
+
+        if query is None:
+            query = MemoryExportQuery()
+        return export_memory(self, query)
+
+    def export_all(self):
+        """Convenience wrapper — unbounded export. Equivalent to export(None).
+
+        WARNING: Materializes ALL notes in memory. For large vaults use
+        export(MemoryExportQuery(...)) with bounded filters instead.
+        """
+        return self.export(None)
+
     def search(self, query: str, limit: int = 10) -> list[NoteRef]:
         """Substring search fallback (no semantic support in filesystem backend)."""
         query_lower = query.lower()
         results = []
         for ref in self.list_notes(include_archived=True, include_superseded=True):
-            if (query_lower in ref.name.lower()
-                    or query_lower in ref.description.lower()):
+            if (
+                query_lower in ref.name.lower()
+                or query_lower in ref.description.lower()
+            ):
                 results.append(ref)
                 if len(results) >= limit:
                     break
@@ -631,6 +674,7 @@ class FilesystemBackend:
 
 # ──────────────────────────────────────────────────────────────────
 # Internal helpers (package-private; shared with thin wrappers)
+
 
 def _enforce_write_path(
     target: Path,
@@ -888,9 +932,21 @@ def _path_to_note(path: Path) -> Note:
 
     # Collect known fields; remainder goes into extra_frontmatter
     known_fields = {
-        "type", "name", "description", "confidence", "sources", "body",
-        "supersedes", "merge_into", "pinned", "expires_at", "tags",
-        "captured", "last_seen", "archived", "superseded_by",
+        "type",
+        "name",
+        "description",
+        "confidence",
+        "sources",
+        "body",
+        "supersedes",
+        "merge_into",
+        "pinned",
+        "expires_at",
+        "tags",
+        "captured",
+        "last_seen",
+        "archived",
+        "superseded_by",
         "schema_version",
     }
     extra = {k: v for k, v in meta.items() if k not in known_fields}
@@ -933,7 +989,9 @@ def _generate_index_from_dir(memory_dir: Path) -> str:
                 continue
             ref = _path_to_note_ref(path)
             if ref:
-                sections[ref.type].append(f"- [{ref.name}]({ref.name}) — {ref.description}")
+                sections[ref.type].append(
+                    f"- [{ref.name}]({ref.name}) — {ref.description}"
+                )
 
     lines = ["# Memory Index\n"]
     for type_key in ("user", "feedback", "project", "decision", "reference"):

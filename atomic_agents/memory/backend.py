@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 # ──────────────────────────────────────────────────────────────────
 # Shared dataclasses
 
+
 @dataclass
 class NoteRef:
     """Lightweight metadata-only reference (cheap to list).
@@ -32,15 +33,16 @@ class NoteRef:
     Callers should prefer NoteRef for listing operations and only call
     read_note() when they need the full body.
     """
-    name: str                        # filename for fs; primary key for db
-    type: str                        # user/feedback/project/decision/reference
+
+    name: str  # filename for fs; primary key for db
+    type: str  # user/feedback/project/decision/reference
     description: str
     captured: date | None
     last_seen: date | None
     pinned: bool
     confidence: str
-    archived: bool                   # explicit filter field
-    superseded_by: str | None        # explicit filter field
+    archived: bool  # explicit filter field
+    superseded_by: str | None  # explicit filter field
 
 
 @dataclass
@@ -50,6 +52,7 @@ class Note:
     The full read model returned by read_note(). Unlike Capture (which is
     the write-path input), Note includes all storage-managed fields.
     """
+
     type: str
     name: str
     description: str
@@ -67,7 +70,7 @@ class Note:
     archived: bool
     superseded_by: str | None
     schema_version: int
-    extra_frontmatter: dict[str, Any]   # any custom fields the operator/agent added
+    extra_frontmatter: dict[str, Any]  # any custom fields the operator/agent added
 
 
 @dataclass
@@ -78,7 +81,8 @@ class VersionRef:
     resolve_version_token() to convert CLI tokens to VersionRef.
     Use __str__ for display only.
     """
-    backend_id: str          # backend internals only
+
+    backend_id: str  # backend internals only
 
     def __str__(self) -> str:
         """Display token for CLI / dashboard.
@@ -102,6 +106,7 @@ class WritePolicy:
     operation. Write_paths and read_only_paths come from agent config
     (tools.md) and must not be dropped in the abstraction layer.
     """
+
     write_paths: list[Path]
     read_only_paths: list[Path] = field(default_factory=list)
 
@@ -113,11 +118,12 @@ class MemoryStats:
     Used by dashboard/memory.py to render the Memory Snapshot tab without
     requiring filesystem-specific scanning logic.
     """
+
     total_notes: int
     by_type: dict[str, int]
     live_bytes: int
     version_history_bytes: int
-    most_churned: list[tuple[str, int]]   # [(note_name, version_count), ...] top 20
+    most_churned: list[tuple[str, int]]  # [(note_name, version_count), ...] top 20
 
 
 class StagedMemory(abc.ABC):
@@ -152,6 +158,7 @@ class StagedMemory(abc.ABC):
 
 # ──────────────────────────────────────────────────────────────────
 # The protocol
+
 
 @runtime_checkable
 class MemoryBackend(Protocol):
@@ -370,6 +377,23 @@ class MemoryBackend(Protocol):
     @property
     def supports_semantic_search(self) -> bool:
         """True if search() uses semantic/vector similarity."""
+        ...
+
+    @property
+    def supports_canonical_export(self) -> bool:
+        """True if this backend implements the Exportable Protocol (spec/40).
+
+        Advertised as a ``@property`` on MemoryBackend (matching the existing
+        ``supports_semantic_search`` @property idiom — the minority pattern
+        among the 13 backends). The majority of backends use a capabilities()
+        -> XCapabilities dataclass instead. The MemoryCapabilities convergence
+        is tracked as a follow-up ([#431](https://github.com/dep0we/atomic-agents-stack/issues/431)),
+        so for now both Memory capability flags are @property.
+
+        FilesystemBackend: True.
+        Future Postgres/pgvector backends: set to True when their export impl
+        ships.
+        """
         ...
 
     def search(self, query: str, limit: int = 10) -> list[NoteRef]:

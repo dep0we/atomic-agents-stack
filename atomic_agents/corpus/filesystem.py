@@ -474,7 +474,31 @@ class FilesystemCorpusBackend:
             supports_versioning=True,
             supports_streaming_iteration=False,
             embedding_provider=None,
+            supports_canonical_export=True,  # spec/40 addendum
         )
+
+    def export(self, query=None):
+        """Export corpus pages as a CorpusExport canonical object (spec/40).
+
+        Enumerates via list_pages() — MUST NOT route through query(text).
+        Export is state extraction, not semantic retrieval (spec/40 MUST 6).
+
+        Args:
+            query: ``CorpusExportQuery | None``. Pass None for both corpora.
+
+        Returns:
+            ``CorpusExport`` with pages_with_bytes populated per corpus.
+        """
+        from ..export.filesystem import export_corpus
+        from ..export.types import CorpusExportQuery
+
+        if query is None:
+            query = CorpusExportQuery()
+        return export_corpus(self, query)
+
+    def export_all(self):
+        """Convenience wrapper — unbounded export. Equivalent to export(None)."""
+        return self.export(None)
 
     # ── Read operations ───────────────────────────────────────────────────
 

@@ -531,6 +531,11 @@ class LogCapabilities:
     supports_streaming: bool
     supports_retention: bool
     durable: bool
+    # spec/40 addendum: Exportable Protocol composition.
+    # FilesystemLogBackend = True (full JSONL export).
+    # SQLite/Postgres backends default False until their export impls ship.
+    # Default False so existing instantiation sites without this kwarg keep working.
+    supports_canonical_export: bool = False
 
 
 # ────────────────────────────────────────────────────────────────────

@@ -60,6 +60,11 @@ class LockCapabilities:
     single_host_only: bool
     supports_reentrancy: bool
     supports_lease: bool
+    # spec/40 addendum: Exportable Protocol composition.
+    # FilesystemLockBackend = True (location-map export only; zero lock records).
+    # RedisLockBackend = False (no persistent lock state to export).
+    # Default False so existing instantiation sites without this kwarg keep working.
+    supports_canonical_export: bool = False
 
 
 @dataclass(frozen=True)

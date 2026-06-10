@@ -480,7 +480,33 @@ class FilesystemMandateBackend:
             # The filesystem backend scans the JSONL log via LogBackend
             # and can emit recovery events (spec/29 MUST #7).
             supports_crash_recovery=True,
+            # spec/40 addendum: Exportable Protocol composition.
+            supports_canonical_export=True,
         )
+
+    def export(self, query=None):
+        """Export mandate definitions as a MandateExport canonical object (spec/40).
+
+        Exports mandate DEFINITIONS (Mandate objects from list_mandates()).
+        The .judge-state/ dedup sidecar is explicitly excluded — it is an
+        implementation detail, not a portable agent artifact.
+
+        Args:
+            query: ``MandateExportQuery | None``. Pass None for all known scopes.
+
+        Returns:
+            ``MandateExport`` with mandates_by_scope populated.
+        """
+        from ..export.filesystem import export_mandate
+        from ..export.types import MandateExportQuery
+
+        if query is None:
+            query = MandateExportQuery()
+        return export_mandate(self, query)
+
+    def export_all(self):
+        """Convenience wrapper — unbounded export. Equivalent to export(None)."""
+        return self.export(None)
 
     # ────────────────────────────────────────────────────────────────
     # Crash recovery (spec/29 §"Crash recovery for reservations")

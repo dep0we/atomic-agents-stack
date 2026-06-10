@@ -144,8 +144,7 @@ class FilesystemLockBackend:
                 # e.g., a permission failure on the lock file should
                 # not be silently retried.
                 if not (
-                    isinstance(exc, BlockingIOError)
-                    or exc.errno == errno.EWOULDBLOCK
+                    isinstance(exc, BlockingIOError) or exc.errno == errno.EWOULDBLOCK
                 ):
                     os.close(fd)
                     raise
@@ -224,7 +223,32 @@ class FilesystemLockBackend:
             single_host_only=True,
             supports_reentrancy=False,
             supports_lease=False,
+            supports_canonical_export=True,  # spec/40 addendum — location-map only
         )
+
+    def export(self, query=None):
+        """Export lock backend configuration as a LockExport canonical object (spec/40).
+
+        Returns the location map only (scope_root + backend_id). Runtime lock
+        state is ephemeral and MUST NOT be exported. Always returns zero lock
+        records — this is correct by design (spec/40 §"LockBackend export contract").
+
+        Args:
+            query: ``LockExportQuery | None`` — unused, present for Protocol uniformity.
+
+        Returns:
+            ``LockExport`` with scope_root and backend_id. lock_file_names is [].
+        """
+        from ..export.filesystem import export_lock
+        from ..export.types import LockExportQuery
+
+        if query is None:
+            query = LockExportQuery()
+        return export_lock(self, query)
+
+    def export_all(self):
+        """Convenience wrapper. Equivalent to export(None)."""
+        return self.export(None)
 
     def scope(self, sub_path: str) -> "FilesystemLockBackend":
         """Return a new FilesystemLockBackend rooted at ``<scope_root>/<sub_path>``.

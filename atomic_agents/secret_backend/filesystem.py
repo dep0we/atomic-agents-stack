@@ -197,6 +197,7 @@ class FilesystemSecretBackend:
         persists_plaintext=False,  # credential sources (keys.json) are
         # machine-scoped, not vault-portable; no plaintext credential
         # travels with the agent vault (see SecretCapabilities docstring)
+        supports_canonical_export=True,  # spec/40 addendum — wiring-map only, never plaintext
     )
 
     @property
@@ -400,6 +401,32 @@ class FilesystemSecretBackend:
         if source is None:
             return None
         return SecretRef(key=key, source=source, present=True)
+
+    def export(self, query=None):
+        """Export secret backend wiring map as a SecretExport canonical object (spec/40).
+
+        Emits ONLY logical reference names + binding hints. NEVER contains
+        resolved plaintext values (spec/40 MUST 9 — absolute invariant).
+
+        Calls locate() for each known provider key to check presence.
+        NEVER calls get() or get_optional() — doing so would leak plaintext.
+
+        Args:
+            query: ``SecretExportQuery | None``. Pass None to export all known
+                provider keys (anthropic, openai, moonshot). Custom operator
+                keys are out of scope for PR1 — see issue #432.
+
+        Returns:
+            ``SecretExport`` with entries as SecretExportRef list.
+        """
+        from ..export.filesystem import export_secret
+        from ..export.types import SecretExportQuery
+
+        return export_secret(self, query or SecretExportQuery())
+
+    def export_all(self):
+        """Convenience wrapper. Equivalent to export(None)."""
+        return self.export(None)
 
     def close(self) -> None:
         """No-op for FilesystemSecretBackend (stateless sources)."""
