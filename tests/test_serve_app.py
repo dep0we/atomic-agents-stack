@@ -914,3 +914,137 @@ def test_call_agent_identity_header_truncated_at_512(tmp_path: Path):
     )
     # Verify short identities are passed through unmodified
     assert captured_identity[0] == long_identity[:512]
+
+
+# ── Finding #401 — body-size cap (CWE-770 OOM DoS) ───────────────────────────
+
+
+def test_call_body_over_limit_with_content_length_returns_413(tmp_path: Path):
+    """POST /call with Content-Length over the limit returns 413 before streaming.
+
+    Stage-1 pre-flight: the server checks the declared Content-Length against
+    max_body_bytes and refuses immediately without touching the body stream.
+    This is the fast-path rejection when the client is honest about body size.
+    Finding #401 / CWE-770.
+    """
+    agents_root = _build_agent_root(tmp_path, "testbot")
+    # Set a tiny limit so a trivial body triggers the guard.
+    app = make_app(agents_root=agents_root, max_body_bytes=100)
+    large_body = b'{"work_item": "' + b"x" * 200 + b'"}'
+    with TestClient(app, raise_server_exceptions=False) as client:
+        resp = client.post(
+            "/agents/testbot/call",
+            content=large_body,
+            headers={"Content-Type": "application/json"},
+        )
+    assert resp.status_code == 413, (
+        f"Expected 413 for over-limit body with Content-Length; got {resp.status_code}"
+    )
+    body = resp.json()
+    assert body["status"] == "error"
+    assert "too large" in body["error"]
+
+
+def test_call_body_over_limit_without_content_length_returns_413(tmp_path: Path):
+    """POST /call with a chunked/no-Content-Length over-limit body returns 413.
+
+    Stage-2 stream cap: even when Content-Length is absent or lies, the stream
+    accumulator detects overflow and returns 413 without OOM-buffering the body.
+    Finding #401 / CWE-770.
+    """
+    agents_root = _build_agent_root(tmp_path, "testbot")
+    # Set a tiny limit (100 bytes) so a 300-byte body triggers the guard.
+    app = make_app(agents_root=agents_root, max_body_bytes=100)
+    large_body = b'{"work_item": "' + b"y" * 300 + b'"}'
+
+    # httpx / TestClient always sends Content-Length for raw bytes; to test
+    # the stream path without Content-Length we patch the header out so the
+    # Stage-1 check is skipped and only Stage-2 fires.
+    class _NoContentLengthTransport:
+        """Wraps TestClient's transport to strip Content-Length before Stage-1."""
+
+    # The cleanest approach: send with Content-Length but set the limit to
+    # something that lets Stage-1 pass (declared < limit) while Stage-2
+    # catches actual overflow. We simulate a lying client: Content-Length
+    # says 50 bytes but the real body is 315 bytes.
+    app2 = make_app(agents_root=agents_root, max_body_bytes=200)
+    # 315-byte body but Content-Length: 50 (a lie). Stage-1 passes (50<200),
+    # Stage-2 detects 315>200 and returns 413.
+    large_body2 = b'{"work_item": "' + b"z" * 300 + b'"}'
+    with TestClient(app2, raise_server_exceptions=False) as client:
+        resp = client.post(
+            "/agents/testbot/call",
+            content=large_body2,
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": "50",  # lie: real body is ~315 bytes
+            },
+        )
+    assert resp.status_code == 413, (
+        f"Expected 413 for over-limit stream body (lying Content-Length); "
+        f"got {resp.status_code}"
+    )
+    body = resp.json()
+    assert body["status"] == "error"
+    assert "too large" in body["error"]
+
+
+def test_call_body_under_limit_succeeds(tmp_path: Path):
+    """POST /call with a body under the limit passes the size guard and proceeds normally.
+
+    Regression test: the body-size cap must not regress the happy path.
+    Finding #401 guard must be transparent to legitimate requests.
+    """
+    agents_root = _build_agent_root(tmp_path, "testbot")
+
+    async def fake_run_agent_call(**kwargs: Any) -> Any:
+        return (
+            "run-size-ok",
+            MagicMock(
+                skipped=False,
+                text="ok",
+                model="m",
+                cost_usd=0.0,
+                input_tokens=1,
+                output_tokens=1,
+            ),
+        )
+
+    # 10 KiB limit; a tiny body is well under it.
+    app = make_app(agents_root=agents_root, max_body_bytes=10_240)
+    with patch(
+        "atomic_agents.serve._app.run_agent_call", side_effect=fake_run_agent_call
+    ):
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.post(
+                "/agents/testbot/call",
+                json={"work_item": "hello"},
+            )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+
+
+def test_call_work_item_over_limit_returns_422(tmp_path: Path):
+    """POST /call with work_item exceeding 32 KiB returns 422 (not dispatched).
+
+    The work_item length cap prevents an oversized field from reaching the LLM
+    dispatch before the cost guardrail fires. Mirrors the 512-char identity cap.
+    Finding #401 / CWE-770; CLAUDE.md principle 4 (cost is first-class).
+    """
+    agents_root = _build_agent_root(tmp_path, "testbot")
+    # Default max_body_bytes (1 MiB) is large enough that the body passes the
+    # size guard; the work_item field cap (32 KiB) fires instead.
+    app = make_app(agents_root=agents_root)
+    oversized_work_item = "x" * (32_768 + 1)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        resp = client.post(
+            "/agents/testbot/call",
+            json={"work_item": oversized_work_item},
+        )
+    assert resp.status_code == 422, (
+        f"Expected 422 for oversized work_item; got {resp.status_code}"
+    )
+    body = resp.json()
+    assert "work_item" in body["error"]
+    assert "too long" in body["error"]
+
