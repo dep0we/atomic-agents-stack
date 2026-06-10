@@ -95,6 +95,16 @@ the framework assumes headers that reach it have already been authenticated by
 the perimeter.  This is a security invariant — the framework will never add
 JWT parsing or signature validation here.
 
+> **Your perimeter MUST strip or overwrite the configured identity header on
+> every inbound request.** The framework trusts that header unconditionally, so
+> if a client can supply it and the perimeter forwards it unchanged, the client
+> can spoof any caller identity in the audit trail. IAP and ALB overwrite their
+> own assertion header by default, but a generic header name (for example
+> `X-Forwarded-User`) or a plain forwarding proxy may pass a client-set value
+> straight through. Configure the perimeter to drop/replace the header on
+> ingress, and prefer a provider-specific header name that the perimeter is
+> known to overwrite.
+
 ### IAP on Cloud Run
 
 Configure IAP in front of the Cloud Run service; IAP strips unauthenticated
