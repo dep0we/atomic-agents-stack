@@ -4677,10 +4677,13 @@ class AtomicAgent:
                 try:
                     self._log(_security_abort_record)
                 except Exception:  # noqa: BLE001 — never shadow the refusal
+                    # Agent name intentionally omitted from this fallback warning:
+                    # the scanner's clear-text-logging heuristic taints self.name
+                    # inside this spawn-gate handler, and the name is already on
+                    # every other log line + the audit record for this run.
                     _logger.warning(
-                        "agent %r: failed to write spawn-gate refusal audit "
-                        "record (the refusal still propagates)",
-                        self.name,
+                        "failed to write spawn-gate refusal audit record "
+                        "(the refusal still propagates)",
                         exc_info=True,
                     )
             _finalize_call_span(error=_call_exc)
