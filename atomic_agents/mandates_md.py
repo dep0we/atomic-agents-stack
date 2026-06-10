@@ -53,6 +53,7 @@ from typing import Any
 import yaml
 
 from .mandate.types import (  # direct import: mandate/__init__.py is incomplete until backend.py lands in a sibling PR
+    ActionClass,
     Mandate,
     MandateConstraints,
     MandateInvalid,
@@ -151,9 +152,7 @@ def parse_mandates_md(
     try:
         raw_bytes = path.read_bytes()
     except OSError as exc:
-        raise MandateInvalid(
-            f"could not read mandates.md at {path}: {exc}"
-        ) from exc
+        raise MandateInvalid(f"could not read mandates.md at {path}: {exc}") from exc
 
     try:
         text = raw_bytes.decode("utf-8", errors="strict")
@@ -400,7 +399,9 @@ def _parse_one_mandate(
 
     # ``scope`` in the YAML is the prose description of authority, distinct
     # from the parser's ``scope`` arg (which is the agent/project scope label).
-    prose_scope = _coerce_str(raw["scope"], field=f"{section_id}.scope")  # noqa: F841
+    # Retained on the Mandate (``prose_scope``) so the canonical-shape export
+    # (spec/40) can reconstruct a re-parseable mandates.md.
+    prose_scope = _coerce_str(raw["scope"], field=f"{section_id}.scope")
 
     revocation_state = _parse_revocation_state(
         raw["revocation_state"], section_id=section_id
@@ -415,9 +416,7 @@ def _parse_one_mandate(
 
     revoked_by_raw = raw.get("revoked_by")
     revoked_by = (
-        str(revoked_by_raw)
-        if revoked_by_raw not in (None, "null", "")
-        else None
+        str(revoked_by_raw) if revoked_by_raw not in (None, "null", "") else None
     )
 
     revocation_reason_raw = raw.get("revocation_reason")
@@ -450,6 +449,7 @@ def _parse_one_mandate(
         constraints=constraints,
         source_hash=source_hash,
         source_path=source_path,
+        prose_scope=prose_scope,
     )
 
 
@@ -497,7 +497,8 @@ def _parse_constraints(raw: dict[str, Any], *, section_id: str) -> MandateConstr
         raw.get("daily_token_usd"), field=f"{section_id}.constraints.daily_token_usd"
     )
     monthly_token_usd = _coerce_usd(
-        raw.get("monthly_token_usd"), field=f"{section_id}.constraints.monthly_token_usd"
+        raw.get("monthly_token_usd"),
+        field=f"{section_id}.constraints.monthly_token_usd",
     )
     cumulative_token_usd = _coerce_usd(
         raw.get("cumulative_token_usd"),
@@ -541,6 +542,26 @@ def _parse_constraints(raw: dict[str, Any], *, section_id: str) -> MandateConstr
         else None
     )
 
+    # Parse action_class — the cap-breach action (spec/29 §"Validation steps").
+    # Default is EXTERNAL_SIDE_EFFECT when the field is absent (matching the
+    # MandateConstraints dataclass default). The renderer emits action_class
+    # only for non-default values; the parser must read it back so a round-trip
+    # through render_mandates_md → parse_mandates_md preserves the operator's
+    # chosen action class (spec/40 round-trip fidelity).
+    action_class_raw = raw.get("action_class")
+    if action_class_raw is not None:
+        try:
+            action_class = ActionClass(str(action_class_raw))
+        except ValueError:
+            valid_values = [e.value for e in ActionClass]
+            raise MandateInvalid(
+                f"mandate {section_id!r}: constraints.action_class "
+                f"{action_class_raw!r} is not a valid value. "
+                f"Allowed values: {valid_values}"
+            )
+    else:
+        action_class = ActionClass.EXTERNAL_SIDE_EFFECT
+
     return MandateConstraints(
         allowed_tools=allowed_tools,
         allowed_targets=tuple(allowed_targets),
@@ -554,6 +575,7 @@ def _parse_constraints(raw: dict[str, Any], *, section_id: str) -> MandateConstr
         cumulative_external_usd=cumulative_external_usd,
         requires_escalation_above_token_usd=requires_escalation_above_token_usd,
         requires_escalation_above_external_usd=requires_escalation_above_external_usd,
+        action_class=action_class,
         unconstrained=unconstrained,
         unconstrained_justification=unconstrained_justification,
     )
@@ -574,8 +596,8 @@ def _check_enforceability(constraints: MandateConstraints, *, section_id: str) -
                 f"but unconstrained_justification is missing or empty. "
                 f"Operators opting out of structured enforcement must supply "
                 f"a non-empty justification string (spec/29 lines 283-286). "
-                f"Example: unconstrained_justification: \"Trust-the-prose; "
-                f"manually reviewed on each run.\""
+                f'Example: unconstrained_justification: "Trust-the-prose; '
+                f'manually reviewed on each run."'
             )
         return  # unconstrained + justification → valid
 
@@ -611,9 +633,7 @@ def _check_enforceability(constraints: MandateConstraints, *, section_id: str) -
 # Target list parser
 
 
-def _parse_target_list(
-    raw: Any, *, field: str
-) -> list[TargetPattern]:
+def _parse_target_list(raw: Any, *, field: str) -> list[TargetPattern]:
     """Parse an ``allowed_targets`` or ``blocked_targets`` list.
 
     Each element is either:
@@ -630,9 +650,7 @@ def _parse_target_list(
     if raw is None:
         return []
     if not isinstance(raw, list):
-        raise MandateInvalid(
-            f"{field} must be a list; got {type(raw).__name__}"
-        )
+        raise MandateInvalid(f"{field} must be a list; got {type(raw).__name__}")
     result: list[TargetPattern] = []
     for idx, item in enumerate(raw):
         if isinstance(item, str):
@@ -718,7 +736,9 @@ def _parse_time_window(raw: Any, *, section_id: str) -> TimeWindow:
             f"mandate {section_id!r}: constraints.time_window requires "
             f"both 'start' and 'end' keys (e.g. start: '09:00', end: '17:00')"
         )
-    start_utc = _parse_time_of_day(str(start_raw), field=f"{section_id}.time_window.start")
+    start_utc = _parse_time_of_day(
+        str(start_raw), field=f"{section_id}.time_window.start"
+    )
     end_utc = _parse_time_of_day(str(end_raw), field=f"{section_id}.time_window.end")
     if start_utc == end_utc:
         raise MandateInvalid(
@@ -826,14 +846,10 @@ def _coerce_str(raw: Any, *, field: str) -> str:
     when the value is ``None`` or not representable as a non-empty string.
     """
     if raw is None:
-        raise MandateInvalid(
-            f"{field}: required string field is null/missing"
-        )
+        raise MandateInvalid(f"{field}: required string field is null/missing")
     value = str(raw).strip()
     if not value:
-        raise MandateInvalid(
-            f"{field}: required string field is empty"
-        )
+        raise MandateInvalid(f"{field}: required string field is empty")
     return value
 
 
@@ -856,9 +872,7 @@ def _coerce_usd(raw: Any, *, field: str) -> float | None:
         )
     value = float(raw)
     if value < 0:
-        raise MandateInvalid(
-            f"{field}: USD amount must be >= 0; got {value}"
-        )
+        raise MandateInvalid(f"{field}: USD amount must be >= 0; got {value}")
     return value
 
 

@@ -147,11 +147,7 @@ class FilesystemLogBackend:
         on-disk shape across the wiring transition.
         """
         day = _record_date(record)
-        target = (
-            self._log_dir
-            / day.strftime("%Y-%m")
-            / f"{day.isoformat()}.jsonl"
-        )
+        target = self._log_dir / day.strftime("%Y-%m") / f"{day.isoformat()}.jsonl"
         atomic_append_jsonl(target, json.dumps(record.to_dict()))
 
     # ────────────────────────────────────────────────────────────
@@ -186,9 +182,7 @@ class FilesystemLogBackend:
                 continue
             # Cheap month-window prefilter — skip month dirs whose
             # entire date range falls outside [since, until].
-            if not _month_overlaps_window(
-                month_dir.name, since_date, until_date
-            ):
+            if not _month_overlaps_window(month_dir.name, since_date, until_date):
                 continue
             for day_file in sorted(month_dir.iterdir()):
                 m = _DAY_FILE_RE.match(day_file.name)
@@ -258,7 +252,11 @@ class FilesystemLogBackend:
         # day file. Accumulate until we have n records; collected order
         # is newest-first.
         month_dirs = sorted(
-            (p for p in log_dir.iterdir() if p.is_dir() and _MONTH_DIR_RE.match(p.name)),
+            (
+                p
+                for p in log_dir.iterdir()
+                if p.is_dir() and _MONTH_DIR_RE.match(p.name)
+            ),
             reverse=True,
         )
         for month_dir in month_dirs:
@@ -497,7 +495,32 @@ class FilesystemLogBackend:
             supports_streaming=False,
             supports_retention=True,
             durable=True,
+            supports_canonical_export=True,  # spec/40 addendum
         )
+
+    def export(self, query=None):
+        """Export log records as a LogExport canonical object (spec/40).
+
+        Args:
+            query: ``LogExportQuery | None``. Pass None for all records.
+
+        Returns:
+            ``LogExport`` with (RunRecord, raw_bytes) tuples.
+        """
+        from ..export.filesystem import export_log
+        from ..export.types import LogExportQuery
+
+        if query is None:
+            query = LogExportQuery()
+        return export_log(self, query)
+
+    def export_all(self):
+        """Convenience wrapper — unbounded export. Equivalent to export(None).
+
+        WARNING: Materializes ALL log records in memory. For large log histories
+        use export(LogExportQuery(log_query=LogQuery(since=...))) instead.
+        """
+        return self.export(None)
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -566,7 +589,10 @@ def _matches(
                 return False
     if filter.mandate_id is not None and record.mandate_id != filter.mandate_id:
         return False
-    if filter.parent_run_id is not None and record.parent_run_id != filter.parent_run_id:
+    if (
+        filter.parent_run_id is not None
+        and record.parent_run_id != filter.parent_run_id
+    ):
         return False
     if filter.agent_name is not None:
         # Lenient: match when record.agent_name equals filter OR is None.
@@ -577,10 +603,7 @@ def _matches(
         # where post-PR-2 records all carry the field. Lenient matching
         # preserves backward compat for filesystem reads without
         # weakening the shared-backend cross-agent isolation property.
-        if (
-            record.agent_name is not None
-            and record.agent_name != filter.agent_name
-        ):
+        if record.agent_name is not None and record.agent_name != filter.agent_name:
             return False
     if since_str is not None and record.ts < since_str:
         return False

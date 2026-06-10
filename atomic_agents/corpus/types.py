@@ -83,6 +83,11 @@ class CorpusCapabilities:
     supports_versioning: bool
     supports_streaming_iteration: bool
     embedding_provider: str | None  # None when supports_semantic_search=False
+    # spec/40 addendum: Exportable Protocol composition.
+    # FilesystemCorpusBackend = True (full wiki+raw page export).
+    # SQLiteCorpusBackend defaults False until its export impl ships.
+    # Default False so existing instantiation sites without this kwarg keep working.
+    supports_canonical_export: bool = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────

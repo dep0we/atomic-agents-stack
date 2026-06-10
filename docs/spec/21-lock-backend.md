@@ -296,3 +296,18 @@ PR 4 freezes the conformance surface against both filesystem + the PR 3 distribu
 * spec/31 — ``LLMBackend`` (second-template Protocol; this spec mirrors its ``types.py``/``backend.py``/registry split).
 * spec/28 — ``JudgeBackend`` (third-template; the lock arc adopts the same "lock spec at PR 4" discipline).
 * ``docs/TENSIONS.md`` — the home-vs-org throughline tension this Protocol's existence is in service of.
+
+## spec/40 addendum — Canonical export
+
+`LockBackend` participates in the **Exportable** companion Protocol (spec/40).
+
+`LockCapabilities.supports_canonical_export = True` for `FilesystemLockBackend`.
+`RedisLockBackend` defaults `False` (no persistent lock state to export).
+
+`export()` returns a `LockExport` carrying only `scope_root` and `backend_id`.
+Runtime lock state (PID, acquired_at, lease files) is **ephemeral** and MUST NOT
+be exported. `lock_file_names` is always `[]`. `supports_canonical_export=True`
+affirms Protocol composition for conformance testing; it does NOT imply there is
+portable lock state to migrate.
+
+For the full normative export contract, see `docs/spec/40-canonical-export.md`.

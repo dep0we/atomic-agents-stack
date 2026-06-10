@@ -139,6 +139,10 @@ class MCPServerRegistryCapabilities:
     supports_capability_handshake: bool
     supports_audit: bool
     durable: bool
+    # spec/40 addendum: Exportable Protocol composition.
+    # MCPServerRegistryBackend = False (deferred; export retrofit is a later PR).
+    # Default False so existing instantiation sites without this kwarg keep working.
+    supports_canonical_export: bool = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────

@@ -856,3 +856,17 @@ No failure mode is both silent AND lacking planned coverage. Every failure eithe
 - `~/.gstack/projects/dep0we-atomic-agents-stack/dep0we-main-design-20260529-092525.md` — Full architectural rationale: 8 premises (P1-P8 revised), 4 approaches considered, Approach C recommendation, /plan-eng-review findings (A1-A4, CQ1-CQ2, T1-T2, P1), /plan-subagent prep-pass findings (S1-S5, H1-H19, M1-M7, L1+), Reviewer Concerns 1-3, and implementation task list T1-T9.
 - #65 — The umbrella issue.
 - #258 — Postgres-adapter family coordinated release (PgvectorCorpusBackend + PgvectorMemoryBackend).
+
+## spec/40 addendum — Canonical export
+
+`CorpusBackend` participates in the **Exportable** companion Protocol (spec/40).
+
+`CorpusCapabilities.supports_canonical_export = True` for `FilesystemCorpusBackend`.
+`SQLiteCorpusBackend` defaults `False` until its export impl ships.
+
+`export()` returns a `CorpusExport` carrying `pages_with_bytes: dict[corpus_name, list[(Page, raw_bytes)]]`.
+Both `"wiki"` and `"raw"` corpora are exported by default; `CorpusExportQuery(corpus="wiki")`
+filters to one. Export enumerates via `list_pages()` — NOT `query(text)` (MUST 6:
+state extraction, not semantic retrieval).
+
+For the full normative export contract, see `docs/spec/40-canonical-export.md`.
