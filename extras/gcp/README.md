@@ -161,10 +161,12 @@ injected as an env var.
 
 ## Secrets
 
-**Until SecretBackend PR 2 (#340) ships:** inject secrets as Cloud Run
-environment variables. `FilesystemSecretBackend` probes env vars first, so
-injected values work transparently with no `ATOMIC_AGENTS_SECRET_BACKEND` env
-var needed.
+**Two supported approaches.**
+
+**(1) Inject secrets as Cloud Run environment variables** (simplest; no secret
+backend selection needed). `FilesystemSecretBackend` (the default) probes env
+vars first, so injected values work transparently with no
+`ATOMIC_AGENTS_SECRET_BACKEND` env var set.
 
 ```bash
 gcloud run services update <your-agent-name> \
@@ -176,12 +178,26 @@ gcloud run services update <your-agent-name> \
 grants the service account accessor role. Re-running the script after a partial
 failure is safe (idempotent).
 
-**Do NOT set `ATOMIC_AGENTS_SECRET_BACKEND=gcp`.** That backend ships at
-#340 PR 2. Setting it today raises `SecretBackendNotRegistered` when the agent
-first resolves a provider credential (during the LLM call), causing the run to
-fail with a backend-not-registered diagnostic. The cost gate is unaffected —
-it runs before key resolution (`_check_cost_guardrails` is the first thing
-`agent.call()` does) and is always honored.
+**(2) Select the GCP Secret Manager backend** (shipped at #340 PR 2). The agent
+resolves each credential from Secret Manager live at call time, so a rotated
+secret is visible on the next run with no redeploy. Install the `[gcp]` extra
+and set both env vars:
+
+```bash
+pip install "atomic-agents-stack[gcp]"
+
+gcloud run services update <your-agent-name> \
+  --set-env-vars ATOMIC_AGENTS_SECRET_BACKEND=gcp \
+  --set-env-vars ATOMIC_AGENTS_SECRET_BACKEND_URL=projects/<your-project-id>/secrets
+```
+
+Secret names follow `KEY.lower().replace('_', '-')` (e.g. `ANTHROPIC_API_KEY` →
+the `anthropic-api-key` secret, `latest` version). The selected backend incurs
+one uncached Secret Manager access per credential resolution (one per LLM
+iteration), which is billable and adds gRPC latency, so budget Secret Manager
+access quota accordingly. See
+[`docs/deployment/secret-backend.md`](../../docs/deployment/secret-backend.md)
+for the full backend selection guide and the no-cache rotation contract.
 
 ---
 
