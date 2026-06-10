@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# secret-manager-bootstrap.sh — provision GCP Secret Manager secrets for
+# secret-manager-bootstrap.sh - provision GCP Secret Manager secrets for
 # atomic-agents-stack on Cloud Run.
 #
-# IMPORTANT — READ BEFORE RUNNING:
+# NOT YET DOGFOODED against the live GCP platform.
+# Claims verified against GCP documentation as of 2026-06-09.
+# See extras/gcp/README.md §External-claim verification status.
+#
+# IMPORTANT - READ BEFORE RUNNING:
 #
 # GCPSecretManagerBackend does NOT yet exist. It ships at issue #340 PR 2.
 # Until #340 PR 2 lands, the framework uses FilesystemSecretBackend, which
@@ -15,16 +19,22 @@
 # Do NOT set ATOMIC_AGENTS_SECRET_BACKEND=gcp in any Cloud Run env section.
 # Setting that env var today raises SecretBackendNotRegistered when the agent
 # resolves a provider credential (at the first LLM call). The cost gate is
-# unaffected — it runs before key resolution and is always honored; the call
+# unaffected - it runs before key resolution and is always honored; the call
 # simply fails closed at credential resolution with a backend-not-registered
 # diagnostic naming the gcp extra and PR 2 of issue #340.
 #
-# When #340 PR 2 ships, replace the --set-secrets section with:
-#   --set-env-vars ATOMIC_AGENTS_SECRET_BACKEND=gcp,\
-#                  ATOMIC_AGENTS_SECRET_BACKEND_URL=projects/PROJECT_ID/secrets/
+# When #340 PR 2 ships, replace the --set-secrets section with the env var
+# approach documented in #340 PR 2. The exact ATOMIC_AGENTS_SECRET_BACKEND_URL
+# format will be specified in the #340 PR 2 docs - verify it there before using.
+# (The format is TBD because GCPSecretManagerBackend has not shipped yet.)
 #
 # SAFE TO RE-RUN: the script guards each create with a describe check so
 # re-running after a partial failure leaves secrets in a consistent state.
+# The grant_accessor function calls add-iam-policy-binding, which is idempotent:
+# adding the same member+role binding twice is a no-op on the policy. Re-runs
+# after partial failure (e.g., create succeeded but version-add failed) are
+# always safe - the re-run re-adds the version and grants the binding, which is
+# the intended recovery path.
 #
 # USAGE:
 #   export PROJECT_ID=your-gcp-project
@@ -37,10 +47,10 @@ set -euo pipefail
 : "${PROJECT_ID:?Set PROJECT_ID}"
 : "${ANTHROPIC_API_KEY:?Set ANTHROPIC_API_KEY}"
 
-# Optional — only required if using Redis lock backend (#60).
+# Optional - only required if using Redis lock backend (#60).
 REDIS_URL="${REDIS_URL:-}"
 
-# Optional — only required when PostgresLogBackend (#258) ships.
+# Optional - only required when PostgresLogBackend (#258) ships.
 POSTGRES_URL="${POSTGRES_URL:-}"
 
 # ── Helper: create a secret idempotently then add a version ──────────────────
@@ -53,7 +63,7 @@ upsert_secret() {
   local value="$2"
 
   if gcloud secrets describe "$name" --project="$PROJECT_ID" &>/dev/null; then
-    echo "Secret $name already exists — adding new version."
+    echo "Secret $name already exists - adding new version."
   else
     echo "Creating secret $name."
     gcloud secrets create "$name" \
@@ -86,6 +96,8 @@ fi
 # ── Grant Cloud Run service account accessor role ────────────────────────────
 # ORDERING: IAM binding comes AFTER version creation (see comment above).
 # If you change SA_EMAIL, the binding must be re-applied.
+# add-iam-policy-binding is idempotent: adding the same member+role twice is a
+# no-op on the policy. Re-runs after partial failure are always safe.
 : "${SA_EMAIL:?Set SA_EMAIL to the Cloud Run service account email}"
 
 grant_accessor() {
@@ -105,25 +117,33 @@ if [[ -n "$POSTGRES_URL" ]]; then grant_accessor "postgres-url"; fi
 echo ""
 echo "=== NEXT STEP: inject secrets as Cloud Run env vars ==="
 echo ""
-echo "Until #340 PR 2 ships, reference secrets as Cloud Run env vars:"
+echo "Until #340 PR 2 ships, reference secrets as Cloud Run env vars."
 echo ""
+echo "# IMPORTANT: --set-secrets is a SINGLE [KEY=VALUE,...] flag, NOT repeatable."
+echo "# Passing --set-secrets more than once does NOT accumulate: gcloud removes"
+echo "# all existing secrets first, then applies ONLY the last occurrence. So all"
+echo "# secret mappings MUST go in one comma-separated --set-secrets flag, below."
+echo ""
+# Build the comma-separated secret assignment list conditionally so unset
+# backends (no REDIS_URL / no POSTGRES_URL) are dropped, never emitted empty.
+SECRET_ASSIGNMENTS="ANTHROPIC_API_KEY=anthropic-api-key:latest"
+if [[ -n "$REDIS_URL" ]]; then
+  SECRET_ASSIGNMENTS="$SECRET_ASSIGNMENTS,ATOMIC_AGENTS_LOCK_BACKEND_URL=redis-url:latest"
+fi
+if [[ -n "$POSTGRES_URL" ]]; then
+  SECRET_ASSIGNMENTS="$SECRET_ASSIGNMENTS,ATOMIC_AGENTS_LOG_BACKEND_URL=postgres-url:latest"
+fi
 echo "  gcloud run services update <your-agent-name> \\"
 echo "    --region=<your-region> \\"
 echo "    --project=$PROJECT_ID \\"
-echo "    --set-secrets ANTHROPIC_API_KEY=anthropic-api-key:latest \\"
-if [[ -n "$REDIS_URL" ]]; then
-  echo "    --set-secrets ATOMIC_AGENTS_LOCK_BACKEND_URL=redis-url:latest \\"
-fi
-if [[ -n "$POSTGRES_URL" ]]; then
-  echo "    --set-secrets ATOMIC_AGENTS_LOG_BACKEND_URL=postgres-url:latest \\"
-fi
+echo "    --set-secrets $SECRET_ASSIGNMENTS"
 echo ""
 echo "The FilesystemSecretBackend reads env vars transparently."
 echo "The cost gate and audit trail remain intact."
 echo ""
 echo "# NOTE: GCPSecretManagerBackend ships with issue #340 PR 2."
-echo "# Until then, Secret Manager values are injected as Cloud Run env vars"
-echo "# via --set-secrets; FilesystemSecretBackend reads them automatically."
+echo "# When it ships, the ATOMIC_AGENTS_SECRET_BACKEND_URL format will be"
+echo "# documented in the #340 PR 2 release notes. Verify there before using."
 echo ""
 echo "Troubleshooting tip:"
 echo "  If doctor reports FAIL for ANTHROPIC_API_KEY with 'not found':"
