@@ -154,6 +154,16 @@ connect to. The framework does not sandbox subprocesses beyond what the OS
 provides — the subprocess inherits the agent's UID, environment variables, and
 filesystem permissions. Operators vouch for the servers they declare.
 
+**Spawn gate — command-basename allowlist (spec/36 MUST 12 / GHSA-xhcr-cqfr-m3hv):** `MCPClientPool` validates every `MCPServerSpec.command` basename against an operator-configurable allowlist **before** constructing `StdioServerParameters`. The default allowlist is `{"npx", "uvx", "python", "python3", "node", "docker"}`. If the command basename is not in the allowlist, `connect_all()` raises `MCPCommandNotAllowed` (a subclass of `MCPServerConnectFailed`) and no subprocess is spawned. Operators may replace the default set by adding a `## Allowed commands` section to the agent's `mcp.md`:
+
+```markdown
+## Allowed commands
+npx
+uvx
+```
+
+An empty `## Allowed commands` section is explicit deny-all (not "use default"). The allowlist is resolved once at `MCPClientPool.__init__` time. `MCPCommandNotAllowed` propagates out of `connect_all()` fail-closed — it is NOT soft-skipped or caught by the surrounding `MCPServerConnectFailed` handler.
+
 **Path-traversal best-effort:** When `_load_config()` calls `parse_mcp_md()`, it
 passes the agent's `read_paths` (from `tools.md`). `parse_mcp_md_text` calls
 `validate_mcp_server_args()` on every parsed spec before returning, so traversal
@@ -187,6 +197,7 @@ is raised immediately (fail-loud rather than silently passing an empty value).
 | Exception | When raised |
 |---|---|
 | `MCPServerConnectFailed` | Server subprocess fails to start or initialize; also raised at parse time for unresolvable `$VAR` references. Caught and logged per-server by `connect_all()`; agent continues with other servers. |
+| `MCPCommandNotAllowed` | Command basename is not in the spawn allowlist (spec/36 MUST 12). Subclass of `MCPServerConnectFailed`. Propagates out of `connect_all()` fail-closed — NOT caught by the surrounding handler. Operators add the command to `## Allowed commands` in `mcp.md` to allow it. |
 | `MCPServerNotConfigured` | Code references a server name not in `mcp.md`. |
 | `MCPToolDispatchFailed` | Runtime failure during a tool call (server error, network issue, etc.). Caught by `ToolRegistry.execute()`, recorded in `ToolCallResult.error`. |
 
