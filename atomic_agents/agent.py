@@ -37,7 +37,7 @@ from . import _capture, _cascade, _costs, _llm, tracing as _tracing
 from ._io import safe_resolve_under
 from .memory.backend import MemoryBackend, WritePolicy
 from .memory import get_default_memory_backend
-from .mcp import MCPClientPool
+from .mcp import MCPClientPool, MCPCommandNotAllowed, parse_mcp_allowed_commands
 from .locks import (
     LockBackend,
     LockBusy,
@@ -3732,9 +3732,25 @@ class AtomicAgent:
                     effective_mcp_specs = allowed_specs
 
                 if effective_mcp_specs:
+                    # spec/36 MUST 12 — resolve the operator-overridable spawn
+                    # allowlist from the AGENT'S LOCAL mcp.md (self._profile.
+                    # mcp_md_raw), independent of which registry backend supplied
+                    # the specs. mcp_md_raw is the canonical, round-tripping
+                    # source already on the profile (Principle #1 — vault is the
+                    # source of truth; no derived-state field to drift). When the
+                    # '## Allowed commands' section is ABSENT, parse returns None
+                    # → MCPClientPool falls back to DEFAULT_COMMAND_ALLOWLIST.
+                    # When the section is PRESENT (even empty), the parsed set
+                    # REPLACES the default (empty = deny-all). For HTTP/DB profile
+                    # backends with no local mcp.md, mcp_md_raw is "" → None →
+                    # default, which is the correct conservative behavior.
+                    _allowed_commands = parse_mcp_allowed_commands(
+                        getattr(self._profile, "mcp_md_raw", "") or ""
+                    )
                     self.mcp_pool = MCPClientPool(
                         server_specs=effective_mcp_specs,
                         agents_root=self.agents_root,
+                        allowed_commands=_allowed_commands,
                     )
                     self.mcp_pool.connect_all()
                     mcp_tool_defs = self.mcp_pool.discover_tools()
@@ -4622,6 +4638,42 @@ class AtomicAgent:
             # accumulators carry whatever partial spend was synced before the
             # raise (0.0 if it fired before the loop). Re-raise unchanged — the
             # finalizer never swallows the real exception.
+            #
+            # Principle #5 (audit trail is structural): the spawn-gate refusal
+            # (MCPCommandNotAllowed, spec/36 MUST 12) fires BEFORE the success-
+            # path self._log(log_record) at the end of the body, so without an
+            # explicit record here a blocked-command run would leave an OTel
+            # error span but NO JSONL line with a run_id. A security block is
+            # exactly the event that most needs an audit trail. Mirror the
+            # refused-path record shape used by the lock_busy (3535) and
+            # cost-skip (3632) early-returns so the audit stream stays uniform.
+            # Scoped narrowly to MCPCommandNotAllowed — generic in-loop crashes
+            # already write their own records and re-emitting here would double-
+            # log them.
+            if isinstance(_call_exc, MCPCommandNotAllowed):
+                _security_abort_record: dict = {
+                    "trigger": self.trigger,
+                    "model": self.config.default_model,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "status": "error",
+                    "error": type(_call_exc).__name__,
+                    "error_detail": str(_call_exc),
+                    "summary": f"MCP spawn gate refused: {_call_exc}",
+                }
+                if caller_identity is not None:
+                    _security_abort_record["http_caller"] = caller_identity
+                # Best-effort: an audit-write failure must not mask the original
+                # security refusal (the refusal is the load-bearing signal).
+                try:
+                    self._log(_security_abort_record)
+                except Exception:  # noqa: BLE001 — never shadow the refusal
+                    _logger.warning(
+                        "agent %r: failed to write spawn-gate refusal audit "
+                        "record (the refusal still propagates)",
+                        self.name,
+                        exc_info=True,
+                    )
             _finalize_call_span(error=_call_exc)
             raise
 

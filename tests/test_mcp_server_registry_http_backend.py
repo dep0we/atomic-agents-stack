@@ -160,7 +160,7 @@ def _make_server_wire_entry(
 
 
 def _make_backend(
-    catalog_url: str = "http://catalog.example.invalid",
+    catalog_url: str = "https://catalog.example.invalid",
     agent_scope: str = "test-scope",
     auth_token: str | None = None,
     probe_failure_cache_s: float = 0.5,
@@ -203,7 +203,7 @@ def test_http_construction_does_not_call_network() -> None:
     client = httpx.Client(transport=transport)
 
     HTTPMCPServerRegistryBackend(
-        catalog_url="http://catalog.example.invalid",
+        catalog_url="https://catalog.example.invalid",
         agent_scope="test-scope",
         _http_client=client,
     )
@@ -234,7 +234,7 @@ def test_http_probe_fires_on_first_method_call_not_construction() -> None:
     client = httpx.Client(transport=transport)
 
     backend = HTTPMCPServerRegistryBackend(
-        catalog_url="http://catalog.example.invalid",
+        catalog_url="https://catalog.example.invalid",
         agent_scope="test-scope",
         _http_client=client,
     )
@@ -893,7 +893,7 @@ def test_auth_token_added_as_bearer_header() -> None:
     transport = httpx.MockTransport(_handler)
     client = httpx.Client(transport=transport)
     backend = HTTPMCPServerRegistryBackend(
-        catalog_url="http://catalog.example.invalid",
+        catalog_url="https://catalog.example.invalid",
         agent_scope="test-scope",
         auth_token="my-secret-token",
         _http_client=client,
@@ -926,7 +926,7 @@ def test_no_auth_token_omits_authorization_header() -> None:
     transport = httpx.MockTransport(_handler)
     client = httpx.Client(transport=transport)
     backend = HTTPMCPServerRegistryBackend(
-        catalog_url="http://catalog.example.invalid",
+        catalog_url="https://catalog.example.invalid",
         agent_scope="test-scope",
         auth_token=None,
         _http_client=client,
@@ -982,7 +982,7 @@ def test_auth_token_not_in_error_messages() -> None:
     transport = httpx.MockTransport(_handler)
     client = httpx.Client(transport=transport)
     backend = HTTPMCPServerRegistryBackend(
-        catalog_url="http://catalog.example.invalid",
+        catalog_url="https://catalog.example.invalid",
         agent_scope="test-scope",
         auth_token="super-secret-bearer-token-abc123",
         _http_client=client,
@@ -1017,7 +1017,7 @@ def test_capabilities_before_first_probe_returns_conservative_default() -> None:
     transport = httpx.MockTransport(_counting_handler)
     client = httpx.Client(transport=transport)
     backend = HTTPMCPServerRegistryBackend(
-        catalog_url="http://catalog.example.invalid",
+        catalog_url="https://catalog.example.invalid",
         agent_scope="test-scope",
         _http_client=client,
     )
@@ -1089,7 +1089,7 @@ def test_capabilities_property_does_not_fire_probe() -> None:
     transport = httpx.MockTransport(_handler)
     client = httpx.Client(transport=transport)
     backend = HTTPMCPServerRegistryBackend(
-        catalog_url="http://catalog.example.invalid",
+        catalog_url="https://catalog.example.invalid",
         agent_scope="test-scope",
         _http_client=client,
     )
@@ -1639,7 +1639,7 @@ def test_mcp_server_ref_source_uses_raw_catalog_url_not_redacted() -> None:
 
 def _make_tier2_backend(
     transport: httpx.MockTransport,
-    catalog_url: str = "http://catalog.example.invalid",
+    catalog_url: str = "https://catalog.example.invalid",
     agent_scope: str = "test-scope",
     auth_token: str | None = None,
 ) -> HTTPMCPServerRegistryBackend:
@@ -1701,7 +1701,7 @@ def test_install_post_201_returns_mcp_server_ref() -> None:
                     "description": spec.description,
                     "transport": spec.transport,
                     "version": None,
-                    "source": f"http://catalog.example.invalid/mcp-servers/{spec.name}",
+                    "source": f"https://catalog.example.invalid/mcp-servers/{spec.name}",
                 },
             )
         return httpx.Response(200, json={"servers": []})
@@ -1710,7 +1710,7 @@ def test_install_post_201_returns_mcp_server_ref() -> None:
     ref = backend.install(spec)
     assert isinstance(ref, MCPServerRef), f"Expected MCPServerRef; got {type(ref)!r}"
     assert ref.name == spec.name
-    assert ref.source == f"http://catalog.example.invalid/mcp-servers/{spec.name}"
+    assert ref.source == f"https://catalog.example.invalid/mcp-servers/{spec.name}"
 
 
 def test_install_post_409_raises_already_installed() -> None:
@@ -2091,7 +2091,7 @@ def test_install_env_dollar_var_refs_accepted() -> None:
                     "description": "",
                     "transport": "stdio",
                     "version": None,
-                    "source": f"http://catalog.example.invalid/mcp-servers/{spec.name}",
+                    "source": f"https://catalog.example.invalid/mcp-servers/{spec.name}",
                 },
             )
         return httpx.Response(200, json={"servers": []})
@@ -2135,7 +2135,7 @@ def test_install_env_empty_dict_accepted() -> None:
                     "description": "",
                     "transport": "stdio",
                     "version": None,
-                    "source": f"http://catalog.example.invalid/mcp-servers/{spec.name}",
+                    "source": f"https://catalog.example.invalid/mcp-servers/{spec.name}",
                 },
             )
         return httpx.Response(200, json={"servers": []})
@@ -2177,7 +2177,7 @@ def test_install_env_empty_string_value_accepted() -> None:
                     "description": "",
                     "transport": "stdio",
                     "version": None,
-                    "source": f"http://catalog.example.invalid/mcp-servers/{spec.name}",
+                    "source": f"https://catalog.example.invalid/mcp-servers/{spec.name}",
                 },
             )
         return httpx.Response(200, json={"servers": []})
@@ -2211,7 +2211,7 @@ def test_install_auth_header_present_on_post() -> None:
                     "description": "",
                     "transport": "stdio",
                     "version": None,
-                    "source": "http://catalog.example.invalid/mcp-servers/auth-test",
+                    "source": "https://catalog.example.invalid/mcp-servers/auth-test",
                 },
             )
         return httpx.Response(200, json={"servers": []})
@@ -2346,7 +2346,7 @@ def test_capabilities_before_first_probe_still_conservative_after_pr5() -> None:
     transport = httpx.MockTransport(_counting_handler)
     client = httpx.Client(transport=transport)
     backend = HTTPMCPServerRegistryBackend(
-        catalog_url="http://catalog.example.invalid",
+        catalog_url="https://catalog.example.invalid",
         agent_scope="test-scope",
         _http_client=client,
     )
@@ -2364,3 +2364,408 @@ def test_capabilities_before_first_probe_still_conservative_after_pr5() -> None:
     assert call_count[0] == 0, (
         "Reading capabilities property must not trigger a probe network call."
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MUST 11 — Transport-security scheme gate (GHSA-xhcr-cqfr-m3hv)
+#
+# Truth table:
+#   loopback http:// always allowed (auto)
+#   non-loopback http:// without opt-in → ValueError
+#   non-loopback http:// with env opt-in → allowed
+#   https:// any host → allowed
+#   kwarg wins over env var
+#   Userinfo-as-host injection refused
+#   IPv6 loopback allowed
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_scheme_gate_loopback_127_0_0_1_allowed() -> None:
+    """http://127.0.0.1 is loopback-auto — no opt-in needed."""
+    from atomic_agents.mcp_registry.http import (
+        _is_loopback_host,
+        _assert_scheme_allowed,
+    )
+
+    assert _is_loopback_host("127.0.0.1") is True
+    # Should not raise:
+    _assert_scheme_allowed("http://127.0.0.1:8080/", allow_http_non_loopback=False)
+
+
+def test_scheme_gate_loopback_localhost_allowed() -> None:
+    """http://localhost is loopback-auto (literal string, no DNS)."""
+    from atomic_agents.mcp_registry.http import (
+        _is_loopback_host,
+        _assert_scheme_allowed,
+    )
+
+    assert _is_loopback_host("localhost") is True
+    _assert_scheme_allowed("http://localhost/", allow_http_non_loopback=False)
+
+
+def test_scheme_gate_loopback_localhost_case_insensitive() -> None:
+    """http://LOCALHOST is treated as loopback (normalized to lowercase)."""
+    from atomic_agents.mcp_registry.http import _is_loopback_host
+
+    assert _is_loopback_host("LOCALHOST") is True
+    assert _is_loopback_host("Localhost") is True
+
+
+def test_scheme_gate_loopback_ipv6_allowed() -> None:
+    """http://[::1] is IPv6 loopback — allowed without opt-in."""
+    from atomic_agents.mcp_registry.http import (
+        _is_loopback_host,
+        _assert_scheme_allowed,
+    )
+
+    assert _is_loopback_host("::1") is True
+    _assert_scheme_allowed("http://[::1]:8080/", allow_http_non_loopback=False)
+
+
+def test_scheme_gate_127_subnet_allowed() -> None:
+    """http://127.0.0.2 (full 127.0.0.0/8 range) is loopback."""
+    from atomic_agents.mcp_registry.http import _is_loopback_host
+
+    assert _is_loopback_host("127.0.0.2") is True
+    assert _is_loopback_host("127.255.255.254") is True
+
+
+def test_scheme_gate_non_loopback_http_refused_without_optin() -> None:
+    """Non-loopback http:// without opt-in raises ValueError with redacted URL.
+
+    The error message MUST name ATOMIC_AGENTS_MCP_SERVER_REGISTRY_ALLOW_HTTP
+    and MUST NOT contain 'evil.com' (credential-redaction check).
+    """
+    from atomic_agents.mcp_registry.http import _assert_scheme_allowed
+
+    with pytest.raises(ValueError) as exc_info:
+        _assert_scheme_allowed("http://evil.com/", allow_http_non_loopback=False)
+    msg = str(exc_info.value)
+    assert "ATOMIC_AGENTS_MCP_SERVER_REGISTRY_ALLOW_HTTP" in msg
+    assert "evil.com" not in msg
+
+
+def test_scheme_gate_non_loopback_http_allowed_with_optin() -> None:
+    """Non-loopback http:// with allow_http_non_loopback=True is allowed."""
+    from atomic_agents.mcp_registry.http import _assert_scheme_allowed
+
+    # Should not raise:
+    _assert_scheme_allowed("http://evil.com/", allow_http_non_loopback=True)
+
+
+def test_scheme_gate_https_always_allowed() -> None:
+    """https:// is allowed for any host without any opt-in."""
+    from atomic_agents.mcp_registry.http import _assert_scheme_allowed
+
+    _assert_scheme_allowed("https://evil.com/")
+    _assert_scheme_allowed("https://127.0.0.1:8080/")
+    _assert_scheme_allowed("https://catalog.example.com/?agent_scope=x")
+
+
+def test_scheme_gate_0_0_0_0_is_not_loopback() -> None:
+    """0.0.0.0 is NOT loopback — refused without opt-in."""
+    from atomic_agents.mcp_registry.http import (
+        _is_loopback_host,
+        _assert_scheme_allowed,
+    )
+
+    assert _is_loopback_host("0.0.0.0") is False
+    with pytest.raises(ValueError):
+        _assert_scheme_allowed("http://0.0.0.0/", allow_http_non_loopback=False)
+
+
+def test_scheme_gate_userinfo_injection_refused() -> None:
+    """http://127.0.0.1@evil.com/ — urlparse.hostname is 'evil.com', not '127.0.0.1'.
+
+    P0 prep finding: netloc is '127.0.0.1@evil.com' but hostname is 'evil.com'.
+    The gate MUST use urlparse().hostname, not raw netloc.
+    """
+    from atomic_agents.mcp_registry.http import _assert_scheme_allowed
+
+    with pytest.raises(ValueError):
+        _assert_scheme_allowed(
+            "http://127.0.0.1@evil.com/", allow_http_non_loopback=False
+        )
+
+
+def test_scheme_gate_none_hostname_is_non_loopback() -> None:
+    """Malformed URL with None hostname treated as non-loopback (default-deny)."""
+    from atomic_agents.mcp_registry.http import _is_loopback_host
+
+    assert _is_loopback_host(None) is False
+
+
+def test_scheme_gate_unsupported_scheme_raises() -> None:
+    """ftp:// and file:// are genuinely unsupported schemes."""
+    from atomic_agents.mcp_registry.http import _assert_scheme_allowed
+
+    with pytest.raises(ValueError) as exc_info:
+        _assert_scheme_allowed("ftp://catalog/")
+    assert "http:// or https://" in str(exc_info.value)
+
+
+def test_scheme_gate_env_optin_allows_non_loopback(monkeypatch) -> None:
+    """ATOMIC_AGENTS_MCP_SERVER_REGISTRY_ALLOW_HTTP=1 env var unlocks non-loopback http."""
+    from atomic_agents.mcp_registry.http import (
+        make_http_mcp_server_registry_backend_from_url,
+    )
+
+    monkeypatch.setenv("ATOMIC_AGENTS_MCP_SERVER_REGISTRY_ALLOW_HTTP", "1")
+    backend = make_http_mcp_server_registry_backend_from_url(
+        "http://non-loopback.example.com/?agent_scope=s"
+    )
+    assert backend._allow_http_non_loopback is True
+
+
+def test_scheme_gate_env_optin_other_values_denied(monkeypatch) -> None:
+    """ATOMIC_AGENTS_MCP_SERVER_REGISTRY_ALLOW_HTTP=true (not '1') keeps default-deny."""
+    from atomic_agents.mcp_registry.http import (
+        make_http_mcp_server_registry_backend_from_url,
+    )
+
+    monkeypatch.setenv("ATOMIC_AGENTS_MCP_SERVER_REGISTRY_ALLOW_HTTP", "true")
+    with pytest.raises(ValueError):
+        make_http_mcp_server_registry_backend_from_url(
+            "http://non-loopback.example.com/?agent_scope=s"
+        )
+
+
+def test_scheme_gate_factory_refuses_non_loopback_http_no_optin() -> None:
+    """Factory raises ValueError for non-loopback http:// without opt-in.
+
+    The error message MUST name the opt-in env var and MUST NOT expose the raw URL.
+    """
+    from atomic_agents.mcp_registry.http import (
+        make_http_mcp_server_registry_backend_from_url,
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        make_http_mcp_server_registry_backend_from_url("http://evil.com/?agent_scope=x")
+    msg = str(exc_info.value)
+    assert "ATOMIC_AGENTS_MCP_SERVER_REGISTRY_ALLOW_HTTP" in msg
+    assert "evil.com" not in msg
+
+
+def test_scheme_gate_direct_construction_also_gated() -> None:
+    """Direct HTTPMCPServerRegistryBackend(http://...) also gates at first method call.
+
+    Direct construction bypasses the factory; the lazy _assert_scheme() in
+    list_mcp_servers fires at first I/O.
+    """
+    from atomic_agents.mcp_registry.http import HTTPMCPServerRegistryBackend
+
+    backend = HTTPMCPServerRegistryBackend(
+        catalog_url="http://remote.example.com",
+        agent_scope="s",
+        allow_http_non_loopback=False,
+        _http_client=httpx.Client(transport=_make_mock_transport({})),
+    )
+    # Construction must not raise (MUST 2).
+    # First method call must raise (MUST 11 defense-in-depth).
+    with pytest.raises(ValueError) as exc_info:
+        backend.list_mcp_servers()
+    assert "ATOMIC_AGENTS_MCP_SERVER_REGISTRY_ALLOW_HTTP" in str(exc_info.value)
+
+
+def test_scheme_gate_kwarg_false_overrides_env_var_true(monkeypatch) -> None:
+    """kwarg=False wins over env var=1 (kwarg-wins precedent).
+
+    P2 prep finding: kwarg must be resolved once at construction; env var
+    re-reads would create TOCTOU.
+    """
+    from atomic_agents.mcp_registry.http import HTTPMCPServerRegistryBackend
+
+    monkeypatch.setenv("ATOMIC_AGENTS_MCP_SERVER_REGISTRY_ALLOW_HTTP", "1")
+    backend = HTTPMCPServerRegistryBackend(
+        catalog_url="http://remote.example.com",
+        agent_scope="s",
+        allow_http_non_loopback=False,  # kwarg wins
+        _http_client=httpx.Client(transport=_make_mock_transport({})),
+    )
+    # kwarg=False → refused even though env says 1
+    with pytest.raises(ValueError):
+        backend.list_mcp_servers()
+
+
+def test_scheme_gate_kwarg_true_overrides_no_env_var(monkeypatch) -> None:
+    """kwarg=True unlocks non-loopback http even when env var is absent."""
+    from atomic_agents.mcp_registry.http import HTTPMCPServerRegistryBackend
+
+    monkeypatch.delenv("ATOMIC_AGENTS_MCP_SERVER_REGISTRY_ALLOW_HTTP", raising=False)
+
+    def _handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/capabilities":
+            return httpx.Response(
+                200,
+                json={
+                    "tier": 1,
+                    "supports_install": False,
+                    "supports_uninstall": False,
+                    "supports_audit": False,
+                    "wire_version": "1.0.0",
+                },
+            )
+        return httpx.Response(200, json={"servers": []})
+
+    backend = HTTPMCPServerRegistryBackend(
+        catalog_url="http://remote.example.com",
+        agent_scope="s",
+        allow_http_non_loopback=True,  # kwarg unlocks
+        _http_client=httpx.Client(transport=httpx.MockTransport(_handler)),
+    )
+    refs = backend.list_mcp_servers()
+    assert refs == []
+
+
+def test_scheme_gate_load_mcp_server_also_re_gates() -> None:
+    """load_mcp_server() re-gates the scheme (defense-in-depth per fixed constraint)."""
+    from atomic_agents.mcp_registry.http import HTTPMCPServerRegistryBackend
+
+    backend = HTTPMCPServerRegistryBackend(
+        catalog_url="http://remote.example.com",
+        agent_scope="s",
+        allow_http_non_loopback=False,
+        _http_client=httpx.Client(transport=_make_mock_transport({})),
+    )
+    with pytest.raises(ValueError):
+        backend.load_mcp_server("my-server")
+
+
+def test_scheme_gate_load_all_mcp_servers_also_re_gates() -> None:
+    """load_all_mcp_servers() re-gates the scheme."""
+    from atomic_agents.mcp_registry.http import HTTPMCPServerRegistryBackend
+
+    backend = HTTPMCPServerRegistryBackend(
+        catalog_url="http://remote.example.com",
+        agent_scope="s",
+        allow_http_non_loopback=False,
+        _http_client=httpx.Client(transport=_make_mock_transport({})),
+    )
+    with pytest.raises(ValueError):
+        backend.load_all_mcp_servers()
+
+
+def test_scheme_gate_loopback_http_no_optin_needed_construction() -> None:
+    """http://127.0.0.1 backend constructs AND operates without opt-in."""
+    from atomic_agents.mcp_registry.http import HTTPMCPServerRegistryBackend
+
+    def _handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/capabilities":
+            return httpx.Response(
+                200,
+                json={
+                    "tier": 1,
+                    "supports_install": False,
+                    "supports_uninstall": False,
+                    "supports_audit": False,
+                    "wire_version": "1.0.0",
+                },
+            )
+        return httpx.Response(200, json={"servers": []})
+
+    backend = HTTPMCPServerRegistryBackend(
+        catalog_url="http://127.0.0.1:8080",
+        agent_scope="s",
+        allow_http_non_loopback=False,
+        _http_client=httpx.Client(transport=httpx.MockTransport(_handler)),
+    )
+    refs = backend.list_mcp_servers()
+    assert refs == []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MUST 11 — write paths (install/uninstall) re-gate the scheme even when the
+# capability cache is already warm. Round-1 convergence: the write paths were
+# only transitively gated via _ensure_probed -> _probe_capabilities, so a warm
+# cache would let the POST/DELETE proceed un-gated.
+
+
+def _prewarmed_tier2_backend(catalog_url: str) -> HTTPMCPServerRegistryBackend:
+    """Construct an HTTP backend whose capability cache is ALREADY warm (tier-2),
+    so _ensure_probed() short-circuits and never re-probes. This isolates the
+    scheme gate: if install/uninstall still refuse, it is because they call
+    _assert_scheme() directly, not because the probe path gated them."""
+    from atomic_agents.mcp_registry.types import MCPServerRegistryCapabilities
+
+    backend = HTTPMCPServerRegistryBackend(
+        catalog_url=catalog_url,
+        agent_scope="s",
+        allow_http_non_loopback=False,
+        _http_client=httpx.Client(transport=_make_mock_transport({})),
+    )
+    # Pre-warm the cache so _ensure_probed() returns early without probing.
+    backend._cached_capabilities = MCPServerRegistryCapabilities(
+        supports_install=True,
+        supports_uninstall=True,
+        supports_capability_handshake=True,
+        supports_audit=False,
+        durable=True,
+    )
+    return backend
+
+
+def test_scheme_gate_install_re_gates_even_with_warm_cache() -> None:
+    """install() refuses a non-loopback http:// URL even when the capability
+    cache is pre-warmed (so the gate is not relying on _ensure_probed)."""
+    backend = _prewarmed_tier2_backend("http://remote.example.com")
+    spec = MCPServerSpec(
+        name="srv",
+        command="python3",
+        args=["-m", "srv"],
+        env={"T": "$T"},
+        transport="stdio",
+        description="",
+    )
+    with pytest.raises(ValueError):
+        backend.install(spec)
+
+
+def test_scheme_gate_uninstall_re_gates_even_with_warm_cache() -> None:
+    """uninstall() refuses a non-loopback http:// URL even when the capability
+    cache is pre-warmed."""
+    backend = _prewarmed_tier2_backend("http://remote.example.com")
+    with pytest.raises(ValueError):
+        backend.uninstall("srv")
+
+
+def test_scheme_gate_validate_also_re_gates() -> None:
+    """validate() re-gates the scheme (completes the read-path enumeration).
+
+    validate(name) returns a ValidationResult for charset failures rather than
+    raising, but the scheme gate fires AFTER charset validation for a valid
+    name, so a refused scheme raises ValueError.
+    """
+    backend = HTTPMCPServerRegistryBackend(
+        catalog_url="http://remote.example.com",
+        agent_scope="s",
+        allow_http_non_loopback=False,
+        _http_client=httpx.Client(transport=_make_mock_transport({})),
+    )
+    with pytest.raises(ValueError):
+        backend.validate("valid-name")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MUST 11 — fail closed on an unparseable-but-http-looking URL. Round-1
+# convergence: the gate previously RETURNED (allowed) on urlparse/hostname
+# failure, granting the non-loopback exemption to a URL it could not classify.
+
+
+def test_scheme_gate_unparseable_url_fails_closed() -> None:
+    """A malformed http:// URL whose host cannot be classified is REFUSED
+    (fail-closed), not allowed by default."""
+    from atomic_agents.mcp_registry.http import _assert_scheme_allowed
+
+    # 'http://[' raises ValueError on parsed.hostname (bad IPv6 bracket).
+    with pytest.raises(ValueError):
+        _assert_scheme_allowed("http://[", allow_http_non_loopback=False)
+
+
+def test_scheme_gate_unparseable_url_redacts() -> None:
+    """The fail-closed error does not echo the raw (potentially credentialed) URL
+    verbatim beyond what the redactor permits."""
+    from atomic_agents.mcp_registry.http import _assert_scheme_allowed
+
+    with pytest.raises(ValueError) as exc_info:
+        _assert_scheme_allowed("http://user:secret@[", allow_http_non_loopback=False)
+    assert "secret" not in str(exc_info.value)

@@ -21,6 +21,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import types
@@ -220,7 +221,7 @@ def test_mcp_client_pool_connect_failure_doesnt_block_others(tmp_path):
     good_tools = [_make_mcp_tool("read_file")]
     good_conn = _ServerConnection(spec=specs[0], tools=good_tools)
 
-    def _connect_side_effect(spec):
+    def _connect_side_effect(spec, allowlist=None):
         if spec.name == "bad-server":
             raise MCPServerConnectFailed("bad-server failed")
         return good_conn
@@ -402,6 +403,128 @@ def test_agent_call_tears_down_pool_in_finally_block(tmp_path):
     mock_pool.disconnect_all.assert_called_once()
     # pool should be cleared
     assert agent.mcp_pool is None
+
+
+# ──────────────────────────────────────────────────────────────────
+# END-TO-END wiring: '## Allowed commands' in mcp.md actually changes
+# the spawn allowlist enforced on the LIVE agent.call() path.
+# (Round-1 convergence: the P0 the parser+kwarg pieces were missing.)
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_agent_call_threads_operator_allowlist_from_mcp_md(tmp_path):
+    """A '## Allowed commands' section in mcp.md REPLACES the default set on the
+    live agent path: MCPClientPool is constructed with the operator's set."""
+    agent_dir = _build_minimal_agent_dir(tmp_path)
+    # Operator declares a server run by 'bun' (NOT in the default set) and an
+    # explicit '## Allowed commands' section that REPLACES the default.
+    (agent_dir / "mcp.md").write_text(
+        "# MCP servers\n\n"
+        "## Allowed commands\n"
+        "bun\n\n"
+        "## bun-server\n"
+        "command: bun\n"
+        "args: run, server.ts\n"
+    )
+
+    _stub_anthropic()
+    from atomic_agents.agent import AtomicAgent
+
+    agent = AtomicAgent(name="test-agent", agents_root=tmp_path)
+
+    raw = _make_raw_response("Done.")
+    mock_pool = MagicMock()
+    mock_pool.connect_all = MagicMock()
+    mock_pool.discover_tools = MagicMock(return_value=[])
+    mock_pool.disconnect_all = MagicMock()
+
+    with patch("atomic_agents._llm.call_llm", return_value=raw):
+        with patch(
+            "atomic_agents.agent.MCPClientPool", return_value=mock_pool
+        ) as pool_cls:
+            agent.call("Do something.")
+
+    pool_cls.assert_called_once()
+    # The live path resolved the operator allowlist from mcp.md and passed it
+    # in. REPLACE semantics: the set is exactly {bun}, NOT the default + bun.
+    _, kwargs = pool_cls.call_args
+    assert kwargs["allowed_commands"] == frozenset({"bun"}), (
+        "operator '## Allowed commands' must reach the pool as the enforced set"
+    )
+
+
+def test_agent_call_no_allowed_commands_section_passes_none(tmp_path):
+    """No '## Allowed commands' section → allowed_commands=None reaches the pool
+    (which then falls back to DEFAULT_COMMAND_ALLOWLIST)."""
+    agent_dir = _build_minimal_agent_dir(tmp_path)
+    (agent_dir / "mcp.md").write_text(
+        "# MCP servers\n\n## time\ncommand: npx\nargs: -y, @mcp/time\n"
+    )
+
+    _stub_anthropic()
+    from atomic_agents.agent import AtomicAgent
+
+    agent = AtomicAgent(name="test-agent", agents_root=tmp_path)
+
+    raw = _make_raw_response("Done.")
+    mock_pool = MagicMock()
+    mock_pool.connect_all = MagicMock()
+    mock_pool.discover_tools = MagicMock(return_value=[])
+    mock_pool.disconnect_all = MagicMock()
+
+    with patch("atomic_agents._llm.call_llm", return_value=raw):
+        with patch(
+            "atomic_agents.agent.MCPClientPool", return_value=mock_pool
+        ) as pool_cls:
+            agent.call("Do something.")
+
+    _, kwargs = pool_cls.call_args
+    assert kwargs["allowed_commands"] is None
+
+
+def test_agent_call_blocked_command_writes_audit_record(tmp_path):
+    """A spawn-gate refusal on the live agent path writes exactly one JSONL run
+    record carrying run_id + the error class (Principle #5 audit trail)."""
+    agent_dir = _build_minimal_agent_dir(tmp_path)
+    # Inject a server whose command is 'bash' (NOT in the default set) and DO
+    # NOT add a '## Allowed commands' section → default applies → 'bash' blocked.
+    (agent_dir / "mcp.md").write_text(
+        "# MCP servers\n\n## evil\ncommand: bash\nargs: -c, echo pwned\n"
+    )
+
+    _stub_anthropic()
+    from atomic_agents.agent import AtomicAgent
+    from atomic_agents.mcp import MCPCommandNotAllowed
+
+    agent = AtomicAgent(name="test-agent", agents_root=tmp_path)
+
+    logged: list[dict] = []
+    orig_log = agent._log
+
+    def _capture_log(record):
+        logged.append(dict(record))
+        return orig_log(record)
+
+    raw = _make_raw_response("Done.")
+    with patch("atomic_agents._llm.call_llm", return_value=raw):
+        with patch.object(agent, "_log", side_effect=_capture_log):
+            with pytest.raises(MCPCommandNotAllowed):
+                agent.call("Do something.")
+
+    # Exactly one audit record for the aborted run, carrying run_id + error class.
+    error_records = [r for r in logged if r.get("error") == "MCPCommandNotAllowed"]
+    assert len(error_records) == 1, (
+        f"expected exactly one spawn-gate audit record, got {len(error_records)}: "
+        f"{logged}"
+    )
+    rec = error_records[0]
+    assert rec.get("status") == "error"
+    assert "error_detail" in rec
+    assert "bash" in rec["error_detail"]
+    # _log defaults run_id to self.run_id (the record is enriched inside _log,
+    # after this capture point), so the on-disk audit line correlates to the
+    # run via the agent's run_id. Assert the run_id exists to anchor the trail.
+    assert agent.run_id
 
 
 def test_mcp_tool_invocation_routes_through_registry_and_loop(tmp_path):
@@ -951,3 +1074,349 @@ def test_render_mcp_md_full_round_trip():
     assert by_name["alpha"].args == ["-y", "@mcp/alpha"]
     assert by_name["beta"].env == {"BETA_KEY": "$BETA_KEY"}
     assert by_name["gamma"].description == "Gamma description"
+
+
+# ──────────────────────────────────────────────────────────────────
+# MUST 12 — Spawn-gate command-basename allowlist (GHSA-xhcr-cqfr-m3hv)
+# ──────────────────────────────────────────────────────────────────
+
+
+from atomic_agents.mcp import (
+    DEFAULT_COMMAND_ALLOWLIST,
+    MCPCommandNotAllowed,
+    _check_command_allowlist,
+    parse_mcp_allowed_commands,
+    parse_mcp_md_with_policy,
+)
+
+
+def test_check_command_allowlist_refuses_bash() -> None:
+    """'bash' is not in the default allowlist → MCPCommandNotAllowed raised."""
+    spec = _make_spec(name="evil", command="bash")
+    with pytest.raises(MCPCommandNotAllowed) as exc_info:
+        _check_command_allowlist(spec, DEFAULT_COMMAND_ALLOWLIST)
+    msg = str(exc_info.value)
+    assert "bash" in msg
+    assert "evil" in msg
+
+
+def test_check_command_allowlist_allows_npx() -> None:
+    """'npx' is in the default allowlist → no exception."""
+    spec = _make_spec(name="ok", command="npx")
+    _check_command_allowlist(spec, DEFAULT_COMMAND_ALLOWLIST)  # must not raise
+
+
+def test_check_command_allowlist_path_qualified_uses_basename() -> None:
+    """'/usr/local/bin/npx' basename is 'npx' — in allowlist, passes."""
+    spec = _make_spec(name="ok", command="/usr/local/bin/npx")
+    _check_command_allowlist(spec, DEFAULT_COMMAND_ALLOWLIST)  # must not raise
+
+
+def test_check_command_allowlist_path_qualified_bad_command_refused() -> None:
+    """'/usr/bin/sh' basename is 'sh' — not in default allowlist, refused."""
+    spec = _make_spec(name="evil", command="/usr/bin/sh")
+    with pytest.raises(MCPCommandNotAllowed):
+        _check_command_allowlist(spec, DEFAULT_COMMAND_ALLOWLIST)
+
+
+def test_check_command_allowlist_empty_frozenset_denies_all() -> None:
+    """Passing frozenset() (empty) denies every command (explicit deny-all)."""
+    spec = _make_spec(name="ok", command="npx")
+    with pytest.raises(MCPCommandNotAllowed):
+        _check_command_allowlist(spec, frozenset())
+
+
+def test_check_command_allowlist_custom_set_allows_bun() -> None:
+    """Operator-extended allowlist adding 'bun' allows that command."""
+    spec = _make_spec(name="ok", command="bun")
+    custom = DEFAULT_COMMAND_ALLOWLIST | {"bun"}
+    _check_command_allowlist(spec, custom)  # must not raise
+
+
+def test_mcp_client_pool_allowlist_blocks_catalog_injected_command(tmp_path) -> None:
+    """MCPClientPool.connect_all raises MCPCommandNotAllowed for 'bash'.
+
+    This is the structural RCE regression test: a catalog-injected spec whose
+    command is 'bash' must be blocked BEFORE any subprocess is spawned.
+    The allowlist check fires in connect_all() before _connect_sync() is called.
+    """
+    spec = _make_spec(name="injected", command="bash")
+    pool = MCPClientPool([spec], agents_root=tmp_path)
+
+    # Track whether _connect_sync was ever reached (it must NOT be).
+    connect_sync_called = []
+
+    def _mock_connect(spec, allowlist=None):
+        connect_sync_called.append(spec.name)
+        return _ServerConnection(spec=spec, tools=[])
+
+    with patch("atomic_agents.mcp._connect_sync", side_effect=_mock_connect):
+        with pytest.raises(MCPCommandNotAllowed):
+            pool.connect_all()
+
+    # _connect_sync must never have been reached.
+    assert connect_sync_called == [], (
+        "Subprocess spawn must be blocked before _connect_sync is called"
+    )
+
+
+def test_mcp_client_pool_allowlist_allows_default_commands(tmp_path) -> None:
+    """Default allowlist commands pass the pre-spawn gate in connect_all."""
+    good_tools = [_make_mcp_tool("read_file")]
+    good_conn = _ServerConnection(
+        spec=_make_spec("npx-server", command="npx"), tools=good_tools
+    )
+
+    def _connect_side_effect(spec, allowlist=None):
+        return good_conn
+
+    specs = [_make_spec("npx-server", command="npx")]
+    pool = MCPClientPool(specs, agents_root=tmp_path)
+
+    with patch("atomic_agents.mcp._connect_sync", side_effect=_connect_side_effect):
+        pool.connect_all()
+
+    assert "npx-server" in pool._connected
+
+
+def test_mcp_client_pool_operator_allowlist_allows_bun(tmp_path) -> None:
+    """Operator-extended allowlist (passed via allowed_commands kwarg) allows 'bun'."""
+    good_tools = [_make_mcp_tool("run")]
+    good_conn = _ServerConnection(
+        spec=_make_spec("bun-server", command="bun"), tools=good_tools
+    )
+
+    def _connect_side_effect(spec, allowlist=None):
+        return good_conn
+
+    specs = [_make_spec("bun-server", command="bun")]
+    custom_allowlist = DEFAULT_COMMAND_ALLOWLIST | {"bun"}
+    pool = MCPClientPool(specs, agents_root=tmp_path, allowed_commands=custom_allowlist)
+
+    with patch("atomic_agents.mcp._connect_sync", side_effect=_connect_side_effect):
+        pool.connect_all()
+
+    assert "bun-server" in pool._connected
+
+
+def test_mcp_client_pool_none_allowlist_uses_default(tmp_path) -> None:
+    """allowed_commands=None → DEFAULT_COMMAND_ALLOWLIST (not deny-all)."""
+    pool = MCPClientPool(
+        [_make_spec("ok", command="npx")],
+        agents_root=tmp_path,
+        allowed_commands=None,
+    )
+    assert pool._allowed_commands == DEFAULT_COMMAND_ALLOWLIST
+
+
+def test_mcp_client_pool_empty_frozenset_denies_all(tmp_path) -> None:
+    """allowed_commands=frozenset() is explicit deny-all, not 'use default'."""
+    spec = _make_spec("ok", command="npx")
+    pool = MCPClientPool([spec], agents_root=tmp_path, allowed_commands=frozenset())
+
+    connect_sync_called = []
+
+    def _mock_connect(s, allowlist=None):
+        connect_sync_called.append(s.name)
+        return _ServerConnection(spec=s, tools=[])
+
+    with patch("atomic_agents.mcp._connect_sync", side_effect=_mock_connect):
+        with pytest.raises(MCPCommandNotAllowed):
+            pool.connect_all()
+    # _connect_sync must never have been reached.
+    assert connect_sync_called == []
+
+
+# ──────────────────────────────────────────────────────────────────
+# parse_mcp_allowed_commands — operator allowlist from mcp.md
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_parse_mcp_allowed_commands_absent_returns_none() -> None:
+    """No '## Allowed commands' section → None (use default)."""
+    text = """
+## my-server
+command: npx
+args: -y, @mcp/server
+"""
+    result = parse_mcp_allowed_commands(text)
+    assert result is None
+
+
+def test_parse_mcp_allowed_commands_section_present() -> None:
+    """'## Allowed commands' section parsed correctly."""
+    text = """
+## Allowed commands
+npx
+uvx
+python
+bun
+
+## my-server
+command: npx
+"""
+    result = parse_mcp_allowed_commands(text)
+    assert result == frozenset({"npx", "uvx", "python", "bun"})
+
+
+def test_parse_mcp_allowed_commands_case_insensitive_section_name() -> None:
+    """Section name matching is case-insensitive."""
+    text = """
+## ALLOWED COMMANDS
+npx
+bun
+"""
+    result = parse_mcp_allowed_commands(text)
+    assert result == frozenset({"npx", "bun"})
+
+
+def test_parse_mcp_allowed_commands_section_excluded_from_server_specs() -> None:
+    """'## Allowed commands' section is NOT parsed as a server spec."""
+    text = """
+## Allowed commands
+npx
+uvx
+
+## my-server
+command: npx
+args: -y, @mcp/server
+"""
+    specs = parse_mcp_md_text(text)
+    # Should parse exactly one server spec (my-server), not "Allowed commands".
+    assert len(specs) == 1
+    assert specs[0].name == "my-server"
+
+
+def test_parse_mcp_md_with_policy_returns_both(tmp_path) -> None:
+    """parse_mcp_md_with_policy returns (specs, allowlist) tuple."""
+    mcp_md = tmp_path / "mcp.md"
+    mcp_md.write_text(
+        """
+## Allowed commands
+npx
+bun
+
+## my-server
+command: npx
+args: -y, @mcp/test
+"""
+    )
+    specs, allowlist = parse_mcp_md_with_policy(mcp_md)
+    assert len(specs) == 1
+    assert specs[0].name == "my-server"
+    assert allowlist == frozenset({"npx", "bun"})
+
+
+def test_parse_mcp_md_with_policy_no_file_returns_empty(tmp_path) -> None:
+    """parse_mcp_md_with_policy on missing file returns ([], None)."""
+    specs, allowlist = parse_mcp_md_with_policy(tmp_path / "nonexistent.md")
+    assert specs == []
+    assert allowlist is None
+
+
+# ──────────────────────────────────────────────────────────────────
+# parse_mcp_allowed_commands — parser-correctness boundaries
+# (H1 terminates section, inline-comment strip, empty-section deny-all,
+#  case sensitivity of command names). Round-1 convergence additions.
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_parse_mcp_allowed_commands_h1_terminates_section() -> None:
+    """A top-level H1 header AFTER the section ENDS it — lines below an H1
+    must NOT be absorbed as command names."""
+    text = """
+## Allowed commands
+npx
+# Some H1 title
+uvx
+"""
+    result = parse_mcp_allowed_commands(text)
+    # 'uvx' is below an H1 that terminated the section → only 'npx' collected.
+    assert result == frozenset({"npx"})
+
+
+def test_parse_mcp_allowed_commands_h3_terminates_section() -> None:
+    """An H3+ header also ends the section."""
+    text = """
+## Allowed commands
+npx
+### sub
+uvx
+"""
+    result = parse_mcp_allowed_commands(text)
+    assert result == frozenset({"npx"})
+
+
+def test_parse_mcp_allowed_commands_inline_comment_stripped() -> None:
+    """An inline trailing comment is stripped from a command line."""
+    text = """
+## Allowed commands
+npx  # node package runner
+bun#no space before hash
+"""
+    result = parse_mcp_allowed_commands(text)
+    assert result == frozenset({"npx", "bun"})
+
+
+def test_parse_mcp_allowed_commands_empty_section_is_deny_all_and_warns(caplog) -> None:
+    """A present-but-empty section is explicit deny-all AND emits a warning."""
+    text = """
+## Allowed commands
+
+## my-server
+command: npx
+"""
+    with caplog.at_level(logging.WARNING):
+        result = parse_mcp_allowed_commands(text)
+    assert result == frozenset()  # deny-all, not None
+    assert any(
+        "DENY-ALL" in rec.message or "block every" in rec.message
+        for rec in caplog.records
+    ), "empty allowlist section must emit a loud deny-all warning"
+
+
+def test_parse_mcp_allowed_commands_comment_only_section_is_deny_all(caplog) -> None:
+    """A comment-only section (no command lines) is deny-all + warns."""
+    text = """
+## Allowed commands
+# just a note, no commands here
+"""
+    with caplog.at_level(logging.WARNING):
+        result = parse_mcp_allowed_commands(text)
+    # The '# just a note' line is a header/comment boundary; no commands → deny-all.
+    assert result == frozenset()
+    assert any("DENY-ALL" in rec.message for rec in caplog.records)
+
+
+def test_parse_mcp_allowed_commands_command_names_case_sensitive() -> None:
+    """Command names are preserved verbatim (case-sensitive), unlike the
+    case-insensitive section heading."""
+    text = """
+## Allowed commands
+NPX
+Bun
+"""
+    result = parse_mcp_allowed_commands(text)
+    # Verbatim — 'NPX' would NOT match a 'command: npx' server at runtime.
+    assert result == frozenset({"NPX", "Bun"})
+    assert "npx" not in result
+
+
+def test_parse_mcp_md_text_h1_inside_allowed_section_does_not_leak(tmp_path) -> None:
+    """The spec parser's view of the file agrees on the section boundary:
+    an H1 inside the allowed-commands section ends it; subsequent H2 server
+    sections are still parsed correctly."""
+    text = """
+## Allowed commands
+npx
+# Stray title
+uvx
+
+## my-server
+command: npx
+args: -y, @mcp/server
+"""
+    specs = parse_mcp_md_text(text)
+    # Exactly one real server spec; 'Allowed commands' is never a spec, and the
+    # stray H1 + 'uvx' line don't produce a phantom spec.
+    assert [s.name for s in specs] == ["my-server"]

@@ -40,6 +40,18 @@ from .tools import ToolDefinition
 
 _logger = logging.getLogger(__name__)
 
+# Default command-basename allowlist for the spawn gate (MUST 12 / GHSA-xhcr-cqfr-m3hv).
+# Only bare basenames — path-qualified commands are rejected unless the operator
+# explicitly adds them via '## Allowed commands' in mcp.md.
+# Operators may REPLACE this set per-agent via the '## Allowed commands' H2 section.
+DEFAULT_COMMAND_ALLOWLIST: frozenset[str] = frozenset(
+    {"npx", "uvx", "python", "python3", "node", "docker"}
+)
+
+# Reserved H2 section name in mcp.md for the operator-overridable allowlist.
+# Case-insensitive match at parse time; excluded from server-spec parse.
+_ALLOWED_COMMANDS_SECTION = "allowed commands"
+
 
 # Detect path-shaped args. A path-shaped arg is one that:
 #   - starts with /  (absolute POSIX path)
@@ -188,6 +200,59 @@ class MCPToolMeta:
 
 
 # ──────────────────────────────────────────────────────────────────
+# Spawn-gate exception (MUST 12 / GHSA-xhcr-cqfr-m3hv)
+
+
+class MCPCommandNotAllowed(MCPServerConnectFailed):
+    """Raised when a catalog-sourced command is not in the spawn allowlist.
+
+    Subclasses ``MCPServerConnectFailed`` for type-compatibility, but is
+    intentionally NOT caught by the soft-skip handler in ``connect_all`` —
+    ``connect_all`` re-raises this exception class to enforce fail-closed
+    behavior.  An allowlist violation is a security gate, not a soft skip.
+
+    See ``_check_command_allowlist`` and MUST 12 in spec/36.
+    """
+
+
+def _check_command_allowlist(
+    spec: MCPServerSpec,
+    allowlist: frozenset[str],
+) -> None:
+    """Assert that ``spec.command`` basename is in the spawn allowlist (MUST 12).
+
+    Raises ``MCPCommandNotAllowed`` (a subclass of ``MCPServerConnectFailed``)
+    when the command is not permitted.  The check fires BEFORE any
+    ``StdioServerParameters`` construction so the OS never sees the command.
+
+    Path-qualified commands (containing ``/`` or ``\\``) are checked by their
+    basename only — ``/usr/local/bin/npx`` passes if ``npx`` is in the
+    allowlist.  This means a path-qualified command to a DIFFERENT binary whose
+    basename collides with a listed name would pass; that is an acceptable
+    trade-off because the operator explicitly configured that command in mcp.md
+    or an HTTP catalog they chose to trust.  (For extra hardening, operators may
+    configure their catalog to only emit bare names.)
+
+    Args:
+        spec:      The ``MCPServerSpec`` about to be spawned.
+        allowlist: The effective allowlist (operator-configured or default).
+                   Passing an empty frozenset is treated as default-deny for
+                   all commands.
+
+    Raises:
+        MCPCommandNotAllowed: when the command basename is not in ``allowlist``.
+    """
+    basename = os.path.basename(spec.command)
+    if not allowlist or basename not in allowlist:
+        raise MCPCommandNotAllowed(
+            f"MCP server {spec.name!r}: command basename {basename!r} is not in "
+            f"the spawn allowlist {sorted(allowlist)}. "
+            f"Add it to '## Allowed commands' in mcp.md or use a command from "
+            f"the default set: {sorted(DEFAULT_COMMAND_ALLOWLIST)}."
+        )
+
+
+# ──────────────────────────────────────────────────────────────────
 # MCPClientPool
 
 
@@ -202,9 +267,22 @@ class MCPClientPool:
     spec/21) serialises concurrent calls.
     """
 
-    def __init__(self, server_specs: list[MCPServerSpec], agents_root: Path) -> None:
+    def __init__(
+        self,
+        server_specs: list[MCPServerSpec],
+        agents_root: Path,
+        *,
+        allowed_commands: frozenset[str] | None = None,
+    ) -> None:
         self._specs = server_specs
         self._agents_root = agents_root
+        # Resolve the allowlist once: None → use the module-level default.
+        # Passing frozenset() explicitly means "deny everything" (not the default).
+        self._allowed_commands: frozenset[str] = (
+            allowed_commands
+            if allowed_commands is not None
+            else DEFAULT_COMMAND_ALLOWLIST
+        )
         # _sessions[server_name] = (process, session, read_stream, write_stream)
         # We store connection state per server for disconnect_all.
         self._connected: dict[str, _ServerConnection] = {}
@@ -216,6 +294,16 @@ class MCPClientPool:
 
         Failures on individual servers are logged but don't fail the whole
         pool — the agent runs with whatever servers connected successfully.
+
+        Note: ``MCPCommandNotAllowed`` (command-basename allowlist violation)
+        is re-raised rather than logged-and-skipped.  An allowlist violation
+        is a security gate, not a soft skip — the agent construction fails
+        closed so no untrusted command reaches the OS.
+
+        The allowlist defaults to ``DEFAULT_COMMAND_ALLOWLIST``
+        ({npx, uvx, python, python3, node, docker}) and is operator-overridable
+        via the ``## Allowed commands`` section in mcp.md (passed at construction
+        via the ``allowed_commands`` kwarg).
         """
         for spec in self._specs:
             if spec.transport != "stdio":
@@ -225,12 +313,19 @@ class MCPClientPool:
                     spec.transport,
                 )
                 continue
+            # Allowlist check BEFORE the try/except so MCPCommandNotAllowed
+            # propagates out of the pool rather than being caught and logged.
+            # ValueError is not caught by the MCPServerConnectFailed handler.
+            _check_command_allowlist(spec, self._allowed_commands)
             try:
-                conn = _connect_sync(spec)
+                conn = _connect_sync(spec, self._allowed_commands)
                 self._connected[spec.name] = conn
                 _logger.debug(
                     "MCP server %r connected (%d tools)", spec.name, len(conn.tools)
                 )
+            except MCPCommandNotAllowed:
+                # Re-raise allowlist violations — fail closed (not soft-skip).
+                raise
             except MCPServerConnectFailed as e:
                 _logger.warning("MCP server %r failed to connect: %s", spec.name, e)
             except Exception as e:
@@ -271,9 +366,12 @@ class MCPClientPool:
                 )
                 self._tool_meta[qualified] = meta
 
-                # Build handler that closes over server_name and original tool name.
+                # Build handler that closes over server_name, original tool name,
+                # and the spawn allowlist (threaded for per-call spawn gate).
                 # asyncio.run() per invocation — v1 simplicity.
-                handler = _make_tool_handler(server_name, tool.name, conn)
+                handler = _make_tool_handler(
+                    server_name, tool.name, conn, self._allowed_commands
+                )
 
                 # Convert MCP inputSchema to our ToolDefinition format.
                 # MCP uses inputSchema (camelCase); we pass it through as-is
@@ -341,26 +439,56 @@ class _ServerConnection:
         self._process: Any = None  # subprocess.Popen, set by _connect_sync
 
 
-def _connect_sync(spec: MCPServerSpec) -> _ServerConnection:
+def _connect_sync(
+    spec: MCPServerSpec,
+    allowlist: frozenset[str] | None = None,
+) -> _ServerConnection:
     """Spawn the MCP server subprocess and initialize a session.
 
     Returns _ServerConnection with the list of available tools.
     Raises MCPServerConnectFailed on any failure.
+
+    ``allowlist``: the effective spawn allowlist.  Defaults to
+    ``DEFAULT_COMMAND_ALLOWLIST`` when None.  Passed through to
+    ``_async_connect_and_list`` so the check fires at the lowest-level
+    spawn boundary (defense-in-depth).
     """
+    effective_allowlist = (
+        allowlist if allowlist is not None else DEFAULT_COMMAND_ALLOWLIST
+    )
     try:
-        tools = asyncio.run(_async_connect_and_list(spec))
+        tools = asyncio.run(_async_connect_and_list(spec, effective_allowlist))
         conn = _ServerConnection(spec=spec, tools=tools)
         return conn
+    except MCPCommandNotAllowed:
+        # Re-raise allowlist violations unchanged — they must not be wrapped.
+        raise
     except Exception as e:
         raise MCPServerConnectFailed(
             f"MCP server '{spec.name}' failed to connect: {type(e).__name__}: {e}"
         ) from e
 
 
-async def _async_connect_and_list(spec: MCPServerSpec) -> list:
-    """Async: spawn server, initialize session, list tools, return tool list."""
+async def _async_connect_and_list(
+    spec: MCPServerSpec,
+    allowlist: frozenset[str] | None = None,
+) -> list:
+    """Async: spawn server, initialize session, list tools, return tool list.
+
+    Raises:
+        MCPCommandNotAllowed: if spec.command basename is not in the configured
+            spawn allowlist. The allowlist defaults to
+            ``{npx, uvx, python, python3, node, docker}`` and is
+            operator-overridable via ``## Allowed commands`` in mcp.md.
+    """
     from mcp.client.stdio import stdio_client, StdioServerParameters
     from mcp.client.session import ClientSession
+
+    # Allowlist check at the lowest-level spawn boundary (MUST 12 defense-in-depth).
+    effective_allowlist = (
+        allowlist if allowlist is not None else DEFAULT_COMMAND_ALLOWLIST
+    )
+    _check_command_allowlist(spec, effective_allowlist)
 
     # Merge spec.env ON TOP OF the parent environment so the child inherits
     # PATH, HOME, etc. Passing only spec.env drops those, breaking commands
@@ -394,17 +522,30 @@ def _disconnect_sync(conn: _ServerConnection) -> None:
     pass
 
 
-def _make_tool_handler(server_name: str, tool_name: str, conn: _ServerConnection):
+def _make_tool_handler(
+    server_name: str,
+    tool_name: str,
+    conn: _ServerConnection,
+    allowlist: frozenset[str] | None = None,
+):
     """Build a sync handler that calls the MCP server's tool.
 
-    Captures server_name and tool_name in closure. Each invocation runs
-    asyncio.run() to execute the async call — v1 simplicity.
+    Captures server_name, tool_name, and the spawn allowlist in closure.
+    Each invocation runs asyncio.run() to execute the async call — v1 simplicity.
+
+    ``allowlist``: the effective spawn allowlist, threaded from MCPClientPool.
+    Defaults to ``DEFAULT_COMMAND_ALLOWLIST`` when None.
     """
     spec = conn.spec
+    effective_allowlist = (
+        allowlist if allowlist is not None else DEFAULT_COMMAND_ALLOWLIST
+    )
 
     def handler(input_data: dict) -> Any:
         try:
-            return asyncio.run(_async_call_tool(spec, tool_name, input_data))
+            return asyncio.run(
+                _async_call_tool(spec, tool_name, input_data, effective_allowlist)
+            )
         except Exception as e:
             raise MCPToolDispatchFailed(
                 f"MCP tool '{server_name}__{tool_name}' dispatch failed: "
@@ -414,10 +555,28 @@ def _make_tool_handler(server_name: str, tool_name: str, conn: _ServerConnection
     return handler
 
 
-async def _async_call_tool(spec: MCPServerSpec, tool_name: str, arguments: dict) -> Any:
-    """Async: spawn server, initialize session, call tool, return result."""
+async def _async_call_tool(
+    spec: MCPServerSpec,
+    tool_name: str,
+    arguments: dict,
+    allowlist: frozenset[str] | None = None,
+) -> Any:
+    """Async: spawn server, initialize session, call tool, return result.
+
+    Raises:
+        MCPServerConnectFailed (MCPCommandNotAllowed): if spec.command basename
+            is not in the configured spawn allowlist. The allowlist defaults to
+            ``{npx, uvx, python, python3, node, docker}`` and is
+            operator-overridable via ``## Allowed commands`` in mcp.md.
+    """
     from mcp.client.stdio import stdio_client, StdioServerParameters
     from mcp.client.session import ClientSession
+
+    # Allowlist check at spawn boundary (MUST 12 defense-in-depth; per-call path).
+    effective_allowlist = (
+        allowlist if allowlist is not None else DEFAULT_COMMAND_ALLOWLIST
+    )
+    _check_command_allowlist(spec, effective_allowlist)
 
     # Same env-merge logic as _async_connect_and_list: parent env + spec.env overlay.
     merged_env = {**os.environ, **spec.env} if spec.env else None
@@ -566,9 +725,15 @@ def parse_mcp_md_text(
     specs: list[MCPServerSpec] = []
     current_name: str | None = None
     current_fields: dict[str, list[str]] = {}
+    # Track whether we're inside the reserved '## Allowed commands' section
+    # so its lines don't get parsed as server spec fields.
+    _in_allowed_commands_section: bool = False
 
     def _flush() -> None:
         if current_name is None:
+            return
+        if current_name.lower() == _ALLOWED_COMMANDS_SECTION:
+            # Reserved section — handled by parse_mcp_allowed_commands; skip.
             return
         spec = _build_spec(current_name, current_fields, resolve_env=resolve_env)
         if spec is not None:
@@ -582,10 +747,16 @@ def parse_mcp_md_text(
             _flush()
             current_name = stripped[3:].strip()
             current_fields = {}
+            _in_allowed_commands_section = (
+                current_name.lower() == _ALLOWED_COMMANDS_SECTION
+            )
             continue
 
-        # Skip H1 and H3+ headers
+        # Skip H1 and H3+ headers. Any non-H2 header also ends the reserved
+        # '## Allowed commands' section, keeping this parser's section boundary
+        # identical to parse_mcp_allowed_commands (a stray '# Title' ends it).
         if stripped.startswith("#"):
+            _in_allowed_commands_section = False
             continue
 
         # Skip blank lines
@@ -594,6 +765,11 @@ def parse_mcp_md_text(
 
         # Skip if not in a server section
         if current_name is None:
+            continue
+
+        # Skip lines inside the reserved '## Allowed commands' section —
+        # parse_mcp_allowed_commands reads them independently.
+        if _in_allowed_commands_section:
             continue
 
         # Key: value line
@@ -625,6 +801,140 @@ def parse_mcp_md_text(
                 raise
 
     return specs
+
+
+def parse_mcp_allowed_commands(text: str) -> frozenset[str] | None:
+    """Parse the operator-overridable spawn allowlist from mcp.md content.
+
+    Reads the ``## Allowed commands`` H2 section (case-insensitive on the
+    HEADING). Each non-blank line in that section is a bare command basename
+    (one per line). An inline ``#`` comment is stripped (``npx  # node wrapper``
+    → ``npx``). A line that is ONLY a comment (starts with ``#``) is skipped.
+
+    Section boundary: ANY markdown header line (``#``, ``##``, ``###`` …) that
+    is NOT the matching ``## Allowed commands`` heading ENDS the section. This
+    matches ``parse_mcp_md_text``'s behavior (which ends spec sections on H1
+    too) so the two parsers treat the same file identically — a stray ``#
+    Title`` after the allowlist does NOT silently absorb the lines below it.
+
+    Command names are CASE-SENSITIVE (unlike the section HEADING, which is
+    matched case-insensitively). This is deliberate: Unix executable resolution
+    is case-sensitive, so ``NPX`` in the allowlist will NOT match a
+    ``command: npx`` server. The runtime check in ``_check_command_allowlist``
+    is likewise case-sensitive; the two stay aligned.
+
+    Return contract (REPLACE, not extend):
+      - Section ABSENT          → ``None`` (caller uses DEFAULT_COMMAND_ALLOWLIST).
+      - Section PRESENT, ≥1 cmd → ``frozenset`` of those names (REPLACES default).
+      - Section PRESENT, empty / comment-only → ``frozenset()`` = explicit
+        DENY-ALL. A ``logging.warning`` is emitted because this bricks every
+        configured MCP server — operators reaching this state by accident
+        (e.g. a heading with no commands under it) get a loud signal rather
+        than silent breakage.
+
+    Operators who want to EXTEND the default set must list the defaults they
+    still want alongside their additions.
+
+    Format example::
+
+        ## Allowed commands
+        npx
+        uvx
+        python
+        python3
+        node
+        docker
+        bun          # locally-built MCP server runner
+
+    Args:
+        text: Raw mcp.md content.
+
+    Returns:
+        ``frozenset[str]`` of bare command basenames when the section is
+        present; ``None`` when the section is absent.
+    """
+    if not text or not text.strip():
+        return None
+
+    in_section = False
+    section_seen = False
+    names: list[str] = []
+
+    for line in text.splitlines():
+        stripped = line.strip()
+
+        # A markdown header line is any line starting with '#' immediately
+        # followed by '#'/space, OR a bare '#'. We classify on '#' prefix and
+        # then check whether it's the matching '## Allowed commands' heading.
+        if stripped.startswith("#"):
+            # Determine the heading text after the leading '#' run.
+            heading_body = stripped.lstrip("#").strip()
+            is_allowed_section_heading = (
+                stripped.startswith("## ")
+                and heading_body.lower() == _ALLOWED_COMMANDS_SECTION
+            )
+            if is_allowed_section_heading:
+                in_section = True
+                section_seen = True
+            else:
+                # ANY other header (H1/H2/H3+) ends the section. A bare-'#'
+                # comment line ALSO ends it — operators document with prose
+                # outside the section, not '#' comments inside it; the inline
+                # '# comment' form (handled below) covers per-line annotation.
+                in_section = False
+            continue
+
+        if not in_section:
+            continue
+
+        if not stripped:
+            continue
+
+        # Strip an inline trailing comment: 'npx  # wrapper' → 'npx'.
+        # Split on the FIRST '#' (commands never contain '#').
+        name = stripped.split("#", 1)[0].strip()
+        if name:
+            names.append(name)
+
+    if not section_seen:
+        return None
+
+    if not names:
+        # Section present but yields no commands → explicit deny-all. Warn
+        # loudly: this blocks EVERY MCP server (Principle #13 — don't let a
+        # config foot-gun fail silently).
+        _logger.warning(
+            "mcp.md: '## Allowed commands' section is present but lists no "
+            "commands — this is interpreted as DENY-ALL and will block every "
+            "configured MCP server at spawn time. Remove the section to use "
+            "the default allowlist (%s), or list the commands you want to "
+            "permit.",
+            sorted(DEFAULT_COMMAND_ALLOWLIST),
+        )
+        return frozenset()
+
+    return frozenset(names)
+
+
+def parse_mcp_md_with_policy(
+    path: Path,
+    read_paths: list | None = None,
+) -> tuple[list[MCPServerSpec], frozenset[str] | None]:
+    """Parse mcp.md into specs AND the operator-declared command allowlist.
+
+    Combines ``parse_mcp_md`` + ``parse_mcp_allowed_commands`` in one read.
+    The allowlist is ``None`` when the ``## Allowed commands`` section is
+    absent (caller should use ``DEFAULT_COMMAND_ALLOWLIST``).
+
+    Returns:
+        ``(specs, allowed_commands_or_None)``
+    """
+    if not path.exists():
+        return [], None
+    text = path.read_text(encoding="utf-8")
+    specs = parse_mcp_md_text(text, mcp_md_path=path, read_paths=read_paths)
+    allowed = parse_mcp_allowed_commands(text)
+    return specs, allowed
 
 
 def _resolve_env_vars(env: dict[str, str], server_name: str) -> dict[str, str]:
@@ -705,6 +1015,19 @@ def _build_spec(
 
     description_lines = fields.get("description", [])
     description = description_lines[0].strip() if description_lines else ""
+
+    # Warn on unknown keys (P2: catches misplaced allowlist directives + typos).
+    _KNOWN_KEYS = frozenset({"command", "args", "env", "transport", "description"})
+    unknown = set(fields) - _KNOWN_KEYS
+    for uk in sorted(unknown):
+        _logger.warning(
+            "mcp.md server %r: unknown field %r (ignored). "
+            "Known fields: command, args, env, transport, description. "
+            "If you meant to set 'allowed_commands', place it in a "
+            "dedicated '## Allowed commands' H2 section at the top level.",
+            name,
+            uk,
+        )
 
     return MCPServerSpec(
         name=name,
