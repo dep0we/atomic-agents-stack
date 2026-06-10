@@ -3738,9 +3738,18 @@ class AtomicAgent:
                     )
                     self.mcp_pool.connect_all()
                     mcp_tool_defs = self.mcp_pool.discover_tools()
+                    # Snapshot pre-existing tool names BEFORE registration so
+                    # teardown can unregister ONLY the names this call added.
+                    # A pre-existing operator tool with the same qualified name
+                    # as an MCP tool raises ToolNameCollision (default
+                    # refuse-to-overwrite) — collisions surface loudly here
+                    # instead of silently shadowing the operator tool and then
+                    # permanently deleting it in the finally block (#402).
+                    _pre_existing = set(self.tool_registry.list_names())
                     for td in mcp_tool_defs:
-                        self.tool_registry.register(td, allow_overwrite=True)
-                        _mcp_registered_names.append(td.name)
+                        self.tool_registry.register(td)  # default: refuse-to-overwrite
+                        if td.name not in _pre_existing:
+                            _mcp_registered_names.append(td.name)
                     _logger.debug(
                         "agent %r: MCP pool ready — %d tools from %d server(s)",
                         self.name,
