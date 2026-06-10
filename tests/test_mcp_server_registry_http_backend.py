@@ -2364,3 +2364,193 @@ def test_capabilities_before_first_probe_still_conservative_after_pr5() -> None:
     assert call_count[0] == 0, (
         "Reading capabilities property must not trigger a probe network call."
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# j) Response byte ceiling -- CWE-400 / finding #403
+
+
+def _make_oversized_transport(
+    body: bytes,
+    *,
+    path: str = "/mcp-servers",
+) -> httpx.MockTransport:
+    """Return a MockTransport that serves ``body`` on GET ``path`` and the
+    standard tier-1 capabilities response for the probe.
+
+    The response has no Content-Length header intentionally -- the fix must
+    enforce the cap on actual bytes read, not trust the header.
+    """
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        req_path = request.url.path
+        if request.method == "GET" and req_path.startswith("/capabilities"):
+            return httpx.Response(200, json=_capabilities_response(tier=1))
+        if request.method == "GET" and req_path.startswith(path):
+            # Return oversized body without Content-Length.
+            return httpx.Response(
+                200, content=body, headers={"content-type": "application/json"}
+            )
+        return httpx.Response(404, json={})
+
+    return httpx.MockTransport(_handler)
+
+
+def test_list_mcp_servers_oversized_response_raises() -> None:
+    """list_mcp_servers raises MCPRegistryDescriptorInvalid when the catalog
+    response body exceeds max_response_bytes (CWE-400 / finding #403).
+
+    Uses a 1-byte ceiling and a 2-byte body so the test is deterministic and
+    fast.  Asserts the error is raised BEFORE any JSON parsing attempt.
+    """
+    oversized_body = b'{"servers": []}'  # valid JSON but over the tiny ceiling
+    transport = _make_oversized_transport(oversized_body, path="/mcp-servers")
+    client = httpx.Client(transport=transport)
+    backend = HTTPMCPServerRegistryBackend(
+        catalog_url="http://catalog.example.invalid",
+        agent_scope="test-scope",
+        max_response_bytes=1,  # 1-byte ceiling forces rejection
+        _http_client=client,
+    )
+
+    with pytest.raises(MCPRegistryDescriptorInvalid, match="exceeding the"):
+        backend.list_mcp_servers()
+
+
+def test_load_mcp_server_oversized_response_raises() -> None:
+    """load_mcp_server raises MCPRegistryDescriptorInvalid when the single-server
+    response exceeds max_response_bytes (CWE-400 / finding #403).
+    """
+    oversized_body = b'{"name": "tool", "command": "echo"}'
+    transport = _make_oversized_transport(oversized_body, path="/mcp-servers")
+    client = httpx.Client(transport=transport)
+    backend = HTTPMCPServerRegistryBackend(
+        catalog_url="http://catalog.example.invalid",
+        agent_scope="test-scope",
+        max_response_bytes=1,
+        _http_client=client,
+    )
+
+    with pytest.raises(MCPRegistryDescriptorInvalid, match="exceeding the"):
+        backend.load_mcp_server("tool")
+
+
+def test_load_all_mcp_servers_oversized_response_raises() -> None:
+    """load_all_mcp_servers raises MCPRegistryDescriptorInvalid when the bulk
+    expand=spec response exceeds max_response_bytes (CWE-400 / finding #403).
+    """
+    oversized_body = b'{"servers": []}'
+    transport = _make_oversized_transport(oversized_body, path="/mcp-servers")
+    client = httpx.Client(transport=transport)
+    backend = HTTPMCPServerRegistryBackend(
+        catalog_url="http://catalog.example.invalid",
+        agent_scope="test-scope",
+        max_response_bytes=1,
+        _http_client=client,
+    )
+
+    with pytest.raises(MCPRegistryDescriptorInvalid, match="exceeding the"):
+        backend.load_all_mcp_servers()
+
+
+def test_validate_oversized_response_raises() -> None:
+    """validate raises MCPRegistryDescriptorInvalid when the /validate response
+    exceeds max_response_bytes (CWE-400 / finding #403).
+    """
+    oversized_body = b'{"ok": true, "errors": [], "warnings": []}'
+    transport = _make_oversized_transport(oversized_body, path="/mcp-servers")
+    client = httpx.Client(transport=transport)
+    backend = HTTPMCPServerRegistryBackend(
+        catalog_url="http://catalog.example.invalid",
+        agent_scope="test-scope",
+        max_response_bytes=1,
+        _http_client=client,
+    )
+
+    with pytest.raises(MCPRegistryDescriptorInvalid, match="exceeding the"):
+        backend.validate("tool")
+
+
+def test_normal_response_within_ceiling_parses_successfully() -> None:
+    """A well-behaved catalog response within the byte ceiling parses normally.
+
+    Regression guard: the size check must not interfere with the happy path.
+    """
+    import json as _json
+
+    servers_body = _json.dumps(
+        {
+            "servers": [
+                {
+                    "name": "echo-tool",
+                    "command": "echo",
+                    "args": [],
+                    "env": {},
+                    "transport": "stdio",
+                }
+            ]
+        }
+    ).encode()
+    # Use a generous ceiling well above the body size.
+    transport = _make_oversized_transport(servers_body, path="/mcp-servers")
+    client = httpx.Client(transport=transport)
+    backend = HTTPMCPServerRegistryBackend(
+        catalog_url="http://catalog.example.invalid",
+        agent_scope="test-scope",
+        max_response_bytes=len(servers_body) + 1024,
+        _http_client=client,
+    )
+
+    refs = backend.list_mcp_servers()
+    assert len(refs) == 1
+    assert refs[0].name == "echo-tool"
+
+
+def test_max_response_bytes_default_is_8mb() -> None:
+    """The default max_response_bytes is 8 MB (8 * 1024 * 1024 = 8,388,608).
+
+    Regression guard: ensures the constant is not accidentally reduced to an
+    operator-hostile value (e.g. 8 bytes) or increased to an unsafe value.
+    """
+    backend = HTTPMCPServerRegistryBackend(
+        catalog_url="http://catalog.example.invalid",
+        agent_scope="test-scope",
+    )
+    assert backend._max_response_bytes == 8 * 1024 * 1024
+
+
+def test_max_response_bytes_is_overridable() -> None:
+    """Operators can pass max_response_bytes= to raise or lower the ceiling."""
+    backend = HTTPMCPServerRegistryBackend(
+        catalog_url="http://catalog.example.invalid",
+        agent_scope="test-scope",
+        max_response_bytes=1024,
+    )
+    assert backend._max_response_bytes == 1024
+
+
+def test_capabilities_probe_oversized_response_raises() -> None:
+    """The /capabilities probe also enforces the byte ceiling.
+
+    A compromised catalog that returns an oversized /capabilities body must
+    raise MCPRegistryDescriptorInvalid rather than buffering it.
+    """
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        # Return oversized capabilities body (valid JSON, over the 1-byte ceiling).
+        body = b'{"tier": 1, "supports_install": false}'
+        return httpx.Response(
+            200, content=body, headers={"content-type": "application/json"}
+        )
+
+    transport = httpx.MockTransport(_handler)
+    client = httpx.Client(transport=transport)
+    backend = HTTPMCPServerRegistryBackend(
+        catalog_url="http://catalog.example.invalid",
+        agent_scope="test-scope",
+        max_response_bytes=1,
+        _http_client=client,
+    )
+
+    with pytest.raises(MCPRegistryDescriptorInvalid, match="exceeding the"):
+        backend.list_mcp_servers()  # triggers _ensure_probed -> _probe_capabilities
