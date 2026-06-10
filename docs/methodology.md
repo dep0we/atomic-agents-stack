@@ -190,6 +190,55 @@ trivially reproducible.
 
 ---
 
+## Verify external-platform claims, not just our own
+
+Principle #12 ("verify before claim, reproduce don't assume") was written for our own surface:
+run `migrate --dry-run`, confirm the exit code, match the docs to actual behavior. It worked
+because the claims were about commands we can run. It has a blind spot it never named: claims
+about external systems we cannot exercise in CI.
+
+#395 found the blind spot. The merged GCP blueprint (PR #391, issue #339 PR 1) mandated a Cloud
+Run volume of type `gce-persistent-disk`. Fully-managed Cloud Run cannot mount one: its v2 API
+`Volume` schema supports exactly `secret`, `cloudSqlInstance`, `emptyDir`, `nfs`, and `gcs`. The
+blueprint correctly reasoned that `atomic_write` needs POSIX `rename()` atomicity, correctly
+forbade GCS/NFS/Filestore for failing to guarantee it, and then mandated a disk Cloud Run
+physically cannot attach. Internally contradictory and undeployable. It passed the full arc:
+discovery, execute, the adversarial rounds, the shortcut-hunter, and /ship. Every one of those
+checks was pointed inward. They confirmed the diff was self-consistent. None checked the one
+external premise the whole topology rested on, because no CI test can run `gcloud run deploy`.
+It was caught only when the blueprint was dogfooded against the real platform.
+
+The correction, scoped so it does not become overkill:
+
+1. Conditional external-fact verification. When a diff touches deployment or integration
+   scaffolding (`extras/`, deployment docs, integration manifests) or asserts third-party
+   behavior (a cloud provider's capabilities, an external API's contract, another tool's flags),
+   one reviewer verifies each external claim against authoritative documentation. The provider's
+   API schema or reference is the strongest source; blog posts and tutorials are softer. Cite the
+   source in the review. Gate this to those diffs. Do not run it on pure-framework arcs (backend
+   protocols, wiring), which never assert external behavior. The trigger is "does this PR claim
+   something about a system no test exercises?" Conditional, not a blanket new stage. It is not
+   `/qa`: `/qa` drives a live web app, and reference manifests for an un-deployed platform have
+   nothing to drive.
+
+2. Assurance labeling. Reference and blueprint material that has never run against the live
+   platform is lower-assurance than tested code, however many adversarial rounds it survived. Say
+   so. Label it "not yet dogfooded against <platform>" rather than letting "adversarially
+   reviewed" imply it works.
+
+3. Sibling suspicion. When one external claim proves false, treat its siblings from the same build
+   as suspect and re-verify the whole set. #395's persistent-disk error put the rest of
+   `extras/gcp/` (IAP setup, Cloud Scheduler, the Secret Manager bootstrap) under the same doubt;
+   those are re-verified during the #395 discovery, not just the disk claim.
+
+The deeper architectural catch #395 forced is recorded in issue #395 and the scale-out sequencing:
+Cloud Run is a post-scale-out target, not a v0 target. It only becomes deployable once state is off
+the filesystem (the #382 / #383 / #258 work), at which point it needs no disk at all and the
+contradiction dissolves. The scale-out work is a hard prerequisite for Cloud Run, not just an
+elasticity improvement.
+
+---
+
 ## Scope discipline by issue, not by PR
 
 When something surfaces that isn't the current task — a missing `atomic-agents migrate`
