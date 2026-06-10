@@ -1,4 +1,8 @@
-# Cloud Armor security policy — rate limiting + basic WAF
+# cloud-armor-rules.yaml.example - Cloud Armor security policy
+#
+# NOT YET DOGFOODED against the live GCP platform.
+# Claims verified against GCP documentation as of 2026-06-09.
+# See extras/gcp/README.md §External-claim verification status.
 #
 # Apply to the load balancer backend service in front of Cloud Run + IAP.
 # This policy runs BEFORE IAP, so unauthenticated flood traffic is blocked
@@ -12,10 +16,194 @@
 # The rules below are a starting point. Tune thresholds for your traffic
 # profile; agent.call() can take 5-120s so per-IP burst allowances should
 # account for legitimate concurrent users, not just bots.
+#
+# TIER NOTE:
+#   Cloud Armor has exactly two tiers: Standard and Cloud Armor Enterprise.
+#   There is no "free" or "base" tier. Every project with an external load
+#   balancer is automatically enrolled in Cloud Armor Standard (pay-as-you-go),
+#   and all rules below run on Standard:
+#     Rule 500  (body-size content-length match) - Standard.
+#     Rule 900  (enforceOnKey: HTTP_HEADER rate limit) - Standard; no Enterprise
+#               subscription required.
+#     Rule 1000 (IP-keyed rate limit) - Standard.
+#     Rule 2000 (preconfigured WAF XSS) - Standard. (Managed Protection Plus /
+#               Adaptive Protection is the separate Enterprise paid feature and
+#               is NOT required here.)
+#   Inspect your security policy tier with:
+#     gcloud compute security-policies describe <policy-name> --format=value(type)
+# (Verified: Standard vs Enterprise tiers at
+#  https://cloud.google.com/armor/docs/armor-enterprise-overview)
+#
+# AGGREGATE SPEND CONTROL NOTE (CWE-770):
+#   Cloud Armor rate limits cap per-IP (Rule 1000, any topology) and per-identity
+#   (Rule 900, CLASSIC ALB only - see the LOAD-BALANCER ORDERING note below)
+#   REQUEST rates, but neither bounds aggregate agent.call() spend across all
+#   users. A billing budget alert is the only project-level ceiling on total LLM
+#   spend. See extras/gcp/README.md §"Cost controls and billing budget" for setup.
+#
+# LOAD-BALANCER ORDERING - READ BEFORE RELYING ON RULE 900:
+#   The per-identity rule (Rule 900) keys on X-Goog-Authenticated-User-Email,
+#   which IAP injects only AFTER it authenticates a request. Whether that header
+#   is present when Cloud Armor evaluates depends ENTIRELY on the load-balancer
+#   type:
+#     - Global external ALB (EXTERNAL_MANAGED, the scheme iap-setup.md
+#       prescribes): Cloud Armor evaluates FIRST, then IAP. The IAP identity
+#       header is therefore NOT present at Cloud Armor evaluation time, so Rule
+#       900 sees no identity key and collapses ALL traffic into one empty-key
+#       bucket. On this topology Rule 900 is NOT a working per-identity control.
+#     - Classic ALB (EXTERNAL): IAP evaluates FIRST, then Cloud Armor. The
+#       identity header IS present, so Rule 900 keys per-identity as intended.
+#   (Verified: "For a backend service of a global external Application Load
+#    Balancer, Cloud Armor evaluation happens first ... If Cloud Armor allows a
+#    request, IAP then evaluates the request" and the inverse for the classic
+#    ALB, at https://cloud.google.com/armor/docs/integrating-cloud-armor)
+#   CONSEQUENCE: On the blueprint's default global external ALB, do NOT treat
+#   Rule 900 as a per-identity spend control - it is a no-op there. Rely on the
+#   billing budget (the only aggregate ceiling) + Rule 1000 (per-IP). If you
+#   specifically want per-identity limiting, deploy on the classic ALB
+#   (--load-balancing-scheme=EXTERNAL) so IAP runs first.
 
 rules:
-  # Rule 1000: rate limit per IP — blocks burst traffic before IAP.
+  # Rule 500: deny requests with large bodies (OOM guard, issue #401).
+  # A large request body sent to /call can cause the serve layer to read it
+  # into memory before the agent starts, contributing to OOM kills.
+  #
+  # Cloud Armor Standard tier supports request size limits via the
+  # evaluatePreconfiguredExpr('methodenforcement-v0') or content-length header
+  # matching. The expression below uses the request.headers content-length check.
+  #
+  # The serve layer's own body-size limit (Starlette max_body_size, if
+  # configured) is the primary gate; this Cloud Armor rule is defense-in-depth.
+  # agent.call() work_item payloads are plain text, not file uploads - 32KB is
+  # a generous ceiling for normal use.
+  #
+  # Cloud Armor CEL supports int() casting on header values for numeric
+  # comparison. The rules-language reference uses
+  # `int(request.headers["content-length"]) == 0` as a canonical example, so an
+  # exact byte threshold (32768 = 32KB) is expressible directly - no digit-count
+  # regex approximation needed.
+  # (Verified: int() on content-length header at
+  #  https://cloud.google.com/armor/docs/rules-language-reference)
+  - priority: 500
+    description: "Deny requests exceeding 32KB body (OOM guard, issue #401)"
+    match:
+      expr:
+        expression: >
+          has(request.headers['content-length']) &&
+          int(request.headers['content-length']) > 32768
+    action: deny(403)
+    # NOTE: Cloud Armor cannot return a literal 413 (Payload Too Large). For a
+    # standard (non-rate-limit) MATCH-deny rule like this one, the deny action
+    # supports only deny-403, deny-404, and deny-502
+    # (gcloud: --action=[ allow | deny-403 | deny-404 | deny-502 ]). 403 is used
+    # here as the closest valid code for a rejected oversized request.
+    # (The rate-limit exceedAction is a SEPARATE action set: Rule 900 below uses
+    # deny(429), which GCP recommends for rate-limited responses - see
+    # https://cloud.google.com/armor/docs/rate-limiting-overview. So 429 is valid
+    # for rate-limit rules, just not for this standard match-deny rule.)
+    # A true 413 would originate at a serve-layer body-size gate, which does NOT
+    # exist today (#401 is open). Until #401 ships, this Cloud Armor rule is the
+    # only body-size control; once it ships, the serve-layer gate becomes the
+    # authoritative one.
+    # (Verified: standard match-deny status codes at
+    #  https://cloud.google.com/armor/docs/configure-security-policies ;
+    #  rate-limit deny-429 at
+    #  https://cloud.google.com/armor/docs/rate-limiting-overview)
+    #
+    # int(content-length) > 32768 denies bodies larger than 32KB exactly.
+    # Tune the byte threshold for your payload ceiling.
+    #
+    # FAILS OPEN for two cases - this rule is defense-in-depth, NOT a complete
+    # OOM defense against a hostile caller:
+    #   1. Requests with NO Content-Length header (e.g. Transfer-Encoding:
+    #      chunked) are not matched by has(content-length) and pass this rule.
+    #   2. The declared Content-Length can lie; only the actual streamed body
+    #      size is authoritative.
+    # A serve-layer max_body_size gate does NOT exist today (#401 is open), so
+    # this Cloud Armor rule is currently the only body-size control. Once #401
+    # ships, the serve-layer gate becomes the authoritative one. Do NOT treat
+    # this rule as closing the #401 OOM surface (it fails open on the two cases
+    # above).
+
+  # Rule 900: per-identity rate limit - WORKS ONLY ON THE CLASSIC ALB.
+  #
+  # DECISIVE TOPOLOGY FACT (read before relying on this rule):
+  #   IAP injects X-Goog-Authenticated-User-Email only AFTER it authenticates.
+  #   On the GLOBAL EXTERNAL ALB (EXTERNAL_MANAGED) that iap-setup.md prescribes,
+  #   Cloud Armor evaluates BEFORE IAP, so this header is ABSENT at Rule 900's
+  #   evaluation time on the LEGITIMATE authenticated path. Every authenticated
+  #   request therefore collapses into ONE shared empty-key bucket and Rule 900
+  #   delivers NO per-identity isolation on that topology - it is a no-op there.
+  #   (Verified: "For a backend service of a global external Application Load
+  #    Balancer, Cloud Armor evaluation happens first ... If Cloud Armor allows a
+  #    request, IAP then evaluates the request"; the classic ALB evaluates IAP
+  #    first, at https://cloud.google.com/armor/docs/integrating-cloud-armor)
+  #
+  #   To get real per-identity limiting you must deploy on the CLASSIC ALB
+  #   (--load-balancing-scheme=EXTERNAL), where IAP runs first and the identity
+  #   header is present when Cloud Armor evaluates. On the default global external
+  #   ALB, do NOT count Rule 900 as a spend control: lean on the billing budget
+  #   (the only aggregate ceiling - README §"Cost controls and billing budget")
+  #   plus the IP-keyed Rule 1000.
+  #
+  # The rule below is scoped with has(...) so it applies ONLY to requests that
+  # actually carry the identity header (i.e. the classic-ALB authenticated path).
+  # This prevents header-less traffic (unauthenticated requests, and the
+  # same-project OIDC/internal Cloud-Scheduler-direct-to-run.app path documented
+  # in iap-setup.md / cloudscheduler-jobs.yaml.example) from collapsing into a
+  # shared empty-key bucket and being collaterally banned by rate_based_ban for
+  # banDurationSec. Header-less traffic is left to Rule 1000's per-IP cap.
+  #
+  # REMAINING LIMITATIONS (even on the classic ALB where Rule 900 functions):
+  #   (1) The X-Goog-Authenticated-User-Email header is UNSIGNED and forgeable if
+  #       IAP is bypassed. Its trustworthiness comes from IAP being enforced in
+  #       front (the ingress lock + Rule 1000 IP cap partially backstop a bypass),
+  #       not from this rule. An attacker who reaches the backend around IAP can
+  #       rotate forged identities to get a fresh rate bucket each time.
+  #       (Verified: header is unsigned / IAP-enforcement-dependent at
+  #        https://cloud.google.com/iap/docs/signed-headers-howto)
+  #   (2) This rule caps per-identity REQUEST rate, not per-identity LLM spend. A
+  #       single request can trigger an agent.call() with unbounded token cost.
+  #   (3) For an aggregate project-level spend ceiling, use a GCP billing budget
+  #       alert (see README §"Cost controls and billing budget") - it is the ONLY
+  #       control that bounds total LLM spend regardless of number of identities
+  #       or IPs, and the ONLY control covering the header-less OIDC/internal path.
+  #   (4) IP-keyed Rule 1000 does NOT bound aggregate spend either - a principal
+  #       cycling IPs bypasses IP-level caps while this identity-keyed cap still
+  #       applies (when the header is present).
+  #
+  # enforceOnKey: HTTP_HEADER rate limiting runs on Cloud Armor Standard, the
+  # default tier for any project with an external load balancer; no Enterprise
+  # subscription is required.
+  # Verified: enforceOnKey: HTTP_HEADER at
+  # https://cloud.google.com/armor/docs/rate-limiting-overview
+  - priority: 900
+    description: "Rate limit per authenticated identity (classic ALB only; no-op on global external ALB)"
+    match:
+      # Apply only to requests carrying the IAP identity header. On the global
+      # external ALB this match is never true (header absent pre-IAP), so the
+      # rule no-ops cleanly instead of banning the shared empty-key bucket.
+      expr:
+        expression: "has(request.headers['x-goog-authenticated-user-email'])"
+    action: rate_based_ban
+    rateLimitOptions:
+      conformAction: allow
+      exceedAction: deny(429)
+      enforceOnKey: HTTP_HEADER
+      enforceOnKeyName: X-Goog-Authenticated-User-Email
+      rateLimitThreshold:
+        count: 60
+        intervalSec: 60
+      banDurationSec: 300
+
+  # Rule 1000: per-IP rate limit - blocks burst traffic before IAP.
   # Tune count + interval for your expected interactive usage.
+  #
+  # NOTE: IP-keyed limiting does NOT bound aggregate agent.call() spend.
+  # An authenticated principal cycling IPs can exceed this per-IP cap while
+  # staying under the identity-keyed cap (Rule 900) if their requests come
+  # from different IPs. Use the billing budget (README §Cost controls) as
+  # the aggregate project-level ceiling.
   - priority: 1000
     description: "Rate limit: 20 requests per minute per IP"
     match:
@@ -34,19 +222,25 @@ rules:
       banDurationSec: 300
 
   # Rule 2000: block XSS-pattern request payloads via a preconfigured WAF
-  # signature. Preconfigured WAF rules run on the standard Cloud Armor tier
-  # (Managed Protection Plus / Adaptive Protection is a separate, paid
-  # IP-threat-intelligence feature — not required for this rule).
+  # signature. Preconfigured WAF rules run on the Standard Cloud Armor tier.
+  #
+  # WAF rule set versions are versioned and updated by GCP. Verify the current
+  # stable version identifier before deploying:
+  #   https://cloud.google.com/armor/docs/rule-tuning
+  # At time of writing the current stable XSS preconfigured rule set is
+  # xss-v422-stable (OWASP CRS 4.22). The older xss-v33-stable (CRS 3.x) still
+  # functions but is the legacy set. Confirm the latest stable version at the
+  # rules-language reference before deploying.
   - priority: 2000
     description: "Block XSS-pattern request payloads (preconfigured WAF)"
     match:
       expr:
-        expression: "evaluatePreconfiguredWaf('xss-v33-stable')"
+        expression: "evaluatePreconfiguredWaf('xss-v422-stable')"
     action: deny(403)
 
   # Rule 3000: allow all other traffic (passes to IAP for authentication).
   - priority: 3000
-    description: "Default allow — IAP handles authentication"
+    description: "Default allow - IAP handles authentication"
     match:
       versionedExpr: SRC_IPS_V1
       config:
