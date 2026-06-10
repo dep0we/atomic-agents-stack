@@ -47,7 +47,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -3110,9 +3110,9 @@ def check_secret_backend() -> CheckResult:
             ),
             fix_hint=(
                 "Unset ATOMIC_AGENTS_SECRET_BACKEND to use the filesystem default, "
-                "or set it to a registered backend id (currently: 'filesystem'). "
-                "If using ATOMIC_AGENTS_SECRET_BACKEND=gcp, the GCP backend ships "
-                "at PR 2 of issue #340."
+                "or set it to a registered backend id (known: 'filesystem', 'gcp'). "
+                "For gcp: set ATOMIC_AGENTS_SECRET_BACKEND_URL=projects/<project_id>/secrets "
+                "and install the [gcp] extra: uv add 'atomic-agents-stack[gcp]'."
             ),
             detail={"backend_id": safe_backend_id, "error": str(e)},
         )
@@ -3125,6 +3125,23 @@ def check_secret_backend() -> CheckResult:
         )
 
     caps = backend.capabilities
+
+    # For the gcp backend, also run the ADC liveness probe. Re-stamp the
+    # result with the stable slot name "secret-backend" so an operator keying off
+    # check names sees one consistent name across all backends. Merge backend_id
+    # into the detail dict so EVERY delegated outcome (PASS, WARN, and all FAIL
+    # branches) carries it -- the failure paths are exactly where an operator
+    # parsing detail["backend_id"] needs it most (Principle #5: audit trail is
+    # structural). check_gcp_secret_backend(), when called directly, keeps its
+    # own "secret-backend[gcp]" name.
+    if backend.backend_id == "gcp":
+        gcp_result = check_gcp_secret_backend()
+        return replace(
+            gcp_result,
+            name="secret-backend",
+            detail={**(gcp_result.detail or {}), "backend_id": "gcp"},
+        )
+
     return CheckResult(
         name="secret-backend",
         status=PASS,
@@ -3139,6 +3156,152 @@ def check_secret_backend() -> CheckResult:
             "supports_audit_logging": caps.supports_audit_logging,
             "persists_plaintext": caps.persists_plaintext,
         },
+    )
+
+
+def check_gcp_secret_backend() -> CheckResult:
+    """Verify GCP Secret Manager ADC credentials are usable (non-billable probe).
+
+    Mirrors ``check_vertex_credentials()`` exactly:
+    - Step 1: SDK import check (google-cloud-secret-manager = [gcp] extra)
+    - Step 2: ADC resolution via ``google.auth.default()``
+    - Step 3: Token mint via ``credentials.refresh(Request())`` -- proves ADC
+      actually works without making a billable Secret Manager call.
+    - Step 4: WARN (not FAIL) when GOOGLE_CLOUD_PROJECT is absent. On Cloud Run /
+      GKE the project is resolved from the metadata server automatically; the env
+      var absence does not mean ADC is broken on those platforms.
+
+    This check is intentionally NOT a ``access_secret_version()`` call -- that is
+    a billable operation and doctor must never trigger unguarded API cost.
+    """
+    # Step 1: SDK import check ([gcp] extra)
+    try:
+        from google.cloud import secretmanager as _sm  # noqa: F401
+    except ImportError as e:
+        return CheckResult(
+            name="secret-backend[gcp]",
+            status=FAIL,
+            message="google-cloud-secret-manager SDK not installed (required for gcp backend)",
+            fix_hint=(
+                "Install the [gcp] extra:\n"
+                "  uv add 'atomic-agents-stack[gcp]'\n"
+                "  Or: pip install google-cloud-secret-manager"
+            ),
+            detail={
+                "missing_sdk": "google.cloud.secretmanager",
+                "underlying_error": str(e),
+            },
+        )
+
+    # Step 2: ADC resolution
+    try:
+        import google.auth as _gauth
+        import google.auth.exceptions as _gauth_exc
+        import google.auth.transport.requests as _gauth_requests
+    except ImportError as e:
+        return CheckResult(
+            name="secret-backend[gcp]",
+            status=FAIL,
+            message=f"google-auth not installed: {e}",
+            fix_hint=(
+                "Install the [gcp] extra:\n"
+                "  uv add 'atomic-agents-stack[gcp]'\n"
+                "  Or: pip install google-auth google-cloud-secret-manager"
+            ),
+            detail={"underlying_error": str(e)},
+        )
+
+    try:
+        project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+        credentials, detected_project = _gauth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+    except _gauth_exc.DefaultCredentialsError as e:
+        return CheckResult(
+            name="secret-backend[gcp]",
+            status=FAIL,
+            message="GCP Secret Manager ADC credentials not found",
+            fix_hint=(
+                "Run one of:\n"
+                "  gcloud auth application-default login    (local dev)\n"
+                "  Set GOOGLE_APPLICATION_CREDENTIALS to a service account key file\n"
+                "  Deploy to Cloud Run / GKE with a service account attached\n"
+                "Also set: export GOOGLE_CLOUD_PROJECT='<your-gcp-project-id>'"
+            ),
+            detail={"underlying_error": str(e)},
+        )
+    except Exception as e:
+        return CheckResult(
+            name="secret-backend[gcp]",
+            status=FAIL,
+            message=f"GCP Secret Manager ADC resolution failed: {type(e).__name__}: {e}",
+            fix_hint=(
+                "Run: gcloud auth application-default login\n"
+                "And set: export GOOGLE_CLOUD_PROJECT='<your-gcp-project-id>'"
+            ),
+            detail={"underlying_error": str(e)},
+        )
+
+    # Step 3: Token mint -- proves the credentials object is actually usable.
+    # credentials.refresh(Request()) hits the OAuth metadata server, not a
+    # billable Secret Manager endpoint.
+    try:
+        request = _gauth_requests.Request()
+        credentials.refresh(request)
+    except _gauth_exc.TransportError as e:
+        return CheckResult(
+            name="secret-backend[gcp]",
+            status=FAIL,
+            message=f"GCP Secret Manager ADC token refresh failed (network error): {e}",
+            fix_hint=(
+                "Check network connectivity to Google's OAuth endpoint.\n"
+                "On GCE/Cloud Run this is automatic; on dev machines ensure\n"
+                "you have run: gcloud auth application-default login"
+            ),
+            detail={"underlying_error": str(e)},
+        )
+    except Exception as e:
+        return CheckResult(
+            name="secret-backend[gcp]",
+            status=FAIL,
+            message=f"GCP Secret Manager ADC token refresh failed: {type(e).__name__}: {e}",
+            fix_hint=(
+                "Re-authenticate: gcloud auth application-default login\n"
+                "Or check that your service account key file is valid."
+            ),
+            detail={"underlying_error": str(e)},
+        )
+
+    # Step 4: Project env var check -- WARN only (not FAIL).
+    effective_project = project or detected_project
+    detail: dict = {
+        "backend_id": "gcp",
+        "project": effective_project,
+        "token_valid": True,
+    }
+    if not project:
+        return CheckResult(
+            name="secret-backend[gcp]",
+            status=WARN,
+            message=(
+                "GCP Secret Manager ADC token minted successfully, but "
+                "GOOGLE_CLOUD_PROJECT env var is not set"
+            ),
+            fix_hint=(
+                "On dev machines, set: export GOOGLE_CLOUD_PROJECT='<your-gcp-project-id>'\n"
+                "On Cloud Run / GKE, the project is resolved from the metadata server "
+                "automatically -- this warning can be ignored in those environments."
+            ),
+            detail=detail,
+        )
+
+    return CheckResult(
+        name="secret-backend[gcp]",
+        status=PASS,
+        message=(
+            f"GCP Secret Manager ADC credentials valid; project={effective_project!r}"
+        ),
+        detail=detail,
     )
 
 
