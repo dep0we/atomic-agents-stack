@@ -596,3 +596,17 @@ backend does not leak a connection per doctor run.
   (factory env-var path, kwarg-wins, lock threading, registry helpers,
   uniform construction contract + registry conformance, doctor coherence +
   liveness checks including a registered-backend PASS)
+
+## spec/40 addendum — Canonical export
+
+`MemoryBackend` participates in the **Exportable** companion Protocol (spec/40).
+
+`FilesystemBackend` advertises `supports_canonical_export = True` via the `@property`
+idiom (matching `supports_semantic_search`). The `MemoryCapabilities` dataclass
+convergence that would unify these two `@property` flags is tracked as issue #431.
+
+`export(query=None)` returns a `MemoryExport` carrying `(Note, raw_bytes)` tuples.
+Raw bytes are read directly from disk (Tier A byte-exact fidelity). The `include_versions`
+flag in `MemoryExportQuery` is deferred (treated as `False` until issue #433 ships).
+
+For the full normative export contract, see `docs/spec/40-canonical-export.md`.

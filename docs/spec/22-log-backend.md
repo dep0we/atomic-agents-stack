@@ -730,3 +730,18 @@ service container is active).
 * spec/28 — ``JudgeBackend`` (third-template; the log arc adopts the same "lock spec at PR 4" discipline).
 * spec/31 — ``LLMBackend`` (second-template; this spec mirrors its types/backend split).
 * CLAUDE.md §5 — the "Audit trail is structural" rule this Protocol is in service of.
+
+## spec/40 addendum — Canonical export
+
+`LogBackend` participates in the **Exportable** companion Protocol (spec/40).
+
+`LogCapabilities.supports_canonical_export = True` for `FilesystemLogBackend`.
+`SQLiteLogBackend` and `PostgresLogBackend` default `False` until their export
+impls ship.
+
+`export()` returns a `LogExport` carrying `(RunRecord, raw_bytes)` tuples.
+Raw bytes are produced by `json.dumps(record.to_dict()).encode("utf-8") + b"\n"` —
+ts-first insertion order, NOT `canonical_json()` (which uses `sort_keys=True` and
+would break Tier A byte-exact fidelity, spec/40 MUST 8).
+
+For the full normative export contract, see `docs/spec/40-canonical-export.md`.

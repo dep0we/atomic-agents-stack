@@ -864,3 +864,18 @@ These are below the threshold of needing resolution before implementation begins
 - #89 PolicyBackend — future cross-fleet mandate-template composition
 - #87 LLMBackend — judge calls flow through this
 - #61 LogBackend — mandate events flow through this
+
+## spec/40 addendum — Canonical export
+
+`MandateBackend` participates in the **Exportable** companion Protocol (spec/40).
+
+`MandateCapabilities.supports_canonical_export = True` for `FilesystemMandateBackend`.
+Future SQL-backed MandateBackend implementations default `False` until their export
+impls ship.
+
+`export()` returns a `MandateExport` carrying `mandates_by_scope: dict[str, list[Mandate]]`.
+Scope discovery for `query=None` scans for `mandates.md` files under `scope_root`.
+The `.judge-state/mandates.json` dedup sidecar is intentionally **excluded** from export
+(it is an implementation detail, not a portable agent artifact).
+
+For the full normative export contract, see `docs/spec/40-canonical-export.md`.

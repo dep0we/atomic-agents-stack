@@ -29,7 +29,7 @@ Your AI agent's persona, memory, and audit trail live in someone else's database
 
 Concretely: INDEX.md routing layer. Persona in `IDENTITY.md` / `SOUL.md` / `USER.md`. Typed atomic notes. Audit trail as JSONL. Cost guardrails in markdown config. Crash-safe writes (temp + fsync + rename + parent-dir fsync — a power loss never leaves a half-written note). Schema migrations are scripts you read before running. The runtime is stateless — point cron, launchd, a Claude Code skill, or embedded Python at the folder.
 
-That's what `atomic-agents-stack` defines, in locked spec docs (plus active RFCs), with a Python reference implementation, 3,840+ tests, and a Caldwell sample shipping 5 days of real JSONL run logs, a rendered cost dashboard, evals across happy / edge / adversarial / decline categories, and a helper-pattern day showing ~76% cost savings vs. all-Opus.
+That's what `atomic-agents-stack` defines, in locked spec docs (plus active RFCs), with a Python reference implementation, 3,920+ tests, and a Caldwell sample shipping 5 days of real JSONL run logs, a rendered cost dashboard, evals across happy / edge / adversarial / decline categories, and a helper-pattern day showing ~76% cost savings vs. all-Opus.
 
 A home user with one agent and an org with a fleet experience the same framework — graceful, coherent, self-explanatory at every scale.
 
@@ -139,7 +139,7 @@ This is the slot in the AI-agent-tooling landscape `atomic-agents-stack` occupie
 | **Audit trail** | JSONL per run with `parent_run_id` rollups; helper + delegate + tool + capture lines all link back | Dashboards in Letta UI / cloud | Mem0 dashboards | LangSmith (hosted) | Build it |
 | **Cost guardrails** | First-class — daily / monthly caps, threshold warnings, fallback action, `critical=True` override, tree-cap across delegates | Per their pricing model | Per their pricing model | Not built into core OSS | Build it |
 | **Multi-agent coordination** | Role × project cascade defined in spec/06 | Multi-agent shared memory blocks | Agent-shared memory pools | LangGraph: graph-based orchestration (more flexible) | Build it |
-| **Numbered, locked spec** | 33 locked docs in `docs/spec/` (+ 5 RFCs/DRAFTs in progress) | API + concept docs | API + concept docs | API reference + concept docs | None |
+| **Numbered, locked spec** | 33 locked docs in `docs/spec/` (+ 6 RFCs/DRAFTs in progress) | API + concept docs | API + concept docs | API reference + concept docs | None |
 | **Reference runtime** | Python, macOS / Linux primary | Python (server) + multi-language clients | Python (OSS) + multi-language clients | Python + JavaScript | Whatever |
 
 **Where the alternatives win:**
@@ -153,7 +153,7 @@ This is the slot in the AI-agent-tooling landscape `atomic-agents-stack` occupie
 
 - **Markdown-source-of-truth, human-editable.** Operators can edit persona / tools / memory from any text editor or Obsidian without a vendor app.
 - **No required server.** The framework is "files + Python." A complete agent runs on a laptop with zero infrastructure.
-- **Spec-level file layout.** 33 numbered docs lock the contract (plus 5 RFCs/DRAFTs in progress); conformance is testable; alternate implementations are possible.
+- **Spec-level file layout.** 33 numbered docs lock the contract (plus 6 RFCs/DRAFTs in progress); conformance is testable; alternate implementations are possible.
 - **Crash-safe writes by default.** `temp file + fsync + rename + parent-dir fsync` for every mutation; an interrupted run leaves recoverable artifacts, not corruption.
 - **Cost story is structural, not bolted on.** Daily / monthly caps + tree-cap for delegations + per-call cost reservation for helper batches + a `critical=True` override that's part of the API, not a per-vendor workaround.
 
@@ -198,6 +198,7 @@ Start at [`docs/README.md`](https://github.com/dep0we/atomic-agents-stack/blob/m
 - [37: atomic-agents serve](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/spec/37-serve.md): thin HTTP wrapper exposing `agent.call()` over four routes; Cloud Run / GKE / Fly.io / Render; identity header pass-through; DRAFT (#342)
 - [38: SecretBackend Protocol](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/spec/38-secret-backend.md): credential resolution abstraction; `FilesystemSecretBackend` (env → Keychain → keys.json) + `GCPSecretManagerBackend`; `atomic-agents secrets` CLI; LOCKED (#340)
 - [39: OpenTelemetry trace export](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/spec/39-otel-export.md): off-by-default tracing seam; `atomic_agents.call` parent span with cost/token/outcome attributes; `[otel]` optional extra; OTLP/HTTP exporter only (no gRPC); DRAFT (#341 PR 1)
+- [40: Canonical-shape export contract](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/spec/40-canonical-export.md): `Exportable` companion Protocol; typed export result hierarchy; filesystem identity export impls for Memory, Log, Mandate, Corpus, Lock, Secret; `supports_canonical_export` capability field; parametrized round-trip conformance scaffold; T15 Position B spine; DRAFT (#379 PR 1)
 
 Each spec doc is locked when the implementation matches and tests pass. Spec changes that imply implementation changes get filed as GitHub issues. **Spec docs separate shipped behavior from explicit future / deferred boundaries** — sections that describe behavior not yet implemented are explicitly marked as such, not silently aspirational.
 
@@ -301,8 +302,8 @@ Same pattern for OpenAI (`atomic-agents-openai`) and Moonshot (`atomic-agents-mo
 ## Repository structure
 
 - `atomic_agents/` — the Python package (runtime in `agent.py`; backend protocols in `memory/`, `_llm.py`, `_locks.py`, `_costs.py`, etc.; CLI in `cli.py`; preflight in `doctor.py`)
-- `tests/` 3,840+ tests collected, Python 3.11 + 3.12 matrix
-- `docs/`: [spec entry point](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/README.md), [`architecture.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/architecture.md), [`spec/`](https://github.com/dep0we/atomic-agents-stack/tree/main/docs/spec/) (33 locked docs + 5 RFCs/DRAFTs), [`deployment/`](https://github.com/dep0we/atomic-agents-stack/tree/main/docs/deployment/) (9 operator runbooks), [`samples/caldwell/`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/samples/caldwell/) (complete worked example), [`GOVERNANCE.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/GOVERNANCE.md), [`TENSIONS.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/TENSIONS.md), [`methodology.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/methodology.md)
+- `tests/` 3,920+ tests collected, Python 3.11 + 3.12 matrix
+- `docs/`: [spec entry point](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/README.md), [`architecture.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/architecture.md), [`spec/`](https://github.com/dep0we/atomic-agents-stack/tree/main/docs/spec/) (33 locked docs + 6 RFCs/DRAFTs), [`deployment/`](https://github.com/dep0we/atomic-agents-stack/tree/main/docs/deployment/) (9 operator runbooks), [`samples/caldwell/`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/samples/caldwell/) (complete worked example), [`GOVERNANCE.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/GOVERNANCE.md), [`TENSIONS.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/TENSIONS.md), [`methodology.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/methodology.md)
 - `extras/` — operational templates (Claude Code skill wrappers, macOS LaunchAgent plists, cron examples, GCP Cloud Run + IAP reference deployment)
 
 ---

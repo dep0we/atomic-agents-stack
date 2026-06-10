@@ -247,3 +247,24 @@ Implementations satisfy the Protocol structurally (do not subclass). **The nine 
 7. **Empty-string as absent** — empty/whitespace values MUST be treated as absent; `get()` raises `SecretNotFound`, `get_optional()` returns `None`.
 8. **`has()` delegation** — MUST be `return self.get_optional(key) is not None`; no separate resolution ladder.
 9. **No caching** — each `get()` call MUST re-resolve from live sources; no instance-level value cache.
+
+## spec/40 addendum — Canonical export
+
+`SecretBackend` participates in the **Exportable** companion Protocol (spec/40) with
+**wiring-map-only semantics** — the absolute invariant is that no resolved plaintext
+credential value EVER appears in export output (spec/40 MUST 9, unconditional).
+
+`SecretCapabilities.supports_canonical_export = True` for `FilesystemSecretBackend`.
+`GCPSecretManagerBackend` defaults `False` for PR1 (export retrofit deferred, see #432).
+
+`export()` returns a `SecretExport` carrying `list[SecretExportRef]`. Each ref has:
+- `logical_key` — canonical key name (`"anthropic"`, `"openai"`, `"moonshot"`)
+- `hint` — deployment-agnostic description (e.g., `"Anthropic Claude API credential"`)
+- `present` — `True` if `locate()` returns non-None at export time
+
+`export()` calls `locate()` ONLY — NEVER `get()` or `get_optional()`. Custom operator
+keys outside `_PROVIDER_METADATA` are deferred (see #432). The never-leak conformance
+test MUST assert that no plaintext value appears in exported bytes even when the key IS
+configured (monkeypatching `ANTHROPIC_API_KEY` in the test environment).
+
+For the full normative export contract, see `docs/spec/40-canonical-export.md`.
