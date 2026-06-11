@@ -1,6 +1,6 @@
 """Conformance tests for GoalBackend Protocol (spec/41).
 
-39 test cases covering the GoalBackend Implementer Contract (the protocol-
+46 test cases covering the GoalBackend Implementer Contract (the protocol-
 behavior subset is parametrized over every registered backend via the
 ``backend`` / ``backend_with_goal`` fixtures; see PARAMETRIZATION below).
 
@@ -48,6 +48,13 @@ contributor reconciling code-to-spec lands on the right requirement.
   TEST 37 — read_schema_version() coerces a string "1" to int 1 (spec/41 schema-version note)
   TEST 38 — read_schema_version() returns None when goal.md present but key absent (spec/41 schema-version note)
   TEST 39 — env var dispatches a registered custom backend (spec/41 MUST 2 / registry)
+  TEST 40 — get_goal_backend() raises BackendNotRegistered for an unknown id (registry error branch)
+  TEST 41 — atomic_agents.goal.__getattr__ raises AttributeError for an unknown name (module __getattr__ error branch)
+  TEST 42 — _redact_for_error_message() >32-char non-URL truncates to 32 chars + "..." (redaction branch)
+  TEST 43 — _redact_for_error_message() short value passes through unchanged (redaction no-op branch)
+  TEST 44 — _redact_for_error_message() URL value returns scheme://... (redaction URL branch)
+  TEST 45 — get_default_goal_backend() empty-string env var falls through to filesystem default (env-var empty-string leg)
+  TEST 46 — read_schema_version() raises GoalCorrupted when schema_version is present but not int-coercible (filesystem.py:527-530)
 
 PARAMETRIZATION: the protocol-behavior tests construct their backend through
 the ``backend`` / ``backend_with_goal`` fixtures, which are themselves
@@ -898,6 +905,30 @@ def test_read_schema_version_none_when_key_missing(tmp_path: Path) -> None:
     assert backend.read_schema_version("agent") is None
 
 
+def test_read_schema_version_raises_goal_corrupted_for_non_int_value(
+    tmp_path: Path,
+) -> None:
+    """read_schema_version() MUST raise GoalCorrupted when schema_version is present but not int-coercible.
+
+    This covers the error branch at filesystem.py:527-530 — the key exists in
+    frontmatter but its value cannot be coerced via int(), so GoalCorrupted is
+    raised. This path is distinct from load_goal()'s validation: it fires
+    directly from read_schema_version() without a full parse pass.
+    """
+    from atomic_agents.exceptions import GoalCorrupted
+
+    root = tmp_path / "badver-agent"
+    root.mkdir(parents=True, exist_ok=True)
+    # "abc" is present in frontmatter but cannot be coerced to int.
+    (root / "goal.md").write_text(
+        "---\nschema_version: abc\nactive: true\n---\n\nbody\n",
+        encoding="utf-8",
+    )
+    backend = FilesystemGoalBackend(root)
+    with pytest.raises(GoalCorrupted, match="schema_version"):
+        backend.read_schema_version("agent")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Operator override: ATOMIC_AGENTS_GOAL_BACKEND dispatches through the registry
 
@@ -930,3 +961,105 @@ def test_env_var_dispatches_registered_custom_backend(
         assert backend.backend_id == "stub"
     finally:
         unregister_goal_backend("stub")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TEST 40 — get_goal_backend() raises BackendNotRegistered for an unknown id
+
+
+def test_get_goal_backend_raises_for_unknown_id() -> None:
+    """get_goal_backend() MUST raise BackendNotRegistered when the id is absent.
+
+    The error message must include the requested id and the list of known ids so
+    operators can diagnose a typo or a missing registration.
+    """
+    from atomic_agents.exceptions import BackendNotRegistered
+    from atomic_agents.goal import get_goal_backend, list_goal_backends
+
+    with pytest.raises(BackendNotRegistered) as exc_info:
+        get_goal_backend("nonexistent")
+
+    msg = str(exc_info.value)
+    assert "nonexistent" in msg
+    # The error must name at least one available backend id.
+    known = list_goal_backends()
+    assert any(bid in msg for bid in known), (
+        f"Expected one of {known!r} to appear in error message: {msg!r}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TEST 41 — atomic_agents.goal.__getattr__ raises AttributeError for unknown name
+
+
+def test_goal_module_getattr_raises_for_unknown_attribute() -> None:
+    """atomic_agents.goal.__getattr__ MUST raise AttributeError for names it does not own.
+
+    This covers the error branch at __init__.py:124 — the name is not in
+    _GOAL_IMPL_NAMES so the hook raises rather than returning anything.
+    Using a name that is definitively not re-exported from _goal_impl.
+    """
+    import atomic_agents.goal as _goal_mod
+
+    with pytest.raises(AttributeError) as exc_info:
+        _ = _goal_mod.this_attr_does_not_exist_at_all
+
+    assert "this_attr_does_not_exist_at_all" in str(exc_info.value)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TEST 42 / 43 / 44 — _redact_for_error_message() branch coverage
+
+
+def test_redact_long_non_url_truncates() -> None:
+    """_redact_for_error_message() MUST truncate values longer than 32 chars.
+
+    Non-URL value longer than 32 chars -> first 32 chars + "...".
+    """
+    import atomic_agents.goal as _goal_mod
+
+    long_value = "a" * 40  # 40 chars, well over the 32-char threshold
+    result = _goal_mod._redact_for_error_message(long_value)
+    assert result == long_value[:32] + "..."
+
+
+def test_redact_short_non_url_passthrough() -> None:
+    """_redact_for_error_message() MUST pass through values <= 32 chars unchanged."""
+    import atomic_agents.goal as _goal_mod
+
+    short_value = "my-custom-backend"
+    assert len(short_value) <= 32
+    assert _goal_mod._redact_for_error_message(short_value) == short_value
+
+
+def test_redact_url_returns_scheme_placeholder() -> None:
+    """_redact_for_error_message() MUST redact URLs to scheme://... only."""
+    import atomic_agents.goal as _goal_mod
+
+    url = "postgres://user:secret@host:5432/db"
+    result = _goal_mod._redact_for_error_message(url)
+    assert result == "postgres://..."
+    assert "secret" not in result
+    assert "host" not in result
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TEST 45 — get_default_goal_backend() empty-string env var -> filesystem default
+
+
+def test_get_default_goal_backend_empty_env_var_returns_filesystem(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """get_default_goal_backend() MUST fall back to FilesystemGoalBackend for "".
+
+    Setting ATOMIC_AGENTS_GOAL_BACKEND="" (empty string) triggers the
+    `if not raw_backend_id` branch at __init__.py:250 and returns a
+    FilesystemGoalBackend — identical behaviour to leaving the var unset.
+    """
+    from atomic_agents.goal import get_default_goal_backend
+
+    monkeypatch.setenv("ATOMIC_AGENTS_GOAL_BACKEND", "")
+    backend = get_default_goal_backend(tmp_path / "agent")
+
+    assert isinstance(backend, FilesystemGoalBackend)
+    assert backend.backend_id == "filesystem"

@@ -205,3 +205,52 @@ def test_check_goal_backend_appears_in_run_doctor(
     results = run_doctor("agent", agents_root, skip_mcp=True)
     names = {r.name for r in results}
     assert "goal-backend" in names
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FAIL — lightweight list_archived() probe raises
+
+
+def test_fail_when_list_archived_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """check_goal_backend() FAILs when the lightweight list_archived() probe raises.
+
+    This exercises the dual-probe step-1 error branch (doctor.py:3743-3753).
+    The heavy load_goal() leg is NOT reached; this is a distinct FAIL path from
+    the corrupted-goal.md test.
+
+    Strategy: register a stub backend whose list_archived() always raises a
+    RuntimeError, set ATOMIC_AGENTS_GOAL_BACKEND to point at it, then confirm
+    the doctor renders FAIL with the error type in the message.
+    """
+    from atomic_agents.goal import (
+        register_goal_backend,
+        unregister_goal_backend,
+    )
+    from atomic_agents.goal.filesystem import FilesystemGoalBackend
+
+    agent_root = tmp_path / "agent"
+    agent_root.mkdir(parents=True, exist_ok=True)
+
+    class _BrokenListBackend(FilesystemGoalBackend):
+        @property
+        def backend_id(self) -> str:
+            return "broken-list"
+
+        def list_archived(self, agent_id: str) -> list:
+            raise RuntimeError("simulated list_archived failure")
+
+    register_goal_backend("broken-list", _BrokenListBackend)
+    try:
+        monkeypatch.setenv("ATOMIC_AGENTS_GOAL_BACKEND", "broken-list")
+
+        result = check_goal_backend(agent_root)
+
+        assert result.status == FAIL
+        assert "list_archived()" in result.message
+        assert "RuntimeError" in result.message
+        assert result.detail["error_type"] == "RuntimeError"
+        assert result.detail["backend_id"] == "broken-list"
+    finally:
+        unregister_goal_backend("broken-list")
