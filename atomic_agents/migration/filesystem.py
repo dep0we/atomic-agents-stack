@@ -361,6 +361,18 @@ class FilesystemMigrationBackend:
                         continue
                     tar.add(str(child), arcname=child.name, filter=self._tar_filter)
 
+            # Fail-close: verify the snapshot we just built is actually
+            # restorable BEFORE declaring success. A vault whose memory/wiki dir
+            # is a symlink with an absolute or escaping target captures an
+            # unrestorable link member — restore() would reject it. Catching it
+            # here aborts the migration pre-mutation (MUST 4: a snapshot MUST be
+            # a recoverable checkpoint; MUST 5 fail-close: no rollback path →
+            # refuse) instead of silently handing the operator a false safety
+            # net that only fails at rollback time. The unsafe tmp tar is
+            # removed by the except-block below.
+            with tarfile.open(str(tmp_path), "r:gz") as verify_tar:
+                self._validate_tar_members(verify_tar)
+
             # fsync the finished tarball + parent dir before the atomic rename
             # so the snapshot is durable on disk — matches MUST 3's atomic-write
             # discipline for unit writes (temp + fsync + rename + dir fsync).
@@ -424,9 +436,20 @@ class FilesystemMigrationBackend:
             with tarfile.open(str(snapshot_path), "r:gz") as tar:
                 self._validate_tar_members(tar)
 
-            # 2. Extract into staging area
+            # 2. Extract into staging area. The ``data`` filter raises
+            #    tarfile.FilterError subclasses (TarError, NOT AtomicAgentsError)
+            #    on any unsafe member that slipped past _validate_tar_members;
+            #    wrap so restore() honors its documented exception contract
+            #    (AtomicAgentsError / MigrationSnapshotNotFound only) instead of
+            #    leaking a raw traceback to programmatic callers.
             with tarfile.open(str(snapshot_path), "r:gz") as tar:
-                tar.extractall(path=str(tmp_dir), filter="data")
+                try:
+                    tar.extractall(path=str(tmp_dir), filter="data")
+                except tarfile.TarError as exc:
+                    raise AtomicAgentsError(
+                        f"Snapshot {ref.snapshot_id!r} could not be safely extracted "
+                        f"({type(exc).__name__}: {exc}). Refusing restore."
+                    ) from exc
 
             # 3. Verify staging has content
             if not any(tmp_dir.iterdir()):
@@ -1114,7 +1137,18 @@ class FilesystemMigrationBackend:
 
     @staticmethod
     def _validate_tar_members(tar: tarfile.TarFile) -> None:
-        """Refuse any snapshot with absolute paths or path-traversal sequences."""
+        """Refuse any snapshot with absolute paths, path traversal, or unsafe links.
+
+        Member *names* are checked for absolute paths / ``..`` traversal. Member
+        *linknames* (sym/hardlink targets) are checked too: a captured symlink
+        whose target is absolute or escapes the vault would be rejected by the
+        ``data`` extraction filter at restore time with a raw ``tarfile`` error,
+        leaving an unrestorable snapshot. Validating linknames here (a) keeps the
+        failure inside the ``AtomicAgentsError`` contract and (b) lets snapshot()
+        fail-close at creation time rather than at rollback time (MUST 4: a
+        snapshot MUST be a *recoverable* checkpoint). Supporting such vaults via
+        symlink dereference is tracked as a follow-up, not silently swallowed.
+        """
         for member in tar.getmembers():
             name = member.name
             if name.startswith("/") or name.startswith("\\"):
@@ -1125,6 +1159,20 @@ class FilesystemMigrationBackend:
                 raise AtomicAgentsError(
                     f"Unsafe snapshot: member {name!r} contains '..' path traversal. Refusing restore."
                 )
+            if member.issym() or member.islnk():
+                link = member.linkname
+                if link.startswith("/") or link.startswith("\\"):
+                    raise AtomicAgentsError(
+                        f"Unsafe snapshot: member {name!r} is a link to an absolute path "
+                        f"{link!r}. Refusing — dereference the symlink or store its target "
+                        "inside the vault so the snapshot is self-contained."
+                    )
+                if ".." in link.replace("\\", "/").split("/"):
+                    raise AtomicAgentsError(
+                        f"Unsafe snapshot: member {name!r} is a link escaping the vault "
+                        f"({link!r}). Refusing — dereference the symlink or store its target "
+                        "inside the vault so the snapshot is self-contained."
+                    )
 
 
 # ──────────────────────────────────────────────────────────────────

@@ -832,6 +832,66 @@ def test_restore_unknown_snapshot_id_raises(backend, vault):
         )
 
 
+def test_snapshot_refuses_escaping_symlink_vault(tmp_path, backend_factory):
+    """snapshot() fail-closes when a unit dir is a symlink with an escaping target.
+
+    A memory/wiki dir symlinked to an absolute path outside the vault would be
+    captured as a link member that restore()'s ``data`` filter rejects — an
+    unrestorable snapshot. snapshot() MUST detect this at creation time and
+    refuse (MUST 4: a snapshot MUST be a recoverable checkpoint; MUST 5
+    fail-close), aborting the migration BEFORE any mutation rather than handing
+    the operator a false safety net that only fails at rollback time. The
+    unsafe temp tarball must not be left behind.
+    """
+    import os
+
+    agents_root = tmp_path / "agents"
+    (agents_root / "alice").mkdir(parents=True)
+    external = tmp_path / "external_memory"
+    external.mkdir()
+    _make_note(external, "feedback_x.md", schema_version=1)
+    os.symlink(str(external), str(agents_root / "alice" / "memory"))
+
+    b = backend_factory(agents_root)
+    with pytest.raises(AtomicAgentsError, match=r"link to an absolute path"):
+        b.snapshot(2)
+
+    # No finished snapshot AND no orphan .tmp left behind on the fail-close path.
+    snaps_dir = agents_root / "_migrations" / "snapshots"
+    leftovers = list(snaps_dir.glob("*")) if snaps_dir.exists() else []
+    assert leftovers == [], f"fail-closed snapshot must leave no artifacts: {leftovers}"
+
+
+def test_restore_unsafe_symlink_snapshot_raises_atomic_error(tmp_path, backend_factory):
+    """restore() wraps an unsafe-member snapshot in AtomicAgentsError, not raw TarError.
+
+    Crafts a snapshot tarball containing an absolute-symlink member directly
+    (bypassing snapshot()'s own guard) and asserts restore() honors its
+    documented contract — AtomicAgentsError, never a leaked tarfile.* exception
+    — so the CLI's `--rollback` and any programmatic caller get a clean error.
+    """
+    import tarfile as _tarfile
+
+    agents_root = tmp_path / "agents"
+    memory = agents_root / "alice" / "memory"
+    memory.mkdir(parents=True)
+    _make_note(memory, "feedback_x.md", schema_version=1)
+
+    b = backend_factory(agents_root)
+    snaps_dir = agents_root / "_migrations" / "snapshots"
+    snaps_dir.mkdir(parents=True, exist_ok=True)
+    malicious = snaps_dir / "2026-01-01T000000_pre_v2_migration.tar.gz"
+    with _tarfile.open(str(malicious), "w:gz") as tar:
+        info = _tarfile.TarInfo(name="alice/memory")
+        info.type = _tarfile.SYMTYPE
+        info.linkname = "/etc/passwd"  # absolute, escaping
+        tar.addfile(info)
+
+    ref = MigrationSnapshotRef(backend_id=b.backend_id, snapshot_id=malicious.name)
+    with pytest.raises(AtomicAgentsError):
+        b.restore(ref)
+
+
 def test_snapshot_restore_fresh_backend_instance(backend_factory, vault):
     """snapshot_id from snapshot() accepted by restore() on a fresh backend instance."""
     b1 = backend_factory(vault)
