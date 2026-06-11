@@ -70,7 +70,7 @@ Anything stateful lives in the agent folder — primarily markdown + JSONL, with
 
 If a feature requires state that *only* exists in a backend, reconsider it. The portability win is load-bearing.
 
-**This rule flexes for backend-swapped deployments** (cloud/enterprise) — see `docs/TENSIONS.md` T15. The short version: "backends are never authoritative" holds for the default filesystem deployment and for *config* (persona/model/tools/goal) in every deployment; *state* run through a swapped backend (Postgres, native cloud store) is authoritative-in-that-deployment, with the canonical vault file *shape* preserved as a tested round-trip export contract (#379) rather than a guaranteed location. Portability is "the file shape is always reconstructable," not "the files are always the truth."
+**This rule flexes for backend-swapped deployments** (cloud/enterprise) — see `docs/TENSIONS.md` T15. The short version: "backends are never authoritative" holds for the default filesystem deployment and for *config* (persona/model/tools/goal) in every deployment; *state* run through a swapped backend (Postgres, native cloud store) is authoritative-in-that-deployment, with the canonical vault file *shape* preserved as a tested round-trip export contract (#379) rather than a guaranteed location. Portability is "the file shape is always reconstructable," not "the files are always the truth." (See TENSIONS.md T15 for the Position B ruling and `docs/spec/40-canonical-export.md` for the LOCKED implementation contract.)
 
 ### 2. Protocols, not subclassing
 
@@ -296,7 +296,7 @@ If the project ever needs to optimize differently, `docs/methodology.md` is the 
 |-----|---------|
 | `docs/architecture.md` | Mental model in diagrams. Read first. |
 | `docs/protocols-shipped.md` | Per-protocol summary of the twelve shipped backends — reference impls, capabilities, operator overrides, doctor checks, Implementer Contracts, and the cliff each closes. |
-| `docs/spec/01-...40-canonical-export.md` | Locked spec (39 docs today, 33 locked + 6 RFCs/DRAFTs at spec/26 (cascade bundle), spec/30 (responsibility audit), spec/35 (init wizard), spec/37 (serve), spec/39 (otel-export), and spec/40 (canonical-export)). The product. |
+| `docs/spec/01-...40-canonical-export.md` | Locked spec (39 docs today, 34 locked + 5 RFCs/DRAFTs at spec/26 (cascade bundle), spec/30 (responsibility audit), spec/35 (init wizard), spec/37 (serve), and spec/39 (otel-export)). The product. |
 | `docs/implementation/` | Build guides per runtime (cron, Claude skill, dashboard) |
 | `docs/deployment/versioning.md`, `upgrading.md` | SemVer + operator runbook |
 | `docs/deployment/release-runbook.md` | Maintainer `/ship` runbook: two-mode workflow + manual surface check |

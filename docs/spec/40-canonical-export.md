@@ -1,6 +1,6 @@
 # spec/40: Canonical-shape Export Contract (Exportable Protocol)
 
-> **Status:** DRAFT — PR 1 of 1 (issue #379). Conformance suite covers all MUSTs for the five PR1 state backends (Memory, Log, Mandate, Corpus, Lock) plus the SecretBackend never-leak invariant (MUST 9). See `tests/test_export_capability_advertisement.py` and `tests/test_export_protocol_conformance.py`.
+> **Status:** LOCKED (issue #379, 2026-06-10). Delivered in #379 PR 1: the `Exportable` companion Protocol + filesystem reference impls + a 91-test round-trip conformance suite covering all MUSTs for the five PR1 state backends (Memory, Log, Mandate, Corpus, Lock) plus the SecretBackend never-leak invariant (MUST 9). Locked on filesystem proof per the contract-first ruling; per-backend SQLite/Postgres/Redis/GCP/HTTP-registry export impls are later PRs that conform to this locked contract. See `tests/test_export_capability_advertisement.py` and `tests/test_export_protocol_conformance.py`.
 
 ---
 
