@@ -280,23 +280,6 @@ Meeting any one trigger is sufficient to justify the async-first rebuild. Until 
 
 ---
 
-### 🟢 T13. Schema migration runner is filesystem-only
-
-**One-sentence:** `migrate.py` walks `<agents_root>/_migrations/*.py` and applies them to filesystem files; doesn't know how to run a migration over a Postgres or SQLite backend.
-
-**Why load-bearing:** When MemoryBackend has a Postgres impl, schema migrations need to work on both paths. The current shape (each migration script implements `applies_to(path)` + `migrate(path)`) is path-shaped, not backend-shaped.
-
-**Where:** `atomic_agents/migrate.py` whole module (816 lines). Migration script protocol documented at top of file.
-
-**When this bites:** First non-filesystem backend that needs a schema bump. Which is "the second backend" — the moment Postgres ships, this is forced.
-
-**What to watch for:**
-- Whether the migration script protocol gets refactored to take a `backend` arg instead of a `path`. That's the right shape and it's a known problem to solve before backend #2.
-
-**Related:** spec/03-file-formats §"Schema migration", spec/20 (memory backend conformance).
-
----
-
 ### 🟢 T14. Markdown system prompt assembly is one giant joined string
 
 **One-sentence:** `assemble_system_prompt()` joins ~14 sections with `═══════════════════════════` separators into one string passed to the LLM.
@@ -347,7 +330,7 @@ The registered backend is the **store of record for its own data in that deploym
 - Marketing/positioning that claims "your agent is portable" before round-trip conformance exists to back it. Same discipline as T6 — don't claim the guarantee before the test enforces it.
 - A config field or state field landing on the wrong side of the config/state line (e.g., mutable runtime state baked into the image, or human-authored config shoved into Postgres). The line is: *who writes it, how often, and does concurrency matter.*
 
-**Related:** Principle #1 (CLAUDE.md), #379 (the export-contract deliverable), #382 (memory config→backend wiring seam — T5 promoted), #383 (protocol-coverage gap: goals/outcomes/journal/cascade), #339 (GCP blueprint), #344 (GCP delivery push), #340 (SecretBackend — first state-leaves-the-filesystem case), #258 (Postgres adapters), T5 (config→backend wiring seam), T13 (migration runner must also become backend-shaped, same root cause), the throughline.
+**Related:** Principle #1 (CLAUDE.md), #379 (the export-contract deliverable), #382 (memory config→backend wiring seam — T5 promoted), #383 (protocol-coverage gap: goals/outcomes/journal/cascade), #339 (GCP blueprint), #344 (GCP delivery push), #340 (SecretBackend — first state-leaves-the-filesystem case), #258 (Postgres adapters), T5 (config→backend wiring seam), T13 (migration runner — same root cause, **resolved** backend-shaped via #429/#446), the throughline.
 
 ---
 
@@ -357,7 +340,7 @@ The registered backend is the **store of record for its own data in that deploym
 
 | Date | Tension | How it resolved |
 |------|---------|------------------|
-| — | — | — |
+| 2026-06-11 | T13 | Migration runner refactored from path-shaped to **backend-shaped** (#429, PR #446). The old `applies_to(path)` / `migrate(path)` script protocol is removed; migration now runs through a dedicated `MigrationBackend` Protocol + per-unit `MigratableUnit` handle, with `FilesystemMigrationBackend` as the reference impl. A future Postgres/SQLite backend satisfies the same Protocol without forking the runner — the root cause T13 named is closed. spec/03 §Schema-migration re-LOCKED (8 MUSTs). See decision log below. |
 
 ---
 
@@ -369,6 +352,7 @@ The registered backend is the **store of record for its own data in that deploym
 | 2026-06-07 | T2 | Hybrid Option C — thread-pool adapter now, async-first rebuild deferred with named triggers | Issue #342 (thin HTTP wrapper). Decision rationale: ships org shape today without async refactor; keeps both home and org shapes first-class; written deferral with measurable triggers is the load-bearing deliverable. See T2 "Decision recorded" block above. |
 | 2026-06-09 | T15 | Position B — registered backend is store-of-record per deployment; canonical vault *shape* is a guaranteed export contract, not a guaranteed location | Authority model for cloud delivery (#339/#344). Explicitly amends Principle #1: "backends never authoritative" holds for the default/filesystem deployment and for config everywhere; backend-swapped state is authoritative-in-that-deployment with a tested round-trip export. Strengthened by the coming first-party home runtime + AWS/Azure adapters — the export contract is the cross-runtime, cross-cloud portability primitive; Position A would multiply file-sync cost per cloud. Implies a new export method + round-trip conformance across all 13 backends (#379). |
 | 2026-06-10 | T15 | spec/40 (`docs/spec/40-canonical-export.md`) delivered + **LOCKED** — the export-contract commitment in the Position B ruling is now a tested contract, not a promise | #379 PR 1 shipped the `Exportable` companion Protocol, `supports_canonical_export` capability field on all six PR1 state backends, filesystem identity export impls for Memory/Log/Mandate/Corpus/Lock/Secret, a 91-test round-trip conformance suite, and spec/40 (LOCKED on filesystem proof per the contract-first ruling). CLAUDE.md Principle #1 now carries the spec/40 pointer. Per-backend SQLite/Postgres/Redis/GCP/HTTP export impls are later PRs that conform to the locked contract. |
+| 2026-06-11 | T13 | **Resolved** — migration runner refactored path-shaped → backend-shaped: dedicated `MigrationBackend` Protocol + `MigratableUnit` handle + `FilesystemMigrationBackend` reference impl; clean break (BREAKING — old `applies_to(path)`/`migrate(path)` removed); read-only `read_schema_version()`; full `snapshot()`/`restore()` protocol methods + fail-close on no-rollback. | #429 (PR #446, merged). Same root cause as T15 — the last path-shaped storage primitive becomes backend-shaped so backend #2 (Postgres/SQLite) satisfies the migration contract without forking the runner. spec/03 §Schema-migration DRAFT→re-LOCK (full drift-gate, 8 MUSTs); `python -m atomic_agents.migrate` CLI entrypoint unchanged (subcommand promotion → #438; legacy v0→v1 → #439). Closes the T13 "must also become backend-shaped" cross-reference flagged in T15's Related list. |
 
 ---
 
