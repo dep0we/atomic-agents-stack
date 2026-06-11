@@ -717,8 +717,8 @@ public surface) is internal. Specifically:
   `backend.run_migration(target_version, dry_run)`. The old free functions
   (`run_migration()`, `build_migration_plan()`, `create_snapshot()`,
   `restore_snapshot()`) are **removed** (BREAKING — see `CHANGELOG.md`).
-  Drive migrations via the documented CLI or the backend API in
-  [`upgrading.md`](upgrading.md).
+  Drive migrations via the documented CLI (see
+  [`upgrading.md`](upgrading.md)) or the backend API shown above.
 - **`atomic_agents.dashboard`** — the renderer is reachable via
   `from atomic_agents.dashboard import render_all`, but the per-tab
   aggregator surface (`aggregate_costs`, `aggregate_activity`, etc.) is

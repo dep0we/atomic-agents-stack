@@ -243,11 +243,16 @@ class MigrationBackend(Protocol):
 
         1. Pre-flight: check ``supports_transactional_rollback`` — refuse
            if ``False`` and ``dry_run=False``.
-        2. Build plan: ``discover_scripts`` (the version chain).
+        2. Build plan: read the current schema version (a read-only vault
+           probe) + ``_discover_scripts`` (the version chain).
         3. Acquire a vault-level exclusive lock so concurrent runs are
            serialized.
-        4. Enumerate units (``enumerate_units``) AFTER the lock — never
-           enumerate before the lock that serializes concurrent mutators.
+        4. Authoritative enumeration (``enumerate_units``) AFTER the lock —
+           the apply-time unit set is read under the lock that serializes
+           concurrent mutators. (The read-only version probe in step 2 runs
+           before the lock; that is intentional so a lock-busy refusal still
+           records the resolved ``from_version`` rather than the ``-1``
+           sentinel — see ``run_migration`` in the filesystem realization.)
         5. Snapshot (real runs only): call ``snapshot()`` and emit the
            ref to STDOUT.
         6. Apply: iterate scripts × units; call ``apply_unit`` for

@@ -141,7 +141,10 @@ python -m atomic_agents.migrate --to vN
 ```
 
 The runner takes a gzipped snapshot of every affected file under
-`<vault>/_migrations/snapshots/<timestamp>.tar.gz` before any write.
+`<vault>/_migrations/snapshots/<timestamp>_pre_v<target>_migration.tar.gz`
+(e.g. `2026-08-12T143000_pre_v2_migration.tar.gz`) before any write. The
+snapshot ref is printed to STDOUT immediately after creation so you can read
+the rollback id.
 Post-write validation re-parses every changed file against the target
 schema; any failure rolls the whole batch back to the snapshot. The
 migration is therefore atomic from the operator's point of view: either

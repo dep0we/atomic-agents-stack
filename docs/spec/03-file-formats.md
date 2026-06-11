@@ -640,7 +640,7 @@ Snapshots are kept indefinitely (they're cheap — markdown compresses well). Pe
 
 When `<agents_root>` has multiple agents, the migration is atomic across all of them. Half-migrated state (Caldwell on v2, another agent on v1) is forbidden — the helper would refuse some writes and accept others, leading to inconsistency.
 
-The migration runner acquires a vault-level exclusive lock before enumeration and holds it through snapshot → apply → validate → unlock. A second concurrent migration attempt raises immediately ("Another migration is already running").
+The migration runner reads the current schema version to build the plan (a read-only vault probe), then acquires a vault-level exclusive lock before the authoritative apply-time enumeration, and holds it through snapshot → apply → validate → unlock. A second concurrent migration attempt raises immediately ("Another migration is already running") and records the resolved `from_version` (not the `-1` pre-plan sentinel — see MUST 8) because the plan is built before the lock is contended.
 
 ### Migration upgrade path (BREAKING — issue #429)
 

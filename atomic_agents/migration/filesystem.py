@@ -634,7 +634,12 @@ class FilesystemMigrationBackend:
             )
 
             try:
-                # ── 4. Enumerate units AFTER lock acquired ──────────────────
+                # ── 4. Authoritative enumeration AFTER lock acquired ────────
+                # The read-only version probe in step 2 (_build_plan ->
+                # read_schema_version) walks the vault BEFORE the lock so a
+                # lock-busy refusal can record the resolved from_version. THIS
+                # apply-time enumeration is the authoritative one and runs
+                # under the lock that serializes concurrent mutators.
                 units = self._iter_units(dry_run=dry_run)
 
                 # ── 5. Snapshot (real runs only) ────────────────────────────

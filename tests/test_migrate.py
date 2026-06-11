@@ -850,6 +850,21 @@ def test_filesystem_backend_fail_close_before_any_apply(tmp_path, backend_factor
 
     assert len(apply_called) == 0, "apply_unit must NOT be called when fail-close fires"
 
+    # MUST 8: the no-rollback fail-close real-run is an audited pre-plan exit.
+    # The refusal fires before the plan is built, so from_version is the -1
+    # sentinel and the refusal error is recorded. A future refactor that moved
+    # the fail-close raise outside the outer try (so the finally never runs)
+    # would silently drop this MUST-8 record — this assertion pins it.
+    log_path = agents_root / "_migrations" / "migration.jsonl"
+    assert log_path.exists(), (
+        "fail-close real-run must still emit a MigrationEvent (MUST 8)"
+    )
+    lines = log_path.read_text().strip().splitlines()
+    assert len(lines) == 1
+    event = json.loads(lines[0])
+    assert event["from_version"] == -1, "pre-plan fail-close → from_version sentinel -1"
+    assert event["error"], "fail-close audit line must record the refusal error"
+
 
 # ──────────────────────────────────────────────────────────────────
 # 24-30. run_migration integration
@@ -1157,6 +1172,49 @@ def test_run_migration_audit_survives_lock_release_failure(
     assert json.loads(lines[0])["to_version"] == 2
 
 
+def test_run_migration_lock_busy_records_resolved_from_version(
+    backend_factory, vault_with_v1_to_v2_script
+):
+    """A lock-busy refusal records the RESOLVED from_version, not the -1 sentinel.
+
+    spec/03 §Schema-migration MUST 8 (and its concurrency paragraph) carve
+    lock-busy out of the pre-plan sentinel set: the lock is acquired at step 3,
+    AFTER the plan is built at step 2, so a LockBusy refusal already knows the
+    resolved ``from_version``. This is the load-bearing reason the code does NOT
+    reorder lock-acquire before plan-build. The complementary pre-plan -1 case is
+    pinned by test_filesystem_backend_fail_close_before_any_apply; this test pins
+    the resolved-version case so a future refactor that moved lock acquisition
+    before plan-build would fail loudly instead of silently breaking the MUST.
+    """
+    import atomic_agents.locks as locks_mod
+
+    agents_root = vault_with_v1_to_v2_script
+    # Pre-acquire the migration lock so the run's own acquire() raises LockBusy.
+    holder = locks_mod.FilesystemLockBackend(agents_root)
+    held = holder.acquire("migration", timeout=0)
+    try:
+        b = backend_factory(agents_root)
+        with pytest.raises(
+            AtomicAgentsError, match="Another migration is already running"
+        ):
+            b.run_migration(target_version=2, dry_run=False)
+    finally:
+        holder.release(held)
+
+    log_path = agents_root / "_migrations" / "migration.jsonl"
+    assert log_path.exists(), (
+        "lock-busy refusal must still emit a MigrationEvent (MUST 8)"
+    )
+    lines = log_path.read_text().strip().splitlines()
+    assert len(lines) == 1
+    event = json.loads(lines[0])
+    assert event["from_version"] == 1, (
+        "lock-busy fires AFTER the plan is built → resolved from_version, NOT the -1 sentinel"
+    )
+    assert event["to_version"] == 2
+    assert event["error"], "lock-busy audit line must record the refusal error"
+
+
 def test_run_migration_midapply_exception_then_rollback_failure_audit(
     tmp_path, backend_factory, monkeypatch
 ):
@@ -1282,6 +1340,68 @@ def test_cmd_rollback_failure_writes_audit_line(
     event = json.loads(lines_after[-1])
     assert event["rolled_back"] is False
     assert "simulated restore failure" in event["error"]
+
+
+def test_restore_and_audit_pre_read_failure_still_restores(
+    vault_with_v1_to_v2_script, monkeypatch
+):
+    """A flaky PRE-restore read must NOT abort the operator-facing rollback.
+
+    MUST 8 / Principle #8 (defensive symmetry): restore_and_audit() reads the
+    schema version BEFORE the restore to record from_version. That read is a
+    full vault walk and can raise on a transient FS error — but the rollback is
+    the destructive recovery the operator most needs to succeed. The pre-restore
+    read must degrade from_version to the -1 sentinel and proceed, symmetric to
+    the post-restore guard. Sibling of
+    test_restore_and_audit_success_post_read_failure_still_audits, which pins the
+    SECOND (post-restore) read; this one pins the FIRST (pre-restore) read.
+    """
+    b = FilesystemMigrationBackend(vault_with_v1_to_v2_script)
+    ref = b.snapshot(2)
+
+    note_path = vault_with_v1_to_v2_script / "alice" / "memory" / "feedback_note_1.md"
+    original = note_path.read_text()
+
+    log_path = vault_with_v1_to_v2_script / "_migrations" / "migration.jsonl"
+    lines_before = (
+        len(log_path.read_text().strip().splitlines()) if log_path.exists() else 0
+    )
+
+    # Mutate the vault so a successful restore is observable.
+    note_path.write_text("CORRUPTED")
+
+    # First read_schema_version() (pre-restore from_version) raises; the second
+    # (post-restore to_version) succeeds.
+    real_read = b.read_schema_version
+    calls = {"n": 0}
+
+    def flaky_read():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("simulated pre-restore read failure")
+        return real_read()
+
+    monkeypatch.setattr(b, "read_schema_version", flaky_read)
+
+    # Must NOT raise — the pre-restore read failure degrades to the sentinel and
+    # the restore proceeds.
+    b.restore_and_audit(ref)
+
+    # The destructive restore actually happened.
+    assert note_path.read_text() == original, (
+        "A flaky pre-restore read must not abort the rollback"
+    )
+
+    lines_after = log_path.read_text().strip().splitlines()
+    assert len(lines_after) == lines_before + 1, (
+        "A successful restore must always produce exactly one audit line, "
+        "even when the pre-restore version read fails"
+    )
+    event = json.loads(lines_after[-1])
+    assert event["rolled_back"] is True
+    assert event["from_version"] == -1, (
+        "Pre-restore read failure must degrade from_version to the -1 sentinel"
+    )
 
 
 def test_restore_and_audit_success_post_read_failure_still_audits(
