@@ -255,6 +255,7 @@ def run_doctor(
     results.append(check_corpus_backend(agent_root))
     results.append(check_mcp_server_registry_backend(agent_root))
     results.append(check_secret_backend())
+    results.append(check_goal_backend(agent_root))
     # memory-backend-config (coherence) runs before memory-backend (liveness),
     # mirroring the check_lock_backend → check_locks ordering (#60 PR 3).
     results.append(check_memory_backend_config(agent_root))
@@ -3674,6 +3675,137 @@ def render_json(results: list[CheckResult]) -> str:
         },
     }
     return json.dumps(payload, indent=2, default=str) + "\n"
+
+
+def check_goal_backend(agent_root: Path) -> CheckResult:
+    """GoalBackend resolves and the configured backend instantiates cleanly.
+
+    Validates that ATOMIC_AGENTS_GOAL_BACKEND is correctly configured.
+    Scoped at agent_root because the goal backend is per-agent — goal.md lives
+    directly under agent_root.
+
+    Doctor dual-probe pattern (MEMORY.md feedback_doctor_dual_probe_pattern):
+    Probes BOTH:
+    1. list_archived() — lightweight list operation
+    2. load_goal() — heavy deserialize+validate path (when goal.md is present)
+
+    When goal.md is absent (reactive agent with no goal), returns PASS with a
+    note ('goal_md_present': False). A missing goal.md is NOT a failure condition
+    — matching check_corpus_backend's pattern for agents without a corpus.
+
+    PASS / FAIL ladder (this check has no WARN path):
+    FAIL when:
+    * get_default_goal_backend(agent_root) raises (bad env var or not registered).
+    * list_archived() raises.
+    * goal.md is present AND load_goal() raises (corrupted goal.md).
+
+    PASS otherwise (including when goal.md is absent).
+    """
+    from .goal import (  # noqa: PLC0415
+        get_default_goal_backend,
+        list_goal_backends,
+        _redact_for_error_message,
+    )
+    from .exceptions import GoalCorrupted, SchemaValidationError  # noqa: PLC0415
+
+    raw_backend_id = (
+        os.environ.get("ATOMIC_AGENTS_GOAL_BACKEND", "").strip().lower() or "filesystem"
+    )
+    # Credential safety: ATOMIC_AGENTS_GOAL_BACKEND is a single env var that may
+    # carry a URL-shaped value (postgres://user:pass@host/db). Redact before it
+    # reaches the rendered CheckResult message or detail — the factory redacts in
+    # its own error, but the doctor recomputes raw_backend_id from os.environ and
+    # must redact independently (MEMORY.md feedback_codeql_constant_name_false_positives).
+    safe_backend_id = _redact_for_error_message(raw_backend_id)
+
+    try:
+        backend = get_default_goal_backend(agent_root)
+    except Exception as e:
+        # Build the known-id list from the registry so the hint stays accurate
+        # as operators register additional backends (matches the dynamic id list
+        # get_default_goal_backend's own error reports).
+        return CheckResult(
+            name="goal-backend",
+            status=FAIL,
+            message=(
+                f"failed to instantiate goal backend "
+                f"(ATOMIC_AGENTS_GOAL_BACKEND={safe_backend_id!r}): {e}"
+            ),
+            fix_hint=(
+                "Unset ATOMIC_AGENTS_GOAL_BACKEND to use the filesystem default, "
+                f"or set it to a registered backend id (known: {list_goal_backends()}). "
+            ),
+            detail={"backend_id": safe_backend_id, "error": str(e)},
+        )
+
+    # Dual-probe step 1: lightweight list
+    try:
+        archived = backend.list_archived(agent_root.name)
+    except Exception as e:
+        return CheckResult(
+            name="goal-backend",
+            status=FAIL,
+            message=f"goal backend list_archived() raised: {type(e).__name__}: {e}",
+            detail={
+                "backend_id": backend.backend_id,
+                "error": str(e),
+                "error_type": type(e).__name__,
+            },
+        )
+
+    # Dual-probe step 2: heavy load (only when goal.md is present)
+    goal_md_present = (agent_root / "goal.md").is_file()
+    if goal_md_present:
+        try:
+            backend.load_goal(agent_root.name)
+        except (GoalCorrupted, SchemaValidationError) as e:
+            return CheckResult(
+                name="goal-backend",
+                status=FAIL,
+                message=f"goal.md present but load_goal() failed: {e}",
+                fix_hint=(
+                    "Inspect goal.md with 'python -m atomic_agents.goal "
+                    "--agents-root <agents_root> status <agent>' to identify the "
+                    "corruption (--agents-root precedes the subcommand; it defaults "
+                    "to the platform agents root if omitted). The file may have a "
+                    "schema_version mismatch or missing required frontmatter fields."
+                ),
+                detail={
+                    "backend_id": backend.backend_id,
+                    "goal_md_present": True,
+                    "error": str(e),
+                },
+            )
+        except Exception as e:
+            return CheckResult(
+                name="goal-backend",
+                status=FAIL,
+                message=f"goal backend load_goal() raised unexpected error: {type(e).__name__}: {e}",
+                detail={
+                    "backend_id": backend.backend_id,
+                    "goal_md_present": True,
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                },
+            )
+
+    caps = backend.capabilities()
+    return CheckResult(
+        name="goal-backend",
+        status=PASS,
+        message=(
+            f"goal backend '{backend.backend_id}' ready"
+            + (" (no goal.md for this agent)" if not goal_md_present else "")
+        ),
+        detail={
+            "backend_id": backend.backend_id,
+            "goal_md_present": goal_md_present,
+            "archived_count": len(archived),
+            "supports_canonical_export": caps.supports_canonical_export,
+            "supports_archive": caps.supports_archive,
+            "supports_history_query": caps.supports_history_query,
+        },
+    )
 
 
 def _summarise(results: list[CheckResult]) -> str:

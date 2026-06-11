@@ -178,7 +178,6 @@ def export_log(
         LogExport with all matching records and their exact on-disk raw bytes.
     """
     import json as _json
-    import re as _re
 
     from ..logs.filesystem import _MONTH_DIR_RE, _DAY_FILE_RE, _month_overlaps_window
     from ..logs.types import LogQuery

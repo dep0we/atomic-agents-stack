@@ -25,6 +25,7 @@ from .types import (
     CorpusExport,
     CorpusExportQuery,
     ExportableResult,
+    GoalExport,
     LockExport,
     LockExportQuery,
     LogExport,
@@ -54,4 +55,5 @@ __all__ = [
     "SecretExport",
     "SecretExportQuery",
     "SecretExportRef",
+    "GoalExport",
 ]
