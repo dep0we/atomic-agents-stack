@@ -304,7 +304,7 @@ Same pattern for OpenAI (`atomic-agents-openai`) and Moonshot (`atomic-agents-mo
 ## Repository structure
 
 - `atomic_agents/` — the Python package (runtime in `agent.py`; backend protocols in `memory/`, `_llm.py`, `_locks.py`, `_costs.py`, etc.; CLI in `cli.py`; preflight in `doctor.py`)
-- `tests/` 4,055+ tests collected, Python 3.11 + 3.12 matrix
+- `tests/` 4,075+ tests collected, Python 3.11 + 3.12 matrix
 - `docs/`: [spec entry point](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/README.md), [`architecture.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/architecture.md), [`spec/`](https://github.com/dep0we/atomic-agents-stack/tree/main/docs/spec/) (34 locked docs + 6 DRAFTs/RFCs), [`deployment/`](https://github.com/dep0we/atomic-agents-stack/tree/main/docs/deployment/) (9 operator runbooks), [`samples/caldwell/`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/samples/caldwell/) (complete worked example), [`GOVERNANCE.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/GOVERNANCE.md), [`TENSIONS.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/TENSIONS.md), [`methodology.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/methodology.md)
 - `extras/` — operational templates (Claude Code skill wrappers, macOS LaunchAgent plists, cron examples, GCP Cloud Run + IAP reference deployment)
 

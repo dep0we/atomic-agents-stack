@@ -356,7 +356,7 @@ The first agent-scope surface of the #383 four-protocol wave (goals, outcomes, j
 
 `GoalManager` was relocated to `_goal_impl.py`. The documented public `from atomic_agents.goal import GoalManager` path is preserved as a **supported, non-deprecated** compatibility re-export (no `DeprecationWarning` — intentionally permanent, matching Principle #14).
 
-**Operator override surface:** `ATOMIC_AGENTS_GOAL_BACKEND` env var (default `"filesystem"`) + `get_default_goal_backend(scope)` factory. The `AtomicAgent(goal_backend=...)` constructor kwarg and `self.goal_backend` attribute are deferred to the runtime-wiring follow-up ([#448](https://github.com/dep0we/atomic-agents-stack/issues/448)).
+**Operator override surface:** `ATOMIC_AGENTS_GOAL_BACKEND` env var (default `"filesystem"`) + `get_default_goal_backend(agent_root)` factory. The `AtomicAgent(goal_backend=...)` constructor kwarg and `self.goal_backend` attribute are deferred to the runtime-wiring follow-up ([#448](https://github.com/dep0we/atomic-agents-stack/issues/448)).
 
 `doctor.check_goal_backend()` uses the dual-probe pattern (`list_archived` liveness + `load_goal` load probe) per `feedback_doctor_dual_probe_pattern`. Located in `atomic_agents/doctor.py`.
 
