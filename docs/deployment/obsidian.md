@@ -238,7 +238,7 @@ specific named subdirectories (`memory/`, `wiki/`, `journal/`,
 - `atomic_agents/agent.py:_load_recent_journal()` uses
   `journal_dir.rglob("*.md")` but `journal_dir` is the agent's
   `journal/` subdirectory; the walker can't escape it.
-- `atomic_agents/migrate.py:find_content_files()` uses `rglob` from
+- `atomic_agents/migration/filesystem.py:_iter_units()` uses `rglob` from
   `agents_root` but applies a `_is_excluded(path)` filter that skips
   any path with a component starting with `.` (dotdir filter) or
   matching `EXCLUDED_DIRS = {"_dashboard", "_migrations", "_cache",

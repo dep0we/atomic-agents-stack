@@ -710,12 +710,15 @@ public surface) is internal. Specifically:
   not yet in `__all__`. Treat them as internal for now; the
   [`doctor` spec doc](../spec/27-doctor.md) will lock the surface when
   it is.
-- **`atomic_agents.migrate`** — `vault_status()`, `build_migration_plan()`,
-  `run_migration()`, `create_snapshot()`, `restore_snapshot()` are
-  intended to become public once the in-package migration runner
-  (#67-adjacent work) replaces the current "copy scripts into
-  `<vault>/_migrations/`" interface. Until then, drive migrations via
-  the documented CLI invocation in [`upgrading.md`](upgrading.md).
+- **`atomic_agents.migration`** — `FilesystemMigrationBackend`,
+  `MigrationBackend` Protocol, `MigratableUnit`, and `MigrationSnapshotRef`
+  are the public API (issue #429, T13 refactor). Construct a
+  `FilesystemMigrationBackend(agents_root)` and call
+  `backend.run_migration(target_version, dry_run)`. The old free functions
+  (`run_migration()`, `build_migration_plan()`, `create_snapshot()`,
+  `restore_snapshot()`) are **removed** (BREAKING — see `CHANGELOG.md`).
+  Drive migrations via the documented CLI (see
+  [`upgrading.md`](upgrading.md)) or the backend API shown above.
 - **`atomic_agents.dashboard`** — the renderer is reachable via
   `from atomic_agents.dashboard import render_all`, but the per-tab
   aggregator surface (`aggregate_costs`, `aggregate_activity`, etc.) is

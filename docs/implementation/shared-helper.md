@@ -794,7 +794,7 @@ class AtomicAgent:
     SPEC_VERSION = 1
 ```
 
-When the spec bumps (frontmatter schema changes, new required fields, etc.), the helper bumps too. Old agent vaults with `schema_version: 0` get migrated by a `migrate_v0_to_v1.py` script before the new helper can run them.
+When the spec bumps (frontmatter schema changes, new required fields, etc.), the helper bumps too. Old agent vaults with `schema_version: 0` will be migrated by a `v0_to_v1.py` script (the script-discovery convention is `v<N>_to_v<N+1>.py`) — planned, not yet implemented: a true v0→v1 pass requires treating a missing `schema_version` as `0`, which is deferred to issue #439 and out of scope for the #429 backend refactor.
 
 ---
 
