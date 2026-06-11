@@ -52,6 +52,7 @@ from ..exceptions import BackendNotRegistered
 from .backend import GoalBackend
 from .filesystem import FilesystemGoalBackend
 from .types import (
+    SUB_GOAL_TRANSITION_FIELDS,
     CompletionEvaluation,
     Goal,
     GoalCapabilities,
@@ -134,6 +135,7 @@ __all__ = [
     "CompletionEvaluation",
     "GoalCapabilities",
     "GoalExport",
+    "SUB_GOAL_TRANSITION_FIELDS",
     # Serialization helpers
     "build_goal_frontmatter",
     "serialize_sub_goal",

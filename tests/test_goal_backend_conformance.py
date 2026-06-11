@@ -642,6 +642,51 @@ def test_apply_transition_fields_status_cannot_bypass_enum_gate(
     assert reloaded_sg1.status == "in_progress"
 
 
+def test_apply_transition_fields_cannot_rewrite_identity(
+    backend_with_goal, agent_root_with_goal: Path
+) -> None:
+    """apply_transition() MUST NOT let fields={'id'|'label': ...} rewrite identity.
+
+    The `fields` channel carries transition metadata only (spec/41); it may set
+    SUB_GOAL_TRANSITION_FIELDS but never the immutable identity fields `id`/
+    `label`. A caller passing them must be ignored (fail closed) so a transition
+    cannot silently rename or re-key a sub-goal mid-flight. A legitimate
+    transition field (`output`) in the same call MUST still be applied — proving
+    the guard discriminates rather than dropping the whole channel.
+    """
+    from datetime import datetime
+
+    backend = backend_with_goal
+    ts = datetime.now().astimezone().isoformat()
+
+    goal = backend.apply_transition(
+        agent_id="agent",
+        sub_goal_id="sg1",
+        to_status="complete",
+        fields={
+            "id": "hijacked",  # identity — must be ignored
+            "label": "renamed",  # identity — must be ignored
+            "output": "artifacts/result.md",  # legit transition field — must apply
+        },
+        history_prose="sg1 → complete",
+        history_event={"ts": ts, "event": "identity_guard_test", "sub_goal_id": "sg1"},
+    )
+
+    sg1 = next(s for s in goal.sub_goals if s.id == "sg1")
+    assert sg1.id == "sg1", "id must not be rewritten via the fields channel"
+    assert sg1.label != "renamed", "label must not be rewritten via the fields channel"
+    assert sg1.output == "artifacts/result.md", (
+        "legit transition field must still apply"
+    )
+
+    # No phantom sub-goal under the hijacked id, and the change is durable.
+    assert not any(s.id == "hijacked" for s in goal.sub_goals)
+    reloaded = backend.load_goal("agent")
+    reloaded_sg1 = next(s for s in reloaded.sub_goals if s.id == "sg1")
+    assert reloaded_sg1.id == "sg1"
+    assert reloaded_sg1.output == "artifacts/result.md"
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # MUST 21 — apply_transition() ts-first key order in JSONL
 

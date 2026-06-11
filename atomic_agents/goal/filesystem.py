@@ -57,6 +57,7 @@ import frontmatter
 from .._io import atomic_write, atomic_append_jsonl
 from ..exceptions import AtomicAgentsError, GoalCorrupted, SchemaValidationError
 from .types import (
+    SUB_GOAL_TRANSITION_FIELDS,
     VALID_SUB_GOAL_STATUSES,
     Goal,
     GoalCapabilities,
@@ -327,15 +328,17 @@ class FilesystemGoalBackend:
                     f"sub_goal not found: {sub_goal_id!r} in {self._goal_path}"
                 )
             sg.status = to_status
-            # `to_status` is the authoritative status channel and was already
-            # enum-validated above. Never let the free-field `fields` channel
-            # overwrite sg.status — a fields={"status": <invalid>} would reopen
-            # the exact write-time/read-time validation asymmetry the to_status
-            # guard closes (it would persist a goal.md load_goal() rejects).
+            # The `fields` channel may ONLY set transition metadata
+            # (SUB_GOAL_TRANSITION_FIELDS) — never identity (`id`/`label`) and
+            # never `status`. `to_status` is the authoritative, already
+            # enum-validated status channel; letting `fields` set `status` would
+            # reopen the write-time/read-time validation asymmetry the to_status
+            # guard closes (persisting a goal.md load_goal() rejects). Letting it
+            # set `id`/`label` would silently rewrite sub-goal identity
+            # mid-transition. Explicit allow-set fails closed: any field not named
+            # (incl. a future SubGoal field) is ignored, not blindly setattr'd.
             for k, v in fields.items():
-                if k == "status":
-                    continue
-                if hasattr(sg, k):
+                if k in SUB_GOAL_TRANSITION_FIELDS:
                     setattr(sg, k, v)
 
             # Append prose to goal body

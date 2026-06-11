@@ -37,6 +37,24 @@ VALID_SUB_GOAL_STATUSES = {"pending", "in_progress", "complete", "blocked", "aba
 VALID_PRIORITIES = {"high", "medium", "low"}
 VALID_AGENT_MODES = {"reactive", "goal-driven", "hybrid"}
 
+# The SubGoal fields the apply_transition() `fields` channel is permitted to set.
+# Explicit ALLOW-set (fails closed): `id`/`label` are immutable identity and
+# `status` is the authoritative `to_status` channel — none may be rewritten via
+# `fields`, and any field NOT named here (incl. a future SubGoal field) is
+# ignored rather than silently mutating identity. spec/41: apply_transition's
+# `fields` channel carries transition metadata only, never identity.
+SUB_GOAL_TRANSITION_FIELDS = frozenset(
+    {
+        "assigned",
+        "deadline",
+        "blocked_by",
+        "completed",
+        "output",
+        "body",
+        "acceptance_criteria",
+    }
+)
+
 
 # ──────────────────────────────────────────────────────────────────
 # Mutable state-machine types (diverge from frozen-DTO convention)
@@ -263,6 +281,13 @@ def validate_goal(goal_dict: dict[str, Any]) -> None:
     reference — is rejected identically on both paths. A second, weaker copy is
     exactly the cross-path divergence Principle #2 (single source of validation)
     and Principle #5 (a corrupt dependency graph must not load silently) forbid.
+
+    Known constraint (forward-only blocked_by, behavior-preserved from the legacy
+    goal.py validator): the referential check runs in list order against ids seen
+    so far, so a sub_goal may only be blocked_by an EARLIER-listed sub_goal; a
+    forward reference (blocked_by an id defined later in the list) is rejected
+    even though the target exists. This is intentional parity with prior behavior,
+    not full referential integrity — see #449 for the two-pass-validation question.
     """
     for field_name in (
         "schema_version",
