@@ -210,7 +210,7 @@ uv run pytest                            # full suite
 uv run pytest tests/test_<module>.py -v  # one module
 ```
 
-Run `uv run pytest --collect-only -q | tail -1` for the live test count (last refresh: 3,981 tests collected, 2026-06-10). New backend protocols add ~25 conformance + ~10 impl-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol — the conformance suite is what keeps the protocol honest.
+Run `uv run pytest --collect-only -q | tail -1` for the live test count (last refresh: 3,984 tests collected, 2026-06-10). New backend protocols add ~25 conformance + ~10 impl-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol — the conformance suite is what keeps the protocol honest.
 
 ### Releases + SemVer
 
@@ -345,7 +345,7 @@ These are not forbidden forever — they're explicitly deferred with rationale. 
 
 ## Status
 
-**v1.0.0, stable, PUBLIC.** Core runtime stable. Test suite: run `uv run pytest --collect-only -q | tail -1` for the live count (last refresh: 3,981 tests collected, 2026-06-10). Full CI runs against `uv sync --extra dev --extra openai --extra validation --extra redis`. **Twelve backend protocols locked at v1.0; SecretBackend (#340), the thirteenth, shipped for v1.5 (both PRs merged, spec/38 LOCKED, Filesystem + GCP Secret Manager reference impls)** — see `docs/protocols-shipped.md` for the per-protocol summary (reference impls, capabilities, operator overrides, doctor checks, Implementer Contracts, and what cliff each closes):
+**v1.0.0, stable, PUBLIC.** Core runtime stable. Test suite: run `uv run pytest --collect-only -q | tail -1` for the live count (last refresh: 3,984 tests collected, 2026-06-10). Full CI runs against `uv sync --extra dev --extra openai --extra validation --extra redis`. **Twelve backend protocols locked at v1.0; SecretBackend (#340), the thirteenth, shipped for v1.5 (both PRs merged, spec/38 LOCKED, Filesystem + GCP Secret Manager reference impls)** — see `docs/protocols-shipped.md` for the per-protocol summary (reference impls, capabilities, operator overrides, doctor checks, Implementer Contracts, and what cliff each closes):
 
 | # | Protocol | Issue / Lock | Reference impls |
 |---|----------|--------------|-----------------|

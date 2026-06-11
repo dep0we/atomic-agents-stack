@@ -54,6 +54,7 @@ Public surface::
         MigrationSnapshotNotFound,
         # Helpers
         parse_target_version,
+        # Script type
         LoadedScript,
     )
 

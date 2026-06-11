@@ -1060,22 +1060,7 @@ class FilesystemMigrationBackend:
         log_path = self._agents_root / "_migrations" / "migration.jsonl"
         try:
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            atomic_append_jsonl(
-                log_path,
-                json.dumps(
-                    {
-                        "run_id": event.run_id,
-                        "timestamp": event.timestamp,
-                        "agents_root": event.agents_root,
-                        "from_version": event.from_version,
-                        "to_version": event.to_version,
-                        "units_touched": event.units_touched,
-                        "dry_run": event.dry_run,
-                        "rolled_back": event.rolled_back,
-                        "error": event.error,
-                    }
-                ),
-            )
+            atomic_append_jsonl(log_path, json.dumps(event.to_dict()))
         except Exception as exc:
             _logger.warning("Could not write migration audit log: %s", exc)
 

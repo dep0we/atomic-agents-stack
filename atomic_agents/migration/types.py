@@ -23,7 +23,7 @@ parse or construct it; pass it back unchanged to ``restore()``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Literal
 
 
@@ -217,3 +217,12 @@ class MigrationEvent:
     dry_run: bool
     rolled_back: bool
     error: str  # empty string on success
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to the JSONL audit shape.
+
+        Single source of truth for the ``migration.jsonl`` line — derived from
+        the dataclass fields so adding a field here cannot silently drift from
+        what the runner writes (matches LogBackend's ``record.to_dict()``).
+        """
+        return asdict(self)

@@ -572,6 +572,66 @@ def test_apply_unit_missing_version_bump_raises(tmp_path, backend_factory):
         b.apply_unit(units[0], scripts[0], dry_run=False)
 
 
+def test_apply_unit_applies_to_exception_wrapped(tmp_path, backend_factory):
+    """An exception inside an operator script's applies_to() is wrapped.
+
+    A buggy operator migration script raising mid-body is the single most
+    likely real-world failure mode. apply_unit MUST wrap it in
+    AtomicAgentsError naming the script + unit (so the runner's rollback gets
+    a diagnostic, not an opaque traceback) and chain the original via __cause__.
+    """
+    agents_root = tmp_path / "agents"
+    memory = agents_root / "alice" / "memory"
+    memory.mkdir(parents=True)
+    _make_note(memory, "feedback_x.md", schema_version=1)
+    migrations = agents_root / "_migrations"
+    migrations.mkdir()
+    (migrations / "v1_to_v2.py").write_text(
+        "FROM_VERSION = 1\n"
+        "TO_VERSION = 2\n"
+        "def applies_to(unit):\n"
+        "    raise ValueError('boom in applies_to')\n"
+        "def migrate(unit):\n"
+        "    return {'unit_id': unit.unit_id}\n"
+    )
+    b = backend_factory(agents_root)
+    units = b.enumerate_units()
+    scripts = b._discover_scripts()
+    with pytest.raises(AtomicAgentsError, match=r"applies_to.*raised") as ei:
+        b.apply_unit(units[0], scripts[0], dry_run=False)
+    assert isinstance(ei.value.__cause__, ValueError)
+    assert "boom in applies_to" in str(ei.value)
+
+
+def test_apply_unit_migrate_exception_wrapped(tmp_path, backend_factory):
+    """An exception inside an operator script's migrate() is wrapped.
+
+    Same contract as applies_to() but for the mutation phase: AtomicAgentsError
+    naming the script + unit, original exception chained via __cause__.
+    """
+    agents_root = tmp_path / "agents"
+    memory = agents_root / "alice" / "memory"
+    memory.mkdir(parents=True)
+    _make_note(memory, "feedback_x.md", schema_version=1)
+    migrations = agents_root / "_migrations"
+    migrations.mkdir()
+    (migrations / "v1_to_v2.py").write_text(
+        "FROM_VERSION = 1\n"
+        "TO_VERSION = 2\n"
+        "def applies_to(unit):\n"
+        "    return True\n"
+        "def migrate(unit):\n"
+        "    raise RuntimeError('boom in migrate')\n"
+    )
+    b = backend_factory(agents_root)
+    units = b.enumerate_units()
+    scripts = b._discover_scripts()
+    with pytest.raises(AtomicAgentsError, match=r"migrate.*raised") as ei:
+        b.apply_unit(units[0], scripts[0], dry_run=False)
+    assert isinstance(ei.value.__cause__, RuntimeError)
+    assert "boom in migrate" in str(ei.value)
+
+
 def _vault_with_empty_dict_migrate(tmp_path, backend_factory):
     """Vault whose script: applies_to->True but migrate->{} (empty dict)."""
     agents_root = tmp_path / "agents"
@@ -1190,7 +1250,13 @@ def test_run_migration_lock_busy_records_resolved_from_version(
 
     agents_root = vault_with_v1_to_v2_script
     # Pre-acquire the migration lock so the run's own acquire() raises LockBusy.
+    # NOTE: this depends on POSIX flock conflicting across two distinct open file
+    # descriptions WITHIN one process — `holder` and the run's own
+    # FilesystemLockBackend are separate instances, so the backend's per-instance
+    # `_held` reentrancy guard does NOT participate; the conflict is the platform
+    # flock contract (see locks/filesystem.py header). Holds on Linux + macOS.
     holder = locks_mod.FilesystemLockBackend(agents_root)
+    assert holder is not None
     held = holder.acquire("migration", timeout=0)
     try:
         b = backend_factory(agents_root)
@@ -1901,3 +1967,36 @@ def test_find_content_files_walks_cascaded_agents(tmp_path, backend_factory):
     assert any("feedback_cascade.md" in uid for uid in ids)
     assert any("overview.md" in uid for uid in ids)
     assert len(units) == 3
+
+
+# ──────────────────────────────────────────────────────────────────
+# CLI entrypoint (python -m atomic_agents.migrate) — dispatch smoke
+
+
+def test_cli_main_dispatch_status_list_and_help(vault, capsys):
+    """`main()` dispatches read commands through a freshly constructed backend.
+
+    This is the end-to-end check for the T13 refactor's headline claim — the
+    `python -m atomic_agents.migrate` CLI is unchanged while its internals now
+    construct a FilesystemMigrationBackend. Exercises argparse dispatch +
+    backend construction + _cmd_status / _cmd_list_snapshots / print-help exit
+    codes (the operator entrypoint that had no behavioral test before).
+    """
+    from atomic_agents.migrate import main
+
+    # --status: builds the backend, prints vault status, exits 0.
+    rc = main(["--agents-root", str(vault), "--status"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Current schema version:" in out
+    assert "Migration scripts:" in out
+
+    # --list-snapshots on a fresh vault: no snapshots, exits 0.
+    rc = main(["--agents-root", str(vault), "--list-snapshots"])
+    assert rc == 0
+    assert "No snapshots." in capsys.readouterr().out
+
+    # No action flag: print help and exit 1 (operator gets usage, not a crash).
+    rc = main(["--agents-root", str(vault)])
+    assert rc == 1
+    assert "usage" in capsys.readouterr().out.lower()
