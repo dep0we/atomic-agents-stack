@@ -103,6 +103,7 @@ def __getattr__(name: str):
     """
     _GOAL_IMPL_NAMES = {
         "GoalManager",
+        "main",
         "validate_goal",
         "validate_agent_mode",
         "parse_agent_mode",
@@ -144,6 +145,7 @@ __all__ = [
     "FilesystemGoalBackend",
     # Lazy re-exports (resolved via __getattr__)
     "GoalManager",
+    "main",
     "validate_goal",
     "validate_agent_mode",
     "parse_agent_mode",

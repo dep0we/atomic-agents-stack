@@ -1,6 +1,6 @@
 """Conformance tests for GoalBackend Protocol (spec/41).
 
-50 test cases covering the GoalBackend Implementer Contract (the protocol-
+53 test cases covering the GoalBackend Implementer Contract (the protocol-
 behavior subset is parametrized over every registered backend via the
 ``backend`` / ``backend_with_goal`` fixtures; see PARAMETRIZATION below).
 
@@ -59,6 +59,9 @@ contributor reconciling code-to-spec lands on the right requirement.
   TEST 48 — load_goal() raises AtomicAgentsError when goal.md is absent (filesystem.py:210)
   TEST 49 — load_goal() + read_schema_version() both raise GoalCorrupted on unparseable frontmatter (filesystem.py:214, 519-521)
   TEST 50 — _redact_for_error_message() redacts a schemeless DSN (user:pass@host/db) (goal/__init__.py:289-290)
+  TEST 51 — apply_transition() write-validation: bad permitted-field value raises SchemaValidationError and goal.md is UNCHANGED (filesystem.py:_write_goal validate_goal pre-write)
+  TEST 52 — from atomic_agents.goal import main; callable(main) (goal/__init__.py __getattr__ re-export)
+  TEST 53 — apply_transition() fields={'blocked_by': 'ghost'} does NOT persist when validate_goal rejects it (write/read symmetry — Principle #12 cross-check)
 
 PARAMETRIZATION: the protocol-behavior tests construct their backend through
 the ``backend`` / ``backend_with_goal`` fixtures, which are themselves
@@ -1203,3 +1206,172 @@ def test_redact_schemeless_dsn_returns_redacted_placeholder() -> None:
     assert "s3cr3tpass" not in result, (
         "password portion of a schemeless DSN must not appear in the redacted output"
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TEST 51 — apply_transition() write-validation: bad permitted-field value
+#            raises SchemaValidationError and goal.md is UNCHANGED
+#            (filesystem.py:_write_goal validate_goal pre-write)
+
+
+def test_apply_transition_write_validation_bad_blocked_by_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """apply_transition() with fields={'blocked_by': '<unknown-id>'} MUST raise
+    SchemaValidationError and leave goal.md UNCHANGED.
+
+    _write_goal() calls validate_goal() BEFORE the durable write (the
+    write/read symmetry — spec/41 MUST 6). A permitted field (blocked_by is in
+    SUB_GOAL_TRANSITION_FIELDS) carrying a value that fails validate_goal's
+    referential-integrity check must:
+      1. Raise SchemaValidationError (not silently commit).
+      2. Leave goal.md byte-for-byte identical to the pre-call state.
+      3. Leave the on-disk sub_goal status unchanged — load_goal() still
+         succeeds and sg1.status is still its prior value ('pending'), not
+         the attempted to_status.
+      4. Leave no JSONL audit line for the rejected event.
+
+    This is the key write/read symmetry test: a permitted-field value that
+    _write_goal rejects closes the gap that the apply_transition `fields`
+    allow-set alone does not — a valid field name with a bad value would
+    otherwise write a goal.md that load_goal() rejects, locking the agent
+    out of its own goal.
+    """
+    from datetime import datetime
+
+    from atomic_agents.exceptions import SchemaValidationError
+
+    root = tmp_path / "agent"
+    root.mkdir(parents=True, exist_ok=True)
+    content = f"""---
+schema_version: {CURRENT_GOAL_SCHEMA_VERSION}
+active: true
+intent: Write-validation test
+priority: high
+created: 2026-06-11
+last_progress_check: 2026-06-11
+success_criteria:
+  - Criterion one
+sub_goals:
+  - id: sg1
+    label: First sub-goal
+    status: pending
+  - id: sg2
+    label: Second sub-goal
+    status: pending
+---
+
+## Overview
+
+Goal body.
+
+## History (auto-appended)
+- 2026-06-11 — goal created
+"""
+    goal_md = root / "goal.md"
+    goal_md.write_text(content, encoding="utf-8")
+    before_bytes = goal_md.read_bytes()
+
+    backend = FilesystemGoalBackend(root)
+    history_path = root / "goal_history.jsonl"
+    assert not history_path.exists(), "precondition: no JSONL before the call"
+
+    ts = datetime.now().astimezone().isoformat()
+    with pytest.raises(SchemaValidationError, match="blocked_by"):
+        backend.apply_transition(
+            agent_id="agent",
+            sub_goal_id="sg1",
+            to_status="blocked",
+            fields={"blocked_by": "ghost-does-not-exist"},
+            history_prose="sg1 → blocked (ghost)",
+            history_event={"ts": ts, "event": "bad_blocked_by", "sub_goal_id": "sg1"},
+        )
+
+    # 1. goal.md is byte-for-byte unchanged — the bad write never committed.
+    assert goal_md.read_bytes() == before_bytes, (
+        "goal.md must be unchanged when _write_goal validation fails"
+    )
+
+    # 2. load_goal still succeeds — the on-disk state is still valid.
+    reloaded = backend.load_goal("agent")
+
+    # 3. sg1.status is still 'pending' — to_status 'blocked' was never persisted.
+    sg1 = next(s for s in reloaded.sub_goals if s.id == "sg1")
+    assert sg1.status == "pending", (
+        "sg1.status must not be mutated on disk when _write_goal rejects the write"
+    )
+    assert sg1.blocked_by is None, (
+        "sg1.blocked_by must not be written when validate_goal raises"
+    )
+
+    # 4. No orphan JSONL audit line for the rejected event.
+    assert not history_path.exists(), (
+        "goal_history.jsonl must not be created when the write fails"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TEST 52 — from atomic_agents.goal import main; callable(main)
+#            (goal/__init__.py __getattr__ re-export)
+
+
+def test_main_re_export_is_callable() -> None:
+    """'from atomic_agents.goal import main' MUST succeed and return a callable.
+
+    goal/__init__.py's __getattr__ hook re-exports 'main' from _goal_impl.
+    This was missing in a prior version (Codex P2 back-compat finding).
+    The test asserts the import resolves (no AttributeError) and the returned
+    object is callable (it's the argparse-driven CLI entry point).
+    """
+    from atomic_agents.goal import main  # noqa: PLC0415
+
+    assert callable(main), "'main' re-exported from atomic_agents.goal must be callable"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TEST 53 — apply_transition() fields={'blocked_by': 'ghost'} does NOT persist
+#            when validate_goal rejects it (write/read symmetry cross-check)
+#
+# NOTE: This is a focused cross-check of TEST 51 through the parametrized
+# backend fixture, so a second backend registered later also inherits this
+# conformance assertion. TEST 51 uses a raw FilesystemGoalBackend + manually
+# written goal.md for byte-level assertion; TEST 53 uses backend_with_goal
+# so it runs against every BACKEND_FACTORIES entry.
+
+
+def test_apply_transition_blocked_by_ghost_rejected_by_conformance_backend(
+    backend_with_goal: "FilesystemGoalBackend",
+    agent_root_with_goal: Path,
+) -> None:
+    """apply_transition() with fields={'blocked_by': '<unknown>'} MUST raise
+    SchemaValidationError (via _write_goal validate_goal) on EVERY conforming
+    backend, and goal.md must remain reloadable with sg1 status unchanged.
+
+    This is the protocol-parametrized twin of TEST 51 — it confirms the
+    write/read validation symmetry is a Protocol requirement, not just a
+    filesystem-impl detail.
+    """
+    from datetime import datetime
+
+    from atomic_agents.exceptions import SchemaValidationError
+
+    backend = backend_with_goal
+    goal_md = agent_root_with_goal / "goal.md"
+    before_bytes = goal_md.read_bytes()
+
+    ts = datetime.now().astimezone().isoformat()
+    with pytest.raises(SchemaValidationError, match="blocked_by"):
+        backend.apply_transition(
+            agent_id="agent",
+            sub_goal_id="sg1",
+            to_status="blocked",
+            fields={"blocked_by": "definitely-not-a-known-sub-goal-id"},
+            history_prose="sg1 → blocked (ghost)",
+            history_event={"ts": ts, "event": "ghost_blocked_by", "sub_goal_id": "sg1"},
+        )
+
+    # goal.md unchanged and load_goal still succeeds (disk state is valid).
+    assert goal_md.read_bytes() == before_bytes
+    reloaded = backend.load_goal("agent")
+    sg1 = next(s for s in reloaded.sub_goals if s.id == "sg1")
+    assert sg1.status == "pending", "sg1.status must not be persisted when write fails"

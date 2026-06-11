@@ -168,6 +168,8 @@ These MUSTs bind every conforming GoalBackend implementation. The conformance te
 
 `load_goal(agent_id)` MUST return a `Goal` whose fields match what `save_goal(agent_id, goal)` wrote. Specifically: `goal.intent`, `goal.priority`, `goal.active`, `goal.sub_goals[*].status`, and the `## History` body section must all survive a round-trip.
 
+**Write/read validation symmetry.** A backend MUST NOT persist a `goal.md` (or its store-native equivalent) that its own `load_goal()` would then reject. Every write path — `save_goal()` AND `apply_transition()` — MUST validate the resulting goal against the same schema `load_goal()` enforces, *before* the durable write, and fail closed (raise `SchemaValidationError`, write nothing) on invalid state. This closes the asymmetry where `apply_transition()`'s `fields` channel could set a permitted-but-invalid value (e.g. `fields={"blocked_by": "<unknown-id>"}`) that writes successfully but locks the agent out of its own goal on the next read. The reference impl centralizes this in `_write_goal()` (the single serializer both paths call). The conformance suite pins the `blocked_by`-to-unknown-id case across every backend.
+
 ### MUST 6 — `apply_transition()` is a single atomic unit (and enum-validates fail-closed)
 
 `apply_transition()` MUST write the updated `goal.md` AND append the `history_event` to `goal_history.jsonl` as a single unit. If the backend uses filesystem locking (e.g., `fcntl.flock`), both writes MUST complete before the lock is released. A crash between the two writes is permissible; a crash that leaves `goal_history.jsonl` written but `goal.md` un-updated is a conformance violation (the JSONL is the audit trail for a committed state change).

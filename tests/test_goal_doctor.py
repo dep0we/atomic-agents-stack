@@ -208,6 +208,107 @@ def test_check_goal_backend_appears_in_run_doctor(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# PASS — TOCTOU (#5): goal.md vanishes between is_file() and load_goal()
+
+
+def test_pass_when_goal_md_vanishes_between_probe_and_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """check_goal_backend() MUST return PASS when load_goal() raises bare
+    AtomicAgentsError (simulating goal.md vanishing between the is_file() probe
+    and the load_goal() call — the TOCTOU race fix).
+
+    doctor.py:3788-3795: a bare AtomicAgentsError from load_goal() is treated as
+    "goal.md vanished" (benign race condition) and falls through to PASS rather
+    than producing a spurious FAIL. GoalCorrupted / SchemaValidationError are
+    subclasses of AtomicAgentsError but are caught FIRST (the except-order
+    correctness), so only the genuine absent-file raise reaches the TOCTOU clause.
+    """
+    from atomic_agents.exceptions import AtomicAgentsError
+    from atomic_agents.goal import (
+        register_goal_backend,
+        unregister_goal_backend,
+    )
+    from atomic_agents.goal.filesystem import FilesystemGoalBackend
+
+    _clear_goal_env(monkeypatch)
+    agent_root = tmp_path / "racing-agent"
+    _write_goal_md(
+        agent_root
+    )  # goal.md IS present on disk (for is_file() to return True)
+
+    class _VanishingGoalBackend(FilesystemGoalBackend):
+        """Simulates the TOCTOU window: is_file() passes but load_goal() raises
+        bare AtomicAgentsError, exactly as if goal.md was unlinked between the
+        two calls."""
+
+        @property
+        def backend_id(self) -> str:
+            return "vanishing"
+
+        def load_goal(self, agent_id: str) -> object:
+            raise AtomicAgentsError(f"No goal.md at {self._agent_root / 'goal.md'}")
+
+    register_goal_backend("vanishing", _VanishingGoalBackend)
+    try:
+        monkeypatch.setenv("ATOMIC_AGENTS_GOAL_BACKEND", "vanishing")
+        result = check_goal_backend(agent_root)
+
+        assert result.status == PASS, (
+            "A bare AtomicAgentsError from load_goal() must be treated as a benign "
+            "vanished-file race (TOCTOU fix) and return PASS, not FAIL"
+        )
+    finally:
+        unregister_goal_backend("vanishing")
+
+
+def test_fail_when_goal_corrupted_is_not_swallowed_as_toctou(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """check_goal_backend() MUST return FAIL when load_goal() raises GoalCorrupted
+    (corruption must NOT be swallowed as the TOCTOU vanished-file race).
+
+    doctor.py:3767-3771 catches (GoalCorrupted, SchemaValidationError) BEFORE the
+    bare AtomicAgentsError clause at 3788. This except-order correctness means a
+    truly corrupt goal.md still produces FAIL, not PASS. The existing
+    test_fail_when_goal_md_corrupted already covers a real corrupt file; this test
+    pins the except-order invariant explicitly by asserting FAIL for a
+    GoalCorrupted-raising backend.
+    """
+    from atomic_agents.exceptions import GoalCorrupted
+    from atomic_agents.goal import (
+        register_goal_backend,
+        unregister_goal_backend,
+    )
+    from atomic_agents.goal.filesystem import FilesystemGoalBackend
+
+    _clear_goal_env(monkeypatch)
+    agent_root = tmp_path / "corrupt-race-agent"
+    _write_goal_md(agent_root)
+
+    class _CorruptGoalBackend(FilesystemGoalBackend):
+        @property
+        def backend_id(self) -> str:
+            return "corrupt-race"
+
+        def load_goal(self, agent_id: str) -> object:
+            raise GoalCorrupted("goal.md unparseable: simulated corruption")
+
+    register_goal_backend("corrupt-race", _CorruptGoalBackend)
+    try:
+        monkeypatch.setenv("ATOMIC_AGENTS_GOAL_BACKEND", "corrupt-race")
+        result = check_goal_backend(agent_root)
+
+        assert result.status == FAIL, (
+            "GoalCorrupted from load_goal() must NOT be swallowed as a vanished-file "
+            "race — corruption is a real FAIL, not a benign TOCTOU"
+        )
+        assert "load_goal()" in result.message
+    finally:
+        unregister_goal_backend("corrupt-race")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # FAIL — lightweight list_archived() probe raises
 
 

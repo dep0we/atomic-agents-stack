@@ -3706,7 +3706,11 @@ def check_goal_backend(agent_root: Path) -> CheckResult:
         list_goal_backends,
         _redact_for_error_message,
     )
-    from .exceptions import GoalCorrupted, SchemaValidationError  # noqa: PLC0415
+    from .exceptions import (  # noqa: PLC0415
+        AtomicAgentsError,
+        GoalCorrupted,
+        SchemaValidationError,
+    )
 
     raw_backend_id = (
         os.environ.get("ATOMIC_AGENTS_GOAL_BACKEND", "").strip().lower() or "filesystem"
@@ -3761,6 +3765,9 @@ def check_goal_backend(agent_root: Path) -> CheckResult:
         try:
             backend.load_goal(agent_root.name)
         except (GoalCorrupted, SchemaValidationError) as e:
+            # NOTE: these are subclasses of AtomicAgentsError, so they MUST be
+            # caught before the bare-AtomicAgentsError clause below — corruption
+            # is a real FAIL, not a benign vanished-file race.
             return CheckResult(
                 name="goal-backend",
                 status=FAIL,
@@ -3778,6 +3785,14 @@ def check_goal_backend(agent_root: Path) -> CheckResult:
                     "error": str(e),
                 },
             )
+        except AtomicAgentsError:
+            # TOCTOU: goal.md vanished between the is_file() probe and load_goal()
+            # (e.g. a concurrent archive_goal unlinked it). That's "no active
+            # goal" — benign, not corruption — so fall through to PASS rather
+            # than a spurious FAIL for a transient race. (GoalCorrupted /
+            # SchemaValidationError subclass AtomicAgentsError but are caught
+            # above, so only the bare absent-file raise reaches here.)
+            goal_md_present = False
         except Exception as e:
             return CheckResult(
                 name="goal-backend",

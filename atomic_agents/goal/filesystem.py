@@ -100,21 +100,19 @@ class FilesystemGoalBackend:
         agents that have no goal.md are valid and goal_text() returns '').
 
         Args:
-            agent_root: absolute path to the agent's root directory.
-                Must be absolute (or convertible to absolute via Path.resolve()).
-                Paths containing '..' are rejected with ValueError.
+            agent_root: the agent's root directory. A relative path is resolved
+                to absolute against the process cwd (matching the sibling
+                filesystem backends' accept-and-resolve convention). Paths
+                containing a literal '..' component are rejected with ValueError.
 
         Raises:
-            ValueError: when agent_root resolves to a relative path or
-                when the raw value contains '..' path components.
+            ValueError: when the raw value contains '..' path components.
         """
         # Resolve to absolute so all subsequent path operations are unambiguous.
+        # (Path.resolve() always returns an absolute path, so there is no
+        # separate is_absolute() rejection — a relative agent_root is accepted
+        # and resolved, like the memory/persona/corpus filesystem backends.)
         resolved = Path(agent_root).resolve()
-        if not resolved.is_absolute():
-            raise ValueError(
-                f"FilesystemGoalBackend requires an absolute agent_root; "
-                f"got {agent_root!r}"
-            )
         # Belt-and-suspenders: reject raw '..' components even after resolve()
         # so callers get a clear error rather than silently accessing a
         # different directory.
@@ -182,8 +180,21 @@ class FilesystemGoalBackend:
         goal.body = goal.body.rstrip() + f"\n- {today} — {entry}"
 
     def _write_goal(self, goal: Goal) -> None:
-        """Serialize and atomic_write goal.md (no lock — caller holds lock)."""
+        """Serialize and atomic_write goal.md (no lock — caller holds lock).
+
+        Validates the resulting frontmatter with the SAME validate_goal() the
+        read path uses, BEFORE the durable write, so the backend can never
+        persist a goal.md its own load_goal() would reject (the write/read
+        validation symmetry — spec/41 MUST 6). This closes the deeper asymmetry
+        the apply_transition `fields` allow-set alone does not: a permitted
+        field carrying a bad value (e.g. fields={"blocked_by": "<unknown-id>"})
+        would otherwise write a goal.md that load_goal() then refuses, locking
+        the agent out of its own goal. SchemaValidationError here fails closed —
+        nothing is written, and on the apply_transition path no JSONL audit line
+        is appended for an un-written state (the write precedes the append).
+        """
         fm = build_goal_frontmatter(goal)
+        validate_goal(fm)
         post = frontmatter.Post(goal.body, **fm)
         atomic_write(self._goal_path, frontmatter.dumps(post) + "\n")
 
@@ -344,10 +355,21 @@ class FilesystemGoalBackend:
             # Append prose to goal body
             self._append_history_prose(goal, history_prose, today)
 
-            # Build ts-first event dict
+            # Build ts-first event dict, then PROVE it serializes BEFORE the
+            # durable goal.md write. A non-JSON-serializable history_event
+            # (Path/datetime/etc.) is normal bad input, not a crash — without
+            # this probe json.dumps() would raise only inside _append_jsonl()
+            # AFTER goal.md is already committed, leaving a transition with no
+            # audit line (a silent partial commit). Serializing here fails
+            # closed: nothing is written. The real append still happens AFTER
+            # goal.md (MUST 6 ordering) via _append_jsonl below — this probe
+            # gates only on serializability, not write order.
             structured_event = self._make_history_event(ts, event_name, **extra_fields)
+            json.dumps(structured_event)
 
-            # Write goal.md and append JSONL — both under the lock
+            # Write goal.md FIRST, then append the JSONL audit line — both under
+            # the lock (spec/41 MUST 6 ordering: never a JSONL line for an
+            # un-written goal.md state).
             self._write_goal(goal)
             self._append_jsonl(structured_event)
 

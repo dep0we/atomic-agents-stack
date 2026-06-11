@@ -348,6 +348,78 @@ def test_backend_id_is_stable(tmp_path: Path) -> None:
     assert b1.backend_id == b2.backend_id
 
 
+def test_apply_transition_non_json_serializable_event_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """apply_transition() with a non-JSON-serializable history_event MUST raise
+    TypeError (from json.dumps) and leave BOTH goal.md AND goal_history.jsonl
+    UNCHANGED — the serialization probe fires BEFORE the durable write.
+
+    filesystem.py:368 calls json.dumps(structured_event) BEFORE _write_goal(),
+    so a non-serializable value (e.g. an object() instance) fails closed:
+    nothing is written and no orphan JSONL line is created for the un-committed
+    transition. Without this probe, json.dumps would only fail inside
+    _append_jsonl() AFTER goal.md was already committed — a silent partial commit.
+    """
+    agent_root = tmp_path / "agent"
+    _make_goal_md(agent_root)
+    backend = FilesystemGoalBackend(agent_root)
+
+    goal_md = agent_root / "goal.md"
+    history_path = agent_root / "goal_history.jsonl"
+    before_bytes = goal_md.read_bytes()
+    assert not history_path.exists(), "precondition: no JSONL before the call"
+
+    from datetime import datetime
+
+    ts = datetime.now().astimezone().isoformat()
+    # object() is not JSON-serializable → json.dumps raises TypeError
+    with pytest.raises(TypeError):
+        backend.apply_transition(
+            agent_id="agent",
+            sub_goal_id="sg1",
+            to_status="in_progress",
+            fields={},
+            history_prose="sg1 → in_progress",
+            history_event={"ts": ts, "event": "bad_event", "bad": object()},
+        )
+
+    # goal.md MUST be unchanged — the serialization probe prevented the write.
+    assert goal_md.read_bytes() == before_bytes, (
+        "goal.md must be unchanged when json.dumps raises before _write_goal"
+    )
+
+    # No JSONL line must exist for the un-committed transition.
+    assert not history_path.exists(), (
+        "goal_history.jsonl must not be created when json.dumps raises before the write"
+    )
+
+    # The sub-goal status on disk must still be 'pending' (not 'in_progress').
+    reloaded = FilesystemGoalBackend(agent_root).load_goal("agent")
+    sg1 = next(s for s in reloaded.sub_goals if s.id == "sg1")
+    assert sg1.status == "pending", (
+        "sg1 status must not be persisted when the serialization probe fails"
+    )
+
+
+def test_relative_agent_root_resolves_to_absolute(tmp_path: Path) -> None:
+    """FilesystemGoalBackend(Path('some/relative/path')) MUST construct without
+    raising, and the resolved agent_root MUST be an absolute path.
+
+    The filesystem reference impl accepts relative paths and resolves them via
+    Path.resolve() (matching the sibling memory/persona/corpus filesystem
+    backends' accept-and-resolve convention). Construction must not raise even
+    though the path does not exist on disk — construction is side-effect-free
+    (spec/41 MUST 1). The existing TEST 24 path-traversal guard still catches
+    '..' components, so we do not re-test that here.
+    """
+    backend = FilesystemGoalBackend(Path("some/relative/path"))
+    assert backend._agent_root.is_absolute(), (
+        "resolved agent_root must be an absolute path even when constructed "
+        "from a relative input"
+    )
+
+
 def test_archive_goal_bumps_last_progress_check_to_today(tmp_path: Path) -> None:
     """archive_goal() MUST set last_progress_check to the archive day.
 
