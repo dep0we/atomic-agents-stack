@@ -1,6 +1,6 @@
 """Conformance tests for GoalBackend Protocol (spec/41).
 
-46 test cases covering the GoalBackend Implementer Contract (the protocol-
+50 test cases covering the GoalBackend Implementer Contract (the protocol-
 behavior subset is parametrized over every registered backend via the
 ``backend`` / ``backend_with_goal`` fixtures; see PARAMETRIZATION below).
 
@@ -55,6 +55,10 @@ contributor reconciling code-to-spec lands on the right requirement.
   TEST 44 — _redact_for_error_message() URL value returns scheme://... (redaction URL branch)
   TEST 45 — get_default_goal_backend() empty-string env var falls through to filesystem default (env-var empty-string leg)
   TEST 46 — read_schema_version() raises GoalCorrupted when schema_version is present but not int-coercible (filesystem.py:527-530)
+  TEST 47 — apply_transition() raises AtomicAgentsError for unknown sub_goal_id, no orphan write (filesystem.py:327-329)
+  TEST 48 — load_goal() raises AtomicAgentsError when goal.md is absent (filesystem.py:210)
+  TEST 49 — load_goal() + read_schema_version() both raise GoalCorrupted on unparseable frontmatter (filesystem.py:214, 519-521)
+  TEST 50 — _redact_for_error_message() redacts a schemeless DSN (user:pass@host/db) (goal/__init__.py:289-290)
 
 PARAMETRIZATION: the protocol-behavior tests construct their backend through
 the ``backend`` / ``backend_with_goal`` fixtures, which are themselves
@@ -1063,3 +1067,139 @@ def test_get_default_goal_backend_empty_env_var_returns_filesystem(
 
     assert isinstance(backend, FilesystemGoalBackend)
     assert backend.backend_id == "filesystem"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TEST 47 — apply_transition() sub_goal-not-found raises AtomicAgentsError, no orphan write
+
+
+def test_apply_transition_sub_goal_not_found_no_orphan_write(
+    backend_with_goal, agent_root_with_goal: Path
+) -> None:
+    """apply_transition() MUST raise AtomicAgentsError for an unknown sub_goal_id.
+
+    When sub_goal_id is not present in the loaded goal's sub_goals list,
+    filesystem.py:327-329 raises AtomicAgentsError (matching "sub_goal not found").
+    Neither goal.md nor goal_history.jsonl must be modified — the operation is
+    fail-closed and leaves no orphan write behind.
+    """
+    from datetime import datetime
+
+    from atomic_agents.exceptions import AtomicAgentsError
+
+    backend = backend_with_goal
+    goal_md = agent_root_with_goal / "goal.md"
+    history = agent_root_with_goal / "goal_history.jsonl"
+
+    before_goal = goal_md.read_bytes()
+    history_existed = history.is_file()
+    before_history = history.read_bytes() if history_existed else None
+
+    ts = datetime.now().astimezone().isoformat()
+    with pytest.raises(AtomicAgentsError, match="sub_goal not found"):
+        backend.apply_transition(
+            agent_id="agent",
+            sub_goal_id="nonexistent",
+            to_status="in_progress",
+            fields={},
+            history_prose="nonexistent → in_progress",
+            history_event={
+                "ts": ts,
+                "event": "ghost_transition",
+                "sub_goal_id": "nonexistent",
+            },
+        )
+
+    # goal.md must be untouched — no partial or orphan write
+    assert goal_md.read_bytes() == before_goal, (
+        "goal.md must not be modified when sub_goal_id is unknown"
+    )
+    # goal_history.jsonl must also be untouched
+    if history_existed:
+        assert history.read_bytes() == before_history, (
+            "goal_history.jsonl must not be modified when sub_goal_id is unknown"
+        )
+    else:
+        assert not history.is_file(), (
+            "goal_history.jsonl must not be created when sub_goal_id is unknown"
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TEST 48 — load_goal() raises AtomicAgentsError when goal.md is absent
+
+
+def test_load_goal_absent_file_raises(tmp_path: Path) -> None:
+    """load_goal() MUST raise AtomicAgentsError (matching "No goal.md") when goal.md is absent.
+
+    filesystem.py:209-210: `if not self._goal_path.is_file(): raise AtomicAgentsError(...)`.
+    An empty agent_root (directory present, goal.md absent) must produce the error,
+    not a silent empty return.
+    """
+    from atomic_agents.exceptions import AtomicAgentsError
+
+    root = tmp_path / "empty-agent"
+    root.mkdir(parents=True, exist_ok=True)
+    backend = FilesystemGoalBackend(root)
+
+    with pytest.raises(AtomicAgentsError, match="No goal.md"):
+        backend.load_goal("agent")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TEST 49 — load_goal() + read_schema_version() both raise GoalCorrupted on
+#            unparseable frontmatter (distinct from TEST 46's non-int-coercible branch)
+
+
+def test_load_goal_and_read_schema_version_raise_goal_corrupted_on_bad_frontmatter(
+    tmp_path: Path,
+) -> None:
+    """load_goal() and read_schema_version() MUST raise GoalCorrupted when the
+    YAML frontmatter block itself cannot be parsed (not just a missing or wrong-type key).
+
+    filesystem.py:213-214 (load_goal): wraps the frontmatter.load() exception into
+        GoalCorrupted("goal.md unparseable: ...")
+    filesystem.py:518-521 (read_schema_version): wraps it into
+        GoalCorrupted("goal.md unparseable in read_schema_version: ...")
+
+    This is DISTINCT from TEST 46 (schema_version present but not int-coercible):
+    here the YAML delimiters themselves are malformed so frontmatter.load() raises
+    before any key lookup occurs.
+    """
+    from atomic_agents.exceptions import GoalCorrupted
+
+    root = tmp_path / "corrupt-agent"
+    root.mkdir(parents=True, exist_ok=True)
+    # Malformed YAML: unclosed mapping value inside the frontmatter block causes
+    # frontmatter.load() to raise a parse exception.
+    malformed = "---\nschema_version: :\n  bad: [unclosed\n---\nbody\n"
+    (root / "goal.md").write_text(malformed, encoding="utf-8")
+    backend = FilesystemGoalBackend(root)
+
+    with pytest.raises(GoalCorrupted, match="goal.md unparseable"):
+        backend.load_goal("agent")
+
+    with pytest.raises(GoalCorrupted, match="unparseable in read_schema_version"):
+        backend.read_schema_version("agent")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TEST 50 — _redact_for_error_message() redacts a schemeless DSN
+
+
+def test_redact_schemeless_dsn_returns_redacted_placeholder() -> None:
+    """_redact_for_error_message() MUST redact a schemeless user:pass@host/db DSN.
+
+    goal/__init__.py:289-290: the DSN heuristic catches ``user:password@host/db``
+    style values that lack a ``://`` scheme (handled by the URL branch) but carry
+    embedded credentials after the ``@``. The result must be the literal string
+    "[redacted-connection-string]" and MUST NOT contain the password.
+    """
+    import atomic_agents.goal as _goal_mod
+
+    dsn = "user:s3cr3tpass@dbhost/mydb"
+    result = _goal_mod._redact_for_error_message(dsn)
+    assert result == "[redacted-connection-string]"
+    assert "s3cr3tpass" not in result, (
+        "password portion of a schemeless DSN must not appear in the redacted output"
+    )

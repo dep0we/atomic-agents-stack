@@ -3712,10 +3712,12 @@ def check_goal_backend(agent_root: Path) -> CheckResult:
         os.environ.get("ATOMIC_AGENTS_GOAL_BACKEND", "").strip().lower() or "filesystem"
     )
     # Credential safety: ATOMIC_AGENTS_GOAL_BACKEND is a single env var that may
-    # carry a URL-shaped value (postgres://user:pass@host/db). Redact before it
-    # reaches the rendered CheckResult message or detail — the factory redacts in
-    # its own error, but the doctor recomputes raw_backend_id from os.environ and
-    # must redact independently (MEMORY.md feedback_codeql_constant_name_false_positives).
+    # carry a URL- or DSN-shaped value (postgres://user:pass@host/db). Redact
+    # before it reaches the rendered CheckResult message or detail — the factory
+    # redacts in its own error, but the doctor recomputes raw_backend_id from
+    # os.environ and must redact independently. Same per-backend
+    # _redact_for_error_message convention as logs/profile/corpus/mcp_registry/
+    # secret_backend (the standing credential-echo-redaction pattern).
     safe_backend_id = _redact_for_error_message(raw_backend_id)
 
     try:

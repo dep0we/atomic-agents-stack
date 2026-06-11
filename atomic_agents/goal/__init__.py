@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 
 from ..exceptions import BackendNotRegistered
@@ -269,10 +270,24 @@ def get_default_goal_backend(agent_root: Path) -> GoalBackend:
 
 
 def _redact_for_error_message(value: str, max_len: int = 32) -> str:
-    """Sanitize a possibly-sensitive env var value for error-message echo."""
+    """Sanitize a possibly-sensitive env var value for error-message echo.
+
+    Strips anything after ``://`` (URL credential heuristic), redacts a
+    schemeless ``user:pass@host/db`` DSN, then truncates at ``max_len`` to
+    bound the echoed string. The full original value is never echoed -- this
+    prevents the credential-leak failure mode where an operator accidentally
+    pastes a connection string into ``ATOMIC_AGENTS_GOAL_BACKEND``.
+
+    Mirrors ``logs/__init__.py``, ``profile/__init__.py``,
+    ``corpus/__init__.py``, ``mcp_registry/__init__.py``, and
+    ``secret_backend/__init__.py`` ``_redact_for_error_message``.
+    """
     if "://" in value:
         scheme = value.split("://", 1)[0]
         return f"{scheme}://..."
+    # DSN heuristic: catch user:password@host/db style without a scheme.
+    if "@" in value and re.search(r":[^/]+@", value):
+        return "[redacted-connection-string]"
     if len(value) > max_len:
         return value[:max_len] + "..."
     return value
