@@ -88,6 +88,13 @@ install becomes `pip install --upgrade atomic-agents-stack==X.Y.Z`.
 
 ## 3. Run the migration runner (only if needed)
 
+> **BREAKING (issue #429 — T13 refactor):** Migration scripts written against
+> the old path-shaped contract (`applies_to(path: Path)` / `migrate(path: Path,
+> dry_run: bool)`) must be rewritten to the new per-unit handle contract
+> (`applies_to(unit: MigratableUnit)` / `migrate(unit: MigratableUnit)`). See
+> `docs/spec/03-file-formats.md §Migration upgrade path` for the mapping table.
+> The `python -m atomic_agents.migrate` CLI entrypoint is unchanged.
+
 Schema changes are the most common reason an upgrade is not drop-in. Any
 release that bumps `CURRENT_SCHEMA_VERSION` ships a corresponding
 migration script — but the runner discovers scripts from
