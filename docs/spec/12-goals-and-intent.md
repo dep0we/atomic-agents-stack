@@ -8,6 +8,8 @@ Most agents don't need this. Caldwell, another agent, agent-a, agent-b are all *
 
 Goal-driven agents are different. They decide what's next themselves, against a target the operator set.
 
+> **Storage abstraction (spec/41).** This spec is the **behavioral contract** for `goal.md` — its frontmatter schema, the `## History` section, sub-goal lifecycle states, and the prose conventions an agent author follows. **How** `goal.md` is read and written is defined by the `GoalBackend` Protocol in [41-goal-backend.md](41-goal-backend.md): `load_goal()`, `save_goal()`, the atomic `apply_transition()` primitive, `archive_goal()`, and the spec/40 canonical export. The default `FilesystemGoalBackend` reads exactly the on-disk shape this spec describes (`goal.md` + `goal_history.jsonl` + `goal_archive/`) with zero behavior change; alternate backends (Postgres, cloud) may swap the storage while preserving this behavioral contract. Read spec/12 for what `goal.md` CONTAINS; read spec/41 for how it is ACCESSED.
+
 ---
 
 ## Agent type taxonomy

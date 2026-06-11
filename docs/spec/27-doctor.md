@@ -555,7 +555,8 @@ output.
 (spec/36). Agent-scoped because the filesystem reference impl reads from
 `<agent_root>/mcp.md`. Doctor reuses `get_default_mcp_server_registry_backend(agent_root)`
 so the verdict and the runtime's `AtomicAgent.__init__` wiring cannot diverge.
-Lands as the 13th `check_*_backend` entry in `doctor.py` in #201 PR 2.
+Lands as the 13th `check_*_backend` entry to ship (landed order, by PR), in
+`doctor.py` in #201 PR 2.
 
 Uses the dual-probe pattern (MEMORY.md `feedback_doctor_dual_probe_pattern`):
 probes both `list_mcp_servers()` (lightweight) and `load_all_mcp_servers()`
@@ -593,7 +594,8 @@ the catalog URL into doctor output or CI logs.
 Deployment-scoped (not per-agent) — secrets are flat per-deployment, not
 per-agent. Doctor probes via `get_default_secret_backend()` so the verdict
 and the runtime's `_get_key()` behaviour cannot diverge. Lands as the 14th
-`check_*_backend` entry in `doctor.py` in #340 PR 1. Grouped with
+`check_*_backend` entry to ship (landed order, by PR), in `doctor.py` in
+#340 PR 1. Grouped with
 agent-scoped backend checks for output consistency; the agent-free way to
 verify the secret backend is `atomic-agents secrets validate`. An explicit
 no-agent / `--deployment` doctor mode is tracked in [#371](https://github.com/dep0we/atomic-agents-stack/issues/371).
@@ -624,6 +626,51 @@ PASS / WARN / FAIL ladder:
 operator sets `ATOMIC_AGENTS_SECRET_BACKEND=gcp` before the GCP extra ships
 (PR 2); silent fall-through to filesystem when an operator typo'd the env var;
 credential leakage from the backend URL into doctor output.
+
+---
+
+### `goal-backend` *(agent-scoped)*
+
+**Verifies:** Operator-config coherence for the GoalBackend (spec/41).
+Agent-scoped because the filesystem reference impl reads from
+`<agent_root>/goal.md` and `<agent_root>/goal_archive/`. Doctor constructs
+the backend via `get_default_goal_backend(agent_root)` directly (the
+`AtomicAgent` constructor kwarg + public attribute are deferred to the #448
+runtime-wiring PR, so there is no `AtomicAgent.goal_backend` to read). Lands
+as the 13th `check_*_backend` entry by **definition order** in `doctor.py`
+in #425 PR 1 (grep-verifiable: `grep -cE '^def check_[a-z_]+_backend\b'` = 13,
+`check_goal_backend` last). NB: distinct from the *landed-order* counts the
+mcp-server-registry (13th) and secret (14th) entries above cite — those count
+ship order by PR, this counts source-definition position.
+
+Uses the dual-probe pattern (MEMORY.md `feedback_doctor_dual_probe_pattern`):
+probes both `list_archived()` (lightweight list) and — only when `goal.md`
+exists — `load_goal()` (full parse + schema validation), because the
+lightweight list never touches `goal.md` and would false-PASS on a corrupt
+goal file that `load_goal()` rejects.
+
+PASS / FAIL ladder (this check has no WARN path):
+
+- **PASS** when `list_archived()` succeeds AND (`goal.md` absent, OR
+  `goal.md` present and `load_goal()` succeeds). A missing `goal.md` is NOT a
+  failure — reactive agents have none; the message carries the suffix
+  `(no goal.md for this agent)` and detail `goal_md_present=False`. Mirrors
+  `corpus-backend`'s PASS-on-absent behavior.
+- **FAIL** when `ATOMIC_AGENTS_GOAL_BACKEND` is set to an unregistered id, or
+  backend construction raises. The echoed env value is redacted via
+  `_redact_for_error_message` (credential-URL heuristic) before it reaches the
+  message or detail — the doctor recomputes the raw id from `os.environ` and
+  redacts independently of the factory's own redaction.
+- **FAIL** when `list_archived()` raises.
+- **FAIL** when `goal.md` is present AND `load_goal()` raises
+  (`GoalCorrupted` / `SchemaValidationError` get a schema-mismatch `fix_hint`;
+  any other exception gets an `error_type` for triage) — closes the
+  dual-probe false-PASS gap.
+
+**Prevents:** A corrupt `goal.md` (bad `schema_version`, missing required
+frontmatter, dangling `blocked_by`) passing silently because the light list
+probe never parses the goal; URL credential leakage from
+`ATOMIC_AGENTS_GOAL_BACKEND` into doctor output or CI logs.
 
 ---
 

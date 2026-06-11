@@ -1,6 +1,6 @@
 # Backend protocols shipped
 
-Twelve backend protocols are locked for v1.0. A thirteenth, SecretBackend (#340), shipped for v1.5 with two reference implementations (FilesystemSecretBackend + GCPSecretManagerBackend) and LOCKED spec/38. Each section captures the reference implementations shipped, the operator override surface, the doctor coherence check, the Implementer Contract location, and the architectural cliff the protocol closes.
+Twelve backend protocols are locked for v1.0. A thirteenth, SecretBackend (#340), shipped for v1.5 with two reference implementations (FilesystemSecretBackend + GCPSecretManagerBackend) and LOCKED spec/38. A fourteenth, GoalBackend (#425), shipped for v1.5 with FilesystemGoalBackend and DRAFT spec/41. Each section captures the reference implementations shipped, the operator override surface, the doctor coherence check, the Implementer Contract location, and the architectural cliff the protocol closes.
 
 This file is the canonical reference for what the framework's storage seam looks like today. CLAUDE.md links here instead of inlining the detail so the session prompt stays under its char budget.
 
@@ -341,6 +341,30 @@ Operator surface: `atomic-agents secrets check <KEY>` (present/absent + source l
 LOCKED spec/38 carries 9 normative MUSTs (charset validation, machine-scoped sources, capability honesty, no value in exceptions, no value in `locate()`, no value in CLI output, empty-string-as-absent, `has()` delegation, no caching). 149 secret-backend tests: 56 conformance (25 parametrized x 2 backends + 6 non-parametrized charset tests) + 49 GCP-specific + 11 CLI + 33 filesystem-specific, plus 8 doctor tests in `test_doctor_gcp_secret_backend.py` (counted in the doctor suite, not the 149).
 
 **Closes the credential-portability cliff:** the same agent runs on a laptop (Keychain / keys.json) and behind a managed cloud secret store (GCP Secret Manager) with no code change -- only the registered secret backend differs.
+
+---
+
+## GoalBackend (#425, DRAFT spec/41, the fourteenth)
+
+The first agent-scope surface of the #383 four-protocol wave (goals, outcomes, journal, cascade). Carves the flat `goal.py` module — which held GoalManager, Goal/SubGoal dataclasses, CLI dispatch, and schema constants — into a proper Protocol + storage backend, separating storage abstraction from runtime behavior.
+
+**Reference implementation:** `FilesystemGoalBackend` (PR 1 of 1). Reproduces today's exact `goal.md` / `goal_history.jsonl` / `goal_archive/` I/O byte-for-byte. Zero behavior change for home users.
+
+`FilesystemGoalBackend` stores goal state in `<agent_root>/goal.md` (frontmatter + body including the `## History` prose section) and structured history events in `<agent_root>/goal_history.jsonl` (JSONL, append-only). Archived goals live in `<agent_root>/goal_archive/<slug>/goal.md`. The backend is `@runtime_checkable` and exposes `load_goal` / `save_goal` / `append_history_event` / `archive_goal` / `list_archived` / `read_schema_version` / `export` / `capabilities` plus the load-bearing `apply_transition(sub_goal_id, to_status, fields)` atomic primitive.
+
+`apply_transition()` is the defining Protocol method: a single durable sub-goal status flip + optional `output`/`blocked_by` fields + one `goal_history.jsonl` audit line, all under a filesystem file lock. This is what a Postgres backend delivers via a SQL transaction — the atomicity guarantee belongs on the Protocol, not above it. Pure computation (legal transition checks, cycle detection via `_would_cycle`, `evaluate_completion`, `next_sub_goal`, `progress_report`) stays in `GoalManager` above the Protocol.
+
+`GoalManager` was relocated to `_goal_impl.py`. The documented public `from atomic_agents.goal import GoalManager` path is preserved as a **supported, non-deprecated** compatibility re-export (no `DeprecationWarning` — intentionally permanent, matching Principle #14).
+
+**Operator override surface:** `ATOMIC_AGENTS_GOAL_BACKEND` env var (default `"filesystem"`) + `get_default_goal_backend(agent_root)` factory. The `AtomicAgent(goal_backend=...)` constructor kwarg and `self.goal_backend` attribute are deferred to the runtime-wiring follow-up ([#448](https://github.com/dep0we/atomic-agents-stack/issues/448)).
+
+`doctor.check_goal_backend()` uses the dual-probe pattern (`list_archived` liveness + `load_goal` load probe) per `feedback_doctor_dual_probe_pattern`. Located in `atomic_agents/doctor.py`.
+
+**Exportable:** `GoalExport` is a composite `ExportableResult` carrying `(goal_md_bytes, history_records_with_bytes, archived_goals_with_bytes)`. `FilesystemGoalBackend` implements `Exportable` with `supports_canonical_export=True` and is registered in the spec/40 export conformance harness (`tests/test_export_protocol_conformance.py` + `tests/test_export_capability_advertisement.py`).
+
+DRAFT spec/41 carries 9 normative MUSTs (charset validation, side-effect-free construction, capability honesty, atomic `apply_transition`, no-data-loss archive, collision-safe archive identity, idempotent archive retry, stable `backend_id`, goal.md-before-history-line audit ordering). Test suite: `tests/test_goal_backend_conformance.py` (parametrized conformance, all 9 MUSTs) + `tests/test_goal_filesystem.py` (filesystem-specific) + `tests/test_goal_doctor.py` (dual-probe, PASS/FAIL/SKIP ladder) + `tests/test_goal_dispatch_audit_ordering.py` (MUST 6 regression). The 4 pre-existing goal test files kept intact as the zero-behavior-change regression guard.
+
+**Closes the goal-persistence cliff:** the same goal state machine — status transitions, history audit trail, archiving — can run on a filesystem or a Postgres table without forking `GoalManager` or the CLI. `dispatch_as_outcome()` correctness fix ships here: goal.md persisted before `goal_history.jsonl` audit line (spec/41 MUST 6), with a dedicated regression test.
 
 ---
 

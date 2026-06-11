@@ -95,6 +95,7 @@ def _render_export_result(result) -> bytes:
     )
     from atomic_agents.export.types import (
         CorpusExport,
+        GoalExport,
         LockExport,
         LogExport,
         MandateExport,
@@ -102,6 +103,14 @@ def _render_export_result(result) -> bytes:
         SecretExport,
     )
 
+    if isinstance(result, GoalExport):
+        # Tier A passthrough: goal.md bytes + history lines + archive bytes,
+        # all raw (already CRLF-normalized by the backend). No re-serialization.
+        parts = [result.goal_md_bytes]
+        parts.extend(result.history_records_with_bytes)
+        for _slug, raw_bytes in result.archived_goals_with_bytes:
+            parts.append(raw_bytes)
+        return b"".join(parts)
     if isinstance(result, MemoryExport):
         parts = []
         for _note, raw_bytes in result.notes_with_bytes:
@@ -564,9 +573,7 @@ def test_log_export_all_blank_ts_line_exported_verbatim(
     after the query-bounds fix (spec/40 F1 regression guard).
     """
     # Write a normal record first to ensure the log dir exists.
-    normal_record = _make_run_record(
-        ts="2020-01-15T00:00:00+00:00", summary="anchor record"
-    )
+    _make_run_record(ts="2020-01-15T00:00:00+00:00", summary="anchor record")
     old_shard = log_backend._log_dir / "2020-01" / "2020-01-15.jsonl"
     old_shard.parent.mkdir(parents=True, exist_ok=True)
     import json as _json
@@ -2095,3 +2102,144 @@ def test_assert_canonical_roundtrip_lock_endtoend(lock_backend) -> None:
         return b""
 
     assert_canonical_roundtrip(lock_backend, write_fn, expected_bytes_fn)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Goal conformance (spec/41 — registered in the shared #379 export harness)
+
+
+@pytest.fixture
+def goal_backend(tmp_path: Path):
+    from atomic_agents.goal.filesystem import FilesystemGoalBackend
+
+    return FilesystemGoalBackend(tmp_path / "agent")
+
+
+def _write_goal_md(agent_root: Path, *, intent: str = "Harness goal") -> None:
+    agent_root.mkdir(parents=True, exist_ok=True)
+    content = (
+        "---\n"
+        "schema_version: 1\n"
+        "active: true\n"
+        f"intent: {intent}\n"
+        "priority: high\n"
+        "created: 2026-06-11\n"
+        "last_progress_check: 2026-06-11\n"
+        "success_criteria:\n"
+        "  - done\n"
+        "sub_goals: []\n"
+        "---\n"
+        "\nGoal body prose.\n"
+    )
+    (agent_root / "goal.md").write_text(content, encoding="utf-8")
+
+
+def test_goal_export_returns_goal_export_type(goal_backend) -> None:
+    """export() returns a GoalExport instance."""
+    from atomic_agents.export.types import GoalExport
+
+    result = goal_backend.export()
+    assert isinstance(result, GoalExport)
+
+
+def test_goal_export_is_exportable_result(goal_backend) -> None:
+    """GoalExport is an ExportableResult subclass (generic Protocol narrowing).
+
+    This is the assertion the shared harness exists to enforce uniformly across
+    backends — it catches a GoalExport that forgot to subclass ExportableResult,
+    which @runtime_checkable Exportable would NOT catch (method-presence only).
+    """
+    from atomic_agents.export.types import ExportableResult
+
+    result = goal_backend.export()
+    assert isinstance(result, ExportableResult)
+
+
+def test_goal_export_empty_returns_empty_components(goal_backend) -> None:
+    """export() with no goal.md returns empty components, not an error."""
+    from atomic_agents.export.types import GoalExport
+
+    result = goal_backend.export()
+    assert isinstance(result, GoalExport)
+    assert result.goal_md_bytes == b""
+    assert result.history_records_with_bytes == []
+    assert result.archived_goals_with_bytes == []
+
+
+def test_goal_export_single_roundtrip(goal_backend) -> None:
+    """Exported goal.md bytes match the on-disk file bytes exactly (Tier A)."""
+
+    def write_fn(b):
+        _write_goal_md(b._agent_root, intent="Roundtrip goal")
+
+    def expected_bytes_fn(b):
+        return (b._agent_root / "goal.md").read_bytes()
+
+    assert_canonical_roundtrip(goal_backend, write_fn, expected_bytes_fn)
+
+
+def test_goal_export_no_crlf_no_bom(goal_backend) -> None:
+    """Exported bytes use LF and have no UTF-8 BOM even when goal.md does."""
+    bom = b"\xef\xbb\xbf"
+    crlf_content = (
+        b"---\r\nschema_version: 1\r\nactive: true\r\nintent: CRLF goal\r\n"
+        b"priority: high\r\ncreated: 2026-06-11\r\nlast_progress_check: 2026-06-11\r\n"
+        b"success_criteria:\r\n  - done\r\nsub_goals: []\r\n---\r\n\r\nbody\r\n"
+    )
+    goal_backend._agent_root.mkdir(parents=True, exist_ok=True)
+    (goal_backend._agent_root / "goal.md").write_bytes(bom + crlf_content)
+
+    result = goal_backend.export()
+    assert not result.goal_md_bytes.startswith(bom), "BOM must be stripped"
+    assert b"\r\n" not in result.goal_md_bytes, "CRLF must be normalized to LF"
+    assert b"CRLF goal" in result.goal_md_bytes
+
+
+def test_goal_export_backend_id_and_scope(goal_backend) -> None:
+    """GoalExport carries backend_id and scope."""
+    result = goal_backend.export()
+    assert result.backend_id == "filesystem"
+    assert result.scope == str(goal_backend._agent_root)
+
+
+def test_goal_export_all_equals_export_none(goal_backend) -> None:
+    """export_all() is the unbounded alias of export(None)."""
+    _write_goal_md(goal_backend._agent_root, intent="Alias goal")
+    result_none = goal_backend.export(None)
+    result_all = goal_backend.export_all()
+    assert result_none.goal_md_bytes == result_all.goal_md_bytes
+    assert result_none.scope == result_all.scope
+    assert result_none.backend_id == result_all.backend_id
+
+
+def test_goal_history_export_normalizes_trailing_newline(goal_backend) -> None:
+    """History export is line-NORMALIZED (newline-terminated), not byte-verbatim.
+
+    Pins the spec/41 export contract clause: a final goal_history.jsonl line
+    lacking a trailing newline (reachable only via a hand-edited or
+    alternate-backend file — atomic_append_jsonl always terminates lines) is
+    exported with one appended. The chosen contract is line-normalization, so
+    the parity reference for the Log backend's strict-verbatim export
+    (test_log_export_legacy_line_exported_verbatim) is DELIBERATELY not mirrored
+    here. The non-final lines are still byte-exact (no json.dumps re-serialize),
+    so key ordering is preserved.
+    """
+    agent_root = goal_backend._agent_root
+    _write_goal_md(agent_root, intent="Trailing newline goal")
+    history = agent_root / "goal_history.jsonl"
+    # Two records; the FINAL line deliberately has no trailing newline.
+    history.write_bytes(
+        b'{"ts": "2026-06-11T00:00:00", "event": "first", "x": 1}\n'
+        b'{"ts": "2026-06-11T00:00:01", "event": "second", "y": 2}'
+    )
+
+    result = goal_backend.export()
+    lines = result.history_records_with_bytes
+
+    assert len(lines) == 2
+    # Every exported line is newline-terminated (normalization invariant).
+    assert all(ln.endswith(b"\n") for ln in lines)
+    # Non-final line is byte-exact (key order preserved, no re-serialize).
+    assert lines[0] == b'{"ts": "2026-06-11T00:00:00", "event": "first", "x": 1}\n'
+    # Final line got the trailing newline appended (normalized, not verbatim).
+    assert lines[1] == b'{"ts": "2026-06-11T00:00:01", "event": "second", "y": 2}\n'

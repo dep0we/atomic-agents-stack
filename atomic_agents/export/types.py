@@ -35,21 +35,17 @@ from typing import TYPE_CHECKING, Literal
 if TYPE_CHECKING:
     from ..logs.types import LogQuery
 
+# ExportableResult lives in the dependency-free top-level leaf _export_base.py so
+# that goal/types.py can import it WITHOUT triggering this package's __init__
+# (which imports goal.types and would otherwise form a cycle through
+# goal/__init__.py). Re-export it here so the public surface
+# 'from atomic_agents.export import ExportableResult' is unchanged.
+from .._export_base import ExportableResult as ExportableResult  # noqa: F401 (re-export)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# ExportableResult — marker base class
-
-
-class ExportableResult:
-    """Marker base class for all canonical export objects.
-
-    Backends return subclasses of ``ExportableResult``; the renderer
-    dispatches on the concrete type to produce on-disk bytes.
-
-    Note: this is NOT a dataclass itself — subclasses define their own
-    fields. The base class exists solely for static-type narrowing and
-    ``isinstance`` dispatch in the renderer.
-    """
+# GoalExport is defined in goal/types.py (it subclasses ExportableResult imported
+# from the leaf module above). Re-export it here so callers can use
+# 'from atomic_agents.export import GoalExport'.
+from ..goal.types import GoalExport as GoalExport  # noqa: F401 (re-export)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

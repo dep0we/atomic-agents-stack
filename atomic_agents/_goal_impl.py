@@ -43,10 +43,9 @@ HARD RULES (per spec/12):
 from __future__ import annotations
 import json
 import re
-from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .outcome import OutcomeResult
@@ -61,137 +60,25 @@ from .exceptions import (
     SchemaValidationError,
 )
 
-
-CURRENT_GOAL_SCHEMA_VERSION = 1
-
-VALID_SUB_GOAL_STATUSES = {"pending", "in_progress", "complete", "blocked", "abandoned"}
-VALID_PRIORITIES = {"high", "medium", "low"}
-VALID_AGENT_MODES = {"reactive", "goal-driven", "hybrid"}
-
-
-# ──────────────────────────────────────────────────────────────────
-# Data model
-
-
-@dataclass
-class SubGoal:
-    """One decomposed unit of work toward the parent goal."""
-
-    id: str
-    label: str
-    status: str = "pending"
-    assigned: str | None = None  # role name | "self" | None
-    deadline: str | None = None  # YYYY-MM-DD
-    blocked_by: str | None = None  # id of another sub_goal
-    completed: str | None = None  # YYYY-MM-DD when status=complete
-    output: str | None = None  # path to artifact this sub_goal produced
-    body: str | None = None  # optional longer description / narrative
-    acceptance_criteria: list[str] = field(
-        default_factory=list
-    )  # optional per-sub-goal criteria
-
-
-@dataclass
-class Goal:
-    """An agent's persistent objective."""
-
-    schema_version: int
-    active: bool
-    intent: str
-    priority: str
-    created: str  # YYYY-MM-DD
-    last_progress_check: str
-    success_criteria: list[str]
-    sub_goals: list[SubGoal] = field(default_factory=list)
-    deadline: str | None = None
-    parent_goal: str | None = None
-    related_atomic_notes: list[str] = field(default_factory=list)
-    related_decisions: list[str] = field(default_factory=list)
-    related_canon_pages: list[str] = field(default_factory=list)
-    body: str = ""  # narrative + history (markdown body of goal.md)
-
-
-@dataclass
-class CompletionEvaluation:
-    """Result of checking whether a goal's success_criteria are met."""
-
-    all_criteria_met: bool
-    sub_goals_complete: int
-    sub_goals_total: int
-    sub_goals_in_progress: int
-    sub_goals_blocked: int
-    sub_goals_pending: int
-    days_until_deadline: int | None
-    overdue: bool
-
-
-# ──────────────────────────────────────────────────────────────────
-# Validation
-
-
-def validate_goal(goal_dict: dict[str, Any]) -> None:
-    """Validate a goal.md frontmatter dict. Raises SchemaValidationError on failure."""
-    for field_name in (
-        "schema_version",
-        "active",
-        "intent",
-        "priority",
-        "created",
-        "last_progress_check",
-        "success_criteria",
-    ):
-        if field_name not in goal_dict:
-            raise SchemaValidationError(f"goal missing required field '{field_name}'")
-
-    if goal_dict["schema_version"] != CURRENT_GOAL_SCHEMA_VERSION:
-        raise SchemaValidationError(
-            f"goal schema_version is {goal_dict['schema_version']}; "
-            f"current is {CURRENT_GOAL_SCHEMA_VERSION}"
-        )
-
-    if not isinstance(goal_dict["active"], bool):
-        raise SchemaValidationError("goal active must be boolean")
-
-    if goal_dict["priority"] not in VALID_PRIORITIES:
-        raise SchemaValidationError(
-            f"goal priority must be one of {VALID_PRIORITIES}; got '{goal_dict['priority']}'"
-        )
-
-    sg = goal_dict.get("sub_goals", [])
-    if not isinstance(sg, list):
-        raise SchemaValidationError("goal sub_goals must be a list")
-
-    seen_ids = set()
-    for i, sub in enumerate(sg):
-        if not isinstance(sub, dict):
-            raise SchemaValidationError(f"sub_goal[{i}] must be a dict")
-        for sf in ("id", "label", "status"):
-            if sf not in sub:
-                raise SchemaValidationError(f"sub_goal[{i}] missing required '{sf}'")
-        if sub["id"] in seen_ids:
-            raise SchemaValidationError(f"duplicate sub_goal id: {sub['id']}")
-        seen_ids.add(sub["id"])
-        if sub["status"] not in VALID_SUB_GOAL_STATUSES:
-            raise SchemaValidationError(
-                f"sub_goal[{sub['id']}] status must be one of {VALID_SUB_GOAL_STATUSES}; "
-                f"got '{sub['status']}'"
-            )
-        bb = sub.get("blocked_by")
-        if bb is not None and not isinstance(bb, str):
-            raise SchemaValidationError(
-                f"sub_goal[{sub['id']}] blocked_by must be string or null"
-            )
-        if bb is not None and bb not in seen_ids:
-            raise SchemaValidationError(
-                f"sub_goal[{sub['id']}] blocked_by references unknown id '{bb}'"
-            )
-
-
-def validate_agent_mode(mode: str) -> None:
-    if mode not in VALID_AGENT_MODES:
-        raise SchemaValidationError(
-            f"agent mode must be one of {VALID_AGENT_MODES}; got '{mode}'"
-        )
+# ── Canonical types AND validation live in goal/types.py — import from there
+# so all callers share the same class identity AND the same single validator
+# regardless of whether they import via 'from atomic_agents.goal import SubGoal'
+# or 'from atomic_agents._goal_impl import SubGoal'. The constants + validate_goal
+# are re-exported here (and via goal/__init__.py's __getattr__) for backward
+# compatibility — there is no second copy of the validator.
+from .goal.types import (  # noqa: F401 (constants + validate_agent_mode re-exported for backward compat)
+    CURRENT_GOAL_SCHEMA_VERSION,
+    VALID_AGENT_MODES,
+    VALID_PRIORITIES,
+    VALID_SUB_GOAL_STATUSES,
+    CompletionEvaluation,
+    Goal,
+    SubGoal,
+    build_goal_frontmatter as _build_goal_frontmatter,
+    serialize_sub_goal as _serialize_sub_goal,
+    validate_agent_mode,
+    validate_goal,
+)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -343,53 +230,18 @@ class GoalManager:
             raise AtomicAgentsError("No goal loaded to save")
         self._goal.last_progress_check = self.today.isoformat()
 
-        # Build frontmatter dict, dropping None values for cleanliness
-        fm: dict[str, Any] = {
-            "schema_version": self._goal.schema_version,
-            "active": self._goal.active,
-            "intent": self._goal.intent,
-            "priority": self._goal.priority,
-            "created": self._goal.created,
-            "last_progress_check": self._goal.last_progress_check,
-            "success_criteria": self._goal.success_criteria,
-            "sub_goals": [self._serialize_sub_goal(sg) for sg in self._goal.sub_goals],
-        }
-        if self._goal.deadline:
-            fm["deadline"] = self._goal.deadline
-        if self._goal.parent_goal:
-            fm["parent_goal"] = self._goal.parent_goal
-        if self._goal.related_atomic_notes:
-            fm["related_atomic_notes"] = self._goal.related_atomic_notes
-        if self._goal.related_decisions:
-            fm["related_decisions"] = self._goal.related_decisions
-        if self._goal.related_canon_pages:
-            fm["related_canon_pages"] = self._goal.related_canon_pages
+        # Serialize frontmatter through the SAME shared helper the backend's
+        # _write_goal() uses (goal/types.py:build_goal_frontmatter) so a future
+        # field addition lands in one place and the two writers cannot diverge.
+        fm = _build_goal_frontmatter(self._goal)
 
         post = frontmatter.Post(self._goal.body, **fm)
         atomic_write(self.goal_path, frontmatter.dumps(post) + "\n")
 
     @staticmethod
     def _serialize_sub_goal(sg: SubGoal) -> dict:
-        d: dict[str, Any] = {
-            "id": sg.id,
-            "label": sg.label,
-            "status": sg.status,
-        }
-        if sg.assigned is not None:
-            d["assigned"] = sg.assigned
-        if sg.deadline:
-            d["deadline"] = sg.deadline
-        if sg.blocked_by:
-            d["blocked_by"] = sg.blocked_by
-        if sg.completed:
-            d["completed"] = sg.completed
-        if sg.output:
-            d["output"] = sg.output
-        if sg.body:
-            d["body"] = sg.body
-        if sg.acceptance_criteria:
-            d["acceptance_criteria"] = sg.acceptance_criteria
-        return d
+        """Delegate to canonical serialize_sub_goal from goal/types.py."""
+        return _serialize_sub_goal(sg)
 
     # ────────────────────────────────────────────────────────────
     # Sub-goal lifecycle
@@ -812,7 +664,10 @@ class GoalManager:
             - max_iterations_reached → blocked (reason cites run_id)
             - failed                 → blocked (reason cites judge explanation)
             - interrupted            → stays in_progress (caller decides whether to retry)
-        - Records a dedicated ``sub_goal_outcome_dispatched`` event in goal_history.jsonl.
+        - Persists goal.md (``self.save()``) BEFORE appending the dedicated
+          ``sub_goal_outcome_dispatched`` event to goal_history.jsonl, so the
+          durable state always precedes its audit record (spec/41 MUST 6 ordering).
+          The method is self-contained: a programmatic caller need not call save().
         - Returns (OutcomeResult, updated SubGoal).
         """
         # Lazy import to avoid circular imports
@@ -902,6 +757,13 @@ class GoalManager:
                 f"sub_goal `{sub_goal_id}` stays in_progress "
                 f"(outcome {result.run_id} interrupted)"
             )
+
+        # Persist goal.md BEFORE writing the JSONL audit line so the durable
+        # state always precedes its audit record (spec/41 MUST 6 ordering:
+        # never let goal_history.jsonl carry a transition goal.md never recorded).
+        # This makes the method self-contained as its docstring promises; the
+        # caller's trailing save() (CLI main(), below) becomes a harmless no-op.
+        self.save()
 
         # Record dedicated JSONL history entry
         self._append_goal_history_jsonl(

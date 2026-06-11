@@ -38,7 +38,7 @@ from __future__ import annotations
 
 from typing import Any, Protocol, runtime_checkable
 
-from .types import ExportableResult
+from .._export_base import ExportableResult
 
 
 @runtime_checkable
