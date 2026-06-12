@@ -100,9 +100,14 @@ def _render_export_result(result) -> bytes:
         LogExport,
         MandateExport,
         MemoryExport,
+        OutcomeExport,
         SecretExport,
     )
 
+    if isinstance(result, OutcomeExport):
+        # OutcomeExport: result_json_bytes is the canonical on-disk content.
+        # artifact_refs are portable references (relative or absolute).
+        return result.result_json_bytes
     if isinstance(result, GoalExport):
         # Tier A passthrough: goal.md bytes + history lines + archive bytes,
         # all raw (already CRLF-normalized by the backend). No re-serialization.
@@ -2243,3 +2248,145 @@ def test_goal_history_export_normalizes_trailing_newline(goal_backend) -> None:
     assert lines[0] == b'{"ts": "2026-06-11T00:00:00", "event": "first", "x": 1}\n'
     # Final line got the trailing newline appended (normalized, not verbatim).
     assert lines[1] == b'{"ts": "2026-06-11T00:00:01", "event": "second", "y": 2}\n'
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# OutcomeBackend export conformance (spec/42 §"spec/40 addendum")
+
+
+@pytest.fixture
+def outcome_backend(tmp_path: Path):
+    from atomic_agents.outcome.filesystem import FilesystemOutcomeBackend
+
+    agents_root = tmp_path / "agents"
+    agents_root.mkdir(parents=True, exist_ok=True)
+    return FilesystemOutcomeBackend(agents_root, "testagent")
+
+
+def _write_outcome_result(backend, run_id: str = "outcome-20260611-190000-abc12345"):
+    """Write a minimal OutcomeResult to the backend and return it."""
+    from atomic_agents.outcome.types import IterationRecord, OutcomeResult
+
+    rec = IterationRecord(
+        iteration=0,
+        agent_response="Here is my draft.",
+        agent_input_tokens=100,
+        agent_output_tokens=50,
+        agent_cost_usd=0.001,
+        agent_latency_ms=500,
+        judge_response_raw='{"satisfied": true, "criterion_results": [], "explanation": "OK"}',
+        judge_verdict={"satisfied": True, "criterion_results": [], "explanation": "OK"},
+        judge_cost_usd=0.0005,
+        judge_input_tokens=80,
+        judge_output_tokens=30,
+        artifact_path=None,
+        timestamp="2026-06-11T19:00:00+00:00",
+    )
+    result = OutcomeResult(
+        run_id=run_id,
+        description="Write a test document.",
+        rubric_source="inline",
+        max_iterations=3,
+        status="satisfied",
+        explanation="All criteria met.",
+        iterations=[rec],
+        final_iteration_idx=0,
+        total_cost_usd=0.0015,
+        total_input_tokens=180,
+        total_output_tokens=80,
+        started_at="2026-06-11T19:00:00+00:00",
+        ended_at="2026-06-11T19:00:05+00:00",
+        output_files=[],
+    )
+    backend.write_result("testagent", run_id, result)
+    return result
+
+
+def test_outcome_export_returns_outcome_export_type(outcome_backend) -> None:
+    """export() returns an OutcomeExport instance."""
+    from atomic_agents.export.types import OutcomeExport
+
+    result = outcome_backend.export()
+    assert isinstance(result, OutcomeExport)
+
+
+def test_outcome_export_is_exportable_result(outcome_backend) -> None:
+    """OutcomeExport is an ExportableResult subclass (generic Protocol narrowing)."""
+    from atomic_agents.export.types import ExportableResult
+
+    result = outcome_backend.export()
+    assert isinstance(result, ExportableResult)
+
+
+def test_outcome_export_empty_returns_empty_components(outcome_backend) -> None:
+    """export() on a backend with no runs returns empty OutcomeExport."""
+    from atomic_agents.export.types import OutcomeExport
+
+    result = outcome_backend.export()
+    assert isinstance(result, OutcomeExport)
+    assert result.run_id == ""
+    assert result.result_json_bytes == b""
+    assert result.artifact_refs == []
+
+
+def test_outcome_export_single_roundtrip(outcome_backend) -> None:
+    """export() result_json_bytes is byte-identical to the on-disk result.json.
+
+    expected_bytes_fn reads the REAL on-disk result.json (NOT export() again) so
+    the round-trip verifies export-vs-disk byte identity — the actual portability
+    guarantee — rather than export-vs-itself (a vacuous tautology).
+    """
+    written = _write_outcome_result(outcome_backend)
+
+    def expected_bytes_fn(b):
+        result_path = (
+            b._agent_root / "outcomes" / "runs" / written.run_id / "result.json"
+        )
+        return result_path.read_bytes()
+
+    assert_canonical_roundtrip(
+        outcome_backend,
+        write_fn=lambda b: None,  # already written above
+        expected_bytes_fn=expected_bytes_fn,
+    )
+    export = outcome_backend.export()
+    assert export.run_id == written.run_id
+    assert len(export.result_json_bytes) > 0
+
+
+def test_outcome_export_backend_id_and_scope(outcome_backend) -> None:
+    """OutcomeExport carries backend_id and scope."""
+    result = outcome_backend.export()
+    assert result.backend_id == "filesystem"
+    assert result.scope == str(outcome_backend._agent_root)
+
+
+def test_outcome_export_all_equals_export_none(outcome_backend) -> None:
+    """export_all() is the unbounded alias of export(None)."""
+    _write_outcome_result(outcome_backend)
+    result_none = outcome_backend.export(None)
+    result_all = outcome_backend.export_all()
+    assert result_none.run_id == result_all.run_id
+    assert result_none.result_json_bytes == result_all.result_json_bytes
+    assert result_none.artifact_refs == result_all.artifact_refs
+
+
+def test_outcome_export_top_level_import_resolves() -> None:
+    """`from atomic_agents.export import OutcomeExport` MUST resolve.
+
+    OutcomeExport is documented (spec/42 §Types, CHANGELOG, export/types.py
+    comment) as importable from the package root, mirroring GoalExport. This
+    pins the public import surface so the package-root re-export cannot silently
+    regress (the gap a prior round shipped: only export/types.py had it).
+    """
+    from atomic_agents.export import GoalExport, OutcomeExport
+    from atomic_agents.export.types import OutcomeExport as OutcomeExportSubmodule
+
+    # Same object via both the package root and the submodule.
+    assert OutcomeExport is OutcomeExportSubmodule
+    # GoalExport (the precedent) resolves from the same root — parity check.
+    assert GoalExport is not None
+    # And it is in the package __all__.
+    import atomic_agents.export as export_pkg
+
+    assert "OutcomeExport" in export_pkg.__all__
