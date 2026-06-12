@@ -53,8 +53,8 @@ Cloud Run-adjacent topology that satisfies POSIX `rename(2)` atomicity today.
     |     |     |- memory/       <- state (durable on disk; #382 seam shipped, #258 Postgres adapter moves it off disk)
     |     |     |- log/          <- state (durable on disk; use PostgresLogBackend for query)
     |     |     |- journal/      <- state (durable on disk, no Protocol yet; #383)
-    |     |     |- goals/        <- state (durable on disk, no Protocol yet; #383)
-    |     |     |- outcomes/     <- state (durable on disk, no Protocol yet; #383)
+    |     |     |- goals/        <- state (durable on disk; GoalBackend Protocol shipped, #425/DRAFT spec/41, filesystem impl)
+    |     |     |- outcomes/     <- state (durable on disk; OutcomeBackend Protocol shipped, #426/DRAFT spec/42, filesystem impl)
     |- atomic-agents serve  <- systemd unit (atomic-agents-serve.service)
     |     listening :8080
     |- Memorystore/Redis    <- LockBackend (recommended; filesystem fallback ok for single-VM)
@@ -451,7 +451,8 @@ This VM is the v0 stateful-today bridge. As backend protocols ship:
 
 - **Logs now (shipped):** activate `PostgresLogBackend` (`ATOMIC_AGENTS_LOG_BACKEND=postgres`) to move run logs off the disk to Cloud SQL.
 - **Memory (#382 + #258):** the operator override seam already shipped (#382 PR 1: set `ATOMIC_AGENTS_MEMORY_BACKEND` or `AtomicAgent(memory_backend=...)`), but only `filesystem` is registered today. Once the Postgres MemoryBackend adapter ships (#258), `ATOMIC_AGENTS_MEMORY_BACKEND=postgres` moves memory off the disk; until then that value fails fast with `BackendNotRegistered`.
-- **Goals, outcomes, journal, cascade (#383):** when Protocols ship for these surfaces, cloud adapters can be written.
+- **Goals, outcomes (#425/#426, shipped):** GoalBackend (DRAFT spec/41) + OutcomeBackend (DRAFT spec/42) Protocols shipped with filesystem reference impls; cloud adapters can now be written.
+- **Journal, cascade (#383):** when Protocols ship for these surfaces, cloud adapters can be written.
 - **After all surfaces move:** the VM's disk is empty; the stateless Cloud Run manifest (`extras/gcp/cloudrun-service.yaml`) becomes the correct topology.
 
 See `extras/gcp/README.md §Scale-out path` for the full phase table.
