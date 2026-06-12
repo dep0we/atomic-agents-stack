@@ -482,7 +482,7 @@ The `AtomicAgent(..., corpus_backend=...)` constructor kwarg always wins over th
 
 **Per-runner kwargs:**
 
-`OutcomeRunner`, `EvalRunner`, and `DreamRunner` accept `corpus_backend=...` constructor kwargs that thread through to internal sub-agents. `OutcomeRunner` threads at `outcome.py:255`, `EvalRunner` at `eval.py:363`, `DreamRunner` stores as `self._corpus_backend` (no internal `AtomicAgent` construction site in v1).
+`OutcomeRunner`, `EvalRunner`, and `DreamRunner` accept `corpus_backend=...` constructor kwargs that thread through to internal sub-agents. `OutcomeRunner` threads in `outcome/_outcome_impl.py`, `EvalRunner` at `eval.py:363`, `DreamRunner` stores as `self._corpus_backend` (no internal `AtomicAgent` construction site in v1).
 
 **`delegate.py` threading:**
 

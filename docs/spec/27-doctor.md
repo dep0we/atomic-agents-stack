@@ -638,10 +638,13 @@ the backend via `get_default_goal_backend(agent_root)` directly (the
 `AtomicAgent` constructor kwarg + public attribute are deferred to the #448
 runtime-wiring PR, so there is no `AtomicAgent.goal_backend` to read). Lands
 as the 13th `check_*_backend` entry by **definition order** in `doctor.py`
-in #425 PR 1 (grep-verifiable: `grep -cE '^def check_[a-z_]+_backend\b'` = 13,
-`check_goal_backend` last). NB: distinct from the *landed-order* counts the
-mcp-server-registry (13th) and secret (14th) entries above cite — those count
-ship order by PR, this counts source-definition position.
+in #425 PR 1. After #426 PR 1 added `check_outcome_backend` immediately
+below it, the live grep is `grep -cE '^def check_[a-z_]+_backend\b'` = 14
+with `check_outcome_backend` last (see the `outcome-backend` section below);
+`check_goal_backend` is the 13th by source-definition position. NB: distinct
+from the *landed-order* counts the mcp-server-registry (13th) and secret
+(14th) entries above cite — those count ship order by PR, this counts
+source-definition position.
 
 Uses the dual-probe pattern (MEMORY.md `feedback_doctor_dual_probe_pattern`):
 probes both `list_archived()` (lightweight list) and — only when `goal.md`
@@ -671,6 +674,55 @@ PASS / FAIL ladder (this check has no WARN path):
 frontmatter, dangling `blocked_by`) passing silently because the light list
 probe never parses the goal; URL credential leakage from
 `ATOMIC_AGENTS_GOAL_BACKEND` into doctor output or CI logs.
+
+---
+
+### `outcome-backend` *(agent-scoped)*
+
+**Verifies:** Operator-config coherence for the OutcomeBackend (spec/42).
+Agent-scoped because the filesystem reference impl reads each run's
+`result.json` from under `<agent_root>/outcomes/`. Doctor constructs the
+backend via `get_default_outcome_backend(agent_root)` directly (the
+`AtomicAgent.outcome_backend` public attribute is set at construction but is
+scaffolding-only this PR — never read internally — and the `OutcomeRunner`
+write-path kwarg is deferred to the #448 runtime-wiring PR). Lands as the
+14th `check_*_backend` entry by **definition order** in `doctor.py` in #426
+PR 1 (grep-verifiable: `grep -cE '^def check_[a-z_]+_backend\b'` = 14,
+`check_outcome_backend` last — it is defined immediately after
+`check_goal_backend`).
+
+Uses the dual-probe pattern (MEMORY.md `feedback_doctor_dual_probe_pattern`):
+probes both `list_runs()` (lightweight enumeration that returns `[]` when
+`outcomes/` is absent and must not raise) and — only when at least one run
+exists — `read_result()` on the most recent run (full parse + reconstruction),
+because the lightweight list never opens `result.json` and would false-PASS on
+a corrupt envelope. `OutcomeCorrupted` is caught BEFORE bare
+`AtomicAgentsError` so real corruption (FAIL) is not swallowed by the benign
+TOCTOU absent-run race (a run that `list_runs()` saw but `read_result()` found
+gone to concurrent cleanup — recorded as `read_result_vanished=True`, still
+PASS).
+
+PASS / FAIL ladder (this check has no WARN path):
+
+- **PASS** when `get_default_outcome_backend()`, `list_runs()`, and (when runs
+  exist) `read_result()` all succeed. No completed runs is NOT a failure —
+  reactive agents that never ran an outcome have none; the message carries the
+  suffix `(no completed runs for this agent)` and detail
+  `outcome_runs_present=False`. The full PASS detail dict is:
+  `backend_id`, `outcome_runs_present`, `run_count`, `read_result_probed`,
+  `read_result_vanished` (the benign vanished-run TOCTOU flag),
+  `supports_canonical_export`, `supports_artifact_storage`.
+- **FAIL** when `ATOMIC_AGENTS_OUTCOME_BACKEND` is set to an unregistered id,
+  or backend construction raises. The echoed env value is redacted before it
+  reaches the message or detail.
+- **FAIL** when `list_runs()` raises.
+- **FAIL** when a run exists AND `read_result()` raises — closes the
+  dual-probe false-PASS gap.
+
+**Prevents:** A corrupt `result.json` (truncated write, missing required
+fields, wrong types) passing silently because the light enumeration probe
+never parses the envelope; URL credential leakage from
+`ATOMIC_AGENTS_OUTCOME_BACKEND` into doctor output or CI logs.
 
 ---
 

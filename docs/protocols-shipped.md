@@ -1,6 +1,6 @@
 # Backend protocols shipped
 
-Twelve backend protocols are locked for v1.0. A thirteenth, SecretBackend (#340), shipped for v1.5 with two reference implementations (FilesystemSecretBackend + GCPSecretManagerBackend) and LOCKED spec/38. A fourteenth, GoalBackend (#425), shipped for v1.5 with FilesystemGoalBackend and DRAFT spec/41. Each section captures the reference implementations shipped, the operator override surface, the doctor coherence check, the Implementer Contract location, and the architectural cliff the protocol closes.
+Twelve backend protocols are locked for v1.0. A thirteenth, SecretBackend (#340), shipped for v1.5 with two reference implementations (FilesystemSecretBackend + GCPSecretManagerBackend) and LOCKED spec/38. A fourteenth, GoalBackend (#425), shipped for v1.5 with FilesystemGoalBackend and DRAFT spec/41. A fifteenth, OutcomeBackend (#426), shipped for v1.5 with FilesystemOutcomeBackend and DRAFT spec/42. Each section captures the reference implementations shipped, the operator override surface, the doctor coherence check, the Implementer Contract location, and the architectural cliff the protocol closes.
 
 This file is the canonical reference for what the framework's storage seam looks like today. CLAUDE.md links here instead of inlining the detail so the session prompt stays under its char budget.
 
@@ -276,7 +276,7 @@ Call-site migration: `agent.py:_load_indexes()` routes `wiki/INDEX.md` reads thr
 
 `CorpusBackend` becomes the source of truth for `wiki/` and `raw/` per spec/34 while `MemoryBackend` retains exclusive ownership of `memory/` and `journal/` (spec/24 Decision 7 addendum).
 
-Operator override via `ATOMIC_AGENTS_CORPUS_BACKEND` + optional `ATOMIC_AGENTS_CORPUS_BACKEND_URL` env vars (when `=sqlite` without URL, defaults to `<agent_root>/.corpus.db` with `agent_scope=quote_plus(agent_root.name)` so single-host operators get a working SQLite default by flipping one env var) OR `AtomicAgent(..., corpus_backend=...)` constructor kwarg + per-runner kwargs on OutcomeRunner (threads at `outcome.py:255`) / EvalRunner (at `eval.py:363`) / DreamRunner (stores as `self._corpus_backend` for API parity; no internal `AtomicAgent` construction site in v1).
+Operator override via `ATOMIC_AGENTS_CORPUS_BACKEND` + optional `ATOMIC_AGENTS_CORPUS_BACKEND_URL` env vars (when `=sqlite` without URL, defaults to `<agent_root>/.corpus.db` with `agent_scope=quote_plus(agent_root.name)` so single-host operators get a working SQLite default by flipping one env var) OR `AtomicAgent(..., corpus_backend=...)` constructor kwarg + per-runner kwargs on OutcomeRunner (threads in `outcome/_outcome_impl.py`) / EvalRunner (at `eval.py:363`) / DreamRunner (stores as `self._corpus_backend` for API parity; no internal `AtomicAgent` construction site in v1).
 
 `delegate.py` explicit-only threading via `_corpus_backend_was_explicit` flag mirroring PersonaBackend D-ER-2 at `agent.py:431` (default-resolved backends do not leak the coordinator's `agent_root` to delegates because corpus is per-agent semantic context, distinct from fleet-scoped Policy + AgentProfile which always thread).
 
@@ -365,6 +365,30 @@ The first agent-scope surface of the #383 four-protocol wave (goals, outcomes, j
 DRAFT spec/41 carries 9 normative MUSTs (charset validation, side-effect-free construction, capability honesty, atomic `apply_transition`, no-data-loss archive, collision-safe archive identity, idempotent archive retry, stable `backend_id`, goal.md-before-history-line audit ordering). Test suite: `tests/test_goal_backend_conformance.py` (parametrized conformance, all 9 MUSTs) + `tests/test_goal_filesystem.py` (filesystem-specific) + `tests/test_goal_doctor.py` (dual-probe, PASS/FAIL/SKIP ladder) + `tests/test_goal_dispatch_audit_ordering.py` (MUST 6 regression). The 4 pre-existing goal test files kept intact as the zero-behavior-change regression guard.
 
 **Closes the goal-persistence cliff:** the same goal state machine — status transitions, history audit trail, archiving — can run on a filesystem or a Postgres table without forking `GoalManager` or the CLI. `dispatch_as_outcome()` correctness fix ships here: goal.md persisted before `goal_history.jsonl` audit line (spec/41 MUST 6), with a dedicated regression test.
+
+---
+
+## OutcomeBackend (#426, DRAFT spec/42, the fifteenth)
+
+The second agent-scope surface of the #383 four-protocol wave (goals, outcomes, journal, cascade). Carves the flat `outcome.py` module — which held `OutcomeRunner`, `OutcomeResult`/`IterationRecord` dataclasses, and the CLI entry point — into a proper Protocol + storage backend, separating the storage abstraction from the runtime behavior.
+
+**Reference implementation:** `FilesystemOutcomeBackend` (PR 1 of 2). Reproduces today's exact `outcomes/runs/<run_id>/result.json` I/O byte-for-byte. Zero behavior change for home users — `OutcomeRunner._write_result_json` is untouched; the golden-file conformance test pins byte-identity against the real runner serializer.
+
+`FilesystemOutcomeBackend` stores completed-run state in `<agent_root>/outcomes/runs/<run_id>/result.json` (the `OutcomeResult` envelope: iteration history, judge verdicts, artifact paths, aggregate cost/tokens, final status). The backend is `@runtime_checkable` and exposes the THIN envelope-only surface `write_result` / `read_result` / `list_runs` / `export` / `export_all` / `capabilities` + `backend_id`. Artifact-file discovery (output_dir glob-diffing), output_dir resolution, and run_id minting STAY in `OutcomeRunner` above the Protocol (Principle #3 layers-don't-merge). `OutcomeResult`/`IterationRecord` (canonical types in `outcome/types.py`) are **mutable** — deliberate divergence from the frozen-DTO convention, documented in the module docstring exactly like `goal/types.py` (the outcome layer is a state machine during the run). `OutcomeCapabilities` is frozen.
+
+`OutcomeRunner` was relocated to `_outcome_impl.py`. The documented public `from atomic_agents.outcome import OutcomeRunner` / `IterationRecord` path (used in 10+ test files) is preserved as a **supported, non-deprecated** compatibility re-export (no `DeprecationWarning`, matching Principle #14), and `python -m atomic_agents.outcome` is preserved via `outcome/__main__.py`.
+
+**Artifact-reference portability (Option C):** on-disk `result.json` stays BYTE-IDENTICAL (absolute paths); the net-new `export()` emits PORTABLE artifact refs by rebasing absolute paths to relative-to-`agent_root` (via `is_relative_to` guard). This rebases against `agent_root` (the agent's own root, for whole-agent portability), NOT the ruling's literal `agents_root` — a deliberate departure recorded in spec/42 §"Artifact-reference portability". `export()`/`export_all()` are deliberately scoped to the single most-recent run for this scaffolding PR (the single-run `OutcomeExport` shape); a multi-run export shape is filed as #454.
+
+**Operator override surface:** `ATOMIC_AGENTS_OUTCOME_BACKEND` env var (default `"filesystem"`) + `get_default_outcome_backend(agent_root)` factory + public `AtomicAgent.outcome_backend` attribute (scaffolding-only this PR — set at construction, never read internally; the write path wires through the backend in #448, which also adds the `OutcomeRunner` kwarg).
+
+`doctor.check_outcome_backend()` uses the dual-probe pattern (`list_runs` liveness + `read_result` only when runs exist) per `feedback_doctor_dual_probe_pattern`, probing the registered factory, not raw files. Located in `atomic_agents/doctor.py`.
+
+**Exportable:** `OutcomeExport` is an `ExportableResult` carrying `(run_id, result_json_bytes, artifact_refs, backend_id, scope)`, re-exported from the `atomic_agents.export` package root. `FilesystemOutcomeBackend` implements `Exportable` with `supports_canonical_export=True` and `supports_artifact_storage=True`, registered in the spec/40 export conformance harness (`tests/test_export_protocol_conformance.py` + `tests/test_export_capability_advertisement.py`).
+
+DRAFT spec/42 carries 9 normative MUSTs (side-effect-free construction, capability honesty, `list_runs` returns `[]` when absent, atomic writes, round-trip fidelity, `OutcomeCorrupted` on corrupt result.json, `AtomicAgentsError` on absent run, stable `backend_id`, write-once/result-immutability as the unique 9th axis). Conformance suite: `tests/test_outcome_backend_conformance.py` (parametrized, all 9 MUSTs + filesystem-specific). The 2 pre-existing outcome tests (`test_outcome.py`, `test_goal_outcome_composition.py`) kept intact as the zero-behavior-change regression guard.
+
+**Closes the outcome-persistence cliff:** the same result.json envelope — iteration history, judge verdicts, artifact refs, final status — can run on a filesystem or a swapped store without forking `OutcomeRunner` or the CLI, and an `export()` carries portable (relative) artifact refs so a whole-agent move survives (T15 / Position B).
 
 ---
 
