@@ -638,9 +638,10 @@ the backend via `get_default_goal_backend(agent_root)` directly (the
 `AtomicAgent` constructor kwarg + public attribute are deferred to the #448
 runtime-wiring PR, so there is no `AtomicAgent.goal_backend` to read). Lands
 as the 13th `check_*_backend` entry by **definition order** in `doctor.py`
-in #425 PR 1. After #426 PR 1 added `check_outcome_backend` immediately
-below it, the live grep is `grep -cE '^def check_[a-z_]+_backend\b'` = 14
-with `check_outcome_backend` last (see the `outcome-backend` section below);
+in #425 PR 1. After #426 PR 1 added `check_outcome_backend` and #427 PR 1
+added `check_journal_backend`, the live grep is
+`grep -cE '^def check_[a-z_]+_backend\b'` = 15 with `check_journal_backend`
+last (see the `journal-backend` section below);
 `check_goal_backend` is the 13th by source-definition position. NB: distinct
 from the *landed-order* counts the mcp-server-registry (13th) and secret
 (14th) entries above cite — those count ship order by PR, this counts
@@ -687,9 +688,9 @@ backend via `get_default_outcome_backend(agent_root)` directly (the
 scaffolding-only this PR — never read internally — and the `OutcomeRunner`
 write-path kwarg is deferred to the #448 runtime-wiring PR). Lands as the
 14th `check_*_backend` entry by **definition order** in `doctor.py` in #426
-PR 1 (grep-verifiable: `grep -cE '^def check_[a-z_]+_backend\b'` = 14,
-`check_outcome_backend` last — it is defined immediately after
-`check_goal_backend`).
+PR 1 (after #427 PR 1 added `check_journal_backend` as the 15th,
+grep-verifiable: `grep -cE '^def check_[a-z_]+_backend\b'` = 15 with
+`check_journal_backend` last).
 
 Uses the dual-probe pattern (MEMORY.md `feedback_doctor_dual_probe_pattern`):
 probes both `list_runs()` (lightweight enumeration that returns `[]` when
@@ -723,6 +724,68 @@ PASS / FAIL ladder (this check has no WARN path):
 fields, wrong types) passing silently because the light enumeration probe
 never parses the envelope; URL credential leakage from
 `ATOMIC_AGENTS_OUTCOME_BACKEND` into doctor output or CI logs.
+
+---
+
+### `journal-backend` *(agent-scoped)*
+
+**Verifies:** Operator-config coherence for the JournalBackend (spec/43).
+Agent-scoped because the filesystem reference impl reads each journal entry
+from under `<agent_root>/journal/`. Doctor constructs the backend via
+`get_default_journal_backend(agent_root)` directly (the
+`AtomicAgent.journal_backend` public attribute is LIVE-WIRED — agent._load_recent_journal
+routes through it — unlike outcome_backend which was scaffolding-only). Lands
+as the 15th `check_*_backend` entry by **definition order** in `doctor.py` in
+#427 PR 1 (grep-verifiable: `grep -cE '^def check_[a-z_]+_backend\b'` = 15,
+`check_journal_backend` last — it is defined immediately after
+`check_outcome_backend`).
+
+Uses the dual-probe pattern (MEMORY.md `feedback_doctor_dual_probe_pattern`):
+probes both `list_entries(limit=1)` (lightweight list) and — only when at
+least one entry exists — `entry.path.read_bytes()` on the first returned entry
+(full read path). This catches the false-PASS class where the backend's list
+succeeds but the paths it returned are wrong/missing and runtime reads fail.
+
+PASS / FAIL ladder (this check has no WARN path):
+
+- **PASS** when `get_default_journal_backend()`, `list_entries(limit=1)`, and
+  (when entries exist) `entry.path.read_bytes()` all succeed. No journal entries
+  is NOT a failure — new agents with no journal pass cleanly; the message carries
+  `(no journal entries for this agent)` and detail `journal_entries_found=0`.
+  Mirrors `goal-backend`'s PASS-on-absent behavior.
+- **FAIL** when `ATOMIC_AGENTS_JOURNAL_BACKEND` is set to an unregistered id,
+  or backend construction raises. The echoed env value is redacted before it
+  reaches the message or detail.
+- **FAIL** when `list_entries()` raises.
+- **FAIL** when the agent's `journal/` DIRECTORY is a symlink resolving outside
+  `agent_root`. This does NOT surface via `list_entries()` — the backend's
+  `_journal_dir()` raises `PathTraversalError` but `list_entries()` CATCHES it
+  and returns `[]` (an absent journal), which would silently PASS the vault
+  even though every runtime read drops the entire journal. Doctor therefore
+  probes the directory DIRECTLY via the backend's `_journal_dir()` helper
+  (`hasattr`-guarded for non-filesystem backends) and FAILs on
+  `PathTraversalError`. This is the real misconfiguration class doctor exists
+  to catch.
+- **PASS** when entries exist AND an individual `.md` entry is a symlink
+  resolving outside `agent_root`. The runtime (bundle/agent/dream via
+  `list_entries`) follows such an entry through exactly as the legacy rglob
+  callers did, so doctor agrees with the runtime contract rather than FAIL on
+  what the runtime reads (`feedback_doctor_dual_probe_pattern`: doctor's
+  verdict and runtime behavior cannot disagree). There is no per-entry
+  `is_relative_to` re-check. Only a symlinked `journal/` DIRECTORY escape is
+  refused (the direct probe above).
+- **PASS** when entries exist AND `entry.path.read_bytes()` raises
+  `FileNotFoundError` — benign TOCTOU (the entry vanished between the list and
+  the read, e.g. concurrent cleanup). Mirrors `outcome-backend`'s vanished-run
+  TOCTOU handling.
+- **FAIL** when entries exist AND `read_bytes()` raises `PermissionError` or any
+  other unexpected error on an existing file — closes the dual-probe false-PASS
+  gap for genuinely-unreadable entries.
+
+**Prevents:** A misconfigured backend whose `list_entries()` returns paths that
+cannot actually be read (wrong subdir layout, wrong path resolution) passing
+silently; URL credential leakage from `ATOMIC_AGENTS_JOURNAL_BACKEND` into
+doctor output or CI logs.
 
 ---
 

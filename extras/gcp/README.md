@@ -153,7 +153,7 @@ own tracking issues, re-point the rows below.
 | Goals | Ephemeral (container writable layer) - GoalBackend Protocol shipped (DRAFT spec/41, FilesystemGoalBackend, #425); only the filesystem impl is registered today, so durable once a cloud adapter ships | Issue #425 (Protocol shipped); cloud adapter pending |
 | Outcomes | Ephemeral (container writable layer) - OutcomeBackend Protocol shipped (DRAFT spec/42, FilesystemOutcomeBackend, #426; write-path wiring deferred to #448); durable once write-path wiring lands AND a cloud adapter ships | Issue #426 (Protocol shipped) + #448 (write-path); cloud adapter pending |
 | Dreams | Ephemeral - operator-triggered dream artifacts at `<agent_root>/dreams/` (`atomic_agents/dream.py`); no Protocol yet; #383 (Phase 3) | Issue #383 |
-| Journal | Ephemeral - no Protocol yet; #383 (Phase 3) | Issue #383 |
+| Journal | Ephemeral (container writable layer) - JournalBackend Protocol shipped (DRAFT spec/43, FilesystemJournalBackend, #427); only the filesystem impl is registered today, so durable once a cloud adapter ships | Issue #427 (Protocol shipped); cloud adapter pending |
 | Cascade queue | Ephemeral - no Protocol yet; #383 + TENSIONS.md T4 (Phase 3) | Issue #383 |
 | Mandate, Policy | Ephemeral - Postgres adapters tracked in #258 (Phase 3) | Issue #258 |
 | Profile, tool-registry, corpus | Ephemeral - Postgres adapters tracked in #258 (Phase 3) | Issue #258 |
@@ -167,8 +167,8 @@ own tracking issues, re-point the rows below.
 | Run logs | Persistent disk (FilesystemLogBackend) or PostgresLogBackend | Activate PostgresLogBackend for query |
 | Locks | Redis (recommended) or FilesystemLockBackend | Redis already shipped |
 | Memory | Persistent disk (FilesystemMemoryBackend) | Issue #382 (T5 wiring seam, shipped) AND issue #258 (Postgres memory adapter, Phase 2) |
-| Goals, Outcomes | Persistent disk - GoalBackend (#425, DRAFT spec/41) + OutcomeBackend (#426, DRAFT spec/42) Protocols shipped, filesystem reference impls | #425 + #426 (Protocols shipped); cloud adapters pending |
-| Journal, Dreams | Persistent disk (no Protocol yet; dreams at `<agent_root>/dreams/`) | Issue #383 (Phase 3) |
+| Goals, Outcomes, Journal | Persistent disk - GoalBackend (#425, DRAFT spec/41) + OutcomeBackend (#426, DRAFT spec/42) + JournalBackend (#427, DRAFT spec/43) Protocols shipped, filesystem reference impls | #425 + #426 + #427 (Protocols shipped); cloud adapters pending |
+| Dreams | Persistent disk (no Protocol yet; dreams at `<agent_root>/dreams/`) | Issue #383 (Phase 3) |
 | Cascade queue | Persistent disk (POSIX rename claim) | Issue #383 + TENSIONS.md T4 |
 | Mandate, Policy, Profile, tool-registry, corpus | Persistent disk (Filesystem/SQLite backends) | Issue #258 (Phase 3) |
 
@@ -177,10 +177,10 @@ own tracking issues, re-point the rows below.
 - **Group A - Protocols exist, cloud adapter can be written once it ships:**
   logs (#258, shipped), memory (#382 override seam shipped; #258 Postgres
   adapter pending), goals (#425, DRAFT spec/41), outcomes (#426, DRAFT spec/42;
-  write-path wiring deferred to #448), mandate, policy, profile, tool-registry,
-  corpus, persona (#258).
+  write-path wiring deferred to #448), journal (#427, DRAFT spec/43), mandate,
+  policy, profile, tool-registry, corpus, persona (#258).
 - **Group B - No Protocol yet; Protocol must be authored before any adapter:**
-  journal, cascade queue. Tracked in #383. The home user
+  cascade queue. Tracked in #383. The home user
   (filesystem-only) is unaffected; this gate only matters for org-scale
   elastic deployments.
 
@@ -464,7 +464,7 @@ off the VM disk, one cloud-native backend at a time.
 |---|---|---|
 | **Phase 1** | Export contract - round-trip: write to cloud store, export, byte-equivalent vault files. Proves cloud store equals filesystem store. Gate for everything after. | Issue #379 |
 | **Phase 2** | Memory backend on Postgres/pgvector (biggest disk shrink). Memory is the most-written, most-shared surface. | Issue #382 (T5 wiring seam) AND issue #258 (Postgres memory adapter) |
-| **Phase 3** | Peel the rest: goals (#425, DRAFT spec/41) + outcomes (#426, DRAFT spec/42) Protocols shipped — cloud adapters pending; journal + cascade work-queue still need Protocols authored (#383; the work-queue's POSIX-rename claim is what T4 tracks). Mandate, policy, profile, tool-registry, corpus, and persona storage (`.personas/`) to Postgres adapters (#258). | Issue #383 + #258 + #425 + #426 + TENSIONS.md T4 + T13 |
+| **Phase 3** | Peel the rest: goals (#425, DRAFT spec/41) + outcomes (#426, DRAFT spec/42) + journal (#427, DRAFT spec/43) Protocols shipped — cloud adapters pending; cascade work-queue still needs a Protocol authored (#383; the work-queue's POSIX-rename claim is what T4 tracks). Mandate, policy, profile, tool-registry, corpus, and persona storage (`.personas/`) to Postgres adapters (#258). | Issue #383 + #258 + #425 + #426 + #427 + TENSIONS.md T4 + T13 |
 | **Phase 4** | Flip topology: all state on multi-writer-safe cloud backends; remove min-instances=1 constraint; raise max-instances. Service is now stateless in the full sense: any instance serves any request, idle = $0. For Cloud Run v0, the disk was never present - Phase 4 is the managed-backend gate only. | All prior phases + issue #379 round-trip conformance |
 | **Phase 5** | Concurrency ceiling (TENSIONS.md T2). Horizontal scale buys headroom before this is forced. | TENSIONS.md T2 triggers |
 

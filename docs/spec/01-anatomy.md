@@ -398,6 +398,8 @@ journal/
 
 **Use**: The agent loads the most recent 1-3 journal entries at runtime as recency context. Older entries are searchable but not loaded by default.
 
+**Storage abstraction (spec/43).** `journal/` is owned by `JournalBackend` (spec/43) — carved out from `MemoryBackend`'s prior ownership claim (see spec/02). The backend handles append atomicity, date-windowed read (for dreams), and newest-N read (for bundle/agent system prompt). The on-disk layout (month-bucketed `YYYY-MM/YYYY-MM-DD.md`) is the canonical format; `JournalBackend.append_entry()` mints filenames and subdirs automatically.
+
 ---
 
 ## log/

@@ -92,6 +92,10 @@ class OutcomeCorrupted(AtomicAgentsError):
     """result.json is present but cannot be parsed as a valid OutcomeResult."""
 
 
+class JournalCorrupted(AtomicAgentsError):
+    """A journal entry file is present but cannot be read or decoded as valid UTF-8."""
+
+
 class NotInRoster(AtomicAgentsError):
     """Target agent not in the coordinator's roster.md."""
 

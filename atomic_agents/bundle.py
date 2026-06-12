@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     # All runtime references use the string annotation "CorpusBackend | None".
     # (PR 3 wiring)
     from .corpus.backend import CorpusBackend
+    from .journal.backend import JournalBackend
 
 
 SECTION_SEPARATOR = "\n\n═══════════════════════════\n\n"
@@ -115,6 +116,7 @@ def render_bundle(
     extra_files: list[Path] | None = None,
     if_stale: bool = False,
     corpus_backend: "CorpusBackend | None" = None,
+    journal_backend: "JournalBackend | None" = None,
 ) -> BundleResult:
     """Render the cascade for *agent_root* into a single bundled file.
 
@@ -143,8 +145,10 @@ def render_bundle(
     bundle_path = cache_dir / f"{slug}.md"
 
     all_extras = _collect_extras(agent_root, extra_files)
-    sources = _source_paths(agent_root) + all_extras
-    staleness_paths = _staleness_paths(agent_root) + all_extras
+    sources = _source_paths(agent_root, journal_backend=journal_backend) + all_extras
+    staleness_paths = (
+        _staleness_paths(agent_root, journal_backend=journal_backend) + all_extras
+    )
 
     if if_stale and bundle_path.is_file():
         bundle_mtime = bundle_path.stat().st_mtime
@@ -172,7 +176,12 @@ def render_bundle(
                     source_count=sum(1 for p in sources if p.is_file()),
                 )
 
-    sections = _render_sections(agent_root, all_extras, corpus_backend=corpus_backend)
+    sections = _render_sections(
+        agent_root,
+        all_extras,
+        corpus_backend=corpus_backend,
+        journal_backend=journal_backend,
+    )
     header = _render_header(agent_root, sources)
     body = SECTION_SEPARATOR.join(s for s in sections if s)
     content = header + "\n\n" + body + "\n\n<!-- end bundle -->\n"
@@ -273,8 +282,22 @@ def _collect_extras(
 
 
 # TODO(v1.1): _source_paths returns filesystem paths for staleness tracking. SQLite backends have no equivalent path to track. See #65 PR 4 follow-up issue (to be filed at arc closer).
-def _source_paths(agent_root: Path) -> list[Path]:
-    """Enumerate every cascade source file whose mtime should drive staleness."""
+def _source_paths(
+    agent_root: Path,
+    journal_backend: "JournalBackend | None" = None,
+) -> list[Path]:
+    """Enumerate every cascade source file whose mtime should drive staleness.
+
+    ADOPT-NOW (#427 PR1 — spec/43): journal entry paths come from
+    journal_backend.list_entries(limit=N, newest_first=True) when provided,
+    replacing the legacy rglob block. The selection order is byte-identical
+    to sorted(journal_dir.rglob('*.md'), reverse=True)[:N] because
+    FilesystemJournalBackend.list_entries() sorts by full Path descending.
+    When journal_backend is None, get_default_journal_backend(instance_root)
+    is called to match the corpus_backend=None pattern.
+    """
+    from .journal import get_default_journal_backend  # noqa: PLC0415
+
     paths: list[Path] = []
     cascade = _cascade.detect_cascade(agent_root)
 
@@ -303,7 +326,6 @@ def _source_paths(agent_root: Path) -> list[Path]:
 
     memory_dir = instance_root / "memory"
     wiki_dir = instance_root / "wiki"
-    journal_dir = instance_root / "journal"
 
     if memory_dir.is_dir():
         paths.append(memory_dir / "INDEX.md")
@@ -311,12 +333,14 @@ def _source_paths(agent_root: Path) -> list[Path]:
         paths.extend(sorted(memory_dir.glob("*.md")))
     if wiki_dir.is_dir():
         paths.append(wiki_dir / "INDEX.md")
-    if journal_dir.is_dir():
-        # Newest first; only the top N drive staleness since older entries
-        # aren't in the bundle. Sort here matches _load_recent_journal.
-        paths.extend(
-            sorted(journal_dir.rglob("*.md"), reverse=True)[:RECENT_JOURNAL_DEFAULT]
-        )
+
+    # Journal entries via JournalBackend (ADOPT-NOW, #427 PR1).
+    # Newest first; only the top N drive staleness since older entries
+    # aren't in the bundle. The backend's list_entries() sorts by full Path
+    # descending — byte-identical to the legacy sorted(rglob, reverse=True)[:N].
+    _jbe = journal_backend or get_default_journal_backend(instance_root)
+    journal_entries = _jbe.list_entries(limit=RECENT_JOURNAL_DEFAULT, newest_first=True)
+    paths.extend(entry.path for entry in journal_entries)
 
     # bundle.md itself: if it changes, the bundle is stale.
     bundle_md = agent_root / "bundle.md"
@@ -326,7 +350,10 @@ def _source_paths(agent_root: Path) -> list[Path]:
     return [p for p in paths if p.is_file()]
 
 
-def _staleness_paths(agent_root: Path) -> list[Path]:
+def _staleness_paths(
+    agent_root: Path,
+    journal_backend: "JournalBackend | None" = None,
+) -> list[Path]:
     """Return paths whose mtime drives staleness — files PLUS directories.
 
     Directories are included so that *deletions* trigger regeneration. POSIX
@@ -338,7 +365,7 @@ def _staleness_paths(agent_root: Path) -> list[Path]:
     directories that scope the bundle's runtime-assembly content (memory/,
     wiki/, journal/, project policy/).
     """
-    paths = _source_paths(agent_root)
+    paths = _source_paths(agent_root, journal_backend=journal_backend)
 
     cascade = _cascade.detect_cascade(agent_root)
     instance_root = cascade.instance_root if cascade else agent_root
@@ -364,6 +391,7 @@ def _render_sections(
     agent_root: Path,
     extras: list[Path],
     corpus_backend: "CorpusBackend | None" = None,
+    journal_backend: "JournalBackend | None" = None,
 ) -> list[str]:
     """Build the ordered list of bundle sections per spec/04 + spec/06.
 
@@ -374,6 +402,9 @@ def _render_sections(
     ``corpus_backend`` is threaded to ``_render_memory_breakpoint`` so PR 3
     wiring can route wiki INDEX reads through the Protocol when available.
     Defaults to ``None`` for full backward compatibility.
+
+    ``journal_backend`` is threaded to ``_render_journal_breakpoint`` (ADOPT-NOW,
+    #427 PR1 — spec/43). Defaults to ``None`` (factory resolved inside).
     """
     cascade = _cascade.detect_cascade(agent_root)
     sections: list[str] = ["# === BREAKPOINT 1: Stable cascade ==="]
@@ -393,7 +424,9 @@ def _render_sections(
         _render_memory_breakpoint(instance_root, corpus_backend=corpus_backend)
     )
     sections.extend(_render_recent_notes_breakpoint(instance_root))
-    sections.extend(_render_journal_breakpoint(instance_root))
+    sections.extend(
+        _render_journal_breakpoint(instance_root, journal_backend=journal_backend)
+    )
 
     return sections
 
@@ -600,15 +633,31 @@ def _render_recent_notes_breakpoint(instance_root: Path) -> list[str]:
     ]
 
 
-def _render_journal_breakpoint(instance_root: Path) -> list[str]:
-    """Render the recent journal entries (BP4), newest first."""
-    journal_dir = instance_root / "journal"
-    entries = _load_recent_journal(journal_dir, n=RECENT_JOURNAL_DEFAULT)
-    if not entries:
+def _render_journal_breakpoint(
+    instance_root: Path,
+    journal_backend: "JournalBackend | None" = None,
+) -> list[str]:
+    """Render the recent journal entries (BP4), newest first.
+
+    ADOPT-NOW (#427 PR1 — spec/43): routes through journal_backend.
+    backend returns raw JournalEntry; formatting stays at this call site.
+    bundle renders: '# Journal — {stem}\\n`{path}`\\n\\n{text}' (WITH path line).
+    agent renders:  '# Journal — {stem}\\n\\n{text}' (NO path line).
+    DO NOT unify — the divergence is LOAD-BEARING (byte-identity golden tests).
+    """
+    from .journal import get_default_journal_backend  # noqa: PLC0415
+
+    _jbe = journal_backend or get_default_journal_backend(instance_root)
+    journal_entries = _jbe.list_entries(limit=RECENT_JOURNAL_DEFAULT, newest_first=True)
+    if not journal_entries:
         return []
+    rendered = [
+        f"# Journal — {entry.path.stem}\n`{entry.path}`\n\n{entry.text}"
+        for entry in journal_entries
+    ]
     return [
         "# === BREAKPOINT 4: Daily (recent journal) ===",
-        "## Recent journal\n\n" + "\n\n---\n\n".join(entries),
+        "## Recent journal\n\n" + "\n\n---\n\n".join(rendered),
     ]
 
 
@@ -663,18 +712,9 @@ def _load_pinned_notes(memory_dir: Path, max_pinned: int = PINNED_MAX) -> list[s
     return notes
 
 
-def _load_recent_journal(
-    journal_dir: Path, n: int = RECENT_JOURNAL_DEFAULT
-) -> list[str]:
-    """Return the n most-recent journal entries by filename (newest first).
-
-    Matches :meth:`AtomicAgent._load_recent_journal`: sort by filename
-    descending (works because journal entries are dated ``YYYY-MM-DD.md``).
-    """
-    if not journal_dir.is_dir():
-        return []
-    entries = sorted(journal_dir.rglob("*.md"), reverse=True)[:n]
-    return [f"# Journal — {p.stem}\n`{p}`\n\n{_safe_read_text(p)}" for p in entries]
+# NOTE: the former _load_recent_journal helper was removed in #427 PR1 — its
+# storage logic now lives in FilesystemJournalBackend.list_entries() and its
+# render logic in _render_journal_breakpoint (which routes through the backend).
 
 
 # ──────────────────────────────────────────────────────────────────

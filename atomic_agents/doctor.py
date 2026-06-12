@@ -194,6 +194,7 @@ def run_doctor(
             "secret-backend",
             "goal-backend",
             "outcome-backend",
+            "journal-backend",
             "memory-backend-config",
             "memory-backend",
             "write-paths",
@@ -259,6 +260,7 @@ def run_doctor(
     results.append(check_secret_backend())
     results.append(check_goal_backend(agent_root))
     results.append(check_outcome_backend(agent_root))
+    results.append(check_journal_backend(agent_root))
     # memory-backend-config (coherence) runs before memory-backend (liveness),
     # mirroring the check_lock_backend → check_locks ordering (#60 PR 3).
     results.append(check_memory_backend_config(agent_root))
@@ -4024,6 +4026,256 @@ def check_outcome_backend(agent_root: Path) -> CheckResult:
             "read_result_vanished": read_result_vanished,
             "supports_canonical_export": caps.supports_canonical_export,
             "supports_artifact_storage": caps.supports_artifact_storage,
+        },
+    )
+
+
+def check_journal_backend(agent_root: Path) -> CheckResult:
+    """JournalBackend resolves and the configured backend instantiates cleanly.
+
+    Validates that ATOMIC_AGENTS_JOURNAL_BACKEND is correctly configured.
+    Scoped at agent_root because the journal backend is per-agent — journal
+    entries live under agent_root/journal/YYYY-MM/YYYY-MM-DD.md.
+
+    Doctor dual-probe pattern (MEMORY.md feedback_doctor_dual_probe_pattern):
+    Probes BOTH:
+    1. list_entries(limit=1) — lightweight enumeration (MUST NOT raise even when
+       journal/ is absent; returns [] for agents with no journal entries)
+    2. entry.path.read_bytes() — heavy read path for the first returned entry
+       (only when list_entries() returns at least one entry)
+
+    When no entries exist (new agent or agent that has never written a journal
+    entry), returns PASS with journal_entries_found=0, read_bytes_probed=False
+    in the detail dict. This is NOT a failure — matching check_goal_backend's
+    pattern for agents without a goal.md.
+
+    PASS / FAIL ladder (this check has no WARN path):
+    FAIL when:
+    * get_default_journal_backend(agent_root) raises (bad env var or not registered).
+    * list_entries() raises.
+    * A symlinked journal/ DIRECTORY escapes agent_root. NOTE: list_entries()
+      does NOT surface this — the filesystem backend's _journal_dir() raises
+      PathTraversalError, which list_entries() CATCHES and returns [] (an absent
+      journal). That would silently PASS the operator's vault even though every
+      runtime read drops the ENTIRE journal. So doctor probes the escape vector
+      DIRECTLY: when the backend exposes a _journal_dir() helper, doctor calls it
+      and FAILs on PathTraversalError. This is the real misconfiguration class
+      doctor exists to catch (a journal/ symlinked outside the vault).
+    * Entries exist AND the existing file is unreadable for a NON-benign reason
+      (PermissionError, or any unexpected error from read_bytes()).
+
+    Deliberately NOT a FAIL (#427 PR1 ADOPT-NOW byte-identity ruling): an
+    individual symlinked .md ENTRY that resolves outside agent_root. The runtime
+    (bundle/agent/dream via list_entries) FOLLOWS such an entry exactly as the
+    legacy rglob callers did, so doctor must agree with that runtime contract
+    rather than FAIL on what the runtime reads
+    (feedback_doctor_dual_probe_pattern: doctor's verdict and runtime behavior
+    cannot disagree). Only a symlinked DIRECTORY escape is refused.
+
+    PASS otherwise, including:
+    * when no entries exist, and
+    * benign TOCTOU — the entry vanished between list_entries() and read_bytes()
+      (FileNotFoundError), e.g. a concurrent archive/cleanup removed the file.
+    """
+    from .journal import (  # noqa: PLC0415
+        get_default_journal_backend,
+        list_journal_backends,
+        _redact_for_error_message,
+    )
+    from .exceptions import PathTraversalError  # noqa: PLC0415
+
+    raw_backend_id = (
+        os.environ.get("ATOMIC_AGENTS_JOURNAL_BACKEND", "").strip().lower()
+        or "filesystem"
+    )
+    # Credential safety: ATOMIC_AGENTS_JOURNAL_BACKEND may carry a URL- or
+    # DSN-shaped value. Redact before it reaches the rendered CheckResult
+    # message or detail. Same per-backend _redact_for_error_message convention
+    # as logs/profile/corpus/mcp_registry/secret_backend/goal/outcome.
+    safe_backend_id = _redact_for_error_message(raw_backend_id)
+
+    try:
+        backend = get_default_journal_backend(agent_root)
+    except Exception as e:
+        return CheckResult(
+            name="journal-backend",
+            status=FAIL,
+            message=(
+                f"failed to instantiate journal backend "
+                f"(ATOMIC_AGENTS_JOURNAL_BACKEND={safe_backend_id!r}): {e}"
+            ),
+            fix_hint=(
+                "Unset ATOMIC_AGENTS_JOURNAL_BACKEND to use the filesystem default, "
+                f"or set it to a registered backend id (known: {list_journal_backends()}). "
+            ),
+            detail={"backend_id": safe_backend_id, "error": str(e)},
+        )
+
+    # Normalized permissions-class fix_hint, shared between the list_entries and
+    # read_bytes probes so a PermissionError surfaces the SAME remediation
+    # regardless of which probe trips first (the journal/ DIRECTORY denied → the
+    # list probe; an individual ENTRY file denied → the read_bytes probe). The
+    # construction probe keeps its own env-var fix_hint because a construction
+    # failure is a config error (bad/unregistered backend id), not a permissions
+    # error. The verdict stays FAIL in every case; only the fix_hint is unified.
+    _PERMS_FIX_HINT = (
+        "A path under journal/ exists but cannot be read (permissions). "
+        "Fix the file or directory's mode or ownership "
+        "(e.g. chmod/chown the journal/ directory and its entry files)."
+    )
+
+    # Dual-probe step 1: lightweight list
+    try:
+        entries = backend.list_entries(limit=1, newest_first=True)
+    except PermissionError as e:
+        # journal/ directory (or an entry within it) is permission-denied and
+        # the backend's list surfaced it as a raise rather than degrading to [].
+        # Normalize to the shared permissions fix_hint so this matches the
+        # read_bytes probe's remediation wording exactly.
+        return CheckResult(
+            name="journal-backend",
+            status=FAIL,
+            message=f"journal backend list_entries() raised: {type(e).__name__}: {e}",
+            fix_hint=_PERMS_FIX_HINT,
+            detail={
+                "backend_id": backend.backend_id,
+                "error": str(e),
+                "error_type": type(e).__name__,
+            },
+        )
+    except Exception as e:
+        return CheckResult(
+            name="journal-backend",
+            status=FAIL,
+            message=f"journal backend list_entries() raised: {type(e).__name__}: {e}",
+            detail={
+                "backend_id": backend.backend_id,
+                "error": str(e),
+                "error_type": type(e).__name__,
+            },
+        )
+
+    # Directory-escape probe: a symlinked journal/ DIRECTORY pointing outside
+    # agent_root is the real escape vector — but list_entries() CATCHES the
+    # backend's PathTraversalError and returns [] (an absent journal), so the
+    # step-1 probe above PASSes it silently. That is a genuine operator
+    # misconfiguration where every runtime read drops the ENTIRE journal, which
+    # is exactly the class doctor exists to catch. Probe it DIRECTLY via the
+    # filesystem backend's _journal_dir() helper (guarded by hasattr so non-fs
+    # backends are unaffected). This is distinct from — and does NOT reintroduce
+    # — the per-entry symlink re-check the ADOPT-NOW ruling forbids: an
+    # individual symlinked .md ENTRY resolving outside agent_root is still a
+    # deliberate PASS (followed through for byte-identity); only a symlinked
+    # DIRECTORY escape FAILs here.
+    journal_dir_probe = getattr(backend, "_journal_dir", None)
+    if callable(journal_dir_probe):
+        try:
+            journal_dir_probe()
+        except PathTraversalError as e:
+            return CheckResult(
+                name="journal-backend",
+                status=FAIL,
+                message=(
+                    f"journal/ directory escapes agent_root "
+                    f"(symlink containment violation): {e}"
+                ),
+                fix_hint=(
+                    "The agent's journal/ directory is a symlink resolving "
+                    "outside agent_root. Every runtime read (system prompt, "
+                    "dream consolidation) silently drops the entire journal. "
+                    "Replace the symlink with a real directory under agent_root, "
+                    "or move journal content back inside the vault."
+                ),
+                detail={
+                    "backend_id": backend.backend_id,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                },
+            )
+
+    # Dual-probe step 2: heavy read (only when at least one entry exists).
+    # When no entries exist, the dual-probe depth is limited — documented in
+    # the check docstring and detail dict so operators know the probe scope.
+    journal_entries_found = len(entries)
+    read_bytes_probed = False
+    if journal_entries_found > 0:
+        latest_entry = entries[0]
+        # NO per-entry symlink-containment re-check here (#427 PR1 ADOPT-NOW,
+        # round-3 ruling). The byte-identity ruling requires list_entries()/
+        # query_by_date() to FOLLOW individual symlinked .md entries exactly as
+        # the three legacy rglob callers did (bundle/agent _safe_read_text and
+        # dream read_text all follow symlinks). The runtime therefore READS a
+        # symlinked-out entry through; doctor must agree with that runtime
+        # contract rather than FAIL on what the runtime reads (a doctor verdict
+        # that contradicts runtime behavior is the very thing
+        # feedback_doctor_dual_probe_pattern forbids). The real escape vector —
+        # a symlinked journal/ DIRECTORY pointing outside agent_root — is still
+        # refused at the backend layer by _journal_dir()'s PathTraversalError
+        # guard (surfaced here as a list_entries() FAIL above). An individual
+        # symlinked day-file is deliberately tolerated by reads.
+        try:
+            latest_entry.path.read_bytes()
+            read_bytes_probed = True
+        except FileNotFoundError:
+            # Benign TOCTOU: the entry vanished between list_entries() and
+            # read_bytes() (e.g. a concurrent archive/cleanup removed the file).
+            # read_bytes() raises FileNotFoundError (an OSError subclass), NOT
+            # AtomicAgentsError — so this branch (not the generic Exception one)
+            # is what actually catches the documented race. Fall through to PASS.
+            pass
+        except PermissionError as e:
+            # A genuine read failure on an existing file (e.g. mode 000). This is
+            # a real FAIL — the entry exists but cannot be read.
+            return CheckResult(
+                name="journal-backend",
+                status=FAIL,
+                message=(
+                    f"journal entry exists but is unreadable: {type(e).__name__}: {e}"
+                ),
+                fix_hint=_PERMS_FIX_HINT,
+                detail={
+                    "backend_id": backend.backend_id,
+                    "journal_entries_found": journal_entries_found,
+                    "entry_path_probed": str(latest_entry.path),
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                },
+            )
+        except Exception as e:
+            return CheckResult(
+                name="journal-backend",
+                status=FAIL,
+                message=(
+                    f"journal backend entry.path.read_bytes() raised "
+                    f"unexpected error: {type(e).__name__}: {e}"
+                ),
+                detail={
+                    "backend_id": backend.backend_id,
+                    "journal_entries_found": journal_entries_found,
+                    "entry_path_probed": str(latest_entry.path),
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                },
+            )
+
+    caps = backend.capabilities()
+    return CheckResult(
+        name="journal-backend",
+        status=PASS,
+        message=(
+            f"journal backend '{backend.backend_id}' ready"
+            + (
+                " (no journal entries for this agent)"
+                if not journal_entries_found
+                else ""
+            )
+        ),
+        detail={
+            "backend_id": backend.backend_id,
+            "journal_entries_found": journal_entries_found,
+            "read_bytes_probed": read_bytes_probed,
+            "supports_canonical_export": caps.supports_canonical_export,
+            "supports_date_query": caps.supports_date_query,
         },
     )
 

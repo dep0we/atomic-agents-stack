@@ -74,6 +74,12 @@ from .corpus import (
     CorpusBackend,
     get_default_corpus_backend,
 )
+
+# JournalBackend imported at module level (mirrors CorpusBackend above) so the
+# `journal_backend: "JournalBackend | None"` annotation on __init__ resolves under
+# typing.get_type_hints() and for mypy/pyright. journal.backend has no heavy deps
+# (only .types + stdlib), so this is circular-import-safe. (#427 PR1)
+from .journal.backend import JournalBackend
 from .mcp_registry import (
     MCPRegistryError,
     MCPRegistryUnavailable,
@@ -322,6 +328,7 @@ class AtomicAgent:
         corpus_backend: CorpusBackend | None = None,
         mcp_server_registry_backend: MCPServerRegistryBackend | None = None,
         memory_backend: MemoryBackend | None = None,
+        journal_backend: JournalBackend | None = None,
     ):
         self.name = name
         self.trigger = trigger
@@ -637,6 +644,18 @@ class AtomicAgent:
         from .outcome import get_default_outcome_backend  # noqa: PLC0415
 
         self.outcome_backend = get_default_outcome_backend(self.agent_root)
+
+        # ── JournalBackend LIVE-WIRED (#427 PR1 — spec/43) ──────────────────
+        # ADOPT-NOW ruling (distinct from #426 outcome_backend scaffolding-only):
+        # self.journal_backend IS the live read path — agent._load_recent_journal()
+        # routes through it. The kwarg-wins-over-env-var pattern matches every
+        # other backend kwarg.
+        from .journal import get_default_journal_backend  # noqa: PLC0415
+
+        if journal_backend is None:
+            self.journal_backend = get_default_journal_backend(self.agent_root)
+        else:
+            self.journal_backend = journal_backend
 
         # Per-agent target extractor registry (spec/29 §"Target extraction",
         # #124 PR 3a). MUST initialize BEFORE tool_registry loading below so
@@ -3164,12 +3183,21 @@ class AtomicAgent:
             self._recent_notes.append(self._render_note_from_model(ref.name, note))
 
     def _load_recent_journal(self, n: int = RECENT_JOURNAL_DEFAULT) -> None:
-        journal_dir = self.agent_root / "journal"
-        if not journal_dir.exists():
-            return
-        entries = sorted(journal_dir.rglob("*.md"), reverse=True)[:n]
+        # ADOPT-NOW (#427 PR1 — spec/43): routes through self.journal_backend.
+        # backend returns raw JournalEntry; formatting stays at this call site.
+        # agent renders: '# Journal — {stem}\n\n{text}' (NO path line).
+        # bundle renders: '# Journal — {stem}\n`{path}`\n\n{text}' (WITH path line).
+        # DO NOT unify — the divergence is LOAD-BEARING (byte-identity golden tests
+        # freeze both formats separately).
+        # Behavior change from legacy: corrupt entries are now KEPT with a degraded
+        # body (the backend's list_entries reads every slot via _safe_read_entry,
+        # mirroring bundle._safe_read_text) rather than raising UnicodeDecodeError.
+        # This makes agent match bundle's long-standing degrade-but-keep behavior
+        # and keeps the selected entry SET identical to the legacy newest-N slice.
+        journal_entries = self.journal_backend.list_entries(limit=n, newest_first=True)
         self._recent_journal = [
-            f"# Journal — {p.stem}\n\n" + p.read_text(encoding="utf-8") for p in entries
+            f"# Journal — {entry.path.stem}\n\n{entry.text}"
+            for entry in journal_entries
         ]
 
     @staticmethod

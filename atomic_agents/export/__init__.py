@@ -32,6 +32,7 @@ from .types import (
     LogExport,
     LogExportQuery,
     MandateExport,
+    JournalExport,
     MandateExportQuery,
     MemoryExport,
     MemoryExportQuery,
@@ -59,4 +60,5 @@ __all__ = [
     "SecretExportRef",
     "GoalExport",
     "OutcomeExport",
+    "JournalExport",
 ]
