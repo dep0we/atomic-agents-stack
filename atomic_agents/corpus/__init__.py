@@ -163,7 +163,7 @@ register_corpus_backend("sqlite", SQLiteCorpusBackend)
 #   - AtomicAgent.__init__ accepts the corpus_backend kwarg + resolves the default
 #     via get_default_corpus_backend(self.agent_root) when not supplied.
 #   - OutcomeRunner, EvalRunner, DreamRunner all accept corpus_backend per-runner
-#     kwargs (OutcomeRunner threads at outcome.py:255, EvalRunner at eval.py:363,
+#     kwargs (OutcomeRunner threads in outcome/_outcome_impl.py, EvalRunner at eval.py:363,
 #     DreamRunner stores as self._corpus_backend for API parity).
 #   - delegate.py threads corpus_backend ONLY when supplied explicitly via the
 #     AtomicAgent constructor kwarg (_corpus_backend_was_explicit flag tracking).

@@ -24,7 +24,7 @@ When filing an issue, include:
 
 - **Bug:** what you expected, what you got, what you ran, the version (`pip show atomic-agents-stack` or commit SHA), the relevant log line from `<vault>/<agent>/log/`.
 - **Feature:** the operator problem you're solving (not the feature you want), what you tried first, why the existing surface didn't fit.
-- **Spec proposal:** the gap you're closing, prior art, why the existing 21 spec docs don't already cover this.
+- **Spec proposal:** the gap you're closing, prior art, why the existing 41 spec docs don't already cover this.
 
 ---
 
@@ -44,7 +44,7 @@ Run the full suite before pushing:
 uv run pytest
 ```
 
-3270+ tests today; CI runs Python 3.11 + 3.12. New backend protocols add ~25 conformance tests + ~10 implementation-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol.
+4,160+ tests today; CI runs Python 3.11 + 3.12. New backend protocols add ~25 conformance tests + ~10 implementation-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol.
 
 ### Review
 

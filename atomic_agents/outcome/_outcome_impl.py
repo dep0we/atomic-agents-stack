@@ -27,36 +27,58 @@ CLI:
         --description "Write a Q1 budget summary" \\
         --rubric evals/rubric.md \\
         --max-iterations 3
+
+NOTE ON AtomicAgent IMPORT:
+    AtomicAgent is imported LAZILY inside run() (not at module level) so that
+    test patches on 'atomic_agents.outcome.AtomicAgent' rebind the name in the
+    outcome package namespace and the lazy import resolves to the patched mock
+    at call time. A module-level import would bypass the patch target.
+    This mirrors the lazy-import pattern _goal_impl.py uses for OutcomeRunner
+    inside GoalManager.dispatch_as_outcome().
 """
 
 from __future__ import annotations
+
 import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .logs import LogBackend
-    from .policy import PolicyBackend
-    from .persona import PersonaBackend
-    from .corpus import CorpusBackend
-    from .mcp_registry import MCPServerRegistryBackend
+    from ..logs import LogBackend
+    from ..policy import PolicyBackend
+    from ..persona import PersonaBackend
+    from ..corpus import CorpusBackend
+    from ..mcp_registry import MCPServerRegistryBackend
 
 _log = logging.getLogger(__name__)
 
-from . import _llm, _costs
-from ._io import atomic_write
-from ._platform import get_agents_root
-from .agent import AtomicAgent
-from .eval import EvalRunner, _provider_available
-from .profile import AgentProfileBackend
-from .registry import ToolRegistryBackend
-from .mandate import MandateBackend
-from .exceptions import AtomicAgentsError, CostGuardrailBlocked
+# _llm imported as a MODULE so patch("atomic_agents.outcome._llm.call_llm") works:
+# both outcome/__init__.py's _llm binding and this module's _llm reference point to
+# the same module object, so patching .call_llm on the object propagates correctly.
+# Do NOT use `from .._llm import call_llm` — that creates a local binding that
+# the patch target cannot reach.
+from .. import _llm, _costs
+from .._io import atomic_write
+from .._platform import get_agents_root
+from ..eval import EvalRunner, _provider_available
+from ..profile import AgentProfileBackend
+from ..registry import ToolRegistryBackend
+from ..mandate import MandateBackend
+from ..exceptions import AtomicAgentsError, CostGuardrailBlocked
+
+# AtomicAgent is NOT imported at module level — see module docstring note.
+# It is imported lazily inside run() so that test patches on
+# 'atomic_agents.outcome.AtomicAgent' work correctly.
+
+# Re-import canonical types from outcome/types.py (the authoritative home
+# post-refactor). The old dataclass definitions in this module are REMOVED
+# to avoid two definitions of the same type.
+from .types import IterationRecord, OutcomeResult  # noqa: F401 (re-export via __init__)
 
 # ──────────────────────────────────────────────────────────────────
 # Constants
@@ -64,48 +86,6 @@ from .exceptions import AtomicAgentsError, CostGuardrailBlocked
 MAX_ITERATIONS_CAP = 20
 MIN_ITERATIONS = 1
 DEFAULT_MAX_ITERATIONS = 3
-
-# ──────────────────────────────────────────────────────────────────
-# Data model
-
-
-@dataclass
-class IterationRecord:
-    """Record of one agent+judge iteration within an OutcomeResult."""
-
-    iteration: int  # 0-indexed
-    agent_response: str
-    agent_input_tokens: int
-    agent_output_tokens: int
-    agent_cost_usd: float
-    agent_latency_ms: int
-    judge_response_raw: str
-    judge_verdict: dict  # parsed: {satisfied, criterion_results, explanation, ...}
-    judge_cost_usd: float
-    judge_input_tokens: int
-    judge_output_tokens: int
-    artifact_path: Path | None  # if the agent wrote a file
-    timestamp: str  # ISO 8601
-
-
-@dataclass
-class OutcomeResult:
-    """Complete result of an OutcomeRunner.run() call."""
-
-    run_id: str
-    description: str
-    rubric_source: str  # "<agent>/outcomes/foo.md" or "inline"
-    max_iterations: int
-    status: str  # 'satisfied' | 'max_iterations_reached' | 'failed' | 'interrupted'
-    explanation: str  # final judge explanation
-    iterations: list[IterationRecord] = field(default_factory=list)
-    final_iteration_idx: int = -1
-    total_cost_usd: float = 0.0
-    total_input_tokens: int = 0
-    total_output_tokens: int = 0
-    started_at: str = ""  # ISO 8601
-    ended_at: str = ""
-    output_files: list[Path] = field(default_factory=list)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -273,6 +253,14 @@ class OutcomeRunner:
         # the runner→agent construction boundary. #61 PR 2 added the
         # log_backend thread; #63 PR 2 adds profile_backend on the same
         # discipline.
+        #
+        # AtomicAgent is imported LAZILY here (not at module level) so that
+        # test patches on 'atomic_agents.outcome.AtomicAgent' rebind the name
+        # in the outcome package namespace and the lazy import resolves to the
+        # mock at call time. Mirrors _goal_impl.py's lazy OutcomeRunner import
+        # inside GoalManager.dispatch_as_outcome(). See module docstring above.
+        from atomic_agents.outcome import AtomicAgent  # noqa: PLC0415
+
         agent = AtomicAgent(
             name=self.agent_name,
             trigger="outcome",
@@ -578,7 +566,7 @@ class OutcomeRunner:
     # ────────────────────────────────────────────────────────────
     # Judge resolution
 
-    def _resolve_judge_model(self, agent: AtomicAgent) -> str:
+    def _resolve_judge_model(self, agent: "Any") -> str:
         """Pick a judge model: explicit param > cross-family > fallback."""
         if self._explicit_judge_model:
             return self._explicit_judge_model
@@ -705,7 +693,7 @@ class OutcomeRunner:
         brain failure shape the LockBackend arc PR 3 Step 11
         adversarial caught for DreamRunner — fixed forward here).
         """
-        from .logs.types import PRIMITIVE_OUTCOME_ITERATION, RunRecord
+        from ..logs.types import PRIMITIVE_OUTCOME_ITERATION, RunRecord
 
         line: dict = {
             "ts": record.timestamp,
@@ -886,7 +874,7 @@ def _print_result(result: OutcomeResult) -> None:
     print()
 
 
-if __name__ == "__main__":
-    import sys
-
-    sys.exit(main())
+# NOTE: `if __name__ == '__main__'` was here in the flat outcome.py module.
+# After the package refactor, python -m atomic_agents.outcome invokes
+# outcome/__main__.py instead. The guard here is intentionally removed
+# to avoid confusion (running _outcome_impl.py directly is not supported).

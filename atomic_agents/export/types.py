@@ -47,6 +47,13 @@ from .._export_base import ExportableResult as ExportableResult  # noqa: F401 (r
 # 'from atomic_agents.export import GoalExport'.
 from ..goal.types import GoalExport as GoalExport  # noqa: F401 (re-export)
 
+# OutcomeExport is defined in outcome/types.py (it subclasses ExportableResult
+# imported from the leaf module _export_base.py — NOT from export/types.py to
+# avoid a circular import: export/types.py → outcome/types.py → _export_base.py
+# is the safe chain). Re-export it here so callers can use
+# 'from atomic_agents.export import OutcomeExport'.
+from ..outcome.types import OutcomeExport as OutcomeExport  # noqa: F401 (re-export)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Per-backend export result types

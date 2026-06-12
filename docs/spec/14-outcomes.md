@@ -2,6 +2,8 @@
 
 The iterate-to-rubric primitive: the agent drafts, the judge grades, the loop continues until the rubric is satisfied or the iteration cap is hit.
 
+> **Storage abstraction (spec/42).** This spec is the **behavioral contract** for the outcome loop — the `result.json` envelope (iteration history, judge verdicts, artifact paths, aggregate cost/tokens, final status), the run directory layout, and the iterate-to-rubric semantics an agent author relies on. **How** `result.json` is read, written, and exported is defined by the `OutcomeBackend` Protocol in [42-outcome-backend.md](42-outcome-backend.md): `write_result()`, `read_result()`, `list_runs()`, and the spec/40 canonical export. The default `FilesystemOutcomeBackend` reads and writes exactly the on-disk `result.json` shape this spec describes with **byte-identical** output (zero behavior change); alternate backends (Postgres, cloud object store) may swap the storage while preserving this behavioral contract. Read spec/14 for what the outcome loop DOES and what `result.json` CONTAINS; read spec/42 for how it is ACCESSED.
+
 ---
 
 ## What an outcome is
@@ -255,4 +257,4 @@ The outcome's terminal state maps to a sub-goal status update:
 
 ---
 
-*See `atomic_agents/outcome.py` for the implementation and `tests/test_outcome.py` for a complete test suite.*
+*See `atomic_agents/outcome/` (the `OutcomeRunner` runtime in `_outcome_impl.py`; the `OutcomeBackend` Protocol in `backend.py` per spec/42) for the implementation and `tests/test_outcome.py` for a complete test suite.*
