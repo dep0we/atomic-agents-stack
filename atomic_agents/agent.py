@@ -622,6 +622,22 @@ class AtomicAgent:
             mcp_servers_resolved=_materialized_mcp_specs,
         )
 
+        # ── OutcomeBackend scaffolding (#426 PR1 — spec/42) ─────────────────
+        # Public self.outcome_backend attribute initialized here as a scaffolding
+        # step — the write path through the backend is wired in #448.
+        # IMPORTANT: self.outcome_backend is SET but NOT CALLED from any
+        # AtomicAgent method in this PR. The OutcomeRunner._write_result_json
+        # still calls atomic_write directly (_outcome_impl.py:731), bypassing the
+        # backend. Wiring the write path through self.outcome_backend ships
+        # in #448 alongside the OutcomeRunner kwarg. Adding the kwarg here
+        # without the write-path wiring would be dead code per the ruling.
+        # Scaffolding-only: read-only inspection and doctor.check_outcome_backend
+        # access only. Do NOT add outcome_backend= to AtomicAgent constructor
+        # until #448 (per arc ruling: stored-but-never-invoked dead code warning).
+        from .outcome import get_default_outcome_backend  # noqa: PLC0415
+
+        self.outcome_backend = get_default_outcome_backend(self.agent_root)
+
         # Per-agent target extractor registry (spec/29 §"Target extraction",
         # #124 PR 3a). MUST initialize BEFORE tool_registry loading below so
         # ToolDefinitions that declare a target_extractor_id can be validated

@@ -7,7 +7,8 @@ Public surface:
 
 - ``Exportable`` — the companion Protocol backends compose to support export.
 - Export result types: ``MemoryExport``, ``LogExport``, ``MandateExport``,
-  ``CorpusExport``, ``LockExport``, ``SecretExport``.
+  ``CorpusExport``, ``LockExport``, ``SecretExport``, ``GoalExport``,
+  ``OutcomeExport``.
 - Export query types: ``MemoryExportQuery``, ``LogExportQuery``, etc.
 - ``SecretExportRef`` — logical-secret + binding-hint abstraction.
 - ``render_run_record_bytes``, ``render_note_bytes_from_raw``, etc. — shared
@@ -34,6 +35,7 @@ from .types import (
     MandateExportQuery,
     MemoryExport,
     MemoryExportQuery,
+    OutcomeExport,
     SecretExport,
     SecretExportQuery,
     SecretExportRef,
@@ -56,4 +58,5 @@ __all__ = [
     "SecretExportQuery",
     "SecretExportRef",
     "GoalExport",
+    "OutcomeExport",
 ]

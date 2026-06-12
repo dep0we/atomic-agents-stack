@@ -192,6 +192,8 @@ def run_doctor(
             "corpus-backend",
             "mcp-server-registry-backend",
             "secret-backend",
+            "goal-backend",
+            "outcome-backend",
             "memory-backend-config",
             "memory-backend",
             "write-paths",
@@ -256,6 +258,7 @@ def run_doctor(
     results.append(check_mcp_server_registry_backend(agent_root))
     results.append(check_secret_backend())
     results.append(check_goal_backend(agent_root))
+    results.append(check_outcome_backend(agent_root))
     # memory-backend-config (coherence) runs before memory-backend (liveness),
     # mirroring the check_lock_backend → check_locks ordering (#60 PR 3).
     results.append(check_memory_backend_config(agent_root))
@@ -3821,6 +3824,206 @@ def check_goal_backend(agent_root: Path) -> CheckResult:
             "supports_canonical_export": caps.supports_canonical_export,
             "supports_archive": caps.supports_archive,
             "supports_history_query": caps.supports_history_query,
+        },
+    )
+
+
+def check_outcome_backend(agent_root: Path) -> CheckResult:
+    """OutcomeBackend resolves and the configured backend instantiates cleanly.
+
+    Validates that ATOMIC_AGENTS_OUTCOME_BACKEND is correctly configured.
+    Scoped at agent_root because the outcome backend is per-agent — result.json
+    lives under agent_root/outcomes/runs/<run_id>/.
+
+    Doctor dual-probe pattern (MEMORY.md feedback_doctor_dual_probe_pattern):
+    Probes BOTH:
+    1. list_runs() — lightweight enumeration (MUST NOT raise even when outcomes/
+       is absent; returns [] for agents with no completed runs)
+    2. read_result() — heavy JSON-parse + OutcomeResult reconstruction path
+       (only when list_runs() returns at least one run_id)
+
+    When no runs exist (new agent or agent that has never run an outcome),
+    returns PASS with outcome_runs_present=False, read_result_probed=False,
+    run_count=0 in the full detail dict (the same 7-key shape documented in
+    spec/27: backend_id, outcome_runs_present, run_count, read_result_probed,
+    read_result_vanished, supports_canonical_export, supports_artifact_storage).
+    This is NOT a failure — matching check_goal_backend's pattern for agents
+    without a goal.md (reactive agents with no active goal pass cleanly).
+
+    Light probe = list_runs(agent_id) MUST NOT raise even when outcomes/ absent.
+    Heavy probe = read_result(agent_id, run_id) for the most-recent run_id
+    returned by list_runs(), skipped with PASS when list_runs() returns [].
+
+    PASS / FAIL ladder (this check has no WARN path):
+    FAIL when:
+    * get_default_outcome_backend(agent_root) raises (bad env var or not registered).
+    * list_runs() raises.
+    * Runs exist AND read_result() raises (corrupted result.json).
+
+    PASS otherwise (including when no runs exist).
+    """
+    from .outcome import (  # noqa: PLC0415
+        get_default_outcome_backend,
+        list_outcome_backends,
+        _redact_for_error_message,
+    )
+    from .exceptions import (  # noqa: PLC0415
+        AtomicAgentsError,
+        OutcomeCorrupted,
+        PathTraversalError,
+    )
+
+    raw_backend_id = (
+        os.environ.get("ATOMIC_AGENTS_OUTCOME_BACKEND", "").strip().lower()
+        or "filesystem"
+    )
+    # Credential safety: ATOMIC_AGENTS_OUTCOME_BACKEND may carry a URL- or
+    # DSN-shaped value. Redact before it reaches the rendered CheckResult
+    # message or detail. Same per-backend _redact_for_error_message convention
+    # as logs/profile/corpus/mcp_registry/secret_backend/goal.
+    safe_backend_id = _redact_for_error_message(raw_backend_id)
+
+    try:
+        backend = get_default_outcome_backend(agent_root)
+    except Exception as e:
+        return CheckResult(
+            name="outcome-backend",
+            status=FAIL,
+            message=(
+                f"failed to instantiate outcome backend "
+                f"(ATOMIC_AGENTS_OUTCOME_BACKEND={safe_backend_id!r}): {e}"
+            ),
+            fix_hint=(
+                "Unset ATOMIC_AGENTS_OUTCOME_BACKEND to use the filesystem default, "
+                f"or set it to a registered backend id (known: {list_outcome_backends()}). "
+            ),
+            detail={"backend_id": safe_backend_id, "error": str(e)},
+        )
+
+    # Dual-probe step 1: lightweight list
+    try:
+        run_ids = backend.list_runs(agent_root.name)
+    except Exception as e:
+        return CheckResult(
+            name="outcome-backend",
+            status=FAIL,
+            message=f"outcome backend list_runs() raised: {type(e).__name__}: {e}",
+            detail={
+                "backend_id": backend.backend_id,
+                "error": str(e),
+                "error_type": type(e).__name__,
+            },
+        )
+
+    # Dual-probe step 2: heavy read (only when at least one run exists).
+    # When no runs exist, the dual-probe depth is limited — documented in the
+    # check docstring and detail dict so operators know the probe scope.
+    outcome_runs_present = bool(run_ids)
+    read_result_probed = False
+    read_result_vanished = False
+    if outcome_runs_present:
+        # Probe the most recent run (last in lexicographic order = most recent
+        # for 'outcome-YYYYMMDD-...' run_id naming convention).
+        latest_run_id = run_ids[-1]
+        try:
+            backend.read_result(agent_root.name, latest_run_id)
+            read_result_probed = True
+        except OutcomeCorrupted as e:
+            # NOTE: OutcomeCorrupted is a subclass of AtomicAgentsError, so it
+            # MUST be caught before the bare-AtomicAgentsError clause below —
+            # corruption is a real FAIL, not a benign vanished-file race.
+            return CheckResult(
+                name="outcome-backend",
+                status=FAIL,
+                message=f"result.json present but read_result() failed: {e}",
+                fix_hint=(
+                    f"Inspect result.json at "
+                    f"{agent_root / 'outcomes' / 'runs' / latest_run_id / 'result.json'} "
+                    "to identify the corruption (may have missing required fields or "
+                    "invalid JSON)."
+                ),
+                detail={
+                    "backend_id": backend.backend_id,
+                    "outcome_runs_present": True,
+                    "run_id_probed": latest_run_id,
+                    "error": str(e),
+                },
+            )
+        except PathTraversalError as e:
+            # A traversing / symlinked run (run dir or result.json escaping
+            # agent_root) is a containment alarm, NOT a benign vanished-file race.
+            # PathTraversalError subclasses AtomicAgentsError, so it MUST be
+            # caught before the bare-AtomicAgentsError clause below or it would
+            # false-PASS as read_result_vanished.
+            return CheckResult(
+                name="outcome-backend",
+                status=FAIL,
+                message=f"result.json path escaped agent_root (path traversal): {e}",
+                fix_hint=(
+                    "A run directory or result.json under outcomes/runs/ is a "
+                    "symlink or escapes the agent vault. Remove the offending "
+                    "symlink; legitimate runs are real files written in-vault."
+                ),
+                detail={
+                    "backend_id": backend.backend_id,
+                    "outcome_runs_present": True,
+                    "run_id_probed": latest_run_id,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                },
+            )
+        except AtomicAgentsError:
+            # TOCTOU: result.json vanished between list_runs() and read_result()
+            # (e.g. a concurrent cleanup removed the run dir). That's "no result"
+            # — benign, not corruption — so fall through to PASS rather than a
+            # spurious FAIL for a transient race. (OutcomeCorrupted subclasses
+            # AtomicAgentsError but is caught above, so only the bare absent-run
+            # raise reaches here.)
+            #
+            # Do NOT mutate outcome_runs_present here: list_runs() DID return
+            # run_ids, so run_count and the "no completed runs" message must stay
+            # keyed to len(run_ids) (otherwise the detail dict would report
+            # run_count >= 1 alongside a "no runs" message — a self-contradiction).
+            # The vanished-run race is recorded distinctly via read_result_probed
+            # staying False + the explicit detail note below.
+            read_result_vanished = True
+        except Exception as e:
+            return CheckResult(
+                name="outcome-backend",
+                status=FAIL,
+                message=f"outcome backend read_result() raised unexpected error: {type(e).__name__}: {e}",
+                detail={
+                    "backend_id": backend.backend_id,
+                    "outcome_runs_present": True,
+                    "run_id_probed": latest_run_id,
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                },
+            )
+
+    caps = backend.capabilities()
+    return CheckResult(
+        name="outcome-backend",
+        status=PASS,
+        message=(
+            f"outcome backend '{backend.backend_id}' ready"
+            # Keyed to len(run_ids), NOT the read-result outcome, so the message
+            # and detail.run_count never disagree (a TOCTOU vanished run leaves
+            # run_count >= 1 but read_result_probed False — recorded in detail).
+            + (" (no completed runs for this agent)" if not run_ids else "")
+        ),
+        detail={
+            "backend_id": backend.backend_id,
+            # outcome_runs_present reflects whether list_runs() found runs on
+            # disk (kept truthful even when the latest run vanished mid-check).
+            "outcome_runs_present": outcome_runs_present,
+            "run_count": len(run_ids),
+            "read_result_probed": read_result_probed,
+            # True only on the benign TOCTOU path: list_runs() returned a run but
+            # read_result() found it gone (concurrent cleanup). PASS is correct.
+            "read_result_vanished": read_result_vanished,
+            "supports_canonical_export": caps.supports_canonical_export,
+            "supports_artifact_storage": caps.supports_artifact_storage,
         },
     )
 

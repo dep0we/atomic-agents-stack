@@ -88,6 +88,10 @@ class GoalCorrupted(AtomicAgentsError):
     """goal.md is missing required fields or invalid."""
 
 
+class OutcomeCorrupted(AtomicAgentsError):
+    """result.json is present but cannot be parsed as a valid OutcomeResult."""
+
+
 class NotInRoster(AtomicAgentsError):
     """Target agent not in the coordinator's roster.md."""
 
