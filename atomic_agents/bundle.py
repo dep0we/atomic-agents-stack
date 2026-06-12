@@ -738,15 +738,21 @@ def _safe_read_text(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
-        body = path.read_text(encoding="utf-8", errors="replace")
+        # Guard the re-read against a TOCTOU OSError (file deleted / perms
+        # changed between reads) so the slot degrades-but-keeps. Kept
+        # byte-identical to FilesystemJournalBackend._safe_read_entry (#464).
+        try:
+            body = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return f"<!-- WARNING: {path.name} unreadable ({type(exc).__name__}). -->\n"
         return (
             f"<!-- WARNING: {path.name} contained non-UTF-8 bytes; replaced. -->\n"
             f"{body}"
         )
     except OSError as exc:
-        return (
-            f"<!-- WARNING: {path.name} unreadable: {type(exc).__name__}: {exc} -->\n"
-        )
+        # Name the failure mode (type only); never embed str(exc) — it carries
+        # the absolute path, which would reach the LLM context via the journal.
+        return f"<!-- WARNING: {path.name} unreadable ({type(exc).__name__}). -->\n"
 
 
 def _render_file_section(path: Path, *, label: str) -> str:

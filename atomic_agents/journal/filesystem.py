@@ -309,16 +309,23 @@ class FilesystemJournalBackend:
         try:
             return path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
-            body = path.read_text(encoding="utf-8", errors="replace")
+            # The re-read can ALSO raise OSError if the file is deleted or its
+            # permissions change between the first (failing) read and this one
+            # (TOCTOU). Guard it so the slot still degrades-but-keeps instead of
+            # propagating an OSError out of the now-hot agent.call() journal path.
+            try:
+                body = path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                return f"<!-- WARNING: {path.name} unreadable ({type(exc).__name__}). -->\n"
             return (
                 f"<!-- WARNING: {path.name} contained non-UTF-8 bytes; replaced. -->\n"
                 f"{body}"
             )
         except OSError as exc:
-            return (
-                f"<!-- WARNING: {path.name} unreadable: "
-                f"{type(exc).__name__}: {exc} -->\n"
-            )
+            # Name the failure mode (type only). Do NOT embed str(exc): OSError's
+            # str carries the absolute filesystem path, which would flow into the
+            # agent system prompt and out to an external LLM provider.
+            return f"<!-- WARNING: {path.name} unreadable ({type(exc).__name__}). -->\n"
 
     @staticmethod
     def _parse_entry_date(path: Path) -> date | None:

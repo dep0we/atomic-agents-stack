@@ -1455,6 +1455,8 @@ def test_journal_append_corrupt_existing_raises_journal_corrupted(
 
     day_file = agent_root / "journal" / "2026-06" / "2026-06-12.md"
     day_file.chmod(0o000)
+    if os.getuid() == 0:
+        pytest.skip("chmod 0o000 does not restrict root; cannot test unreadable path")
     try:
         with pytest.raises(JournalCorrupted):
             be.append_entry("second", when=d)

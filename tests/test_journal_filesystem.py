@@ -21,6 +21,7 @@ and are NOT part of the parametrized conformance suite. They cover:
 
 from __future__ import annotations
 
+import os
 from datetime import date
 from pathlib import Path
 
@@ -330,6 +331,8 @@ def test_filesystem_journal_list_keeps_unreadable_oserror_slot(tmp_path: Path) -
     bad_file = journal_dir / "2026-06-11.md"
     bad_file.write_text("Unreadable", encoding="utf-8")
     bad_file.chmod(0o000)
+    if os.getuid() == 0:
+        pytest.skip("chmod 0o000 does not restrict root; cannot test unreadable path")
 
     try:
         entries = be.list_entries()

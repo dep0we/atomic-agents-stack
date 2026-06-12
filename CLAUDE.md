@@ -213,7 +213,7 @@ uv run pytest                            # full suite
 uv run pytest tests/test_<module>.py -v  # one module
 ```
 
-Run `uv run pytest --collect-only -q | tail -1` for the live test count (last refresh: 4,251 tests collected, 2026-06-12). New backend protocols add ~25 conformance + ~10 impl-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol — the conformance suite is what keeps the protocol honest.
+Run `uv run pytest --collect-only -q | tail -1` for the live test count (last refresh: 4,252 tests collected, 2026-06-12). New backend protocols add ~25 conformance + ~10 impl-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol — the conformance suite is what keeps the protocol honest.
 
 ### Releases + SemVer
 
@@ -348,7 +348,7 @@ These are not forbidden forever — they're explicitly deferred with rationale. 
 
 ## Status
 
-**v1.1.0, stable, PUBLIC.** Core runtime stable. Test suite: run `uv run pytest --collect-only -q | tail -1` for the live count (last refresh: 4,251 tests collected, 2026-06-12). Full CI runs against `uv sync --extra dev --extra openai --extra validation --extra redis`. **Twelve backend protocols locked at v1.0; SecretBackend (#340), the thirteenth, shipped for v1.5 (both PRs merged, spec/38 LOCKED, Filesystem + GCP Secret Manager reference impls); GoalBackend (#425), the fourteenth, shipped for v1.5 (DRAFT spec/41, FilesystemGoalBackend reference impl); OutcomeBackend (#426), the fifteenth, shipped for v1.5 PR 1 (DRAFT spec/42, FilesystemOutcomeBackend reference impl); JournalBackend (#427), the sixteenth, shipped for v1.5 PR 1 (DRAFT spec/43, FilesystemJournalBackend reference impl, ADOPT-NOW all three read sites)** — see `docs/protocols-shipped.md` for the per-protocol summary (reference impls, capabilities, operator overrides, doctor checks, Implementer Contracts, and what cliff each closes):
+**v1.1.0, stable, PUBLIC.** Core runtime stable. Test suite: run `uv run pytest --collect-only -q | tail -1` for the live count (last refresh: 4,252 tests collected, 2026-06-12). Full CI runs against `uv sync --extra dev --extra openai --extra validation --extra redis`. **Twelve backend protocols locked at v1.0; SecretBackend (#340), the thirteenth, shipped for v1.5 (both PRs merged, spec/38 LOCKED, Filesystem + GCP Secret Manager reference impls); GoalBackend (#425), the fourteenth, shipped for v1.5 (DRAFT spec/41, FilesystemGoalBackend reference impl); OutcomeBackend (#426), the fifteenth, shipped for v1.5 PR 1 (DRAFT spec/42, FilesystemOutcomeBackend reference impl); JournalBackend (#427), the sixteenth, shipped for v1.5 PR 1 (DRAFT spec/43, FilesystemJournalBackend reference impl, ADOPT-NOW all three read sites)** — see `docs/protocols-shipped.md` for the per-protocol summary (reference impls, capabilities, operator overrides, doctor checks, Implementer Contracts, and what cliff each closes):
 
 | # | Protocol | Issue / Lock | Reference impls |
 |---|----------|--------------|-----------------|
