@@ -12,7 +12,7 @@ For broader context, read these in order on a fresh session:
 
 ## What this is
 
-Atomic Agents is a vault-native AI agent framework: agents live as plain markdown files, the runtime is stateless, and storage is moving toward swappable protocols layer by layer. **Twelve backend protocols shipped through v1.0; sixteen total as of v1.5 in progress** — see `docs/protocols-shipped.md` for the per-protocol summary (reference impls, capabilities, operator overrides, doctor checks, Implementer Contracts, and what cliff each closes).
+Atomic Agents is a vault-native AI agent framework: agents live as plain markdown files, the runtime is stateless, and storage is moving toward swappable protocols layer by layer. **Twelve backend protocols shipped through v1.0; seventeen total as of v1.5 in progress** — see `docs/protocols-shipped.md` for the per-protocol summary (reference impls, capabilities, operator overrides, doctor checks, Implementer Contracts, and what cliff each closes).
 
 The spec is the central artifact. The Python package is one conforming reference implementation. Anyone can build agents to the spec without using this code — and eventually, alternate implementations will.
 
@@ -54,6 +54,7 @@ When you can't tell whether a design move helps both — stop, name the tradeoff
                   GoalBackend 🟡 (#425 PR 1, DRAFT spec/41 — the 14th, v1.5)
                   OutcomeBackend 🟡 (#426 PR 1, DRAFT spec/42 — the 15th, v1.5)
                   JournalBackend 🟡 (#427 PR 1, DRAFT spec/43 — the 16th, v1.5)
+                  QueueBackend 🟡 (#428 PR 1, DRAFT spec/44 — the 17th, v1.5)
                                 │
                   Storage substrate — swappable
                   Filesystem (today)  →  Postgres / pgvector / Redis (later)
@@ -213,7 +214,7 @@ uv run pytest                            # full suite
 uv run pytest tests/test_<module>.py -v  # one module
 ```
 
-Run `uv run pytest --collect-only -q | tail -1` for the live test count (last refresh: 4,252 tests collected, 2026-06-12). New backend protocols add ~25 conformance + ~10 impl-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol — the conformance suite is what keeps the protocol honest.
+Run `uv run pytest --collect-only -q | tail -1` for the live test count (last refresh: 4,254 tests collected, 2026-06-12). New backend protocols add ~25 conformance + ~10 impl-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol — the conformance suite is what keeps the protocol honest.
 
 ### Releases + SemVer
 
@@ -348,7 +349,7 @@ These are not forbidden forever — they're explicitly deferred with rationale. 
 
 ## Status
 
-**v1.1.0, stable, PUBLIC.** Core runtime stable. Test suite: run `uv run pytest --collect-only -q | tail -1` for the live count (last refresh: 4,252 tests collected, 2026-06-12). Full CI runs against `uv sync --extra dev --extra openai --extra validation --extra redis`. **Twelve backend protocols locked at v1.0; SecretBackend (#340), the thirteenth, shipped for v1.5 (both PRs merged, spec/38 LOCKED, Filesystem + GCP Secret Manager reference impls); GoalBackend (#425), the fourteenth, shipped for v1.5 (DRAFT spec/41, FilesystemGoalBackend reference impl); OutcomeBackend (#426), the fifteenth, shipped for v1.5 PR 1 (DRAFT spec/42, FilesystemOutcomeBackend reference impl); JournalBackend (#427), the sixteenth, shipped for v1.5 PR 1 (DRAFT spec/43, FilesystemJournalBackend reference impl, ADOPT-NOW all three read sites)** — see `docs/protocols-shipped.md` for the per-protocol summary (reference impls, capabilities, operator overrides, doctor checks, Implementer Contracts, and what cliff each closes):
+**v1.1.0, stable, PUBLIC.** Core runtime stable. Test suite: run `uv run pytest --collect-only -q | tail -1` for the live count (last refresh: 4,254 tests collected, 2026-06-12). Full CI runs against `uv sync --extra dev --extra openai --extra validation --extra redis`. **Twelve backend protocols locked at v1.0; SecretBackend (#340), the thirteenth, shipped for v1.5 (both PRs merged, spec/38 LOCKED, Filesystem + GCP Secret Manager reference impls); GoalBackend (#425), the fourteenth, shipped for v1.5 (DRAFT spec/41, FilesystemGoalBackend reference impl); OutcomeBackend (#426), the fifteenth, shipped for v1.5 PR 1 (DRAFT spec/42, FilesystemOutcomeBackend reference impl); JournalBackend (#427), the sixteenth, shipped for v1.5 PR 1 (DRAFT spec/43, FilesystemJournalBackend reference impl, ADOPT-NOW all three read sites); QueueBackend (#428), the seventeenth, shipped for v1.5 PR 1 (DRAFT spec/44, FilesystemQueueBackend reference impl, SCAFFOLDING-ONLY carve from _cascade.py, closes TENSIONS T4)** — see `docs/protocols-shipped.md` for the per-protocol summary (reference impls, capabilities, operator overrides, doctor checks, Implementer Contracts, and what cliff each closes):
 
 | # | Protocol | Issue / Lock | Reference impls |
 |---|----------|--------------|-----------------|
@@ -368,7 +369,8 @@ These are not forbidden forever — they're explicitly deferred with rationale. 
 | 14 | GoalBackend | #425 PR 1 (DRAFT spec/41) | Filesystem |
 | 15 | OutcomeBackend | #426 PR 1 (DRAFT spec/42) | Filesystem |
 | 16 | JournalBackend | #427 PR 1 (DRAFT spec/43) | Filesystem |
+| 17 | QueueBackend | #428 PR 1 (DRAFT spec/44) | Filesystem |
 
-MCP client support shipped (PRs #55 + #56). All twelve backend protocols shipped; v1.0.0 released 2026-06-04. SecretBackend (#340) shipped for v1.5 (both PRs merged, spec/38 LOCKED, Filesystem + GCP Secret Manager reference impls). GoalBackend (#425) shipped for v1.5 (DRAFT spec/41, FilesystemGoalBackend reference impl). OutcomeBackend (#426) shipped for v1.5 PR 1 (DRAFT spec/42, FilesystemOutcomeBackend reference impl — write-path wiring deferred to #448). JournalBackend (#427) shipped for v1.5 PR 1 (DRAFT spec/43, FilesystemJournalBackend reference impl — ADOPT-NOW: all three read sites wired this PR). Single-developer project; reference implementation that anyone can use, fork, or extend.
+MCP client support shipped (PRs #55 + #56). All twelve backend protocols shipped; v1.0.0 released 2026-06-04. SecretBackend (#340) shipped for v1.5 (both PRs merged, spec/38 LOCKED, Filesystem + GCP Secret Manager reference impls). GoalBackend (#425) shipped for v1.5 (DRAFT spec/41, FilesystemGoalBackend reference impl). OutcomeBackend (#426) shipped for v1.5 PR 1 (DRAFT spec/42, FilesystemOutcomeBackend reference impl — write-path wiring deferred to #448). JournalBackend (#427) shipped for v1.5 PR 1 (DRAFT spec/43, FilesystemJournalBackend reference impl — ADOPT-NOW: all three read sites wired this PR). QueueBackend (#428) shipped for v1.5 PR 1 (DRAFT spec/44, FilesystemQueueBackend scaffolding-only carve from _cascade.py — closes TENSIONS T4; runtime adoption deferred to follow-up). Single-developer project; reference implementation that anyone can use, fork, or extend.
 
 Going forward: **the elegance is the product.** Protect it.

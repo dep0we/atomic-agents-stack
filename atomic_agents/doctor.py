@@ -195,6 +195,7 @@ def run_doctor(
             "goal-backend",
             "outcome-backend",
             "journal-backend",
+            "queue-backend",
             "memory-backend-config",
             "memory-backend",
             "write-paths",
@@ -261,6 +262,7 @@ def run_doctor(
     results.append(check_goal_backend(agent_root))
     results.append(check_outcome_backend(agent_root))
     results.append(check_journal_backend(agent_root))
+    results.append(check_queue_backend(agent_root))
     # memory-backend-config (coherence) runs before memory-backend (liveness),
     # mirroring the check_lock_backend → check_locks ordering (#60 PR 3).
     results.append(check_memory_backend_config(agent_root))
@@ -4276,6 +4278,171 @@ def check_journal_backend(agent_root: Path) -> CheckResult:
             "read_bytes_probed": read_bytes_probed,
             "supports_canonical_export": caps.supports_canonical_export,
             "supports_date_query": caps.supports_date_query,
+        },
+    )
+
+
+def check_queue_backend(agent_root: Path) -> CheckResult:
+    """QueueBackend resolves and the configured backend instantiates cleanly.
+
+    Validates that ATOMIC_AGENTS_QUEUE_BACKEND is correctly configured.
+    Scoped at agent_root but probes the CASCADE project queue — this check
+    detects cascade via detect_cascade(agent_root) and derives project_root
+    from the cascade. When no cascade is detected (single-agent layout),
+    returns SKIP (no cascade queue to probe).
+
+    Doctor dual-probe pattern (MEMORY.md feedback_doctor_dual_probe_pattern):
+    Probes BOTH:
+    1. list_claimed() — lightweight enumeration (MUST NOT raise even when
+       claimed/ is absent; returns [] for projects with no active claims)
+    2. get_default_queue_backend() instantiation — confirms env var is valid
+
+    PASS / WARN / FAIL ladder (this check has a WARN path):
+    SKIP when:
+    * No cascade is detected for agent_root (single-agent layout, no project queue).
+
+    FAIL when:
+    * get_default_queue_backend(project_root) raises (bad env var or not registered).
+    * list_claimed() raises.
+    * _queue_root() raises PathTraversalError (symlinked queue/ escape).
+
+    WARN when:
+    * capabilities().single_host_only=True AND ATOMIC_AGENTS_MULTI_HOST=true
+      (or '1'). A filesystem queue in a declared multi-host deployment may cause
+      double-claims if workers run on different hosts. Operators should switch
+      to a Redis/SQS/DB QueueBackend for multi-host safety.
+
+    PASS otherwise (including when no queue/ exists for this project).
+
+    Multi-host detection: ATOMIC_AGENTS_MULTI_HOST env var (set to 'true' or '1'
+    by operators on Cloud Run / Kubernetes deployments). Defined in spec/44 §Doctor
+    check. A follow-up issue should harmonize this with LockBackend's
+    single_host_only WARN pattern — #TODO file during this PR.
+    """
+    from ._cascade import detect_cascade  # noqa: PLC0415
+    from .queue import (  # noqa: PLC0415
+        get_default_queue_backend,
+        list_queue_backends,
+        _redact_for_error_message,
+    )
+    from .exceptions import PathTraversalError  # noqa: PLC0415
+
+    # Step 1: detect cascade to get project_root.
+    cascade = detect_cascade(agent_root)
+    if cascade is None:
+        return CheckResult(
+            name="queue-backend",
+            status=SKIP,
+            message="queue backend check skipped: agent is not in a multi-agent cascade project",
+        )
+
+    project_root = cascade.project_root
+
+    raw_backend_id = (
+        os.environ.get("ATOMIC_AGENTS_QUEUE_BACKEND", "").strip().lower()
+        or "filesystem"
+    )
+    # Credential safety: ATOMIC_AGENTS_QUEUE_BACKEND may carry a URL- or
+    # DSN-shaped value. Redact before it reaches the rendered CheckResult.
+    safe_backend_id = _redact_for_error_message(raw_backend_id)
+
+    try:
+        backend = get_default_queue_backend(project_root)
+    except Exception as e:
+        return CheckResult(
+            name="queue-backend",
+            status=FAIL,
+            message=(
+                f"failed to instantiate queue backend "
+                f"(ATOMIC_AGENTS_QUEUE_BACKEND={safe_backend_id!r}): {e}"
+            ),
+            fix_hint=(
+                "Unset ATOMIC_AGENTS_QUEUE_BACKEND to use the filesystem default, "
+                f"or set it to a registered backend id (known: {list_queue_backends()}). "
+            ),
+            detail={"backend_id": safe_backend_id, "error": str(e)},
+        )
+
+    # Dual-probe step 1: lightweight list
+    try:
+        claimed = backend.list_claimed()
+    except Exception as e:
+        return CheckResult(
+            name="queue-backend",
+            status=FAIL,
+            message=f"queue backend list_claimed() raised: {type(e).__name__}: {e}",
+            detail={
+                "backend_id": backend.backend_id,
+                "error": str(e),
+                "error_type": type(e).__name__,
+            },
+        )
+
+    # Directory-escape probe: a symlinked queue/ DIRECTORY pointing outside
+    # project_root is the real escape vector. Probe via _queue_root() helper.
+    queue_root_probe = getattr(backend, "_queue_root", None)
+    if callable(queue_root_probe):
+        try:
+            queue_root_probe()
+        except PathTraversalError as e:
+            return CheckResult(
+                name="queue-backend",
+                status=FAIL,
+                message=(
+                    f"queue/ directory escapes project_root "
+                    f"(symlink containment violation): {e}"
+                ),
+                fix_hint=(
+                    "The project's queue/ directory is a symlink resolving "
+                    "outside project_root. Replace the symlink with a real "
+                    "directory under project_root."
+                ),
+                detail={
+                    "backend_id": backend.backend_id,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                },
+            )
+
+    # Single-host WARN: check if backend claims single_host_only=True in a
+    # declared multi-host deployment (ATOMIC_AGENTS_MULTI_HOST=true/1).
+    caps = backend.capabilities()
+    multi_host_declared = os.environ.get("ATOMIC_AGENTS_MULTI_HOST", "").lower() in (
+        "1",
+        "true",
+    )
+    if caps.single_host_only and multi_host_declared:
+        return CheckResult(
+            name="queue-backend",
+            status=WARN,
+            message=(
+                f"queue backend '{backend.backend_id}' is single-host-only "
+                f"but ATOMIC_AGENTS_MULTI_HOST is set. "
+                f"Double-claims are possible across hosts."
+            ),
+            fix_hint=(
+                "Switch to a Redis/SQS/DB QueueBackend for multi-host safety. "
+                "Filesystem queue-claim atomicity (POSIX rename) does not extend "
+                "across hosts — two workers on different hosts may claim the same item."
+            ),
+            detail={
+                "backend_id": backend.backend_id,
+                "single_host_only": caps.single_host_only,
+                "multi_host_declared": multi_host_declared,
+                "active_claims": len(claimed),
+            },
+        )
+
+    return CheckResult(
+        name="queue-backend",
+        status=PASS,
+        message=f"queue backend '{backend.backend_id}' ready",
+        detail={
+            "backend_id": backend.backend_id,
+            "project_root": str(project_root),
+            "single_host_only": caps.single_host_only,
+            "supports_canonical_export": caps.supports_canonical_export,
+            "active_claims": len(claimed),
         },
     )
 

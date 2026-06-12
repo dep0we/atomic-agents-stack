@@ -59,6 +59,14 @@ from ..outcome.types import OutcomeExport as OutcomeExport  # noqa: F401 (re-exp
 # Re-export here so callers can use 'from atomic_agents.export import JournalExport'.
 from ..journal.types import JournalExport as JournalExport  # noqa: F401 (re-export)
 
+# QueueExport is defined in queue/types.py (it subclasses ExportableResult
+# imported from the leaf module _export_base.py — same safe chain as the
+# other three #383 wave exports). Re-export here so callers can use
+# 'from atomic_agents.export import QueueExport'.
+# spec/40 registration: supports_canonical_export=True; embed bytes for
+# queued/ + done/ + dead-letter/ (durable); exclude claimed/ + .lease.json (ephemeral).
+from ..queue.types import QueueExport as QueueExport  # noqa: F401 (re-export)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Per-backend export result types

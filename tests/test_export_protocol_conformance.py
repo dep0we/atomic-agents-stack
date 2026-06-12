@@ -102,9 +102,15 @@ def _render_export_result(result) -> bytes:
         MandateExport,
         MemoryExport,
         OutcomeExport,
+        QueueExport,
         SecretExport,
     )
 
+    if isinstance(result, QueueExport):
+        # QueueExport embeds bytes for queued/ + done/ + dead-letter/ items.
+        # Tier A passthrough: concatenate the raw per-item bytes in sorted order.
+        # claimed/ and .lease.json sidecars are structurally excluded (whitelist).
+        return b"".join(raw_bytes for _rel_path, raw_bytes in result.items_with_bytes)
     if isinstance(result, JournalExport):
         # JournalExport embeds entry bytes (read_bytes() passthrough per *.md
         # file). Tier A passthrough: concatenate the raw per-entry bytes in
