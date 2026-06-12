@@ -96,6 +96,7 @@ def _render_export_result(result) -> bytes:
     from atomic_agents.export.types import (
         CorpusExport,
         GoalExport,
+        JournalExport,
         LockExport,
         LogExport,
         MandateExport,
@@ -104,6 +105,12 @@ def _render_export_result(result) -> bytes:
         SecretExport,
     )
 
+    if isinstance(result, JournalExport):
+        # JournalExport embeds entry bytes (read_bytes() passthrough per *.md
+        # file). Tier A passthrough: concatenate the raw per-entry bytes in
+        # list_entries(newest_first=True) order. No re-serialization — the
+        # journal is human-authored markdown, bytes are exact.
+        return b"".join(raw_bytes for _rel_path, raw_bytes in result.entries_with_bytes)
     if isinstance(result, OutcomeExport):
         # OutcomeExport: result_json_bytes is the canonical on-disk content.
         # artifact_refs are portable references (relative or absolute).
@@ -2390,3 +2397,116 @@ def test_outcome_export_top_level_import_resolves() -> None:
     import atomic_agents.export as export_pkg
 
     assert "OutcomeExport" in export_pkg.__all__
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Journal export conformance (#427 PR1 — spec/43 joins the spec/40 round-trip harness)
+
+
+@pytest.fixture
+def journal_backend(tmp_path: Path):
+    from atomic_agents.journal.filesystem import FilesystemJournalBackend
+
+    agent_root = tmp_path / "agent"
+    agent_root.mkdir()
+    return FilesystemJournalBackend(agent_root)
+
+
+def test_journal_export_returns_journal_export_type(journal_backend) -> None:
+    """export() returns a JournalExport instance."""
+    from atomic_agents.export.types import JournalExport
+
+    result = journal_backend.export()
+    assert isinstance(result, JournalExport)
+
+
+def test_journal_export_is_exportable_result(journal_backend) -> None:
+    """JournalExport is an ExportableResult subclass (generic Protocol narrowing)."""
+    from atomic_agents.export.types import ExportableResult
+
+    result = journal_backend.export()
+    assert isinstance(result, ExportableResult)
+
+
+def test_journal_export_empty_returns_empty_components(journal_backend) -> None:
+    """export() on a backend with no entries returns empty JournalExport."""
+    from atomic_agents.export.types import JournalExport
+
+    result = journal_backend.export()
+    assert isinstance(result, JournalExport)
+    assert result.entries_with_bytes == []
+
+
+def test_journal_export_single_roundtrip(journal_backend) -> None:
+    """Byte-exact round-trip: exported bytes equal the on-disk file bytes."""
+    from datetime import date
+
+    journal_backend.append_entry("# Entry one\n\nbody", when=date(2026, 6, 12))
+
+    def write_fn(_be):
+        pass  # already populated above
+
+    def expected_bytes_fn(be):
+        # Read the REAL on-disk file bytes (newest-first concatenation).
+        entries = be.list_entries(newest_first=True)
+        return b"".join(e.path.read_bytes() for e in entries)
+
+    assert_canonical_roundtrip(journal_backend, write_fn, expected_bytes_fn)
+
+
+def test_journal_export_no_crlf_no_bom(journal_backend) -> None:
+    """Export passes operator-authored bytes through verbatim (no CRLF/BOM mangling).
+
+    Journal is human-authored markdown — bytes are NOT normalized. If the
+    operator wrote LF/no-BOM, the export carries LF/no-BOM unchanged.
+    """
+    from datetime import date
+
+    journal_backend.append_entry("plain lf body", when=date(2026, 6, 12))
+    result = journal_backend.export()
+    assert len(result.entries_with_bytes) == 1
+    _rel, raw = result.entries_with_bytes[0]
+    assert b"\r\n" not in raw
+    assert not raw.startswith(b"\xef\xbb\xbf")
+
+
+def test_journal_export_relative_paths(journal_backend) -> None:
+    """Exported path metadata is relative-to-agent_root (portable)."""
+    from datetime import date
+
+    journal_backend.append_entry("body", when=date(2026, 6, 12))
+    result = journal_backend.export()
+    rel_path, _raw = result.entries_with_bytes[0]
+    assert rel_path == "journal/2026-06/2026-06-12.md"
+
+
+def test_journal_export_backend_id_and_scope(journal_backend) -> None:
+    result = journal_backend.export()
+    assert result.backend_id == journal_backend.backend_id
+    assert result.scope == str(journal_backend._agent_root)
+
+
+def test_journal_export_all_equals_export_none(journal_backend) -> None:
+    """export_all() produces the same result as export(None)."""
+    from datetime import date
+
+    journal_backend.append_entry("body", when=date(2026, 6, 12))
+    result_none = journal_backend.export(None)
+    result_all = journal_backend.export_all()
+    assert len(result_none.entries_with_bytes) == len(result_all.entries_with_bytes)
+    assert result_none.entries_with_bytes == result_all.entries_with_bytes
+
+
+def test_journal_export_top_level_import_resolves() -> None:
+    """`from atomic_agents.export import JournalExport` MUST resolve.
+
+    Pins the public import surface so the package-root re-export cannot silently
+    regress, mirroring the Goal/Outcome import-resolution conformance tests.
+    """
+    from atomic_agents.export import JournalExport
+    from atomic_agents.export.types import JournalExport as JournalExportSubmodule
+
+    assert JournalExport is JournalExportSubmodule
+    import atomic_agents.export as export_pkg
+
+    assert "JournalExport" in export_pkg.__all__

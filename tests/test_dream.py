@@ -38,6 +38,7 @@ from atomic_agents.exceptions import (
 # ──────────────────────────────────────────────────────────────────
 # Fixtures
 
+
 def _build_agent(tmp_path: Path, agent_name: str = "dreamer") -> Path:
     """Build a minimal agent directory layout."""
     agents_root = tmp_path / "agents"
@@ -51,9 +52,16 @@ def _build_agent(tmp_path: Path, agent_name: str = "dreamer") -> Path:
     return agents_root
 
 
-def _write_note(agent_dir: Path, filename: str, note_type: str, name: str,
-                body: str, last_seen: str, pinned: bool = False,
-                tags: list | None = None) -> Path:
+def _write_note(
+    agent_dir: Path,
+    filename: str,
+    note_type: str,
+    name: str,
+    body: str,
+    last_seen: str,
+    pinned: bool = False,
+    tags: list | None = None,
+) -> Path:
     """Write a memory note to agent_dir/memory/."""
     memory_dir = agent_dir / "memory"
     memory_dir.mkdir(exist_ok=True)
@@ -81,6 +89,7 @@ def _make_llm_response(text: str, input_tokens: int = 10, output_tokens: int = 2
     """Build a mock _RawLLMResponse (as returned by _llm.call_llm)."""
     # atomic_agents._llm.call_llm returns _RawLLMResponse, not the raw SDK object
     from atomic_agents._llm import _RawLLMResponse
+
     return _RawLLMResponse(
         text=text,
         input_tokens=input_tokens,
@@ -95,12 +104,25 @@ def _make_llm_response(text: str, input_tokens: int = 10, output_tokens: int = 2
 # ──────────────────────────────────────────────────────────────────
 # Pure logic tests (no LLM)
 
+
 def test_detect_duplicates_clusters_same_type_similar_names():
     """Notes of same type with similar names should cluster together."""
     notes = [
-        {"filename": "feedback_debt_priority.md", "meta": {"type": "feedback", "name": "Debt priority rule"}, "body": "Body A"},
-        {"filename": "feedback_debt_prioritization.md", "meta": {"type": "feedback", "name": "Debt prioritization"}, "body": "Body B"},
-        {"filename": "decision_api_design.md", "meta": {"type": "decision", "name": "API design choice"}, "body": "Body C"},
+        {
+            "filename": "feedback_debt_priority.md",
+            "meta": {"type": "feedback", "name": "Debt priority rule"},
+            "body": "Body A",
+        },
+        {
+            "filename": "feedback_debt_prioritization.md",
+            "meta": {"type": "feedback", "name": "Debt prioritization"},
+            "body": "Body B",
+        },
+        {
+            "filename": "decision_api_design.md",
+            "meta": {"type": "decision", "name": "API design choice"},
+            "body": "Body C",
+        },
     ]
     clusters = _cluster_by_type_and_name(notes)
     # The two feedback notes should end up in the same cluster
@@ -124,6 +146,7 @@ def test_detect_stale_marks_old_unpinned_notes():
     assert markings[0].note == "feedback_old.md"
     # expires_at should be in the future
     from datetime import date as dt
+
     expires = dt.fromisoformat(markings[0].new_expires_at)
     assert expires > dt.today()
 
@@ -144,6 +167,7 @@ def test_detect_stale_skips_pinned_notes():
 
 # ──────────────────────────────────────────────────────────────────
 # Full pipeline tests (mock LLM)
+
 
 def _no_op_response():
     """Helper response that claims no duplicates, no promotions."""
@@ -172,8 +196,14 @@ def agents_root(tmp_path):
 def test_dream_pipeline_satisfied_path(agents_root, monkeypatch):
     """Full happy-path: manifest reaches 'completed', output dir has notes."""
     agent_dir = agents_root / "dreamer"
-    _write_note(agent_dir, "feedback_test.md", "feedback", "Test feedback",
-                "Test body", "2026-01-01")
+    _write_note(
+        agent_dir,
+        "feedback_test.md",
+        "feedback",
+        "Test feedback",
+        "Test body",
+        "2026-01-01",
+    )
 
     with patch("atomic_agents.dream._llm.call_llm") as mock_llm:
         mock_llm.return_value = _no_op_response()
@@ -193,8 +223,14 @@ def test_dream_pipeline_satisfied_path(agents_root, monkeypatch):
 def test_dream_pipeline_writes_report_md(agents_root, monkeypatch):
     """report.md is written and has sections per change."""
     agent_dir = agents_root / "dreamer"
-    _write_note(agent_dir, "feedback_test.md", "feedback", "Test feedback",
-                "Test body", "2026-01-01")
+    _write_note(
+        agent_dir,
+        "feedback_test.md",
+        "feedback",
+        "Test feedback",
+        "Test body",
+        "2026-01-01",
+    )
 
     with patch("atomic_agents.dream._llm.call_llm") as mock_llm:
         mock_llm.return_value = _no_op_response()
@@ -208,11 +244,63 @@ def test_dream_pipeline_writes_report_md(agents_root, monkeypatch):
     assert "Summary" in content
 
 
+def test_dream_pipeline_reads_journal_entry_through_real_adapter(
+    agents_root, monkeypatch
+):
+    """#427 regression: a dated journal entry nested in a month-subdir reaches the
+    REAL DreamRunner.start() -> _run_pipeline journal adapter via query_by_date,
+    carried to the LLM as path.name (NOT the nested path). Locks the subdir-loss
+    fix and the real call-site flow — the conformance suite only proves the adapter
+    via an inline reconstruction, not by driving the real dream pipeline.
+    """
+    agent_dir = agents_root / "dreamer"
+    # A memory note so the contradiction/promotion stages (which embed the journal
+    # filename + text into their prompts) actually run.
+    _write_note(
+        agent_dir,
+        "feedback_test.md",
+        "feedback",
+        "Test feedback",
+        "Test body",
+        "2026-01-01",
+    )
+    # Journal entry nested in a YYYY-MM/ subdir, recent enough to be in lookback.
+    recent = date.today() - timedelta(days=1)
+    month_dir = recent.strftime("%Y-%m")
+    entry_name = f"{recent.isoformat()}.md"
+    jdir = agent_dir / "journal" / month_dir
+    jdir.mkdir(parents=True)
+    (jdir / entry_name).write_text(
+        "Journal narrative DREAM_JOURNAL_SENTINEL.", encoding="utf-8"
+    )
+
+    with patch("atomic_agents.dream._llm.call_llm") as mock_llm:
+        mock_llm.return_value = _no_op_response()
+        runner = DreamRunner(agents_root, "dreamer")
+        result = runner.start()
+
+    assert result.status == "completed"
+    # Flatten every prompt the real pipeline handed to the LLM.
+    all_prompts = (
+        " ".join(str(a) for call in mock_llm.call_args_list for a in call.args)
+        + " "
+        + " ".join(
+            str(v) for call in mock_llm.call_args_list for v in call.kwargs.values()
+        )
+    )
+    # The entry's text reached a real prompt -> the real adapter read it off disk.
+    assert "DREAM_JOURNAL_SENTINEL" in all_prompts
+    # ...carried as the bare filename (path.name), NOT the nested subdir path.
+    assert entry_name in all_prompts
+    assert f"{month_dir}/{entry_name}" not in all_prompts
+
+
 def test_dream_apply_atomically_swaps_directories(agents_root, monkeypatch):
     """Apply: old memory/ is archived, dreamed memory/ becomes live memory/."""
     agent_dir = agents_root / "dreamer"
-    _write_note(agent_dir, "feedback_test.md", "feedback", "Test",
-                "Test body", "2026-03-01")
+    _write_note(
+        agent_dir, "feedback_test.md", "feedback", "Test", "Test body", "2026-03-01"
+    )
 
     with patch("atomic_agents.dream._llm.call_llm") as mock_llm:
         mock_llm.return_value = _no_op_response()
@@ -250,8 +338,11 @@ def test_dream_apply_refuses_uncompleted_dream(agents_root, monkeypatch):
         model="claude-haiku-4-5-20251001",
         instructions="",
         inputs=DreamInputs(
-            memory_count=0, journal_lookback_days=30,
-            journal_count=0, log_lookback_days=30, log_line_count=0,
+            memory_count=0,
+            journal_lookback_days=30,
+            journal_count=0,
+            log_lookback_days=30,
+            log_line_count=0,
         ),
         output_memory_count=0,
         consolidated=[],
@@ -273,8 +364,9 @@ def test_dream_apply_refuses_uncompleted_dream(agents_root, monkeypatch):
 def test_dream_apply_refuses_already_applied(agents_root, monkeypatch):
     """Applying a dream twice should raise."""
     agent_dir = agents_root / "dreamer"
-    _write_note(agent_dir, "feedback_test.md", "feedback", "Test",
-                "Test body", "2026-03-01")
+    _write_note(
+        agent_dir, "feedback_test.md", "feedback", "Test", "Test body", "2026-03-01"
+    )
 
     with patch("atomic_agents.dream._llm.call_llm") as mock_llm:
         mock_llm.return_value = _no_op_response()
@@ -290,8 +382,7 @@ def test_dream_apply_refuses_already_applied(agents_root, monkeypatch):
 def test_dream_discard_removes_dir(agents_root, monkeypatch):
     """Discarding a dream removes its directory."""
     agent_dir = agents_root / "dreamer"
-    _write_note(agent_dir, "feedback_test.md", "feedback", "Test",
-                "Body", "2026-03-01")
+    _write_note(agent_dir, "feedback_test.md", "feedback", "Test", "Body", "2026-03-01")
 
     with patch("atomic_agents.dream._llm.call_llm") as mock_llm:
         mock_llm.return_value = _no_op_response()
@@ -308,8 +399,7 @@ def test_dream_discard_removes_dir(agents_root, monkeypatch):
 def test_dream_discard_refuses_applied(agents_root, monkeypatch):
     """Discarding an already-applied dream should raise."""
     agent_dir = agents_root / "dreamer"
-    _write_note(agent_dir, "feedback_test.md", "feedback", "Test",
-                "Body", "2026-03-01")
+    _write_note(agent_dir, "feedback_test.md", "feedback", "Test", "Body", "2026-03-01")
 
     with patch("atomic_agents.dream._llm.call_llm") as mock_llm:
         mock_llm.return_value = _no_op_response()
@@ -325,8 +415,7 @@ def test_dream_discard_refuses_applied(agents_root, monkeypatch):
 def test_dream_list_returns_newest_first(agents_root, monkeypatch):
     """list_dreams() returns dreams with the most recent first."""
     agent_dir = agents_root / "dreamer"
-    _write_note(agent_dir, "feedback_test.md", "feedback", "Test",
-                "Body", "2026-03-01")
+    _write_note(agent_dir, "feedback_test.md", "feedback", "Test", "Body", "2026-03-01")
 
     with patch("atomic_agents.dream._llm.call_llm") as mock_llm:
         mock_llm.return_value = _no_op_response()
@@ -344,10 +433,13 @@ def test_dream_list_returns_newest_first(agents_root, monkeypatch):
     assert dreams[1].dream_id == r1.dream_id
 
 
-def _hold_dream_lock_for_test(dreams_dir_str: str, hold_seconds: float, ready_path: str) -> None:
+def _hold_dream_lock_for_test(
+    dreams_dir_str: str, hold_seconds: float, ready_path: str
+) -> None:
     """Module-level helper for multiprocessing spawn (must be pickle-able)."""
     import time as _time
     from atomic_agents.locks import FilesystemLockBackend
+
     backend = FilesystemLockBackend(Path(dreams_dir_str))
     handle = backend.acquire("", timeout=0)
     Path(ready_path).write_text("ready")
@@ -416,8 +508,14 @@ def test_dream_cost_guardrail_pre_check_refuses(tmp_path):
 
     # Write some notes to inflate the cost estimate
     for i in range(5):
-        _write_note(agent_dir, f"feedback_note_{i}.md", "feedback", f"Note {i}",
-                    "Body " * 100, "2026-03-01")
+        _write_note(
+            agent_dir,
+            f"feedback_note_{i}.md",
+            "feedback",
+            f"Note {i}",
+            "Body " * 100,
+            "2026-03-01",
+        )
 
     with patch("atomic_agents.dream._llm.call_llm") as mock_llm:
         mock_llm.return_value = _no_op_response()
@@ -447,8 +545,9 @@ def test_dream_critical_bypasses_cap(tmp_path):
         "```\n"
     )
     (agent_dir / "model.md").write_text(model_md)
-    _write_note(agent_dir, "feedback_test.md", "feedback", "Test",
-                "Body " * 100, "2026-03-01")
+    _write_note(
+        agent_dir, "feedback_test.md", "feedback", "Test", "Body " * 100, "2026-03-01"
+    )
 
     with patch("atomic_agents.dream._llm.call_llm") as mock_llm:
         mock_llm.return_value = _no_op_response()
@@ -461,8 +560,7 @@ def test_dream_critical_bypasses_cap(tmp_path):
 def test_dream_failed_pipeline_preserves_partial_output(agents_root, monkeypatch):
     """Exception during synthesis → manifest=failed, error captured, partial output preserved."""
     agent_dir = agents_root / "dreamer"
-    _write_note(agent_dir, "feedback_test.md", "feedback", "Test",
-                "Body", "2026-03-01")
+    _write_note(agent_dir, "feedback_test.md", "feedback", "Test", "Body", "2026-03-01")
 
     # Fail on the first synthesis call (which is the only call when there's 1 note
     # and no duplicate clusters needing LLM checks)
@@ -475,7 +573,11 @@ def test_dream_failed_pipeline_preserves_partial_output(agents_root, monkeypatch
             runner.start()
 
     # Find the most recent dream dir
-    dreams = list((agent_dir / "dreams").iterdir()) if (agent_dir / "dreams").exists() else []
+    dreams = (
+        list((agent_dir / "dreams").iterdir())
+        if (agent_dir / "dreams").exists()
+        else []
+    )
     dream_dirs = [d for d in dreams if d.is_dir() and d.name.startswith("drm_")]
     assert len(dream_dirs) >= 1
 
@@ -510,6 +612,7 @@ def test_dream_empty_vault_completes_with_zero_changes(agents_root, monkeypatch)
 # Codex R2 regression tests
 # ──────────────────────────────────────────────────────────────────
 
+
 def test_dream_apply_takes_agent_lock(agents_root, monkeypatch):
     """apply() must acquire the AgentLock and wait/fail if held by another process.
 
@@ -520,9 +623,11 @@ def test_dream_apply_takes_agent_lock(agents_root, monkeypatch):
     """
     from atomic_agents.locks import FilesystemLockBackend
     from atomic_agents.memory.filesystem import FilesystemBackend
+
     agent_dir = agents_root / "dreamer"
-    _write_note(agent_dir, "feedback_test.md", "feedback", "Test",
-                "Test body", "2026-03-01")
+    _write_note(
+        agent_dir, "feedback_test.md", "feedback", "Test", "Test body", "2026-03-01"
+    )
 
     with patch("atomic_agents.dream._llm.call_llm") as mock_llm:
         mock_llm.return_value = _no_op_response()
@@ -549,9 +654,7 @@ def test_dream_apply_takes_agent_lock(agents_root, monkeypatch):
         # by Step 9.1 security review as a process-wide mutation risk).
         # Patch ``FilesystemBackend.__init__`` so the existing runner's
         # internal backend re-instantiates with the fail-fast value.
-        runner._backend = FilesystemBackend(
-            agent_dir, apply_staging_lock_timeout=0.0
-        )
+        runner._backend = FilesystemBackend(agent_dir, apply_staging_lock_timeout=0.0)
         with pytest.raises(AgentLockBusy):
             runner.apply(result.dream_id)
     finally:

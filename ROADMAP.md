@@ -8,7 +8,7 @@ For shipped work, see [CHANGELOG.md](CHANGELOG.md). For the framework's design s
 
 ## v1.0 — backend protocols shipped
 
-The framework's protocol-pattern scaling story closed at v1.0 on 2026-06-05. **Twelve of twelve** backend protocols have shipped: `MemoryBackend`, `LLMBackend`, `JudgeBackend`, `LockBackend`, `LogBackend`, `AgentProfileBackend`, `ToolRegistryBackend`, `MandateBackend`, `PolicyBackend`, `PersonaBackend`, `CorpusBackend`, `MCPServerRegistryBackend`. All twelve have locked specs, reference implementations, and parametrized conformance suites. Three more have since shipped for v1.5: `SecretBackend` (#340, LOCKED spec/38), `GoalBackend` (#425, DRAFT spec/41), and `OutcomeBackend` (#426, DRAFT spec/42) — fifteen backend protocols total.
+The framework's protocol-pattern scaling story closed at v1.0 on 2026-06-05. **Twelve of twelve** backend protocols have shipped: `MemoryBackend`, `LLMBackend`, `JudgeBackend`, `LockBackend`, `LogBackend`, `AgentProfileBackend`, `ToolRegistryBackend`, `MandateBackend`, `PolicyBackend`, `PersonaBackend`, `CorpusBackend`, `MCPServerRegistryBackend`. All twelve have locked specs, reference implementations, and parametrized conformance suites. Four more have since shipped for v1.5: `SecretBackend` (#340, LOCKED spec/38), `GoalBackend` (#425, DRAFT spec/41), `OutcomeBackend` (#426, DRAFT spec/42), and `JournalBackend` (#427, DRAFT spec/43) — sixteen backend protocols total.
 
 | Issue | Backend | Status | What it unblocks |
 |-------|---------|--------|------------------|

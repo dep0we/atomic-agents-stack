@@ -338,7 +338,7 @@ at the top. Tiebreaker for ambiguous order: alphabetical by issue number.
    (per-file atomicity from `atomic_write`); not-yet-written files are left as
    their existing versions; the wizard prints a partial-update warning listing
    committed and failed relpaths and exits status 1. Operator-authored memory
-   notes (under `memory/` except `INDEX.md`), journal entries (`journal/*.jsonl`),
+   notes (under `memory/` except `INDEX.md`), journal entries (`journal/*.md`),
    log files (`log/`), and raw documents (`raw/`) MUST NOT be touched during
    Add-to-it. Schema-owned scaffolding files (`memory/INDEX.md`, `wiki/INDEX.md`)
    ARE rewritten through the normal Add-to-it merge pattern because they are

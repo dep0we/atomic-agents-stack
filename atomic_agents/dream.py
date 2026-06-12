@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     from .persona import PersonaBackend
     from .corpus import CorpusBackend
     from .mcp_registry import MCPServerRegistryBackend
+    from .journal.backend import JournalBackend
 
 import frontmatter
 
@@ -273,31 +274,11 @@ def _read_memory_notes_via_backend(backend: "MemoryBackend") -> list[dict]:
     return notes
 
 
-def _read_journal_entries(agent_root: Path, lookback_days: int) -> list[dict]:
-    """Return journal entry dicts within lookback window."""
-    journal_dir = agent_root / "journal"
-    entries = []
-    if not journal_dir.exists():
-        return entries
-    cutoff = date.today() - timedelta(days=lookback_days)
-    for path in sorted(journal_dir.rglob("*.md"), reverse=True):
-        try:
-            # stem is typically YYYY-MM-DD
-            entry_date = date.fromisoformat(path.stem)
-            if entry_date < cutoff:
-                continue
-        except (ValueError, TypeError):
-            pass  # include if we can't parse the date
-        try:
-            entries.append(
-                {
-                    "filename": path.name,
-                    "text": path.read_text(encoding="utf-8"),
-                }
-            )
-        except OSError:
-            continue
-    return entries
+# NOTE: the former _read_journal_entries helper was removed in #427 PR1. Its
+# date-window read now lives in JournalBackend.query_by_date(); the two dream
+# call sites adapt JournalEntry → {"filename", "text"} dicts and pass
+# end=date.max to preserve the legacy lower-bound-only window (future-dated
+# entries included).
 
 
 def _read_log_lines(
@@ -772,8 +753,11 @@ def _run_pipeline(
     critical: bool,
     backend: "MemoryBackend | None" = None,
     log_backend: "LogBackend | None" = None,
+    journal_backend: "JournalBackend | None" = None,
 ) -> DreamResult:
     """Execute the full dream pipeline. Mutates and returns result."""
+    from .journal import get_default_journal_backend  # noqa: PLC0415
+
     total_input_tokens = 0
     total_output_tokens = 0
     total_cost = 0.0
@@ -784,7 +768,30 @@ def _run_pipeline(
         notes = _read_memory_notes_via_backend(backend)
     else:
         notes = _read_memory_notes(agent_root)
-    journal_entries = _read_journal_entries(agent_root, journal_lookback_days)
+
+    # ADOPT-NOW (#427 PR1 — spec/43): route journal reads through JournalBackend.
+    # backend returns raw JournalEntry objects; adapt to list[dict] for all
+    # downstream callers (_build_contradiction_prompts, _build_promotion_prompts,
+    # _estimate_dream_cost, _synthesis_pass) which consume list[dict] with
+    # keys 'filename' and 'text'. This keeps all 13+ downstream callers unchanged.
+    # from_journal_entries in PromotedNote stores path.name (filename only, not
+    # full path) — preserve this by using entry.path.name for 'filename'.
+    # Upper bound is date.max (NOT date.today()): legacy dream._read_journal_entries
+    # applied ONLY a lower bound (if entry_date < cutoff: continue) and had NO
+    # upper bound, so future-dated entries (clock skew, post-dated, TZ-boundary
+    # writes) were INCLUDED. Passing end=date.today() would silently DROP them —
+    # a silent dream-consolidation divergence (#427 PR1 byte-identity selection).
+    _jbe = journal_backend or get_default_journal_backend(agent_root)
+    cutoff = date.today() - timedelta(days=journal_lookback_days)
+    raw_journal_entries = _jbe.query_by_date(start=cutoff, end=date.max)
+    journal_entries = [
+        # path.name for LLM-facing filename string — full path used for read
+        # (fixes #427 subdir-loss latent bug in legacy path.name storage).
+        # from_journal_entries holds filename only (path.name), not full path
+        # — matches PromotedNote field contract and existing dream report output.
+        {"filename": entry.path.name, "text": entry.text}
+        for entry in raw_journal_entries
+    ]
     log_lines = _read_log_lines(
         agent_root,
         log_lookback_days,
@@ -1182,6 +1189,7 @@ class DreamRunner:
         persona_backend: "PersonaBackend | None" = None,
         corpus_backend: "CorpusBackend | None" = None,
         mcp_server_registry_backend: "MCPServerRegistryBackend | None" = None,
+        journal_backend: "JournalBackend | None" = None,
     ):
         self.agents_root = Path(agents_root)
         self.agent_name = agent_name
@@ -1347,6 +1355,11 @@ class DreamRunner:
         # at that construction site via
         # ``AtomicAgent(..., mcp_server_registry_backend=self._mcp_server_registry_backend)``.
         self._mcp_server_registry_backend = mcp_server_registry_backend
+        # spec/43 PR 1 — JournalBackend LIVE-WIRED (ADOPT-NOW ruling).
+        # Unlike the other backends stored above for API-parity only, this one
+        # IS consumed by _run_pipeline() and start() to replace _read_journal_entries.
+        # DreamRunner is the only consumer of query_by_date() (date-window read).
+        self._journal_backend = journal_backend
 
         # Resolve model: explicit kwarg > profile.model_config default.
         # PR 2 Decision 2: pre-resolved model_config is also passed to
@@ -1370,8 +1383,20 @@ class DreamRunner:
         dream_dir.mkdir(parents=True, exist_ok=True)
 
         # Upfront cost estimate and cap check
+        # ADOPT-NOW (#427 PR1 — spec/43): route journal reads through JournalBackend.
+        # Adapt JournalEntry → list[dict] for _estimate_dream_cost (list[dict] consumer).
+        # This cost-estimate read happens BEFORE _check_cap so TypeError from JournalEntry
+        # would abort before the cost gate — using the same adapter as _run_pipeline
+        # preserves the cost gate ordering (spec/43 prep finding P1 at dream.py:685).
+        from .journal import get_default_journal_backend as _get_jbe  # noqa: PLC0415
+
         notes = _read_memory_notes(self.agent_root)
-        journal_entries = _read_journal_entries(self.agent_root, journal_lookback_days)
+        # end=date.max mirrors legacy's lower-bound-only filter (see _run_pipeline);
+        # date.today() would drop future-dated entries the legacy path included.
+        _jbe_start = self._journal_backend or _get_jbe(self.agent_root)
+        _cutoff_start = date.today() - timedelta(days=journal_lookback_days)
+        _raw_je = _jbe_start.query_by_date(start=_cutoff_start, end=date.max)
+        journal_entries = [{"filename": e.path.name, "text": e.text} for e in _raw_je]
         log_lines = _read_log_lines(
             self.agent_root,
             log_lookback_days,
@@ -1456,6 +1481,7 @@ class DreamRunner:
                 critical=critical,
                 backend=self._backend,
                 log_backend=self._log_backend,
+                journal_backend=self._journal_backend,
             )
             _write_manifest(dream_dir, result)
             # Inter-pipeline lock-loss check (#60 PR 3 + spec/21

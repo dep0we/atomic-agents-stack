@@ -119,6 +119,13 @@ def outcome_backend(tmp_path: Path):
     return FilesystemOutcomeBackend(tmp_path / "agents", "agent")
 
 
+@pytest.fixture
+def journal_backend(tmp_path: Path):
+    from atomic_agents.journal.filesystem import FilesystemJournalBackend
+
+    return FilesystemJournalBackend(tmp_path / "agent")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Assertion tests — NOT capability-gated (must not skip)
 
@@ -273,6 +280,30 @@ def test_outcome_backend_is_exportable(outcome_backend) -> None:
     )
 
 
+def test_journal_backend_advertises_canonical_export(journal_backend) -> None:
+    """FilesystemJournalBackend MUST advertise supports_canonical_export=True.
+
+    Per spec/43 §'spec/40 round-trip export'. JournalBackend bakes in the
+    Exportable Protocol at definition time (not retrofitted). This test MUST
+    NOT skip — it is the registration gate that prevents a future developer
+    from accidentally setting False without any test failure.
+    """
+    assert get_supports_canonical_export(journal_backend) is True, (
+        "FilesystemJournalBackend must advertise supports_canonical_export=True "
+        "per spec/43 §'spec/40 round-trip export'"
+    )
+
+
+def test_journal_backend_is_exportable(journal_backend) -> None:
+    """FilesystemJournalBackend satisfies the Exportable Protocol."""
+    from atomic_agents.export.backend import Exportable
+
+    assert isinstance(journal_backend, Exportable), (
+        "FilesystemJournalBackend must satisfy the Exportable Protocol "
+        "(must have export() and export_all() methods)"
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Capability flag type checks
 
@@ -286,6 +317,7 @@ def test_all_capability_flags_are_bool(
     secret_backend,
     goal_backend,
     outcome_backend,
+    journal_backend,
 ) -> None:
     """supports_canonical_export MUST be a Python bool (not truthy int or None)."""
     for name, backend in [
@@ -297,6 +329,7 @@ def test_all_capability_flags_are_bool(
         ("secret", secret_backend),
         ("goal", goal_backend),
         ("outcome", outcome_backend),
+        ("journal", journal_backend),
     ]:
         val = get_supports_canonical_export(backend)
         assert isinstance(val, bool), (

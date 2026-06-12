@@ -61,7 +61,7 @@ They differ in three ways that matter:
 
 If you collapse them into one pool, the agent can't tell the difference between "I learned this from the user" and "I read this in a book." That distinction matters at advice-time.
 
-**CorpusBackend (spec/34).** The `wiki/` and `raw/` layers are abstracted by `CorpusBackend` when registered (locked at #65 PR 4 of 4). `MemoryBackend` (spec/20) retains exclusive ownership of `memory/` and `journal/`; `CorpusBackend` owns `wiki/` and `raw/`. They compose at prompt assembly: `agent.py:_load_indexes()` reads from both. See spec/34 for the Protocol contract.
+**CorpusBackend (spec/34).** The `wiki/` and `raw/` layers are abstracted by `CorpusBackend` when registered (locked at #65 PR 4 of 4). `MemoryBackend` (spec/20) retains exclusive ownership of `memory/` only; `CorpusBackend` owns `wiki/` and `raw/`. As of spec/43, `journal/` is carved out to `JournalBackend (spec/43)` — `MemoryBackend` no longer owns `journal/`. They compose at prompt assembly: `agent.py:_load_indexes()` reads from both. See spec/34 for the Protocol contract.
 
 ---
 

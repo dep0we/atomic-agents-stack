@@ -1399,7 +1399,7 @@ def _add_to_it(
     pre-flight _detect_sections call; it is informational only here.
 
     Operator-authored memory notes (under memory/ except INDEX.md), journal
-    entries (journal/*.jsonl), log files (log/), and raw documents (raw/) are
+    entries (journal/*.md), log files (log/), and raw documents (raw/) are
     never touched: _compute_merged_content only operates on files listed in
     TEMPLATE_SECTION_SCHEMA[template_name]. Schema-owned scaffolding files
     (memory/INDEX.md, wiki/INDEX.md) ARE rewritten through the normal merge

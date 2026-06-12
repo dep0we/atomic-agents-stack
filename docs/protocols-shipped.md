@@ -1,6 +1,6 @@
 # Backend protocols shipped
 
-Twelve backend protocols are locked for v1.0. A thirteenth, SecretBackend (#340), shipped for v1.5 with two reference implementations (FilesystemSecretBackend + GCPSecretManagerBackend) and LOCKED spec/38. A fourteenth, GoalBackend (#425), shipped for v1.5 with FilesystemGoalBackend and DRAFT spec/41. A fifteenth, OutcomeBackend (#426), shipped for v1.5 with FilesystemOutcomeBackend and DRAFT spec/42. Each section captures the reference implementations shipped, the operator override surface, the doctor coherence check, the Implementer Contract location, and the architectural cliff the protocol closes.
+Twelve backend protocols are locked for v1.0. A thirteenth, SecretBackend (#340), shipped for v1.5 with two reference implementations (FilesystemSecretBackend + GCPSecretManagerBackend) and LOCKED spec/38. A fourteenth, GoalBackend (#425), shipped for v1.5 with FilesystemGoalBackend and DRAFT spec/41. A fifteenth, OutcomeBackend (#426), shipped for v1.5 with FilesystemOutcomeBackend and DRAFT spec/42. A sixteenth, JournalBackend (#427), shipped for v1.5 with FilesystemJournalBackend and DRAFT spec/43. Each section captures the reference implementations shipped, the operator override surface, the doctor coherence check, the Implementer Contract location, and the architectural cliff the protocol closes.
 
 This file is the canonical reference for what the framework's storage seam looks like today. CLAUDE.md links here instead of inlining the detail so the session prompt stays under its char budget.
 
@@ -274,7 +274,7 @@ Parametrized conformance suite across both backends pins the Protocol contract s
 
 Call-site migration: `agent.py:_load_indexes()` routes `wiki/INDEX.md` reads through `corpus_backend.render_index_summary("wiki")` when registered (per spec/04 step [7]; legacy direct-read path catches `OSError` + `UnicodeDecodeError` with logged warning marker for soft-degrade symmetry). `bundle.py:_render_memory_breakpoint` gains a `corpus_backend: CorpusBackend | None = None` parameter threaded three levels through `render_bundle`, with a shared `_render_wiki_index_section(label, path, content)` helper producing byte-identical output between Protocol path and legacy fallback (IRON RULE assertion 4). `bundle.py:_source_paths` migration deferred to v1.1 (filesystem-only function; pinned by the deferral test and tracked at #314).
 
-`CorpusBackend` becomes the source of truth for `wiki/` and `raw/` per spec/34 while `MemoryBackend` retains exclusive ownership of `memory/` and `journal/` (spec/24 Decision 7 addendum).
+`CorpusBackend` becomes the source of truth for `wiki/` and `raw/` per spec/34 while `MemoryBackend` retains exclusive ownership of `memory/` only; `journal/` is carved out to `JournalBackend` (spec/43) as of #427 (spec/24 Decision 7 addendum + spec/02 addendum).
 
 Operator override via `ATOMIC_AGENTS_CORPUS_BACKEND` + optional `ATOMIC_AGENTS_CORPUS_BACKEND_URL` env vars (when `=sqlite` without URL, defaults to `<agent_root>/.corpus.db` with `agent_scope=quote_plus(agent_root.name)` so single-host operators get a working SQLite default by flipping one env var) OR `AtomicAgent(..., corpus_backend=...)` constructor kwarg + per-runner kwargs on OutcomeRunner (threads in `outcome/_outcome_impl.py`) / EvalRunner (at `eval.py:363`) / DreamRunner (stores as `self._corpus_backend` for API parity; no internal `AtomicAgent` construction site in v1).
 
@@ -392,7 +392,31 @@ DRAFT spec/42 carries 9 normative MUSTs (side-effect-free construction, capabili
 
 ---
 
-## Why twelve protocols, summarized
+## JournalBackend (#427, DRAFT spec/43, the sixteenth)
+
+Filed as [#427](https://github.com/dep0we/atomic-agents-stack/issues/427). Shipped in 1 PR (ADOPT-NOW ruling — all three read sites wired in the same PR as the Protocol definition).
+
+**Reference implementation:** `FilesystemJournalBackend` (PR 1 of 1). Reproduces today's exact `journal/YYYY-MM/YYYY-MM-DD.md` month-bucketed I/O byte-for-byte. Zero behavior change for home users — the three legacy rglob callers in bundle.py, agent.py, and dream.py are replaced with single `JournalBackend` calls, but the rendered output is byte-identical (frozen by golden tests).
+
+`FilesystemJournalBackend` stores journal entries in `<agent_root>/journal/YYYY-MM/YYYY-MM-DD.md` (month-bucketed markdown files, one per calendar date). The backend is `@runtime_checkable` and exposes `append_entry` / `query_by_date` / `list_entries` / `export` / `export_all` / `capabilities` + `backend_id`. The `.journal.lock` sidecar at `agent_root` level serializes concurrent same-day writes via `fcntl.flock` (MUST 9 append atomicity). `JournalEntry` and `JournalCapabilities` are **frozen** dataclasses — deliberate inverse of goal/outcome's mutable exception (journal entries are append-only immutable episodes, not state-machine objects).
+
+**Operator override:** `ATOMIC_AGENTS_JOURNAL_BACKEND` env var (default `'filesystem'`) OR `AtomicAgent(..., journal_backend=...)` (programmatic path always wins). Registry: `register_journal_backend` / `get_journal_backend` / `list_journal_backends` / `unregister_journal_backend` in `atomic_agents/journal/__init__.py`.
+
+**Doctor:** `check_journal_backend()` uses the dual-probe pattern (`list_entries(limit=1)` liveness + `entry.path.read_bytes()` only when entries exist) per `feedback_doctor_dual_probe_pattern`, probing the registered factory, not raw files. Located in `atomic_agents/doctor.py`.
+
+**Exportable:** `JournalExport` is an `ExportableResult` carrying `(entries_with_bytes, backend_id, scope)`, re-exported from the `atomic_agents.export` package root. `FilesystemJournalBackend` implements `Exportable` with `supports_canonical_export=True` and `supports_date_query=True`, registered in the spec/40 export conformance harness (`tests/test_export_protocol_conformance.py` + `tests/test_export_capability_advertisement.py`).
+
+**STORAGE-ONLY boundary:** the backend owns the data layer (find/read/sort/date-window → raw `JournalEntry`). Formatting STAYS at each call site. The divergence between bundle format (WITH backtick path line) and agent format (WITHOUT) is LOAD-BEARING — byte-identity golden tests in `test_journal_backend_conformance.py` (TESTS 44–45) freeze both.
+
+**spec/02 ownership reconciliation:** journal/ ownership carved out from MemoryBackend's prior claim (spec/02 and spec/24 both corrected in PR 1).
+
+DRAFT spec/43 carries 10 normative MUSTs (base-8 PersonaBackend pattern + MUST 9 append atomicity + MUST 10 date-query correctness incl. include-on-unparse fallback). Conformance suite: `tests/test_journal_backend_conformance.py` (60 tests — a parametrized conformance core (MUST 1–10) plus filesystem-impl-specific doctor, golden-render byte-identity, `_source_paths`/`_staleness_paths` selection-parity, and call-site-adoption tests that drive the real bundle/agent/dream functions, incl. the directory-escape FAIL + symlinked-entry PASS doctor pair + a normalized permissions-class fix_hint pair across the list/read probes) + `tests/test_journal_filesystem.py` (20 filesystem-specific tests).
+
+**Closes the journal-persistence cliff:** bundle, agent, and dream all read from one canonical backend; a Postgres or append-log backend can drop in without touching any of the three call sites.
+
+---
+
+## Why sixteen protocols, summarized
 
 A person at home runs filesystem-everything with one agent. An organization runs the same agents over Postgres, behind an HTTP service, with a fleet of orchestrated roles. **Same agent definitions, same `call()` flow, same audit trail. Different backends.**
 

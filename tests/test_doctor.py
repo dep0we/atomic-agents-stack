@@ -470,6 +470,7 @@ def test_run_doctor_no_agent_skips_agent_checks(tmp_path):
         "secret-backend",
         "goal-backend",
         "outcome-backend",
+        "journal-backend",
         "memory-backend-config",
         "memory-backend",
         "write-paths",
