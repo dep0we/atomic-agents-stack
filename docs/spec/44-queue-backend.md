@@ -28,10 +28,11 @@ Filed as [#428](https://github.com/dep0we/atomic-agents-stack/issues/428) as the
 
 The free-function cron/project-runner API (`claim_next_queued` etc.) is preserved in `_cascade.py` via wrapper functions that construct `FilesystemQueueBackend(project_root)` internally and delegate. NO internal runtime callers are wired — matching the #425 GoalBackend / #426 OutcomeBackend scaffolding shape.
 
-A follow-up issue should file for:
-- Queue inspection CLI (`queue inspect` / `queue list-dead-letter` / `queue recover`) after spec/44 locks.
-- Runtime adoption (cascade-runner wiring through QueueBackend Protocol) after spec/44 locks.
-- Harmonizing `ATOMIC_AGENTS_MULTI_HOST` with LockBackend's single_host_only pattern.
+Follow-up work is tracked in these filed issues:
+- **#468** — Queue inspection CLI (`queue inspect` / `queue list-dead-letter` / `queue recover`), after spec/44 locks.
+- **#469** — Runtime adoption (cascade-runner wiring through QueueBackend Protocol), after spec/44 locks.
+- **#470** — Harmonizing `ATOMIC_AGENTS_MULTI_HOST` with LockBackend's single_host_only pattern.
+- **#472** — Extending `doctor.check_queue_backend`'s containment probe to per-subdirectory symlinks.
 
 ---
 
@@ -49,7 +50,7 @@ A follow-up issue should file for:
 
 The spec/06 vocabulary is conceptual and pre-dates this spec. spec/44 is normative for on-disk directory names. Operators with existing queue directories (built from the `_cascade.py` implementation) are unaffected — the layout did not change.
 
-A follow-up issue should update spec/06's queue section to cross-reference spec/44 for the authoritative on-disk layout after spec/44 locks.
+Tracked as **#471**: update spec/06's queue section to cross-reference spec/44 for the authoritative on-disk layout after spec/44 locks.
 
 ---
 
@@ -168,7 +169,11 @@ The queue is project-scoped (constructor: `FilesystemQueueBackend(project_root)`
 
 The structural exclusion (whitelist: enumerate only `queued/`, `done/`, `dead-letter/`) mirrors the LOCKED `LockExport.lock_file_names=[]` precedent. The conformance test MUST assert the ephemeral exclusion even when a claim IS held (not skip-and-assume).
 
-**OPEN spec/44 nuance (to settle in adversarial rounds):** whether `done/` and `dead-letter/` should be EMBEDDED or treated as reconstructable from LogBackend audit stream. The `queued/` backlog exports regardless. `FilesystemQueueBackend` embeds all three durable directories. This nuance is in-scope spec wording for this DRAFT.
+**SETTLED (was OPEN in the discovery panel):** `done/` and `dead-letter/` are **EMBEDDED** as raw bytes, NOT treated as reconstructable from the LogBackend audit stream. Rationale: (1) the LogBackend audit stream records per-iteration *telemetry*, not the *work-item file bytes* — a completed/failed item's payload (the markdown work file, its `.reason.txt`) is not recoverable from log lines, so "reconstructable from LogBackend" is false for the bytes a restore needs; (2) embedding all three durable directories keeps the export self-contained (a restore needs only the `QueueExport`, not a join against a separate log corpus) and matches the maintainer's register-now-complete-durable-subset ruling in `428-pr1-args.json` (`spec40-exportable-shape`); (3) the durable/ephemeral boundary stays a single clean rule — *embed everything the backend durably owns, exclude only runtime-bound lease state* — rather than a three-way embed/derive/exclude split. The `queued/` backlog exports regardless. `FilesystemQueueBackend` embeds all three durable directories.
+
+### Per-subdirectory symlink containment (security)
+
+`_queue_root()` proves only that `queue/` itself is contained under `project_root`. The per-operation subdirectories — `queued/`, `claimed/`, `done/`, `dead-letter/`, and their `<role>` / `<lease_token>` namespaces — are themselves attacker-influenceable and MAY be symlinks. A symlinked `claimed/` (or any durable subdir) pointing outside `queue/` would let a `claim_next()`/`release()`/`move_to_dead_letter()` rename land OUTSIDE `project_root`, leaking work-item bytes (the `#426 _runs_root()` ancestor-escalation pattern). Every write AND read site (`claim_next`, `release`, `move_to_dead_letter`, `renew_lease`, `list_claimed`, `recover`, `export`) MUST resolve its target subdirectory and re-assert `is_relative_to(queue_root_resolved)` before use. In `FilesystemQueueBackend` the containment guard raises `PathTraversalError` internally and every operation catches it and fails SOFT: writes (`claim_next`, `release`, `move_to_dead_letter`, `renew_lease`) return `None` / no-op, and reads (`list_claimed`, `recover`, `export`) skip / return `[]`. This preserves the pre-carve `_cascade.py` contract, which had no containment check and so never propagated an exception to a caller. (A backend MAY instead fail-loud on writes; that is an implementation choice, not a Protocol requirement.) The containment check uses the RESOLVED anchor, but the path RETURNED for file operations is the UNRESOLVED `queue_root.joinpath(...)` — mirroring `FilesystemJournalBackend._journal_dir()` — so caller-visible `item.path` stays in the operator's own path representation (byte-identical to the pre-carve `_cascade.py` cron API; a project reached through a symlink does not get `item.path` silently rewritten to the real on-disk location). Because returned paths AND the `export()` relativization base (`self._project_root`) share that same unresolved representation, `relative_to()` never raises for the symlinked-`project_root` case, so the export is never silently emptied. `export()` ADDITIONALLY re-asserts per-leaf containment: each durable work FILE is resolved and checked `is_relative_to(queue_root_resolved)` before its bytes are read, so a symlinked work file pointing outside `queue/` cannot exfiltrate host bytes into the portable export.
 
 ---
 
@@ -182,7 +187,7 @@ The structural exclusion (whitelist: enumerate only `queued/`, `done/`, `dead-le
 
 3. **Capability honesty.** `capabilities()` MUST return a `QueueCapabilities` instance whose values match the backend's actual behavior. A backend claiming `supports_canonical_export=True` MUST implement `export()`. A backend claiming `single_host_only=False` MUST support cross-host atomic claim (not just POSIX rename). `capabilities()` MUST return the same values on every call.
 
-4. **Atomic claim — no double-claim under race.** `claim_next(role, lease_token, lease_seconds)` MUST be atomic: under concurrent callers, only ONE caller claims any given work item. The POSIX-rename guarantee (filesystem) or backend-equivalent guarantee (Redis `SETNX`, SQS `ReceiveMessage`) is the atomicity primitive.
+4. **Atomic claim — no double-claim under race.** `claim_next(role, lease_token, lease_seconds)` MUST be atomic: under concurrent callers, only ONE caller claims any given work item. The POSIX-rename guarantee (filesystem) or backend-equivalent guarantee (Redis `SETNX`, SQS `ReceiveMessage`) is the atomicity primitive. _(Conformance: this requirement shares its race assertion with MUST 9 — see TEST 30/31 in `test_queue_backend_conformance.py`. MUST 4 states the contract; MUST 9 fixes the rename-based exclusion primitive and its test.)_
 
 5. **Storage isolation.** Two `QueueBackend` instances scoped to different `project_root` values MUST NOT see each other's items. Operations on one backend MUST NOT affect the other.
 

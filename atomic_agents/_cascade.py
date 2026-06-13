@@ -237,13 +237,17 @@ def _load_policy_dir(policy_dir: Path) -> str:
 #   constructor-scope-signature: Option A with reconciliation
 #   adopt-now-vs-scaffolding-only: Scaffolding-only
 
-from .queue import (
+from .queue import (  # noqa: E402 (intentional mid-file shim; see banner above)
     FilesystemQueueItem as QueueItem,  # backward-compat alias (item.path works)
     _sidecar_path,
-    _write_sidecar,
+    _write_sidecar,  # noqa: F401 (re-export for backward compat; see comment above)
 )
-from .queue.backend import recover_stale_claims as _recover_stale_claims_impl
-from .queue.filesystem import FilesystemQueueBackend as _FilesystemQueueBackend
+from .queue.backend import (  # noqa: E402 (intentional mid-file shim)
+    recover_stale_claims as _recover_stale_claims_impl,
+)
+from .queue.filesystem import (  # noqa: E402 (intentional mid-file shim)
+    FilesystemQueueBackend as _FilesystemQueueBackend,
+)
 
 
 def claim_next_queued(
@@ -277,9 +281,19 @@ def release_claim(item: "QueueItem", project_root: Path) -> None:
 
     The destination is namespaced by ``lease_token`` so two leases with
     identically-named files do not overwrite each other.
+
+    Renames from ``item.path`` directly (via ``_release_at_path``), exactly as
+    the pre-carve _cascade.py implementation did. This works for an item at ANY
+    path depth — a normally claimed item under ``queue/claimed/<token>/`` AND a
+    recovered item under ``queue/queued/_recovered/<token>/``. We do NOT
+    reconstruct ``claimed/<token>/<name>`` (which crashed for recovered items).
     """
-    _FilesystemQueueBackend(project_root).release(
-        lease_token=item.lease_token, original_name=item.original_name
+    backend = _FilesystemQueueBackend(project_root)
+    backend._release_at_path(
+        item.path,
+        backend._queue_root(),
+        item.lease_token,
+        item.original_name,
     )
 
 
@@ -295,9 +309,20 @@ def move_to_dead_letter(
 
     A sibling ``.reason.txt`` is written alongside the item when *reason* is
     provided. The lease sidecar is removed (dead-letter is a terminal state).
+
+    Renames from ``item.path`` directly (via ``_dead_letter_at_path``), exactly
+    as the pre-carve _cascade.py implementation did. This works for an item at
+    ANY path depth — a normally claimed item under ``queue/claimed/<token>/`` AND
+    a recovered item under ``queue/queued/_recovered/<token>/``. We do NOT
+    reconstruct ``claimed/<token>/<name>`` (which crashed for recovered items).
     """
-    _FilesystemQueueBackend(project_root).move_to_dead_letter(
-        lease_token=item.lease_token, original_name=item.original_name, reason=reason
+    backend = _FilesystemQueueBackend(project_root)
+    backend._dead_letter_at_path(
+        item.path,
+        backend._queue_root(),
+        item.lease_token,
+        item.original_name,
+        reason,
     )
 
 
@@ -324,19 +349,22 @@ def recover_stale_claims(
 def renew_lease(item: "QueueItem", additional_seconds: int = None) -> None:
     """Extend the lease for an actively-worked item.
 
-    NON-DEPRECATED shim — wraps FilesystemQueueBackend.renew_lease() while
-    preserving the VERBATIM free-function signature.
+    NON-DEPRECATED shim — preserves the VERBATIM free-function signature.
 
     Updates ``lease_expires_at`` in the sidecar to ``now + additional_seconds``.
     If *additional_seconds* is ``None``, the original ``lease_seconds`` from
     the sidecar is reused.
+
+    Writes the sidecar directly next to ``item.path`` (via
+    ``_sidecar_path(item.path)``), exactly as the pre-carve _cascade.py
+    implementation did. This works for an item at ANY path depth — a normally
+    claimed item under ``queue/claimed/<token>/`` AND a recovered item under
+    ``queue/queued/_recovered/<token>/``. We do NOT reconstruct the sidecar
+    location from ``item.path.parents[3]`` + ``lease_token`` (which assumed a
+    fixed claimed-dir depth and crashed for recovered items).
     """
-    # Derive project_root from item.path:
-    # item.path is queue/claimed/<lease_token>/<original_name>
-    # project_root is item.path.parents[3]
-    project_root = item.path.parents[3]
-    _FilesystemQueueBackend(project_root).renew_lease(
+    _FilesystemQueueBackend._renew_lease_at_sidecar(
+        _sidecar_path(item.path),
         lease_token=item.lease_token,
-        original_name=item.original_name,
         additional_seconds=additional_seconds,
     )

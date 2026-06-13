@@ -2,9 +2,13 @@
 
 This is the default backend for single-host deployments. It carves the
 cascade work-queue cluster from atomic_agents/_cascade.py into the
-QueueBackend Protocol package, preserving behavior byte-for-byte for the
-scaffolding-only carve (zero runtime caller changes, per arc ruling
-428-pr1-args.json adopt-now-vs-scaffolding-only).
+QueueBackend Protocol package as a behavior-preserving, scaffolding-only
+carve (zero runtime caller changes, per arc ruling 428-pr1-args.json
+adopt-now-vs-scaffolding-only). Runtime semantics, on-disk directory layout,
+and atomicity guarantees are unchanged. The ONE intentional on-disk addition
+is an additive ``role`` key in the .lease.json sidecar (see _write_sidecar) to
+support list_claimed(role=...) filtering — additive and ignored by legacy
+readers, so existing sidecars and callers are unaffected.
 
 Directory layout (under project_root/queue/):
     queued/<role>/           — pending work items (FIFO by sorted name)
@@ -23,7 +27,8 @@ Sidecar files:
     <work_file>.lease.json  — lease metadata (in claimed/ only, ephemeral)
     <work_file>.reason.txt  — failure reason (in dead-letter/ only)
 
-Atomicity contract for claim_next() (spec/44 MUST 1):
+Atomicity contract for claim_next() (spec/44 MUST 4, see MUST 9 for the rename
+primitive):
     The PRIMARY guarantee is the POSIX rename that moves the work file
     from queued/<role>/ to claimed/<lease_token>/. Under concurrent callers,
     only one rename succeeds for any given file; the loser gets
@@ -33,7 +38,8 @@ Atomicity contract for claim_next() (spec/44 MUST 1):
     no sidecar. recover_stale_claims() handles this via mtime fallback.
     POSIX rename is the atomicity boundary; the sidecar follows.
 
-Atomicity contract for release() and move_to_dead_letter() (spec/44 MUST 1/3):
+Atomicity contract for release() and move_to_dead_letter() (spec/44 MUST 4 /
+MUST 10):
     The PRIMARY guarantee is the POSIX rename that moves the work file to
     done/ or dead-letter/. The sidecar cleanup (.lease.json unlink from the
     OLD claimed/ location) is best-effort. An orphaned sidecar in done/ or
@@ -50,10 +56,16 @@ Atomicity contract for release() and move_to_dead_letter() (spec/44 MUST 1/3):
 Symlink containment (spec/44 security contract):
     _queue_root() resolves both project_root and project_root/'queue',
     then checks is_relative_to before trusting queue/ as the containment
-    root. A symlinked queue/ that points outside project_root raises
-    PathTraversalError on write operations (fail-loud) and returns []
-    on read operations (fail-soft). Mirrors FilesystemJournalBackend._journal_dir()
-    and FilesystemOutcomeBackend._runs_root().
+    root. When a symlinked queue/ (or symlinked subdirectory) points outside
+    project_root, the containment guard raises PathTraversalError internally;
+    every operation catches it and fails SOFT — writes (claim_next, release,
+    move_to_dead_letter, renew_lease) return None / no-op, and reads
+    (list_claimed, recover, export) skip / return []. This is the deliberate,
+    carve-consistent choice: the pre-carve _cascade.py had no containment check
+    at all, so no operation ever propagated an exception to its caller. Mirrors
+    FilesystemJournalBackend._journal_dir() and FilesystemOutcomeBackend._runs_root()
+    in resolving-then-checking; it differs from them in failing soft on writes
+    rather than raising, to preserve the pre-carve no-exception contract.
 
 Export contract (spec/40 + spec/44):
     export() enumerates ONLY the three durable directories by name:
@@ -78,7 +90,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .._io import safe_resolve_under
 from ..exceptions import PathTraversalError
 from .types import QueueCapabilities, QueueItem, QueueExport
 
@@ -105,15 +116,16 @@ class FilesystemQueueItem(QueueItem):
     Fields:
         path: the on-disk path to the claimed work file. Lives at
             project_root/queue/claimed/<lease_token>/<original_name>.
+            Defaults to None ONLY to keep the dataclass inheritance chain clean
+            (the base QueueItem has required fields with no defaults, so a
+            subclass field added after them needs a default). Every real
+            construction site — claim_next(), list_claimed(), recovery — always
+            passes path. There is intentionally NO validation hook here: a
+            None default with a runtime guard would reject the inheritance
+            default itself; callers are trusted to supply path.
     """
 
-    path: Path = None  # type: ignore[assignment]  # set in __post_init__
-
-    def __post_init__(self):
-        """Validate that path is set when instantiated."""
-        # path is required for filesystem items but has a default to allow
-        # the dataclass inheritance chain to work cleanly.
-        pass
+    path: Path = None  # type: ignore[assignment]  # always set by the backend
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -133,14 +145,20 @@ def _write_sidecar(
 ) -> None:
     """Write a lease sidecar alongside *work_file*.
 
-    NOTE: This uses raw Path.write_text() — NOT atomic_write(). This is a
-    deliberate behavior-neutral carve (preserving _cascade.py's implementation
-    byte-for-byte). The sidecar write is BEST-EFFORT: the claim atomicity
-    guarantee is on the rename, not the sidecar. A torn sidecar is recoverable
+    NOTE: This uses raw Path.write_text() — NOT atomic_write(). This preserves
+    _cascade.py's write mechanism (best-effort sidecar; the claim atomicity
+    guarantee is on the rename, not the sidecar). A torn sidecar is recoverable
     via the mtime fallback path in recover_stale_claims(). The mtime fallback
     reads the work file's mtime (not the sidecar's mtime), so atomic_write
-    for sidecars would be safe — but changing it would diverge from the
-    behavior-neutral carve mandate.
+    for sidecars would be safe — but raw write_text matches the carved-from
+    behavior.
+
+    The sidecar gains an additive ``role`` key (absent in the pre-carve
+    _cascade.py sidecar) so list_claimed(role=...) filtering works on the
+    claimed/ side. It is additive and ignored by legacy readers — the only
+    intentional on-disk shape change in this otherwise behavior-preserving
+    carve. The sidecar is therefore NOT byte-identical to the pre-carve sidecar,
+    but every other field and the rename atomicity contract are unchanged.
 
     Args:
         work_file: path to the work file (in claimed/).
@@ -216,19 +234,26 @@ class FilesystemQueueBackend:
     # Symlink containment guard
 
     def _queue_root(self) -> Path:
-        """Return the resolved queue/ dir after a containment check.
+        """Return the UNRESOLVED queue/ dir after a resolved containment check.
 
-        Resolves both project_root and project_root/'queue', checks
-        is_relative_to before trusting queue/ as the containment root.
-        A symlinked queue/ that points outside project_root raises
-        PathTraversalError (fail-loud for writes, return [] for reads).
+        Resolves both project_root and project_root/'queue' PURELY to run the
+        is_relative_to containment check (a symlinked queue/ pointing outside
+        project_root is refused). On success returns the UNRESOLVED
+        ``self._project_root / 'queue'`` — NOT the resolved path — so that
+        caller-visible ``item.path`` values stay in the caller's own path
+        representation (byte-identical to the pre-carve _cascade.py behavior,
+        and to the documented spec/06 cron/project-runner API). Returning the
+        resolved path here would silently rewrite item.path to the real on-disk
+        location whenever project_root is reached through a symlink (a symlinked
+        $HOME, /tmp→/private/tmp on macOS, a bind mount), breaking
+        item.path.relative_to(project_root) for external callers and leaking the
+        absolute on-disk location.
 
-        Mirrors FilesystemJournalBackend._journal_dir() and
-        FilesystemOutcomeBackend._runs_root() — confirmed load-bearing
-        by MEMORY.md feedback_cross_model_catches_same_family_blind_spots.
+        Mirrors FilesystemJournalBackend._journal_dir() exactly: resolve to
+        CHECK containment, return the unresolved root for file operations.
 
         Returns:
-            The resolved project_root/queue/ path.
+            The UNRESOLVED project_root/queue/ path.
 
         Raises:
             PathTraversalError: when queue/ resolves outside project_root
@@ -251,7 +276,54 @@ class FilesystemQueueBackend:
                 child="queue",
                 root=str(project_root_resolved),
             )
-        return queue_resolved
+        return self._project_root / "queue"
+
+    @staticmethod
+    def _safe_under_queue(queue_root: Path, *parts: str) -> Path:
+        """Resolve ``queue_root/<parts...>`` to refuse escape, return UNRESOLVED.
+
+        ``_queue_root()`` only proves that ``queue/`` itself is contained. The
+        per-operation subdirectories (queued/, claimed/, done/, dead-letter/ and
+        their lease-token / role namespaces) are attacker-influenced names AND
+        can themselves be symlinks pointing outside ``queue_root`` — the #426
+        ``_runs_root()`` ancestor-escalation pattern. Without this guard a
+        symlinked ``claimed/`` (or done/, dead-letter/, queued/) directory lets
+        a claim_next()/release()/move_to_dead_letter() rename land OUTSIDE the
+        project root, leaking work-item bytes.
+
+        Resolves the full target and enforces ``is_relative_to(queue_root_resolved)``
+        — mirrors ``_io.safe_resolve_under`` and the sibling Filesystem*Backend
+        containment guards. Works for not-yet-created namespaces because
+        ``Path.resolve()`` resolves the existing ancestor portion (so a
+        symlinked parent is caught before the leaf is created).
+
+        Returns the UNRESOLVED ``queue_root.joinpath(*parts)`` so that returned
+        ``item.path`` values stay in the caller's path representation (see
+        _queue_root). The resolved form is used ONLY for the containment check,
+        never returned — mirroring FilesystemJournalBackend._journal_dir().
+
+        Raises:
+            PathTraversalError: when the resolved target escapes ``queue_root``
+                (symlinked subdirectory), or when it cannot be resolved.
+        """
+        target = queue_root.joinpath(*parts)
+        try:
+            resolved = target.resolve()
+            queue_root_resolved = queue_root.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise PathTraversalError(
+                "queue subpath could not be resolved "
+                "(symlink loop or inaccessible ancestor)",
+                child="/".join(parts),
+                root=str(queue_root),
+            ) from exc
+        if not resolved.is_relative_to(queue_root_resolved):
+            raise PathTraversalError(
+                "queue subpath resolves outside queue/ (symlinked ancestor refused)",
+                child="/".join(parts),
+                root=str(queue_root),
+            )
+        return target
 
     # ──────────────────────────────────────────────────────────────
     # Protocol methods
@@ -268,14 +340,14 @@ class FilesystemQueueBackend:
         """
         try:
             queue_root = self._queue_root()
+            queued_dir = self._safe_under_queue(queue_root, "queued", role)
+            claimed_dir = self._safe_under_queue(queue_root, "claimed", lease_token)
         except PathTraversalError:
             return None
 
-        queued_dir = queue_root / "queued" / role
         if not queued_dir.is_dir():
             return None
 
-        claimed_dir = queue_root / "claimed" / lease_token
         claimed_dir.mkdir(parents=True, exist_ok=True)
 
         # Sort to give deterministic FIFO-by-name behavior.
@@ -317,16 +389,44 @@ class FilesystemQueueBackend:
         """
         try:
             queue_root = self._queue_root()
+            claimed_dir = self._safe_under_queue(queue_root, "claimed", lease_token)
         except PathTraversalError:
             return
 
-        src = queue_root / "claimed" / lease_token / original_name
-        done_dir = queue_root / "done" / lease_token
+        # Protocol entry point renames from the canonical claimed/ location.
+        # The _cascade.py shim, which must finalize items at ANY depth (e.g. a
+        # recovered item under queued/_recovered/), calls _release_at_path()
+        # directly with the actual work-file path.
+        self._release_at_path(
+            claimed_dir / original_name, queue_root, lease_token, original_name
+        )
+
+    @staticmethod
+    def _release_at_path(
+        work_path: Path,
+        queue_root: Path,
+        lease_token: str,
+        original_name: str,
+    ) -> None:
+        """Move *work_path* to done/<lease_token>/<original_name>, renaming from the
+        actual path (not a reconstructed claimed/ path).
+
+        Restores pre-carve any-depth behavior: the original _cascade.py
+        release_claim() did ``item.path.rename(done_dir/...)``, so it worked for a
+        work file at any depth — a normally claimed item under claimed/<token>/
+        AND a recovered item under queued/_recovered/<token>/. Reconstructing
+        claimed/<token>/<name> here would FileNotFoundError on recovered items.
+        """
+        try:
+            done_dir = FilesystemQueueBackend._safe_under_queue(
+                queue_root, "done", lease_token
+            )
+        except PathTraversalError:
+            return
         done_dir.mkdir(parents=True, exist_ok=True)
-        src.rename(done_dir / original_name)
-        # Remove sidecar from the (now-moved) claimed location.
-        # Compute from first principles (not from src.parent — src no longer exists).
-        sc = queue_root / "claimed" / lease_token / (original_name + ".lease.json")
+        work_path.rename(done_dir / original_name)
+        # Remove the sidecar from the (now-moved) original location.
+        sc = _sidecar_path(work_path)
         if sc.exists():
             sc.unlink(missing_ok=True)
 
@@ -338,7 +438,7 @@ class FilesystemQueueBackend:
     ) -> None:
         """Move a claimed item to dead-letter/ — a terminal failure state.
 
-        Dead-work-stays-dead (spec/44 MUST 3): once in dead-letter/, no
+        Dead-work-stays-dead (spec/44 MUST 10): once in dead-letter/, no
         claim, recover, or release operation affects this item.
 
         Atomicity: POSIX rename is the state transition. Sidecar cleanup
@@ -347,20 +447,54 @@ class FilesystemQueueBackend:
         """
         try:
             queue_root = self._queue_root()
+            claimed_dir = self._safe_under_queue(queue_root, "claimed", lease_token)
         except PathTraversalError:
             return
 
-        src = queue_root / "claimed" / lease_token / original_name
-        dl_dir = queue_root / "dead-letter" / lease_token
+        # Protocol entry point renames from the canonical claimed/ location.
+        # The _cascade.py shim, which must finalize items at ANY depth (e.g. a
+        # recovered item under queued/_recovered/), calls _dead_letter_at_path()
+        # directly with the actual work-file path.
+        self._dead_letter_at_path(
+            claimed_dir / original_name,
+            queue_root,
+            lease_token,
+            original_name,
+            reason,
+        )
+
+    @staticmethod
+    def _dead_letter_at_path(
+        work_path: Path,
+        queue_root: Path,
+        lease_token: str,
+        original_name: str,
+        reason: str = "",
+    ) -> None:
+        """Move *work_path* to dead-letter/<lease_token>/<original_name>, renaming
+        from the actual path (not a reconstructed claimed/ path).
+
+        Restores pre-carve any-depth behavior (see _release_at_path): the original
+        _cascade.py move_to_dead_letter() did ``item.path.rename(target)``, so it
+        worked for a work file at any depth, including a recovered item under
+        queued/_recovered/<token>/. Reconstructing claimed/<token>/<name> here
+        would FileNotFoundError on recovered items.
+        """
+        try:
+            dl_dir = FilesystemQueueBackend._safe_under_queue(
+                queue_root, "dead-letter", lease_token
+            )
+        except PathTraversalError:
+            return
         dl_dir.mkdir(parents=True, exist_ok=True)
         target = dl_dir / original_name
-        src.rename(target)
+        work_path.rename(target)
         if reason:
             (dl_dir / (original_name + ".reason.txt")).write_text(
                 reason, encoding="utf-8"
             )
-        # Remove sidecar from the (now-moved) claimed location.
-        sc = queue_root / "claimed" / lease_token / (original_name + ".lease.json")
+        # Remove the sidecar from the (now-moved) original location.
+        sc = _sidecar_path(work_path)
         if sc.exists():
             sc.unlink(missing_ok=True)
 
@@ -372,15 +506,46 @@ class FilesystemQueueBackend:
     ) -> None:
         """Extend the lease for an actively-worked item.
 
+        Protocol entry point. Resolves the sidecar at the canonical claimed/
+        location (claimed/<lease_token>/<original_name>.lease.json) and renews
+        it. For renewing an item whose work file lives elsewhere (e.g. a
+        recovered item under queued/_recovered/), use _renew_lease_at_sidecar()
+        with the sidecar path computed next to the actual work file — that is
+        what the _cascade.py shim does to match pre-carve behavior at any depth.
+
         NOTE: Uses raw Path.write_text() — behavior-neutral carve preserving
         the _cascade.py implementation. See _write_sidecar docstring.
         """
         try:
             queue_root = self._queue_root()
+            claimed_dir = self._safe_under_queue(queue_root, "claimed", lease_token)
         except PathTraversalError:
             return
 
-        sidecar = queue_root / "claimed" / lease_token / (original_name + ".lease.json")
+        sidecar = claimed_dir / (original_name + ".lease.json")
+        self._renew_lease_at_sidecar(
+            sidecar, lease_token=lease_token, additional_seconds=additional_seconds
+        )
+
+    @staticmethod
+    def _renew_lease_at_sidecar(
+        sidecar: Path,
+        lease_token: str,
+        additional_seconds: int | None = None,
+    ) -> None:
+        """Renew (read-modify-write) the lease sidecar at an explicit path.
+
+        Writes the sidecar wherever *sidecar* points — it does NOT reconstruct
+        the path from a lease_token/depth assumption. This restores the
+        pre-carve _cascade.py renew_lease() semantics, which wrote the sidecar
+        directly next to the work file via _sidecar_path(item.path) and so
+        worked for an item at ANY path depth (including recovered items under
+        queued/_recovered/). The _cascade.py shim passes _sidecar_path(item.path)
+        here; the Protocol renew_lease() passes the canonical claimed/ location.
+
+        NOTE: Uses raw Path.write_text() — behavior-neutral carve. See
+        _write_sidecar docstring.
+        """
         if sidecar.is_file():
             try:
                 data = json.loads(sidecar.read_text(encoding="utf-8"))
@@ -422,11 +587,13 @@ class FilesystemQueueBackend:
         simply returns what it knows from the sidecar.
 
         Args:
-            role: optional filter. list_claimed does NOT currently filter
-                by role for the filesystem backend (role is in queued/,
-                not in claimed/ — the claimed/ structure is by lease_token).
-                The role field on each returned item IS populated from
-                the sidecar. Pass None for all claimed items.
+            role: optional filter. When set, only items whose sidecar 'role'
+                matches are returned. Items with an empty/absent role in the
+                sidecar are INCLUDED regardless of the filter (the role check
+                is skipped when the item's role is falsy — legacy sidecars
+                without a role key are never hidden). The role field on each
+                returned item is populated from the sidecar. Pass None for all
+                claimed items.
 
         Returns:
             List of FilesystemQueueItem objects. Empty list when claimed/
@@ -434,10 +601,10 @@ class FilesystemQueueBackend:
         """
         try:
             queue_root = self._queue_root()
+            claimed_root = self._safe_under_queue(queue_root, "claimed")
         except PathTraversalError:
             return []
 
-        claimed_root = queue_root / "claimed"
         if not claimed_root.is_dir():
             return []
 
@@ -455,7 +622,15 @@ class FilesystemQueueBackend:
                 sidecar = _sidecar_path(path)
                 item_role = ""
                 lease_expires_at = None
-                claimed_at = path.stat().st_mtime  # fallback
+                # Guard the mtime fallback: between the is_file() check above and
+                # this stat(), a concurrent release()/move_to_dead_letter()/recovery
+                # can rename the work file out of claimed/. Skip vanished files
+                # rather than raising — mirrors _recover_stale_claims_native and
+                # honors spec/44 MUST 11 (list_claimed must not raise on concurrency).
+                try:
+                    claimed_at = path.stat().st_mtime  # fallback
+                except FileNotFoundError:
+                    continue
                 if sidecar.is_file():
                     try:
                         data = json.loads(sidecar.read_text(encoding="utf-8"))
@@ -496,7 +671,7 @@ class FilesystemQueueBackend:
         enumeration of queued/ and the read of a specific file may cause the
         exported bytes to reflect the post-claim state (file moved to claimed/).
         Such files would appear absent from the export (the whitelist finds no
-        file where it was). This is the acknowledged spec/40 MUST 7 snapshot-
+        file where it was). This is the acknowledged spec/44 MUST 7 snapshot-
         consistency bound; callers requiring strict consistency MUST hold a
         LockBackend before calling export().
         """
@@ -512,8 +687,24 @@ class FilesystemQueueBackend:
         items_with_bytes: list[tuple[str, bytes]] = []
         durable_dirs = ["queued", "done", "dead-letter"]
 
+        # file_path values come from the UNRESOLVED queue_root (see _queue_root /
+        # _safe_under_queue), so relativize against the UNRESOLVED project root.
+        # The two share the same representation, so relative_to() never raises
+        # for the symlinked-project_root case. The per-leaf symlink guard below
+        # uses a separately-resolved queue_root to catch a symlinked WORK FILE
+        # escaping queue/ — that containment check needs the resolved anchor even
+        # though the emitted relative path uses the unresolved base.
+        try:
+            queue_root_resolved = queue_root.resolve()
+        except (OSError, RuntimeError):
+            queue_root_resolved = queue_root
+
         for dir_name in durable_dirs:
-            dir_path = queue_root / dir_name
+            try:
+                dir_path = self._safe_under_queue(queue_root, dir_name)
+            except PathTraversalError:
+                # Symlinked durable dir escaping queue/ — skip it (fail-soft for reads).
+                continue
             if not dir_path.is_dir():
                 continue
             for file_path in sorted(dir_path.rglob("*")):
@@ -522,6 +713,21 @@ class FilesystemQueueBackend:
                 # Exclude .lease.json files (belt-and-suspenders: they only
                 # exist in claimed/, which we skip by whitelist, but be explicit)
                 if file_path.name.endswith(".lease.json"):
+                    continue
+                # Per-LEAF symlink containment: _safe_under_queue() proved only
+                # that the durable directory (queued/done/dead-letter) is
+                # contained. A symlinked FILE inside that directory pointing
+                # outside queue_root would otherwise have its bytes read and
+                # embedded into the portable export (host-file exfiltration —
+                # the #426/#427 leaf-escape class). Re-assert containment on the
+                # resolved leaf; fail-soft (skip) for reads. Mirrors the spec/44
+                # §"Per-subdirectory symlink containment" MUST and the
+                # FilesystemOutcomeBackend.export() is_relative_to leaf guard.
+                try:
+                    leaf_resolved = file_path.resolve()
+                except (OSError, RuntimeError):
+                    continue
+                if not leaf_resolved.is_relative_to(queue_root_resolved):
                     continue
                 try:
                     raw_bytes = file_path.read_bytes()
@@ -563,7 +769,7 @@ class FilesystemQueueBackend:
     def _recover_stale_claims_native(
         self, lease_seconds: int = 3600
     ) -> list[FilesystemQueueItem]:
-        """Native filesystem recovery — preserves _cascade.py behavior byte-for-byte.
+        """Native filesystem recovery — preserves _cascade.py recovery behavior.
 
         This is the native recovery implementation called by the free-function
         recover_stale_claims() when available. It preserves the original
@@ -583,10 +789,10 @@ class FilesystemQueueBackend:
         """
         try:
             queue_root = self._queue_root()
+            claimed_root = self._safe_under_queue(queue_root, "claimed")
         except PathTraversalError:
             return []
 
-        claimed_root = queue_root / "claimed"
         if not claimed_root.is_dir():
             return []
 
@@ -624,7 +830,12 @@ class FilesystemQueueBackend:
                         continue
 
                 if is_stale:
-                    recovered_dir = queue_root / "queued" / "_recovered" / lease_token
+                    try:
+                        recovered_dir = self._safe_under_queue(
+                            queue_root, "queued", "_recovered", lease_token
+                        )
+                    except PathTraversalError:
+                        continue
                     recovered_dir.mkdir(parents=True, exist_ok=True)
                     target = recovered_dir / path.name
                     try:
@@ -662,11 +873,16 @@ class FilesystemQueueBackend:
         """
         try:
             queue_root = self._queue_root()
+            claimed_dir = self._safe_under_queue(
+                queue_root, "claimed", item.lease_token
+            )
+            recovered_dir = self._safe_under_queue(
+                queue_root, "queued", "_recovered", item.lease_token
+            )
         except PathTraversalError:
             return None
 
-        src = queue_root / "claimed" / item.lease_token / item.original_name
-        recovered_dir = queue_root / "queued" / "_recovered" / item.lease_token
+        src = claimed_dir / item.original_name
         recovered_dir.mkdir(parents=True, exist_ok=True)
         target = recovered_dir / item.original_name
         try:

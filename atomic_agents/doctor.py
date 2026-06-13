@@ -4316,8 +4316,8 @@ def check_queue_backend(agent_root: Path) -> CheckResult:
 
     Multi-host detection: ATOMIC_AGENTS_MULTI_HOST env var (set to 'true' or '1'
     by operators on Cloud Run / Kubernetes deployments). Defined in spec/44 §Doctor
-    check. A follow-up issue should harmonize this with LockBackend's
-    single_host_only WARN pattern — #TODO file during this PR.
+    check. Harmonizing this with LockBackend's single_host_only WARN pattern is
+    tracked in issue #470.
     """
     from ._cascade import detect_cascade  # noqa: PLC0415
     from .queue import (  # noqa: PLC0415

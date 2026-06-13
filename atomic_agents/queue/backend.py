@@ -94,9 +94,10 @@ class QueueBackend(Protocol):
     ) -> QueueItem | None:
         """Atomically claim the next pending work item for the given role.
 
-        Atomicity guarantee (spec/44 MUST 1): the state transition from
-        'queued' to 'claimed' is all-or-nothing. Under concurrent callers,
-        only ONE caller claims any given item — no double-claim.
+        Atomicity guarantee (spec/44 MUST 4, see MUST 9 for the rename
+        primitive): the state transition from 'queued' to 'claimed' is
+        all-or-nothing. Under concurrent callers, only ONE caller claims any
+        given item — no double-claim.
 
         For the filesystem backend, atomicity comes from POSIX rename.
         The sidecar write (.lease.json) is best-effort and may be absent
@@ -120,7 +121,7 @@ class QueueBackend(Protocol):
     def release(self, lease_token: str, original_name: str) -> None:
         """Mark a claimed item as completed by moving it to done/.
 
-        Atomicity guarantee (spec/44 MUST 1): the state transition from
+        Atomicity guarantee (spec/44 MUST 4): the state transition from
         'claimed' to 'done' is all-or-nothing (the work file moves).
         Sidecar cleanup (.lease.json removal) is best-effort.
 
@@ -138,7 +139,7 @@ class QueueBackend(Protocol):
     ) -> None:
         """Move a claimed item to dead-letter/ — a terminal failure state.
 
-        Atomicity guarantee (spec/44 MUST 3): dead-work-stays-dead. The
+        Atomicity guarantee (spec/44 MUST 10): dead-work-stays-dead. The
         state transition from 'claimed' to 'dead-letter' is all-or-nothing.
         Once a file is in dead-letter/, no claim, recover, or release
         operation affects it. Sidecar cleanup is best-effort.

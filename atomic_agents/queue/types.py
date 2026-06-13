@@ -31,7 +31,6 @@ See docs/spec/44-queue-backend.md for the full normative contract.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 
 from .._export_base import ExportableResult
 
@@ -152,10 +151,11 @@ class QueueExport(ExportableResult):
     The structural exclusion (whitelist: enumerate only queued/done/dead-letter)
     is preferred over a filter-based exclusion to guarantee the invariant.
 
-    OPEN spec/44 nuance (to be settled in adversarial rounds): whether
-    done/ and dead-letter/ are EMBEDDED or treated as reconstructable from
-    LogBackend. The queued/ backlog exports regardless. FilesystemQueueBackend
-    embeds all three durable directories.
+    SETTLED (spec/44 §"Spec/40 export contract"): done/ and dead-letter/ are
+    EMBEDDED as raw bytes, NOT reconstructable from the LogBackend audit stream
+    — the log records per-iteration telemetry, not the work-item file bytes a
+    restore needs. FilesystemQueueBackend embeds all three durable directories;
+    the queued/ backlog exports regardless.
 
     Fields:
         items_with_bytes: list of (relative_path_str, raw_bytes) tuples

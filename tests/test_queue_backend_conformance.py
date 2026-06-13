@@ -47,10 +47,10 @@ test-case indices, NOT spec/44 MUST numbers (spec/44 has exactly 12 MUSTs).
   TEST 38 — env var dispatches registered custom backend
   TEST 39 — get_default_queue_backend() unknown env var raises BackendNotRegistered
   TEST 40 — QueueBackend is @runtime_checkable (isinstance check)
-  TEST 41 — doctor.check_queue_backend SKIP for non-cascade agent (spec/27)
-  TEST 42 — doctor.check_queue_backend PASS for cascade agent (spec/27)
-  TEST 43 — doctor.check_queue_backend FAIL for bad env var (spec/27)
-  TEST 44 — doctor.check_queue_backend WARN for single_host_only + MULTI_HOST (spec/27)
+  TEST 41 — doctor.check_queue_backend SKIP for non-cascade agent (spec/44)
+  TEST 42 — doctor.check_queue_backend PASS for cascade agent (spec/44)
+  TEST 43 — doctor.check_queue_backend FAIL for bad env var (spec/44)
+  TEST 44 — doctor.check_queue_backend WARN for single_host_only + MULTI_HOST (spec/44 MUST 12)
   TEST 45 — compatibility: old and new import paths are behaviorally equivalent
   TEST 46 — QueueExport importable from atomic_agents.export (spec/40)
   TEST 47 — QueueItem has no path field (abstract Protocol-level type)
@@ -253,6 +253,37 @@ def test_dead_work_stays_dead(tmp_path):
         pass  # expected: item already moved
     done_file = project_root / "queue" / "done" / "lease-1" / "001_task.md"
     assert not done_file.exists(), "dead-letter item must not appear in done/"
+
+
+def test_dead_letter_not_resurrected_by_recover_stale(tmp_path):
+    """Lifecycle gap (Codex #427): fail → dead-letter → stale-recovery MUST NOT
+    re-enter queued/.
+
+    recover_stale_claims only scans claimed/; a dead-lettered item has left
+    claimed/, so recovery (even with lease_seconds=0, which would treat any
+    remaining claim as stale) must NOT resurrect it into queued/_recovered/.
+    Exercises the REAL recover surface, not a sequential simulation.
+    """
+    project_root, _ = _make_project_with_queue_item(tmp_path)
+    backend = FilesystemQueueBackend(project_root)
+    item = backend.claim_next("writer", "lease-1")
+    assert item is not None
+    backend.move_to_dead_letter(item.lease_token, item.original_name, reason="terminal")
+
+    dl_file = project_root / "queue" / "dead-letter" / "lease-1" / "001_task.md"
+    assert dl_file.exists()
+
+    # lease_seconds=0 forces "any claim is stale" — the strongest recovery pressure.
+    recovered = recover_stale_claims(backend, lease_seconds=0)
+
+    # Nothing recovered, dead-letter item untouched, no _recovered/ namespace born.
+    assert recovered == [], f"dead-lettered item must not be recovered: {recovered}"
+    assert dl_file.exists(), "dead-letter item must remain in dead-letter/"
+    assert not (project_root / "queue" / "queued" / "_recovered").exists(), (
+        "recover MUST NOT resurrect a dead-lettered item into queued/"
+    )
+    # And it is not re-claimable.
+    assert backend.claim_next("writer", "lease-2") is None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -465,14 +496,28 @@ def test_export_excludes_claimed_when_claim_held(tmp_path):
     assert item is not None
     assert item.path.exists()  # confirmed: item is in claimed/
 
+    # The real .lease.json sidecar exists in claimed/ right now.
+    sidecar = item.path.parent / (item.original_name + ".lease.json")
+    assert sidecar.exists(), "precondition: a real lease sidecar is held in claimed/"
+
     # Export WHILE the item is claimed
     result = backend.export()
 
-    # No item from claimed/ should appear in the export
-    for rel_path, _ in result.items_with_bytes:
+    # No item from claimed/ — and no .lease.json sidecar — may appear, even
+    # though a claim is currently held (assert the exclusion, don't skip-and-assume).
+    rels = [rel for rel, _ in result.items_with_bytes]
+    for rel_path in rels:
         assert "claimed" not in rel_path, (
             f"export() MUST NOT include claimed/ items: {rel_path}"
         )
+        assert not rel_path.endswith(".lease.json"), (
+            f"export() MUST NOT include the held .lease.json sidecar: {rel_path}"
+        )
+    # The claimed work file itself is absent from the export.
+    assert not any(
+        rel.endswith(item.original_name) and "queued" not in rel and "done" not in rel
+        for rel in rels
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -569,11 +614,19 @@ def test_export_all_equals_export_none(backend):
 
 
 def test_claim_race_only_one_winner_barrier(tmp_path):
-    """MUST 9: under concurrent two-claimer race, only one wins.
+    """MUST 4 + MUST 9: validate the rename-EXCLUSION primitive under a synchronized race.
 
-    Uses a threading.Barrier placed just before rename in claim_next via
-    a subclass, ensuring both threads race simultaneously. NOT multiprocessing
-    (macOS APFS flake class per ruling).
+    Uses a threading.Barrier placed just before rename in a SUBCLASS copy of
+    claim_next (BarrierQueueBackend), ensuring both threads attempt the rename
+    simultaneously. NOT multiprocessing (macOS APFS flake class per ruling).
+
+    SCOPE NOTE: this exercises a hand-written copy of the queued→claimed rename
+    loop (the only way to inject a deterministic barrier at the rename point),
+    so it validates the POSIX-rename mutual-exclusion guarantee — NOT the exact
+    production claim_next bytes. The AUTHORITATIVE no-double-claim test against
+    the real shipped claim_next is TEST 31 (test_claim_race_rename_loser_returns_none),
+    which monkeypatches Path.rename and drives the production code path. Keep
+    both: TEST 30 proves the primitive, TEST 31 proves production uses it.
     """
     project_root = tmp_path / "project"
     qd = project_root / "queue" / "queued" / "writer"
@@ -647,37 +700,41 @@ def test_claim_race_only_one_winner_barrier(tmp_path):
 
 
 def test_claim_race_rename_loser_returns_none(tmp_path, monkeypatch):
-    """MUST 9: the FileNotFoundError loser in a rename race gets None."""
+    """MUST 4 + MUST 9: the FileNotFoundError rename-loser skips the contended file.
+
+    Deterministic (not a sequential simulation): the ONLY candidate's rename
+    raises FileNotFoundError — exactly what the kernel returns to the loser of
+    a concurrent rename. The claimer must (a) NOT crash, (b) move on to the
+    next candidate (here there are none), and (c) return None. A naive impl
+    that lets FileNotFoundError propagate would fail this test.
+    """
     project_root = tmp_path / "project"
     qd = project_root / "queue" / "queued" / "writer"
     qd.mkdir(parents=True)
     (qd / "only.md").write_text("only")
 
-    # Simulate: second call to rename raises FileNotFoundError (race loser)
-    rename_call_count = [0]
     original_rename = Path.rename
+    raised = {"count": 0}
 
     def patched_rename(self, target):
-        rename_call_count[0] += 1
-        if rename_call_count[0] == 2:
-            raise FileNotFoundError("race loser")
+        # The work-file rename (queued → claimed) is the contended op. Make the
+        # FIRST such rename always lose the race; let any other rename through.
+        if self.name == "only.md":
+            raised["count"] += 1
+            raise FileNotFoundError("race loser: another worker took only.md")
         return original_rename(self, target)
 
     monkeypatch.setattr(Path, "rename", patched_rename)
 
-    # First backend claims successfully
-    b1 = FilesystemQueueBackend(project_root)
-    item1 = b1.claim_next("writer", "winner", lease_seconds=60)
-    # Reset count for second attempt
-    rename_call_count[0] = 1  # next rename is call #2 → raises
+    backend = FilesystemQueueBackend(project_root)
+    item = backend.claim_next("writer", "loser", lease_seconds=60)
 
-    b2 = FilesystemQueueBackend(project_root)
-    item2 = b2.claim_next("writer", "loser", lease_seconds=60)
-
-    # item1 may be None here because monkeypatch starts at call 1; adjust
-    # the test to just assert that a FileNotFoundError race is handled gracefully
-    # (returns None, not a crash).
-    assert item2 is None or (item2 is not None and item2.original_name == "only.md")
+    assert raised["count"] >= 1, "the contended rename must have been attempted"
+    assert item is None, "the rename-loser must get None, not a crash or stale item"
+    # No sidecar was written for the file we never actually claimed.
+    assert not (
+        project_root / "queue" / "claimed" / "loser" / "only.md.lease.json"
+    ).exists()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -910,6 +967,46 @@ def test_compatibility_old_and_new_import_paths_equivalent(tmp_path):
     assert item_new.claimed_at > 0
 
 
+def test_cascade_reexports_are_same_object_and_quiet():
+    """The _cascade.py NON-deprecated re-export shim must:
+
+    1. Re-export QueueItem, _sidecar_path, _write_sidecar as the SAME OBJECTS
+       from atomic_agents.queue (not copies/wrappers).
+    2. Alias QueueItem to FilesystemQueueItem so item.path keeps working.
+    3. Emit NO DeprecationWarning on import or on use (sunset is deferred to
+       the v1.0/T10 shim-retirement pass).
+
+    Per arc-ruling 428-pr1-args.json re-export-shim-shape: Option A.
+    """
+    import warnings
+    import importlib
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        # Re-import to prove no DeprecationWarning fires at import time.
+        cascade = importlib.import_module("atomic_agents._cascade")
+        importlib.reload(cascade)
+
+        from atomic_agents.queue import (
+            FilesystemQueueItem,
+            _sidecar_path as queue_sidecar_path,
+            _write_sidecar as queue_write_sidecar,
+        )
+
+        # SAME-OBJECT identity for the re-exported symbols.
+        assert cascade.QueueItem is FilesystemQueueItem, (
+            "_cascade.QueueItem must be the SAME object as "
+            "queue.FilesystemQueueItem (backward-compat alias, item.path works)"
+        )
+        assert cascade._sidecar_path is queue_sidecar_path
+        assert cascade._write_sidecar is queue_write_sidecar
+
+        # item.path access still works through the alias.
+        import dataclasses
+
+        assert "path" in {f.name for f in dataclasses.fields(cascade.QueueItem)}
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # TEST 46 — QueueExport importable from atomic_agents.export
 
@@ -983,3 +1080,80 @@ def test_writepolicy_not_in_queue_backend():
             assert "WritePolicy" not in annotation, (
                 f"WritePolicy MUST NOT appear in QueueBackend.{name} signature"
             )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TEST 48 — item.path stays in the CALLER's (unresolved/symlinked) representation
+#
+# Closes the tmp_path blind spot: pytest's tmp_path is already resolved on macOS,
+# so the standard claim_next tests cannot detect a backend that returns the
+# RESOLVED path instead of the caller's unresolved one. Pre-carve _cascade.py
+# returned the caller-supplied path; a regression to the resolved path breaks
+# item.path.relative_to(project_root) for any external cron/spec-06 caller whose
+# project_root is reached through a symlink (a symlinked $HOME, /tmp→/private/tmp
+# on macOS, a bind mount). This test constructs the backend with a SYMLINKED
+# project_root and asserts the returned path uses the caller's representation.
+
+
+def test_claim_next_path_uses_caller_unresolved_root(tmp_path):
+    """MUST: item.path is byte-identical to the caller's project_root layout.
+
+    Construct the backend with a symlinked project_root (real_dir <- symlink),
+    pass the SYMLINK as project_root, and assert the returned item.path is
+    expressed under the symlink — NOT resolved to real_dir. Mirrors the
+    FilesystemJournalBackend._journal_dir() unresolved-return contract.
+    """
+    real_dir = tmp_path / "real_project"
+    qd = real_dir / "queue" / "queued" / "writer"
+    qd.mkdir(parents=True)
+    (qd / "001_task.md").write_text("work")
+
+    symlinked_root = tmp_path / "linked_project"
+    os.symlink(real_dir, symlinked_root)
+
+    backend = FilesystemQueueBackend(symlinked_root)
+    item = backend.claim_next("writer", "lease-1")
+    assert item is not None
+    assert item.path.exists()
+
+    # The returned path MUST be under the caller's symlinked root, not real_dir.
+    assert symlinked_root in item.path.parents, (
+        f"item.path must use the caller's (symlinked) root {symlinked_root}, "
+        f"got {item.path}"
+    )
+    assert real_dir not in item.path.parents, (
+        f"item.path must NOT be resolved to the real dir {real_dir}, got {item.path}"
+    )
+    # The external spec/06 cron contract: relative_to(project_root) succeeds.
+    rel = item.path.relative_to(symlinked_root)
+    assert rel == Path("queue") / "claimed" / "lease-1" / "001_task.md"
+    # parents[3] (used by the renew_lease shim) lands back on the caller root.
+    assert item.path.parents[3] == symlinked_root
+
+
+def test_renew_lease_shim_symlinked_root(tmp_path):
+    """The renew_lease shim (parents[3]) works with a symlinked project_root.
+
+    Guards the P2 follow-on: parents[3] must reconstruct the caller's root, not
+    a resolved divergent string, so the shim renews the right sidecar.
+    """
+    import json as _json
+
+    from atomic_agents._cascade import claim_next_queued, renew_lease as shim_renew
+
+    real_dir = tmp_path / "real_project"
+    qd = real_dir / "queue" / "queued" / "writer"
+    qd.mkdir(parents=True)
+    (qd / "renewable.md").write_text("work")
+
+    symlinked_root = tmp_path / "linked_project"
+    os.symlink(real_dir, symlinked_root)
+
+    item = claim_next_queued(symlinked_root, "writer", "renew-lease", lease_seconds=60)
+    assert item is not None
+    sidecar = item.path.parent / (item.original_name + ".lease.json")
+    orig = _json.loads(sidecar.read_text())["lease_expires_at"]
+
+    shim_renew(item, additional_seconds=3600)
+    new = _json.loads(sidecar.read_text())["lease_expires_at"]
+    assert new != orig, "renew_lease must have updated the sidecar via parents[3]"

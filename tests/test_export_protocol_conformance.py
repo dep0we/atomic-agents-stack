@@ -2516,3 +2516,155 @@ def test_journal_export_top_level_import_resolves() -> None:
     import atomic_agents.export as export_pkg
 
     assert "JournalExport" in export_pkg.__all__
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Queue export conformance (#428 PR1 — spec/44 joins the spec/40 round-trip harness)
+
+
+@pytest.fixture
+def queue_backend(tmp_path: Path):
+    from atomic_agents.queue.filesystem import FilesystemQueueBackend
+
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    return FilesystemQueueBackend(project_root)
+
+
+def _seed_durable_queue(backend) -> None:
+    """Populate durable queue dirs (queued/ + done/ + dead-letter/) on disk.
+
+    The durable subset is what export() embeds. We write the files directly so
+    the on-disk bytes are the ground truth the round-trip is checked against.
+    """
+    qr = backend._project_root / "queue"
+    (qr / "queued" / "writer").mkdir(parents=True)
+    (qr / "queued" / "writer" / "001_task.md").write_text(
+        "pending work\n", encoding="utf-8"
+    )
+    (qr / "done" / "lease-1").mkdir(parents=True)
+    (qr / "done" / "lease-1" / "002_done.md").write_text(
+        "completed work\n", encoding="utf-8"
+    )
+    (qr / "dead-letter" / "lease-2").mkdir(parents=True)
+    (qr / "dead-letter" / "lease-2" / "003_dead.md").write_text(
+        "failed work\n", encoding="utf-8"
+    )
+
+
+def test_queue_export_returns_queue_export_type(queue_backend) -> None:
+    """export() returns a QueueExport instance."""
+    from atomic_agents.export.types import QueueExport
+
+    result = queue_backend.export()
+    assert isinstance(result, QueueExport)
+
+
+def test_queue_export_is_exportable_result(queue_backend) -> None:
+    """QueueExport is an ExportableResult subclass (generic Protocol narrowing)."""
+    from atomic_agents.export.types import ExportableResult
+
+    result = queue_backend.export()
+    assert isinstance(result, ExportableResult)
+
+
+def test_queue_export_empty_returns_empty_components(queue_backend) -> None:
+    """export() on a backend with no durable items returns empty QueueExport."""
+    from atomic_agents.export.types import QueueExport
+
+    result = queue_backend.export()
+    assert isinstance(result, QueueExport)
+    assert result.items_with_bytes == []
+
+
+def test_queue_export_single_roundtrip(queue_backend) -> None:
+    """Byte-exact round-trip: exported bytes equal the on-disk durable file bytes.
+
+    Exercises the shared #379 render path (assert_canonical_roundtrip) so the
+    QueueExport render-helper branch is verified, not dead plumbing.
+    """
+    _seed_durable_queue(queue_backend)
+
+    def write_fn(_be):
+        pass  # already populated above
+
+    def expected_bytes_fn(be):
+        # Concatenate the durable on-disk bytes in the same sorted order export()
+        # uses (queued, then done, then dead-letter; each rglob sorted).
+        qr = be._project_root / "queue"
+        order = [
+            qr / "queued" / "writer" / "001_task.md",
+            qr / "done" / "lease-1" / "002_done.md",
+            qr / "dead-letter" / "lease-2" / "003_dead.md",
+        ]
+        return b"".join(p.read_bytes() for p in order)
+
+    assert_canonical_roundtrip(queue_backend, write_fn, expected_bytes_fn)
+
+
+def test_queue_export_excludes_claimed_and_lease_sidecars(queue_backend) -> None:
+    """In-flight claimed/ + .lease.json sidecars are excluded even when held.
+
+    Ruling 428-pr1-args spec40-exportable-shape: the conformance test MUST
+    assert the ephemeral exclusion when a claim IS currently held — not just
+    skip-and-assume.
+    """
+    # Seed a pending item and actually claim it so claimed/ + a sidecar exist.
+    qr = queue_backend._project_root / "queue"
+    (qr / "queued" / "writer").mkdir(parents=True)
+    (qr / "queued" / "writer" / "live.md").write_text("live", encoding="utf-8")
+    item = queue_backend.claim_next("writer", "held-lease")
+    assert item is not None
+    assert item.path.exists()
+    sidecar = item.path.parent / (item.original_name + ".lease.json")
+    assert sidecar.exists(), "precondition: a live sidecar exists in claimed/"
+
+    result = queue_backend.export()
+    rels = [rel for rel, _b in result.items_with_bytes]
+    assert all("claimed" not in r for r in rels), (
+        f"claimed/ must be excluded from export, got {rels}"
+    )
+    assert all(not r.endswith(".lease.json") for r in rels), (
+        f".lease.json sidecars must be excluded, got {rels}"
+    )
+
+
+def test_queue_export_relative_paths(queue_backend) -> None:
+    """Exported path metadata is relative-to-project_root (portable)."""
+    _seed_durable_queue(queue_backend)
+    result = queue_backend.export()
+    rels = sorted(rel for rel, _b in result.items_with_bytes)
+    assert rels == [
+        "queue/dead-letter/lease-2/003_dead.md",
+        "queue/done/lease-1/002_done.md",
+        "queue/queued/writer/001_task.md",
+    ]
+
+
+def test_queue_export_backend_id_and_scope(queue_backend) -> None:
+    result = queue_backend.export()
+    assert result.backend_id == queue_backend.backend_id
+    assert result.scope == str(queue_backend._project_root)
+
+
+def test_queue_export_all_equals_export_none(queue_backend) -> None:
+    """export_all() produces the same result as export(None)."""
+    _seed_durable_queue(queue_backend)
+    result_none = queue_backend.export(None)
+    result_all = queue_backend.export_all()
+    assert result_none.items_with_bytes == result_all.items_with_bytes
+
+
+def test_queue_export_top_level_import_resolves() -> None:
+    """`from atomic_agents.export import QueueExport` MUST resolve.
+
+    Pins the public import surface so the package-root re-export cannot silently
+    regress, mirroring the Goal/Outcome/Journal import-resolution tests.
+    """
+    from atomic_agents.export import QueueExport
+    from atomic_agents.export.types import QueueExport as QueueExportSubmodule
+
+    assert QueueExport is QueueExportSubmodule
+    import atomic_agents.export as export_pkg
+
+    assert "QueueExport" in export_pkg.__all__

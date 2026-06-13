@@ -52,8 +52,8 @@ from .backend import QueueBackend, recover_stale_claims
 from .filesystem import (
     FilesystemQueueBackend,
     FilesystemQueueItem,
-    _sidecar_path,
-    _write_sidecar,
+    _sidecar_path,  # noqa: F401 (re-export for _cascade.py backward compat)
+    _write_sidecar,  # noqa: F401 (re-export for _cascade.py backward compat)
 )
 from .types import QueueCapabilities, QueueExport, QueueItem
 
