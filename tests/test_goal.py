@@ -41,6 +41,7 @@ intent: Complete novel first draft by Q4
 priority: high
 created: 2026-04-01
 deadline: 2026-12-31
+parent_goal: muse-director-novel-2026
 last_progress_check: 2026-05-01
 success_criteria:
   - All 24 chapters drafted
@@ -70,6 +71,8 @@ related_atomic_notes:
   - feedback_voice.md
 related_decisions:
   - policy/lock_001_pov.md
+related_canon_pages:
+  - canon/world/vienna_1920s.md
 ---
 
 # The Unfinished — Director goal
@@ -450,6 +453,18 @@ def test_archive_moves_goal_to_archive(agent_with_goal):
     assert parsed.metadata["active"] is False
     assert parsed.metadata["archived_at"] == "2026-05-08"
     assert parsed.metadata["archive_reason"] == "completed"
+    # A3 exception (intentional data-loss fix, #448 PR1): archive() previously
+    # hand-rolled a frontmatter dict that silently dropped these five optional
+    # fields. It now serializes via build_goal_frontmatter() (same as save() and
+    # the backend), preserving them. These assertions guard the fix — all five
+    # fields the old dict dropped (deadline, parent_goal, related_atomic_notes,
+    # related_decisions, related_canon_pages). This is the ONE sanctioned change
+    # to the four frozen regression-guard files (the rest stay byte-frozen).
+    assert parsed.metadata["deadline"] == "2026-12-31"
+    assert parsed.metadata["parent_goal"] == "muse-director-novel-2026"
+    assert parsed.metadata["related_atomic_notes"] == ["feedback_voice.md"]
+    assert parsed.metadata["related_decisions"] == ["policy/lock_001_pov.md"]
+    assert parsed.metadata["related_canon_pages"] == ["canon/world/vienna_1920s.md"]
 
 
 def test_abandon_uses_archive_with_reason_prefix(agent_with_goal):

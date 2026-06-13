@@ -41,7 +41,6 @@ HARD RULES (per spec/12):
 """
 
 from __future__ import annotations
-import json
 import re
 from datetime import date, datetime
 from pathlib import Path
@@ -52,7 +51,7 @@ if TYPE_CHECKING:
 
 import frontmatter
 
-from ._io import atomic_write, atomic_append_jsonl
+from ._io import atomic_write
 from ._platform import get_agents_root
 from .exceptions import (
     AtomicAgentsError,
@@ -75,10 +74,16 @@ from .goal.types import (  # noqa: F401 (constants + validate_agent_mode re-expo
     Goal,
     SubGoal,
     build_goal_frontmatter as _build_goal_frontmatter,
-    serialize_sub_goal as _serialize_sub_goal,
     validate_agent_mode,
     validate_goal,
 )
+
+# GoalBackend imported from the direct submodule (NOT goal/__init__.py) for
+# circular-import safety. goal/__init__.py uses __getattr__ to lazily load
+# _goal_impl; importing from goal/__init__.py here at module level would
+# close that cycle and break bootstrap. goal.backend imports only from
+# goal/types.py + stdlib — no heavy deps, no cycle risk.
+from .goal.backend import GoalBackend
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -151,6 +156,7 @@ class GoalManager:
         agents_root: Path | None = None,
         agent_name: str = "",
         today: date | None = None,
+        goal_backend: GoalBackend | None = None,
     ):
         self.agents_root = agents_root or get_agents_root()
         self.agent_name = agent_name
@@ -163,6 +169,20 @@ class GoalManager:
         self.goal_path = self.agent_root / "goal.md"
         self.archive_dir = self.agent_root / "goal_archive"
         self._goal: Goal | None = None
+
+        # GoalBackend instance. kwarg-wins-over-env: if a backend was explicitly
+        # passed, use it; otherwise resolve via the operator-config factory (which
+        # reads ATOMIC_AGENTS_GOAL_BACKEND). Lazy import inside __init__ to avoid
+        # closing the bootstrap cycle that goal/__init__.py's __getattr__ exists
+        # to prevent (profile/filesystem.py imports parse_agent_mode_text from
+        # atomic_agents.goal during package bootstrap). Mirrors agent.py's
+        # journal_backend resolution (kwarg-wins-over-env, default factory).
+        if goal_backend is None:
+            from .goal import get_default_goal_backend  # noqa: PLC0415
+
+            self.goal_backend: GoalBackend = get_default_goal_backend(self.agent_root)
+        else:
+            self.goal_backend = goal_backend
 
     # ────────────────────────────────────────────────────────────
     # Load / save
@@ -180,68 +200,53 @@ class GoalManager:
             return False
 
     def load(self) -> Goal:
-        """Load + validate goal.md. Returns the Goal."""
+        """Load + validate goal.md. Returns the Goal.
+
+        Routes through self.goal_backend.load_goal() (COARSE-ROUTE adoption,
+        #448 PR1). self._goal is set so subsequent method calls that guard on
+        'if self._goal is None: self.load()' work correctly.
+        """
         if not self.has_goal():
             raise AtomicAgentsError(f"No goal.md at {self.goal_path}")
-        try:
-            parsed = frontmatter.load(self.goal_path)
-        except Exception as e:
-            raise GoalCorrupted(f"goal.md unparseable: {e}") from e
-        meta = dict(parsed.metadata)
-        validate_goal(meta)
-
-        sub_goals = [
-            SubGoal(
-                id=sg["id"],
-                label=sg.get("label", ""),
-                status=sg.get("status", "pending"),
-                assigned=sg.get("assigned"),
-                deadline=str(sg["deadline"]) if sg.get("deadline") else None,
-                blocked_by=sg.get("blocked_by"),
-                completed=str(sg["completed"]) if sg.get("completed") else None,
-                output=sg.get("output"),
-                body=sg.get("body"),
-                acceptance_criteria=list(sg.get("acceptance_criteria") or []),
-            )
-            for sg in meta.get("sub_goals", [])
-        ]
-
-        self._goal = Goal(
-            schema_version=int(meta["schema_version"]),
-            active=bool(meta["active"]),
-            intent=str(meta["intent"]),
-            priority=str(meta["priority"]),
-            created=str(meta["created"]),
-            last_progress_check=str(meta["last_progress_check"]),
-            success_criteria=list(meta["success_criteria"]),
-            sub_goals=sub_goals,
-            deadline=str(meta["deadline"]) if meta.get("deadline") else None,
-            parent_goal=meta.get("parent_goal"),
-            related_atomic_notes=list(meta.get("related_atomic_notes", [])),
-            related_decisions=list(meta.get("related_decisions", [])),
-            related_canon_pages=list(meta.get("related_canon_pages", [])),
-            body=parsed.content,
-        )
+        self._goal = self.goal_backend.load_goal(self.agent_name)
         return self._goal
 
     def save(self) -> None:
-        """Write the current goal back to goal.md. Updates last_progress_check."""
+        """Write the current goal back to goal.md. Updates last_progress_check.
+
+        COARSE-ROUTE adoption (#448 PR1): routes through self.goal_backend.save_goal().
+        Caller-side stamping (A2 ruling): self._goal.last_progress_check is set
+        FIRST with self.today (injectable clock), then save_goal() writes verbatim.
+        self.goal_backend.save_goal() is intentionally lock-free — single-session
+        saves are safe without the lock. The backend's apply_transition() (PR3's
+        coordinator primitive) holds the lock for its atomic sequence; this coarse
+        save path does not (accepted COARSE-ROUTE ordering contract, spec/41).
+        (Note: archive() also takes no GoalManager-level lock and is NOT routed
+        through backend.archive_goal() this PR — see #483.)
+
+        BEHAVIOR DELTA vs. pre-#448 save() (conscious, spec/41 MUST 5-aligned,
+        documented in CHANGELOG): the old save() wrote goal.md with NO frontmatter
+        validation. save_goal() routes through the backend's _write_goal(), which
+        runs validate_goal() BEFORE the durable write and fails closed (raises
+        SchemaValidationError, writes nothing) on an in-memory Goal whose
+        serialized frontmatter the backend's own load_goal() would reject. This is
+        BYTE-IDENTICAL for any valid goal (validation is read-only) — every
+        mark_*/add_sub_goal mutator produces valid state. It only changes the
+        failure mode on an already-invalid in-memory Goal from "write invalid
+        bytes" to "raise" — a hardening that closes the write-time/read-time
+        validation asymmetry spec/41 MUST 5 requires of EVERY write path
+        (save_goal AND apply_transition). The one reachable public path that hits
+        this is mark_blocked() with a forward reference (sub-goal A blocked_by a
+        later-listed B): the validator's forward-only referential check rejects on
+        save where the old unvalidated path persisted it. Guarded by
+        test_save_forward_ref_blocked_by_fails_closed below.
+        """
         if self._goal is None:
             raise AtomicAgentsError("No goal loaded to save")
+        # A2 ruling: stamp last_progress_check BEFORE calling save_goal so the
+        # backend writes the injectable self.today clock value, not a stale date.
         self._goal.last_progress_check = self.today.isoformat()
-
-        # Serialize frontmatter through the SAME shared helper the backend's
-        # _write_goal() uses (goal/types.py:build_goal_frontmatter) so a future
-        # field addition lands in one place and the two writers cannot diverge.
-        fm = _build_goal_frontmatter(self._goal)
-
-        post = frontmatter.Post(self._goal.body, **fm)
-        atomic_write(self.goal_path, frontmatter.dumps(post) + "\n")
-
-    @staticmethod
-    def _serialize_sub_goal(sg: SubGoal) -> dict:
-        """Delegate to canonical serialize_sub_goal from goal/types.py."""
-        return _serialize_sub_goal(sg)
+        self.goal_backend.save_goal(self.agent_name, self._goal)
 
     # ────────────────────────────────────────────────────────────
     # Sub-goal lifecycle
@@ -484,28 +489,32 @@ class GoalManager:
             counter += 1
             archive_path = self.archive_dir / f"{base_name}_{counter}.md"
 
-        # Mark inactive + record reason in history before saving to archive
+        # Mark inactive + update last_progress_check + record reason in history.
+        # Mutation ORDER MATTERS for build_goal_frontmatter (reads Goal fields
+        # directly — no override kwargs): active and last_progress_check MUST be
+        # mutated on self._goal BEFORE calling build_goal_frontmatter so the
+        # archive file reflects active=False and today's date. (A3 ruling fix.)
         self._goal.active = False
+        self._goal.last_progress_check = self.today.isoformat()
         self._append_history(f"goal archived ({reason})")
 
-        # Write archive first — unlink goal.md only after successful write
-        post = frontmatter.Post(
-            self._goal.body,
-            **{
-                "schema_version": self._goal.schema_version,
-                "active": False,
-                "intent": self._goal.intent,
-                "priority": self._goal.priority,
-                "created": self._goal.created,
-                "last_progress_check": self.today.isoformat(),
-                "success_criteria": self._goal.success_criteria,
-                "sub_goals": [
-                    self._serialize_sub_goal(sg) for sg in self._goal.sub_goals
-                ],
-                "archived_at": self.today.isoformat(),
-                "archive_reason": reason,
-            },
-        )
+        # A3 fix (intentional data-loss fix, #448 PR1): swap the hand-rolled
+        # frontmatter dict for build_goal_frontmatter(self._goal). The old dict
+        # silently dropped deadline, parent_goal, related_atomic_notes,
+        # related_decisions, related_canon_pages. build_goal_frontmatter
+        # preserves all optional Goal fields. archived_at + archive_reason are
+        # NOT Goal dataclass fields; they are appended to the dict after the call.
+        # archive() is NOT routed through backend.archive_goal() this PR — that
+        # drags in the backend's date.today() and loses the injectable self.today
+        # clock for archived_at. Full archive-path adoption is a filed follow-up.
+        # NOTE: Not lock-protected at GoalManager level — concurrent archive()
+        # calls on the same agent could race (rare in single-session use). The
+        # backend's archive_goal() is lock-protected; full adoption tracked in
+        # the follow-up issue for routing archive() through backend.archive_goal().
+        fm = _build_goal_frontmatter(self._goal)
+        fm["archived_at"] = self.today.isoformat()
+        fm["archive_reason"] = reason
+        post = frontmatter.Post(self._goal.body, **fm)
         atomic_write(archive_path, frontmatter.dumps(post) + "\n")
 
         # Remove the active goal.md only after archive is safely written
@@ -856,16 +865,36 @@ class GoalManager:
         )
 
     def _append_goal_history_jsonl(self, entry: dict) -> None:
-        """Append a structured event to goal_history.jsonl in the agent root."""
-        history_path = self.agent_root / "goal_history.jsonl"
-        atomic_append_jsonl(history_path, json.dumps(entry))
+        """Append a structured event to goal_history.jsonl via the backend.
+
+        COARSE-ROUTE adoption (#448 PR1): delegates to
+        self.goal_backend.append_history_event(). The backend always acquires
+        the .goal.lock before appending (PIPE_BUF safety for large payloads,
+        e.g. outcome explanations). This changes locking behavior vs. the
+        pre-adoption unlocked atomic_append_jsonl path: appends now serialize
+        under the advisory lock unconditionally.
+
+        ORDERING CONTRACT: The lock in backend.append_history_event serializes
+        the JSONL append; save_goal() (called by save() before this method in
+        dispatch_as_outcome) does NOT hold the lock. The ordering guarantee is
+        call-sequence: save() precedes this method per dispatch_as_outcome.
+        MUST 6 atomicity applies only to apply_transition() (under the backend
+        lock). This is the accepted COARSE-ROUTE ordering contract.
+
+        METHOD NAME PRESERVED INTENTIONALLY: test_goal_dispatch_audit_ordering.py
+        patches this method by name via patch.object(gm,
+        '_append_goal_history_jsonl', ...) for the MUST 6 ordering regression
+        test. Removing or renaming it would silently break that frozen guard.
+        The body delegates to the backend; the name is the patch target contract.
+        """
+        self.goal_backend.append_history_event(self.agent_name, entry)
 
 
 # ──────────────────────────────────────────────────────────────────
 # CLI
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, goal_backend: GoalBackend | None = None) -> int:
     import argparse
     import sys
 
@@ -945,7 +974,11 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     try:
-        gm = GoalManager(agents_root, args.agent)
+        # goal_backend kwarg: None uses operator env-var default; non-None injects
+        # a backend (programmatic callers / test fixtures) without a CLI flag.
+        # The CLI itself does not expose --goal-backend (deployment-env territory);
+        # env var ATOMIC_AGENTS_GOAL_BACKEND is the operator override surface.
+        gm = GoalManager(agents_root, args.agent, goal_backend=goal_backend)
     except AtomicAgentsError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1

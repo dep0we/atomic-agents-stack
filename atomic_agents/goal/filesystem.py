@@ -55,7 +55,12 @@ from typing import Any, Iterator
 import frontmatter
 
 from .._io import atomic_write, atomic_append_jsonl
-from ..exceptions import AtomicAgentsError, GoalCorrupted, SchemaValidationError
+from ..exceptions import (
+    AtomicAgentsError,
+    GoalCorrupted,
+    PathTraversalError,
+    SchemaValidationError,
+)
 from .types import (
     SUB_GOAL_TRANSITION_FIELDS,
     VALID_SUB_GOAL_STATUSES,
@@ -143,7 +148,8 @@ class FilesystemGoalBackend:
         The lock file is created if absent. The lock is released in finally.
         """
         self._agent_root.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(self._lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        lock_path = self._require_within_root(self._lock_path, ".goal.lock")
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
             try:
@@ -152,6 +158,59 @@ class FilesystemGoalBackend:
                 fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
+
+    # ──────────────────────────────────────────────────────────────
+    # Symlink containment guard
+
+    def _require_within_root(self, path: Path, label: str) -> Path:
+        """Resolve ``path`` and verify it stays under the resolved agent_root.
+
+        The single canonical containment invariant for this backend (#448 PR1).
+        ``__init__`` resolves ``agent_root`` and rejects ``..`` components, but a
+        symlinked ``goal.md`` / ``goal_history.jsonl`` / ``goal_archive`` /
+        ``.goal.lock`` pointing OUTSIDE the resolved root would otherwise be
+        followed on read/write — a perimeter escape (a write landing outside the
+        agent vault). This mirrors the sibling backends'
+        ``FilesystemOutcomeBackend._runs_root()`` and
+        ``FilesystemJournalBackend._journal_dir()`` guards (resolve + verify
+        ``is_relative_to``), consolidated into ONE helper applied at every I/O
+        boundary rather than per-path point-checks (MEMORY.md
+        feedback_containment_reframe_not_whackamole).
+
+        Within-vault integrity (a writer who can already plant a symlink INSIDE
+        the resolved agent_root) is OUT of scope — that actor is inside the trust
+        boundary and could write goal.md directly; adversarial/multi-host
+        deployments use a real-authz backend (the spec/44 trust-model ruling).
+        The defended class is the PERIMETER: a write must never escape the vault.
+
+        Resolution failure (symlink loop / inaccessible ancestor) is folded into
+        PathTraversalError rather than surfacing a raw OSError/RuntimeError —
+        get_default_goal_backend() is now constructed at AtomicAgent.__init__
+        (#448 PR1), so a bare resolve() crash would take down agent construction.
+
+        Returns:
+            The resolved, contained path (safe to read/write).
+
+        Raises:
+            PathTraversalError: when ``path`` resolves outside agent_root, or
+                cannot be resolved at all.
+        """
+        try:
+            resolved = path.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise PathTraversalError(
+                f"{label} could not be resolved (symlink loop or inaccessible "
+                f"ancestor)",
+                child=label,
+                root=str(self._agent_root),
+            ) from exc
+        if not resolved.is_relative_to(self._agent_root):
+            raise PathTraversalError(
+                f"{label} resolves outside the agent vault (symlinked path refused)",
+                child=label,
+                root=str(self._agent_root),
+            )
+        return resolved
 
     # ──────────────────────────────────────────────────────────────
     # Internal: history helpers
@@ -193,15 +252,19 @@ class FilesystemGoalBackend:
         nothing is written, and on the apply_transition path no JSONL audit line
         is appended for an un-written state (the write precedes the append).
         """
+        goal_path = self._require_within_root(self._goal_path, "goal.md")
         fm = build_goal_frontmatter(goal)
         validate_goal(fm)
         post = frontmatter.Post(goal.body, **fm)
-        atomic_write(self._goal_path, frontmatter.dumps(post) + "\n")
+        atomic_write(goal_path, frontmatter.dumps(post) + "\n")
 
     def _append_jsonl(self, event: dict[str, Any]) -> None:
         """Serialize event and append to goal_history.jsonl (caller holds lock)."""
+        history_path = self._require_within_root(
+            self._history_path, "goal_history.jsonl"
+        )
         line = json.dumps(event)
-        atomic_append_jsonl(self._history_path, line)
+        atomic_append_jsonl(history_path, line)
 
     # ──────────────────────────────────────────────────────────────
     # Protocol: load / save
@@ -217,10 +280,11 @@ class FilesystemGoalBackend:
             GoalCorrupted: when goal.md is unparseable.
             SchemaValidationError: when frontmatter is invalid.
         """
-        if not self._goal_path.is_file():
-            raise AtomicAgentsError(f"No goal.md at {self._goal_path}")
+        goal_path = self._require_within_root(self._goal_path, "goal.md")
+        if not goal_path.is_file():
+            raise AtomicAgentsError(f"No goal.md at {goal_path}")
         try:
-            parsed = frontmatter.load(self._goal_path)
+            parsed = frontmatter.load(goal_path)
         except Exception as e:
             raise GoalCorrupted(f"goal.md unparseable: {e}") from e
 
@@ -380,8 +444,8 @@ class FilesystemGoalBackend:
 
     def append_history_event(
         self,
-        agent_id: str,
-        event: dict[str, Any],  # noqa: ARG002
+        agent_id: str,  # noqa: ARG002 (filesystem ignores agent_id — scoped at construction time)
+        event: dict[str, Any],
     ) -> None:
         """Append one structured event to goal_history.jsonl.
 
@@ -408,8 +472,8 @@ class FilesystemGoalBackend:
 
     def archive_goal(
         self,
-        agent_id: str,
-        reason: str = "completed",  # noqa: ARG002
+        agent_id: str,  # noqa: ARG002 (filesystem ignores agent_id — scoped at construction time)
+        reason: str = "completed",
     ) -> str:
         """Archive the active goal to goal_archive/ with crash safety.
 
@@ -430,10 +494,14 @@ class FilesystemGoalBackend:
         today = date.today().isoformat()
 
         with self._goal_lock():
+            # Containment: refuse a symlinked goal.md / goal_archive that escapes
+            # the vault BEFORE any read/glob/mkdir/write (perimeter guard).
+            goal_path = self._require_within_root(self._goal_path, "goal.md")
+            archive_dir = self._require_within_root(self._archive_dir, "goal_archive")
             # MUST 9 (idempotency): if goal.md is absent, look for an existing
             # archive rather than raising. Covers the retry-after-unlink path.
-            if not self._goal_path.is_file():
-                if self._archive_dir.exists():
+            if not goal_path.is_file():
+                if archive_dir.exists():
                     # Find any archive file whose base name starts with today's date
                     # or any date (we can't know the exact slug without the intent).
                     # Return the most recently modified one as the idempotent result.
@@ -441,31 +509,29 @@ class FilesystemGoalBackend:
                     # written in the same filesystem tick) resolve deterministically
                     # rather than relying on OS-arbitrary glob order.
                     existing = sorted(
-                        self._archive_dir.glob("*.md"),
+                        archive_dir.glob("*.md"),
                         key=lambda p: (p.stat().st_mtime, p.name),
                         reverse=True,
                     )
                     if existing:
                         return existing[0].stem
-                raise AtomicAgentsError(
-                    f"No active goal to archive at {self._goal_path}"
-                )
+                raise AtomicAgentsError(f"No active goal to archive at {goal_path}")
 
             goal = self.load_goal(agent_id)
 
-            self._archive_dir.mkdir(parents=True, exist_ok=True)
+            archive_dir.mkdir(parents=True, exist_ok=True)
             intent_slug = re.sub(r"[^a-z0-9]+", "_", goal.intent.lower()).strip("_")[
                 :60
             ]
             base_name = f"{today}_{intent_slug}"
-            archive_path = self._archive_dir / f"{base_name}.md"
+            archive_path = archive_dir / f"{base_name}.md"
 
             # MUST 8: collision-safe suffix loop (race-free under lock)
             # Check for existing archive with same base name before creating new
             counter = 0
             while archive_path.exists():
                 counter += 1
-                archive_path = self._archive_dir / f"{base_name}_{counter}.md"
+                archive_path = archive_dir / f"{base_name}_{counter}.md"
 
             # Mark inactive + record in body history before writing archive
             goal.active = False
@@ -473,16 +539,18 @@ class FilesystemGoalBackend:
             # Bump last_progress_check to the archive day, matching
             # GoalManager.archive()'s last_progress_check=today behavior.
             #
-            # NOT a byte-for-byte match with GoalManager.archive(): this backend
-            # serializes via build_goal_frontmatter(), which PRESERVES the
-            # optional fields (deadline, parent_goal, related_atomic_notes,
-            # related_decisions, related_canon_pages) that GoalManager.archive()
-            # drops by building an explicit dict. That is an intentional
-            # data-loss fix, not a regression — the backend never silently
-            # discards goal metadata on archive. Convergence of GoalManager
-            # onto build_goal_frontmatter is tracked for the #448 runtime-wiring
-            # PR. The zero-behavior-change guarantee of this arc covers the live
-            # GoalManager path (untouched), not this not-yet-wired backend.
+            # Both this backend and GoalManager.archive() now serialize via
+            # build_goal_frontmatter(), which PRESERVES the optional fields
+            # (deadline, parent_goal, related_atomic_notes, related_decisions,
+            # related_canon_pages). GoalManager.archive() was fixed in #448 PR1
+            # (A3 ruling, intentional data-loss fix) so both paths share ONE
+            # serializer — the field set + key order match. They are NOT
+            # byte-for-byte identical, though: this backend stamps archived_at /
+            # last_progress_check from date.today() (wall clock) while
+            # GoalManager.archive() uses the injectable self.today clock, so the
+            # two diverge on date when the clocks differ. Full convergence onto a
+            # single backend.archive_goal() path (which needs an injectable clock
+            # on the backend) is a filed follow-up.
             goal.last_progress_check = today_str
             self._append_history_prose(goal, f"goal archived ({reason})", today_str)
 
@@ -493,8 +561,8 @@ class FilesystemGoalBackend:
             post = frontmatter.Post(goal.body, **fm)
             atomic_write(archive_path, frontmatter.dumps(post) + "\n")
 
-            # Remove goal.md only after archive is safely written
-            self._goal_path.unlink()
+            # Remove goal.md only after archive is safely written (guarded local)
+            goal_path.unlink()
 
         return archive_path.stem
 
@@ -504,9 +572,10 @@ class FilesystemGoalBackend:
         Returns [] when goal_archive/ does not exist (common case for agents
         that have never archived a goal). MUST NOT raise FileNotFoundError.
         """
-        if not self._archive_dir.exists():
+        archive_dir = self._require_within_root(self._archive_dir, "goal_archive")
+        if not archive_dir.exists():
             return []
-        return sorted(p.stem for p in self._archive_dir.glob("*.md"))
+        return sorted(p.stem for p in archive_dir.glob("*.md"))
 
     # ──────────────────────────────────────────────────────────────
     # Protocol: schema version
@@ -533,10 +602,11 @@ class FilesystemGoalBackend:
             GoalCorrupted: when goal.md is present but unparseable, OR when the
                 schema_version key is present but not coercible to int.
         """
-        if not self._goal_path.is_file():
+        goal_path = self._require_within_root(self._goal_path, "goal.md")
+        if not goal_path.is_file():
             return None
         try:
-            parsed = frontmatter.load(self._goal_path)
+            parsed = frontmatter.load(goal_path)
         except Exception as e:
             raise GoalCorrupted(
                 f"goal.md unparseable in read_schema_version: {e}"
@@ -561,9 +631,10 @@ class FilesystemGoalBackend:
         Same behavior as the current goal_path.read_text() in profile/filesystem.py
         (zero behavior change for agents without goal.md).
         """
-        if not self._goal_path.is_file():
+        goal_path = self._require_within_root(self._goal_path, "goal.md")
+        if not goal_path.is_file():
             return ""
-        return self._goal_path.read_text(encoding="utf-8")
+        return goal_path.read_text(encoding="utf-8")
 
     # ──────────────────────────────────────────────────────────────
     # Protocol: export (spec/40 Exportable)
@@ -585,17 +656,25 @@ class FilesystemGoalBackend:
         See GoalExport docstring for the snapshot-consistency acknowledgment
         (spec/40 MUST 7).
         """
+        # Containment: refuse symlinked goal.md / goal_history.jsonl / goal_archive
+        # that escape the vault before reading their bytes into the export.
+        goal_path = self._require_within_root(self._goal_path, "goal.md")
+        history_path = self._require_within_root(
+            self._history_path, "goal_history.jsonl"
+        )
+        archive_dir = self._require_within_root(self._archive_dir, "goal_archive")
+
         # --- goal.md bytes ---
         goal_md_bytes = b""
-        if self._goal_path.is_file():
-            raw = self._goal_path.read_bytes()
+        if goal_path.is_file():
+            raw = goal_path.read_bytes()
             goal_md_bytes = _normalize_crlf(raw)
 
         # --- goal_history.jsonl bytes (CRLF/BOM-normalized + newline-terminated;
         #     key order preserved, NOT re-serialized through json.dumps) ---
         history_records_with_bytes: list[bytes] = []
-        if self._history_path.is_file():
-            raw_history = self._history_path.read_bytes()
+        if history_path.is_file():
+            raw_history = history_path.read_bytes()
             # Split into lines; normalize CRLF; keep non-empty lines
             for raw_line in raw_history.splitlines(keepends=True):
                 line = _normalize_crlf(raw_line)
@@ -607,10 +686,10 @@ class FilesystemGoalBackend:
 
         # --- archived goals ---
         archived_goals_with_bytes: list[tuple[str, bytes]] = []
-        if self._archive_dir.exists():
+        if archive_dir.exists():
             # glob("*.md") already excludes atomic_write .tmp temp files (they end
             # in a different suffix), so no extra .tmp filter is needed here.
-            for p in sorted(self._archive_dir.glob("*.md")):
+            for p in sorted(archive_dir.glob("*.md")):
                 raw = p.read_bytes()
                 archived_goals_with_bytes.append((p.stem, _normalize_crlf(raw)))
 

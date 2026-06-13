@@ -236,9 +236,8 @@ def get_default_goal_backend(agent_root: Path) -> GoalBackend:
 
     Programmatic operators who want to construct the backend themselves can
     instantiate FilesystemGoalBackend(agent_root) directly, bypassing this
-    factory. (An AtomicAgent(..., goal_backend=...) constructor kwarg that
-    bypasses this factory is deferred to the runtime-wiring PR #448; the
-    constructor does not accept goal_backend today.)
+    factory. AtomicAgent accepts goal_backend= as of #448 PR1; pass it to
+    override the factory-resolved default (kwarg wins over env var).
 
     Returns:
         A GoalBackend instance scoped to agent_root.
