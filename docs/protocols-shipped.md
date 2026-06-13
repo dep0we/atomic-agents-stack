@@ -1,6 +1,6 @@
 # Backend protocols shipped
 
-Twelve backend protocols are locked for v1.0. A thirteenth, SecretBackend (#340), shipped for v1.5 with two reference implementations (FilesystemSecretBackend + GCPSecretManagerBackend) and LOCKED spec/38. A fourteenth, GoalBackend (#425), shipped for v1.5 with FilesystemGoalBackend and DRAFT spec/41. A fifteenth, OutcomeBackend (#426), shipped for v1.5 with FilesystemOutcomeBackend and DRAFT spec/42. A sixteenth, JournalBackend (#427), shipped for v1.5 with FilesystemJournalBackend and DRAFT spec/43. Each section captures the reference implementations shipped, the operator override surface, the doctor coherence check, the Implementer Contract location, and the architectural cliff the protocol closes.
+Twelve backend protocols are locked for v1.0. A thirteenth, SecretBackend (#340), shipped for v1.5 with two reference implementations (FilesystemSecretBackend + GCPSecretManagerBackend) and LOCKED spec/38. A fourteenth, GoalBackend (#425), shipped for v1.5 with FilesystemGoalBackend and DRAFT spec/41. A fifteenth, OutcomeBackend (#426), shipped for v1.5 with FilesystemOutcomeBackend and DRAFT spec/42. A sixteenth, JournalBackend (#427), shipped for v1.5 with FilesystemJournalBackend and DRAFT spec/43. A seventeenth, QueueBackend (#428), shipped for v1.5 with FilesystemQueueBackend and DRAFT spec/44. Each section captures the reference implementations shipped, the operator override surface, the doctor coherence check, the Implementer Contract location, and the architectural cliff the protocol closes.
 
 This file is the canonical reference for what the framework's storage seam looks like today. CLAUDE.md links here instead of inlining the detail so the session prompt stays under its char budget.
 
@@ -416,7 +416,27 @@ DRAFT spec/43 carries 10 normative MUSTs (base-8 PersonaBackend pattern + MUST 9
 
 ---
 
-## Why sixteen protocols, summarized
+## QueueBackend (#428, DRAFT spec/44, the seventeenth)
+
+Filed as [#428](https://github.com/dep0we/atomic-agents-stack/issues/428). Shipped in 1 PR (SCAFFOLDING-ONLY carve — the queue cluster is lifted out of `_cascade.py` into `atomic_agents/queue/` with zero new internal runtime callers wired; the documented spec/06 cron/project-runner free-function API is preserved via a thin non-deprecated re-export shim).
+
+**Reference implementation:** `FilesystemQueueBackend` (PR 1 of 1). Reproduces today's exact `project_root/queue/{queued,claimed,done,dead-letter}/` directory-tree claim mechanics with behavior preserved — runtime semantics, on-disk layout, and POSIX-rename atomicity are unchanged. The one intentional on-disk addition is an additive `role` key in the `.lease.json` sidecar (additive, ignored by legacy readers) so `list_claimed(role=...)` filters on the claimed side.
+
+`FilesystemQueueBackend` is **project-scoped** — its scope token is `project_root` (NOT `agent_root`), the one project-scoped backend in the v1.5 wave, matching spec/06 where the queue is a shared project resource. Construction is side-effect-free. The backend exposes the four atomicity primitives `claim_next` / `release` / `move_to_dead_letter` / `renew_lease` plus the `list_claimed` enumeration read primitive on the Protocol; `recover_stale_claims` is shared free-function code built only from Protocol calls (`list_claimed` + reclaim) so every backend runs the same recovery with no drift. `claim_next` atomicity is the queued→claimed POSIX rename (one winner under a concurrent race; the loser gets `FileNotFoundError` and tries the next candidate). The `.lease.json` sidecar write is best-effort; `recover_stale_claims()` falls back to the work file's mtime for torn/legacy sidecars. `QueueItem` (abstract Protocol type) carries NO `path` field — that filesystem detail lives on the `FilesystemQueueItem` subtype, so future Redis/SQS/DB backends don't fake a path. Symlink containment mirrors the journal/outcome siblings: resolve to CHECK `is_relative_to(project_root)`, then return the UNRESOLVED path for file ops, so `item.path` stays in the caller's representation (byte-identical to the pre-carve cron API). `export()` re-asserts containment on every durable leaf to refuse a symlinked work file exfiltrating host bytes.
+
+**Operator override:** `ATOMIC_AGENTS_QUEUE_BACKEND` env var (default `'filesystem'`). Factory `get_default_queue_backend(project_root)`; registry `register_queue_backend` / `get_queue_backend` / `list_queue_backends` / `unregister_queue_backend` in `atomic_agents/queue/__init__.py`. No operator CLI in PR 1 (deferred to a follow-up that hardens onto a locked spec/44).
+
+**Doctor:** `check_queue_backend(agent_root)` (derives `project_root` internally via `detect_cascade()`) validates the configured backend resolves, then applies the capability-honesty coherence probe — a SKIP/PASS/WARN/FAIL ladder that WARNs (not FAILs) when a `single_host_only=True` backend is run in a declared multi-host deployment (`ATOMIC_AGENTS_MULTI_HOST=true`/`1`). Located in `atomic_agents/doctor.py`. Credential-bearing override values are redacted in error messages.
+
+**Exportable:** `QueueExport` is an `ExportableResult` carrying `(items_with_bytes, backend_id, scope)`, re-exported from the `atomic_agents.export` package root. `FilesystemQueueBackend` implements `Exportable` with `supports_canonical_export=True`, registered in the spec/40 export conformance harness (`tests/test_export_protocol_conformance.py` + `tests/test_export_capability_advertisement.py`). The export embeds the DURABLE subset only — `queued/` (the irreplaceable pending backlog) + `done/` + `dead-letter/` — and structurally EXCLUDES in-flight `claimed/` and all `.lease.json` sidecars (runtime-bound/ephemeral, double-claim hazard on re-import — mirrors the LOCKED `LockExport` precedent where `lock_file_names` is always `[]`). The conformance suite asserts the ephemeral exclusion even when a claim is currently held.
+
+DRAFT spec/44 carries 12 normative MUSTs (base-8 PersonaBackend pattern + 4 queue-unique axes: atomic-claim-via-rename / no-double-claim-under-race; lease-expiry-recovery correctness; dead-letter terminal-transition / dead-work-stays-dead; `single_host_only` capability honesty). Conformance suite: `tests/test_queue_backend_conformance.py` (parametrized conformance core + the claim-race tests + doctor + export + import-equivalence) + `tests/test_queue_filesystem.py` (POSIX-rename + `.lease.json` sidecar + legacy-mtime-fallback specifics).
+
+**Closes the queue-atomicity cliff (TENSIONS T4):** queue-claim atomicity was locked to POSIX `Path.rename()`. With the Protocol carved out, a Redis/SQS/DB backend providing cross-host atomicity can drop in without forking the claim logic, lifting the single-host constraint for multi-host deployments.
+
+---
+
+## Why seventeen protocols, summarized
 
 A person at home runs filesystem-everything with one agent. An organization runs the same agents over Postgres, behind an HTTP service, with a fleet of orchestrated roles. **Same agent definitions, same `call()` flow, same audit trail. Different backends.**
 
