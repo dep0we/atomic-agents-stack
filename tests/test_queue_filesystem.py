@@ -1179,3 +1179,164 @@ def test_claim_next_skips_symlinked_source_file(tmp_path):
         )
     # The external secret is untouched.
     assert secret.read_text() == "EXTERNAL-SECRET"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FIX #3 — sink-layer original_name validation covers shim callers
+# (regression for the _cascade.py bypass: a forged QueueItem with a traversing
+# original_name passed through the shim to _release_at_path / _dead_letter_at_path
+# BYPASSED the public-method validation, escaping the destination directory)
+
+
+def test_shim_move_to_dead_letter_forged_original_name_contained(tmp_path):
+    """_cascade.move_to_dead_letter with a forged original_name MUST NOT write
+    outside dead-letter/ even when the shim calls _dead_letter_at_path directly.
+
+    Regression: the original_name validation lived only in the Protocol public
+    method, so a caller that forged a QueueItem(original_name='../../evil', ...)
+    and called the shim bypassed it.  The fix moves validation INTO the sink.
+    """
+    from atomic_agents._cascade import move_to_dead_letter
+
+    project_root = tmp_path / "project"
+    # Plant a real claimed work file (shim needs item.path to point somewhere real)
+    claimed_dir = project_root / "queue" / "claimed" / "tok"
+    claimed_dir.mkdir(parents=True)
+    real_work = claimed_dir / "real.md"
+    real_work.write_text("legit work")
+
+    # Forge a QueueItem: original_name traverses out of dead-letter/
+    forged = FilesystemQueueItem(
+        original_name="../../evil",
+        role="writer",
+        lease_token="tok",
+        claimed_at=0.0,
+        path=real_work,
+    )
+
+    # Must be a no-op: no exception raised, no file written outside dead-letter/
+    move_to_dead_letter(forged, project_root, reason="x")
+
+    # Nothing must appear outside queue/dead-letter/
+    escaped_queue = project_root / "queue" / "evil.reason.txt"
+    escaped_project = project_root / "evil.reason.txt"
+    escaped_tmp = tmp_path / "evil.reason.txt"
+    assert not escaped_queue.exists(), (
+        "shim move_to_dead_letter wrote reason.txt outside dead-letter/ (queue/)"
+    )
+    assert not escaped_project.exists(), (
+        "shim move_to_dead_letter wrote reason.txt outside dead-letter/ (project/)"
+    )
+    assert not escaped_tmp.exists(), (
+        "shim move_to_dead_letter wrote reason.txt outside project entirely"
+    )
+    # The shim must not raise
+    # (no assert needed — if it raised, the test would have failed above)
+
+
+def test_shim_release_forged_original_name_contained(tmp_path):
+    """_cascade.release_claim with a forged original_name MUST NOT move any file
+    outside done/ even when the shim calls _release_at_path directly.
+
+    Same bypass class as test_shim_move_to_dead_letter_forged_original_name_contained:
+    original_name validation was only in the Protocol public method, not the sink.
+    """
+    from atomic_agents._cascade import release_claim
+
+    project_root = tmp_path / "project"
+    # Plant a real claimed work file
+    claimed_dir = project_root / "queue" / "claimed" / "tok"
+    claimed_dir.mkdir(parents=True)
+    real_work = claimed_dir / "real.md"
+    real_work.write_text("legit work")
+
+    # Forge a QueueItem: original_name traverses out of done/
+    forged = FilesystemQueueItem(
+        original_name="../../evil",
+        role="writer",
+        lease_token="tok",
+        claimed_at=0.0,
+        path=real_work,
+    )
+
+    # Must be a no-op: no exception raised, no file written/moved outside done/
+    release_claim(forged, project_root)
+
+    # Nothing must appear outside queue/done/
+    escaped_queue = project_root / "queue" / "evil"
+    escaped_project = project_root / "evil"
+    escaped_tmp = tmp_path / "evil"
+    assert not escaped_queue.exists(), (
+        "shim release_claim moved file outside done/ (queue/evil)"
+    )
+    assert not escaped_project.exists(), (
+        "shim release_claim moved file outside done/ (project/evil)"
+    )
+    assert not escaped_tmp.exists(), (
+        "shim release_claim moved file outside project entirely"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FIX #4 — bare-component validation for role and lease_token at claim_next()
+# (forward-nested components like 'a/b' escape the one-level scan of list_claimed,
+# leaving an unrecoverable claim after a crash)
+
+
+def test_claim_next_rejects_nested_lease_token(tmp_path):
+    """claim_next() with a forward-nested lease_token (e.g. 'a/b') MUST return None
+    and must NOT create a nested claimed/a/ directory or move any queued file.
+
+    A nested lease_token is not a traversal attack (no escape via '..'), but it
+    hides the claim from list_claimed()'s one-level scan of claimed/, so a crash
+    leaves the item permanently unrecoverable.  The fix validates lease_token is a
+    bare component (no path separators) before creating any directory.
+    """
+    project_root = tmp_path / "project"
+    _queued(project_root, role="writer", name="task.md", content="work")
+    backend = FilesystemQueueBackend(project_root)
+
+    result = backend.claim_next("writer", "a/b")
+
+    assert result is None, (
+        f"claim_next() accepted a forward-nested lease_token 'a/b': {result}"
+    )
+    # No nested directory must have been created under claimed/
+    nested_dir = project_root / "queue" / "claimed" / "a"
+    assert not nested_dir.exists(), (
+        "claim_next() created claimed/a/ for a nested lease_token 'a/b'"
+    )
+    # The queued item must be untouched
+    assert (project_root / "queue" / "queued" / "writer" / "task.md").exists(), (
+        "claim_next() with a bad lease_token removed the queued item"
+    )
+
+
+def test_claim_next_rejects_nested_role(tmp_path):
+    """claim_next() with a forward-nested role (e.g. 'a/b') MUST return None and
+    must NOT escape into queued/a/ or create any nested directory.
+
+    Same class as test_claim_next_rejects_nested_lease_token but for the role
+    component: 'a/b' as role would compose to queue/queued/a/b/ instead of the
+    expected one-level queue/queued/<role>/, potentially hiding items from
+    recovery or allowing surprising path construction.
+    """
+    project_root = tmp_path / "project"
+    # Plant a legit item for a real role so we can confirm it's untouched.
+    _queued(project_root, role="writer", name="task.md", content="work")
+    backend = FilesystemQueueBackend(project_root)
+
+    result = backend.claim_next("a/b", "lease-1")
+
+    assert result is None, (
+        f"claim_next() accepted a forward-nested role 'a/b': {result}"
+    )
+    # No nested directory must have been created under queued/ for the bad role
+    nested_queued = project_root / "queue" / "queued" / "a"
+    assert not nested_queued.exists(), (
+        "claim_next() created queued/a/ for a nested role 'a/b'"
+    )
+    # The legitimate writer item is untouched
+    assert (project_root / "queue" / "queued" / "writer" / "task.md").exists(), (
+        "claim_next() with a bad role removed a legitimate queued item"
+    )

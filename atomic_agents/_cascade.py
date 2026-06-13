@@ -302,12 +302,15 @@ def release_claim(item: "QueueItem", project_root: Path) -> None:
         queue_root = backend._queue_root()
     except PathTraversalError:
         return
-    backend._release_at_path(
-        item.path,
-        queue_root,
-        item.lease_token,
-        item.original_name,
-    )
+    try:
+        backend._release_at_path(
+            item.path,
+            queue_root,
+            item.lease_token,
+            item.original_name,
+        )
+    except PathTraversalError:
+        return
 
 
 def move_to_dead_letter(
@@ -340,13 +343,16 @@ def move_to_dead_letter(
         queue_root = backend._queue_root()
     except PathTraversalError:
         return
-    backend._dead_letter_at_path(
-        item.path,
-        queue_root,
-        item.lease_token,
-        item.original_name,
-        reason,
-    )
+    try:
+        backend._dead_letter_at_path(
+            item.path,
+            queue_root,
+            item.lease_token,
+            item.original_name,
+            reason,
+        )
+    except PathTraversalError:
+        return
 
 
 def recover_stale_claims(

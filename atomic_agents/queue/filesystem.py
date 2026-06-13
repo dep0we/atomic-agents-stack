@@ -143,33 +143,46 @@ def _sidecar_path(work_file: Path) -> Path:
     return work_file.parent / (work_file.name + ".lease.json")
 
 
+def _validate_bare_component(value: str, label: str) -> None:
+    """Reject a caller-supplied path component that is not a bare filename.
+
+    A valid bare component must be a single path component with no separators,
+    not empty, and not the reserved names '.' or '..'.  Any of those conditions
+    would allow a traversing value (e.g. 'a/b' or '../../evil') to compose into
+    a path that escapes its containing directory when concatenated with a base dir.
+
+    Used for original_name, role, and lease_token — all caller-supplied values
+    that are appended to directory paths at the sink layer.
+
+    Args:
+        value: the caller-supplied string to validate.
+        label: a human-readable field label for the error message (e.g.
+            "original_name", "role", "lease_token").
+
+    Raises:
+        PathTraversalError: when value contains path separators, is empty,
+            or is '.' or '..'.
+    """
+    if not value or value in (".", "..") or value != Path(value).name:
+        raise PathTraversalError(
+            f"{label} must be a bare filename (no path separators, not empty, "
+            f"not '.' or '..')",
+            child=value,
+            root=f"<{label} validation>",
+        )
+
+
 def _validate_original_name(original_name: str) -> None:
     """Reject original_name values that contain path separators or are reserved names.
 
-    original_name is a caller-supplied path component that gets appended to
-    directory paths (done/<token>/<original_name>, dead-letter/<token>/
-    <original_name>.reason.txt, claimed/<token>/<original_name>.lease.json).
-    Without this check a traversing value like '../../evil' composes into a path
-    that escapes its containing directory.
-
-    A valid original_name must be a bare filename: a single path component with
-    no separators, not empty, and not the reserved names '.' or '..'.
+    Delegates to _validate_bare_component.  Kept as a named alias so
+    existing call sites remain readable and test names stay descriptive.
 
     Raises:
         PathTraversalError: when original_name contains path separators, is empty,
             or is '.' or '..'.
     """
-    if (
-        not original_name
-        or original_name in (".", "..")
-        or original_name != Path(original_name).name
-    ):
-        raise PathTraversalError(
-            "original_name must be a bare filename (no path separators, not empty, "
-            "not '.' or '..')",
-            child=original_name,
-            root="<original_name validation>",
-        )
+    _validate_bare_component(original_name, "original_name")
 
 
 def _write_sidecar(
@@ -374,6 +387,8 @@ class FilesystemQueueBackend:
         See module docstring for the full atomicity contract.
         """
         try:
+            _validate_bare_component(role, "role")
+            _validate_bare_component(lease_token, "lease_token")
             queue_root = self._queue_root()
             queued_dir = self._safe_under_queue(queue_root, "queued", role)
             claimed_dir = self._safe_under_queue(queue_root, "claimed", lease_token)
@@ -432,7 +447,6 @@ class FilesystemQueueBackend:
         is in done/ is harmless — no recovery code looks there.
         """
         try:
-            _validate_original_name(original_name)
             queue_root = self._queue_root()
             claimed_dir = self._safe_under_queue(queue_root, "claimed", lease_token)
         except PathTraversalError:
@@ -461,8 +475,16 @@ class FilesystemQueueBackend:
         work file at any depth — a normally claimed item under claimed/<token>/
         AND a recovered item under queued/_recovered/<token>/. Reconstructing
         claimed/<token>/<name> here would FileNotFoundError on recovered items.
+
+        Validates original_name and lease_token at the sink so both the Protocol
+        entry point AND any direct caller (e.g. the _cascade.py shim) are covered.
+        A traversing original_name or nested lease_token raises PathTraversalError;
+        the Protocol method's try/except and the _cascade.py shim's try/except both
+        handle it as a no-op.
         """
         try:
+            _validate_original_name(original_name)
+            _validate_bare_component(lease_token, "lease_token")
             done_dir = FilesystemQueueBackend._safe_under_queue(
                 queue_root, "done", lease_token
             )
@@ -491,7 +513,6 @@ class FilesystemQueueBackend:
         An orphaned sidecar in dead-letter/ is harmless.
         """
         try:
-            _validate_original_name(original_name)
             queue_root = self._queue_root()
             claimed_dir = self._safe_under_queue(queue_root, "claimed", lease_token)
         except PathTraversalError:
@@ -525,8 +546,15 @@ class FilesystemQueueBackend:
         worked for a work file at any depth, including a recovered item under
         queued/_recovered/<token>/. Reconstructing claimed/<token>/<name> here
         would FileNotFoundError on recovered items.
+
+        Validates original_name and lease_token at the sink so both the Protocol
+        entry point AND any direct caller (e.g. the _cascade.py shim) are covered.
+        A traversing original_name or nested lease_token raises PathTraversalError;
+        callers catch it as a no-op.
         """
         try:
+            _validate_original_name(original_name)
+            _validate_bare_component(lease_token, "lease_token")
             dl_dir = FilesystemQueueBackend._safe_under_queue(
                 queue_root, "dead-letter", lease_token
             )
@@ -563,21 +591,27 @@ class FilesystemQueueBackend:
         the _cascade.py implementation. See _write_sidecar docstring.
         """
         try:
-            _validate_original_name(original_name)
             queue_root = self._queue_root()
             claimed_dir = self._safe_under_queue(queue_root, "claimed", lease_token)
         except PathTraversalError:
             return
 
         sidecar = claimed_dir / (original_name + ".lease.json")
-        self._renew_lease_at_sidecar(
-            sidecar, lease_token=lease_token, additional_seconds=additional_seconds
-        )
+        try:
+            self._renew_lease_at_sidecar(
+                sidecar,
+                lease_token=lease_token,
+                original_name=original_name,
+                additional_seconds=additional_seconds,
+            )
+        except PathTraversalError:
+            return
 
     @staticmethod
     def _renew_lease_at_sidecar(
         sidecar: Path,
         lease_token: str,
+        original_name: str = "",
         additional_seconds: int | None = None,
     ) -> None:
         """Renew (read-modify-write) the lease sidecar at an explicit path.
@@ -590,9 +624,23 @@ class FilesystemQueueBackend:
         queued/_recovered/). The _cascade.py shim passes _sidecar_path(item.path)
         here; the Protocol renew_lease() passes the canonical claimed/ location.
 
+        original_name is validated when provided (non-empty): a traversing name
+        would compose into a path escaping the sidecar's directory if used as a
+        filename component.  The _cascade.py shim derives the sidecar path from
+        _sidecar_path(item.path) (no name concatenation), so it passes "" and
+        skips the validation — consistent with its pre-carve any-depth semantics.
+        The Protocol renew_lease() always supplies original_name.
+
         NOTE: Uses raw Path.write_text() — behavior-neutral carve. See
         _write_sidecar docstring.
+
+        Raises:
+            PathTraversalError: when original_name is provided and is not a bare
+                filename (no separators, not empty, not '.' or '..').
         """
+        if original_name:
+            _validate_original_name(original_name)
+
         if sidecar.is_file():
             try:
                 data = json.loads(sidecar.read_text(encoding="utf-8"))
