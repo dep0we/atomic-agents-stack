@@ -1,6 +1,6 @@
 # spec/41: GoalBackend Protocol
 
-> **Status:** DRAFT — Protocol scaffold: #425 PR1 (2026-06-11); write-path adoption: #448 PR1 (2026-06-13). Lock ceremony deferred to #448 PR3 (arc-closer). Conformance suite covers all 9 Implementer Contract MUSTs for `FilesystemGoalBackend` (`test_goal_backend_conformance.py`) plus filesystem-specific tests (`test_goal_filesystem.py`). Goal is also registered in the shared #379 export conformance harness (`test_export_protocol_conformance.py`) and the capability-advertisement harness (`test_export_capability_advertisement.py`: 2 goal-specific tests — `test_goal_backend_advertises_canonical_export`, `test_goal_backend_is_exportable` — plus the shared `test_all_capability_flags_are_bool` parametrization extended to cover goal). The four pre-existing goal tests (`test_goal.py`, `test_agent_goal_loading.py`, `test_dashboard_goals.py`, `test_goal_outcome_composition.py`) remain the zero-behavior-change regression guard; archive golden assertions updated in #448 PR1 for the A3 data-loss fix (the one sanctioned exception to the freeze).
+> **Status:** LOCKED — Protocol scaffold: #425 PR1 (2026-06-11); write-path adoption: #448 PR1 (2026-06-13); audit + CAS conformance: #448 PR2 (2026-06-13); coordinator + fail-closed cost gate + spec/41 LOCK: #448 PR3 (2026-06-13). Conformance suite covers all 10 Implementer Contract MUSTs for `FilesystemGoalBackend` (`test_goal_backend_conformance.py`, 56 tests) plus filesystem-specific tests (`test_goal_filesystem.py`) and coordinator integration tests (`test_goal_coordinator.py`, 15 tests). Goal is also registered in the shared #379 export conformance harness (`test_export_protocol_conformance.py`) and the capability-advertisement harness (`test_export_capability_advertisement.py`: 2 goal-specific tests — `test_goal_backend_advertises_canonical_export`, `test_goal_backend_is_exportable` — plus the shared `test_all_capability_flags_are_bool` parametrization extended to cover goal). The four pre-existing goal tests (`test_goal.py`, `test_agent_goal_loading.py`, `test_dashboard_goals.py`, `test_goal_outcome_composition.py`) remain the zero-behavior-change regression guard (assertions unchanged); archive golden assertions updated in #448 PR1 for the A3 data-loss fix (the one sanctioned exception to the freeze), and the `test_goal_outcome_composition.py` `agent_with_goal` fixture gained a minimal `persona/IDENTITY.md` in #448 PR3 so the shim can construct the real `AtomicAgent` the now-live cost gate requires (fixture-only; every assertion is byte-identical).
 
 ---
 
@@ -18,9 +18,11 @@ The motivation: `goal.py` held GoalManager (a runtime object), Goal/SubGoal data
 
 ---
 
-## Shipping plan (1 PR)
+## Shipping plan (3 PRs — all merged)
 
-- **PR 1 (this PR).** Protocol scaffold + dataclasses + capability advertisement + `FilesystemGoalBackend` reference impl + compatibility re-export (`goal.py` → `goal/` package; the documented `from atomic_agents.goal import GoalManager` path stays a **supported** public import, NOT deprecated — no `DeprecationWarning` is emitted because the path is intentionally permanent) + `GoalManager` relocated to `_goal_impl.py` + single shared `validate_goal()`/constants in `goal/types.py` + `GoalExport` (an `ExportableResult` subclass) wired into `atomic_agents.export` + `check_goal_backend()` doctor check + full conformance suite + filesystem-specific tests + spec/41 DRAFT. Goal-outcome composition (a coordinator wiring `GoalBackend` + `OutcomeRunner` with a pre-dispatch cost gate) is deferred to a follow-up that wires the backend into the runtime, with its own tests — it is NOT part of this scaffolding PR.
+- **PR 1 (#487).** Protocol scaffold + dataclasses + capability advertisement + `FilesystemGoalBackend` reference impl + compatibility re-export (`goal.py` → `goal/` package; the documented `from atomic_agents.goal import GoalManager` path stays a **supported** public import, NOT deprecated — no `DeprecationWarning` is emitted because the path is intentionally permanent) + `GoalManager` relocated to `_goal_impl.py` + single shared `validate_goal()`/constants in `goal/types.py` + `GoalExport` (an `ExportableResult` subclass) wired into `atomic_agents.export` + `check_goal_backend()` doctor check + full conformance suite + filesystem-specific tests + spec/41 DRAFT. Goal-outcome composition deferred to PR 3.
+- **PR 2 (#490).** Write-path adoption: `dispatch_as_outcome()` routed through `backend.save_goal` + `backend.append_history_event` (A3 data-loss fix, golden test updates); `AtomicAgent(goal_backend=...)` constructor kwarg + `AtomicAgent.goal_backend` attribute; audit-ordering test (`test_goal_dispatch_audit_ordering.py`, 2 tests); golden-test regression suite (`test_goal_adoption_golden.py`, 4 tests).
+- **PR 3 (#448 PR3, this PR).** Goal-outcome coordinator (`goal/coordinator.py` — thin free function `dispatch_sub_goal_as_outcome()`); fail-closed cost gate (`CostGuardrailBlocked`); compare-and-set `apply_transition()` (`expected_from_status` param, `GoalConcurrentModification`); `dispatch_as_outcome()` refactored to a thin shim; coordinator integration tests (`test_goal_coordinator.py`, 15 tests); 2 CAS conformance tests (TEST 54–55, total 56 conformance tests); spec/41 LOCKED.
 
 ---
 
@@ -46,7 +48,11 @@ atomic_agents/goal/
 │                      # the single validate_goal()/validate_agent_mode() +
 │                      # the goal constants (CURRENT_GOAL_SCHEMA_VERSION, …)
 ├── backend.py         # GoalBackend Protocol (@runtime_checkable)
-└── filesystem.py      # FilesystemGoalBackend reference implementation
+├── filesystem.py      # FilesystemGoalBackend reference implementation
+└── coordinator.py     # dispatch_sub_goal_as_outcome() — thin free function
+                       # composing GoalBackend + OutcomeRunner with a
+                       # pre-dispatch fail-closed cost gate; NOT a Protocol
+                       # method (needs both backend AND runtime)
 
 atomic_agents/_goal_impl.py   # GoalManager (runtime behavior); imports the
                                # canonical types + the single validate_goal()
@@ -105,6 +111,7 @@ class GoalBackend(Protocol):
         fields: dict[str, Any],
         history_prose: str,
         history_event: dict[str, Any],
+        expected_from_status: str | None = None,  # MUST 10 — CAS guard
     ) -> Goal: ...
     def append_history_event(
         self, agent_id: str, event: dict[str, Any]
@@ -144,9 +151,9 @@ class GoalBackend(Protocol):
 
 ---
 
-## Implementer Contract (9 MUSTs)
+## Implementer Contract (10 MUSTs)
 
-These MUSTs bind every conforming GoalBackend implementation. The conformance test suite in `tests/test_goal_backend_conformance.py` covers all nine.
+These MUSTs bind every conforming GoalBackend implementation. The conformance test suite in `tests/test_goal_backend_conformance.py` covers all ten (56 tests total, including 2 CAS tests at TEST 54–55).
 
 ### MUST 1 — Side-effect-free construction
 
@@ -184,6 +191,21 @@ These MUSTs bind every conforming GoalBackend implementation. The conformance te
 
 **MUST 9 (idempotency on retry-after-unlink):** The idempotency condition is — no `goal.md` present AND at least one archive file present. Under that condition, `archive_goal()` MUST return the most-recently-modified archive slug in `goal_archive/` without writing a second file, rather than raising. This handles the retry-after-crash case (a prior partial run completed the unlink step). With no `goal.md` present the intent slug cannot be reconstructed, so the newest archive is returned; this is a best-effort retry guard, correct for the common single-goal case. (Per-goal exactness for agents that have archived many goals over their lifetime is tracked as a follow-up; it does not change the Protocol contract.)
 
+### MUST 10 — `apply_transition()` compare-and-set guard (CAS)
+
+When the optional `expected_from_status` parameter is supplied (not `None`), `apply_transition()` MUST:
+
+1. Re-read the sub-goal's current `status` from durable storage **under the same lock** used for the write (i.e., after acquiring `fcntl.flock` on the filesystem reference impl, before any mutation).
+2. Compare the on-disk status against `expected_from_status`.
+3. If they differ, raise `GoalConcurrentModification` **with no write to goal.md and no JSONL append** — the lock is released, the goal state is identical to before the call.
+4. If they match, proceed with the normal `apply_transition()` write path.
+
+This closes the TOCTOU window in the goal-outcome coordinator: the coordinator pre-transitions the sub-goal `pending → in_progress`, then runs `OutcomeRunner` (without holding the goal lock), then calls the terminal `apply_transition(expected_from_status='in_progress')`. If a concurrent writer moved the sub-goal to `complete` (or any other non-`in_progress` status) during the run, the terminal transition MUST be rejected — not silently applied over the concurrent write.
+
+`expected_from_status=None` (the default) is backward-compatible: existing callers that do not pass the parameter get the pre-MUST-10 behavior (no CAS check, no `GoalConcurrentModification` risk).
+
+The conformance suite pins both the match path (TEST 54, transition succeeds) and the mismatch path (TEST 55, `GoalConcurrentModification` raised, goal.md bytes identical before/after, no orphan JSONL line, sub-goal status unchanged).
+
 ---
 
 ## `apply_transition()` JSONL key ordering
@@ -206,13 +228,25 @@ All bytes are **Tier A passthrough** (spec/40 §"Tier A passthrough"): the backe
 
 ---
 
-## Goal-outcome composition (coordinator deferred to #448 PR3)
+## Goal-outcome composition (coordinator shipped in #448 PR3)
 
-As of #448 PR1 (write-path adoption), `GoalManager.dispatch_as_outcome()` routes its `save()` through `backend.save_goal` and its `_append_goal_history_jsonl` through `backend.append_history_event` (coarse-route adoption). The terminal-status mapping (`apply_transition` calls for coordinator-managed transitions) and the pre-dispatch cost gate remain deferred to #448 PR3.
+`GoalManager.dispatch_as_outcome()` is now a thin shim that delegates to `dispatch_sub_goal_as_outcome()` in `goal/coordinator.py`. The coordinator is a thin free function (NOT a `GoalBackend` method) that composes the backend with `OutcomeRunner` and enforces the pre-dispatch fail-closed cost gate. The cost gate is **live on the CLI path** (`python -m atomic_agents.goal dispatch-outcome`): the shim constructs a real `AtomicAgent` (keyword args `name`/`agents_root`/`goal_backend`, outside any try/except so a construction failure propagates) and passes it to the coordinator, so the gate consults the same budget universe (model.md caps) the `OutcomeRunner` will spend. A `CostGuardrailBlocked` propagates to the CLI as exit 3.
 
-A future PR (#448 PR3, the arc-closer) will add a goal-outcome coordinator — a thin function (not a `GoalBackend` method) that composes the backend with `OutcomeRunner`, adding a pre-dispatch cost gate (`_check_cost_guardrails(critical=False)` → raise `CostGuardrailBlocked` on a blocked cap), the `pending → in_progress` pre-transition via `apply_transition`, the outcome run (without holding the goal lock), and the terminal transition via `apply_transition`. It is deferred rather than shipped here because (a) shipping an un-wired, parallel copy of the cost-guardrail path risks silent drift from the live gate (CLAUDE.md Principle #4), and (b) `apply_transition` uses `date.today()` internally — wiring dispatch through it before the coordinator clock-injection design is settled would break the golden tests.
+1. **Validation.** Sub-goal must be `pending` or `in_progress`; `blocked_by` (if set) must reference a `complete` sub-goal.
+2. **Cost gate (fail-closed, Principle #4).** `result = agent._check_cost_guardrails(critical=False)`. Read `result.allow` as a dataclass attribute (NOT 2-tuple). If `not result.allow`: append the `coordinator_dispatch_rejected` event to `goal_history.jsonl` FIRST (audit-before-raise ordering), then raise `CostGuardrailBlocked(result.reason)`. Sub-goal stays `pending`; `OutcomeRunner` is never called. The `coordinator_dispatch_rejected` event field set is `{ts, event: "coordinator_dispatch_rejected", sub_goal_id, reason}` (`reason` is `CostCheckResult.reason`); the event name deliberately omits the `blocked` substring so `dashboard/goals.py`'s substring match does not stamp a spurious `blocked_at`. If the append itself fails (IO error), the IO error propagates as a distinct error from `CostGuardrailBlocked` — the coordinator does NOT dispatch after a failed audit write (fail-closed: never pretend the block was audited).
+3. **Pre-transition (if pending).** `apply_transition(to_status='in_progress', event='sub_goal_outcome_started')`. Lock released after write. In-memory `goal_manager._goal` updated to the returned `Goal` so callers see `in_progress` during the run.
+4. **Run.** `OutcomeRunner(...).run(...)` — no goal lock held during the LLM calls.
+5. **Terminal transition.** `apply_transition(to_status=<mapped>, expected_from_status='in_progress', history_event={"event": "sub_goal_outcome_dispatched", outcome_run_id, terminal_state, applied_status, iterations, total_cost_usd, ts})`. CAS guard (MUST 10) rejects concurrent modifications that moved the sub-goal off `in_progress` during the run.
 
-The coordinator will NOT be a `GoalBackend` method: it needs both the backend AND the runtime (`AtomicAgent`, `OutcomeRunner`) simultaneously, and making it a Protocol method would invert the dependency direction (the backend must not depend on the runtime).
+**Terminal-state mapping:**
+| `OutcomeResult.status` | `applied_status` (sub-goal `to_status`) | `fields` |
+|---|---|---|
+| `satisfied` | `complete` | `completed=today` |
+| `max_iterations_reached` | `blocked` | `blocked_by=None` |
+| `failed` | `blocked` | `blocked_by=None` |
+| `interrupted` | `in_progress` | `{}` (stays in_progress; CAS passes) |
+
+The coordinator is NOT a `GoalBackend` method: it needs both the backend AND the runtime (`AtomicAgent`, `OutcomeRunner`) simultaneously, and making it a Protocol method would invert the dependency direction (the backend must not depend on the runtime). A lazy in-function import of `OutcomeRunner` guards the `goal/` bootstrap cycle (`goal/__init__.py`'s `__getattr__` lazy loader); `AtomicAgent` is passed in by the caller (the shim constructs it) and is never imported in the coordinator.
 
 ---
 
