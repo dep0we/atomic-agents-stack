@@ -22,8 +22,8 @@ contributor reconciling code-to-spec lands on the right requirement.
   TEST 10 — export() returns OutcomeExport type (spec/42 export contract)
   TEST 11 — export() returns empty OutcomeExport when no runs (spec/42 export contract)
   TEST 12 — export() all equals export(None) (spec/42 export contract)
-  TEST 13 — export() artifact_refs are relative-to-agent_root (spec/42 Option C)
-  TEST 14 — export() artifact outside agent_root stays absolute (spec/42 Option C fallback)
+  TEST 13 — export() artifact_refs are relative-to-agent_root (spec/42 §Artifact-reference portability)
+  TEST 14 — export() artifact outside agent_root stays absolute (spec/42 §Artifact-reference portability fallback)
   TEST 15 — export() result_json_bytes is byte-identical to written file (spec/42 MUST 9/Tier B)
   TEST 16 — OutcomeResult/IterationRecord are mutable (spec/42 mutable-dataclass note)
   TEST 17 — OutcomeCapabilities is frozen (spec/42 MUST 2)
@@ -47,12 +47,12 @@ contributor reconciling code-to-spec lands on the right requirement.
   TEST 35 — doctor.check_outcome_backend returns PASS with runs + dual-probe
   TEST 36 — doctor.check_outcome_backend returns FAIL for bad env var
   TEST 37 — export() corrupt-but-present JSON: bytes preserved, refs empty
-  TEST 38 — export() resolve-both-sides symlink rebases to relative (Option C)
+  TEST 38 — export() resolve-both-sides symlink rebases to relative (artifact-reference portability)
   TEST 39 — get_default_outcome_backend() unknown env var raises BackendNotRegistered
   TEST 40 — doctor.check_outcome_backend list_runs() raises → FAIL (light probe)
   TEST 41 — doctor.check_outcome_backend read_result() corrupt → FAIL (heavy probe)
   TEST 42 — doctor.check_outcome_backend vanished-run TOCTOU benign → PASS
-  TEST 43 — AtomicAgent.outcome_backend scaffolding wiring (agent.py #426 PR1)
+  TEST 43 — AtomicAgent.outcome_backend per-agent handle wiring (agent.py)
   TEST 44 — doctor.check_outcome_backend read_result() unexpected error → FAIL
 
 PARAMETRIZATION: protocol-behavior tests use the ``backend`` / ``backend_with_result``
@@ -366,7 +366,7 @@ def test_list_runs_excludes_dir_without_result_json(backend) -> None:
 
 
 # TEST 8d — export() de-dupes an artifact referenced by both output_files and an
-# iteration artifact_path into exactly one ref (load-bearing for Option C).
+# iteration artifact_path into exactly one ref (load-bearing for artifact-reference portability).
 
 
 def test_export_dedupes_repeated_artifact_to_one_ref(backend) -> None:
@@ -587,7 +587,7 @@ def test_export_all_is_single_most_recent_run_with_multiple_runs(backend) -> Non
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# TEST 13 — export() artifact_refs are relative-to-agent_root (spec/42 Option C)
+# TEST 13 — export() artifact_refs are relative-to-agent_root (spec/42 §Artifact-reference portability)
 
 
 def test_export_artifact_refs_are_relative(tmp_path: Path) -> None:
@@ -629,7 +629,7 @@ def test_export_artifact_refs_are_relative(tmp_path: Path) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# TEST 14 — export() artifact outside agent_root stays absolute (spec/42 Option C fallback)
+# TEST 14 — export() artifact outside agent_root stays absolute (spec/42 §Artifact-reference portability fallback)
 
 
 def test_export_artifact_outside_agent_root_stays_absolute(tmp_path: Path) -> None:
@@ -881,7 +881,7 @@ def test_empty_env_var_uses_filesystem_default(tmp_path: Path, monkeypatch) -> N
 def test_golden_file_byte_identity(tmp_path: Path) -> None:
     """write_result() MUST produce byte-identical JSON to the existing runner.
 
-    This test verifies the Option C ruling: on-disk result.json STAYS
+    This test verifies the artifact-reference-portability ruling: on-disk result.json STAYS
     byte-identical to what OutcomeRunner._write_result_json() produces.
 
     The reference bytes are produced by the REAL production serializer
@@ -925,7 +925,7 @@ def test_golden_file_byte_identity(tmp_path: Path) -> None:
 
     assert actual_bytes == expected_bytes, (
         "write_result() MUST produce byte-identical JSON to the REAL runner's "
-        "_write_result_json() (artifact-reference-portability Option C ruling). "
+        "_write_result_json() (artifact-reference-portability ruling). "
         "If this fails, write_result() and OutcomeRunner._write_result_json have "
         "diverged — the zero-behavior-change guarantee is broken."
     )
@@ -1149,7 +1149,7 @@ def test_export_resolve_both_sides_symlink_rebases_relative(tmp_path: Path) -> N
     This pins the comparison-only .resolve() on BOTH sides (filesystem.py
     ~258-274): without it, a symlinked /tmp (macOS /tmp → /private/tmp) or an
     unresolved agents_root would silently fall back to a non-portable absolute
-    ref. This is the load-bearing 'Option C artifact portability' guard.
+    ref. This is the load-bearing artifact-reference-portability guard.
     """
     real = tmp_path / "real"
     real.mkdir()
@@ -1332,16 +1332,19 @@ def test_doctor_check_outcome_backend_unexpected_read_error_fail(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# TEST 43 — AtomicAgent.outcome_backend scaffolding wiring (agent.py #426 PR1)
+# TEST 43 — AtomicAgent.outcome_backend per-agent handle wiring (agent.py)
 
 
 def test_agent_outcome_backend_attribute_is_wired(tmp_path: Path, monkeypatch) -> None:
     """AtomicAgent.__init__ MUST set self.outcome_backend to a backend instance.
 
-    Scaffolding-only wiring (#426 PR1): the attribute is SET (read-only
-    inspection + doctor access) but NOT invoked from any call path until #448.
-    This pins that the public attribute exists and resolves to the filesystem
-    default so the #448 write-path wiring has a stable handle to build on.
+    Per-agent handle wiring: `AtomicAgent.outcome_backend` is the per-agent
+    inspection/coordinator HANDLE (set at construction, resolves to the
+    filesystem default + doctor access). It is NOT the live write path — that
+    is `OutcomeRunner.outcome_backend`, exercised by TEST 30 and the goldens in
+    `test_outcome_adoption_golden.py` (#448 PR2). This test pins that the public
+    attribute exists and resolves to the filesystem default so the PR3
+    coordinator handoff has a stable handle to build on.
     """
     from atomic_agents.agent import AtomicAgent
 
