@@ -223,10 +223,11 @@ def get_default_outcome_backend(agent_root: Path) -> OutcomeBackend:
 
     Programmatic operators who want to construct the backend themselves can
     instantiate FilesystemOutcomeBackend(agents_root, agent_name) directly,
-    bypassing this factory. (An OutcomeRunner(..., outcome_backend=...) constructor
-    kwarg that bypasses this factory is deferred to #448; the OutcomeRunner does
-    not accept outcome_backend today. AtomicAgent.outcome_backend is scaffolding-
-    only in this PR — read-only inspection; all write-path wiring ships in #448.)
+    bypassing this factory. As of #448 PR2, OutcomeRunner accepts outcome_backend=
+    as a keyword-only kwarg and routes its write path through the backend.
+    AtomicAgent.outcome_backend is the per-agent public handle for operator
+    inspection and the PR3 coordinator — it is NOT the write path. `write_result`
+    is called via OutcomeRunner.outcome_backend, not via AtomicAgent.outcome_backend.
 
     Returns:
         An OutcomeBackend instance scoped to agent_root.

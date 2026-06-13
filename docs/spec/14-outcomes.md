@@ -2,7 +2,7 @@
 
 The iterate-to-rubric primitive: the agent drafts, the judge grades, the loop continues until the rubric is satisfied or the iteration cap is hit.
 
-> **Storage abstraction (spec/42).** This spec is the **behavioral contract** for the outcome loop — the `result.json` envelope (iteration history, judge verdicts, artifact paths, aggregate cost/tokens, final status), the run directory layout, and the iterate-to-rubric semantics an agent author relies on. **How** `result.json` is read, written, and exported is defined by the `OutcomeBackend` Protocol in [42-outcome-backend.md](42-outcome-backend.md): `write_result()`, `read_result()`, `list_runs()`, and the spec/40 canonical export. The default `FilesystemOutcomeBackend` reads and writes exactly the on-disk `result.json` shape this spec describes with **byte-identical** output (zero behavior change); alternate backends (Postgres, cloud object store) may swap the storage while preserving this behavioral contract. Read spec/14 for what the outcome loop DOES and what `result.json` CONTAINS; read spec/42 for how it is ACCESSED.
+> **Storage abstraction (spec/42).** This spec is the **behavioral contract** for the outcome loop — the `result.json` envelope (iteration history, judge verdicts, artifact paths, aggregate cost/tokens, final status), the run directory layout, and the iterate-to-rubric semantics an agent author relies on. **How** `result.json` is read, written, and exported is defined by the `OutcomeBackend` Protocol in [42-outcome-backend.md](42-outcome-backend.md): `write_result()`, `read_result()`, `list_runs()`, and the spec/40 canonical export. The default `FilesystemOutcomeBackend` reads and writes exactly the on-disk `result.json` shape this spec describes with **byte-identical** output for the default `output_dir` case; as of #448 PR2, a custom `--output-dir` causes `result.json` to relocate to the canonical `outcomes/runs/<run_id>/result.json` (the audit envelope always belongs with the run — agent artifact files still go to the custom dir). Alternate backends (Postgres, cloud object store) may swap the storage while preserving this behavioral contract. Read spec/14 for what the outcome loop DOES and what `result.json` CONTAINS; read spec/42 for how it is ACCESSED.
 
 ---
 
@@ -142,14 +142,14 @@ Costs from all iterations are aggregated in `OutcomeResult.total_cost_usd`.
 ├── outcomes/
 │   └── runs/
 │       └── <run_id>/
-│           ├── result.json          ← full OutcomeResult, for replay/audit
-│           └── <any files the agent wrote>
+│           ├── result.json          ← full OutcomeResult, for replay/audit (ALWAYS canonical)
+│           └── <any files the agent wrote>  ← default; custom --output-dir moves artifacts elsewhere
 └── log/
     └── YYYY-MM/
         └── YYYY-MM-DD.jsonl         ← per-iteration records (trigger: outcome_iteration)
 ```
 
-The per-iteration log records follow the same JSONL format as other agent log records (spec/09), with `trigger: outcome_iteration` so cost dashboards can roll them up.
+`result.json` ALWAYS lands at `outcomes/runs/<run_id>/result.json` regardless of `--output-dir` (as of #448 PR2). Agent artifact files go to `output_dir` (default: same `<run_id>/` directory; custom: wherever the operator pointed it). The per-iteration log records follow the same JSONL format as other agent log records (spec/09), with `trigger: outcome_iteration` so cost dashboards can roll them up.
 
 ---
 
@@ -171,7 +171,7 @@ Anthropic's [Outcomes API](https://platform.claude.com/docs/en/managed-agents/de
 | **Cross-session** | Not directly (within-session loop) | Not directly (within-session loop) |
 | **Agent identity** | Any Claude model | Any AtomicAgent (Claude, GPT, Moonshot) |
 | **Cost tracking** | API billing | Per-iteration JSONL + aggregate `total_cost_usd` |
-| **Composition with goals** | Not specified | Deferred to a follow-up (goal-manager dispatch_as_outcome) |
+| **Composition with goals** | Not specified | `GoalManager.dispatch_as_outcome()` live (ships in #448 PR1; PR3 adds the coordinator + cost gate) |
 
 The primary difference is context: Anthropic's version is a hosted API feature; `atomic_agents.outcome` is a local primitive that composes with the rest of the framework — same agent identity, same memory, same cost guardrails, same rubric format the team already knows.
 

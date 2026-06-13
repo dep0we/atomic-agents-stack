@@ -5,13 +5,18 @@ on-disk shape OutcomeRunner has used since the framework's first outcome support
     <agent_root>/outcomes/runs/<run_id>/result.json  — completed run result
 
 The on-disk result.json is BYTE-IDENTICAL to what OutcomeRunner._write_result_json
-produces today — zero behavior change for existing deployments. The write_result()
-method lifts _write_result_json's asdict + Path-coercion + atomic_write logic
-verbatim (artifact-reference-portability Option C ruling: on-disk stays absolute).
+produces today for the DEFAULT output_dir (== outcomes/runs/<run_id>). The
+write_result() method lifts _write_result_json's asdict + Path-coercion +
+atomic_write logic verbatim (artifact-reference-portability ruling: on-disk stays
+absolute). NOTE: for a CUSTOM --output-dir the audit envelope now relocates to the
+canonical outcomes/runs/<run_id>/result.json per the #448 PR2 A1 ruling (the orphan-bug
+fix — agent artifact files still land in the custom dir; only result.json relocates).
+See spec/42 §"Artifact-reference portability".
 
 The export() method is NET-NEW and emits PORTABLE artifact references by rebasing
 absolute artifact paths to relative-to-AGENT_ROOT using the is_relative_to guard
-(Option C ruling). The on-disk result.json bytes are NOT changed by export().
+(artifact-reference-portability ruling). The on-disk result.json bytes are NOT
+changed by export().
 
 Construction is side-effect-free (no filesystem I/O in __init__).
 
@@ -32,7 +37,7 @@ pattern):
     relocated anywhere on disk, which is the portability property OutcomeBackend
     exists to deliver (T15 / Position B). agents_root-relative (fleet-prefixed,
     `agentname/outcomes/...`) would bake the fleet layout into the export. The
-    departure is recorded in spec/42 §"Artifact-reference portability (Option C)"
+    departure is recorded in spec/42 §"Artifact-reference portability"
     and the PR body. agents_root is therefore NOT stored — the backend is scoped
     to one agent_root, derived as agents_root / agent_name at construction.
 
@@ -172,8 +177,14 @@ class FilesystemOutcomeBackend:
             run_id: the run identifier (directory name under outcomes/runs/).
             result: the OutcomeResult to serialize.
         """
-        run_dir = self._run_dir(run_id)
-        result_path = run_dir / "result.json"
+        # Use _validated_result_path (not raw _run_dir / "result.json") so the
+        # now-live write path refuses a symlinked result.json exactly as
+        # read_result()/export() do — one containment posture across read AND
+        # write (#448 PR2: this path became load-bearing, so the asymmetry
+        # mattered). _validated_result_path only checks is_symlink(), which is
+        # False for a not-yet-written result.json, so it is safe on the write
+        # path. _run_dir inside it still refuses a symlinked/escaping run dir.
+        result_path = self._validated_result_path(run_id)
 
         # Write-once contract (spec/42 MUST 9)
         if result_path.exists():
@@ -182,10 +193,10 @@ class FilesystemOutcomeBackend:
                 f"OutcomeBackend write-once contract (spec/42 MUST 9) forbids overwrite"
             )
 
-        run_dir.mkdir(parents=True, exist_ok=True)
+        result_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Serialize — VERBATIM lift of _write_result_json logic
-        # (outcome/_outcome_impl.py:721-731) for byte-identical on-disk output.
+        # Serialize — VERBATIM lift of OutcomeRunner._write_result_json logic
+        # (in outcome/_outcome_impl.py) for byte-identical on-disk output.
         # Do NOT use to_dict() here — asdict()
         # is the base for write_result() to preserve field declaration order exactly.
         data = asdict(result)
@@ -286,8 +297,8 @@ class FilesystemOutcomeBackend:
         DELIBERATELY SINGLE-RUN: this returns ONLY the most-recent run
         (``list_runs()[-1]``), NOT every run. The ``OutcomeExport`` shape is
         single-run (one ``run_id`` + one ``result_json_bytes`` + one
-        ``artifact_refs``) for this scaffolding PR — see spec/42 §"Export
-        fidelity" for why and the spec/40 addendum cross-reference. This means
+        ``artifact_refs``) by deliberate design (see spec/42 §"Export
+        fidelity" and follow-up #454 for the multi-run export shape). This means
         ``export()``/``export_all()`` here are scoped to the latest run, NOT the
         spec/40 ``Exportable.export_all()`` "all records, no filter" wording; a
         multi-run export shape (carrying list[run]) is filed as a follow-up
@@ -407,9 +418,9 @@ class FilesystemOutcomeBackend:
         NOTE: despite the ``export_all`` name (inherited from the spec/40
         ``Exportable`` surface, where it means "all records, no filter"),
         OutcomeBackend's ``export_all()`` returns ONLY the most-recent run —
-        identical to ``export()``. The single-run ``OutcomeExport`` shape cannot
-        carry multiple runs in this scaffolding PR. See ``export()`` and spec/42
-        §"Export fidelity" for the documented divergence and follow-up #454.
+        identical to ``export()``. The single-run ``OutcomeExport`` shape is
+        deliberate by design (see spec/42 §"Export fidelity" and follow-up #454
+        for the multi-run export shape).
         """
         return self.export(None)
 

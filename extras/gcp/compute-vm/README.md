@@ -54,7 +54,7 @@ Cloud Run-adjacent topology that satisfies POSIX `rename(2)` atomicity today.
     |     |     |- log/          <- state (durable on disk; use PostgresLogBackend for query)
     |     |     |- journal/      <- state (durable on disk; JournalBackend Protocol shipped, #427/DRAFT spec/43, filesystem impl)
     |     |     |- goals/        <- state (durable on disk; GoalBackend Protocol shipped, #425/DRAFT spec/41, filesystem impl)
-    |     |     |- outcomes/     <- state (durable on disk; OutcomeBackend Protocol shipped, #426/DRAFT spec/42, filesystem impl)
+    |     |     |- outcomes/     <- state (durable on disk; OutcomeBackend Protocol shipped, #426+#448 PR2/LOCKED spec/42, write-path adopted, filesystem impl)
     |- atomic-agents serve  <- systemd unit (atomic-agents-serve.service)
     |     listening :8080
     |- Memorystore/Redis    <- LockBackend (recommended; filesystem fallback ok for single-VM)
@@ -451,7 +451,7 @@ This VM is the v0 stateful-today bridge. As backend protocols ship:
 
 - **Logs now (shipped):** activate `PostgresLogBackend` (`ATOMIC_AGENTS_LOG_BACKEND=postgres`) to move run logs off the disk to Cloud SQL.
 - **Memory (#382 + #258):** the operator override seam already shipped (#382 PR 1: set `ATOMIC_AGENTS_MEMORY_BACKEND` or `AtomicAgent(memory_backend=...)`), but only `filesystem` is registered today. Once the Postgres MemoryBackend adapter ships (#258), `ATOMIC_AGENTS_MEMORY_BACKEND=postgres` moves memory off the disk; until then that value fails fast with `BackendNotRegistered`.
-- **Goals, outcomes, journal (#425/#426/#427, shipped):** GoalBackend (DRAFT spec/41) + OutcomeBackend (DRAFT spec/42) + JournalBackend (DRAFT spec/43) Protocols shipped with filesystem reference impls; cloud adapters can now be written.
+- **Goals, outcomes, journal (#425/#426/#427 + #448 write-path, shipped):** GoalBackend (DRAFT spec/41, write-path adopted #448 PR1) + OutcomeBackend (LOCKED spec/42, write-path adopted #448 PR2) + JournalBackend (DRAFT spec/43) Protocols shipped with filesystem reference impls; cloud adapters can now be written.
 - **Cascade (#383):** when a Protocol ships for this surface, a cloud adapter can be written.
 - **After all surfaces move:** the VM's disk is empty; the stateless Cloud Run manifest (`extras/gcp/cloudrun-service.yaml`) becomes the correct topology.
 

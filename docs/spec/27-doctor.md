@@ -634,14 +634,16 @@ credential leakage from the backend URL into doctor output.
 **Verifies:** Operator-config coherence for the GoalBackend (spec/41).
 Agent-scoped because the filesystem reference impl reads from
 `<agent_root>/goal.md` and `<agent_root>/goal_archive/`. Doctor constructs
-the backend via `get_default_goal_backend(agent_root)` directly (the
-`AtomicAgent` constructor kwarg + public attribute are deferred to the #448
-runtime-wiring PR, so there is no `AtomicAgent.goal_backend` to read). Lands
+the backend via `get_default_goal_backend(agent_root)` directly (doctor does
+NOT read the agent attribute). As of #448 PR1, `AtomicAgent.goal_backend` IS a
+live-wired constructor kwarg + public attribute — but doctor still resolves its
+own backend from `agent_root` rather than reading the agent handle. Lands
 as the 13th `check_*_backend` entry by **definition order** in `doctor.py`
 in #425 PR 1. After #426 PR 1 added `check_outcome_backend` and #427 PR 1
-added `check_journal_backend`, the live grep is
-`grep -cE '^def check_[a-z_]+_backend\b'` = 15 with `check_journal_backend`
-last (see the `journal-backend` section below);
+added `check_journal_backend` (and #428 PR 1 added `check_queue_backend`),
+the live grep is
+`grep -cE '^def check_[a-z_]+_backend\b'` = 16 with `check_queue_backend`
+last (see the `queue-backend` section below);
 `check_goal_backend` is the 13th by source-definition position. NB: distinct
 from the *landed-order* counts the mcp-server-registry (13th) and secret
 (14th) entries above cite — those count ship order by PR, this counts
@@ -684,13 +686,15 @@ probe never parses the goal; URL credential leakage from
 Agent-scoped because the filesystem reference impl reads each run's
 `result.json` from under `<agent_root>/outcomes/`. Doctor constructs the
 backend via `get_default_outcome_backend(agent_root)` directly (the
-`AtomicAgent.outcome_backend` public attribute is set at construction but is
-scaffolding-only this PR — never read internally — and the `OutcomeRunner`
-write-path kwarg is deferred to the #448 runtime-wiring PR). Lands as the
+`AtomicAgent.outcome_backend` public attribute is the per-agent handle for
+operator inspection and the future #448 PR3 coordinator — NOT itself the write
+path; the live write path is `OutcomeRunner.outcome_backend`, which routes
+`OutcomeRunner.run()` through `write_result()` as of #448 PR2). Lands as the
 14th `check_*_backend` entry by **definition order** in `doctor.py` in #426
-PR 1 (after #427 PR 1 added `check_journal_backend` as the 15th,
-grep-verifiable: `grep -cE '^def check_[a-z_]+_backend\b'` = 15 with
-`check_journal_backend` last).
+PR 1 (after #427 PR 1 added `check_journal_backend` as the 15th and #428 PR 1
+added `check_queue_backend` as the 16th,
+grep-verifiable: `grep -cE '^def check_[a-z_]+_backend\b'` = 16 with
+`check_queue_backend` last).
 
 Uses the dual-probe pattern (MEMORY.md `feedback_doctor_dual_probe_pattern`):
 probes both `list_runs()` (lightweight enumeration that returns `[]` when
@@ -734,11 +738,14 @@ Agent-scoped because the filesystem reference impl reads each journal entry
 from under `<agent_root>/journal/`. Doctor constructs the backend via
 `get_default_journal_backend(agent_root)` directly (the
 `AtomicAgent.journal_backend` public attribute is LIVE-WIRED — agent._load_recent_journal
-routes through it — unlike outcome_backend which was scaffolding-only). Lands
+routes through it. The `AtomicAgent.outcome_backend` attribute, by contrast, is
+the per-agent coordinator/inspection handle rather than a read/write path — the
+outcome write path lives on `OutcomeRunner.outcome_backend`, see above). Lands
 as the 15th `check_*_backend` entry by **definition order** in `doctor.py` in
-#427 PR 1 (grep-verifiable: `grep -cE '^def check_[a-z_]+_backend\b'` = 15,
-`check_journal_backend` last — it is defined immediately after
-`check_outcome_backend`).
+#427 PR 1; #428 PR 1 then added `check_queue_backend` as the 16th
+(grep-verifiable: `grep -cE '^def check_[a-z_]+_backend\b'` = 16,
+`check_queue_backend` last — `check_journal_backend` is defined immediately
+after `check_outcome_backend`).
 
 Uses the dual-probe pattern (MEMORY.md `feedback_doctor_dual_probe_pattern`):
 probes both `list_entries(limit=1)` (lightweight list) and — only when at

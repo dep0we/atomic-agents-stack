@@ -55,6 +55,13 @@ if TYPE_CHECKING:
     from ..corpus import CorpusBackend
     from ..mcp_registry import MCPServerRegistryBackend
 
+    # OutcomeBackend is used ONLY in string annotations (kwarg + attribute type) under
+    # `from __future__ import annotations`, so it lives under TYPE_CHECKING alongside the
+    # sibling backend types. The import is cycle-free (_outcome_impl → .backend → .types,
+    # no path back) — it could sit at module level, but TYPE_CHECKING matches the in-file
+    # convention and avoids the E402 suppression.
+    from .backend import OutcomeBackend
+
 _log = logging.getLogger(__name__)
 
 # _llm imported as a MODULE so patch("atomic_agents.outcome._llm.call_llm") works:
@@ -113,6 +120,7 @@ class OutcomeRunner:
         persona_backend: "PersonaBackend | None" = None,
         corpus_backend: "CorpusBackend | None" = None,
         mcp_server_registry_backend: "MCPServerRegistryBackend | None" = None,
+        outcome_backend: OutcomeBackend | None = None,
     ):
         self.agents_root = Path(agents_root) if agents_root else get_agents_root()
         self.agent_name = agent_name
@@ -186,6 +194,32 @@ class OutcomeRunner:
                 f"Agent folder not found: {self.agent_root}. "
                 f"Set ATOMIC_AGENTS_ROOT env var or create the agent."
             )
+
+        # OutcomeBackend instance. kwarg-wins-over-env: if a backend was explicitly
+        # passed, use it; otherwise resolve via the operator-config factory (which
+        # reads ATOMIC_AGENTS_OUTCOME_BACKEND). Lazy import inside __init__ to avoid
+        # the circular import that a module-level `from . import get_default_outcome_backend`
+        # would cause (outcome/__init__.py imports _outcome_impl at module level, so a
+        # module-level import in _outcome_impl → outcome/__init__ is a cycle). Mirrors
+        # agent.py's journal_backend / goal_backend resolution (kwarg-wins-over-env,
+        # default factory, lazy import). Resolved AFTER the agent_root.exists() guard
+        # (mirrors PR1's GoalManager.__init__ ordering) so construction fails fast on a
+        # missing agent before touching the factory — Principle #4 "refuse before paying
+        # overhead". BackendNotRegistered from the factory surfaces at runner construction
+        # time (fail-fast — before any LLM spend).
+        #
+        # IMPORTANT TOPOLOGY: self.outcome_backend is THIS RUNNER'S write path.
+        # AtomicAgent.outcome_backend (initialized separately in agent.py) is the
+        # per-agent handle for the PR3 coordinator and operator inspection — it is NOT
+        # this runner's backend, and AtomicAgent does NOT feed it into OutcomeRunner.
+        if outcome_backend is None:
+            from . import get_default_outcome_backend  # noqa: PLC0415
+
+            self.outcome_backend: OutcomeBackend = get_default_outcome_backend(
+                self.agent_root
+            )
+        else:
+            self.outcome_backend = outcome_backend
 
     # ────────────────────────────────────────────────────────────
     # Public entry point
@@ -517,8 +551,35 @@ class OutcomeRunner:
             )
         result.total_cost_usd = round(result.total_cost_usd, 6)
 
-        # Write result.json to output dir
-        self._write_result_json(output_dir, result)
+        # Route write through self.outcome_backend (OPTION A — coarse-route).
+        # The backend computes the canonical path agent_root/outcomes/runs/<run_id>/result.json
+        # from run_id alone. When output_dir is the DEFAULT (== agent_root/outcomes/runs/<run_id>),
+        # the backend writes to the SAME location as the old direct call — byte-identical.
+        # When output_dir is a CUSTOM path (operator-supplied --output-dir), result.json
+        # now lands at the CANONICAL path (the audit envelope belongs with the run, not the
+        # artifact dir). This is a narrow, conscious correctness fix: the custom-output_dir
+        # result.json was previously invisible to list_runs/read_result/export (orphan bug);
+        # agent ARTIFACT files still go to output_dir — only the envelope relocates.
+        # See spec/42 §"Shipping history" PR 2 and CHANGELOG for the documented behavior change.
+        #
+        # NO try/except around this call — preserve today's propagation exactly. A fallback
+        # to direct atomic_write would be split-brain / fail-open (spec/42 MUST 9 write-once
+        # and Principle #5 audit trail). If write_result raises, the exception propagates to
+        # the caller (same behavior as today's bare atomic_write call).
+        #
+        # self.outcome_backend is the runner-owned backend (resolved at __init__ time, above)
+        # and is the ONLY write path for result.json. AtomicAgent.outcome_backend (constructed
+        # independently in agent.py) is a SEPARATE per-agent handle for operator inspection and
+        # the future PR3 coordinator — it is NOT this runner's backend and never writes
+        # result.json. The internal AtomicAgent built earlier in run() (above) also carries its
+        # own outcome_backend, which the runner does not use for the write.
+        #
+        # Pass the LOCAL run_id variable (minted at the top of run()) rather than
+        # result.run_id — they are equal, but the local variable is the authoritative
+        # mint (spec/42 thin-seam ruling: run_id minting stays above the Protocol).
+        self.outcome_backend.write_result(
+            self.agent_name, run_id, result
+        )  # no-catch discipline
 
         return result
 
@@ -720,7 +781,21 @@ class OutcomeRunner:
         agent.log_backend.append(RunRecord.from_dict(line))
 
     def _write_result_json(self, output_dir: Path, result: OutcomeResult) -> None:
-        """Write the full OutcomeResult to result.json in the run's output dir."""
+        """Serialize the full OutcomeResult to result.json in ``output_dir``.
+
+        Retained as the byte-identity REFERENCE serializer for conformance
+        (TEST 30 in ``test_outcome_backend_conformance.py`` and
+        ``test_outcome_adoption_golden.py`` pin ``write_result`` byte-for-byte
+        against this method). It is NO LONGER the live write path: as of #448
+        PR2, ``run()`` routes through ``self.outcome_backend.write_result``.
+        Do not re-route the live call back through here.
+
+        NOTE: FilesystemOutcomeBackend.write_result (outcome/filesystem.py) is a
+        VERBATIM lift of this serialization. TEST 30 (test_outcome_backend_conformance.py)
+        pins byte-identity — if you change the serialization here, update write_result
+        to match. run() routes through write_result since #448 PR2; _write_result_json
+        stays ONLY as the TEST 30 reference serializer — do not delete it as dead code.
+        """
         result_path = output_dir / "result.json"
         # Serialize — convert Path objects to strings for JSON
         data = asdict(result)

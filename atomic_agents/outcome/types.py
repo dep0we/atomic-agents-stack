@@ -56,7 +56,8 @@ class IterationRecord:
         """Return a JSON-serializable dict with Path fields coerced to str.
 
         Uses asdict() as the base to preserve field declaration order
-        (matching _write_result_json at _outcome_impl.py:721-731). Path fields
+        (matching `OutcomeRunner._write_result_json` in `_outcome_impl.py`).
+        Path fields
         are coerced to str explicitly because asdict() does NOT convert Path
         objects to str — json.dumps() cannot serialize Path objects.
         """
@@ -103,7 +104,7 @@ class OutcomeResult:
     output_files and artifact_path stay Path-typed on the dataclass.
     Portability (relative-path refs) is handled at export(), not by
     retyping the dataclass (per artifact-reference-portability ruling,
-    spec/42 §"Option C").
+    spec/42 §"Artifact-reference portability").
     """
 
     run_id: str
@@ -125,7 +126,8 @@ class OutcomeResult:
         """Return a JSON-serializable dict with Path fields coerced to str.
 
         Uses asdict() as the base to preserve field declaration order
-        (matching _write_result_json's asdict() call at _outcome_impl.py:725).
+        (matching `OutcomeRunner._write_result_json`'s asdict() call in
+        `_outcome_impl.py`).
         Path fields in output_files and nested IterationRecord.artifact_path
         are coerced to str because json.dumps() cannot serialize Path objects.
 
@@ -235,7 +237,7 @@ class OutcomeExport(ExportableResult):
 
     Carries the result.json bytes for one completed outcome run, plus artifact
     references (relative-to-agent_root paths, NOT embedded bytes per Tier B
-    export ruling — spec/42 §"Option C").
+    export ruling — spec/42 §"Artifact-reference portability").
 
     Fields:
         run_id: the run identifier (directory name under outcomes/runs/).
@@ -243,7 +245,7 @@ class OutcomeExport(ExportableResult):
         artifact_refs: list of artifact path strings, relative to agent_root
             (e.g. "outcomes/runs/outcome-2026.../artifact.md").
             Absolute when the artifact lives outside agent_root (is_relative_to
-            fallback per spec/42 §"Option C").
+            fallback per spec/42 §"Artifact-reference portability").
         backend_id: stable backend identifier.
         scope: agent root path as a string.
 
