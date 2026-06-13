@@ -103,13 +103,13 @@ Meeting any one trigger is sufficient to justify the async-first rebuild. Until 
 
 ---
 
-### 🟡 T4. Cascade queue is filesystem-only
+### ✅ T4. Cascade queue is filesystem-only — resolved 2026-06-12 via #428
 
 **One-sentence:** `_cascade.py:claim_next_queued()` uses POSIX atomic `Path.rename()` + sidecar `.lease.json` — beautiful for one host, requires a real queue (Redis / SQS / DB) for multi-host.
 
 **Why load-bearing:** This is the primitive that lets multiple agents (or roles, or hosts eventually) consume a shared work queue without trampling each other. Today it works because rename is atomic on local POSIX filesystems. The lease sidecar is operator-readable, the work file IS the work item, no DB needed. **Aesthetically perfect for a home user.** Architecturally, it's the same single-host assumption as T3.
 
-**Where:** `atomic_agents/_cascade.py:232-310` (`_sidecar_path` at 232, `_write_sidecar` at 237, `claim_next_queued` at 252).
+**Where:** `atomic_agents/queue/` (`FilesystemQueueBackend` + `QueueBackend` Protocol + `_sidecar_path`/`_write_sidecar` in `filesystem.py`). The `_cascade.py` free functions are now a thin non-deprecated shim over the Protocol.
 
 **When this bites:** Same trigger as T3 — first multi-host deployment. But also bites earlier if anyone tries to run the cascade queue on a network filesystem with weak rename guarantees.
 
@@ -117,7 +117,9 @@ Meeting any one trigger is sufficient to justify the async-first rebuild. Until 
 - Multi-agent project deployments on shared infrastructure. Symptom: occasional double-claim (two roles see the same work item).
 - Roadmap item #5 (multi-tenant serve) implicitly creates this need — a service running multiple operators' agents needs queue-claim to be reliable.
 
-**Related:** spec/06-multi-agent-projects, Issue #60 (LockBackend resolves *part* of this; queue-claim is its own problem).
+**Closed by:** #428 — QueueBackend Protocol + FilesystemQueueBackend + DRAFT spec/44. The queue cluster is now a swappable Protocol (QueueBackend in `atomic_agents/queue/`). A Redis/SQS/DB backend can register at import time and plug in via `ATOMIC_AGENTS_QUEUE_BACKEND`. The `single_host_only=True` capability flag + `doctor.check_queue_backend` WARN path give operators visibility when the filesystem backend is in use on a multi-host deployment. spec/44 DRAFT ships this PR; spec/44 LOCK follows after adversarial rounds.
+
+**Related:** spec/06-multi-agent-projects, spec/44-queue-backend (DRAFT), Issue #60 (LockBackend resolves *part* of this; queue-claim is its own problem).
 
 ---
 
@@ -341,6 +343,7 @@ The registered backend is the **store of record for its own data in that deploym
 | Date | Tension | How it resolved |
 |------|---------|------------------|
 | 2026-06-11 | T13 | Migration runner refactored from path-shaped to **backend-shaped** (#429, PR #446). The old `applies_to(path)` / `migrate(path)` script protocol is removed; migration now runs through a dedicated `MigrationBackend` Protocol + per-unit `MigratableUnit` handle, with `FilesystemMigrationBackend` as the reference impl. A future Postgres/SQLite backend satisfies the same Protocol without forking the runner — the root cause T13 named is closed. spec/03 §Schema-migration re-LOCKED (8 MUSTs). See decision log below. |
+| 2026-06-12 | T4 | Cascade work queue carved from `_cascade.py` into a swappable **`QueueBackend` Protocol** + `FilesystemQueueBackend` reference impl (#428, PR #481). A Redis/SQS/DB backend providing cross-host claim atomicity can now register via `ATOMIC_AGENTS_QUEUE_BACKEND` without forking the claim logic — the single-host filesystem-rename constraint T4 named is liftable per deployment. The `single_host_only=True` capability flag + `doctor.check_queue_backend` WARN make the cliff visible. SCAFFOLDING-ONLY (no internal runtime caller wired yet); DRAFT spec/44. See decision log below. The filesystem backend's perimeter containment was hardened to a single canonical-source invariant during `/ship`, with the trust model (boundary = `project_root`; adversarial/multi-host → a real-authz backend) documented in spec/44. |
 
 ---
 
@@ -353,6 +356,7 @@ The registered backend is the **store of record for its own data in that deploym
 | 2026-06-09 | T15 | Position B — registered backend is store-of-record per deployment; canonical vault *shape* is a guaranteed export contract, not a guaranteed location | Authority model for cloud delivery (#339/#344). Explicitly amends Principle #1: "backends never authoritative" holds for the default/filesystem deployment and for config everywhere; backend-swapped state is authoritative-in-that-deployment with a tested round-trip export. Strengthened by the coming first-party home runtime + AWS/Azure adapters — the export contract is the cross-runtime, cross-cloud portability primitive; Position A would multiply file-sync cost per cloud. Implies a new export method + round-trip conformance across all 13 backends (#379). |
 | 2026-06-10 | T15 | spec/40 (`docs/spec/40-canonical-export.md`) delivered + **LOCKED** — the export-contract commitment in the Position B ruling is now a tested contract, not a promise | #379 PR 1 shipped the `Exportable` companion Protocol, `supports_canonical_export` capability field on all six PR1 state backends, filesystem identity export impls for Memory/Log/Mandate/Corpus/Lock/Secret, a 91-test round-trip conformance suite, and spec/40 (LOCKED on filesystem proof per the contract-first ruling). CLAUDE.md Principle #1 now carries the spec/40 pointer. Per-backend SQLite/Postgres/Redis/GCP/HTTP export impls are later PRs that conform to the locked contract. |
 | 2026-06-11 | T13 | **Resolved** — migration runner refactored path-shaped → backend-shaped: dedicated `MigrationBackend` Protocol + `MigratableUnit` handle + `FilesystemMigrationBackend` reference impl; clean break (BREAKING — old `applies_to(path)`/`migrate(path)` removed); read-only `read_schema_version()`; full `snapshot()`/`restore()` protocol methods + fail-close on no-rollback. | #429 (PR #446, merged). Same root cause as T15 — the last path-shaped storage primitive becomes backend-shaped so backend #2 (Postgres/SQLite) satisfies the migration contract without forking the runner. spec/03 §Schema-migration DRAFT→re-LOCK (full drift-gate, 8 MUSTs); `python -m atomic_agents.migrate` CLI entrypoint unchanged (subcommand promotion → #438; legacy v0→v1 → #439). Closes the T13 "must also become backend-shaped" cross-reference flagged in T15's Related list. |
+| 2026-06-12 | T4 | **Resolved** — queue cluster carved from `_cascade.py` into `atomic_agents/queue/` as `QueueBackend` Protocol + `FilesystemQueueBackend` reference impl (SCAFFOLDING-ONLY; zero internal runtime callers wired). | #428 PR 1. Thin non-deprecated re-export shim in `_cascade.py` preserves verbatim free-function signatures for existing callers. DRAFT spec/44 ships; 12-MUST Implementer Contract. `single_host_only` capability flag mirrors `LockCapabilities` pattern. `recover_stale_claims()` is a free function above the Protocol, calling only Protocol methods. spec/40 export whitelist (queued/ + done/ + dead-letter/ only; claimed/ excluded). Doctor check SKIP for single-agent layouts (detect_cascade → None); WARN on ATOMIC_AGENTS_MULTI_HOST. Runtime adoption (cascade runner wiring) deferred to follow-up issue. |
 
 ---
 
