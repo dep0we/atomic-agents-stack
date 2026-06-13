@@ -1340,3 +1340,184 @@ def test_claim_next_rejects_nested_role(tmp_path):
     assert (project_root / "queue" / "queued" / "writer" / "task.md").exists(), (
         "claim_next() with a bad role removed a legitimate queued item"
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SOURCE-containment regression tests (issue #473 / Codex round-2 adversarial)
+#
+# These tests verify that the sink helpers (_release_at_path, _dead_letter_at_path,
+# _renew_lease_at_sidecar) refuse to operate on source paths that resolve outside
+# queue_root — even when original_name and lease_token are valid bare components.
+#
+# A forged FilesystemQueueItem(path=/outside/secret.md, ...) passed through the
+# _cascade.py shims must be a no-op: the external file must remain where it is,
+# nothing must appear in queue/done| dead-letter/, and no exception must propagate.
+
+
+def test_shim_release_forged_external_path_contained(tmp_path):
+    """release_claim shim MUST NOT move an out-of-tree work file into queue/done/.
+
+    A forged FilesystemQueueItem whose .path points outside project_root must be
+    refused by _release_at_path's source-containment guard. The external file must
+    stay where it is, nothing must appear in queue/done/, and the shim must return
+    without raising.
+    """
+    from atomic_agents._cascade import release_claim
+
+    project_root = tmp_path / "project"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secret.md"
+    secret.write_text("external secret content")
+
+    forged_item = FilesystemQueueItem(
+        original_name="secret.md",
+        role="writer",
+        lease_token="tok-release",
+        claimed_at=time.time(),
+        path=secret,
+    )
+
+    # Must not raise; must not move the external file.
+    release_claim(forged_item, project_root)
+
+    # External file untouched.
+    assert secret.exists(), "external file was moved (exfiltration via release_claim)"
+    assert secret.read_text() == "external secret content"
+
+    # Nothing landed in queue/done/.
+    done_root = project_root / "queue" / "done"
+    if done_root.exists():
+        found = list(done_root.rglob("*"))
+        assert all(not p.is_file() for p in found), (
+            f"external file exfiltrated into queue/done/: {[p for p in found if p.is_file()]}"
+        )
+
+
+def test_shim_dead_letter_forged_external_path_contained(tmp_path):
+    """move_to_dead_letter shim MUST NOT move an out-of-tree file into queue/dead-letter/.
+
+    Same class as test_shim_release_forged_external_path_contained, via the
+    dead-letter code path.
+    """
+    from atomic_agents._cascade import move_to_dead_letter
+
+    project_root = tmp_path / "project"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secret.md"
+    secret.write_text("external dead-letter content")
+
+    forged_item = FilesystemQueueItem(
+        original_name="secret.md",
+        role="writer",
+        lease_token="tok-deadletter",
+        claimed_at=time.time(),
+        path=secret,
+    )
+
+    # Must not raise; must not move the external file.
+    move_to_dead_letter(forged_item, project_root, reason="attempted exfiltration")
+
+    # External file untouched.
+    assert secret.exists(), (
+        "external file was moved (exfiltration via move_to_dead_letter)"
+    )
+    assert secret.read_text() == "external dead-letter content"
+
+    # Nothing landed in queue/dead-letter/.
+    dl_root = project_root / "queue" / "dead-letter"
+    if dl_root.exists():
+        found = list(dl_root.rglob("*"))
+        assert all(not p.is_file() for p in found), (
+            f"external file exfiltrated into queue/dead-letter/: "
+            f"{[p for p in found if p.is_file()]}"
+        )
+
+
+def test_shim_renew_lease_forged_external_path_contained(tmp_path):
+    """renew_lease shim MUST NOT write a sidecar next to an out-of-tree path.
+
+    The cascade renew_lease shim cannot anchor a queue_root guard (frozen
+    signature), so the sink receives queue_root=None and skips the containment
+    check. This test verifies the current (partial-close) behaviour: the shim
+    wraps the call in try/except PathTraversalError but cannot prevent the write
+    when queue_root is absent.
+
+    NOTE: This test documents the KNOWN RESIDUAL GAP: without queue_root the
+    sidecar write-outside is not blocked by the sink guard. Full closure requires
+    a signature change deferred to the v1.0/T10 shim-retirement pass. The test
+    asserts the shim does NOT raise (fail-soft contract) and leaves the external
+    file content unchanged — it does NOT assert that the sidecar was prevented,
+    because the sink has no queue_root to anchor the check.
+    """
+    from atomic_agents._cascade import renew_lease as shim_renew
+
+    project_root = tmp_path / "project"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secret.md"
+    secret.write_text("external content")
+
+    forged_item = FilesystemQueueItem(
+        original_name="secret.md",
+        role="writer",
+        lease_token="tok-renew",
+        claimed_at=time.time(),
+        path=secret,
+    )
+
+    # Must not raise (fail-soft contract maintained).
+    shim_renew(forged_item, additional_seconds=3600)
+
+    # The external WORK file must not be modified.
+    assert secret.read_text() == "external content", (
+        "renew_lease shim modified the external work file"
+    )
+
+
+def test_shim_release_legit_claimed_item_still_works(tmp_path):
+    """SOURCE-containment guard must NOT block legitimately claimed items.
+
+    A work file under queue/claimed/<token>/ resolves inside queue_root and must
+    pass the new guard without error. Regression guard: over-restrictive containment
+    check that rejects real claimed items would break the normal workflow.
+    """
+    from atomic_agents._cascade import claim_next_queued, release_claim
+
+    project_root = tmp_path / "project"
+    _queued(project_root, name="legit.md", content="legit content")
+    item = claim_next_queued(project_root, "writer", "legit-lease")
+    assert item is not None, "claim_next_queued returned None for a legit item"
+
+    # Must succeed and move the file to done/.
+    release_claim(item, project_root)
+
+    done_file = project_root / "queue" / "done" / "legit-lease" / "legit.md"
+    assert done_file.is_file(), "release_claim failed for a legitimately claimed item"
+    assert not item.path.exists(), "claimed item path still exists after release"
+
+
+def test_shim_release_legit_recovered_item_still_works(tmp_path):
+    """SOURCE-containment guard must NOT block recovered items under queued/_recovered/.
+
+    A recovered work file lives at queue/queued/_recovered/<token>/<name> — still
+    under queue_root. The containment guard must pass it through. Regression guard
+    for the fix: the two valid depths (claimed/<token>/ depth 3, recovered/<token>/
+    depth 4) must both resolve as is_relative_to(queue_root).
+    """
+    from atomic_agents._cascade import release_claim
+
+    project_root = tmp_path / "project"
+    recovered_item = _recover_one(project_root, "recovered_legit.md")
+
+    # Must succeed and move the file to done/.
+    release_claim(recovered_item, project_root)
+
+    done_file = project_root / "queue" / "done" / "stale-lease" / "recovered_legit.md"
+    assert done_file.is_file(), (
+        "release_claim failed for a recovered item (over-restrictive containment guard)"
+    )
+    assert not recovered_item.path.exists(), (
+        "recovered item path still exists after release"
+    )

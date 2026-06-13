@@ -392,19 +392,23 @@ def renew_lease(item: "QueueItem", additional_seconds: int = None) -> None:
     location from ``item.path.parents[3]`` + ``lease_token`` (which assumed a
     fixed claimed-dir depth and crashed for recovered items).
 
-    Trust boundary (asymmetric with the release/move_to_dead_letter shims): those
+    Trust boundary (partially closed by #473): the release/move_to_dead_letter shims
     re-derive their target through the project_root-anchored ``_safe_under_queue``
-    guard and so fail-soft on a symlinked ``queue/``. This shim writes next to
-    ``item.path`` with NO containment guard — its frozen signature carries no
-    ``project_root`` to anchor one. That is byte-faithful to pre-carve behavior
-    and safe for items produced by ``claim_next_queued``/recovery (paths under
-    ``queue/``); an EXTERNALLY-constructed item with an out-of-tree ``path`` would
-    write outside. The Protocol method ``FilesystemQueueBackend.renew_lease()``
-    IS contained; closing this shim gap requires a signature change deferred to
-    the v1.0/T10 shim-retirement pass (tracked as a follow-up issue).
+    guard, so they fail-soft on forged out-of-tree paths. This shim's frozen
+    signature carries no ``project_root``, so it cannot pass ``queue_root`` into
+    ``_renew_lease_at_sidecar``'s source-containment guard (which fires only when
+    ``queue_root`` is provided). The call is wrapped in try/except PathTraversalError
+    so any containment error from the sink propagates as a no-op. Full containment
+    for external forged paths requires a signature change deferred to the v1.0/T10
+    shim-retirement pass (tracked as a follow-up issue). Items produced by
+    ``claim_next_queued``/recovery (paths genuinely under ``queue/``) are unaffected.
+    The Protocol method ``FilesystemQueueBackend.renew_lease()`` IS fully contained.
     """
-    _FilesystemQueueBackend._renew_lease_at_sidecar(
-        _sidecar_path(item.path),
-        lease_token=item.lease_token,
-        additional_seconds=additional_seconds,
-    )
+    try:
+        _FilesystemQueueBackend._renew_lease_at_sidecar(
+            _sidecar_path(item.path),
+            lease_token=item.lease_token,
+            additional_seconds=additional_seconds,
+        )
+    except PathTraversalError:
+        return
