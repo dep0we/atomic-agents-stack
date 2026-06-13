@@ -57,6 +57,7 @@ import frontmatter
 from .._io import atomic_write, atomic_append_jsonl
 from ..exceptions import (
     AtomicAgentsError,
+    GoalConcurrentModification,
     GoalCorrupted,
     PathTraversalError,
     SchemaValidationError,
@@ -351,6 +352,7 @@ class FilesystemGoalBackend:
         fields: dict[str, Any],
         history_prose: str,
         history_event: dict[str, Any],
+        expected_from_status: str | None = None,
     ) -> Goal:
         """Serialized + ordered: flip sub-goal status, write goal.md, append JSONL.
 
@@ -402,6 +404,25 @@ class FilesystemGoalBackend:
                 raise AtomicAgentsError(
                     f"sub_goal not found: {sub_goal_id!r} in {self._goal_path}"
                 )
+
+            # Compare-and-set guard (spec/41 MUST 10): UNDER THE LOCK, after
+            # load_goal() and before any write — check the current on-disk
+            # status against expected_from_status. If they differ, another
+            # writer moved the goal between the coordinator's first transition
+            # (pending→in_progress) and this terminal transition. Reject with
+            # GoalConcurrentModification (no write, no JSONL line).
+            # The check is inside the lock so no concurrent write can slip
+            # between the check and the durable write (no TOCTOU race).
+            # Default None = no check (backward-compatible: all callers that
+            # omit this parameter are unaffected). Alternate backend authors:
+            # mirror this placement inside your own lock/transaction.
+            if expected_from_status is not None and sg.status != expected_from_status:
+                raise GoalConcurrentModification(
+                    f"sub_goal '{sub_goal_id}' expected status "
+                    f"'{expected_from_status}' but found '{sg.status}' on disk "
+                    f"— concurrent modification detected (spec/41 MUST 10)"
+                )
+
             sg.status = to_status
             # The `fields` channel may ONLY set transition metadata
             # (SUB_GOAL_TRANSITION_FIELDS) — never identity (`id`/`label`) and

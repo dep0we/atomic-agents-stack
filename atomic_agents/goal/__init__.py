@@ -51,6 +51,7 @@ from pathlib import Path
 
 from ..exceptions import BackendNotRegistered
 from .backend import GoalBackend
+from .coordinator import dispatch_sub_goal_as_outcome
 from .filesystem import FilesystemGoalBackend
 from .types import (
     SUB_GOAL_TRANSITION_FIELDS,
@@ -143,6 +144,8 @@ __all__ = [
     "serialize_sub_goal",
     # Reference impl
     "FilesystemGoalBackend",
+    # Coordinator
+    "dispatch_sub_goal_as_outcome",
     # Lazy re-exports (resolved via __getattr__)
     "GoalManager",
     "main",

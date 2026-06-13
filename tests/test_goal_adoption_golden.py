@@ -10,7 +10,7 @@ Design:
   and goal_history.jsonl). .goal.lock is explicitly excluded per the ruling
   (created by backend.append_history_event's _goal_lock(); benign sidecar).
 - dispatch-outcome golden pins goal.md and goal_history.jsonl bytes across
-  the full real code path (save + _append_goal_history_jsonl → backend).
+  the full real code path (coordinator's apply_transition() → backend).
 - The 4 frozen test files remain unchanged EXCEPT test_goal.py archive golden
   assertions (A3 exception — intentional data-loss fix).
 
@@ -21,8 +21,8 @@ All 6 CLI subcommands exercised:
   4. abandon     — archives; verifies archive() A3 fix + goal.md removal
   5. complete    — archives; verifies archive() A3 fix + goal.md removal
   6. report      — read-only; verifies load() routes through backend
-  + dispatch-outcome — injected OutcomeRunner mock; verifies save() +
-    _append_goal_history_jsonl() route through backend
+  + dispatch-outcome — injected OutcomeRunner mock; verifies terminal
+    transition routes through coordinator's apply_transition() → backend
 """
 
 from __future__ import annotations
@@ -83,10 +83,23 @@ related_decisions:
 
 @pytest.fixture
 def agent_fixture(tmp_path):
-    """Minimal agent vault with goal.md + injected backend."""
+    """Minimal agent vault with goal.md + injected backend.
+
+    Includes a minimal persona/IDENTITY.md so dispatch_as_outcome's shim can
+    construct a real AtomicAgent for the (now-live) fail-closed cost gate
+    (Principle #4). No model.md is written, so cost_guardrails_enabled defaults
+    False and the gate passes (allow=True) — the dispatch proceeds and every
+    golden assertion below (goal.md bytes, JSONL ordering, terminal mapping) is
+    byte-identical to the pre-gate behavior. The gate enforces model.md caps;
+    an agent with no configured caps has nothing to refuse.
+    """
     agents_root = tmp_path / "agents"
     agent_root = agents_root / "muse-director"
     agent_root.mkdir(parents=True)
+    (agent_root / "persona").mkdir()
+    (agent_root / "persona" / "IDENTITY.md").write_text(
+        "# Identity\nTest agent for goal adoption golden tests.\n"
+    )
     (agent_root / "goal.md").write_text(GOAL_TEXT)
     backend = FilesystemGoalBackend(agent_root)
     return agents_root, "muse-director", agent_root, backend
@@ -307,8 +320,8 @@ def test_golden_report_reads_through_backend(agent_fixture):
 
 
 # ──────────────────────────────────────────────────────────────────
-# 7. dispatch-outcome — verifies BOTH save() and _append_goal_history_jsonl()
-#    route through the backend (COARSE-ROUTE adoption)
+# 7. dispatch-outcome — verifies terminal transition routes through the
+#    coordinator's apply_transition() to the backend (COARSE-ROUTE adoption)
 
 
 def _make_outcome_result(status: str) -> MagicMock:
@@ -359,8 +372,8 @@ def test_golden_dispatch_goal_md_written_through_backend(agent_fixture):
     # 2. goal_history.jsonl: MUST exist and have the dispatch event
     history_path = agent_root / "goal_history.jsonl"
     assert history_path.is_file(), (
-        "_append_goal_history_jsonl() must have routed through "
-        "backend.append_history_event() and created goal_history.jsonl"
+        "coordinator's apply_transition() must have written both goal.md and "
+        "the JSONL audit line to goal_history.jsonl via the backend"
     )
     events = [
         json.loads(line)
@@ -383,7 +396,7 @@ def test_golden_dispatch_goal_md_written_through_backend(agent_fixture):
 
 
 def test_golden_dispatch_jsonl_ts_first_key_order(agent_fixture):
-    """JSONL event from _append_goal_history_jsonl must have ts as the first key.
+    """JSONL event written by the coordinator's apply_transition() must have ts as the first key.
     The backend's _make_history_event enforces ts-first regardless of input order."""
     agents_root, agent_name, agent_root, backend = agent_fixture
     today = date(2026, 5, 8)
@@ -414,32 +427,39 @@ def test_golden_dispatch_jsonl_ts_first_key_order(agent_fixture):
 
 
 def test_golden_dispatch_save_before_jsonl_ordering(agent_fixture):
-    """White-box ordering: save() (→ backend.save_goal) fires BEFORE
-    _append_goal_history_jsonl() (→ backend.append_history_event).
-    Mirrors test_goal_dispatch_audit_ordering.py but validates the BACKEND route."""
+    """White-box ordering: goal.md is written BEFORE the JSONL audit line.
+
+    As of #448 PR3, the coordinator routes terminal transitions through
+    apply_transition(), which enforces MUST 6 ordering (goal.md before JSONL)
+    atomically under the goal lock — both in one call. The legacy
+    save() + _append_goal_history_jsonl() pattern was replaced by the
+    coordinator's apply_transition() call.
+
+    This test verifies the durable ordering contract at the apply_transition level:
+    apply_transition() must be called at least once for the terminal status write,
+    and after dispatch, goal.md must contain status:complete with a
+    sub_goal_outcome_dispatched event in goal_history.jsonl — the invariant that
+    goal.md always precedes or equals the JSONL is enforced by apply_transition's
+    lock (fcntl.flock holds both writes sequentially).
+    """
     agents_root, agent_name, agent_root, backend = agent_fixture
     today = date(2026, 5, 8)
     gm = GoalManager(agents_root, agent_name, today=today, goal_backend=backend)
     gm.load()
 
-    call_order: list[str] = []
-    real_save = gm.save
-    real_append = gm._append_goal_history_jsonl
+    apply_transition_calls: list[str] = []
+    real_apply = backend.apply_transition
 
-    def traced_save():
-        call_order.append("save")
-        return real_save()
-
-    def traced_append(entry):
-        call_order.append("jsonl")
-        return real_append(entry)
+    def traced_apply(*args, **kwargs):
+        to_status = args[2] if len(args) > 2 else kwargs.get("to_status", "?")
+        apply_transition_calls.append(to_status)
+        return real_apply(*args, **kwargs)
 
     outcome_result = _make_outcome_result("satisfied")
 
     with (
         patch("atomic_agents.outcome.OutcomeRunner") as MockRunner,
-        patch.object(gm, "save", side_effect=traced_save),
-        patch.object(gm, "_append_goal_history_jsonl", side_effect=traced_append),
+        patch.object(backend, "apply_transition", side_effect=traced_apply),
     ):
         mock_runner_instance = MagicMock()
         mock_runner_instance.run.return_value = outcome_result
@@ -450,12 +470,31 @@ def test_golden_dispatch_save_before_jsonl_ordering(agent_fixture):
             rubric="inline:Chapter complete.",
         )
 
-    assert "save" in call_order and "jsonl" in call_order
-    assert call_order.index("save") < call_order.index("jsonl"), (
-        "goal.md (save → backend.save_goal) must be persisted BEFORE the "
-        "JSONL audit line (→ backend.append_history_event); "
-        "got call order: " + ", ".join(call_order)
+    # apply_transition must have been called (at least the terminal write).
+    assert len(apply_transition_calls) >= 1, (
+        "apply_transition() must be called for the terminal status write "
+        "(spec/41 MUST 6); dispatch_as_outcome must NOT bypass the backend"
     )
+    assert "complete" in apply_transition_calls, (
+        "apply_transition() must write 'complete' for a satisfied outcome; "
+        f"got: {apply_transition_calls}"
+    )
+
+    # Behavioral ordering assertion: goal.md has the terminal status AND
+    # goal_history.jsonl records it — apply_transition's lock guarantees
+    # goal.md is always written before the JSONL audit line.
+    goal_text = (agent_root / "goal.md").read_text()
+    assert "status: complete" in goal_text
+    history_path = agent_root / "goal_history.jsonl"
+    assert history_path.is_file()
+    events = [
+        json.loads(line)
+        for line in history_path.read_text().splitlines()
+        if line.strip()
+    ]
+    dispatched = [e for e in events if e.get("event") == "sub_goal_outcome_dispatched"]
+    assert len(dispatched) == 1
+    assert dispatched[0]["applied_status"] == "complete"
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -835,6 +874,81 @@ def test_dispatch_as_outcome_all_terminal_branches(
     # ts-first key order
     assert list(ev.keys())[0] == "ts"
     assert list(ev.keys())[1] == "event"
+
+
+# ──────────────────────────────────────────────────────────────────
+# 12b. Fail-closed cost gate is LIVE on the shim/CLI path (#448 PR3)
+#
+#     The headline correctness deliverable: GoalManager.dispatch_as_outcome
+#     (the dispatch-outcome CLI's single production caller) constructs a REAL
+#     AtomicAgent and passes it to the coordinator, so the pre-dispatch
+#     fail-closed cost gate (Principle #4) fires on the live path — not only
+#     when a programmatic caller hands in a real agent. The #425 version failed
+#     OPEN here; an earlier draft of this PR injected a no-gate sentinel that
+#     made the gate a permanent no-op on the only shipping path. This test
+#     proves the gate is consulted, blocks, audits, and refuses BEFORE any run.
+
+
+def test_dispatch_as_outcome_shim_cost_gate_blocks_live(agent_fixture):
+    """The shim constructs a REAL AtomicAgent; when its cost gate denies, the
+    shim path raises CostGuardrailBlocked, appends coordinator_dispatch_rejected,
+    and does NOT dispatch (no OutcomeRunner.run, sub-goal stays pending).
+
+    Patches AtomicAgent._check_cost_guardrails (the class the shim actually
+    constructs) to deny — exercising the full live wiring (real agent
+    construction + gate consultation + fail-closed propagation) without
+    fabricating a cost-history file. The coordinator-level test
+    (test_goal_coordinator.py) covers the mock-agent block; THIS test closes
+    the gap that the gate was never exercised through the shim/CLI caller.
+    """
+    from atomic_agents.agent import AtomicAgent
+    from atomic_agents.exceptions import CostGuardrailBlocked
+    from atomic_agents.types import CostCheckResult
+
+    agents_root, agent_name, agent_root, backend = agent_fixture
+    gm = GoalManager(
+        agents_root, agent_name, today=date(2026, 5, 8), goal_backend=backend
+    )
+    gm.load()
+
+    denied = CostCheckResult(allow=False, reason="daily cap exceeded")
+
+    with (
+        patch.object(
+            AtomicAgent, "_check_cost_guardrails", return_value=denied
+        ) as mock_gate,
+        patch("atomic_agents.outcome.OutcomeRunner") as MockRunner,
+    ):
+        with pytest.raises(CostGuardrailBlocked, match="daily cap exceeded"):
+            gm.dispatch_as_outcome(
+                sub_goal_id="ch_2",
+                rubric="inline:Chapter complete.",
+            )
+
+        # The gate was consulted on the REAL constructed agent...
+        mock_gate.assert_called_once()
+        # ...and the run was refused BEFORE paying construction/run overhead.
+        MockRunner.assert_not_called()
+
+    # Sub-goal stays pending — no apply_transition fired on the blocked path.
+    goal_from_disk = backend.load_goal(agent_name)
+    ch2 = next(s for s in goal_from_disk.sub_goals if s.id == "ch_2")
+    assert ch2.status == "pending"
+
+    # coordinator_dispatch_rejected event appended (audit-before-raise);
+    # NO sub_goal_outcome_dispatched event (nothing was dispatched).
+    history_path = agent_root / "goal_history.jsonl"
+    events = [
+        json.loads(line)
+        for line in history_path.read_text().splitlines()
+        if line.strip()
+    ]
+    rejected = [e for e in events if e.get("event") == "coordinator_dispatch_rejected"]
+    assert len(rejected) == 1
+    assert rejected[0]["sub_goal_id"] == "ch_2"
+    assert rejected[0]["reason"] == "daily cap exceeded"
+    assert list(rejected[0].keys())[0] == "ts"
+    assert not [e for e in events if e.get("event") == "sub_goal_outcome_dispatched"]
 
 
 # ──────────────────────────────────────────────────────────────────

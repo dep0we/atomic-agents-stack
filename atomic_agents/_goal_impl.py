@@ -42,7 +42,7 @@ HARD RULES (per spec/12):
 
 from __future__ import annotations
 import re
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -661,134 +661,85 @@ class GoalManager:
     ) -> "tuple[OutcomeResult, SubGoal]":
         """Dispatch a sub-goal as an outcome and update sub-goal status from result.
 
-        Behavior:
-        - Refuses if sub-goal is not ``pending`` or ``in_progress`` (raises GoalCorrupted).
-        - Refuses if sub-goal has unresolved blocked_by dependencies (raises GoalCorrupted).
-        - Marks sub-goal ``in_progress`` before dispatch (idempotent if already in_progress).
-        - Builds outcome ``description`` from the sub-goal's label + body + acceptance criteria.
-        - Calls OutcomeRunner(agents_root, agent_name).run(description, rubric,
-          max_iterations, extra_context, judge_model).
-        - Maps terminal state to sub-goal status:
-            - satisfied              → complete
-            - max_iterations_reached → blocked (reason cites run_id)
-            - failed                 → blocked (reason cites judge explanation)
-            - interrupted            → stays in_progress (caller decides whether to retry)
-        - Persists goal.md (``self.save()``) BEFORE appending the dedicated
-          ``sub_goal_outcome_dispatched`` event to goal_history.jsonl, so the
-          durable state always precedes its audit record (spec/41 MUST 6 ordering).
-          The method is self-contained: a programmatic caller need not call save().
-        - Returns (OutcomeResult, updated SubGoal).
+        Thin shim over ``goal/coordinator.py::dispatch_sub_goal_as_outcome()``.
+
+        All dispatch logic — pre-dispatch cost gate, apply_transition
+        pre/terminal transitions (spec/41 MUST 6 ordering: goal.md written
+        BEFORE the JSONL audit line, both under the lock), terminal-state
+        mapping, and GoalConcurrentModification (CAS) protection — lives in the
+        coordinator (spec/41 §"Goal-outcome composition", CLAUDE.md Principle #4).
+
+        The CLI path (``python -m atomic_agents.goal dispatch-outcome``) calls
+        this method and the coordinator runs end-to-end. A programmatic caller
+        does NOT need to call save() after dispatch — the coordinator's
+        apply_transition calls are self-contained.
+
+        Cost gate (Principle #4 — live on this path): this shim constructs a real
+        ``AtomicAgent`` (keyword args: ``name``/``agents_root``/``goal_backend``)
+        and passes it to the coordinator, so the pre-dispatch fail-closed cost
+        gate consults the SAME budget universe (model.md caps) the
+        ``OutcomeRunner`` will spend. The agent is constructed OUTSIDE any
+        try/except — a construction failure propagates (fail-closed, never
+        swallowed into "allowed"). When the gate fires, ``CostGuardrailBlocked``
+        propagates to the CLI (exit 3) BEFORE the run + construction overhead is
+        paid ("refuse before paying overhead").
+
+        Returns:
+            (OutcomeResult, updated SubGoal)
+
+        Raises:
+            GoalCorrupted: sub-goal is not pending/in_progress, or has an
+                unresolved blocked_by dependency.
+            CostGuardrailBlocked: pre-dispatch cost gate fired (model.md cap hit);
+                the coordinator_dispatch_rejected event was appended first.
+            GoalConcurrentModification: terminal apply_transition detected a
+                concurrent modification (sub-goal moved off in_progress during run).
         """
-        # Lazy import to avoid circular imports
-        from .outcome import OutcomeRunner  # noqa: PLC0415
+        from .agent import AtomicAgent  # noqa: PLC0415
+        from .goal.coordinator import dispatch_sub_goal_as_outcome  # noqa: PLC0415
 
-        if self._goal is None:
-            self.load()
-
-        sg = self._require_sub_goal(sub_goal_id)
-
-        # Refuse degenerate states
-        if sg.status not in ("pending", "in_progress"):
-            raise GoalCorrupted(
-                f"sub_goal '{sub_goal_id}' is '{sg.status}'; "
-                f"dispatch_as_outcome only accepts pending or in_progress sub-goals"
-            )
-
-        # Refuse if blocked_by is unresolved
-        if sg.blocked_by:
-            blocker = self.find_sub_goal(sg.blocked_by)
-            if blocker is None:
-                raise GoalCorrupted(
-                    f"sub_goal '{sub_goal_id}' blocked_by '{sg.blocked_by}' which does not exist; "
-                    f"goal graph is inconsistent — operator must repair goal.md"
-                )
-            if blocker.status != "complete":
-                raise GoalCorrupted(
-                    f"sub_goal '{sub_goal_id}' has unresolved blocked_by dependency "
-                    f"'{sg.blocked_by}' (status: {blocker.status}); "
-                    f"resolve the blocker before dispatching as outcome"
-                )
-
-        # Mark in_progress before running so observers see the dispatch in-flight
-        if sg.status == "pending":
-            sg.status = "in_progress"
-            self._append_history(
-                f"sub_goal `{sub_goal_id}` → in_progress (outcome dispatch)"
-            )
-
-        # Build the outcome description from the sub-goal
-        description = self._build_outcome_description_from_sub_goal(sg)
-
-        # Run the outcome
-        runner = OutcomeRunner(
+        # Construct a real AtomicAgent for the coordinator's fail-closed cost gate
+        # (Principle #4). KEYWORD args (the #425 bug constructed it positionally);
+        # goal_backend threaded so the agent shares this manager's persistence
+        # universe. NO try/except — a construction failure must propagate (a
+        # swallowed TypeError is exactly the #425 fail-OPEN bug).
+        gate_agent = AtomicAgent(
+            name=self.agent_name,
             agents_root=self.agents_root,
-            agent_name=self.agent_name,
-            judge_model=judge_model,
+            goal_backend=self.goal_backend,
         )
-        result = runner.run(
-            description=description,
+        outcome_result, updated_sg = dispatch_sub_goal_as_outcome(
+            agent=gate_agent,
+            goal_manager=self,
+            sub_goal_id=sub_goal_id,
             rubric=rubric,
             max_iterations=max_iterations,
             extra_context=extra_context,
+            judge_model=judge_model,
         )
 
-        # Map terminal state to sub-goal status
-        applied_status: str
-        if result.status == "satisfied":
-            sg.status = "complete"
-            sg.completed = self.today.isoformat()
-            applied_status = "complete"
-            self._append_history(
-                f"sub_goal `{sub_goal_id}` → complete "
-                f"(outcome {result.run_id} satisfied)"
-            )
-        elif result.status == "max_iterations_reached":
-            sg.status = "blocked"
-            sg.blocked_by = None  # no sub-goal blocker — narrative in history
-            applied_status = "blocked"
-            self._append_history(
-                f"sub_goal `{sub_goal_id}` → blocked "
-                f"(max_iterations_reached on outcome {result.run_id})"
-            )
-        elif result.status == "failed":
-            sg.status = "blocked"
-            sg.blocked_by = None
-            applied_status = "blocked"
-            explanation_short = (result.explanation or "")[:200]
-            self._append_history(
-                f"sub_goal `{sub_goal_id}` → blocked "
-                f"(outcome failed — {explanation_short})"
-            )
-        else:
-            # interrupted — leave in_progress; caller decides whether to retry
-            applied_status = "in_progress"
-            self._append_history(
-                f"sub_goal `{sub_goal_id}` stays in_progress "
-                f"(outcome {result.run_id} interrupted)"
-            )
+        # The coordinator wrote goal.md via apply_transition(). Reload the in-memory
+        # _goal so the manager's state is consistent with the on-disk state (the
+        # coordinator set the terminal status + history body), then stamp
+        # last_progress_check via self.save() (A2 ruling: injectable today clock).
+        # self.save() calls save_goal() which is a verbatim write-what-I-give-you
+        # after stamping last_progress_check — it rewrites the file (now including
+        # the terminal status written by apply_transition) with the updated date.
+        # The CLI's trailing gm.save() after this call is a harmless no-op.
+        #
+        # DELIBERATE lock-free re-stamp: this trailing save() is OUTSIDE the goal
+        # lock (save_goal is the COARSE-ROUTE path) and exists ONLY to stamp
+        # last_progress_check with the injectable self.today clock, which
+        # apply_transition's non-injectable date.today() cannot do. The CAS-guarded
+        # terminal apply_transition already persisted the authoritative status under
+        # the lock; this re-stamp is accepted under the single-session COARSE-ROUTE
+        # contract (the CLI is single-session). The injectable-clock surface that
+        # would let apply_transition stamp last_progress_check under the lock — and
+        # retire this trailing save — is tracked in #483.
+        self._goal = self.goal_backend.load_goal(self.agent_name)
+        self.save()  # stamps last_progress_check = self.today (lock-free, see above)
 
-        # Persist goal.md BEFORE writing the JSONL audit line so the durable
-        # state always precedes its audit record (spec/41 MUST 6 ordering:
-        # never let goal_history.jsonl carry a transition goal.md never recorded).
-        # This makes the method self-contained as its docstring promises; the
-        # caller's trailing save() (CLI main(), below) becomes a harmless no-op.
-        self.save()
-
-        # Record dedicated JSONL history entry
-        self._append_goal_history_jsonl(
-            {
-                "ts": datetime.now().astimezone().isoformat(),
-                "event": "sub_goal_outcome_dispatched",
-                "sub_goal_id": sub_goal_id,
-                "outcome_run_id": result.run_id,
-                "terminal_state": result.status,
-                "applied_status": applied_status,
-                "iterations": len(result.iterations),
-                "total_cost_usd": result.total_cost_usd,
-            }
-        )
-
-        return result, sg
+        return outcome_result, updated_sg
 
     def _build_outcome_description_from_sub_goal(self, sg: SubGoal) -> str:
         """Build a clear outcome description from sub-goal fields.
@@ -863,31 +814,6 @@ class GoalManager:
         self._goal.body = (
             self._goal.body.rstrip() + f"\n- {self.today.isoformat()} — {entry}"
         )
-
-    def _append_goal_history_jsonl(self, entry: dict) -> None:
-        """Append a structured event to goal_history.jsonl via the backend.
-
-        COARSE-ROUTE adoption (#448 PR1): delegates to
-        self.goal_backend.append_history_event(). The backend always acquires
-        the .goal.lock before appending (PIPE_BUF safety for large payloads,
-        e.g. outcome explanations). This changes locking behavior vs. the
-        pre-adoption unlocked atomic_append_jsonl path: appends now serialize
-        under the advisory lock unconditionally.
-
-        ORDERING CONTRACT: The lock in backend.append_history_event serializes
-        the JSONL append; save_goal() (called by save() before this method in
-        dispatch_as_outcome) does NOT hold the lock. The ordering guarantee is
-        call-sequence: save() precedes this method per dispatch_as_outcome.
-        MUST 6 atomicity applies only to apply_transition() (under the backend
-        lock). This is the accepted COARSE-ROUTE ordering contract.
-
-        METHOD NAME PRESERVED INTENTIONALLY: test_goal_dispatch_audit_ordering.py
-        patches this method by name via patch.object(gm,
-        '_append_goal_history_jsonl', ...) for the MUST 6 ordering regression
-        test. Removing or renaming it would silently break that frozen guard.
-        The body delegates to the backend; the name is the patch target contract.
-        """
-        self.goal_backend.append_history_event(self.agent_name, entry)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -1055,6 +981,8 @@ def main(argv: list[str] | None = None, goal_backend: GoalBackend | None = None)
         else:
             rubric = Path(args.rubric)
 
+        from .exceptions import CostGuardrailBlocked, GoalConcurrentModification  # noqa: PLC0415
+
         try:
             result, sg = gm.dispatch_as_outcome(
                 sub_goal_id=args.sub_goal_id,
@@ -1065,6 +993,12 @@ def main(argv: list[str] | None = None, goal_backend: GoalBackend | None = None)
         except GoalCorrupted as e:
             print(f"Error: {e}", file=_sys.stderr)
             return 1
+        except CostGuardrailBlocked as e:
+            print(f"Error: cost gate blocked dispatch — {e}", file=_sys.stderr)
+            return 3
+        except GoalConcurrentModification as e:
+            print(f"Error: concurrent modification detected — {e}", file=_sys.stderr)
+            return 4
 
         gm.save()
 

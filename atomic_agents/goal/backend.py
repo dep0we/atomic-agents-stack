@@ -128,6 +128,7 @@ class GoalBackend(Protocol):
         fields: dict[str, Any],
         history_prose: str,
         history_event: dict[str, Any],
+        expected_from_status: str | None = None,
     ) -> Goal:
         """Atomic transition: flip sub-goal status + write history as one durable unit.
 
@@ -166,7 +167,19 @@ class GoalBackend(Protocol):
             history_event: structured event dict for goal_history.jsonl. The
                 backend MUST place "ts" as the first key and "event" as the
                 second key regardless of the dict's insertion order.
-                All other fields are passed through.
+                All other fields are passed through. When the history_event
+                carries event="sub_goal_outcome_dispatched", it is the
+                coordinator's terminal audit record (spec/41 MUST 6 + MUST 10).
+            expected_from_status: optional compare-and-set guard (spec/41 MUST 10).
+                When not None, the backend MUST, UNDER THE LOCK (after
+                load_goal(), before the write), check the sub-goal's current
+                on-disk status against this value. If they differ, MUST raise
+                GoalConcurrentModification (no write, no JSONL line). Default
+                None = no check (backward-compatible — all existing callers
+                that omit this parameter are unaffected). Alternate backend
+                authors: the check MUST be under the lock/transaction so a
+                concurrent write cannot slip between the check and the write
+                (TOCTOU guard).
 
         Note:
             `fields` MUST NOT carry a "status" key — `to_status` is the sole
@@ -183,6 +196,11 @@ class GoalBackend(Protocol):
                 write — no partial goal.md and no orphan JSONL line are
                 produced (spec/41 MUST 6). This raise is a conformance
                 requirement; the conformance suite asserts it for every backend.
+            GoalConcurrentModification: when expected_from_status is not None
+                and the sub-goal's current on-disk status differs from
+                expected_from_status — another writer moved the goal between
+                the caller's lock release and re-acquisition (spec/41 MUST 10).
+                No write is performed; no JSONL line is appended.
             AtomicAgentsError: when goal.md is absent.
             AtomicAgentsError: when sub_goal_id is not found in the goal.
         """

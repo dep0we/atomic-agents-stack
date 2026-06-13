@@ -1375,3 +1375,133 @@ def test_apply_transition_blocked_by_ghost_rejected_by_conformance_backend(
     reloaded = backend.load_goal("agent")
     sg1 = next(s for s in reloaded.sub_goals if s.id == "sg1")
     assert sg1.status == "pending", "sg1.status must not be persisted when write fails"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TEST 54 — apply_transition() expected_from_status CAS match (spec/41 MUST 10)
+#
+# When expected_from_status matches the sub-goal's current on-disk status, the
+# transition MUST proceed normally (no GoalConcurrentModification raised).
+# The check happens UNDER THE LOCK (after load_goal, before write) so no
+# concurrent write can slip between check and write.
+
+
+def test_apply_transition_expected_from_status_match_proceeds(
+    backend_with_goal: "FilesystemGoalBackend",
+    agent_root_with_goal: Path,
+) -> None:
+    """apply_transition() with expected_from_status matching current status MUST succeed.
+
+    spec/41 MUST 10 (compare-and-set guard): when expected_from_status is provided
+    and the sub-goal's current on-disk status matches, the transition proceeds as
+    normal. This is the happy path for the coordinator's terminal transition.
+    """
+    from datetime import datetime
+
+    backend = backend_with_goal
+    ts = datetime.now().astimezone().isoformat()
+
+    # sg1 starts as 'pending'; expected_from_status='pending' matches — should proceed.
+    goal = backend.apply_transition(
+        agent_id="agent",
+        sub_goal_id="sg1",
+        to_status="in_progress",
+        fields={},
+        history_prose="sg1 → in_progress (CAS match test)",
+        history_event={"ts": ts, "event": "cas_match_test", "sub_goal_id": "sg1"},
+        expected_from_status="pending",
+    )
+
+    # Transition succeeded — sub-goal is now in_progress.
+    sg1 = next(s for s in goal.sub_goals if s.id == "sg1")
+    assert sg1.status == "in_progress", (
+        "expected_from_status='pending' must allow the transition when sub-goal "
+        "is actually pending (spec/41 MUST 10 match case)"
+    )
+
+    # Durable: reloaded goal also shows in_progress.
+    reloaded = backend.load_goal("agent")
+    sg1_reloaded = next(s for s in reloaded.sub_goals if s.id == "sg1")
+    assert sg1_reloaded.status == "in_progress"
+
+    # JSONL audit line was written (no orphan-line concern on success).
+    history = agent_root_with_goal / "goal_history.jsonl"
+    assert history.is_file()
+    events = [json.loads(ln) for ln in history.read_text().splitlines() if ln.strip()]
+    assert any(e.get("event") == "cas_match_test" for e in events)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TEST 55 — apply_transition() expected_from_status CAS mismatch (spec/41 MUST 10)
+#
+# When expected_from_status does NOT match the current on-disk status (another
+# writer moved the sub-goal), apply_transition() MUST raise GoalConcurrentModification
+# and MUST NOT write to goal.md or append a JSONL line (fail-closed, no orphan audit).
+
+
+def test_apply_transition_expected_from_status_mismatch_raises(
+    backend_with_goal: "FilesystemGoalBackend",
+    agent_root_with_goal: Path,
+) -> None:
+    """apply_transition() with expected_from_status mismatching current status MUST raise.
+
+    spec/41 MUST 10 (compare-and-set guard): when expected_from_status is provided
+    but the sub-goal's current on-disk status differs, GoalConcurrentModification
+    MUST be raised, goal.md MUST be unchanged, and goal_history.jsonl MUST have NO
+    new line for the rejected transition (fail-closed, no orphan audit line).
+
+    This is the guard the coordinator relies on for the terminal transition: if a
+    concurrent writer moved the sub-goal off in_progress between the pre-transition
+    and the terminal transition, GoalConcurrentModification surfaces rather than a
+    stale write landing on disk.
+    """
+    from datetime import datetime
+
+    from atomic_agents.exceptions import GoalConcurrentModification
+
+    backend = backend_with_goal
+    goal_md = agent_root_with_goal / "goal.md"
+    history = agent_root_with_goal / "goal_history.jsonl"
+
+    before_bytes = goal_md.read_bytes()
+    history_lines_before = history.read_text().splitlines() if history.is_file() else []
+
+    ts = datetime.now().astimezone().isoformat()
+    # sg1 is 'pending'; claiming expected_from_status='in_progress' is a mismatch.
+    with pytest.raises(GoalConcurrentModification):
+        backend.apply_transition(
+            agent_id="agent",
+            sub_goal_id="sg1",
+            to_status="complete",
+            fields={"completed": "2026-06-13"},
+            history_prose="sg1 → complete (should not land)",
+            history_event={
+                "ts": ts,
+                "event": "cas_mismatch_test",
+                "sub_goal_id": "sg1",
+            },
+            expected_from_status="in_progress",
+        )
+
+    # goal.md must be completely unchanged (spec/41 MUST 10 fail-closed).
+    assert goal_md.read_bytes() == before_bytes, (
+        "goal.md must NOT be written when expected_from_status mismatches "
+        "(spec/41 MUST 10 — GoalConcurrentModification is fail-closed)"
+    )
+
+    # No orphan JSONL line for the rejected transition.
+    if history.is_file():
+        current_lines = [ln for ln in history.read_text().splitlines() if ln.strip()]
+        new_lines = current_lines[len(history_lines_before) :]
+        assert not any("cas_mismatch_test" in ln for ln in new_lines), (
+            "goal_history.jsonl must NOT have a line for the rejected CAS transition "
+            "(spec/41 MUST 10 — no orphan audit line on GoalConcurrentModification)"
+        )
+
+    # Sub-goal must still be 'pending' (not 'complete') — no stale write.
+    reloaded = backend.load_goal("agent")
+    sg1 = next(s for s in reloaded.sub_goals if s.id == "sg1")
+    assert sg1.status == "pending", (
+        "sub-goal status must not be changed when GoalConcurrentModification is raised "
+        "(spec/41 MUST 10 — no stale write)"
+    )

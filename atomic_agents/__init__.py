@@ -20,6 +20,7 @@ from .agent import AtomicAgent
 from .exceptions import (
     AtomicAgentsError,
     CostGuardrailBlocked,
+    GoalConcurrentModification,
     AgentLockBusy,
     LockBusy,
     SchemaValidationError,
@@ -165,6 +166,7 @@ __all__ = [
     "AtomicAgent",
     "AtomicAgentsError",
     "CostGuardrailBlocked",
+    "GoalConcurrentModification",
     "AgentLockBusy",
     "LockBusy",
     "SchemaValidationError",
