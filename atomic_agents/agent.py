@@ -636,25 +636,33 @@ class AtomicAgent:
             mcp_servers_resolved=_materialized_mcp_specs,
         )
 
-        # ── OutcomeBackend scaffolding (#426 PR1 — spec/42) ─────────────────
-        # Public self.outcome_backend attribute initialized here as a scaffolding
-        # step — the write path through the backend is wired in #448 PR2 (outcome
-        # write-path adoption, deferred from this PR1 which adopted goal only).
-        # IMPORTANT: self.outcome_backend is SET but NOT CALLED from any
-        # AtomicAgent method yet. The OutcomeRunner._write_result_json still calls
-        # atomic_write directly (_outcome_impl.py:731), bypassing the backend.
-        # Wiring the write path through self.outcome_backend ships in #448 PR2
-        # alongside the OutcomeRunner kwarg. Adding the kwarg here without the
-        # write-path wiring would be dead code per the ruling.
-        # Scaffolding-only: read-only inspection and doctor.check_outcome_backend
-        # access only. Do NOT add outcome_backend= to AtomicAgent constructor
-        # until #448 (per arc ruling: stored-but-never-invoked dead code warning).
+        # ── OutcomeBackend LIVE-WIRED (#448 PR2 — spec/42 LOCKED) ──────────────
+        # self.outcome_backend is the per-agent public handle for operator
+        # inspection and the future #448 PR3 goal-outcome coordinator.
+        # Mirrors self.goal_backend (initialized below) — kwarg on AtomicAgent
+        # is NOT added (the runner resolves independently; adding it here would be
+        # dead code, matching the #426 arc ruling).
+        #
+        # IMPORTANT: the LIVE WRITE PATH is OutcomeRunner.outcome_backend —
+        # OutcomeRunner resolves its OWN backend independently via
+        # get_default_outcome_backend(agent_root), or via the outcome_backend=
+        # kwarg added to OutcomeRunner.__init__ in #448 PR2.
+        # AtomicAgent does NOT construct or feed an OutcomeRunner; they are
+        # separate instances. The coordinator handoff from AtomicAgent.outcome_backend
+        # to the runner is the PR3 story, not a present one.
+        # Do NOT add outcome_backend= to AtomicAgent.__init__ — it would be dead code
+        # (OutcomeRunner is constructed independently and resolves its own backend,
+        # same shape as GoalManager).
         from .outcome import get_default_outcome_backend  # noqa: PLC0415
 
         self.outcome_backend = get_default_outcome_backend(self.agent_root)
 
         # ── JournalBackend LIVE-WIRED (#427 PR1 — spec/43) ──────────────────
-        # ADOPT-NOW ruling (distinct from #426 outcome_backend scaffolding-only):
+        # ADOPT-NOW ruling: self.journal_backend IS a live path ON THE AGENT —
+        # agent._load_recent_journal() routes through it. (By contrast,
+        # self.outcome_backend above is the per-agent coordinator/inspection
+        # handle, NOT the agent's read/write path — the outcome write path lives
+        # on OutcomeRunner.outcome_backend, a separate instance.)
         # self.journal_backend IS the live read path — agent._load_recent_journal()
         # routes through it. The kwarg-wins-over-env-var pattern matches every
         # other backend kwarg.
@@ -678,9 +686,9 @@ class AtomicAgent:
         # goal_text reader for prompt assembly. _load_goal_text() STAYS on
         # self._profile.goal_text (the profile snapshot). Do NOT add a second
         # goal_text reader here (Principle #6 single reader, A7 ruling).
-        # NOTE: AtomicAgent only STORES this handle this PR — it never invokes a
-        # backend method (no load_goal/save_goal/append_history_event call from
-        # agent.py). The agent_id argument semantics (filesystem ignores it,
+        # NOTE: AtomicAgent STORES this handle but never invokes a backend method
+        # directly (no load_goal/save_goal/append_history_event call from agent.py).
+        # The agent_id argument semantics (filesystem ignores it,
         # scoped via agent_root; a multi-tenant backend keys on it — the
         # tierC-agent-id-argument-value ruling) apply at GoalManager's call
         # sites, not here.

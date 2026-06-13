@@ -17,8 +17,8 @@ Protocol method surface — THIN envelope-only (per arc ruling):
 Pure computation stays ABOVE the Protocol in OutcomeRunner:
   artifact-file discovery (output_dir.glob diffing between iterations),
   output_dir resolution, run_id minting — all remain in the runner.
-  No query/filter method this PR (deferred until the outcome-catalog
-  consumer's PR lands with its known filter shape).
+  No query/filter method in this version (deferred to #454 until the
+  outcome-catalog consumer's PR lands with its known filter shape).
 
 This mirrors the GoalBackend Protocol pattern (spec/41): coarse storage
 primitives on the Protocol, computation in the runner layer.
@@ -91,8 +91,13 @@ class OutcomeBackend(Protocol):
             agent_id: the agent directory name (relative to agents_root).
             run_id: the run identifier (directory name under outcomes/runs/).
             result: the OutcomeResult to write. Path fields are serialized as
-                absolute path strings (byte-identical to the current runner's
-                _write_result_json output — zero on-disk behavior change).
+                absolute path strings; the serialization is byte-identical to
+                the runner's _write_result_json (TEST 30 pins this). Since #448
+                PR2 the runner routes its write through this method, so a run
+                launched with a custom --output-dir now lands result.json at the
+                canonical outcomes/runs/<run_id>/ (the agent's artifact files
+                still go to --output-dir) — see spec/42 §"Artifact-reference
+                portability".
 
         Raises:
             AtomicAgentsError: when result.json already exists for this run_id
