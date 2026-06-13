@@ -1677,3 +1677,134 @@ def test_reclaim_to_recovered_legit_item_still_works(tmp_path):
     assert str(result.path).startswith(str(recovered_root)), (
         f"recovered item landed outside _recovered/: {result.path}"
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FIX C — source-state check in _release_at_path / _dead_letter_at_path
+# (Codex round-4 adversarial: queue-root containment alone is insufficient —
+# a forged item.path pointing at dead-letter/<other>/x.md or done/<other>/x.md
+# passes the queue_root check and gets renamed into done/ or dead-letter/,
+# violating the dead-work-stays-dead invariant (spec/44 MUST 10)).
+
+
+def test_shim_release_forged_dead_letter_source_refused(tmp_path):
+    """release_claim shim MUST NOT move a dead-lettered item into done/.
+
+    A forged FilesystemQueueItem whose .path points at an existing
+    queue/dead-letter/<other>/<name> file passes the queue_root containment
+    check (the path is under queue/) but is NOT a valid source for release
+    (only claimed/<token>/ and queued/_recovered/<token>/ are legal).
+    The source-state check must refuse it: the dead-lettered file stays in
+    dead-letter/, nothing lands in done/, dead-work-stays-dead (spec/44 MUST 10).
+    """
+    from atomic_agents._cascade import claim_next_queued, release_claim
+
+    project_root = tmp_path / "project"
+
+    # Create a real dead-lettered item (via the normal workflow).
+    _queued(project_root, name="x.md", content="dead work")
+    item = claim_next_queued(project_root, "writer", "other-tok")
+    assert item is not None
+    backend = FilesystemQueueBackend(project_root)
+    backend.move_to_dead_letter("other-tok", "x.md", reason="test setup")
+    dl_path = project_root / "queue" / "dead-letter" / "other-tok" / "x.md"
+    assert dl_path.is_file(), "test setup: dead-lettered file must exist"
+
+    # Forge a QueueItem: path points at the dead-lettered file.
+    # Use a different lease_token so claimed_src is a different directory.
+    forged = FilesystemQueueItem(
+        original_name="x.md",
+        role="writer",
+        lease_token="attacker-tok",
+        claimed_at=time.time(),
+        path=dl_path,
+    )
+
+    # Must be a no-op: the dead-lettered file must NOT be moved into done/.
+    release_claim(forged, project_root)
+
+    # Dead-lettered file stays in dead-letter/ (dead-work-stays-dead).
+    assert dl_path.is_file(), (
+        "source-state check moved a dead-lettered file out of dead-letter/ "
+        "(dead-work-stays-dead violated)"
+    )
+
+    # Nothing must have landed in done/.
+    done_root = project_root / "queue" / "done"
+    if done_root.exists():
+        found = [p for p in done_root.rglob("*") if p.is_file()]
+        assert found == [], (
+            f"dead-lettered item was moved into done/ via forged release_claim: {found}"
+        )
+
+
+def test_shim_release_basename_mismatch_refused(tmp_path):
+    """release_claim shim MUST NOT operate when work_path.name != original_name.
+
+    A forged FilesystemQueueItem whose .path is a legitimately-claimed file but
+    whose .original_name differs from path.name must be refused. The source-state
+    check's basename guard prevents silent renames into done/ under an attacker-
+    chosen name.  Must fail-soft: no file moved, no exception raised.
+    """
+    from atomic_agents._cascade import claim_next_queued, release_claim
+
+    project_root = tmp_path / "project"
+
+    # Claim a real item so item.path is a real file under claimed/<token>/.
+    _queued(project_root, name="real.md", content="real work")
+    item = claim_next_queued(project_root, "writer", "tok-mismatch")
+    assert item is not None
+    assert item.path.name == "real.md"
+
+    # Forge: original_name differs from path.name — both are otherwise valid.
+    forged = FilesystemQueueItem(
+        original_name="different.md",
+        role="writer",
+        lease_token="tok-mismatch",
+        claimed_at=time.time(),
+        path=item.path,  # path.name == "real.md" != "different.md"
+    )
+
+    # Must be a no-op: no file moved, no raise.
+    release_claim(forged, project_root)
+
+    # The claimed file must still be in claimed/ (not moved).
+    assert item.path.is_file(), (
+        "basename-mismatch forged item caused the claimed file to be moved"
+    )
+
+    # Nothing must have landed in done/.
+    done_root = project_root / "queue" / "done"
+    if done_root.exists():
+        found = [p for p in done_root.rglob("*") if p.is_file()]
+        assert found == [], f"basename-mismatch item moved into done/: {found}"
+
+
+def test_release_recovered_item_basename_preserved(tmp_path):
+    """SOURCE-state check must pass a legitimately recovered item through to done/.
+
+    A recovered item lives at queue/queued/_recovered/<token>/<name> — the second
+    valid source location.  The source-state check must accept it: the item must be
+    moved into done/ and the path must no longer exist in _recovered/.
+
+    Regression guard: an over-restrictive check that rejects recovered_src would
+    break the normal recovered-item release workflow.
+    """
+    from atomic_agents._cascade import release_claim
+
+    project_root = tmp_path / "project"
+    recovered_item = _recover_one(project_root, "recovered_basename.md")
+
+    # Must succeed: recovered item must move to done/.
+    release_claim(recovered_item, project_root)
+
+    done_file = (
+        project_root / "queue" / "done" / "stale-lease" / "recovered_basename.md"
+    )
+    assert done_file.is_file(), (
+        "source-state check over-restricted a legitimate recovered item "
+        "(did not move to done/)"
+    )
+    assert not recovered_item.path.exists(), (
+        "recovered item path still exists after successful release"
+    )

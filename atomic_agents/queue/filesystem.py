@@ -493,23 +493,48 @@ class FilesystemQueueBackend:
             done_dir = FilesystemQueueBackend._safe_under_queue(
                 queue_root, "done", lease_token
             )
-            # SOURCE containment: work_path must resolve under queue_root before rename.
-            # Legitimately-claimed items live under queue/claimed/<token>/ AND recovered
-            # items under queue/queued/_recovered/<token>/ — both resolve under queue_root.
-            # Only out-of-tree forged paths are refused.
+            # FIX B: SOURCE STATE CHECK — work_path must resolve under one of the
+            # two legitimate source locations for a release operation:
+            #   (1) queue/claimed/<lease_token>/          — normally-claimed items
+            #   (2) queue/queued/_recovered/<lease_token>/ — stale-recovered items
+            # Without this check a forged FilesystemQueueItem whose path points at
+            # queue/dead-letter/<other>/x.md, queue/done/<other>/x.md, or
+            # queue/queued/<role>/x.md passes the queue_root containment check and
+            # gets renamed into done/<lease_token>/ — violating dead-work-stays-dead
+            # and other state-transition invariants (spec/44 MUST 10 + MUST 4).
+            # Also enforce work_path.name == original_name to prevent a caller from
+            # passing a legitimate work_path but a different original_name that would
+            # produce a silently-renamed done/ entry.
+            claimed_src = FilesystemQueueBackend._safe_under_queue(
+                queue_root, "claimed", lease_token
+            )
+            recovered_src = FilesystemQueueBackend._safe_under_queue(
+                queue_root, "queued", "_recovered", lease_token
+            )
             try:
-                if not work_path.resolve().is_relative_to(queue_root.resolve()):
-                    raise PathTraversalError(
-                        "work item path escapes queue/",
-                        child=str(work_path),
-                        root=str(queue_root),
-                    )
+                wr = work_path.resolve()
             except (OSError, RuntimeError) as exc:
                 raise PathTraversalError(
                     "work item path could not be resolved",
                     child=str(work_path),
                     root=str(queue_root),
                 ) from exc
+            if not (
+                wr.is_relative_to(claimed_src.resolve())
+                or wr.is_relative_to(recovered_src.resolve())
+            ):
+                raise PathTraversalError(
+                    "work item path is not in a valid source state for release "
+                    "(must be under claimed/<token>/ or queued/_recovered/<token>/)",
+                    child=str(work_path),
+                    root=str(queue_root),
+                )
+            if work_path.name != original_name:
+                raise PathTraversalError(
+                    "work item basename does not match original_name",
+                    child=str(work_path),
+                    root=str(queue_root),
+                )
             done_dir.mkdir(parents=True, exist_ok=True)
             work_path.rename(done_dir / original_name)
             # Remove the sidecar from the (now-moved) original location.
@@ -585,23 +610,46 @@ class FilesystemQueueBackend:
             dl_dir = FilesystemQueueBackend._safe_under_queue(
                 queue_root, "dead-letter", lease_token
             )
-            # SOURCE containment: work_path must resolve under queue_root before rename.
-            # Legitimately-claimed items live under queue/claimed/<token>/ AND recovered
-            # items under queue/queued/_recovered/<token>/ — both resolve under queue_root.
-            # Only out-of-tree forged paths are refused.
+            # FIX B: SOURCE STATE CHECK — work_path must resolve under one of the
+            # two legitimate source locations for a dead-letter operation:
+            #   (1) queue/claimed/<lease_token>/          — normally-claimed items
+            #   (2) queue/queued/_recovered/<lease_token>/ — stale-recovered items
+            # Without this check a forged FilesystemQueueItem whose path points at
+            # queue/done/<other>/x.md or queue/queued/<role>/x.md passes the
+            # queue_root containment check and gets moved into dead-letter/ —
+            # violating dead-work-stays-dead (spec/44 MUST 10: once in dead-letter/
+            # no release can affect the item; using dead-letter/ as a source is
+            # equally wrong). The basename check prevents silent renames.
+            claimed_src = FilesystemQueueBackend._safe_under_queue(
+                queue_root, "claimed", lease_token
+            )
+            recovered_src = FilesystemQueueBackend._safe_under_queue(
+                queue_root, "queued", "_recovered", lease_token
+            )
             try:
-                if not work_path.resolve().is_relative_to(queue_root.resolve()):
-                    raise PathTraversalError(
-                        "work item path escapes queue/",
-                        child=str(work_path),
-                        root=str(queue_root),
-                    )
+                wr = work_path.resolve()
             except (OSError, RuntimeError) as exc:
                 raise PathTraversalError(
                     "work item path could not be resolved",
                     child=str(work_path),
                     root=str(queue_root),
                 ) from exc
+            if not (
+                wr.is_relative_to(claimed_src.resolve())
+                or wr.is_relative_to(recovered_src.resolve())
+            ):
+                raise PathTraversalError(
+                    "work item path is not in a valid source state for dead-letter "
+                    "(must be under claimed/<token>/ or queued/_recovered/<token>/)",
+                    child=str(work_path),
+                    root=str(queue_root),
+                )
+            if work_path.name != original_name:
+                raise PathTraversalError(
+                    "work item basename does not match original_name",
+                    child=str(work_path),
+                    root=str(queue_root),
+                )
             dl_dir.mkdir(parents=True, exist_ok=True)
             target = dl_dir / original_name
             work_path.rename(target)
