@@ -385,6 +385,17 @@ def renew_lease(item: "QueueItem", additional_seconds: int = None) -> None:
     ``queue/queued/_recovered/<token>/``. We do NOT reconstruct the sidecar
     location from ``item.path.parents[3]`` + ``lease_token`` (which assumed a
     fixed claimed-dir depth and crashed for recovered items).
+
+    Trust boundary (asymmetric with the release/move_to_dead_letter shims): those
+    re-derive their target through the project_root-anchored ``_safe_under_queue``
+    guard and so fail-soft on a symlinked ``queue/``. This shim writes next to
+    ``item.path`` with NO containment guard — its frozen signature carries no
+    ``project_root`` to anchor one. That is byte-faithful to pre-carve behavior
+    and safe for items produced by ``claim_next_queued``/recovery (paths under
+    ``queue/``); an EXTERNALLY-constructed item with an out-of-tree ``path`` would
+    write outside. The Protocol method ``FilesystemQueueBackend.renew_lease()``
+    IS contained; closing this shim gap requires a signature change deferred to
+    the v1.0/T10 shim-retirement pass (tracked as a follow-up issue).
     """
     _FilesystemQueueBackend._renew_lease_at_sidecar(
         _sidecar_path(item.path),

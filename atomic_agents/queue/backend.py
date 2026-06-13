@@ -54,9 +54,12 @@ See docs/spec/44-queue-backend.md for the full normative contract.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Protocol, runtime_checkable
 
 from .types import QueueCapabilities, QueueItem, QueueExport
+
+_logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -269,8 +272,10 @@ def recover_stale_claims(
     lease_expires_at. When that timestamp is in the past (or None and the item
     is older than lease_seconds by mtime — checked by the backend's list_claimed
     impl), the item is stale. The stale item is moved back to queued via the
-    backend's internal reclaim mechanism (triggered by claiming from _recovered/
-    for filesystem, or a reclaim call for other backends).
+    backend's internal reclaim primitive — ``_reclaim_to_recovered(item)``; for
+    the filesystem backend this renames the work file into ``queued/_recovered/``
+    (there is no "claim from _recovered/" step). A non-filesystem backend MUST
+    provide ``_reclaim_to_recovered`` for recovery to function.
 
     NOTE for filesystem backend: FilesystemQueueBackend.list_claimed() directly
     handles the mtime fallback and malformed-sidecar fall-through. This function
@@ -321,9 +326,21 @@ def recover_stale_claims(
             # Move back to queued via the backend's internal reclaim mechanism.
             # For filesystem: item is in claimed/, we move it to queued/_recovered/.
             # This is done by the backend's own release/reclaim primitive.
-            if hasattr(backend, "_reclaim_to_recovered"):
-                result = backend._reclaim_to_recovered(item)  # type: ignore[attr-defined]
-                if result is not None:
-                    recovered.append(result)
+            reclaim = getattr(backend, "_reclaim_to_recovered", None)
+            if reclaim is None:
+                # A backend that structurally conforms to the Protocol but omits
+                # this private primitive would silently recover nothing — make
+                # the contract gap loud rather than returning [] with no signal.
+                _logger.warning(
+                    "QueueBackend %s found a stale claimed item but exposes no "
+                    "_reclaim_to_recovered() primitive; cannot recover it. A "
+                    "non-filesystem backend MUST provide _reclaim_to_recovered "
+                    "for recover_stale_claims() to function.",
+                    type(backend).__name__,
+                )
+                continue
+            result = reclaim(item)
+            if result is not None:
+                recovered.append(result)
 
     return recovered

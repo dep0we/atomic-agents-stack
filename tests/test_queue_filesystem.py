@@ -435,6 +435,83 @@ def test_symlinked_claimed_subdir_does_not_escape_on_recover(tmp_path):
     assert not (project_root / "queue" / "queued" / "_recovered").exists()
 
 
+def test_symlinked_claimed_CHILD_leasedir_does_not_escape_on_list(tmp_path):
+    """list_claimed MUST NOT surface bytes from a symlinked child lease dir.
+
+    claimed/ is a REAL directory; claimed/<lease_token>/ is a symlink pointing
+    outside queue_root.  The one-time claimed/ containment guard passes; the
+    per-child guard must catch and skip the escaping lease dir.
+    """
+    project_root = tmp_path / "project"
+    (project_root / "queue" / "claimed").mkdir(parents=True)
+    outside = tmp_path / "outside_lease"
+    outside.mkdir()
+    (outside / "secret.md").write_text("external secret")
+    # claimed/ is real; claimed/lease-x is the symlinked child escaping queue/
+    (project_root / "queue" / "claimed" / "lease-x").symlink_to(outside)
+
+    backend = FilesystemQueueBackend(project_root)
+    result = backend.list_claimed()
+    assert result == [], f"list_claimed leaked symlinked child lease dir: {result}"
+    # Confirm the external file bytes were NOT read
+    assert (outside / "secret.md").read_text() == "external secret"
+
+
+def test_symlinked_claimed_CHILD_leasedir_does_not_escape_on_recover(tmp_path):
+    """recover_stale_claims MUST NOT move files through a symlinked child lease dir.
+
+    claimed/ is a REAL directory; claimed/<lease_token>/ is a symlink pointing
+    to an external dir containing a stale work file.  Without the per-child guard
+    the rename would exfiltrate the file into queued/_recovered/ and the rmdir
+    cleanup would crash with NotADirectoryError on the symlink.
+    """
+    project_root = tmp_path / "project"
+    (project_root / "queue" / "claimed").mkdir(parents=True)
+    outside = tmp_path / "outside_lease"
+    outside.mkdir()
+    (outside / "stale.md").write_text("external stale")
+    # claimed/ is real; claimed/lease-x is the symlinked child
+    (project_root / "queue" / "claimed" / "lease-x").symlink_to(outside)
+
+    backend = FilesystemQueueBackend(project_root)
+    # Must not raise, must not move the external file, must return empty list.
+    result = recover_stale_claims(backend, lease_seconds=0)
+    assert result == [], f"recover leaked symlinked child lease dir: {result}"
+    # External file is untouched and NOT moved into queued/_recovered/
+    assert (outside / "stale.md").exists(), "external file was moved (exfiltration)"
+    assert (outside / "stale.md").read_text() == "external stale"
+    assert not (project_root / "queue" / "queued" / "_recovered").exists()
+
+
+def test_symlinked_work_FILE_in_real_leasedir_skipped(tmp_path):
+    """list_claimed and recover MUST NOT surface a symlinked work file inside a real lease dir.
+
+    claimed/<lease_token>/ is a REAL directory; the work file inside it is a
+    symlink pointing to a file outside queue_root.  The per-work-file guard must
+    skip it on both list and recover.
+    """
+    project_root = tmp_path / "project"
+    lease_dir = project_root / "queue" / "claimed" / "lease-y"
+    lease_dir.mkdir(parents=True)
+    outside_file = tmp_path / "outside_work.md"
+    outside_file.write_text("external work content")
+    # The work file inside the legit lease dir is a symlink escaping queue_root
+    (lease_dir / "work.md").symlink_to(outside_file)
+
+    backend = FilesystemQueueBackend(project_root)
+
+    # list_claimed: must not surface the symlinked work file
+    result = backend.list_claimed()
+    assert result == [], f"list_claimed surfaced symlinked work file: {result}"
+
+    # recover: must not move the external file
+    result = recover_stale_claims(backend, lease_seconds=0)
+    assert result == [], f"recover moved symlinked work file: {result}"
+    assert outside_file.exists(), "external file was moved (exfiltration)"
+    assert outside_file.read_text() == "external work content"
+    assert not (project_root / "queue" / "queued" / "_recovered").exists()
+
+
 def test_traversing_role_or_lease_token_arg_stays_under_queue(tmp_path):
     """A role / lease_token argument containing '..' MUST NOT escape queue/.
 

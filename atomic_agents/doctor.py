@@ -4370,7 +4370,7 @@ def check_queue_backend(agent_root: Path) -> CheckResult:
         return CheckResult(
             name="queue-backend",
             status=FAIL,
-            message=f"queue backend list_claimed() raised: {type(e).__name__}: {e}",
+            message=f"queue backend list_claimed() raised: {type(e).__name__}",
             detail={
                 "backend_id": backend.backend_id,
                 "error": str(e),
@@ -4389,8 +4389,8 @@ def check_queue_backend(agent_root: Path) -> CheckResult:
                 name="queue-backend",
                 status=FAIL,
                 message=(
-                    f"queue/ directory escapes project_root "
-                    f"(symlink containment violation): {e}"
+                    "queue/ directory escapes project_root "
+                    "(symlink containment violation)"
                 ),
                 fix_hint=(
                     "The project's queue/ directory is a symlink resolving "

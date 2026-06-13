@@ -619,10 +619,26 @@ class FilesystemQueueBackend:
             if not lease_dir.is_dir():
                 continue
             lease_token = lease_dir.name
+            # Per-lease-dir containment: a symlinked lease dir (real claimed/,
+            # symlinked child) would bypass the one-time claimed/ guard above and
+            # expose external bytes or crash on cleanup.  Mirror export()'s
+            # per-leaf guard — skip any lease dir that escapes queue_root.
+            try:
+                self._safe_under_queue(queue_root, "claimed", lease_token)
+            except PathTraversalError:
+                continue
             for path in lease_dir.iterdir():
                 if not path.is_file():
                     continue
                 if path.name.endswith(".lease.json"):
+                    continue
+                # Per-work-file containment: a symlinked work file inside an
+                # otherwise-legit lease dir could still escape queue_root.
+                try:
+                    self._safe_under_queue(
+                        queue_root, "claimed", lease_token, path.name
+                    )
+                except PathTraversalError:
                     continue
                 # Read sidecar for metadata
                 sidecar = _sidecar_path(path)
@@ -812,10 +828,27 @@ class FilesystemQueueBackend:
             if not lease_dir.is_dir():
                 continue
             lease_token = lease_dir.name
+            # Per-lease-dir containment: a symlinked lease dir bypasses the
+            # one-time claimed/ guard.  The rename below would otherwise move
+            # external bytes into queued/_recovered/ (exfiltration), and the
+            # rmdir cleanup would crash with NotADirectoryError on the symlink.
+            try:
+                self._safe_under_queue(queue_root, "claimed", lease_token)
+            except PathTraversalError:
+                continue
             for path in lease_dir.iterdir():
                 if not path.is_file():
                     continue
                 if path.name.endswith(".lease.json"):
+                    continue
+                # Per-work-file containment: mirrors export()'s per-leaf guard —
+                # a symlinked work file inside a legit lease dir must not be
+                # moved outside queue_root.
+                try:
+                    self._safe_under_queue(
+                        queue_root, "claimed", lease_token, path.name
+                    )
+                except PathTraversalError:
                     continue
                 sidecar = _sidecar_path(path)
                 is_stale = False
@@ -862,12 +895,17 @@ class FilesystemQueueBackend:
                     except FileNotFoundError:
                         pass
 
-            # Clean up empty lease dirs.
+            # Clean up empty lease dirs.  Wrap the rmdir in a broad OSError
+            # catch so a symlinked or vanished lease_dir (NotADirectoryError /
+            # FileNotFoundError) never aborts the whole recovery sweep.
             try:
                 next(lease_dir.iterdir())
             except StopIteration:
-                lease_dir.rmdir()
-            except FileNotFoundError:
+                try:
+                    lease_dir.rmdir()
+                except OSError:
+                    pass
+            except (FileNotFoundError, OSError):
                 pass
 
         return recovered
