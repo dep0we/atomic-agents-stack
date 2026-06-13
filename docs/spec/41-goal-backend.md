@@ -1,6 +1,6 @@
 # spec/41: GoalBackend Protocol
 
-> **Status:** DRAFT at PR 1 (issue #425). Conformance suite covers all 9 Implementer Contract MUSTs for `FilesystemGoalBackend` (`test_goal_backend_conformance.py`) plus filesystem-specific tests (`test_goal_filesystem.py`). Goal is also registered in the shared #379 export conformance harness (`test_export_protocol_conformance.py`) and the capability-advertisement harness (`test_export_capability_advertisement.py`: 2 goal-specific tests — `test_goal_backend_advertises_canonical_export`, `test_goal_backend_is_exportable` — plus the shared `test_all_capability_flags_are_bool` parametrization extended to cover goal). The four pre-existing goal tests (`test_goal.py`, `test_agent_goal_loading.py`, `test_dashboard_goals.py`, `test_goal_outcome_composition.py`) remain the zero-behavior-change regression guard; they are not modified by this protocol change (as of PR 1, 2026-06-11).
+> **Status:** DRAFT — Protocol scaffold: #425 PR1 (2026-06-11); write-path adoption: #448 PR1 (2026-06-13). Lock ceremony deferred to #448 PR3 (arc-closer). Conformance suite covers all 9 Implementer Contract MUSTs for `FilesystemGoalBackend` (`test_goal_backend_conformance.py`) plus filesystem-specific tests (`test_goal_filesystem.py`). Goal is also registered in the shared #379 export conformance harness (`test_export_protocol_conformance.py`) and the capability-advertisement harness (`test_export_capability_advertisement.py`: 2 goal-specific tests — `test_goal_backend_advertises_canonical_export`, `test_goal_backend_is_exportable` — plus the shared `test_all_capability_flags_are_bool` parametrization extended to cover goal). The four pre-existing goal tests (`test_goal.py`, `test_agent_goal_loading.py`, `test_dashboard_goals.py`, `test_goal_outcome_composition.py`) remain the zero-behavior-change regression guard; archive golden assertions updated in #448 PR1 for the A3 data-loss fix (the one sanctioned exception to the freeze).
 
 ---
 
@@ -206,11 +206,11 @@ All bytes are **Tier A passthrough** (spec/40 §"Tier A passthrough"): the backe
 
 ---
 
-## Goal-outcome composition (deferred to a follow-up)
+## Goal-outcome composition (coordinator deferred to #448 PR3)
 
-This scaffolding PR ships the `GoalBackend` Protocol and `FilesystemGoalBackend`, but does NOT wire the backend into the live runtime — `GoalManager.dispatch_as_outcome()` (in `_goal_impl.py`) remains the live CLI path and continues to do direct file I/O.
+As of #448 PR1 (write-path adoption), `GoalManager.dispatch_as_outcome()` routes its `save()` through `backend.save_goal` and its `_append_goal_history_jsonl` through `backend.append_history_event` (coarse-route adoption). The terminal-status mapping (`apply_transition` calls for coordinator-managed transitions) and the pre-dispatch cost gate remain deferred to #448 PR3.
 
-A future PR (filed as #448) will add a goal-outcome coordinator — a thin function (not a `GoalBackend` method) that composes the backend with `OutcomeRunner`, adding a pre-dispatch cost gate (`_check_cost_guardrails(critical=False)` → raise `CostGuardrailBlocked` on a blocked cap), the `pending → in_progress` pre-transition, the outcome run (without holding the goal lock), and the terminal transition. It is deferred rather than shipped here because (a) it needs the backend actually adopted by the runtime to be exercised, and (b) shipping an un-wired, parallel copy of the cost-guardrail path risks silent drift from the live gate (CLAUDE.md Principle #4). It will ship WITH its own tests when the backend is adopted.
+A future PR (#448 PR3, the arc-closer) will add a goal-outcome coordinator — a thin function (not a `GoalBackend` method) that composes the backend with `OutcomeRunner`, adding a pre-dispatch cost gate (`_check_cost_guardrails(critical=False)` → raise `CostGuardrailBlocked` on a blocked cap), the `pending → in_progress` pre-transition via `apply_transition`, the outcome run (without holding the goal lock), and the terminal transition via `apply_transition`. It is deferred rather than shipped here because (a) shipping an un-wired, parallel copy of the cost-guardrail path risks silent drift from the live gate (CLAUDE.md Principle #4), and (b) `apply_transition` uses `date.today()` internally — wiring dispatch through it before the coordinator clock-injection design is settled would break the golden tests.
 
 The coordinator will NOT be a `GoalBackend` method: it needs both the backend AND the runtime (`AtomicAgent`, `OutcomeRunner`) simultaneously, and making it a Protocol method would invert the dependency direction (the backend must not depend on the runtime).
 
@@ -218,15 +218,15 @@ The coordinator will NOT be a `GoalBackend` method: it needs both the backend AN
 
 ## Operator override surface
 
-As of PR 1 (this scaffolding PR), GoalBackend is operator-configurable via **two** surfaces — the env var and the factory. The `AtomicAgent` constructor kwarg + public attribute are **deferred to the runtime-wiring PR (#448)**, mirroring how the goal-outcome coordinator is deferred above. This PR does NOT wire the backend into `AtomicAgent.__init__`, so there is no `goal_backend` constructor parameter or `AtomicAgent.goal_backend` attribute today.
+GoalBackend is operator-configurable via **three** surfaces — the env var, the factory, and the `AtomicAgent` constructor kwarg. The `AtomicAgent` constructor kwarg + public attribute ship in **#448 PR1**.
 
 | Surface | Mechanism | Status |
 |---------|-----------|--------|
-| Environment variable | `ATOMIC_AGENTS_GOAL_BACKEND=<backend_id>` | Ships in PR 1 |
-| Factory function | `get_default_goal_backend(agent_root)` | Ships in PR 1 |
-| Constructor kwarg | `AtomicAgent(goal_backend=my_backend)` + `AtomicAgent.goal_backend` attribute | Deferred to #448 (runtime wiring) |
+| Environment variable | `ATOMIC_AGENTS_GOAL_BACKEND=<backend_id>` | Ships in #425 PR1 |
+| Factory function | `get_default_goal_backend(agent_root)` | Ships in #425 PR1 |
+| Constructor kwarg | `AtomicAgent(goal_backend=my_backend)` + `AtomicAgent.goal_backend` attribute | Ships in #448 PR1 |
 
-The doctor's `check_goal_backend()` constructs the backend via `get_default_goal_backend(agent_root)` directly and runs the dual-probe health check against it (it does not read any `AtomicAgent` attribute — none exists yet).
+`AtomicAgent(goal_backend=...)` kwarg wins over the env-var factory (same pattern as `journal_backend`). `AtomicAgent.goal_backend` is the per-agent persistence handle (NOT the goal_text reader — `_load_goal_text()` stays on `self._profile.goal_text` per Principle #6). The doctor's `check_goal_backend()` constructs the backend via `get_default_goal_backend(agent_root)` directly and runs the dual-probe health check against it.
 
 ---
 
