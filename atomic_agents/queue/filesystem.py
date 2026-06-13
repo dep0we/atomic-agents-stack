@@ -143,6 +143,35 @@ def _sidecar_path(work_file: Path) -> Path:
     return work_file.parent / (work_file.name + ".lease.json")
 
 
+def _validate_original_name(original_name: str) -> None:
+    """Reject original_name values that contain path separators or are reserved names.
+
+    original_name is a caller-supplied path component that gets appended to
+    directory paths (done/<token>/<original_name>, dead-letter/<token>/
+    <original_name>.reason.txt, claimed/<token>/<original_name>.lease.json).
+    Without this check a traversing value like '../../evil' composes into a path
+    that escapes its containing directory.
+
+    A valid original_name must be a bare filename: a single path component with
+    no separators, not empty, and not the reserved names '.' or '..'.
+
+    Raises:
+        PathTraversalError: when original_name contains path separators, is empty,
+            or is '.' or '..'.
+    """
+    if (
+        not original_name
+        or original_name in (".", "..")
+        or original_name != Path(original_name).name
+    ):
+        raise PathTraversalError(
+            "original_name must be a bare filename (no path separators, not empty, "
+            "not '.' or '..')",
+            child=original_name,
+            root="<original_name validation>",
+        )
+
+
 def _write_sidecar(
     work_file: Path,
     lease_token: str,
@@ -359,6 +388,15 @@ class FilesystemQueueBackend:
         # Sort to give deterministic FIFO-by-name behavior.
         candidates = sorted(p for p in queued_dir.iterdir() if p.is_file())
         for src in candidates:
+            # Per-source-file containment: a symlinked file inside queued/<role>/
+            # pointing outside queue_root would be renamed into claimed/ and its
+            # bytes (or the external file it links to) read by the worker — host-file
+            # exfiltration. Mirror the per-work-file guard in list_claimed and
+            # _recover_stale_claims_native: skip candidates that escape queue_root.
+            try:
+                self._safe_under_queue(queue_root, "queued", role, src.name)
+            except PathTraversalError:
+                continue
             dst = claimed_dir / src.name
             try:
                 src.rename(dst)
@@ -394,6 +432,7 @@ class FilesystemQueueBackend:
         is in done/ is harmless — no recovery code looks there.
         """
         try:
+            _validate_original_name(original_name)
             queue_root = self._queue_root()
             claimed_dir = self._safe_under_queue(queue_root, "claimed", lease_token)
         except PathTraversalError:
@@ -452,6 +491,7 @@ class FilesystemQueueBackend:
         An orphaned sidecar in dead-letter/ is harmless.
         """
         try:
+            _validate_original_name(original_name)
             queue_root = self._queue_root()
             claimed_dir = self._safe_under_queue(queue_root, "claimed", lease_token)
         except PathTraversalError:
@@ -523,6 +563,7 @@ class FilesystemQueueBackend:
         the _cascade.py implementation. See _write_sidecar docstring.
         """
         try:
+            _validate_original_name(original_name)
             queue_root = self._queue_root()
             claimed_dir = self._safe_under_queue(queue_root, "claimed", lease_token)
         except PathTraversalError:

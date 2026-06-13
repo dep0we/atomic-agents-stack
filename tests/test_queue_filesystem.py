@@ -1031,3 +1031,151 @@ def test_export_skips_symlinked_dead_letter_subdir_escaping_queue(tmp_path):
     )
     # The escaped target file must not appear
     assert not any("stolen_dl" in r for r in rels)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# original_name traversal containment (F1) and symlinked source-file in
+# claim_next (F2) — regression tests for the two confirmed escapes.
+
+
+def test_renew_lease_traversing_original_name_stays_under_queue(tmp_path):
+    """renew_lease() MUST NOT write a sidecar outside claimed/ when original_name
+    contains '..' path components (e.g. '../../evil').
+
+    Regression: the sidecar was assembled as claimed_dir / (original_name +
+    '.lease.json') without validating that original_name is a bare filename.
+    A traversing name composes into a path escaping claimed/ — and potentially
+    escaping queue/ or project_root — and .write_text() would land the sidecar
+    there. The fix rejects any original_name that is not a bare filename.
+    """
+    project_root = tmp_path / "project"
+    _queued(project_root, role="writer", name="real.md", content="work")
+    backend = FilesystemQueueBackend(project_root)
+    item = backend.claim_next("writer", "tok")
+    assert item is not None
+
+    # Attack: traversing original_name should be a no-op (fail-soft).
+    backend.renew_lease("tok", "../../evil")
+
+    # Nothing must have been written outside claimed/.
+    escaped_in_queue = project_root / "queue" / "evil.lease.json"
+    escaped_in_project = project_root / "evil.lease.json"
+    escaped_in_tmp = tmp_path / "evil.lease.json"
+    assert not escaped_in_queue.exists(), (
+        "renew_lease() wrote sidecar outside claimed/ (queue/evil.lease.json)"
+    )
+    assert not escaped_in_project.exists(), (
+        "renew_lease() wrote sidecar outside claimed/ (project/evil.lease.json)"
+    )
+    assert not escaped_in_tmp.exists(), (
+        "renew_lease() wrote sidecar outside project entirely"
+    )
+
+
+def test_move_to_dead_letter_traversing_original_name_contained(tmp_path):
+    """move_to_dead_letter() MUST NOT write a .reason.txt outside dead-letter/ when
+    original_name contains '..' path components.
+
+    Regression: dl_dir / (original_name + '.reason.txt') was assembled without
+    validating that original_name is a bare filename. A traversing name escapes
+    dead-letter/ and .write_text() lands the reason file at an attacker-controlled
+    path. The fix rejects traversing original_name before any path construction.
+    """
+    project_root = tmp_path / "project"
+    _queued(project_root, role="writer", name="real.md", content="work")
+    backend = FilesystemQueueBackend(project_root)
+    item = backend.claim_next("writer", "tok")
+    assert item is not None
+
+    # Attack: traversing original_name should be a no-op (fail-soft).
+    backend.move_to_dead_letter("tok", "../../evil", reason="PWNED")
+
+    # Nothing must have been written outside dead-letter/.
+    escaped_in_queue = project_root / "queue" / "evil.reason.txt"
+    escaped_in_project = project_root / "evil.reason.txt"
+    escaped_in_tmp = tmp_path / "evil.reason.txt"
+    assert not escaped_in_queue.exists(), (
+        "move_to_dead_letter() wrote reason file outside dead-letter/ (queue/evil.reason.txt)"
+    )
+    assert not escaped_in_project.exists(), (
+        "move_to_dead_letter() wrote reason file outside dead-letter/ (project/evil.reason.txt)"
+    )
+    assert not escaped_in_tmp.exists(), (
+        "move_to_dead_letter() wrote reason file outside project entirely"
+    )
+
+
+def test_release_traversing_original_name_contained(tmp_path):
+    """release() MUST NOT move or unlink anything outside claimed/done when
+    original_name contains '..' path components.
+
+    Regression: claimed_dir / original_name was assembled without validating that
+    original_name is a bare filename. A traversing name composes into a path
+    escaping claimed/, and the sidecar unlink (_sidecar_path(work_path).unlink())
+    would follow the escaped path. The fix rejects traversing original_name before
+    any path construction.
+    """
+    project_root = tmp_path / "project"
+    _queued(project_root, role="writer", name="real.md", content="work")
+    # Plant a file outside queue/ that the sidecar-unlink might otherwise hit.
+    canary = project_root / "canary.txt"
+    canary.write_text("must not be touched")
+
+    backend = FilesystemQueueBackend(project_root)
+    item = backend.claim_next("writer", "tok")
+    assert item is not None
+
+    # Attack: traversing original_name should be a no-op (fail-soft).
+    backend.release("tok", "../../canary.txt")
+
+    # The canary file must be untouched.
+    assert canary.exists(), (
+        "release() with a traversing original_name unlinked a file outside claimed/"
+    )
+    assert canary.read_text() == "must not be touched", (
+        "release() with a traversing original_name modified a file outside claimed/"
+    )
+    # The legitimate claimed item must still be present (release was a no-op).
+    assert item.path.exists(), (
+        "release() with a traversing original_name moved the legitimate claimed item"
+    )
+
+
+def test_claim_next_skips_symlinked_source_file(tmp_path):
+    """claim_next() MUST NOT claim a symlinked file in queued/<role>/ that
+    points outside queue_root (host-file exfiltration).
+
+    Regression: claim_next() used 'p.is_file()' to filter candidates — which
+    follows symlinks — so a symlinked file in queued/<role>/ whose target lived
+    outside project_root passed the filter and was renamed into claimed/. The
+    worker then reads item.path (the symlink now under claimed/), following it to
+    the external target. The fix adds a per-source-file _safe_under_queue() guard
+    that skips any candidate whose resolved path escapes queue_root, mirroring the
+    per-work-file guard already in list_claimed and _recover_stale_claims_native.
+    """
+    project_root = tmp_path / "project"
+    (project_root / "queue" / "queued" / "writer").mkdir(parents=True)
+    # External secret that must NOT be surfaced to the worker.
+    secret = tmp_path / "external_secret.txt"
+    secret.write_text("EXTERNAL-SECRET")
+    # Symlink inside queued/writer/ pointing to the external secret.
+    (project_root / "queue" / "queued" / "writer" / "link.md").symlink_to(secret)
+
+    backend = FilesystemQueueBackend(project_root)
+    item = backend.claim_next("writer", "tok2")
+
+    # claim_next must return None (the only candidate was the symlinked file).
+    assert item is None, (
+        f"claim_next() claimed a symlinked source file escaping queue_root: {item}"
+    )
+    # The external secret bytes must NOT have been surfaced.
+    # (If item were not None, the caller would do item.path.read_text() → exfil.)
+    # Belt-and-suspenders: confirm the symlink was NOT moved into claimed/.
+    claimed_dir = project_root / "queue" / "claimed" / "tok2"
+    if claimed_dir.exists():
+        claimed_files = list(claimed_dir.iterdir())
+        assert claimed_files == [], (
+            f"claim_next() moved a symlinked source file into claimed/: {claimed_files}"
+        )
+    # The external secret is untouched.
+    assert secret.read_text() == "EXTERNAL-SECRET"
