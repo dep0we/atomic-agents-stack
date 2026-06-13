@@ -1,8 +1,6 @@
 # spec/42: OutcomeBackend Protocol
 
-> **Status:** DRAFT at PR 1 (issue #426). Conformance suite covers all 9 Implementer Contract MUSTs for `FilesystemOutcomeBackend` (`test_outcome_backend_conformance.py`, 76 tests) plus filesystem-specific tests. OutcomeBackend is also registered in the shared spec/40 export conformance harness (`test_export_protocol_conformance.py`) and the capability-advertisement harness (`test_export_capability_advertisement.py`: 2 outcome-specific tests — `test_outcome_backend_advertises_canonical_export`, `test_outcome_backend_is_exportable` — plus the shared `test_all_capability_flags_are_bool` parametrization extended to cover outcome). The two pre-existing outcome tests (`test_outcome.py`, `test_goal_outcome_composition.py`) remain the zero-behavior-change regression guard; they are not modified by this protocol change.
->
-> **Spec lock deferred to post-#448 (OutcomeRunner write-path wiring).** The write path inside `OutcomeRunner._write_result_json` still calls `atomic_write` directly, bypassing the backend. All MUSTs in this DRAFT document describe `FilesystemOutcomeBackend` as a standalone store, not as the target of `OutcomeRunner` writes. The `AtomicAgent.outcome_backend` attribute is scaffolding-only in PR 1 — set at construction, never read by any internal method. Full wiring ships in #448.
+> **Status:** LOCKED at PR 2 (issue #448 PR2, 2026-06-13). Conformance suite covers all 9 Implementer Contract MUSTs for `FilesystemOutcomeBackend` (`test_outcome_backend_conformance.py`, 76 tests) plus write-path adoption golden tests (`test_outcome_adoption_golden.py`) and filesystem-specific tests. OutcomeBackend is also registered in the shared spec/40 export conformance harness (`test_export_protocol_conformance.py`) and the capability-advertisement harness (`test_export_capability_advertisement.py`: 2 outcome-specific tests — `test_outcome_backend_advertises_canonical_export`, `test_outcome_backend_is_exportable` — plus the shared `test_all_capability_flags_are_bool` parametrization extended to cover outcome). The two pre-existing outcome tests (`test_outcome.py`, `test_goal_outcome_composition.py`) remain the zero-behavior-change regression guard.
 >
 > **Note:** The issue body and PR1 kickoff scope reference spec/13 as the cross-link. This is a typo. The correct cross-reference is **spec/14 (Outcomes)**, where the outcome behavior narrative lives. spec/13 covers Research Integrity, an unrelated domain. This note self-documents the correction.
 
@@ -22,11 +20,11 @@ The motivation: `outcome.py` held `OutcomeRunner` (a runtime object), `OutcomeRe
 
 ---
 
-## Shipping plan (2 PRs)
+## Shipping history (2 PRs)
 
-- **PR 1 (this PR, #426).** Protocol scaffold + dataclasses + capability advertisement + `FilesystemOutcomeBackend` reference impl + compatibility re-export (`outcome.py` → `outcome/` package; `from atomic_agents.outcome import OutcomeRunner` stays a supported public import, NOT deprecated) + `OutcomeRunner` relocated to `_outcome_impl.py` + `OutcomeResult`/`IterationRecord` canonical types in `outcome/types.py` + `OutcomeExport` (an `ExportableResult` subclass) wired into `atomic_agents.export` + `check_outcome_backend()` doctor check + `AtomicAgent.outcome_backend` scaffolding attribute + full conformance suite + spec/42 DRAFT.
+- **PR 1 (#426, merged).** Protocol scaffold + dataclasses + capability advertisement + `FilesystemOutcomeBackend` reference impl + compatibility re-export (`outcome.py` → `outcome/` package; `from atomic_agents.outcome import OutcomeRunner` stays a supported public import, NOT deprecated) + `OutcomeRunner` relocated to `_outcome_impl.py` + `OutcomeResult`/`IterationRecord` canonical types in `outcome/types.py` + `OutcomeExport` (an `ExportableResult` subclass) wired into `atomic_agents.export` + `check_outcome_backend()` doctor check + `AtomicAgent.outcome_backend` scaffolding attribute (scaffolding-only at PR 1 — upgraded to the per-agent coordinator/inspection handle at PR 2) + full conformance suite + spec/42 DRAFT.
 
-- **PR 2 (#448, deferred).** Wire `OutcomeRunner._write_result_json` through `self.outcome_backend.write_result()` — the actual write path. Adds the `outcome_backend=` kwarg to `OutcomeRunner.__init__`. Updates `AtomicAgent.outcome_backend` from scaffolding to active. Locks spec/42.
+- **PR 2 (#448, merged).** Replaces the single `run()` call site — `self._write_result_json(output_dir, result)` → `self.outcome_backend.write_result(self.agent_name, run_id, result)`. `_write_result_json` stays intact as the reference serializer (TEST 30 in `test_outcome_backend_conformance.py` depends on it). Adds the `outcome_backend=` kwarg to `OutcomeRunner.__init__` (keyword-only, default `get_default_outcome_backend(self.agent_root)`, kwarg-wins-over-env). `AtomicAgent.outcome_backend` remains the per-agent HANDLE for operator inspection and the future PR3 coordinator — it is NOT the write path. `AtomicAgent` does NOT construct or feed an OutcomeRunner (GoalManager and the CLI do that independently). Locks spec/42.
 
 ---
 
@@ -94,13 +92,15 @@ properties:
   backend_id                            — stable backend identifier string
 ```
 
-No `query/filter` method ships in this PR (deferred until the outcome-catalog consumer's PR lands with its known filter shape, per Principle #2 "no abstractions for hypothetical future needs").
+No `query/filter` method ships in this version (deferred to #454 until the outcome-catalog consumer's PR lands with its known filter shape, per Principle #2 "no abstractions for hypothetical future needs").
 
 ---
 
-## Artifact-reference portability (Option C)
+## Artifact-reference portability
 
-**On-disk `result.json` stays BYTE-IDENTICAL to today.** `OutcomeRunner._write_result_json` is UNTOUCHED; it still calls `atomic_write` with absolute paths. Zero on-disk behavior change.
+**On-disk `result.json` is byte-identical to the pre-adoption serializer.** The live write path now routes through `self.outcome_backend.write_result()` (#448 PR2); `OutcomeRunner._write_result_json` is retained only as the byte-identity reference serializer (`test_outcome_backend_conformance.py` TEST 30 + `test_outcome_adoption_golden.py` pin `write_result` against it). For the DEFAULT `output_dir` the file lands at the same canonical location as before (`outcomes/runs/<run_id>/result.json` — byte-identical-location). For a CUSTOM `--output-dir` the audit envelope now relocates to the canonical `outcomes/runs/<run_id>/result.json` (the A1 conscious correctness fix — see §Shipping history PR 2), while agent artifact files still go to `output_dir`.
+
+> The #426 PR1 design here was "Option C" — keep `_write_result_json` as the direct `atomic_write` write path and leave a custom-`output_dir` `result.json` where the operator pointed it. A1 (#448 PR2) deliberately superseded that: a filesystem-only "write the receipt to an arbitrary operator folder" model cannot survive a swapped backend keyed by `run_id`, and it left custom-`output_dir` receipts invisible to `list_runs`/`read_result`/`export` (the orphan bug). The backend now owns the canonical path.
 
 **The net-new `FilesystemOutcomeBackend.export()` emits PORTABLE artifact references** by rebasing absolute artifact paths to relative-to-`agent_root`:
 
@@ -241,7 +241,7 @@ Export fidelity is a spec/40 addendum concern, NOT a core MUST (following GoalBa
 2. Artifact refs in the export are relative-to-`agent_root` where possible (is_relative_to guard), absolute otherwise (fallback).
 3. `export_all()` is a convenience alias for `export(None)`.
 
-**Deliberate single-run scope (divergence from spec/40 `export_all()` wording).** The spec/40 `Exportable.export_all()` contract documents `export_all` as "unbounded export (all records, no filter)." OutcomeBackend's `OutcomeExport` shape is **single-run** — one `run_id`, one `result_json_bytes`, one `artifact_refs` — so both `export()` and `export_all()` here deliberately return ONLY the most-recent run (`list_runs()[-1]`), NOT every run. This is honest for this scaffolding PR: the outcome-catalog / cross-run quality-rollup consumer that needs multi-run export builds it OVER `read_result`/`export` for now, and a multi-run `OutcomeExport` shape (carrying `list[run]`) ships WITH that consumer's PR and its conformance tests — filed inline as [#454](https://github.com/dep0we/atomic-agents-stack/issues/454). Adding a multi-run shape now would be an abstraction for a hypothetical future need (Principle #2/#6). The `export()`/`export_all()` docstrings carry the same note.
+**Deliberate single-run scope (divergence from spec/40 `export_all()` wording).** The spec/40 `Exportable.export_all()` contract documents `export_all` as "unbounded export (all records, no filter)." OutcomeBackend's `OutcomeExport` shape is **single-run** — one `run_id`, one `result_json_bytes`, one `artifact_refs` — so both `export()` and `export_all()` here deliberately return ONLY the most-recent run (`list_runs()[-1]`), NOT every run. This is honest for the current implementation: the outcome-catalog / cross-run quality-rollup consumer that needs multi-run export builds it OVER `read_result`/`export` for now, and a multi-run `OutcomeExport` shape (carrying `list[run]`) ships WITH that consumer's PR and its conformance tests — filed inline as [#454](https://github.com/dep0we/atomic-agents-stack/issues/454). Adding a multi-run shape now would be an abstraction for a hypothetical future need (Principle #2/#6). The `export()`/`export_all()` docstrings carry the same note.
 
 The golden-file conformance test asserts BOTH (a) byte-identical on-disk `result.json` AND (b) a portable export with relative artifact refs (`test_golden_file_byte_identity`, `test_export_artifact_refs_are_relative`).
 
@@ -259,7 +259,7 @@ scope:     ONE agent root — <agent_root>/outcomes/runs/<run_id>/result.json
 
 `agents_root` is derived as `agent_root.parent` (the framework-wide invariant: `agents_root / agent_name = agent_root`). Operators with non-standard layouts (multi-tenant, nested agents) should instantiate `FilesystemOutcomeBackend(agents_root, agent_name)` directly.
 
-`AtomicAgent.outcome_backend` is a public attribute initialized at construction with the result of `get_default_outcome_backend(self.agent_root)`. It is **scaffolding-only** in PR 1 — never read by any `AtomicAgent` method. The write path wires through `outcome_backend.write_result()` in #448. Do NOT add `outcome_backend=` to `OutcomeRunner.__init__` until #448 (the write path is not wired; a kwarg would be dead code).
+`AtomicAgent.outcome_backend` is a public attribute initialized at construction with `get_default_outcome_backend(self.agent_root)`. It is the per-agent HANDLE for operator inspection and the future PR3 goal-outcome coordinator. **It is NOT the write path.** The live write path routes through `OutcomeRunner.outcome_backend` (active as of #448 PR2) — resolved independently by the runner via `get_default_outcome_backend(agent_root)` at `OutcomeRunner.__init__` time, or via the `outcome_backend=` kwarg added to `OutcomeRunner.__init__` in #448 PR2. `AtomicAgent` does NOT construct or feed an OutcomeRunner; the two `outcome_backend` instances are separate objects (both pointing at the same agent root in the default case). Do NOT add `outcome_backend=` to `AtomicAgent.__init__` (the runner is independently constructed — a kwarg on AtomicAgent would be dead code in the same shape #426 warned against).
 
 ---
 
