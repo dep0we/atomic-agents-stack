@@ -80,6 +80,12 @@ from .corpus import (
 # typing.get_type_hints() and for mypy/pyright. journal.backend has no heavy deps
 # (only .types + stdlib), so this is circular-import-safe. (#427 PR1)
 from .journal.backend import JournalBackend
+
+# GoalBackend imported at module level (mirrors JournalBackend above) so the
+# `goal_backend: GoalBackend | None` annotation on __init__ resolves under
+# typing.get_type_hints() and for mypy/pyright. goal.backend imports only from
+# goal/types.py + stdlib — no heavy deps, no circular-import risk. (#448 PR1)
+from .goal.backend import GoalBackend
 from .mcp_registry import (
     MCPRegistryError,
     MCPRegistryUnavailable,
@@ -329,6 +335,7 @@ class AtomicAgent:
         mcp_server_registry_backend: MCPServerRegistryBackend | None = None,
         memory_backend: MemoryBackend | None = None,
         journal_backend: JournalBackend | None = None,
+        goal_backend: GoalBackend | None = None,
     ):
         self.name = name
         self.trigger = trigger
@@ -631,13 +638,14 @@ class AtomicAgent:
 
         # ── OutcomeBackend scaffolding (#426 PR1 — spec/42) ─────────────────
         # Public self.outcome_backend attribute initialized here as a scaffolding
-        # step — the write path through the backend is wired in #448.
+        # step — the write path through the backend is wired in #448 PR2 (outcome
+        # write-path adoption, deferred from this PR1 which adopted goal only).
         # IMPORTANT: self.outcome_backend is SET but NOT CALLED from any
-        # AtomicAgent method in this PR. The OutcomeRunner._write_result_json
-        # still calls atomic_write directly (_outcome_impl.py:731), bypassing the
-        # backend. Wiring the write path through self.outcome_backend ships
-        # in #448 alongside the OutcomeRunner kwarg. Adding the kwarg here
-        # without the write-path wiring would be dead code per the ruling.
+        # AtomicAgent method yet. The OutcomeRunner._write_result_json still calls
+        # atomic_write directly (_outcome_impl.py:731), bypassing the backend.
+        # Wiring the write path through self.outcome_backend ships in #448 PR2
+        # alongside the OutcomeRunner kwarg. Adding the kwarg here without the
+        # write-path wiring would be dead code per the ruling.
         # Scaffolding-only: read-only inspection and doctor.check_outcome_backend
         # access only. Do NOT add outcome_backend= to AtomicAgent constructor
         # until #448 (per arc ruling: stored-but-never-invoked dead code warning).
@@ -656,6 +664,32 @@ class AtomicAgent:
             self.journal_backend = get_default_journal_backend(self.agent_root)
         else:
             self.journal_backend = journal_backend
+
+        # ── GoalBackend LIVE-WIRED (#448 PR1 — spec/41) ─────────────────────
+        # self.goal_backend is the per-agent persistence handle exposed for
+        # operator override / doctor / the future #448 PR3 goal-outcome
+        # coordinator. kwarg-wins-over-env-var pattern matches journal_backend.
+        # NOTE: AtomicAgent does NOT construct or feed a GoalManager today —
+        # GoalManager resolves its OWN backend independently (in the CLI main()
+        # and programmatic callers). The provider/consumer handoff is the
+        # future-coordinator path (PR3), not a present one; do not write code
+        # assuming AtomicAgent passes self.goal_backend into a GoalManager.
+        # NOTE: self.goal_backend is the PERSISTENCE handle only — it is NOT the
+        # goal_text reader for prompt assembly. _load_goal_text() STAYS on
+        # self._profile.goal_text (the profile snapshot). Do NOT add a second
+        # goal_text reader here (Principle #6 single reader, A7 ruling).
+        # NOTE: AtomicAgent only STORES this handle this PR — it never invokes a
+        # backend method (no load_goal/save_goal/append_history_event call from
+        # agent.py). The agent_id argument semantics (filesystem ignores it,
+        # scoped via agent_root; a multi-tenant backend keys on it — the
+        # tierC-agent-id-argument-value ruling) apply at GoalManager's call
+        # sites, not here.
+        from .goal import get_default_goal_backend  # noqa: PLC0415
+
+        if goal_backend is None:
+            self.goal_backend = get_default_goal_backend(self.agent_root)
+        else:
+            self.goal_backend = goal_backend
 
         # Per-agent target extractor registry (spec/29 §"Target extraction",
         # #124 PR 3a). MUST initialize BEFORE tool_registry loading below so
