@@ -482,37 +482,42 @@ class FilesystemQueueBackend:
         the Protocol method's try/except and the _cascade.py shim's try/except both
         handle it as a no-op.
         """
+        # FIX A: the ENTIRE operation — destination validation, source containment,
+        # mkdir, rename, sidecar cleanup — is inside ONE try/except PathTraversalError
+        # so ANY PathTraversalError (destination OR source, including unresolvable
+        # work_path) fails soft for ALL callers (Protocol methods + _cascade shims).
+        # FileNotFoundError/other OSError from rename propagate normally (not swallowed).
         try:
             _validate_original_name(original_name)
             _validate_bare_component(lease_token, "lease_token")
             done_dir = FilesystemQueueBackend._safe_under_queue(
                 queue_root, "done", lease_token
             )
-        except PathTraversalError:
-            return
-        # SOURCE containment: work_path must resolve under queue_root before rename.
-        # Legitimately-claimed items live under queue/claimed/<token>/ AND recovered
-        # items under queue/queued/_recovered/<token>/ — both resolve under queue_root.
-        # Only out-of-tree forged paths are refused.
-        try:
-            if not work_path.resolve().is_relative_to(queue_root.resolve()):
+            # SOURCE containment: work_path must resolve under queue_root before rename.
+            # Legitimately-claimed items live under queue/claimed/<token>/ AND recovered
+            # items under queue/queued/_recovered/<token>/ — both resolve under queue_root.
+            # Only out-of-tree forged paths are refused.
+            try:
+                if not work_path.resolve().is_relative_to(queue_root.resolve()):
+                    raise PathTraversalError(
+                        "work item path escapes queue/",
+                        child=str(work_path),
+                        root=str(queue_root),
+                    )
+            except (OSError, RuntimeError) as exc:
                 raise PathTraversalError(
-                    "work item path escapes queue/",
+                    "work item path could not be resolved",
                     child=str(work_path),
                     root=str(queue_root),
-                )
-        except (OSError, RuntimeError) as exc:
-            raise PathTraversalError(
-                "work item path could not be resolved",
-                child=str(work_path),
-                root=str(queue_root),
-            ) from exc
-        done_dir.mkdir(parents=True, exist_ok=True)
-        work_path.rename(done_dir / original_name)
-        # Remove the sidecar from the (now-moved) original location.
-        sc = _sidecar_path(work_path)
-        if sc.exists():
-            sc.unlink(missing_ok=True)
+                ) from exc
+            done_dir.mkdir(parents=True, exist_ok=True)
+            work_path.rename(done_dir / original_name)
+            # Remove the sidecar from the (now-moved) original location.
+            sc = _sidecar_path(work_path)
+            if sc.exists():
+                sc.unlink(missing_ok=True)
+        except PathTraversalError:
+            return
 
     def move_to_dead_letter(
         self,
@@ -569,42 +574,47 @@ class FilesystemQueueBackend:
         A traversing original_name or nested lease_token raises PathTraversalError;
         callers catch it as a no-op.
         """
+        # FIX A: the ENTIRE operation — destination validation, source containment,
+        # mkdir, rename, sidecar cleanup — is inside ONE try/except PathTraversalError
+        # so ANY PathTraversalError (destination OR source, including unresolvable
+        # work_path) fails soft for ALL callers (Protocol methods + _cascade shims).
+        # FileNotFoundError/other OSError from rename propagate normally (not swallowed).
         try:
             _validate_original_name(original_name)
             _validate_bare_component(lease_token, "lease_token")
             dl_dir = FilesystemQueueBackend._safe_under_queue(
                 queue_root, "dead-letter", lease_token
             )
-        except PathTraversalError:
-            return
-        # SOURCE containment: work_path must resolve under queue_root before rename.
-        # Legitimately-claimed items live under queue/claimed/<token>/ AND recovered
-        # items under queue/queued/_recovered/<token>/ — both resolve under queue_root.
-        # Only out-of-tree forged paths are refused.
-        try:
-            if not work_path.resolve().is_relative_to(queue_root.resolve()):
+            # SOURCE containment: work_path must resolve under queue_root before rename.
+            # Legitimately-claimed items live under queue/claimed/<token>/ AND recovered
+            # items under queue/queued/_recovered/<token>/ — both resolve under queue_root.
+            # Only out-of-tree forged paths are refused.
+            try:
+                if not work_path.resolve().is_relative_to(queue_root.resolve()):
+                    raise PathTraversalError(
+                        "work item path escapes queue/",
+                        child=str(work_path),
+                        root=str(queue_root),
+                    )
+            except (OSError, RuntimeError) as exc:
                 raise PathTraversalError(
-                    "work item path escapes queue/",
+                    "work item path could not be resolved",
                     child=str(work_path),
                     root=str(queue_root),
+                ) from exc
+            dl_dir.mkdir(parents=True, exist_ok=True)
+            target = dl_dir / original_name
+            work_path.rename(target)
+            if reason:
+                (dl_dir / (original_name + ".reason.txt")).write_text(
+                    reason, encoding="utf-8"
                 )
-        except (OSError, RuntimeError) as exc:
-            raise PathTraversalError(
-                "work item path could not be resolved",
-                child=str(work_path),
-                root=str(queue_root),
-            ) from exc
-        dl_dir.mkdir(parents=True, exist_ok=True)
-        target = dl_dir / original_name
-        work_path.rename(target)
-        if reason:
-            (dl_dir / (original_name + ".reason.txt")).write_text(
-                reason, encoding="utf-8"
-            )
-        # Remove the sidecar from the (now-moved) original location.
-        sc = _sidecar_path(work_path)
-        if sc.exists():
-            sc.unlink(missing_ok=True)
+            # Remove the sidecar from the (now-moved) original location.
+            sc = _sidecar_path(work_path)
+            if sc.exists():
+                sc.unlink(missing_ok=True)
+        except PathTraversalError:
+            return
 
     def renew_lease(
         self,
@@ -1063,6 +1073,11 @@ class FilesystemQueueBackend:
         Protocol-based recover_stale_claims path (not the native path).
         """
         try:
+            # FIX B: validate bare components and source containment inside the
+            # existing try/except PathTraversalError so a forged/malformed QueueItem
+            # fed to the generic recovery path fails soft (returns None, no raise).
+            _validate_bare_component(item.lease_token, "lease_token")
+            _validate_original_name(item.original_name)
             queue_root = self._queue_root()
             claimed_dir = self._safe_under_queue(
                 queue_root, "claimed", item.lease_token
@@ -1070,12 +1085,26 @@ class FilesystemQueueBackend:
             recovered_dir = self._safe_under_queue(
                 queue_root, "queued", "_recovered", item.lease_token
             )
+            src = claimed_dir / item.original_name
+            # SOURCE containment: src must resolve under queue_root before rename.
+            try:
+                if not src.resolve().is_relative_to(queue_root.resolve()):
+                    raise PathTraversalError(
+                        "reclaim source path escapes queue/",
+                        child=str(src),
+                        root=str(queue_root),
+                    )
+            except (OSError, RuntimeError) as exc:
+                raise PathTraversalError(
+                    "reclaim source path could not be resolved",
+                    child=str(src),
+                    root=str(queue_root),
+                ) from exc
+            recovered_dir.mkdir(parents=True, exist_ok=True)
+            target = recovered_dir / item.original_name
         except PathTraversalError:
             return None
 
-        src = claimed_dir / item.original_name
-        recovered_dir.mkdir(parents=True, exist_ok=True)
-        target = recovered_dir / item.original_name
         try:
             src.rename(target)
             sc = _sidecar_path(src)

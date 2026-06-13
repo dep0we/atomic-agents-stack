@@ -1521,3 +1521,159 @@ def test_shim_release_legit_recovered_item_still_works(tmp_path):
     assert not recovered_item.path.exists(), (
         "recovered item path still exists after release"
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FIX A regression: unresolvable work_path fails soft (no raise from Protocol)
+
+
+def test_release_unresolvable_work_path_fails_soft(tmp_path):
+    """_release_at_path must NOT raise when work_path cannot be resolved.
+
+    FIX A regression: before the fix, the source-containment guard in
+    _release_at_path converted an OSError/RuntimeError from work_path.resolve()
+    into a PathTraversalError and re-raised it OUTSIDE the destination-validation
+    try/except block, so the exception propagated to the Protocol caller.
+
+    After the fix, the entire operation is inside one try/except PathTraversalError,
+    so an unresolvable work_path (e.g. broken symlink) returns silently.
+    """
+    project_root = tmp_path / "project"
+    (project_root / "queue" / "claimed" / "tok-broken").mkdir(parents=True)
+
+    # Create a broken symlink under claimed/ — it has a parent under queue_root
+    # but target.resolve() will raise OSError (dangling symlink).
+    broken_link = project_root / "queue" / "claimed" / "tok-broken" / "work.md"
+    broken_link.symlink_to(tmp_path / "nonexistent" / "missing.md")
+
+    queue_root = project_root / "queue"
+
+    # Must return without raising (fail-soft contract).
+    FilesystemQueueBackend._release_at_path(
+        broken_link,
+        queue_root,
+        "tok-broken",
+        "work.md",
+    )
+
+    # No file should have appeared in done/.
+    done_root = project_root / "queue" / "done"
+    if done_root.exists():
+        found = list(done_root.rglob("*"))
+        assert all(not p.is_file() for p in found), (
+            f"unexpected file in done/ after unresolvable-work_path call: "
+            f"{[str(p) for p in found if p.is_file()]}"
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FIX B regression: _reclaim_to_recovered forged-item containment
+
+
+def test_reclaim_to_recovered_forged_original_name_contained(tmp_path):
+    """_reclaim_to_recovered must reject a forged original_name with traversal.
+
+    FIX B regression: before the fix, _reclaim_to_recovered validated the
+    lease_token via _safe_under_queue but did NOT call _validate_original_name,
+    so a forged QueueItem with original_name='../../evil' could escape queue_root.
+    """
+    project_root = tmp_path / "project"
+    # Create a real claimed dir with a legitimate file.
+    claimed_dir = project_root / "queue" / "claimed" / "tok-forged"
+    claimed_dir.mkdir(parents=True)
+    real_file = claimed_dir / "real.md"
+    real_file.write_text("legitimate content")
+
+    backend = FilesystemQueueBackend(project_root)
+    forged = FilesystemQueueItem(
+        original_name="../../evil",
+        role="writer",
+        lease_token="tok-forged",
+        claimed_at=time.time(),
+        path=real_file,
+    )
+
+    result = backend._reclaim_to_recovered(forged)
+
+    assert result is None, (
+        "_reclaim_to_recovered should return None for a traversing original_name"
+    )
+    # Nothing must have been written outside queue/.
+    evil_path = project_root / "queue" / "evil"
+    assert not evil_path.exists(), (
+        "traversal via original_name escaped into queue/../evil"
+    )
+    # The real file must remain in place (no accidental move).
+    assert real_file.exists(), "legitimate work file was moved unexpectedly"
+
+
+def test_reclaim_to_recovered_forged_external_src_contained(tmp_path):
+    """_reclaim_to_recovered must reject a forged item whose src resolves outside queue_root.
+
+    FIX B regression: if claimed/<lease_token>/<original_name> is a symlink
+    pointing outside queue_root, the source-containment check must catch it
+    and return None without performing any rename.
+    """
+    project_root = tmp_path / "project"
+    external = tmp_path / "secret.md"
+    external.write_text("EXTERNAL-SECRET")
+
+    # Plant a symlink inside claimed/ that points to the external file.
+    claimed_dir = project_root / "queue" / "claimed" / "tok-ext"
+    claimed_dir.mkdir(parents=True)
+    symlink = claimed_dir / "secret.md"
+    symlink.symlink_to(external)
+
+    backend = FilesystemQueueBackend(project_root)
+    forged = FilesystemQueueItem(
+        original_name="secret.md",
+        role="writer",
+        lease_token="tok-ext",
+        claimed_at=time.time(),
+        path=symlink,
+    )
+
+    result = backend._reclaim_to_recovered(forged)
+
+    assert result is None, (
+        "_reclaim_to_recovered should return None when src resolves outside queue_root"
+    )
+    # External file must be untouched.
+    assert external.exists(), "external file was moved (source-containment escape)"
+    assert external.read_text() == "EXTERNAL-SECRET"
+    # Nothing in _recovered/.
+    recovered_root = project_root / "queue" / "queued" / "_recovered"
+    if recovered_root.exists():
+        found = list(recovered_root.rglob("*"))
+        assert all(not p.is_file() for p in found), (
+            f"external file exfiltrated into _recovered/: "
+            f"{[str(p) for p in found if p.is_file()]}"
+        )
+
+
+def test_reclaim_to_recovered_legit_item_still_works(tmp_path):
+    """_reclaim_to_recovered must succeed for a legitimately claimed item.
+
+    Regression guard for FIX B: the new validation guards must NOT block
+    real items whose claimed_dir/<name> resolves inside queue_root.
+    """
+    from atomic_agents._cascade import claim_next_queued
+
+    project_root = tmp_path / "project"
+    _queued(project_root, name="legit_reclaim.md", content="real work")
+
+    # Claim the item normally.
+    item = claim_next_queued(project_root, "writer", "tok-legit-reclaim")
+    assert item is not None
+
+    backend = FilesystemQueueBackend(project_root)
+    result = backend._reclaim_to_recovered(item)
+
+    assert result is not None, (
+        "_reclaim_to_recovered returned None for a legitimately claimed item"
+    )
+    assert result.path.exists(), "recovered item path does not exist after reclaim"
+    recovered_root = project_root / "queue" / "queued" / "_recovered"
+    assert str(result.path).startswith(str(recovered_root)), (
+        f"recovered item landed outside _recovered/: {result.path}"
+    )
