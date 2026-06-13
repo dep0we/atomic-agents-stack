@@ -1808,3 +1808,183 @@ def test_release_recovered_item_basename_preserved(tmp_path):
     assert not recovered_item.path.exists(), (
         "recovered item path still exists after successful release"
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Codex round-5 — within-queue symlink bypass (symlink leaf invariant)
+#
+# The previous symlink guards checked only that the RESOLVED target escapes
+# queue_root.  A symlink pointing to ANOTHER FILE UNDER queue_root passes that
+# check — the target is inside queue_root — but still violates the invariant
+# that work-file leaves are always regular files.  The exploitable shape:
+#
+#   queued/writer/link.md  ->  claimed/<token>/secret.md
+#
+# claim_next: renames the SYMLINK into claimed/ (worker reads through it to
+#   claimed/<other>/secret.md — cross-boundary read).
+# release / dead_letter: moves the symlink into done/ / dead-letter/; then
+#   export() resolves the symlink back into claimed/ content, bypassing the
+#   durable/ephemeral export boundary (spec/40 MUST).
+#
+# Fix: `Path.is_symlink()` does NOT follow the link — it detects the leaf
+# itself is a symlink regardless of where the target lives.
+
+
+def test_claim_next_skips_symlinked_in_queue_source(tmp_path):
+    """claim_next() MUST NOT claim a symlink pointing to another in-queue file.
+
+    A within-queue symlink (target under queue_root) passes the existing
+    _safe_under_queue containment check — the resolved target is under
+    queue_root — so the previous code would rename the SYMLINK into claimed/
+    and the worker would read through it to the wrong queue file (cross-
+    boundary read).  The fix: skip any candidate whose leaf is_symlink().
+    """
+    project_root = tmp_path / "project"
+    # Plant a real regular work file (the 'secret' target).
+    other_claimed = project_root / "queue" / "claimed" / "other-token"
+    other_claimed.mkdir(parents=True)
+    secret = other_claimed / "secret.md"
+    secret.write_text("OTHER-WORKER-SECRET")
+
+    # Plant a symlink in queued/writer/ pointing to the in-queue secret.
+    queued_role = project_root / "queue" / "queued" / "writer"
+    queued_role.mkdir(parents=True)
+    (queued_role / "link.md").symlink_to(secret)
+
+    backend = FilesystemQueueBackend(project_root)
+    item = backend.claim_next("writer", "attacker-token")
+
+    # Must return None — the symlink must be skipped, not claimed.
+    assert item is None, f"claim_next() claimed a within-queue symlink: {item}"
+    # Belt-and-suspenders: symlink must NOT have moved into claimed/.
+    attacker_claimed = project_root / "queue" / "claimed" / "attacker-token"
+    if attacker_claimed.exists():
+        files = list(attacker_claimed.iterdir())
+        assert files == [], (
+            f"claim_next() moved within-queue symlink into claimed/: {files}"
+        )
+    # The original secret is untouched.
+    assert secret.read_text() == "OTHER-WORKER-SECRET"
+
+
+def test_release_refuses_symlink_work_leaf(tmp_path):
+    """release() MUST NOT move a symlink work leaf from claimed/ into done/.
+
+    A symlink under claimed/<token>/ pointing to another in-queue file passes
+    the source-state check (resolved target is under claimed/<token>/) but
+    rename() would move the SYMLINK into done/.  export() then resolves it back
+    into claimed/ content — bypassing the durable/ephemeral export boundary.
+
+    Expected behaviour: fail-soft — the symlink stays in place, no exception
+    raised, done/ is empty (no regular file or symlink moved there).
+    """
+    project_root = tmp_path / "project"
+    # Build the within-queue symlink: claimed/<token>/link.md -> claimed/<token>/real.md
+    claimed_dir = project_root / "queue" / "claimed" / "tok"
+    claimed_dir.mkdir(parents=True)
+    real_file = claimed_dir / "real.md"
+    real_file.write_text("REAL-CONTENT")
+    symlink_leaf = claimed_dir / "link.md"
+    symlink_leaf.symlink_to(real_file)  # target is within claimed/<token>/
+
+    backend = FilesystemQueueBackend(project_root)
+    # Must not raise; must not move the symlink.
+    backend.release("tok", "link.md")
+
+    done_dir = project_root / "queue" / "done" / "tok"
+    assert not done_dir.exists() or not (done_dir / "link.md").exists(), (
+        "release() moved a symlink work leaf into done/ — "
+        "durable/ephemeral boundary violated"
+    )
+    # Symlink still in claimed/ (fail-soft = leave in place).
+    assert symlink_leaf.is_symlink(), (
+        "symlink leaf was removed from claimed/ without being moved to done/ "
+        "(fail-soft should leave it in place)"
+    )
+    # The real file is untouched.
+    assert real_file.read_text() == "REAL-CONTENT"
+
+
+def test_export_skips_symlink_leaf_resolving_into_claimed(tmp_path):
+    """export() MUST NOT embed a symlink leaf in done/ whose target is in claimed/.
+
+    Plant done/<token>/link.md -> queue/claimed/<other>/secret.md.
+    The resolved target is under queue_root so the existing containment guard
+    passes.  The symlink-leaf guard added in Codex round-5 must catch it before
+    read_bytes() runs.
+
+    Also verify that a legitimate regular-file item in done/ IS exported
+    (legit flow must not break).
+    """
+    project_root = tmp_path / "project"
+    # Plant a legit regular-file item in done/ (must appear in export).
+    done_dir = project_root / "queue" / "done" / "legit-tok"
+    done_dir.mkdir(parents=True)
+    legit = done_dir / "legit.md"
+    legit.write_text("LEGIT-CONTENT")
+
+    # Plant a claimed file (ephemeral — must NOT appear in export).
+    claimed_dir = project_root / "queue" / "claimed" / "other-tok"
+    claimed_dir.mkdir(parents=True)
+    secret = claimed_dir / "secret.md"
+    secret.write_text("CLAIMED-SECRET")
+
+    # Plant a symlink in done/ pointing to the claimed secret.
+    symlink_done_dir = project_root / "queue" / "done" / "attacker-tok"
+    symlink_done_dir.mkdir(parents=True)
+    (symlink_done_dir / "link.md").symlink_to(secret)
+
+    backend = FilesystemQueueBackend(project_root)
+    result = backend.export()
+
+    exported_paths = [path for path, _ in result.items_with_bytes]
+    exported_contents = [data.decode() for _, data in result.items_with_bytes]
+
+    # The symlinked leaf must NOT be embedded (claimed/ content excluded).
+    assert not any("link.md" in p for p in exported_paths), (
+        f"export() embedded a symlink leaf resolving into claimed/: {exported_paths}"
+    )
+    assert "CLAIMED-SECRET" not in exported_contents, (
+        "export() embedded claimed/ content via symlink leaf"
+    )
+
+    # The legit regular-file item MUST be present.
+    assert any("legit.md" in p for p in exported_paths), (
+        f"export() dropped a legit regular-file item: {exported_paths}"
+    )
+    assert "LEGIT-CONTENT" in exported_contents, (
+        "legit regular-file content missing from export"
+    )
+
+
+def test_legit_claim_release_export_regular_files_unaffected(tmp_path):
+    """Legit regular-file claim → release → export flow must still work end-to-end.
+
+    Confirms the symlink-leaf invariant guards do not break the normal path:
+    a regular-file item is claimed, released to done/, and then exported.
+    """
+    project_root = tmp_path / "project"
+    _queued(project_root, role="writer", name="task.md", content="TASK-BODY")
+
+    backend = FilesystemQueueBackend(project_root)
+
+    # Claim.
+    item = backend.claim_next("writer", "legit-token")
+    assert item is not None, "claim_next() failed on a regular-file item"
+    assert not item.path.is_symlink(), "claimed item path is unexpectedly a symlink"
+
+    # Release to done/.
+    backend.release("legit-token", "task.md")
+    done_file = project_root / "queue" / "done" / "legit-token" / "task.md"
+    assert done_file.is_file(), "release() did not move regular-file item to done/"
+
+    # Export — must include the item.
+    result = backend.export()
+    exported_paths = [p for p, _ in result.items_with_bytes]
+    exported_contents = [d.decode() for _, d in result.items_with_bytes]
+    assert any("task.md" in p for p in exported_paths), (
+        f"export() dropped legit regular-file item: {exported_paths}"
+    )
+    assert "TASK-BODY" in exported_contents, (
+        "legit regular-file content missing from export"
+    )

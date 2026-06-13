@@ -401,8 +401,18 @@ class FilesystemQueueBackend:
         claimed_dir.mkdir(parents=True, exist_ok=True)
 
         # Sort to give deterministic FIFO-by-name behavior.
+        # `p.is_file()` follows symlinks — a symlink to a regular file passes.
+        # The symlink check below is the explicit guard (regular-file invariant).
         candidates = sorted(p for p in queued_dir.iterdir() if p.is_file())
         for src in candidates:
+            # SYMLINK INVARIANT: a work-file leaf must be a regular file, never a
+            # symlink. A symlink pointing to another in-queue file passes the
+            # `is_file()` check AND the _safe_under_queue containment check
+            # (resolved target is still under queue_root). Reject it here so a
+            # planted symlink is never claimed, never renamed into claimed/, and
+            # never read by a worker — closes the within-queue symlink bypass.
+            if src.is_symlink():
+                continue
             # Per-source-file containment: a symlinked file inside queued/<role>/
             # pointing outside queue_root would be renamed into claimed/ and its
             # bytes (or the external file it links to) read by the worker — host-file
@@ -535,6 +545,19 @@ class FilesystemQueueBackend:
                     child=str(work_path),
                     root=str(queue_root),
                 )
+            # SYMLINK INVARIANT: a claimed work-file must be a regular file, not a
+            # symlink. A symlink under claimed/<token>/ pointing to another in-queue
+            # file passes the source-state check above (resolved target lands under
+            # claimed/) but rename() would move the SYMLINK into done/ — and then
+            # export() could resolve it into claimed/ content, bypassing the
+            # durable/ephemeral export boundary. Reject here so the symlink stays
+            # in place (fail-soft: treat as if the item does not exist for release).
+            if work_path.is_symlink():
+                raise PathTraversalError(
+                    "work item is a symlink; only regular files may be released",
+                    child=str(work_path),
+                    root=str(queue_root),
+                )
             done_dir.mkdir(parents=True, exist_ok=True)
             work_path.rename(done_dir / original_name)
             # Remove the sidecar from the (now-moved) original location.
@@ -647,6 +670,16 @@ class FilesystemQueueBackend:
             if work_path.name != original_name:
                 raise PathTraversalError(
                     "work item basename does not match original_name",
+                    child=str(work_path),
+                    root=str(queue_root),
+                )
+            # SYMLINK INVARIANT: same guard as _release_at_path — a symlink work
+            # file under claimed/<token>/ passes the source-state check but must
+            # not be moved into dead-letter/ (would let export() resolve it into
+            # excluded claimed/ content). Fail-soft via PathTraversalError.
+            if work_path.is_symlink():
+                raise PathTraversalError(
+                    "work item is a symlink; only regular files may be dead-lettered",
                     child=str(work_path),
                     root=str(queue_root),
                 )
@@ -956,6 +989,13 @@ class FilesystemQueueBackend:
                     continue
                 if not leaf_resolved.is_relative_to(queue_root_resolved):
                     continue
+                # SYMLINK INVARIANT: a symlink leaf that resolves under queue_root
+                # passes the containment check above but could point from done/ into
+                # claimed/ (or another excluded/ephemeral directory), bypassing the
+                # spec/40 durable/ephemeral export boundary. Legit work files are
+                # always regular files — skipping symlinks drops no legitimate content.
+                if file_path.is_symlink():
+                    continue
                 try:
                     raw_bytes = file_path.read_bytes()
                     rel = file_path.relative_to(self._project_root)
@@ -1148,6 +1188,16 @@ class FilesystemQueueBackend:
                     child=str(src),
                     root=str(queue_root),
                 ) from exc
+            # SYMLINK INVARIANT: a claimed work file must be a regular file.
+            # A symlink src that resolves under queue_root passes the containment
+            # check above; skip it here so a planted symlink is never moved into
+            # queued/_recovered/ (fail-soft: return None).
+            if src.is_symlink():
+                raise PathTraversalError(
+                    "reclaim source is a symlink; only regular files may be reclaimed",
+                    child=str(src),
+                    root=str(queue_root),
+                )
             recovered_dir.mkdir(parents=True, exist_ok=True)
             target = recovered_dir / item.original_name
         except PathTraversalError:
