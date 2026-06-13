@@ -327,6 +327,46 @@ class FilesystemQueueBackend:
         return self._project_root / "queue"
 
     @staticmethod
+    def _require_canonical_source(
+        work_path: Path,
+        queue_root: Path,
+        allowed_segment_lists: list[tuple[str, ...]],
+    ) -> None:
+        """Require work_path to resolve to EXACTLY queue_root/<segments> for one of
+        the allowed segment lists, and to not be a symlink leaf.
+
+        This is the single containment invariant: it subsumes under-queue_root
+        containment, source-state (claimed/ vs _recovered/), basename match,
+        symlink-leaf rejection, AND symlinked-PARENT rejection (a symlinked parent
+        makes resolve() diverge from the expected canonical path).
+
+        Raises PathTraversalError on any violation; callers wrap in their
+        existing fail-soft try/except.
+        """
+        try:
+            qr = queue_root.resolve()
+            wr = work_path.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise PathTraversalError(
+                "work item path could not be resolved",
+                child=str(work_path),
+                root=str(queue_root),
+            ) from exc
+        expected = [qr.joinpath(*segs) for segs in allowed_segment_lists]
+        if wr not in expected:
+            raise PathTraversalError(
+                "work item path is not its expected canonical location",
+                child=str(work_path),
+                root=str(queue_root),
+            )
+        if work_path.is_symlink():
+            raise PathTraversalError(
+                "work item leaf is a symlink",
+                child=str(work_path),
+                root=str(queue_root),
+            )
+
+    @staticmethod
     def _safe_under_queue(queue_root: Path, *parts: str) -> Path:
         """Resolve ``queue_root/<parts...>`` to refuse escape, return UNRESOLVED.
 
@@ -402,24 +442,20 @@ class FilesystemQueueBackend:
 
         # Sort to give deterministic FIFO-by-name behavior.
         # `p.is_file()` follows symlinks — a symlink to a regular file passes.
-        # The symlink check below is the explicit guard (regular-file invariant).
+        # The canonical-source invariant below is the explicit guard (regular-file
+        # invariant + containment + symlinked-parent rejection).
         candidates = sorted(p for p in queued_dir.iterdir() if p.is_file())
         for src in candidates:
-            # SYMLINK INVARIANT: a work-file leaf must be a regular file, never a
-            # symlink. A symlink pointing to another in-queue file passes the
-            # `is_file()` check AND the _safe_under_queue containment check
-            # (resolved target is still under queue_root). Reject it here so a
-            # planted symlink is never claimed, never renamed into claimed/, and
-            # never read by a worker — closes the within-queue symlink bypass.
-            if src.is_symlink():
-                continue
-            # Per-source-file containment: a symlinked file inside queued/<role>/
-            # pointing outside queue_root would be renamed into claimed/ and its
-            # bytes (or the external file it links to) read by the worker — host-file
-            # exfiltration. Mirror the per-work-file guard in list_claimed and
-            # _recover_stale_claims_native: skip candidates that escape queue_root.
+            # CANONICAL SOURCE INVARIANT: src must resolve to EXACTLY
+            # queue/queued/<role>/<src.name>. This subsumes: queue_root containment,
+            # symlink-leaf rejection (is_symlink), AND symlinked-PARENT rejection
+            # (a symlinked queued/<role>/ makes resolve() diverge from the expected
+            # canonical path — round-6 fix). Using src.name (not an attacker value)
+            # as the leaf because iteration gives us the actual on-disk name.
             try:
-                self._safe_under_queue(queue_root, "queued", role, src.name)
+                self._require_canonical_source(
+                    src, queue_root, [("queued", role, src.name)]
+                )
             except PathTraversalError:
                 continue
             dst = claimed_dir / src.name
@@ -503,61 +539,22 @@ class FilesystemQueueBackend:
             done_dir = FilesystemQueueBackend._safe_under_queue(
                 queue_root, "done", lease_token
             )
-            # FIX B: SOURCE STATE CHECK — work_path must resolve under one of the
-            # two legitimate source locations for a release operation:
-            #   (1) queue/claimed/<lease_token>/          — normally-claimed items
-            #   (2) queue/queued/_recovered/<lease_token>/ — stale-recovered items
-            # Without this check a forged FilesystemQueueItem whose path points at
-            # queue/dead-letter/<other>/x.md, queue/done/<other>/x.md, or
-            # queue/queued/<role>/x.md passes the queue_root containment check and
-            # gets renamed into done/<lease_token>/ — violating dead-work-stays-dead
-            # and other state-transition invariants (spec/44 MUST 10 + MUST 4).
-            # Also enforce work_path.name == original_name to prevent a caller from
-            # passing a legitimate work_path but a different original_name that would
-            # produce a silently-renamed done/ entry.
-            claimed_src = FilesystemQueueBackend._safe_under_queue(
-                queue_root, "claimed", lease_token
+            # CANONICAL SOURCE INVARIANT: work_path must resolve to EXACTLY one of
+            # the two legitimate source locations for a release operation:
+            #   (1) queue/claimed/<lease_token>/<original_name>
+            #   (2) queue/queued/_recovered/<lease_token>/<original_name>
+            # This single call subsumes: under-queue_root containment, source-state
+            # check, basename==original_name match, symlink-leaf rejection, AND
+            # symlinked-PARENT rejection (a symlinked parent makes resolve() diverge
+            # from the expected canonical path, so it also fails the equality check).
+            FilesystemQueueBackend._require_canonical_source(
+                work_path,
+                queue_root,
+                [
+                    ("claimed", lease_token, original_name),
+                    ("queued", "_recovered", lease_token, original_name),
+                ],
             )
-            recovered_src = FilesystemQueueBackend._safe_under_queue(
-                queue_root, "queued", "_recovered", lease_token
-            )
-            try:
-                wr = work_path.resolve()
-            except (OSError, RuntimeError) as exc:
-                raise PathTraversalError(
-                    "work item path could not be resolved",
-                    child=str(work_path),
-                    root=str(queue_root),
-                ) from exc
-            if not (
-                wr.is_relative_to(claimed_src.resolve())
-                or wr.is_relative_to(recovered_src.resolve())
-            ):
-                raise PathTraversalError(
-                    "work item path is not in a valid source state for release "
-                    "(must be under claimed/<token>/ or queued/_recovered/<token>/)",
-                    child=str(work_path),
-                    root=str(queue_root),
-                )
-            if work_path.name != original_name:
-                raise PathTraversalError(
-                    "work item basename does not match original_name",
-                    child=str(work_path),
-                    root=str(queue_root),
-                )
-            # SYMLINK INVARIANT: a claimed work-file must be a regular file, not a
-            # symlink. A symlink under claimed/<token>/ pointing to another in-queue
-            # file passes the source-state check above (resolved target lands under
-            # claimed/) but rename() would move the SYMLINK into done/ — and then
-            # export() could resolve it into claimed/ content, bypassing the
-            # durable/ephemeral export boundary. Reject here so the symlink stays
-            # in place (fail-soft: treat as if the item does not exist for release).
-            if work_path.is_symlink():
-                raise PathTraversalError(
-                    "work item is a symlink; only regular files may be released",
-                    child=str(work_path),
-                    root=str(queue_root),
-                )
             done_dir.mkdir(parents=True, exist_ok=True)
             work_path.rename(done_dir / original_name)
             # Remove the sidecar from the (now-moved) original location.
@@ -633,56 +630,19 @@ class FilesystemQueueBackend:
             dl_dir = FilesystemQueueBackend._safe_under_queue(
                 queue_root, "dead-letter", lease_token
             )
-            # FIX B: SOURCE STATE CHECK — work_path must resolve under one of the
-            # two legitimate source locations for a dead-letter operation:
-            #   (1) queue/claimed/<lease_token>/          — normally-claimed items
-            #   (2) queue/queued/_recovered/<lease_token>/ — stale-recovered items
-            # Without this check a forged FilesystemQueueItem whose path points at
-            # queue/done/<other>/x.md or queue/queued/<role>/x.md passes the
-            # queue_root containment check and gets moved into dead-letter/ —
-            # violating dead-work-stays-dead (spec/44 MUST 10: once in dead-letter/
-            # no release can affect the item; using dead-letter/ as a source is
-            # equally wrong). The basename check prevents silent renames.
-            claimed_src = FilesystemQueueBackend._safe_under_queue(
-                queue_root, "claimed", lease_token
+            # CANONICAL SOURCE INVARIANT: same invariant as _release_at_path but
+            # for the dead-letter transition. work_path must resolve to EXACTLY one of:
+            #   (1) queue/claimed/<lease_token>/<original_name>
+            #   (2) queue/queued/_recovered/<lease_token>/<original_name>
+            # Subsumes: source-state, basename match, symlink-leaf, symlinked-parent.
+            FilesystemQueueBackend._require_canonical_source(
+                work_path,
+                queue_root,
+                [
+                    ("claimed", lease_token, original_name),
+                    ("queued", "_recovered", lease_token, original_name),
+                ],
             )
-            recovered_src = FilesystemQueueBackend._safe_under_queue(
-                queue_root, "queued", "_recovered", lease_token
-            )
-            try:
-                wr = work_path.resolve()
-            except (OSError, RuntimeError) as exc:
-                raise PathTraversalError(
-                    "work item path could not be resolved",
-                    child=str(work_path),
-                    root=str(queue_root),
-                ) from exc
-            if not (
-                wr.is_relative_to(claimed_src.resolve())
-                or wr.is_relative_to(recovered_src.resolve())
-            ):
-                raise PathTraversalError(
-                    "work item path is not in a valid source state for dead-letter "
-                    "(must be under claimed/<token>/ or queued/_recovered/<token>/)",
-                    child=str(work_path),
-                    root=str(queue_root),
-                )
-            if work_path.name != original_name:
-                raise PathTraversalError(
-                    "work item basename does not match original_name",
-                    child=str(work_path),
-                    root=str(queue_root),
-                )
-            # SYMLINK INVARIANT: same guard as _release_at_path — a symlink work
-            # file under claimed/<token>/ passes the source-state check but must
-            # not be moved into dead-letter/ (would let export() resolve it into
-            # excluded claimed/ content). Fail-soft via PathTraversalError.
-            if work_path.is_symlink():
-                raise PathTraversalError(
-                    "work item is a symlink; only regular files may be dead-lettered",
-                    child=str(work_path),
-                    root=str(queue_root),
-                )
             dl_dir.mkdir(parents=True, exist_ok=True)
             target = dl_dir / original_name
             work_path.rename(target)
@@ -1174,30 +1134,16 @@ class FilesystemQueueBackend:
                 queue_root, "queued", "_recovered", item.lease_token
             )
             src = claimed_dir / item.original_name
-            # SOURCE containment: src must resolve under queue_root before rename.
-            try:
-                if not src.resolve().is_relative_to(queue_root.resolve()):
-                    raise PathTraversalError(
-                        "reclaim source path escapes queue/",
-                        child=str(src),
-                        root=str(queue_root),
-                    )
-            except (OSError, RuntimeError) as exc:
-                raise PathTraversalError(
-                    "reclaim source path could not be resolved",
-                    child=str(src),
-                    root=str(queue_root),
-                ) from exc
-            # SYMLINK INVARIANT: a claimed work file must be a regular file.
-            # A symlink src that resolves under queue_root passes the containment
-            # check above; skip it here so a planted symlink is never moved into
-            # queued/_recovered/ (fail-soft: return None).
-            if src.is_symlink():
-                raise PathTraversalError(
-                    "reclaim source is a symlink; only regular files may be reclaimed",
-                    child=str(src),
-                    root=str(queue_root),
-                )
+            # CANONICAL SOURCE INVARIANT: src must resolve to EXACTLY
+            # queue/claimed/<lease_token>/<original_name>. Subsumes: queue_root
+            # containment, symlink-leaf rejection, AND symlinked-parent rejection
+            # (a symlinked claimed/<token>/ makes resolve() diverge from the
+            # expected canonical path).
+            FilesystemQueueBackend._require_canonical_source(
+                src,
+                queue_root,
+                [("claimed", item.lease_token, item.original_name)],
+            )
             recovered_dir.mkdir(parents=True, exist_ok=True)
             target = recovered_dir / item.original_name
         except PathTraversalError:

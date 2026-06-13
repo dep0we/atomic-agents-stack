@@ -1988,3 +1988,115 @@ def test_legit_claim_release_export_regular_files_unaffected(tmp_path):
     assert "TASK-BODY" in exported_contents, (
         "legit regular-file content missing from export"
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Round-6 regression: symlinked PARENT of the state directory
+#
+# The previous point-checks (is_relative_to claimed_src / recovered_src) accepted
+# any path that resolved UNDER those dirs — a symlinked claimed/<token>/ pointing
+# to an external dir passes that check because the resolved src file IS under the
+# resolved claimed_src.  The canonical-path invariant (_require_canonical_source)
+# requires the resolved path to match EXACTLY queue_root/<segments>, so a symlinked
+# parent makes resolve() diverge and the check catches it.
+
+
+def test_release_refuses_symlinked_parent_state_dir(tmp_path):
+    """release_claim MUST NOT move an item when claimed/<token>/ is a symlink.
+
+    A symlinked claimed/<token>/ pointing to an external dir contains a real file.
+    The per-child containment guards in list_claimed / _recover_stale_claims_native
+    already skip such dirs, but the source-state check in _release_at_path previously
+    used is_relative_to(claimed_src.resolve()) — which PASSES because the resolved src
+    path IS under the resolved claimed_src (which itself resolves to the external dir).
+    The canonical-path invariant catches it: resolve() diverges from the expected
+    canonical location queue_root/claimed/<token>/<name>, so the check fails.
+
+    Expected behaviour: fail-soft — the external file stays where it is, nothing
+    lands in done/, and no exception is raised.
+    """
+    from atomic_agents._cascade import release_claim
+
+    project_root = tmp_path / "project"
+    (project_root / "queue" / "claimed").mkdir(parents=True)
+    # External dir that claimed/<token>/ will symlink to.
+    external_dir = tmp_path / "external_token_dir"
+    external_dir.mkdir()
+    (external_dir / "secret.md").write_text("SYMLINKED-PARENT-SECRET")
+    # claimed/<token>/ is a symlink pointing to external_dir.
+    (project_root / "queue" / "claimed" / "sym-token").symlink_to(external_dir)
+
+    # Build a forged item whose path traverses through the symlinked parent.
+    forged_work = project_root / "queue" / "claimed" / "sym-token" / "secret.md"
+    forged = FilesystemQueueItem(
+        original_name="secret.md",
+        role="writer",
+        lease_token="sym-token",
+        claimed_at=time.time(),
+        path=forged_work,
+    )
+
+    # Must not raise; must not move the external file.
+    release_claim(forged, project_root)
+
+    # External file is untouched.
+    assert (external_dir / "secret.md").exists(), (
+        "symlinked-parent: external file was moved via release_claim"
+    )
+    assert (external_dir / "secret.md").read_text() == "SYMLINKED-PARENT-SECRET"
+
+    # Nothing must have landed in done/.
+    done_root = project_root / "queue" / "done"
+    if done_root.exists():
+        found = [p for p in done_root.rglob("*") if p.is_file()]
+        assert found == [], (
+            f"symlinked-parent: file exfiltrated into done/ via release_claim: {found}"
+        )
+
+
+def test_claim_next_refuses_symlinked_role_parent(tmp_path):
+    """claim_next MUST NOT claim a file when queued/<role>/ is a symlink to an
+    external dir.
+
+    queued/<role>/ is a symlink; the files inside it are regular files.  Without
+    the canonical-path invariant, _safe_under_queue(queued, role, p.name) would
+    call resolve() on the path, which diverges from the expected canonical location
+    — now caught by _require_canonical_source as an equality mismatch.
+
+    Expected behaviour: claim_next returns None, no file is moved into claimed/,
+    and the external file stays in the external dir.
+    """
+    project_root = tmp_path / "project"
+    (project_root / "queue").mkdir(parents=True)
+
+    # External dir with a legitimate-looking work file.
+    external_role_dir = tmp_path / "external_role"
+    external_role_dir.mkdir()
+    (external_role_dir / "task.md").write_text("EXTERNAL-WORK")
+
+    # queued/<role>/ is a symlink pointing to the external dir.
+    (project_root / "queue" / "queued").mkdir(parents=True)
+    (project_root / "queue" / "queued" / "writer").symlink_to(external_role_dir)
+
+    backend = FilesystemQueueBackend(project_root)
+
+    # Must fail-soft: the role's queued dir is a symlink, not a canonical path.
+    result = backend.claim_next("writer", "tok-rp")
+
+    assert result is None, (
+        f"claim_next() claimed through a symlinked queued/<role>/ parent: {result}"
+    )
+
+    # External file must not have been moved into claimed/.
+    claimed_dir = project_root / "queue" / "claimed" / "tok-rp"
+    if claimed_dir.exists():
+        found = [p for p in claimed_dir.iterdir() if p.is_file() or p.is_symlink()]
+        assert found == [], (
+            f"claim_next() moved a file through a symlinked queued/<role>/: {found}"
+        )
+
+    # External file is untouched.
+    assert (external_role_dir / "task.md").exists(), (
+        "claim_next() moved the external file (exfiltration via symlinked role parent)"
+    )
+    assert (external_role_dir / "task.md").read_text() == "EXTERNAL-WORK"
