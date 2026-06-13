@@ -88,6 +88,15 @@ class GoalCorrupted(AtomicAgentsError):
     """goal.md is missing required fields or invalid."""
 
 
+class GoalConcurrentModification(AtomicAgentsError):
+    """Raised by apply_transition() when expected_from_status is set and the
+    sub-goal's current on-disk status differs — another writer moved the goal
+    between the lock release and re-acquisition (re-dispatch or concurrent
+    modification detected). Callers that need to detect this race catch
+    GoalConcurrentModification; the coordinator lets it propagate.
+    """
+
+
 class OutcomeCorrupted(AtomicAgentsError):
     """result.json is present but cannot be parsed as a valid OutcomeResult."""
 
