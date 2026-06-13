@@ -50,6 +50,17 @@ def agent_with_goal(tmp_path):
     agent_root = agents_root / "muse-director"
     agent_root.mkdir(parents=True)
 
+    # Minimal persona so dispatch_as_outcome's shim can construct a real
+    # AtomicAgent for the fail-closed cost gate (Principle #4 — the gate is now
+    # LIVE on this path; the shim no longer injects a no-gate sentinel). No
+    # model.md is written, so cost_guardrails_enabled defaults False and the gate
+    # passes (allow=True) — exactly the documented bound: the gate enforces
+    # model.md caps, and an agent with no configured caps has nothing to refuse.
+    (agent_root / "persona").mkdir()
+    (agent_root / "persona" / "IDENTITY.md").write_text(
+        "# Identity\nTest agent for goal-outcome composition.\n"
+    )
+
     goal_text = """\
 ---
 schema_version: 1
@@ -291,7 +302,9 @@ def test_dispatch_as_outcome_writes_history_entry(agent_with_goal):
     gm.load()
 
     run_id = "outcome-20260507-histtest-aaaa"
-    outcome_result = _make_outcome_result("satisfied", run_id=run_id, iterations=2, total_cost_usd=0.0099)
+    outcome_result = _make_outcome_result(
+        "satisfied", run_id=run_id, iterations=2, total_cost_usd=0.0099
+    )
 
     with patch("atomic_agents.outcome.OutcomeRunner") as MockRunner:
         mock_runner_instance = MagicMock()
@@ -372,7 +385,9 @@ def test_dispatch_as_outcome_passes_max_iterations_through(agent_with_goal):
 
         # Verify OutcomeRunner.run was called with max_iterations=7
         call_kwargs = mock_runner_instance.run.call_args
-        assert call_kwargs.kwargs.get("max_iterations") == 7 or call_kwargs.args[2] == 7, (
+        assert (
+            call_kwargs.kwargs.get("max_iterations") == 7 or call_kwargs.args[2] == 7
+        ), (
             f"max_iterations=7 should have been passed to OutcomeRunner.run; "
             f"got: {call_kwargs}"
         )
