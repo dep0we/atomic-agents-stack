@@ -1157,3 +1157,60 @@ def test_renew_lease_shim_symlinked_root(tmp_path):
     shim_renew(item, additional_seconds=3600)
     new = _json.loads(sidecar.read_text())["lease_expires_at"]
     assert new != orig, "renew_lease must have updated the sidecar via parents[3]"
+
+
+# TEST 49 — release_claim shim fails SOFT when queue/ is a symlink escaping
+# project_root. Regression for the Round-4 P1: the shim called backend._queue_root()
+# OUTSIDE a try/except, so a symlinked-escaping queue/ made it RAISE
+# PathTraversalError to the caller — whereas the Protocol method release() catches
+# it and no-ops, and the pre-carve _cascade.py had no containment check and never
+# raised. The shim now matches the Protocol fail-soft contract (spec/44 symlink
+# containment). The existing 7 symlink tests only exercised the backend/Protocol
+# layer; this exercises the free-function shim surface that cron/project-runner uses.
+def test_release_claim_shim_fails_soft_on_symlinked_queue(tmp_path):
+    """release_claim() free-function no-ops (no raise) on a symlinked-escaping queue/."""
+    from atomic_agents._cascade import release_claim
+
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (project_root / "queue").symlink_to(outside)
+
+    item = FilesystemQueueItem(
+        original_name="x.md",
+        role="writer",
+        lease_token="lease-1",
+        claimed_at=0.0,
+        path=project_root / "queue" / "claimed" / "lease-1" / "x.md",
+    )
+
+    # Must NOT raise — parity with FilesystemQueueBackend.release() fail-soft.
+    release_claim(item, project_root)
+    # And no bytes may land outside project_root.
+    assert list(outside.rglob("*")) == [], "no bytes may land outside project_root"
+
+
+# TEST 50 — move_to_dead_letter shim fails SOFT on a symlinked-escaping queue/.
+# Same Round-4 P1 root cause as TEST 49; same fail-soft parity assertion.
+def test_move_to_dead_letter_shim_fails_soft_on_symlinked_queue(tmp_path):
+    """move_to_dead_letter() free-function no-ops (no raise) on a symlinked queue/."""
+    from atomic_agents._cascade import move_to_dead_letter
+
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (project_root / "queue").symlink_to(outside)
+
+    item = FilesystemQueueItem(
+        original_name="x.md",
+        role="writer",
+        lease_token="lease-1",
+        claimed_at=0.0,
+        path=project_root / "queue" / "claimed" / "lease-1" / "x.md",
+    )
+
+    # Must NOT raise — parity with FilesystemQueueBackend.move_to_dead_letter().
+    move_to_dead_letter(item, project_root, reason="terminal")
+    assert list(outside.rglob("*")) == [], "no bytes may land outside project_root"

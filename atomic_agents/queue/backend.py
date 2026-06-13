@@ -19,9 +19,11 @@ Protocol method surface (Hybrid Option B, per arc ruling 428-pr1-args.json):
     list_claimed(role=None)  — return currently-held items (basis for recovery)
 
   Shared recovery code ABOVE the Protocol:
-    recover_stale_claims(backend, lease_seconds) — free function calling only
-    list_claimed() + claim_next() through Protocol primitives so every
-    backend gets the same recovery logic with no drift.
+    recover_stale_claims(backend, lease_seconds) — free function calling
+    list_claimed() + the backend's reclaim primitive
+    (_reclaim_to_recovered, or _recover_stale_claims_native for the
+    filesystem fast path) so every backend gets the same recovery logic
+    with no drift. It does NOT call claim_next().
 
   Plus the standard Protocol surface:
     capabilities()    — return QueueCapabilities
@@ -180,8 +182,9 @@ class QueueBackend(Protocol):
         """Return all currently-held (claimed) work items.
 
         This is the enumeration READ primitive that enables recover_stale_claims
-        to be implemented as shared code ABOVE the Protocol, calling only
-        Protocol methods (list_claimed + claim_next for reclaim).
+        to be implemented as shared code ABOVE the Protocol, calling
+        list_claimed + the backend's reclaim primitive
+        (_reclaim_to_recovered / _recover_stale_claims_native) — NOT claim_next.
 
         For the filesystem backend: scans queue/claimed/ subdirectories and
         returns one QueueItem (FilesystemQueueItem) per work file, with
@@ -249,10 +252,12 @@ def recover_stale_claims(
 ) -> list[QueueItem]:
     """Find claimed items whose lease has expired and move them back to queued.
 
-    This is shared recovery code ABOVE the Protocol, built ONLY from Protocol
-    calls (list_claimed + claim_next). This means EVERY registered QueueBackend
-    gets the same recovery logic with no drift — a Redis backend, a Postgres
-    backend, and the filesystem backend all use this function.
+    This is shared recovery code ABOVE the Protocol, built from list_claimed()
+    + the backend's reclaim primitive (_reclaim_to_recovered, or
+    _recover_stale_claims_native for the filesystem fast path) — it does NOT
+    call claim_next(). This means EVERY registered QueueBackend gets the same
+    recovery logic with no drift — a Redis backend, a Postgres backend, and the
+    filesystem backend all use this function.
 
     Per arc-ruling 428-pr1-args.json hybrid-protocol-surface: recover_stale_claims
     is a free function above the Protocol. The filesystem-specific internals

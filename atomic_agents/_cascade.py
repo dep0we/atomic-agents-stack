@@ -225,9 +225,12 @@ def _load_policy_dir(policy_dir: Path) -> str:
 # - The free functions below WRAP FilesystemQueueBackend, constructing it
 #   internally on each call and delegating to Protocol methods. This preserves
 #   the old positional signatures (project_root as first arg) exactly.
-# - Old and new import paths are BEHAVIORALLY EQUIVALENT (not same-object
-#   identity — the shim wraps the backend call). See compatibility test in
-#   tests/test_queue_backend_conformance.py.
+# - Old and new import paths are behaviorally equivalent for the documented
+#   cron/project-runner API surface — including fail-soft on symlink-escape
+#   (release_claim / move_to_dead_letter no-op rather than raise, matching the
+#   Protocol methods). They are NOT same-object identity: the shim constructs a
+#   fresh FilesystemQueueBackend per call and wraps it. See compatibility tests
+#   in tests/test_queue_backend_conformance.py.
 # - _sidecar_path / _write_sidecar are filesystem impl details. They are
 #   importable from atomic_agents._cascade for backward compat but are NOT
 #   part of the public queue package __all__.
@@ -248,6 +251,7 @@ from .queue.backend import (  # noqa: E402 (intentional mid-file shim)
 from .queue.filesystem import (  # noqa: E402 (intentional mid-file shim)
     FilesystemQueueBackend as _FilesystemQueueBackend,
 )
+from .exceptions import PathTraversalError  # noqa: E402 (mid-file shim; fail-soft)
 
 
 def claim_next_queued(
@@ -287,11 +291,20 @@ def release_claim(item: "QueueItem", project_root: Path) -> None:
     path depth — a normally claimed item under ``queue/claimed/<token>/`` AND a
     recovered item under ``queue/queued/_recovered/<token>/``. We do NOT
     reconstruct ``claimed/<token>/<name>`` (which crashed for recovered items).
+
+    Fails SOFT (no-op, no raise) when ``queue/`` resolves outside
+    ``project_root`` via a symlink — parity with ``FilesystemQueueBackend.release()``
+    and the pre-carve _cascade.py contract, which had no containment check and
+    so never propagated an exception to a caller (spec/44 symlink-containment).
     """
     backend = _FilesystemQueueBackend(project_root)
+    try:
+        queue_root = backend._queue_root()
+    except PathTraversalError:
+        return
     backend._release_at_path(
         item.path,
-        backend._queue_root(),
+        queue_root,
         item.lease_token,
         item.original_name,
     )
@@ -315,11 +328,21 @@ def move_to_dead_letter(
     ANY path depth — a normally claimed item under ``queue/claimed/<token>/`` AND
     a recovered item under ``queue/queued/_recovered/<token>/``. We do NOT
     reconstruct ``claimed/<token>/<name>`` (which crashed for recovered items).
+
+    Fails SOFT (no-op, no raise) when ``queue/`` resolves outside
+    ``project_root`` via a symlink — parity with
+    ``FilesystemQueueBackend.move_to_dead_letter()`` and the pre-carve
+    _cascade.py contract, which had no containment check and so never propagated
+    an exception to a caller (spec/44 symlink-containment).
     """
     backend = _FilesystemQueueBackend(project_root)
+    try:
+        queue_root = backend._queue_root()
+    except PathTraversalError:
+        return
     backend._dead_letter_at_path(
         item.path,
-        backend._queue_root(),
+        queue_root,
         item.lease_token,
         item.original_name,
         reason,

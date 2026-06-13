@@ -5,10 +5,16 @@ cascade work-queue cluster from atomic_agents/_cascade.py into the
 QueueBackend Protocol package as a behavior-preserving, scaffolding-only
 carve (zero runtime caller changes, per arc ruling 428-pr1-args.json
 adopt-now-vs-scaffolding-only). Runtime semantics, on-disk directory layout,
-and atomicity guarantees are unchanged. The ONE intentional on-disk addition
-is an additive ``role`` key in the .lease.json sidecar (see _write_sidecar) to
-support list_claimed(role=...) filtering — additive and ignored by legacy
-readers, so existing sidecars and callers are unaffected.
+and atomicity guarantees are unchanged, with two disclosed intentional
+deviations:
+  1. An additive ``role`` key in the .lease.json sidecar (see _write_sidecar)
+     to support list_claimed(role=...) filtering — additive and ignored by
+     legacy readers, so existing sidecars and callers are unaffected.
+  2. claim_next() rmdir's an empty claimed/<lease_token>/ directory after a
+     no-candidate claim (the pre-carve _cascade.py left it behind). Functionally
+     harmless — list_claimed skips empty dirs and recover_stale_claims rmdir's
+     them anyway — but it is a behavior change, disclosed here so the
+     "directory layout unchanged" claim stays honest.
 
 Directory layout (under project_root/queue/):
     queued/<role>/           — pending work items (FIFO by sorted name)
@@ -625,8 +631,10 @@ class FilesystemQueueBackend:
                 # Guard the mtime fallback: between the is_file() check above and
                 # this stat(), a concurrent release()/move_to_dead_letter()/recovery
                 # can rename the work file out of claimed/. Skip vanished files
-                # rather than raising — mirrors _recover_stale_claims_native and
-                # honors spec/44 MUST 11 (list_claimed must not raise on concurrency).
+                # rather than raising — mirrors _recover_stale_claims_native.
+                # Concurrency-robust enumeration is implied by spec/44 MUST 11's
+                # "list_claimed MUST return all currently-held items": a vanished
+                # item is no longer held, so omitting it is correct.
                 try:
                     claimed_at = path.stat().st_mtime  # fallback
                 except FileNotFoundError:
