@@ -881,3 +881,76 @@ def test_export_skips_symlinked_leaf_escaping_queue(tmp_path):
         "the per-leaf guard must not drop legitimate sibling files"
     )
     assert not any(r.endswith("leak.md") for r in rels)
+
+
+def test_export_skips_symlinked_done_subdir_escaping_queue(tmp_path):
+    """export() MUST NOT include bytes from a symlinked done/ DIRECTORY escaping queue/.
+
+    G3 [P2]: _safe_under_queue() catches a symlinked done/ directory that resolves
+    outside queue/ and skips it (fail-soft). Neither the escaped target bytes nor
+    any path under done/ may appear in the export. The export MUST NOT raise.
+    Mirrors the test_symlinked_queued_subdir_does_not_escape_on_read pattern but
+    for the done/ durable directory.
+    """
+    project_root = tmp_path / "project"
+    (project_root / "queue").mkdir(parents=True)
+    # Plant a legitimate queued item so the export is not vacuously empty.
+    _queued(project_root, role="writer", name="legit.md", content="legit work")
+    secrets = tmp_path / "secrets_done"
+    secrets.mkdir()
+    (secrets / "stolen_done.txt").write_text("DONE SECRET")
+    # done/ is a symlink pointing outside queue/
+    (project_root / "queue" / "done").symlink_to(secrets)
+
+    backend = FilesystemQueueBackend(project_root)
+    # Must NOT raise
+    result = backend.export()
+
+    payloads = [data for _, data in result.items_with_bytes]
+    assert b"DONE SECRET" not in payloads, (
+        "export() MUST NOT embed bytes from a symlinked done/ escaping queue/"
+    )
+    rels = [rel for rel, _ in result.items_with_bytes]
+    # The legitimate queued item must still appear
+    assert any("legit.md" in r for r in rels), (
+        "export() must still include legitimate queued/ items when done/ is a bad symlink"
+    )
+    # The escaped target file must not appear
+    assert not any("stolen_done" in r for r in rels)
+
+
+def test_export_skips_symlinked_dead_letter_subdir_escaping_queue(tmp_path):
+    """export() MUST NOT include bytes from a symlinked dead-letter/ DIRECTORY escaping queue/.
+
+    G4 [P2]: _safe_under_queue() catches a symlinked dead-letter/ directory that
+    resolves outside queue/ and skips it (fail-soft). Neither the escaped target
+    bytes nor any path under dead-letter/ may appear in the export. The export
+    MUST NOT raise.
+    Mirrors test_export_skips_symlinked_done_subdir_escaping_queue but for
+    dead-letter/.
+    """
+    project_root = tmp_path / "project"
+    (project_root / "queue").mkdir(parents=True)
+    # Plant a legitimate queued item so the export is not vacuously empty.
+    _queued(project_root, role="writer", name="legit.md", content="legit work")
+    secrets = tmp_path / "secrets_dl"
+    secrets.mkdir()
+    (secrets / "stolen_dl.txt").write_text("DEAD SECRET")
+    # dead-letter/ is a symlink pointing outside queue/
+    (project_root / "queue" / "dead-letter").symlink_to(secrets)
+
+    backend = FilesystemQueueBackend(project_root)
+    # Must NOT raise
+    result = backend.export()
+
+    payloads = [data for _, data in result.items_with_bytes]
+    assert b"DEAD SECRET" not in payloads, (
+        "export() MUST NOT embed bytes from a symlinked dead-letter/ escaping queue/"
+    )
+    rels = [rel for rel, _ in result.items_with_bytes]
+    # The legitimate queued item must still appear
+    assert any("legit.md" in r for r in rels), (
+        "export() must still include legitimate queued/ items when dead-letter/ is a bad symlink"
+    )
+    # The escaped target file must not appear
+    assert not any("stolen_dl" in r for r in rels)

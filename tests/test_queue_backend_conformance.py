@@ -929,7 +929,87 @@ def test_doctor_check_queue_backend_warn_multi_host(tmp_path, monkeypatch):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# TEST 45 — compatibility: old and new import paths are behaviorally equivalent
+# TEST 45 — doctor.check_queue_backend FAIL when _queue_root() raises PathTraversalError
+# G1 [P1, security rung]: cascade layout with a queue/ symlink escaping project_root.
+# list_claimed() catches PathTraversalError internally and returns [] (PASS so far).
+# The second, dedicated _queue_root() probe surfaces the containment violation → FAIL.
+
+
+def test_doctor_check_queue_backend_fail_symlinked_queue_escape(tmp_path, monkeypatch):
+    """doctor FAIL when queue/ is a symlink escaping project_root (symlink containment).
+
+    list_claimed() catches PathTraversalError internally and returns [], so the
+    dual-probe step 1 succeeds. The explicit _queue_root() probe in the doctor
+    surfaces the violation and returns FAIL with a message referencing symlink /
+    containment.
+    """
+    from atomic_agents.doctor import check_queue_backend, FAIL
+
+    monkeypatch.delenv("ATOMIC_AGENTS_QUEUE_BACKEND", raising=False)
+    monkeypatch.delenv("ATOMIC_AGENTS_MULTI_HOST", raising=False)
+
+    # Build cascade layout
+    system_root = tmp_path / "muse"
+    role_dir = system_root / "roles" / "writer"
+    role_dir.mkdir(parents=True)
+    instance_dir = system_root / "projects" / "proj" / "agents" / "writer"
+    instance_dir.mkdir(parents=True)
+
+    # Make project_root/queue/ a symlink that escapes project_root.
+    # project_root = system_root / "projects" / "proj"
+    project_root = system_root / "projects" / "proj"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (project_root / "queue").symlink_to(outside)
+
+    result = check_queue_backend(instance_dir)
+    assert result.status == FAIL
+    assert result.name == "queue-backend"
+    # Message must reference symlink / containment violation
+    msg_lower = result.message.lower()
+    assert "symlink" in msg_lower or "containment" in msg_lower, (
+        f"Expected symlink/containment in FAIL message, got: {result.message!r}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TEST 46 — doctor.check_queue_backend FAIL when list_claimed() raises
+# G2 [P2]: inject a backend whose list_claimed raises a non-PathTraversalError
+# Exception.  The doctor catches any Exception from list_claimed() → FAIL.
+
+
+def test_doctor_check_queue_backend_fail_list_claimed_raises(tmp_path, monkeypatch):
+    """doctor FAIL when list_claimed() raises a non-PathTraversalError Exception.
+
+    Monkeypatches FilesystemQueueBackend.list_claimed to raise RuntimeError.
+    The doctor dual-probe catches any exception from list_claimed() and returns
+    FAIL with the exception type/message.
+    """
+    from atomic_agents.doctor import check_queue_backend, FAIL
+    from atomic_agents.queue.filesystem import FilesystemQueueBackend
+
+    monkeypatch.delenv("ATOMIC_AGENTS_QUEUE_BACKEND", raising=False)
+    monkeypatch.delenv("ATOMIC_AGENTS_MULTI_HOST", raising=False)
+
+    # Build cascade layout
+    system_root = tmp_path / "muse"
+    role_dir = system_root / "roles" / "writer"
+    role_dir.mkdir(parents=True)
+    instance_dir = system_root / "projects" / "proj" / "agents" / "writer"
+    instance_dir.mkdir(parents=True)
+
+    def _broken_list_claimed(self, role=None):
+        raise RuntimeError("simulated backend failure in list_claimed")
+
+    monkeypatch.setattr(FilesystemQueueBackend, "list_claimed", _broken_list_claimed)
+
+    result = check_queue_backend(instance_dir)
+    assert result.status == FAIL
+    assert result.name == "queue-backend"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TEST 47 — compatibility: old and new import paths are behaviorally equivalent
 
 
 def test_compatibility_old_and_new_import_paths_equivalent(tmp_path):
