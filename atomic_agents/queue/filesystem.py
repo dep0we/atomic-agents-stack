@@ -748,7 +748,7 @@ class FilesystemQueueBackend:
                     root=str(queue_root),
                 ) from exc
 
-        if sidecar.is_file():
+        if sidecar.is_file() and not sidecar.is_symlink():
             try:
                 data = json.loads(sidecar.read_text(encoding="utf-8"))
             except (ValueError, OSError):
@@ -851,7 +851,7 @@ class FilesystemQueueBackend:
                     claimed_at = path.stat().st_mtime  # fallback
                 except FileNotFoundError:
                     continue
-                if sidecar.is_file():
+                if sidecar.is_file() and not sidecar.is_symlink():
                     try:
                         data = json.loads(sidecar.read_text(encoding="utf-8"))
                         item_role = data.get("role", "")
@@ -1055,7 +1055,7 @@ class FilesystemQueueBackend:
                     continue
                 sidecar = _sidecar_path(path)
                 is_stale = False
-                if sidecar.is_file():
+                if sidecar.is_file() and not sidecar.is_symlink():
                     try:
                         data = json.loads(sidecar.read_text(encoding="utf-8"))
                         expires_at = datetime.fromisoformat(data["lease_expires_at"])

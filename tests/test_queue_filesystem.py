@@ -2100,3 +2100,36 @@ def test_claim_next_refuses_symlinked_role_parent(tmp_path):
         "claim_next() moved the external file (exfiltration via symlinked role parent)"
     )
     assert (external_role_dir / "task.md").read_text() == "EXTERNAL-WORK"
+
+
+def test_list_claimed_and_recover_skip_symlinked_sidecar(tmp_path):
+    """A symlinked .lease.json must NOT be read (perimeter read escape).
+
+    The work file stays canonical+regular under claimed/<token>/, but its sidecar
+    is a symlink to an external JSON. list_claimed() and recover MUST NOT read the
+    external file (no field like 'role' may be surfaced from outside project_root);
+    they fall back to mtime as if no sidecar existed.
+    """
+    project_root = tmp_path / "project"
+    (project_root / "queue" / "queued" / "writer").mkdir(parents=True)
+    (project_root / "queue" / "queued" / "writer" / "task.md").write_text("work")
+    backend = FilesystemQueueBackend(project_root)
+    backend.claim_next("writer", "tok")
+
+    real_sidecar = project_root / "queue" / "claimed" / "tok" / "task.md.lease.json"
+    real_sidecar.unlink()
+    external = tmp_path / "outside.json"
+    external.write_text(
+        '{"role":"LEAKED-EXTERNAL-ROLE",'
+        '"lease_expires_at":"2099-01-01T00:00:00+00:00",'
+        '"claimed_at":"2020-01-01T00:00:00+00:00"}'
+    )
+    real_sidecar.symlink_to(external)
+
+    items = backend.list_claimed()
+    assert all(i.role != "LEAKED-EXTERNAL-ROLE" for i in items), (
+        "list_claimed() read a symlinked sidecar pointing outside project_root"
+    )
+    # recover must not raise and must not read the external sidecar either.
+    recover_stale_claims(backend, lease_seconds=999999)
+    assert external.read_text().startswith("{"), "external file must be untouched"
