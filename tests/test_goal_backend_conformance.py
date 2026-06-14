@@ -1,11 +1,11 @@
 """Conformance tests for GoalBackend Protocol (spec/41).
 
-53 test cases covering the GoalBackend Implementer Contract (the protocol-
+60 test cases covering the GoalBackend Implementer Contract (the protocol-
 behavior subset is parametrized over every registered backend via the
 ``backend`` / ``backend_with_goal`` fixtures; see PARAMETRIZATION below).
 
 NOTE ON NUMBERING: the "TEST N" labels below are this file's own granular
-test-case indices, NOT spec/41 MUST numbers (spec/41 has exactly 9 MUSTs).
+test-case indices, NOT spec/41 MUST numbers (spec/41 has exactly 10 MUSTs).
 Each test case maps to its governing spec/41 MUST in the trailing parens so a
 contributor reconciling code-to-spec lands on the right requirement.
 
@@ -62,6 +62,12 @@ contributor reconciling code-to-spec lands on the right requirement.
   TEST 51 — apply_transition() write-validation: bad permitted-field value raises SchemaValidationError and goal.md is UNCHANGED (filesystem.py:_write_goal validate_goal pre-write)
   TEST 52 — from atomic_agents.goal import main; callable(main) (goal/__init__.py __getattr__ re-export)
   TEST 53 — apply_transition() fields={'blocked_by': 'ghost'} does NOT persist when validate_goal rejects it (write/read symmetry — Principle #12 cross-check)
+  TEST 54 — apply_transition() expected_from_status CAS match proceeds (spec/41 MUST 10)
+  TEST 55 — apply_transition() expected_from_status CAS mismatch raises GoalConcurrentModification (spec/41 MUST 10)
+  TEST 56 — archive_goal(when=pinned_date) clock injection: all date fields use the injected date (#483 PR1 addendum)
+  TEST 57 — archive_goal() 'goal archived' prose appears exactly once (backend owns prose, no double-write)
+  TEST 58 — append_history_event() reorders ts-first when ts is NOT the first key in input dict (#485)
+  TEST 59 — apply_transition(when=pinned) stamps the ## History prose date only; JSONL ts stays caller wall-clock (spec/41 MUST 6 clock injection, #483 PR1)
 
 PARAMETRIZATION: the protocol-behavior tests construct their backend through
 the ``backend`` / ``backend_with_goal`` fixtures, which are themselves
@@ -1504,4 +1510,248 @@ def test_apply_transition_expected_from_status_mismatch_raises(
     assert sg1.status == "pending", (
         "sub-goal status must not be changed when GoalConcurrentModification is raised "
         "(spec/41 MUST 10 — no stale write)"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TEST 56 — archive_goal() clock injection via when= parameter (#483 PR1)
+#
+# Parametrized over BACKEND_FACTORIES so alternate backend authors who don't
+# support `when=` fail immediately (the Protocol's @runtime_checkable isinstance
+# check is signature-blind; only a conformance call catches the TypeError).
+
+
+def test_archive_goal_when_parameter_accepted(
+    backend_with_goal: "FilesystemGoalBackend",
+    agent_root_with_goal: Path,
+) -> None:
+    """archive_goal(when=pinned_date) MUST use the injected date for ALL date fields.
+
+    spec/41 Addendum #483 PR1 clock-injection contract: `when=` controls
+    archived_at, last_progress_check, the ## History datestamp, and the
+    archive slug date prefix. ALL four MUST agree with the injected date
+    (no split-clock divergence). The returned slug MUST contain the pinned date.
+
+    Passes `when=date(2026, 1, 1)` — a date that cannot match date.today() so
+    any field that falls back to the wall clock fails the assertion.
+    """
+    import frontmatter
+    from datetime import date
+
+    backend = backend_with_goal
+    pinned = date(2026, 1, 1)
+
+    slug = backend.archive_goal("agent", reason="clock-test", when=pinned)
+
+    # (a) Slug prefix must carry the pinned date, not wall-clock date.
+    assert "2026-01-01" in slug, (
+        f"archive slug must start with the injected date '2026-01-01'; got {slug!r}"
+    )
+
+    # (b) Archive frontmatter must use the pinned date for both timestamp fields.
+    archive_path = agent_root_with_goal / "goal_archive" / f"{slug}.md"
+    assert archive_path.is_file(), f"archive file must exist: {archive_path}"
+    parsed = frontmatter.load(archive_path)
+    assert parsed.metadata.get("archived_at") == "2026-01-01", (
+        "archive_goal(when=pinned) must write archived_at == '2026-01-01', "
+        f"not the wall-clock date.today(). Got: {parsed.metadata.get('archived_at')!r}"
+    )
+    assert parsed.metadata.get("last_progress_check") == "2026-01-01", (
+        "archive_goal(when=pinned) must write last_progress_check == '2026-01-01'. "
+        f"Got: {parsed.metadata.get('last_progress_check')!r}"
+    )
+
+    # (c) History prose datestamp in the archive body must also use the pinned date.
+    body = parsed.content
+    assert "2026-01-01" in body, (
+        "archive_goal(when=pinned) must stamp the ## History prose entry with "
+        f"'2026-01-01', not wall-clock today. Body: {body!r}"
+    )
+    assert "goal archived" in body, (
+        "archive body must contain the 'goal archived' prose line written by the backend"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TEST 57 — archive_goal() single-occurrence of 'goal archived' prose (#483 PR1)
+#
+# Guards the "backend owns the prose" ruling: after GoalManager.archive() is a
+# thin shim, the 'goal archived' line must appear EXACTLY ONCE in the archive
+# body — once from the backend under the lock. Zero occurrences = backend
+# forgot to write prose; two occurrences = GoalManager and backend both wrote it.
+
+
+def test_archive_goal_prose_appears_exactly_once(
+    backend_with_goal: "FilesystemGoalBackend",
+    agent_root_with_goal: Path,
+) -> None:
+    """archive_goal() MUST write the 'goal archived' history prose exactly once.
+
+    Guards double-write regression: the backend owns the prose and writes it
+    under the lock. The GoalManager thin shim must NOT also call _append_history
+    before delegating — that would produce two occurrences in the archive body.
+    """
+    import frontmatter
+
+    backend = backend_with_goal
+    slug = backend.archive_goal("agent", reason="prose-test")
+    archive_path = agent_root_with_goal / "goal_archive" / f"{slug}.md"
+    parsed = frontmatter.load(archive_path)
+    body = parsed.content
+    occurrences = body.count("goal archived")
+    assert occurrences == 1, (
+        f"'goal archived' must appear exactly once in the archive body; "
+        f"found {occurrences} occurrence(s). "
+        f"Double-write: GoalManager and backend both wrote prose? Body: {body!r}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TEST 58 — append_history_event() reorders ts-first when ts is NOT the first key
+#
+# Decision 485-conformance-test-placement-and-shape: the existing TEST 22 passes
+# a dict with 'ts' already first — it does NOT exercise the reorder path. This
+# test intentionally passes a dict with extra keys BEFORE 'ts' to prove the
+# backend actively reorders rather than passing through caller-ordered input.
+#
+# A backend that naively passes through json.dumps(event) without _make_history_event
+# would PASS TEST 22 but FAIL this test — which is the desired discriminator.
+
+
+def test_append_history_event_reorders_ts_first_when_ts_not_first(
+    backend_with_goal: "FilesystemGoalBackend",
+    agent_root_with_goal: Path,
+) -> None:
+    """append_history_event() MUST reorder a caller dict to ts-first/event-second.
+
+    spec/41 JSONL key ordering (addendum): the backend MUST reorder the output
+    regardless of input key order. A caller-supplied dict
+    {'extra_key': ..., 'ts': ..., 'event': ...} MUST serialize as
+    {"ts": ..., "event": ..., "extra_key": ...}.
+
+    Input: ts intentionally NOT the first key (extra_leading, another_key appear
+    before ts). This is the only shape that genuinely exercises the reorder path
+    rather than verifying a caller-ordered dict passes through unchanged.
+    """
+    from datetime import datetime
+
+    backend = backend_with_goal
+    ts_val = datetime.now().astimezone().isoformat()
+
+    # ts intentionally NOT first — extra keys appear before it.
+    backend.append_history_event(
+        "agent",
+        {
+            "extra_leading": "leading_value",
+            "another_key": 42,
+            "event": "test_reorder_probe",
+            "ts": ts_val,
+            "after_ts": "trailing_value",
+        },
+    )
+
+    history = agent_root_with_goal / "goal_history.jsonl"
+    lines = [ln for ln in history.read_text().splitlines() if ln.strip()]
+    last_line = lines[-1].encode("utf-8")
+
+    # (a) Byte-level: serialized JSON must start with {"ts"
+    assert last_line.startswith(b'{"ts"'), (
+        f"First key in JSONL line must be 'ts' (byte-level); "
+        f"got: {last_line[:60]!r}. "
+        f"Backend must REORDER, not pass through caller key order."
+    )
+
+    # (b) Parse and verify 'event' is the second key
+    parsed_event = json.loads(last_line)
+    keys = list(parsed_event.keys())
+    assert keys[0] == "ts", f"Parsed first key must be 'ts'; got {keys[0]!r}"
+    assert keys[1] == "event", (
+        f"Parsed second key must be 'event'; got {keys[1]!r}. Key order: {keys}"
+    )
+
+    # (c) All input fields must be present (no data loss on reorder)
+    assert parsed_event["extra_leading"] == "leading_value"
+    assert parsed_event["another_key"] == 42
+    assert parsed_event["after_ts"] == "trailing_value"
+    assert parsed_event["event"] == "test_reorder_probe"
+    assert parsed_event["ts"] == ts_val
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TEST 59 — apply_transition() clock injection via when= parameter (#483 PR1)
+#
+# Parametrized over BACKEND_FACTORIES. Guards spec/41 MUST 6's injectable-clock
+# clause: `when=` controls the ## History prose date prefix ONLY; the JSONL `ts`
+# field MUST remain the caller-supplied wall-clock value. The new normative MUST
+# (spec/41 line ~190) had no conformance guard before this test — apply_transition's
+# clock was only exercised indirectly via the coordinator. This pins both halves:
+#   (a) prose date == injected `when` (proves `when` reaches the prose stamp)
+#   (b) JSONL ts == caller-supplied wall-clock (proves `when` does NOT bleed into ts)
+
+
+def test_apply_transition_when_parameter_stamps_prose_not_ts(
+    backend_with_goal: "FilesystemGoalBackend",
+    agent_root_with_goal: Path,
+) -> None:
+    """apply_transition(when=pinned) MUST stamp the ## History prose date only.
+
+    spec/41 MUST 6 (injectable clock clause, #483 PR1): `when=` controls the
+    `## History` prose bullet date prefix. When `when=None` the backend defaults
+    to date.today(). The `when` parameter MUST NOT affect the JSONL `ts` field,
+    which is the real wall-clock audit timestamp supplied by the caller via
+    history_event['ts'].
+
+    Passes when=date(2026, 1, 1) (cannot match date.today()) and a DISTINCT
+    real wall-clock ts so each clock proves its own independence:
+      (a) the goal.md ## History prose bullet carries '2026-01-01'
+      (b) the JSONL ts equals the caller-supplied wall-clock value verbatim
+    """
+    from datetime import date, datetime
+
+    backend = backend_with_goal
+    pinned = date(2026, 1, 1)
+    # Real wall-clock ts, deliberately NOT 2026-01-01 so a `when`→ts bleed fails.
+    ts_val = datetime.now().astimezone().isoformat()
+    assert not ts_val.startswith("2026-01-01"), (
+        "test precondition: wall-clock ts must differ from the pinned `when` date "
+        "so the ts-independence assertion is meaningful"
+    )
+
+    goal = backend.apply_transition(
+        agent_id="agent",
+        sub_goal_id="sg1",
+        to_status="in_progress",
+        fields={},
+        history_prose="sg1 → in_progress (clock-injection test)",
+        history_event={
+            "ts": ts_val,
+            "event": "clock_inject_probe",
+            "sub_goal_id": "sg1",
+        },
+        when=pinned,
+    )
+
+    # (a) Prose date in the ## History body must be the injected `when` date.
+    assert "- 2026-01-01 — sg1 → in_progress (clock-injection test)" in goal.body, (
+        "apply_transition(when=date(2026,1,1)) must stamp the ## History prose "
+        f"bullet with '2026-01-01', not wall-clock today. Body: {goal.body!r}"
+    )
+    # Durable on reload (prose persisted to goal.md, not just the returned object).
+    reloaded = backend.load_goal("agent")
+    assert "- 2026-01-01 — " in reloaded.body, (
+        "the injected prose date must persist to goal.md on disk; "
+        f"reloaded body: {reloaded.body!r}"
+    )
+
+    # (b) JSONL ts MUST be the caller-supplied wall-clock value, NOT the `when` date.
+    history = agent_root_with_goal / "goal_history.jsonl"
+    events = [json.loads(ln) for ln in history.read_text().splitlines() if ln.strip()]
+    probe = next(e for e in events if e.get("event") == "clock_inject_probe")
+    assert probe["ts"] == ts_val, (
+        "apply_transition's `when` MUST NOT bleed into the JSONL ts field; "
+        f"ts must equal the caller-supplied wall-clock {ts_val!r}, got {probe['ts']!r}"
+    )
+    assert not probe["ts"].startswith("2026-01-01"), (
+        "the JSONL ts must be the real wall-clock audit timestamp, never the "
+        f"injected `when` date prefix; got {probe['ts']!r}"
     )

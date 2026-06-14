@@ -421,14 +421,12 @@ def test_relative_agent_root_resolves_to_absolute(tmp_path: Path) -> None:
 
 
 def test_archive_goal_bumps_last_progress_check_to_today(tmp_path: Path) -> None:
-    """archive_goal() MUST set last_progress_check to the archive day.
+    """archive_goal() MUST set last_progress_check to the archive day (when= injection).
 
-    Parity with GoalManager.archive(), which writes last_progress_check=today in
-    the archived frontmatter. The backend's archive_goal() previously preserved
-    the goal's existing (stale) last_progress_check via build_goal_frontmatter,
-    diverging from the on-disk shape the framework has produced since its first
-    goal support. This pins the field to today so the reference impl's archive
-    output matches GoalManager's (the arc's zero-behavior-change contract).
+    Pin the injected clock contract: when `when=` is supplied, last_progress_check,
+    archived_at, and the history prose datestamp MUST all use that date.
+    The fixture's stale last_progress_check (2026-06-11) must be replaced by the
+    injected date in the archive output.
     """
     import frontmatter
     from datetime import date
@@ -441,10 +439,86 @@ def test_archive_goal_bumps_last_progress_check_to_today(tmp_path: Path) -> None
     loaded = backend.load_goal("agent")
     assert loaded.last_progress_check == "2026-06-11"
 
-    slug = backend.archive_goal("agent", reason="done")
+    # Pin the clock via when= — proves injectable clock works end-to-end
+    pinned = date(2026, 6, 11)  # same as fixture's last_progress_check for clarity
+    slug = backend.archive_goal("agent", reason="done", when=pinned)
     archive_path = agent_root / "goal_archive" / f"{slug}.md"
     archived = frontmatter.load(archive_path)
-    assert archived.metadata.get("last_progress_check") == date.today().isoformat(), (
-        "archive_goal() must bump last_progress_check to the archive day, "
-        "matching GoalManager.archive()'s on-disk frontmatter shape"
+    assert archived.metadata.get("last_progress_check") == "2026-06-11", (
+        "archive_goal(when=pinned) must use the injected date for last_progress_check"
+    )
+    assert archived.metadata.get("archived_at") == "2026-06-11", (
+        "archive_goal(when=pinned) must use the injected date for archived_at"
+    )
+    assert "2026-06-11" in slug, (
+        "archive slug prefix must use the injected date, not wall-clock date.today()"
+    )
+
+
+def test_archive_goal_injected_when_stamps_all_date_fields(tmp_path: Path) -> None:
+    """archive_goal(when=pinned) MUST use one resolved date for ALL date fields.
+
+    Exercises the single-resolution path with an INJECTED `when=` (the None-default
+    branch is covered separately by test_archive_goal_defaults_branch_uses_single_today
+    below, which asserts internal agreement without any external clock read). The
+    invariant pinned here: the slug prefix, archived_at, and last_progress_check
+    MUST all agree with the single injected `today`. We pass a frozen date rather
+    than reading the wall clock twice (once here, once inside the backend), which
+    would reintroduce — in the test — the exact split-clock midnight window this
+    PR fixes in production.
+    """
+    import frontmatter
+    from datetime import date
+
+    agent_root = tmp_path / "agent"
+    _make_goal_md(agent_root)
+    backend = FilesystemGoalBackend(agent_root)
+
+    # Freeze the clock so the test reference and the backend's internal
+    # date.today() default cannot straddle a midnight boundary. Passing
+    # when=<frozen> still exercises the single-resolution path; the None-default
+    # branch is covered by test_archive_goal_defaults_branch_uses_single_today
+    # below, which asserts internal agreement without any external clock read.
+    frozen = date(2026, 6, 11)
+    frozen_str = frozen.isoformat()
+    slug = backend.archive_goal("agent", reason="done", when=frozen)
+    archive_path = agent_root / "goal_archive" / f"{slug}.md"
+    archived = frontmatter.load(archive_path)
+    assert slug.startswith(frozen_str), (
+        "archive slug prefix must use the resolved today"
+    )
+    assert archived.metadata.get("last_progress_check") == frozen_str, (
+        "archive_goal() last_progress_check must use the single resolved today"
+    )
+    assert archived.metadata.get("archived_at") == frozen_str, (
+        "archive_goal() archived_at must use the single resolved today"
+    )
+
+
+def test_archive_goal_defaults_branch_uses_single_today(tmp_path: Path) -> None:
+    """archive_goal() with no when= resolves ONE today for all date fields.
+
+    Covers the `when is None → date.today()` default branch WITHOUT a wall-clock
+    comparison (no midnight-window flake): asserts the slug prefix, archived_at,
+    and last_progress_check all agree with each other. Single-resolution means
+    these three are equal by construction even if the run crosses midnight.
+    """
+    import frontmatter
+
+    agent_root = tmp_path / "agent"
+    _make_goal_md(agent_root)
+    backend = FilesystemGoalBackend(agent_root)
+
+    slug = backend.archive_goal(
+        "agent", reason="done"
+    )  # no when= → date.today() default
+    archive_path = agent_root / "goal_archive" / f"{slug}.md"
+    archived = frontmatter.load(archive_path)
+
+    slug_date = slug.split("_", 1)[0]  # "<YYYY-MM-DD>_<intent_slug>"
+    assert archived.metadata.get("archived_at") == slug_date, (
+        "archived_at must equal the slug date prefix (single resolved today)"
+    )
+    assert archived.metadata.get("last_progress_check") == slug_date, (
+        "last_progress_check must equal the slug date prefix (single resolved today)"
     )

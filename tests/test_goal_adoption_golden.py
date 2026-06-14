@@ -40,7 +40,11 @@ from atomic_agents.goal import (
     FilesystemGoalBackend,
 )
 from atomic_agents._goal_impl import main as goal_main
-from atomic_agents.exceptions import SchemaValidationError
+from atomic_agents.exceptions import (
+    AtomicAgentsError,
+    PathTraversalError,
+    SchemaValidationError,
+)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -1144,3 +1148,317 @@ def test_minimal_goal_archive_cli_optional_keys_absent(minimal_agent_fixture):
             f"Optional key {optional_key!r} must be ABSENT in minimal archive (CLI path); "
             f"got value {meta.get(optional_key)!r}."
         )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 15. Golden byte-identity test: GoalManager.archive() thin shim produces a
+#     pinned, byte-stable archive file under a fixed clock (#483 PR1).
+#
+#     Decision archive-byte-identity-vs-divergence-acknowledgment Option 1:
+#     golden byte-identity assertion under a pinned clock. The shim passes
+#     `when=self.today` to backend.archive_goal(), so all date-stamped fields
+#     (slug prefix, archived_at, last_progress_check, ## History prose date)
+#     derive from the same injected date. The test asserts the FULL archive
+#     file bytes (read_text()) equal a frozen expected literal, so any serializer
+#     drift fails — not just a date mismatch. The pre-#483 in-place serializer
+#     was deleted in this PR; under the pinned clock it produced the same date
+#     everywhere, so this golden is the durable successor to an old-vs-new diff.
+
+
+def test_archive_shim_byte_identity_under_pinned_clock(agent_fixture):
+    """GoalManager.archive() thin shim produces byte-identical output under pinned clock.
+
+    The shim routes through backend.archive_goal(when=self.today), which uses the
+    injectable clock for ALL date-stamped fields. This test pins:
+      (a) The archive file exists and goal.md is removed.
+      (b) archived_at, last_progress_check, and slug prefix == pinned date (2026-05-08).
+      (c) '## History' section contains 'goal archived' EXACTLY ONCE
+          (backend owns the prose; GoalManager does NOT also call _append_history).
+      (d) Optional fields (deadline, related_*) are preserved (A3 fix still in effect).
+      (e) active == False in the archive.
+
+    Under a fixed `today=date(2026, 5, 8)`, the shim routes through
+    backend.archive_goal(when=self.today), pinning every date-stamped field.
+    This test is a TRUE golden: it asserts the FULL archive-file bytes equal a
+    frozen literal (EXPECTED_ARCHIVE_BYTES below), so a serializer change (key
+    reorder, whitespace, frontmatter emission) that keeps the four dates correct
+    still fails — the strongest durable guard against clock-mismatch AND
+    serializer drift (decision archive-byte-identity-vs-divergence-acknowledgment
+    Option 1). The field-level assertions below the byte comparison remain as a
+    readable diagnostic when the golden breaks.
+
+    Note: the pre-#483 in-place serializer was deleted in this PR, so the golden
+    captures the post-shim bytes (produced by the single shared backend
+    serializer); under the pinned clock the shim and the former in-place path
+    produced the same date everywhere, so this golden is the durable successor to
+    an old-vs-new differential.
+    """
+    agents_root, agent_name, agent_root, backend = agent_fixture
+    today = date(2026, 5, 8)
+    gm = GoalManager(agents_root, agent_name, today=today, goal_backend=backend)
+
+    archive_path = gm.abandon(reason="scope shifted")
+
+    # (a) goal.md removed; archive exists
+    assert not (agent_root / "goal.md").exists(), (
+        "goal.md must be removed after archive"
+    )
+    assert archive_path.exists(), f"archive file must exist at {archive_path}"
+
+    # TRUE byte-identity golden: full archive-file bytes under the pinned clock.
+    # If this fails, the serializer (key order / whitespace / frontmatter
+    # emission) or a date field changed; the field-level assertions below
+    # localize which.
+    EXPECTED_ARCHIVE_BYTES = (
+        "---\n"
+        "active: false\n"
+        "archive_reason: 'abandoned: scope shifted'\n"
+        "archived_at: '2026-05-08'\n"
+        "created: '2026-04-01'\n"
+        "deadline: '2026-12-31'\n"
+        "intent: Complete novel first draft by Q4\n"
+        "last_progress_check: '2026-05-08'\n"
+        "priority: high\n"
+        "related_atomic_notes:\n"
+        "- feedback_voice.md\n"
+        "related_decisions:\n"
+        "- policy/lock_001_pov.md\n"
+        "schema_version: 1\n"
+        "sub_goals:\n"
+        "- assigned: writer\n"
+        "  id: ch_1\n"
+        "  label: Chapter 1 first draft\n"
+        "  status: in_progress\n"
+        "- assigned: writer\n"
+        "  id: ch_2\n"
+        "  label: Chapter 2 first draft\n"
+        "  status: pending\n"
+        "success_criteria:\n"
+        "- All 24 chapters drafted\n"
+        "- Style guide passes lint on every scene\n"
+        "---\n"
+        "\n"
+        "# The Unfinished — Director goal\n"
+        "\n"
+        "## History (auto-appended)\n"
+        "\n"
+        "- 2026-04-28 — sub_goal `ch_1` started\n"
+        "- 2026-05-08 — goal archived (abandoned: scope shifted)\n"
+    )
+    assert archive_path.read_text() == EXPECTED_ARCHIVE_BYTES, (
+        "Archive-file bytes diverged from the pinned-clock golden. A serializer "
+        "change (key order, whitespace, frontmatter emission) or a date-field "
+        "drift broke byte identity. See the field-level diagnostics below."
+    )
+
+    # (b) Slug prefix must use the pinned date
+    assert "2026-05-08" in archive_path.name, (
+        f"archive slug must contain the pinned date '2026-05-08'; "
+        f"got filename: {archive_path.name!r}"
+    )
+
+    parsed = frontmatter.load(archive_path)
+    meta = parsed.metadata
+
+    assert meta.get("archived_at") == "2026-05-08", (
+        f"archived_at must be the pinned date; got {meta.get('archived_at')!r}"
+    )
+    assert meta.get("last_progress_check") == "2026-05-08", (
+        f"last_progress_check must be the pinned date; got {meta.get('last_progress_check')!r}"
+    )
+    assert meta.get("active") is False, "archive must mark active=False"
+    assert "abandoned: scope shifted" in meta.get("archive_reason", ""), (
+        f"archive_reason must contain 'abandoned: scope shifted'; "
+        f"got {meta.get('archive_reason')!r}"
+    )
+
+    # (c) Single-occurrence of 'goal archived' in the body (backend owns the prose)
+    body = parsed.content
+    occurrences = body.count("goal archived")
+    assert occurrences == 1, (
+        f"'goal archived' must appear exactly once in the archive body; "
+        f"found {occurrences} occurrence(s). "
+        f"Double-write means GoalManager._append_history was not removed from the shim. "
+        f"Body: {body!r}"
+    )
+    assert "2026-05-08" in body, (
+        "The '## History' prose datestamp must use the pinned clock date '2026-05-08'. "
+        f"Body: {body!r}"
+    )
+
+    # (d) Optional fields preserved (A3 fix — build_goal_frontmatter via backend)
+    assert meta.get("deadline") == "2026-12-31"
+    assert meta.get("related_atomic_notes") == ["feedback_voice.md"]
+    assert meta.get("related_decisions") == ["policy/lock_001_pov.md"]
+
+    # (e) _goal is cleared after archive (shim must set self._goal = None)
+    assert gm._goal is None, (
+        "GoalManager._goal must be None after archive() so has_active_goal() works"
+    )
+
+
+def test_archive_shim_path_exists_after_return(agent_fixture):
+    """The Path returned by GoalManager.archive() must exist on disk.
+
+    The shim reconstructs the Path from the returned slug as
+    `self.archive_dir / f'{slug}.md'`. This test verifies the reconstructed
+    path is consistent with the on-disk file written by backend.archive_goal().
+    """
+    agents_root, agent_name, agent_root, backend = agent_fixture
+    today = date(2026, 5, 8)
+    gm = GoalManager(agents_root, agent_name, today=today, goal_backend=backend)
+
+    archive_path = gm.archive(reason="completed — all sub-goals done")
+
+    assert archive_path.exists(), (
+        f"Path returned by GoalManager.archive() must exist on disk. "
+        f"Got path: {archive_path}. "
+        f"Check that self.archive_dir is resolved (#486) and slug reconstruction is correct."
+    )
+    # Verify it's in the expected location
+    assert archive_path.parent == agent_root / "goal_archive", (
+        f"Archive must be in goal_archive/; got parent: {archive_path.parent}"
+    )
+    assert archive_path.suffix == ".md"
+
+
+def test_archive_on_already_archived_agent_raises_not_stale_return(agent_fixture):
+    """archive()/abandon() on an agent with no active goal.md MUST raise.
+
+    Regression for the #483 PR1 thin-shim false-success: the shim removed the
+    GoalManager active-goal precheck and let backend MUST 9 idempotency take over
+    for ALL GoalManager callers. MUST 9's retry-after-unlink behavior (return the
+    most-recently-modified archive slug when goal.md is absent) is scoped to
+    DIRECT backend.archive_goal() crash-retry callers — at the GoalManager public
+    boundary it produced a FALSE SUCCESS: a second abandon() returned a stale
+    prior-archive Path, exit 0, with the operator's reason silently discarded.
+    GoalManager's contract is restored: raise AtomicAgentsError when nothing is
+    active (Principle #5 audit honesty, Principle #14 no silent behavior delta).
+    """
+    agents_root, agent_name, agent_root, backend = agent_fixture
+    today = date(2026, 5, 8)
+
+    gm = GoalManager(agents_root, agent_name, today=today, goal_backend=backend)
+    first = gm.abandon(reason="cancel it")
+    assert first.exists()
+    assert not (agent_root / "goal.md").exists()
+
+    # Second abandon — no active goal.md. Must RAISE, not return the stale slug.
+    gm2 = GoalManager(agents_root, agent_name, today=today, goal_backend=backend)
+    with pytest.raises(AtomicAgentsError, match="No active goal to archive"):
+        gm2.abandon(reason="cancel again")
+
+    # Same via the CLI: non-zero exit + honest message, NOT "Goal abandoned".
+    rc = goal_main(
+        [
+            "--agents-root",
+            str(agents_root),
+            "abandon",
+            agent_name,
+            "--reason",
+            "cancel again",
+        ],
+        goal_backend=backend,
+    )
+    assert rc != 0, (
+        "goal abandon on an already-archived agent must exit non-zero, not "
+        "print 'Goal abandoned' and exit 0 (false-success regression)"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 16. #486 agent_root resolution — GoalManager constructed with a symlinked
+#     agents_root derives an absolute, resolved agent_root.
+
+
+def test_goalmanager_agent_root_is_resolved(tmp_path):
+    """GoalManager.__init__ MUST resolve agent_root through symlinks (#486).
+
+    Resolving agent_root at __init__ closes the perimeter for all GoalManager
+    file operations (has_goal, archive_dir reconstruction): the derived paths
+    are canonical, matching the filesystem backend's own ``_require_within_root``
+    containment check. This test constructs a REAL within-vault symlink for
+    agents_root and asserts the resolution actually collapses it — so removing
+    either ``.resolve()`` call from GoalManager.__init__ fails the test (the
+    earlier ``is_absolute()``-only assertions were a false-green: tmp_path is
+    already absolute, so they passed even with .resolve() stripped).
+    """
+    # Two independent within-vault symlink levels so the test pins BOTH
+    # .resolve() calls in GoalManager.__init__:
+    #   - linked-vault → real-vault           pins agents_root.resolve() (line 159)
+    #   - real-vault/test-agent → .actual/...  pins (agents_root/name).resolve() (176)
+    # .resolve() collapses every symlink component in a path, so a single-level
+    # symlink only exercises one call; with the agent-level symlink the agent_root
+    # equality pins line 176, and the agents_root equality pins line 159.
+    real_root = tmp_path / "real-vault"
+    actual_agent = real_root / ".actual" / "test-agent"
+    actual_agent.mkdir(parents=True)
+    # Write a minimal goal.md so GoalManager construction succeeds
+    (actual_agent / "goal.md").write_text(
+        "---\n"
+        "schema_version: 1\n"
+        "active: true\n"
+        "intent: resolution test\n"
+        "priority: high\n"
+        "created: 2026-01-01\n"
+        "last_progress_check: 2026-01-01\n"
+        "success_criteria:\n"
+        "  - done\n"
+        "sub_goals: []\n"
+        "---\n\n# Goal\n",
+        encoding="utf-8",
+    )
+    # Agent-level symlink: agents_root/test-agent → .actual/test-agent
+    (real_root / "test-agent").symlink_to(actual_agent, target_is_directory=True)
+    # Outer agents_root symlink: linked-vault → real-vault
+    linked_root = tmp_path / "linked-vault"
+    linked_root.symlink_to(real_root, target_is_directory=True)
+
+    backend = FilesystemGoalBackend(linked_root / "test-agent")
+    gm = GoalManager(linked_root, "test-agent", goal_backend=backend)
+
+    # agent_root must collapse BOTH symlink levels to the canonical .actual path.
+    # Stripping line 176's .resolve() leaves the agent-level symlink uncollapsed
+    # (".actual" absent) → this fails.
+    expected_agent = actual_agent.resolve()
+    assert gm.agent_root == expected_agent, (
+        f"GoalManager.agent_root must resolve through agent + agents_root "
+        f"symlinks (#486); expected {expected_agent}, got {gm.agent_root}"
+    )
+    assert ".actual" in gm.agent_root.parts, (
+        f"resolved agent_root must follow the agent-level symlink to .actual; "
+        f"got {gm.agent_root}"
+    )
+    assert "linked-vault" not in gm.agent_root.parts
+    # agents_root must collapse the outer symlink. Stripping line 159's .resolve()
+    # leaves "linked-vault" in agents_root → this fails.
+    assert gm.agents_root == real_root.resolve(), (
+        f"GoalManager.agents_root must resolve the outer symlink (#486); "
+        f"expected {real_root.resolve()}, got {gm.agents_root}"
+    )
+    # goal_path and archive_dir must derive from the resolved (canonical) root
+    assert gm.goal_path == gm.agent_root / "goal.md"
+    assert gm.archive_dir == gm.agent_root / "goal_archive"
+    assert gm.agent_root.is_absolute()
+
+
+def test_goalmanager_resolve_failure_fails_closed(tmp_path):
+    """A symlink loop in agents_root MUST fail closed with PathTraversalError,
+    not crash GoalManager.__init__ with a raw OSError (#483 PR1 /ship review).
+
+    GoalManager.__init__ resolves agents_root/agent_root; resolve() raises
+    OSError(ELOOP) on a symlink loop. The constructor folds that into
+    PathTraversalError (a subclass of AtomicAgentsError the CLI already catches)
+    so a malformed vault path produces a controlled error rather than taking
+    down a reactive construction path (the journal-backend #427 precedent).
+    """
+    loop_a = tmp_path / "loop-a"
+    loop_b = tmp_path / "loop-b"
+    loop_a.symlink_to(loop_b)
+    loop_b.symlink_to(loop_a)  # a → b → a: resolve() raises OSError(ELOOP)
+
+    with pytest.raises(PathTraversalError):
+        GoalManager(loop_a, "test-agent")
+    # PathTraversalError is an AtomicAgentsError → the CLI's existing handler
+    # catches it and exits non-zero with a controlled message.
+    assert issubclass(PathTraversalError, AtomicAgentsError)
