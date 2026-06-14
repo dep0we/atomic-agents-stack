@@ -88,10 +88,16 @@ def dispatch_sub_goal_as_outcome(
     apply_transition() for atomic goal.md+JSONL writes under the lock.
 
     Args:
-        agent: AtomicAgent instance. Used ONLY for the pre-dispatch cost gate
-            (_check_cost_guardrails). MUST be the same agent whose budget the
-            OutcomeRunner will spend — do NOT construct a second AtomicAgent
-            here (divergent budget universe). The coordinator accepts it as a
+        agent: AtomicAgent instance. Used for the pre-dispatch cost gate AND
+            as the source of log_backend, policy_backend, and profile_backend
+            threaded into OutcomeRunner construction so the runner's internal
+            AtomicAgent spends in the same backend universe the gate checked
+            (backend-universe alignment property — see spec/41 §"Goal-outcome
+            composition"). The coordinator reads agent.log_backend,
+            agent.policy_backend, and agent.profile_backend directly (no helper).
+            MUST be the same agent whose budget and operator backends the
+            OutcomeRunner will use — do NOT construct a second AtomicAgent here
+            (divergent budget/backend universe). The coordinator accepts it as a
             parameter so construction stays in ONE place (the caller/CLI).
         goal_manager: GoalManager instance (provides goal_backend, agent_name,
             agents_root, and the today date for the completed field).
@@ -247,12 +253,30 @@ def dispatch_sub_goal_as_outcome(
     # ── Step 4: build description + run OutcomeRunner [NO lock held] ─────────
     # The goal lock is released (apply_transition returned). Run can be minutes.
     # OutcomeRunner.run() constructs its OWN AtomicAgent internally with
-    # trigger='outcome' and threads all operator backends — the agent passed into
-    # THIS function is used ONLY for the cost gate above (Step 2), not for the run.
-    # OutcomeRunner also has its own per-iteration cost gate (which fires on block
-    # and sets result.status='interrupted' — it does NOT raise). The coordinator's
-    # pre-dispatch gate is ADDITIONAL and is the only one that raises before paying
-    # the run + construction overhead (Principle #4 "refuse before paying overhead").
+    # trigger='outcome'. The coordinator threads agent.log_backend,
+    # agent.policy_backend, and agent.profile_backend into OutcomeRunner so
+    # the runner's internal AtomicAgent is constructed against the SAME backend
+    # instances the gate agent carries (backend-universe alignment — see spec/41
+    # §"Goal-outcome composition"). NB they align at different boundaries: only
+    # log_backend is load-bearing for the gate (the cost gate reads spend from
+    # self.log_backend); policy_backend aligns the runner's IN-call() caps, not
+    # the gate (policy caps are None outside agent.call(), so neither pre-dispatch
+    # gate consults them); profile_backend is run-side identity/config, not cost.
+    # CAVEAT: caps are NOT yet fully aligned. The effective cap is composed via
+    # MIN with the mandate (inside _check_cost_guardrails's MIN composition +
+    # MandateCheck), and mandate_backend is intentionally NOT threaded here (#496
+    # scoped the set to log/policy/profile). A custom mandate_backend pinned on
+    # the gate agent would tighten the gate's cap but NOT the runner's — a
+    # mandate-derived cap can still diverge on the custom-backend path. Tracked
+    # in #503. Other OutcomeRunner backends (persona, corpus,
+    # mcp_server_registry, mandate, tool_registry) are also NOT threaded here —
+    # they default to filesystem resolution. outcome_backend is also NOT
+    # threaded — the runner owns its outcome write-path topology.
+    # OutcomeRunner also has its own per-iteration cost gate (which fires on
+    # block and sets result.status='interrupted' — it does NOT raise). The
+    # coordinator's pre-dispatch gate is ADDITIONAL and is the only one that
+    # raises before paying the run + construction overhead (Principle #4
+    # "refuse before paying overhead").
 
     # Reload the sub-goal from the updated in-memory state for description building.
     # goal_manager._goal was loaded at the start; sg is a reference to the in-memory
@@ -267,6 +291,17 @@ def dispatch_sub_goal_as_outcome(
         agents_root=goal_manager.agents_root,
         agent_name=goal_manager.agent_name,
         judge_model=judge_model,
+        # keyword args, not positional — mirrors the #425 fix discipline.
+        # Threading the gate agent's RESOLVED policy_backend flips the runner's
+        # internal-agent _policy_backend_was_explicit True, which SKIPS its
+        # cascade re-resolution. That is safe ONLY because the runner is built
+        # with the same agent_name + agents_root as the gate agent, so both
+        # resolve the SAME cascade — the gate agent already cascade-resolved its
+        # policy_backend. If a future change ever lets the runner's name/agents_root
+        # diverge from the gate agent's, that equivalence breaks (see #503).
+        log_backend=agent.log_backend,
+        policy_backend=agent.policy_backend,
+        profile_backend=agent.profile_backend,
     )
     outcome_result = runner.run(
         description=description,
