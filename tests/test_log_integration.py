@@ -327,10 +327,11 @@ def test_sum_cost_routes_through_backend_when_provided(tmp_path):
         cost_source="actor",
     ))
 
-    total = _costs.sum_cost_for_period(
+    result = _costs.sum_cost_for_period(
         tmp_path / "log", "today", source="actor", backend=captured,
     )
-    assert total == pytest.approx(0.42)
+    assert result.total_usd == pytest.approx(0.42)
+    assert result.degraded is False
 
 
 def test_sum_cost_falls_back_to_filesystem_when_no_backend(tmp_path):
@@ -348,8 +349,9 @@ def test_sum_cost_falls_back_to_filesystem_when_no_backend(tmp_path):
         "cost_source": "actor",
     }) + "\n")
 
-    total = _costs.sum_cost_for_period(log_dir, "today", source="actor")
-    assert total == pytest.approx(0.99)
+    result = _costs.sum_cost_for_period(log_dir, "today", source="actor")
+    assert result.total_usd == pytest.approx(0.99)
+    assert result.degraded is False
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -539,14 +541,16 @@ def test_sum_cost_with_real_filesystem_backend(tmp_path):
     ))
     # Filesystem backend preserves legacy walk semantic (Step 11 P0
     # #4 mitigation) — sums by file location, filters by cost_source.
-    total_actor = _costs.sum_cost_for_period(
+    result_actor = _costs.sum_cost_for_period(
         log_dir, "today", source="actor", backend=backend,
     )
-    assert total_actor == pytest.approx(0.75)
-    total_judge = _costs.sum_cost_for_period(
+    assert result_actor.total_usd == pytest.approx(0.75)
+    assert result_actor.degraded is False
+    result_judge = _costs.sum_cost_for_period(
         log_dir, "today", source="judge", backend=backend,
     )
-    assert total_judge == pytest.approx(0.10)
+    assert result_judge.total_usd == pytest.approx(0.10)
+    assert result_judge.degraded is False
 
 
 def test_sum_cost_filesystem_tolerates_malformed_ts_record(tmp_path):
@@ -568,11 +572,12 @@ def test_sum_cost_filesystem_tolerates_malformed_ts_record(tmp_path):
         json.dumps({"cost_usd": 0.42, "cost_source": "actor", "ts": "x"}) + "\n"
     )
     backend = FilesystemLogBackend(tmp_path / "alice")
-    total = _costs.sum_cost_for_period(
+    result = _costs.sum_cost_for_period(
         log_dir, "today", source="actor", backend=backend,
     )
     # Legacy semantic preserved — the malformed-ts record counts.
-    assert total == pytest.approx(0.42)
+    assert result.total_usd == pytest.approx(0.42)
+    assert result.degraded is False
 
 
 def test_doctor_check_log_backend_redacts_url_credential(tmp_path, monkeypatch):

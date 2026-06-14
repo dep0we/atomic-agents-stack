@@ -525,13 +525,15 @@ def test_agent_cost_cap_breaks_tool_loop(tmp_path):
     # by patching _costs.sum_cost_for_period
     call_seq = [0]
 
+    from atomic_agents._costs import CostReadResult as _CRR
+
     def fake_sum_cost(log_dir, period, *args, **kwargs):
         call_seq[0] += 1
         # Return over-cap after the first guardrail check (which is the pre-check
         # for iteration 2)
         if call_seq[0] > 2:  # first 2 calls are the initial check
-            return 1.0  # over the $0.00001 cap
-        return 0.0
+            return _CRR(1.0, False, 0)  # over the $0.00001 cap
+        return _CRR(0.0, False, 0)
 
     with patch.dict(sys.modules, {"anthropic": fake_anthropic}):
         with patch("atomic_agents.agent._costs.sum_cost_for_period", side_effect=fake_sum_cost):

@@ -251,8 +251,19 @@ def _check_cost_guardrails(self) -> CostCheckResult:
     if not self.cost_guardrails.enabled:
         return CostCheckResult(allow=True, action=None)
 
-    today_cost = self._sum_cost_for_period("today")
-    month_cost = self._sum_cost_for_period("this_month")
+    # sum_cost_for_period returns CostReadResult(total_usd, degraded, dropped_records)
+    # rather than a bare float; see §"Cost-read error posture (fail-closed-when-blind)"
+    today_result = sum_cost_for_period(log_dir, "today", ...)
+    month_result = sum_cost_for_period(log_dir, "this_month", ...)
+
+    # Fail-closed if either read is degraded (blind / majority-corrupt current-day file)
+    if today_result.degraded or month_result.degraded:
+        return CostCheckResult(allow=False, action="skip",
+                               reason="cost data unreadable — fail-closed",
+                               cost_data_degraded=True)
+
+    today_cost = today_result.total_usd
+    month_cost = month_result.total_usd
 
     daily_pct = today_cost / self.cost_guardrails.daily_cap_usd
     monthly_pct = month_cost / self.cost_guardrails.monthly_cap_usd
@@ -271,6 +282,22 @@ def _check_cost_guardrails(self) -> CostCheckResult:
 ```
 
 For runtimes that can't use the helper (Claude Code skill without the helper installed, ChatGPT web), guardrails are advisory — same caveat as `tools.md` enforcement (see [01-anatomy#policy-vs-enforcement](01-anatomy.md#policy-vs-enforcement)).
+
+### Cost-read error posture (fail-closed-when-blind) — v1.5
+
+The cost-summing reader (`sum_cost_for_period` and `_sum_via_backend`) returns a `CostReadResult(total_usd, degraded, dropped_records)` rather than a bare float. The error posture is two-tier:
+
+- **Whole-file OSError on the current-day guardrail log** (or any backend exception) → `degraded=True`, `total_usd=0.0` — the gate is blind, fail-closed.
+- **Empty / whitespace-only file** (0-byte or all-blank) → `degraded=False`, no cost contribution — treated identically to an ABSENT file, NOT as corruption. An empty file is readable; it simply has no logged cost yet. This is load-bearing because the log writer's `open("a")` creates the file before the first write+fsync, so a concurrent reader hits a legitimate 0-byte window on every first append of the day — failing closed there would spuriously block a legitimate call on a normal append race.
+
+  **Trust-boundary note (cost-log integrity is NOT defended here).** Because empty/absent reads as `$0`, an actor who can **truncate or delete** the cost log can reset the agent's apparent spend and re-open the full cap. This is a deliberate non-goal of the filesystem backend, not a regression: the same vector is unchanged from before the #495 read-error work (empty/absent has always summed to `$0`), and an actor with write access to the agent's `log/` can equally forge cheap (`cost_usd: 0`) records or edit `model.md` caps directly. Per CLAUDE.md Principle #1 (the vault is the source of truth) and TENSIONS T15 / spec/44's trust model, a writer inside the vault is in-scope-trusted; tamper-evident cost accounting (signed/append-only ledger, monotonic counter, or a separate authoritative store) is the job of a real-authz backend (Postgres/Redis), not the filesystem default. Surfaced by cross-family review during #495; tracked as [#500](https://github.com/dep0we/atomic-agents-stack/issues/500).
+- **Per-line JSON, non-numeric, or boolean `cost_usd` corruption below 50% of non-empty lines** → skip + `logger.warning` (deduped per file+reason per process), `degraded=True`, partial total surfaced. A boolean `cost_usd` is rejected as corruption on BOTH the filesystem and backend paths (`bool` is an `int` subclass, so `float(True)==1.0` would silently mis-count it) — the two cost-read paths are symmetric on every malformed value.
+- **Per-line corruption above 50% of non-empty lines, on the CURRENT-DAY guardrail file** → `degraded=True`, `total_usd=0.0` — fail-closed. The current-day file is the one the gate must trust, so a majority-corrupt current-day log fails the whole read closed.
+- A **historical** file that is unreadable (OSError) or majority-corrupt (>50%) in a monthly walk → skip that file's cost contribution + `degraded=True` (partial month total); it does **not** zero the whole read. Current-day and historical blindness are handled **asymmetrically by design**: a blind current-day file fails the whole read closed (it is the file the gate must trust), while a blind historical file is skipped (degraded + partial month total) so a single garbage old daily log cannot brick the gate for the rest of the month.
+
+A **majority-corrupt or unreadable backend read** (via `_sum_via_backend`, for **either** the `today` or `this_month` period) fails the whole read closed (`degraded=True`, `total_usd=0.0`). For the **monthly** period this is stricter than the filesystem path, which skips only the offending historical file and keeps summing; for the **today** period both paths whole-read fail-close identically (the filesystem path's current-day file is the file the gate must trust). The backend path can over-block, never under-block — safe under fail-closed-when-blind. The genuine, reachable asymmetry between the two paths is the **denominator** for the >50% threshold: the filesystem path counts ALL non-empty lines, while the backend path counts only cost-bearing (non-`None`) records — the backend has already applied the since/until/source/mandate filters server-side, so its denominator is smaller and trips the threshold sooner. Note that every shipped backend yields a `cost_usd` already coerced to `float | None` — via typed DB columns (SQLite `REAL`, Postgres `DOUBLE PRECISION`) or `RunRecord.from_dict`'s coercion — so a non-numeric string is coerced to `None` upstream and **skipped** (it never reaches the threshold denominator), and a numeric string is coerced to a float and summed, the same net result as the filesystem `float()` coercion. The backend loop's drop path (counting a record toward `dropped` and the threshold) is a **defensive belt** for a misbehaving custom backend that returns un-coerced raw objects; it is not a behavior any shipped backend exhibits. Promoting the cost-read error posture into a LogBackend Implementer-Contract MUST is deferred to #497, once a 2nd backend (SQLite/Postgres) has dogfooded read-error semantics against a real conformance test.
+
+**Gate sites** (`_check_cost_guardrails`, `_check_batch_reservation`, delegation headroom, `dream._check_cap`) gate on `cost_guardrails_enabled` BEFORE reading cost, then map `degraded=True` → fail-closed / over-cap **only when there is a budget to enforce**. A guardrails-DISABLED agent is never fail-closed by a degraded read — the enabled-gate short-circuits before the cost read at every gate site. A degraded read at `_check_cost_guardrails` always yields `action="skip"` (block), never `"fallback"` or `"alert"`: falling through to a fallback model on a blind read would still spend on a cheaper LLM, which is a fail-open. The degraded fail-close fires only when an effective cap exists — an own daily/monthly cap (model.md or Policy) **or** a parent coordinator tree-cap (`parent_remaining_headroom_usd`). An **uncapped** (warnings-only) agent where `daily_cap_usd == 0` and `monthly_cap_usd == 0` and no Policy cap and no parent tree-cap is **NOT** blocked by a degraded read: with no cap to bypass it always proceeds even with perfect cost data, so blocking it would be a spurious refusal with zero safety benefit. The `CostCheckResult.cost_data_degraded` flag is still set on the allowed result for audit honesty (the cost figure was a lower bound). The dashboard cost aggregation does **not** consume this reader — it reads through the spec/22 `LogBackend.query()` path (partial-line tolerant, unchanged by this work) and is therefore unaffected by the cost-read fail-closed posture and does not crash on corruption. Reporting consumers that adopt the cost-summing reader in future (none today) should render the partial `total_usd` with a "data may be incomplete" indication rather than crash; wiring a degraded-aware banner into the dashboard is tracked as follow-up [#498](https://github.com/dep0we/atomic-agents-stack/issues/498).
 
 ### Behavior matrix per cap action
 

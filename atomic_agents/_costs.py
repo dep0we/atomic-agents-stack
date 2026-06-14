@@ -6,7 +6,9 @@ Pricing table is hardcoded; update when Anthropic/OpenAI/Moonshot change rates.
 from __future__ import annotations
 import json
 import logging
-from datetime import date, datetime, time, timezone
+import os
+from dataclasses import dataclass
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -18,6 +20,39 @@ logger = logging.getLogger(__name__)
 # Cost-event source categories (spec/28 actor/judge split + spec/30 audit).
 # Legacy records (no cost_source field) are treated as "actor" on read.
 CostSource = Literal["actor", "judge", "audit"]
+
+
+@dataclass
+class CostReadResult:
+    """Internal result from the cost-summing reader.
+
+    Returned by sum_cost_for_period and _sum_via_backend. NOT part of the
+    public API — internal to _costs.py. Do not export from atomic_agents/__init__.py.
+
+    total_usd:      summed cost for the requested period.
+    degraded:       True when the read was partial or completely blind.
+                    Gate sites must map degraded=True → fail-closed (treat as
+                    over-cap). Reporting consumers that adopt this reader (none
+                    today; the dashboard uses the spec/22 query() path instead)
+                    should surface total_usd as possibly-incomplete rather than
+                    crash.
+    dropped_records: count of per-line corruption events skipped (unparseable
+                    JSON / non-numeric / boolean cost_usd). Non-zero via
+                    below-threshold per-line skips, via the current-day >50%
+                    fail-closed return, AND via a historical >50%-corrupt file
+                    that is skipped while the rest of the month keeps summing.
+                    0 on a whole-file/backend blind failure (OSError, unreadable
+                    dir, backend exception) and on an empty/whitespace file
+                    (treated as no-cost, NOT corruption) — any path that produced
+                    no line-level tally. Diagnostic only — `degraded` is the
+                    load-bearing flag (a whole-file blind skip flips degraded=True
+                    with dropped_records=0).
+    """
+
+    total_usd: float
+    degraded: bool
+    dropped_records: int
+
 
 # USD per 1M tokens — input / output
 PRICING: dict[str, dict[str, float]] = {
@@ -74,6 +109,15 @@ CACHE_HIT_DISCOUNT = 0.10
 # so operators see the message exactly once per process lifetime.
 _unknown_model_warned: set[str] = set()
 
+# Per-process dedup set for per-line corruption warnings (mirrors
+# _unknown_model_warned). Key: (str(path), sub_reason) where sub_reason is one
+# of the two per-line corruption kinds passed to _warn_corruption:
+#   'json_decode_error', 'non_numeric_cost_usd'
+# One warning per (file, reason) per process lifetime. The fail-closed paths
+# (whole-file OSError, unreadable dir, >50% threshold, backend exception) call
+# logger.warning directly and are NOT deduped — each is a one-time event per read.
+_corruption_warned: set[tuple[str, str]] = set()
+
 
 def _fallback_pricing() -> dict[str, float]:
     """Return the most expensive (conservative-pessimistic) rates from PRICING.
@@ -122,6 +166,27 @@ def calc_cost(
     return round(cost_cached + cost_uncached + cost_output, 6), fallback
 
 
+def _warn_corruption(path: Path, sub_reason: str, msg: str) -> None:
+    """Emit logger.warning for cost-read corruption, deduped by (path, sub_reason).
+
+    Per-line corruption warnings are suppressed after the first occurrence for a
+    given (file path, sub_reason) pair — prevents log flooding when an agent runs
+    on a recurring schedule against the same corrupt file.
+
+    Only the two per-line corruption kinds ('json_decode_error',
+    'non_numeric_cost_usd') route through here. Fail-closed paths (whole-file
+    OSError, unreadable dir, >50% threshold, backend exception) call
+    logger.warning directly and are not deduped — each is a one-time event.
+    """
+    key = (str(path), sub_reason)
+    if key in _corruption_warned:
+        return
+    # Bound dedup set size: beyond 1000 entries always warn (no suppression).
+    if len(_corruption_warned) < 1000:
+        _corruption_warned.add(key)
+    logger.warning(msg)
+
+
 def sum_cost_for_period(
     log_dir: Path,
     period: str,
@@ -131,10 +196,33 @@ def sum_cost_for_period(
     mandate_id: str | None = None,
     backend: "LogBackend | None" = None,
     agent_name: str | None = None,
-) -> float:
+) -> CostReadResult:
     """Sum cost_usd across log records for the given period.
 
+    Returns a CostReadResult (total_usd, degraded, dropped_records).
+
     period: 'today' or 'this_month'.
+
+    Cost-read fail-closed posture (spec/09 §"Cost-read error posture"):
+    - Whole-file OSError on the current-day guardrail log → degraded=True
+      (gate sites treat as over-cap / fail-closed).
+    - Per-line JSON or float() corruption below 50%-of-non-empty-lines →
+      skip + logger.warning + degraded=True with dropped_records > 0.
+    - Per-line corruption above 50%-of-non-empty-lines on the CURRENT-DAY file
+      → degraded=True, total_usd=0.0 (fail-closed). A HISTORICAL file over the
+      threshold → skip that file's cost + degraded=True (partial month total);
+      it does not zero the whole read.
+    - OSError on a prior-day (historical) file in a monthly walk → skip that
+      file + degraded=True (partial month total, its real cost is silently
+      dropped, so the read is flagged blind). Only the current-day file triggers
+      whole-read fail-closed (total_usd=0.0) when blind; a historical blind skip
+      keeps summing the rest of the month but still flips degraded so the gate
+      fail-closes (fail-closed-when-blind). dropped_records stays 0 on this path
+      (it's a per-line tally; a whole-file skip produces no line-level drops) —
+      degraded is the load-bearing signal, not dropped_records.
+
+    Denominator for the >50% threshold: non-empty lines only — blank lines
+    are not corruption.
 
     source: optional filter on cost-event origin (spec/28 + spec/30):
         - None (default): sum every cost record (legacy behavior).
@@ -171,11 +259,11 @@ def sum_cost_for_period(
     # records have indexed ts and the malformed-ts case doesn't apply.
     #
     # Step 11 adversarial P0 #4 caught this: a record with ``ts="x"``
-    # in today's JSONL file was counted by legacy sum_cost_for_period
-    # but silently dropped by the backend.query() path — a silent
-    # loosening of the cost cap. The fix preserves legacy semantic
-    # for filesystem while still threading the backend through (so
-    # the operator surface is consistent across all backend types).
+    # in today's JSONL file was counted by this function's filesystem
+    # file-walk path but silently dropped by the backend.query() path —
+    # a silent loosening of the cost cap. The fix preserves the file-walk
+    # semantic for filesystem while still threading the backend through
+    # (so the operator surface is consistent across all backend types).
     if backend is not None:
         from .logs.filesystem import FilesystemLogBackend
 
@@ -184,29 +272,122 @@ def sum_cost_for_period(
                 backend, today, period, source, mandate_id, agent_name
             )
 
+    # Identify the current-day file path for OSError fail-closed logic.
+    today_file = log_dir / today.strftime("%Y-%m") / f"{today.isoformat()}.jsonl"
+
     total = 0.0
+    total_dropped = 0
+    # had_blind_skip: set True whenever a WHOLE historical file is skipped
+    # blindly (unreadable OSError, or majority-corrupt over the >50% threshold)
+    # so its real cost contribution is silently dropped from the month total.
+    # This is a blind spot in the monthly read distinct from the per-line
+    # corruption tally (total_dropped), and it must flip degraded=True even when
+    # no individual line was counted (e.g. an unreadable historical file yields
+    # zero line-level drops). Fail-closed-when-blind: a dropped historical file
+    # is a partial month total, so the gate must treat the read as degraded.
+    had_blind_skip = False
     if period == "today":
-        log_path = log_dir / today.strftime("%Y-%m") / f"{today.isoformat()}.jsonl"
-        paths = [log_path] if log_path.exists() else []
+        # Absent file = first run of the day = no cost (not blind).
+        # Path.exists() PROPAGATES non-ENOENT OSErrors on Py3.12 (e.g. EACCES
+        # when the parent month dir is unreadable) — guard it so an unreadable
+        # current-day probe maps to degraded (blind), not a raw crash.
+        try:
+            today_exists = today_file.exists()
+        except OSError:
+            logger.warning(
+                "cost-read: OSError probing current-day log %s — "
+                "cost gate is BLIND, failing closed (degraded=True)",
+                today_file,
+            )
+            return CostReadResult(total_usd=0.0, degraded=True, dropped_records=0)
+        paths = [today_file] if today_exists else []
     elif period == "this_month":
         month_dir = log_dir / today.strftime("%Y-%m")
-        paths = list(month_dir.glob("*.jsonl")) if month_dir.exists() else []
+        # Path.glob() swallows the underlying os.scandir EACCES and yields an
+        # EMPTY iterator when the month dir is unreadable — that would fail-OPEN
+        # ($0 spent, degraded=False). Enumerate via a SINGLE os.scandir handle and
+        # materialize the *.jsonl listing from it directly: this both maps an
+        # unreadable month dir to BLIND (the scandir raises OSError → fail-closed)
+        # AND closes the TOCTOU window that a probe-then-reglob shape would leave
+        # (perms could flip between the probe and a second glob walk, and Path.glob
+        # would silently swallow the late EACCES → fail-OPEN). One walk, no window.
+        try:
+            if month_dir.exists():
+                with os.scandir(month_dir) as it:
+                    paths = [
+                        Path(entry.path)
+                        for entry in it
+                        if entry.name.endswith(".jsonl")
+                    ]
+            else:
+                paths = []
+        except OSError:
+            logger.warning(
+                "cost-read: OSError enumerating month dir %s — "
+                "monthly cost gate is BLIND, failing closed (degraded=True)",
+                month_dir,
+            )
+            return CostReadResult(total_usd=0.0, degraded=True, dropped_records=0)
     else:
         raise ValueError(f"unknown period: {period}")
 
     for path in paths:
+        is_today_file = path == today_file
         try:
             text = path.read_text(encoding="utf-8")
         except OSError:
-            continue
+            if is_today_file:
+                # Current-day guardrail log is unreadable → gate is blind.
+                logger.warning(
+                    "cost-read: OSError reading current-day log %s — "
+                    "cost gate is BLIND, failing closed (degraded=True)",
+                    path,
+                )
+                return CostReadResult(total_usd=0.0, degraded=True, dropped_records=0)
+            else:
+                # Historical file — skip the whole file, but don't zero the
+                # whole read. The skip drops this file's real cost contribution
+                # silently, so mark the month read degraded (blind spot) — the
+                # gate fail-closes, but the rest of the month still sums. This
+                # is symmetric with the historical >50%-corrupt path below: both
+                # are whole-file blind skips that set had_blind_skip.
+                logger.warning(
+                    "cost-read: OSError reading historical log %s — "
+                    "skipping file (degraded=True, partial month total)",
+                    path,
+                )
+                had_blind_skip = True
+                continue
+
+        # Per-file corruption tally. A historic file that is unreadable or
+        # majority-corrupt is treated symmetrically: skip its contribution +
+        # set degraded (partial month total), but do NOT zero the whole read.
+        # Only the CURRENT-DAY guardrail file fails the whole read closed when
+        # blind/majority-corrupt — that is the file the gate must trust.
+        file_total_lines = 0
+        file_corrupt_lines = 0
+        file_cost = 0.0
+        file_dropped = 0
+
         for line in text.splitlines():
             line = line.strip()
             if not line:
                 continue
+            file_total_lines += 1
+
             try:
                 rec = json.loads(line)
             except json.JSONDecodeError:
+                file_corrupt_lines += 1
+                file_dropped += 1
+                _warn_corruption(
+                    path,
+                    "json_decode_error",
+                    f"cost-read: unparseable JSON line in {path} — "
+                    "skipping line (counts toward corruption tally)",
+                )
                 continue
+
             if source is not None:
                 rec_source = rec.get("cost_source", "actor")
                 if source == "actor":
@@ -219,11 +400,94 @@ def sum_cost_for_period(
             if mandate_id is not None:
                 if rec.get("mandate_id") != mandate_id:
                     continue
-            try:
-                total += float(rec.get("cost_usd", 0.0))
-            except (TypeError, ValueError):
+
+            cost_val = rec.get("cost_usd", 0.0)
+            # Reject bools BEFORE float(): float(True) == 1.0 would silently count
+            # a JSON `true` cost as a $1.00 charge (and `false` as $0), inflating
+            # or hiding spend rather than surfacing the malformed value. A boolean
+            # cost is corruption, not a number — it must flow through the same
+            # dropped/degraded path as any other non-numeric cost_usd.
+            if isinstance(cost_val, bool):
+                file_corrupt_lines += 1
+                file_dropped += 1
+                _warn_corruption(
+                    path,
+                    "non_numeric_cost_usd",
+                    f"cost-read: boolean cost_usd in {path} — "
+                    "skipping line (counts toward corruption tally)",
+                )
                 continue
-    return total
+            try:
+                file_cost += float(cost_val)
+            except (TypeError, ValueError):
+                file_corrupt_lines += 1
+                file_dropped += 1
+                _warn_corruption(
+                    path,
+                    "non_numeric_cost_usd",
+                    f"cost-read: non-numeric cost_usd in {path} — "
+                    "skipping line (counts toward corruption tally)",
+                )
+                continue
+
+        # An empty (0-byte / all-blank) file is READABLE but carries no logged
+        # cost yet — semantically identical to an ABSENT file (no cost), NOT to a
+        # corrupt or unreadable one. Genuine blindness is the OSError path above;
+        # "no content" is not blind. Critically, the log writer's open("a")
+        # (atomic_append_jsonl) CREATES the file before the first write+fsync, so
+        # a concurrent reader hits a legitimate 0-byte window on every first
+        # append of the day — failing closed there would spuriously block a
+        # legitimate call on a normal append race. Treat empty the same for the
+        # current-day and historical files: skip, no cost, no degradation.
+        if file_total_lines == 0:
+            continue
+
+        # >50%-of-non-empty-lines threshold, applied per-file.
+        if file_corrupt_lines > 0.5 * file_total_lines:
+            if is_today_file:
+                # Current-day guardrail file is majority-corrupt → the gate
+                # cannot trust today's spend → fail the whole read closed.
+                logger.warning(
+                    "cost-read: %d/%d lines corrupt in current-day log %s "
+                    "(>50%% threshold) — failing closed (degraded=True)",
+                    file_corrupt_lines,
+                    file_total_lines,
+                    path,
+                )
+                return CostReadResult(
+                    total_usd=0.0, degraded=True, dropped_records=file_corrupt_lines
+                )
+            # Historical file over threshold: skip its (untrustworthy) cost
+            # contribution and mark degraded, but keep summing the rest of the
+            # month — symmetric with the historical-OSError skip above. A single
+            # garbage old daily log must NOT brick the gate for the whole month.
+            logger.warning(
+                "cost-read: %d/%d lines corrupt in historical log %s "
+                "(>50%% threshold) — skipping file's cost (degraded=True, "
+                "partial month total)",
+                file_corrupt_lines,
+                file_total_lines,
+                path,
+            )
+            total_dropped += file_dropped
+            had_blind_skip = True
+            continue
+
+        total += file_cost
+        total_dropped += file_dropped
+
+    # degraded=True when EITHER per-line corruption was skipped (total_dropped>0,
+    # below-threshold skips on any file) OR a whole historical file was skipped
+    # blindly (had_blind_skip: unreadable OSError or >50%-corrupt historical
+    # file, whose real cost is silently dropped from the month total). Clean
+    # reads return degraded=False. The whole-file blind skip is the audit signal
+    # the gate consumes (fail-closed-when-blind, Principle #4/#5); total_dropped
+    # alone would miss an unreadable historical file that produced zero line-level
+    # drops, leaving the monthly cap silently under-counting.
+    degraded = total_dropped > 0 or had_blind_skip
+    return CostReadResult(
+        total_usd=total, degraded=degraded, dropped_records=total_dropped
+    )
 
 
 def _sum_via_backend(
@@ -233,8 +497,10 @@ def _sum_via_backend(
     source: CostSource | None,
     mandate_id: str | None,
     agent_name: str | None = None,
-) -> float:
+) -> CostReadResult:
     """Sum cost_usd via LogBackend.query (PR 2 backend-routed path).
+
+    Returns CostReadResult. Any backend exception → degraded=True / fail-closed.
 
     Uses ISO-8601 lexicographic comparison via LogQuery.since/until —
     backends with index pushdown (SQLite PR 3 forward) translate this
@@ -267,22 +533,118 @@ def _sum_via_backend(
     else:
         raise ValueError(f"unknown period: {period}")
 
-    records = backend.query(
-        LogQuery(
-            since=since_dt,
-            until=until_dt,
-            cost_source=source,
-            mandate_id=mandate_id,
-            agent_name=agent_name,
+    try:
+        records = list(
+            backend.query(
+                LogQuery(
+                    since=since_dt,
+                    until=until_dt,
+                    cost_source=source,
+                    mandate_id=mandate_id,
+                    agent_name=agent_name,
+                )
+            )
         )
-    )
+    except Exception as exc:  # noqa: BLE001  # backend contract does not constrain exc type
+        logger.warning(
+            "cost-read: backend.query() raised %s: %s — "
+            "gate is BLIND, failing closed (degraded=True)",
+            type(exc).__name__,
+            exc,
+        )
+        return CostReadResult(total_usd=0.0, degraded=True, dropped_records=0)
 
     total = 0.0
+    dropped = 0
+    # The backend denominator counts only cost-BEARING records (cost_usd not
+    # None); None-cost audit records must not dilute the threshold. This is a
+    # DELIBERATELY different population from the filesystem path's denominator:
+    # the fs reader counts ALL non-empty lines (including audit/non-cost records
+    # and records later filtered out by source/mandate), because on disk it
+    # cannot cheaply distinguish them before parsing, whereas the backend has
+    # already applied the since/until/source/mandate filters server-side. The
+    # backend path is therefore the stricter of the two (a smaller denominator
+    # trips the >50% threshold sooner) — that asymmetry is safe (stricter never
+    # fails OPEN); it is not a parity guarantee. spec/09 only normatively
+    # specifies the fs denominator ("50% of non-empty lines"); the backend
+    # denominator is an implementation choice consistent with fail-closed-when-blind.
+    cost_bearing = 0
+
     for r in records:
-        if r.cost_usd is None:
+        # DEFENSIVE BELT, normally dead path. Every shipped backend yields a
+        # cost_usd already coerced to float | None — either via a typed DB column
+        # (SQLite REAL, Postgres DOUBLE PRECISION) or via RunRecord.from_dict's
+        # _coerce_optional_float (logs/types.py), which turns a non-numeric string
+        # into None upstream. So a non-numeric cost_usd never reaches this loop
+        # from a real backend: it is coerced to None and skipped by the guard
+        # below. The try/except + bad-record accounting only fires for a
+        # misbehaving custom backend that hands back un-coerced raw objects
+        # (e.g. the SimpleNamespace records in tests/test_costs.py). It is kept so
+        # ANY backend misbehavior fail-closes via the >50% threshold rather than
+        # crashing the gate, matching the broad except around backend.query().
+        try:
+            # Read the value first. An AttributeError here (duck-typed record with
+            # no cost_usd) is a malformed record → drop it (still cost-bearing for
+            # threshold purposes — a record we cannot read a cost from is exactly
+            # what the >50% blind-read threshold exists to catch).
+            cost = r.cost_usd
+        except AttributeError:
+            cost_bearing += 1
+            dropped += 1
+            logger.warning(
+                "cost-read: un-coerced/malformed backend record (run_id=%s) — "
+                "skipping (counts toward corruption tally)",
+                getattr(r, "run_id", "?"),
+            )
             continue
-        total += r.cost_usd
-    return total
+        if cost is None:
+            # None-cost (audit) records are not cost-bearing and never dilute the
+            # threshold denominator — skipped without counting.
+            continue
+        cost_bearing += 1
+        # Reject bools BEFORE the add (parity with the fs path's bool reject):
+        # bool is a subclass of int, so `total += True` succeeds as +1.0 and
+        # `+= False` as +0.0 — a boolean cost_usd would silently mis-count spend
+        # rather than being surfaced. Treat it as corruption so it flows through
+        # the same >50% fail-closed / degraded logic. (Unreachable for shipped
+        # backends — _coerce_optional_float never yields a bool — but keeps the
+        # two cost-read paths symmetric so the spec/09 "same net result" claim
+        # holds for every malformed value, not just strings.)
+        if isinstance(cost, bool):
+            dropped += 1
+            logger.warning(
+                "cost-read: boolean cost_usd in backend record (run_id=%s) — "
+                "skipping (counts toward corruption tally)",
+                getattr(r, "run_id", "?"),
+            )
+            continue
+        try:
+            total += cost
+        except (TypeError, ValueError):
+            # A value that will not add as a float (un-coerced str/Decimal from a
+            # misbehaving backend) counts toward the dropped tally — already
+            # counted toward cost_bearing above — so it flows through the same
+            # >50% fail-closed / degraded logic instead of escaping uncaught.
+            dropped += 1
+            logger.warning(
+                "cost-read: un-coerced/non-numeric cost_usd in backend record "
+                "(run_id=%s) — skipping (counts toward corruption tally)",
+                getattr(r, "run_id", "?"),
+            )
+
+    # Apply >50% threshold to backend records (denominator is the cost-bearing
+    # population — see the note above; stricter than, not identical to, the fs path).
+    if cost_bearing > 0 and dropped > 0.5 * cost_bearing:
+        logger.warning(
+            "cost-read: %d/%d cost-bearing backend records non-numeric "
+            "(>50%% threshold) — failing closed (degraded=True)",
+            dropped,
+            cost_bearing,
+        )
+        return CostReadResult(total_usd=0.0, degraded=True, dropped_records=dropped)
+
+    degraded = dropped > 0
+    return CostReadResult(total_usd=total, degraded=degraded, dropped_records=dropped)
 
 
 def load_warning_state(state_path: Path) -> dict:

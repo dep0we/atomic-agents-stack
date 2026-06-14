@@ -180,7 +180,8 @@ def test_tool_loop_cost_cap_enforced_mid_flight(tmp_path):
             mock_lock.acquire.return_value = MagicMock()  # fake LockHandle (#60 PR 2)
             mock_lock.release.return_value = None
             # sum_cost_for_period always returns 0 — all blocking via accumulator
-            with patch("atomic_agents.agent._costs.sum_cost_for_period", return_value=0.0):
+            from atomic_agents._costs import CostReadResult as _CRR
+            with patch("atomic_agents.agent._costs.sum_cost_for_period", return_value=_CRR(0.0, False, 0)):
                 response = agent.call("Run the loop.")
 
     # With the accumulator fix: exactly 3 iterations complete; iteration 4 is
@@ -297,7 +298,8 @@ def test_delegate_returns_add_to_coordinator_accumulator(tmp_path):
     with patch.dict(sys.modules, {"anthropic": fake_anthropic}):
         # Mock sum_cost_for_period so the coordinator's on-disk log always reads 0
         # (tests that the accumulator alone enforces the cap on the 2nd call)
-        with patch("atomic_agents.agent._costs.sum_cost_for_period", return_value=0.0):
+        from atomic_agents._costs import CostReadResult as _CRR
+        with patch("atomic_agents.agent._costs.sum_cost_for_period", return_value=_CRR(0.0, False, 0)):
             # Also need to mock _costs.calc_cost to return a known cost per call
             # so we can predict when the cap is hit.
             # Haiku: 10*0.80/1M + 20*4.0/1M = 0.000008 + 0.000080 = $0.000088

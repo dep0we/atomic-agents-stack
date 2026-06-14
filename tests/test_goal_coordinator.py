@@ -68,12 +68,16 @@ def _make_outcome_result(
 def _make_cost_check_result(allow: bool, reason: str = "") -> MagicMock:
     """Build a CostCheckResult-like mock for the cost gate test.
 
-    The coordinator reads result.allow (bool) and result.reason (str) as
-    dataclass attributes — NOT tuple-unpacked, NOT `if result:` (always truthy).
+    The coordinator reads result.allow (bool), result.reason (str), and
+    result.cost_data_degraded (bool) as dataclass attributes — NOT
+    tuple-unpacked, NOT `if result:` (always truthy).
+    cost_data_degraded is set to False for normal mock results; tests that
+    want to simulate a degraded-blind gate should pass cost_data_degraded=True.
     """
     result = MagicMock()
     result.allow = allow
     result.reason = reason
+    result.cost_data_degraded = False  # must be JSON-serializable bool
     return result
 
 

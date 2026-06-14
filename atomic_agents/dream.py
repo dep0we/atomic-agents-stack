@@ -707,27 +707,49 @@ def _check_cap(
     """
     if critical or reserved <= 0:
         return
-    log_dir = agent_root / "log"
-    today_cost = _costs.sum_cost_for_period(
-        log_dir, "today", source="actor", backend=log_backend, agent_name=agent_name
-    )
-    month_cost = _costs.sum_cost_for_period(
-        log_dir,
-        "this_month",
-        source="actor",
-        backend=log_backend,
-        agent_name=agent_name,
-    )
-    # Load caps from the resolved model_config (PR 2) or fall back to a
-    # direct parse_model_md (legacy / standalone _check_cap callers).
+    # Resolve the model config and gate on cost_guardrails_enabled BEFORE
+    # reading cost, mirroring _check_cost_guardrails' ordering (agent.py).
+    # A guardrails-DISABLED agent must never be fail-closed by a degraded
+    # read — spec/09 scopes the degraded→fail-closed mapping to
+    # guardrails-ENABLED agents only, and the sibling gate returns allow=True
+    # before any cost read. Reading first would brick a default (guardrails-off)
+    # dream on a single corrupt current-day log.
     if model_config is not None:
         model_data = model_config
     else:
         model_data = _model.parse_model_md(agent_root / "model.md")
     if not model_data.get("cost_guardrails_enabled"):
         return
+    log_dir = agent_root / "log"
+    today_result = _costs.sum_cost_for_period(
+        log_dir, "today", source="actor", backend=log_backend, agent_name=agent_name
+    )
+    month_result = _costs.sum_cost_for_period(
+        log_dir,
+        "this_month",
+        source="actor",
+        backend=log_backend,
+        agent_name=agent_name,
+    )
+    today_cost = today_result.total_usd
+    month_cost = month_result.total_usd
     daily_cap = model_data.get("daily_cap_usd", 0.0)
     monthly_cap = model_data.get("monthly_cap_usd", 0.0)
+    # Gate site: fail-closed on a degraded read ONLY when there is a cap to
+    # enforce (same uncapped-skip POSTURE as _check_cost_guardrails — #495 P2,
+    # but a model.md-only predicate: dream reads caps from model_data and does
+    # not enforce Policy caps, so the predicate matches that surface). An
+    # uncapped dream agent's headroom is inf (the reservation can never exceed
+    # it), so a blind read changes nothing; blocking it would be a spurious
+    # refusal. This is a gate, not a reporting path: when a cap IS set and the
+    # data is blind, refuse rather than render a partial number.
+    if (daily_cap > 0 or monthly_cap > 0) and (
+        today_result.degraded or month_result.degraded
+    ):
+        raise ValueError(
+            "cost data unreadable — dream cost gate fail-closed. "
+            "Use critical=True to bypass."
+        )
     daily_remaining = (daily_cap - today_cost) if daily_cap > 0 else float("inf")
     monthly_remaining = (monthly_cap - month_cost) if monthly_cap > 0 else float("inf")
     headroom = min(daily_remaining, monthly_remaining)

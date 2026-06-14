@@ -209,6 +209,9 @@ def dispatch_sub_goal_as_outcome(
                 "event": "coordinator_dispatch_rejected",
                 "sub_goal_id": sub_goal_id,
                 "reason": result_check.reason,
+                # Include degraded flag so the audit trail distinguishes a real
+                # cap hit from a data-quality blind spot (spec/09 cost-read posture).
+                "cost_data_degraded": result_check.cost_data_degraded,
             },
         )
         raise CostGuardrailBlocked(result_check.reason)
