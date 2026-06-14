@@ -573,7 +573,7 @@ def test_atomic_agent_accepts_goal_backend_kwarg(tmp_path):
 
 
 # ──────────────────────────────────────────────────────────────────
-# 9. has_goal() — still works after backend injection (filesystem probe)
+# 9. has_goal() — is_file() predicate; still works after backend injection
 
 
 def test_save_forward_ref_blocked_by_fails_closed(tmp_path):
@@ -646,8 +646,10 @@ def test_save_backward_ref_blocked_by_still_persists(agent_fixture):
 
 
 def test_has_goal_works_after_backend_injection(agent_fixture):
-    """has_goal() is still a filesystem probe (unchanged); backend injection
-    does not break it."""
+    """has_goal() is a filesystem probe (is_file(), not exists()); backend
+    injection does not break it. After #494 the probe uses is_file() rather
+    than exists() — a directory-shaped goal.md returns False (is_file() rejects
+    a directory, matching the backend's own presence predicate)."""
     agents_root, agent_name, agent_root, backend = agent_fixture
     gm = GoalManager(agents_root, agent_name, goal_backend=backend)
     assert gm.has_goal() is True
@@ -656,6 +658,43 @@ def test_has_goal_works_after_backend_injection(agent_fixture):
     (agent_root / "goal.md").unlink()
     gm2 = GoalManager(agents_root, agent_name, goal_backend=backend)
     assert gm2.has_goal() is False
+
+
+def test_has_goal_returns_false_for_directory_shaped_goal_md(tmp_path):
+    """Regression guard for #494: a directory at goal.md is treated as absent.
+
+    Covers the degenerate shape where goal.md exists as a directory (e.g. from
+    a botched init or filesystem corruption). Both invariants are asserted in one
+    atomic scenario against the same fixture:
+      - has_goal() returns False  (is_file() rejects a directory)
+      - archive() raises AtomicAgentsError('No active goal to archive')
+        via the GoalManager.archive() has_goal() precheck guard,
+        NOT via any deeper raise site (no goal_archive/ pre-exists here).
+
+    The regex anchors the no-suffix precheck message ("...archive" with no
+    trailing " at {path}"), so this test fails if a future refactor lets a
+    deeper raise site (e.g. load()'s "No goal.md at {goal_path}") become the
+    raise site instead of the precheck.
+
+    The fixture uses a fresh tmp_path with no goal_archive/ so the
+    GoalManager precheck is the raise site, not the backend idempotency path.
+    """
+    agents_root = tmp_path / "agents"
+    agent_root = agents_root / "dir-goal-agent"
+    agent_root.mkdir(parents=True)
+
+    # Create goal.md as a directory (the degenerate shape)
+    (agent_root / "goal.md").mkdir()
+
+    backend = FilesystemGoalBackend(agent_root)
+    gm = GoalManager(agents_root, "dir-goal-agent", goal_backend=backend)
+
+    # has_goal() must treat a directory-shaped goal.md as absent
+    assert gm.has_goal() is False
+
+    # archive() must fail closed at the GoalManager precheck, not silently succeed
+    with pytest.raises(AtomicAgentsError, match=r"No active goal to archive$"):
+        gm.archive(reason="test")
 
 
 # ──────────────────────────────────────────────────────────────────

@@ -218,7 +218,17 @@ class GoalManager:
     # Load / save
 
     def has_goal(self) -> bool:
-        return self.goal_path.exists()
+        """Return True only when goal.md is a regular file (is_file()).
+
+        Matches FilesystemGoalBackend's own is_file() presence predicate
+        (filesystem.py): a directory or dangling symlink at goal.md is treated
+        as absent (returns False, fail-closed); a symlink-to-file resolves and
+        returns True. That predicate is the gate that drives spec/41 MUST 9's
+        "no goal.md present" retry-idempotency condition — it is the backend's
+        implementation choice for presence, not a distinct normative MUST. #494
+        aligns the manager boundary to it so both agree for every fs shape.
+        """
+        return self.goal_path.is_file()
 
     def has_active_goal(self) -> bool:
         if not self.has_goal():
@@ -514,8 +524,13 @@ class GoalManager:
         closes the common single-session false-success case, not a race.
 
         Active-goal precheck (public-API contract, preserved): if there is no
-        active goal.md, this raises ``AtomicAgentsError("No active goal to
-        archive")`` rather than returning a stale prior-archive slug. This is the
+        active goal.md as a regular file (has_goal() uses is_file()), this
+        raises ``AtomicAgentsError("No active goal to archive")`` rather than
+        returning a stale prior-archive slug. The precheck uses is_file()
+        (matching the backend's own is_file() presence predicate — the gate that
+        drives MUST 9's "no goal.md present" condition) but still runs outside
+        the lock — the TOCTOU note above still applies; the window was not
+        narrowed by the is_file() tightening. This is the
         historical GoalManager.archive()/abandon() contract — ``goal abandon``
         on an agent with nothing active must FAIL (non-zero, honest message), not
         print "Goal abandoned" while writing nothing and silently discarding the
