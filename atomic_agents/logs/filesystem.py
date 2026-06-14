@@ -579,7 +579,7 @@ def _matches(
         return False
     if filter.cost_source is not None:
         # Legacy records without cost_source count as "actor" — mirrors
-        # ``_costs.sum_cost_for_period`` line 149-157.
+        # the source-filter block in ``_costs.sum_cost_for_period``.
         rec_source = record.cost_source if record.cost_source is not None else "actor"
         if filter.cost_source == "actor":
             if rec_source != "actor":

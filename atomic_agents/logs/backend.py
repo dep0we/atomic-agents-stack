@@ -146,8 +146,8 @@ class LogBackend(Protocol):
           not 100 unsorted records.
         * ``cost_source=None`` filter is special-cased for backward
           compatibility: legacy records without the field are treated
-          as ``"actor"``. This mirrors ``_costs.sum_cost_for_period``
-          line 149-157.
+          as ``"actor"``. This mirrors the source-filter block in
+          ``_costs.sum_cost_for_period``.
         * MUST return an empty list when the backend is empty; MUST
           NOT raise ``FileNotFoundError`` etc. for missing-backend
           state. PR 2 wires ``query`` into call paths that today

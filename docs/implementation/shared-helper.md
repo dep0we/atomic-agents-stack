@@ -423,8 +423,19 @@ class AtomicAgent:
             # Critical flag bypasses caps but still fires warnings
             return CostCheckResult(allow=True, action=None, reason="critical_override")
 
-        today_cost = self._sum_cost_for_period("today")
-        month_cost = self._sum_cost_for_period("this_month")
+        # sum_cost_for_period returns CostReadResult(total_usd, degraded, dropped_records)
+        # (not a bare float) — see spec/09 §"Cost-read error posture" (#495 PR1)
+        today_result = self._sum_cost_for_period("today")
+        month_result = self._sum_cost_for_period("this_month")
+
+        # Fail-closed if either read is degraded (unreadable / majority-corrupt)
+        if today_result.degraded or month_result.degraded:
+            return CostCheckResult(allow=False, action="skip",
+                                   reason="cost data unreadable — fail-closed",
+                                   cost_data_degraded=True)
+
+        today_cost = today_result.total_usd
+        month_cost = month_result.total_usd
         daily_pct = today_cost / self.cost_guardrails.daily_cap_usd
         monthly_pct = month_cost / self.cost_guardrails.monthly_cap_usd
 

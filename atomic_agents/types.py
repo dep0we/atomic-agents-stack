@@ -58,6 +58,10 @@ class CostCheckResult:
     action: str | None = None         # 'skip' | 'fallback' | 'alert' | None
     reason: str = ""
     fallback_model: str | None = None
+    # True when the cost reader was degraded (blind / partial read). Gate sites
+    # that set this distinguish a real-cap-hit from a data-quality blind spot.
+    # Defaults False so existing CostCheckResult(allow=True) sites need no change.
+    cost_data_degraded: bool = False
 
 
 @dataclass

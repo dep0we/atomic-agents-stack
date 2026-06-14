@@ -3723,6 +3723,11 @@ class AtomicAgent:
                     "status": "skipped",
                     "summary": f"Skipped: {check.reason}",
                 }
+                # Structured audit signal so a JSONL query can distinguish a
+                # genuine cap hit from a blind-read fail-close without substring
+                # matching prose (mirrors the coordinator dispatch-rejected event).
+                if check.cost_data_degraded:
+                    _skip_record["cost_data_degraded"] = True
                 # spec/37 MUST 7: include caller identity on the cost-skip path
                 # so audit can attribute refused HTTP calls to their principals.
                 if caller_identity is not None:
@@ -4051,6 +4056,10 @@ class AtomicAgent:
                             "summary": skip_reason,
                             "run_id": self.run_id,
                         }
+                        # Structured degraded signal (audit symmetry with the
+                        # pre-loop skip + coordinator dispatch-rejected event).
+                        if iter_check.cost_data_degraded:
+                            _mid_loop_skip["cost_data_degraded"] = True
                         # spec/37 MUST 7: include http_caller on ALL HTTP-triggered
                         # terminal records, including this mid-loop cost-cap path.
                         # The pre-loop cost-skip (3398-3401) and lock_busy (3325-3327)
@@ -5152,29 +5161,46 @@ class AtomicAgent:
         # Compute coordinator's remaining headroom to pass to the delegate.
         # This enforces the coordinator cap as a true tree-cap. (fix R2-A2)
         # Include already-delegated spend so the headroom accounts for it.
+        #
+        # Fail-closed when blind: if either cost read is degraded (OSError /
+        # majority corruption), the coordinator cannot verify its own spend.
+        # Giving a delegate headroom in that state would silently over-grant
+        # budget → fail-closed by raising CostGuardrailBlocked with zero headroom.
         remaining_headroom: float | None = None
         if self.config.cost_guardrails_enabled and not critical:
             log_dir = self.agent_root / "log"
-            today_cost = (
-                _costs.sum_cost_for_period(
-                    log_dir,
-                    "today",
-                    source="actor",
-                    backend=self.log_backend,
-                    agent_name=self.name,
-                )
-                + self._delegated_cost_this_run
+            today_result = _costs.sum_cost_for_period(
+                log_dir,
+                "today",
+                source="actor",
+                backend=self.log_backend,
+                agent_name=self.name,
             )
-            month_cost = (
-                _costs.sum_cost_for_period(
-                    log_dir,
-                    "this_month",
-                    source="actor",
-                    backend=self.log_backend,
-                    agent_name=self.name,
-                )
-                + self._delegated_cost_this_run
+            month_result = _costs.sum_cost_for_period(
+                log_dir,
+                "this_month",
+                source="actor",
+                backend=self.log_backend,
+                agent_name=self.name,
             )
+            # Fail-closed on a degraded read ONLY when this coordinator has a cap
+            # to pass down as a tree-cap. An uncapped coordinator grants unbounded
+            # headroom (remaining_headroom stays None) regardless of the read, so a
+            # degraded read changes nothing — blocking would be a spurious refusal.
+            # Predicate is intentionally model.md-only (no Policy caps): the
+            # headroom passed to the delegate is computed from self.config caps
+            # only, so the uncapped-skip must match that surface. Do NOT copy
+            # _check_cost_guardrails's wider Policy+parent-tree-cap predicate here.
+            _delegation_capped = (
+                self.config.daily_cap_usd > 0 or self.config.monthly_cap_usd > 0
+            )
+            if _delegation_capped and (today_result.degraded or month_result.degraded):
+                raise CostGuardrailBlocked(
+                    "delegation blocked: cost data degraded — "
+                    "cannot compute safe headroom (fail-closed)"
+                )
+            today_cost = today_result.total_usd + self._delegated_cost_this_run
+            month_cost = month_result.total_usd + self._delegated_cost_this_run
             daily_remaining = (
                 self.config.daily_cap_usd - today_cost
                 if self.config.daily_cap_usd > 0
@@ -5505,20 +5531,35 @@ class AtomicAgent:
         if not self.config.cost_guardrails_enabled or reserved_usd <= 0:
             return
         log_dir = self.agent_root / "log"
-        today_cost = _costs.sum_cost_for_period(
+        today_result = _costs.sum_cost_for_period(
             log_dir,
             "today",
             source="actor",
             backend=self.log_backend,
             agent_name=self.name,
         )
-        month_cost = _costs.sum_cost_for_period(
+        month_result = _costs.sum_cost_for_period(
             log_dir,
             "this_month",
             source="actor",
             backend=self.log_backend,
             agent_name=self.name,
         )
+        # Gate site: fail-closed on a degraded read ONLY when there is a cap to
+        # enforce. An uncapped agent's headroom is inf (a reservation can never
+        # exceed it), so a degraded read changes nothing — blocking it would be a
+        # spurious refusal with no safety benefit.
+        # Predicate is intentionally model.md-only (no Policy caps): this site's
+        # headroom math below uses only self.config caps, so the uncapped-skip must
+        # match that surface. _check_cost_guardrails is the only gate that resolves
+        # Policy caps + parent tree-cap; do NOT copy its wider predicate here.
+        _batch_capped = self.config.daily_cap_usd > 0 or self.config.monthly_cap_usd > 0
+        if _batch_capped and (today_result.degraded or month_result.degraded):
+            raise CostGuardrailBlocked(
+                "cost data unreadable — batch reservation blocked (fail-closed)"
+            )
+        today_cost = today_result.total_usd
+        month_cost = month_result.total_usd
         daily_remaining = (
             self.config.daily_cap_usd - today_cost
             if self.config.daily_cap_usd > 0
@@ -5667,26 +5708,32 @@ class AtomicAgent:
             return CostCheckResult(allow=True, reason="critical_override")
 
         log_dir = self.agent_root / "log"
-        today_cost = (
-            _costs.sum_cost_for_period(
-                log_dir,
-                "today",
-                source="actor",
-                backend=self.log_backend,
-                agent_name=self.name,
-            )
-            + extra_in_flight_cost_usd
+        today_result = _costs.sum_cost_for_period(
+            log_dir,
+            "today",
+            source="actor",
+            backend=self.log_backend,
+            agent_name=self.name,
         )
-        month_cost = (
-            _costs.sum_cost_for_period(
-                log_dir,
-                "this_month",
-                source="actor",
-                backend=self.log_backend,
-                agent_name=self.name,
-            )
-            + extra_in_flight_cost_usd
+        month_result = _costs.sum_cost_for_period(
+            log_dir,
+            "this_month",
+            source="actor",
+            backend=self.log_backend,
+            agent_name=self.name,
         )
+
+        # Degraded read (blind / majority-corrupt). The fail-closed ACTION is
+        # deferred until after the effective caps are resolved: a degraded read
+        # only matters when there is a budget to be blind about. An uncapped
+        # (warnings-only) agent with no own caps and no parent tree-cap ALWAYS
+        # proceeds even with perfect cost data, so failing it closed on a corrupt
+        # log is a spurious block with zero safety benefit (it would never have
+        # been refused). See the budget-constraint gate after cap resolution.
+        is_degraded = today_result.degraded or month_result.degraded
+
+        today_cost = today_result.total_usd + extra_in_flight_cost_usd
+        month_cost = month_result.total_usd + extra_in_flight_cost_usd
 
         # ── Policy MIN composition (#89 PR 3a / spec/32 D2) ──────────────────
         # Resolve Policy caps from the per-call frozen snapshot taken at
@@ -5713,6 +5760,26 @@ class AtomicAgent:
             _model_monthly, _policy_caps.monthly_usd
         )
         # ─────────────────────────────────────────────────────────────────────
+
+        # Degraded fail-closed gate (deferred from the read above): only fail
+        # closed on a blind/majority-corrupt read when there is an actual budget
+        # to enforce — an own cap (daily/monthly, model.md or Policy) OR a parent
+        # coordinator tree-cap. A truly uncapped agent has no cap to bypass, so a
+        # degraded read changes nothing; blocking it would be a spurious refusal
+        # with no safety benefit. action="skip" (not a daily/monthly cap action):
+        # allow=False drives the block and the specific action is meaningless when
+        # the read is blind (degradation can stem from the monthly read too).
+        if is_degraded and (
+            _effective_daily is not None
+            or _effective_monthly is not None
+            or parent_remaining_headroom_usd is not None
+        ):
+            return CostCheckResult(
+                allow=False,
+                action="skip",
+                reason="cost data unreadable — fail-closed",
+                cost_data_degraded=True,
+            )
 
         # F2 fix (PR 3a Round 1 P1): a Policy operator writing
         # `cost_caps: {daily_usd: 0}` intends "freeze this agent — no spend."
@@ -5799,7 +5866,10 @@ class AtomicAgent:
                     ),
                 )
 
-        return CostCheckResult(allow=True)
+        # Allowed. Carry cost_data_degraded for audit honesty: an uncapped agent
+        # proceeds even when the read was degraded (no budget to enforce), but the
+        # audit trail should still record that the cost number was a lower bound.
+        return CostCheckResult(allow=True, cost_data_degraded=is_degraded)
 
     def _maybe_emit_cost_cap_policy_decision(
         self,
