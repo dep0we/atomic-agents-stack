@@ -29,7 +29,7 @@ Verify the install:
 uv run pytest -q
 ```
 
-You should see `4088 passed` (exact count may vary slightly with skips). If anything fails, the install isn't right yet — fix that before continuing.
+You should see `4393 passed` (exact count may vary slightly with skips). If anything fails, the install isn't right yet — fix that before continuing.
 
 ## 2. Set your API key
 
