@@ -234,6 +234,7 @@ def dispatch_sub_goal_as_outcome(
                 "event": "sub_goal_outcome_started",
                 "sub_goal_id": sub_goal_id,
             },
+            when=goal_manager.today,  # prose date from injectable clock (#483 PR1)
         )
         # Sync the in-memory goal on GoalManager so callers inspecting
         # goal_manager._goal.sub_goals during the run see the in_progress status.
@@ -343,6 +344,7 @@ def dispatch_sub_goal_as_outcome(
             "total_cost_usd": outcome_result.total_cost_usd,
         },
         expected_from_status="in_progress",
+        when=goal_manager.today,  # prose date from injectable clock (#483 PR1)
     )
 
     # Extract the updated sub-goal from the returned Goal object for the caller.

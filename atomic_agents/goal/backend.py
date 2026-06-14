@@ -43,6 +43,7 @@ See docs/spec/41-goal-backend.md for the full normative contract.
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Any, Protocol, runtime_checkable
 
 from .types import Goal, GoalCapabilities, GoalExport
@@ -129,6 +130,7 @@ class GoalBackend(Protocol):
         history_prose: str,
         history_event: dict[str, Any],
         expected_from_status: str | None = None,
+        when: date | None = None,
     ) -> Goal:
         """Atomic transition: flip sub-goal status + write history as one durable unit.
 
@@ -180,6 +182,14 @@ class GoalBackend(Protocol):
                 authors: the check MUST be under the lock/transaction so a
                 concurrent write cannot slip between the check and the write
                 (TOCTOU guard).
+            when: the date used for the ## History prose bullet date prefix
+                (e.g. "- 2026-05-08 — sub_goal ..."). Defaults to date.today()
+                when None. Injected for clock-determinism in tests. Does NOT
+                affect the JSONL `ts` field, which is always the real wall-clock
+                time supplied by the caller via history_event['ts'] (audit
+                timestamp, not a date label). Mirrors JournalBackend.append_entry
+                (when=...) precedent (spec/43). Backward-compatible default:
+                callers not passing `when` continue to work.
 
         Note:
             `fields` MUST NOT carry a "status" key — `to_status` is the sole
@@ -223,7 +233,9 @@ class GoalBackend(Protocol):
         """
         ...
 
-    def archive_goal(self, agent_id: str, reason: str = "completed") -> str:
+    def archive_goal(
+        self, agent_id: str, reason: str = "completed", when: date | None = None
+    ) -> str:
         """Archive the active goal to goal_archive/. Return the archive slug.
 
         Implementer Contract — three behavioral MUSTs (spec/41 MUST 7/8/9):
@@ -248,6 +260,14 @@ class GoalBackend(Protocol):
         Args:
             agent_id: the agent directory name.
             reason: archive reason string embedded in the archive frontmatter.
+            when: the date to use for archived_at, last_progress_check, the
+                ## History datestamp, and the archive slug date prefix. Defaults
+                to date.today() when None. Injected for clock-determinism in
+                tests. ALL date-stamped fields in one archive operation MUST use
+                the same resolved date — no split-clock divergence (Grok-flagged
+                byte-identity bug). Mirrors JournalBackend.append_entry(when=...)
+                precedent (spec/43). Backward-compatible default: callers not
+                passing `when` continue to work.
 
         Returns:
             The archive slug (filename without .md extension), e.g.

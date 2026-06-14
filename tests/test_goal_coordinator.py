@@ -14,10 +14,15 @@ Coverage required by arc-rulings/448-pr3-args.json:
 Mirrors test_goal_outcome_composition.py's patch('atomic_agents.outcome.OutcomeRunner')
 + MagicMock pattern.
 
-Clock trap (per arc-rulings discovery_facts_verified item 4 + spec/41 line 213):
-apply_transition() uses date.today() internally for the prose-history date prefix
-(filesystem.py) — NOT an injectable clock. Tests must NOT assert on the exact prose
-date string; scope assertions to JSONL events and sub-goal status instead.
+Clock contract (#483 PR1 — spec/41 MUST 6 + addendum):
+apply_transition() now accepts `when: date | None = None`, which controls the
+prose-history date prefix (`## History` bullet). The coordinator threads
+`when=goal_manager.today` into both apply_transition() calls, so the prose date
+IS deterministic and prose-date assertions ARE valid — assert against the injected
+date (goal_manager.today.isoformat()). The JSONL `ts` field is independent: it is
+the caller-supplied wall-clock audit timestamp and is NOT affected by `when`.
+(The pinned-clock prose-date conformance guard lives in
+test_goal_backend_conformance.py TEST 59.)
 """
 
 from __future__ import annotations

@@ -1,6 +1,6 @@
 # spec/41: GoalBackend Protocol
 
-> **Status:** LOCKED — Protocol scaffold: #425 PR1 (2026-06-11); write-path adoption: #448 PR1 (2026-06-13); audit + CAS conformance: #448 PR2 (2026-06-13); coordinator + fail-closed cost gate + spec/41 LOCK: #448 PR3 (2026-06-13). Conformance suite covers all 10 Implementer Contract MUSTs for `FilesystemGoalBackend` (`test_goal_backend_conformance.py`, 56 tests) plus filesystem-specific tests (`test_goal_filesystem.py`) and coordinator integration tests (`test_goal_coordinator.py`, 15 tests). Goal is also registered in the shared #379 export conformance harness (`test_export_protocol_conformance.py`) and the capability-advertisement harness (`test_export_capability_advertisement.py`: 2 goal-specific tests — `test_goal_backend_advertises_canonical_export`, `test_goal_backend_is_exportable` — plus the shared `test_all_capability_flags_are_bool` parametrization extended to cover goal). The four pre-existing goal tests (`test_goal.py`, `test_agent_goal_loading.py`, `test_dashboard_goals.py`, `test_goal_outcome_composition.py`) remain the zero-behavior-change regression guard (assertions unchanged); archive golden assertions updated in #448 PR1 for the A3 data-loss fix (the one sanctioned exception to the freeze), and the `test_goal_outcome_composition.py` `agent_with_goal` fixture gained a minimal `persona/IDENTITY.md` in #448 PR3 so the shim can construct the real `AtomicAgent` the now-live cost gate requires (fixture-only; every assertion is byte-identical).
+> **Status:** LOCKED — Protocol scaffold: #425 PR1 (2026-06-11); write-path adoption: #448 PR1 (2026-06-13); audit + CAS conformance: #448 PR2 (2026-06-13); coordinator + fail-closed cost gate + spec/41 LOCK: #448 PR3 (2026-06-13); clock-injection addendum + GoalManager shim + agent_root resolution: #483 PR1 (2026-06-13). Conformance suite covers all 10 Implementer Contract MUSTs for `FilesystemGoalBackend` (`test_goal_backend_conformance.py`, 60 tests) plus filesystem-specific tests (`test_goal_filesystem.py`) and coordinator integration tests (`test_goal_coordinator.py`, 19 tests). Goal is also registered in the shared #379 export conformance harness (`test_export_protocol_conformance.py`) and the capability-advertisement harness (`test_export_capability_advertisement.py`: 2 goal-specific tests — `test_goal_backend_advertises_canonical_export`, `test_goal_backend_is_exportable` — plus the shared `test_all_capability_flags_are_bool` parametrization extended to cover goal). The four pre-existing goal tests (`test_goal.py`, `test_agent_goal_loading.py`, `test_dashboard_goals.py`, `test_goal_outcome_composition.py`) remain the zero-behavior-change regression guard (assertions unchanged); archive golden assertions updated in #448 PR1 for the A3 data-loss fix (the one sanctioned exception to the freeze), and the `test_goal_outcome_composition.py` `agent_with_goal` fixture gained a minimal `persona/IDENTITY.md` in #448 PR3 so the shim can construct the real `AtomicAgent` the now-live cost gate requires (fixture-only; every assertion is byte-identical).
 
 ---
 
@@ -18,11 +18,12 @@ The motivation: `goal.py` held GoalManager (a runtime object), Goal/SubGoal data
 
 ---
 
-## Shipping plan (3 PRs — all merged)
+## Shipping plan (4 PRs — all merged)
 
 - **PR 1 (#487).** Protocol scaffold + dataclasses + capability advertisement + `FilesystemGoalBackend` reference impl + compatibility re-export (`goal.py` → `goal/` package; the documented `from atomic_agents.goal import GoalManager` path stays a **supported** public import, NOT deprecated — no `DeprecationWarning` is emitted because the path is intentionally permanent) + `GoalManager` relocated to `_goal_impl.py` + single shared `validate_goal()`/constants in `goal/types.py` + `GoalExport` (an `ExportableResult` subclass) wired into `atomic_agents.export` + `check_goal_backend()` doctor check + full conformance suite + filesystem-specific tests + spec/41 DRAFT. Goal-outcome composition deferred to PR 3.
 - **PR 2 (#490).** Write-path adoption: `dispatch_as_outcome()` routed through `backend.save_goal` + `backend.append_history_event` (A3 data-loss fix, golden test updates); `AtomicAgent(goal_backend=...)` constructor kwarg + `AtomicAgent.goal_backend` attribute; audit-ordering test (`test_goal_dispatch_audit_ordering.py`, 2 tests); golden-test regression suite (`test_goal_adoption_golden.py`, 4 tests).
-- **PR 3 (#448 PR3, this PR).** Goal-outcome coordinator (`goal/coordinator.py` — thin free function `dispatch_sub_goal_as_outcome()`); fail-closed cost gate (`CostGuardrailBlocked`); compare-and-set `apply_transition()` (`expected_from_status` param, `GoalConcurrentModification`); `dispatch_as_outcome()` refactored to a thin shim; coordinator integration tests (`test_goal_coordinator.py`, 15 tests); 2 CAS conformance tests (TEST 54–55, total 56 conformance tests); spec/41 LOCKED.
+- **PR 3 (#448 PR3, this PR).** Goal-outcome coordinator (`goal/coordinator.py` — thin free function `dispatch_sub_goal_as_outcome()`); fail-closed cost gate (`CostGuardrailBlocked`); compare-and-set `apply_transition()` (`expected_from_status` param, `GoalConcurrentModification`); `dispatch_as_outcome()` refactored to a thin shim; coordinator integration tests (`test_goal_coordinator.py`, 19 tests); 2 CAS conformance tests (TEST 54–55, total 56 conformance tests as of PR3); spec/41 LOCKED.
+- **PR 4 (#483/#485/#486 PR1, this PR — goal-adoption cleanup bundle).** Injectable clock (`when: date | None = None`) on `apply_transition()` + `archive_goal()` (closes the split-clock byte-identity bug); `GoalManager.archive()`/`abandon()` reduced to thin shims over `backend.archive_goal(when=self.today)` (backend owns the "goal archived" prose exclusively — no double-write); `GoalManager.agent_root`/`agents_root` resolved at `__init__` for path consistency with the backend's containment check (#486; trust boundary unchanged — see the addendum's "Trust boundary" note); 4 new conformance tests (TEST 56–59 — `archive_goal(when=…)` clock injection, single-prose, `append_history_event` ts-first reorder, `apply_transition(when=…)` prose-vs-ts independence) for a total of 60; golden byte-identity test under a pinned clock; spec/41 versioned normative addendum (this section). Stays LOCKED.
 
 ---
 
@@ -112,12 +113,18 @@ class GoalBackend(Protocol):
         history_prose: str,
         history_event: dict[str, Any],
         expected_from_status: str | None = None,  # MUST 10 — CAS guard
+        when: date | None = None,  # injectable clock for ## History prose date
     ) -> Goal: ...
     def append_history_event(
         self, agent_id: str, event: dict[str, Any]
     ) -> None: ...
 
-    def archive_goal(self, agent_id: str, reason: str = "completed") -> str: ...
+    def archive_goal(
+        self,
+        agent_id: str,
+        reason: str = "completed",
+        when: date | None = None,  # injectable clock — all date-stamped fields use this
+    ) -> str: ...
     def list_archived(self, agent_id: str) -> list[str]: ...
 
     def read_schema_version(self, agent_id: str) -> int | None: ...
@@ -153,7 +160,7 @@ class GoalBackend(Protocol):
 
 ## Implementer Contract (10 MUSTs)
 
-These MUSTs bind every conforming GoalBackend implementation. The conformance test suite in `tests/test_goal_backend_conformance.py` covers all ten (56 tests total, including 2 CAS tests at TEST 54–55).
+These MUSTs bind every conforming GoalBackend implementation. The conformance test suite in `tests/test_goal_backend_conformance.py` covers all ten (60 tests total, including 2 CAS tests at TEST 54–55 and 4 clock-injection / key-ordering tests at TEST 56–59).
 
 ### MUST 1 — Side-effect-free construction
 
@@ -181,6 +188,8 @@ These MUSTs bind every conforming GoalBackend implementation. The conformance te
 
 `apply_transition()` MUST write the updated `goal.md` AND append the `history_event` to `goal_history.jsonl` as a single unit. If the backend uses filesystem locking (e.g., `fcntl.flock`), both writes MUST complete before the lock is released. A crash between the two writes is permissible; a crash that leaves `goal_history.jsonl` written but `goal.md` un-updated is a conformance violation (the JSONL is the audit trail for a committed state change).
 
+**Injectable clock (`when` parameter).** The `when: date | None = None` parameter controls the date prefix in the `## History` prose line only. When `when=None`, the backend MUST default to `date.today()`. The `when` parameter MUST NOT affect the JSONL `ts` field in `history_event` — that field is a real wall-clock audit timestamp provided by the caller and MUST be written as-is. The two clocks are intentionally independent: `when` is a reproducible prose stamp; `ts` is the immutable audit record of when the call actually happened.
+
 `apply_transition()` MUST also **enum-validate fail-closed**: if `to_status` is not a member of `VALID_SUB_GOAL_STATUSES`, it MUST raise `SchemaValidationError` **before any write** (no partial `goal.md`, no orphan JSONL line). The `fields` parameter is a constrained channel: it MAY set only transition metadata — the members of `SUB_GOAL_TRANSITION_FIELDS` (`assigned`, `deadline`, `blocked_by`, `completed`, `output`, `body`, `acceptance_criteria`) — and MUST NOT reach `sub_goal.status` (the sole status channel is `to_status`, so `fields={"status": <anything>}` MUST NOT be persisted) or the immutable identity fields `id`/`label` (so `fields={"id": …}` MUST NOT rewrite a sub-goal's identity mid-transition). The allow-set fails closed: any key not in `SUB_GOAL_TRANSITION_FIELDS` — including a future `SubGoal` field — is ignored, not blindly applied. This guarantees the backend never persists a `goal.md` its own `load_goal()` would reject (no write-time/read-time validation asymmetry) and never silently corrupts sub-goal identity. The conformance suite pins the `status` side-door, the `id`/`label` identity side-door, and a co-passed legitimate field across **every** backend. Transition-graph *ordering* legality is NOT enforced here — see §"WritePolicy applicability" (a) vs (b).
 
 ### MUST 7, 8, 9 — `archive_goal()` behavioral constraints
@@ -190,6 +199,8 @@ These MUSTs bind every conforming GoalBackend implementation. The conformance te
 **MUST 8 (collision-safe slug):** When an archive file with the computed slug already exists, `archive_goal()` MUST append a numeric suffix (`_1`, `_2`, …) until a free name is found. The loop MUST terminate (backends may impose a reasonable maximum, e.g., 999).
 
 **MUST 9 (idempotency on retry-after-unlink):** The idempotency condition is — no `goal.md` present AND at least one archive file present. Under that condition, `archive_goal()` MUST return the most-recently-modified archive slug in `goal_archive/` without writing a second file, rather than raising. This handles the retry-after-crash case (a prior partial run completed the unlink step). With no `goal.md` present the intent slug cannot be reconstructed, so the newest archive is returned; this is a best-effort retry guard, correct for the common single-goal case. (Per-goal exactness for agents that have archived many goals over their lifetime is tracked as a follow-up; it does not change the Protocol contract.)
+
+**Injectable clock (`when` parameter — all three MUSTs).** `archive_goal()` accepts `when: date | None = None`. The backend MUST resolve this ONCE at method entry: `today = (when or date.today()).isoformat()`. The resolved value MUST be used for ALL date-stamped fields in a single archive operation: the slug date prefix, the `archived_at` frontmatter field, the `last_progress_check` frontmatter field, and the `## History` prose date. Using `date.today()` separately for any of these fields while `when` is supplied, OR calling `date.today()` more than once, is a conformance violation (split-clock divergence). The conformance suite verifies field-value parity of all four date-stamped fields under a pinned `when` value (TEST 56); the filesystem golden suite additionally pins the full archive-file bytes under a pinned clock (`test_goal_adoption_golden.py::test_archive_shim_byte_identity_under_pinned_clock`) so a serializer change (key reorder, whitespace) that keeps the four dates correct still fails.
 
 ### MUST 10 — `apply_transition()` compare-and-set guard (CAS)
 
@@ -210,7 +221,7 @@ The conformance suite pins both the match path (TEST 54, transition succeeds) an
 
 ## `apply_transition()` JSONL key ordering
 
-Every `history_event` dict appended by `apply_transition()` or `append_history_event()` MUST be serialized with `"ts"` as the **first key** in the JSON object. This is enforced by `_make_history_event()` which builds an ordered dict starting with `"ts"` and `"event"` before any caller-supplied extra fields. The ordering is load-bearing for log-reader tools that extract timestamps from the first JSON field without full deserialization.
+Every `history_event` dict appended by `apply_transition()` or `append_history_event()` MUST be serialized with `"ts"` as the **first key** and `"event"` as the **second key** in the JSON object, regardless of the order in which the caller supplies keys. If the caller passes a dict with `"ts"` not first, or with extra keys before `"ts"`, the backend MUST actively reorder — it MUST NOT write the caller's key ordering as-is. This reorder is enforced by `_make_history_event()` which builds an ordered dict with `"ts"` and `"event"` first, then merges any remaining caller-supplied extra fields. The ordering is load-bearing for log-reader tools that extract timestamps from the first JSON field without full deserialization. The conformance suite verifies both the byte-level `startswith('{"ts"')` invariant AND that `"event"` is the second key, even when the caller passes extra leading keys before `"ts"` in the input dict (TEST 58).
 
 ---
 
@@ -301,3 +312,54 @@ The two specs compose as follows:
 - spec/12 defines what goal.md CONTAINS (schema, fields, prose conventions).
 - spec/41 defines how goal.md is ACCESSED (Protocol, Implementer Contract, operator override).
 - A backend conforming to spec/41 MUST preserve the spec/12 narrative contract — `save_goal()` must not corrupt the `## History` section, and `apply_transition()` must append to it rather than overwriting it.
+
+---
+
+## Addendum — #483 PR1 (2026-06-13): clock injection, GoalManager shim, agent_root resolution
+
+This versioned normative addendum records the Protocol surface changes and behavioral contracts added in #483 PR1. The spec remains LOCKED; these changes are backward-compatible (new optional parameters with `None` defaults).
+
+### Protocol surface changes
+
+Two method signatures extended with `when: date | None = None`:
+
+- `apply_transition(…, when: date | None = None)` — controls the `## History` prose date prefix only. Default `date.today()`. MUST NOT affect the JSONL `ts` field.
+- `archive_goal(…, when: date | None = None)` — controls ALL date-stamped fields in the archive operation (slug prefix, `archived_at`, `last_progress_check`, `## History` prose date). Single-resolution contract: compute `today = (when or date.today()).isoformat()` ONCE at method entry; use for all four fields.
+
+### Closed defects
+
+**Split-clock bug (#483).** `archive_goal()` in `FilesystemGoalBackend` previously called `date.today()` independently for the slug prefix (line ~515) and the `archived_at` / `last_progress_check` fields (line ~559). A midnight-boundary call would produce a slug dated `2026-06-13` and frontmatter fields dated `2026-06-14` — a byte-identity-breaking inconsistency with no recovery path. Fixed by single-resolution `today = (when or date.today()).isoformat()` computed once before the file lock.
+
+**`apply_transition` prose date not injectable (#483).** `today` was hardcoded to `date.today()` before the `when` parameter existed. Now `today = (when or date.today()).isoformat()` for prose; JSONL `ts` unchanged.
+
+**`GoalManager.archive()` in-place duplicate (#483).** `GoalManager.archive()` previously contained ~60 lines of archival logic that duplicated `FilesystemGoalBackend.archive_goal()`, including its own frontmatter parsing, slug construction, and a separate `_append_history("goal archived")` call. This created double history prose ("goal archived" appearing twice in the `## History` section) when routed through the backend. Fixed by replacing the in-place implementation with a thin shim that delegates to `backend.archive_goal(…, when=self.today)`, reconstructs the `Path` from the returned slug, and nulls `self._goal`. The backend now owns the "goal archived" prose exclusively.
+
+**`GoalManager.agent_root` not resolved (#486).** `self.agent_root` was set as `self.agents_root / agent_name` without calling `.resolve()`. Relative `agents_root` values (or paths with symlinks) produced unresolved paths that diverged from `FilesystemGoalBackend._require_within_root`'s resolved-path containment check. Fixed by resolving both `self.agents_root` and `self.agent_root` at `__init__` construction time via `Path(…).resolve()` (folding `OSError`/`RuntimeError` from a symlink loop into `PathTraversalError` so a malformed vault path fails closed instead of crashing construction). All derived paths (`goal_path`, `archive_dir`) inherit the resolved root.
+
+**Trust boundary (not a perimeter guard).** This resolution is for path *consistency* with the backend's containment check, NOT a defense against an escaping agent-directory symlink. Per TENSIONS T15 / spec/44 "Security model", the trust boundary is the vault root and a writer who can plant a symlink inside the vault is already inside the trust zone (within-perimeter planting is out of scope). `resolve()` FOLLOWS an agent-directory symlink even when it points outside the vault: the resolved (escaped) path becomes the manager's root and the default backend is constructed against it, so the backend's containment then anchors on the escaped target rather than rejecting it. That is acceptable because it requires a vault-writer; adversarial / multi-tenant deployments MUST use a real-authz backend (Postgres/Redis), not a hardened filesystem backend.
+
+### Coordinator clock threading
+
+`goal/coordinator.py` passes `when=goal_manager.today` to both `apply_transition()` calls (pre-transition `pending → in_progress` and terminal transition). `GoalManager.today` is a plain `date` attribute set ONCE at construction as `self.today = today or date.today()` (`_goal_impl.py`) — it is NOT a property, there is no `_today` backing field, and the value is frozen at construction time (not re-evaluated per call). For a single-session CLI dispatch (the COARSE-ROUTE contract) this is correct: the whole dispatch shares one reproducible date. A long-lived `GoalManager` instance held across a midnight boundary would stamp its construction-time date; that is acceptable under the single-session contract and is the same frozen-clock shape `GoalManager` already uses for `mark_complete`/`save`. This mirrors the injectable-clock intent of `JournalBackend.append_entry(when=…)` from spec/43 (the backend method accepts an injected date; the caller threads a fixed value).
+
+### New conformance tests (TEST 56–59)
+
+| TEST | Name | Contract pinned |
+|------|------|-----------------|
+| 56 | `test_archive_goal_when_parameter_accepted` | `when=date(2026,1,1)` → slug/`archived_at`/`last_progress_check`/body all contain "2026-01-01"; "goal archived" in body |
+| 57 | `test_archive_goal_prose_appears_exactly_once` | `body.count("goal archived") == 1` (no double-prose from shim + backend) |
+| 58 | `test_append_history_event_reorders_ts_first_when_ts_not_first` | Input dict with extra leading keys before `"ts"`; JSONL line `startswith('{"ts"')`, `"event"` is second key, all fields present |
+| 59 | `test_apply_transition_when_parameter_stamps_prose_not_ts` | `apply_transition(when=date(2026,1,1))` with a distinct wall-clock `ts` → `## History` prose bullet carries "2026-01-01" (durable on reload) AND the JSONL `ts` equals the caller-supplied wall-clock value verbatim (the `when`→`ts` independence MUST 6 binds) |
+
+### GoalManager runtime boundary — deliberate narrowing of backend MUST 9
+
+The `GoalManager.archive()` / `abandon()` runtime boundary (above the Protocol) **fails closed**: it raises `AtomicAgentsError` ("No active goal to archive") when no active `goal.md` is present, and does **NOT** inherit backend MUST 9's retry-after-unlink idempotency (which returns the newest archive slug at exit 0). MUST 9 is scoped to direct `backend.archive_goal()` crash-retry callers — the runtime layer narrows it because the `GoalManager` public boundary must surface "nothing to archive" as a clean error rather than a stale slug (the false-success regression guard restored in #483 PR1; pinned by `test_archive_on_already_archived_agent_raises_not_stale_return`). This is a runtime-boundary contract, not a backend conformance violation (`GoalManager` is not a backend).
+
+### Unchanged invariants
+
+- MUST 1–5, MUST 10: no changes.
+- MUST 6–9 clock-injection clauses: additive normative language only (backward-compatible defaults). MUST 6's `apply_transition(when=…)` clause is conformance-guarded by TEST 59 (prose-date injection + JSONL `ts` independence); MUST 7–9's `archive_goal(when=…)` clause by TEST 56.
+- `FilesystemGoalBackend.append_history_event()` JSONL `ts` field: unchanged (caller-supplied, not affected by `when`).
+- The `GoalManager.archive(reason)` public signature: unchanged (`returns Path`; thin shim behavior-compatible).
+- `AtomicAgent.goal_backend` public attribute: unchanged.
+- All pre-existing conformance tests (TEST 1–55): no behavioral change, all passing.

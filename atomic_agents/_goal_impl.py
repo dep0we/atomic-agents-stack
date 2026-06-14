@@ -49,13 +49,11 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .outcome import OutcomeResult
 
-import frontmatter
-
-from ._io import atomic_write
 from ._platform import get_agents_root
 from .exceptions import (
     AtomicAgentsError,
     GoalCorrupted,
+    PathTraversalError,
     SchemaValidationError,
 )
 
@@ -73,7 +71,6 @@ from .goal.types import (  # noqa: F401 (constants + validate_agent_mode re-expo
     CompletionEvaluation,
     Goal,
     SubGoal,
-    build_goal_frontmatter as _build_goal_frontmatter,
     validate_agent_mode,
     validate_goal,
 )
@@ -158,14 +155,47 @@ class GoalManager:
         today: date | None = None,
         goal_backend: GoalBackend | None = None,
     ):
-        self.agents_root = agents_root or get_agents_root()
         self.agent_name = agent_name
         self.today = today or date.today()
-        self.agent_root = self.agents_root / agent_name
+
+        # #486 (one canonical-path invariant): resolve agents_root AND agent_root
+        # at construction so all derived paths (goal_path, archive_dir) are
+        # absolute and canonical regardless of process cwd — and therefore agree
+        # with FilesystemGoalBackend._require_within_root's own resolved-path
+        # containment check (the divergence #486 closed: an unresolved agent_root
+        # whose .exists()/relative-to checks disagreed with the backend's).
+        #
+        # Trust model (TENSIONS T15 / spec/44 "Security model"): the perimeter is
+        # the vault root, and a writer who can plant a symlink INSIDE the vault is
+        # already inside the trust zone — within-perimeter planting is explicitly
+        # OUT OF SCOPE here. In particular, resolution FOLLOWS an agent-directory
+        # symlink even when it points outside the vault: the resolved (escaped)
+        # path then becomes this GoalManager's root and the default backend is
+        # constructed against it, so the backend's containment anchors on the
+        # escaped target rather than rejecting it. That is acceptable under T15
+        # (it requires a vault-writer); adversarial / multi-tenant deployments
+        # MUST use a real-authz backend (Postgres/Redis), not a hardened
+        # filesystem backend. This resolve() is for path *consistency*, not a
+        # perimeter guard against an already-trusted vault-writer.
+        #
+        # resolve(strict=False) can still raise OSError/RuntimeError on a symlink
+        # loop or an inaccessible ancestor; fold those into PathTraversalError so
+        # a malformed vault path fails closed with a controlled error instead of
+        # crashing GoalManager construction (the journal-backend #427 precedent —
+        # a raw resolve() crash must not take down a reactive construction path).
+        try:
+            self.agents_root = Path(agents_root or get_agents_root()).resolve()
+            self.agent_root = (self.agents_root / agent_name).resolve()
+        except (OSError, RuntimeError) as exc:
+            raise PathTraversalError(
+                f"could not resolve agent root for {agent_name!r} "
+                f"(symlink loop or inaccessible path)"
+            ) from exc
 
         if not self.agent_root.exists():
             raise AtomicAgentsError(f"Agent folder not found: {self.agent_root}")
 
+        # Derived paths inherit the resolved root — all three are absolute.
         self.goal_path = self.agent_root / "goal.md"
         self.archive_dir = self.agent_root / "goal_archive"
         self._goal: Goal | None = None
@@ -221,8 +251,7 @@ class GoalManager:
         saves are safe without the lock. The backend's apply_transition() (PR3's
         coordinator primitive) holds the lock for its atomic sequence; this coarse
         save path does not (accepted COARSE-ROUTE ordering contract, spec/41).
-        (Note: archive() also takes no GoalManager-level lock and is NOT routed
-        through backend.archive_goal() this PR — see #483.)
+        (Note: archive() is a thin shim over backend.archive_goal() — see #483 PR1.)
 
         BEHAVIOR DELTA vs. pre-#448 save() (conscious, spec/41 MUST 5-aligned,
         documented in CHANGELOG): the old save() wrote goal.md with NO frontmatter
@@ -456,71 +485,58 @@ class GoalManager:
     def archive(self, reason: str = "completed") -> Path:
         """Archive the current goal — move goal.md to goal_archive/.
 
-        Used for both successful completion and operator-initiated abandonment.
+        Thin shim over backend.archive_goal() (#483 PR1). The backend owns:
+        - Collision-safe slug generation (MUST 8)
+        - Write ordering: archive file written BEFORE goal.md unlinked (MUST 7)
+        - Idempotency: retry-after-crash returns existing slug (MUST 9)
+        - Single prose write: backend appends '## History' entry under lock
+        - Injectable clock: `when=self.today` makes all date-stamps deterministic
 
-        Collision safety: if <date>_<slug>.md already exists (same day, same intent
-        slug), a numeric suffix is appended (_1, _2, …) until a free path is found.
-        This prevents overwriting a previous archive.
+        GoalManager no longer implements the in-place archive logic. Path
+        reconstruction: backend returns the slug (filename stem); shim rebuilds
+        the full Path as `self.archive_dir / f'{slug}.md'` using the resolved
+        archive_dir (#486 resolution ensures consistency with backend's root).
 
-        Write ordering: the archive file is written first; goal.md is unlinked only
-        after the archive has been successfully committed to disk.  A failure between
-        the two steps leaves both files present (recoverable state) rather than
-        losing data.
+        Injected-backend contract: when a custom ``goal_backend`` is passed to
+        ``GoalManager.__init__``, it MUST address the same agent_root as this
+        manager. The precheck below inspects ``self.goal_path`` and the returned
+        Path is rebuilt from ``self.archive_dir``; a backend scoped to a
+        *different* root would make the precheck inspect the wrong file and return
+        a Path that does not match where the backend actually wrote. The shipped
+        CLI path builds the backend from ``self.agent_root`` (no divergence); this
+        is a contract on the public kwarg, not a defended boundary.
 
-        Idempotent: if goal.md is already absent when this is called, a second call
-        via has_goal() guard will raise AtomicAgentsError rather than silently
-        double-archiving.
+        Concurrency: the active-goal precheck below is best-effort — it runs
+        OUTSIDE the backend lock. Under a concurrent ``archive``/unlink between
+        the precheck and ``backend.archive_goal()``, the backend's MUST 9 path
+        could still return a stale prior-archive slug at exit 0. This is accepted
+        under the single-session COARSE-ROUTE contract (spec/41); the precheck
+        closes the common single-session false-success case, not a race.
+
+        Active-goal precheck (public-API contract, preserved): if there is no
+        active goal.md, this raises ``AtomicAgentsError("No active goal to
+        archive")`` rather than returning a stale prior-archive slug. This is the
+        historical GoalManager.archive()/abandon() contract — ``goal abandon``
+        on an agent with nothing active must FAIL (non-zero, honest message), not
+        print "Goal abandoned" while writing nothing and silently discarding the
+        operator's ``--reason``. The backend's MUST 9 retry-after-unlink
+        idempotency (return most-recently-modified slug when goal.md is absent
+        but an archive exists) is intentionally scoped to *direct*
+        ``backend.archive_goal()`` crash-retry callers; the GoalManager public
+        boundary fails closed here so the audit line stays honest (Principle #5,
+        Principle #14 backward-compat — no silent raise→stale-return delta).
         """
-        if self._goal is None:
-            self.load()
         if not self.has_goal():
             raise AtomicAgentsError("No active goal to archive")
-
-        self.archive_dir.mkdir(parents=True, exist_ok=True)
-        intent_slug = re.sub(r"[^a-z0-9]+", "_", self._goal.intent.lower()).strip("_")[
-            :60
-        ]
-        base_name = f"{self.today.isoformat()}_{intent_slug}"
-        archive_path = self.archive_dir / f"{base_name}.md"
-
-        # Increment suffix until a free path is found (collision safety)
-        counter = 0
-        while archive_path.exists():
-            counter += 1
-            archive_path = self.archive_dir / f"{base_name}_{counter}.md"
-
-        # Mark inactive + update last_progress_check + record reason in history.
-        # Mutation ORDER MATTERS for build_goal_frontmatter (reads Goal fields
-        # directly — no override kwargs): active and last_progress_check MUST be
-        # mutated on self._goal BEFORE calling build_goal_frontmatter so the
-        # archive file reflects active=False and today's date. (A3 ruling fix.)
-        self._goal.active = False
-        self._goal.last_progress_check = self.today.isoformat()
-        self._append_history(f"goal archived ({reason})")
-
-        # A3 fix (intentional data-loss fix, #448 PR1): swap the hand-rolled
-        # frontmatter dict for build_goal_frontmatter(self._goal). The old dict
-        # silently dropped deadline, parent_goal, related_atomic_notes,
-        # related_decisions, related_canon_pages. build_goal_frontmatter
-        # preserves all optional Goal fields. archived_at + archive_reason are
-        # NOT Goal dataclass fields; they are appended to the dict after the call.
-        # archive() is NOT routed through backend.archive_goal() this PR — that
-        # drags in the backend's date.today() and loses the injectable self.today
-        # clock for archived_at. Full archive-path adoption is a filed follow-up.
-        # NOTE: Not lock-protected at GoalManager level — concurrent archive()
-        # calls on the same agent could race (rare in single-session use). The
-        # backend's archive_goal() is lock-protected; full adoption tracked in
-        # the follow-up issue for routing archive() through backend.archive_goal().
-        fm = _build_goal_frontmatter(self._goal)
-        fm["archived_at"] = self.today.isoformat()
-        fm["archive_reason"] = reason
-        post = frontmatter.Post(self._goal.body, **fm)
-        atomic_write(archive_path, frontmatter.dumps(post) + "\n")
-
-        # Remove the active goal.md only after archive is safely written
-        self.goal_path.unlink()
+        slug = self.goal_backend.archive_goal(
+            self.agent_name, reason=reason, when=self.today
+        )
+        # Clear in-memory state (the backend unlinked goal.md under the lock)
         self._goal = None
-        return archive_path
+        # Reconstruct the archive Path from the returned slug.
+        # self.archive_dir derives from the resolved self.agent_root (#486), so
+        # this path is consistent with the backend's own _archive_dir.
+        return self.archive_dir / f"{slug}.md"
 
     def abandon(self, reason: str) -> Path:
         """Operator-initiated abandonment. Same mechanism as completion-archive,
@@ -727,15 +743,14 @@ class GoalManager:
         # the terminal status written by apply_transition) with the updated date.
         # The CLI's trailing gm.save() after this call is a harmless no-op.
         #
-        # DELIBERATE lock-free re-stamp: this trailing save() is OUTSIDE the goal
-        # lock (save_goal is the COARSE-ROUTE path) and exists ONLY to stamp
-        # last_progress_check with the injectable self.today clock, which
-        # apply_transition's non-injectable date.today() cannot do. The CAS-guarded
-        # terminal apply_transition already persisted the authoritative status under
-        # the lock; this re-stamp is accepted under the single-session COARSE-ROUTE
-        # contract (the CLI is single-session). The injectable-clock surface that
-        # would let apply_transition stamp last_progress_check under the lock — and
-        # retire this trailing save — is tracked in #483.
+        # DELIBERATE lock-free re-stamp: this trailing save() stamps
+        # last_progress_check with the injectable self.today clock. The
+        # apply_transition `when=goal_manager.today` param (#483 PR1) already makes
+        # the prose date injectable; this save() additionally makes last_progress_check
+        # injectable, consistent with save()'s A2 ruling (caller-side stamp before
+        # save_goal). The CAS-guarded terminal apply_transition already persisted the
+        # authoritative status under the lock; this re-stamp is accepted under the
+        # single-session COARSE-ROUTE contract (the CLI is single-session).
         self._goal = self.goal_backend.load_goal(self.agent_name)
         self.save()  # stamps last_progress_check = self.today (lock-free, see above)
 
@@ -947,7 +962,14 @@ def main(argv: list[str] | None = None, goal_backend: GoalBackend | None = None)
         return 0
 
     if args.cmd == "abandon":
-        archive_path = gm.abandon(args.reason)
+        try:
+            archive_path = gm.abandon(args.reason)
+        except AtomicAgentsError as e:
+            # No active goal to archive — fail honestly (non-zero, real message)
+            # rather than printing "Goal abandoned" while writing nothing and
+            # discarding --reason (false-success guard, #483 PR1 regression).
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
         print(f"Goal abandoned. Archived to {archive_path}")
         return 0
 

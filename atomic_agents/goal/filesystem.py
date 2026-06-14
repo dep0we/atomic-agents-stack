@@ -353,6 +353,7 @@ class FilesystemGoalBackend:
         history_prose: str,
         history_event: dict[str, Any],
         expected_from_status: str | None = None,
+        when: date | None = None,
     ) -> Goal:
         """Serialized + ordered: flip sub-goal status, write goal.md, append JSONL.
 
@@ -367,6 +368,14 @@ class FilesystemGoalBackend:
 
         history_event must have "ts" and "event" keys; the backend enforces
         ts-first order in the serialized JSON via _make_history_event.
+
+        Args:
+            when: the date used for the ## History prose bullet date prefix.
+                Defaults to date.today() when None. Injected for clock-
+                determinism in tests. Does NOT affect the JSONL `ts` field
+                (which is always the real wall-clock time supplied by the caller
+                via history_event['ts'] — an audit timestamp, not a date label).
+                Mirrors JournalBackend.append_entry(when=...) precedent.
 
         Raises:
             SchemaValidationError: when to_status is not in VALID_SUB_GOAL_STATUSES
@@ -386,7 +395,9 @@ class FilesystemGoalBackend:
                 f"to_status must be one of {sorted(VALID_SUB_GOAL_STATUSES)}; "
                 f"got {to_status!r}"
             )
-        today = date.today().isoformat()
+        # `when` controls the ## History prose date prefix ONLY — not the JSONL
+        # `ts` field (which is a real wall-clock audit timestamp from the caller).
+        today = (when or date.today()).isoformat()
         ts = history_event.get("ts") or datetime.now().astimezone().isoformat()
         event_name = history_event.get("event", "transition")
 
@@ -495,6 +506,7 @@ class FilesystemGoalBackend:
         self,
         agent_id: str,  # noqa: ARG002 (filesystem ignores agent_id — scoped at construction time)
         reason: str = "completed",
+        when: date | None = None,
     ) -> str:
         """Archive the active goal to goal_archive/ with crash safety.
 
@@ -511,8 +523,21 @@ class FilesystemGoalBackend:
 
         The entire operation runs under the goal lock so the suffix loop is
         race-free (no TOCTOU window between .exists() check and atomic_write).
+
+        Args:
+            when: the date to use for archived_at, last_progress_check, the
+                ## History datestamp, and the archive slug date prefix. Defaults
+                to date.today() when None. Compute ONCE at method entry (before
+                the lock) and use consistently throughout — eliminates the
+                multi-call date.today() split-clock divergence (Grok-flagged
+                byte-identity bug). Backward-compatible: callers not passing
+                `when` continue to work with the wall-clock default.
         """
-        today = date.today().isoformat()
+        # Resolve the injectable clock ONCE before the lock so all date-stamped
+        # fields (slug prefix, archived_at, last_progress_check, ## History prose)
+        # are byte-identical under a pinned clock. Computing date.today() multiple
+        # times inside the lock body would diverge across a midnight boundary.
+        today = (when or date.today()).isoformat()
 
         with self._goal_lock():
             # Containment: refuse a symlinked goal.md / goal_archive that escapes
@@ -523,10 +548,12 @@ class FilesystemGoalBackend:
             # archive rather than raising. Covers the retry-after-unlink path.
             if not goal_path.is_file():
                 if archive_dir.exists():
-                    # Find any archive file whose base name starts with today's date
-                    # or any date (we can't know the exact slug without the intent).
-                    # Return the most recently modified one as the idempotent result.
-                    # Secondary sort on name so coarse-mtime ties (two archives
+                    # Return the most-recently-modified archive as the idempotent
+                    # result. This match is DATE-AGNOSTIC: `when`/`today` does NOT
+                    # filter it — without goal.md the intent slug is unrecoverable,
+                    # so newest-by-mtime is the best-effort idempotent result per
+                    # spec/41 MUST 9 (the glob below spans ALL archives, not just
+                    # today's). Secondary sort on name so coarse-mtime ties (two archives
                     # written in the same filesystem tick) resolve deterministically
                     # rather than relying on OS-arbitrary glob order.
                     existing = sorted(
@@ -554,30 +581,22 @@ class FilesystemGoalBackend:
                 counter += 1
                 archive_path = archive_dir / f"{base_name}_{counter}.md"
 
-            # Mark inactive + record in body history before writing archive
+            # Mark inactive + record in body history before writing archive.
+            # Use `today` (resolved once at method entry from the injectable `when`
+            # param, before lock acquisition) for all date-stamped fields. Using a
+            # single pre-computed string eliminates the split-clock divergence
+            # (Grok-flagged bug) where multiple date.today() calls inside the lock
+            # could disagree across a midnight boundary (slug date vs archived_at
+            # vs history prose). (#483 PR1: clock injection — `when` param above.)
             goal.active = False
-            today_str = date.today().isoformat()
             # Bump last_progress_check to the archive day, matching
             # GoalManager.archive()'s last_progress_check=today behavior.
-            #
-            # Both this backend and GoalManager.archive() now serialize via
-            # build_goal_frontmatter(), which PRESERVES the optional fields
-            # (deadline, parent_goal, related_atomic_notes, related_decisions,
-            # related_canon_pages). GoalManager.archive() was fixed in #448 PR1
-            # (A3 ruling, intentional data-loss fix) so both paths share ONE
-            # serializer — the field set + key order match. They are NOT
-            # byte-for-byte identical, though: this backend stamps archived_at /
-            # last_progress_check from date.today() (wall clock) while
-            # GoalManager.archive() uses the injectable self.today clock, so the
-            # two diverge on date when the clocks differ. Full convergence onto a
-            # single backend.archive_goal() path (which needs an injectable clock
-            # on the backend) is a filed follow-up.
-            goal.last_progress_check = today_str
-            self._append_history_prose(goal, f"goal archived ({reason})", today_str)
+            goal.last_progress_check = today
+            self._append_history_prose(goal, f"goal archived ({reason})", today)
 
             # MUST 7: write archive FIRST, then unlink goal.md
             fm = build_goal_frontmatter(goal)
-            fm["archived_at"] = today_str
+            fm["archived_at"] = today
             fm["archive_reason"] = reason
             post = frontmatter.Post(goal.body, **fm)
             atomic_write(archive_path, frontmatter.dumps(post) + "\n")
