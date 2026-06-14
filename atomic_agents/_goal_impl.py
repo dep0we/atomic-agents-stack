@@ -719,6 +719,15 @@ class GoalManager:
         # goal_backend threaded so the agent shares this manager's persistence
         # universe. NO try/except — a construction failure must propagate (a
         # swallowed TypeError is exactly the #425 fail-OPEN bug).
+        #
+        # TODO(#502): thread log_backend/policy_backend/profile_backend here too
+        # if GoalManager ever gains custom-backend construction — currently safe
+        # because gate_agent defaults (filesystem) match the OutcomeRunner's
+        # defaults when no custom backends are configured.  The coordinator already
+        # reads these three attrs off gate_agent and forwards them to OutcomeRunner;
+        # a programmatic caller who pins custom backends on a GoalManager will NOT
+        # achieve backend-universe alignment via this shim path until that issue
+        # is resolved.
         gate_agent = AtomicAgent(
             name=self.agent_name,
             agents_root=self.agents_root,

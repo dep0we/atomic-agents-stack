@@ -358,6 +358,78 @@ def test_outcome_clamps_max_iterations_to_valid_range(agent_vault):
 
 
 # ──────────────────────────────────────────────────────────────────
+# Boundary-2 forwarding: OutcomeRunner.run() → internal AtomicAgent ctor
+#
+# This is the regression guard for the backend-universe alignment property
+# (spec/41 §"Goal-outcome composition", #496 PR1). The coordinator threads the
+# gate agent's backends into OutcomeRunner (boundary 1, covered in
+# test_goal_coordinator.py); this test covers boundary 2 — that run() forwards
+# those backend kwargs into the internally-constructed AtomicAgent at
+# _outcome_impl.py:298-311. Without this guard, a refactor dropping the
+# forwarding would pass every other test while silently breaking the property.
+#
+# The existing test_log_integration.py::test_outcome_runner_kwarg_threaded_to_
+# internal_agent and test_profile_integration.py::test_outcome_runner_threads_
+# profile_backend assert only STORAGE (runner._log_backend/_profile_backend);
+# they do NOT assert the constructor forwarding. This test closes that gap.
+
+
+def test_outcome_runner_forwards_backends_to_internal_agent(agent_vault, rubric_text, satisfied_verdict):
+    """run() must construct its internal AtomicAgent with the SAME
+    log_backend / policy_backend / profile_backend objects passed to OutcomeRunner.
+
+    Asserts on MockAgent.call_args.kwargs — what run() actually passed to
+    AtomicAgent(...) — closing boundary 2 of the universe-alignment chain
+    (spec/41 §"Goal-outcome composition", #496 PR1).
+    """
+    agents_root, agent_name = agent_vault
+
+    sentinel_log = object()
+    sentinel_policy = object()
+    sentinel_profile = object()
+
+    runner = OutcomeRunner(
+        agents_root=agents_root,
+        agent_name=agent_name,
+        judge_model="gpt-5",
+        log_backend=sentinel_log,
+        policy_backend=sentinel_policy,
+        profile_backend=sentinel_profile,
+    )
+
+    agent_resp = _make_agent_response()
+    judge_resp = _make_judge_response(satisfied_verdict)
+
+    with patch("atomic_agents.outcome.AtomicAgent") as MockAgent:
+        mock_instance = MagicMock()
+        mock_instance.call.return_value = agent_resp
+        mock_instance.config.default_model = "claude-sonnet-4-6-20260101"
+        mock_instance._check_cost_guardrails.return_value = CostCheckResult(allow=True)
+        MockAgent.return_value = mock_instance
+
+        with patch("atomic_agents.outcome._llm.call_llm", return_value=judge_resp):
+            runner.run(
+                description="Write a test summary",
+                rubric=rubric_text,
+                max_iterations=3,
+            )
+
+    ctor_kwargs = MockAgent.call_args.kwargs
+    assert ctor_kwargs["log_backend"] is sentinel_log, (
+        "run() must forward log_backend into the internal AtomicAgent ctor "
+        f"(boundary 2). Got: {ctor_kwargs.get('log_backend')!r}"
+    )
+    assert ctor_kwargs["policy_backend"] is sentinel_policy, (
+        "run() must forward policy_backend into the internal AtomicAgent ctor "
+        f"(boundary 2). Got: {ctor_kwargs.get('policy_backend')!r}"
+    )
+    assert ctor_kwargs["profile_backend"] is sentinel_profile, (
+        "run() must forward profile_backend into the internal AtomicAgent ctor "
+        f"(boundary 2). Got: {ctor_kwargs.get('profile_backend')!r}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
 # Test 7: iteration records written to agent log
 
 
