@@ -41,7 +41,7 @@ import logging
 import os
 from pathlib import Path
 
-from ..exceptions import BackendNotRegistered
+from ..exceptions import BackendNotRegistered, LogBackendReadError
 from .backend import LogBackend
 from .filesystem import FilesystemLogBackend
 from .sqlite import SQLiteLogBackend, make_sqlite_backend_from_url
@@ -114,6 +114,8 @@ __all__ = [
     "list_log_backends",
     # Operator-config factory
     "get_default_log_backend",
+    # Read-failure exception (spec/22 addendum — issue #497)
+    "LogBackendReadError",
 ]
 
 

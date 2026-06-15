@@ -67,6 +67,13 @@ class LogBackend(Protocol):
     is the single retention escape hatch and MAY be unimplemented when
     ``capabilities().supports_retention=False``.
 
+    Note: ``isinstance(obj, LogBackend)`` checks structural method presence
+    only (Python structural Protocol — not behavior). Conformance to the
+    read-failure MUST (``query``/``tail``/``aggregate`` raise
+    ``LogBackendReadError`` on unrecoverable I/O errors) is verified by
+    the conformance test suite, not by this isinstance check. See spec/22
+    §"spec/22 addendum — Read-failure posture".
+
     Ordering: records are stored and returned in ``ts`` order. ISO-8601
     timestamps with tz sort lexicographically into chronological order,
     so backends can use string comparison as the canonical sort key.
@@ -153,6 +160,12 @@ class LogBackend(Protocol):
           state. PR 2 wires ``query`` into call paths that today
           tolerate missing log dirs gracefully (see
           ``dashboard/costs.py:128``).
+        * MUST raise ``LogBackendReadError`` (from
+          ``atomic_agents.exceptions``) for unrecoverable read failures
+          (corruption, I/O error, lost database connection after all
+          retries). Empty / absent backend state MUST NOT raise — return
+          ``[]``. See spec/22 §"spec/22 addendum — Read-failure posture" for the
+          full boundary definition.
 
         Performance: backends advertising
         ``capabilities().supports_aggregation_pushdown=True`` SHOULD
@@ -186,6 +199,8 @@ class LogBackend(Protocol):
           returns all of them (not padded).
         * Empty backend returns ``[]`` (NOT raise).
         * Negative ``n`` raises ``ValueError`` (no implicit conversion).
+        * Unrecoverable read failure raises ``LogBackendReadError``.
+          See spec/22 §"spec/22 addendum — Read-failure posture".
 
         Performance: ``FilesystemLogBackend`` reverse-walks month dirs
         and day files to BOUND the scan to the most recent files;
@@ -228,6 +243,9 @@ class LogBackend(Protocol):
           canonical vocabulary (``types.VALID_METRICS``). Backends MUST
           NOT silently fall back to ``count``; surfacing the typo lets
           callers fail fast.
+        * MUST raise ``LogBackendReadError`` on unrecoverable read
+          failure (corruption, I/O error, lost connection). See spec/22
+          §"spec/22 addendum — Read-failure posture" for the full boundary.
         * Backends advertising
           ``capabilities().supports_aggregation_pushdown=True`` SHOULD
           push the aggregation to native primitives. The reference

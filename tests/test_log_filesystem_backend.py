@@ -12,6 +12,7 @@ dashboard/cost-walker call sites keep working until PR 2 rewires them.
 
 from __future__ import annotations
 
+import errno
 import json
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -20,7 +21,7 @@ from unittest.mock import patch
 import pytest
 
 from atomic_agents.dashboard.costs import _record_from_dict
-from atomic_agents.exceptions import BackendNotRegistered
+from atomic_agents.exceptions import BackendNotRegistered, LogBackendReadError
 from atomic_agents.logs import (
     FilesystemLogBackend,
     LogAggregate,
@@ -151,9 +152,7 @@ def test_atomic_append_jsonl_integration(tmp_path):
     # The backend imports atomic_append_jsonl from .._io into its module
     # namespace — patch the module-level reference inside the backend
     # module, not the original _io location.
-    with patch(
-        "atomic_agents.logs.filesystem.atomic_append_jsonl"
-    ) as mock_append:
+    with patch("atomic_agents.logs.filesystem.atomic_append_jsonl") as mock_append:
         backend.append(record)
         assert mock_append.called
         # First positional arg is the target path; second is the JSON string.
@@ -181,12 +180,7 @@ def test_append_falls_back_to_today_for_malformed_ts(tmp_path):
     )
     # Expect a file under today's month/day to exist.
     today = date.today()
-    expected = (
-        tmp_path
-        / "log"
-        / today.strftime("%Y-%m")
-        / f"{today.isoformat()}.jsonl"
-    )
+    expected = tmp_path / "log" / today.strftime("%Y-%m") / f"{today.isoformat()}.jsonl"
     assert expected.exists()
 
 
@@ -197,18 +191,42 @@ def test_append_falls_back_to_today_for_malformed_ts(tmp_path):
 def test_query_walks_month_directories(tmp_path):
     """Records across three months all surface via a single query."""
     backend = FilesystemLogBackend(tmp_path)
-    backend.append(RunRecord(
-        ts=_ts_at(2026, 1, 15), run_id="jan", primitive="agent_call",
-        status="ok", summary="t", model="m", input_tokens=0, output_tokens=0,
-    ))
-    backend.append(RunRecord(
-        ts=_ts_at(2026, 3, 15), run_id="mar", primitive="agent_call",
-        status="ok", summary="t", model="m", input_tokens=0, output_tokens=0,
-    ))
-    backend.append(RunRecord(
-        ts=_ts_at(2026, 5, 15), run_id="may", primitive="agent_call",
-        status="ok", summary="t", model="m", input_tokens=0, output_tokens=0,
-    ))
+    backend.append(
+        RunRecord(
+            ts=_ts_at(2026, 1, 15),
+            run_id="jan",
+            primitive="agent_call",
+            status="ok",
+            summary="t",
+            model="m",
+            input_tokens=0,
+            output_tokens=0,
+        )
+    )
+    backend.append(
+        RunRecord(
+            ts=_ts_at(2026, 3, 15),
+            run_id="mar",
+            primitive="agent_call",
+            status="ok",
+            summary="t",
+            model="m",
+            input_tokens=0,
+            output_tokens=0,
+        )
+    )
+    backend.append(
+        RunRecord(
+            ts=_ts_at(2026, 5, 15),
+            run_id="may",
+            primitive="agent_call",
+            status="ok",
+            summary="t",
+            model="m",
+            input_tokens=0,
+            output_tokens=0,
+        )
+    )
     out = backend.query(LogQuery())
     assert {r.run_id for r in out} == {"jan", "mar", "may"}
 
@@ -223,10 +241,18 @@ def test_query_skips_unrelated_files_and_dirs(tmp_path):
     """Stray files in the log tree are skipped (matches legacy walker defensive shape)."""
     backend = FilesystemLogBackend(tmp_path)
     # Real record so the log dir exists.
-    backend.append(RunRecord(
-        ts=_ts_at(2026, 5, 15), run_id="real", primitive="agent_call",
-        status="ok", summary="t", model="m", input_tokens=0, output_tokens=0,
-    ))
+    backend.append(
+        RunRecord(
+            ts=_ts_at(2026, 5, 15),
+            run_id="real",
+            primitive="agent_call",
+            status="ok",
+            summary="t",
+            model="m",
+            input_tokens=0,
+            output_tokens=0,
+        )
+    )
     # Stray files / directories in the log tree.
     (tmp_path / "log" / "README.md").write_text("not a JSONL")
     (tmp_path / "log" / "stray-dir").mkdir()
@@ -240,10 +266,18 @@ def test_query_skips_unrelated_files_and_dirs(tmp_path):
 def test_query_handles_malformed_jsonl_lines(tmp_path):
     """Malformed lines are skipped — matches dashboard.costs._record_from_dict defensive shape."""
     backend = FilesystemLogBackend(tmp_path)
-    backend.append(RunRecord(
-        ts=_ts_at(2026, 5, 15), run_id="real", primitive="agent_call",
-        status="ok", summary="t", model="m", input_tokens=0, output_tokens=0,
-    ))
+    backend.append(
+        RunRecord(
+            ts=_ts_at(2026, 5, 15),
+            run_id="real",
+            primitive="agent_call",
+            status="ok",
+            summary="t",
+            model="m",
+            input_tokens=0,
+            output_tokens=0,
+        )
+    )
     log_file = tmp_path / "log" / "2026-05" / "2026-05-15.jsonl"
     with log_file.open("a") as f:
         f.write("not json\n")
@@ -261,14 +295,30 @@ def test_query_handles_malformed_jsonl_lines(tmp_path):
 def test_delete_older_than_removes_full_month_dirs(tmp_path):
     """A full month before cutoff: every day file dropped + month dir cleaned."""
     backend = FilesystemLogBackend(tmp_path)
-    backend.append(RunRecord(
-        ts=_ts_at(2026, 1, 15), run_id="jan", primitive="agent_call",
-        status="ok", summary="t", model="m", input_tokens=0, output_tokens=0,
-    ))
-    backend.append(RunRecord(
-        ts=_ts_at(2026, 5, 15), run_id="may", primitive="agent_call",
-        status="ok", summary="t", model="m", input_tokens=0, output_tokens=0,
-    ))
+    backend.append(
+        RunRecord(
+            ts=_ts_at(2026, 1, 15),
+            run_id="jan",
+            primitive="agent_call",
+            status="ok",
+            summary="t",
+            model="m",
+            input_tokens=0,
+            output_tokens=0,
+        )
+    )
+    backend.append(
+        RunRecord(
+            ts=_ts_at(2026, 5, 15),
+            run_id="may",
+            primitive="agent_call",
+            status="ok",
+            summary="t",
+            model="m",
+            input_tokens=0,
+            output_tokens=0,
+        )
+    )
     backend.delete_older_than(datetime(2026, 3, 1, tzinfo=timezone.utc))
     # Jan month dir should be gone.
     assert not (tmp_path / "log" / "2026-01").exists()
@@ -279,14 +329,30 @@ def test_delete_older_than_removes_full_month_dirs(tmp_path):
 def test_delete_older_than_partial_day_rewrite(tmp_path):
     """Same-day cutoff: file rewritten atomically with only records ts >= threshold."""
     backend = FilesystemLogBackend(tmp_path)
-    backend.append(RunRecord(
-        ts=_ts_at(2026, 5, 15, 8), run_id="early", primitive="agent_call",
-        status="ok", summary="t", model="m", input_tokens=0, output_tokens=0,
-    ))
-    backend.append(RunRecord(
-        ts=_ts_at(2026, 5, 15, 14), run_id="late", primitive="agent_call",
-        status="ok", summary="t", model="m", input_tokens=0, output_tokens=0,
-    ))
+    backend.append(
+        RunRecord(
+            ts=_ts_at(2026, 5, 15, 8),
+            run_id="early",
+            primitive="agent_call",
+            status="ok",
+            summary="t",
+            model="m",
+            input_tokens=0,
+            output_tokens=0,
+        )
+    )
+    backend.append(
+        RunRecord(
+            ts=_ts_at(2026, 5, 15, 14),
+            run_id="late",
+            primitive="agent_call",
+            status="ok",
+            summary="t",
+            model="m",
+            input_tokens=0,
+            output_tokens=0,
+        )
+    )
     threshold = datetime(2026, 5, 15, 12, tzinfo=timezone.utc)
     deleted = backend.delete_older_than(threshold)
     assert deleted == 1
@@ -302,18 +368,42 @@ def test_delete_older_than_partial_day_rewrite(tmp_path):
 def test_tail_reads_reverse_across_files(tmp_path):
     """Last 3 records across two day files in chronological order."""
     backend = FilesystemLogBackend(tmp_path)
-    backend.append(RunRecord(
-        ts=_ts_at(2026, 5, 14), run_id="r1", primitive="agent_call",
-        status="ok", summary="t", model="m", input_tokens=0, output_tokens=0,
-    ))
-    backend.append(RunRecord(
-        ts=_ts_at(2026, 5, 15, 10), run_id="r2", primitive="agent_call",
-        status="ok", summary="t", model="m", input_tokens=0, output_tokens=0,
-    ))
-    backend.append(RunRecord(
-        ts=_ts_at(2026, 5, 15, 14), run_id="r3", primitive="agent_call",
-        status="ok", summary="t", model="m", input_tokens=0, output_tokens=0,
-    ))
+    backend.append(
+        RunRecord(
+            ts=_ts_at(2026, 5, 14),
+            run_id="r1",
+            primitive="agent_call",
+            status="ok",
+            summary="t",
+            model="m",
+            input_tokens=0,
+            output_tokens=0,
+        )
+    )
+    backend.append(
+        RunRecord(
+            ts=_ts_at(2026, 5, 15, 10),
+            run_id="r2",
+            primitive="agent_call",
+            status="ok",
+            summary="t",
+            model="m",
+            input_tokens=0,
+            output_tokens=0,
+        )
+    )
+    backend.append(
+        RunRecord(
+            ts=_ts_at(2026, 5, 15, 14),
+            run_id="r3",
+            primitive="agent_call",
+            status="ok",
+            summary="t",
+            model="m",
+            input_tokens=0,
+            output_tokens=0,
+        )
+    )
     out = backend.tail(2)
     # Newest two in chronological order.
     assert [r.run_id for r in out] == ["r2", "r3"]
@@ -325,19 +415,32 @@ def test_tail_reads_reverse_across_files(tmp_path):
 
 def test_stats_size_bytes_sums_files(tmp_path):
     backend = FilesystemLogBackend(tmp_path)
-    backend.append(RunRecord(
-        ts=_ts_at(2026, 5, 15), run_id="r1", primitive="agent_call",
-        status="ok", summary="t", model="m", input_tokens=0, output_tokens=0,
-    ))
-    backend.append(RunRecord(
-        ts=_ts_at(2026, 5, 16), run_id="r2", primitive="agent_call",
-        status="ok", summary="t", model="m", input_tokens=0, output_tokens=0,
-    ))
-    stats = backend.stats()
-    actual_bytes = sum(
-        p.stat().st_size
-        for p in (tmp_path / "log").rglob("*.jsonl")
+    backend.append(
+        RunRecord(
+            ts=_ts_at(2026, 5, 15),
+            run_id="r1",
+            primitive="agent_call",
+            status="ok",
+            summary="t",
+            model="m",
+            input_tokens=0,
+            output_tokens=0,
+        )
     )
+    backend.append(
+        RunRecord(
+            ts=_ts_at(2026, 5, 16),
+            run_id="r2",
+            primitive="agent_call",
+            status="ok",
+            summary="t",
+            model="m",
+            input_tokens=0,
+            output_tokens=0,
+        )
+    )
+    stats = backend.stats()
+    actual_bytes = sum(p.stat().st_size for p in (tmp_path / "log").rglob("*.jsonl"))
     assert stats.size_bytes == actual_bytes
     assert stats.size_bytes > 0
 
@@ -349,21 +452,45 @@ def test_stats_size_bytes_sums_files(tmp_path):
 def test_aggregate_group_by_extra_field(tmp_path):
     """group_by names can resolve through ``extra`` for primitive-specific aggregations."""
     backend = FilesystemLogBackend(tmp_path)
-    backend.append(RunRecord(
-        ts=_ts_at(2026, 5, 15, 10), run_id="r1", primitive="outcome_iteration",
-        status="ok", summary="t", model="m", input_tokens=0, output_tokens=0,
-        extra={"iteration": 0},
-    ))
-    backend.append(RunRecord(
-        ts=_ts_at(2026, 5, 15, 11), run_id="r1", primitive="outcome_iteration",
-        status="ok", summary="t", model="m", input_tokens=0, output_tokens=0,
-        extra={"iteration": 1},
-    ))
-    backend.append(RunRecord(
-        ts=_ts_at(2026, 5, 15, 12), run_id="r1", primitive="outcome_iteration",
-        status="ok", summary="t", model="m", input_tokens=0, output_tokens=0,
-        extra={"iteration": 1},
-    ))
+    backend.append(
+        RunRecord(
+            ts=_ts_at(2026, 5, 15, 10),
+            run_id="r1",
+            primitive="outcome_iteration",
+            status="ok",
+            summary="t",
+            model="m",
+            input_tokens=0,
+            output_tokens=0,
+            extra={"iteration": 0},
+        )
+    )
+    backend.append(
+        RunRecord(
+            ts=_ts_at(2026, 5, 15, 11),
+            run_id="r1",
+            primitive="outcome_iteration",
+            status="ok",
+            summary="t",
+            model="m",
+            input_tokens=0,
+            output_tokens=0,
+            extra={"iteration": 1},
+        )
+    )
+    backend.append(
+        RunRecord(
+            ts=_ts_at(2026, 5, 15, 12),
+            run_id="r1",
+            primitive="outcome_iteration",
+            status="ok",
+            summary="t",
+            model="m",
+            input_tokens=0,
+            output_tokens=0,
+            extra={"iteration": 1},
+        )
+    )
     result = backend.aggregate(
         LogQuery(),
         LogAggregate(group_by=("iteration",), metric="count"),
@@ -419,9 +546,7 @@ def test_get_log_backend_unknown_id_includes_sqlite_in_hint():
     assert "filesystem" in msg
 
 
-def test_get_default_log_backend_redacts_url_credential_in_error(
-    tmp_path, monkeypatch
-):
+def test_get_default_log_backend_redacts_url_credential_in_error(tmp_path, monkeypatch):
     """An operator who accidentally pastes a URL into
     ATOMIC_AGENTS_LOG_BACKEND (instead of _URL) MUST NOT see the
     credential echoed in the BackendNotRegistered exception message.
@@ -438,3 +563,177 @@ def test_get_default_log_backend_redacts_url_credential_in_error(
     assert "ingest.host" not in msg
     # The scheme should still appear so the operator can debug.
     assert "datadog" in msg
+
+
+# ──────────────────────────────────────────────────────────────────
+# spec/22 read-failure addendum (#497): empty-vs-failure boundary
+#
+# The conformance suite covers the directory-level NON-ENOENT OSError → raise
+# path (NotADirectoryError) for query/tail/aggregate. These filesystem-specific
+# tests pin the finer-grained errno boundary that distinguishes the ABSENT-state
+# contract (return []) and the TOCTOU skip branches from the FAIL-CLOSED raise
+# branches:
+#   - directory-level ENOENT (dir vanished after .exists()) → return []
+#   - month-dir ENOENT mid-walk → skip that month (other months still read)
+#   - per-file ENOENT (file vanished after listing) → skip that file
+#   - per-file non-ENOENT OSError (EIO/EACCES) → raise LogBackendReadError
+# Each test seeds a real record first so the walk body is entered (not the
+# absent-backend early-return), and the assertions only pass if the injected
+# errno branch actually fired (e.g. a no-op patch would return the seeded
+# record, not []).
+
+
+def _seed(backend: FilesystemLogBackend, ts: str, run_id: str) -> None:
+    backend.append(
+        RunRecord(
+            ts=ts,
+            run_id=run_id,
+            primitive="agent_call",
+            status="ok",
+            summary="t",
+            model="m",
+            input_tokens=1,
+            output_tokens=1,
+        )
+    )
+
+
+def test_query_dir_level_enoent_after_exists_returns_empty(tmp_path, monkeypatch):
+    """log_dir vanishes between .exists() and iterdir() (TOCTOU) → return []."""
+    backend = FilesystemLogBackend(tmp_path)
+    _seed(backend, _ts_at(2026, 6, 10), "r1")
+    log_dir = tmp_path / "log"
+    real_iterdir = Path.iterdir
+
+    def fake_iterdir(self):
+        if self == log_dir:
+            raise OSError(errno.ENOENT, "log dir vanished")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+    # If the ENOENT branch did NOT fire, the seeded record would come back.
+    assert backend.query(LogQuery()) == []
+
+
+def test_query_month_dir_enoent_mid_walk_skips_month(tmp_path, monkeypatch):
+    """A month dir vanishing mid-walk is skipped; other months still read."""
+    backend = FilesystemLogBackend(tmp_path)
+    _seed(backend, _ts_at(2026, 5, 10), "may")
+    _seed(backend, _ts_at(2026, 6, 10), "jun")
+    gone_month = tmp_path / "log" / "2026-06"
+    real_iterdir = Path.iterdir
+
+    def fake_iterdir(self):
+        if self == gone_month:
+            raise OSError(errno.ENOENT, "month vanished")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+    results = backend.query(LogQuery())
+    # June skipped (not raised, not total []), May still returned.
+    assert [r.run_id for r in results] == ["may"]
+
+
+def test_query_per_file_enoent_skips_that_file(tmp_path, monkeypatch):
+    """A day file vanishing between listing and open is skipped, not raised."""
+    backend = FilesystemLogBackend(tmp_path)
+    _seed(backend, _ts_at(2026, 6, 10), "keep")
+    _seed(backend, _ts_at(2026, 6, 11), "vanish")
+    gone_file = tmp_path / "log" / "2026-06" / "2026-06-11.jsonl"
+    real_read_text = Path.read_text
+
+    def fake_read_text(self, *args, **kwargs):
+        if self == gone_file:
+            raise OSError(errno.ENOENT, "file vanished")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fake_read_text)
+    results = backend.query(LogQuery())
+    assert [r.run_id for r in results] == ["keep"]
+
+
+def test_query_per_file_non_enoent_oserror_raises(tmp_path, monkeypatch):
+    """A listed-but-unreadable day file (EIO) fails closed → LogBackendReadError."""
+    backend = FilesystemLogBackend(tmp_path)
+    _seed(backend, _ts_at(2026, 6, 10), "r1")
+    day_file = tmp_path / "log" / "2026-06" / "2026-06-10.jsonl"
+    real_read_text = Path.read_text
+
+    def fake_read_text(self, *args, **kwargs):
+        if self == day_file:
+            raise OSError(errno.EIO, "I/O error")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fake_read_text)
+    with pytest.raises(LogBackendReadError):
+        backend.query(LogQuery())
+
+
+def test_tail_dir_level_enoent_after_exists_returns_empty(tmp_path, monkeypatch):
+    """tail() shares query()'s boundary: dir-level ENOENT (TOCTOU) → return []."""
+    backend = FilesystemLogBackend(tmp_path)
+    _seed(backend, _ts_at(2026, 6, 10), "r1")
+    log_dir = tmp_path / "log"
+    real_iterdir = Path.iterdir
+
+    def fake_iterdir(self):
+        if self == log_dir:
+            raise OSError(errno.ENOENT, "log dir vanished")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+    assert backend.tail(5) == []
+
+
+def test_tail_per_file_non_enoent_oserror_raises(tmp_path, monkeypatch):
+    """tail() fails closed on a listed-but-unreadable day file (EIO)."""
+    backend = FilesystemLogBackend(tmp_path)
+    _seed(backend, _ts_at(2026, 6, 10), "r1")
+    day_file = tmp_path / "log" / "2026-06" / "2026-06-10.jsonl"
+    real_read_text = Path.read_text
+
+    def fake_read_text(self, *args, **kwargs):
+        if self == day_file:
+            raise OSError(errno.EIO, "I/O error")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fake_read_text)
+    with pytest.raises(LogBackendReadError):
+        backend.tail(5)
+
+
+def test_tail_month_dir_enoent_mid_walk_skips_month(tmp_path, monkeypatch):
+    """tail() skips a month dir that vanishes mid-walk; other months still read."""
+    backend = FilesystemLogBackend(tmp_path)
+    _seed(backend, _ts_at(2026, 5, 10), "may")
+    _seed(backend, _ts_at(2026, 6, 10), "jun")
+    gone_month = tmp_path / "log" / "2026-06"
+    real_iterdir = Path.iterdir
+
+    def fake_iterdir(self):
+        if self == gone_month:
+            raise OSError(errno.ENOENT, "month vanished")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+    results = backend.tail(10)
+    # June skipped (not raised, not total []), May still returned.
+    assert [r.run_id for r in results] == ["may"]
+
+
+def test_tail_per_file_enoent_skips_that_file(tmp_path, monkeypatch):
+    """tail() skips a day file that vanishes between listing and open."""
+    backend = FilesystemLogBackend(tmp_path)
+    _seed(backend, _ts_at(2026, 6, 10), "keep")
+    _seed(backend, _ts_at(2026, 6, 11), "vanish")
+    gone_file = tmp_path / "log" / "2026-06" / "2026-06-11.jsonl"
+    real_read_text = Path.read_text
+
+    def fake_read_text(self, *args, **kwargs):
+        if self == gone_file:
+            raise OSError(errno.ENOENT, "file vanished")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fake_read_text)
+    results = backend.tail(10)
+    assert [r.run_id for r in results] == ["keep"]

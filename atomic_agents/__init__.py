@@ -158,6 +158,8 @@ from .exceptions import (
     ToolHandlerImportFailed,
     ToolDescriptorInvalid,
     ToolAlreadyInstalled,
+    # LogBackend read-failure contract (spec/22 addendum — issue #497)
+    LogBackendReadError,
 )
 
 __version__ = "1.1.0"
@@ -287,4 +289,6 @@ __all__ = [
     "ToolHandlerImportFailed",
     "ToolDescriptorInvalid",
     "ToolAlreadyInstalled",
+    # LogBackend read-failure contract (spec/22 addendum — issue #497)
+    "LogBackendReadError",
 ]

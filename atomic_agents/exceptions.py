@@ -722,3 +722,47 @@ class CorpusCorrupted(CorpusError):
     the page EXISTS but its data cannot be interpreted without operator
     intervention.
     """
+
+
+# ──────────────────────────────────────────────────────────────────
+# LogBackend exceptions (spec/22 read-failure posture addendum — issue #497)
+
+
+class LogBackendReadError(AtomicAgentsError):
+    """Raised by ``query()`` / ``tail()`` / ``aggregate()`` on an unrecoverable
+    read failure — disk corruption, I/O error, or lost database connection after
+    all retry attempts are exhausted.
+
+    **Not** raised for absent or empty backend state (that returns ``[]``).
+    The boundary rule (per spec/22 read-failure posture addendum; see that
+    section's boundary table for the canonical version):
+
+    * ``log_dir`` does not exist / db is empty → return ``[]``
+    * directory-level ``ENOENT`` (``log_dir`` / a month dir vanished AFTER the
+      ``.exists()`` check — TOCTOU with retention cleanup) → return ``[]`` /
+      skip; this is the absent-state contract, NOT a read failure
+    * ``log_dir.iterdir()`` raises a NON-ENOENT ``OSError`` (``PermissionError``,
+      ``NotADirectoryError``, ``EIO``) → raise ``LogBackendReadError``
+    * per-file ``ENOENT`` inside a directory walk (file vanished between listing
+      and ``open()``) → skip (``continue``)
+    * per-file non-ENOENT ``OSError`` (``EIO``, ``EACCES``) → raise
+      ``LogBackendReadError``
+    * SQLite ``DatabaseError`` (the base class — covers ``OperationalError``,
+      which is how sqlite3 reports disk I/O errors) at the SELECT ``execute()``
+      OR at connection/schema setup on a corrupt ``.db`` file → raise
+      ``LogBackendReadError``. SQLite ``RuntimeError`` from ``_ensure_schema``
+      propagates uncaught — covers BOTH the schema-version mismatch (config
+      error) AND the defensive "row missing after INSERT OR IGNORE — corruption
+      suspected" near-unreachable branch; neither is a ``sqlite3.DatabaseError``
+      so the narrow wrap does not catch it.
+    * psycopg error surviving the one-shot reconnect → raise
+      ``LogBackendReadError``. A Postgres ``ValueError`` (could-not-connect) /
+      ``RuntimeError`` (schema mismatch) propagates uncaught — config error.
+
+    ``stats()`` is **EXEMPT** — it is a racy diagnostic surface and MUST NOT
+    be used for control flow per spec/22's locked ``stats()`` contract.
+
+    Raised by conforming ``LogBackend`` implementations. Importable from both
+    ``atomic_agents`` (top-level caller surface) and ``atomic_agents.logs``
+    (backend-implementer surface).
+    """

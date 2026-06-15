@@ -368,12 +368,19 @@ Capabilities: ``supports_aggregation_pushdown=False``,
 ## Exception surface
 
 * ``ValueError`` — raised by ``aggregate`` for unknown metrics.
-  No new exception class; bare ``ValueError`` matches the lock arc's
-  "no new exception unless behavior-distinct" rule.
+  No new exception class for the original 8-MUST surface; bare
+  ``ValueError`` matches the lock arc's "no new exception unless
+  behavior-distinct" rule.
 * ``NotImplementedError`` — backends with
   ``supports_retention=False`` MAY raise from ``delete_older_than``.
 * ``BackendNotRegistered`` — raised by ``get_log_backend`` and
   ``get_default_log_backend`` for unknown backend_ids.
+* ``LogBackendReadError(AtomicAgentsError)`` — **added in v1.5 by the
+  read-failure posture addendum (issue #497)**. Raised by ``query()`` /
+  ``tail()`` / ``aggregate()`` on unrecoverable read failures (disk
+  corruption, I/O error, lost database connection after all retries
+  exhausted). See §"spec/22 addendum — Read-failure posture" below for
+  the full normative boundary and conformance contract.
 
 ## Registry
 
@@ -697,30 +704,62 @@ The conformance suite:
   override, primitive derivation from legacy trigger, byte-for-byte
   legacy-reader compat at the end-to-end boundary, OutcomeRunner +
   DreamRunner kwarg threading, sum_cost routing, dashboard load_runs
-  routing, count_provenance wiring, doctor PASS/FAIL/URL-redaction.
+  routing, _count_provenance wiring, doctor PASS/FAIL/URL-redaction.
 
-Total: 127 LogBackend-arc tests + 96 local parametrized invocations =
-**223 local test runs** (144 CI parametrized invocations when Postgres
-service container is active).
+Total: 137 LogBackend-arc tests + 103 local conformance invocations =
+**240 local test runs**. The net delta over the pre-#497 census
+(224 → 240, **+16**) breaks down as **conformance +7** (96 → 103: 6 from the
+three read-failure tests parametrized over the two local backends — filesystem,
+sqlite — + 1 standalone reader-seam test) and **arc +9** (filesystem 22 → 30:
+6 read-failure boundary tests pinning the empty-vs-failure errno branches
+[dir-level ENOENT → [], month-dir ENOENT skip, per-file ENOENT skip, per-file
+non-ENOENT → raise] for query() + 2 tail() skip-branch tests; postgres 54 → 55:
+1 connect-time read-error wrap test for tail()/aggregate() — all added during
+the #497 ``/ship`` review for coverage completeness). The postgres
+``test_read_error_discards_connection_prevents_aborted_tx_trap`` was UPDATED
+in place to expect ``LogBackendReadError`` (not added). There are **two**
+near-identical reader-seam tests proving ``_sum_via_backend`` fails closed on
+``LogBackendReadError``: (1) ``test_sum_via_backend_fails_closed_on_log_backend_read_error``
+lives **in this conformance file** (``tests/test_log_protocol_conformance.py``)
+and **is** the census's "+1 standalone reader-seam test" counted inside the 103
+conformance term; (2) ``test_backend_query_logbackendreaderror_returns_degraded``
+lives in ``tests/test_costs.py``, **outside** this arc census. (Both assert the
+same fail-closed property from the consumer side; the conformance-file copy
+keeps the contract demonstrable from the conformance suite alone, the
+``test_costs.py`` copy keeps the cost-reader's own test file self-complete.)
+(Mandate spend-gate posture: #497 adds an INTERIM fail-closed guard for the
+outstanding-reservation read — a typed ``except LogBackendReadError`` at the
+step-7/step-8 callers that BLOCKs (``mandate_{token,external}_reservations_unreadable``),
+with 2 tests in ``tests/test_mandate_check.py``. The FULL posture — flipping the
+remaining broad-``except`` prior-cost-sum sites, ``BLOCK mandate_cost_unreadable``
+across all mandate read methods, and the spec/29 LOCKED amendment — stays #506.) (Census-honesty note: the pre-#497 census stated postgres as 53 and a
+total of 223; both were a pre-existing undercount-by-one — ``--collect-only``
+reports postgres at 54 on main, so the true pre-#497 local total was 224. The
+figures here are recomputed from ``--collect-only`` and are authoritative.)
 
 <!-- Census arithmetic — recompute from `--collect-only`, do not hand-increment:
-     non-conformance arc tests = filesystem 22 + sqlite 33 + postgres 53 +
-     integration 19 = 127.
-     conformance term = 96 = 48 unique funcs x 2 local backends (fs + sqlite).
-     local total = 127 + 96 = 223.
-     CI conformance = 48 x 3 backends (fs + sqlite + postgres) = 144 when the
-     Postgres service container provides ATOMIC_AGENTS_TEST_POSTGRES_URL.
+     arc (non-conformance) tests = filesystem 30 + sqlite 33 + postgres 55 +
+       integration 19 = 137. (filesystem 22 → 30: +8 #497 /ship coverage tests
+       [6 query() errno-boundary + 2 tail() skip-branch]; postgres 54 → 55: +1
+       #497 connect-time read-error wrap test; the pre-#497 census also
+       mis-stated postgres as 53 — corrected to 54 on main.)
+     conformance term (local, Postgres-absent) = 96 (48 unique funcs × 2 local
+       backends fs+sqlite) + 6 (3 read-failure tests × 2 local backends) + 1
+       (standalone reader-seam test) = 103.
+     local total = 137 + 103 = 240 (was 224 pre-#497: 128 arc + 96 conformance;
+       +16 net = +9 arc [filesystem +8, postgres +1] + +7 conformance [96 → 103]).
+     CI/Postgres-present: the postgres backend joins both the 48-func
+       parametrization and the 3 read-failure tests, so the conformance term
+       becomes 48×3 + 3×3 + 1 = 154 and the Postgres-present command collects
+       137 + 154 = 291.
      Verify (local, Postgres-absent — clamp the env var so the count is
-     deterministic; the conformance file parametrizes the postgres backend at
-     COLLECTION time, so an exported ATOMIC_AGENTS_TEST_POSTGRES_URL changes the
-     conformance term 96 -> 144 and the total 223 -> 271):
+     deterministic; an exported ATOMIC_AGENTS_TEST_POSTGRES_URL adds the
+     postgres backend at COLLECTION time and changes the total):
      `env -u ATOMIC_AGENTS_TEST_POSTGRES_URL uv run pytest
      tests/test_log_protocol_conformance.py
      tests/test_log_filesystem_backend.py tests/test_log_sqlite_backend.py
      tests/test_log_postgres_backend.py tests/test_log_integration.py
-     --collect-only -q | tail -1` -> 223 collected.
-     CI/Postgres-present (URL exported): the same command -> 271 collected
-     (127 arc tests + 144 conformance invocations). -->
+     --collect-only -q | tail -1` -> 240 collected. -->
 
 
 ## Related
@@ -745,3 +784,183 @@ ts-first insertion order, NOT `canonical_json()` (which uses `sort_keys=True` an
 would break Tier A byte-exact fidelity, spec/40 MUST 8).
 
 For the full normative export contract, see `docs/spec/40-canonical-export.md`.
+
+## spec/22 addendum — Read-failure posture (v2, issue #497)
+
+This versioned normative addendum records the read-failure contract added in
+issue #497. The spec remains LOCKED; this addendum is backward-compatible
+(new exception class; existing empty/absent behavior unchanged).
+
+**This rule is OUTSIDE the 8-MUST queryable-backend Implementer Contract
+count at §"Implementer contract for queryable backends" (heading at line 458;
+MUST 8 at line 476) above.** That 8-MUST contract is documented ONLY in
+spec/22 itself — there is no `8-MUST` cross-reference in README.md or
+CLAUDE.md to keep in sync, so the count remains valid by not touching the
+queryable-backend section. This addendum is a BASE Protocol-surface rule
+binding ALL backends (including `FilesystemLogBackend`) via the public
+exception type, and is delivered as a separate normative subsection rather
+than a renumbered MUST #9 (per the lock-ceremony ruling, matching the spec/41
+#483 versioned-addendum precedent).
+
+### Read-failure boundary
+
+The **explicit boundary** (reusing spec/09's locked taxonomy):
+
+| Condition | Behavior |
+|---|---|
+| Backend is absent / empty / log directory does not exist | Return `[]` — MUST NOT raise |
+| Directory-level `ENOENT` — `log_dir` (or a month dir) vanished AFTER the `.exists()` check (TOCTOU with retention cleanup / external `rm`) | Return `[]` (top dir) / skip (month dir) — MUST NOT raise; this is the absent-state contract |
+| File disappeared between directory listing and `open()` (TOCTOU race — ENOENT on a per-file read) | Skip (continue) — MUST NOT raise |
+| Directory-level NON-ENOENT `OSError` — e.g., `PermissionError` on `iterdir()`, `NotADirectoryError`, `EIO` | Raise `LogBackendReadError` |
+| Non-ENOENT per-file `OSError` — e.g., `EIO`, `EACCES` | Raise `LogBackendReadError` |
+| `sqlite3.DatabaseError` (the base class — covers `OperationalError`, which is how sqlite3 surfaces disk I/O errors) at the `execute()` of the SELECT **or** at connection setup (the `PRAGMA journal_mode=WAL` / schema-read on a corrupt `.db` file). Corruption surfaces at connect time for a genuinely corrupt file, so the reference impl wraps BOTH phases (`SQLiteLogBackend._get_conn_for_read()` + the per-call `execute`). A raw non-`DatabaseError` `OSError` is out of scope because sqlite3 reports I/O errors as `OperationalError` (a `DatabaseError` subclass), so the narrow `except sqlite3.DatabaseError` is sufficient. | Raise `LogBackendReadError` |
+| SQLite `RuntimeError` from `_ensure_schema()` — BOTH the schema-version-mismatch case AND the defensive "schema_version row missing after INSERT OR IGNORE — db corruption suspected" case (a near-unreachable post-`INSERT OR IGNORE` branch) | Propagate uncaught — NOT a `sqlite3.DatabaseError`, so the narrow wrap does not catch it. The version-mismatch case is a config error; the corruption-suspected case is a defensive "impossible" branch whose practical reachability is near-zero (it would require an `INSERT OR IGNORE` to leave no row). A future PR MAY raise `sqlite3.DatabaseError` instead of `RuntimeError` at that branch so corruption surfaces as `LogBackendReadError` per this addendum's intent; doc-acknowledged here rather than wrapped, given reachability. |
+| `psycopg.Error` (the base class) surviving the one-shot reconnect retry — corruption / I/O / connection drop after retry | Raise `LogBackendReadError`. The wrap catches `psycopg.Error` NARROWLY (mirroring SQLite's narrow `sqlite3.DatabaseError`), NOT bare `Exception`: a non-psycopg bug in the query builder is a code defect and propagates as itself, not relabeled a transient read failure. |
+| `psycopg.Error` at **connection setup** — a *connectable-but-corrupt* database whose `_ensure_schema()` meta-table `SELECT` raises a raw `psycopg.Error` on first connect (note: `_ensure_schema`'s `except Exception: ... raise` re-raises this UNWRAPPED) | Raise `LogBackendReadError`. The reference impl wraps the pre-wrap connection setup in `PostgresLogBackend._get_conn_for_read()` (mirroring SQLite's `_get_conn_for_read()`), so connect-time-schema-read corruption gets the typed signal too — not just the per-call `execute()`. A pure connect *failure* still surfaces as `ValueError` (next row) because `_get_conn` itself converts `psycopg.connect` failures to a DSN-redacted `ValueError`; only a successful connect followed by a corrupt meta SELECT reaches this row. |
+| Postgres `ValueError` (could-not-connect, DSN-redacted) / `RuntimeError` (schema-version mismatch) — at the FIRST connection setup (the pre-wrap `_get_conn_for_read()`) **or** on the inner one-shot-reconnect `_get_conn()` (server hard-down / schema mismatch on the reconnect target) | Propagate uncaught — config/deploy error, NOT a read failure. `_get_conn_for_read` catches only `psycopg.Error`, so these config-typed errors propagate on EVERY path (first-connect AND reconnect), not just first-connect. **Operator caveat:** a Postgres server restart / failover / idle-timeout mid-read can surface on the one-shot-reconnect path as this DSN-redacted `ValueError` (a connect failure, not a `psycopg.Error`). It therefore does NOT become `LogBackendReadError`; downstream cost consumers MUST fail closed on it via their broad backstop branch, not only on the typed signal (see `_costs._sum_via_backend`'s broad `except Exception`; the mandate spend-gate's parallel fail-closed posture is tracked in issue #506). |
+
+The boundary resolves the apparent contradiction with the original Protocol
+contract (`query()` MUST NOT raise for missing-backend state): absent/empty →
+`[]` is the missing-backend contract; `LogBackendReadError` is reserved for
+**unrecoverable I/O failures** where the backend exists and is entered but
+cannot be read.
+
+**Catch-breadth caveat (deliberate fail-closed-when-blind).** Both reference DB
+backends catch a base class, so the read-failure class is intentionally broader
+than "disk corruption only":
+
+- SQLite's `except sqlite3.DatabaseError` also covers `OperationalError`, which
+  includes transient `database is locked` contention under WAL with concurrent
+  writers. Wrapping that into `LogBackendReadError` makes a downstream cost gate
+  fail **closed** (block) on a lock a retry might clear. This is accepted under
+  the project's fail-closed-when-blind posture (Principle 4: a blind spend gate
+  MUST over-block) — a spurious refusal is recoverable; a silent budget overrun
+  is not. The SQLite WAL-init path already retries `SQLITE_BUSY`/`SQLITE_LOCKED`
+  per the queryable-backend contract MUST #4 above; per-`execute` lock
+  contention is not retried and is classified as a (recoverable) read failure.
+- Postgres's narrow `except psycopg.Error` deliberately classifies a
+  statement-level `psycopg.ProgrammingError` (a genuine SQL-builder code defect)
+  as a read failure rather than letting it surface as itself. This is the one
+  place the "code defect surfaces as itself" rule yields to fail-closed: at the
+  `_run_with_reconnect(_do)` call site there is no way to distinguish a builder
+  bug from a server-rejected statement without inspecting `sqlstate`, so the
+  conservative choice is fail-closed. Backends that want finer classification
+  MAY inspect the error code and re-raise builder defects, but MUST NOT
+  fail-open (treat the read as empty).
+
+### The exception class
+
+```python
+class LogBackendReadError(AtomicAgentsError):
+    """Raised by query() / tail() / aggregate() on unrecoverable read failure."""
+```
+
+Importable from both `atomic_agents` (top-level) and `atomic_agents.logs`
+(backend-implementer surface):
+
+```python
+from atomic_agents import LogBackendReadError           # operator / caller surface
+from atomic_agents.logs import LogBackendReadError      # backend implementer surface
+```
+
+### Scope
+
+* `query()`, `tail()`, `aggregate()` **MUST** raise `LogBackendReadError` on
+  unrecoverable read failures.
+* `stats()` is **EXEMPT** — `stats()` is a racy diagnostic surface with a
+  locked "MUST NOT use for control flow" contract (see §stats above). Wrapping
+  its failures into `LogBackendReadError` would invite callers to use it for
+  control decisions, which the locked contract explicitly refuses.
+* `append()` and `delete_older_than()` are write/retention paths; this addendum
+  does not constrain their exception surface.
+
+### Cost-reader integration
+
+`_costs._sum_via_backend()` uses a **layered catch**:
+
+1. `except LogBackendReadError` — caught first; logs a clean "genuine
+   unrecoverable read failure" message; returns
+   `CostReadResult(total_usd=0.0, degraded=True)`.
+2. `except Exception` — unconditional fail-closed backstop for non-conforming
+   custom backends that raise other exception types; logs "unexpected exception
+   type"; returns `CostReadResult(total_usd=0.0, degraded=True)`.
+
+The two branches produce distinct log messages so operators can tell whether
+degraded-mode came from a conforming backend (typed catch) or a non-conforming
+backend (broad catch).
+
+### Protocol isinstance note
+
+`isinstance(obj, LogBackend)` checks structural method presence only (Python
+`@runtime_checkable` Protocol — not behavior). Conformance to this MUST is
+verified by the conformance test suite, not by the isinstance check.
+
+### Conformance tests
+
+The following tests verify this addendum. The three per-backend tests are in
+`tests/test_log_protocol_conformance.py` (parametrized over every available
+backend). There are **two** reader-seam tests: one in the conformance file (the
+census's "+1") and one in `tests/test_costs.py` (outside the census):
+
+* `test_query_raises_log_backend_read_error` — per-backend break_read injection,
+  asserts `LogBackendReadError` from `query()`.
+* `test_tail_raises_log_backend_read_error` — same for `tail()`.
+* `test_aggregate_raises_log_backend_read_error` — same for `aggregate()`.
+* `test_sum_via_backend_fails_closed_on_log_backend_read_error`
+  (`tests/test_log_protocol_conformance.py`) — reader-seam test **in the
+  conformance file**; this is the census's "+1 standalone reader-seam test"
+  counted inside the 103 conformance term. Asserts `_sum_via_backend` returns
+  `CostReadResult(degraded=True)` when the backend's `query()` raises
+  `LogBackendReadError`.
+* `test_backend_query_logbackendreaderror_returns_degraded`
+  (`tests/test_costs.py`) — the near-identical reader-seam test in the
+  cost-reader's own test file, **outside** this arc census; same assertion,
+  keeps `test_costs.py` self-complete.
+
+Filesystem break_read: replaces `log/` directory with a regular file so
+`iterdir()` raises `NotADirectoryError` (OSError subclass) — exercises the
+directory-level OSError path. Per-file ENOENT is intentionally NOT the
+injection target (that returns `[]`, not an error).
+
+SQLite break_read: corrupts the **real on-disk `.db` file** — drops the cached
+thread-local connection, deletes the WAL/SHM sidecars, then overwrites the
+main file with non-database garbage bytes. The next call builds a fresh
+connection and surfaces a genuine `sqlite3.DatabaseError` ("file is not a
+database") at connect/schema-setup time, which `_get_conn_for_read()` wraps
+into `LogBackendReadError`. This exercises the realistic corruption path the
+boundary table names (corruption surfaces at connection setup for a corrupt
+file, not at the SELECT's `execute()`).
+
+Postgres break_read: monkeypatches `_run_with_reconnect` to raise a real
+`psycopg.OperationalError` (a `psycopg.Error` subclass) — exercises the
+`try/except psycopg.Error` wrapping at the `_run_with_reconnect(_do)` call site,
+proving the spec-named "psycopg error surviving the one-shot reconnect" boundary
+row (NOT a generic-Exception catch-all; a non-psycopg error would propagate as a
+code defect, matching SQLite's narrow catch). Monkeypatching avoids a live
+server FOR THE BREAK INJECTION, but the postgres conformance test still requires
+a **live Postgres** (`ATOMIC_AGENTS_TEST_POSTGRES_URL` + `psycopg`) to construct
+the backend and append the seed record — it is SKIPPED otherwise (gated by
+`_POSTGRES_AVAILABLE`).
+
+**Assurance label — Postgres connect-time-schema-read row** (the boundary-table
+row reading "`psycopg.Error` at **connection setup** — a *connectable-but-corrupt*
+database whose `_ensure_schema()` meta-table `SELECT` raises a raw `psycopg.Error`
+on first connect"; this is the row immediately *after* the "surviving the
+one-shot reconnect retry" row — a textual anchor, since hand-maintained line
+numbers drift on any edit).** The
+behavioral conformance test injects at the **post-connect** `_run_with_reconnect`
+seam, not at the **connect-time** `PostgresLogBackend._get_conn_for_read()` wrap
+(the row where a connectable-but-corrupt database's `_ensure_schema` meta
+`SELECT` raises a `psycopg.Error` on first connect). That connect-time wrap is
+verified by **code-reading + structural mirroring of SQLite's
+`_get_conn_for_read()`** — whose connect-time path *is* exercised by a real
+on-disk-corruption behavioral test (above) — NOT by a dedicated live-Postgres
+test. This matches the project's assurance-labeling convention for paths that
+require an external system to exercise end-to-end (per
+`feedback_verify_external_platform_claims`): the row is normatively specified and
+structurally proven, with the live behavioral assertion deferred until a live
+Postgres CI lane exists. A maintainer with a live Postgres can force the
+connect-time path by monkeypatching `_ensure_schema` (or the meta `SELECT`) to
+raise a `psycopg.Error` on a fresh thread-local connection and asserting
+`query()` / `tail()` / `aggregate()` raise `LogBackendReadError` with the
+`psycopg` error as `__cause__`.

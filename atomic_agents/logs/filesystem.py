@@ -36,6 +36,7 @@ partial-cutoff day file via ``_io.atomic_write``.
 
 from __future__ import annotations
 
+import errno
 import json
 import re
 from collections import defaultdict
@@ -44,6 +45,7 @@ from pathlib import Path
 from typing import Any
 
 from .._io import atomic_append_jsonl, atomic_write
+from ..exceptions import LogBackendReadError
 from .types import (
     LogAggregate,
     LogCapabilities,
@@ -177,14 +179,48 @@ class FilesystemLogBackend:
 
         results: list[RunRecord] = []
 
-        for month_dir in sorted(log_dir.iterdir()):
+        # spec/22 read-failure addendum boundary:
+        #  - directory-level non-ENOENT OSError (PermissionError /
+        #    NotADirectoryError / EIO) is unrecoverable (the whole log tree is
+        #    unreadable) → raise LogBackendReadError.
+        #  - directory-level ENOENT is the absent-state contract: the dir
+        #    vanished between the .exists() check above and iterdir() (TOCTOU
+        #    with delete_older_than cleanup / external rm) → return [].
+        #  - per-file ENOENT (file vanished between iterdir and read) → skip.
+        #  - per-file non-ENOENT OSError (EIO, EACCES) → raise (fail closed).
+        #  - json.JSONDecodeError on individual lines → silent skip (malformed
+        #    record, not a read failure).
+        try:
+            month_dirs_iter = sorted(log_dir.iterdir())
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                # log_dir removed after the .exists() check (TOCTOU) — absent
+                # state, not a read failure.
+                return []
+            raise LogBackendReadError(
+                f"FilesystemLogBackend: unrecoverable read failure iterating "
+                f"log directory {log_dir}: {exc}"
+            ) from exc
+
+        for month_dir in month_dirs_iter:
             if not month_dir.is_dir() or not _MONTH_DIR_RE.match(month_dir.name):
                 continue
             # Cheap month-window prefilter — skip month dirs whose
             # entire date range falls outside [since, until].
             if not _month_overlaps_window(month_dir.name, since_date, until_date):
                 continue
-            for day_file in sorted(month_dir.iterdir()):
+            try:
+                day_files_iter = sorted(month_dir.iterdir())
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    # month_dir vanished mid-walk (TOCTOU) — skip it.
+                    continue
+                raise LogBackendReadError(
+                    f"FilesystemLogBackend: unrecoverable read failure iterating "
+                    f"month directory {month_dir}: {exc}"
+                ) from exc
+
+            for day_file in day_files_iter:
                 m = _DAY_FILE_RE.match(day_file.name)
                 if not m:
                     continue
@@ -198,10 +234,24 @@ class FilesystemLogBackend:
                 if until_date and day > until_date:
                     continue
                 # Read and parse.
+                # per spec/22 read-failure addendum (per-file boundary):
+                #   ENOENT  → TOCTOU skip (file vanished between listing and
+                #             open; not an error).
+                #   any other OSError (EIO, EACCES) → raise LogBackendReadError
+                #             (fail closed — a day file we listed but cannot read
+                #             is an unrecoverable read failure, NOT a skip).
                 try:
                     text = day_file.read_text(encoding="utf-8")
-                except OSError:
-                    continue
+                except OSError as exc:
+                    if exc.errno == errno.ENOENT:
+                        # File disappeared between directory listing and open
+                        # (TOCTOU race) — skip this file; not an error.
+                        continue
+                    # Non-ENOENT per-file OSError: raise as LogBackendReadError.
+                    raise LogBackendReadError(
+                        f"FilesystemLogBackend: unrecoverable read failure on "
+                        f"{day_file}: {exc}"
+                    ) from exc
                 for line in text.splitlines():
                     line = line.strip()
                     if not line:
@@ -251,28 +301,63 @@ class FilesystemLogBackend:
         # files within each month, then reverse-walk lines within each
         # day file. Accumulate until we have n records; collected order
         # is newest-first.
-        month_dirs = sorted(
-            (
-                p
-                for p in log_dir.iterdir()
-                if p.is_dir() and _MONTH_DIR_RE.match(p.name)
-            ),
-            reverse=True,
-        )
+        # spec/22 read-failure addendum boundary (identical to query()):
+        #   directory-level ENOENT (dir vanished after .exists()) → return [];
+        #   month_dir ENOENT mid-walk → skip; other directory-level OSError →
+        #   raise; per-file ENOENT → skip; non-ENOENT per-file OSError → raise.
+        try:
+            month_dirs = sorted(
+                (
+                    p
+                    for p in log_dir.iterdir()
+                    if p.is_dir() and _MONTH_DIR_RE.match(p.name)
+                ),
+                reverse=True,
+            )
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                # log_dir removed after the .exists() check (TOCTOU) — absent.
+                return []
+            raise LogBackendReadError(
+                f"FilesystemLogBackend: unrecoverable read failure iterating "
+                f"log directory {log_dir}: {exc}"
+            ) from exc
+
         for month_dir in month_dirs:
             if len(collected) >= n:
                 break
-            day_files = sorted(
-                (p for p in month_dir.iterdir() if _DAY_FILE_RE.match(p.name)),
-                reverse=True,
-            )
+            try:
+                day_files = sorted(
+                    (p for p in month_dir.iterdir() if _DAY_FILE_RE.match(p.name)),
+                    reverse=True,
+                )
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    # month_dir vanished mid-walk (TOCTOU) — skip it.
+                    continue
+                raise LogBackendReadError(
+                    f"FilesystemLogBackend: unrecoverable read failure iterating "
+                    f"month directory {month_dir}: {exc}"
+                ) from exc
+
             for day_file in day_files:
                 if len(collected) >= n:
                     break
+                # per spec/22 read-failure addendum (per-file boundary):
+                #   ENOENT → TOCTOU skip; any other OSError (EIO, EACCES) →
+                #   raise LogBackendReadError (fail closed).
                 try:
                     text = day_file.read_text(encoding="utf-8")
-                except OSError:
-                    continue
+                except OSError as exc:
+                    if exc.errno == errno.ENOENT:
+                        # File disappeared between directory listing and open
+                        # (TOCTOU race) — skip this file; not an error.
+                        continue
+                    # Non-ENOENT per-file OSError: raise as LogBackendReadError.
+                    raise LogBackendReadError(
+                        f"FilesystemLogBackend: unrecoverable read failure on "
+                        f"{day_file}: {exc}"
+                    ) from exc
                 lines = [l.strip() for l in text.splitlines() if l.strip()]
                 for line in reversed(lines):
                     if len(collected) >= n:

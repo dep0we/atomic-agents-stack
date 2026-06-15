@@ -47,9 +47,10 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
-
 import pytest
 
+from atomic_agents import LogBackendReadError
+from atomic_agents.exceptions import AtomicAgentsError
 from atomic_agents.logs import (
     FilesystemLogBackend,
     LogAggregate,
@@ -132,7 +133,7 @@ def backend_factory(request) -> BackendFactory:
 
 
 @pytest.fixture(autouse=True)
-def postgres_truncate(backend_factory, request):
+def postgres_truncate(request):
     """Truncate run_records (RESTART IDENTITY) before each Postgres conformance test.
 
     Filesystem and SQLite backends get per-test isolation for free via a
@@ -153,7 +154,25 @@ def postgres_truncate(backend_factory, request):
     autouse=True — runs for every test in this module.  The guard
     ``_is_postgres`` skips the TRUNCATE for filesystem and SQLite tests so
     there is zero overhead for those backends.
+
+    IMPORTANT: this fixture pulls ``backend_factory`` LAZILY via
+    ``request.getfixturevalue`` only for tests that actually request it
+    (directly or transitively through the ``backend`` fixture). Declaring
+    ``backend_factory`` as a direct parameter would force its
+    parametrization onto EVERY test in the module — including the
+    read-failure tests that use ``backend_and_breaker`` instead — producing
+    a spurious cross-product of test invocations. The lazy lookup keeps each
+    test parametrized by exactly the backend axis it consumes.
     """
+    # Only the tests that consume backend_factory (directly or via the
+    # ``backend`` fixture) participate in Postgres truncation. Tests that use
+    # ``backend_and_breaker`` instead never request backend_factory, so we skip
+    # without forcing its parametrization onto them.
+    if "backend_factory" not in request.fixturenames:
+        yield
+        return
+
+    backend_factory = request.getfixturevalue("backend_factory")
     # Determine whether this test is using the Postgres factory.
     # backend_factory is a callable; compare by identity to _postgres_factory.
     _is_postgres = backend_factory is _postgres_factory and _POSTGRES_URL is not None
@@ -1076,3 +1095,281 @@ def test_aggregate_extra_field_key_type_divergence(backend):
         assert bool_str_keys & {"true", "false"} == set(), (
             f"unexpected postgres-shaped bool keys off-postgres: {bool_str_keys}"
         )
+
+
+# ──────────────────────────────────────────────────────────────────
+# spec/22 read-failure posture conformance tests (issue #497 addendum)
+#
+# These tests verify that conforming backends raise LogBackendReadError
+# on unrecoverable read failures (not the empty/absent → [] path).
+#
+# Design:
+#   - break_read() is a TEST-SIDE callable, not a method on the backend
+#     class (backends MUST NOT have test-only APIs per CLAUDE.md principle).
+#   - A separate ``backend_and_breaker`` fixture carries the (backend,
+#     break_read_fn) pair WITHOUT changing BackendFactory's type or the
+#     existing ``backend`` fixture used by the 48 other conformance tests.
+#   - Filesystem: replace log/ dir with a regular file so iterdir() raises
+#     NotADirectoryError (an OSError subclass; NOT ENOENT — that returns []).
+#     Exercises the directory-level OSError → raise path.
+#   - SQLite: overwrite the real on-disk .db file with garbage bytes AFTER
+#     dropping the thread-local connection and the WAL/SHM sidecars, so the
+#     next call builds a fresh connection and surfaces a genuine
+#     sqlite3.DatabaseError ("file is not a database") at connect/schema time
+#     — the realistic corruption path the addendum's boundary table calls out,
+#     which _get_conn_for_read() wraps.
+#   - Postgres: monkeypatch _run_with_reconnect to raise, so the read
+#     methods' try/except converts it to LogBackendReadError. Note: the
+#     postgres backend itself is still constructed against a LIVE server (the
+#     fixture appends a seed record first), so the postgres read-failure test
+#     is SKIPPED unless ATOMIC_AGENTS_TEST_POSTGRES_URL + psycopg are present;
+#     monkeypatching only avoids a live server FOR THE BREAK INJECTION, not for
+#     constructing the backend.
+# ──────────────────────────────────────────────────────────────────
+
+
+def _fs_break_read(backend: FilesystemLogBackend) -> None:
+    """Replace the log/ directory with a regular file → iterdir() raises ENOTDIR."""
+    log_dir = backend._log_dir
+    if log_dir.exists():
+        import shutil
+
+        shutil.rmtree(log_dir)
+    # Create a regular FILE at the path where the directory should be.
+    # iterdir() on a non-directory raises NotADirectoryError (OSError subclass).
+    log_dir.write_text("corrupt-marker")
+
+
+def _sqlite_break_read(backend: "SQLiteLogBackend") -> None:  # type: ignore[name-defined]
+    """Corrupt the real on-disk .db file so the next read raises DatabaseError.
+
+    This exercises the REALISTIC corruption path the addendum's boundary table
+    names ("sqlite3.DatabaseError on execute() (corruption, I/O error)"): a
+    corrupt SQLite file surfaces its DatabaseError during connection setup
+    (_get_conn's WAL pragma / _ensure_schema SELECT), which
+    ``_get_conn_for_read()`` wraps into LogBackendReadError — NOT via a mocked
+    inner ``execute()``. Steps:
+
+      1. Drop the cached thread-local connection so the next call reconnects.
+      2. Delete the WAL/SHM sidecars (otherwise sqlite may recover from them).
+      3. Overwrite the main .db file with non-database garbage bytes.
+
+    In-memory backends have no on-disk file to corrupt and are not used by the
+    sqlite conformance factory (which points at ``scope_root / 'logs.db'``).
+    """
+    import os
+
+    # 1. Drop the thread-local connection (close it first to release the file).
+    conn = getattr(backend._tls, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        backend._tls.conn = None
+
+    db_path = backend._db_path
+    # 2. Remove the WAL/SHM sidecars so SQLite cannot recover the header.
+    for sidecar in (f"{db_path}-wal", f"{db_path}-shm"):
+        try:
+            os.remove(sidecar)
+        except FileNotFoundError:
+            pass
+
+    # 3. Overwrite the main database file with non-database garbage. The SQLite
+    #    header magic ("SQLite format 3\000") no longer matches, so the next
+    #    connection's first execute() raises sqlite3.DatabaseError.
+    with open(db_path, "wb") as fh:
+        fh.write(b"this is not a sqlite database file " * 8)
+
+
+def _make_postgres_break_read(backend):
+    """Return a break_read_fn that monkeypatches _run_with_reconnect to raise.
+
+    Raises a REAL ``psycopg.OperationalError`` (a ``psycopg.Error`` subclass),
+    NOT a generic exception: spec/22's boundary table scopes the Postgres wrap
+    to "psycopg error surviving the one-shot reconnect retry → raise
+    LogBackendReadError", and the impl now catches ``psycopg.Error`` NARROWLY
+    (so a generic RuntimeError would NOT be wrapped — it would propagate as a
+    code defect, symmetric with SQLite's narrow ``sqlite3.DatabaseError``).
+    Injecting the spec-named type proves the actual read-failure boundary
+    rather than a generic catch-all. psycopg is importable here because this
+    factory only runs when ``_POSTGRES_AVAILABLE`` is True.
+    """
+    import psycopg  # noqa: PLC0415
+
+    def _break():
+        def _raise(_op):
+            # Simulate a psycopg OperationalError escaping _run_with_reconnect
+            # (e.g., connection drop on the one-shot retry attempt as well).
+            raise psycopg.OperationalError(
+                "simulated unrecoverable postgres read failure"
+            )
+
+        backend._run_with_reconnect = _raise
+
+    return _break
+
+
+# Backend-and-breaker parameter list (parallel structure to BACKEND_FACTORIES
+# but carries the break_read_fn). filesystem + sqlite are always present
+# (local, no server). postgres is added ONLY when _POSTGRES_AVAILABLE is True
+# (ATOMIC_AGENTS_TEST_POSTGRES_URL set AND psycopg importable) — the fixture
+# constructs the backend against a LIVE server and appends a seed record before
+# breaking, so the postgres read-failure test is SKIPPED without a server.
+# Monkeypatching only avoids a server FOR THE BREAK INJECTION, not for
+# constructing/seeding the backend.
+
+_BACKEND_AND_BREAKER_PARAMS: list[tuple[str, Callable, Callable]] = []
+
+# Filesystem entry.
+_BACKEND_AND_BREAKER_PARAMS.append(("filesystem", _filesystem_factory, _fs_break_read))
+
+# SQLite entry.
+_BACKEND_AND_BREAKER_PARAMS.append(("sqlite", _sqlite_factory, _sqlite_break_read))
+
+# Postgres entry — added only when a live server is configured (see note above).
+if _POSTGRES_AVAILABLE:
+    _BACKEND_AND_BREAKER_PARAMS.append(
+        ("postgres", _postgres_factory, _make_postgres_break_read)
+    )
+
+
+@pytest.fixture(
+    params=_BACKEND_AND_BREAKER_PARAMS,
+    ids=lambda p: p[0],
+)
+def backend_and_breaker(request, tmp_path):
+    """Yields (backend, break_read_fn) for read-failure injection tests.
+
+    break_read_fn is a zero-argument callable that corrupts the backend's
+    read path so the next query/tail/aggregate call hits a genuine
+    unrecoverable failure.  The backend has already had one record appended
+    before break_read_fn is called, so the backend body is entered (not the
+    early-return [] path).
+    """
+    name, factory_fn, make_breaker = request.param
+    backend = factory_fn(tmp_path)
+    # Append a record to confirm the backend is live and to ensure the break
+    # exercises the read path (not the absent-backend early-return).
+    rec = _make_record(run_id="before-break")
+    backend.append(rec)
+
+    # For postgres: breaker is a factory (needs the backend instance).
+    # For fs/sqlite: breaker takes the backend directly.
+    if name == "postgres":
+        break_read_fn = make_breaker(backend)
+    else:
+        break_read_fn = lambda: make_breaker(backend)  # noqa: E731
+
+    yield backend, break_read_fn
+
+    # Teardown: filesystem break replaces log/ with a file; restore is not
+    # strictly needed (tmp_path is cleaned up by pytest), but we do close
+    # the backend if it has a close() method (Postgres cleanup).
+    if hasattr(backend, "close"):
+        try:
+            backend.close()
+        except Exception:
+            pass
+
+
+def test_query_raises_log_backend_read_error(backend_and_breaker):
+    """query() MUST raise LogBackendReadError on unrecoverable read failure.
+
+    spec/22 read-failure posture addendum: break_read() injects a genuine
+    I/O failure AFTER a successful append so the query() body is entered,
+    not the absent-backend early-return path.
+
+    Asserts:
+    - LogBackendReadError is raised (not the raw native error type)
+    - The raised exception is a subclass of AtomicAgentsError
+    - __cause__ is the underlying native error (chained exception) for ALL
+      backends — every reference impl wraps with ``raise ... from exc``.
+    """
+    backend, break_read_fn = backend_and_breaker
+    break_read_fn()
+    with pytest.raises(LogBackendReadError) as exc_info:
+        backend.query(LogQuery())
+    # Typed exception is part of the AtomicAgentsError hierarchy.
+    assert isinstance(exc_info.value, AtomicAgentsError)
+    # Exception must be properly chained (not a bare raise) — all three
+    # reference impls use ``raise LogBackendReadError(...) from exc``.
+    assert exc_info.value.__cause__ is not None
+
+
+def test_tail_raises_log_backend_read_error(backend_and_breaker):
+    """tail() MUST raise LogBackendReadError on unrecoverable read failure.
+
+    Mirrors test_query_raises_log_backend_read_error for the tail() path,
+    including the ``raise ... from exc`` chaining assertion.
+    """
+    backend, break_read_fn = backend_and_breaker
+    break_read_fn()
+    with pytest.raises(LogBackendReadError) as exc_info:
+        backend.tail(1)
+    # Same chaining contract as query(): a bare ``raise LogBackendReadError``
+    # (no ``from exc``) would pass conformance otherwise.
+    assert exc_info.value.__cause__ is not None
+
+
+def test_aggregate_raises_log_backend_read_error(backend_and_breaker):
+    """aggregate() MUST raise LogBackendReadError on unrecoverable read failure.
+
+    Mirrors test_query_raises_log_backend_read_error for the aggregate() path,
+    including the ``raise ... from exc`` chaining assertion. The
+    ValueError-for-unknown-metric guard fires before any I/O, so we use a valid
+    metric (count) to reach the I/O path.
+    """
+    backend, break_read_fn = backend_and_breaker
+    break_read_fn()
+    with pytest.raises(LogBackendReadError) as exc_info:
+        backend.aggregate(
+            LogQuery(), LogAggregate(group_by=("primitive",), metric="count")
+        )
+    assert exc_info.value.__cause__ is not None
+
+
+def test_sum_via_backend_fails_closed_on_log_backend_read_error(tmp_path, caplog):
+    """_sum_via_backend MUST return degraded=True when the backend raises
+    LogBackendReadError (reader-seam test).
+
+    spec/22 read-failure addendum: the layered catch in _costs._sum_via_backend
+    catches LogBackendReadError FIRST (typed catch — clean log), then the broad
+    Exception backstop. This test verifies the typed branch fires and returns
+    CostReadResult(total_usd=0.0, degraded=True).
+
+    Discriminating assertion (review #497): degraded=True alone does NOT prove
+    the TYPED branch fired — the broad ``except Exception`` also catches
+    LogBackendReadError (it is an Exception subclass) and returns the same
+    degraded result. We assert the typed branch's distinctive log line ("genuine
+    unrecoverable read failure"); the broad backstop logs "raised unexpected"
+    instead, so this FAILS if the typed handler is removed.
+    """
+    import logging
+    from datetime import date
+    from unittest.mock import MagicMock
+
+    from atomic_agents._costs import _sum_via_backend, CostReadResult
+
+    # Build a mock backend whose query() raises LogBackendReadError.
+    mock_backend = MagicMock()
+    mock_backend.query.side_effect = LogBackendReadError("injected read failure")
+
+    with caplog.at_level(logging.WARNING, logger="atomic_agents._costs"):
+        result = _sum_via_backend(
+            backend=mock_backend,
+            today=date(2026, 6, 14),
+            period="today",
+            source=None,
+            mandate_id=None,
+            agent_name=None,
+        )
+
+    assert isinstance(result, CostReadResult)
+    assert result.degraded is True
+    assert result.total_usd == 0.0
+    # Verify the TYPED branch fired (not the broad backstop): distinctive log.
+    assert mock_backend.query.called
+    assert "genuine unrecoverable read failure" in caplog.text
+    assert "raised unexpected" not in caplog.text

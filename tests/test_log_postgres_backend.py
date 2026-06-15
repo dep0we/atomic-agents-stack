@@ -803,11 +803,19 @@ def test_read_error_discards_connection_prevents_aborted_tx_trap():
     from atomic_agents.logs import LogQuery
 
     # First connection: execute raises immediately (simulates a transient SQL
-    # error leaving the transaction in ABORTED state).
+    # error leaving the transaction in ABORTED state). The error must be a
+    # psycopg.Error subclass: the read-failure wrap now catches psycopg.Error
+    # NARROWLY (not bare Exception), so a non-psycopg error would propagate as a
+    # code defect rather than being wrapped into LogBackendReadError. We use a
+    # dedicated subclass so the cause assertion below is type-precise.
+    class _FakePsycopgError(Exception):
+        """Stands in for a psycopg.Error subclass (the mock aliases
+        ``psycopg.Error = _FakePsycopgError`` below)."""
+
     bad_conn = MagicMock()
     bad_conn.closed = 0
     bad_conn.broken = False
-    bad_conn.execute.side_effect = RuntimeError("simulated SQL error")
+    bad_conn.execute.side_effect = _FakePsycopgError("simulated SQL error")
 
     # Second connection: healthy.
     # _ensure_schema calls execute(advisory_lock), execute(CREATE TABLE×N),
@@ -832,7 +840,9 @@ def test_read_error_discards_connection_prevents_aborted_tx_trap():
         return good_conn
 
     psycopg_mock = MagicMock()
-    psycopg_mock.Error = Exception
+    # The read-failure wrap resolves the catch class via psycopg.Error; alias it
+    # to our fake subclass so the narrow catch actually wraps the injected error.
+    psycopg_mock.Error = _FakePsycopgError
     psycopg_mock.connect.side_effect = connect_side_effect
     psycopg_mock.rows = MagicMock()
     psycopg_mock.rows.dict_row = MagicMock()
@@ -851,9 +861,16 @@ def test_read_error_discards_connection_prevents_aborted_tx_trap():
         # reuse of a connection whose transaction went ABORTED).
         backend._tls.conn = bad_conn
 
-        # First query must raise (the SQL error).
-        with pytest.raises(RuntimeError, match="simulated SQL error"):
+        # First query must raise LogBackendReadError (spec/22 addendum: the
+        # postgres backend wraps a psycopg.Error surviving the one-shot
+        # reconnect into LogBackendReadError). The original psycopg error is
+        # the __cause__.
+        from atomic_agents import LogBackendReadError
+
+        with pytest.raises(LogBackendReadError) as exc_info:
             backend.query(LogQuery(run_id=None))
+        assert isinstance(exc_info.value.__cause__, _FakePsycopgError)
+        assert "simulated SQL error" in str(exc_info.value.__cause__)
 
         # After the error, the connection must have been discarded.
         assert backend._tls.conn is None, (
@@ -875,6 +892,77 @@ def test_read_error_discards_connection_prevents_aborted_tx_trap():
             "_get_conn() must have called psycopg.connect() once to rebuild "
             "the fresh connection on the second query"
         )
+
+
+def test_tail_and_aggregate_wrap_psycopg_error_as_log_backend_read_error():
+    """tail() and aggregate() MUST wrap a psycopg.Error into LogBackendReadError,
+    symmetric with the query() path.
+
+    spec/22 read-failure addendum (#497). SCOPE NOTE (review #497): every
+    connection this mock builds raises ``psycopg.Error`` on execute(), so the
+    failure surfaces inside ``_get_conn_for_read()`` (the connect-time
+    schema-read establishment) — which is the REALISTIC corruption surface the
+    addendum's boundary table names, and is itself a read-failure wrap that
+    tail()/aggregate() must honor. It does NOT exercise the post-connect
+    ``_run_with_reconnect`` wrap (that would need a connection whose schema
+    establishment succeeds but whose data query then fails); that shared wrap is
+    already proven for query() by
+    ``test_read_error_discards_connection_prevents_aborted_tx_trap`` (pre-seeded
+    ``_tls.conn``). The conformance read-error tests cover tail/aggregate
+    end-to-end ONLY against a live server (skipped without
+    ATOMIC_AGENTS_TEST_POSTGRES_URL); this pins the off-server connect-time wrap
+    for the other two read methods so they are not silently uncovered.
+    """
+    import threading
+    from unittest.mock import MagicMock, patch
+
+    from atomic_agents import LogBackendReadError
+    from atomic_agents.logs import LogAggregate, LogQuery
+    from atomic_agents.logs.postgres import PostgresLogBackend
+
+    # A psycopg.Error subclass — the wrap catches psycopg.Error NARROWLY, so a
+    # non-psycopg error would propagate as a code defect rather than be wrapped.
+    class _FakePsycopgError(Exception):
+        pass
+
+    def _make_failing_conn():
+        # Every connection's execute raises — both the initial connection and
+        # any one-shot reconnect attempt — so the read definitively fails (not a
+        # transient disconnect that recovers on retry).
+        c = MagicMock()
+        c.closed = 0
+        c.broken = False
+        c.execute.side_effect = _FakePsycopgError("simulated unrecoverable read")
+        return c
+
+    psycopg_mock = MagicMock()
+    psycopg_mock.Error = _FakePsycopgError
+    psycopg_mock.connect.side_effect = lambda **kw: _make_failing_conn()
+    psycopg_mock.rows = MagicMock()
+    psycopg_mock.rows.dict_row = MagicMock()
+
+    def _fresh_backend():
+        b = PostgresLogBackend.__new__(PostgresLogBackend)
+        b._host = "localhost"
+        b._port = 5432
+        b._dbname = "test"
+        b._user = "u"
+        b._password = "p"
+        b._safe_url = "postgresql://u:***@localhost/test"
+        b._tls = threading.local()
+        return b
+
+    with patch.dict(__import__("sys").modules, {"psycopg": psycopg_mock}):
+        with pytest.raises(LogBackendReadError) as ei_tail:
+            _fresh_backend().tail(5)
+        assert isinstance(ei_tail.value.__cause__, _FakePsycopgError)
+
+        with pytest.raises(LogBackendReadError) as ei_agg:
+            _fresh_backend().aggregate(
+                LogQuery(),
+                LogAggregate(group_by=("primitive",), metric="count"),
+            )
+        assert isinstance(ei_agg.value.__cause__, _FakePsycopgError)
 
 
 # ─────────────────────────────────────────────────────────────────

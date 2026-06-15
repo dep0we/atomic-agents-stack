@@ -137,6 +137,7 @@ from datetime import date, datetime, time as dt_time
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse
 
+from ..exceptions import LogBackendReadError
 from .types import (
     LogAggregate,
     LogCapabilities,
@@ -152,6 +153,30 @@ from .types import (
 )
 
 _logger = logging.getLogger(__name__)
+
+
+def _psycopg_error() -> type[BaseException]:
+    """Return ``psycopg.Error`` (the base exception class) for use in
+    ``except`` clauses on the read-failure boundary.
+
+    psycopg is importable at the read-method **post-connect** wrap sites: the
+    read methods call ``self._get_conn()`` (which imports + connects) BEFORE
+    entering the ``except _psycopg_error()`` wrap, so by the time those wraps are
+    evaluated the extra is present. (Narrow caveat: ``_get_conn_for_read`` wraps
+    ``self._get_conn()`` itself — if the ``postgres`` extra is absent,
+    ``_get_conn`` raises a curated ImportError and Python then evaluates this
+    ``except`` clause, which re-imports psycopg and raises a second, less-helpful
+    ImportError during exception handling. The practical message in both cases
+    still names psycopg, so this is a cosmetic edge limited to constructing a
+    Postgres backend with psycopg uninstalled — not a correctness issue.)
+    Resolving the class lazily (rather than at module import) keeps the
+    ``postgres`` extra optional for callers that never touch this backend,
+    mirroring the lazy ``import psycopg`` pattern at ``_get_conn``.
+    """
+    import psycopg  # noqa: PLC0415 — lazy import by design
+
+    return psycopg.Error
+
 
 # Schema version — independent of SQLite's _SCHEMA_VERSION = 1.
 # Bumping SQLite v1→v2 does NOT require bumping Postgres v1→v2 and vice versa.
@@ -625,6 +650,38 @@ class PostgresLogBackend:
             self._tls.conn = conn
         return conn
 
+    def _get_conn_for_read(self, op: str) -> Any:
+        """``_get_conn()`` wrapped for the spec/22 read-failure boundary.
+
+        Mirrors ``SQLiteLogBackend._get_conn_for_read``. The realistic
+        connect-time read failure for Postgres is a *connectable-but-corrupt*
+        database whose meta-table ``SELECT`` inside ``_ensure_schema()`` raises a
+        raw ``psycopg.Error`` on first connect. ``_ensure_schema``'s own
+        ``except Exception: ... raise`` re-raises that psycopg error UNWRAPPED,
+        so without this helper it would escape the read methods' post-connect
+        ``except _psycopg_error()`` wrap (which only surrounds
+        ``_run_with_reconnect(_do)``) and surface as a raw psycopg error — the
+        one connect-time path the per-call wrap misses.
+
+        Boundary carve-out (matches SQLite + the spec/22 boundary table):
+          - ``ValueError`` (could-not-connect, DSN-redacted — raised by
+            ``_get_conn`` when ``psycopg.connect`` fails) → config error,
+            propagates uncaught.
+          - ``RuntimeError`` (schema-version mismatch from ``_ensure_schema``)
+            → config error, propagates uncaught.
+          - ``psycopg.Error`` (connectable-but-corrupt meta-table SELECT) →
+            wrapped as ``LogBackendReadError`` here, so the typed-signal
+            contract holds on the connect-time-schema-read path too.
+        """
+        try:
+            return self._get_conn()
+        except _psycopg_error() as exc:
+            raise LogBackendReadError(
+                f"PostgresLogBackend: unrecoverable read failure establishing "
+                f"connection in {op}() (connectable-but-corrupt database or "
+                f"connect-time I/O error): {exc}"
+            ) from exc
+
     def _ensure_schema(self, conn: Any) -> None:
         """Create tables + indexes if missing; assert schema version.
 
@@ -907,7 +964,39 @@ class PostgresLogBackend:
             conn.commit()
             return rows
 
-        rows = self._run_with_reconnect(_do)
+        # spec/22 read-failure addendum boundary carve-out (mirrors SQLite's
+        # NARROW catch). Establish the connection + schema via _get_conn_for_read
+        # so config/deploy errors propagate with their own taxonomy
+        # (ValueError = could-not-connect, RuntimeError = schema-version
+        # mismatch) while a connect-time-schema-read corruption (raw
+        # psycopg.Error from _ensure_schema's meta SELECT) is wrapped as
+        # LogBackendReadError — the one connect-time path the post-connect wrap
+        # below otherwise misses.
+        # Return value intentionally discarded: we only need the connect-time
+        # corruption wrap here; the actual conn is (cheaply) re-fetched from the
+        # thread-local cache inside _run_with_reconnect → _get_conn below.
+        self._get_conn_for_read("query")
+        # Wrap ONLY psycopg errors that survive the one-shot reconnect —
+        # corruption / I/O error / connection drop after retry. We catch
+        # ``psycopg.Error`` (the base class, mirroring _get_conn's
+        # ``except psycopg.Error`` at line 622), NOT bare ``Exception``: a
+        # statement-level psycopg error (ProgrammingError / syntax error) is a
+        # genuine read failure at this point, but a non-psycopg bug in the query
+        # builder or _do closure is a CODE DEFECT that MUST surface as itself,
+        # not be relabeled a transient read failure (which the cost reader would
+        # silently degrade the gate on). This also keeps the catch breadth
+        # symmetric with SQLite's narrow ``sqlite3.DatabaseError`` catch. A
+        # ValueError/RuntimeError raised by _get_conn() on the INNER reconnect
+        # path (server hard-down / schema mismatch on the reconnect target) is
+        # NOT a psycopg.Error, so it too propagates uncaught — matching the
+        # boundary table's "config error, NOT a read failure" row on every path,
+        # not just first-connect.
+        try:
+            rows = self._run_with_reconnect(_do)
+        except _psycopg_error() as exc:
+            raise LogBackendReadError(
+                f"PostgresLogBackend: unrecoverable read failure in query(): {exc}"
+            ) from exc
         return [self._row_to_record(row) for row in rows]
 
     # ────────────────────────────────────────────────────────────
@@ -933,7 +1022,25 @@ class PostgresLogBackend:
             conn.commit()
             return rows
 
-        rows = self._run_with_reconnect(_do)
+        # spec/22 read-failure addendum boundary carve-out (mirrors SQLite's
+        # NARROW catch). Establish connection + schema via _get_conn_for_read so
+        # first-connect ValueError (could-not-connect) / RuntimeError
+        # (schema-version mismatch) propagate uncaught as config errors, while a
+        # connect-time-schema-read corruption (raw psycopg.Error) is wrapped as
+        # LogBackendReadError. ValueError (negative n) is raised above.
+        # Return value intentionally discarded (see query() — conn is re-fetched
+        # from the thread-local cache inside _run_with_reconnect below).
+        self._get_conn_for_read("tail")
+        # Wrap ONLY psycopg.Error surviving the one-shot reconnect (see query()
+        # for the full rationale: narrow catch keeps code defects + config
+        # errors from being relabeled transient read failures, and stays
+        # symmetric with SQLite).
+        try:
+            rows = self._run_with_reconnect(_do)
+        except _psycopg_error() as exc:
+            raise LogBackendReadError(
+                f"PostgresLogBackend: unrecoverable read failure in tail(): {exc}"
+            ) from exc
         records = [self._row_to_record(row) for row in rows]
         records.reverse()
         return records
@@ -1015,7 +1122,24 @@ class PostgresLogBackend:
             conn.commit()
             return rows
 
-        rows = self._run_with_reconnect(_do)
+        # spec/22 read-failure addendum boundary carve-out (mirrors SQLite's
+        # NARROW catch). Establish connection + schema via _get_conn_for_read so
+        # first-connect ValueError (could-not-connect) / RuntimeError
+        # (schema-version mismatch) propagate uncaught as config errors, while a
+        # connect-time-schema-read corruption (raw psycopg.Error) is wrapped as
+        # LogBackendReadError. ValueError (unknown metric, invalid group_by) is
+        # raised above.
+        # Return value intentionally discarded (see query() — conn is re-fetched
+        # from the thread-local cache inside _run_with_reconnect below).
+        self._get_conn_for_read("aggregate")
+        # Wrap ONLY psycopg.Error surviving the one-shot reconnect (see query()
+        # for the full rationale).
+        try:
+            rows = self._run_with_reconnect(_do)
+        except _psycopg_error() as exc:
+            raise LogBackendReadError(
+                f"PostgresLogBackend: unrecoverable read failure in aggregate(): {exc}"
+            ) from exc
 
         result: dict[tuple, float | int] = {}
         for row in rows:
