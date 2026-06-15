@@ -2777,6 +2777,10 @@ class TestMandateCheckCapExceededBlock:
             "mandate_external_cost_unprojectable",
             "mandate_escalation_threshold_hit_token",
             "mandate_escalation_threshold_hit_external",
+            # #506 — new third reason for prior-spend/projection read failures
+            "mandate_token_reservations_unreadable",
+            "mandate_external_reservations_unreadable",
+            "mandate_cost_unreadable",
         ]
         forbidden_fragments = ["_in_3a", "_pr3", "_v2", "_phase_b", "_3b", "_stub"]
 
@@ -2786,3 +2790,605 @@ class TestMandateCheckCapExceededBlock:
                     f"Reason {reason!r} contains PR-identifier fragment {fragment!r}; "
                     "BLOCK reasons must be forever-stable per spec/29 §'BLOCK reason naming discipline'"
                 )
+
+
+def _query_blind_on(kind: str, error: BaseException, *, occurrence: int = 1):
+    """Build a callable ``side_effect`` for ``null_log_backend.query`` that raises
+    ``error`` on the ``occurrence``-th query of the given ``kind`` and returns
+    ``[]`` for every other query.
+
+    Keyed on query SHAPE + per-kind occurrence, NOT global call position, so it is
+    immune to ``compute_outstanding``'s variable query count (1 reservation query
+    when there are no create-events, else reservation + cost = 2). That call-count
+    drift was the root cause of the list-based ``side_effect`` flakiness the #506
+    review flagged (P1): a fixed-length list shifts which query receives the error.
+
+    ``kind``: ``"project"`` (_project_token_cost), ``"token_sum"``
+    (_sum_prior_token_cost), or ``"external_sum"`` (_sum_prior_external_cost).
+    """
+    seen: dict[str, int] = {}
+
+    def _classify(q: Any) -> str:
+        # compute_outstanding's reservation/cost queries always set `primitive`
+        # (and agent_name); the three cost-read helpers never do. Exclude them
+        # first so a cost_source="actor" cost_query is not mistaken for token_sum.
+        if getattr(q, "primitive", None) is not None:
+            return "other"
+        if getattr(q, "limit", None) == 1:
+            return "project"  # LogQuery(run_id=..., cost_source="actor", limit=1)
+        cost_source = getattr(q, "cost_source", None)
+        mandate_id = getattr(q, "mandate_id", None)
+        if cost_source == "actor" and mandate_id is not None:
+            return "token_sum"  # LogQuery(cost_source="actor", mandate_id=...)
+        if cost_source is None and mandate_id is not None:
+            return "external_sum"  # LogQuery(mandate_id=...)
+        return "other"
+
+    def _dispatch(q: Any) -> list:
+        k = _classify(q)
+        seen[k] = seen.get(k, 0) + 1
+        if k == kind and seen[k] == occurrence:
+            raise error
+        return []
+
+    return _dispatch
+
+
+class TestMandateCheckCostUnreadable:
+    """#506 — blind-read fail-closed posture: prior-spend / projection read failures.
+
+    Covers the three helpers (_sum_prior_token_cost, _sum_prior_external_cost,
+    _project_token_cost) plus the evaluate()-level try/except that converts
+    _MandateCostUnreadable → BLOCK reason='mandate_cost_unreadable'.
+
+    Negative controls per feedback_layered_except_typed_branch_false_green and
+    feedback_false_green_test_needs_per_invocation_negative_control:
+    - each typed-branch test asserts the branch-distinctive WARNING log line
+    - each code-defect-propagates test verifies with pytest.raises (not outcome)
+    """
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _capped_mandate(mandate_id: str) -> "Mandate":
+        """Mandate with a tight daily_token_usd cap (0.01 < $0.10 default projection)."""
+        from datetime import timedelta
+
+        now = datetime.now(timezone.utc)
+        return Mandate(
+            mandate_id=mandate_id,
+            scope="agent:test-agent",
+            granted_by="test-operator@example.com",
+            granted_at=now,
+            expires_at=now + timedelta(days=30),
+            revocation_state=RevocationState.ACTIVE,
+            revoked_at=None,
+            revoked_by=None,
+            revocation_reason=None,
+            constraints=MandateConstraints(
+                allowed_tools=frozenset(["test_tool"]),
+                daily_token_usd=0.01,  # tight cap: 0.01 < default $0.10 projection
+            ),
+            source_hash="sha256:capped-506",
+        )
+
+    @staticmethod
+    def _external_capped_mandate(mandate_id: str) -> "Mandate":
+        """Mandate with a tight daily_external_usd cap for external-path tests."""
+        from datetime import timedelta
+        from atomic_agents.tools import ToolRegistry
+
+        now = datetime.now(timezone.utc)
+        return Mandate(
+            mandate_id=mandate_id,
+            scope="agent:test-agent",
+            granted_by="test-operator@example.com",
+            granted_at=now,
+            expires_at=now + timedelta(days=30),
+            revocation_state=RevocationState.ACTIVE,
+            revoked_at=None,
+            revoked_by=None,
+            revocation_reason=None,
+            constraints=MandateConstraints(
+                allowed_tools=frozenset(["test_tool"]),
+                daily_external_usd=0.01,  # tight: 0.01 < $1.0 tool cost
+            ),
+            source_hash="sha256:ext-capped-506",
+        )
+
+    # ── _sum_prior_token_cost — narrow read failures ───────────────────────────
+
+    def test_sum_prior_token_cost_log_backend_read_error_blocks_closed(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """_sum_prior_token_cost: LogBackendReadError → BLOCK mandate_cost_unreadable.
+
+        Negative control: null_log_backend.query returns [] without exception, so
+        with the pre-#506 fail-open path (except Exception → return 0.0) the
+        proposal would pass the daily_token_usd=0.01 cap (prior cost = 0.0 < cap).
+        The narrow-catch flip makes LogBackendReadError → _MandateCostUnreadable →
+        BLOCK.  This test FAILS (ALLOW) if the narrow catch is removed and the
+        broad except-and-return-0 path is restored.
+        """
+        from atomic_agents.exceptions import LogBackendReadError as LBRError
+
+        mandate_id = "sum-token-lbr"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = self._capped_mandate(mandate_id)
+        mc = _make_mc(mandate_backend, scope, null_log_backend)
+
+        # Raise on the _sum_prior_token_cost read (shape-keyed, drift-immune);
+        # _project_token_cost + compute_outstanding return [].
+        null_log_backend.query.side_effect = _query_blind_on(
+            "token_sum",
+            LBRError("simulated LogBackendReadError in sum_prior_token_cost"),
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            with caplog.at_level("WARNING", logger="atomic_agents.judge.mandate_check"):
+                judgment = mc.evaluate(proposal)
+
+        assert judgment.outcome == JudgmentOutcome.BLOCK
+        assert judgment.reason.startswith("mandate_cost_unreadable")
+        # Distinctive log line — branch identity check per feedback_layered_except
+        assert any(
+            "step 7" in r.message and "mandate_cost_unreadable" in r.message
+            for r in caplog.records
+            if r.levelname == "WARNING"
+        ), "Expected WARNING log containing 'step 7' and 'mandate_cost_unreadable'"
+
+    def test_sum_prior_token_cost_os_error_blocks_closed(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """_sum_prior_token_cost: OSError (narrow family member) → BLOCK mandate_cost_unreadable."""
+        mandate_id = "sum-token-oserror"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = self._capped_mandate(mandate_id)
+        mc = _make_mc(mandate_backend, scope, null_log_backend)
+
+        null_log_backend.query.side_effect = _query_blind_on(
+            "token_sum",
+            OSError("simulated filesystem OSError in sum_prior_token_cost"),
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+
+        assert judgment.outcome == JudgmentOutcome.BLOCK
+        assert judgment.reason.startswith("mandate_cost_unreadable")
+
+    def test_sum_prior_token_cost_sqlite_error_blocks_closed(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """_sum_prior_token_cost: sqlite3.DatabaseError (narrow family member) → BLOCK."""
+        import sqlite3
+
+        mandate_id = "sum-token-sqlite"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = self._capped_mandate(mandate_id)
+        mc = _make_mc(mandate_backend, scope, null_log_backend)
+
+        null_log_backend.query.side_effect = _query_blind_on(
+            "token_sum",
+            sqlite3.DatabaseError("simulated sqlite3.DatabaseError"),
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+
+        assert judgment.outcome == JudgmentOutcome.BLOCK
+        assert judgment.reason.startswith("mandate_cost_unreadable")
+
+    def test_sum_prior_token_cost_key_error_propagates(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """_sum_prior_token_cost: KeyError (code defect) propagates unchanged.
+
+        A KeyError is NOT in the narrow-catch family — it must propagate as
+        itself, not be silently converted to a cost-log BLOCK or a 0.0 return.
+        Verifying this with pytest.raises rather than checking judgment.reason
+        ensures the typed-branch false-green pattern is avoided.
+        """
+        mandate_id = "sum-token-keyerror"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = self._capped_mandate(mandate_id)
+        mc = _make_mc(mandate_backend, scope, null_log_backend)
+
+        null_log_backend.query.side_effect = _query_blind_on(
+            "token_sum",
+            KeyError("code defect: unexpected key in log record"),
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            with pytest.raises(KeyError):
+                mc.evaluate(proposal)
+
+    # ── _sum_prior_external_cost — narrow read failures ───────────────────────
+
+    def test_sum_prior_external_cost_log_backend_read_error_blocks_closed(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """_sum_prior_external_cost: LogBackendReadError → BLOCK mandate_cost_unreadable.
+
+        Negative control: null_log_backend.query returns [] by default, so with
+        the pre-#506 fail-open path the cap wouldn't be exceeded (prior = 0.0).
+        This test FAILS (ALLOW) if the narrow catch on _sum_prior_external_cost
+        is reverted to except-Exception-return-0.
+        """
+        from atomic_agents.exceptions import LogBackendReadError as LBRError
+        from atomic_agents.tools import ToolRegistry
+
+        mandate_id = "sum-ext-lbr"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = self._external_capped_mandate(mandate_id)
+        mc = _make_mc_with_tool(
+            mandate_backend, scope, null_log_backend, "test_tool", 1.0
+        )
+
+        # No token cap → _step7 skipped; _step8 calls _sum_prior_external_cost
+        # (raises) + compute_outstanding (returns []).  Shape-keyed, drift-immune.
+        null_log_backend.query.side_effect = _query_blind_on(
+            "external_sum",
+            LBRError("simulated LogBackendReadError in sum_prior_external_cost"),
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            with caplog.at_level("WARNING", logger="atomic_agents.judge.mandate_check"):
+                judgment = mc.evaluate(proposal)
+
+        assert judgment.outcome == JudgmentOutcome.BLOCK
+        assert judgment.reason.startswith("mandate_cost_unreadable")
+        assert any(
+            "step 8" in r.message and "mandate_cost_unreadable" in r.message
+            for r in caplog.records
+            if r.levelname == "WARNING"
+        ), "Expected WARNING log containing 'step 8' and 'mandate_cost_unreadable'"
+
+    def test_sum_prior_external_cost_key_error_propagates(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """_sum_prior_external_cost: KeyError (code defect) propagates unchanged."""
+        from atomic_agents.tools import ToolRegistry
+
+        mandate_id = "sum-ext-keyerror"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = self._external_capped_mandate(mandate_id)
+        mc = _make_mc_with_tool(
+            mandate_backend, scope, null_log_backend, "test_tool", 1.0
+        )
+
+        null_log_backend.query.side_effect = _query_blind_on(
+            "external_sum",
+            KeyError("code defect in external sum"),
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            with pytest.raises(KeyError):
+                mc.evaluate(proposal)
+
+    # ── _project_token_cost — cap-gated fail-close ────────────────────────────
+
+    def test_project_token_cost_read_failure_no_cap_degrades_to_default(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """_project_token_cost read failure + cap_active=False → degrade-to-default, ALLOW.
+
+        The cap_active=False path fires when a token escalation threshold exists
+        (so _step7 runs) but NO token budget cap is set.  In that case
+        _project_token_cost uses a generous fallback ($0.10 default) instead of
+        failing closed — there is no cap to bypass, so spurious blocking is avoided
+        (feedback_fail_closed_only_where_theres_something_to_protect).
+
+        Mandate has requires_escalation_above_token_usd=100.0 (way above the $0.10
+        default) but no token budget cap.  The read failure degrades to $0.10 and
+        the escalation check does NOT fire → ALLOW.
+        """
+        from atomic_agents.exceptions import LogBackendReadError as LBRError
+
+        mandate_id = "project-no-cap-degrade"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        from datetime import timedelta
+
+        now = datetime.now(timezone.utc)
+        mandate = Mandate(
+            mandate_id=mandate_id,
+            scope="agent:test-agent",
+            granted_by="test-operator@example.com",
+            granted_at=now,
+            expires_at=now + timedelta(days=30),
+            revocation_state=RevocationState.ACTIVE,
+            revoked_at=None,
+            revoked_by=None,
+            revocation_reason=None,
+            constraints=MandateConstraints(
+                allowed_tools=frozenset(["test_tool"]),
+                # NO token budget caps (daily/monthly/cumulative all None) →
+                # cap_active=False; _project_token_cost read failure degrades safely
+                requires_escalation_above_token_usd=100.0,  # threshold above $0.10 default
+            ),
+            source_hash="sha256:no-cap-degrade",
+        )
+        mc = _make_mc(mandate_backend, scope, null_log_backend)
+
+        # _project_token_cost read fails (cap_active=False → degrades to $0.10);
+        # every other read returns [].  Projection $0.10 < escalation 100.0 → ALLOW.
+        null_log_backend.query.side_effect = _query_blind_on(
+            "project",
+            LBRError("simulated read failure in preceding-iteration baseline read"),
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+
+        assert judgment.outcome == JudgmentOutcome.ALLOW
+
+    def test_project_token_cost_read_failure_with_cap_blocks_closed(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """_project_token_cost read failure + cap_active=True → BLOCK mandate_cost_unreadable.
+
+        Mandate has a tight daily_token_usd cap (0.01).  When the preceding-
+        iteration read fails and a cap is in effect, the gate cannot verify the
+        projection is safe → fail-closed.
+
+        Negative control: if cap_active were always False (cap-gating removed),
+        the read failure would degrade to $0.10 default and the cap check would
+        produce mandate_cap_would_exceed — NOT mandate_cost_unreadable.  This
+        test distinguishes the two outcomes.
+        """
+        from atomic_agents.exceptions import LogBackendReadError as LBRError
+
+        mandate_id = "project-with-cap-block"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = self._capped_mandate(mandate_id)  # daily_token_usd=0.01
+        mc = _make_mc(mandate_backend, scope, null_log_backend)
+
+        # _project_token_cost read fails; cap is active → _MandateCostUnreadable.
+        # The exception text deliberately does NOT contain "cap active" so the
+        # log-line assertion below can only be satisfied by the branch's OWN
+        # label, not by the interpolated exception message (P2-A:
+        # feedback_layered_except_typed_branch_false_green — the branch-identity
+        # signal must be load-bearing).
+        null_log_backend.query.side_effect = _query_blind_on(
+            "project",
+            LBRError("simulated read failure in preceding-iteration baseline read"),
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            with caplog.at_level("WARNING", logger="atomic_agents.judge.mandate_check"):
+                judgment = mc.evaluate(proposal)
+
+        assert judgment.outcome == JudgmentOutcome.BLOCK
+        assert judgment.reason.startswith("mandate_cost_unreadable")
+        # Distinctive branch log line — "cap active" appears ONLY in the
+        # cap-gated branch's own warning (mandate_check.py _project_token_cost),
+        # never in the exception text, so this is a load-bearing branch-identity
+        # assertion.
+        assert any(
+            "cap active" in r.message and "mandate_cost_unreadable" in r.message
+            for r in caplog.records
+            if r.levelname == "WARNING"
+        ), "Expected WARNING log containing 'cap active' and 'mandate_cost_unreadable'"
+
+    # ── cap-exceeded re-read path ─────────────────────────────────────────────
+
+    def test_cap_exceeded_token_sum_reread_failure_blocks_closed(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Cap-exceeded verdict: the TOKEN re-read (mandate_check.py:702) raises →
+        BLOCK mandate_cost_unreadable, not mandate_cap_would_exceed.
+
+        Per-invocation negative control for the token-side cap-exceeded re-read
+        (feedback_false_green_test_needs_per_invocation_negative_control): revert
+        _sum_prior_token_cost's raise to a fail-open return-0 and this flips to
+        mandate_cap_would_exceed.  The sibling external test below pins line 705.
+
+        For a token-capped mandate the projection ($0.10 default) exceeds the
+        0.01 cap, so caps_exceeded is non-empty; the SECOND _sum_prior_token_cost
+        call (occurrence 2, the diagnostic re-read) raises.  The dispatcher keys on
+        query shape + occurrence, so compute_outstanding's variable query count
+        cannot shift which read receives the error.
+        """
+        from atomic_agents.exceptions import LogBackendReadError as LBRError
+
+        mandate_id = "cap-exceeded-token-reread"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = self._capped_mandate(mandate_id)  # daily_token_usd=0.01
+        mc = _make_mc(mandate_backend, scope, null_log_backend)
+
+        # token_sum occurrence 1 = step-7 read ([]); occurrence 2 = cap-exceeded
+        # re-read at line 702 (raises).  Projection $0.10 > 0.01 → caps_exceeded.
+        null_log_backend.query.side_effect = _query_blind_on(
+            "token_sum",
+            LBRError("blind on cap-exceeded token re-read"),
+            occurrence=2,
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+
+        assert judgment.outcome == JudgmentOutcome.BLOCK
+        assert judgment.reason.startswith("mandate_cost_unreadable")
+
+    def test_cap_exceeded_external_sum_reread_failure_blocks_closed(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Cap-exceeded verdict: the EXTERNAL re-read (mandate_check.py:705) raises →
+        BLOCK mandate_cost_unreadable.
+
+        Per-invocation negative control for the external-side cap-exceeded re-read.
+        For a token-capped mandate _step8 is skipped, so the ONLY
+        _sum_prior_external_cost call is the cap-exceeded re-read at line 705
+        (external_sum occurrence 1).  Revert that helper's raise to a fail-open
+        return-0 and this flips to mandate_cap_would_exceed.
+        """
+        from atomic_agents.exceptions import LogBackendReadError as LBRError
+
+        mandate_id = "cap-exceeded-ext-reread"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = self._capped_mandate(mandate_id)  # daily_token_usd=0.01
+        mc = _make_mc(mandate_backend, scope, null_log_backend)
+
+        # Projection $0.10 > 0.01 cap → caps_exceeded; the external re-read at
+        # line 705 (external_sum occurrence 1 — _step8 skipped) raises.
+        null_log_backend.query.side_effect = _query_blind_on(
+            "external_sum",
+            LBRError("blind on cap-exceeded external re-read"),
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+
+        assert judgment.outcome == JudgmentOutcome.BLOCK
+        assert judgment.reason.startswith("mandate_cost_unreadable")
+
+    # ── boundary: empty log history → ALLOW (not a read failure) ─────────────
+
+    def test_empty_log_history_allows(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Empty log (query returns []) is NOT a read failure — it is an authoritative
+        'no prior spend' answer.  A generous-cap mandate must ALLOW.
+
+        Verifies that the narrow-catch does not conflate absence-of-data with a
+        read failure (feedback_fail_closed_catches_base_error_class: empty → []
+        is the boundary, not a failure).
+        """
+        mandate_id = "empty-log-allow"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        from datetime import timedelta
+
+        now = datetime.now(timezone.utc)
+        mandate = Mandate(
+            mandate_id=mandate_id,
+            scope="agent:test-agent",
+            granted_by="test-operator@example.com",
+            granted_at=now,
+            expires_at=now + timedelta(days=30),
+            revocation_state=RevocationState.ACTIVE,
+            revoked_at=None,
+            revoked_by=None,
+            revocation_reason=None,
+            constraints=MandateConstraints(
+                allowed_tools=frozenset(["test_tool"]),
+                daily_token_usd=10.0,  # generous cap — $0.10 default < 10.0
+            ),
+            source_hash="sha256:empty-log",
+        )
+        mc = _make_mc(mandate_backend, scope, null_log_backend)
+        # null_log_backend.query already returns [] by default (no side_effect needed)
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+
+        assert judgment.outcome == JudgmentOutcome.ALLOW
+
+    # ── documented residual: escalation-only-no-cap SUM over-block (#512) ──────
+
+    def test_escalation_only_no_cap_token_sum_failure_blocks_closed(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """#512 — pins the DELIBERATE escalation-only-no-cap over-block.
+
+        The prior-spend SUM helpers flip fail-closed UNCONDITIONALLY (the #506
+        ruling), unlike _project_token_cost (cap-gated).  For a mandate with a
+        token escalation threshold but NO cap, _step7 runs and _sum_prior_token_cost
+        is read; on a blind read it BLOCKs even though the summed value gates
+        nothing here (cumulative is compared only against absent caps, and the
+        escalate decision uses the projection).  This is fail-SAFE (over-block,
+        never leak) and spec-consistent (spec/29 §"Blind-read fail-closed posture"
+        acknowledges the asymmetry).  #512 tracks the optional refinement to
+        cap-gate the SUM helpers too; this test pins the current behavior so that
+        refinement is a conscious, tested change rather than an accidental one.
+        """
+        from datetime import timedelta
+
+        from atomic_agents.exceptions import LogBackendReadError as LBRError
+
+        mandate_id = "escalation-only-no-cap-512"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        now = datetime.now(timezone.utc)
+        mandate = Mandate(
+            mandate_id=mandate_id,
+            scope="agent:test-agent",
+            granted_by="test-operator@example.com",
+            granted_at=now,
+            expires_at=now + timedelta(days=30),
+            revocation_state=RevocationState.ACTIVE,
+            revoked_at=None,
+            revoked_by=None,
+            revocation_reason=None,
+            constraints=MandateConstraints(
+                allowed_tools=frozenset(["test_tool"]),
+                # escalation threshold but NO token cap → cap_active=False for the
+                # projection, yet the SUM helper still fails closed unconditionally.
+                requires_escalation_above_token_usd=100.0,
+            ),
+            source_hash="sha256:escalation-only-512",
+        )
+        mc = _make_mc(mandate_backend, scope, null_log_backend)
+
+        # _project_token_cost read succeeds ([] → $0.10 default, no raise); the
+        # _sum_prior_token_cost read fails → unconditional fail-closed → BLOCK.
+        null_log_backend.query.side_effect = _query_blind_on(
+            "token_sum",
+            LBRError("blind prior-spend read, escalation-only-no-cap mandate"),
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+
+        # Current (deliberate) behavior: BLOCK, not ALLOW/ESCALATE. See #512.
+        assert judgment.outcome == JudgmentOutcome.BLOCK
+        assert judgment.reason.startswith("mandate_cost_unreadable")

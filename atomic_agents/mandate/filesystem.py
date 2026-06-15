@@ -334,10 +334,11 @@ class FilesystemMandateBackend:
             )
             return []
 
-        # Derive EXPIRED state for mandates past expires_at (spec/29 line 548 —
-        # the framework computes expired at load time; mandates.md is never
-        # edited). The parser produces ACTIVE; we re-stamp REVOCATION_STATE
-        # here so callers see derived state consistently.
+        # Derive EXPIRED state for mandates past expires_at
+        # (spec/29 §"Source-hash-before-state ordering" — the framework
+        # computes expired at load time; mandates.md is never edited). The
+        # parser produces ACTIVE; we re-stamp REVOCATION_STATE here so callers
+        # see derived state consistently.
         from datetime import datetime as _dt, timezone as _tz
 
         now = _dt.now(_tz.utc)
@@ -596,7 +597,7 @@ class FilesystemMandateBackend:
 
         The TTL-age gate from ``compute_outstanding`` does NOT apply — after
         a crash, TTL is suspect; the recovery pass assumes committed
-        (spec/29 line 604).
+        (spec/29 §"Crash recovery for reservations").
         """
         from ..judge.mandate_reservations import ReservationRecord  # runtime import
 
@@ -654,9 +655,9 @@ class FilesystemMandateBackend:
                 resolved_proposal_ids.add(proposal_id)
 
         # Also resolve proposal_ids covered by cost events — clause 3 of
-        # the orphan definition (spec/29 line 582).  A cost event with a
-        # matching proposal_id means the spend was recorded even if the
-        # framework crashed before writing _committed.
+        # the orphan definition (spec/29 §"Cost reservation pattern" clause 3).
+        # A cost event with a matching proposal_id means the spend was recorded
+        # even if the framework crashed before writing _committed.
         #
         # Cost events use primitives like "agent_call", "tool", "outcome_iteration",
         # etc. — NOT PRIMITIVE_MANDATE_RESERVATION — so we need a separate query
@@ -710,7 +711,8 @@ class FilesystemMandateBackend:
             "mandate_id": orphan.mandate_id,
             "proposal_id": orphan.proposal_id,
             "cost_kind": orphan.cost_kind,
-            # Pessimistic: actual_usd = projected_usd (spec/29 line 601).
+            # Pessimistic: actual_usd = projected_usd
+            # (spec/29 §"Crash recovery for reservations").
             "actual_usd": orphan.projected_usd,
             "recovery": True,
             # Original reservation ts preserved for audit readers.
@@ -746,7 +748,8 @@ class FilesystemMandateBackend:
 
         if orphan.cost_kind == "external":
             # External orphan: also emit _external_unverified so the doctor
-            # surfaces it for operator reconciliation (spec/29 line 602).
+            # surfaces it for operator reconciliation
+            # (spec/29 §"Crash recovery for reservations").
             unverified_extra: dict = {
                 "event": "mandate_reservation_external_unverified",
                 "reservation_id": orphan.reservation_id,

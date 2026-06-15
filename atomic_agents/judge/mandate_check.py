@@ -4,17 +4,27 @@ Runs when ``proposal.authorization.granted_by`` starts with ``"mandate:"``.
 Returns an ALLOW pass-through for proposals that don't cite a mandate
 (the common case — fast-path at the top of ``evaluate``).
 
-Per spec/29 §"MandateCheck judge specialist" (line 347-394), sibling of
-``PolicyJudge`` in the composition ``[PolicyJudge, MandateCheck, LLMCatchAll]``.
-Both are rule-engine, both always-on, both fail-fast.
+Per spec/29 §"MandateCheck judge specialist", sibling of ``PolicyJudge`` in
+the composition ``[PolicyJudge, MandateCheck, LLMCatchAll]``. Both are
+rule-engine, both always-on, both fail-fast.
 
 PR 3b of #124. Validation steps 1-6 implemented in PR 3a (existence, source hash
 no-op stub, state, tool allowlist, target allowlist, time window). Steps 7-9
 (token budget, external budget, escalation thresholds) ungated here.
 
-BLOCK reason naming discipline (spec/29 §"BLOCK reason naming discipline",
-line 433): all reasons are forever-stable strings — no PR identifiers,
-version suffixes, or transient context embedded in reason strings.
+BLOCK reason naming discipline (spec/29 §"BLOCK reason naming discipline"):
+all reasons are forever-stable strings — no PR identifiers, version suffixes,
+or transient context embedded in reason strings.
+
+Blind-read fail-closed posture (spec/29 §"Blind-read fail-closed"):
+the three prior-spend / baseline-projection read helpers
+(``_sum_prior_token_cost``, ``_sum_prior_external_cost``,
+``_project_token_cost``) raise ``_MandateCostUnreadable`` on genuine
+read-failure (``LogBackendReadError``, ``OSError``,
+``sqlite3.DatabaseError``). ``evaluate()`` catches these and returns
+``BLOCK`` with reason ``mandate_cost_unreadable`` (#506).
+Code defects (``KeyError``, ``TypeError``, ``AttributeError``) are NOT
+caught here — they propagate as themselves so audit records are honest.
 
 Defensive imports for parallel-agent interfaces
 (Agent B: MandateStateManager, Agent C: TargetExtractorRegistry):
@@ -26,6 +36,7 @@ basic tests with the stubs in place.
 from __future__ import annotations
 
 import logging
+import sqlite3
 import threading
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
@@ -49,6 +60,35 @@ if TYPE_CHECKING:
     from ..tools import ToolRegistry
 
 _logger = logging.getLogger(__name__)
+
+# ── Blind-read fail-closed sentinel ─────────────────────────────────────────
+# Raised by the three prior-spend / baseline-projection read helpers when a
+# genuine read failure occurs (LogBackendReadError, OSError,
+# sqlite3.DatabaseError).  evaluate() catches this and returns
+# BLOCK reason='mandate_cost_unreadable' (#506).
+#
+# psycopg.Error is NOT listed here directly: a conforming PostgresLogBackend
+# wraps psycopg errors in LogBackendReadError before they reach this layer
+# (spec/22 addendum §"Read-failure boundary").  Including psycopg.Error as a
+# bare name would require an optional import that crashes non-Postgres
+# deployments at import time.  A non-conforming backend's raw psycopg.Error
+# propagates as a code defect — the narrow-catch guarantee — not a blind read.
+_NARROW_READ_FAILURE = (LogBackendReadError, OSError, sqlite3.DatabaseError)
+
+
+class _MandateCostUnreadable(Exception):
+    """Internal sentinel: a prior-spend SUM or baseline-projection read failed.
+
+    Raised by ``_sum_prior_token_cost``, ``_sum_prior_external_cost``, and
+    (cap-gated) ``_project_token_cost`` on genuine read failure from the
+    narrow-catch family ``(LogBackendReadError, OSError, sqlite3.DatabaseError)``.
+
+    ``evaluate()`` catches this and returns BLOCK with reason
+    ``mandate_cost_unreadable``.  Code defects (``KeyError``, ``TypeError``,
+    ``AttributeError``) are NOT caught as read failures — they propagate as
+    themselves so the audit reason is honest (Principle #5/#8 — the audit
+    verdict 'cost unreadable' is a claim about the world, not a code bug).
+    """
 
 
 # ── Defensive shims for parallel-agent interfaces ────────────────────────────
@@ -83,16 +123,16 @@ class MandateCheck:
     Runs when ``proposal.authorization.granted_by`` starts with
     ``"mandate:"``. Validates the cite against live mandate state via
     the ``MandateBackend`` Protocol (spec/29 §"MandateCheck judge
-    specialist", line 347-394).
+    specialist").
 
     Per spec/29, sibling of ``PolicyJudge`` in the composition
     ``[PolicyJudge, MandateCheck, LLMCatchAll]`` — both rule-engine,
     both always-on, both fail-fast.
 
-    Validation steps (spec/29 §"Validation steps (in order)", line 360):
+    Validation steps (spec/29 §"Validation steps (in order)"):
       0.  Pass-through for proposals not citing a mandate (fast path).
       0.5 Suspicious-rebind throttle check (spec/29 §"Suspicious-rebind
-          throttle", line 394).
+          throttle").
       1.  Existence — ``MandateNotFound`` / ``MandateInvalid`` → BLOCK.
       2.  Source hash — NO-OP in PR 3a; see TODO below.
       3.  State (active / revoked / expired) → BLOCK.
@@ -103,7 +143,7 @@ class MandateCheck:
 
     Thread safety: one ``threading.Lock`` per instance guards the
     per-scope state read-modify-write that ``arm_rebind_throttle`` uses
-    (spec/29 §"Lifecycle event deduplication", line 741 — within-process
+    (spec/29 §"Lifecycle event deduplication" — within-process
     serialization is sufficient; cross-process consistency is documented
     eventual).
     """
@@ -195,7 +235,8 @@ class MandateCheck:
         # steps 7-8 (#89 PR 3a).  ``None`` means no Policy opinion — steps
         # use mandate constraint values unchanged (pre-PR-3a behavior).
         self._policy_effective_caps = policy_effective_caps
-        # Within-process lock for state read-modify-write (spec/29 line 741).
+        # Within-process lock for state read-modify-write
+        # (spec/29 §"Lifecycle event deduplication").
         self._state_lock = threading.Lock()
         # Round 1 Finding 6: per-proposal projection cache so callers can
         # pass non-zero ``projected_usd`` to MandateReservationManager.create().
@@ -239,7 +280,7 @@ class MandateCheck:
     ) -> Judgment:
         """Apply mandate cite validation checks to ``proposal``.
 
-        Outcome flow (spec/29 §"Validation steps (in order)", line 360):
+        Outcome flow (spec/29 §"Validation steps (in order)"):
 
         1. Non-mandate proposals pass through immediately (fast path).
         2. Throttle check — blocks re-binding on recently-inconsistent mandates.
@@ -252,7 +293,7 @@ class MandateCheck:
         9. Token budget check (step 7).
         10. External budget check (step 8) + escalation threshold check (step 9)
             evaluated together; step 9 ESCALATE preempts step 8 BLOCK (spec/29
-            line 384, Risk 7 amendment).
+            §"Validation steps (in order)" step 9 Risk 7 amendment).
 
         Does NOT mutate ``proposal`` or ``context`` (spec/28 idempotency
         invariant). Each call is side-effect-free from the proposal's
@@ -270,7 +311,7 @@ class MandateCheck:
         mandate_id = proposal.authorization.granted_by.removeprefix("mandate:")
 
         # ── Step 0.5: Suspicious-rebind throttle ──────────────────────────────
-        # Spec/29 §"Suspicious-rebind throttle" (line 394-428).
+        # Spec/29 §"Suspicious-rebind throttle".
         # Guards against the source-hash-before-state edit window: a
         # malicious or hallucinating actor that sees mandate_state_inconsistent
         # is throttled from re-citing the same mandate for
@@ -283,7 +324,7 @@ class MandateCheck:
                 mandate_id=mandate_id,
             )
             return self._block(
-                # spec/29 §"BLOCK reason naming discipline" (line 433):
+                # spec/29 §"BLOCK reason naming discipline":
                 # forever-stable, no PR identifier embedded.
                 reason="mandate_rebind_suspicious_throttled",
                 mandate_id=mandate_id,
@@ -295,13 +336,13 @@ class MandateCheck:
                 ),
             )
 
-        # ── Step 1: Existence (spec/29 line 362) ──────────────────────────────
+        # ── Step 1: Existence (spec/29 §"Validation steps (in order)" step 1) ──
         # Load the mandate — raises MandateNotFound when the id is valid but
         # absent; raises MandateInvalid on parse-level failures.
         try:
             mandate = self._backend.load_mandate(mandate_id, self._scope)
         except MandateNotFound:
-            # spec/29 line 362: "Not found → BLOCK with reason mandate_not_found"
+            # spec/29 §"Validation steps (in order)" step 1: not found → BLOCK
             return self._block(
                 reason="mandate_not_found",
                 mandate_id=mandate_id,
@@ -313,21 +354,22 @@ class MandateCheck:
             )
         except MandateInvalid as exc:
             # Covers parser-level failures (malformed YAML, invalid ID charset,
-            # missing unconstrained justification, etc.). spec/29 line 362.
+            # missing unconstrained justification, etc.).
+            # spec/29 §"Validation steps (in order)" step 1.
             return self._block(
                 reason="mandate_invalid",
                 mandate_id=mandate_id,
                 detail=f"Mandate {mandate_id!r} failed validation: {exc}",
             )
 
-        # ── Step 2: Source hash (spec/29 line 363) ────────────────────────────
-        # Spec/29 line 354: re-read mandates.md, recompute source_hash of the
-        # cited mandate's section, compare against the value bound at proposal
-        # time. The framework re-reads FIRST (before state) because
-        # state-from-stale-bytes is misleading — if the operator just revoked
-        # the mandate, the hash check catches it before the state check would
-        # (spec/29 §"Source-hash-before-state ordering", line 363 + the
-        # §"Suspicious-rebind throttle" rationale at line 396).
+        # ── Step 2: Source hash (spec/29 §"Validation steps (in order)" step 2) ─
+        # Re-read mandates.md, recompute source_hash of the cited mandate's
+        # section, compare against the value bound at proposal time.  The
+        # framework re-reads FIRST (before state) because state-from-stale-bytes
+        # is misleading — if the operator just revoked the mandate, the hash
+        # check catches it before the state check would.
+        # (spec/29 §"Source-hash-before-state ordering" + §"Suspicious-rebind
+        # throttle" rationale).
         #
         # TODO (PR 4): wire proposal assembly to bind mandate_source_hash into
         # the proposal so this check has something to compare against.
@@ -349,7 +391,7 @@ class MandateCheck:
         # mandate_source_hash field to the proposal assembly path.
         pass  # step 2 is intentionally no-op in PR 3a
 
-        # ── Step 3: State (spec/29 line 364) ──────────────────────────────────
+        # ── Step 3: State (spec/29 §"Validation steps (in order)" step 3) ──────
         # Check revocation_state; also covers time-based expiry (the backend
         # infers EXPIRED from expires_at at load time per mandate/types.py
         # RevocationState docstring).
@@ -377,7 +419,7 @@ class MandateCheck:
                 ),
             )
 
-        # ── Step 4: Tool allowlist (spec/29 line 365) ─────────────────────────
+        # ── Step 4: Tool allowlist (spec/29 §"Validation steps (in order)" step 4) ─
         # If allowed_tools is set (non-empty frozenset), the proposal's
         # tool_name MUST appear in it. An empty frozenset means "unconstrained
         # by tool" — the constraint is absent, not zero-length restriction.
@@ -395,9 +437,10 @@ class MandateCheck:
                 ),
             )
 
-        # ── Step 5: Target allowlist + blocklist (spec/29 line 366-370) ───────
-        # Target extraction is framework-owned (spec/29 §"Target extraction",
-        # line 439). The actor cannot influence target_canonical; it is
+        # ── Step 5: Target allowlist + blocklist (spec/29 §"Validation steps
+        #   (in order)" steps 5a-5c) ──────────────────────────────────────────
+        # Target extraction is framework-owned (spec/29 §"Target extraction").
+        # The actor cannot influence target_canonical; it is
         # extracted from the proposal's tool_arguments by the per-agent
         # TargetExtractorRegistry (Agent C's implementation).
         #
@@ -418,8 +461,8 @@ class MandateCheck:
 
             # Sub-case (a): unextractable target with an allowlist set.
             if target is None and has_allowed_targets:
-                # spec/29 line 366-370: behavior controlled by
-                # judges.md mandate_settings.unextractable_target_action.
+                # spec/29 §"Validation steps (in order)" step 5 — behavior
+                # controlled by judges.md unextractable_target_action.
                 if self._settings.unextractable_target_action == "escalate":
                     return self._escalate(
                         reason="mandate_target_unextractable",
@@ -431,7 +474,7 @@ class MandateCheck:
                             "match. Configured action: escalate."
                         ),
                     )
-                # Default: block (fail-closed per spec/29 line 367).
+                # Default: block (fail-closed per spec/29 §"Validation steps (in order)" step 5).
                 return self._block(
                     reason="mandate_target_unextractable",
                     mandate_id=mandate_id,
@@ -470,7 +513,7 @@ class MandateCheck:
                         ),
                     )
 
-        # ── Step 6: Time window (spec/29 line 371) ────────────────────────────
+        # ── Step 6: Time window (spec/29 §"Validation steps (in order)" step 6) ─
         # If constraints.time_window is set, current UTC time must fall within
         # the window. Supports contiguous windows (start < end) and
         # wrap-around windows that span midnight (start > end, e.g., 22:00–06:00).
@@ -500,7 +543,26 @@ class MandateCheck:
                     ),
                 )
 
-        # ── Step 7: Token budget (spec/29 line 372-380) ───────────────────────
+        # ── Steps 7-8: Token + external budget (spec/29 §"Validation steps (in
+        #   order)" steps 7-8; blind-read fail-closed: spec/29 §"Blind-read
+        #   fail-closed") ───────────────────────────────────────────────────────
+        #
+        # Precedence for unreadable-cost paths (any-unreadable → BLOCK):
+        #   (a) compute_outstanding (reservation store) read failures → _step7/_step8
+        #       return {'reservations_unreadable': True} → BLOCK with the two
+        #       #497-shipped reasons (mandate_token_reservations_unreadable /
+        #       mandate_external_reservations_unreadable).  These reasons are
+        #       audit-log-stable and MUST NOT be retired.
+        #   (b) prior-spend SUM or baseline-projection read failures → helpers
+        #       raise _MandateCostUnreadable → caught at the evaluate()-level
+        #       try/except below → BLOCK with the new reason mandate_cost_unreadable.
+        #
+        # The two paths are mutually exclusive in the common case: if (a) fires,
+        # evaluate() already returned before reaching the _MandateCostUnreadable
+        # catch.  A _MandateCostUnreadable at the cap-exceeded re-read site (lines
+        # below) can only be raised after (a) already succeeded (reservations
+        # were readable), so the distinct reason strings are correct and intentional.
+        #
         # Collect all token-cap exceeded entries. Do NOT return here; feed into
         # the unified cap-exceeded helper at the end (spec says collect all
         # exceeded caps into an intermediate, then select primary by priority).
@@ -518,110 +580,163 @@ class MandateCheck:
             mandate.constraints.requires_escalation_above_token_usd is not None
         )
         projected_token_usd: float = 0.0
-        if has_token_cap or has_token_escalation_threshold:
-            token_result = self._step7_token_budget(
+        projected_external_usd: float = (
+            0.0  # initialised before try so record_projection sees it
+        )
+
+        # _MandateCostUnreadable from _sum_prior_token_cost / _sum_prior_external_cost
+        # / _project_token_cost (cap-gated) propagates out of _step7/_step8 to here.
+        # Caught below after both budget steps and the escalation evaluation.
+        try:
+            if has_token_cap or has_token_escalation_threshold:
+                token_result = self._step7_token_budget(
+                    proposal=proposal,
+                    mandate=mandate,
+                    mandate_id=mandate_id,
+                    has_token_cap=has_token_cap,
+                )
+                # Fail-closed: token reservation store unreadable → immediate BLOCK,
+                # bypass step 9 (mirrors the step-8 unprojectable path).
+                # Note: reservations_unreadable fires only for compute_outstanding
+                # read failures (#497 reason); prior-spend SUM failures raise
+                # _MandateCostUnreadable and are caught by the outer try/except.
+                if token_result.get("reservations_unreadable"):
+                    return self._block(
+                        reason="mandate_token_reservations_unreadable",
+                        mandate_id=mandate_id,
+                        detail=(
+                            f"Mandate {mandate_id!r} token spend-gate could not read "
+                            "outstanding reservations (cost-log read failure). Blocking "
+                            "fail-closed: the cumulative token cap cannot be verified "
+                            "against an unreadable reservation store."
+                        ),
+                    )
+                projected_token_usd = token_result["projected_usd"]
+                caps_exceeded.update(token_result["caps_exceeded"])
+                contributing_reservation_ids.extend(
+                    token_result.get("reservation_ids", [])
+                )
+
+            # ── Step 8: External budget ────────────────────────────────────────
+            has_external_escalation_threshold = (
+                mandate.constraints.requires_escalation_above_external_usd is not None
+            )
+            has_external_cap = any(
+                [
+                    mandate.constraints.daily_external_usd is not None,
+                    mandate.constraints.monthly_external_usd is not None,
+                    mandate.constraints.cumulative_external_usd is not None,
+                    mandate.constraints.per_action_max_usd is not None
+                    if hasattr(mandate.constraints, "per_action_max_usd")
+                    else False,
+                ]
+            )
+            if has_external_cap or has_external_escalation_threshold:
+                ext_result = self._step8_external_budget(
+                    proposal=proposal,
+                    mandate=mandate,
+                    mandate_id=mandate_id,
+                )
+                # Fail-closed: external reservation store unreadable → immediate
+                # BLOCK, bypass step 9 (mirrors the unprojectable path).
+                if ext_result.get("reservations_unreadable"):
+                    return self._block(
+                        reason="mandate_external_reservations_unreadable",
+                        mandate_id=mandate_id,
+                        detail=(
+                            f"Mandate {mandate_id!r} external spend-gate could not read "
+                            "outstanding reservations (cost-log read failure). Blocking "
+                            "fail-closed: external caps cannot be verified against an "
+                            "unreadable reservation store."
+                        ),
+                    )
+                # Fail-closed: unprojectable → immediate BLOCK, bypass step 9
+                if ext_result.get("unprojectable"):
+                    return self._block(
+                        reason="mandate_external_cost_unprojectable",
+                        mandate_id=mandate_id,
+                        detail=(
+                            f"Mandate {mandate_id!r} requires external budget projection "
+                            f"for tool {proposal.tool_name!r}, but neither a registered "
+                            "cost_estimator_id nor a static expected_external_cost_usd "
+                            "is configured for this tool. Register an estimator via "
+                            "agent.register_cost_estimator() or add "
+                            "expected_external_cost_usd to the tool definition."
+                        ),
+                    )
+                projected_external_usd = ext_result["projected_usd"]
+                caps_exceeded.update(ext_result["caps_exceeded"])
+                contributing_reservation_ids.extend(
+                    ext_result.get("reservation_ids", [])
+                )
+            # (projected_external_usd stays 0.0 when no external cap/threshold)
+
+            # ── Step 9: Escalation thresholds ─────────────────────────────────
+            # Spec/29 §"Validation steps (in order)" step 9: ESCALATE preempts
+            # step 8 BLOCK when both fire for the same projection.
+            escalation_judgment = self._step9_escalation_thresholds(
                 proposal=proposal,
                 mandate=mandate,
                 mandate_id=mandate_id,
+                projected_token_usd=projected_token_usd,
+                projected_external_usd=projected_external_usd,
             )
-            # Fail-closed: token reservation store unreadable → immediate BLOCK,
-            # bypass step 9 (mirrors the step-8 unprojectable path; #497/#506).
-            if token_result.get("reservations_unreadable"):
-                return self._block(
-                    reason="mandate_token_reservations_unreadable",
-                    mandate_id=mandate_id,
-                    detail=(
-                        f"Mandate {mandate_id!r} token spend-gate could not read "
-                        "outstanding reservations (cost-log read failure). Blocking "
-                        "fail-closed: the cumulative token cap cannot be verified "
-                        "against an unreadable reservation store."
-                    ),
-                )
-            projected_token_usd = token_result["projected_usd"]
-            caps_exceeded.update(token_result["caps_exceeded"])
-            contributing_reservation_ids.extend(token_result.get("reservation_ids", []))
+            if escalation_judgment is not None:
+                return escalation_judgment
 
-        # ── Step 8: External budget (spec/29 line 381) ────────────────────────
-        has_external_escalation_threshold = (
-            mandate.constraints.requires_escalation_above_external_usd is not None
-        )
-        projected_external_usd: float = 0.0
-        has_external_cap = any(
-            [
-                mandate.constraints.daily_external_usd is not None,
-                mandate.constraints.monthly_external_usd is not None,
-                mandate.constraints.cumulative_external_usd is not None,
-                mandate.constraints.per_action_max_usd is not None
-                if hasattr(mandate.constraints, "per_action_max_usd")
-                else False,
-            ]
-        )
-        if has_external_cap or has_external_escalation_threshold:
-            ext_result = self._step8_external_budget(
-                proposal=proposal,
-                mandate=mandate,
+            # ── Cap-exceeded verdict (steps 7 + 8) ────────────────────────────
+            if caps_exceeded:
+                # Second read of _sum helpers — must also be guarded.  These
+                # re-reads are diagnostic-only (cumulative_*_now fields in the
+                # mandate_cap_exceeded_block event); the BLOCK outcome is already
+                # determined by caps_exceeded being non-empty.  A blind read here
+                # still raises _MandateCostUnreadable and is caught by the outer
+                # try/except which returns the mandate_cost_unreadable BLOCK.
+                #
+                # Note: if we reach this point, reservations_unreadable was False
+                # (the early-return guards above already handled it).
+                # _MandateCostUnreadable here means the PRIOR-SPEND SUM re-read
+                # failed, not the reservation read.  The distinct reason strings
+                # (mandate_token_reservations_unreadable vs mandate_cost_unreadable)
+                # are intentional — they identify which read path was blind.
+                cumulative_token_now = self._sum_prior_token_cost(
+                    mandate_id, proposal.actor_run_id
+                )
+                cumulative_external_now = self._sum_prior_external_cost(mandate_id)
+                return self._build_cap_exceeded_judgment(
+                    proposal=proposal,
+                    mandate=mandate,
+                    caps_exceeded=caps_exceeded,
+                    contributing_reservation_ids=list(
+                        set(contributing_reservation_ids)
+                    ),
+                    action_class=proposal.classification,
+                    cumulative_token_now=cumulative_token_now,
+                    cumulative_external_now=cumulative_external_now,
+                    projected_usd=max(projected_token_usd, projected_external_usd),
+                )
+
+        except _MandateCostUnreadable as exc:
+            # any-unreadable → BLOCK (spec/29 §"Blind-read fail-closed").
+            # Fires when _sum_prior_token_cost, _sum_prior_external_cost, or
+            # _project_token_cost (cap-gated) raise _MandateCostUnreadable.
+            # compute_outstanding read failures produce the #497-shipped reasons
+            # via the reservations_unreadable flag path above; this catch covers
+            # only the prior-spend/projection read paths.
+            _logger.warning(
+                "MandateCheck: prior-spend or projection read unreadable for "
+                "mandate %r — fail-closed (mandate_cost_unreadable): %s",
+                mandate_id,
+                exc,
+            )
+            return self._block(
+                reason="mandate_cost_unreadable",
                 mandate_id=mandate_id,
-            )
-            # Fail-closed: external reservation store unreadable → immediate
-            # BLOCK, bypass step 9 (#497/#506; mirrors the unprojectable path).
-            if ext_result.get("reservations_unreadable"):
-                return self._block(
-                    reason="mandate_external_reservations_unreadable",
-                    mandate_id=mandate_id,
-                    detail=(
-                        f"Mandate {mandate_id!r} external spend-gate could not read "
-                        "outstanding reservations (cost-log read failure). Blocking "
-                        "fail-closed: external caps cannot be verified against an "
-                        "unreadable reservation store."
-                    ),
-                )
-            # Fail-closed: unprojectable → immediate BLOCK, bypass step 9
-            if ext_result.get("unprojectable"):
-                return self._block(
-                    reason="mandate_external_cost_unprojectable",
-                    mandate_id=mandate_id,
-                    detail=(
-                        f"Mandate {mandate_id!r} requires external budget projection "
-                        f"for tool {proposal.tool_name!r}, but neither a registered "
-                        "cost_estimator_id nor a static expected_external_cost_usd "
-                        "is configured for this tool. Register an estimator via "
-                        "agent.register_cost_estimator() or add "
-                        "expected_external_cost_usd to the tool definition."
-                    ),
-                )
-            projected_external_usd = ext_result["projected_usd"]
-            caps_exceeded.update(ext_result["caps_exceeded"])
-            contributing_reservation_ids.extend(ext_result.get("reservation_ids", []))
-
-        # ── Step 9: Escalation thresholds (spec/29 line 382-384, Risk 7) ─────
-        # Spec/29 line 384 amendment: step 9 ESCALATE preempts step 8 BLOCK
-        # when both fire for the same projection.  Evaluate before returning
-        # any cap-exceeded verdict.
-        escalation_judgment = self._step9_escalation_thresholds(
-            proposal=proposal,
-            mandate=mandate,
-            mandate_id=mandate_id,
-            projected_token_usd=projected_token_usd,
-            projected_external_usd=projected_external_usd,
-        )
-        if escalation_judgment is not None:
-            return escalation_judgment
-
-        # ── Cap-exceeded verdict (steps 7 + 8) ───────────────────────────────
-        if caps_exceeded:
-            cumulative_token_now = self._sum_prior_token_cost(
-                mandate_id, proposal.actor_run_id
-            )
-            cumulative_external_now = self._sum_prior_external_cost(mandate_id)
-            return self._build_cap_exceeded_judgment(
-                proposal=proposal,
-                mandate=mandate,
-                caps_exceeded=caps_exceeded,
-                contributing_reservation_ids=list(set(contributing_reservation_ids)),
-                action_class=proposal.classification,
-                cumulative_token_now=cumulative_token_now,
-                cumulative_external_now=cumulative_external_now,
-                projected_usd=max(projected_token_usd, projected_external_usd),
+                detail=(
+                    f"Mandate {mandate_id!r} spend-gate could not read prior cost "
+                    "history (cost-log read failure). Blocking fail-closed: the "
+                    "cumulative cap cannot be verified against an unreadable cost log."
+                ),
             )
 
         # Round 1 Finding 6 + Round 2 Finding R2-1: cache the projection so
@@ -634,9 +749,9 @@ class MandateCheck:
         )
 
         # ── All checks pass → ALLOW ────────────────────────────────────────────
-        # Spec/29 line 390: "If all checks pass: ALLOW. The judgment event's
-        # `binding` carries the `mandate_source_hash` so execution-time
-        # re-binding can re-verify if needed."
+        # Spec/29 §"Validation steps (in order)": "If all checks pass: ALLOW.
+        # The judgment event's `binding` carries the `mandate_source_hash` so
+        # execution-time re-binding can re-verify if needed."
         # mandate_source_hash is included in the Judgment's reason (as a
         # structured comment) so it surfaces in audit; the formal binding-field
         # wiring is PR 4 (proposal assembly wiring closes the loop).
@@ -647,7 +762,7 @@ class MandateCheck:
 
         Per spec/29, MandateCheck returns ALLOW, BLOCK, and ESCALATE.
         REVISE is never returned — mandate cites cannot be repaired by
-        the judge (spec/29 line 343-345).
+        the judge (spec/29 §"Mandate cites cannot be repaired by REVISE").
         """
         return {
             JudgmentOutcome.ALLOW,
@@ -661,7 +776,7 @@ class MandateCheck:
 
     def supports_specialist_composition(self) -> bool:
         # MandateCheck composes into the [PolicyJudge, MandateCheck,
-        # LLMCatchAll] ensemble (spec/29 line 392).
+        # LLMCatchAll] ensemble (spec/29 §"MandateCheck judge specialist").
         return True
 
     @property
@@ -690,8 +805,15 @@ class MandateCheck:
         """Sum prior actor-source cost events tagged with ``mandate_id``.
 
         These are the actual committed token costs for this mandate.  The
-        per-action projection is approximate (spec/29 line 378); this sum
-        is the ground truth after the fact.
+        per-action projection is approximate (spec/29 §"Validation steps (in
+        order)" step 7); this sum is the ground truth after the fact.
+
+        Raises:
+            _MandateCostUnreadable: on genuine read failure from the narrow
+                family ``(LogBackendReadError, OSError, sqlite3.DatabaseError)``.
+                Code defects (``KeyError``, ``TypeError``, ``AttributeError``)
+                propagate as themselves — NOT wrapped here.  See module docstring
+                §"Blind-read fail-closed posture".
         """
         from ..logs.types import LogQuery
 
@@ -709,21 +831,38 @@ class MandateCheck:
                 # Exclude records without mandate_id set (legacy safeguard)
                 and r.mandate_id == mandate_id
             )
-        except Exception as exc:  # noqa: BLE001
+        except _NARROW_READ_FAILURE as exc:
+            # Genuine read failure (LogBackendReadError / OSError /
+            # sqlite3.DatabaseError) — fail closed (#506).
+            # psycopg errors are not caught directly: a conforming
+            # PostgresLogBackend wraps them in LogBackendReadError before they
+            # reach this layer (spec/22 addendum §"Read-failure boundary").
+            # A non-conforming backend's psycopg.Error propagates as a code
+            # defect — deliberately NOT relabelled a quiet BLOCK (Principle #5/#8:
+            # the audit verdict 'cost unreadable' is a claim about the world, not
+            # a code bug).
             _logger.warning(
-                "MandateCheck step 7: failed to sum prior token cost for "
-                "mandate %r: %s — treating as 0 (optimistic fallback)",
+                "MandateCheck step 7: cost-log read failure summing prior token "
+                "cost for mandate %r — failing closed (mandate_cost_unreadable): %s",
                 mandate_id,
                 exc,
             )
-            return 0.0
+            raise _MandateCostUnreadable(
+                f"prior token cost unreadable for mandate {mandate_id!r}: {exc}"
+            ) from exc
 
     def _sum_prior_external_cost(self, mandate_id: str) -> float:
         """Sum prior external_cost events tagged with ``mandate_id``.
 
-        Per spec/29 §"Cost integration" (line 537-554): external costs land
-        in a cost event with ``extra["cost_kind"] == "external"`` and
-        ``mandate_id`` set.  The sum drives the cumulative external budget.
+        Per spec/29 §"Cost integration": external costs land in a cost event
+        with ``extra["cost_kind"] == "external"`` and ``mandate_id`` set.  The
+        sum drives the cumulative external budget.
+
+        Raises:
+            _MandateCostUnreadable: on genuine read failure from the narrow
+                family ``(LogBackendReadError, OSError, sqlite3.DatabaseError)``.
+                Code defects propagate as themselves.  See module docstring
+                §"Blind-read fail-closed posture".
         """
         from ..logs.types import LogQuery
 
@@ -738,31 +877,56 @@ class MandateCheck:
                 for r in records
                 if r.extra.get("cost_kind") == "external" and r.mandate_id == mandate_id
             )
-        except Exception as exc:  # noqa: BLE001
+        except _NARROW_READ_FAILURE as exc:
+            # Genuine read failure — fail closed (#506).  Same narrow-catch
+            # rationale as _sum_prior_token_cost above.
             _logger.warning(
-                "MandateCheck step 8: failed to sum prior external cost for "
-                "mandate %r: %s — treating as 0 (optimistic fallback)",
+                "MandateCheck step 8: cost-log read failure summing prior external "
+                "cost for mandate %r — failing closed (mandate_cost_unreadable): %s",
                 mandate_id,
                 exc,
             )
-            return 0.0
+            raise _MandateCostUnreadable(
+                f"prior external cost unreadable for mandate {mandate_id!r}: {exc}"
+            ) from exc
 
-    def _project_token_cost(self, proposal: ActionProposal, n_tool_calls: int) -> float:
+    def _project_token_cost(
+        self,
+        proposal: ActionProposal,
+        n_tool_calls: int,
+        *,
+        cap_active: bool = False,
+    ) -> float:
         """Project this action's share of the upcoming turn's token cost.
 
         Uses the preceding iteration's actual token cost as the baseline
-        (spec/29 line 374-376).  Falls back to ``expected_cost_per_call_usd``
-        (from model.md) or the $0.10 conservative default when no prior
-        iteration event exists for the current run (Risk 2 discipline).
+        (spec/29 §"Validation steps (in order)" step 7).  Falls back to
+        ``expected_cost_per_call_usd`` (from model.md) or the $0.10
+        conservative default when no prior iteration event exists for the
+        current run (Risk 2 discipline).
 
         Token cost is apportioned as ``turn_cost / N`` across N concurrent
         tool calls in the turn (v1 simplification — argument-token-weighted
-        apportionment is a follow-up issue per spec/29 line 376).
+        apportionment is a follow-up issue per spec/29 §"Validation steps (in
+        order)" step 7).
+
+        Args:
+            cap_active: when ``True`` and the baseline read fails with the
+                narrow family (LogBackendReadError, OSError,
+                sqlite3.DatabaseError), raise ``_MandateCostUnreadable``
+                instead of degrading to the conservative default.  Pass
+                ``True`` when a token/daily/monthly token cap is in effect —
+                a blind read could let us under-project and silently pass a
+                cap check (fail-open).  When ``False`` (no cap in effect),
+                the conservative fallback is safe and spurious blocking is
+                avoided (per ``feedback_fail_closed_only_where_theres_something_
+                to_protect``; avoids re-introducing the #495 regression).
         """
         from ..logs.types import LogQuery
 
         # Find the preceding iteration's cost event for this run.
         turn_cost: float | None = None
+        _read_failed = False
         try:
             records = self._log.query(
                 LogQuery(
@@ -786,23 +950,45 @@ class MandateCheck:
                     turn_cost = None
                 elif most_recent.cost_usd is not None:
                     turn_cost = most_recent.cost_usd
-        except Exception as exc:  # noqa: BLE001
+        except _NARROW_READ_FAILURE as exc:
+            # Cap-gated fail-close (#506): raise _MandateCostUnreadable only
+            # when a token cap is actually in effect.  When no cap exists, a
+            # blind read only means we fall back to the conservative default —
+            # there is nothing to bypass, so spurious blocking is avoided.
+            # (feedback_fail_closed_only_where_theres_something_to_protect)
+            if cap_active:
+                _logger.warning(
+                    "MandateCheck step 7: cost-log read failure reading preceding "
+                    "iteration baseline for run %r (cap active) — failing closed "
+                    "(mandate_cost_unreadable): %s",
+                    proposal.actor_run_id,
+                    exc,
+                )
+                raise _MandateCostUnreadable(
+                    f"baseline-projection read unreadable for run "
+                    f"{proposal.actor_run_id!r}: {exc}"
+                ) from exc
+            # No cap active — degrade to conservative default (safe).
+            _read_failed = True
             _logger.warning(
                 "MandateCheck step 7: failed to read preceding iteration "
-                "cost event for run %r: %s — falling back to default baseline",
+                "cost event for run %r: %s — falling back to default baseline "
+                "(no cap active, degrade-to-default is safe)",
                 proposal.actor_run_id,
                 exc,
             )
 
         if turn_cost is None:
-            # First iteration or stale baseline: use model.md field or default.
+            # First iteration, stale baseline, or (no-cap) read failure:
+            # use model.md field or default.
             turn_cost = (
                 self._expected_cost_per_call_usd
                 if self._expected_cost_per_call_usd is not None
                 else self._DEFAULT_EXPECTED_TOKEN_COST_USD
             )
 
-        # Simple N-way apportionment (v1 — see spec/29 line 376).
+        # Simple N-way apportionment (v1 — see spec/29 §"Validation steps
+        # (in order)" step 7).
         n = max(1, n_tool_calls)
         return turn_cost / n
 
@@ -825,6 +1011,7 @@ class MandateCheck:
         proposal: ActionProposal,
         mandate: Any,
         mandate_id: str,
+        has_token_cap: bool = False,
     ) -> dict[str, Any]:
         """Evaluate step 7 token budget caps.
 
@@ -833,13 +1020,27 @@ class MandateCheck:
           ``caps_exceeded`` — dict of cap_kind → metadata for caps that fire.
           ``reservation_ids`` — list of outstanding reservation IDs that
               contributed to pushing the cumulative over the cap.
+
+        Raises:
+            _MandateCostUnreadable: propagated from ``_project_token_cost``
+                (cap-gated) or ``_sum_prior_token_cost`` on genuine read
+                failure.  NOT caught here — propagates to evaluate() which
+                has the outer try/except handler.
         """
         # Simple assumption: one tool call per turn for v1 apportionment.
         # The framework does not yet pass N across tool calls per turn to
         # MandateCheck; argument-token-weighted apportionment is a follow-up.
         n_tool_calls = 1
-        projected = self._project_token_cost(proposal, n_tool_calls)
+        # _project_token_cost is called FIRST. When cap_active=True it raises
+        # _MandateCostUnreadable on read failure, which short-circuits the
+        # entire _step7 path before _sum_prior_token_cost is even called
+        # (ordering guarantee per prep finding P2 / #506).
+        projected = self._project_token_cost(
+            proposal, n_tool_calls, cap_active=has_token_cap
+        )
 
+        # _MandateCostUnreadable from _sum_prior_token_cost is intentionally
+        # NOT caught here — it propagates to evaluate()'s outer try/except.
         prior_spend = self._sum_prior_token_cost(mandate_id, proposal.actor_run_id)
 
         # Sum outstanding reservations for this mandate (token kind).
@@ -847,18 +1048,19 @@ class MandateCheck:
             outstanding = compute_outstanding(self._log, self._scope, mandate_id)
             token_reservations = [r for r in outstanding if r.cost_kind == "token"]
         except LogBackendReadError as exc:
-            # #497: a cost-log READ FAILURE must fail CLOSED at the mandate gate
-            # (mirror the cost reader's layered catch + the step-8 unprojectable
-            # precedent). The broad backstop below zeros reservations = fail-OPEN;
-            # that is a pre-existing posture whose FULL fix (broad-except flip +
-            # spec/29 amendment + BLOCK mandate_cost_unreadable across all read
-            # methods) is tracked in #506. This typed guard only stops #497's new
-            # LogBackendReadError from WIDENING that fail-open: an unreadable
-            # reservation store means the cap cannot be verified, so block rather
-            # than admit the proposal with zeroed outstanding reservations.
+            # #497 + #506: a cost-log READ FAILURE must fail CLOSED at the mandate
+            # gate.  The typed LogBackendReadError guard stops reservation read
+            # failures from being swallowed by the broad backstop below.
+            # Note: this path is intentionally different from _sum_prior_token_cost
+            # above — reservation zeroing was the old fail-OPEN posture; this guard
+            # converts it to fail-CLOSED for the reservation read specifically.
+            # The broad backstop (next except) remains for code defects only —
+            # it does NOT mirror _sum_via_backend's broad backstop because the
+            # audit verdict 'reservations unreadable' is a claim about the world,
+            # not a code defect (#506 narrow-catch guarantee, Principle #5/#8).
             _logger.warning(
                 "MandateCheck step 7: reservation store unreadable for mandate "
-                "%r: %s — fail-closed, blocking (#497; full posture #506)",
+                "%r: %s — fail-closed, blocking (#497/#506)",
                 mandate_id,
                 exc,
             )
@@ -869,6 +1071,12 @@ class MandateCheck:
                 "reservations_unreadable": True,
             }
         except Exception as exc:  # noqa: BLE001
+            # Code defect in compute_outstanding (not a read failure) — this
+            # broad backstop intentionally does NOT mirror _sum_via_backend's
+            # broad-catch posture.  For reservation reads, a code defect
+            # degrades to zeroed reservations (same pre-#506 behavior); it is
+            # NOT relabelled as 'reservations unreadable' (#506 narrow-catch
+            # guarantee).  The SUM helpers above use a narrow catch instead.
             _logger.warning(
                 "MandateCheck step 7: compute_outstanding failed for mandate "
                 "%r: %s — treating outstanding reservations as 0",
@@ -940,7 +1148,13 @@ class MandateCheck:
           ``caps_exceeded`` — dict of cap_kind → metadata for caps that fire.
           ``reservation_ids`` — list of outstanding reservation IDs.
           ``unprojectable`` — True when the external cost cannot be
-              projected (fail-closed per spec/29 line 381).
+              projected (fail-closed per spec/29 §"Validation steps (in
+              order)" step 8).
+
+        Raises:
+            _MandateCostUnreadable: propagated from ``_sum_prior_external_cost``
+                on genuine read failure.  NOT caught here — propagates to
+                evaluate()'s outer try/except handler.
         """
         # Resolve the tool definition for cost_estimator_id and
         # expected_external_cost_usd.
@@ -1000,6 +1214,8 @@ class MandateCheck:
                 "unprojectable": True,
             }
 
+        # _MandateCostUnreadable from _sum_prior_external_cost is intentionally
+        # NOT caught here — propagates to evaluate()'s outer try/except.
         prior_external = self._sum_prior_external_cost(mandate_id)
 
         # Outstanding external reservations.
@@ -1007,12 +1223,17 @@ class MandateCheck:
             outstanding = compute_outstanding(self._log, self._scope, mandate_id)
             ext_reservations = [r for r in outstanding if r.cost_kind == "external"]
         except LogBackendReadError as exc:
-            # #497 fail-closed guard — see the step-7 rationale above. An
-            # unreadable reservation store means external caps cannot be verified,
-            # so block rather than admit with zeroed outstanding. Full posture #506.
+            # #497 + #506: typed reservation-store read failure → fail-CLOSED.
+            # See step-7 compute_outstanding rationale for the intentional asymmetry:
+            # the broad backstop below is for code defects only; this typed guard
+            # prevents a genuine read failure from being swallowed into zeroed
+            # reservations (fail-OPEN).  The broad backstop does NOT mirror
+            # _sum_via_backend's broad catch — the audit verdict 'reservations
+            # unreadable' is a claim about the world, not a code defect (Principle
+            # #5/#8, #506 narrow-catch guarantee).
             _logger.warning(
                 "MandateCheck step 8: reservation store unreadable for mandate "
-                "%r: %s — fail-closed, blocking (#497; full posture #506)",
+                "%r: %s — fail-closed, blocking (#497/#506)",
                 mandate_id,
                 exc,
             )
@@ -1024,6 +1245,9 @@ class MandateCheck:
                 "reservations_unreadable": True,
             }
         except Exception as exc:  # noqa: BLE001
+            # Code defect in compute_outstanding — NOT relabelled 'unreadable'.
+            # See step-7 broad-backstop comment for the intentional asymmetry
+            # vs. the narrow catch in _sum_prior_external_cost.
             _logger.warning(
                 "MandateCheck step 8: compute_outstanding failed for mandate "
                 "%r: %s — treating outstanding external reservations as 0",
@@ -1108,13 +1332,13 @@ class MandateCheck:
         """Evaluate step 9 escalation thresholds.
 
         Returns an ESCALATE Judgment when any threshold is exceeded; else
-        None.  Step 9 ESCALATE preempts step 8 BLOCK per spec/29 line 384
-        (Risk 7 amendment) — the caller checks this BEFORE returning the
-        cap-exceeded verdict.
+        None.  Step 9 ESCALATE preempts step 8 BLOCK per spec/29 §"Validation
+        steps (in order)" step 9 (Risk 7 amendment) — the caller checks this
+        BEFORE returning the cap-exceeded verdict.
         """
         c = mandate.constraints
 
-        # Token escalation threshold (spec/29 line 382).
+        # Token escalation threshold (spec/29 §"Validation steps (in order)" step 9).
         if (
             c.requires_escalation_above_token_usd is not None
             and projected_token_usd > c.requires_escalation_above_token_usd
@@ -1129,7 +1353,7 @@ class MandateCheck:
                 ),
             )
 
-        # External escalation threshold (spec/29 line 382).
+        # External escalation threshold (spec/29 §"Validation steps (in order)" step 9).
         if (
             c.requires_escalation_above_external_usd is not None
             and projected_external_usd > c.requires_escalation_above_external_usd
@@ -1147,7 +1371,7 @@ class MandateCheck:
         return None
 
     # Priority order for cap_kind selection in mandate_cap_exceeded_block event.
-    # Forever-stable per spec/29 line 629 (Risk 1 amendment):
+    # Forever-stable per spec/29 §"Mandate lifecycle events" (Risk 1 amendment):
     # monthly_external > daily_external > cumulative_external >
     # monthly_token > daily_token > cumulative_token > per_action_max
     _CAP_KIND_PRIORITY: tuple[str, ...] = (
@@ -1174,11 +1398,11 @@ class MandateCheck:
     ) -> Judgment:
         """Build a ``mandate_cap_exceeded_block`` judgment with priority-selected cap_kind.
 
-        Priority order (spec/29 line 629, Risk 1 amendment — forever-stable):
+        Priority order (spec/29 §"Mandate lifecycle events" Risk 1 amendment — forever-stable):
         ``monthly_external > daily_external > cumulative_external >
         monthly_token > daily_token > cumulative_token > per_action_max``.
 
-        Action class → outcome (spec/29 line 386-390):
+        Action class → outcome (spec/29 §"Validation steps (in order)" budget-breach action):
         - ``high_risk`` → ESCALATE with reason ``mandate_cap_would_exceed_high_risk``
         - ``external_side_effect``, ``reversible_write`` → BLOCK with reason ``mandate_cap_would_exceed``
         """
@@ -1216,7 +1440,8 @@ class MandateCheck:
             },
         )
 
-        # Budget-breach action per action class (spec/29 line 386-390).
+        # Budget-breach action per action class
+        # (spec/29 §"Validation steps (in order)").
         is_high_risk = (
             action_class == ActionClass.HIGH_RISK
             # Also accept string form (StrEnum comparison).
@@ -1316,8 +1541,8 @@ class MandateCheck:
     ) -> Judgment:
         """BLOCK with a forever-stable reason string.
 
-        ``reason`` must be one of the spec/29 BLOCK reasons (per §"BLOCK
-        reason naming discipline", line 433). ``detail`` carries the
+        ``reason`` must be one of the spec/29 BLOCK reasons (per
+        §"BLOCK reason naming discipline"). ``detail`` carries the
         human-readable explanation that may change across versions;
         ``reason`` does not.
         """
@@ -1343,7 +1568,8 @@ class MandateCheck:
         """ESCALATE for cases where the operator should decide.
 
         Currently used for ``mandate_target_unextractable`` when
-        ``unextractable_target_action == "escalate"`` (spec/29 line 368).
+        ``unextractable_target_action == "escalate"``
+        (spec/29 §"Validation steps (in order)").
         """
         full_reason = reason
         if detail:
@@ -1372,7 +1598,7 @@ class MandateCheck:
             prefix TargetPattern with ``pattern="foo."``).
 
         MCP tool targets are prefixed with ``"mcp:<server>:"`` by the
-        framework before reaching this method (spec/29 line 464). Pattern
+        framework before reaching this method (spec/29 §"Target extraction"). Pattern
         strings in ``mandates.md`` must include the prefix to match:
         ``mcp:stripe:`` as a prefix pattern covers all Stripe MCP targets.
         """
