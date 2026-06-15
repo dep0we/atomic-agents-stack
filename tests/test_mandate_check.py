@@ -2876,7 +2876,6 @@ class TestMandateCheckCostUnreadable:
     def _external_capped_mandate(mandate_id: str) -> "Mandate":
         """Mandate with a tight daily_external_usd cap for external-path tests."""
         from datetime import timedelta
-        from atomic_agents.tools import ToolRegistry
 
         now = datetime.now(timezone.utc)
         return Mandate(
@@ -3038,7 +3037,6 @@ class TestMandateCheckCostUnreadable:
         is reverted to except-Exception-return-0.
         """
         from atomic_agents.exceptions import LogBackendReadError as LBRError
-        from atomic_agents.tools import ToolRegistry
 
         mandate_id = "sum-ext-lbr"
         _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
@@ -3074,7 +3072,6 @@ class TestMandateCheckCostUnreadable:
         null_log_backend: Any,
     ):
         """_sum_prior_external_cost: KeyError (code defect) propagates unchanged."""
-        from atomic_agents.tools import ToolRegistry
 
         mandate_id = "sum-ext-keyerror"
         _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
@@ -3094,63 +3091,44 @@ class TestMandateCheckCostUnreadable:
 
     # ── _project_token_cost — cap-gated fail-close ────────────────────────────
 
-    def test_project_token_cost_read_failure_no_cap_degrades_to_default(
+    def test_project_token_cost_read_failure_cap_inactive_degrades_to_default_unit(
         self,
         mandate_backend: FilesystemMandateBackend,
         scope_root: Path,
         scope: str,
         null_log_backend: Any,
     ):
-        """_project_token_cost read failure + cap_active=False → degrade-to-default, ALLOW.
+        """_project_token_cost(cap_active=False) + read failure → degrade-to-default.
 
-        The cap_active=False path fires when a token escalation threshold exists
-        (so _step7 runs) but NO token budget cap is set.  In that case
-        _project_token_cost uses a generous fallback ($0.10 default) instead of
-        failing closed — there is no cap to bypass, so spurious blocking is avoided
+        Direct unit test of the projection's safe-degrade primitive: when the
+        projection gates NOTHING (cap_active=False), a blind baseline read falls
+        back to the $0.10 conservative default instead of raising
         (feedback_fail_closed_only_where_theres_something_to_protect).
 
-        Mandate has requires_escalation_above_token_usd=100.0 (way above the $0.10
-        default) but no token budget cap.  The read failure degrades to $0.10 and
-        the escalation check does NOT fire → ALLOW.
+        NOTE (#512): via the live ``evaluate()``/``_step7`` path this branch is no
+        longer reachable — ``_step7`` runs only when a cap, escalation threshold,
+        or Policy cap exists, and in every one of those cases the projection gates
+        an active control, so ``projection_cap_active`` is always True there (see
+        ``test_escalation_only_no_cap_blind_projection_blocks_protects_escalation``
+        for the escalation-only case that now BLOCKs).  This test pins the
+        degrade primitive directly so the defensive ``cap_active=False`` branch
+        stays covered.
         """
         from atomic_agents.exceptions import LogBackendReadError as LBRError
 
-        mandate_id = "project-no-cap-degrade"
+        mandate_id = "project-cap-inactive-degrade"
         _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
-        from datetime import timedelta
-
-        now = datetime.now(timezone.utc)
-        mandate = Mandate(
-            mandate_id=mandate_id,
-            scope="agent:test-agent",
-            granted_by="test-operator@example.com",
-            granted_at=now,
-            expires_at=now + timedelta(days=30),
-            revocation_state=RevocationState.ACTIVE,
-            revoked_at=None,
-            revoked_by=None,
-            revocation_reason=None,
-            constraints=MandateConstraints(
-                allowed_tools=frozenset(["test_tool"]),
-                # NO token budget caps (daily/monthly/cumulative all None) →
-                # cap_active=False; _project_token_cost read failure degrades safely
-                requires_escalation_above_token_usd=100.0,  # threshold above $0.10 default
-            ),
-            source_hash="sha256:no-cap-degrade",
-        )
         mc = _make_mc(mandate_backend, scope, null_log_backend)
 
-        # _project_token_cost read fails (cap_active=False → degrades to $0.10);
-        # every other read returns [].  Projection $0.10 < escalation 100.0 → ALLOW.
         null_log_backend.query.side_effect = _query_blind_on(
             "project",
             LBRError("simulated read failure in preceding-iteration baseline read"),
         )
         proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
-        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
-            judgment = mc.evaluate(proposal)
-
-        assert judgment.outcome == JudgmentOutcome.ALLOW
+        # Direct call with cap_active=False — must degrade to the $0.10 default,
+        # not raise _MandateCostUnreadable.
+        projected = mc._project_token_cost(proposal, 1, cap_active=False)
+        assert projected == pytest.approx(0.10)
 
     def test_project_token_cost_read_failure_with_cap_blocks_closed(
         self,
@@ -3195,15 +3173,19 @@ class TestMandateCheckCostUnreadable:
 
         assert judgment.outcome == JudgmentOutcome.BLOCK
         assert judgment.reason.startswith("mandate_cost_unreadable")
-        # Distinctive branch log line — "cap active" appears ONLY in the
-        # cap-gated branch's own warning (mandate_check.py _project_token_cost),
-        # never in the exception text, so this is a load-bearing branch-identity
-        # assertion.
+        # Distinctive branch log line — "projection gate active" appears ONLY in
+        # the cap-gated projection branch's own warning (mandate_check.py
+        # _project_token_cost), never in the exception text, so this is a
+        # load-bearing branch-identity assertion (#512 reworded "cap active" →
+        # "projection gate active: cap or escalation threshold").
         assert any(
-            "cap active" in r.message and "mandate_cost_unreadable" in r.message
+            "projection gate active" in r.message
+            and "mandate_cost_unreadable" in r.message
             for r in caplog.records
             if r.levelname == "WARNING"
-        ), "Expected WARNING log containing 'cap active' and 'mandate_cost_unreadable'"
+        ), (
+            "Expected WARNING log containing 'projection gate active' and 'mandate_cost_unreadable'"
+        )
 
     # ── cap-exceeded re-read path ─────────────────────────────────────────────
 
@@ -3214,13 +3196,19 @@ class TestMandateCheckCostUnreadable:
         scope: str,
         null_log_backend: Any,
     ):
-        """Cap-exceeded verdict: the TOKEN re-read (mandate_check.py:702) raises →
-        BLOCK mandate_cost_unreadable, not mandate_cap_would_exceed.
+        """Cap-exceeded verdict — SAME-dimension blind re-read with the cap active:
+        a token-capped mandate whose TOKEN re-read goes blind → BLOCK
+        mandate_cost_unreadable (cap_active=token_cap_active=True at the re-read).
 
-        Per-invocation negative control for the token-side cap-exceeded re-read
-        (feedback_false_green_test_needs_per_invocation_negative_control): revert
-        _sum_prior_token_cost's raise to a fail-open return-0 and this flips to
-        mandate_cap_would_exceed.  The sibling external test below pins line 705.
+        Positive control for the token re-read's cap-gate (#512, spec/29
+        §"Blind-read fail-closed posture": the cap-exceeded verdict re-reads pass
+        the same per-dimension effective-cap flag).  The cap whose verdict is
+        being composed IS the token cap, so its blind re-read fails closed.
+
+        Per-invocation negative control
+        (feedback_false_green_test_needs_per_invocation_negative_control): strip
+        the token re-read's cap-gate (pass cap_active=False, i.e. revert to the
+        pre-fix degrade-to-0 there) and this flips to mandate_cap_would_exceed.
 
         For a token-capped mandate the projection ($0.10 default) exceeds the
         0.01 cap, so caps_exceeded is non-empty; the SECOND _sum_prior_token_cost
@@ -3235,8 +3223,9 @@ class TestMandateCheckCostUnreadable:
         mandate = self._capped_mandate(mandate_id)  # daily_token_usd=0.01
         mc = _make_mc(mandate_backend, scope, null_log_backend)
 
-        # token_sum occurrence 1 = step-7 read ([]); occurrence 2 = cap-exceeded
-        # re-read at line 702 (raises).  Projection $0.10 > 0.01 → caps_exceeded.
+        # token_sum occurrence 1 = step-7 read ([]); occurrence 2 = the
+        # cap-exceeded diagnostic re-read (the second _sum_prior_token_cost call)
+        # which raises.  Projection $0.10 > 0.01 → caps_exceeded.
         null_log_backend.query.side_effect = _query_blind_on(
             "token_sum",
             LBRError("blind on cap-exceeded token re-read"),
@@ -3249,34 +3238,96 @@ class TestMandateCheckCostUnreadable:
         assert judgment.outcome == JudgmentOutcome.BLOCK
         assert judgment.reason.startswith("mandate_cost_unreadable")
 
-    def test_cap_exceeded_external_sum_reread_failure_blocks_closed(
+    def test_cap_exceeded_token_only_blind_external_reread_degrades_not_blocks(
         self,
         mandate_backend: FilesystemMandateBackend,
         scope_root: Path,
         scope: str,
         null_log_backend: Any,
     ):
-        """Cap-exceeded verdict: the EXTERNAL re-read (mandate_check.py:705) raises →
-        BLOCK mandate_cost_unreadable.
+        """Cap-exceeded CROSS-dimension corner (#512): a TOKEN-cap-only mandate
+        that exceeds its token cap, whose blind EXTERNAL re-read MUST degrade to
+        $0.00 (cap_active=external_cap_active=False) rather than flip the truthful
+        token verdict to mandate_cost_unreadable.
 
-        Per-invocation negative control for the external-side cap-exceeded re-read.
-        For a token-capped mandate _step8 is skipped, so the ONLY
-        _sum_prior_external_cost call is the cap-exceeded re-read at line 705
-        (external_sum occurrence 1).  Revert that helper's raise to a fail-open
-        return-0 and this flips to mandate_cap_would_exceed.
+        This is the corner the hardcoded cap_active=True at the re-read site got
+        wrong: failing closed on the uncapped external dimension falsified the
+        BLOCK reason for a dimension with nothing to protect (Principle #5 audit
+        honesty; feedback_fail_closed_only_where_theres_something_to_protect).  The
+        verdict stays a BLOCK either way (the token cap genuinely fired), but the
+        REASON must be the truthful mandate_cap_would_exceed, not
+        mandate_cost_unreadable.
+
+        For a token-cap-only mandate _step8 is skipped, so the ONLY
+        _sum_prior_external_cost call is the cap-exceeded re-read (external_sum
+        occurrence 1) — it raises but, with no external cap, degrades to $0.00.
+
+        Per-invocation negative control: the sibling test
+        ``test_cap_exceeded_external_cap_blind_external_reread_blocks_closed`` adds
+        a real external cap, making cap_active=True so the SAME blind external
+        re-read BLOCKs — proving the external re-read's cap-gate is load-bearing.
         """
         from atomic_agents.exceptions import LogBackendReadError as LBRError
 
-        mandate_id = "cap-exceeded-ext-reread"
+        mandate_id = "cap-exceeded-token-only-blind-ext"
         _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
-        mandate = self._capped_mandate(mandate_id)  # daily_token_usd=0.01
+        mandate = self._capped_mandate(mandate_id)  # daily_token_usd=0.01, NO ext cap
         mc = _make_mc(mandate_backend, scope, null_log_backend)
 
-        # Projection $0.10 > 0.01 cap → caps_exceeded; the external re-read at
-        # line 705 (external_sum occurrence 1 — _step8 skipped) raises.
+        # Projection $0.10 > 0.01 token cap → caps_exceeded (token only); the
+        # external re-read (external_sum occurrence 1 — _step8 skipped) goes blind
+        # but external_cap_active=False so it degrades to $0.00.
         null_log_backend.query.side_effect = _query_blind_on(
             "external_sum",
-            LBRError("blind on cap-exceeded external re-read"),
+            LBRError("blind on cap-exceeded external re-read, no external cap"),
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+
+        assert judgment.outcome == JudgmentOutcome.BLOCK
+        assert judgment.reason.startswith("mandate_cap_would_exceed")
+        assert not judgment.reason.startswith("mandate_cost_unreadable")
+
+    def test_cap_exceeded_external_cap_blind_external_reread_blocks_closed(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Cap-exceeded SAME-dimension positive control for the external re-read:
+        an EXTERNAL-capped mandate that exceeds its external cap, whose blind
+        EXTERNAL re-read → BLOCK mandate_cost_unreadable (cap_active=
+        external_cap_active=True at the re-read).
+
+        Isolated negative control for
+        ``test_cap_exceeded_token_only_blind_external_reread_degrades_not_blocks``:
+        the only difference is the presence of an external cap, which flips the
+        external re-read from degrade-to-$0.00 to fail-closed — proving the
+        external re-read's per-dimension cap-gate is load-bearing, not a no-op
+        (feedback_false_green_test_needs_per_invocation_negative_control).
+
+        Tool static cost $1.00 > 0.01 external cap → caps_exceeded (external); for
+        an external-cap-only mandate _step7 is skipped, so the cap-exceeded
+        external re-read (external_sum occurrence 2 — step-8 read is occurrence 1)
+        raises and, with the external cap active, fails closed.
+        """
+        from atomic_agents.exceptions import LogBackendReadError as LBRError
+
+        mandate_id = "cap-exceeded-ext-cap-blind-ext"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = self._external_capped_mandate(mandate_id)  # daily_external_usd=0.01
+        mc = _make_mc_with_tool(
+            mandate_backend, scope, null_log_backend, "test_tool", 1.0
+        )
+
+        # external_sum occurrence 1 = step-8 read ([]); occurrence 2 = cap-exceeded
+        # re-read (raises).  Tool cost $1.00 > 0.01 cap → caps_exceeded.
+        null_log_backend.query.side_effect = _query_blind_on(
+            "external_sum",
+            LBRError("blind on cap-exceeded external re-read, external cap active"),
+            occurrence=2,
         )
         proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
         with patch.object(mandate_backend, "load_mandate", return_value=mandate):
@@ -3284,6 +3335,54 @@ class TestMandateCheckCostUnreadable:
 
         assert judgment.outcome == JudgmentOutcome.BLOCK
         assert judgment.reason.startswith("mandate_cost_unreadable")
+
+    def test_cap_exceeded_external_only_blind_token_reread_degrades_not_blocks(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Cap-exceeded CROSS-dimension symmetric corner (#512): an EXTERNAL-cap-only
+        mandate that exceeds its external cap, whose blind TOKEN re-read MUST
+        degrade to $0.00 (cap_active=token_cap_active=False) rather than flip the
+        truthful external verdict to mandate_cost_unreadable.
+
+        Mirror of
+        ``test_cap_exceeded_token_only_blind_external_reread_degrades_not_blocks``
+        across the token/external axis.  For an external-cap-only mandate _step7
+        is skipped (no token cap, no token escalation threshold), so the ONLY
+        _sum_prior_token_cost call is the cap-exceeded re-read (token_sum
+        occurrence 1) — it raises but, with no token cap, degrades to $0.00 and the
+        external cap's truthful mandate_cap_would_exceed verdict survives.
+
+        Per-invocation negative control: the sibling
+        ``test_cap_exceeded_token_sum_reread_failure_blocks_closed`` (token cap
+        present) BLOCKs on the same token re-read failure.
+        """
+        from atomic_agents.exceptions import LogBackendReadError as LBRError
+
+        mandate_id = "cap-exceeded-ext-only-blind-token"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = self._external_capped_mandate(mandate_id)  # daily_external_usd=0.01
+        mc = _make_mc_with_tool(
+            mandate_backend, scope, null_log_backend, "test_tool", 1.0
+        )
+
+        # Tool cost $1.00 > 0.01 external cap → caps_exceeded (external only); the
+        # token re-read (token_sum occurrence 1 — _step7 skipped) goes blind but
+        # token_cap_active=False so it degrades to $0.00.
+        null_log_backend.query.side_effect = _query_blind_on(
+            "token_sum",
+            LBRError("blind on cap-exceeded token re-read, no token cap"),
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+
+        assert judgment.outcome == JudgmentOutcome.BLOCK
+        assert judgment.reason.startswith("mandate_cap_would_exceed")
+        assert not judgment.reason.startswith("mandate_cost_unreadable")
 
     # ── boundary: empty log history → ALLOW (not a read failure) ─────────────
 
@@ -3330,27 +3429,34 @@ class TestMandateCheckCostUnreadable:
 
         assert judgment.outcome == JudgmentOutcome.ALLOW
 
-    # ── documented residual: escalation-only-no-cap SUM over-block (#512) ──────
+    # ── #512 resolved: escalation-only-no-cap SUM degrades, not blocks ──────────
 
-    def test_escalation_only_no_cap_token_sum_failure_blocks_closed(
+    def test_escalation_only_no_cap_token_sum_failure_degrades_not_blocks(
         self,
         mandate_backend: FilesystemMandateBackend,
         scope_root: Path,
         scope: str,
         null_log_backend: Any,
+        caplog: pytest.LogCaptureFixture,
     ):
-        """#512 — pins the DELIBERATE escalation-only-no-cap over-block.
+        """#512 resolved — SUM helpers are now cap-gated (like _project_token_cost).
 
-        The prior-spend SUM helpers flip fail-closed UNCONDITIONALLY (the #506
-        ruling), unlike _project_token_cost (cap-gated).  For a mandate with a
-        token escalation threshold but NO cap, _step7 runs and _sum_prior_token_cost
-        is read; on a blind read it BLOCKs even though the summed value gates
-        nothing here (cumulative is compared only against absent caps, and the
-        escalate decision uses the projection).  This is fail-SAFE (over-block,
-        never leak) and spec-consistent (spec/29 §"Blind-read fail-closed posture"
-        acknowledges the asymmetry).  #512 tracks the optional refinement to
-        cap-gate the SUM helpers too; this test pins the current behavior so that
-        refinement is a conscious, tested change rather than an accidental one.
+        For a mandate with only a token escalation threshold and NO cap,
+        _step7 runs and _sum_prior_token_cost is read; on a blind read it now
+        degrades to 0.0 instead of failing closed (cap_active=False, nothing to
+        protect).  cumulative = 0.0 + $0.10 default projection + 0.0 = $0.10,
+        which is well below the $100.0 escalation threshold → ALLOW.
+
+        Previously (the #506 ruling) the SUM helpers failed closed
+        UNCONDITIONALLY, causing an over-block in this configuration.  #512
+        resolves that residual by aligning the SUM helpers with _project_token_cost.
+        The never-under-report-spend invariant is preserved because "under-report"
+        only means something against an ACTIVE constraint — in the no-cap case the
+        sum gates nothing.
+
+        Per-invocation negative control: adding a token cap to the SAME mandate
+        makes cap_active=True and restores the BLOCK — proving the cap-gate is
+        load-bearing, not a no-op.
         """
         from datetime import timedelta
 
@@ -3359,7 +3465,7 @@ class TestMandateCheckCostUnreadable:
         mandate_id = "escalation-only-no-cap-512"
         _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
         now = datetime.now(timezone.utc)
-        mandate = Mandate(
+        mandate_no_cap = Mandate(
             mandate_id=mandate_id,
             scope="agent:test-agent",
             granted_by="test-operator@example.com",
@@ -3371,8 +3477,7 @@ class TestMandateCheckCostUnreadable:
             revocation_reason=None,
             constraints=MandateConstraints(
                 allowed_tools=frozenset(["test_tool"]),
-                # escalation threshold but NO token cap → cap_active=False for the
-                # projection, yet the SUM helper still fails closed unconditionally.
+                # escalation threshold but NO token cap → cap_active=False
                 requires_escalation_above_token_usd=100.0,
             ),
             source_hash="sha256:escalation-only-512",
@@ -3380,15 +3485,508 @@ class TestMandateCheckCostUnreadable:
         mc = _make_mc(mandate_backend, scope, null_log_backend)
 
         # _project_token_cost read succeeds ([] → $0.10 default, no raise); the
-        # _sum_prior_token_cost read fails → unconditional fail-closed → BLOCK.
+        # _sum_prior_token_cost read fails → cap_active=False → degrade to 0.0 → ALLOW.
         null_log_backend.query.side_effect = _query_blind_on(
             "token_sum",
             LBRError("blind prior-spend read, escalation-only-no-cap mandate"),
         )
         proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate_no_cap):
+            with caplog.at_level("WARNING", logger="atomic_agents.judge.mandate_check"):
+                judgment = mc.evaluate(proposal)
+
+        # #512: no-cap blind SUM read degrades to 0.0 → ALLOW (not BLOCK).
+        assert judgment.outcome == JudgmentOutcome.ALLOW
+        # Distinctive log line proves the degrade-not-block path fired.
+        assert any(
+            "step 7" in r.message and "no cap active" in r.message
+            for r in caplog.records
+            if r.levelname == "WARNING"
+        ), "Expected WARNING log containing 'step 7' and 'no cap active'"
+
+    def test_escalation_only_no_cap_blind_projection_blocks_protects_escalation(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """#512 — the baseline PROJECTION fails closed when an escalation threshold
+        is the active control, even with NO cap.
+
+        The projection feeds the step-9 escalation gate ("require operator
+        approval above $X").  If a blind baseline read degraded to the
+        conservative $0.10 default here, a truthful high baseline (which would
+        ESCALATE to a human) would be silently SUPPRESSED → ALLOW.  So with an
+        escalation threshold set, the projection read fails closed (BLOCK
+        mandate_cost_unreadable) even though the prior-spend SUM (which gates only
+        the cap) would degrade.  This is the escalation-control half of
+        ``feedback_fail_closed_only_where_theres_something_to_protect`` — an
+        escalation threshold IS something to protect.
+
+        Per-invocation negative control: strip ``has_token_escalation_threshold``
+        from the ``projection_cap_active`` expression at the _step7 call site and
+        this BLOCK flips to ALLOW (the blind projection degrades to $0.10, under
+        the threshold, escalation suppressed).  Verified by the build's adversarial
+        repro.  Distinct from the SUM-degrade sibling above (same mandate shape,
+        but here the *projection* read is blind, not the SUM).
+        """
+        from datetime import timedelta
+
+        from atomic_agents.exceptions import LogBackendReadError as LBRError
+
+        mandate_id = "escalation-only-no-cap-projection-512"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        now = datetime.now(timezone.utc)
+        mandate_no_cap = Mandate(
+            mandate_id=mandate_id,
+            scope="agent:test-agent",
+            granted_by="test-operator@example.com",
+            granted_at=now,
+            expires_at=now + timedelta(days=30),
+            revocation_state=RevocationState.ACTIVE,
+            revoked_at=None,
+            revoked_by=None,
+            revocation_reason=None,
+            constraints=MandateConstraints(
+                allowed_tools=frozenset(["test_tool"]),
+                # escalation threshold but NO token cap. The projection still
+                # fails closed because the escalation gate is an active control.
+                requires_escalation_above_token_usd=0.50,
+            ),
+            source_hash="sha256:escalation-only-projection-512",
+        )
+        mc = _make_mc(mandate_backend, scope, null_log_backend)
+
+        # The baseline PROJECTION read (LogQuery limit=1) is blind; with an
+        # escalation threshold set, projection_cap_active=True → raise → BLOCK.
+        null_log_backend.query.side_effect = _query_blind_on(
+            "project",
+            LBRError("blind baseline read, escalation-only-no-cap mandate"),
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate_no_cap):
+            with caplog.at_level("WARNING", logger="atomic_agents.judge.mandate_check"):
+                judgment = mc.evaluate(proposal)
+
+        assert judgment.outcome == JudgmentOutcome.BLOCK
+        assert judgment.reason.startswith("mandate_cost_unreadable")
+        # Distinctive log proves the projection fail-close (not the SUM) fired.
+        assert any(
+            "baseline" in r.message and "failing closed" in r.message
+            for r in caplog.records
+            if r.levelname == "WARNING"
+        ), "Expected WARNING log containing 'baseline' and 'failing closed'"
+
+    def test_escalation_with_token_cap_sum_failure_blocks(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """#512 per-invocation negative control (isolated instance).
+
+        Sibling of ``test_escalation_only_no_cap_token_sum_failure_degrades_not_blocks``
+        with a fresh ``mc`` and a fresh ``_query_blind_on`` closure so that neither
+        ``MandateCheck`` instance state (``_projection_cache`` / ``_state_manager``)
+        nor the dispatcher's ``seen`` dict can bleed in from the no-cap assertion.
+        Adding a tight token cap makes ``cap_active=True`` and restores the BLOCK,
+        proving the cap-gate is load-bearing, not a no-op
+        (``feedback_false_green_test_needs_per_invocation_negative_control``).
+        """
+        from datetime import timedelta
+
+        from atomic_agents.exceptions import LogBackendReadError as LBRError
+
+        mandate_id = "escalation-with-token-cap-512"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        now = datetime.now(timezone.utc)
+        mandate_with_cap = Mandate(
+            mandate_id=mandate_id,
+            scope="agent:test-agent",
+            granted_by="test-operator@example.com",
+            granted_at=now,
+            expires_at=now + timedelta(days=30),
+            revocation_state=RevocationState.ACTIVE,
+            revoked_at=None,
+            revoked_by=None,
+            revocation_reason=None,
+            constraints=MandateConstraints(
+                allowed_tools=frozenset(["test_tool"]),
+                requires_escalation_above_token_usd=100.0,
+                daily_token_usd=0.001,  # tight cap → cap_active=True on blind read
+            ),
+            source_hash="sha256:escalation-with-cap-512",
+        )
+        mc = _make_mc(mandate_backend, scope, null_log_backend)
+        null_log_backend.query.side_effect = _query_blind_on(
+            "token_sum",
+            LBRError("blind prior-spend read, with cap"),
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(
+            mandate_backend, "load_mandate", return_value=mandate_with_cap
+        ):
+            judgment_capped = mc.evaluate(proposal)
+
+        # With cap active, the blind SUM read must BLOCK (not degrade).
+        assert judgment_capped.outcome == JudgmentOutcome.BLOCK
+        assert judgment_capped.reason.startswith("mandate_cost_unreadable")
+
+    def test_escalation_only_no_cap_external_sum_failure_degrades_not_blocks(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """#512 — external SUM sibling: escalation-only-no-external-cap degrades, not blocks.
+
+        Symmetric with the token variant above.  For a mandate with only an
+        external escalation threshold and NO external cap, _step8 runs and
+        _sum_prior_external_cost is read; on a blind read it degrades to 0.0
+        (cap_active=False) rather than failing closed.
+
+        Per-invocation negative control: adding a tight external cap restores BLOCK.
+        """
+        from datetime import timedelta
+
+        from atomic_agents.exceptions import LogBackendReadError as LBRError
+
+        mandate_id = "escalation-only-no-ext-cap-512"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        now = datetime.now(timezone.utc)
+        mandate_no_cap = Mandate(
+            mandate_id=mandate_id,
+            scope="agent:test-agent",
+            granted_by="test-operator@example.com",
+            granted_at=now,
+            expires_at=now + timedelta(days=30),
+            revocation_state=RevocationState.ACTIVE,
+            revoked_at=None,
+            revoked_by=None,
+            revocation_reason=None,
+            constraints=MandateConstraints(
+                allowed_tools=frozenset(["test_tool"]),
+                # external escalation threshold but NO external cap → cap_active=False
+                requires_escalation_above_external_usd=1000.0,
+            ),
+            source_hash="sha256:ext-escalation-only-512",
+        )
+
+        # Use _make_mc_with_tool so _step8 is projectable (tool has static external
+        # cost $0.50, well below the $1000.0 escalation threshold).  Without a tool
+        # registry, _step8 returns unprojectable before ever reaching the SUM read.
+        mc = _make_mc_with_tool(
+            mandate_backend, scope, null_log_backend, "test_tool", 0.50
+        )
+
+        null_log_backend.query.side_effect = _query_blind_on(
+            "external_sum",
+            LBRError("blind external prior-spend read, no cap"),
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate_no_cap):
+            with caplog.at_level("WARNING", logger="atomic_agents.judge.mandate_check"):
+                judgment = mc.evaluate(proposal)
+
+        # #512: no-cap blind external SUM read degrades to 0.0 → ALLOW.
+        assert judgment.outcome == JudgmentOutcome.ALLOW
+        # Distinctive log line proves the degrade-not-block path fired.
+        assert any(
+            "step 8" in r.message and "no cap active" in r.message
+            for r in caplog.records
+            if r.levelname == "WARNING"
+        ), "Expected WARNING log containing 'step 8' and 'no cap active'"
+
+    def test_escalation_with_external_cap_sum_failure_blocks(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """#512 external per-invocation negative control (isolated instance).
+
+        Sibling of ``test_escalation_only_no_cap_external_sum_failure_degrades_not_blocks``
+        with a fresh ``mc`` and a fresh ``_query_blind_on`` closure so no instance
+        state or dispatcher ``seen`` dict bleeds in from the no-cap assertion.
+        Adding a tight external cap makes ``cap_active=True`` and restores the BLOCK.
+        """
+        from datetime import timedelta
+
+        from atomic_agents.exceptions import LogBackendReadError as LBRError
+
+        mandate_id = "escalation-with-ext-cap-512"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        now = datetime.now(timezone.utc)
+        mandate_with_cap = Mandate(
+            mandate_id=mandate_id,
+            scope="agent:test-agent",
+            granted_by="test-operator@example.com",
+            granted_at=now,
+            expires_at=now + timedelta(days=30),
+            revocation_state=RevocationState.ACTIVE,
+            revoked_at=None,
+            revoked_by=None,
+            revocation_reason=None,
+            constraints=MandateConstraints(
+                allowed_tools=frozenset(["test_tool"]),
+                requires_escalation_above_external_usd=1000.0,
+                daily_external_usd=0.001,  # tight cap → cap_active=True
+            ),
+            source_hash="sha256:ext-escalation-with-cap-512",
+        )
+        mc = _make_mc_with_tool(
+            mandate_backend, scope, null_log_backend, "test_tool", 0.50
+        )
+        null_log_backend.query.side_effect = _query_blind_on(
+            "external_sum",
+            LBRError("blind external prior-spend read, with cap"),
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(
+            mandate_backend, "load_mandate", return_value=mandate_with_cap
+        ):
+            judgment_capped = mc.evaluate(proposal)
+
+        assert judgment_capped.outcome == JudgmentOutcome.BLOCK
+        assert judgment_capped.reason.startswith("mandate_cost_unreadable")
+
+    # ── #512 P0: Policy-composed cap raises the EFFECTIVE-cap flag ───────────────
+
+    @staticmethod
+    def _no_cap_mandate(mandate_id: str) -> "Mandate":
+        """Mandate with NO cost cap of its own and no escalation threshold.
+
+        The deciding constraint comes entirely from a Policy-composed effective
+        cap (``policy_effective_caps``); the mandate declares no token/external
+        cap, so ``has_token_cap``/``has_external_cap`` are both False.
+        """
+        from datetime import timedelta
+
+        now = datetime.now(timezone.utc)
+        return Mandate(
+            mandate_id=mandate_id,
+            scope="agent:test-agent",
+            granted_by="test-operator@example.com",
+            granted_at=now,
+            expires_at=now + timedelta(days=30),
+            revocation_state=RevocationState.ACTIVE,
+            revoked_at=None,
+            revoked_by=None,
+            revocation_reason=None,
+            constraints=MandateConstraints(
+                allowed_tools=frozenset(["test_tool"]),
+                # NO daily/monthly/cumulative cap, NO escalation threshold:
+                # the only active budget is the Policy-composed effective cap.
+            ),
+            source_hash="sha256:no-cap-policy-only-512",
+        )
+
+    def test_policy_only_cap_blind_token_sum_blocks_closed(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """#512 P0 — fail-CLOSED against a Policy-composed cap when the mandate
+        declares NO cap of its own.
+
+        The cap actually enforced in steps 7-8 is the EFFECTIVE cap =
+        MIN(mandate constraint, Policy cap) via ``_min_or_other``.  A mandate
+        with no cap but running under a Policy daily cap therefore HAS an active
+        budget the prior-spend SUM gates.  If the SUM helper's fail-close were
+        gated on the mandate-declared cap only (``has_token_cap=False``), a blind
+        read would degrade the prior spend to ``$0.00`` and fail OPEN against the
+        live Policy budget — the never-under-report-spend invariant violation the
+        round-5 review flagged.  The fix derives ``cap_active`` from the EFFECTIVE
+        cap (mandate OR Policy), so the blind read must BLOCK
+        ``mandate_cost_unreadable``.
+
+        Policy daily cap is $0.50 — above the $0.10 default projection — so a
+        SUCCESSFUL read would ALLOW (projection alone is under cap); the blind
+        prior-spend read is the deciding factor.
+
+        Per-invocation negative control:
+        ``test_policy_none_no_cap_blind_token_sum_degrades_not_blocks`` runs the
+        SAME mandate + same blind read with ``policy_effective_caps=None`` and
+        gets ALLOW — proving the Policy-cap inclusion in ``cap_active`` is
+        load-bearing, not a no-op
+        (feedback_false_green_test_needs_per_invocation_negative_control).
+        """
+        from atomic_agents.exceptions import LogBackendReadError as LBRError
+        from atomic_agents.policy.types import CostCaps
+
+        mandate_id = "policy-only-cap-512"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = self._no_cap_mandate(mandate_id)
+        mc = MandateCheck(
+            mandate_backend=mandate_backend,
+            scope=scope,
+            target_extractor_registry=TargetExtractorRegistry(),
+            mandate_state_manager=MandateStateManager(
+                mandate_backend=mandate_backend, scope=scope
+            ),
+            mandate_settings=MandateSettings(),
+            log_backend=null_log_backend,
+            policy_effective_caps=CostCaps(daily_usd=0.50),
+        )
+
+        # _project_token_cost read succeeds ([] → $0.10 default); the
+        # _sum_prior_token_cost read goes blind.  With the Policy cap raising
+        # cap_active, the blind SUM must fail closed.
+        null_log_backend.query.side_effect = _query_blind_on(
+            "token_sum",
+            LBRError("blind prior-spend read, policy-only cap"),
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
         with patch.object(mandate_backend, "load_mandate", return_value=mandate):
             judgment = mc.evaluate(proposal)
 
-        # Current (deliberate) behavior: BLOCK, not ALLOW/ESCALATE. See #512.
         assert judgment.outcome == JudgmentOutcome.BLOCK
         assert judgment.reason.startswith("mandate_cost_unreadable")
+
+    def test_policy_none_no_cap_blind_token_sum_degrades_not_blocks(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """#512 P0 per-invocation negative control (isolated instance).
+
+        Identical to ``test_policy_only_cap_blind_token_sum_blocks_closed`` except
+        ``policy_effective_caps=None`` — no mandate cap AND no Policy cap, so the
+        prior-spend SUM gates nothing.  The blind read must degrade to ``$0.00``
+        and ALLOW.  Stripping the Policy-cap inclusion from ``cap_active`` (this
+        case) flips BLOCK → ALLOW, proving the P0 fix is load-bearing.
+        """
+        from atomic_agents.exceptions import LogBackendReadError as LBRError
+
+        mandate_id = "no-cap-no-policy-512"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = self._no_cap_mandate(mandate_id)
+        # policy_effective_caps defaults to None in _make_mc — no cap anywhere.
+        mc = _make_mc(mandate_backend, scope, null_log_backend)
+
+        null_log_backend.query.side_effect = _query_blind_on(
+            "token_sum",
+            LBRError("blind prior-spend read, no cap anywhere"),
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+
+        # No cap (mandate or Policy) → blind SUM degrades to 0.0 → ALLOW.
+        assert judgment.outcome == JudgmentOutcome.ALLOW
+
+    def test_policy_only_cap_blind_external_sum_blocks_closed(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """#512 P0 external sibling — fail-CLOSED against a Policy-composed cap.
+
+        ``CostCaps`` daily/monthly compose onto the EXTERNAL budget too (the
+        dimension is cost-agnostic).  A mandate with no external cap but a Policy
+        daily cap of $1.00 has an active external budget; a blind
+        ``_sum_prior_external_cost`` read must BLOCK ``mandate_cost_unreadable``,
+        not degrade to $0.00.  Tool static external cost is $0.50 (< $1.00 Policy
+        cap) so the projection alone would ALLOW; the blind prior-spend read is
+        the deciding factor.
+        """
+        from atomic_agents.exceptions import LogBackendReadError as LBRError
+        from atomic_agents.policy.types import CostCaps
+        from atomic_agents.tools import ToolRegistry
+
+        mandate_id = "policy-only-ext-cap-512"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = self._no_cap_mandate(mandate_id)
+        # Tool registry wired (static external cost $0.50) so step 8 is
+        # projectable; Policy daily cap $1.00 raises external_cap_active.
+        registry = ToolRegistry()
+        registry.register(_make_tool_def_with_static_cost("test_tool", 0.50))
+        mc = MandateCheck(
+            mandate_backend=mandate_backend,
+            scope=scope,
+            target_extractor_registry=TargetExtractorRegistry(),
+            mandate_state_manager=MandateStateManager(
+                mandate_backend=mandate_backend, scope=scope
+            ),
+            mandate_settings=MandateSettings(),
+            log_backend=null_log_backend,
+            tool_registry=registry,
+            policy_effective_caps=CostCaps(daily_usd=1.00),
+        )
+
+        null_log_backend.query.side_effect = _query_blind_on(
+            "external_sum",
+            LBRError("blind external prior-spend read, policy-only cap"),
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+
+        assert judgment.outcome == JudgmentOutcome.BLOCK
+        assert judgment.reason.startswith("mandate_cost_unreadable")
+
+    def test_policy_none_no_external_cap_step8_skipped_allows_neg_control(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """#512 P0 external ISOLATED negative control for the test above.
+
+        Identical to ``test_policy_only_cap_blind_external_sum_blocks_closed``
+        except ``policy_effective_caps=None`` — no mandate external cap AND no
+        Policy cap, so ``external_cap_active`` is False.  With no external cap,
+        threshold, or Policy cap, **step 8 short-circuits entirely** and the
+        blind external read never fires, so the verdict is ALLOW.  (The external
+        SUM helper's own ``cap_active=False`` *degrade* branch is exercised by
+        ``test_escalation_only_no_cap_external_sum_failure_degrades_not_blocks``,
+        which adds an escalation threshold so step 8 runs.)  This test is the
+        per-invocation negative control proving the ``_has_policy_cap`` inclusion
+        in ``external_cap_active`` is load-bearing: strip it from the BLOCK test
+        above and that BLOCK flips to this ALLOW
+        (``feedback_false_green_test_needs_per_invocation_negative_control``).
+        """
+        from atomic_agents.exceptions import LogBackendReadError as LBRError
+        from atomic_agents.tools import ToolRegistry
+
+        mandate_id = "no-cap-no-policy-ext-512"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = self._no_cap_mandate(mandate_id)
+        registry = ToolRegistry()
+        registry.register(_make_tool_def_with_static_cost("test_tool", 0.50))
+        # policy_effective_caps=None — no cap anywhere; external_cap_active=False.
+        mc = MandateCheck(
+            mandate_backend=mandate_backend,
+            scope=scope,
+            target_extractor_registry=TargetExtractorRegistry(),
+            mandate_state_manager=MandateStateManager(
+                mandate_backend=mandate_backend, scope=scope
+            ),
+            mandate_settings=MandateSettings(),
+            log_backend=null_log_backend,
+            tool_registry=registry,
+            policy_effective_caps=None,
+        )
+
+        null_log_backend.query.side_effect = _query_blind_on(
+            "external_sum",
+            LBRError("blind external prior-spend read, no cap anywhere"),
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
+            judgment = mc.evaluate(proposal)
+
+        assert judgment.outcome == JudgmentOutcome.ALLOW

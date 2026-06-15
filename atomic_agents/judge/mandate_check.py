@@ -16,13 +16,19 @@ BLOCK reason naming discipline (spec/29 §"BLOCK reason naming discipline"):
 all reasons are forever-stable strings — no PR identifiers, version suffixes,
 or transient context embedded in reason strings.
 
-Blind-read fail-closed posture (spec/29 §"Blind-read fail-closed"):
-the three prior-spend / baseline-projection read helpers
-(``_sum_prior_token_cost``, ``_sum_prior_external_cost``,
-``_project_token_cost``) raise ``_MandateCostUnreadable`` on genuine
-read-failure (``LogBackendReadError``, ``OSError``,
-``sqlite3.DatabaseError``). ``evaluate()`` catches these and returns
-``BLOCK`` with reason ``mandate_cost_unreadable`` (#506).
+Blind-read fail-closed posture (spec/29 §"Blind-read fail-closed posture"):
+all three prior-spend / baseline-projection read helpers share one
+cap-gated rule (#512): ``_sum_prior_token_cost`` (cap-gated),
+``_sum_prior_external_cost`` (cap-gated), and ``_project_token_cost``
+(cap-gated) raise ``_MandateCostUnreadable`` on genuine read-failure
+(``LogBackendReadError``, ``OSError``, ``sqlite3.DatabaseError``) **when
+``cap_active=True``** (a cap is in effect). When ``cap_active=False``
+(no cap exists), the SUM helpers return ``0.0`` and ``_project_token_cost``
+degrades to the conservative default — failing closed where there is
+nothing to protect spuriously blocks unconstrained agents (see
+``feedback_fail_closed_only_where_theres_something_to_protect``).
+``evaluate()`` catches ``_MandateCostUnreadable`` and returns ``BLOCK``
+with reason ``mandate_cost_unreadable`` (#506/#512).
 Code defects (``KeyError``, ``TypeError``, ``AttributeError``) are NOT
 caught here — they propagate as themselves so audit records are honest.
 
@@ -63,9 +69,10 @@ _logger = logging.getLogger(__name__)
 
 # ── Blind-read fail-closed sentinel ─────────────────────────────────────────
 # Raised by the three prior-spend / baseline-projection read helpers when a
-# genuine read failure occurs (LogBackendReadError, OSError,
-# sqlite3.DatabaseError).  evaluate() catches this and returns
-# BLOCK reason='mandate_cost_unreadable' (#506).
+# genuine read failure occurs AND a cap is in effect (cap_active=True).
+# When cap_active=False the SUM helpers return 0.0 instead; _project_token_cost
+# degrades to the conservative default.  evaluate() catches _MandateCostUnreadable
+# and returns BLOCK reason='mandate_cost_unreadable' (#506/#512).
 #
 # psycopg.Error is NOT listed here directly: a conforming PostgresLogBackend
 # wraps psycopg errors in LogBackendReadError before they reach this layer
@@ -79,9 +86,12 @@ _NARROW_READ_FAILURE = (LogBackendReadError, OSError, sqlite3.DatabaseError)
 class _MandateCostUnreadable(Exception):
     """Internal sentinel: a prior-spend SUM or baseline-projection read failed.
 
-    Raised by ``_sum_prior_token_cost``, ``_sum_prior_external_cost``, and
-    (cap-gated) ``_project_token_cost`` on genuine read failure from the
-    narrow-catch family ``(LogBackendReadError, OSError, sqlite3.DatabaseError)``.
+    Raised by ``_sum_prior_token_cost`` (cap-gated), ``_sum_prior_external_cost``
+    (cap-gated), and ``_project_token_cost`` (cap-gated) on genuine read failure
+    from the narrow-catch family ``(LogBackendReadError, OSError,
+    sqlite3.DatabaseError)`` **when ``cap_active=True``**.  When ``cap_active=False``
+    the SUM helpers return ``0.0`` instead; ``_project_token_cost`` degrades to
+    the conservative default.
 
     ``evaluate()`` catches this and returns BLOCK with reason
     ``mandate_cost_unreadable``.  Code defects (``KeyError``, ``TypeError``,
@@ -569,6 +579,21 @@ class MandateCheck:
         caps_exceeded: dict[str, dict[str, Any]] = {}
         contributing_reservation_ids: list[str] = []
 
+        # A Policy-composed effective cap (#89 PR 3a / spec/32 D2) is the cap
+        # ACTUALLY enforced in steps 7-8: the effective cap for each dimension is
+        # MIN(mandate constraint, Policy cap) via _min_or_other.  `CostCaps`
+        # daily_usd/monthly_usd are dimension-agnostic — a Policy cap composes
+        # onto BOTH the token and external budgets — so a Policy cap with NO
+        # mandate cap still produces an active effective cap that the prior-spend
+        # SUM gates.  The cap_active flags MUST therefore reflect the EFFECTIVE
+        # cap, not mandate-declared caps alone; gating only on the mandate-declared
+        # presence would let a blind SUM degrade-to-$0.00 fail OPEN against a live
+        # Policy budget (the never-under-report-spend invariant — #506/#512).
+        _pec = self._policy_effective_caps
+        _has_policy_cap = _pec is not None and (
+            _pec.daily_usd is not None or _pec.monthly_usd is not None
+        )
+
         has_token_cap = any(
             [
                 mandate.constraints.daily_token_usd is not None,
@@ -576,6 +601,9 @@ class MandateCheck:
                 mandate.constraints.cumulative_token_usd is not None,
             ]
         )
+        # Effective token cap presence = mandate-declared token cap OR a
+        # Policy-composed cap (which lands on the token budget via _min_or_other).
+        token_cap_active = has_token_cap or _has_policy_cap
         has_token_escalation_threshold = (
             mandate.constraints.requires_escalation_above_token_usd is not None
         )
@@ -584,22 +612,36 @@ class MandateCheck:
             0.0  # initialised before try so record_projection sees it
         )
 
-        # _MandateCostUnreadable from _sum_prior_token_cost / _sum_prior_external_cost
-        # / _project_token_cost (cap-gated) propagates out of _step7/_step8 to here.
+        # _MandateCostUnreadable from _sum_prior_token_cost (cap-gated),
+        # _sum_prior_external_cost (cap-gated), and _project_token_cost (cap-gated)
+        # propagates out of _step7/_step8 to here when a cap is in effect.
         # Caught below after both budget steps and the escalation evaluation.
         try:
-            if has_token_cap or has_token_escalation_threshold:
+            if has_token_cap or has_token_escalation_threshold or _has_policy_cap:
                 token_result = self._step7_token_budget(
                     proposal=proposal,
                     mandate=mandate,
                     mandate_id=mandate_id,
-                    has_token_cap=has_token_cap,
+                    cap_active=token_cap_active,
+                    # The baseline PROJECTION feeds BOTH the cap check and the
+                    # step-9 escalation gate.  An escalation threshold is itself
+                    # an active control to protect, so the projection read must
+                    # fail closed when EITHER a cap OR an escalation threshold is
+                    # set — otherwise a blind baseline read degrades to the
+                    # conservative default and could silently SUPPRESS an
+                    # escalation a truthful read would have fired (#512).  The
+                    # prior-spend SUM gates only the cap, so it stays on
+                    # token_cap_active.
+                    projection_cap_active=(
+                        token_cap_active or has_token_escalation_threshold
+                    ),
                 )
                 # Fail-closed: token reservation store unreadable → immediate BLOCK,
                 # bypass step 9 (mirrors the step-8 unprojectable path).
                 # Note: reservations_unreadable fires only for compute_outstanding
                 # read failures (#497 reason); prior-spend SUM failures raise
-                # _MandateCostUnreadable and are caught by the outer try/except.
+                # _MandateCostUnreadable (only when a cap is active, #512) and are
+                # caught by the outer try/except.
                 if token_result.get("reservations_unreadable"):
                     return self._block(
                         reason="mandate_token_reservations_unreadable",
@@ -631,11 +673,21 @@ class MandateCheck:
                     else False,
                 ]
             )
-            if has_external_cap or has_external_escalation_threshold:
+            # Effective external cap presence = mandate-declared external cap OR a
+            # Policy-composed cap (which lands on the external budget too).  Note:
+            # per_action_max_usd is folded into has_external_cap because step 8
+            # ALSO needs to run for it (the projection-vs-per-action check); the
+            # prior-spend external SUM it gates is only consumed against the
+            # daily/monthly/cumulative external caps, so a per_action-only mandate
+            # is a fail-SAFE over-block corner, not an under-report — see the
+            # _sum_prior_external_cost cap-gate comment.
+            external_cap_active = has_external_cap or _has_policy_cap
+            if has_external_cap or has_external_escalation_threshold or _has_policy_cap:
                 ext_result = self._step8_external_budget(
                     proposal=proposal,
                     mandate=mandate,
                     mandate_id=mandate_id,
+                    cap_active=external_cap_active,
                 )
                 # Fail-closed: external reservation store unreadable → immediate
                 # BLOCK, bypass step 9 (mirrors the unprojectable path).
@@ -686,23 +738,45 @@ class MandateCheck:
 
             # ── Cap-exceeded verdict (steps 7 + 8) ────────────────────────────
             if caps_exceeded:
-                # Second read of _sum helpers — must also be guarded.  These
-                # re-reads are diagnostic-only (cumulative_*_now fields in the
+                # Second read of _sum helpers — must also be guarded, and under
+                # the SAME one cap-gated rule as steps 7/8 (#512, spec/29
+                # §"Blind-read fail-closed posture": "the cap-exceeded verdict
+                # re-reads pass the same flag").  These re-reads are
+                # diagnostic-only (the cumulative_*_now fields in the
                 # mandate_cap_exceeded_block event); the BLOCK outcome is already
-                # determined by caps_exceeded being non-empty.  A blind read here
-                # still raises _MandateCostUnreadable and is caught by the outer
-                # try/except which returns the mandate_cost_unreadable BLOCK.
+                # determined by caps_exceeded being non-empty.
+                #
+                # cap_active is per-dimension and reflects the EFFECTIVE cap, NOT
+                # a literal True: caps_exceeded being non-empty proves AT LEAST ONE
+                # cap was exceeded — token OR external — not that BOTH a token cap
+                # and an external cap are in effect.  Hardcoding True would
+                # over-block the uncapped dimension: e.g. a token-cap-only mandate
+                # whose blind external re-read would raise _MandateCostUnreadable
+                # and flip the truthful mandate_cap_would_exceed verdict to
+                # mandate_cost_unreadable, falsifying the audit reason for a
+                # dimension with no cap to protect
+                # (feedback_fail_closed_only_where_theres_something_to_protect).
+                # So the token re-read fails closed only when token_cap_active, the
+                # external re-read only when external_cap_active; both flags fold in
+                # any Policy-composed cap (which lands on both dimensions), so a
+                # Policy-only cap correctly gates the re-read for the dimension(s)
+                # it composes onto.  Otherwise the blind read degrades to $0.00 —
+                # the honest diagnostic when nothing is summed because nothing
+                # gates it.
                 #
                 # Note: if we reach this point, reservations_unreadable was False
-                # (the early-return guards above already handled it).
+                # (the early-return guards above already handled it).  A
                 # _MandateCostUnreadable here means the PRIOR-SPEND SUM re-read
-                # failed, not the reservation read.  The distinct reason strings
-                # (mandate_token_reservations_unreadable vs mandate_cost_unreadable)
-                # are intentional — they identify which read path was blind.
+                # failed for a dimension whose cap IS active, not the reservation
+                # read.  The distinct reason strings (mandate_token_reservations_-
+                # unreadable vs mandate_cost_unreadable) are intentional — they
+                # identify which read path was blind.
                 cumulative_token_now = self._sum_prior_token_cost(
-                    mandate_id, proposal.actor_run_id
+                    mandate_id, proposal.actor_run_id, cap_active=token_cap_active
                 )
-                cumulative_external_now = self._sum_prior_external_cost(mandate_id)
+                cumulative_external_now = self._sum_prior_external_cost(
+                    mandate_id, cap_active=external_cap_active
+                )
                 return self._build_cap_exceeded_judgment(
                     proposal=proposal,
                     mandate=mandate,
@@ -717,9 +791,10 @@ class MandateCheck:
                 )
 
         except _MandateCostUnreadable as exc:
-            # any-unreadable → BLOCK (spec/29 §"Blind-read fail-closed").
-            # Fires when _sum_prior_token_cost, _sum_prior_external_cost, or
-            # _project_token_cost (cap-gated) raise _MandateCostUnreadable.
+            # any-unreadable → BLOCK (spec/29 §"Blind-read fail-closed posture").
+            # Fires when _sum_prior_token_cost (cap-gated), _sum_prior_external_cost
+            # (cap-gated), or _project_token_cost (cap-gated) raise
+            # _MandateCostUnreadable — all three share the same cap-gated rule (#512).
             # compute_outstanding read failures produce the #497-shipped reasons
             # via the reservations_unreadable flag path above; this catch covers
             # only the prior-spend/projection read paths.
@@ -801,6 +876,8 @@ class MandateCheck:
         self,
         mandate_id: str,
         run_id: str,
+        *,
+        cap_active: bool = True,
     ) -> float:
         """Sum prior actor-source cost events tagged with ``mandate_id``.
 
@@ -808,12 +885,29 @@ class MandateCheck:
         per-action projection is approximate (spec/29 §"Validation steps (in
         order)" step 7); this sum is the ground truth after the fact.
 
+        Args:
+            mandate_id: The mandate whose prior token spend to sum.
+            run_id: Accepted for call-site symmetry; not currently used in the
+                query (the sum is scoped by ``mandate_id`` + ``cost_source``
+                only).
+            cap_active: When ``True`` (an EFFECTIVE token cap is in effect —
+                mandate-declared OR Policy-composed), a genuine read failure
+                raises ``_MandateCostUnreadable`` and the gate fails closed.
+                When ``False`` (no cap — the sum gates nothing), a read failure
+                degrades to ``0.0`` rather than spuriously blocking an
+                unconstrained agent.  Defaults to ``True`` (fail-CLOSED): for a
+                money gate an omitted flag must over-block, never silently
+                fail-open — every live caller passes it explicitly from the
+                effective-cap presence.  Mirrors ``_project_token_cost``'s
+                ``cap_active`` parameter (#512).
+
         Raises:
             _MandateCostUnreadable: on genuine read failure from the narrow
-                family ``(LogBackendReadError, OSError, sqlite3.DatabaseError)``.
-                Code defects (``KeyError``, ``TypeError``, ``AttributeError``)
-                propagate as themselves — NOT wrapped here.  See module docstring
-                §"Blind-read fail-closed posture".
+                family ``(LogBackendReadError, OSError, sqlite3.DatabaseError)``
+                **when ``cap_active=True``**.  When ``cap_active=False``, returns
+                ``0.0`` instead.  Code defects (``KeyError``, ``TypeError``,
+                ``AttributeError``) propagate as themselves — NOT wrapped here.
+                See module docstring §"Blind-read fail-closed posture".
         """
         from ..logs.types import LogQuery
 
@@ -832,37 +926,72 @@ class MandateCheck:
                 and r.mandate_id == mandate_id
             )
         except _NARROW_READ_FAILURE as exc:
-            # Genuine read failure (LogBackendReadError / OSError /
-            # sqlite3.DatabaseError) — fail closed (#506).
-            # psycopg errors are not caught directly: a conforming
-            # PostgresLogBackend wraps them in LogBackendReadError before they
-            # reach this layer (spec/22 addendum §"Read-failure boundary").
-            # A non-conforming backend's psycopg.Error propagates as a code
-            # defect — deliberately NOT relabelled a quiet BLOCK (Principle #5/#8:
-            # the audit verdict 'cost unreadable' is a claim about the world, not
-            # a code bug).
+            # Cap-gated fail-close (#512): raise _MandateCostUnreadable only when
+            # a token cap is actually in effect.  When no cap exists, a blind read
+            # returns 0.0 — the sum gates nothing, so there is nothing to protect
+            # (feedback_fail_closed_only_where_theres_something_to_protect).
+            # psycopg errors are not caught directly: a conforming PostgresLogBackend
+            # wraps them in LogBackendReadError before they reach this layer
+            # (spec/22 addendum §"Read-failure boundary").  A non-conforming
+            # backend's psycopg.Error propagates as a code defect — deliberately
+            # NOT relabelled a quiet BLOCK (Principle #5/#8: the audit verdict
+            # 'cost unreadable' is a claim about the world, not a code bug).
+            if cap_active:
+                _logger.warning(
+                    "MandateCheck step 7: cost-log read failure summing prior token "
+                    "cost for mandate %r (cap active) — failing closed "
+                    "(mandate_cost_unreadable): %s",
+                    mandate_id,
+                    exc,
+                )
+                raise _MandateCostUnreadable(
+                    f"prior token cost unreadable for mandate {mandate_id!r}: {exc}"
+                ) from exc
+            # No cap active — degrade to 0.0 (safe: a zero sum gates nothing with
+            # no cap in effect; never-under-report-spend invariant holds because
+            # 'under-report' only matters against an ACTIVE constraint).
             _logger.warning(
                 "MandateCheck step 7: cost-log read failure summing prior token "
-                "cost for mandate %r — failing closed (mandate_cost_unreadable): %s",
+                "cost for mandate %r (no cap active) — degrading to 0.0: %s",
                 mandate_id,
                 exc,
             )
-            raise _MandateCostUnreadable(
-                f"prior token cost unreadable for mandate {mandate_id!r}: {exc}"
-            ) from exc
+            return 0.0
 
-    def _sum_prior_external_cost(self, mandate_id: str) -> float:
+    def _sum_prior_external_cost(
+        self,
+        mandate_id: str,
+        *,
+        cap_active: bool = True,
+    ) -> float:
         """Sum prior external_cost events tagged with ``mandate_id``.
 
         Per spec/29 §"Cost integration": external costs land in a cost event
         with ``extra["cost_kind"] == "external"`` and ``mandate_id`` set.  The
         sum drives the cumulative external budget.
 
+        Args:
+            mandate_id: The mandate whose prior external spend to sum.
+            cap_active: When ``True`` (an EFFECTIVE external cap is in effect —
+                mandate-declared OR Policy-composed), a genuine read failure
+                raises ``_MandateCostUnreadable`` and the gate fails closed.
+                When ``False`` (no cap — the sum gates nothing), a read failure
+                degrades to ``0.0`` rather than spuriously blocking an
+                unconstrained agent.  Defaults to ``True`` (fail-CLOSED): for a
+                money gate an omitted flag must over-block, never silently
+                fail-open.  Note: the caller folds ``per_action_max_usd`` into
+                ``has_external_cap`` because step 8 needs it for the per-action
+                projection check, but this SUM is consumed only against the
+                daily/monthly/cumulative external caps — a per_action-only mandate
+                is a fail-SAFE over-block here, not an under-report.  Mirrors
+                ``_project_token_cost``'s ``cap_active`` parameter (#512).
+
         Raises:
             _MandateCostUnreadable: on genuine read failure from the narrow
-                family ``(LogBackendReadError, OSError, sqlite3.DatabaseError)``.
-                Code defects propagate as themselves.  See module docstring
-                §"Blind-read fail-closed posture".
+                family ``(LogBackendReadError, OSError, sqlite3.DatabaseError)``
+                **when ``cap_active=True``**.  When ``cap_active=False``, returns
+                ``0.0`` instead.  Code defects propagate as themselves.
+                See module docstring §"Blind-read fail-closed posture".
         """
         from ..logs.types import LogQuery
 
@@ -878,24 +1007,36 @@ class MandateCheck:
                 if r.extra.get("cost_kind") == "external" and r.mandate_id == mandate_id
             )
         except _NARROW_READ_FAILURE as exc:
-            # Genuine read failure — fail closed (#506).  Same narrow-catch
-            # rationale as _sum_prior_token_cost above.
+            # Cap-gated fail-close (#512): raise _MandateCostUnreadable only when
+            # an external cap is actually in effect.  Same rationale as
+            # _sum_prior_token_cost's cap-gate above.
+            if cap_active:
+                _logger.warning(
+                    "MandateCheck step 8: cost-log read failure summing prior external "
+                    "cost for mandate %r (cap active) — failing closed "
+                    "(mandate_cost_unreadable): %s",
+                    mandate_id,
+                    exc,
+                )
+                raise _MandateCostUnreadable(
+                    f"prior external cost unreadable for mandate {mandate_id!r}: {exc}"
+                ) from exc
+            # No cap active — degrade to 0.0 (safe: a zero sum gates nothing with
+            # no cap in effect).
             _logger.warning(
                 "MandateCheck step 8: cost-log read failure summing prior external "
-                "cost for mandate %r — failing closed (mandate_cost_unreadable): %s",
+                "cost for mandate %r (no cap active) — degrading to 0.0: %s",
                 mandate_id,
                 exc,
             )
-            raise _MandateCostUnreadable(
-                f"prior external cost unreadable for mandate {mandate_id!r}: {exc}"
-            ) from exc
+            return 0.0
 
     def _project_token_cost(
         self,
         proposal: ActionProposal,
         n_tool_calls: int,
         *,
-        cap_active: bool = False,
+        cap_active: bool = True,
     ) -> float:
         """Project this action's share of the upcoming turn's token cost.
 
@@ -914,13 +1055,16 @@ class MandateCheck:
             cap_active: when ``True`` and the baseline read fails with the
                 narrow family (LogBackendReadError, OSError,
                 sqlite3.DatabaseError), raise ``_MandateCostUnreadable``
-                instead of degrading to the conservative default.  Pass
-                ``True`` when a token/daily/monthly token cap is in effect —
-                a blind read could let us under-project and silently pass a
-                cap check (fail-open).  When ``False`` (no cap in effect),
-                the conservative fallback is safe and spurious blocking is
-                avoided (per ``feedback_fail_closed_only_where_theres_something_
-                to_protect``; avoids re-introducing the #495 regression).
+                instead of degrading to the conservative default.  Callers
+                pass ``True`` when the projection gates an active control — a
+                token/daily/monthly cap (a blind read could under-project and
+                silently pass a cap check) OR an escalation threshold (a blind
+                read could under-project and silently SUPPRESS an escalation a
+                truthful read would fire).  When ``False`` (no cap AND no
+                escalation threshold), the conservative fallback is safe and
+                spurious blocking is avoided (per
+                ``feedback_fail_closed_only_where_theres_something_to_protect``;
+                avoids re-introducing the #495 regression).
         """
         from ..logs.types import LogQuery
 
@@ -951,16 +1095,19 @@ class MandateCheck:
                 elif most_recent.cost_usd is not None:
                     turn_cost = most_recent.cost_usd
         except _NARROW_READ_FAILURE as exc:
-            # Cap-gated fail-close (#506): raise _MandateCostUnreadable only
-            # when a token cap is actually in effect.  When no cap exists, a
-            # blind read only means we fall back to the conservative default —
-            # there is nothing to bypass, so spurious blocking is avoided.
+            # Cap-gated fail-close (#506/#512): raise _MandateCostUnreadable only
+            # when the projection gates an active control — a token cap OR an
+            # escalation threshold (cap_active here is the caller's
+            # projection_cap_active).  When neither exists, a blind read only
+            # means we fall back to the conservative default — there is nothing
+            # to bypass, so spurious blocking is avoided.
             # (feedback_fail_closed_only_where_theres_something_to_protect)
             if cap_active:
                 _logger.warning(
                     "MandateCheck step 7: cost-log read failure reading preceding "
-                    "iteration baseline for run %r (cap active) — failing closed "
-                    "(mandate_cost_unreadable): %s",
+                    "iteration baseline for run %r (projection gate active: cap or "
+                    "escalation threshold) — failing closed (mandate_cost_unreadable): "
+                    "%s",
                     proposal.actor_run_id,
                     exc,
                 )
@@ -1011,7 +1158,11 @@ class MandateCheck:
         proposal: ActionProposal,
         mandate: Any,
         mandate_id: str,
-        has_token_cap: bool = False,
+        # Fail-CLOSED default (money gate): matches the leaf SUM/projection
+        # helpers' cap_active=True default. All live callers pass the effective
+        # flag explicitly; an omitted flag must over-block, never fail-open (#512).
+        cap_active: bool = True,
+        projection_cap_active: bool | None = None,
     ) -> dict[str, Any]:
         """Evaluate step 7 token budget caps.
 
@@ -1021,27 +1172,55 @@ class MandateCheck:
           ``reservation_ids`` — list of outstanding reservation IDs that
               contributed to pushing the cumulative over the cap.
 
+        Args:
+            cap_active: whether an EFFECTIVE token cap is in effect — the
+                mandate-declared token cap OR a Policy-composed cap
+                (`MIN(mandate, Policy)`).  Gates the prior-spend SUM read (which
+                only feeds the cumulative-vs-cap check).
+            projection_cap_active: whether the baseline PROJECTION read must fail
+                closed — ``cap_active`` OR an escalation threshold is set.  The
+                projection feeds BOTH the cap check and the step-9 escalation
+                gate; an escalation threshold is its own active control, so the
+                projection fails closed when one is set even with no cap (else a
+                blind baseline read degrades to the conservative default and could
+                silently suppress an escalation — #512).  ``None`` (the default)
+                falls back to ``cap_active`` so any future caller stays
+                fail-closed.
+
         Raises:
             _MandateCostUnreadable: propagated from ``_project_token_cost``
-                (cap-gated) or ``_sum_prior_token_cost`` on genuine read
-                failure.  NOT caught here — propagates to evaluate() which
-                has the outer try/except handler.
+                (gated on ``projection_cap_active``) or ``_sum_prior_token_cost``
+                (gated on ``cap_active``) on genuine read failure.  NOT caught
+                here — propagates to evaluate()'s outer try/except handler.
         """
         # Simple assumption: one tool call per turn for v1 apportionment.
         # The framework does not yet pass N across tool calls per turn to
         # MandateCheck; argument-token-weighted apportionment is a follow-up.
         n_tool_calls = 1
-        # _project_token_cost is called FIRST. When cap_active=True it raises
+        # The baseline projection feeds the step-9 escalation gate as well as the
+        # cap check, so it fails closed on a blind read when EITHER a cap OR an
+        # escalation threshold is in effect.  Callers pass that combined flag as
+        # projection_cap_active; it falls back to cap_active when omitted so the
+        # default-True (fail-closed) posture is preserved for any future caller.
+        if projection_cap_active is None:
+            projection_cap_active = cap_active
+        # _project_token_cost is called FIRST. When its cap_active=True it raises
         # _MandateCostUnreadable on read failure, which short-circuits the
         # entire _step7 path before _sum_prior_token_cost is even called
         # (ordering guarantee per prep finding P2 / #506).
         projected = self._project_token_cost(
-            proposal, n_tool_calls, cap_active=has_token_cap
+            proposal, n_tool_calls, cap_active=projection_cap_active
         )
 
         # _MandateCostUnreadable from _sum_prior_token_cost is intentionally
         # NOT caught here — it propagates to evaluate()'s outer try/except.
-        prior_spend = self._sum_prior_token_cost(mandate_id, proposal.actor_run_id)
+        # With cap_active threaded from the effective cap, a read failure raises
+        # only when a token cap (mandate or Policy) is in effect; otherwise it
+        # returns 0.0 (safe degrade — no cap to bypass, so spurious blocking is
+        # avoided).
+        prior_spend = self._sum_prior_token_cost(
+            mandate_id, proposal.actor_run_id, cap_active=cap_active
+        )
 
         # Sum outstanding reservations for this mandate (token kind).
         try:
@@ -1140,6 +1319,10 @@ class MandateCheck:
         proposal: ActionProposal,
         mandate: Any,
         mandate_id: str,
+        # Fail-CLOSED default (money gate): matches the leaf SUM/projection
+        # helpers' cap_active=True default. All live callers pass the effective
+        # flag explicitly; an omitted flag must over-block, never fail-open (#512).
+        cap_active: bool = True,
     ) -> dict[str, Any]:
         """Evaluate step 8 external budget caps.
 
@@ -1151,10 +1334,21 @@ class MandateCheck:
               projected (fail-closed per spec/29 §"Validation steps (in
               order)" step 8).
 
+        Args:
+            cap_active: whether an EFFECTIVE external cap is in effect — the
+                mandate-declared external cap OR a Policy-composed cap
+                (`MIN(mandate, Policy)`).  When ``True``,
+                ``_sum_prior_external_cost`` fails closed on a blind read
+                (raises ``_MandateCostUnreadable``).  When ``False`` (no cap),
+                a read failure degrades to ``0.0``.  Mirrors
+                ``_step7_token_budget``'s ``cap_active`` parameter (#512).
+
         Raises:
             _MandateCostUnreadable: propagated from ``_sum_prior_external_cost``
-                on genuine read failure.  NOT caught here — propagates to
-                evaluate()'s outer try/except handler.
+                (cap-gated) on genuine read failure **only when
+                ``cap_active=True``**.  When ``cap_active=False``,
+                ``_sum_prior_external_cost`` returns ``0.0`` instead.  NOT caught
+                here — propagates to evaluate()'s outer try/except handler.
         """
         # Resolve the tool definition for cost_estimator_id and
         # expected_external_cost_usd.
@@ -1216,7 +1410,12 @@ class MandateCheck:
 
         # _MandateCostUnreadable from _sum_prior_external_cost is intentionally
         # NOT caught here — propagates to evaluate()'s outer try/except.
-        prior_external = self._sum_prior_external_cost(mandate_id)
+        # With cap_active threaded from the effective cap, a read failure raises
+        # only when an external cap (mandate or Policy) is in effect; otherwise
+        # returns 0.0 (safe degrade).
+        prior_external = self._sum_prior_external_cost(
+            mandate_id, cap_active=cap_active
+        )
 
         # Outstanding external reservations.
         try:
