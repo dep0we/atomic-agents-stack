@@ -3877,7 +3877,7 @@ class TestMandateCheckCostUnreadable:
         assert judgment.outcome == JudgmentOutcome.BLOCK
         assert judgment.reason.startswith("mandate_cost_unreadable")
 
-    def test_policy_none_no_external_cap_blind_external_sum_degrades_not_blocks(
+    def test_policy_none_no_external_cap_step8_skipped_allows_neg_control(
         self,
         mandate_backend: FilesystemMandateBackend,
         scope_root: Path,
@@ -3888,13 +3888,16 @@ class TestMandateCheckCostUnreadable:
 
         Identical to ``test_policy_only_cap_blind_external_sum_blocks_closed``
         except ``policy_effective_caps=None`` — no mandate external cap AND no
-        Policy cap, so ``external_cap_active`` is False and the blind external
-        prior-spend read gates nothing.  Step 8 short-circuits (no external cap /
-        threshold / Policy cap), the blind read never fires, and the verdict is
-        ALLOW.  This is the per-invocation negative control proving the
-        ``_has_policy_cap`` inclusion in ``external_cap_active`` is load-bearing
-        (strip it from the test above → that BLOCK flips to this ALLOW), per
-        ``feedback_false_green_test_needs_per_invocation_negative_control``.
+        Policy cap, so ``external_cap_active`` is False.  With no external cap,
+        threshold, or Policy cap, **step 8 short-circuits entirely** and the
+        blind external read never fires, so the verdict is ALLOW.  (The external
+        SUM helper's own ``cap_active=False`` *degrade* branch is exercised by
+        ``test_escalation_only_no_cap_external_sum_failure_degrades_not_blocks``,
+        which adds an escalation threshold so step 8 runs.)  This test is the
+        per-invocation negative control proving the ``_has_policy_cap`` inclusion
+        in ``external_cap_active`` is load-bearing: strip it from the BLOCK test
+        above and that BLOCK flips to this ALLOW
+        (``feedback_false_green_test_needs_per_invocation_negative_control``).
         """
         from atomic_agents.exceptions import LogBackendReadError as LBRError
         from atomic_agents.tools import ToolRegistry

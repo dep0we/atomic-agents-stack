@@ -670,11 +670,7 @@ class MandateCheck:
             # is a fail-SAFE over-block corner, not an under-report — see the
             # _sum_prior_external_cost cap-gate comment.
             external_cap_active = has_external_cap or _has_policy_cap
-            if (
-                has_external_cap
-                or has_external_escalation_threshold
-                or _has_policy_cap
-            ):
+            if has_external_cap or has_external_escalation_threshold or _has_policy_cap:
                 ext_result = self._step8_external_budget(
                     proposal=proposal,
                     mandate=mandate,
@@ -1144,7 +1140,10 @@ class MandateCheck:
         proposal: ActionProposal,
         mandate: Any,
         mandate_id: str,
-        cap_active: bool = False,
+        # Fail-CLOSED default (money gate): matches the leaf SUM/projection
+        # helpers' cap_active=True default. All live callers pass the effective
+        # flag explicitly; an omitted flag must over-block, never fail-open (#512).
+        cap_active: bool = True,
     ) -> dict[str, Any]:
         """Evaluate step 7 token budget caps.
 
@@ -1287,7 +1286,10 @@ class MandateCheck:
         proposal: ActionProposal,
         mandate: Any,
         mandate_id: str,
-        cap_active: bool = False,
+        # Fail-CLOSED default (money gate): matches the leaf SUM/projection
+        # helpers' cap_active=True default. All live callers pass the effective
+        # flag explicitly; an omitted flag must over-block, never fail-open (#512).
+        cap_active: bool = True,
     ) -> dict[str, Any]:
         """Evaluate step 8 external budget caps.
 
