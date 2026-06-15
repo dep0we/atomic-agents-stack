@@ -3091,63 +3091,44 @@ class TestMandateCheckCostUnreadable:
 
     # ── _project_token_cost — cap-gated fail-close ────────────────────────────
 
-    def test_project_token_cost_read_failure_no_cap_degrades_to_default(
+    def test_project_token_cost_read_failure_cap_inactive_degrades_to_default_unit(
         self,
         mandate_backend: FilesystemMandateBackend,
         scope_root: Path,
         scope: str,
         null_log_backend: Any,
     ):
-        """_project_token_cost read failure + cap_active=False → degrade-to-default, ALLOW.
+        """_project_token_cost(cap_active=False) + read failure → degrade-to-default.
 
-        The cap_active=False path fires when a token escalation threshold exists
-        (so _step7 runs) but NO token budget cap is set.  In that case
-        _project_token_cost uses a generous fallback ($0.10 default) instead of
-        failing closed — there is no cap to bypass, so spurious blocking is avoided
+        Direct unit test of the projection's safe-degrade primitive: when the
+        projection gates NOTHING (cap_active=False), a blind baseline read falls
+        back to the $0.10 conservative default instead of raising
         (feedback_fail_closed_only_where_theres_something_to_protect).
 
-        Mandate has requires_escalation_above_token_usd=100.0 (way above the $0.10
-        default) but no token budget cap.  The read failure degrades to $0.10 and
-        the escalation check does NOT fire → ALLOW.
+        NOTE (#512): via the live ``evaluate()``/``_step7`` path this branch is no
+        longer reachable — ``_step7`` runs only when a cap, escalation threshold,
+        or Policy cap exists, and in every one of those cases the projection gates
+        an active control, so ``projection_cap_active`` is always True there (see
+        ``test_escalation_only_no_cap_blind_projection_blocks_protects_escalation``
+        for the escalation-only case that now BLOCKs).  This test pins the
+        degrade primitive directly so the defensive ``cap_active=False`` branch
+        stays covered.
         """
         from atomic_agents.exceptions import LogBackendReadError as LBRError
 
-        mandate_id = "project-no-cap-degrade"
+        mandate_id = "project-cap-inactive-degrade"
         _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
-        from datetime import timedelta
-
-        now = datetime.now(timezone.utc)
-        mandate = Mandate(
-            mandate_id=mandate_id,
-            scope="agent:test-agent",
-            granted_by="test-operator@example.com",
-            granted_at=now,
-            expires_at=now + timedelta(days=30),
-            revocation_state=RevocationState.ACTIVE,
-            revoked_at=None,
-            revoked_by=None,
-            revocation_reason=None,
-            constraints=MandateConstraints(
-                allowed_tools=frozenset(["test_tool"]),
-                # NO token budget caps (daily/monthly/cumulative all None) →
-                # cap_active=False; _project_token_cost read failure degrades safely
-                requires_escalation_above_token_usd=100.0,  # threshold above $0.10 default
-            ),
-            source_hash="sha256:no-cap-degrade",
-        )
         mc = _make_mc(mandate_backend, scope, null_log_backend)
 
-        # _project_token_cost read fails (cap_active=False → degrades to $0.10);
-        # every other read returns [].  Projection $0.10 < escalation 100.0 → ALLOW.
         null_log_backend.query.side_effect = _query_blind_on(
             "project",
             LBRError("simulated read failure in preceding-iteration baseline read"),
         )
         proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
-        with patch.object(mandate_backend, "load_mandate", return_value=mandate):
-            judgment = mc.evaluate(proposal)
-
-        assert judgment.outcome == JudgmentOutcome.ALLOW
+        # Direct call with cap_active=False — must degrade to the $0.10 default,
+        # not raise _MandateCostUnreadable.
+        projected = mc._project_token_cost(proposal, 1, cap_active=False)
+        assert projected == pytest.approx(0.10)
 
     def test_project_token_cost_read_failure_with_cap_blocks_closed(
         self,
@@ -3192,15 +3173,19 @@ class TestMandateCheckCostUnreadable:
 
         assert judgment.outcome == JudgmentOutcome.BLOCK
         assert judgment.reason.startswith("mandate_cost_unreadable")
-        # Distinctive branch log line — "cap active" appears ONLY in the
-        # cap-gated branch's own warning (mandate_check.py _project_token_cost),
-        # never in the exception text, so this is a load-bearing branch-identity
-        # assertion.
+        # Distinctive branch log line — "projection gate active" appears ONLY in
+        # the cap-gated projection branch's own warning (mandate_check.py
+        # _project_token_cost), never in the exception text, so this is a
+        # load-bearing branch-identity assertion (#512 reworded "cap active" →
+        # "projection gate active: cap or escalation threshold").
         assert any(
-            "cap active" in r.message and "mandate_cost_unreadable" in r.message
+            "projection gate active" in r.message
+            and "mandate_cost_unreadable" in r.message
             for r in caplog.records
             if r.levelname == "WARNING"
-        ), "Expected WARNING log containing 'cap active' and 'mandate_cost_unreadable'"
+        ), (
+            "Expected WARNING log containing 'projection gate active' and 'mandate_cost_unreadable'"
+        )
 
     # ── cap-exceeded re-read path ─────────────────────────────────────────────
 
@@ -3518,6 +3503,81 @@ class TestMandateCheckCostUnreadable:
             for r in caplog.records
             if r.levelname == "WARNING"
         ), "Expected WARNING log containing 'step 7' and 'no cap active'"
+
+    def test_escalation_only_no_cap_blind_projection_blocks_protects_escalation(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """#512 — the baseline PROJECTION fails closed when an escalation threshold
+        is the active control, even with NO cap.
+
+        The projection feeds the step-9 escalation gate ("require operator
+        approval above $X").  If a blind baseline read degraded to the
+        conservative $0.10 default here, a truthful high baseline (which would
+        ESCALATE to a human) would be silently SUPPRESSED → ALLOW.  So with an
+        escalation threshold set, the projection read fails closed (BLOCK
+        mandate_cost_unreadable) even though the prior-spend SUM (which gates only
+        the cap) would degrade.  This is the escalation-control half of
+        ``feedback_fail_closed_only_where_theres_something_to_protect`` — an
+        escalation threshold IS something to protect.
+
+        Per-invocation negative control: strip ``has_token_escalation_threshold``
+        from the ``projection_cap_active`` expression at the _step7 call site and
+        this BLOCK flips to ALLOW (the blind projection degrades to $0.10, under
+        the threshold, escalation suppressed).  Verified by the build's adversarial
+        repro.  Distinct from the SUM-degrade sibling above (same mandate shape,
+        but here the *projection* read is blind, not the SUM).
+        """
+        from datetime import timedelta
+
+        from atomic_agents.exceptions import LogBackendReadError as LBRError
+
+        mandate_id = "escalation-only-no-cap-projection-512"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        now = datetime.now(timezone.utc)
+        mandate_no_cap = Mandate(
+            mandate_id=mandate_id,
+            scope="agent:test-agent",
+            granted_by="test-operator@example.com",
+            granted_at=now,
+            expires_at=now + timedelta(days=30),
+            revocation_state=RevocationState.ACTIVE,
+            revoked_at=None,
+            revoked_by=None,
+            revocation_reason=None,
+            constraints=MandateConstraints(
+                allowed_tools=frozenset(["test_tool"]),
+                # escalation threshold but NO token cap. The projection still
+                # fails closed because the escalation gate is an active control.
+                requires_escalation_above_token_usd=0.50,
+            ),
+            source_hash="sha256:escalation-only-projection-512",
+        )
+        mc = _make_mc(mandate_backend, scope, null_log_backend)
+
+        # The baseline PROJECTION read (LogQuery limit=1) is blind; with an
+        # escalation threshold set, projection_cap_active=True → raise → BLOCK.
+        null_log_backend.query.side_effect = _query_blind_on(
+            "project",
+            LBRError("blind baseline read, escalation-only-no-cap mandate"),
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with patch.object(mandate_backend, "load_mandate", return_value=mandate_no_cap):
+            with caplog.at_level("WARNING", logger="atomic_agents.judge.mandate_check"):
+                judgment = mc.evaluate(proposal)
+
+        assert judgment.outcome == JudgmentOutcome.BLOCK
+        assert judgment.reason.startswith("mandate_cost_unreadable")
+        # Distinctive log proves the projection fail-close (not the SUM) fired.
+        assert any(
+            "baseline" in r.message and "failing closed" in r.message
+            for r in caplog.records
+            if r.levelname == "WARNING"
+        ), "Expected WARNING log containing 'baseline' and 'failing closed'"
 
     def test_escalation_with_token_cap_sum_failure_blocks(
         self,

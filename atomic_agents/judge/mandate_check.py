@@ -623,6 +623,18 @@ class MandateCheck:
                     mandate=mandate,
                     mandate_id=mandate_id,
                     cap_active=token_cap_active,
+                    # The baseline PROJECTION feeds BOTH the cap check and the
+                    # step-9 escalation gate.  An escalation threshold is itself
+                    # an active control to protect, so the projection read must
+                    # fail closed when EITHER a cap OR an escalation threshold is
+                    # set — otherwise a blind baseline read degrades to the
+                    # conservative default and could silently SUPPRESS an
+                    # escalation a truthful read would have fired (#512).  The
+                    # prior-spend SUM gates only the cap, so it stays on
+                    # token_cap_active.
+                    projection_cap_active=(
+                        token_cap_active or has_token_escalation_threshold
+                    ),
                 )
                 # Fail-closed: token reservation store unreadable → immediate BLOCK,
                 # bypass step 9 (mirrors the step-8 unprojectable path).
@@ -1043,13 +1055,16 @@ class MandateCheck:
             cap_active: when ``True`` and the baseline read fails with the
                 narrow family (LogBackendReadError, OSError,
                 sqlite3.DatabaseError), raise ``_MandateCostUnreadable``
-                instead of degrading to the conservative default.  Pass
-                ``True`` when a token/daily/monthly token cap is in effect —
-                a blind read could let us under-project and silently pass a
-                cap check (fail-open).  When ``False`` (no cap in effect),
-                the conservative fallback is safe and spurious blocking is
-                avoided (per ``feedback_fail_closed_only_where_theres_something_
-                to_protect``; avoids re-introducing the #495 regression).
+                instead of degrading to the conservative default.  Callers
+                pass ``True`` when the projection gates an active control — a
+                token/daily/monthly cap (a blind read could under-project and
+                silently pass a cap check) OR an escalation threshold (a blind
+                read could under-project and silently SUPPRESS an escalation a
+                truthful read would fire).  When ``False`` (no cap AND no
+                escalation threshold), the conservative fallback is safe and
+                spurious blocking is avoided (per
+                ``feedback_fail_closed_only_where_theres_something_to_protect``;
+                avoids re-introducing the #495 regression).
         """
         from ..logs.types import LogQuery
 
@@ -1080,16 +1095,19 @@ class MandateCheck:
                 elif most_recent.cost_usd is not None:
                     turn_cost = most_recent.cost_usd
         except _NARROW_READ_FAILURE as exc:
-            # Cap-gated fail-close (#506): raise _MandateCostUnreadable only
-            # when a token cap is actually in effect.  When no cap exists, a
-            # blind read only means we fall back to the conservative default —
-            # there is nothing to bypass, so spurious blocking is avoided.
+            # Cap-gated fail-close (#506/#512): raise _MandateCostUnreadable only
+            # when the projection gates an active control — a token cap OR an
+            # escalation threshold (cap_active here is the caller's
+            # projection_cap_active).  When neither exists, a blind read only
+            # means we fall back to the conservative default — there is nothing
+            # to bypass, so spurious blocking is avoided.
             # (feedback_fail_closed_only_where_theres_something_to_protect)
             if cap_active:
                 _logger.warning(
                     "MandateCheck step 7: cost-log read failure reading preceding "
-                    "iteration baseline for run %r (cap active) — failing closed "
-                    "(mandate_cost_unreadable): %s",
+                    "iteration baseline for run %r (projection gate active: cap or "
+                    "escalation threshold) — failing closed (mandate_cost_unreadable): "
+                    "%s",
                     proposal.actor_run_id,
                     exc,
                 )
@@ -1144,6 +1162,7 @@ class MandateCheck:
         # helpers' cap_active=True default. All live callers pass the effective
         # flag explicitly; an omitted flag must over-block, never fail-open (#512).
         cap_active: bool = True,
+        projection_cap_active: bool | None = None,
     ) -> dict[str, Any]:
         """Evaluate step 7 token budget caps.
 
@@ -1156,27 +1175,41 @@ class MandateCheck:
         Args:
             cap_active: whether an EFFECTIVE token cap is in effect — the
                 mandate-declared token cap OR a Policy-composed cap
-                (`MIN(mandate, Policy)`).  ``evaluate()`` computes this and
-                threads it straight through to the prior-spend SUM /
-                baseline-projection reads so their fail-close fires against the
-                cap actually enforced here, not the mandate-declared cap alone.
+                (`MIN(mandate, Policy)`).  Gates the prior-spend SUM read (which
+                only feeds the cumulative-vs-cap check).
+            projection_cap_active: whether the baseline PROJECTION read must fail
+                closed — ``cap_active`` OR an escalation threshold is set.  The
+                projection feeds BOTH the cap check and the step-9 escalation
+                gate; an escalation threshold is its own active control, so the
+                projection fails closed when one is set even with no cap (else a
+                blind baseline read degrades to the conservative default and could
+                silently suppress an escalation — #512).  ``None`` (the default)
+                falls back to ``cap_active`` so any future caller stays
+                fail-closed.
 
         Raises:
             _MandateCostUnreadable: propagated from ``_project_token_cost``
-                (cap-gated) or ``_sum_prior_token_cost`` (cap-gated) on genuine
-                read failure **when ``cap_active=True``**.  NOT caught here —
-                propagates to evaluate() which has the outer try/except handler.
+                (gated on ``projection_cap_active``) or ``_sum_prior_token_cost``
+                (gated on ``cap_active``) on genuine read failure.  NOT caught
+                here — propagates to evaluate()'s outer try/except handler.
         """
         # Simple assumption: one tool call per turn for v1 apportionment.
         # The framework does not yet pass N across tool calls per turn to
         # MandateCheck; argument-token-weighted apportionment is a follow-up.
         n_tool_calls = 1
-        # _project_token_cost is called FIRST. When cap_active=True it raises
+        # The baseline projection feeds the step-9 escalation gate as well as the
+        # cap check, so it fails closed on a blind read when EITHER a cap OR an
+        # escalation threshold is in effect.  Callers pass that combined flag as
+        # projection_cap_active; it falls back to cap_active when omitted so the
+        # default-True (fail-closed) posture is preserved for any future caller.
+        if projection_cap_active is None:
+            projection_cap_active = cap_active
+        # _project_token_cost is called FIRST. When its cap_active=True it raises
         # _MandateCostUnreadable on read failure, which short-circuits the
         # entire _step7 path before _sum_prior_token_cost is even called
         # (ordering guarantee per prep finding P2 / #506).
         projected = self._project_token_cost(
-            proposal, n_tool_calls, cap_active=cap_active
+            proposal, n_tool_calls, cap_active=projection_cap_active
         )
 
         # _MandateCostUnreadable from _sum_prior_token_cost is intentionally
