@@ -14,12 +14,20 @@ from pathlib import Path
 
 import pytest
 
-from atomic_agents.dashboard.render import render_all
+from atomic_agents.dashboard.render import (
+    render_all,
+    render_global,
+    render_agent,
+    _render_global_template,
+    _render_agent_template,
+)
+from atomic_agents.dashboard.costs import aggregate_global, aggregate_agent
 from atomic_agents.dashboard._shared import nav_bar
 
 
 # ──────────────────────────────────────────────────────────────────
 # Helpers
+
 
 def _write_log(agents_root: Path, agent: str, when: date, records: list[dict]) -> None:
     log_dir = agents_root / agent / "log" / when.strftime("%Y-%m")
@@ -68,14 +76,21 @@ def _build_synthetic_vault(agents_root: Path, with_goals: bool = True) -> None:
     today = date.today()
 
     for agent in ("alice", "bob"):
-        _write_log(agents_root, agent, today, [
-            {"cost_usd": 0.10, "status": "ok", "summary": "morning brief"},
-            {"cost_usd": 0.05, "status": "error", "summary": "failed run"},
-        ])
+        _write_log(
+            agents_root,
+            agent,
+            today,
+            [
+                {"cost_usd": 0.10, "status": "ok", "summary": "morning brief"},
+                {"cost_usd": 0.05, "status": "error", "summary": "failed run"},
+            ],
+        )
         # Write some memory notes
         mem_dir = agents_root / agent / "memory"
         mem_dir.mkdir(parents=True)
-        (mem_dir / "pref.md").write_text("---\ntype: user\nlast_seen: 2026-05-01\n---\nPreferences.")
+        (mem_dir / "pref.md").write_text(
+            "---\ntype: user\nlast_seen: 2026-05-01\n---\nPreferences."
+        )
         (mem_dir / "INDEX.md").write_text("# Index\n- pref\n")
 
     if with_goals:
@@ -84,6 +99,7 @@ def _build_synthetic_vault(agents_root: Path, with_goals: bool = True) -> None:
 
 # ──────────────────────────────────────────────────────────────────
 # Tests
+
 
 def test_render_all_with_goals_creates_five_files(tmp_path):
     _build_synthetic_vault(tmp_path, with_goals=True)
@@ -119,7 +135,13 @@ def test_nav_bar_present_on_all_pages_with_goals(tmp_path):
     render_all(tmp_path)
 
     dashboard_dir = tmp_path / "_dashboard"
-    for page in ("index.html", "activity.html", "quality.html", "memory.html", "goals.html"):
+    for page in (
+        "index.html",
+        "activity.html",
+        "quality.html",
+        "memory.html",
+        "goals.html",
+    ):
         html = (dashboard_dir / page).read_text()
         assert 'class="tab-nav"' in html, f"tab-nav missing from {page}"
         # All 5 tab links should be present
@@ -135,11 +157,11 @@ def test_nav_bar_active_class_per_page(tmp_path):
 
     dashboard_dir = tmp_path / "_dashboard"
     page_expectations = {
-        "index.html":    'href="index.html" class="active"',
+        "index.html": 'href="index.html" class="active"',
         "activity.html": 'href="activity.html" class="active"',
-        "quality.html":  'href="quality.html" class="active"',
-        "memory.html":   'href="memory.html" class="active"',
-        "goals.html":    'href="goals.html" class="active"',
+        "quality.html": 'href="quality.html" class="active"',
+        "memory.html": 'href="memory.html" class="active"',
+        "goals.html": 'href="goals.html" class="active"',
     }
     for page, expected_fragment in page_expectations.items():
         html = (dashboard_dir / page).read_text()
@@ -232,7 +254,13 @@ def test_all_pages_are_valid_html(tmp_path):
     render_all(tmp_path)
 
     dashboard_dir = tmp_path / "_dashboard"
-    for page in ("index.html", "activity.html", "quality.html", "memory.html", "goals.html"):
+    for page in (
+        "index.html",
+        "activity.html",
+        "quality.html",
+        "memory.html",
+        "goals.html",
+    ):
         html = (dashboard_dir / page).read_text()
         assert html.startswith("<!DOCTYPE html>"), f"{page} doesn't start with DOCTYPE"
         assert "</html>" in html, f"{page} is missing closing </html>"
@@ -258,3 +286,181 @@ def test_nav_bar_helper_functions():
         # The active page's href should have class="active"
         expected_href = "index.html" if tab_name == "cost" else f"{tab_name}.html"
         assert f'href="{expected_href}" class="active"' in nav
+
+
+# ──────────────────────────────────────────────────────────────────
+# #498 — degraded-read banner integration tests
+#
+# Strategy: monkeypatch get_default_log_backend at the logs module level to
+# raise LogBackendReadError for a specific agent, then render and assert the
+# banner text appears in the output HTML. This directly tests the full chain:
+#   _load_runs_with_degraded → aggregate_* → _render_*_template → HTML output
+#
+# Banner correctness is asserted on the IN-MEMORY template output
+# (_render_global_template / _render_agent_template) rather than the
+# atomic_write→read_text round-trip — the read-back path inherits this
+# project's documented macOS APFS atomic-write/read flake (MEMORY: "macOS
+# APFS WAL flake"). The write path is smoke-covered (file exists) without a
+# banner-text assertion so the flake cannot produce an intermittent false
+# failure on the load-bearing correctness check.
+#
+# Per the prep findings (P1): use monkeypatch injection rather than file-based
+# I/O to trigger the degraded path — avoids tz-aware timestamp edge cases in
+# _write_log and directly exercises the LogBackendReadError code path.
+
+
+def _make_failing_get_default_log_backend(fail_agent: str):
+    """Return a patched get_default_log_backend that raises LogBackendReadError
+    for the named agent while delegating to the real backend for all others."""
+    from unittest.mock import MagicMock
+
+    import atomic_agents.logs as logs_mod
+    from atomic_agents import LogBackendReadError
+
+    original_get = logs_mod.get_default_log_backend
+
+    def _patched(root):
+        if root.name == fail_agent:
+            mock = MagicMock()
+            mock.query.side_effect = LogBackendReadError("injected failure")
+            return mock
+        return original_get(root)
+
+    return _patched
+
+
+def test_global_cost_view_banner_appears_on_degraded_read(tmp_path, monkeypatch):
+    """Integration: global cost page shows 'data may be incomplete' banner on degraded read.
+
+    Verifies the full chain: LogBackendReadError → aggregate_global →
+    GlobalSummary.cost_data_degraded=True → render_global → HTML banner text.
+
+    Also verifies PARTIAL RENDER (alice's data is present) so we know the banner
+    is triggered by a degraded read, NOT by a completely empty render path.
+    Negative control: without the monkeypatch, the banner is absent.
+    """
+    today = date.today()
+    # Alice writes clean data; bob's backend will fail
+    _write_log(
+        tmp_path,
+        "alice",
+        today,
+        [{"cost_usd": 0.10, "status": "ok", "summary": "alice run"}],
+    )
+    _write_log(
+        tmp_path,
+        "bob",
+        today,
+        [{"cost_usd": 0.05, "status": "ok", "summary": "bob run"}],
+    )
+
+    import atomic_agents.logs as logs_mod
+
+    monkeypatch.setattr(
+        logs_mod,
+        "get_default_log_backend",
+        _make_failing_get_default_log_backend("bob"),
+    )
+
+    summary = aggregate_global(tmp_path, today=today)
+    assert summary.cost_data_degraded is True  # pre-render sanity check
+
+    # Assert on the in-memory template output, NOT the atomic_write→read_text
+    # round-trip. The banner correctness is a property of the template; routing
+    # the assertion through disk would inherit the documented macOS APFS
+    # atomic-write/read-back flake (MEMORY: "macOS APFS WAL flake") that bit
+    # this exact test once on a cold run. The write path is smoke-covered
+    # separately below.
+    rendered_html = _render_global_template(summary)
+
+    # Branch-distinctive assertion: banner text (not the shared empty-render path)
+    assert "data may be incomplete" in rendered_html, (
+        "Global cost page must contain 'data may be incomplete' banner when degraded"
+    )
+    # Partial render check: alice's partial total is present, not a blank page
+    assert "Spend this month" in rendered_html
+
+    # Write-path smoke: the file is produced without crashing (no banner-text
+    # assertion on the read-back — that would re-introduce the APFS flake).
+    out_path = render_global(tmp_path, summary)
+    assert out_path.exists()
+
+
+def test_global_cost_view_no_banner_on_clean_read(tmp_path):
+    """Negative control: global cost page does NOT show banner on clean reads."""
+    today = date.today()
+    _write_log(
+        tmp_path,
+        "alice",
+        today,
+        [{"cost_usd": 0.10, "status": "ok", "summary": "alice run"}],
+    )
+
+    summary = aggregate_global(tmp_path, today=today)
+    assert summary.cost_data_degraded is False
+
+    # In-memory template so the absence assertion is meaningful (a flaky empty
+    # read-back would also be banner-absent and falsely "pass").
+    rendered_html = _render_global_template(summary)
+
+    assert "data may be incomplete" not in rendered_html, (
+        "Banner must NOT appear when all reads succeed"
+    )
+    # Spot-check the page actually rendered (not an empty string).
+    assert "Spend this month" in rendered_html
+
+
+def test_agent_cost_view_banner_appears_on_degraded_read(tmp_path, monkeypatch):
+    """Integration: per-agent cost page shows 'data may be incomplete' banner on degraded read.
+
+    Verifies the banner appears in the per-agent drilldown (dashboard.html),
+    independent of the global page test — the banner must appear on BOTH views
+    per the ruling (#498).
+    """
+    from unittest.mock import MagicMock
+
+    import atomic_agents.logs as logs_mod
+    from atomic_agents import LogBackendReadError
+
+    mock_backend = MagicMock()
+    mock_backend.query.side_effect = LogBackendReadError("injected failure")
+    monkeypatch.setattr(logs_mod, "get_default_log_backend", lambda root: mock_backend)
+
+    today = date.today()
+    data = aggregate_agent(tmp_path, "alice", today=today)
+    assert data.cost_data_degraded is True  # pre-render sanity check
+
+    # In-memory template assertion (see global test above for why the banner
+    # correctness check is NOT routed through atomic_write→read_text).
+    rendered_html = _render_agent_template(data)
+
+    # Branch-distinctive assertion: banner text (not the shared empty-render path)
+    assert "data may be incomplete" in rendered_html, (
+        "Per-agent cost page must contain 'data may be incomplete' banner when degraded"
+    )
+
+    # Write-path smoke: file is produced without crashing.
+    out_path = render_agent(tmp_path, data)
+    assert out_path.exists()
+
+
+def test_agent_cost_view_no_banner_on_clean_read(tmp_path):
+    """Negative control: per-agent cost page does NOT show banner on clean reads."""
+    today = date.today()
+    _write_log(
+        tmp_path,
+        "alice",
+        today,
+        [{"cost_usd": 0.10, "status": "ok", "summary": "alice run"}],
+    )
+
+    data = aggregate_agent(tmp_path, "alice", today=today)
+    assert data.cost_data_degraded is False
+
+    # In-memory template so the absence assertion is meaningful.
+    rendered_html = _render_agent_template(data)
+
+    assert "data may be incomplete" not in rendered_html, (
+        "Banner must NOT appear when all reads succeed"
+    )
+    assert rendered_html.startswith("<!DOCTYPE html>")

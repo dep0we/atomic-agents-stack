@@ -207,6 +207,10 @@ tbody tr:hover { background: rgba(78, 201, 176, 0.04); }
 .pill.local { color: var(--local); border-color: var(--local); background: rgba(136, 136, 136, 0.1); }
 .pill.fallback { color: var(--warn); border-color: var(--warn); background: rgba(209, 154, 102, 0.1); margin-left: 4px; }
 .pill.helper { color: var(--haiku); border-color: var(--haiku); background: rgba(152, 195, 121, 0.05); font-size: 10px; }
+.pill.warn { color: var(--warn); border-color: var(--warn); background: rgba(209, 154, 102, 0.1); }
+.degraded-banner { margin-bottom: 16px; padding: 10px 16px; border-radius: 8px;
+  background: rgba(209, 154, 102, 0.08); border: 1px solid rgba(209, 154, 102, 0.3);
+  font-size: 13px; color: var(--warn); }
 
 .day-chart { display: flex; align-items: flex-end; height: 220px; gap: 12px; padding: 16px 0; }
 .day-col { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 6px; }
@@ -406,6 +410,15 @@ def _render_global_template(s: GlobalSummary, has_goals: bool = True) -> str:
         provider_html = '<p class="empty-note">No provider activity.</p>'
 
     _nav = _nav_bar("cost", has_goals=has_goals)
+    _degraded_banner = (
+        '<div class="degraded-banner">'
+        '<span class="pill warn">⚠ data may be incomplete</span>'
+        " &nbsp;One or more log reads failed. The figures below reflect"
+        " partial data only — some agent costs may be missing or understated."
+        "</div>"
+        if s.cost_data_degraded
+        else ""
+    )
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -428,7 +441,7 @@ def _render_global_template(s: GlobalSummary, has_goals: bool = True) -> str:
 </header>
 
 {_nav}
-
+{_degraded_banner}
 <section class="kpis">
   <div class="kpi">
     <div class="value">${s.total_cost:.2f}</div>
@@ -645,6 +658,15 @@ def _render_agent_template(d: AgentDashboardData) -> str:
         cache_line = '<span class="muted">No cache hits recorded yet.</span>'
 
     _agent_name_safe = html.escape(d.name)
+    _agent_degraded_banner = (
+        '<div class="degraded-banner">'
+        '<span class="pill warn">⚠ data may be incomplete</span>'
+        " &nbsp;One or more log reads failed for this agent. The figures"
+        " below reflect partial data only — some costs may be understated."
+        "</div>"
+        if d.cost_data_degraded
+        else ""
+    )
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -666,6 +688,7 @@ def _render_agent_template(d: AgentDashboardData) -> str:
   </div>
 </header>
 
+{_agent_degraded_banner}
 <section class="kpis">
   <div class="kpi">
     <div class="value">${s.cost_usd:.4f}</div>

@@ -363,3 +363,349 @@ def test_load_runs_degrades_to_empty_on_read_error(tmp_path, monkeypatch):
     # False-green guard: prove the backend was consulted and the exception
     # path (not the absent-dir [] path) was exercised.
     assert mock_backend.query.called
+
+
+# ──────────────────────────────────────────────────────────────────
+# #498 — degraded-read banner propagation tests
+
+
+def _inject_failing_backend(monkeypatch, *, fail_agent: str = "alice"):
+    """Monkeypatch get_default_log_backend so the named agent's backend raises
+    LogBackendReadError while other agents' backends succeed normally."""
+    from unittest.mock import MagicMock
+
+    import atomic_agents.logs as logs_mod
+    from atomic_agents import LogBackendReadError
+
+    original_get = logs_mod.get_default_log_backend
+
+    def _patched_get(root):
+        if root.name == fail_agent:
+            mock = MagicMock()
+            mock.query.side_effect = LogBackendReadError("injected failure")
+            return mock
+        return original_get(root)
+
+    monkeypatch.setattr(logs_mod, "get_default_log_backend", _patched_get)
+
+
+def test_load_runs_with_degraded_sets_flag_on_error(tmp_path, monkeypatch):
+    """_load_runs_with_degraded returns ([], True) on LogBackendReadError.
+
+    Branch-distinctive assertion: degraded=True (not just runs==[]).
+    Both the degraded path AND the clean path return [], so the empty
+    list alone is the shared empty-render path — the flag is what distinguishes
+    them (layered-except false-green lesson, MEMORY.md).
+    """
+    from unittest.mock import MagicMock
+
+    import atomic_agents.logs as logs_mod
+    from atomic_agents import LogBackendReadError
+    from atomic_agents.dashboard.costs import _load_runs_with_degraded
+
+    mock_backend = MagicMock()
+    mock_backend.query.side_effect = LogBackendReadError("corrupt log")
+    monkeypatch.setattr(logs_mod, "get_default_log_backend", lambda root: mock_backend)
+
+    today = date.today()
+    runs, degraded = _load_runs_with_degraded(tmp_path, "alice", today, today)
+
+    # Branch-distinctive assertion: degraded flag, not the empty list
+    assert degraded is True, "LogBackendReadError must set degraded=True"
+    assert runs == []
+    # False-green guard: the backend was called (not the absent-dir [] path)
+    assert mock_backend.query.called
+
+
+def test_load_runs_with_degraded_no_flag_on_success(tmp_path):
+    """Negative control: _load_runs_with_degraded returns (runs, False) on clean read.
+
+    Strips the failure injection — confirms degraded=False when no error occurs.
+    This is the negative control required by the layered-except false-green lesson.
+    """
+    from atomic_agents.dashboard.costs import _load_runs_with_degraded
+
+    today = date.today()
+    _write_log(tmp_path, "alice", today, [{"cost_usd": 0.10}])
+    runs, degraded = _load_runs_with_degraded(tmp_path, "alice", today, today)
+
+    assert degraded is False, "A clean read must NOT set degraded=True"
+    assert len(runs) == 1
+
+
+def test_aggregate_global_cost_data_degraded_on_read_error(tmp_path, monkeypatch):
+    """aggregate_global sets cost_data_degraded=True when any agent read fails.
+
+    Verifies the OR-accumulation threading from _load_runs_with_degraded
+    through to GlobalSummary.cost_data_degraded.
+    """
+    today = date.today()
+    # Write clean data for alice; bob will fail
+    _write_log(tmp_path, "alice", today, [{"cost_usd": 0.10}])
+    _write_log(tmp_path, "bob", today, [{"cost_usd": 0.05}])
+    _inject_failing_backend(monkeypatch, fail_agent="bob")
+
+    summary = aggregate_global(tmp_path, today=today)
+
+    assert summary.cost_data_degraded is True, (
+        "GlobalSummary.cost_data_degraded must be True when any agent's read fails"
+    )
+    # Alice's data should still be present (partial render, not crash)
+    assert summary.total_cost > 0.0
+
+
+def test_aggregate_global_not_degraded_on_clean_read(tmp_path):
+    """Negative control: aggregate_global leaves cost_data_degraded=False when all reads succeed."""
+    today = date.today()
+    _write_log(tmp_path, "alice", today, [{"cost_usd": 0.10}])
+
+    summary = aggregate_global(tmp_path, today=today)
+
+    assert summary.cost_data_degraded is False, (
+        "GlobalSummary.cost_data_degraded must be False when all reads succeed"
+    )
+
+
+def test_aggregate_agent_cost_data_degraded_on_read_error(tmp_path, monkeypatch):
+    """aggregate_agent sets cost_data_degraded=True when its 12-month read fails."""
+    from unittest.mock import MagicMock
+
+    import atomic_agents.logs as logs_mod
+    from atomic_agents import LogBackendReadError
+
+    mock_backend = MagicMock()
+    mock_backend.query.side_effect = LogBackendReadError("corrupt log")
+    monkeypatch.setattr(logs_mod, "get_default_log_backend", lambda root: mock_backend)
+
+    today = date.today()
+    data = aggregate_agent(tmp_path, "alice", today=today)
+
+    # Branch-distinctive assertion: the degraded field, not the empty summary
+    assert data.cost_data_degraded is True, (
+        "AgentDashboardData.cost_data_degraded must be True on LogBackendReadError"
+    )
+
+
+def test_aggregate_agent_not_degraded_on_clean_read(tmp_path):
+    """Negative control: aggregate_agent leaves cost_data_degraded=False on clean read."""
+    today = date.today()
+    _write_log(tmp_path, "alice", today, [{"cost_usd": 0.10}])
+
+    data = aggregate_agent(tmp_path, "alice", today=today)
+
+    assert data.cost_data_degraded is False
+
+
+def test_json_sidecar_includes_degraded_field(tmp_path):
+    """to_json_dict serialises cost_data_degraded from GlobalSummary.
+
+    The dashboard ships only the boolean signal (no dropped_records count): the
+    query()/LogBackendReadError read path raises before returning any records,
+    so a record count has no honest definition on this surface (unlike
+    _costs.CostReadResult.dropped_records, which counts per-line corruption on
+    the cost-summing reader). Asserting the bool's absence default + forced-True
+    round-trip guards the backward-compatible sidecar shape (Principle #1/#14).
+    """
+    today = date.today()
+    _write_log(tmp_path, "alice", today, [{"cost_usd": 0.10}])
+    summary = aggregate_global(tmp_path, today=today)
+
+    # Default (clean read): field present and False in the sidecar.
+    parsed_default = json.loads(json.dumps(to_json_dict(summary)))
+    assert parsed_default["cost_data_degraded"] is False
+    # No dropped_records key — the dashboard intentionally does not ship one.
+    assert "dropped_records" not in parsed_default
+
+    # Force the flag so we can assert it round-trips.
+    summary.cost_data_degraded = True
+    parsed = json.loads(json.dumps(to_json_dict(summary)))
+    assert parsed["cost_data_degraded"] is True
+
+
+# ──────────────────────────────────────────────────────────────────
+# #498 — per-CONTRIBUTOR negative-control isolation for aggregate_global
+#
+# aggregate_global OR-merges the degraded flag from TWO independent reads of a
+# failing backend: the per-agent this_month/last_month KPI load
+# (costs.py: ``any_degraded = any_degraded or deg_this or deg_last``) AND the
+# monthly-trend load (costs.py: ``any_degraded = any_degraded or trend_degraded``,
+# fed by ``_build_monthly_trend``, which ALSO reads the current month).
+#
+# A current-month-degraded test cannot tell the two apart: stripping the KPI
+# contributor alone leaves the trend contributor firing, so the headline-banner
+# test stays green while half the fix is gone (the original false-green caught in
+# Round 4). Per ``feedback_false_green_test_needs_per_invocation_negative_control``
+# (MEMORY.md: "strip EACH independent part separately; only the negative control
+# catches a partial false-green"), the two tests below give the failing read
+# DISJOINT windows / occurrences so EACH contributor is exercised in isolation:
+#
+#   * ``..._isolates_monthly_trend_contributor`` fails ONLY on an old month
+#     (2 months back) that the KPI reads never touch — bites the monthly-trend
+#     OR-term (``any_degraded = any_degraded or trend_degraded`` in
+#     ``aggregate_global``), stays green under a strip of the KPI OR-term.
+#   * ``..._isolates_kpi_contributor`` fails ONLY on the FIRST query (the
+#     this_month KPI read, which runs before the trend reads the same month) —
+#     bites the KPI OR-term (``any_degraded = any_degraded or deg_this or
+#     deg_last`` in ``aggregate_global``), stays green under a strip of the
+#     monthly-trend OR-term.
+#
+# Negative controls verified by hand (Round 4): stripping the KPI OR-term
+# (``or deg_this or deg_last``) leaves the monthly-trend test green + the KPI
+# test red; stripping the monthly-trend OR-term (``or trend_degraded``) leaves
+# the KPI test green + the monthly-trend test red — i.e. each strip bites
+# exactly ONE. (Symbolic OR-term citations, not line numbers, which drift on
+# any edit above them — per the #506 "convert line citations to section/
+# behavioral citations" discipline.)
+
+
+def _window_failing_backend(monkeypatch, *, fail_agent: str, fail_months: set[int]):
+    """Patch get_default_log_backend so ``fail_agent``'s backend raises
+    LogBackendReadError ONLY when the query's ``since`` month is in
+    ``fail_months``; all other windows (and all other agents) read normally.
+
+    This isolates which read window triggered the degraded flag, so a test can
+    target ONE of aggregate_global's two OR-contributors at a time."""
+    import atomic_agents.logs as logs_mod
+    from atomic_agents import LogBackendReadError
+
+    original_get = logs_mod.get_default_log_backend
+
+    def _patched_get(root):
+        real = original_get(root)
+        if root.name != fail_agent:
+            return real
+        orig_query = real.query
+
+        def _maybe_fail(q):
+            if q.since is not None and q.since.month in fail_months:
+                raise LogBackendReadError("injected window failure")
+            return orig_query(q)
+
+        real.query = _maybe_fail
+        return real
+
+    monkeypatch.setattr(logs_mod, "get_default_log_backend", _patched_get)
+
+
+def _occurrence_failing_backend(monkeypatch, *, fail_agent: str, fail_on: int):
+    """Patch get_default_log_backend so ``fail_agent``'s backend raises
+    LogBackendReadError ONLY on its ``fail_on``-th query (1-indexed); all other
+    queries (and all other agents) read normally.
+
+    aggregate_global issues the per-agent KPI this_month read FIRST, then the
+    monthly-trend reads. Failing only query #1 degrades the KPI contributor
+    while the trend's same-month read succeeds — isolating the KPI OR-term
+    (``any_degraded = any_degraded or deg_this or deg_last``)."""
+    import atomic_agents.logs as logs_mod
+    from atomic_agents import LogBackendReadError
+
+    original_get = logs_mod.get_default_log_backend
+    counter = {"n": 0}
+
+    def _patched_get(root):
+        real = original_get(root)
+        if root.name != fail_agent:
+            return real
+        orig_query = real.query
+
+        def _maybe_fail(q):
+            counter["n"] += 1
+            if counter["n"] == fail_on:
+                raise LogBackendReadError("injected occurrence failure")
+            return orig_query(q)
+
+        real.query = _maybe_fail
+        return real
+
+    monkeypatch.setattr(logs_mod, "get_default_log_backend", _patched_get)
+
+
+def test_aggregate_global_degraded_isolates_monthly_trend_contributor(
+    tmp_path, monkeypatch
+):
+    """Isolation: degraded flag fired SOLELY by the monthly-trend read.
+
+    The failing window is 2 months before ``today`` — outside the KPI reads'
+    this_month/last_month windows, so ONLY ``_build_monthly_trend`` touches it.
+    This bites a strip of the monthly-trend OR-term (``any_degraded =
+    any_degraded or trend_degraded``) and stays green under a strip of the KPI
+    OR-term (``... or deg_this or deg_last``) (the existing current-month test
+    covers the joint case; this one guards the trend contributor in isolation).
+    """
+    today = date(2026, 6, 15)
+    two_months_ago = date(2026, 4, 10)
+    # bob has data in the old (failing) month; alice keeps the page non-empty.
+    _write_log(tmp_path, "alice", today, [{"cost_usd": 0.10}])
+    _write_log(tmp_path, "bob", two_months_ago, [{"cost_usd": 0.07}])
+    _window_failing_backend(monkeypatch, fail_agent="bob", fail_months={4})
+
+    summary = aggregate_global(tmp_path, today=today)
+
+    # Branch-distinctive assertion on the flag, not the (shared) empty-render path.
+    assert summary.cost_data_degraded is True, (
+        "monthly-trend read failure (old month) must set cost_data_degraded — "
+        "this is the `or trend_degraded` OR-contributor in isolation"
+    )
+    # Partial render preserved: the current-month KPI read of bob succeeded
+    # (empty for the failing old month is fine) and alice's data is present.
+    assert summary.total_cost > 0.0
+
+
+def test_aggregate_global_degraded_not_set_when_only_old_clean(tmp_path, monkeypatch):
+    """Negative control for the monthly-trend isolation: when NO window fails,
+    even with old-month data present, the flag stays False."""
+    today = date(2026, 6, 15)
+    two_months_ago = date(2026, 4, 10)
+    _write_log(tmp_path, "alice", today, [{"cost_usd": 0.10}])
+    _write_log(tmp_path, "bob", two_months_ago, [{"cost_usd": 0.07}])
+    _window_failing_backend(monkeypatch, fail_agent="bob", fail_months=set())
+
+    summary = aggregate_global(tmp_path, today=today)
+
+    assert summary.cost_data_degraded is False
+
+
+def test_aggregate_global_degraded_isolates_kpi_contributor(tmp_path, monkeypatch):
+    """Isolation: degraded flag fired SOLELY by the this_month KPI read.
+
+    aggregate_global issues the per-agent KPI this_month query FIRST, before any
+    monthly-trend query. Failing ONLY query #1 degrades the KPI
+    (``... or deg_this or deg_last``) contributor while the trend's later read
+    of the SAME current month succeeds, so the flag's truth comes exclusively
+    from the KPI OR-term.
+
+    This bites a strip of the KPI OR-term (``... or deg_this or deg_last``) and
+    stays green under a strip of the monthly-trend OR-term
+    (``... or trend_degraded``) — the missing half of the negative control
+    that let the original current-month-only test false-green.
+    """
+    today = date(2026, 6, 15)
+    # Single failing agent so query ordering is deterministic (KPI this_month is
+    # query #1). alice's current-month data is present for a partial render.
+    _write_log(tmp_path, "alice", today, [{"cost_usd": 0.10}])
+    _occurrence_failing_backend(monkeypatch, fail_agent="alice", fail_on=1)
+
+    summary = aggregate_global(tmp_path, today=today)
+
+    # Branch-distinctive assertion on the flag.
+    assert summary.cost_data_degraded is True, (
+        "this_month KPI read failure (query #1) must set cost_data_degraded — "
+        "this is the `or deg_this or deg_last` OR-contributor in isolation; the "
+        "trend's later read of the same month succeeds, so only the KPI term "
+        "can carry it"
+    )
+
+
+def test_aggregate_global_degraded_not_set_when_no_occurrence_fails(
+    tmp_path, monkeypatch
+):
+    """Negative control for the KPI isolation: failing an out-of-range
+    occurrence (one that never fires) leaves the flag False."""
+    today = date(2026, 6, 15)
+    _write_log(tmp_path, "alice", today, [{"cost_usd": 0.10}])
+    # fail_on far beyond the number of queries aggregate_global issues.
+    _occurrence_failing_backend(monkeypatch, fail_agent="alice", fail_on=9999)
+
+    summary = aggregate_global(tmp_path, today=today)
+
+    assert summary.cost_data_degraded is False
