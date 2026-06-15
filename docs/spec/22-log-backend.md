@@ -727,12 +727,17 @@ lives in ``tests/test_costs.py``, **outside** this arc census. (Both assert the
 same fail-closed property from the consumer side; the conformance-file copy
 keeps the contract demonstrable from the conformance suite alone, the
 ``test_costs.py`` copy keeps the cost-reader's own test file self-complete.)
-(Mandate spend-gate posture: #497 adds an INTERIM fail-closed guard for the
+(Mandate spend-gate posture: #497 added an INTERIM fail-closed guard for the
 outstanding-reservation read — a typed ``except LogBackendReadError`` at the
 step-7/step-8 callers that BLOCKs (``mandate_{token,external}_reservations_unreadable``),
-with 2 tests in ``tests/test_mandate_check.py``. The FULL posture — flipping the
-remaining broad-``except`` prior-cost-sum sites, ``BLOCK mandate_cost_unreadable``
-across all mandate read methods, and the spec/29 LOCKED amendment — stays #506.) (Census-honesty note: the pre-#497 census stated postgres as 53 and a
+with 2 tests in ``tests/test_mandate_check.py``. The FULL posture shipped in #506 —
+the remaining prior-cost-sum sites were flipped from broad-``except`` to a narrow
+read-failure catch raising ``BLOCK mandate_cost_unreadable``, with the
+spec/29 §"Blind-read fail-closed posture (issue #506)" LOCKED amendment.
+Tamper-evidence of the cost log itself — so "unverifiable" subsumes "tampered",
+not only "unreadable" — is the **#500** named seam: out of scope for the default
+filesystem backend, available to a future real-authz ``LogBackend``; see spec/29
+§"Blind-read fail-closed posture (issue #506)".) (Census-honesty note: the pre-#497 census stated postgres as 53 and a
 total of 223; both were a pre-existing undercount-by-one — ``--collect-only``
 reports postgres at 54 on main, so the true pre-#497 local total was 224. The
 figures here are recomputed from ``--collect-only`` and are authoritative.)
