@@ -86,12 +86,13 @@ class GlobalSummary:
     monthly_trend: list[dict]  # [{month: "2026-05", agent: "x", cost: 1.23}, ...]
     by_model_global: dict[str, float]  # model id → total cost this month
     by_provider: dict[str, float]  # "anthropic"/"openai"/"moonshot"/"local" → total
-    # #498 degraded-read banner field. The default is MANDATORY by dataclass
-    # field-ordering (this is the last field, after the non-defaulted predecessors
-    # above) — a no-default field here would be a syntax error. ADDITIONAL BENEFIT
-    # (not the reason for the default): because GlobalSummary is the one dashboard
-    # dataclass serialized to a JSON sidecar (to_json_dict, written by render_global),
-    # `False` keeps that sidecar forward-compatible per Principle #1/#14. The sidecar
+    # #498 degraded-read banner field. The default is CHOSEN, not forced: every
+    # field above is non-defaulted, so a no-default field in last position would
+    # also be valid Python (the field-ordering rule only forbids a non-defaulted
+    # field AFTER a defaulted one). The reason for `False` is forward-compat:
+    # GlobalSummary is the one dashboard dataclass serialized to a JSON sidecar
+    # (to_json_dict, written by render_global), and the default keeps that sidecar
+    # readable per Principle #1/#14. The sidecar
     # is WRITE-ONLY today (the banner reads the live in-memory dataclass, not the JSON),
     # so no current code path reads this field back; if a sidecar reader is ever added,
     # an absent key in a pre-#498 sidecar must be read as False
@@ -120,14 +121,12 @@ class AgentDashboardData:
     helper_savings: HelperSavings | None
     cache_savings_usd: float  # "you saved this much by caching"
     suggested_caps: dict | None  # if 14+ days of data, suggest daily/monthly caps
-    # #498 degraded-read banner field. The default is MANDATORY by dataclass
-    # field-ordering (same as GlobalSummary): it follows the non-defaulted
-    # `suggested_caps` above, and a field after a no-default field MUST carry a
-    # default or construction is a syntax error. UNLIKE GlobalSummary, this dataclass
-    # is NEVER serialized to a JSON sidecar (only render_global calls to_json_dict;
-    # the per-agent path is HTML-only) — so there is no sidecar-compat benefit here,
-    # only the field-ordering requirement. The banner reads the live in-memory
-    # dataclass either way.
+    # #498 degraded-read banner field. The default is OPTIONAL here, kept only for
+    # consistency with GlobalSummary: every field above is non-defaulted, so a
+    # no-default field in last position would be valid Python. UNLIKE GlobalSummary,
+    # this dataclass is NEVER serialized to a JSON sidecar (only render_global calls
+    # to_json_dict; the per-agent path is HTML-only) — so there is no sidecar-compat
+    # reason for the default either. The banner reads the live in-memory dataclass.
     # Boolean-only (see GlobalSummary above for why a record count has no honest definition on
     # the query()/LogBackendReadError path).
     cost_data_degraded: bool = (

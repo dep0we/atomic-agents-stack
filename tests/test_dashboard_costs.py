@@ -690,10 +690,48 @@ def test_aggregate_global_degraded_isolates_kpi_contributor(tmp_path, monkeypatc
     # Branch-distinctive assertion on the flag.
     assert summary.cost_data_degraded is True, (
         "this_month KPI read failure (query #1) must set cost_data_degraded — "
-        "this is the `or deg_this or deg_last` OR-contributor in isolation; the "
-        "trend's later read of the same month succeeds, so only the KPI term "
+        "this is the `deg_this` sub-term of the KPI OR-contributor in isolation; "
+        "the trend's later read of the same month succeeds, so only the KPI term "
         "can carry it"
     )
+
+
+def test_aggregate_global_degraded_isolates_kpi_last_month_contributor(
+    tmp_path, monkeypatch
+):
+    """Isolation: degraded flag fired SOLELY by the last_month KPI read.
+
+    The KPI OR-term is ``any_degraded or deg_this or deg_last`` — TWO independent
+    sub-terms. The this_month test above bites ``deg_this`` (query #1). This test
+    is its sibling negative control for ``deg_last``: aggregate_global issues the
+    per-agent last_month read as query #2 (immediately after this_month), so
+    failing ONLY query #2 fires ``deg_last`` while the this_month read (query #1)
+    AND the later monthly-trend reads all succeed.
+
+    Without this test, stripping ``or deg_last`` from the source leaves every
+    other test green (the this_month test fires on query #1; the trend test fires
+    on an old month) — the exact false-green the project's per-invocation
+    negative-control discipline forbids
+    (feedback_false_green_test_needs_per_invocation_negative_control).
+    """
+    today = date(2026, 6, 15)
+    # Single failing agent so query ordering is deterministic (this_month is
+    # query #1, last_month is query #2). alice's current-month data is present
+    # for a partial render; the this_month read (query #1) succeeds.
+    _write_log(tmp_path, "alice", today, [{"cost_usd": 0.10}])
+    _occurrence_failing_backend(monkeypatch, fail_agent="alice", fail_on=2)
+
+    summary = aggregate_global(tmp_path, today=today)
+
+    # Branch-distinctive assertion on the flag.
+    assert summary.cost_data_degraded is True, (
+        "last_month KPI read failure (query #2) must set cost_data_degraded — "
+        "this is the `deg_last` sub-term of the KPI OR-contributor in isolation; "
+        "query #1 (this_month) and the later trend reads succeed, so only the "
+        "deg_last term can carry it"
+    )
+    # Partial render preserved: the current-month KPI read (query #1) succeeded.
+    assert summary.total_cost > 0.0
 
 
 def test_aggregate_global_degraded_not_set_when_no_occurrence_fails(
@@ -709,3 +747,58 @@ def test_aggregate_global_degraded_not_set_when_no_occurrence_fails(
     summary = aggregate_global(tmp_path, today=today)
 
     assert summary.cost_data_degraded is False
+
+
+def test_aggregate_global_no_banner_on_empty_vault(tmp_path):
+    """First-run / empty-vault: zero agents must NOT fire the degraded banner.
+
+    A spurious "data may be incomplete" banner on a brand-new dashboard (no
+    agents, no logs) would directly violate the home-user-first-run throughline.
+    The for-loop never executes (any_degraded stays False) and
+    _build_monthly_trend gets [] agent_names → ([], False); this pins that
+    invariant against a refactor that re-inits any_degraded inside the loop or
+    reorders the discover_agents → trend call path.
+    """
+    summary = aggregate_global(tmp_path, today=date(2026, 6, 15))
+
+    assert summary.cost_data_degraded is False
+    assert summary.total_cost == 0.0
+    assert summary.total_runs == 0
+    assert summary.agents == []
+
+
+def test_aggregate_global_all_agents_degraded(tmp_path, monkeypatch):
+    """Total data loss: EVERY agent's backend raising LogBackendReadError must
+    set the banner AND produce a well-formed, crash-free all-zero summary.
+
+    Guards the no-crash invariant (cache_pct / delta_pct division-by-zero guards
+    under empty collections) under the worst case, and confirms the banner fires
+    when nothing is readable — distinct from the mixed clean/fail case already
+    covered.
+    """
+    from unittest.mock import MagicMock
+
+    import atomic_agents.logs as logs_mod
+    from atomic_agents import LogBackendReadError
+
+    # Two agents must exist (a log dir) for discover_agents to find them, but
+    # every backend read fails.
+    today = date(2026, 6, 15)
+    _write_log(tmp_path, "alice", today, [{"cost_usd": 0.10}])
+    _write_log(tmp_path, "bob", today, [{"cost_usd": 0.20}])
+
+    def _always_fail(root):
+        mock = MagicMock()
+        mock.query.side_effect = LogBackendReadError("injected total failure")
+        return mock
+
+    monkeypatch.setattr(logs_mod, "get_default_log_backend", _always_fail)
+
+    summary = aggregate_global(tmp_path, today=today)
+
+    assert summary.cost_data_degraded is True
+    # No crash + all-zero (every read blind → partial render of nothing).
+    assert summary.total_cost == 0.0
+    assert summary.total_runs == 0
+    assert summary.agents == []
+    assert summary.composite_cache_hit_pct == 0.0

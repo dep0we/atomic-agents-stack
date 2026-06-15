@@ -410,6 +410,25 @@ def test_global_cost_view_no_banner_on_clean_read(tmp_path):
     assert "Spend this month" in rendered_html
 
 
+def test_global_cost_view_no_banner_on_empty_vault(tmp_path):
+    """Negative control (render layer): a first-run empty vault (no agents) must
+    render the global page WITHOUT the degraded banner.
+
+    Pairs the costs-layer empty-vault test with the render layer so the
+    home-user-first-run path is pinned end-to-end (no spurious banner).
+    """
+    summary = aggregate_global(tmp_path, today=date(2026, 6, 15))
+    assert summary.cost_data_degraded is False
+
+    rendered_html = _render_global_template(summary)
+
+    assert "data may be incomplete" not in rendered_html, (
+        "Banner must NOT appear on an empty first-run dashboard"
+    )
+    # The page still renders its chrome (not an empty string / crash).
+    assert "Spend this month" in rendered_html
+
+
 def test_agent_cost_view_banner_appears_on_degraded_read(tmp_path, monkeypatch):
     """Integration: per-agent cost page shows 'data may be incomplete' banner on degraded read.
 
