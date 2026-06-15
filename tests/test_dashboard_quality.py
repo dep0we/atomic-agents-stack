@@ -15,7 +15,9 @@ from atomic_agents.dashboard.quality import (
 )
 
 
-def _write_eval_run(agents_root: Path, agent: str, when: date, records: list[dict]) -> Path:
+def _write_eval_run(
+    agents_root: Path, agent: str, when: date, records: list[dict]
+) -> Path:
     runs_dir = agents_root / agent / "evals" / "runs"
     runs_dir.mkdir(parents=True, exist_ok=True)
     path = runs_dir / f"{when.isoformat()}.jsonl"
@@ -33,10 +35,15 @@ def _write_eval_run(agents_root: Path, agent: str, when: date, records: list[dic
 
 def test_load_eval_runs_basic(tmp_path):
     today = date.today()
-    _write_eval_run(tmp_path, "alice", today, [
-        {"weighted_score": 3.5, "test_id": "t1"},
-        {"weighted_score": 4.0, "test_id": "t2"},
-    ])
+    _write_eval_run(
+        tmp_path,
+        "alice",
+        today,
+        [
+            {"weighted_score": 3.5, "test_id": "t1"},
+            {"weighted_score": 4.0, "test_id": "t2"},
+        ],
+    )
     records = _load_eval_runs(tmp_path, "alice", today - timedelta(days=5), today)
     assert len(records) == 2
     assert records[0].test_id == "t1"
@@ -63,14 +70,21 @@ def test_build_eval_trend(tmp_path):
     # 5 days of evals, slowly improving
     for i in range(5):
         d = today - timedelta(days=4 - i)
-        records.append(type("R", (), {
-            "ts": d.isoformat(),
-            "weighted_score": 3.0 + i * 0.2,
-            "scores": {"accuracy": 3 + i * 0.1},
-        })())
+        records.append(
+            type(
+                "R",
+                (),
+                {
+                    "ts": d.isoformat(),
+                    "weighted_score": 3.0 + i * 0.2,
+                    "scores": {"accuracy": 3 + i * 0.1},
+                },
+            )()
+        )
 
     # Build using raw dataclass-like objects
     from atomic_agents.dashboard.quality import EvalRunRecord
+
     rec_list = [
         EvalRunRecord(
             ts=(today - timedelta(days=4 - i)).isoformat(),
@@ -98,12 +112,26 @@ def test_hard_fail_detection(tmp_path):
     two_weeks_ago = today - timedelta(days=14)
     # alice must have log/ dir to be discovered
     (tmp_path / "alice" / "log").mkdir(parents=True)
-    _write_eval_run(tmp_path, "alice", today, [
-        {"weighted_score": 2.0, "hard_fails": ["response_too_short"], "test_id": "bad"},
-    ])
-    _write_eval_run(tmp_path, "alice", two_weeks_ago, [
-        {"weighted_score": 4.5, "hard_fails": [], "test_id": "good"},
-    ])
+    _write_eval_run(
+        tmp_path,
+        "alice",
+        today,
+        [
+            {
+                "weighted_score": 2.0,
+                "hard_fails": ["response_too_short"],
+                "test_id": "bad",
+            },
+        ],
+    )
+    _write_eval_run(
+        tmp_path,
+        "alice",
+        two_weeks_ago,
+        [
+            {"weighted_score": 4.5, "hard_fails": [], "test_id": "good"},
+        ],
+    )
 
     data = aggregate_quality(tmp_path, today=today)
     assert len(data.hard_fails_30d) == 1
@@ -144,6 +172,7 @@ def test_date_ge_helper():
 
 def test_eval_trend_no_data_returns_none_fields(tmp_path):
     from atomic_agents.dashboard.quality import EvalRunRecord
+
     # Single data point — can't compute 30d delta
     rec = EvalRunRecord(
         ts=date.today().isoformat(),
@@ -153,6 +182,33 @@ def test_eval_trend_no_data_returns_none_fields(tmp_path):
         hard_fails=[],
         scores={"accuracy": 4.0},
     )
-    trend = _build_eval_trend("alice", [rec], date.today() - timedelta(days=30), date.today())
+    trend = _build_eval_trend(
+        "alice", [rec], date.today() - timedelta(days=30), date.today()
+    )
     assert trend.latest_score == pytest.approx(4.0)
     assert trend.delta_30d is None  # only 1 data point
+
+
+def test_count_provenance_degrades_to_zero_on_read_error(tmp_path, monkeypatch):
+    """_count_provenance degrades to (0, 0) on LogBackendReadError.
+
+    spec/22 read-failure addendum (#497): the quality dashboard is a reporting
+    surface, not a control gate — an unrecoverable blind read returns (0, 0)
+    rather than crashing the render. (Empty/absent already returns (0, 0).)
+    """
+    from unittest.mock import MagicMock
+
+    import atomic_agents.logs as logs_mod
+    from atomic_agents import LogBackendReadError
+    from atomic_agents.dashboard.quality import _count_provenance
+
+    mock_backend = MagicMock()
+    mock_backend.query.side_effect = LogBackendReadError("corrupt log")
+    monkeypatch.setattr(logs_mod, "get_default_log_backend", lambda root: mock_backend)
+
+    today = date.today()
+    result = _count_provenance(tmp_path, "alice", today, today)
+    assert result == (0, 0)
+    # False-green guard: prove the backend was consulted and the exception
+    # path (not the absent-dir (0, 0) path) was exercised.
+    assert mock_backend.query.called

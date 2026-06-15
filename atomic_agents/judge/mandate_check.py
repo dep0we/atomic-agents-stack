@@ -30,6 +30,7 @@ import threading
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+from ..exceptions import LogBackendReadError
 from ..mandate.backend import MandateBackend
 from ..mandate.types import (
     MandateInvalid,
@@ -523,6 +524,19 @@ class MandateCheck:
                 mandate=mandate,
                 mandate_id=mandate_id,
             )
+            # Fail-closed: token reservation store unreadable → immediate BLOCK,
+            # bypass step 9 (mirrors the step-8 unprojectable path; #497/#506).
+            if token_result.get("reservations_unreadable"):
+                return self._block(
+                    reason="mandate_token_reservations_unreadable",
+                    mandate_id=mandate_id,
+                    detail=(
+                        f"Mandate {mandate_id!r} token spend-gate could not read "
+                        "outstanding reservations (cost-log read failure). Blocking "
+                        "fail-closed: the cumulative token cap cannot be verified "
+                        "against an unreadable reservation store."
+                    ),
+                )
             projected_token_usd = token_result["projected_usd"]
             caps_exceeded.update(token_result["caps_exceeded"])
             contributing_reservation_ids.extend(token_result.get("reservation_ids", []))
@@ -548,6 +562,19 @@ class MandateCheck:
                 mandate=mandate,
                 mandate_id=mandate_id,
             )
+            # Fail-closed: external reservation store unreadable → immediate
+            # BLOCK, bypass step 9 (#497/#506; mirrors the unprojectable path).
+            if ext_result.get("reservations_unreadable"):
+                return self._block(
+                    reason="mandate_external_reservations_unreadable",
+                    mandate_id=mandate_id,
+                    detail=(
+                        f"Mandate {mandate_id!r} external spend-gate could not read "
+                        "outstanding reservations (cost-log read failure). Blocking "
+                        "fail-closed: external caps cannot be verified against an "
+                        "unreadable reservation store."
+                    ),
+                )
             # Fail-closed: unprojectable → immediate BLOCK, bypass step 9
             if ext_result.get("unprojectable"):
                 return self._block(
@@ -819,6 +846,28 @@ class MandateCheck:
         try:
             outstanding = compute_outstanding(self._log, self._scope, mandate_id)
             token_reservations = [r for r in outstanding if r.cost_kind == "token"]
+        except LogBackendReadError as exc:
+            # #497: a cost-log READ FAILURE must fail CLOSED at the mandate gate
+            # (mirror the cost reader's layered catch + the step-8 unprojectable
+            # precedent). The broad backstop below zeros reservations = fail-OPEN;
+            # that is a pre-existing posture whose FULL fix (broad-except flip +
+            # spec/29 amendment + BLOCK mandate_cost_unreadable across all read
+            # methods) is tracked in #506. This typed guard only stops #497's new
+            # LogBackendReadError from WIDENING that fail-open: an unreadable
+            # reservation store means the cap cannot be verified, so block rather
+            # than admit the proposal with zeroed outstanding reservations.
+            _logger.warning(
+                "MandateCheck step 7: reservation store unreadable for mandate "
+                "%r: %s — fail-closed, blocking (#497; full posture #506)",
+                mandate_id,
+                exc,
+            )
+            return {
+                "projected_usd": projected,
+                "caps_exceeded": {},
+                "reservation_ids": [],
+                "reservations_unreadable": True,
+            }
         except Exception as exc:  # noqa: BLE001
             _logger.warning(
                 "MandateCheck step 7: compute_outstanding failed for mandate "
@@ -957,6 +1006,23 @@ class MandateCheck:
         try:
             outstanding = compute_outstanding(self._log, self._scope, mandate_id)
             ext_reservations = [r for r in outstanding if r.cost_kind == "external"]
+        except LogBackendReadError as exc:
+            # #497 fail-closed guard — see the step-7 rationale above. An
+            # unreadable reservation store means external caps cannot be verified,
+            # so block rather than admit with zeroed outstanding. Full posture #506.
+            _logger.warning(
+                "MandateCheck step 8: reservation store unreadable for mandate "
+                "%r: %s — fail-closed, blocking (#497; full posture #506)",
+                mandate_id,
+                exc,
+            )
+            return {
+                "projected_usd": projected,
+                "caps_exceeded": {},
+                "reservation_ids": [],
+                "unprojectable": False,
+                "reservations_unreadable": True,
+            }
         except Exception as exc:  # noqa: BLE001
             _logger.warning(
                 "MandateCheck step 8: compute_outstanding failed for mandate "

@@ -305,10 +305,15 @@ def _count_provenance(
     full window and filtering in-Python preserves backward compat for
     every legacy helper record.
 
-    Returns (preserved_count, total_count).
+    Returns (preserved_count, total_count). On an unrecoverable
+    ``LogBackendReadError`` (corruption / I/O / lost connection) this
+    degrades to ``(0, 0)`` rather than crashing — the quality dashboard
+    is a reporting surface, not a control gate (spec/09 §"Cost-read
+    fail-closed posture"; spec/22 read-failure addendum). An
+    empty/absent log already returns ``(0, 0)`` without raising.
     """
     from datetime import datetime, time as dt_time
-    from ..logs import LogQuery, get_default_log_backend
+    from ..logs import LogQuery, get_default_log_backend, LogBackendReadError
 
     backend = get_default_log_backend(agents_root / agent)
     since_dt = datetime.combine(since, dt_time.min).astimezone()
@@ -319,9 +324,16 @@ def _count_provenance(
     # NO primitive filter in the LogQuery — see docstring rationale.
     # agent_name filter prevents shared-backend cross-agent record mix
     # (Step 11 P0 #1).
-    for rec in backend.query(LogQuery(
-        since=since_dt, until=until_dt, agent_name=agent,
-    )):
+    #
+    # spec/22 read-failure addendum (issue #497): a blind read degrades to
+    # (0, 0) rather than crashing the dashboard render.
+    try:
+        records = backend.query(LogQuery(
+            since=since_dt, until=until_dt, agent_name=agent,
+        ))
+    except LogBackendReadError:
+        return 0, 0
+    for rec in records:
         # Helper records are identified by EITHER primitive (post-PR-2)
         # OR trigger (legacy, pre-PR-2). Belt-and-suspenders.
         if rec.primitive != "helper" and rec.trigger != "helper":

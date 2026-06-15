@@ -43,6 +43,7 @@ Exit codes: 0 success, 1 failed/canceled, 2 cost-guardrail-blocked.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 import shutil
@@ -88,6 +89,11 @@ from .types import Capture
 # any sequence of alphanumeric + underscore + hyphen with no path separators.
 # This prevents path traversal via dream_id such as "../../persona".
 import re as _re
+
+# Module logger. Declared after the deferred ``import re as _re`` above so that
+# inserting it does not push the (pre-existing) deferred import below a non-import
+# statement and trip ruff E402.
+_logger = logging.getLogger(__name__)
 
 _VALID_DREAM_ID_RE = _re.compile(r"^[a-zA-Z0-9_-]+$")
 
@@ -300,11 +306,30 @@ def _read_log_lines(
     cutoff = date.today() - timedelta(days=lookback_days)
 
     if log_backend is not None:
-        from .logs import LogQuery
+        from .logs import LogQuery, LogBackendReadError
 
         since_dt = datetime.combine(cutoff, dt_time.min).astimezone()
         records = []
-        for rec in log_backend.query(LogQuery(since=since_dt, agent_name=agent_name)):
+        # spec/22 read-failure addendum (issue #497): query() now raises
+        # LogBackendReadError on an unrecoverable read failure. This read runs
+        # BEFORE the dream cost gate (_check_cap) and any LLM batch, so a raise
+        # here cannot leak uncosted spend — but it WOULD hard-crash a dream run.
+        # Dream consolidation is analysis, not a control gate: degrade gracefully
+        # (lose the log signal, complete the run) rather than crash, matching how
+        # the cost reader and dashboard treat the same blind read.
+        try:
+            query_iter = log_backend.query(
+                LogQuery(since=since_dt, agent_name=agent_name)
+            )
+        except LogBackendReadError as exc:
+            _logger.warning(
+                "dream: log read for agent %r raised LogBackendReadError "
+                "(blind read): %s — proceeding with empty log signal",
+                agent_name,
+                exc,
+            )
+            return records
+        for rec in query_iter:
             # filter out helper runs — too noisy. Belt-and-suspenders:
             # check BOTH primitive (post-PR-2 records) AND trigger
             # (legacy pre-PR-2 records that don't have primitive set).
@@ -1425,6 +1450,16 @@ class DreamRunner:
             log_backend=self._log_backend,
             agent_name=self.agent_name,
         )
+        # NOTE (issue #497): a degraded log read (LogBackendReadError) makes
+        # _read_log_lines return [] (see its except branch), so log_chars=0 and
+        # this upfront estimate is conservative-LOW. That cannot leak uncosted
+        # spend, covering both cases (cf. the #495 "fail-closed only where there
+        # is something to protect" lesson): WHEN A CAP IS SET, the actual-spend
+        # degraded branch in _check_cap (the _sum_via_backend fail-closed path)
+        # is the binding gate on a blind read and fires first, so the estimate
+        # undercount is moot in exactly the failure case; WHEN NO CAP IS SET,
+        # _check_cap does not block, but an uncapped agent has no budget to leak
+        # against regardless, so the undercount is harmless.
         estimated_cost = _estimate_dream_cost(
             self._model, notes, journal_entries, log_lines
         )

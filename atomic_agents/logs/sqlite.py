@@ -72,6 +72,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from ..exceptions import LogBackendReadError
 from .types import (
     LogAggregate,
     LogCapabilities,
@@ -303,6 +304,32 @@ class SQLiteLogBackend:
             self._tls.conn = conn
         return conn
 
+    def _get_conn_for_read(self, op: str) -> sqlite3.Connection:
+        """``_get_conn()`` wrapped for the spec/22 read-failure boundary.
+
+        The most realistic SQLite read failure — a corrupt ``.db`` file — does
+        NOT surface at ``execute()`` time. It surfaces during connection setup:
+        ``_get_conn()`` runs ``PRAGMA journal_mode=WAL`` and then
+        ``_ensure_schema()`` (which executes DDL + a ``SELECT`` on the meta
+        table) on a fresh thread-local connection. On a corrupt file those
+        execute calls raise ``sqlite3.DatabaseError('file is not a database')``.
+        To satisfy the addendum's "corruption → LogBackendReadError" boundary
+        row, connect-time corruption must be wrapped here too — not just the
+        per-call ``execute(sql)``.
+
+        Boundary carve-out: ``_ensure_schema()`` raises ``RuntimeError`` on a
+        true schema-version mismatch (a config error, not a read failure). That
+        ``RuntimeError`` is NOT a ``sqlite3.DatabaseError``, so it propagates
+        uncaught — matching the locked "config error, not read failure" rule.
+        """
+        try:
+            return self._get_conn()
+        except sqlite3.DatabaseError as exc:
+            raise LogBackendReadError(
+                f"SQLiteLogBackend: unrecoverable read failure establishing "
+                f"connection in {op}() (corrupt database file or I/O error): {exc}"
+            ) from exc
+
     def _ensure_schema(self, conn: sqlite3.Connection) -> None:
         """Create tables + indexes if missing; assert schema version.
 
@@ -402,26 +429,60 @@ class SQLiteLogBackend:
         order for tz-aware records — the same invariant the filesystem
         backend relies on. SQLite's TEXT comparison is byte-wise, which
         agrees with Python's string comparison for ASCII ISO-8601.
+
+        Raises:
+            LogBackendReadError: on unrecoverable SQLite read failure
+                (corruption, I/O error). See spec/22 read-failure posture
+                addendum.
         """
         sql, params = self._build_query_sql(filter, select="*", order_limit=True)
-        conn = self._get_conn()
-        rows = conn.execute(sql, params).fetchall()
+        # spec/22 read-failure addendum: wrap sqlite3.DatabaseError (the base
+        # class covering DatabaseError + OperationalError) for genuine I/O /
+        # corruption failures — at BOTH the connection/schema-setup phase
+        # (_get_conn_for_read; corrupt .db surfaces here) AND the execute path.
+        # RuntimeError from _ensure_schema (schema version mismatch) is a config
+        # error, not a read failure, and propagates uncaught (it is not a
+        # sqlite3.DatabaseError). ValueError (invalid filter args) is raised
+        # above, before this point.
+        conn = self._get_conn_for_read("query")
+        try:
+            rows = conn.execute(sql, params).fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise LogBackendReadError(
+                f"SQLiteLogBackend: unrecoverable read failure in query(): {exc}"
+            ) from exc
         return [self._row_to_record(row) for row in rows]
 
     # ────────────────────────────────────────────────────────────
     # Tail
 
     def tail(self, n: int) -> list[RunRecord]:
-        """SELECT ORDER BY ts DESC LIMIT n — index seek bounded to ``n`` rows."""
+        """SELECT ORDER BY ts DESC LIMIT n — index seek bounded to ``n`` rows.
+
+        Raises:
+            LogBackendReadError: on unrecoverable SQLite read failure
+                (corruption, I/O error). See spec/22 read-failure posture
+                addendum.
+        """
         if n < 0:
             raise ValueError(f"tail(n) requires n >= 0; got {n}")
         if n == 0:
             return []
-        conn = self._get_conn()
-        rows = conn.execute(
-            "SELECT * FROM run_records ORDER BY ts DESC, id DESC LIMIT ?",
-            (n,),
-        ).fetchall()
+        # spec/22 read-failure addendum: wrap sqlite3.DatabaseError at BOTH the
+        # connection/schema-setup phase (corrupt .db surfaces here) and the
+        # execute path. ValueError (negative n) is raised above, before this
+        # point. RuntimeError from _ensure_schema (schema version mismatch) is a
+        # config error and propagates uncaught (not a sqlite3.DatabaseError).
+        conn = self._get_conn_for_read("tail")
+        try:
+            rows = conn.execute(
+                "SELECT * FROM run_records ORDER BY ts DESC, id DESC LIMIT ?",
+                (n,),
+            ).fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise LogBackendReadError(
+                f"SQLiteLogBackend: unrecoverable read failure in tail(): {exc}"
+            ) from exc
         # Reverse to chronological-LAST order.
         records = [self._row_to_record(row) for row in rows]
         records.reverse()
@@ -485,8 +546,19 @@ class SQLiteLogBackend:
             select_cols = metric_expr
 
         sql = f"SELECT {select_cols} FROM run_records {where_sql} {group_clause}"
-        conn = self._get_conn()
-        rows = conn.execute(sql, params).fetchall()
+        # spec/22 read-failure addendum: wrap sqlite3.DatabaseError at BOTH the
+        # connection/schema-setup phase (corrupt .db surfaces here) and the
+        # execute path. ValueError (unknown metric, invalid group_by) is raised
+        # above, before this point (caller error, not read failure). RuntimeError
+        # from _ensure_schema (schema version mismatch) is a config error and
+        # propagates uncaught (not a sqlite3.DatabaseError).
+        conn = self._get_conn_for_read("aggregate")
+        try:
+            rows = conn.execute(sql, params).fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise LogBackendReadError(
+                f"SQLiteLogBackend: unrecoverable read failure in aggregate(): {exc}"
+            ) from exc
 
         result: dict[tuple, float | int] = {}
         for row in rows:

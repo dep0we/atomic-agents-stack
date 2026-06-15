@@ -958,8 +958,43 @@ class TestFilesystemFailClosed:
 class TestBackendFailClosed:
     """_sum_via_backend fail-closed posture."""
 
+    def test_backend_query_logbackendreaderror_returns_degraded(self, tmp_path, caplog):
+        """Typed LogBackendReadError → degraded=True via the typed catch branch.
+
+        Issue #497 R3: _sum_via_backend catches LogBackendReadError FIRST
+        (clean read-failure log) before the broad backstop. This exercises the
+        typed branch specifically (_costs.py ``except LogBackendReadError``),
+        backing the readiness-census claim that the typed signal fails closed —
+        the prior seam tests only injected RuntimeError/OSError, which hit the
+        broad backstop, leaving the typed branch unproven.
+
+        Discriminating assertion (review #497): result.degraded=True alone does
+        NOT prove the TYPED branch fired — the broad ``except Exception`` also
+        catches LogBackendReadError (it is an Exception subclass) and returns
+        the same degraded result. We assert the typed branch's distinctive log
+        line ("genuine unrecoverable read failure"); the broad backstop logs
+        "raised unexpected" instead, so this assertion FAILS if the typed
+        ``except LogBackendReadError`` handler is removed.
+        """
+        import logging
+        from unittest.mock import MagicMock
+        from atomic_agents._costs import _sum_via_backend
+        from atomic_agents import LogBackendReadError
+
+        bad_backend = MagicMock()
+        bad_backend.query.side_effect = LogBackendReadError("corrupt log")
+
+        with caplog.at_level(logging.WARNING, logger="atomic_agents._costs"):
+            result = _sum_via_backend(bad_backend, date.today(), "today", None, None)
+        assert result.degraded is True
+        assert result.total_usd == 0.0
+        assert result.dropped_records == 0
+        # Typed branch fired (not the broad backstop): its log line is distinctive.
+        assert "genuine unrecoverable read failure" in caplog.text
+        assert "raised unexpected" not in caplog.text
+
     def test_backend_query_exception_returns_degraded(self, tmp_path):
-        """Any exception from backend.query() → degraded=True, fail-closed."""
+        """Any OTHER exception from backend.query() → degraded=True (broad backstop)."""
         from unittest.mock import MagicMock
         from atomic_agents._costs import _sum_via_backend
 

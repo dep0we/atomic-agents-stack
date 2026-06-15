@@ -12,6 +12,8 @@ from datetime import date, datetime, time
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
+from .exceptions import LogBackendReadError
+
 if TYPE_CHECKING:
     from .logs import LogBackend
 
@@ -545,9 +547,22 @@ def _sum_via_backend(
                 )
             )
         )
-    except Exception as exc:  # noqa: BLE001  # backend contract does not constrain exc type
+    except LogBackendReadError as exc:
+        # Typed catch — conforming backend raised LogBackendReadError,
+        # signalling a genuine unrecoverable read failure (corruption /
+        # I/O error / lost connection after all retries). Clean log.
         logger.warning(
-            "cost-read: backend.query() raised %s: %s — "
+            "cost-read: backend raised LogBackendReadError (genuine "
+            "unrecoverable read failure): %s — gate is BLIND, "
+            "failing closed (degraded=True)",
+            exc,
+        )
+        return CostReadResult(total_usd=0.0, degraded=True, dropped_records=0)
+    except Exception as exc:  # noqa: BLE001  # backend contract does not constrain exc type
+        # Broad backstop — non-conforming backend raised an unexpected
+        # exception type. Fail closed, same shape as the typed path.
+        logger.warning(
+            "cost-read: backend.query() raised unexpected %s: %s — "
             "gate is BLIND, failing closed (degraded=True)",
             type(exc).__name__,
             exc,
