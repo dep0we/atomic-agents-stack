@@ -1693,6 +1693,42 @@ class TestMandateCheckStep7TokenBudget:
         assert judgment.outcome == JudgmentOutcome.BLOCK
         assert "mandate_cap_would_exceed" in judgment.reason
 
+    def test_step7_blocks_fail_closed_when_reservation_store_unreadable(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Step 7 (#497): a LogBackendReadError from the reservation read must
+        fail CLOSED — BLOCK with mandate_token_reservations_unreadable — not fall
+        into the broad except's fail-OPEN zeroing.
+
+        Negative control: the cap is generous (daily_token_usd=10.0), so with the
+        pre-#497 fail-open path (LogBackendReadError → except Exception →
+        reservations=[]) cumulative stays under cap and the proposal is ALLOWED.
+        The typed guard turns the read failure into a BLOCK regardless of cap, so
+        this test FAILS (ALLOW) if the `except LogBackendReadError` guard is
+        removed. The broad backstop / full mandate fail-closed posture is #506.
+        """
+        from atomic_agents.exceptions import LogBackendReadError
+
+        mandate_id = "token-reservations-unreadable"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = _make_token_capped_mandate(mandate_id, daily_token_usd=10.0)
+        mc = _make_mc(mandate_backend, scope, null_log_backend)
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with (
+            patch.object(mandate_backend, "load_mandate", return_value=mandate),
+            patch(
+                "atomic_agents.judge.mandate_check.compute_outstanding",
+                side_effect=LogBackendReadError("simulated cost-log read failure"),
+            ),
+        ):
+            judgment = mc.evaluate(proposal)
+        assert judgment.outcome == JudgmentOutcome.BLOCK
+        assert "mandate_token_reservations_unreadable" in judgment.reason
+
     def test_step7_allows_when_under_cap(
         self,
         mandate_backend: FilesystemMandateBackend,
@@ -1970,6 +2006,42 @@ class TestMandateCheckStep8ExternalBudget:
             judgment = mc.evaluate(proposal)
         assert judgment.outcome == JudgmentOutcome.BLOCK
         assert "mandate_cap_would_exceed" in judgment.reason
+
+    def test_step8_blocks_fail_closed_when_reservation_store_unreadable(
+        self,
+        mandate_backend: FilesystemMandateBackend,
+        scope_root: Path,
+        scope: str,
+        null_log_backend: Any,
+    ):
+        """Step 8 (#497): a LogBackendReadError from the external reservation read
+        must fail CLOSED — BLOCK with mandate_external_reservations_unreadable —
+        not fall into the broad except's fail-OPEN zeroing.
+
+        Negative control: cap is generous (daily_external_usd=100.0) and the tool
+        is projectable (static $1.00), so absent the read failure this ALLOWs;
+        the typed guard turns the read failure into a BLOCK, so this FAILS (ALLOW)
+        if the `except LogBackendReadError` guard is removed. Full posture #506.
+        """
+        from atomic_agents.exceptions import LogBackendReadError
+
+        mandate_id = "ext-reservations-unreadable"
+        _write_mandate(scope_root, scope, mandate_id, allowed_tools=["test_tool"])
+        mandate = _make_external_capped_mandate(mandate_id, daily_external_usd=100.0)
+        mc = _make_mc_with_tool(
+            mandate_backend, scope, null_log_backend, "test_tool", 1.0
+        )
+        proposal = make_proposal_citing(mandate_id, tool_name="test_tool")
+        with (
+            patch.object(mandate_backend, "load_mandate", return_value=mandate),
+            patch(
+                "atomic_agents.judge.mandate_check.compute_outstanding",
+                side_effect=LogBackendReadError("simulated cost-log read failure"),
+            ),
+        ):
+            judgment = mc.evaluate(proposal)
+        assert judgment.outcome == JudgmentOutcome.BLOCK
+        assert "mandate_external_reservations_unreadable" in judgment.reason
 
     def test_step8_blocks_when_monthly_external_cap_exceeded(
         self,

@@ -131,7 +131,11 @@ def load_runs(
     default; ``SQLiteLogBackend`` in PR 3 forward) — same env-var
     resolution path as ``AtomicAgent.__init__``, keeping runtime
     writes and dashboard reads in sync. Falls back silently to an
-    empty list when the agent has no log dir / no records yet.
+    empty list when the agent has no log dir / no records yet, and
+    likewise degrades to an empty list on an unrecoverable
+    ``LogBackendReadError`` (corruption / I/O / lost connection) — the
+    dashboard is a reporting surface, not a control gate (spec/09
+    §"Cost-read fail-closed posture"; spec/22 read-failure addendum).
 
     The returned ``RunRecord`` shape is the dashboard's own dataclass
     (with ``ts: datetime`` and ``agent: str`` required); we adapt the
@@ -139,7 +143,7 @@ def load_runs(
     preserve the existing dashboard's reader contract.
     """
     from datetime import datetime, time as dt_time
-    from ..logs import LogQuery, get_default_log_backend
+    from ..logs import LogQuery, get_default_log_backend, LogBackendReadError
 
     until = until or date.today()
     backend = get_default_log_backend(agents_root / agent)
@@ -152,9 +156,19 @@ def load_runs(
     # records into one agent's dashboard view. Step 11 P0 #1 — the
     # filesystem-default per-agent dir shape provides this isolation
     # naturally; shared backends require the explicit filter.
-    for rec in backend.query(LogQuery(
-        since=since_dt, until=until_dt, agent_name=agent,
-    )):
+    #
+    # spec/22 read-failure addendum (issue #497): query() now raises
+    # LogBackendReadError on an unrecoverable read failure. The dashboard is a
+    # REPORTING surface, not a control gate — degrade to an empty render (the
+    # documented "falls back silently to an empty list" contract) rather than
+    # crash. (Empty/absent state already returns [] without raising.)
+    try:
+        records = backend.query(LogQuery(
+            since=since_dt, until=until_dt, agent_name=agent,
+        ))
+    except LogBackendReadError:
+        return []
+    for rec in records:
         rr = _record_from_dict(rec.to_dict(), agent)
         if rr is None:
             continue

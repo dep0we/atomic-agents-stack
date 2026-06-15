@@ -67,10 +67,15 @@ def test_discover_agents_empty_root(tmp_path):
 
 def test_load_runs_basic(tmp_path):
     today = date.today()
-    _write_log(tmp_path, "alice", today, [
-        {"summary": "morning", "cost_usd": 0.10},
-        {"summary": "afternoon", "cost_usd": 0.20},
-    ])
+    _write_log(
+        tmp_path,
+        "alice",
+        today,
+        [
+            {"summary": "morning", "cost_usd": 0.10},
+            {"summary": "afternoon", "cost_usd": 0.20},
+        ],
+    )
     runs = load_runs(tmp_path, "alice", today, today)
     assert len(runs) == 2
     assert runs[0].agent == "alice"
@@ -86,9 +91,15 @@ def test_load_runs_skips_malformed(tmp_path):
     log_dir = tmp_path / "alice" / "log" / today.strftime("%Y-%m")
     log_dir.mkdir(parents=True)
     log_dir.joinpath(f"{today.isoformat()}.jsonl").write_text(
-        json.dumps({"ts": ts_today, "cost_usd": 0.10, "model": "claude-opus-4-7-20260101"}) + "\n"
+        json.dumps(
+            {"ts": ts_today, "cost_usd": 0.10, "model": "claude-opus-4-7-20260101"}
+        )
+        + "\n"
         + "not valid json\n"
-        + json.dumps({"ts": ts_today, "cost_usd": 0.20, "model": "claude-opus-4-7-20260101"}) + "\n"
+        + json.dumps(
+            {"ts": ts_today, "cost_usd": 0.20, "model": "claude-opus-4-7-20260101"}
+        )
+        + "\n"
     )
     runs = load_runs(tmp_path, "alice", today, today)
     assert len(runs) == 2  # malformed line skipped
@@ -112,14 +123,38 @@ def test_load_runs_respects_date_range(tmp_path):
 
 def test_summarize_agent_basic(tmp_path):
     today = date.today()
-    _write_log(tmp_path, "alice", today, [
-        {"trigger": "cron", "model": "claude-opus-4-7-20260101", "cost_usd": 0.10,
-         "input_tokens": 1000, "output_tokens": 200, "cache_hit_tokens": 800, "cache_miss_tokens": 200},
-        {"trigger": "skill", "model": "claude-sonnet-4-6-20260101", "cost_usd": 0.02,
-         "input_tokens": 500, "output_tokens": 100, "cache_hit_tokens": 0, "cache_miss_tokens": 500},
-        {"trigger": "helper", "model": "claude-haiku-4-5-20251001", "cost_usd": 0.001,
-         "input_tokens": 100, "output_tokens": 20},
-    ])
+    _write_log(
+        tmp_path,
+        "alice",
+        today,
+        [
+            {
+                "trigger": "cron",
+                "model": "claude-opus-4-7-20260101",
+                "cost_usd": 0.10,
+                "input_tokens": 1000,
+                "output_tokens": 200,
+                "cache_hit_tokens": 800,
+                "cache_miss_tokens": 200,
+            },
+            {
+                "trigger": "skill",
+                "model": "claude-sonnet-4-6-20260101",
+                "cost_usd": 0.02,
+                "input_tokens": 500,
+                "output_tokens": 100,
+                "cache_hit_tokens": 0,
+                "cache_miss_tokens": 500,
+            },
+            {
+                "trigger": "helper",
+                "model": "claude-haiku-4-5-20251001",
+                "cost_usd": 0.001,
+                "input_tokens": 100,
+                "output_tokens": 20,
+            },
+        ],
+    )
     runs = load_runs(tmp_path, "alice", today, today)
     summary = summarize_agent(runs)
 
@@ -145,14 +180,34 @@ def test_summarize_agent_empty():
 
 def test_helper_savings(tmp_path):
     today = date.today()
-    _write_log(tmp_path, "alice", today, [
-        {"trigger": "cron", "model": "claude-opus-4-7-20260101", "cost_usd": 0.10,
-         "input_tokens": 1000, "output_tokens": 200},
-        {"trigger": "helper", "model": "claude-haiku-4-5-20251001", "cost_usd": 0.001,
-         "input_tokens": 1000, "output_tokens": 100},
-        {"trigger": "helper", "model": "claude-haiku-4-5-20251001", "cost_usd": 0.001,
-         "input_tokens": 1000, "output_tokens": 100},
-    ])
+    _write_log(
+        tmp_path,
+        "alice",
+        today,
+        [
+            {
+                "trigger": "cron",
+                "model": "claude-opus-4-7-20260101",
+                "cost_usd": 0.10,
+                "input_tokens": 1000,
+                "output_tokens": 200,
+            },
+            {
+                "trigger": "helper",
+                "model": "claude-haiku-4-5-20251001",
+                "cost_usd": 0.001,
+                "input_tokens": 1000,
+                "output_tokens": 100,
+            },
+            {
+                "trigger": "helper",
+                "model": "claude-haiku-4-5-20251001",
+                "cost_usd": 0.001,
+                "input_tokens": 1000,
+                "output_tokens": 100,
+            },
+        ],
+    )
     runs = load_runs(tmp_path, "alice", today, today)
     savings = helper_savings(runs, "claude-opus-4-7-20260101")
 
@@ -168,19 +223,33 @@ def test_helper_savings(tmp_path):
 
 def test_helper_savings_no_helpers(tmp_path):
     today = date.today()
-    _write_log(tmp_path, "alice", today, [
-        {"trigger": "cron", "cost_usd": 0.10},
-    ])
+    _write_log(
+        tmp_path,
+        "alice",
+        today,
+        [
+            {"trigger": "cron", "cost_usd": 0.10},
+        ],
+    )
     runs = load_runs(tmp_path, "alice", today, today)
     assert helper_savings(runs, "claude-opus-4-7-20260101") is None
 
 
 def test_cache_savings_usd(tmp_path):
     today = date.today()
-    _write_log(tmp_path, "alice", today, [
-        {"model": "claude-opus-4-7-20260101", "cache_hit_tokens": 10000, "cache_miss_tokens": 0,
-         "cost_usd": 0.015},
-    ])
+    _write_log(
+        tmp_path,
+        "alice",
+        today,
+        [
+            {
+                "model": "claude-opus-4-7-20260101",
+                "cache_hit_tokens": 10000,
+                "cache_miss_tokens": 0,
+                "cost_usd": 0.015,
+            },
+        ],
+    )
     runs = load_runs(tmp_path, "alice", today, today)
     saved = cache_savings_usd(runs)
     # 10000 cached tokens at $15/MTok with 90% discount saved = 10000 * 15 * 0.9 / 1M = 0.135
@@ -220,11 +289,16 @@ def test_aggregate_global(tmp_path):
 
 def test_aggregate_global_top_runs(tmp_path):
     today = date.today()
-    _write_log(tmp_path, "alice", today, [
-        {"cost_usd": 0.50, "summary": "expensive"},
-        {"cost_usd": 0.10, "summary": "medium"},
-        {"cost_usd": 0.01, "summary": "cheap"},
-    ])
+    _write_log(
+        tmp_path,
+        "alice",
+        today,
+        [
+            {"cost_usd": 0.50, "summary": "expensive"},
+            {"cost_usd": 0.10, "summary": "medium"},
+            {"cost_usd": 0.01, "summary": "cheap"},
+        ],
+    )
     summary = aggregate_global(tmp_path, today=today, top_runs_count=2)
     assert len(summary.top_runs) == 2
     assert summary.top_runs[0].cost_usd == 0.50  # most expensive first
@@ -233,11 +307,21 @@ def test_aggregate_global_top_runs(tmp_path):
 
 def test_aggregate_agent(tmp_path):
     today = date.today()
-    _write_log(tmp_path, "alice", today, [
-        {"trigger": "cron", "model": "claude-opus-4-7-20260101", "cost_usd": 0.10},
-        {"trigger": "helper", "model": "claude-haiku-4-5-20251001", "cost_usd": 0.001,
-         "input_tokens": 1000, "output_tokens": 50},
-    ])
+    _write_log(
+        tmp_path,
+        "alice",
+        today,
+        [
+            {"trigger": "cron", "model": "claude-opus-4-7-20260101", "cost_usd": 0.10},
+            {
+                "trigger": "helper",
+                "model": "claude-haiku-4-5-20251001",
+                "cost_usd": 0.001,
+                "input_tokens": 1000,
+                "output_tokens": 50,
+            },
+        ],
+    )
     data = aggregate_agent(tmp_path, "alice", today=today)
     assert data.name == "alice"
     assert data.summary_this_month.runs == 2
@@ -254,3 +338,28 @@ def test_to_json_dict_handles_dataclasses_and_dates(tmp_path):
     text = json.dumps(j)
     parsed = json.loads(text)
     assert parsed["total_runs"] == 1
+
+
+def test_load_runs_degrades_to_empty_on_read_error(tmp_path, monkeypatch):
+    """load_runs degrades to [] when the backend raises LogBackendReadError.
+
+    spec/22 read-failure addendum (#497): the dashboard is a reporting surface,
+    not a control gate — an unrecoverable blind read renders empty rather than
+    crashing the dashboard. (Empty/absent state already returns [] without
+    raising; this pins the corruption/I-O failure path.)
+    """
+    from unittest.mock import MagicMock
+
+    import atomic_agents.logs as logs_mod
+    from atomic_agents import LogBackendReadError
+
+    mock_backend = MagicMock()
+    mock_backend.query.side_effect = LogBackendReadError("corrupt log")
+    monkeypatch.setattr(logs_mod, "get_default_log_backend", lambda root: mock_backend)
+
+    today = date.today()
+    result = load_runs(tmp_path, "alice", today, today)
+    assert result == []
+    # False-green guard: prove the backend was consulted and the exception
+    # path (not the absent-dir [] path) was exercised.
+    assert mock_backend.query.called

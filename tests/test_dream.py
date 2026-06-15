@@ -681,3 +681,25 @@ def test_dream_discard_refuses_dream_id_with_slash(agents_root):
     runner = DreamRunner(agents_root, "dreamer")
     with pytest.raises(DreamNotFound, match="Invalid dream_id"):
         runner.discard("some/nested/path")
+
+
+def test_read_log_lines_degrades_on_read_error(tmp_path):
+    """_read_log_lines degrades to an empty signal on LogBackendReadError.
+
+    spec/22 read-failure addendum (#497): the log read runs BEFORE the dream
+    cost gate and any LLM batch, so a raise here cannot leak uncosted spend —
+    but it WOULD hard-crash a dream run. Dream consolidation is analysis, not a
+    control gate: it degrades (loses the log signal, completes) rather than
+    crashing, matching the cost reader and dashboard.
+    """
+    from atomic_agents import LogBackendReadError
+    from atomic_agents.dream import _read_log_lines
+
+    mock_backend = MagicMock()
+    mock_backend.query.side_effect = LogBackendReadError("corrupt log")
+
+    result = _read_log_lines(tmp_path, 7, log_backend=mock_backend, agent_name="alice")
+    assert result == []
+    # False-green guard: prove the backend was consulted and the exception
+    # path was exercised (not the log_backend-is-None legacy walk).
+    assert mock_backend.query.called
