@@ -378,6 +378,12 @@ _VERSIONS_INSERT_COLUMNS = (
     "content_hash",
 )
 
+# JSONB columns among the version-insert columns: when copied from a live
+# memory_notes row (read back by psycopg as Python dict/list), they MUST be
+# re-serialized to a JSON TEXT param — psycopg cannot adapt a raw dict to %s.
+# (supersedes is TEXT, superseded_by is TEXT — not in this set.)
+_VERSIONS_JSONB_COLUMNS = frozenset({"sources", "tags", "extra_frontmatter"})
+
 _VERSIONS_INSERT_SQL = (
     "INSERT INTO memory_note_versions ("
     + ", ".join(_VERSIONS_INSERT_COLUMNS)
@@ -2289,7 +2295,19 @@ def _versions_params_from_note_row(row: dict[str, Any]) -> tuple:
     """
 
     def _col(c: str) -> Any:
-        return row["name"] if c == "note_name" else row[c]
+        if c == "note_name":
+            return row["name"]
+        if c in _VERSIONS_JSONB_COLUMNS:
+            # JSONB columns read back from `SELECT *` as Python objects
+            # (dict/list); psycopg cannot adapt a raw dict to a `%s` placeholder,
+            # so re-serialize to a JSON TEXT param (implicitly cast to JSONB on
+            # INSERT) — the same json.dumps pattern the other version-insert
+            # sites use. A NULL column defaults to its empty shape.
+            v = row[c]
+            if v is None:
+                v = {} if c == "extra_frontmatter" else []
+            return json.dumps(v)
+        return row[c]
 
     return tuple(_col(c) for c in _VERSIONS_INSERT_COLUMNS)
 

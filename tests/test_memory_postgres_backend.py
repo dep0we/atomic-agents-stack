@@ -122,19 +122,20 @@ def test_redact_dsn_strips_password():
     url = "postgresql://alice:secretpassword@db.example.com:5432/mydb"
     redacted = _redact_dsn(url)
     assert "secretpassword" not in redacted
-    assert "alice" in redacted
-    assert "db.example.com" in redacted
-    assert "***" in redacted
+    # Exact-equality (not host-substring `in redacted`) so CodeQL does not
+    # pattern-match this as incomplete-URL-substring-sanitization; it also
+    # pins user + host + port + db survival and the *** masking in one assert.
+    assert redacted == "postgresql://alice:***@db.example.com:5432/mydb"
 
 
 def test_redact_dsn_postgres_scheme():
     """_redact_dsn handles postgres:// scheme (alias for postgresql://)."""
     from atomic_agents.memory.postgres import _redact_dsn
 
-    url = "postgres://user:pw@localhost/db"
+    url = "postgres://user:secretpw@localhost/db"
     redacted = _redact_dsn(url)
-    assert "pw" not in redacted
-    assert "user" in redacted
+    assert "secretpw" not in redacted
+    assert redacted == "postgres://user:***@localhost/db"
 
 
 def test_redact_dsn_no_password():
@@ -143,7 +144,7 @@ def test_redact_dsn_no_password():
 
     url = "postgresql://user@host:5432/db"
     redacted = _redact_dsn(url)
-    assert "user" in redacted
+    assert redacted == "postgresql://user@host:5432/db"
     assert "***" not in redacted
 
 
@@ -154,7 +155,7 @@ def test_redact_dsn_query_string_password():
     url = "postgresql://host:5432/db?password=hunter2&user=alice"
     redacted = _redact_dsn(url)
     assert "hunter2" not in redacted
-    assert "alice" in redacted
+    assert redacted == "postgresql://host:5432/db?password=***&user=alice"
 
 
 def test_redact_dsn_malformed_url_returns_safe_string():
@@ -163,6 +164,63 @@ def test_redact_dsn_malformed_url_returns_safe_string():
 
     result = _redact_dsn("not-a-url-at-all")
     assert isinstance(result, str)
+
+
+def test_versions_params_serializes_jsonb_columns():
+    """_versions_params_from_note_row must re-serialize JSONB columns (sources/
+    tags/extra_frontmatter) read back as Python dict/list into JSON TEXT params.
+
+    Non-DB regression for the snapshot-path bug CI's Postgres lane caught: a live
+    `SELECT *` returns JSONB as native dict/list; passing those raw to a `%s`
+    INSERT param raises `psycopg.ProgrammingError: cannot adapt type 'dict'`.
+    Every version-snapshot path (merge/restore/orphan-recovery) hits this.
+    Negative control: revert _col to `return row[c]` for the JSONB columns and
+    these assertions fail (the params come back as dict/list, not str).
+    """
+    import json as _json
+    from atomic_agents.memory.postgres import (
+        _versions_params_from_note_row,
+        _VERSIONS_INSERT_COLUMNS,
+    )
+
+    row = {c: None for c in _VERSIONS_INSERT_COLUMNS}
+    row["name"] = "feedback_x.md"
+    row["sources"] = ["a", "b"]  # JSONB read back as a list
+    row["tags"] = ["t1"]  # JSONB read back as a list
+    row["extra_frontmatter"] = {"k": "v"}  # JSONB read back as a dict
+
+    params = _versions_params_from_note_row(row)
+    by_col = dict(zip(_VERSIONS_INSERT_COLUMNS, params))
+
+    for col, expected in (
+        ("sources", ["a", "b"]),
+        ("tags", ["t1"]),
+        ("extra_frontmatter", {"k": "v"}),
+    ):
+        assert isinstance(by_col[col], str), (
+            f"{col} must be a JSON string param, not a raw {type(by_col[col]).__name__} "
+            f"(psycopg cannot adapt a dict/list to %s)"
+        )
+        assert _json.loads(by_col[col]) == expected
+    # note_name is sourced from row['name']; supersedes (TEXT) stays raw None.
+    assert by_col["note_name"] == "feedback_x.md"
+
+
+def test_versions_params_jsonb_null_defaults_to_empty_shape():
+    """NULL JSONB columns serialize to their empty shape ([] / {}), never 'null'-as-dict."""
+    import json as _json
+    from atomic_agents.memory.postgres import (
+        _versions_params_from_note_row,
+        _VERSIONS_INSERT_COLUMNS,
+    )
+
+    row = {c: None for c in _VERSIONS_INSERT_COLUMNS}
+    row["name"] = "feedback_y.md"
+    params = _versions_params_from_note_row(row)
+    by_col = dict(zip(_VERSIONS_INSERT_COLUMNS, params))
+    assert _json.loads(by_col["sources"]) == []
+    assert _json.loads(by_col["tags"]) == []
+    assert _json.loads(by_col["extra_frontmatter"]) == {}
 
 
 # ─────────────────────────────────────────────────────────────────
