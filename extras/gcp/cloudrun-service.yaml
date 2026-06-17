@@ -126,19 +126,21 @@ spec:
             # - name: ATOMIC_AGENTS_LOG_BACKEND_URL
             #   value: ""  # set via --set-secrets
 
-            # Secrets: until SecretBackend PR 2 (#340) ships, inject
-            # credentials as Cloud Run env vars. The FilesystemSecretBackend
-            # probes env vars first, so injected values are picked up
-            # automatically with no ATOMIC_AGENTS_SECRET_BACKEND env var needed.
-            # Example - inject from Secret Manager secret versions:
+            # Secrets: two supported paths (GCPSecretManagerBackend shipped at
+            # #340 PR 2, spec/38 LOCKED).
+            # PATH 1 (simplest) - inject credentials as Cloud Run env vars. The
+            # FilesystemSecretBackend (default) probes env vars first, so injected
+            # values are picked up with no ATOMIC_AGENTS_SECRET_BACKEND needed:
             #   gcloud run services update ... \
             #     --set-secrets ANTHROPIC_API_KEY=anthropic-api-key:latest
             #
-            # Do NOT set ATOMIC_AGENTS_SECRET_BACKEND=gcp. That backend ships
-            # at #340 PR 2; setting it today raises SecretBackendNotRegistered
-            # when the agent resolves a provider credential (at the first LLM
-            # call). The cost gate is unaffected - it runs before key resolution
-            # and is always honored; the call simply fails closed at dispatch.
+            # PATH 2 - resolve secrets live from Secret Manager at call time
+            # (rotation visible next run, no redeploy). Requires the [gcp] extra
+            # and both env vars:
+            #   --set-env-vars ATOMIC_AGENTS_SECRET_BACKEND=gcp
+            #   --set-env-vars ATOMIC_AGENTS_SECRET_BACKEND_URL=projects/<project-id>/secrets
+            # See extras/gcp/secret-manager-bootstrap.sh and
+            # docs/deployment/secret-backend.md for the full guide.
 
             # Don't set ATOMIC_AGENTS_SERVE_PORT here. The CMD's `--port` CLI
             # flag takes precedence over this env var (resolution order:

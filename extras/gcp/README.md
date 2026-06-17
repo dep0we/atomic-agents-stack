@@ -109,7 +109,7 @@ credentials.
                                │  atomic-agents serve (non-root, UID 10001)
                                ├→ Vertex AI / Anthropic (LLM)   see §LLM backend
                                ├→ Cloud SQL                      run logs (activate PostgresLogBackend, #258)
-                               ├→ Secret Manager                 secrets (active via env vars today; GCPSecretBackend at #340 PR 2)
+                               ├→ Secret Manager                 secrets (env vars, or GCPSecretManagerBackend #340, shipped)
                                └→ Memorystore/Redis              locks (#60, shipped)
 
                   State surfaces: EPHEMERAL (container writable layer, lost on replacement)

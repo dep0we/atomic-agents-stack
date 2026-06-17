@@ -8,25 +8,30 @@
 #
 # IMPORTANT - READ BEFORE RUNNING:
 #
-# GCPSecretManagerBackend does NOT yet exist. It ships at issue #340 PR 2.
-# Until #340 PR 2 lands, the framework uses FilesystemSecretBackend, which
-# probes environment variables first (FilesystemSecretBackend.resolve_with_spec
-# in atomic_agents/secret_backend/filesystem.py). This script provisions
-# secrets into Secret Manager for when #340 PR 2 lands; the values are
-# immediately usable TODAY by injecting them as Cloud Run env vars via
-# --set-secrets (see "Wire secrets to Cloud Run" section below).
+# GCPSecretManagerBackend is shipped (spec/38 LOCKED at #340 PR 2).
+# This script provisions secrets into Secret Manager. Once provisioned,
+# you have two supported delivery paths - choose one:
 #
-# Do NOT set ATOMIC_AGENTS_SECRET_BACKEND=gcp in any Cloud Run env section.
-# Setting that env var today raises SecretBackendNotRegistered when the agent
-# resolves a provider credential (at the first LLM call). The cost gate is
-# unaffected - it runs before key resolution and is always honored; the call
-# simply fails closed at credential resolution with a backend-not-registered
-# diagnostic naming the gcp extra and PR 2 of issue #340.
+# PATH 1 (simplest) - inject secrets as Cloud Run env vars.
+# FilesystemSecretBackend (the default) probes env vars first, so no
+# ATOMIC_AGENTS_SECRET_BACKEND selection is needed. See "Wire secrets to
+# Cloud Run" below for the full --set-secrets command this script prints,
+# built from the env vars you provided.
 #
-# When #340 PR 2 ships, replace the --set-secrets section with the env var
-# approach documented in #340 PR 2. The exact ATOMIC_AGENTS_SECRET_BACKEND_URL
-# format will be specified in the #340 PR 2 docs - verify it there before using.
-# (The format is TBD because GCPSecretManagerBackend has not shipped yet.)
+# PATH 2 - select GCPSecretManagerBackend for live resolution at call time.
+# Each credential is fetched from Secret Manager uncached on every LLM
+# iteration, so secret rotation is visible on the next run with no redeploy.
+# Requires the [gcp] extra and both env vars:
+#
+#   pip install "atomic-agents-stack[gcp]"
+#
+#   gcloud run services update <your-agent-name> \
+#     --set-env-vars ATOMIC_AGENTS_SECRET_BACKEND=gcp \
+#     --set-env-vars ATOMIC_AGENTS_SECRET_BACKEND_URL=projects/<your-project-id>/secrets
+#
+# Key-to-secret-name mapping: KEY.lower().replace('_', '-')
+# e.g. ANTHROPIC_API_KEY -> anthropic-api-key (always resolved at 'latest').
+# See docs/deployment/secret-backend.md for the full backend selection guide.
 #
 # SAFE TO RE-RUN: the script guards each create with a describe check so
 # re-running after a partial failure leaves secrets in a consistent state.
@@ -50,7 +55,7 @@ set -euo pipefail
 # Optional - only required if using Redis lock backend (#60).
 REDIS_URL="${REDIS_URL:-}"
 
-# Optional - only required when PostgresLogBackend (#258) ships.
+# Optional - only required if using PostgresLogBackend (#258, shipped).
 POSTGRES_URL="${POSTGRES_URL:-}"
 
 # ── Helper: create a secret idempotently then add a version ──────────────────
@@ -72,10 +77,10 @@ upsert_secret() {
   fi
 
   # printf '%s' (not echo) so the stored secret byte-matches the credential.
-  # echo appends a trailing newline; the future GCPSecretManagerBackend
-  # (#340 PR 2) reads the stored bytes directly, and a trailing \n is a classic
-  # auth-failure footgun. (The env-var fallback path today is unaffected:
-  # FilesystemSecretBackend .strip()s env values.)
+  # echo appends a trailing newline; both GCPSecretManagerBackend and
+  # FilesystemSecretBackend .strip() the resolved value, but a trailing \n
+  # stored in Secret Manager is a classic auth-failure footgun for any caller
+  # that reads the raw bytes directly (e.g. third-party tooling). Use printf.
   printf '%s' "$value" | gcloud secrets versions add "$name" \
     --project="$PROJECT_ID" \
     --data-file=-
@@ -113,11 +118,11 @@ grant_accessor "anthropic-api-key"
 if [[ -n "$REDIS_URL" ]]; then grant_accessor "redis-url"; fi
 if [[ -n "$POSTGRES_URL" ]]; then grant_accessor "postgres-url"; fi
 
-# ── Wire secrets to Cloud Run (env-var injection, NOT ATOMIC_AGENTS_SECRET_BACKEND=gcp) ──
+# ── Wire secrets to Cloud Run (PATH 1: env-var injection via --set-secrets) ──
 echo ""
 echo "=== NEXT STEP: inject secrets as Cloud Run env vars ==="
 echo ""
-echo "Until #340 PR 2 ships, reference secrets as Cloud Run env vars."
+echo "PATH 1: inject secrets as Cloud Run env vars (FilesystemSecretBackend, no ATOMIC_AGENTS_SECRET_BACKEND needed)."
 echo ""
 echo "# IMPORTANT: --set-secrets is a SINGLE [KEY=VALUE,...] flag, NOT repeatable."
 echo "# Passing --set-secrets more than once does NOT accumulate: gcloud removes"
@@ -141,9 +146,11 @@ echo ""
 echo "The FilesystemSecretBackend reads env vars transparently."
 echo "The cost gate and audit trail remain intact."
 echo ""
-echo "# NOTE: GCPSecretManagerBackend ships with issue #340 PR 2."
-echo "# When it ships, the ATOMIC_AGENTS_SECRET_BACKEND_URL format will be"
-echo "# documented in the #340 PR 2 release notes. Verify there before using."
+echo "# PATH 2 (optional): resolve secrets live from Secret Manager on every call."
+echo "# Install the [gcp] extra and set both env vars:"
+echo "#   ATOMIC_AGENTS_SECRET_BACKEND=gcp"
+echo "#   ATOMIC_AGENTS_SECRET_BACKEND_URL=projects/<your-project-id>/secrets"
+echo "# See docs/deployment/secret-backend.md for the full guide."
 echo ""
 echo "Troubleshooting tip:"
 echo "  If doctor reports FAIL for ANTHROPIC_API_KEY with 'not found':"
