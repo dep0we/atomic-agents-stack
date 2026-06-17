@@ -1,10 +1,13 @@
 """Protocol conformance tests for MemoryBackend.
 
-These 25 named behavioral tests define the contract every MemoryBackend
-implementation must satisfy. They are parameterized over backends so a
-future SQLiteBackend or PostgresBackend can plug in trivially.
+These 26 named behavioral tests define the contract every MemoryBackend
+implementation must satisfy. They are parameterized over backends via the
+BACKEND_FACTORIES registry at the bottom of this module.
 
-Currently, only FilesystemBackend is tested here.
+Backend coverage:
+    "filesystem"  — FilesystemBackend: runs unconditionally.
+    "postgres"    — PostgresMemoryBackend: runs only when
+                    ATOMIC_AGENTS_TEST_POSTGRES_URL is set (requires_postgres gate).
 
 See docs/spec/20-memory-backend.md for the full protocol specification.
 """
@@ -12,10 +15,12 @@ See docs/spec/20-memory-backend.md for the full protocol specification.
 from __future__ import annotations
 
 import hashlib
+import os
 import threading
 import time
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -24,15 +29,38 @@ from atomic_agents.memory.filesystem import FilesystemBackend
 from atomic_agents.exceptions import (
     MemoryPreconditionFailed,
     SchemaValidationError,
+    StagingNotApplied,
     VersionNotFound,
     WritePathViolation,
-    StagingNotApplied,
 )
 from atomic_agents.types import Capture
 
+# ──────────────────────────────────────────────────────────────────
+# Postgres availability gate (mirrors test_memory_postgres_backend.py)
+
+_POSTGRES_URL = os.environ.get("ATOMIC_AGENTS_TEST_POSTGRES_URL")
+_POSTGRES_AVAILABLE = False
+
+if _POSTGRES_URL:
+    try:
+        import psycopg as _psycopg_check  # noqa: F401
+
+        _POSTGRES_AVAILABLE = True
+    except ImportError:
+        pass
+
+requires_postgres = pytest.mark.skipif(
+    not _POSTGRES_AVAILABLE,
+    reason=(
+        "Requires ATOMIC_AGENTS_TEST_POSTGRES_URL env var and psycopg installed. "
+        "Set ATOMIC_AGENTS_TEST_POSTGRES_URL=postgresql://... to run Postgres tests."
+    ),
+)
+
 
 # ──────────────────────────────────────────────────────────────────
-# Fixtures
+# Helpers
+
 
 def _make_capture(
     *,
@@ -68,8 +96,28 @@ def _make_backend(tmp_path: Path) -> tuple[FilesystemBackend, WritePolicy]:
     return backend, policy
 
 
+def _make_postgres_backend(tmp_path: Path) -> tuple[Any, WritePolicy]:
+    """Factory for PostgresMemoryBackend conformance suite.
+
+    Requires ATOMIC_AGENTS_TEST_POSTGRES_URL. Cleans up all notes before
+    yielding so each test starts from an empty backend (isolation).
+    """
+    from atomic_agents.memory.postgres import PostgresMemoryBackend
+
+    agent_root = tmp_path / "agent"
+    agent_root.mkdir(parents=True, exist_ok=True)
+    backend = PostgresMemoryBackend(agent_root, url=_POSTGRES_URL)
+    conn = backend._get_conn()
+    conn.execute("DELETE FROM memory_note_versions")
+    conn.execute("DELETE FROM memory_notes")
+    conn.commit()
+    policy = WritePolicy(write_paths=[tmp_path])
+    return backend, policy
+
+
 # ──────────────────────────────────────────────────────────────────
 # 1. read_note round-trips a Capture → Note losslessly
+
 
 def test_conformance_01_read_note_roundtrip(tmp_path):
     """read_note round-trips a Capture → Note losslessly."""
@@ -98,6 +146,7 @@ def test_conformance_01_read_note_roundtrip(tmp_path):
 # ──────────────────────────────────────────────────────────────────
 # 2. read_note returns None for nonexistent note
 
+
 def test_conformance_02_read_note_returns_none_for_missing(tmp_path):
     """read_note returns None for a nonexistent note name."""
     backend, _ = _make_backend(tmp_path)
@@ -107,6 +156,7 @@ def test_conformance_02_read_note_returns_none_for_missing(tmp_path):
 
 # ──────────────────────────────────────────────────────────────────
 # 3. write_note rejects when policy.write_paths doesn't include target
+
 
 def test_conformance_03_write_note_rejects_outside_write_paths(tmp_path):
     """write_note raises WritePathViolation when target is outside write_paths."""
@@ -127,6 +177,7 @@ def test_conformance_03_write_note_rejects_outside_write_paths(tmp_path):
 
 # ──────────────────────────────────────────────────────────────────
 # 4. write_note rejects when target falls under policy.read_only_paths
+
 
 def test_conformance_04_write_note_rejects_read_only_path(tmp_path):
     """write_note raises WritePathViolation when target is under read_only_paths."""
@@ -149,6 +200,7 @@ def test_conformance_04_write_note_rejects_read_only_path(tmp_path):
 # ──────────────────────────────────────────────────────────────────
 # 5. write_note enforces expected_content_sha256 precondition
 
+
 def test_conformance_05_write_note_sha256_precondition(tmp_path):
     """write_note raises MemoryPreconditionFailed when sha256 doesn't match."""
     backend, policy = _make_backend(tmp_path)
@@ -158,9 +210,13 @@ def test_conformance_05_write_note_sha256_precondition(tmp_path):
     ref = backend.write_note(capture, policy)
 
     # Try to overwrite with wrong sha256 precondition
-    merge_cap = _make_capture(name="Comm style", merge_into=ref.name, sources=["new_src"])
+    merge_cap = _make_capture(
+        name="Comm style", merge_into=ref.name, sources=["new_src"]
+    )
     with pytest.raises(MemoryPreconditionFailed):
-        backend.write_note(merge_cap, policy, expected_content_sha256="wrong_sha256_here")
+        backend.write_note(
+            merge_cap, policy, expected_content_sha256="wrong_sha256_here"
+        )
 
 
 def test_conformance_05b_write_note_sha256_precondition_note_missing(tmp_path):
@@ -174,6 +230,7 @@ def test_conformance_05b_write_note_sha256_precondition_note_missing(tmp_path):
 
 # ──────────────────────────────────────────────────────────────────
 # 6. write_note orphan-recovery: same-content rewrite repairs index
+
 
 def test_conformance_06_write_note_orphan_recovery(tmp_path):
     """write_note repairs INDEX when same-content note exists (orphan recovery)."""
@@ -200,6 +257,7 @@ def test_conformance_06_write_note_orphan_recovery(tmp_path):
 # ──────────────────────────────────────────────────────────────────
 # 7. write_note merge: refreshes last_seen + sources, preserves body
 
+
 def test_conformance_07_write_note_merge_refreshes_metadata(tmp_path):
     """write_note merge refreshes last_seen and sources while preserving body."""
     backend, policy = _make_backend(tmp_path)
@@ -221,13 +279,16 @@ def test_conformance_07_write_note_merge_refreshes_metadata(tmp_path):
     backend.write_note(merge_cap, policy)
 
     note_after = backend.read_note(ref.name)
-    assert note_after.body.strip() == original_body.strip(), "body must be preserved on merge"
+    assert note_after.body.strip() == original_body.strip(), (
+        "body must be preserved on merge"
+    )
     assert "src_001" in note_after.sources
     assert "src_002" in note_after.sources
 
 
 # ──────────────────────────────────────────────────────────────────
 # 8. write_note merge: raises if target missing
+
 
 def test_conformance_08_write_note_merge_target_missing_raises(tmp_path):
     """write_note merge raises SchemaValidationError if target doesn't exist."""
@@ -243,6 +304,7 @@ def test_conformance_08_write_note_merge_target_missing_raises(tmp_path):
 
 # ──────────────────────────────────────────────────────────────────
 # 9. write_note distinct-content collision: raises (use merge_into)
+
 
 def test_conformance_09_write_note_collision_raises(tmp_path):
     """write_note raises SchemaValidationError on distinct-content name collision."""
@@ -260,6 +322,7 @@ def test_conformance_09_write_note_collision_raises(tmp_path):
 # ──────────────────────────────────────────────────────────────────
 # 10. list_notes excludes archived/superseded by default
 
+
 def test_conformance_10_list_notes_excludes_archived_superseded(tmp_path):
     """list_notes excludes archived and superseded notes by default."""
     agent_root = tmp_path / "agent"
@@ -274,12 +337,19 @@ def test_conformance_10_list_notes_excludes_archived_superseded(tmp_path):
     # Manually write an archived note
     import frontmatter
     from atomic_agents._io import atomic_write
+
     archived_path = memory_dir / "feedback_archived.md"
     post = frontmatter.Post(
         "archived body",
-        schema_version=1, type="feedback", name="Archived",
-        description="x", confidence="high", sources=["s"],
-        captured="2026-01-01", last_seen="2026-01-01", archived=True,
+        schema_version=1,
+        type="feedback",
+        name="Archived",
+        description="x",
+        confidence="high",
+        sources=["s"],
+        captured="2026-01-01",
+        last_seen="2026-01-01",
+        archived=True,
     )
     atomic_write(archived_path, frontmatter.dumps(post) + "\n")
 
@@ -287,9 +357,14 @@ def test_conformance_10_list_notes_excludes_archived_superseded(tmp_path):
     superseded_path = memory_dir / "feedback_superseded.md"
     post2 = frontmatter.Post(
         "superseded body",
-        schema_version=1, type="feedback", name="Superseded",
-        description="y", confidence="high", sources=["s"],
-        captured="2026-01-01", last_seen="2026-01-01",
+        schema_version=1,
+        type="feedback",
+        name="Superseded",
+        description="y",
+        confidence="high",
+        sources=["s"],
+        captured="2026-01-01",
+        last_seen="2026-01-01",
         superseded_by="feedback_active.md",
     )
     atomic_write(superseded_path, frontmatter.dumps(post2) + "\n")
@@ -310,6 +385,7 @@ def test_conformance_10_list_notes_excludes_archived_superseded(tmp_path):
 # ──────────────────────────────────────────────────────────────────
 # 11. list_recent sort order is last_seen DESC
 
+
 def test_conformance_11_list_recent_sort_order(tmp_path):
     """list_recent returns notes sorted by last_seen DESC."""
     agent_root = tmp_path / "agent"
@@ -326,9 +402,14 @@ def test_conformance_11_list_recent_sort_order(tmp_path):
         path = memory_dir / f"feedback_note_{i}.md"
         post = frontmatter.Post(
             f"body {i}",
-            schema_version=1, type="feedback", name=f"Note {i}",
-            description=f"note {i}", confidence="high", sources=["s"],
-            captured="2026-01-01", last_seen=last_seen,
+            schema_version=1,
+            type="feedback",
+            name=f"Note {i}",
+            description=f"note {i}",
+            confidence="high",
+            sources=["s"],
+            captured="2026-01-01",
+            last_seen=last_seen,
         )
         atomic_write(path, frontmatter.dumps(post) + "\n")
 
@@ -339,6 +420,7 @@ def test_conformance_11_list_recent_sort_order(tmp_path):
 
 # ──────────────────────────────────────────────────────────────────
 # 12. list_stale filters by threshold + excludes pinned
+
 
 def test_conformance_12_list_stale_filters_threshold_and_pinned(tmp_path):
     """list_stale returns notes older than threshold and excludes pinned."""
@@ -355,9 +437,14 @@ def test_conformance_12_list_stale_filters_threshold_and_pinned(tmp_path):
     stale_path = memory_dir / "feedback_stale.md"
     post = frontmatter.Post(
         "stale body",
-        schema_version=1, type="feedback", name="Stale note",
-        description="x", confidence="high", sources=["s"],
-        captured="2026-01-01", last_seen=old_date,
+        schema_version=1,
+        type="feedback",
+        name="Stale note",
+        description="x",
+        confidence="high",
+        sources=["s"],
+        captured="2026-01-01",
+        last_seen=old_date,
     )
     atomic_write(stale_path, frontmatter.dumps(post) + "\n")
 
@@ -365,9 +452,14 @@ def test_conformance_12_list_stale_filters_threshold_and_pinned(tmp_path):
     recent_path = memory_dir / "feedback_recent.md"
     post2 = frontmatter.Post(
         "recent body",
-        schema_version=1, type="feedback", name="Recent note",
-        description="y", confidence="high", sources=["s"],
-        captured="2026-01-01", last_seen=date.today().isoformat(),
+        schema_version=1,
+        type="feedback",
+        name="Recent note",
+        description="y",
+        confidence="high",
+        sources=["s"],
+        captured="2026-01-01",
+        last_seen=date.today().isoformat(),
     )
     atomic_write(recent_path, frontmatter.dumps(post2) + "\n")
 
@@ -375,9 +467,15 @@ def test_conformance_12_list_stale_filters_threshold_and_pinned(tmp_path):
     pinned_path = memory_dir / "feedback_pinned_stale.md"
     post3 = frontmatter.Post(
         "pinned body",
-        schema_version=1, type="feedback", name="Pinned stale",
-        description="z", confidence="high", sources=["s"],
-        captured="2026-01-01", last_seen=old_date, pinned=True,
+        schema_version=1,
+        type="feedback",
+        name="Pinned stale",
+        description="z",
+        confidence="high",
+        sources=["s"],
+        captured="2026-01-01",
+        last_seen=old_date,
+        pinned=True,
     )
     atomic_write(pinned_path, frontmatter.dumps(post3) + "\n")
 
@@ -391,6 +489,7 @@ def test_conformance_12_list_stale_filters_threshold_and_pinned(tmp_path):
 
 # ──────────────────────────────────────────────────────────────────
 # 13. list_orphans returns notes missing from index
+
 
 def test_conformance_13_list_orphans_returns_missing_from_index(tmp_path):
     """list_orphans returns notes that exist in memory/ but not in INDEX.md."""
@@ -407,12 +506,18 @@ def test_conformance_13_list_orphans_returns_missing_from_index(tmp_path):
     # Write orphan directly (no INDEX update)
     import frontmatter
     from atomic_agents._io import atomic_write
+
     orphan_path = memory_dir / "feedback_orphan.md"
     post = frontmatter.Post(
         "orphan body",
-        schema_version=1, type="feedback", name="Orphan",
-        description="x", confidence="high", sources=["s"],
-        captured="2026-01-01", last_seen="2026-01-01",
+        schema_version=1,
+        type="feedback",
+        name="Orphan",
+        description="x",
+        confidence="high",
+        sources=["s"],
+        captured="2026-01-01",
+        last_seen="2026-01-01",
     )
     atomic_write(orphan_path, frontmatter.dumps(post) + "\n")
 
@@ -426,6 +531,7 @@ def test_conformance_13_list_orphans_returns_missing_from_index(tmp_path):
 # ──────────────────────────────────────────────────────────────────
 # 14. list_versions returns newest-first
 
+
 def test_conformance_14_list_versions_newest_first(tmp_path):
     """list_versions returns newest-first version refs."""
     backend, policy = _make_backend(tmp_path)
@@ -434,11 +540,15 @@ def test_conformance_14_list_versions_newest_first(tmp_path):
     ref = backend.write_note(capture, policy)
 
     # Merge to trigger a snapshot
-    merge_cap = _make_capture(name="Versioned note", merge_into=ref.name, sources=["src2"])
+    merge_cap = _make_capture(
+        name="Versioned note", merge_into=ref.name, sources=["src2"]
+    )
     backend.write_note(merge_cap, policy)
 
     # Merge again for a second snapshot
-    merge_cap2 = _make_capture(name="Versioned note", merge_into=ref.name, sources=["src3"])
+    merge_cap2 = _make_capture(
+        name="Versioned note", merge_into=ref.name, sources=["src3"]
+    )
     backend.write_note(merge_cap2, policy)
 
     versions = backend.list_versions(ref.name)
@@ -451,6 +561,7 @@ def test_conformance_14_list_versions_newest_first(tmp_path):
 
 # ──────────────────────────────────────────────────────────────────
 # 15. read_version returns full Note (frontmatter + body)
+
 
 def test_conformance_15_read_version_returns_full_note(tmp_path):
     """read_version returns a full Note with frontmatter and body."""
@@ -476,6 +587,7 @@ def test_conformance_15_read_version_returns_full_note(tmp_path):
 # ──────────────────────────────────────────────────────────────────
 # 16. restore_version snapshots pre-state THEN replaces
 
+
 def test_conformance_16_restore_version_snapshots_pre_state(tmp_path):
     """restore_version snapshots the current live state before restoring."""
     backend, policy = _make_backend(tmp_path)
@@ -483,7 +595,9 @@ def test_conformance_16_restore_version_snapshots_pre_state(tmp_path):
     # Write initial note and create a version by merging
     capture = _make_capture(name="Restore target", body="Original body.")
     ref = backend.write_note(capture, policy)
-    merge_cap = _make_capture(name="Restore target", merge_into=ref.name, sources=["src2"])
+    merge_cap = _make_capture(
+        name="Restore target", merge_into=ref.name, sources=["src2"]
+    )
     backend.write_note(merge_cap, policy)
 
     versions_before = backend.list_versions(ref.name)
@@ -499,6 +613,7 @@ def test_conformance_16_restore_version_snapshots_pre_state(tmp_path):
 
 # ──────────────────────────────────────────────────────────────────
 # 17. redact_version preserves frontmatter, replaces body
+
 
 def test_conformance_17_redact_version_preserves_frontmatter(tmp_path):
     """redact_version replaces body with redaction marker, frontmatter preserved."""
@@ -526,6 +641,7 @@ def test_conformance_17_redact_version_preserves_frontmatter(tmp_path):
 # ──────────────────────────────────────────────────────────────────
 # 18. resolve_version_token raises VersionNotFound for bad token
 
+
 def test_conformance_18_resolve_version_token_raises_for_bad_token(tmp_path):
     """resolve_version_token raises VersionNotFound for unresolvable token."""
     backend, policy = _make_backend(tmp_path)
@@ -542,6 +658,7 @@ def test_conformance_18_resolve_version_token_raises_for_bad_token(tmp_path):
 
 # ──────────────────────────────────────────────────────────────────
 # 19. create_staging → write to staging → apply → live reflects staged
+
 
 def test_conformance_19_staging_apply_reflects_in_live(tmp_path):
     """create_staging → write_note → apply_staging → live memory updated."""
@@ -574,6 +691,7 @@ def test_conformance_19_staging_apply_reflects_in_live(tmp_path):
 
 # ──────────────────────────────────────────────────────────────────
 # 20. discard_staging removes staging without touching live
+
 
 def test_conformance_20_discard_staging_preserves_live(tmp_path):
     """discard_staging removes staging area without touching live memory."""
@@ -608,6 +726,7 @@ def test_conformance_20_discard_staging_preserves_live(tmp_path):
 # ──────────────────────────────────────────────────────────────────
 # 21. Concurrent writes: two threads with preconditions → only one succeeds
 
+
 def test_conformance_21_concurrent_writes_precondition(tmp_path):
     """Concurrent writes with sha256 preconditions — exactly one wins, one raises.
 
@@ -621,7 +740,9 @@ def test_conformance_21_concurrent_writes_precondition(tmp_path):
 
     # Write initial note with NO sources so the first merge can add one and
     # guarantee a content change (which shifts the sha256 for the second thread).
-    capture = _make_capture(name="Concurrent target", body="Initial body.", sources=["initial_src"])
+    capture = _make_capture(
+        name="Concurrent target", body="Initial body.", sources=["initial_src"]
+    )
     ref = backend.write_note(capture, policy)
 
     # Get the sha256 of the current content
@@ -645,7 +766,9 @@ def test_conformance_21_concurrent_writes_precondition(tmp_path):
                 merge_into=ref.name,
                 sources=[f"new_src_{thread_id}"],
             )
-            backend.write_note(merge_cap, policy, expected_content_sha256=correct_sha256)
+            backend.write_note(
+                merge_cap, policy, expected_content_sha256=correct_sha256
+            )
             successes.append(thread_id)
         except MemoryPreconditionFailed:
             precondition_failures.append(thread_id)
@@ -659,11 +782,11 @@ def test_conformance_21_concurrent_writes_precondition(tmp_path):
         t.join()
 
     # Both threads must complete without unexpected exceptions
-    assert not other_failures, (
-        f"Unexpected exceptions: {other_failures}"
-    )
+    assert not other_failures, f"Unexpected exceptions: {other_failures}"
     total = len(successes) + len(precondition_failures)
-    assert total == 2, f"Both threads must complete: successes={successes}, failures={precondition_failures}"
+    assert total == 2, (
+        f"Both threads must complete: successes={successes}, failures={precondition_failures}"
+    )
     # Exactly one success and one precondition failure (the loser sees a changed sha256)
     assert len(successes) == 1, (
         f"Exactly one thread should succeed — got {len(successes)}: {successes}"
@@ -676,11 +799,14 @@ def test_conformance_21_concurrent_writes_precondition(tmp_path):
 # ──────────────────────────────────────────────────────────────────
 # 22. render_index_summary returns non-empty parseable text
 
+
 def test_conformance_22_render_index_summary_non_empty(tmp_path):
     """render_index_summary returns non-empty text parseable by humans and LLMs."""
     backend, policy = _make_backend(tmp_path)
 
-    capture = _make_capture(name="Important fact", body="Remember this.", type_="decision")
+    capture = _make_capture(
+        name="Important fact", body="Remember this.", type_="decision"
+    )
     backend.write_note(capture, policy)
 
     summary = backend.render_index_summary()
@@ -692,14 +818,12 @@ def test_conformance_22_render_index_summary_non_empty(tmp_path):
 # ──────────────────────────────────────────────────────────────────
 # 23. stats returns coherent total_notes and by_type matching actual
 
+
 def test_conformance_23_stats_coherent(tmp_path):
     """stats returns total_notes and by_type that match actual note count."""
     backend, policy = _make_backend(tmp_path)
 
-    captures = [
-        _make_capture(name=f"Feedback {i}", type_="feedback")
-        for i in range(3)
-    ]
+    captures = [_make_capture(name=f"Feedback {i}", type_="feedback") for i in range(3)]
     captures.append(_make_capture(name="Decision 1", type_="decision"))
     for cap in captures:
         backend.write_note(cap, policy)
@@ -713,6 +837,7 @@ def test_conformance_23_stats_coherent(tmp_path):
 # ──────────────────────────────────────────────────────────────────
 # 24. version_count matches len(list_versions())
 
+
 def test_conformance_24_version_count_matches_list(tmp_path):
     """version_count matches len(list_versions())."""
     backend, policy = _make_backend(tmp_path)
@@ -722,7 +847,9 @@ def test_conformance_24_version_count_matches_list(tmp_path):
 
     # Create 2 versions via merges
     for i in range(2):
-        merge_cap = _make_capture(name="Counted", merge_into=ref.name, sources=[f"src_{i}"])
+        merge_cap = _make_capture(
+            name="Counted", merge_into=ref.name, sources=[f"src_{i}"]
+        )
         backend.write_note(merge_cap, policy)
 
     versions = backend.list_versions(ref.name)
@@ -732,6 +859,7 @@ def test_conformance_24_version_count_matches_list(tmp_path):
 
 # ──────────────────────────────────────────────────────────────────
 # 25. last_mutation_at reflects most recent snapshot or write
+
 
 def test_conformance_25_last_mutation_at_reflects_recent(tmp_path):
     """last_mutation_at returns a datetime that reflects the most recent snapshot or write."""
@@ -749,3 +877,390 @@ def test_conformance_25_last_mutation_at_reflects_recent(tmp_path):
 
     mutation_dt = backend.last_mutation_at(ref.name)
     assert mutation_dt is not None, "Should return a datetime after write/merge"
+
+
+# ──────────────────────────────────────────────────────────────────
+# 26. search returns results matching the query (FTS or substring)
+
+
+def test_conformance_26_search_returns_matches(tmp_path):
+    """search() returns NoteRefs that match the query string (FTS or substring)."""
+    backend, policy = _make_backend(tmp_path)
+
+    backend.write_note(
+        _make_capture(
+            name="Python best practices",
+            body="Use type hints and write tests.",
+            description="Python coding guidelines",
+        ),
+        policy,
+    )
+    backend.write_note(
+        _make_capture(
+            name="Coffee preferences",
+            body="Oat milk flat white.",
+            description="Beverage preferences",
+        ),
+        policy,
+    )
+
+    results = backend.search("Python")
+    assert isinstance(results, list)
+    # The Python note must appear; the coffee note must not dominate
+    names = [r.name for r in results]
+    assert any("python" in n.lower() for n in names), (
+        "search('Python') must return at least the Python note"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# BACKEND_FACTORIES — parametrize key Protocol invariants over Postgres
+#
+# The 26 numbered tests above target FilesystemBackend only (they use
+# _make_backend which hardcodes FilesystemBackend). BACKEND_FACTORIES
+# feeds a minimal set of shared Protocol invariants that EVERY backend
+# must pass, gated per-backend by their availability decorator.
+#
+# These are labelled pg_conformance_XX to distinguish them from the
+# filesystem conformance_XX tests above.
+
+BACKEND_FACTORIES = {
+    "filesystem": _make_backend,
+}
+
+if _POSTGRES_AVAILABLE:
+    BACKEND_FACTORIES["postgres"] = _make_postgres_backend
+
+
+def _parametrize_backends(*ids):
+    """Return pytest.mark.parametrize for the given backend ids."""
+    factories = [
+        (bid, BACKEND_FACTORIES[bid]) for bid in ids if bid in BACKEND_FACTORIES
+    ]
+    return pytest.mark.parametrize(
+        "backend_factory_id,backend_factory",
+        factories,
+        ids=[f[0] for f in factories],
+    )
+
+
+@_parametrize_backends("filesystem", "postgres")
+def test_pg_conformance_01_read_note_roundtrip(
+    tmp_path, backend_factory_id, backend_factory
+):
+    """[BACKEND_FACTORIES] read_note round-trips a Capture → Note losslessly."""
+    backend, policy = backend_factory(tmp_path)
+    try:
+        capture = _make_capture(
+            name="Communication style",
+            body="Direct and concise.",
+            tags=["style"],
+            pinned=True,
+        )
+        ref = backend.write_note(capture, policy)
+        note = backend.read_note(ref.name)
+
+        assert note is not None
+        assert note.type == capture.type
+        # The human note name must round-trip on EVERY backend (Postgres stores
+        # it in display_name; filesystem in frontmatter). Without this assert the
+        # test was false-green by omission — it skipped the one field that
+        # diverged across backends.
+        assert note.name == capture.name
+        assert note.description == capture.description
+        assert note.confidence == capture.confidence
+        assert note.body.strip() == capture.body.strip()
+        assert note.pinned == capture.pinned
+        assert note.schema_version == 1
+    finally:
+        if hasattr(backend, "close"):
+            backend.close()
+
+
+@_parametrize_backends("filesystem", "postgres")
+def test_pg_conformance_02_read_note_returns_none_for_missing(
+    tmp_path, backend_factory_id, backend_factory
+):
+    """[BACKEND_FACTORIES] read_note returns None for a nonexistent note name."""
+    backend, _ = backend_factory(tmp_path)
+    try:
+        result = backend.read_note("feedback_does_not_exist.md")
+        assert result is None
+    finally:
+        if hasattr(backend, "close"):
+            backend.close()
+
+
+@_parametrize_backends("filesystem", "postgres")
+def test_pg_conformance_03_write_note_rejects_outside_write_paths(
+    tmp_path, backend_factory_id, backend_factory
+):
+    """[BACKEND_FACTORIES] write_note raises WritePathViolation for empty write_paths."""
+    backend, _ = backend_factory(tmp_path)
+    try:
+        bad_policy = WritePolicy(write_paths=[])
+        with pytest.raises(WritePathViolation):
+            backend.write_note(_make_capture(), bad_policy)
+    finally:
+        if hasattr(backend, "close"):
+            backend.close()
+
+
+@_parametrize_backends("filesystem", "postgres")
+def test_pg_conformance_04_write_note_case4_collision(
+    tmp_path, backend_factory_id, backend_factory
+):
+    """[BACKEND_FACTORIES] write_note Case 4: collision → SchemaValidationError."""
+    backend, policy = backend_factory(tmp_path)
+    try:
+        backend.write_note(
+            _make_capture(name="Stable note", body="original content"), policy
+        )
+        with pytest.raises(SchemaValidationError):
+            backend.write_note(
+                _make_capture(name="Stable note", body="different"), policy
+            )
+    finally:
+        if hasattr(backend, "close"):
+            backend.close()
+
+
+@_parametrize_backends("filesystem", "postgres")
+def test_pg_conformance_05_list_notes_reflects_writes(
+    tmp_path, backend_factory_id, backend_factory
+):
+    """[BACKEND_FACTORIES] list_notes reflects written notes."""
+    backend, policy = backend_factory(tmp_path)
+    try:
+        backend.write_note(_make_capture(name="Alpha"), policy)
+        backend.write_note(_make_capture(name="Beta", type_="user"), policy)
+
+        refs = backend.list_notes()
+        assert len(refs) >= 2
+    finally:
+        if hasattr(backend, "close"):
+            backend.close()
+
+
+@_parametrize_backends("filesystem", "postgres")
+def test_pg_conformance_06_list_orphans_empty(
+    tmp_path, backend_factory_id, backend_factory
+):
+    """[BACKEND_FACTORIES] list_orphans returns [] for Postgres (no INDEX concept)."""
+    backend, policy = backend_factory(tmp_path)
+    try:
+        backend.write_note(_make_capture(name="Note for orphan check"), policy)
+        # Postgres always returns []; filesystem may return [] for fresh writes
+        orphans = backend.list_orphans()
+        assert isinstance(orphans, list)
+        if backend_factory_id == "postgres":
+            assert orphans == []
+    finally:
+        if hasattr(backend, "close"):
+            backend.close()
+
+
+@_parametrize_backends("filesystem", "postgres")
+def test_pg_conformance_07_stats_total_notes(
+    tmp_path, backend_factory_id, backend_factory
+):
+    """[BACKEND_FACTORIES] stats().total_notes matches number of written notes."""
+    backend, policy = backend_factory(tmp_path)
+    try:
+        backend.write_note(_make_capture(name="S1", type_="feedback"), policy)
+        backend.write_note(_make_capture(name="S2", type_="user"), policy)
+
+        s = backend.stats()
+        assert s.total_notes >= 2
+        assert isinstance(s.by_type, dict)
+    finally:
+        if hasattr(backend, "close"):
+            backend.close()
+
+
+@_parametrize_backends("filesystem", "postgres")
+def test_pg_conformance_08_supports_semantic_false(
+    tmp_path, backend_factory_id, backend_factory
+):
+    """[BACKEND_FACTORIES] supports_semantic_search is False for non-embedding backends."""
+    backend, _ = backend_factory(tmp_path)
+    try:
+        assert backend.supports_semantic_search is False
+    finally:
+        if hasattr(backend, "close"):
+            backend.close()
+
+
+@_parametrize_backends("filesystem", "postgres")
+def test_pg_conformance_09_supports_canonical_export_true(
+    tmp_path, backend_factory_id, backend_factory
+):
+    """[BACKEND_FACTORIES] supports_canonical_export is True for backends shipping export."""
+    backend, _ = backend_factory(tmp_path)
+    try:
+        # Both filesystem and postgres ship Tier B export in PR1
+        assert backend.supports_canonical_export is True
+    finally:
+        if hasattr(backend, "close"):
+            backend.close()
+
+
+@_parametrize_backends("filesystem", "postgres")
+def test_pg_conformance_10_export_round_trip_field_lossless(
+    tmp_path, backend_factory_id, backend_factory
+):
+    """[BACKEND_FACTORIES] export() Tier B: type, name, description survive round-trip."""
+    from atomic_agents.export.backend import Exportable
+
+    backend, policy = backend_factory(tmp_path)
+    try:
+        capture = _make_capture(
+            name="Export round trip",
+            type_="feedback",
+            description="Export description",
+            body="Export body.",
+        )
+        backend.write_note(capture, policy)
+
+        assert isinstance(backend, Exportable)
+        result = backend.export()
+        assert len(result.notes_with_bytes) >= 1
+
+        # Field-level round-trip: bytes can be parsed back to frontmatter
+        import frontmatter
+
+        note, raw_bytes = result.notes_with_bytes[0]
+        parsed = frontmatter.loads(raw_bytes.decode("utf-8"))
+        # body must survive in the content portion
+        assert "Export body." in parsed.content
+        # The HUMAN name must survive the round-trip (on the Note object and in
+        # the exported frontmatter) — not the derived filename. Asserts the
+        # field that actually diverges; the docstring's "name survives" claim
+        # was previously unverified.
+        assert note.name == capture.name
+        assert parsed.metadata.get("name") == capture.name
+    finally:
+        if hasattr(backend, "close"):
+            backend.close()
+
+
+def _staged_write_policy(backend, staging, base_policy):
+    """Return the WritePolicy a staged write needs for the given backend.
+
+    FilesystemBackend enforces staged writes against the on-disk staging_dir;
+    PostgresMemoryBackend enforces against agent_root (the base policy). This
+    helper keeps the parametrized staging test backend-agnostic.
+    """
+    staging_dir = getattr(staging, "staging_dir", None)
+    if staging_dir is not None:
+        return WritePolicy(write_paths=[staging_dir])
+    return base_policy
+
+
+@_parametrize_backends("filesystem", "postgres")
+def test_pg_conformance_11_read_only_path_blocks_write(
+    tmp_path, backend_factory_id, backend_factory
+):
+    """[BACKEND_FACTORIES] MUST 5: a write under read_only_paths is rejected.
+
+    For filesystem the read-only scope is the memory dir; for Postgres it is the
+    agent_root (the authorization scope). Negative control: the same write
+    succeeds when read_only_paths is dropped.
+    """
+    backend, policy = backend_factory(tmp_path)
+    try:
+        # The read-only scope is whatever write_paths authorizes; declaring the
+        # same path read-only must block the write on both backends.
+        ro_scope = policy.write_paths[0]
+        ro_policy = WritePolicy(
+            write_paths=list(policy.write_paths), read_only_paths=[ro_scope]
+        )
+        with pytest.raises(WritePathViolation):
+            backend.write_note(_make_capture(name="RO conformance"), ro_policy)
+        # Negative control — drop read_only_paths and the write goes through.
+        backend.write_note(_make_capture(name="RO conformance"), policy)
+    finally:
+        if hasattr(backend, "close"):
+            backend.close()
+
+
+@_parametrize_backends("filesystem", "postgres")
+def test_pg_conformance_12_merge_refreshes_metadata(
+    tmp_path, backend_factory_id, backend_factory
+):
+    """[BACKEND_FACTORIES] merge refreshes last_seen+sources, preserves body, and
+    the returned ref reflects the post-merge last_seen (not the stale pre-row)."""
+    from datetime import date
+
+    backend, policy = backend_factory(tmp_path)
+    try:
+        capture = _make_capture(
+            name="Merge conformance", body="Body.", sources=["src_001"]
+        )
+        ref = backend.write_note(capture, policy)
+        original_body = backend.read_note(ref.name).body
+
+        merge_cap = _make_capture(
+            name="Merge conformance",
+            merge_into=ref.name,
+            sources=["src_002"],
+            body="DIFFERENT BODY — ignored on merge",
+        )
+        merged_ref = backend.write_note(merge_cap, policy)
+
+        # Returned ref reflects post-merge last_seen (today).
+        assert merged_ref.last_seen == date.today()
+
+        note_after = backend.read_note(ref.name)
+        assert note_after.body.strip() == original_body.strip()
+        assert "src_001" in note_after.sources
+        assert "src_002" in note_after.sources
+    finally:
+        if hasattr(backend, "close"):
+            backend.close()
+
+
+@_parametrize_backends("filesystem", "postgres")
+def test_pg_conformance_13_staging_apply_reflects_in_live(
+    tmp_path, backend_factory_id, backend_factory
+):
+    """[BACKEND_FACTORIES] create_staging → write → apply_staging → live updated."""
+    backend, policy = backend_factory(tmp_path)
+    try:
+        staging = backend.create_staging()
+        new_cap = _make_capture(
+            name="Staged conformance", body="Staged body.", type_="decision"
+        )
+        staging.write_note(new_cap, _staged_write_policy(backend, staging, policy))
+        backend.apply_staging(staging, policy)
+
+        live_names = [r.name for r in backend.list_notes()]
+        assert "decision_staged_conformance.md" in live_names
+    finally:
+        if hasattr(backend, "close"):
+            backend.close()
+
+
+@_parametrize_backends("filesystem", "postgres")
+def test_pg_conformance_14_discard_staging_preserves_live(
+    tmp_path, backend_factory_id, backend_factory
+):
+    """[BACKEND_FACTORIES] discard_staging leaves live memory untouched."""
+    backend, policy = backend_factory(tmp_path)
+    try:
+        live_cap = _make_capture(name="Live conformance", body="Live body.")
+        backend.write_note(live_cap, policy)
+        live_before = {r.name for r in backend.list_notes()}
+
+        staging = backend.create_staging()
+        staging.write_note(
+            _make_capture(name="Discarded staged"),
+            _staged_write_policy(backend, staging, policy),
+        )
+        backend.discard_staging(staging)
+
+        live_after = {r.name for r in backend.list_notes()}
+        assert live_after == live_before
+    finally:
+        if hasattr(backend, "close"):
+            backend.close()

@@ -451,6 +451,90 @@ def test_check_memory_backend_fail_missing_dir(tmp_path, monkeypatch):
     assert "memory/" in r.message
 
 
+class _DeadConnectionBackend(_MockMemoryBackend):
+    """A backend whose stats() degrades silently (returns empty) but whose
+    list_notes() RE-RAISES — modeling a dead/unreachable Postgres.
+
+    PostgresMemoryBackend.stats() swallows failures into an empty MemoryStats;
+    list_notes() raises MemoryBackendError. If doctor's liveness probe used
+    stats() it would false-PASS a dead backend; using list_notes() catches it.
+    """
+
+    def list_notes(self, **_):
+        from atomic_agents.exceptions import MemoryBackendError
+
+        raise MemoryBackendError("simulated dead Postgres connection")
+
+    # stats() inherits the benign empty MemoryStats from _MockMemoryBackend —
+    # exactly the silently-degrading shape that would false-PASS.
+
+
+def test_check_memory_backend_fail_on_dead_connection(tmp_path, monkeypatch):
+    """Doctor liveness probe FAILs when the backend's read path raises.
+
+    Negative control for the doctor probe fix: the backend's stats() returns a
+    benign empty MemoryStats (would false-PASS), but list_notes() raises. The
+    check must report FAIL — proving the probe exercises the re-raising read
+    path, not the swallowing stats(). If the probe reverts to stats()-only this
+    test goes green-when-it-should-be-red (a regression the assertion catches).
+    """
+    register_backend("test-dead-conn", _DeadConnectionBackend)
+    try:
+        monkeypatch.setenv("ATOMIC_AGENTS_MEMORY_BACKEND", "test-dead-conn")
+        r = check_memory_backend(tmp_path)
+        assert r.status == FAIL
+        # Branch-distinctive assertion (layered-except lesson): asserting only
+        # status==FAIL is a false-green — it passes whether list_notes() or
+        # stats() raised, so it does NOT prove the re-raising read path is the
+        # probe. The message must name the liveness probe and carry the
+        # simulated MemoryBackendError text, which only list_notes() raises here
+        # (stats() returns a benign empty MemoryStats). If the probe reverts to
+        # stats()-only, stats() does NOT raise → status would be PASS and this
+        # block goes red.
+        assert "liveness probe" in r.message
+        assert "MemoryBackendError" in r.message
+        assert "simulated dead Postgres connection" in r.message
+    finally:
+        unregister_backend("test-dead-conn")
+        monkeypatch.delenv("ATOMIC_AGENTS_MEMORY_BACKEND", raising=False)
+
+
+def test_check_memory_backend_fail_fix_hint_is_backend_specific(tmp_path, monkeypatch):
+    """The liveness-probe FAIL fix_hint matches the configured backend.
+
+    A filesystem-shaped hint ('check memory/ + INDEX.md') is misleading for a
+    Postgres backend that has no local memory/ dir — its probe FAILs on a dead
+    connection, not a malformed local file. Negative control for the
+    backend-specific fix_hint branch: if the FAIL hint reverts to the
+    filesystem-only string, the postgres assertions below go red.
+    """
+
+    def _dead_backend(*_a, **_k):
+        return _DeadConnectionBackend(*_a, **_k)
+
+    # backend_id branches on the env var string, so set it to "postgres" and
+    # stub the factory to return a backend whose list_notes() raises.
+    monkeypatch.setenv("ATOMIC_AGENTS_MEMORY_BACKEND", "postgres")
+    # doctor imports the factory locally from .memory, so patch it at source.
+    monkeypatch.setattr(
+        "atomic_agents.memory.get_default_memory_backend", _dead_backend
+    )
+    r = check_memory_backend(tmp_path)
+    assert r.status == FAIL
+    assert r.fix_hint is not None
+    # Postgres branch: names the URL var + reachability, NOT the filesystem hint.
+    assert "ATOMIC_AGENTS_MEMORY_BACKEND_URL" in r.fix_hint
+    assert "reachable" in r.fix_hint
+    assert "memory/ is readable" not in r.fix_hint
+    assert "INDEX.md" not in r.fix_hint
+    # Branch-distinctive assertions: the FAIL must come from list_notes() raising
+    # MemoryBackendError, NOT from a TypeError at construction time. If the
+    # closure drops args (construction TypeError), the message text below is
+    # absent — confirming the probe reached list_notes() as intended.
+    assert "liveness probe" in r.message
+    assert "simulated dead Postgres connection" in r.message
+
+
 # ──────────────────────────────────────────────────────────────────
 # run_doctor skip list includes memory-backend-config
 
@@ -580,3 +664,212 @@ def test_delegate_does_not_inherit_default_resolved_memory_backend(
     assert delegate_agent.memory is not coordinator.memory, (
         "Default-resolved memory backend must NOT be threaded to the delegate"
     )
+
+
+# ──────────────────────────────────────────────────────────────────
+# PostgresMemoryBackend — env-var surface + lazy-backend-id coverage
+# (tests that do NOT require a live Postgres connection)
+
+
+def test_postgres_in_lazy_backend_ids():
+    """'postgres' is listed in _LAZY_BACKEND_IDS before the extra is installed.
+
+    This ensures BackendNotRegistered error messages cite 'postgres' as a
+    known id even before psycopg is installed, and doctor's known-ids list
+    stays accurate. Locks spec/20 §"Operator override surface" and the
+    lazy-backend-id pattern.
+    """
+    from atomic_agents.memory import _LAZY_BACKEND_IDS
+
+    assert "postgres" in _LAZY_BACKEND_IDS
+
+
+def test_postgres_appears_in_backend_not_registered_known_ids(tmp_path, monkeypatch):
+    """BackendNotRegistered for a typo lists 'postgres' among known ids.
+
+    get_backend() computes known ids as list_backends() | _LAZY_BACKEND_IDS.
+    Since 'postgres' is in _LAZY_BACKEND_IDS, it appears in the error message
+    even before the extra is installed, guiding operators who mis-type the id.
+    """
+    with pytest.raises(BackendNotRegistered, match="postgres"):
+        get_backend("postgres-misspelled")
+
+
+def test_get_default_postgres_no_url_raises_valueerror(tmp_path, monkeypatch):
+    """get_default_memory_backend(postgres) raises ValueError when URL env var absent.
+
+    This is the fail-fast spec/20 §"Operator override surface" contract:
+    selecting postgres without supplying ATOMIC_AGENTS_MEMORY_BACKEND_URL fails
+    immediately with a clear message — not a confusing 'backend not registered'
+    or an obscure psycopg failure.
+    """
+    monkeypatch.setenv("ATOMIC_AGENTS_MEMORY_BACKEND", "postgres")
+    monkeypatch.delenv("ATOMIC_AGENTS_MEMORY_BACKEND_URL", raising=False)
+    with pytest.raises(ValueError, match="ATOMIC_AGENTS_MEMORY_BACKEND_URL"):
+        get_default_memory_backend(tmp_path)
+
+
+def test_get_default_postgres_url_present_routes_to_factory(tmp_path, monkeypatch):
+    """get_default_memory_backend(postgres) with a URL calls the factory (mocked).
+
+    The factory make_postgres_memory_backend_from_url is patched so we don't
+    need a live Postgres connection. Confirms the URL is read from the env var
+    and passed through — the routing logic is what's under test here.
+    """
+    import unittest.mock as _mock
+
+    monkeypatch.setenv("ATOMIC_AGENTS_MEMORY_BACKEND", "postgres")
+    monkeypatch.setenv(
+        "ATOMIC_AGENTS_MEMORY_BACKEND_URL", "postgresql://u:p@host:5432/db"
+    )
+
+    sentinel = object()
+    with _mock.patch(
+        "atomic_agents.memory.postgres.make_postgres_memory_backend_from_url",
+        return_value=sentinel,
+    ) as mock_factory:
+        result = get_default_memory_backend(tmp_path)
+
+    assert result is sentinel
+    mock_factory.assert_called_once()
+    call_kwargs = mock_factory.call_args
+    # URL must be the value from the env var
+    assert call_kwargs.args[0] == "postgresql://u:p@host:5432/db"
+
+
+def test_check_memory_backend_config_postgres_no_url_fail(tmp_path, monkeypatch):
+    """check_memory_backend_config FAILs for postgres when URL is absent.
+
+    The fix_hint must mention ATOMIC_AGENTS_MEMORY_BACKEND_URL so the
+    operator knows exactly what env var to set. This locks the doctor
+    postgres-URL-hint spec from CLAUDE.md working-methods §"verify before claim".
+    """
+    monkeypatch.setenv("ATOMIC_AGENTS_MEMORY_BACKEND", "postgres")
+    monkeypatch.delenv("ATOMIC_AGENTS_MEMORY_BACKEND_URL", raising=False)
+    r = check_memory_backend_config(tmp_path)
+    assert r.status == FAIL
+    assert r.fix_hint is not None
+    assert "ATOMIC_AGENTS_MEMORY_BACKEND_URL" in r.fix_hint
+
+
+def test_postgres_backend_id_construction_signature(tmp_path):
+    """PostgresMemoryBackend satisfies the uniform (agent_root, *, lock_backend=None) MUST.
+
+    Construction-free signature check (psycopg not required): verifies
+    lock_backend is keyword-only and agent_root is the first positional param.
+    Mirrors test_uniform_construction_contract_filesystem for the Postgres backend.
+    """
+    import inspect
+
+    from atomic_agents.memory.postgres import PostgresMemoryBackend
+
+    params = inspect.signature(PostgresMemoryBackend.__init__).parameters
+    assert "lock_backend" in params
+    assert params["lock_backend"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert "agent_root" in params
+
+
+# ──────────────────────────────────────────────────────────────────
+# Recall does NOT depend on a local memory/ dir (#258 — non-filesystem backend)
+
+
+class _RecallRecordingBackend(_MockMemoryBackend):
+    """Fake backend that returns notes and records which recall calls fire.
+
+    Models a non-filesystem backend (Postgres on a zero-local-disk fleet): the
+    agent_root has NO local memory/ dir, yet recall must still load notes via
+    list_pinned()/list_recent(). Guards the agent.py fix that dropped the
+    filesystem-shaped `(agent_root/"memory").exists()` early-return.
+    """
+
+    def __init__(self, agent_root):
+        super().__init__(agent_root)
+        self.list_pinned_called = False
+        self.list_recent_called = False
+
+    def _ref(self, name):
+        from atomic_agents.memory.backend import NoteRef
+        from datetime import date
+
+        return NoteRef(
+            name=name,
+            type="feedback",
+            description="d",
+            captured=date.today(),
+            last_seen=date.today(),
+            pinned=("pinned" in name),
+            confidence="high",
+            archived=False,
+            superseded_by=None,
+        )
+
+    def _note(self, name, body):
+        from atomic_agents.memory.backend import Note
+        from datetime import date
+
+        return Note(
+            type="feedback",
+            name=name,
+            description="d",
+            confidence="high",
+            sources=[],
+            body=body,
+            supersedes=None,
+            merge_into=None,
+            pinned=("pinned" in name),
+            expires_at=None,
+            tags=[],
+            captured=date.today(),
+            last_seen=date.today(),
+            archived=False,
+            superseded_by=None,
+            schema_version=1,
+            extra_frontmatter={},
+        )
+
+    def list_pinned(self):
+        self.list_pinned_called = True
+        return [self._ref("feedback_pinned_note.md")]
+
+    def list_recent(self, n, **_):
+        self.list_recent_called = True
+        return [self._ref("feedback_recent_note.md")]
+
+    def read_note(self, name):
+        if "pinned" in name:
+            return self._note(name, "PINNED-BODY-MARKER")
+        return self._note(name, "RECENT-BODY-MARKER")
+
+    def render_index_summary(self):
+        return ""
+
+
+def test_recall_loads_notes_without_local_memory_dir(tmp_path, monkeypatch):
+    """A non-filesystem backend's pinned+recent notes load even with NO memory/ dir.
+
+    Negative control: restoring the dropped `(agent_root/"memory").exists()`
+    guard would make list_pinned/list_recent never fire here (no memory/ dir),
+    so the asserts below would go red — confirming the guard removal is what
+    enables Postgres-fleet recall.
+    """
+    from atomic_agents.agent import AtomicAgent
+
+    agent_dir = _build_minimal_agent_dir(tmp_path)
+    # Remove the local memory/ dir to model a zero-local-disk deployment.
+    import shutil
+
+    shutil.rmtree(agent_dir / "memory")
+    assert not (agent_dir / "memory").exists()
+
+    monkeypatch.setenv("ATOMIC_AGENTS_ROOT", str(tmp_path))
+    monkeypatch.delenv("ATOMIC_AGENTS_MEMORY_BACKEND", raising=False)
+
+    be = _RecallRecordingBackend(agent_dir)
+    agent = AtomicAgent("test", memory_backend=be)
+    agent.load()  # loads the context layers (recall fires here)
+
+    assert be.list_pinned_called, "list_pinned must fire despite missing memory/ dir"
+    assert be.list_recent_called, "list_recent must fire despite missing memory/ dir"
+    prompt = agent.assemble_system_prompt()
+    assert "PINNED-BODY-MARKER" in prompt
+    assert "RECENT-BODY-MARKER" in prompt
