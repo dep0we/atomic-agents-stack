@@ -145,6 +145,14 @@ _XSS_SUMMARY = "<img src=x onerror=alert(document.cookie)>"
 _XSS_AGENT_NAME = 'a"><img src=x onerror=alert(1)>'
 _XSS_TRIGGER = "<script>alert(1)</script>"
 
+# Log-derived model id (#517). The "zz" prefix dodges every _short_model_name /
+# _model_pill_class keyword so it hits the raw fallthrough. No "/" on purpose:
+# _short_model_name does `model.split("/")[-1][:24]`, so a slash would strip the
+# `"><` breakout before it ever reaches the bar label / per-agent pill sites.
+# The leading `">` is the attribute breakout the title="{model}" interpolation
+# must not admit.
+_XSS_MODEL = 'zz"><img src=x onerror=alert(1)>'
+
 _RAW_IMG = "<img src=x"  # present in both payloads; must never appear raw
 
 
@@ -229,6 +237,54 @@ def test_xss_summary_escaped_in_per_agent_dashboard(tmp_path):
         "raw <img> XSS payload found unescaped in per-agent dashboard"
     )
     assert "&lt;img" in content, "expected html-escaped &lt;img in per-agent dashboard"
+
+
+def test_xss_model_id_escaped_in_global_dashboard(tmp_path):
+    """model id from a run record must be html-escaped in the global index
+    (model-mix bar title attr + label, and the per-agent model pills) (#517)."""
+    today = date.today()
+    _write_log(
+        tmp_path,
+        "safe-agent",
+        today,
+        [{"cost_usd": 0.10, "model": _XSS_MODEL}],
+    )
+    summary = aggregate_global(tmp_path, today=today)
+    out_path = render_global(tmp_path, summary)
+    content = out_path.read_text()
+
+    assert _XSS_MODEL not in content, (
+        "raw model-id XSS payload found unescaped in global index"
+    )
+    # The breakout must not appear from any site: title="{model}" attr, the
+    # model-mix bar label, or the per-agent model pills.
+    assert '"><img' not in content, (
+        'attribute/text breakout "><img found unescaped in global index'
+    )
+    assert "&lt;img" in content, "expected html-escaped model id in global index"
+
+
+def test_xss_model_id_escaped_in_per_agent_dashboard(tmp_path):
+    """model id must be html-escaped in the per-agent model-mix table and
+    top-runs table (both route through _model_pill) (#517)."""
+    today = date.today()
+    _write_log(
+        tmp_path,
+        "safe-agent",
+        today,
+        [{"cost_usd": 0.10, "model": _XSS_MODEL}],
+    )
+    data = aggregate_agent(tmp_path, "safe-agent", today=today)
+    out_path = render_agent(tmp_path, data)
+    content = out_path.read_text()
+
+    assert _XSS_MODEL not in content, (
+        "raw model-id XSS payload found unescaped in per-agent dashboard"
+    )
+    assert '"><img' not in content, (
+        'attribute/text breakout "><img found unescaped in per-agent dashboard'
+    )
+    assert "&lt;img" in content, "expected html-escaped model id in per-agent dashboard"
 
 
 def test_xss_agent_name_escaped_in_per_agent_template(tmp_path):
