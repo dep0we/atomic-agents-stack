@@ -37,7 +37,12 @@ _REGISTRY: dict[str, type] = {}
 # Listed here so the BackendNotRegistered error message stays accurate even
 # before the extra is installed.  Mirrors the ``{"redis"}`` augmentation in
 # ``atomic_agents.locks.get_default_lock_backend``.
-_LAZY_BACKEND_IDS: frozenset[str] = frozenset()
+#
+# "postgres" is listed here so doctor and registry-introspection tests show it
+# as a known id before the 'postgres' extra is installed.  Actual registration
+# happens inside get_default_memory_backend() when ATOMIC_AGENTS_MEMORY_BACKEND
+# =postgres is detected — same lazy-import pattern used by PostgresLogBackend.
+_LAZY_BACKEND_IDS: frozenset[str] = frozenset({"postgres"})
 
 
 def register_backend(name: str, cls: type) -> None:
@@ -136,6 +141,31 @@ def get_default_memory_backend(
         os.environ.get("ATOMIC_AGENTS_MEMORY_BACKEND", "filesystem").strip().lower()
     )
 
+    # --- Lazy-import dispatch for backends that require optional extras ---
+    #
+    # "postgres" is not registered at module-load time (the psycopg3 extra is
+    # optional).  When selected, we lazy-import the backend, register it in the
+    # registry (so subsequent get_backend("postgres") calls don't lazy-load
+    # again), and construct via the factory that reads the URL.
+    #
+    # Pattern mirrors logs/__init__.py PostgresLogBackend dispatch (lines ~299-323).
+    if backend_id == "postgres":
+        from .postgres import make_postgres_memory_backend_from_url  # noqa: PLC0415
+
+        raw_url = os.environ.get("ATOMIC_AGENTS_MEMORY_BACKEND_URL")
+        if not raw_url:
+            raise ValueError(
+                "ATOMIC_AGENTS_MEMORY_BACKEND=postgres requires "
+                "ATOMIC_AGENTS_MEMORY_BACKEND_URL=postgresql://user:pass@host:5432/dbname"
+            )
+        if "postgres" not in _REGISTRY:
+            from .postgres import PostgresMemoryBackend  # noqa: PLC0415
+
+            register_backend("postgres", PostgresMemoryBackend)
+        return make_postgres_memory_backend_from_url(
+            raw_url, agent_root=agent_root, lock_backend=lock_backend
+        )
+
     # Dispatch through the registry so that ANY backend registered via
     # ``register_backend`` (including third-party extras that register at
     # import time) is reachable — not just the literal "filesystem" id.
@@ -180,8 +210,9 @@ __all__ = [
     "StagedMemory",
     # Exceptions
     "BackendNotRegistered",
-    "VersionNotFound",
+    "MemoryBackendError",
     "StagingNotApplied",
+    "VersionNotFound",
 ]
 
 
@@ -198,7 +229,12 @@ def __getattr__(name: str):
         "MemoryStats",
         "StagedMemory",
     }
-    _exception_names = {"BackendNotRegistered", "VersionNotFound", "StagingNotApplied"}
+    _exception_names = {
+        "BackendNotRegistered",
+        "VersionNotFound",
+        "StagingNotApplied",
+        "MemoryBackendError",
+    }
 
     if name in _protocol_types:
         from .backend import (
@@ -225,14 +261,16 @@ def __getattr__(name: str):
     if name in _exception_names:
         from ..exceptions import (
             BackendNotRegistered,
-            VersionNotFound,
+            MemoryBackendError,
             StagingNotApplied,
+            VersionNotFound,
         )
 
         _locals = {
             "BackendNotRegistered": BackendNotRegistered,
-            "VersionNotFound": VersionNotFound,
+            "MemoryBackendError": MemoryBackendError,
             "StagingNotApplied": StagingNotApplied,
+            "VersionNotFound": VersionNotFound,
         }
         return _locals[name]
 

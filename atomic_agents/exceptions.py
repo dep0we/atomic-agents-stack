@@ -242,6 +242,44 @@ class MCPToolDispatchFailed(AtomicAgentsError):
 # MemoryBackend exceptions (spec/20)
 
 
+class MemoryBackendError(AtomicAgentsError):
+    """Raised by a MemoryBackend on an unrecoverable I/O or protocol failure.
+
+    NOT raised for domain-level conditions (note not found → None returned;
+    orphan-recovery → Case 3 path; CAS precondition mismatch →
+    MemoryPreconditionFailed; collision → SchemaValidationError). It signals
+    that the backend cannot service the request due to an unrecoverable
+    backend-level failure (e.g. a connection failure after reconnect retry, or
+    a schema migration failure at connection time).
+
+    Which reference impls raise it, today (#258 PR1):
+    * ``PostgresMemoryBackend`` raises this on unrecoverable connection/read
+      failure after its reconnect retry — its read paths wrap and re-raise as
+      MemoryBackendError.
+    * ``FilesystemBackend`` does NOT currently raise it. Its per-note parse
+      paths swallow malformed-file errors (return None / skip the note).
+      Directory-enumeration reads (``list_notes`` / ``list_pinned`` /
+      ``list_by_type``) do NOT wrap ``glob`` / ``scandir``, so an
+      unrecoverable dir-level OSError (EACCES / EIO) propagates raw
+      (unwrapped) — it is caught by doctor's broad ``except Exception``
+      liveness gate but NOT surfaced as MemoryBackendError. Wiring the
+      filesystem impl to convert I/O failures to MemoryBackendError is
+      future work. So catching MemoryBackendError catches the failure
+      surface of the backends that raise it (Postgres today), not the
+      filesystem default.
+
+    Framework call sites that adopt fail-closed handling for a swapped backend
+    catch MemoryBackendError (the base class) to distinguish backend failure
+    from domain conditions, preserving the original type via ``type(exc)(...)``.
+    As of #258 PR1 the only in-framework catch site is doctor's memory-backend
+    liveness probe (check_memory_backend) — the runtime hot-path catch sites
+    (agent recall, cost-style fail-closed gates) are wired in a follow-up
+    (#258 PR2+). Subclasses may be added by reference implementations; catching
+    MemoryBackendError catches the backend-failure surface of any impl that
+    raises it, regardless of subclass. Modeled on LogBackendReadError.
+    """
+
+
 class BackendNotRegistered(AtomicAgentsError):
     """Operator declared a backend that isn't registered.
 

@@ -3241,8 +3241,14 @@ class AtomicAgent:
                     self._wiki_index_text = ""
 
     def _load_pinned_notes(self) -> None:
-        if not (self.agent_root / "memory").exists():
-            return
+        # No on-disk precheck: the memory backend is authoritative for whether
+        # any notes exist. A filesystem-shaped guard (agent_root/"memory"
+        # exists) silently disables recall on a non-filesystem backend
+        # (Postgres on a zero-local-disk Cloud Run fleet — the #258 target
+        # deployment). FilesystemBackend.list_pinned() already returns [] when
+        # its memory/ dir is absent, so dropping the guard is safe for both
+        # shapes and lets render_index_summary (called unconditionally) and
+        # recall agree.
         pinned_refs = self.memory.list_pinned()
         pinned = []
         for ref in pinned_refs[:PINNED_MAX]:
@@ -3253,8 +3259,10 @@ class AtomicAgent:
         self._pinned_notes = pinned
 
     def _load_recent_notes(self, n: int = RECENT_NOTES_DEFAULT) -> None:
-        if not (self.agent_root / "memory").exists():
-            return
+        # No on-disk precheck — see _load_pinned_notes. The backend is
+        # authoritative; FilesystemBackend.list_recent() returns [] when the
+        # memory/ dir is absent, and a non-filesystem backend (Postgres) has no
+        # local memory/ dir at all.
         recent_refs = self.memory.list_recent(n=n, exclude_pinned=True)
         self._recent_notes = []
         for ref in recent_refs:
