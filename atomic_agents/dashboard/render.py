@@ -289,7 +289,9 @@ def _model_pill_class(model: str) -> str:
 def _model_pill(model: str, label: str | None = None) -> str:
     cls = _model_pill_class(model)
     label = label or _short_model_name(model)
-    return f'<span class="pill {cls}">{label}</span>'
+    # label is log-derived (model id) on some call sites; escape at the HTML
+    # boundary so a crafted model string can't inject markup (#517).
+    return f'<span class="pill {cls}">{html.escape(label)}</span>'
 
 
 def _short_model_name(model: str) -> str:
@@ -336,7 +338,7 @@ def _render_global_template(s: GlobalSummary, has_goals: bool = True) -> str:
         for a in s.agents:
             models_html = "".join(
                 f'<span class="pill {_model_pill_class(m)}" style="margin-right: 4px;">'
-                f"{_short_model_name(m)}: ${cost:.4f}</span>"
+                f"{html.escape(_short_model_name(m))}: ${cost:.4f}</span>"
                 for m, cost in a.cost_by_model.items()
             )
             _name_href = urllib.parse.quote(a.name, safe="")
@@ -519,10 +521,13 @@ def _render_model_mix_bar(by_model: dict[str, float], total: float) -> str:
         if pct < 0.5:
             label = ""
         else:
-            label = f"{_short_model_name(model)} {pct:.1f}%"
+            # model is log-derived; escape both the bar label (text) and the
+            # title attribute (a raw " would break out of the attribute) (#517).
+            label = f"{html.escape(_short_model_name(model))} {pct:.1f}%"
         cls = _model_pill_class(model)
         bar_segs.append(
-            f'<div class="model-mix-seg {cls}" style="width: {pct}%" title="{model}: ${cost:.4f}">'
+            f'<div class="model-mix-seg {cls}" style="width: {pct}%" '
+            f'title="{html.escape(model)}: ${cost:.4f}">'
             f"{label}</div>"
         )
 
