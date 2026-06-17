@@ -1625,7 +1625,12 @@ def test_postgres_schema_created_on_first_append(pg_backend):
 
 @requires_postgres
 def test_postgres_schema_version_recorded(pg_backend):
-    """schema_version=1 must be written to the meta table on first init."""
+    """schema_version=2 must be written to the meta table on first init.
+
+    Bumped to 2 in #520 PR2 (idempotency_key + replayed_run_id columns +
+    idx_idempotency_key). A fresh init inserts the CURRENT _SCHEMA_VERSION (2)
+    directly; the v1->v2 migration ladder is covered by the mock-conn test above.
+    """
     import psycopg
 
     pg_backend.append(_make_record(run_id="version_test"))
@@ -1634,12 +1639,16 @@ def test_postgres_schema_version_recorded(pg_backend):
     row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
     conn.close()
     assert row is not None
-    assert int(row[0]) == 1
+    assert int(row[0]) == 2
 
 
 @requires_postgres
 def test_postgres_indexes_created(pg_backend):
-    """Six B-tree indexes matching the SQLite reference set must be created."""
+    """Seven B-tree indexes matching the SQLite reference set must be created.
+
+    Six base indexes + idx_idempotency_key (partial, WHERE idempotency_key IS NOT
+    NULL) added in #520 PR2.
+    """
     import psycopg
 
     pg_backend.append(_make_record(run_id="index_test"))
@@ -1657,6 +1666,7 @@ def test_postgres_indexes_created(pg_backend):
     assert "idx_parent_run_id" in index_names
     assert "idx_cost_source" in index_names
     assert "idx_mandate_id" in index_names
+    assert "idx_idempotency_key" in index_names
 
 
 @requires_postgres
