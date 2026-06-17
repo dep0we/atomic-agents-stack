@@ -133,6 +133,13 @@ def queue_backend(tmp_path: Path):
     return FilesystemQueueBackend(tmp_path / "project")
 
 
+@pytest.fixture
+def idempotency_backend(tmp_path: Path):
+    from atomic_agents.idempotency.filesystem import FilesystemDedupLedger
+
+    return FilesystemDedupLedger(tmp_path / "agent")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Assertion tests — NOT capability-gated (must not skip)
 
@@ -335,6 +342,30 @@ def test_queue_backend_is_exportable(queue_backend) -> None:
     )
 
 
+def test_idempotency_backend_advertises_canonical_export(idempotency_backend) -> None:
+    """FilesystemDedupLedger MUST advertise supports_canonical_export=True.
+
+    Per spec/45 §'spec/40 export contract'. IdempotencyBackend bakes in the
+    Exportable Protocol at definition time (not retrofitted). This test MUST
+    NOT skip — it is the registration gate that prevents a future developer
+    from accidentally setting False without any test failure.
+    """
+    assert get_supports_canonical_export(idempotency_backend) is True, (
+        "FilesystemDedupLedger must advertise supports_canonical_export=True "
+        "per spec/45 §'spec/40 export contract'"
+    )
+
+
+def test_idempotency_backend_is_exportable(idempotency_backend) -> None:
+    """FilesystemDedupLedger satisfies the Exportable Protocol."""
+    from atomic_agents.export.backend import Exportable
+
+    assert isinstance(idempotency_backend, Exportable), (
+        "FilesystemDedupLedger must satisfy the Exportable Protocol "
+        "(must have export() and export_all() methods)"
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Capability flag type checks
 
@@ -350,6 +381,7 @@ def test_all_capability_flags_are_bool(
     outcome_backend,
     journal_backend,
     queue_backend,
+    idempotency_backend,
 ) -> None:
     """supports_canonical_export MUST be a Python bool (not truthy int or None)."""
     for name, backend in [
@@ -363,6 +395,7 @@ def test_all_capability_flags_are_bool(
         ("outcome", outcome_backend),
         ("journal", journal_backend),
         ("queue", queue_backend),
+        ("idempotency", idempotency_backend),
     ]:
         val = get_supports_canonical_export(backend)
         assert isinstance(val, bool), (

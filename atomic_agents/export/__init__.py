@@ -27,6 +27,7 @@ from .types import (
     CorpusExportQuery,
     ExportableResult,
     GoalExport,
+    IdempotencyExport,
     JournalExport,
     LockExport,
     LockExportQuery,
@@ -63,4 +64,5 @@ __all__ = [
     "OutcomeExport",
     "JournalExport",
     "QueueExport",
+    "IdempotencyExport",
 ]

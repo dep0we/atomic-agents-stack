@@ -96,6 +96,7 @@ def _render_export_result(result) -> bytes:
     from atomic_agents.export.types import (
         CorpusExport,
         GoalExport,
+        IdempotencyExport,
         JournalExport,
         LockExport,
         LogExport,
@@ -106,6 +107,13 @@ def _render_export_result(result) -> bytes:
         SecretExport,
     )
 
+    if isinstance(result, IdempotencyExport):
+        # IdempotencyExport embeds raw bytes for *.terminal.json entries ONLY.
+        # Tier A passthrough: concatenate the raw per-entry bytes in
+        # entries_with_bytes order (export() iterates ledger_root sorted).
+        # *.lease.json (in-flight) is structurally excluded by the backend's
+        # whitelist (phantom-block hazard) — never reaches this renderer.
+        return b"".join(raw_bytes for _rel_path, raw_bytes in result.entries_with_bytes)
     if isinstance(result, QueueExport):
         # QueueExport embeds bytes for queued/ + done/ + dead-letter/ items.
         # Tier A passthrough: concatenate the raw per-item bytes in sorted order.
@@ -2668,3 +2676,191 @@ def test_queue_export_top_level_import_resolves() -> None:
     import atomic_agents.export as export_pkg
 
     assert "QueueExport" in export_pkg.__all__
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Idempotency export conformance (#520 PR1 — spec/45 joins the spec/40 round-trip
+# harness). Mirrors the Journal (#427) / Queue (#428) blocks: byte-exact
+# round-trip via assert_canonical_roundtrip, relative-path-format, type
+# narrowing, backend_id/scope, export_all==export(None), top-level import.
+# Terminal markers (*.terminal.json) are durable + embedded; in-flight leases
+# (*.lease.json) are structurally excluded (phantom-block hazard).
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def idempotency_backend(tmp_path: Path):
+    from atomic_agents.idempotency.filesystem import FilesystemDedupLedger
+
+    agent_root = tmp_path / "agent"
+    agent_root.mkdir()
+    return FilesystemDedupLedger(agent_root)
+
+
+def _seed_terminal_entry(backend, key: str, run_id: str, result_ref: str) -> Path:
+    """Drive a key to a terminal marker via begin()+commit(); return its path.
+
+    Uses the real write path (no hand-rolled JSON) so the on-disk bytes the
+    round-trip asserts against are exactly what the backend produces.
+    """
+    from atomic_agents.idempotency.filesystem import _key_hash
+
+    decision = backend.begin(key, run_id)
+    assert not decision.is_duplicate, "precondition: first begin() is FRESH"
+    backend.commit(key, result_ref)
+    terminal_path = (
+        backend._agent_root / "idempotency" / f"{_key_hash(key)}.terminal.json"
+    )
+    assert terminal_path.is_file(), "precondition: commit() wrote the terminal marker"
+    return terminal_path
+
+
+def test_idempotency_export_returns_idempotency_export_type(
+    idempotency_backend,
+) -> None:
+    """export() returns an IdempotencyExport instance."""
+    from atomic_agents.export.types import IdempotencyExport
+
+    result = idempotency_backend.export()
+    assert isinstance(result, IdempotencyExport)
+
+
+def test_idempotency_export_is_exportable_result(idempotency_backend) -> None:
+    """IdempotencyExport is an ExportableResult subclass (generic Protocol narrowing)."""
+    from atomic_agents.export.types import ExportableResult
+
+    result = idempotency_backend.export()
+    assert isinstance(result, ExportableResult)
+
+
+def test_idempotency_export_empty_returns_empty_components(idempotency_backend) -> None:
+    """export() on a backend with no terminal markers returns empty entries."""
+    from atomic_agents.export.types import IdempotencyExport
+
+    result = idempotency_backend.export()
+    assert isinstance(result, IdempotencyExport)
+    assert result.entries_with_bytes == []
+
+
+def test_idempotency_export_single_roundtrip(idempotency_backend) -> None:
+    """Byte-exact spec/40 round-trip: rendered export bytes == on-disk marker bytes."""
+    from atomic_agents.idempotency.filesystem import _key_hash
+
+    key = "order-42"
+
+    def write_fn(backend):
+        # Drive the key to a terminal marker via the REAL write path.
+        _seed_terminal_entry(backend, key, "run-abc", "runs/2026/order-42.json")
+
+    def expected_bytes_fn(backend):
+        # Tier A passthrough: the on-disk terminal marker bytes are exact.
+        terminal_path = (
+            backend._agent_root / "idempotency" / f"{_key_hash(key)}.terminal.json"
+        )
+        return terminal_path.read_bytes()
+
+    assert_canonical_roundtrip(idempotency_backend, write_fn, expected_bytes_fn)
+
+
+def test_idempotency_export_multi_entry_sorted_and_roundtrips(
+    idempotency_backend,
+) -> None:
+    """Multiple terminal entries export in sorted-by-relative-path order and round-trip.
+
+    Single-entry tests can't catch an unsorted iterdir() (one entry is trivially
+    sorted). Seed several distinct keys, then assert (a) the exported relative
+    paths are in sorted order and (b) the canonical round-trip holds with >1 entry.
+    """
+    from atomic_agents.idempotency.filesystem import _key_hash
+
+    keys = ["alpha", "bravo", "charlie"]
+    for k in keys:
+        _seed_terminal_entry(idempotency_backend, k, f"run-{k}", f"ref-{k}")
+
+    result = idempotency_backend.export()
+    rels = [rel for rel, _b in result.entries_with_bytes]
+    assert len(rels) == len(keys)
+    assert rels == sorted(rels), (
+        f"export() entries must be in sorted-by-relative-path order, got {rels}"
+    )
+
+    # Byte-exact canonical round-trip with multiple entries via the shared helper.
+    # The renderer concatenates entries in export() order; expected_bytes_fn
+    # concatenates the on-disk markers in sorted-by-relative-path order. They
+    # match ONLY if export() emits in sorted order — so this is the negative
+    # control for the sorted(...) iterdir in export() (unsorted iterdir flips the
+    # concatenation order on a multi-entry ledger and the round-trip fails).
+    def write_fn(backend):
+        # Entries already seeded above; the helper re-exports this ledger.
+        pass
+
+    def expected_bytes_fn(backend):
+        paths = sorted(
+            (backend._agent_root / "idempotency").glob("*.terminal.json"),
+            key=lambda p: str(p.relative_to(backend._agent_root)),
+        )
+        return b"".join(p.read_bytes() for p in paths)
+
+    assert_canonical_roundtrip(idempotency_backend, write_fn, expected_bytes_fn)
+
+
+def test_idempotency_export_relative_paths(idempotency_backend) -> None:
+    """Exported path metadata is relative-to-agent_root (portable, non-absolute)."""
+    from atomic_agents.idempotency.filesystem import _key_hash
+
+    _seed_terminal_entry(idempotency_backend, "k1", "run-1", "ref-1")
+    result = idempotency_backend.export()
+    rels = [rel for rel, _b in result.entries_with_bytes]
+    expected = f"idempotency/{_key_hash('k1')}.terminal.json"
+    assert rels == [expected]
+    assert not Path(rels[0]).is_absolute()
+
+
+def test_idempotency_export_excludes_in_flight_lease(idempotency_backend) -> None:
+    """An uncommitted begin() (in-flight *.lease.json) MUST NOT appear in export."""
+    # Committed key -> terminal marker (durable, exported).
+    _seed_terminal_entry(idempotency_backend, "done-key", "run-done", "ref-done")
+    # In-flight key -> lease only, never committed (ephemeral, excluded).
+    decision = idempotency_backend.begin("inflight-key", "run-inflight")
+    assert not decision.is_duplicate
+
+    result = idempotency_backend.export()
+    rels = [rel for rel, _b in result.entries_with_bytes]
+    assert all(r.endswith(".terminal.json") for r in rels), (
+        f"only *.terminal.json may be exported, got {rels}"
+    )
+    assert all(not r.endswith(".lease.json") for r in rels), (
+        f"in-flight *.lease.json must be excluded, got {rels}"
+    )
+    assert len(rels) == 1
+
+
+def test_idempotency_export_backend_id_and_scope(idempotency_backend) -> None:
+    result = idempotency_backend.export()
+    assert result.backend_id == idempotency_backend.backend_id
+    assert result.scope == str(idempotency_backend._agent_root)
+
+
+def test_idempotency_export_all_equals_export_none(idempotency_backend) -> None:
+    """export_all() produces the same result as export(None)."""
+    _seed_terminal_entry(idempotency_backend, "k", "run", "ref")
+    result_none = idempotency_backend.export(None)
+    result_all = idempotency_backend.export_all()
+    assert result_none.entries_with_bytes == result_all.entries_with_bytes
+
+
+def test_idempotency_export_top_level_import_resolves() -> None:
+    """`from atomic_agents.export import IdempotencyExport` MUST resolve.
+
+    Pins the public import surface so the package-root re-export cannot silently
+    regress, mirroring the Goal/Outcome/Journal/Queue import-resolution tests.
+    """
+    from atomic_agents.export import IdempotencyExport
+    from atomic_agents.export.types import (
+        IdempotencyExport as IdempotencyExportSubmodule,
+    )
+
+    assert IdempotencyExport is IdempotencyExportSubmodule
+    import atomic_agents.export as export_pkg
+
+    assert "IdempotencyExport" in export_pkg.__all__
