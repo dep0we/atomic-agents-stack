@@ -377,6 +377,66 @@ Surface the weekly cost to the operator via Telegram or as a journal entry.
 
 ---
 
+## Deduplication
+
+Cron scripts sometimes fire more than once per intended tick (LaunchAgent retries, manual replays, system wake-from-sleep). Without dedup, each firing runs the LLM and writes a second log entry. `cron_tick_key` produces a stable idempotency key for a schedule tick — two firings within the same window yield the same key, and the second is served from cache with zero LLM spend.
+
+```python
+# jobs/agents/caldwell_daily_brief.py (excerpt)
+from datetime import datetime, timezone
+from atomic_agents.idempotency import cron_tick_key
+
+def main():
+    agent = AtomicAgent(name="caldwell")
+    key = cron_tick_key(
+        agent_name="caldwell",
+        schedule_name="daily-brief",
+        when=datetime.now(timezone.utc),
+        granularity="day",       # same key for all firings on the same UTC day
+    )
+    response = agent.call(
+        work_item="Write today's brief.",
+        idempotency_key=key,
+    )
+    if response.deduped:
+        print(f"Already ran today (replayed from {response.replayed_run_id}). Skipping.")
+        return
+    # normal handling ...
+```
+
+`granularity` options: `"minute"` / `"hour"` / `"day"` / `"week"`. Match the granularity to your cron schedule — a daily LaunchAgent → `"day"`, an hourly job → `"hour"`.
+
+For queue-driven cascade agents, use `extract_queue_idempotency_key` instead:
+
+```python
+from atomic_agents._cascade import claim_next_queued, extract_queue_idempotency_key
+import json
+
+item = claim_next_queued(project_root, role="writer", lease_token="daily-brief-lease")
+if item is None:
+    sys.exit(0)
+payload = json.loads(item.path.read_text())
+work_text = payload.get("work_item") or item.original_name
+idemp_key = extract_queue_idempotency_key(payload)   # reads payload['idempotency_key']
+response = agent.call(work_item=work_text, idempotency_key=idemp_key)
+```
+
+`extract_queue_idempotency_key` reads ONLY `payload['idempotency_key']` and
+deliberately does NOT fall back to `payload['id']` — queue ids are not
+guaranteed unique across distinct work items, so an id fallback could
+false-dedup two unrelated runs (silently dropping a real run). Missing key →
+`None` → no dedup (the LLM runs).
+
+### Implicit dedup via model.md (no explicit key)
+
+If you can't supply an explicit key, add a `## Dedup Body Hash` section to the
+agent's `model.md` (presence enables; default OFF). `agent.call()` then derives
+an implicit key from `sha256(work_item + model + max_tokens + temperature)`, so
+a bit-identical re-delivery dedups automatically. An explicit `idempotency_key=`
+always wins over the derived hash. See spec/45 PR2.
+
+---
+
 ## Testing a new cron agent before scheduling
 
 1. Run the script manually: `python3 jobs/agents/caldwell_daily_brief.py`

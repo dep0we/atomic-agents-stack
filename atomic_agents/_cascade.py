@@ -412,3 +412,58 @@ def renew_lease(item: "QueueItem", additional_seconds: int = None) -> None:
         )
     except PathTraversalError:
         return
+
+
+# ──────────────────────────────────────────────────────────────────
+# Queue deduplication helper per spec/45 PR2
+#
+# Cascade cron scripts call agent.call(idempotency_key=...) to prevent
+# duplicate runs when the same work item is delivered more than once
+# (queue re-delivery, crash-recovery, or manual replay). This helper
+# extracts the idempotency key from the work item's JSON payload dict
+# following the spec/45 PR2 extraction order:
+#   1. payload['idempotency_key'] — explicit caller-supplied key (preferred).
+#   2. Missing or None → return None (no dedup; zero-change path).
+#
+# An 'item["id"]' fallback was considered but INTENTIONALLY NOT used: queue
+# item ids are not guaranteed globally unique across distinct work items, so
+# falling back to 'id' could silently dedup two UNRELATED runs (false-dedup is
+# worse than no-dedup — it drops a real run). Only the explicit, caller-supplied
+# 'idempotency_key' field is honoured. spec/45 PR2.
+
+
+def extract_queue_idempotency_key(payload: dict) -> str | None:
+    """Extract the idempotency key from a queue work-item payload dict.
+
+    Call this on the parsed JSON dict of a claimed queue item before
+    invoking ``agent.call(idempotency_key=...)``. Returns the string key
+    when present and non-empty, otherwise ``None`` (no dedup).
+
+    Extraction order (spec/45 PR2):
+      1. ``payload['idempotency_key']`` — explicit field; used when present
+         and non-empty string.
+      2. Absent or non-string → ``None`` (zero-change path; no dedup applied).
+
+    An ``item['id']`` fallback is INTENTIONALLY NOT used: queue item ids are
+    not guaranteed globally unique across distinct work items, so falling back
+    to 'id' could false-dedup two unrelated runs (silently dropping a real run).
+    Only an explicit caller-supplied 'idempotency_key' is safe as a dedup key.
+
+    Usage in a cascade cron script::
+
+        item = claim_next_queued(project_root, role="writer", lease_token="daily-brief-lease")
+        if item is None:
+            sys.exit(0)
+        payload = json.loads(item.path.read_text())
+        work_text = payload.get("work_item") or item.original_name
+        idemp_key = extract_queue_idempotency_key(payload)
+        response = agent.call(work_item=work_text, idempotency_key=idemp_key)
+
+    spec/45 PR2 — trigger wiring (queue path).
+    """
+    if not isinstance(payload, dict):
+        return None
+    key = payload.get("idempotency_key")
+    if isinstance(key, str) and key:
+        return key
+    return None

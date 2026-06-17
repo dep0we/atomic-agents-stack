@@ -4515,6 +4515,10 @@ def check_idempotency_backend(agent_root: Path) -> CheckResult:
        mis-permissioned ledger FAILs here rather than false-PASSing. The probe
        markers (uuid-keyed, never collides with a real key) are unlinked on every
        exit path via _doctor_cleanup_idempotency_probe.
+    3. release_lease() leg (spec/45 MUST 13): begin(release_key) →
+       release_lease(release_key) → begin(release_key) MUST return FRESH again,
+       proving the lease was genuinely released (a buggy or no-op release_lease
+       would wedge the key IN_FLIGHT). Uses a separate uuid key, cleaned up after.
 
     PASS / WARN / FAIL ladder:
     FAIL when:
@@ -4523,6 +4527,8 @@ def check_idempotency_backend(agent_root: Path) -> CheckResult:
     * begin(temp_key) raises or does not return FRESH.
     * commit(temp_key) raises.
     * lookup(temp_key) post-commit does not return COMPLETED.
+    * release_lease() probe raises, OR begin() after release_lease() does not
+      return FRESH (the lease was not actually released — spec/45 MUST 13).
     * _ledger_root() raises PathTraversalError (symlinked idempotency/ escape).
 
     WARN when:
@@ -4702,6 +4708,70 @@ def check_idempotency_backend(agent_root: Path) -> CheckResult:
                 "error_type": type(e).__name__,
             },
         )
+
+    # Step 4b: release_lease() probe (spec/45 MUST 13 — dual-probe extension per
+    # feedback_doctor_dual_probe_pattern). A read-only/mis-permissioned ledger
+    # could pass begin/commit/lookup yet fail the lease-release write path, or a
+    # buggy release_lease() could fail to actually unlink the lease (wedging the
+    # key IN_FLIGHT for TTL-free single-host deployments). Probe it directly with
+    # a SEPARATE uuid key: begin() (claim a lease) → release_lease() → begin()
+    # again MUST return FRESH (the lease was genuinely released). Using a distinct
+    # key keeps this leg independent of the COMPLETED temp_key above.
+    import uuid as _uuid_release  # noqa: PLC0415
+
+    release_key = f"__doctor_release_probe_{_uuid_release.uuid4().hex}__"
+    try:
+        d_claim = backend.begin(release_key, run_id="__doctor_release__")
+        if d_claim.is_duplicate or d_claim.state != "fresh":
+            _doctor_cleanup_idempotency_probe(backend, temp_key)
+            _doctor_cleanup_idempotency_probe(backend, release_key)
+            return CheckResult(
+                name="idempotency-backend",
+                status=FAIL,
+                message=(
+                    f"idempotency backend begin() on a fresh release-probe key "
+                    f"returned state={d_claim.state!r}, expected 'fresh'"
+                ),
+                detail={"backend_id": backend.backend_id, "state": d_claim.state},
+            )
+        backend.release_lease(release_key)
+        d_after = backend.begin(release_key, run_id="__doctor_release2__")
+    except Exception as e:
+        _doctor_cleanup_idempotency_probe(backend, temp_key)
+        _doctor_cleanup_idempotency_probe(backend, release_key)
+        return CheckResult(
+            name="idempotency-backend",
+            status=FAIL,
+            message=f"idempotency backend release_lease() probe raised: {type(e).__name__}",
+            fix_hint=(
+                "The agent's idempotency/ ledger could not release a lease. Check "
+                "that agent_root/idempotency/ is writable (release_lease unlinks the "
+                "*.lease.json marker): chmod u+w on the directory."
+            ),
+            detail={
+                "backend_id": backend.backend_id,
+                "error": str(e),
+                "error_type": type(e).__name__,
+            },
+        )
+    # After release_lease(), re-claiming the SAME key must return FRESH — proves
+    # the lease was actually released (not merely no-op'd). A non-FRESH result
+    # means release_lease() did not unlink the lease (MUST 13 violation).
+    if d_after.is_duplicate or d_after.state != "fresh":
+        _doctor_cleanup_idempotency_probe(backend, temp_key)
+        _doctor_cleanup_idempotency_probe(backend, release_key)
+        return CheckResult(
+            name="idempotency-backend",
+            status=FAIL,
+            message=(
+                f"idempotency backend begin() after release_lease() returned "
+                f"state={d_after.state!r}, expected 'fresh' — the lease was not "
+                f"released (spec/45 MUST 13)"
+            ),
+            detail={"backend_id": backend.backend_id, "state": d_after.state},
+        )
+    # Clean up the release-probe's lease (the second begin() re-claimed it).
+    _doctor_cleanup_idempotency_probe(backend, release_key)
 
     # Step 5: cleanup — unlink the probe markers from the real ledger.
     _doctor_cleanup_idempotency_probe(backend, temp_key)

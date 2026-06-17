@@ -304,17 +304,25 @@ OUTCOME_SKIPPED = "skipped"
 OUTCOME_DEFERRED = "deferred"
 OUTCOME_ERROR = "error"
 OUTCOME_LOCK_BUSY = "lock_busy"
+OUTCOME_DEDUPED = "deduped"  # spec/45 PR2 — COMPLETED replay short-circuit
+OUTCOME_IN_FLIGHT = "in_flight"  # spec/45 PR2 — concurrent IN_FLIGHT key
 
 
 def _derive_outcome(response: Any) -> str:
     """Derive the canonical outcome string from a Response object.
 
-    Derivation rule (per spec/39 MUST 8, precedence order: error > skipped > deferred > ok):
+    Derivation rule (per spec/39 MUST 8, updated precedence order:
+    error > deduped > skipped > deferred > ok):
       - error:   span status was set to ERROR (handled externally via span.set_status)
+      - deduped: Response.deduped=True (checked before skipped — a deduped call
+                 is NOT a cost-skip; misclassifying it as OUTCOME_SKIPPED would
+                 produce misleading traces) (spec/45 PR2)
       - skipped: Response.skipped=True
       - deferred: Response.deferred=True and Response.skipped=False
       - ok:      otherwise
     """
+    if getattr(response, "deduped", False):
+        return OUTCOME_DEDUPED
     if getattr(response, "skipped", False):
         return OUTCOME_SKIPPED
     if getattr(response, "deferred", False):

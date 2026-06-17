@@ -185,6 +185,28 @@ class IdempotencyBackend(Protocol):
         """
         ...
 
+    def release_lease(self, key: str) -> None:
+        """Best-effort release of an IN_FLIGHT lease (spec/45 MUST 13).
+
+        Called by ``agent.call()`` on error/exception (via try/finally) to
+        remove the in-flight lease so that TTL-free deployments do not wedge
+        permanently. This is a best-effort operation — a genuine I/O failure
+        raises ``IdempotencyBackendError`` but the call() finally block catches
+        it (must not propagate from the finally block and interrupt lock release).
+
+        MUST be idempotent: no error raised when the lease file does not exist
+        (already committed, or never created). MUST NOT raise on a missing key.
+
+        Key validation is run before any I/O — ``PathTraversalError`` on invalid
+        key (caller bug surfaced loudly). Only raises ``IdempotencyBackendError``
+        on genuine I/O failure (EACCES, ENOSPC, etc.) — not on ENOENT.
+
+        Raises:
+            PathTraversalError: when ``key`` is invalid.
+            IdempotencyBackendError: on genuine I/O failure other than ENOENT.
+        """
+        ...
+
     def export(self, query: Any = None) -> IdempotencyExport:
         """Export TERMINAL ledger entries as a canonical IdempotencyExport (spec/40).
 

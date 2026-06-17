@@ -969,3 +969,16 @@ connect-time path by monkeypatching `_ensure_schema` (or the meta `SELECT`) to
 raise a `psycopg.Error` on a fresh thread-local connection and asserting
 `query()` / `tail()` / `aggregate()` raise `LogBackendReadError` with the
 `psycopg` error as `__cause__`.
+
+---
+
+### Versioned normative addendum — status='deduped' / status='in_flight' and idempotency audit fields (spec/45 PR2)
+
+When agent.call() is invoked with an idempotency_key, the framework may short-circuit before the LLM runs. Two new status values and two new canonical fields record this, with these normative properties in all conforming LogBackends:
+
+1. status='deduped' (a COMPLETED replay — call() returns the cached marker) and status='in_flight' (a concurrent twin holds the lease — call() raises DedupInFlight): on BOTH, the cost_usd key MUST be absent from the JSONL line (not 0.0 — omitted entirely). Cost readers MUST treat an absent cost_usd as zero, identical to lock_busy and skipped. No new logic in the cost path. Both records are written before call() returns/raises (no invisible exit path, Principle 5), mirroring the lock_busy record.
+2. idempotency_key — NEW CANONICAL RunRecord field (str | None). Carries the caller-supplied key. MUST be recorded on every keyed run (ok, deduped, in_flight) so the replayed_run_id join is verifiable.
+3. replayed_run_id — NEW CANONICAL RunRecord field (str | None). On status='deduped' records it carries the run_id of the original completed run whose result is served. Absent on ok and in_flight records (no result is served).
+4. LogQuery.idempotency_key — conforming backends MUST support it as an AND-predicate returning only matching records; SQLite and Postgres backends MUST add a PARTIAL index, CREATE INDEX IF NOT EXISTS idx_idempotency_key ON run_records(idempotency_key) WHERE idempotency_key IS NOT NULL. The column is NULL for nearly every run (only keyed runs set it), so a partial index keeps the index small and the append hot-path cheap; the AND-predicate is an equality (`= ?`) lookup that matches the partial predicate, so it still resolves as an index seek.
+
+Added OUTSIDE the 8-MUST count, following the versioned-addendum precedent of spec/09 §Cost-read error posture (#495) and spec/22 §Read-failure contract (#497).

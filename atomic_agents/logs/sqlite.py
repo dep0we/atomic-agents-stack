@@ -91,9 +91,10 @@ from .types import (
 # Schema version — bumped on any breaking schema change. The
 # ``schema_version`` row in the ``meta`` table records the version
 # the file was created with; mismatches at open time raise. PR 3
-# ships ``v1``; future PRs that add columns bump to ``v2`` + provide
-# an upgrade migration via ``ALTER TABLE`` inside ``_ensure_schema``.
-_SCHEMA_VERSION = 1
+# ships ``v1``; spec/45 PR2 bumps to ``v2`` (adds idempotency_key +
+# replayed_run_id columns + idx_idempotency_key index, per the
+# spec/22 versioned normative addendum).
+_SCHEMA_VERSION = 2
 
 
 # SQL for schema creation. Idempotent — ``CREATE TABLE IF NOT EXISTS``
@@ -123,6 +124,9 @@ CREATE TABLE IF NOT EXISTS run_records (
     agent_name TEXT,
     fallback INTEGER,
     critical INTEGER,
+    -- spec/45 PR2 / spec/22 addendum: idempotency audit fields.
+    idempotency_key TEXT,
+    replayed_run_id TEXT,
     extra TEXT NOT NULL DEFAULT '{}'
 )
 """
@@ -145,6 +149,15 @@ _CREATE_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_parent_run_id ON run_records(parent_run_id)",
     "CREATE INDEX IF NOT EXISTS idx_cost_source ON run_records(cost_source)",
     "CREATE INDEX IF NOT EXISTS idx_mandate_id ON run_records(mandate_id)",
+    # spec/22 versioned normative addendum (spec/45 PR2): MUST add this index
+    # to enable LogQuery.idempotency_key AND-predicate as an index seek. PARTIAL
+    # index (WHERE idempotency_key IS NOT NULL): idempotency_key is NULL for the
+    # overwhelming majority of run records (only keyed runs set it), so a partial
+    # index keeps the index small and the append hot-path cheap while still
+    # serving the AND-predicate lookup as an index seek (a `= ?` lookup matches
+    # the partial predicate). SQLite 3.8.0+ supports partial indexes.
+    "CREATE INDEX IF NOT EXISTS idx_idempotency_key ON run_records(idempotency_key) "
+    "WHERE idempotency_key IS NOT NULL",
 ]
 
 
@@ -171,6 +184,8 @@ _INSERT_COLUMNS = (
     "agent_name",
     "fallback",
     "critical",
+    "idempotency_key",
+    "replayed_run_id",
     "extra",
 )
 
@@ -331,7 +346,7 @@ class SQLiteLogBackend:
             ) from exc
 
     def _ensure_schema(self, conn: sqlite3.Connection) -> None:
-        """Create tables + indexes if missing; assert schema version.
+        """Create tables + indexes if missing; run migrations; assert schema version.
 
         Cold-start multi-process race mitigation (Step 11 P0 #2): the
         ``schema_version`` row goes in via ``INSERT OR IGNORE`` so two
@@ -341,19 +356,15 @@ class SQLiteLogBackend:
         moves on. Then both validate the existing row matches the
         expected version.
 
-        Schema migration ladder (#61 PR 3): the current behavior is
-        "raise RuntimeError on mismatch." When a future PR bumps
-        ``_SCHEMA_VERSION`` to 2, insert the migration here BEFORE the
-        validation read:
-          # if existing == 1: conn.execute("ALTER TABLE run_records ADD COLUMN ...")
-          # conn.execute("UPDATE meta SET value=? WHERE key='schema_version'", ("2",))
-        Document the migration in CHANGELOG under ### BREAKING and
-        cross-link to spec/22 §"Schema migration ladder".
+        Schema migration ladder (#61 PR 3 / spec/45 PR2):
+        Migrations run AFTER table+meta creation but BEFORE index creation,
+        because migrations may ADD columns that indexes depend on. Adding a
+        new migration: insert a new ``if existing == N:`` block below and
+        bump ``_SCHEMA_VERSION``. Document in CHANGELOG under ### BREAKING
+        and cross-link to the relevant spec.
         """
         conn.execute(_CREATE_RUN_RECORDS)
         conn.execute(_CREATE_META)
-        for stmt in _CREATE_INDEXES:
-            conn.execute(stmt)
         # Idempotent insert — losing the cold-start race is a no-op.
         conn.execute(
             "INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)",
@@ -370,6 +381,36 @@ class SQLiteLogBackend:
                 "INSERT OR IGNORE — db corruption suspected."
             )
         existing = int(row[0])
+        # Schema migration ladder — run BEFORE index creation so migrations
+        # that add columns (which indexes may reference) are applied first.
+        # v1 → v2 (spec/45 PR2): add idempotency_key + replayed_run_id columns
+        # and idx_idempotency_key index (spec/22 versioned normative addendum).
+        # ALTER TABLE ADD COLUMN is safe: existing rows get NULL for new columns.
+        # CREATE INDEX IF NOT EXISTS is idempotent.
+        #
+        # CRASH/RETRY SAFETY: in Python's sqlite3 module DDL implicitly commits.
+        # If the process dies AFTER the first ALTER commits but BEFORE the meta
+        # UPDATE, schema_version stays 1 with one column already present. On
+        # reopen this block re-runs; a bare ALTER would then raise "duplicate
+        # column name" and permanently wedge the backend. SQLite has no
+        # ``ADD COLUMN IF NOT EXISTS`` (unlike Postgres), so we guard each ALTER
+        # with a PRAGMA table_info() existence check, making the migration
+        # idempotent and crash-resumable. This mirrors Postgres's
+        # ADD COLUMN IF NOT EXISTS so the two backends are consistent.
+        if existing == 1:
+            _cols = {
+                str(r[1])
+                for r in conn.execute("PRAGMA table_info(run_records)").fetchall()
+            }
+            if "idempotency_key" not in _cols:
+                conn.execute("ALTER TABLE run_records ADD COLUMN idempotency_key TEXT")
+            if "replayed_run_id" not in _cols:
+                conn.execute("ALTER TABLE run_records ADD COLUMN replayed_run_id TEXT")
+            conn.execute("UPDATE meta SET value='2' WHERE key='schema_version'")
+            existing = 2
+        # Create/update indexes AFTER migrations so all columns they reference exist.
+        for stmt in _CREATE_INDEXES:
+            conn.execute(stmt)
         if existing != _SCHEMA_VERSION:
             raise RuntimeError(
                 f"SQLiteLogBackend schema version mismatch: file has "
@@ -414,6 +455,8 @@ class SQLiteLogBackend:
             record.agent_name,
             None if record.fallback is None else int(record.fallback),
             None if record.critical is None else int(record.critical),
+            record.idempotency_key,
+            record.replayed_run_id,
             json.dumps(record.extra) if record.extra else "{}",
         )
         conn.execute(_INSERT_SQL, values)
@@ -749,6 +792,11 @@ class SQLiteLogBackend:
         if filter.until is not None:
             clauses.append("ts <= ?")
             params.append(filter.until.isoformat())
+        # spec/22 addendum (spec/45 PR2): idempotency_key AND-predicate.
+        # Uses the idx_idempotency_key index for O(log N) matching.
+        if filter.idempotency_key is not None:
+            clauses.append("idempotency_key = ?")
+            params.append(filter.idempotency_key)
 
         where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
@@ -806,6 +854,8 @@ class SQLiteLogBackend:
             agent_name=row["agent_name"],
             fallback=None if row["fallback"] is None else bool(row["fallback"]),
             critical=None if row["critical"] is None else bool(row["critical"]),
+            idempotency_key=row["idempotency_key"],
+            replayed_run_id=row["replayed_run_id"],
             extra=extra,
         )
 

@@ -24,7 +24,7 @@ from typing import Any
 
 from .._platform import get_agents_root
 from ..agent import AtomicAgent
-from ..exceptions import LockBusy
+from ..exceptions import DedupInFlight, LockBusy
 
 # Module-level thread pool. Shared across all requests; sized by the OS default
 # (min(32, os.cpu_count() + 4) on CPython 3.8+).
@@ -64,6 +64,20 @@ class LockBusyWithRunId(LockBusy):
         self.run_id = run_id
 
 
+class DedupInFlightWithRunId(DedupInFlight):
+    """DedupInFlight subclass that carries the agent's current run_id.
+
+    Mirrors LockBusyWithRunId — threads the pre-dedup-check run_id back to
+    the HTTP handler so the 409 response body can carry both the run_id for
+    the current (refused) invocation and prior_run_id of the in-flight call.
+    spec/45 PR2.
+    """
+
+    def __init__(self, original: DedupInFlight, run_id: str) -> None:
+        super().__init__(str(original), prior_run_id=original.prior_run_id)
+        self.run_id = run_id
+
+
 async def run_agent_call(
     name: str,
     work_item: str,
@@ -73,6 +87,7 @@ async def run_agent_call(
     temperature: float | None = None,
     caller_identity: str | None = None,
     agents_root: Path | None = None,
+    idempotency_key: str | None = None,
 ) -> tuple[str, Any]:
     """Dispatch agent.call() in a thread-pool executor.
 
@@ -85,10 +100,12 @@ async def run_agent_call(
     ``response`` is the Response object from agent.call().
 
     Raises:
-        AtomicAgentsError       — agent not found or vault error (→ HTTP 404/500)
-        LockBusyWithRunId       — agent locked by another call (→ HTTP 503);
-                                  carries ``.run_id`` for the 503 response body
-        Various                 — pass through to the HTTP handler
+        AtomicAgentsError         — agent not found or vault error (→ HTTP 404/500)
+        LockBusyWithRunId         — agent locked by another call (→ HTTP 503);
+                                    carries ``.run_id`` for the 503 response body
+        DedupInFlightWithRunId    — key is IN_FLIGHT (→ HTTP 409, spec/45 PR2);
+                                    carries ``.run_id`` + ``.prior_run_id``
+        Various                   — pass through to the HTTP handler
     """
     _root = agents_root or get_agents_root()
     loop = asyncio.get_running_loop()
@@ -108,6 +125,7 @@ async def run_agent_call(
                 # spec/37 MUST 5.
                 critical=False,
                 caller_identity=caller_identity,
+                idempotency_key=idempotency_key,
             )
         except LockBusy as e:
             # Attach run_id to the exception so the HTTP handler can include it
@@ -116,6 +134,12 @@ async def run_agent_call(
             # body carry the same run_id — the caller can correlate. CLAUDE.md
             # principle 5 (audit trail is structural).
             raise LockBusyWithRunId(e, agent.run_id) from e
+        except DedupInFlight as e:
+            # spec/45 PR2: thread the run_id alongside prior_run_id so the HTTP
+            # handler can build a 409 body with both correlation handles.
+            # agent.run_id was reset before the lookup (MUST 8), matching the
+            # JSONL in_flight audit record for this call.
+            raise DedupInFlightWithRunId(e, agent.run_id) from e
         # Capture agent.run_id after call() returns — call() resets it at the
         # start, so this is the run_id that was written to the JSONL log.
         # For the skipped (cost-cap) path, agent.run_id is also set correctly

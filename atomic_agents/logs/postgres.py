@@ -178,9 +178,12 @@ def _psycopg_error() -> type[BaseException]:
     return psycopg.Error
 
 
-# Schema version — independent of SQLite's _SCHEMA_VERSION = 1.
-# Bumping SQLite v1→v2 does NOT require bumping Postgres v1→v2 and vice versa.
-_SCHEMA_VERSION = 1
+# Schema version — independent of SQLite's _SCHEMA_VERSION.
+# Bumping SQLite v1→v2 does NOT require bumping Postgres v1→v2 and vice versa,
+# but spec/45 PR2's spec/22 versioned normative addendum (idempotency_key +
+# replayed_run_id columns + idx_idempotency_key) lands on BOTH backends, so
+# Postgres also moves to v2 with a v1→v2 ALTER-TABLE migration ladder.
+_SCHEMA_VERSION = 2
 
 # Advisory lock key — stable int64 derived from a fixed constant string.
 # All processes using this backend target the same key, so the cold-start
@@ -220,6 +223,9 @@ CREATE TABLE IF NOT EXISTS run_records (
     agent_name TEXT,
     fallback BOOLEAN,
     critical BOOLEAN,
+    -- spec/45 PR2 / spec/22 versioned normative addendum: idempotency audit fields.
+    idempotency_key TEXT,
+    replayed_run_id TEXT,
     extra JSONB NOT NULL DEFAULT '{}'::jsonb
 )
 """
@@ -242,6 +248,14 @@ _CREATE_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_parent_run_id ON run_records(parent_run_id)",
     "CREATE INDEX IF NOT EXISTS idx_cost_source ON run_records(cost_source)",
     "CREATE INDEX IF NOT EXISTS idx_mandate_id ON run_records(mandate_id)",
+    # spec/22 versioned normative addendum (spec/45 PR2): MUST index for the
+    # LogQuery.idempotency_key AND-predicate (index seek, not table scan).
+    # PARTIAL index (WHERE idempotency_key IS NOT NULL): the column is NULL for
+    # nearly every run (only keyed runs set it), so a partial index stays small
+    # and keeps the append hot-path cheap while still serving the `= %s` lookup
+    # as an index seek (the AND-predicate matches the partial predicate).
+    "CREATE INDEX IF NOT EXISTS idx_idempotency_key ON run_records(idempotency_key) "
+    "WHERE idempotency_key IS NOT NULL",
 ]
 
 # Column names in INSERT order (matches CREATE TABLE column order minus id).
@@ -266,6 +280,8 @@ _INSERT_COLUMNS = (
     "agent_name",
     "fallback",
     "critical",
+    "idempotency_key",
+    "replayed_run_id",
     "extra",
 )
 
@@ -706,10 +722,10 @@ class PostgresLogBackend:
             )
             conn.execute(_CREATE_RUN_RECORDS)
             conn.execute(_CREATE_META)
-            for stmt in _CREATE_INDEXES:
-                conn.execute(stmt)
             # ON CONFLICT DO NOTHING — Postgres equivalent of SQLite's INSERT OR IGNORE.
             # Losing the cold-start race (another process already inserted) is a no-op.
+            # Insert the schema_version row BEFORE migrations + index creation so the
+            # migration ladder reads the authoritative existing version.
             conn.execute(
                 "INSERT INTO meta (key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING",
                 ("schema_version", str(_SCHEMA_VERSION)),
@@ -725,6 +741,27 @@ class PostgresLogBackend:
                     "INSERT ON CONFLICT DO NOTHING — db corruption suspected."
                 )
             existing = int(row["value"])
+            # Schema migration ladder — run UNDER the advisory lock, BEFORE index
+            # creation so migrations that ADD columns (which an index references)
+            # are applied first. v1 → v2 (spec/45 PR2): add idempotency_key +
+            # replayed_run_id columns (spec/22 versioned normative addendum).
+            # ADD COLUMN IF NOT EXISTS is idempotent + safe (existing rows get NULL).
+            # On a fresh DB the CREATE TABLE already includes the columns and the
+            # meta row is already v2, so this block is skipped.
+            if existing == 1:
+                conn.execute(
+                    "ALTER TABLE run_records ADD COLUMN IF NOT EXISTS "
+                    "idempotency_key TEXT"
+                )
+                conn.execute(
+                    "ALTER TABLE run_records ADD COLUMN IF NOT EXISTS "
+                    "replayed_run_id TEXT"
+                )
+                conn.execute("UPDATE meta SET value = '2' WHERE key = 'schema_version'")
+                existing = 2
+            # Create indexes AFTER migrations so idx_idempotency_key's column exists.
+            for stmt in _CREATE_INDEXES:
+                conn.execute(stmt)
             if existing != _SCHEMA_VERSION:
                 raise RuntimeError(
                     f"PostgresLogBackend schema version mismatch: db has "
@@ -909,6 +946,8 @@ class PostgresLogBackend:
             record.agent_name,
             record.fallback,
             record.critical,
+            record.idempotency_key,
+            record.replayed_run_id,
             _pj.Jsonb(record.extra if record.extra is not None else {}),
         )
 
@@ -1388,6 +1427,11 @@ class PostgresLogBackend:
         if filter.until is not None:
             clauses.append("ts <= %s")
             params.append(filter.until.isoformat())
+        # spec/22 versioned normative addendum (spec/45 PR2): idempotency_key
+        # AND-predicate. Uses the idx_idempotency_key index for an index seek.
+        if filter.idempotency_key is not None:
+            clauses.append("idempotency_key = %s")
+            params.append(filter.idempotency_key)
 
         where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
@@ -1452,6 +1496,13 @@ class PostgresLogBackend:
             # would silently corrupt records with genuinely unset fallback/critical.
             fallback=None if row["fallback"] is None else bool(row["fallback"]),
             critical=None if row["critical"] is None else bool(row["critical"]),
+            # spec/45 PR2 / spec/22 addendum: idempotency audit fields. After the
+            # v1→v2 migration these columns ALWAYS exist (NULL on old rows, never
+            # absent), so direct subscript is correct and symmetric with SQLite's
+            # _row_to_record. Unit-test row dicts carry all columns (including these
+            # two) for the same reason — prod shape is not bent to test convenience.
+            idempotency_key=row["idempotency_key"],
+            replayed_run_id=row["replayed_run_id"],
             extra=extra,
         )
 

@@ -43,6 +43,7 @@ def parse_model_md_text(text: str) -> dict:
           "monthly_cap_action": str,
           "warning_thresholds": list[float],
           "alert_channel": str,
+          "dedup_body_hash_enabled": bool,  # spec/45 PR2; default False (opt-in)
         }
 
     Empty input returns pure defaults.
@@ -60,6 +61,10 @@ def parse_model_md_text(text: str) -> dict:
         "monthly_cap_action": "alert",
         "warning_thresholds": [0.50, 0.80],
         "alert_channel": "log_only",
+        # spec/45 PR2: when True, agent.call() derives an implicit idempotency key
+        # as sha256(work_item+model+max_tokens+temperature) when no explicit key is
+        # supplied. Default False — operator must opt in via model.md.
+        "dedup_body_hash_enabled": False,
     }
 
     if not text:
@@ -132,5 +137,16 @@ def parse_model_md_text(text: str) -> dict:
         m = re.search(label_pattern, text, re.IGNORECASE)
         if m:
             defaults[key] = int(m.group(1).replace(",", ""))
+
+    # spec/45 PR2: "## Dedup Body Hash" section — presence (any body or empty)
+    # enables implicit sha256(work_item+model+max_tokens+temperature) key derivation.
+    # Mirrors the "## Allow No Auth" convention in serve.md: the section's presence
+    # is the signal; the body text (if any) is ignored. Default is False (opt-in).
+    # Anchored to a standalone h2 line (^## ... $, MULTILINE) so that an h3/h4
+    # heading like "### Dedup Body Hash" or a longer heading such as
+    # "## Dedup Body Hash Strategy" does NOT spuriously enable dedup — matching
+    # the exact-equality discipline serve.md's "## Allow No Auth" parser uses.
+    if re.search(r"^##\s+Dedup Body Hash\s*$", text, re.IGNORECASE | re.MULTILINE):
+        defaults["dedup_body_hash_enabled"] = True
 
     return defaults

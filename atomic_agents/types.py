@@ -31,10 +31,10 @@ class AgentConfig:
     cost_guardrails_enabled: bool = False
     daily_cap_usd: float = 0.0
     monthly_cap_usd: float = 0.0
-    daily_cap_action: str = "skip"      # skip | fallback | alert
+    daily_cap_action: str = "skip"  # skip | fallback | alert
     monthly_cap_action: str = "alert"
     warning_thresholds: list[float] = field(default_factory=lambda: [0.50, 0.80])
-    alert_channel: str = "log_only"     # telegram | email | journal | log_only
+    alert_channel: str = "log_only"  # telegram | email | journal | log_only
 
     # From tools.md (parsed)
     read_paths: list[Path] = field(default_factory=list)
@@ -42,6 +42,14 @@ class AgentConfig:
     read_only_paths: list[Path] = field(default_factory=list)
     external_apis: list[str] = field(default_factory=list)
     hard_nos: list[str] = field(default_factory=list)
+
+    # spec/45 PR2: when True, agent.call() computes an implicit idempotency key
+    # as sha256(work_item + model + max_tokens + temperature) when the caller
+    # does not supply an explicit idempotency_key. Disabled by default (opt-in).
+    # Enable via model.md '## Dedup Body Hash' section. ONLY active when
+    # idempotency_key is None — an explicit caller-supplied key always takes
+    # precedence.
+    dedup_body_hash_enabled: bool = False
 
     # From roster.md (parsed) — agent names this coordinator may delegate to.
     # Empty list = no delegation allowed.
@@ -55,7 +63,7 @@ class AgentConfig:
 @dataclass
 class CostCheckResult:
     allow: bool
-    action: str | None = None         # 'skip' | 'fallback' | 'alert' | None
+    action: str | None = None  # 'skip' | 'fallback' | 'alert' | None
     reason: str = ""
     fallback_model: str | None = None
     # True when the cost reader was degraded (blind / partial read). Gate sites
@@ -67,10 +75,11 @@ class CostCheckResult:
 @dataclass
 class Capture:
     """One atomic note to be written, parsed from a capture marker."""
-    type: str                          # user | feedback | project | decision | reference
+
+    type: str  # user | feedback | project | decision | reference
     name: str
     description: str
-    confidence: str                    # high | medium | low
+    confidence: str  # high | medium | low
     sources: list[str]
     body: str
     supersedes: str | None = None
@@ -83,8 +92,9 @@ class Capture:
 @dataclass
 class Response:
     """Result of an LLM call via AtomicAgent.call()."""
+
     text: str
-    model: str                         # the model actually used (may differ if fallback)
+    model: str  # the model actually used (may differ if fallback)
     input_tokens: int
     output_tokens: int
     cache_hit_tokens: int = 0
@@ -95,11 +105,11 @@ class Response:
     summary: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
     captures: list[Capture] = field(default_factory=list)
-    skipped: bool = False              # True if cost guardrail blocked the call
+    skipped: bool = False  # True if cost guardrail blocked the call
     skip_reason: str = ""
     # Custom tools fields (spec/17) — populated when tool_registry has tools
     tool_calls: list["ToolCallResult"] = field(default_factory=list)
-    tool_iterations: int = 1           # 1 = no tools used, 2+ = multi-turn loop
+    tool_iterations: int = 1  # 1 = no tools used, 2+ = multi-turn loop
     tool_iterations_maxed: bool = False  # True when max_iterations cap was hit
     # Judge-layer ESCALATE (spec/28). When any tool_use in the actor's
     # turn produces an ESCALATE judgment, the framework writes a PENDING
@@ -110,6 +120,21 @@ class Response:
     # See spec/28 §"Escalate" and the ESCALATE state machine docs.
     deferred: bool = False
     escalation_queue_ids: list[str] = field(default_factory=list)
+    # Idempotency dedup fields (spec/45 PR2). Set when agent.call() returns a
+    # deduplicated result without running the LLM (a prior COMPLETED run was
+    # found for this idempotency_key). The caller resolves the actual result
+    # bytes via OutcomeBackend.read_result(agent_id, prior_run_id).
+    #
+    # deduped=True distinguishes a replayed result from a normal ok response.
+    # prior_run_id: the run_id of the original completed run.
+    # replayed_run_id: same as prior_run_id (alias for symmetry with the audit
+    #   record field name — both refer to the original run's id).
+    # result_ref: the opaque result reference stored by commit() — typically
+    #   the original run's run_id; use with OutcomeBackend.read_result(agent_id, ...).
+    deduped: bool = False
+    prior_run_id: str | None = None
+    replayed_run_id: str | None = None
+    result_ref: str | None = None
 
     @classmethod
     def skipped_response(cls, reason: str, model: str) -> "Response":
@@ -124,10 +149,51 @@ class Response:
             summary=f"skipped: {reason}",
         )
 
+    @classmethod
+    def deduped_response(
+        cls,
+        prior_run_id: str | None,
+        replayed_run_id: str | None,
+        result_ref: str | None,
+        model: str,
+    ) -> "Response":
+        """Build a Response representing a deduplicated (replayed) call (spec/45).
+
+        Returned by agent.call() when lookup() finds a COMPLETED entry for
+        the caller-supplied idempotency_key. The actual result bytes are NOT
+        fetched eagerly — the caller resolves them via
+        OutcomeBackend.read_result(agent_id, prior_run_id).
+
+        Args:
+            prior_run_id: run_id of the original completed run.
+            replayed_run_id: alias for prior_run_id (audit-record field name).
+            result_ref: opaque result reference from commit() — typically the
+                original run_id; use with OutcomeBackend.read_result(agent_id, ...).
+            model: the model from the agent config (for span attribute
+                consistency — no LLM call is made for this response).
+
+        Returns:
+            A Response with deduped=True, cost_usd=0.0 (no LLM spend),
+            zero token counts, and the three idempotency fields populated.
+        """
+        return cls(
+            text="",
+            model=model,
+            input_tokens=0,
+            output_tokens=0,
+            cost_usd=0.0,
+            deduped=True,
+            prior_run_id=prior_run_id,
+            replayed_run_id=replayed_run_id,
+            result_ref=result_ref,
+            summary=f"deduped: replayed from run {prior_run_id!r}",
+        )
+
 
 @dataclass
 class HelperResult:
     """One helper_call result (returned to the parent agent)."""
+
     text: str
     model: str
     input_tokens: int

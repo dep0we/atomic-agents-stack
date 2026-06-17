@@ -246,6 +246,8 @@ def _make_record(
     cache_hit_tokens: int | None = None,
     cache_miss_tokens: int | None = None,
     mandate_id: str | None = None,
+    idempotency_key: str | None = None,
+    replayed_run_id: str | None = None,
     parent_run_id: str | None = None,
     parent_agent: str | None = None,
     trigger: str | None = None,
@@ -271,6 +273,8 @@ def _make_record(
         cache_hit_tokens=cache_hit_tokens,
         cache_miss_tokens=cache_miss_tokens,
         mandate_id=mandate_id,
+        idempotency_key=idempotency_key,
+        replayed_run_id=replayed_run_id,
         parent_run_id=parent_run_id,
         parent_agent=parent_agent,
         trigger=trigger,
@@ -506,6 +510,50 @@ def test_query_filters_by_mandate_id(backend):
     out = backend.query(LogQuery(mandate_id="m-1"))
     assert len(out) == 1
     assert out[0].mandate_id == "m-1"
+
+
+def test_query_filters_by_idempotency_key(backend):
+    """spec/22 addendum item 4: every conforming backend MUST support the
+    ``idempotency_key`` AND-predicate, returning only matching records. Mirrors
+    the ``mandate_id`` precedent so a third-party backend that omits the filter
+    fails the canonical gate rather than passing it (Design Principle #2/#10).
+    """
+    backend.append(
+        _make_record(run_id="k1", idempotency_key="k-1", ts=_ts_at(2026, 5, 15, 10))
+    )
+    backend.append(
+        _make_record(run_id="k2", idempotency_key="k-2", ts=_ts_at(2026, 5, 15, 11))
+    )
+    backend.append(
+        _make_record(run_id="kn", idempotency_key=None, ts=_ts_at(2026, 5, 15, 12))
+    )
+    out = backend.query(LogQuery(idempotency_key="k-1"))
+    assert len(out) == 1
+    assert out[0].run_id == "k1"
+    assert out[0].idempotency_key == "k-1"
+    # Negative arm: no idempotency_key predicate returns all three records.
+    out_all = backend.query(LogQuery())
+    assert len(out_all) == 3
+
+
+def test_query_idempotency_key_round_trips_replayed_run_id(backend):
+    """replayed_run_id is a canonical field (spec/22 addendum item 3) and MUST
+    survive the append → query round trip alongside idempotency_key on a
+    status='deduped' record.
+    """
+    backend.append(
+        _make_record(
+            run_id="replay",
+            status="deduped",
+            idempotency_key="dk-1",
+            replayed_run_id="orig-run",
+            ts=_ts_at(2026, 5, 15, 13),
+        )
+    )
+    out = backend.query(LogQuery(idempotency_key="dk-1"))
+    assert len(out) == 1
+    assert out[0].status == "deduped"
+    assert out[0].replayed_run_id == "orig-run"
 
 
 def test_query_filters_by_parent_run_id(backend):

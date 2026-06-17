@@ -234,6 +234,62 @@ def test_commit_then_lookup_completed(backend) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# TEST 8b — release_lease() conformance (spec/45 MUST 13). NEW in PR2.
+
+
+def test_release_lease_after_begin_makes_key_fresh_again(backend) -> None:
+    """release_lease() MUST remove the IN_FLIGHT lease so a later begin() is FRESH
+    again (spec/45 MUST 13). This is the wedge-recovery contract: a crashed run's
+    lease is released and the next delivery re-runs."""
+    first = backend.begin("rl-key", run_id="run-1")
+    assert first.state == FRESH
+    # A second begin() before release sees IN_FLIGHT.
+    busy = backend.begin("rl-key", run_id="run-2")
+    assert busy.state == IN_FLIGHT
+    # Release the lease.
+    backend.release_lease("rl-key")
+    # Now begin() is FRESH again (lease gone, no terminal marker).
+    after = backend.begin("rl-key", run_id="run-3")
+    assert after.state == FRESH, (
+        "release_lease() MUST remove the IN_FLIGHT lease so begin() returns FRESH"
+    )
+
+
+def test_release_lease_on_absent_key_is_noop(backend) -> None:
+    """release_lease() on a key with no lease MUST NOT raise (idempotent / ENOENT
+    is a no-op — spec/45 MUST 13)."""
+    # Never began — no lease file exists.
+    backend.release_lease("never-seen-key")  # must not raise
+
+
+def test_release_lease_is_idempotent(backend) -> None:
+    """release_lease() MUST be idempotent — calling it twice does not raise
+    (the second call is a no-op, spec/45 MUST 13)."""
+    backend.begin("rl-idem-key", run_id="run-1")
+    backend.release_lease("rl-idem-key")
+    backend.release_lease("rl-idem-key")  # second call — must not raise
+
+
+def test_release_lease_does_not_affect_committed_terminal(backend) -> None:
+    """release_lease() after commit() MUST NOT resurrect the key to FRESH — the
+    terminal marker is permanent; only the (already-unlinked) lease is targeted."""
+    backend.begin("rl-commit-key", run_id="run-1")
+    backend.commit("rl-commit-key", result_ref="run-1-result")
+    backend.release_lease("rl-commit-key")  # no lease to remove — no-op
+    decision = backend.lookup("rl-commit-key")
+    assert decision.state == COMPLETED, (
+        "release_lease() MUST NOT undo a committed terminal marker"
+    )
+
+
+def test_release_lease_invalid_key_raises_path_traversal(backend) -> None:
+    """release_lease() MUST validate the key BEFORE any I/O — an invalid key
+    (path separator) raises PathTraversalError (spec/45 MUST 13, loud caller bug)."""
+    with pytest.raises(PathTraversalError):
+        backend.release_lease("bad/key")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # TEST 9 — commit() MARKER-ONLY: terminal file size is bounded
 
 
@@ -328,7 +384,8 @@ def test_idempotency_capabilities_is_frozen() -> None:
 
 
 def test_single_host_only_is_required() -> None:
-    """IdempotencyCapabilities.single_host_only MUST be required (no default).
+    """spec/45 MUST 7 (single-host capability advertisement).
+    IdempotencyCapabilities.single_host_only MUST be required (no default).
 
     A backend that omits it must get a TypeError, not silently claim False
     (multi-host-safe when it is not) — LockCapabilities/QueueCapabilities pattern.
@@ -415,7 +472,8 @@ def test_export_empty_when_ledger_absent(tmp_path) -> None:
 
 
 def test_export_excludes_in_flight_lease(backend) -> None:
-    """export() MUST NOT include in-flight lease entries (spec/45 export contract).
+    """spec/45 MUST 11 (export emits TERMINAL entries only).
+    export() MUST NOT include in-flight lease entries (spec/45 export contract).
 
     In-flight entries exported and then imported would permanently block begin()
     on the restored system (phantom block).
@@ -485,7 +543,8 @@ def test_backend_id_stable_across_calls(backend) -> None:
 
 
 def test_storage_isolation(tmp_path) -> None:
-    """Two FilesystemDedupLedger backends with different agent_roots MUST NOT share state."""
+    """spec/45 MUST 9 (storage isolation).
+    Two FilesystemDedupLedger backends with different agent_roots MUST NOT share state."""
     root_a = tmp_path / "agent-a"
     root_b = tmp_path / "agent-b"
     root_a.mkdir()

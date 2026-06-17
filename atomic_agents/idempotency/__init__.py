@@ -49,9 +49,9 @@ import os
 import re
 from pathlib import Path
 
-from ..exceptions import BackendNotRegistered
+from ..exceptions import BackendNotRegistered, DedupInFlight, IdempotencyBackendError
 from .backend import IdempotencyBackend
-from .filesystem import FilesystemDedupLedger, IdempotencyBackendError
+from .filesystem import FilesystemDedupLedger
 from .types import (
     COMPLETED,
     FRESH,
@@ -76,8 +76,9 @@ __all__ = [
     "COMPLETED",
     # Reference impl
     "FilesystemDedupLedger",
-    # Implementation exception
+    # Exceptions
     "IdempotencyBackendError",
+    "DedupInFlight",
     # Registry
     "register_idempotency_backend",
     "unregister_idempotency_backend",
@@ -85,6 +86,8 @@ __all__ = [
     "list_idempotency_backends",
     # Operator-config factory
     "get_default_idempotency_backend",
+    # Cron helper
+    "cron_tick_key",
     # Credential-echo-redaction helper
     "_redact_for_error_message",
 ]
@@ -215,3 +218,10 @@ def _redact_for_error_message(value: str, max_len: int = 32) -> str:
     if len(value) > max_len:
         return value[:max_len] + "..."
     return value
+
+
+# ──────────────────────────────────────────────────────────────────
+# Cron helper — lazy import to avoid pulling in datetime overhead at
+# package import time for callers who only need the registry / backend.
+
+from .cron import cron_tick_key  # noqa: E402 — import after registry bootstrap

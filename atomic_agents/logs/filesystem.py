@@ -694,6 +694,12 @@ def _matches(
         return False
     if until_str is not None and record.ts > until_str:
         return False
+    # spec/22 addendum (spec/45 PR2): idempotency_key AND-predicate.
+    if (
+        filter.idempotency_key is not None
+        and record.idempotency_key != filter.idempotency_key
+    ):
+        return False
     return True
 
 

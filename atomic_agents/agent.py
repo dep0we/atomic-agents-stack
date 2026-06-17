@@ -86,6 +86,13 @@ from .journal.backend import JournalBackend
 # typing.get_type_hints() and for mypy/pyright. goal.backend imports only from
 # goal/types.py + stdlib — no heavy deps, no circular-import risk. (#448 PR1)
 from .goal.backend import GoalBackend
+from .idempotency.backend import IdempotencyBackend
+from .idempotency import (
+    COMPLETED as _DEDUP_COMPLETED,
+    IN_FLIGHT as _DEDUP_IN_FLIGHT,
+    get_default_idempotency_backend,
+)
+from .idempotency.types import DedupDecision
 from .mcp_registry import (
     MCPRegistryError,
     MCPRegistryUnavailable,
@@ -111,7 +118,9 @@ from ._platform import get_agents_root
 from .exceptions import (
     AtomicAgentsError,
     CostGuardrailBlocked,
+    DedupInFlight,
     HelperBatchPartialFailure,
+    IdempotencyBackendError,
     NestedDelegationRefused,
     NotInRoster,
     PathTraversalError,
@@ -191,6 +200,19 @@ _PRIMITIVE_BY_TRIGGER: dict[str, str] = {
     "escalation_operator_revise_invalid_amendment": PRIMITIVE_ESCALATION,
     "escalation_resolved": PRIMITIVE_ESCALATION,
 }
+
+# spec/45 PR2 — body-hash auto-derivation gate. dedup_body_hash_enabled
+# auto-derives an idempotency key ONLY for triggers where the same logical
+# request can actually be REDELIVERED by an external transport (an HTTP retry,
+# a queue redelivery, a cron over-fire). For framework-internal repeat-
+# invocation callers — eval (trigger='eval'), delegate child calls
+# (trigger='delegate'), outcome inner runs (trigger='outcome'), and plain
+# manual/api/skill calls — identical inputs are EXPECTED to run again, and
+# auto-deduping them would return a text='' deduped Response those consumers
+# treat as a real result (a judge would score empty; a delegate would log empty
+# as ok). An EXPLICIT caller-supplied idempotency_key is still honored on ANY
+# trigger; only the implicit body-hash AUTO derivation is gated to this set.
+_BODY_HASH_AUTO_DERIVE_TRIGGERS: frozenset[str] = frozenset({"http", "queue", "cron"})
 
 
 def _derive_primitive_from_trigger(trigger: str | None) -> str:
@@ -336,6 +358,7 @@ class AtomicAgent:
         memory_backend: MemoryBackend | None = None,
         journal_backend: JournalBackend | None = None,
         goal_backend: GoalBackend | None = None,
+        idempotency_backend: IdempotencyBackend | None = None,
     ):
         self.name = name
         self.trigger = trigger
@@ -698,6 +721,17 @@ class AtomicAgent:
             self.goal_backend = get_default_goal_backend(self.agent_root)
         else:
             self.goal_backend = goal_backend
+
+        # spec/45 PR2: idempotency backend — kwarg-wins-over-env-var pattern
+        # matching journal_backend / goal_backend. Resolved lazily to avoid
+        # creating the idempotency/ directory on every agent construction
+        # (only needed when idempotency_key is supplied to call()).
+        if idempotency_backend is None:
+            self.idempotency_backend: IdempotencyBackend = (
+                get_default_idempotency_backend(self.agent_root)
+            )
+        else:
+            self.idempotency_backend = idempotency_backend
 
         # Per-agent target extractor registry (spec/29 §"Target extraction",
         # #124 PR 3a). MUST initialize BEFORE tool_registry loading below so
@@ -3068,6 +3102,11 @@ class AtomicAgent:
             monthly_cap_action=model_data["monthly_cap_action"],
             warning_thresholds=model_data["warning_thresholds"],
             alert_channel=model_data["alert_channel"],
+            # spec/45 PR2: opt-in implicit body-hash dedup key derivation.
+            # .get() with False default for backward compat with AgentProfile
+            # snapshots that pre-date this field (no 'dedup_body_hash_enabled'
+            # in their model_config dict).
+            dedup_body_hash_enabled=model_data.get("dedup_body_hash_enabled", False),
             read_paths=tools_data["read_paths"],
             write_paths=tools_data["write_paths"],
             read_only_paths=tools_data.get("read_only_paths", []),
@@ -3356,6 +3395,8 @@ class AtomicAgent:
         write_captures: bool = True,
         parent_remaining_headroom_usd: float | None = None,
         caller_identity: str | None = None,
+        *,
+        idempotency_key: str | None = None,
     ) -> Response:
         """Make the LLM call. Returns a Response with captures populated.
 
@@ -3386,6 +3427,20 @@ class AtomicAgent:
         parent_remaining_headroom_usd: when set (by a coordinator's delegate()),
         this call's own cap is clamped to min(own remaining, parent headroom).
         This enforces the coordinator's cap as a true tree-cap (spec/15).
+
+        ``idempotency_key``: optional caller-supplied key that activates the
+        two-phase deduplication gate (spec/45 PR2, W1–W7). A prior COMPLETED run
+        for the same key short-circuits — NO LLM call, NO lock acquire — and
+        returns ``Response.deduped_response()`` (``deduped=True`` with
+        ``replayed_run_id`` / ``result_ref`` of the original run; the cached
+        bytes are resolved out-of-band via ``result_ref``/OutcomeBackend, never
+        inlined, because the ledger is MARKER-ONLY). A concurrent IN_FLIGHT run
+        for the same key raises ``DedupInFlight`` (carrying ``prior_run_id``).
+        ``None`` (the default) = no dedup — zero behavioral change for callers
+        that don't opt in. When ``dedup_body_hash_enabled`` is set in model.md
+        and no explicit key is supplied, an implicit key is derived from
+        ``sha256(work_item+model+max_tokens+temperature)`` so bit-identical
+        re-deliveries dedup without caller key management. See spec/45 W1–W7.
 
         When self.tool_registry has registered tools, call() runs a multi-turn
         loop (up to self.max_tool_iterations iterations):
@@ -3597,6 +3652,125 @@ class AtomicAgent:
                     )
                 _tracing.safe_span_op(_call_span.end, "end call span")
 
+        # spec/45 PR2 — Body-hash key derivation (opt-in, default OFF).
+        # When dedup_body_hash_enabled=True (model.md '## Dedup Body Hash' section)
+        # AND the caller did NOT supply an explicit idempotency_key, derive one
+        # automatically as sha256(work_item + model + max_tokens + temperature).
+        # This prevents duplicate LLM spend for bit-identical re-deliveries of the
+        # same request without requiring the caller to manage keys explicitly.
+        # Explicit caller-supplied keys always take precedence (zero-override).
+        #
+        # spec/45 PR2: AUTO derivation is gated to EXTERNAL DELIVERY triggers
+        # (http/queue/cron) where redelivery actually occurs. Framework-internal
+        # repeat-invocation callers (eval/delegate/outcome) and plain manual/api/
+        # skill calls expect identical inputs to RUN again — auto-deduping them
+        # would hand a text='' deduped Response to a consumer that treats it as a
+        # real result. See _BODY_HASH_AUTO_DERIVE_TRIGGERS. An explicit
+        # idempotency_key (handled above) is honored on ANY trigger; only this
+        # implicit derivation is trigger-gated.
+        if (
+            idempotency_key is None
+            and self.config.dedup_body_hash_enabled
+            and self.trigger in _BODY_HASH_AUTO_DERIVE_TRIGGERS
+        ):
+            import hashlib as _hashlib
+
+            _resolved_model = (
+                model_override
+                if model_override is not None
+                else self.config.default_model
+            )
+            _resolved_max_tokens = (
+                max_tokens if max_tokens is not None else self.config.max_output_tokens
+            )
+            _resolved_temp = (
+                temperature if temperature is not None else self.config.temperature
+            )
+            # This repr-based serialization is stable within a Python version;
+            # not cross-language safe (repr() of floats/strings can vary across
+            # languages/versions) but sufficient for within-agent dedup. Format:
+            # deterministic serialization of the four fields that uniquely
+            # identify an LLM call's inputs.
+            # SHA-256 hex digest (full 64-char, untruncated).
+            _hash_input = (
+                f"work_item={work_item!r},"
+                f"model={_resolved_model!r},"
+                f"max_tokens={_resolved_max_tokens!r},"
+                f"temperature={_resolved_temp!r}"
+            )
+            idempotency_key = _hashlib.sha256(_hash_input.encode("utf-8")).hexdigest()
+
+        # spec/45 PR2 — Phase 1: lookup() BEFORE lock acquire (reconciled order).
+        # An idempotency_key lookup is a read-only probe that should short-circuit
+        # BEFORE paying the lock-acquire cost. A COMPLETED decision returns the
+        # cached result immediately (no LLM call, no lock). Mirrors the lock_busy
+        # path in structure: write an audit record, finalize the span, return/raise.
+        # IMPORTANT: this gate ONLY runs when idempotency_key is set; zero
+        # behavioral change for callers that don't use dedup.
+        #
+        # The _serve_completed_dedup closure is defined INSIDE this guard so the
+        # dominant idempotency_key=None path pays ZERO overhead (no closure
+        # construction per call() — matches the spec/PR zero-overhead-None claim).
+        # Both call sites that reference it (Phase-1 lookup-COMPLETED here, and the
+        # Phase-2 begin-COMPLETED site below) only execute when idempotency_key is
+        # not None, so the name is always bound before either site runs.
+        if idempotency_key is not None:
+            # spec/45 PR2 — shared COMPLETED-serve path. A COMPLETED decision can
+            # surface in TWO places: Phase 1 lookup() (before the lock) AND Phase 2
+            # begin() (after the cost gate, when a concurrent twin committed the key
+            # between our lookup and our begin — the realistic lookup→commit→begin
+            # race). Both serve the cached result identically: write a
+            # status='deduped' audit record (cost_usd OMITTED per spec/22 addendum),
+            # finalize the span with OUTCOME_DEDUPED, and return
+            # Response.deduped_response. Factored into one closure so the two call
+            # sites can never diverge (W7).
+            def _serve_completed_dedup(_decision: "DedupDecision") -> Response:
+                _dedup_record: dict = {
+                    "trigger": self.trigger,
+                    "model": self.config.default_model,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "status": "deduped",
+                    "summary": (
+                        f"deduped: replayed from run {_decision.prior_run_id!r}"
+                    ),
+                    "idempotency_key": idempotency_key,
+                    "replayed_run_id": _decision.prior_run_id,
+                    # cost_usd intentionally ABSENT (not 0.0) per spec/22 addendum.
+                }
+                if caller_identity is not None:
+                    _dedup_record["http_caller"] = caller_identity
+                self._log(_dedup_record)
+                _resp = Response.deduped_response(
+                    prior_run_id=_decision.prior_run_id,
+                    replayed_run_id=_decision.prior_run_id,
+                    result_ref=_decision.prior_result_ref,
+                    model=self.config.default_model,
+                )
+                _finalize_call_span(outcome=_tracing.OUTCOME_DEDUPED)
+                return _resp
+
+            try:
+                _lookup_decision = self.idempotency_backend.lookup(idempotency_key)
+            except (PathTraversalError, IdempotencyBackendError) as _lookup_exc:
+                # Invalid key (caller bug) or I/O failure — finalize span as
+                # error and propagate. Mirrors the non-LockBusy acquire except.
+                _finalize_call_span(error=_lookup_exc)
+                raise
+            except BaseException as _lookup_other_exc:
+                # spec/39 MUST 3: a NON-conforming backend that raises an
+                # un-wrapped exception type (e.g. a bare OSError / RuntimeError)
+                # from lookup() still runs BEFORE the body try/finally and before
+                # lock acquire, so it must finalize the span here or the call span
+                # leaks (never end()ed, context token never detached). The lock is
+                # NOT held yet, so no lock leak. Mirrors the broad acquire except
+                # below at the lock-acquire block. Re-raise unchanged.
+                _finalize_call_span(error=_lookup_other_exc)
+                raise
+            if _lookup_decision.state == _DEDUP_COMPLETED:
+                # COMPLETED: serve the cached result without running the LLM.
+                return _serve_completed_dedup(_lookup_decision)
+
         # Acquire agent lock via the bound LockBackend. Empty name maps
         # to ``<agent_root>/.lock`` on the filesystem backend — preserves
         # the legacy on-disk artifact so doctor + external scripts keep
@@ -3659,6 +3833,10 @@ class AtomicAgent:
         # Track MCP tool names registered this call so we can clean them up in
         # finally even if an exception occurs mid-call (spec/19 fix M3).
         _mcp_registered_names: list[str] = []
+        # spec/45 PR2: pre-body declaration so the finally can always read this flag
+        # regardless of where an exception fires. Set True inside the body after
+        # begin() returns FRESH; reset to False when commit() succeeds.
+        _idempotency_lease_held: bool = False
 
         try:
             # Take Policy snapshot at call entry (#89 PR 3a / design Premise 3).
@@ -3728,6 +3906,13 @@ class AtomicAgent:
                 # matching prose (mirrors the coordinator dispatch-rejected event).
                 if check.cost_data_degraded:
                     _skip_record["cost_data_degraded"] = True
+                # spec/45 W6 (cost-skip variant): tag idempotency_key on the
+                # pre-loop cost-skip record so a keyed run that was refused before
+                # begin() still links to its key. The lease is NOT claimed on this
+                # path (begin() runs AFTER the cost gate), so the key is recordable
+                # but the ledger stays uncommitted and a retry re-runs.
+                if idempotency_key is not None:
+                    _skip_record["idempotency_key"] = idempotency_key
                 # spec/37 MUST 7: include caller identity on the cost-skip path
                 # so audit can attribute refused HTTP calls to their principals.
                 if caller_identity is not None:
@@ -3753,6 +3938,67 @@ class AtomicAgent:
                     check.reason, self.config.default_model
                 )
                 return _call_response
+
+            # spec/45 PR2 — Phase 2: begin() AFTER cost gate (reconciled order).
+            # begin() claims the lease ONLY when a cost-cap allows the run.
+            # A cost-skipped call MUST NOT claim an idempotency key (nothing ran).
+            # _idempotency_lease_held is pre-declared outside the body try (above).
+            if idempotency_key is not None:
+                # begin() exceptions (PathTraversalError / IdempotencyBackendError)
+                # propagate to the body's ``except BaseException`` below, which
+                # finalizes the span as error and re-raises. No local catch needed.
+                _begin_decision = self.idempotency_backend.begin(
+                    idempotency_key, self.run_id
+                )
+                if _begin_decision.state == _DEDUP_COMPLETED:
+                    # spec/45 W7: a concurrent twin committed this key between our
+                    # Phase-1 lookup() (which saw FRESH) and our begin(). begin()
+                    # checks the terminal marker FIRST and returns COMPLETED. Serve
+                    # the cached result identically to the Phase-1 lookup-COMPLETED
+                    # path — NO LLM run, NO lease claimed (_idempotency_lease_held
+                    # stays False), so the finally never releases a lease we don't
+                    # own. The lock IS held and the finally releases it correctly.
+                    # Omitting this branch silently double-spends (the P0).
+                    _call_response = _serve_completed_dedup(_begin_decision)
+                    return _call_response
+                if _begin_decision.state == _DEDUP_IN_FLIGHT:
+                    # Another call is already in progress for this key.
+                    # Write a status='in_flight' audit record (cost_usd OMITTED per
+                    # spec/22 addendum, replayed_run_id ABSENT) THEN raise.
+                    _in_flight_record: dict = {
+                        "trigger": self.trigger,
+                        "model": self.config.default_model,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "status": "in_flight",
+                        "summary": (
+                            f"in_flight: concurrent call holds lease for key "
+                            f"{idempotency_key!r}"
+                        ),
+                        "idempotency_key": idempotency_key,
+                        # replayed_run_id intentionally ABSENT (no result served).
+                        # cost_usd intentionally ABSENT per spec/22 addendum.
+                    }
+                    if caller_identity is not None:
+                        _in_flight_record["http_caller"] = caller_identity
+                    self._log(_in_flight_record)
+                    # Finalize span as IN_FLIGHT (a refusal, not an error — mirrors
+                    # lock_busy span semantics per spec/39).
+                    _tracing.safe_span_op(
+                        lambda: _call_span.set_status(
+                            _tracing.StatusCode.ERROR, description="in_flight"
+                        ),
+                        "set in_flight status",
+                    )
+                    _finalize_call_span(outcome=_tracing.OUTCOME_IN_FLIGHT)
+                    raise DedupInFlight(
+                        f"idempotency key {idempotency_key!r} is IN_FLIGHT "
+                        f"(held by run {_begin_decision.prior_run_id!r})",
+                        prior_run_id=_begin_decision.prior_run_id,
+                    )
+                else:
+                    # state == FRESH: we own the lease.
+                    _idempotency_lease_held = True
 
             # MCP client pool — lazy init (spec/19).
             # Only spin up when mcp.md declares servers and pool not yet live.
@@ -4060,6 +4306,15 @@ class AtomicAgent:
                         # pre-loop skip + coordinator dispatch-rejected event).
                         if iter_check.cost_data_degraded:
                             _mid_loop_skip["cost_data_degraded"] = True
+                        # spec/45 W6 (cost-skip variant): tag idempotency_key on
+                        # the mid-loop cost-skip record. This path is reached AFTER
+                        # begin() returned FRESH (the lease IS held), so a keyed run
+                        # that spent money on iteration N then hit the cap mid-loop
+                        # must still link to its key. The skip returns via the body
+                        # try, so the finally releases the lease (NOT commit()ed) —
+                        # a retry re-runs.
+                        if idempotency_key is not None:
+                            _mid_loop_skip["idempotency_key"] = idempotency_key
                         # spec/37 MUST 7: include http_caller on ALL HTTP-triggered
                         # terminal records, including this mid-loop cost-cap path.
                         # The pre-loop cost-skip (3398-3401) and lock_busy (3325-3327)
@@ -4722,7 +4977,54 @@ class AtomicAgent:
                 log_record["tool_iterations"] = iteration_count
             if tool_iterations_maxed:
                 log_record["tool_iterations_maxed"] = True
+            # spec/45 PR2: tag idempotency_key on every keyed ok-path run record
+            # (spec/22 addendum: MUST be recorded on every keyed run — ok, deduped,
+            # in_flight). replayed_run_id is absent on ok records (no prior result).
+            if idempotency_key is not None:
+                log_record["idempotency_key"] = idempotency_key
+            # spec/45 PR2 / spec/22 addendum: JSONL audit record FIRST (durable),
+            # THEN commit() the ledger terminal. A crash between the two leaves the
+            # JSONL intact and the ledger uncommitted — the next delivery re-runs
+            # (safe at-least-once direction). A crash between commit() and _log()
+            # would leave the ledger COMPLETED but no JSONL record — invisible run
+            # violates Principle 5 (audit trail is structural). Write order is load-
+            # bearing; changing it is a P0.
             self._log(log_record)
+            # commit() AFTER _log(). Wrap in try/except so a commit failure
+            # logs a warning but does NOT fail the call (the LLM work is done;
+            # the run completed; only the dedup ledger is unmarked).
+            #
+            # spec/45 commit-vs-release lifecycle: a DEFERRED (ESCALATE) run is
+            # NOT a completed result — call() returned deferred=True with
+            # escalation_queue_ids, signalling the run is paused for human/judge
+            # review. Committing the idempotency key here would mark it COMPLETED,
+            # so a retry would short-circuit to Response.deduped_response() (text='',
+            # NO deferred flag, NO escalation_queue_ids) — silently dropping the
+            # escalation signal. Instead, leave the lease unclaimed-for-commit so
+            # the finally (release-on-failure) releases it and a retry re-runs and
+            # re-surfaces the escalation. _idempotency_lease_held stays True here
+            # (we do NOT set it False), so the finally below releases the lease —
+            # the same at-least-once direction as the failure path.
+            _response_deferred = bool(getattr(response, "deferred", False))
+            if (
+                idempotency_key is not None
+                and _idempotency_lease_held
+                and not _response_deferred
+            ):
+                try:
+                    self.idempotency_backend.commit(
+                        idempotency_key, result_ref=self.run_id
+                    )
+                    _idempotency_lease_held = False  # commit() unlinks the lease
+                except Exception:  # noqa: BLE001 — intentionally broad: the LLM
+                    # run already succeeded; a commit() failure must NOT fail the
+                    # call. (IdempotencyBackendError is an Exception subclass, so a
+                    # single broad catch covers it — no need for a redundant tuple.)
+                    _logger.error(
+                        "idempotency commit() failed after successful run — "
+                        "lease will be released by finally; key may be re-runnable",
+                        exc_info=True,
+                    )
 
             # spec/39 MUST 1: sync the span accumulators from the final loop
             # accumulators on the success path so the body finally records the
@@ -4804,6 +5106,26 @@ class AtomicAgent:
                 self.tool_registry.unregister(_mcp_name)
             # Clear Policy snapshot at call exit — None outside of call().
             self._policy_snapshot_this_call = None
+            # spec/45 PR2: best-effort lease release on any non-success exit path.
+            # _idempotency_lease_held is False when:
+            #   - begin() was never called (no idempotency_key, or cost-skipped)
+            #   - commit() succeeded (it unlinks the lease and sets flag False)
+            # Only True when we own an IN_FLIGHT lease that was NOT committed.
+            # Wrap in try/except so an I/O error from release_lease() cannot
+            # propagate from finally and prevent the lock release below (Principle 8).
+            if idempotency_key is not None and _idempotency_lease_held:
+                try:
+                    self.idempotency_backend.release_lease(idempotency_key)
+                except Exception:  # noqa: BLE001 — best-effort, never propagate
+                    _logger.warning(
+                        "idempotency release_lease() failed in finally for key=%r "
+                        "(best-effort). No automatic sweep exists yet "
+                        "(supports_ttl=False) — if the key stays wedged IN_FLIGHT, "
+                        "an operator must clear its lease file manually or a later "
+                        "release_lease attempt must succeed.",
+                        idempotency_key,
+                        exc_info=True,
+                    )
             self.lock_backend.release(lock_handle)
 
     def _build_tool_loop_messages(

@@ -26,8 +26,14 @@ from .._io import safe_resolve_under
 from .._model import parse_model_md
 from .._platform import get_agents_root
 from ..exceptions import AtomicAgentsError, LockBusy, PathTraversalError
+from ..idempotency.filesystem import _MAX_KEY_LEN as _IDEMPOTENCY_KEY_MAX_LEN
 from ._config import ServeConfig
-from ._runner import LockBusyWithRunId, run_agent_call, shutdown_executor
+from ._runner import (
+    DedupInFlightWithRunId,
+    LockBusyWithRunId,
+    run_agent_call,
+    shutdown_executor,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -37,6 +43,7 @@ def make_app(
     agent_name: str | None = None,
     identity_header: str = ServeConfig.identity_header,
     max_body_bytes: int = ServeConfig.max_body_bytes,
+    idempotency_header: str = ServeConfig.idempotency_header,
 ) -> Starlette:
     """Build and return the Starlette app.
 
@@ -57,6 +64,10 @@ def make_app(
     header are also capped at this limit while streaming, so a lying or absent
     header cannot bypass the guard. Default: 1 MiB (1_048_576 bytes).
     CWE-770 / Finding #401.
+
+    ``idempotency_header``: the HTTP header name from which the caller-supplied
+    idempotency key is extracted (default: ``Idempotency-Key``). Absent header
+    → no deduplication (zero-change path). spec/45 PR2.
     """
     _agents_root: Path | None = agents_root
     _single_agent: str | None = agent_name
@@ -334,6 +345,70 @@ def make_app(
             raw_identity[:512] if raw_identity is not None else None
         )
 
+        # spec/45 PR2: extract idempotency key from the configured header.
+        # Absent header → None → no dedup (zero-change path). Present header:
+        # validate (reject values that contain path separators or NUL bytes —
+        # same guard as safe_resolve_under but for the header value, which feeds
+        # the idempotency filesystem key) and length-bound to the backend cap.
+        idempotency_header_name: str = request.app.state.idempotency_header
+        raw_idemp_key: str | None = request.headers.get(idempotency_header_name)
+        idempotency_key: str | None = None
+        if raw_idemp_key is not None:
+            # Validate before use. This guard MUST mirror the backend's
+            # _validate_key (idempotency/filesystem.py) so that a client-controlled
+            # invalid key surfaces as a clean HTTP 422 here rather than reaching
+            # lookup()/begin() and raising PathTraversalError — which, being an
+            # AtomicAgentsError, would be caught downstream and mapped to a
+            # misleading HTTP 500. Rejected: empty, '.'/'..', path separators,
+            # and any C0 control character (ord < 32, incl. NUL). spec/45 PR2.
+            #
+            # An idempotency key is a correctness-bearing identifier, not a
+            # display string: it MUST NOT be silently truncated. Two distinct
+            # caller keys sharing a prefix would otherwise collide into one dedup
+            # bucket, serving a genuinely-new request the cached result of an
+            # unrelated one (a dropped real run — the same false-dedup failure
+            # the queue helper explicitly refuses). So we REJECT over-length keys
+            # with a loud 422 rather than narrow them. The cap mirrors the
+            # backend's _MAX_KEY_LEN (2048). This serve guard is a strict SUPERSET
+            # of the backend's rejections — it additionally rejects backslash
+            # (a legal filename char on POSIX that the backend's name-check would
+            # accept), as cross-platform defense-in-depth at the HTTP edge. The
+            # load-bearing property is the superset relationship: no key passes
+            # serve that the backend would then reject (which would surface as a
+            # misleading 500); the reverse (serve stricter than backend) is the
+            # safe direction.
+            _bad_key = (
+                raw_idemp_key == ""
+                or raw_idemp_key in (".", "..")
+                or "/" in raw_idemp_key
+                or "\\" in raw_idemp_key
+                or any(ord(ch) < 32 for ch in raw_idemp_key)
+            )
+            if _bad_key:
+                return JSONResponse(
+                    {
+                        "status": "error",
+                        "error": (
+                            "Idempotency-Key header value is invalid: must be a "
+                            "non-empty bare string, not '.'/'..', and must not "
+                            "contain path separators or control characters"
+                        ),
+                    },
+                    status_code=422,
+                )
+            if len(raw_idemp_key) > _IDEMPOTENCY_KEY_MAX_LEN:
+                return JSONResponse(
+                    {
+                        "status": "error",
+                        "error": (
+                            "Idempotency-Key header value is too long: must not "
+                            f"exceed {_IDEMPOTENCY_KEY_MAX_LEN} characters"
+                        ),
+                    },
+                    status_code=422,
+                )
+            idempotency_key = raw_idemp_key
+
         try:
             run_id, response = await run_agent_call(
                 name=name,
@@ -343,6 +418,20 @@ def make_app(
                 temperature=temperature,
                 caller_identity=caller_identity,
                 agents_root=root,
+                idempotency_key=idempotency_key,
+            )
+        except DedupInFlightWithRunId as e:
+            # spec/45 PR2: idempotency key is currently IN_FLIGHT in another call.
+            # Return HTTP 409 Conflict with both the current run_id (for audit
+            # correlation) and the prior_run_id of the in-flight call. The caller
+            # can retry after the in-flight call completes or times out.
+            return JSONResponse(
+                {
+                    "status": "in_flight",
+                    "prior_run_id": e.prior_run_id,
+                    "run_id": e.run_id,
+                },
+                status_code=409,
             )
         except LockBusyWithRunId as e:
             # Include run_id so the caller can correlate the 503 with the JSONL
@@ -423,6 +512,31 @@ def make_app(
                 {"status": "skipped", "reason": response.skip_reason, "run_id": run_id},
                 status_code=402,
             )
+
+        # spec/45 PR2: deduped response — the idempotency key matched a COMPLETED
+        # record. Return the cached result via HTTP 200 with status='deduped'.
+        # cost_usd MUST be absent (not 0.0) per the spec/22 addendum: the deduped
+        # record carries no cost because no LLM spend occurred in this invocation.
+        # served_from_cache=true is a client-friendly boolean derived from the
+        # status field. replayed_run_id identifies the original run whose output
+        # is being replayed. CLAUDE.md principle 5 (audit trail is structural).
+        if response.deduped is True:
+            deduped_body: dict = {
+                "run_id": run_id,
+                "status": "deduped",
+                "served_from_cache": True,
+                "replayed_run_id": response.replayed_run_id,
+            }
+            # The cached output is NOT inlined in the deduped response. The dedup
+            # ledger is MARKER-ONLY (spec/45 MUST 5: no result body stored at any
+            # scale), so Response.deduped_response() carries no result bytes — only
+            # a result_ref. The caller resolves the actual output via
+            # OutcomeBackend.read_result(agent_id, result_ref) / by reading the original run's
+            # JSONL record. We deliberately do NOT emit a (misleadingly empty)
+            # "output" field. result_ref is the handle the caller uses to fetch it.
+            if response.result_ref is not None:
+                deduped_body["result_ref"] = response.result_ref
+            return JSONResponse(deduped_body, status_code=200)
 
         # spec/37 §"Response body": return only the operator-facing fields.
         # Internal bookkeeping (helper_provenance, tool_calls, captures,
@@ -628,4 +742,6 @@ def make_app(
     # to set app.state manually. _server.py may still override this if the
     # resolved config differs from the constructor default.
     app.state.identity_header = identity_header
+    # spec/45 PR2: bake idempotency_header into app state, mirroring identity_header.
+    app.state.idempotency_header = idempotency_header
     return app

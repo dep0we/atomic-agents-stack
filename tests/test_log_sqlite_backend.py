@@ -51,9 +51,14 @@ def _make_record(
     if ts is None:
         ts = datetime.now(timezone.utc).isoformat()
     return RunRecord(
-        ts=ts, run_id=run_id, primitive=primitive, status=status,
-        summary=summary, model=model,
-        input_tokens=input_tokens, output_tokens=output_tokens,
+        ts=ts,
+        run_id=run_id,
+        primitive=primitive,
+        status=status,
+        summary=summary,
+        model=model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
         **extras,
     )
 
@@ -92,9 +97,12 @@ def test_schema_created_on_first_append(tmp_path):
     backend = SQLiteLogBackend(db)
     backend.append(_make_record())
     conn = sqlite3.connect(db)
-    tables = [r[0] for r in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'"
-    ).fetchall()]
+    tables = [
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    ]
     assert "run_records" in tables
     assert "meta" in tables
 
@@ -105,9 +113,12 @@ def test_indexes_created(tmp_path):
     backend = SQLiteLogBackend(db)
     backend.append(_make_record())
     conn = sqlite3.connect(db)
-    indexes = {r[0] for r in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='index'"
-    ).fetchall()}
+    indexes = {
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        ).fetchall()
+    }
     # AUTOINCREMENT creates an internal index; only check the
     # named ones we explicitly create.
     assert "idx_ts" in indexes
@@ -119,16 +130,17 @@ def test_indexes_created(tmp_path):
 
 
 def test_schema_version_recorded(tmp_path):
-    """A fresh DB carries schema_version=1 in meta — pins the bump-on-change contract."""
+    """A fresh DB carries schema_version=2 in meta — pins the bump-on-change contract.
+
+    v2 adds idempotency_key + replayed_run_id columns (spec/45 PR2).
+    """
     db = tmp_path / "logs.db"
     backend = SQLiteLogBackend(db)
     backend.append(_make_record())
     conn = sqlite3.connect(db)
-    row = conn.execute(
-        "SELECT value FROM meta WHERE key = 'schema_version'"
-    ).fetchone()
+    row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
     assert row is not None
-    assert int(row[0]) == 1
+    assert int(row[0]) == 2
 
 
 def test_schema_version_mismatch_raises(tmp_path):
@@ -138,14 +150,182 @@ def test_schema_version_mismatch_raises(tmp_path):
     backend.append(_make_record())
     # Corrupt the version in a fresh connection.
     conn = sqlite3.connect(db)
-    conn.execute(
-        "UPDATE meta SET value = '999' WHERE key = 'schema_version'"
-    )
+    conn.execute("UPDATE meta SET value = '999' WHERE key = 'schema_version'")
     conn.commit()
     conn.close()
     # New backend instance — must refuse to open a future-schema DB.
     with pytest.raises(RuntimeError, match="schema version"):
         SQLiteLogBackend(db).append(_make_record())
+
+
+# ──────────────────────────────────────────────────────────────────
+# spec/45 PR2 / spec/22 addendum — SQLite v1 → v2 migration ladder.
+# Behavioral coverage of the ALTER/UPDATE/index-ordering migration (NOT
+# string-presence on the constants): a real v1 DB is built on disk, opened
+# by the backend, and the post-migration schema is asserted. Mirrors the
+# Postgres mock-conn migration test (cross-backend parity, CLAUDE.md
+# Principle 12 — verify before claim).
+
+# v1 CREATE statement: the run_records table as it existed at schema_version=1,
+# i.e. WITHOUT idempotency_key / replayed_run_id. Hand-rolled here so the test
+# does not depend on the v2 constant (which already carries the new columns).
+_V1_CREATE_RUN_RECORDS = """
+CREATE TABLE run_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    primitive TEXT NOT NULL,
+    status TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    model TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    cost_usd REAL,
+    cost_source TEXT,
+    latency_ms REAL,
+    cache_hit_tokens INTEGER,
+    cache_miss_tokens INTEGER,
+    mandate_id TEXT,
+    parent_run_id TEXT,
+    parent_agent TEXT,
+    trigger TEXT,
+    agent_name TEXT,
+    fallback INTEGER,
+    critical INTEGER,
+    extra TEXT NOT NULL DEFAULT '{}'
+)
+"""
+
+
+def _build_v1_db(db: Path, *, with_legacy_row: bool = True) -> None:
+    """Create a schema_version=1 SQLite DB on disk (pre-idempotency-columns)."""
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(_V1_CREATE_RUN_RECORDS)
+        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute("INSERT INTO meta (key, value) VALUES ('schema_version', '1')")
+        if with_legacy_row:
+            conn.execute(
+                "INSERT INTO run_records "
+                "(ts, run_id, primitive, status, summary, model, "
+                " input_tokens, output_tokens) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    _ts(2026, 6, 1),
+                    "legacy-run",
+                    "agent_call",
+                    "ok",
+                    "pre-migration row",
+                    "gpt-x",
+                    10,
+                    20,
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _table_columns(db: Path) -> set[str]:
+    conn = sqlite3.connect(db)
+    try:
+        return {
+            str(r[1]) for r in conn.execute("PRAGMA table_info(run_records)").fetchall()
+        }
+    finally:
+        conn.close()
+
+
+def test_sqlite_v1_to_v2_migration_adds_columns_index_and_bumps_version(tmp_path):
+    """Opening a real v1 DB MUST migrate it to v2: add both idempotency columns,
+    create idx_idempotency_key, bump meta.schema_version to 2 — and the legacy
+    row MUST survive with NULL for the new columns (no data loss).
+
+    This is the behavioral coverage the CHANGELOG/CLAUDE.md 'SQLite v1→v2
+    migration' claim asserts; without it the claim is unverified (the static
+    constant tests do not exercise the ALTER ladder)."""
+    db = tmp_path / "logs.db"
+    _build_v1_db(db, with_legacy_row=True)
+    # v1 precondition: neither v2 column exists yet (the real coverage — the
+    # self-compare "sanity" line was vacuous and was removed).
+    assert "idempotency_key" not in _table_columns(db)
+    assert "replayed_run_id" not in _table_columns(db)
+
+    # Open the backend — this triggers _ensure_schema()'s v1→v2 ladder.
+    backend = SQLiteLogBackend(db)
+    backend.append(_make_record())  # forces _get_conn()/_ensure_schema()
+
+    cols = _table_columns(db)
+    assert "idempotency_key" in cols, "migration MUST add idempotency_key column"
+    assert "replayed_run_id" in cols, "migration MUST add replayed_run_id column"
+
+    conn = sqlite3.connect(db)
+    try:
+        version = conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()[0]
+        assert int(version) == 2, "migration MUST bump schema_version to 2"
+        indexes = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
+        assert "idx_idempotency_key" in indexes, (
+            "migration MUST create idx_idempotency_key (spec/22 addendum)"
+        )
+        # Legacy row survives, with NULL for the two new columns.
+        legacy = conn.execute(
+            "SELECT idempotency_key, replayed_run_id FROM run_records "
+            "WHERE run_id = 'legacy-run'"
+        ).fetchone()
+        assert legacy == (None, None), (
+            "legacy row MUST survive migration with NULL idempotency fields"
+        )
+    finally:
+        conn.close()
+
+
+def test_sqlite_v1_to_v2_migration_resumes_after_partial_crash(tmp_path):
+    """CRASH/RETRY SAFETY: if a prior migration died AFTER the first ALTER
+    committed but BEFORE the meta UPDATE (schema_version still 1, one column
+    already present), reopening MUST complete the migration WITHOUT raising
+    'duplicate column name'. Pins the PRAGMA-guarded ALTER fix.
+
+    NEGATIVE CONTROL: with a bare (unguarded) ALTER the second open raises
+    sqlite3.OperationalError('duplicate column name idempotency_key') — verified
+    by manually adding only the first column below, which simulates the exact
+    partial-migration state."""
+    db = tmp_path / "logs.db"
+    _build_v1_db(db, with_legacy_row=True)
+
+    # Simulate a partial migration: first ALTER committed, meta still v1.
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("ALTER TABLE run_records ADD COLUMN idempotency_key TEXT")
+        conn.commit()
+    finally:
+        conn.close()
+    cols = _table_columns(db)
+    assert "idempotency_key" in cols and "replayed_run_id" not in cols, (
+        "precondition: exactly one of the two columns present (partial state)"
+    )
+
+    # Reopen — the guarded migration MUST skip the already-present column,
+    # add the missing one, and bump to v2 without raising.
+    backend = SQLiteLogBackend(db)
+    backend.append(_make_record())  # must NOT raise duplicate-column
+
+    cols = _table_columns(db)
+    assert "idempotency_key" in cols and "replayed_run_id" in cols
+    conn = sqlite3.connect(db)
+    try:
+        version = conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()[0]
+        assert int(version) == 2
+    finally:
+        conn.close()
 
 
 def test_wal_journal_mode_enabled(tmp_path):
@@ -198,10 +378,12 @@ def test_concurrent_appends_no_wal_race_under_repeated_runs(tmp_path):
 
         def worker(thread_id: int):
             for i in range(10):
-                backend.append(_make_record(
-                    run_id=f"i{iteration}-t{thread_id}-r{i}",
-                    ts=_ts(2026, 5, 15, thread_id),
-                ))
+                backend.append(
+                    _make_record(
+                        run_id=f"i{iteration}-t{thread_id}-r{i}",
+                        ts=_ts(2026, 5, 15, thread_id),
+                    )
+                )
 
         threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
         for t in threads:
@@ -289,18 +471,30 @@ def test_aggregate_group_by_extra_field_via_json1(tmp_path):
     """
     db = tmp_path / "logs.db"
     backend = SQLiteLogBackend(db)
-    backend.append(_make_record(
-        run_id="r1", primitive="outcome_iteration",
-        ts=_ts(2026, 5, 15, 10), extra={"iteration": 0},
-    ))
-    backend.append(_make_record(
-        run_id="r2", primitive="outcome_iteration",
-        ts=_ts(2026, 5, 15, 11), extra={"iteration": 1},
-    ))
-    backend.append(_make_record(
-        run_id="r3", primitive="outcome_iteration",
-        ts=_ts(2026, 5, 15, 12), extra={"iteration": 1},
-    ))
+    backend.append(
+        _make_record(
+            run_id="r1",
+            primitive="outcome_iteration",
+            ts=_ts(2026, 5, 15, 10),
+            extra={"iteration": 0},
+        )
+    )
+    backend.append(
+        _make_record(
+            run_id="r2",
+            primitive="outcome_iteration",
+            ts=_ts(2026, 5, 15, 11),
+            extra={"iteration": 1},
+        )
+    )
+    backend.append(
+        _make_record(
+            run_id="r3",
+            primitive="outcome_iteration",
+            ts=_ts(2026, 5, 15, 12),
+            extra={"iteration": 1},
+        )
+    )
     result = backend.aggregate(
         LogQuery(),
         LogAggregate(group_by=("iteration",), metric="count"),
@@ -352,15 +546,27 @@ def test_query_cost_source_actor_includes_legacy_null(tmp_path):
     """Backward-compat: records without cost_source count as 'actor'."""
     db = tmp_path / "logs.db"
     backend = SQLiteLogBackend(db)
-    backend.append(_make_record(
-        run_id="actor1", cost_source="actor", ts=_ts(2026, 5, 15, 10),
-    ))
-    backend.append(_make_record(
-        run_id="judge1", cost_source="judge", ts=_ts(2026, 5, 15, 11),
-    ))
-    backend.append(_make_record(
-        run_id="legacy", cost_source=None, ts=_ts(2026, 5, 15, 12),
-    ))
+    backend.append(
+        _make_record(
+            run_id="actor1",
+            cost_source="actor",
+            ts=_ts(2026, 5, 15, 10),
+        )
+    )
+    backend.append(
+        _make_record(
+            run_id="judge1",
+            cost_source="judge",
+            ts=_ts(2026, 5, 15, 11),
+        )
+    )
+    backend.append(
+        _make_record(
+            run_id="legacy",
+            cost_source=None,
+            ts=_ts(2026, 5, 15, 12),
+        )
+    )
     out = backend.query(LogQuery(cost_source="actor"))
     assert {r.run_id for r in out} == {"actor1", "legacy"}
 
@@ -376,9 +582,7 @@ def test_delete_older_than_pushes_to_sql(tmp_path):
     backend.append(_make_record(ts=_ts(2026, 1, 15), run_id="jan"))
     backend.append(_make_record(ts=_ts(2026, 3, 15), run_id="mar"))
     backend.append(_make_record(ts=_ts(2026, 5, 15), run_id="may"))
-    deleted = backend.delete_older_than(
-        datetime(2026, 4, 1, tzinfo=timezone.utc)
-    )
+    deleted = backend.delete_older_than(datetime(2026, 4, 1, tzinfo=timezone.utc))
     assert deleted == 2
     remaining = backend.query(LogQuery())
     assert {r.run_id for r in remaining} == {"may"}
@@ -395,10 +599,12 @@ def test_concurrent_appends_from_threads(tmp_path):
 
     def worker(thread_id: int):
         for i in range(10):
-            backend.append(_make_record(
-                run_id=f"t{thread_id}-r{i}",
-                ts=_ts(2026, 5, 15, thread_id),
-            ))
+            backend.append(
+                _make_record(
+                    run_id=f"t{thread_id}-r{i}",
+                    ts=_ts(2026, 5, 15, thread_id),
+                )
+            )
 
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
     for t in threads:
@@ -454,6 +660,7 @@ def test_url_rejects_netloc(tmp_path):
 def test_url_in_memory_three_slash_form(tmp_path):
     """SQLAlchemy-convention ``sqlite:///:memory:`` works alongside ``sqlite::memory:``."""
     import warnings
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
         backend = make_sqlite_backend_from_url("sqlite:///:memory:")
@@ -464,12 +671,13 @@ def test_url_in_memory_three_slash_form(tmp_path):
 def test_in_memory_construction_warns(tmp_path):
     """Step 11 security #4: :memory: emits a data-loss warning."""
     import warnings
+
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         make_sqlite_backend_from_url("sqlite::memory:")
-    assert any(
-        "non-persistent" in str(w.message) for w in caught
-    ), "Expected RuntimeWarning about in-memory non-persistence"
+    assert any("non-persistent" in str(w.message) for w in caught), (
+        "Expected RuntimeWarning about in-memory non-persistence"
+    )
 
 
 def test_canonical_columns_derived_from_run_record(tmp_path):
@@ -480,6 +688,7 @@ def test_canonical_columns_derived_from_run_record(tmp_path):
     field on RunRecord would surface in _CANONICAL_COLUMNS.
     """
     from atomic_agents.logs.sqlite import _CANONICAL_COLUMNS
+
     expected = frozenset(
         name for name in RunRecord.__dataclass_fields__ if name != "extra"
     )
@@ -492,11 +701,13 @@ def test_row_to_record_preserves_empty_required_strings(tmp_path):
     as `model=""`, not `model="n/a"`."""
     db = tmp_path / "logs.db"
     backend = SQLiteLogBackend(db)
-    backend.append(_make_record(
-        model="",  # empty string; not None
-        summary="",
-        run_id="empty_strings",
-    ))
+    backend.append(
+        _make_record(
+            model="",  # empty string; not None
+            summary="",
+            run_id="empty_strings",
+        )
+    )
     out = backend.tail(1)
     assert out[0].model == ""
     assert out[0].summary == ""
@@ -546,9 +757,7 @@ def test_get_default_log_backend_sqlite_with_url(tmp_path, monkeypatch):
     """Operator sets sqlite + URL → SQLiteLogBackend constructed."""
     db = tmp_path / "operator.db"
     monkeypatch.setenv("ATOMIC_AGENTS_LOG_BACKEND", "sqlite")
-    monkeypatch.setenv(
-        "ATOMIC_AGENTS_LOG_BACKEND_URL", f"sqlite:///{db}"
-    )
+    monkeypatch.setenv("ATOMIC_AGENTS_LOG_BACKEND_URL", f"sqlite:///{db}")
     backend = get_default_log_backend(tmp_path / "scope")
     assert isinstance(backend, SQLiteLogBackend)
 

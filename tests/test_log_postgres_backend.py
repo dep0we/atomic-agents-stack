@@ -1058,6 +1058,190 @@ def test_build_query_sql_any_for_tuple_primitive():
     assert set(list_param) == {"agent_call", "helper"}
 
 
+# ──────────────────────────────────────────────────────────────────
+# spec/45 PR2 / spec/22 addendum — idempotency_key parity (static, no DB).
+# These verify the Postgres backend honors the spec/22 versioned normative
+# addendum point 4 (LogQuery.idempotency_key MUST be an AND-predicate on
+# conforming backends) without requiring a live Postgres connection.
+
+
+def test_postgres_schema_has_idempotency_columns_and_index():
+    """The Postgres CREATE TABLE + index set MUST include the idempotency audit
+    columns + idx_idempotency_key (spec/22 addendum point 4). Without these,
+    LogQuery(idempotency_key=...) silently returns wrong results and the two
+    RunRecord audit fields are dropped on write."""
+    from atomic_agents.logs.postgres import (
+        _CREATE_INDEXES,
+        _CREATE_RUN_RECORDS,
+        _INSERT_COLUMNS,
+        _SCHEMA_VERSION,
+    )
+
+    assert "idempotency_key" in _CREATE_RUN_RECORDS, (
+        "Postgres run_records MUST have an idempotency_key column"
+    )
+    assert "replayed_run_id" in _CREATE_RUN_RECORDS, (
+        "Postgres run_records MUST have a replayed_run_id column"
+    )
+    assert "idempotency_key" in _INSERT_COLUMNS
+    assert "replayed_run_id" in _INSERT_COLUMNS
+    assert any("idx_idempotency_key" in stmt for stmt in _CREATE_INDEXES), (
+        "Postgres MUST create idx_idempotency_key (spec/22 addendum)"
+    )
+    # Schema bumped to v2 with the migration ladder.
+    assert _SCHEMA_VERSION == 2
+
+
+def test_postgres_build_query_sql_includes_idempotency_key_predicate():
+    """LogQuery(idempotency_key=...) MUST add an AND-predicate clause on the
+    Postgres backend (spec/22 addendum point 4). Without this clause the filter
+    is silently ignored and ALL records are returned."""
+    from atomic_agents.logs import LogQuery
+    from atomic_agents.logs.postgres import PostgresLogBackend
+
+    backend = PostgresLogBackend.__new__(PostgresLogBackend)
+    backend._host = "localhost"
+    backend._port = 5432
+    backend._dbname = "test"
+    backend._user = "u"
+    backend._password = "p"
+    backend._safe_url = "postgresql://u:***@localhost/test"
+    backend._tls = threading.local()
+
+    sql, params = backend._build_query_sql(
+        LogQuery(idempotency_key="my-key-123"),
+        select="*",
+        order_limit=False,
+    )
+    assert "idempotency_key = %s" in sql, (
+        "Postgres _build_query_sql MUST emit an idempotency_key AND-predicate"
+    )
+    assert "my-key-123" in params
+
+
+def test_postgres_build_query_sql_no_idempotency_predicate_when_absent():
+    """NEGATIVE control: LogQuery with NO idempotency_key MUST NOT add the
+    idempotency_key clause (so unfiltered queries return all records)."""
+    from atomic_agents.logs import LogQuery
+    from atomic_agents.logs.postgres import PostgresLogBackend
+
+    backend = PostgresLogBackend.__new__(PostgresLogBackend)
+    backend._host = "localhost"
+    backend._port = 5432
+    backend._dbname = "test"
+    backend._user = "u"
+    backend._password = "p"
+    backend._safe_url = "postgresql://u:***@localhost/test"
+    backend._tls = threading.local()
+
+    sql, _ = backend._build_query_sql(
+        LogQuery(run_id="r1"), select="*", order_limit=False
+    )
+    assert "idempotency_key" not in sql, (
+        "no idempotency_key filter -> no idempotency_key clause"
+    )
+
+
+def test_postgres_ensure_schema_v1_to_v2_migration_ladder_order():
+    """BEHAVIORAL coverage of the Postgres v1→v2 migration (not string-presence
+    on the constants): drive _ensure_schema() with a mock conn pre-seeded to
+    schema_version='1' and assert it issues BOTH idempotency ADD-COLUMN ALTERs
+    and the meta UPDATE BEFORE any idx_idempotency_key CREATE INDEX.
+
+    The ordering is load-bearing: idx_idempotency_key references the
+    idempotency_key column, so it MUST be created AFTER the ALTER that adds it.
+    No live Postgres required — mirrors the SQLite on-disk migration test for
+    cross-backend parity (the CHANGELOG/CLAUDE.md 'Postgres v1→v2 migration'
+    claim is otherwise unverified; static column-name string checks do not
+    exercise the ALTER/UPDATE ladder)."""
+    from atomic_agents.logs.postgres import PostgresLogBackend
+
+    backend = PostgresLogBackend.__new__(PostgresLogBackend)
+
+    executed: list[str] = []
+
+    def _execute(sql, params=None):
+        executed.append(sql)
+        cur = MagicMock()
+        # The meta SELECT inside _ensure_schema must report v1 so the migration
+        # ladder runs. Any other execute() returns a benign cursor.
+        if "SELECT value FROM meta" in sql:
+            cur.fetchone.return_value = {"value": "1"}
+        else:
+            cur.fetchone.return_value = None
+        return cur
+
+    conn = MagicMock()
+    conn.execute.side_effect = _execute
+
+    backend._ensure_schema(conn)
+
+    joined = "\n".join(executed)
+    # Both new columns added via idempotent ADD COLUMN IF NOT EXISTS.
+    assert any(
+        "ADD COLUMN IF NOT EXISTS" in s and "idempotency_key" in s for s in executed
+    ), "v1→v2 migration MUST ALTER ... ADD COLUMN IF NOT EXISTS idempotency_key"
+    assert any(
+        "ADD COLUMN IF NOT EXISTS" in s and "replayed_run_id" in s for s in executed
+    ), "v1→v2 migration MUST ALTER ... ADD COLUMN IF NOT EXISTS replayed_run_id"
+    # meta bumped to '2'.
+    assert any("UPDATE meta SET value = '2'" in s for s in executed), (
+        "v1→v2 migration MUST bump meta.schema_version to 2"
+    )
+
+    # Ordering invariant: the idempotency_key ALTER MUST precede the
+    # idx_idempotency_key CREATE INDEX (the index references the new column).
+    alter_idx = next(
+        i
+        for i, s in enumerate(executed)
+        if "ADD COLUMN IF NOT EXISTS" in s and "idempotency_key" in s
+    )
+    create_index_idx = next(
+        i for i, s in enumerate(executed) if "idx_idempotency_key" in s
+    )
+    assert alter_idx < create_index_idx, (
+        "ADD COLUMN idempotency_key MUST run BEFORE CREATE INDEX "
+        "idx_idempotency_key (the index references the column)"
+    )
+    # And the UPDATE meta MUST land before the index creation too (the ladder
+    # bumps the version, then creates indexes).
+    update_idx = next(
+        i for i, s in enumerate(executed) if "UPDATE meta SET value = '2'" in s
+    )
+    assert update_idx < create_index_idx
+    assert "idx_idempotency_key" in joined
+
+
+def test_postgres_ensure_schema_v2_db_skips_migration_ladder():
+    """NEGATIVE control: when the meta row already reports v2, _ensure_schema
+    MUST NOT issue any ADD COLUMN ALTER (the ladder is gated on existing==1).
+    Without this gate a warm DB would re-run the migration on every connect."""
+    from atomic_agents.logs.postgres import PostgresLogBackend, _SCHEMA_VERSION
+
+    backend = PostgresLogBackend.__new__(PostgresLogBackend)
+    executed: list[str] = []
+
+    def _execute(sql, params=None):
+        executed.append(sql)
+        cur = MagicMock()
+        if "SELECT value FROM meta" in sql:
+            cur.fetchone.return_value = {"value": str(_SCHEMA_VERSION)}
+        else:
+            cur.fetchone.return_value = None
+        return cur
+
+    conn = MagicMock()
+    conn.execute.side_effect = _execute
+
+    backend._ensure_schema(conn)
+
+    assert not any("ADD COLUMN" in s for s in executed), (
+        "a v2 DB MUST NOT re-run the ADD COLUMN migration ladder"
+    )
+    # Index creation still runs (idempotent CREATE INDEX IF NOT EXISTS).
+    assert any("idx_idempotency_key" in s for s in executed)
+
+
 def test_aggregate_injection_guard_raises_on_bad_identifier():
     """The SQL injection guard in aggregate() must reject malicious group_by
     field names before any SQL is executed. Mirrors test_aggregate_group_by_
@@ -1281,6 +1465,9 @@ def test_row_to_record_handles_jsonb_dict():
         "agent_name": None,
         "fallback": None,
         "critical": None,
+        # spec/45 PR2: post-migration these columns ALWAYS exist (NULL on old rows).
+        "idempotency_key": None,
+        "replayed_run_id": None,
         # JSONB returns a Python dict directly — must NOT json.loads this.
         "extra": {"iteration": 3, "nested": [1, 2]},
     }
@@ -1325,6 +1512,9 @@ def test_row_to_record_fallback_none_preserved():
         "agent_name": None,
         "fallback": None,  # Must stay None, not become False
         "critical": None,  # Must stay None, not become False
+        # spec/45 PR2: post-migration these columns ALWAYS exist (NULL on old rows).
+        "idempotency_key": None,
+        "replayed_run_id": None,
         "extra": {},
     }
 
@@ -1367,6 +1557,9 @@ def test_row_to_record_boolean_true_false():
         "agent_name": None,
         "fallback": True,
         "critical": False,
+        # spec/45 PR2: post-migration these columns ALWAYS exist (NULL on old rows).
+        "idempotency_key": None,
+        "replayed_run_id": None,
         "extra": {},
     }
 
@@ -1432,7 +1625,12 @@ def test_postgres_schema_created_on_first_append(pg_backend):
 
 @requires_postgres
 def test_postgres_schema_version_recorded(pg_backend):
-    """schema_version=1 must be written to the meta table on first init."""
+    """schema_version=2 must be written to the meta table on first init.
+
+    Bumped to 2 in #520 PR2 (idempotency_key + replayed_run_id columns +
+    idx_idempotency_key). A fresh init inserts the CURRENT _SCHEMA_VERSION (2)
+    directly; the v1->v2 migration ladder is covered by the mock-conn test above.
+    """
     import psycopg
 
     pg_backend.append(_make_record(run_id="version_test"))
@@ -1441,12 +1639,16 @@ def test_postgres_schema_version_recorded(pg_backend):
     row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
     conn.close()
     assert row is not None
-    assert int(row[0]) == 1
+    assert int(row[0]) == 2
 
 
 @requires_postgres
 def test_postgres_indexes_created(pg_backend):
-    """Six B-tree indexes matching the SQLite reference set must be created."""
+    """Seven B-tree indexes matching the SQLite reference set must be created.
+
+    Six base indexes + idx_idempotency_key (partial, WHERE idempotency_key IS NOT
+    NULL) added in #520 PR2.
+    """
     import psycopg
 
     pg_backend.append(_make_record(run_id="index_test"))
@@ -1464,6 +1666,7 @@ def test_postgres_indexes_created(pg_backend):
     assert "idx_parent_run_id" in index_names
     assert "idx_cost_source" in index_names
     assert "idx_mandate_id" in index_names
+    assert "idx_idempotency_key" in index_names
 
 
 @requires_postgres
