@@ -1,0 +1,343 @@
+# pubsub-to-call-transform.py.example - Pub/Sub push → /call transform
+#
+# NOT YET DOGFOODED against the live GCP platform.
+# Claims verified against GCP documentation as of 2026-06-17.
+# See extras/gcp/README.md §External-claim verification status.
+#
+# PURPOSE:
+# Pub/Sub push subscriptions deliver a JSON envelope to Cloud Run, NOT a flat
+# /call body. The serve layer expects {"work_item": "..."} at POST /agents/.../call.
+# This Cloud Function (or Eventarc trigger) bridges the two:
+#   (1) Receives the Pub/Sub push envelope from Cloud Run (the push endpoint)
+#   (2) Decodes message.data (base64 → UTF-8 JSON → {work_item, ...})
+#   (3) Derives the Idempotency-Key header from message.attributes OR messageId
+#   (4) Forwards the flat body + Idempotency-Key header to the Cloud Run /call endpoint
+#
+# This transform REPLACES the push subscription endpoint. The Pub/Sub push
+# subscription's endpoint is this Cloud Function URL, NOT the Cloud Run /call URL
+# directly.
+#
+# WHY A TRANSFORM IS NEEDED:
+# Pub/Sub push delivers:
+#   POST /your-function-url HTTP/1.1
+#   {"message": {"data": "<base64>", "messageId": "...", "attributes": {...}},
+#    "subscription": "projects/..."}
+#
+# Cloud Run /call expects:
+#   POST /agents/<name>/call HTTP/1.1
+#   Idempotency-Key: <key>
+#   {"work_item": "..."}
+#
+# Without this transform, /call receives the raw Pub/Sub envelope and returns
+# HTTP 422 (work_item missing) on every delivery.
+#
+# IDEMPOTENCY KEY STRATEGY (two tiers):
+#
+#   TIER 1 — STABLE KEY (recommended for cross-republish dedup):
+#     Use message.attributes["idempotency_key"] when the publisher sets it.
+#     The same logical message always uses the same key, even if republished.
+#     The publisher bears responsibility for setting this attribute.
+#     This is the "explicit key wins" path (spirit of spec/45 W8).
+#
+#   TIER 2 — DELIVERY KEY (default, at-least-once posture):
+#     Fall back to message.messageId when the attribute is absent.
+#     message.messageId is stable across SERVICE-initiated redeliveries of the
+#     SAME message — redeliveries of the same unacked message get the same
+#     messageId, so dedup works across those retries.
+#     BUT messageId stability is narrower than it looks (two non-dedup cases):
+#       (a) a republished message (re-injected by the operator, or wrapped onto
+#           a dead-letter topic) gets a NEW messageId → the agent re-runs;
+#       (b) the publisher CLIENT library retries publishes by default, and
+#           "multiple unique publishes by the publishing client, across retries,
+#           lead to redeliveries with DIFFERENT message IDs" (GCP exactly-once
+#           doc) → a transient blip during the ORIGINAL publish yields two
+#           messages with different messageIds for the same logical work item,
+#           and Tier 2 silently re-runs with NO operator involved.
+#     This is at-least-once, not exactly-once. Use Tier 1 (explicit attribute)
+#     for any dedup guarantee that must survive republish OR publish-time retries.
+#
+#   ABSENT KEY (no dedup, OR body-hash auto-derive — depends on model.md):
+#     If neither attribute nor messageId is available (should not happen in
+#     practice), the transform omits the Idempotency-Key header entirely.
+#     With dedup_body_hash_enabled=False (the default): absent header = no
+#     dedup per spec/45 — the call runs unconditionally.
+#     With dedup_body_hash_enabled=True in model.md AND serve's trigger='http'
+#     (which is in _BODY_HASH_AUTO_DERIVE_TRIGGERS={http,queue,cron}): the
+#     framework AUTO-derives the key from sha256(work_item+model+max_tokens+
+#     temperature) precisely WHEN the header is absent (agent.py
+#     _BODY_HASH_AUTO_DERIVE_TRIGGERS) — so a bit-identical redelivery (including
+#     a republished message with a NEW messageId but identical body) is deduped
+#     to a text='' replayed Response even with no header. An explicit
+#     Idempotency-Key always wins on any trigger (zero-override).
+#     PRECONDITION: if you deliberately remove the messageId fallback (below) to
+#     force this no-header path, dedup ONLY fires when dedup_body_hash_enabled=True
+#     is ALSO set in model.md. The default is False = NO dedup on an absent header
+#     (the call runs unconditionally). Wiring the no-header path without the flag
+#     yields no dedup with no warning — verify BOTH before relying on it.
+#
+# IMPORTANT PATH DISTINCTION:
+#   This transform uses the HTTP-trigger idempotency path: it sets the
+#   Idempotency-Key HTTP HEADER on the forwarded /call request.
+#   This is NOT the queue-trigger payload field path (spec/45 W8).
+#   The messageId fallback is safe here (no false-dedup hazard) because messageId
+#   is GLOBALLY UNIQUE per publish (a republish — or a publisher-client retry —
+#   gets a new id) — which is exactly the uniqueness property spec/45 W8 requires
+#   of any dedup key. W8 refuses the queue extractor's payload[id] fallback
+#   because work-item ids are NOT globally unique across distinct items
+#   (→ false-dedup → dropped run); messageId carries none of that hazard, so the
+#   fallback is valid. NOTE the flip side of that uniqueness: because each publish
+#   gets a distinct id, Tier 2 dedups ONLY service-initiated redeliveries of one
+#   message — NOT republishes and NOT publisher-client publish retries (see the
+#   Tier 2 caveats above). The explicit-attribute Tier 1 is the stronger
+#   guarantee — it dedups across republish AND publish-time retries, which
+#   messageId does not.)
+#
+# NOT DOGFOODED — verified against:
+#   Cloud Functions Gen2 Pub/Sub trigger: https://cloud.google.com/functions/docs/calling/pubsub
+#   Pub/Sub push envelope format: https://cloud.google.com/pubsub/docs/push
+#   base64 module: https://docs.python.org/3/library/base64.html
+#
+
+import base64
+import json
+import logging
+import os
+
+import functions_framework
+import google.auth
+import google.auth.transport.requests
+import google.oauth2.id_token
+import requests
+
+logger = logging.getLogger(__name__)
+
+# Cloud Run /call endpoint for the agent.
+# Set this env var when deploying the Cloud Function. The deploy MUST specify
+# --gen2 (the entire IAM/invoke discussion in pubsub-ingestion.yaml.example
+# assumes a Gen2 function) and --no-allow-unauthenticated (the security model
+# requires the function to be private / OIDC-only — a publicly-invokable
+# transform bypasses the perimeter). It must ALSO set --timeout high enough that
+# the function is not SIGKILLed before its own `requests` timeout (620s, below)
+# can fire: the timeout chain is
+#     function --timeout  >=  requests timeout (620s)  >=  ackDeadlineSeconds (600s)
+# and Cloud Run --timeout >= ackDeadlineSeconds. Gen2 HTTP functions default to
+# a 60s timeout (max 3600s) — at the default the function dies mid-call, Pub/Sub
+# redelivers while agent.call() may still be running, and the 504→NACK→409 storm
+# (see pubsub-ingestion.yaml.example §ACK DEADLINE) is triggered by an avoidable
+# cause. Set --timeout=3600 (or at minimum > 620).
+#   gcloud functions deploy pubsub-to-call \
+#     --gen2 \
+#     --runtime=python312 \
+#     --region=${REGION} \
+#     --trigger-http \
+#     --no-allow-unauthenticated \
+#     --entry-point=handle_pubsub_push \
+#     --timeout=3600 \
+#     --set-env-vars CLOUD_RUN_CALL_URL=https://YOUR_SERVICE_URL/agents/YOUR_AGENT/call,CLOUD_RUN_SERVICE_URL=https://YOUR_SERVICE_URL
+CLOUD_RUN_CALL_URL = os.environ["CLOUD_RUN_CALL_URL"]
+
+# Cloud Run service base URL (for OIDC audience, no trailing slash).
+# Usually the same as the service URL up to the path portion.
+CLOUD_RUN_SERVICE_URL = os.environ["CLOUD_RUN_SERVICE_URL"]
+
+
+@functions_framework.http
+def handle_pubsub_push(request):
+    """
+    Cloud Functions Gen2 HTTP handler that receives a Pub/Sub push envelope
+    and forwards the decoded payload to the Cloud Run /call endpoint.
+
+    Pub/Sub push sends a JSON body with:
+      {
+        "message": {
+          "data": "<base64-encoded payload>",
+          "messageId": "...",
+          "attributes": {"idempotency_key": "optional-stable-key", ...},
+          "publishTime": "..."
+        },
+        "subscription": "projects/PROJECT/subscriptions/SUBSCRIPTION"
+      }
+
+    Response mapping (Pub/Sub ACKs only 2xx; any non-2xx is a NACK):
+      204  → ACK   (serve returned 200 = ok / deduped / DEFERRED(ESCALATE) —
+                    see the deferred caveat on the 200 handler below)
+      400  → NACK  (malformed envelope/payload — a poison message; will be
+                    redelivered until maxDeliveryAttempts, then DLQ for
+                    operator inspection. NACK is deliberate: a 4xx here is
+                    surfaced via the DLQ rather than silently dropped.)
+      500  → NACK  (every non-200 serve response, redelivered after backoff;
+                    these are NOT all the same kind of failure — see below)
+
+    The 500→NACK bucket folds three distinct serve responses; the operator
+    tuning retry backoff needs to tell them apart:
+      409 in-flight       — TRANSIENT: a concurrent run holds the lease;
+                            resolves once that run terminates (then dedups or
+                            re-runs). Expected within the retry window.
+      503 lock_busy       — TRANSIENT: FilesystemLockBackend busy (spec/37
+                            MUST 9 / TENSIONS T2). Retry succeeds; but a
+                            PERSISTENT 503 storm signals lock-pool saturation
+                            (the maxConcurrentDispatches=1 concern), NOT a
+                            poison message — reduce concurrency, don't churn.
+      402 / 422 / other 5xx — DETERMINISTIC refusals (see status handling
+                            below): a redelivery re-hits the same gate and
+                            burns the retry budget before dead-lettering.
+    """
+    try:
+        envelope = request.get_json(silent=True)
+        if envelope is None:
+            logger.error("Empty or non-JSON Pub/Sub push envelope")
+            return ("Bad request: expected JSON body", 400)
+
+        message = envelope.get("message")
+        if not message:
+            logger.error("Pub/Sub envelope missing 'message' field")
+            return ("Bad request: missing message", 400)
+
+        # ── STEP 1: Decode message.data ────────────────────────────────────────
+        # Pub/Sub message.data is standard base64 (RFC 4648 §4, with = padding).
+        # base64.b64decode() handles padded and unpadded input.
+        # Do NOT use atob() — it is a browser API, not available in Cloud Functions.
+        raw_data = message.get("data", "")
+        if raw_data:
+            try:
+                decoded_bytes = base64.b64decode(raw_data)
+                work_payload = json.loads(decoded_bytes.decode("utf-8"))
+            except Exception as e:
+                logger.error("Failed to decode message.data: %s", e)
+                return (f"Bad request: invalid message data: {e}", 400)
+        else:
+            # Empty data — no work_item to forward. Rejected by the transform
+            # itself below (returns 400, NACK), so serve is never reached.
+            work_payload = {}
+
+        # Ensure work_payload has work_item (required by serve layer, spec/37).
+        if "work_item" not in work_payload or not work_payload["work_item"]:
+            logger.error("Decoded message.data missing 'work_item' field")
+            return ("Bad request: work_item missing or empty in decoded data", 400)
+
+        # Drop `critical` before forwarding. The serve layer HARD-REFUSES
+        # critical=true with HTTP 422 (spec/37 MUST 5 — the cost guardrail
+        # cannot be bypassed from the network). A publisher that puts
+        # critical=true in message.data (innocently or as a bypass attempt)
+        # would otherwise produce a deterministic 422 on every delivery and
+        # burn the full maxDeliveryAttempts budget → DLQ storm. Popping it here
+        # matches serve's own "silently ignored unless explicitly true" posture
+        # (serve/_app.py): a forwarded body never carries critical.
+        if "critical" in work_payload:
+            logger.warning("Dropping publisher-supplied 'critical' field (refused by serve, spec/37 MUST 5)")
+            work_payload.pop("critical", None)
+
+        # ── STEP 2: Derive Idempotency-Key ────────────────────────────────────
+        # Idempotency-Key MUST be an HTTP HEADER on the /call request.
+        # message.attributes are in the Pub/Sub envelope body and do NOT
+        # automatically become HTTP headers — this step is mandatory.
+        attributes = message.get("attributes", {}) or {}
+        message_id = message.get("messageId", "")
+
+        # Attribute-precedence rule:
+        #   - Explicit publisher attribute (stable across republish — use for
+        #     exactly-once dedup when publisher controls the key)
+        #   - Fall back to messageId (stable across Pub/Sub retries for the same
+        #     delivery event, but a republished message gets a new messageId)
+        idempotency_key = attributes.get("idempotency_key") or message_id
+        if idempotency_key:
+            logger.info(
+                "Idempotency-Key derived from %s: %s",
+                "attribute" if attributes.get("idempotency_key") else "messageId",
+                idempotency_key,
+            )
+
+        # ── STEP 3: Obtain OIDC token for Cloud Run ───────────────────────────
+        # The Cloud Function must authenticate to Cloud Run using an OIDC token
+        # targeting the Cloud Run service URL (no trailing slash).
+        auth_req = google.auth.transport.requests.Request()
+        id_token = google.oauth2.id_token.fetch_id_token(auth_req, CLOUD_RUN_SERVICE_URL)
+
+        # ── STEP 4: Forward to Cloud Run /call ────────────────────────────────
+        # Two separate steps made explicit so operators can verify each:
+        #   (a) the /call body = the decoded work payload
+        #   (b) the Idempotency-Key header = the derived key
+        call_body = work_payload  # {"work_item": "...", ...}
+        call_headers = {
+            # Content-Type: application/json is REQUIRED — the serve layer
+            # parses the body as JSON directly. Do not use requests.post(data=...)
+            # without this header (data= defaults to form-encoding, not JSON).
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {id_token}",
+        }
+        if idempotency_key:
+            # Idempotency-Key must be in the HTTP HEADER, not in the body.
+            # The serve layer reads only the configured header (default: Idempotency-Key).
+            # It does NOT read idempotency_key from the JSON body.
+            call_headers["Idempotency-Key"] = idempotency_key
+
+        resp = requests.post(
+            CLOUD_RUN_CALL_URL,
+            json=call_body,      # json= sets Content-Type: application/json automatically
+            headers=call_headers,
+            timeout=620,         # > ackDeadlineSeconds=600 to avoid client-timeout retry loops
+        )
+
+        if resp.status_code == 200:
+            # 200 covers THREE serve outcomes that share the same status line:
+            # ok, deduped, AND a DEFERRED (ESCALATE-on-first-delivery) run —
+            # serve has no distinct status code or body field for a deferred
+            # run (Response.deferred=True falls through to the status:"ok" 200
+            # path), so the transform cannot tell them apart at the HTTP layer.
+            # ACKing is correct for all three, but note what ACK means for the
+            # deferred case:
+            #   - ok / deduped: the work is done; nothing more to do.
+            #   - deferred (ESCALATE): the lease is RELEASED without committing
+            #     (spec/45 W4), but ACK still ENDS delivery of THIS message —
+            #     Pub/Sub does NOT auto-redeliver an ACKed message. The
+            #     escalation is NOT lost: it is durably enqueued in the agent's
+            #     own escalation/proposal queue (JSONL escalation_queue_id +
+            #     PENDING files) and surfaced via the dashboard, independent of
+            #     the Pub/Sub message lifecycle. Re-PROCESSING the original work
+            #     item after a human resolves the escalation requires a
+            #     deliberate operator RE-PUBLISH (which, with a Tier-1 explicit
+            #     idempotency_key attribute, re-runs predictably). Do NOT rely on
+            #     automatic redelivery to re-surface deferred work — there is
+            #     none. Monitor the escalation queue for deferred runs.
+            logger.info("Cloud Run /call returned 200 (ok/deduped/deferred) — ACKing message")
+            return ("", 204)  # ACK the Pub/Sub message
+
+        if resp.status_code == 409:
+            # 409 = IN-FLIGHT: a DIFFERENT concurrent run currently holds the
+            # idempotency lease; the result does NOT yet exist. We MUST NOT ACK
+            # here — if that in-flight run later fails/ESCALATEs/is killed, its
+            # lease is RELEASED without committing (spec/45 W4: deferred/skipped
+            # MUST NOT commit), so this redelivery would be the only surviving
+            # copy. ACKing it would silently drop the work, violating the
+            # at-least-once contract. NACK instead so Pub/Sub redelivers after
+            # backoff: the redelivery either finds the key COMPLETED (→200,
+            # deduped, ACK) or finds the in-flight run gone and re-runs. Repeated
+            # 409s within the retry window are EXPECTED and resolve once the
+            # original run terminates; a genuinely-wedged key reaches the DLQ
+            # after maxDeliveryAttempts (see README §Troubleshooting stale-lease
+            # recovery). Tune ackDeadline + retryPolicy backoff to avoid a tight
+            # redelivery storm — do NOT "fix" the storm by ACKing in-flight work.
+            logger.warning("Cloud Run /call returned 409 in-flight — NACKing for retry")
+            return ("Cloud Run in-flight (409): retry after completion", 500)  # NACK
+
+        # 402 (cost cap), 422 (bad request), 5xx (server error): NACK and let
+        # Pub/Sub redeliver. NOTE: 422 is an unconditionally deterministic refusal
+        # (a malformed body is malformed on every delivery). 402 is deterministic
+        # WITHIN the redelivery window only: the cost cap is a ROLLING daily/monthly
+        # window (sum_cost_for_period over today/this_month in _costs.py), not a
+        # fixed per-request cap — a delivery that lands after the window rolls could
+        # succeed. But Pub/Sub's 5×≤600s retry budget stays inside the day, so a
+        # 402 will keep recurring and exhaust maxDeliveryAttempts before the day
+        # rolls. Either way the redelivery re-hits the same gate and burns the
+        # budget before dead-lettering. That is the documented behavior (README
+        # redelivery table); the DLQ is where these terminal-but-refused messages
+        # surface for operator inspection. If you would rather fast-route a
+        # deterministic 4xx (or a within-window 402) to the DLQ without spending
+        # the retry budget, ACK (204) it here with a structured error log instead
+        # — a deliberate tradeoff, not the default.
+        logger.error("Cloud Run /call returned %s: %s", resp.status_code, resp.text[:200])
+        return (f"Cloud Run error: {resp.status_code}", 500)  # NACK
+
+    except Exception as e:
+        logger.exception("Unexpected error in pubsub-to-call transform: %s", e)
+        return (f"Internal error: {e}", 500)  # NACK

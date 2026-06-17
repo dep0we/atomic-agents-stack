@@ -1,7 +1,8 @@
 # cloud-monitoring-policies.yaml - Cloud Monitoring alert policies
 #
 # NOT YET DOGFOODED against the live GCP platform.
-# Claims verified against GCP documentation as of 2026-06-09.
+# Claims verified against GCP documentation as of 2026-06-17 (policy 5 DLQ-depth
+# metric); prior policies (1-4) as of 2026-06-09.
 # See extras/gcp/README.md §External-claim verification status.
 #
 # IMPORTANT: The JSONL audit trail (run_id, cost_usd, status, etc.) lives in
@@ -166,3 +167,76 @@
         aggregations:
           - alignmentPeriod: 60s
             perSeriesAligner: ALIGN_MEAN
+
+# ── 5. DLQ depth > 0 (dead-lettered Pub/Sub messages pending) ────────────────
+#
+# IMPORTANT: This policy monitors a Pub/Sub SUBSCRIPTION resource
+# (resource.type = "pubsub_subscription"), NOT a Cloud Run revision.
+# The filter and aligner differ from policies 1-4 above.
+#
+# PREREQUISITE (REQUIRED — alert NEVER fires without this):
+# The dead-letter TOPIC must have its own SUBSCRIPTION. The metric
+# pubsub.googleapis.com/subscription/num_undelivered_messages is a
+# SUBSCRIPTION-level metric — a topic with no subscriber emits no data points.
+# A DLQ topic without a subscription also means all dead-lettered messages are
+# PERMANENTLY LOST (Pub/Sub discards unsubscribed messages).
+#
+# Create the DLQ pull subscription:
+#   gcloud pubsub subscriptions create <dlq-subscription-name> \
+#     --topic=<dlq-topic-name> --project=<your-project-id>
+#
+# Recommended: atomic-agents-deadletter-sub on topic atomic-agents-deadletter.
+# See extras/gcp/pubsub-ingestion.yaml.example for the full provisioning sequence.
+#
+# METRIC CHOICE:
+# This policy uses pubsub.googleapis.com/subscription/num_undelivered_messages
+# which measures the CURRENT BACKLOG (unacknowledged messages) on the DLQ
+# subscription (GAUGE, INT64). This is the correct metric for "DLQ has
+# unprocessed messages that need operator attention."
+# (Verified: https://cloud.google.com/monitoring/api/metrics_gcp#gcp-pubsub)
+#
+# An alternative metric, subscription/dead_letter_message_count (DELTA, INT64),
+# counts cumulative messages forwarded TO the dead-letter topic per response_code
+# — useful for trend analysis, not threshold alerting.
+#
+# FILTER: targets the dead-letter PULL subscription, not the original push
+# subscription. Adjust <your-dlq-subscription-name> to match the subscription
+# created above (e.g. atomic-agents-deadletter-sub).
+#
+# OPERATIONAL CHECK: If this alert never fires despite confirmed dead-lettered
+# messages, verify:
+#   (a) The DLQ topic has an active pull subscription.
+#   (b) The filter subscription_id matches THAT subscription's name exactly.
+#   gcloud pubsub subscriptions list --filter="topic:<dlq-topic-name>"
+#
+# Cross-reference: see extras/gcp/pubsub-ingestion.yaml.example §STEP 2 for
+# the DLQ pull subscription creation command.
+- displayName: "Pub/Sub DLQ depth > 0 — dead-lettered messages pending"
+  combiner: OR
+  conditions:
+    - displayName: "DLQ subscription has undelivered messages"
+      conditionThreshold:
+        # resource.type = "pubsub_subscription" — distinct from cloud_run_revision
+        # used in policies 1-4. The label key is subscription_id (not service_name).
+        # resource.labels.subscription_id verified at:
+        # https://cloud.google.com/monitoring/api/metrics_gcp#gcp-pubsub
+        filter: >
+          resource.type = "pubsub_subscription"
+          AND resource.labels.subscription_id = "<your-dlq-subscription-name>"
+          AND metric.type = "pubsub.googleapis.com/subscription/num_undelivered_messages"
+        comparison: COMPARISON_GT
+        thresholdValue: 0
+        # duration=0s fires as soon as the metric reads > 0 (no sustained-window
+        # requirement). For noisy queues, increase to 60s to avoid alert flap.
+        duration: 0s
+        aggregations:
+          # ALIGN_MEAN for a GAUGE metric (current backlog, not a delta).
+          # num_undelivered_messages is a GAUGE — use ALIGN_MEAN, not ALIGN_SUM.
+          - alignmentPeriod: 60s
+            perSeriesAligner: ALIGN_MEAN
+  alertStrategy:
+    notificationRateLimit:
+      # Re-alert at most every 30 minutes while the DLQ stays non-empty.
+      period: 1800s
+  # Attach a notification channel via the GCP console.
+  # notificationChannels: []

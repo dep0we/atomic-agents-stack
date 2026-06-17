@@ -191,6 +191,15 @@ spec:
           #   .personas/    EPHEMERAL - persona-backend storage (FilesystemPersonaBackend,
           #                 <root>/.personas/<persona_id>/); gated on the PersonaBackend
           #                 cloud adapter, #258 (Phase 3). NOT cascade work-claim leases.
+          #   idempotency/  EPHEMERAL - FilesystemDedupLedger (spec/45; #520). Dedup
+          #                 lease (*.lease.json) and terminal (*.terminal.json) files
+          #                 live here. LOST on container replacement — a redelivered
+          #                 message arriving after restart sees FRESH and re-runs.
+          #                 Dedup-across-restarts requires Redis/Postgres IdempotencyBackend.
+          #                 On the VM topology (persistent disk): stale *.lease.json files
+          #                 from a crashed run require manual removal (TTL sweep deferred;
+          #                 spec/45 supports_ttl=False). See extras/gcp/README.md
+          #                 §Troubleshooting for the stale-lease recovery command.
           #
           # For the LAYOUT RULE (never mount at the agent folder root - see why in
           # extras/gcp/compute-vm/README.md §CRITICAL LAYOUT RULE), which applies
