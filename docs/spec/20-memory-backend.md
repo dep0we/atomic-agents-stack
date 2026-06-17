@@ -439,9 +439,9 @@ Third-party backends MUST NOT be required to accept them.
 ## Operator override surface
 
 Added in #382 PR 1. Mirrors the `LockBackend` (#60 PR 3) / `LogBackend`
-(#61 PR 3) override surface, minus the `_URL` companion var
-(`ATOMIC_AGENTS_MEMORY_BACKEND_URL`), which is deferred to #258 (the first
-memory backend that needs a connection URL — Postgres/pgvector).
+(#61 PR 3) override surface, including the `_URL` companion var
+(`ATOMIC_AGENTS_MEMORY_BACKEND_URL`) shipped in #258 PR 1 (the first
+memory backend that needs a connection URL — `PostgresMemoryBackend`).
 
 ### Selection mechanism
 
@@ -566,7 +566,7 @@ Two checks mirror the `check_lock_backend` / `check_locks` pair:
 | Check name | Type | What it verifies |
 |------------|------|-----------------|
 | `memory-backend-config` | coherence | `ATOMIC_AGENTS_MEMORY_BACKEND` is a known id AND (for non-filesystem ids) constructs |
-| `memory-backend` | liveness | factory resolves and `stats()` returns |
+| `memory-backend` | liveness | factory resolves and `list_notes()` returns (re-raising probe) |
 
 The liveness check (and the non-filesystem branch of the coherence check)
 route through `get_default_memory_backend` so doctor's verdict and the
@@ -578,9 +578,19 @@ The liveness check first probes the on-disk `memory/` directory — but this is
 a **filesystem-shaped precheck that only runs when the configured backend is
 `filesystem`**. When `ATOMIC_AGENTS_MEMORY_BACKEND` names a non-filesystem
 backend (the #258 Postgres/pgvector case this seam exists to enable), the
-on-disk guard is skipped and the factory + `stats()` probe is authoritative —
-a healthy non-local backend with no local `memory/` dir must not spuriously
-FAIL. Both doctor checks construct the backend through the factory and call
+on-disk guard is skipped and the factory + `list_notes()` probe is
+authoritative — a healthy non-local backend with no local `memory/` dir must
+not spuriously FAIL. The probe calls `list_notes()` (which surfaces an
+unrecoverable read as an exception — `MemoryBackendError` on connection-backed
+backends such as Postgres, which wrap and re-raise; a raw `OSError` on the
+`FilesystemBackend` reference impl, whose `list_notes()` does not wrap reads
+today) rather than `stats()`: doctor's liveness gate catches broad `Exception`,
+so either surface FAILs the check. `stats()` is not used because
+connection-backed backends degrade `stats()` silently to an empty
+`MemoryStats` on failure, which would false-PASS a dead backend (the
+doctor-dual-probe lesson — the swallowing op hides the error). `stats()` is
+still called afterwards, but only for the note count, never as the liveness
+gate. Both doctor checks construct the backend through the factory and call
 `close()` on it (when the backend exposes one) so a future connection-backed
 backend does not leak a connection per doctor run.
 
@@ -610,3 +620,239 @@ Raw bytes are read directly from disk (Tier A byte-exact fidelity). The `include
 flag in `MemoryExportQuery` is deferred (treated as `False` until issue #433 ships).
 
 For the full normative export contract, see `docs/spec/40-canonical-export.md`.
+
+Future Postgres/pgvector backends: set `supports_canonical_export = True` when
+their export impl ships. `PostgresMemoryBackend` (shipped in #258 PR 1) sets
+`supports_canonical_export = True` and uses `render_note_bytes_from_object(note)`
+for Tier B field-lossless fidelity (not Tier A byte-exact).
+
+---
+
+## PostgresMemoryBackend — Postgres reference implementation
+
+> **NON-NORMATIVE.** This section describes `PostgresMemoryBackend` shipping in
+> issue #258 PR 1. It does not amend or supersede any LOCKED MUST in this spec.
+> All 7 LOCKED normative MUSTs (MUST 1-7) in the Implementer Contract section
+> remain unchanged. This section documents Postgres-specific behavior that is
+> PERMITTED by those MUSTs and fills in implementation details that the
+> Protocol intentionally leaves to implementers.
+
+### Motivation
+
+`PostgresMemoryBackend` is the first non-filesystem reference impl for
+`MemoryBackend`. It targets multi-host deployments (Cloud Run fleet, shared
+database, zero local disk dependency) where `FilesystemBackend`'s single-node
+file layout is insufficient.
+
+PR 1 ships: FTS (tsvector) recall, Tier B field-lossless export, MUST-1 uniform
+construction, multi-thread connection management, and spec/20 conformance.
+
+PR 2/PR 3 (pgvector + `EmbeddingBackend` Protocol #200): deferred.
+
+### Selection
+
+```bash
+ATOMIC_AGENTS_MEMORY_BACKEND=postgres
+ATOMIC_AGENTS_MEMORY_BACKEND_URL=postgresql://user:pass@host:5432/dbname
+```
+
+`get_default_memory_backend()` reads `ATOMIC_AGENTS_MEMORY_BACKEND_URL` from
+the environment when `ATOMIC_AGENTS_MEMORY_BACKEND=postgres` is selected.
+Missing URL raises `ValueError` at agent construction time (fail-fast, per
+spec/20 MUST 1 uniform construction requirement extended to connection-backed
+backends). `ATOMIC_AGENTS_MEMORY_BACKEND_URL` is the canonical companion env
+var for this backend, mirroring `ATOMIC_AGENTS_LOG_BACKEND_URL`.
+
+### Construction signature
+
+`PostgresMemoryBackend(agent_root, *, lock_backend=None, url=None)` — satisfies
+MUST 1. The `url` kwarg (default `None`) is NOT part of the normative MUST 1
+signature; it is a Postgres-specific extension. When `url=None`, the backend
+reads from `ATOMIC_AGENTS_MEMORY_BACKEND_URL`. The factory
+`make_postgres_memory_backend_from_url(url, agent_root, lock_backend)` is the
+recommended construction path for programmatic callers.
+
+### WritePolicy enforcement (MUST 5 Postgres interpretation)
+
+spec/20 MUST 5 requires every mutating operation to verify the target is under
+`write_paths` and NOT under `read_only_paths`. For a Postgres backend there is
+no filesystem path — all notes are SQL row-addressed. The Postgres
+interpretation uses `agent_root` as the authorization scope:
+
+- `read_only_paths` is checked FIRST: if `agent_root` falls under any
+  `read_only_paths` entry → raise `WritePathViolation` (parity with
+  `FilesystemBackend`, which checks read-only before write_paths). The
+  `WritePolicy` contract is explicit that `read_only_paths` must not be dropped
+  by the abstraction layer; a conforming impl enforces both halves of MUST 5.
+- If `write_paths` is empty → raise `WritePathViolation` (no authorized scope).
+- If `agent_root` is not under any `write_paths` entry → raise
+  `WritePathViolation`.
+
+This is the Postgres-scope equivalent of `FilesystemBackend._enforce_write_path()`.
+Path-containment checks on individual SQL rows are not possible; the `agent_root`
+scope check is the closest meaningful analog. This behavior is PERMITTED by MUST 5
+(which says "verify the target is under `write_paths` and NOT under
+`read_only_paths`" without mandating a per-note filesystem path check).
+
+### Schema (independent versioning, `_SCHEMA_VERSION = 2`)
+
+Tables created in `_ensure_schema()` under a `pg_advisory_xact_lock`:
+
+| Table | Purpose |
+|-------|---------|
+| `memory_notes` | One row per live note. `name TEXT UNIQUE` (derived filename = the row address); `display_name TEXT` (the human note name = `capture.name`, round-trips to `Note.name`). |
+| `memory_note_versions` | One row per version snapshot. `note_name TEXT`; `display_name TEXT`. |
+| `memory_meta` | Schema version tracking (`key`, `value`). |
+| `memory_staging_notes_<uuid>` | Per-staging-session notes (created by `create_staging()`), REGULAR (not Postgres TEMPORARY) tables. |
+| `memory_staging_note_versions_<uuid>` | Per-staging-session versions. |
+
+**v1 → v2 migration.** v2 added `display_name` to `memory_notes` and
+`memory_note_versions` so the human note name round-trips to `Note.name`
+(cross-backend parity with `FilesystemBackend`, which reads `name` from
+frontmatter). The migration runs under the advisory lock, before index
+creation: `ALTER TABLE ... ADD COLUMN IF NOT EXISTS display_name` (idempotent).
+Legacy v1 rows get `display_name = ''` and fall back to the derived filename on
+read. Staging tables are regular tables so the apply connection can see staging
+rows under the per-thread connection model.
+
+`_SCHEMA_VERSION = 2` is INDEPENDENT of `PostgresLogBackend._SCHEMA_VERSION = 2`.
+Both backends can share a Postgres database without table collision (tables are
+namespaced: `memory_*` vs `run_records` / `meta`).
+
+Advisory lock key: `struct.unpack('>q', sha256(b'atomic-agents-memory-schema-v1')[:8])`
+— DISTINCT from the LogBackend key (`b'atomic-agents-log-schema-v1'`) so memory
+and log DDL serialize independently under separate advisory locks.
+
+### FTS search (MUST 7 compliance)
+
+`search()` uses `websearch_to_tsquery('english', %s)` parameterized query over
+`to_tsvector('english', COALESCE(display_name,'') || ' ' || COALESCE(name,'') || ' ' || COALESCE(description,'') || ' ' || COALESCE(body,''))`.
+(The four columns are `NOT NULL DEFAULT ''`, so the `COALESCE(...,'')` wrappers
+are defensive — a bare `col || ' '` would null the whole concatenation if any
+column were ever NULL; equivalent here, matched to the impl.)
+The query argument is a `%s` placeholder — never string-interpolated (SQL
+injection safe). `websearch_to_tsquery` tolerates arbitrary punctuation as
+ordinary lexemes; genuine tsquery PARSE failures are caught and return `[]`,
+while CONNECTION-level failures propagate to the reconnect-retry layer and, if
+unrecoverable, surface as `MemoryBackendError` (consistent with `read_note` /
+`list_notes`) rather than masquerading as "no results".
+
+`supports_semantic_search = False`: FTS is NOT semantic/vector search. LOCKED
+MUST 7 requires `search()` on a non-semantic backend to "raise
+NotImplementedError or return an empty list consistently." Returning FTS
+matches instead is the project's own interpretation: it mirrors the LOCKED,
+conformance-tested `FilesystemBackend.search()` substring behavior under
+`supports_semantic_search = False` (a non-semantic search mode, not vector
+search), so it is consistent with the established reference impl rather than a
+new spec authority. (A spec-text refinement to MUST 7 to explicitly bless
+non-empty non-semantic search is tracked in #530.) Callers
+branching on `supports_semantic_search` use this path correctly.
+
+No GIN index on tsvector in v1 (on-the-fly computation). GIN index optimization
+is tracked as a follow-up issue.
+
+### `list_orphans()` returns `[]` unconditionally
+
+All notes are primary-key addressable rows. There is no `INDEX.md` concept; a
+note cannot exist "on disk" without being in the table. `list_orphans()` returns
+`[]` always. `list_orphans()` is a Protocol method, NOT an Implementer-Contract
+MUST (the contract enumerates MUST 1-7; orphan detection is not among them). For
+a SQL backend orphans are structurally impossible — every note is a primary-key
+row, with no on-disk file existing outside an index — so `list_orphans()`
+returns `[]` unconditionally.
+
+### VersionRef encoding
+
+`VersionRef.backend_id` for Postgres is the string representation of the
+`memory_note_versions` row id (e.g., `"42"`). `resolve_version_token()` accepts
+this same row-id string as the CLI token. No `/` separator (unlike
+`FilesystemBackend`'s `<stem>/<version_filename>` encoding). `list_versions()`
+returns `VersionRef` objects ordered by `snapshotted_at DESC, id DESC`.
+
+### Thread-safety
+
+`threading.local()` gives each thread its own psycopg connection. All
+per-thread connections are tracked in a thread-safe `_all_conns` list so
+`close()` from the main thread releases worker-thread connections (critical
+because `helper_call_parallel()` spawns worker threads that open connections
+for memory captures and exit without calling `close()` themselves).
+
+### Credential redaction
+
+Three layers:
+1. All logged URLs stripped via `_redact_dsn()`.
+2. psycopg opened with explicit keyword args; psycopg logger suppressed.
+3. Full URL string NOT retained; only `_safe_url` (redacted) stored.
+
+### Tier B export (spec/40)
+
+`supports_canonical_export = True`. `export()` uses
+`render_note_bytes_from_object(note)` from `atomic_agents/export/renderer.py`
+for each note. Tier B = field-level round-trip guaranteed; byte-exact round-trip
+NOT guaranteed (date formatting and key ordering diverge — see spec/40
+§"Tier A vs Tier B fidelity").
+
+`MemoryExportQuery.include_versions=True` is deferred to #433 (same as
+`FilesystemBackend`). When a caller passes `include_versions=True`,
+`PostgresMemoryBackend.export()` emits a `warnings.warn()` matching the
+filesystem message shape — the export contains current-state notes only, NOT
+version history — rather than silently ignoring the flag.
+
+### apply_staging — version-history and recovery divergence
+
+`apply_staging()` is a wholesale swap on both reference impls, but the two
+diverge in two observable ways (both PERMITTED, documented here so a future
+conformance fixture and #396 adopter expect them):
+
+- **Post-swap live version history.** `FilesystemBackend` renames the entire
+  live `memory/` dir (including `.versions/`) to `memory.archived-<ts>/` and
+  swaps staging in, so live version history = staging-versions only. The
+  Postgres path issues an unconditional `DELETE FROM memory_notes` (full live
+  note replace) but appends staging versions via `INSERT INTO
+  memory_note_versions ... SELECT FROM <staging_versions>` with NO delete of
+  prior version rows, so live version history = prior-live-versions ∪
+  staging-versions. The rule-5 audit trail itself is intact on both (version
+  rows are never destroyed on Postgres; on filesystem they survive in the
+  archive dir), so neither violates the audit-trail invariant — they differ
+  only in whether the prior note set's versions remain queryable in-place
+  after apply.
+- **Recovery artifact.** Filesystem leaves a `memory.archived-<ts>/` dir as a
+  post-swap recovery artifact on disk; Postgres has no equivalent (rely on
+  `memory_note_versions` for history). 
+
+Intra-session staging `write_note` is last-write-wins by derived filename on
+BOTH reference impls (Postgres `INSERT ... ON CONFLICT (name) DO UPDATE`;
+filesystem plain `atomic_write` over the staging path), with no Case-4
+same-filename/different-human-name collision raise inside staging — that guard
+lives only in the live `write_note`. This is intentional parity, not a third
+divergence.
+
+This divergence is not runtime-reachable today (`DreamRunner.apply()` refuses
+non-filesystem backends — see below); reconciling the post-apply version
+semantics across backends is tracked with #396.
+
+### DreamRunner integration
+
+`DreamRunner.__init__` raises `NotImplementedError` for non-filesystem backends
+(#396 tracks the backend-agnostic adopt path). `create_staging()` and
+`apply_staging()` are implemented in `PostgresMemoryBackend` for programmatic
+use; `DreamRunner.apply()` cannot call them until #396 ships.
+
+### Exportable Protocol
+
+`PostgresMemoryBackend` satisfies the `Exportable` Protocol (spec/40):
+- `export(query=None)` → `MemoryExport(notes_with_bytes, backend_id=implementation_id, scope=str(agent_root))`
+  — `MemoryExport.backend_id` is the export envelope's own field; it is sourced
+  from the backend's `implementation_id` property (= `"postgres"`).
+- `export_all()` → alias for `export(None)`
+
+`isinstance(backend, Exportable)` is `True` at runtime.
+
+### Impl identifier (MUST 3)
+
+Per spec/20 MUST 3, a backend MUST NOT reuse the name `backend_id` for an
+impl-level identifier (that name denotes note/version/staging handles).
+`PostgresMemoryBackend` exposes `implementation_id` (= `"postgres"`) for that
+purpose (#397). (`FilesystemBackend` predates #397 and still exposes
+`backend_id="filesystem"`; reconciling the reference impl is tracked in #528 and
+is out of scope for the Postgres adapter PR.)

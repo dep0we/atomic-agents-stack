@@ -354,7 +354,7 @@ These are not forbidden forever — they're explicitly deferred with rationale. 
 
 | # | Protocol | Issue / Lock | Reference impls |
 |---|----------|--------------|-----------------|
-| 1 | MemoryBackend | #57 + #382 PR 1 (override surface) | Filesystem |
+| 1 | MemoryBackend | #57 + #382 PR 1 (override surface) + #258 PR 1 (Postgres FTS) | Filesystem + Postgres (FTS, PR1 of 4-PR arc) |
 | 2 | LLMBackend | #87 | Anthropic + OpenAI + Moonshot + Vertex Gemini |
 | 3 | JudgeBackend | #112 PR 4 | PolicyJudge + LLMJudgeBackend |
 | 4 | LockBackend | #60 PR 4 | Filesystem + Redis |
