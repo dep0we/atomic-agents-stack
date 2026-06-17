@@ -78,6 +78,8 @@ X-Goog-IAP-JWT-Assertion
 | `## Bind Host` | `127.0.0.1` | Default to loopback; operators override to `0.0.0.0` for network binding. |
 | `## Bind Port` | `8000` | Port number as a string. |
 | `## Allow No Auth` | absent (false) | Presence of this section (any value or empty) sets allow\_no\_auth=True. |
+| `## Max Body Bytes` | `1048576` (1 MiB) | Maximum request body size in bytes (integer). Larger requests are rejected with HTTP 413. |
+| `## Idempotency Header` | `Idempotency-Key` | Header name the caller-supplied idempotency key is read from. Presence with a non-empty body sets the header name; absent → default. Opt-in: absent header on a request → no dedup. (spec/45 PR2) |
 
 **Environment variable overrides (highest priority):**
 
@@ -86,6 +88,7 @@ X-Goog-IAP-JWT-Assertion
 | `ATOMIC_AGENTS_SERVE_HOST` | Bind Host |
 | `ATOMIC_AGENTS_SERVE_PORT` | Bind Port |
 | `ATOMIC_AGENTS_SERVE_IDENTITY_HEADER` | Identity Header |
+| `ATOMIC_AGENTS_SERVE_IDEMPOTENCY_HEADER` | Idempotency Header |
 
 Resolution order: env var > `serve.md` section > default.
 
@@ -226,6 +229,26 @@ that the cost cap was hit, not that the agent failed.
 The `run_id` lets the caller correlate the 503 response to its JSONL audit
 record. `agent.run_id` is reset before lock acquisition (MUST 8), so even the
 `lock_busy` record and this response body carry the same unique id.
+
+**Deduped (HTTP 200):** When the request carries an `## Idempotency Header`
+value matching a prior COMPLETED run, `agent.call()` short-circuits before the
+LLM runs and returns `Response.deduped_response()`. The serve layer returns
+HTTP 200 with `{"status": "deduped", "served_from_cache": true, "run_id":
+"<this run_id>", "replayed_run_id": "<original run_id>", "result_ref":
+"<fetch handle>"}`. `served_from_cache` is a derived JSON field signalling the
+output was served from the prior run, not freshly computed. The cached output is
+NOT inlined — `result_ref` is the handle the caller fetches the stored result
+through, and `cost_usd` is absent from the audit record (spec/22 addendum;
+spec/45 W2/W7). `replayed_run_id` joins this deduped record to the original
+completed run whose result is served.
+
+**In-flight (HTTP 409):** When a concurrent twin already holds the idempotency
+lease, `agent.call()` raises `DedupInFlight` and the serve layer returns HTTP
+409 (Conflict) with `{"status": "in_flight", "prior_run_id": "<owner run_id>",
+"run_id": "<this run_id>"}`. This is a refusal — NOT a 500 — telling the caller
+the same key is being processed right now; retry after the owner completes.
+`cost_usd` is absent from the audit record (spec/22 addendum; spec/45 W3). The
+`run_id` correlates this 409 to its `status='in_flight'` JSONL audit record.
 
 **Agent not found (HTTP 404):** `AtomicAgentsError` for a missing agent folder
 returns HTTP 404.

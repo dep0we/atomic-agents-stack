@@ -1,7 +1,7 @@
 # spec/45 — IdempotencyBackend Protocol
 
-**Status:** DRAFT  
-**Issue:** #520 PR1  
+**Status:** LOCKED  
+**Issue:** #520 PR1 + PR2  
 **Depends on:** spec/40 (canonical export), spec/44 (queue backend pattern)
 
 ---
@@ -15,9 +15,14 @@ for a key succeeds (FRESH); subsequent calls return IN_FLIGHT or COMPLETED
 without triggering re-execution.
 
 This is the eighteenth backend Protocol in the atomic-agents framework (v1.5
-wave). PR1 (this spec) covers scaffolding only: the Protocol + types +
-`FilesystemDedupLedger` + conformance tests + doctor check + canonical export.
-Agent wiring (`idempotency_key` on `agent.call()`, trigger integration) is PR2.
+wave). PR1 covers scaffolding: the Protocol + types + `FilesystemDedupLedger` +
+conformance tests + doctor check + canonical export. PR2 covers agent wiring:
+`idempotency_key` on `agent.call()`, two-phase gate (lookup before lock →
+COMPLETED short-circuit; begin after cost gate → COMPLETED short-circuit (the
+lookup→commit→begin race), IN_FLIGHT raise, or FRESH claim),
+`RunRecord` audit fields (`idempotency_key`, `replayed_run_id`), spec/22 addendum,
+serve/queue/cron trigger integration, `dedup_body_hash_enabled` opt-in key
+derivation, and this spec LOCK.
 
 ---
 
@@ -104,6 +109,19 @@ WITHOUT reserving the key. Equivalent to `begin()` with no side effects.
 
 Returns `DedupDecision(state='fresh')` when the key is absent. This is the
 authoritative FRESH signal — no fallback scan.
+
+### `release_lease(key: str) -> None`
+
+**Best-effort release of an IN_FLIGHT lease** (MUST 13). Called by
+`agent.call()` in the `try/finally` block on error or exception after `begin()`
+returned FRESH — ensures that a crashed/aborted run does not permanently wedge
+the key for TTL-free single-host deployments.
+
+MUST be idempotent — no error when the lease file does not exist (already
+committed, or never created). MUST NOT raise on a missing key. MUST raise
+`PathTraversalError` on invalid key (caller bug surfaced loudly). MAY raise
+`IdempotencyBackendError` on genuine I/O failure — the caller's `finally` block
+MUST swallow this to avoid interrupting lock release.
 
 ### `capabilities() -> IdempotencyCapabilities`
 
@@ -383,6 +401,109 @@ in-flight lease files (phantom-block hazard). The structural whitelist
 verified as (a) a regular file, (b) resolved under `agent_root`, (c) not a
 symlink, before its bytes are read into the export.
 
+**MUST 13** — `release_lease(key)` MUST be idempotent. No error raised when the
+lease file does not exist (already committed, or never created). MUST NOT raise
+on a missing key (`ENOENT` is swallowed). MUST raise `PathTraversalError` on an
+invalid key. MAY raise `IdempotencyBackendError` on genuine I/O failure (EACCES,
+ENOSPC). The caller's `finally` block is contractually obligated to swallow
+`IdempotencyBackendError` from `release_lease()` — but `IdempotencyBackendError`
+MUST only be raised on genuine I/O failure, never on absent-key.
+
+**MUST 14** — `cron_tick_key(agent_name, schedule_name, when, granularity)` MUST
+produce the same key for any two `when` values that fall within the same
+granularity bucket (minute / hour / day / week), and MUST produce a DIFFERENT key
+for any two `when` values in ADJACENT buckets. `when` MUST be a timezone-aware
+datetime (a naive datetime MUST raise `ValueError` — a naive value would be
+floored against the host's local timezone, defeating the cross-host invariance
+this key exists to provide); it is converted to UTC before bucket-flooring so the
+key is timezone-invariant. The format MUST be
+`<agent_name>:<schedule_name>:<bucket_epoch_seconds>`.
+
+---
+
+## PR2 wiring contract (agent.call() integration)
+
+The following are normative caller-side requirements established by PR2. They
+bind `agent.call()` and the trigger layer, not backend implementations.
+
+**W1** — `agent.call()` MUST run `begin()` AFTER `_check_cost_guardrails()` and
+AFTER lock acquire. The ordering is: run_id reset → OTel span open → `lookup()`
+BEFORE lock → lock acquire → cost gate → `begin()` AFTER cost gate. This ensures
+the cost gate fires before the idempotency lease is claimed, so a cost-skipped
+call does not wedge the key.
+
+**W2** — When `lookup()` returns COMPLETED, `agent.call()` MUST write a
+`status='deduped'` JSONL audit record (with `cost_usd` ABSENT per spec/22
+addendum, `idempotency_key` set, `replayed_run_id` = `prior_run_id`) THEN return
+`Response.deduped_response()`. No lock acquired, no LLM call.
+
+**W3** — When `begin()` returns IN_FLIGHT, `agent.call()` MUST write a
+`status='in_flight'` JSONL audit record (with `cost_usd` ABSENT, `idempotency_key`
+set) THEN raise `DedupInFlight`. The lease is NOT held by the caller in this case
+(the other run holds it); `release_lease()` MUST NOT be called.
+
+**W4** — When `begin()` returns FRESH (lease claimed — the only state that runs
+the LLM), `agent.call()` MUST call `commit()` AFTER the success-path JSONL write
+(`self._log(log_record)`), not before. This preserves the Principle 5 audit-trail
+invariant: durable JSONL write first, then ledger terminal.
+
+A DEFERRED (ESCALATE) run MUST NOT `commit()` the idempotency key — it is not a
+completed result. When `agent.call()` returns a Response with `deferred=True`
+(the run paused for human/judge review, carrying `escalation_queue_ids`),
+committing would mark the key COMPLETED so a retry short-circuits to
+`Response.deduped_response()` (text='', NO deferred flag, NO
+`escalation_queue_ids`) — silently dropping the escalation signal. Instead the
+lease is released (the lease-held flag stays set so the `try/finally`
+release-on-failure path releases it — the same at-least-once direction as the
+failure path), so a retry re-runs and re-surfaces the escalation.
+
+**W5** — `release_lease()` MUST run in `try/finally` whenever the caller holds a
+FRESH-path lease (`_idempotency_lease_held=True`). `IdempotencyBackendError` from
+`release_lease()` MUST be swallowed in the `finally` block (log warning, do not
+re-raise) to prevent the finally from aborting lock release.
+
+**W6** — `idempotency_key` MUST be recorded in the JSONL audit record on EVERY
+keyed run (ok, deduped, in_flight, AND the two cost-skip variants — the pre-loop
+cost-skip refused before `begin()`, and the mid-loop cost-skip after `begin()`
+returned FRESH and the run had already spent on at least one iteration). On both
+cost-skip variants the ledger stays uncommitted (pre-loop never claimed a lease;
+mid-loop releases its lease via the `try/finally`), so a retry re-runs.
+`replayed_run_id` is set on deduped records only.
+
+**Body-hash auto-derivation trigger gate** — when `dedup_body_hash_enabled` is
+set and no explicit `idempotency_key` is supplied, the implicit body-hash key is
+auto-derived ONLY for external delivery triggers (`http`, `queue`, `cron`) where
+redelivery actually occurs. For framework-internal repeat-invocation callers
+(`eval`, `delegate` child calls, `outcome` inner runs) and plain
+`manual`/`api`/`skill` calls, identical inputs are expected to run again, so the
+auto-derivation MUST NOT fire (returning a text='' deduped Response to a consumer
+that treats it as a real result is the hazard). An EXPLICIT caller-supplied
+`idempotency_key` is honored on ANY trigger — only the implicit AUTO derivation is
+trigger-gated.
+
+**W7** — When `begin()` returns COMPLETED, `agent.call()` MUST serve the cached
+result identically to W2 — write a `status='deduped'` JSONL audit record (with
+`cost_usd` ABSENT, `idempotency_key` set, `replayed_run_id` = `prior_run_id`) and
+return `Response.deduped_response()`, with NO LLM run and NO lease claimed
+(`release_lease()` MUST NOT be called — the caller never owned a lease). This is
+reachable in the realistic lookup→commit→begin race: `lookup()` (W2, before the
+lock) sees FRESH for two concurrent calls; the fast twin acquires the lock, runs,
+and `commit()`s; the slow twin then acquires the lock, passes the cost gate, and
+its `begin()` sees the now-COMPLETED terminal marker and returns COMPLETED
+(`begin()` checks the terminal marker FIRST — see MUST 4 sequence step 3). Without
+W7, `agent.call()` would mis-treat COMPLETED as FRESH and double-spend the LLM call
+the dedup exists to prevent. (Note: `begin()` therefore returns one of THREE
+states — FRESH, IN_FLIGHT, or COMPLETED — and `agent.call()` MUST handle all three.)
+
+**W8** — The queue-trigger key extractor (`extract_queue_idempotency_key()` in
+`_cascade.py`) MUST read ONLY `payload['idempotency_key']` (when a non-empty
+string) and MUST return `None` (no dedup) when that field is absent or non-string.
+It MUST NOT fall back to `payload['id']` or any other field. Queue item ids are
+not guaranteed globally unique across distinct work items, so an `id` fallback
+could false-dedup two unrelated runs — silently dropping a real run, which is
+strictly worse than no dedup. The trigger surface fails OPEN (runs the LLM) rather
+than risk a dropped run; only an explicit caller-supplied key is safe to dedup on.
+
 ---
 
 ## spec/40 export contract
@@ -461,7 +582,7 @@ dual-var SecretBackend pattern).
 
 ## Conformance suite
 
-`tests/test_idempotency_backend_conformance.py` — 58 tests covering:
+`tests/test_idempotency_backend_conformance.py` — 68 tests covering:
 - Protocol-behavior tests (parametrized over BACKEND_FACTORIES)
 - DedupDecision/IdempotencyCapabilities dataclass tests
 - Registry dispatch tests
@@ -471,8 +592,11 @@ dual-var SecretBackend pattern).
 - Race condition (O_EXCL barrier) test
 - Error-path branch assertions (caplog for typed-handler confirmation)
 - result_ref is opaque: URI/path/backslash result_ref round-trips (not rejected)
+- `release_lease()` (MUST 13): wedge-recovery (begin→release→FRESH again),
+  absent-key no-op, idempotent double-call, no-resurrect-after-commit, invalid-key
+  PathTraversalError
 
-`tests/test_idempotency_filesystem.py` — 41 filesystem-specific tests covering:
+`tests/test_idempotency_filesystem.py` — 44 filesystem-specific tests covering:
 - Symlink containment (ledger root perimeter, leaf symlink, claim sink)
 - O_EXCL atomicity + post-claim terminal re-check (at-most-once TOCTOU close)
 - atomic_write crash-safety
@@ -482,19 +606,41 @@ dual-var SecretBackend pattern).
 - Fail-closed / fail-open boundary (directory perimeter vs per-key leaf)
 - Dangling-symlink leaf fail-closed (is_symlink-before-exists masking fix)
 - begin() bounded-retry recovery (_begin_after_vanished both branches)
+- `release_lease()` symlink-leaf refusal + real-leaf-unlink negative control + EACCES→IdempotencyBackendError mapping (MUST 13)
 - Per-guard negative controls (each strip verified RED)
+
+MUST-number traceability (grep `spec/45 MUST N` to find the pinning test):
+MUSTs 1–9, 11, 13 carry an inline `spec/45 MUST N` tag in
+`test_idempotency_backend_conformance.py`. The named pinning tests are:
+MUST 7 (single-host advertisement) → `test_single_host_only_is_required`;
+MUST 9 (storage isolation) → `test_storage_isolation`;
+MUST 10 (canonical path containment) →
+`test_require_canonical_rejects_symlink_leaf` (symlink-leaf branch) +
+`test_require_canonical_rejects_path_escaping_root` (root-containment branch)
+in `test_idempotency_filesystem.py`;
+MUST 11 (export TERMINAL-only) → `test_export_excludes_in_flight_lease`;
+MUST 12 (export per-leaf containment) → `test_export_skips_symlinked_terminal_file`
+in `test_idempotency_filesystem.py`; MUST 14 (cron_tick_key) →
+`test_cron_tick_key_*` in `tests/test_idempotency_pr2_wiring.py`;
+W8 (queue extractor no-`id`-fallback) →
+`test_extract_queue_idempotency_key_does_not_fall_back_to_id` in
+`tests/test_idempotency_pr2_wiring.py`.
 
 ---
 
-## PR2 scope (NOT in this spec)
+## PR2 scope (shipped in this spec)
 
-The following are explicitly deferred to PR2:
-- `idempotency_key` parameter on `agent.call()`
-- Trigger wiring (serve/queue/cron)
-- `RunRecord`/JSONL audit-shape changes
-- spec/22 addendum
-- spec LOCK ceremony
-- TTL sweep implementation
+PR2 shipped the following (all now normative in this LOCKED spec):
+- `idempotency_key` keyword-only parameter on `agent.call()` (W1–W8 above)
+- Trigger wiring: `idempotency_header` on serve (HTTP 200 deduped / HTTP 409 in_flight), `extract_queue_idempotency_key()` helper in `_cascade.py` for queue dispatch (honors ONLY an explicit `payload['idempotency_key']`; an `item['id']` fallback is intentionally NOT used — ids are not guaranteed unique across distinct work items and would risk false-dedup), `cron_tick_key` helper (MUST 14; requires a timezone-aware `when`)
+- `RunRecord`/JSONL audit-shape changes: `idempotency_key` + `replayed_run_id` fields; `LogQuery.idempotency_key` AND-predicate filter on all three reference log backends (Filesystem, SQLite, Postgres); SQLite + Postgres v1→v2 column/index migration
+- spec/22 versioned normative addendum (status='deduped'/'in_flight', cost_usd ABSENT)
+- `release_lease()` Protocol method (MUST 13) + `try/finally` wiring in `agent.call()`
+- `dedup_body_hash_enabled` opt-in in `AgentConfig` / model.md (`## Dedup Body Hash`)
+- MUST 13 (release_lease idempotency) + MUST 14 (cron_tick_key bucket stability) + W1–W8 wiring contract
+
+**Still deferred to a follow-up issue:**
+- TTL sweep implementation (`supports_ttl=False` until the sweep ships)
 
 ---
 

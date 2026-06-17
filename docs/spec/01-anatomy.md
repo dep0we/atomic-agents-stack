@@ -321,7 +321,26 @@ If daily cap hit:
 - Cron runs SKIP until next day (write to log/, no API call)
 - Skill invocations FALL BACK to Sonnet for the rest of the day
 - Critical-flag invocations override the cap (rare; the operator tags manually)
+
+## Dedup Body Hash
+(presence enables; default OFF)
 ```
+
+The `## Dedup Body Hash` section is opt-in idempotency for triggers that do not
+supply an explicit key (spec/45 PR2). When the section is present (any value or
+empty body, mirroring `## Allow No Auth` in `serve.md`), `agent.call()` derives
+an implicit idempotency key from `sha256(work_item + model + max_tokens +
+temperature)` so an identical re-delivery dedups without caller key management.
+Absent → no implicit key. An explicit `idempotency_key=` passed to `call()`
+always wins over the derived hash.
+
+The implicit body-hash key is derived **only for external delivery triggers**
+(`http`, `queue`, `cron`) where the same request can actually be redelivered. For
+framework-internal callers (`eval`, `delegate`, `outcome`) and plain
+`manual`/`api`/`skill` calls, identical inputs are expected to run again, so the
+auto-derivation does not fire — those consumers treat the result as real and an
+empty deduped Response would be wrong. An explicit `idempotency_key` is honored
+on any trigger; only the implicit derivation is trigger-gated.
 
 **Why this is its own file**:
 Cost profile travels with the agent. Switching from cron to skill to openclaw doesn't reset which model the agent uses. Future model upgrades only edit this one file.
