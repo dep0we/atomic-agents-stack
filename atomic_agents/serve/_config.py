@@ -33,6 +33,12 @@ class ServeConfig:
     # Cloud Run instance from OOM DoS via an unbounded body stream.
     # CWE-770 / Finding #401.
     max_body_bytes: int = 1 * 1024 * 1024  # 1 MiB
+    # spec/45 PR2: idempotency_header — the HTTP header name from which the
+    # caller-supplied idempotency key is extracted. Defaults to 'Idempotency-Key'
+    # (de-facto standard, used by Stripe, Square, etc.). Operator override via
+    # serve.md '## Idempotency Header' section or ATOMIC_AGENTS_SERVE_IDEMPOTENCY_HEADER
+    # env var, mirroring identity_header resolution order.
+    idempotency_header: str = "Idempotency-Key"
 
 
 # Explicit loopback hostnames recognised in addition to the 127.0.0.0/8 range.
@@ -89,6 +95,11 @@ def _parse_serve_md(text: str) -> ServeConfig:
                     raise ValueError(
                         f"serve.md '## Max Body Bytes' value is not a valid integer: {body!r}"
                     ) from None
+        elif sn_lower == "idempotency header":
+            # spec/45 PR2: operator-specified idempotency header name.
+            # Presence with non-empty body sets the header name.
+            if body:
+                cfg.idempotency_header = body
 
     # Apply env var overrides (highest priority). spec/37 resolution order.
     env_host = os.environ.get("ATOMIC_AGENTS_SERVE_HOST")
@@ -108,6 +119,11 @@ def _parse_serve_md(text: str) -> ServeConfig:
     env_header = os.environ.get("ATOMIC_AGENTS_SERVE_IDENTITY_HEADER")
     if env_header:
         cfg.identity_header = env_header
+
+    # spec/45 PR2: idempotency_header env override.
+    env_idemp_header = os.environ.get("ATOMIC_AGENTS_SERVE_IDEMPOTENCY_HEADER")
+    if env_idemp_header:
+        cfg.idempotency_header = env_idemp_header
 
     return cfg
 

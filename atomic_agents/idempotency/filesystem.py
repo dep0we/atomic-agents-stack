@@ -85,7 +85,7 @@ from pathlib import Path
 from typing import Any
 
 from .._io import atomic_write
-from ..exceptions import PathTraversalError
+from ..exceptions import IdempotencyBackendError, PathTraversalError
 from .types import (
     COMPLETED,
     FRESH,
@@ -178,23 +178,6 @@ def _key_hash(key: str) -> str:
     detected on read.
     """
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
-
-
-# ──────────────────────────────────────────────────────────────────
-# IdempotencyBackendError exception
-
-
-class IdempotencyBackendError(Exception):
-    """Raised by FilesystemDedupLedger on unrecoverable I/O failure.
-
-    NOT raised for duplicate-detection (FRESH/IN_FLIGHT/COMPLETED) — those
-    are expressed as DedupDecision value objects. Only raised when the backend
-    cannot determine the key's state due to a disk error, permission denial,
-    or symlink escape.
-
-    Callers that need to distinguish dedup from backend failure catch this
-    exception; callers that want to fail-closed on any error catch Exception.
-    """
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -766,6 +749,69 @@ class FilesystemDedupLedger:
                 lease_path.unlink(missing_ok=True)
         except OSError:
             pass
+
+    def release_lease(self, key: str) -> None:
+        """Best-effort release of an IN_FLIGHT lease (spec/45 MUST 13).
+
+        Unlinks the ``<key_hash>.lease.json`` file, removing the in-flight
+        claim for ``key``. Called by ``agent.call()`` on error/exception via
+        a try/finally so that a crash never permanently wedges a key IN_FLIGHT
+        (in the absence of TTL sweep, which is ``supports_ttl=False`` in PR1).
+
+        Idempotent — no error raised when the lease file does not exist
+        (already committed, or never created). Raises ``IdempotencyBackendError``
+        on genuine I/O failure (EACCES, ENOSPC, etc.) — never on ENOENT — and
+        also when ``key`` exceeds ``_MAX_KEY_LEN`` (raised by ``_validate_key``
+        before any I/O).
+
+        Key validation is run before any I/O so caller bugs are surfaced loudly:
+        separator/empty/``.``/``..``/NUL/C0-control keys raise
+        ``PathTraversalError``; over-length keys raise ``IdempotencyBackendError``.
+        The ledger root containment check is run to refuse a symlinked
+        idempotency/ escape. If the containment check fails, the method returns
+        without raising (best-effort — no lease file can safely be unlinked in
+        that state).
+
+        Raises:
+            PathTraversalError: when ``key`` contains path separators, is empty,
+                ``.``/``..``, or contains NUL/C0 control chars.
+            IdempotencyBackendError: when ``key`` exceeds ``_MAX_KEY_LEN``
+                (raised by ``_validate_key`` before any I/O), OR on genuine I/O
+                failure (EACCES, ENOSPC) — never on ENOENT.
+        """
+        _validate_key(key)
+
+        try:
+            ledger_root = self._ledger_root()
+        except PathTraversalError:
+            # Ledger root containment failure — best-effort, do not raise.
+            _logger.error(
+                "idempotency release_lease: ledger root containment violation "
+                "— skipping lease unlink for key=%r",
+                key,
+            )
+            return
+
+        lease_path = self._lease_path(ledger_root, key)
+
+        # Guard the unlink sink — same pattern as commit()'s lease unlink.
+        # Only unlink a non-symlink lease leaf (symlinked lease = fail-closed
+        # in begin/lookup; we cannot trust its content so don't touch it).
+        try:
+            if lease_path.is_symlink():
+                # Tampered lease leaf — don't unlink (could unlink a real file
+                # at the symlink target). Log and return.
+                _logger.error(
+                    "idempotency release_lease: lease path is a symlink — "
+                    "refusing unlink: %s",
+                    lease_path,
+                )
+                return
+            lease_path.unlink(missing_ok=True)
+        except OSError as exc:
+            raise IdempotencyBackendError(
+                f"idempotency ledger release_lease() I/O error for key={key!r}: {exc}"
+            ) from exc
 
     def lookup(self, key: str) -> DedupDecision:
         """Read-only state query for an idempotency key (no side effects).

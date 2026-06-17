@@ -250,6 +250,158 @@ def test_non_lockbusy_acquire_failure_exports_error_span(
     assert spans[0].status.status_code == otel_trace.StatusCode.ERROR
 
 
+def test_phase1_lookup_untyped_failure_exports_error_span(
+    tmp_path, monkeypatch, in_memory_exporter
+):
+    """spec/45 PR2 (#520): the Phase-1 idempotency lookup() gate runs BEFORE the
+    body try/finally and before lock acquire. A NON-conforming backend that
+    raises an un-wrapped exception type (e.g. a bare RuntimeError, not the typed
+    PathTraversalError / IdempotencyBackendError) from lookup() MUST still
+    finalize the call span (end + detach) — otherwise the span leaks (never
+    end()ed, context token never detached). Mirrors the non-LockBusy
+    acquire-failure span guard above.
+
+    NEGATIVE CONTROL: with the broad ``except BaseException`` removed from the
+    Phase-1 lookup gate, the RuntimeError propagates uncaught past the only
+    finalize site and NO call span is exported (len == 0) — this assertion goes
+    RED. (Verified by stripping the except during review.)
+    """
+    from atomic_agents.agent import AtomicAgent
+    from atomic_agents.idempotency.types import DedupDecision, FRESH
+
+    class _BadLookupBackend:
+        def lookup(self, key: str):
+            raise RuntimeError("non-conforming backend exploded in lookup()")
+
+        def begin(self, key: str, run_id: str):
+            return DedupDecision(
+                is_duplicate=False,
+                state=FRESH,
+                prior_run_id=None,
+                prior_result_ref=None,
+            )
+
+        def commit(self, key: str, result_ref: str) -> None:
+            pass
+
+        def release_lease(self, key: str) -> None:
+            pass
+
+    _build_minimal_agent_dir(tmp_path)
+    monkeypatch.setenv("ATOMIC_AGENTS_ROOT", str(tmp_path))
+    agent = AtomicAgent(name="test", idempotency_backend=_BadLookupBackend())
+
+    with patch("atomic_agents.agent._llm.call_llm", return_value=_text_only_response()):
+        with pytest.raises(RuntimeError, match="non-conforming backend"):
+            agent.call("do the thing", idempotency_key="k-untyped")
+
+    spans = _spans_named_call(in_memory_exporter)
+    assert len(spans) == 1, (
+        "an untyped lookup() failure MUST finalize (not leak) the call span"
+    )
+    assert dict(spans[0].attributes)[tracing.ATTR_OUTCOME] == tracing.OUTCOME_ERROR
+    assert spans[0].status.status_code == otel_trace.StatusCode.ERROR
+
+
+def test_phase2_begin_in_flight_exports_in_flight_outcome_span(
+    tmp_path, monkeypatch, in_memory_exporter
+):
+    """spec/45 PR2 (#520) + spec/39: begin()->IN_FLIGHT finalizes the call span
+    with outcome=in_flight (a refusal, not a crash) BEFORE raising DedupInFlight.
+
+    NEGATIVE CONTROL: the in_flight branch sets span status ERROR + calls
+    _finalize_call_span(outcome=OUTCOME_IN_FLIGHT) BEFORE the raise. Because
+    _finalize_call_span is idempotent (via _span_ended), the body's later
+    ``except BaseException`` finalize does NOT overwrite it. If the pre-raise
+    _finalize_call_span were moved AFTER the raise (or dropped), the span would
+    be finalized by the broad except as OUTCOME_ERROR instead — this assertion
+    goes RED. (Verified by deleting the pre-raise finalize during review.)
+    """
+    from atomic_agents.agent import AtomicAgent
+    from atomic_agents.exceptions import DedupInFlight
+    from atomic_agents.idempotency.types import DedupDecision, FRESH, IN_FLIGHT
+
+    class _InFlightBackend:
+        def lookup(self, key: str):
+            return DedupDecision(
+                is_duplicate=False,
+                state=FRESH,
+                prior_run_id=None,
+                prior_result_ref=None,
+            )
+
+        def begin(self, key: str, run_id: str):
+            return DedupDecision(
+                is_duplicate=True,
+                state=IN_FLIGHT,
+                prior_run_id="run-holder-1",
+                prior_result_ref=None,
+            )
+
+        def commit(self, key: str, result_ref: str) -> None:
+            pass
+
+        def release_lease(self, key: str) -> None:
+            pass
+
+    _build_minimal_agent_dir(tmp_path)
+    monkeypatch.setenv("ATOMIC_AGENTS_ROOT", str(tmp_path))
+    agent = AtomicAgent(name="test", idempotency_backend=_InFlightBackend())
+
+    with patch("atomic_agents.agent._llm.call_llm", return_value=_text_only_response()):
+        with pytest.raises(DedupInFlight):
+            agent.call("do the thing", idempotency_key="k-busy")
+
+    spans = _spans_named_call(in_memory_exporter)
+    assert len(spans) == 1
+    assert dict(spans[0].attributes)[tracing.ATTR_OUTCOME] == tracing.OUTCOME_IN_FLIGHT
+
+
+def test_phase1_lookup_completed_exports_deduped_outcome_span(
+    tmp_path, monkeypatch, in_memory_exporter
+):
+    """spec/45 PR2 (#520) + spec/39: a Phase-1 lookup()->COMPLETED short-circuit
+    finalizes the call span with outcome=deduped (no LLM, no lock).
+
+    NEGATIVE CONTROL: the deduped path calls
+    _finalize_call_span(outcome=OUTCOME_DEDUPED) on the COMPLETED branch. Strip
+    that outcome (or fall through to the body) and the span is finalized as
+    OUTCOME_OK/OUTCOME_ERROR instead — this assertion goes RED.
+    """
+    from atomic_agents.agent import AtomicAgent
+    from atomic_agents.idempotency.types import COMPLETED, DedupDecision
+
+    class _CompletedBackend:
+        def lookup(self, key: str):
+            return DedupDecision(
+                is_duplicate=True,
+                state=COMPLETED,
+                prior_run_id="run-orig-1",
+                prior_result_ref="run-orig-1",
+            )
+
+        def begin(self, key: str, run_id: str):  # pragma: no cover - not reached
+            raise AssertionError("Phase-1 COMPLETED must short-circuit before begin()")
+
+        def commit(self, key: str, result_ref: str) -> None:  # pragma: no cover
+            pass
+
+        def release_lease(self, key: str) -> None:  # pragma: no cover
+            pass
+
+    _build_minimal_agent_dir(tmp_path)
+    monkeypatch.setenv("ATOMIC_AGENTS_ROOT", str(tmp_path))
+    agent = AtomicAgent(name="test", idempotency_backend=_CompletedBackend())
+
+    with patch("atomic_agents.agent._llm.call_llm", return_value=_text_only_response()):
+        resp = agent.call("do the thing", idempotency_key="k-dup")
+
+    assert resp.deduped is True
+    spans = _spans_named_call(in_memory_exporter)
+    assert len(spans) == 1
+    assert dict(spans[0].attributes)[tracing.ATTR_OUTCOME] == tracing.OUTCOME_DEDUPED
+
+
 def test_lock_busy_exports_lock_busy_span(tmp_path, monkeypatch, in_memory_exporter):
     """MUST 9: lock_busy exports one span with outcome=lock_busy + ERROR status."""
     from atomic_agents.agent import AtomicAgent

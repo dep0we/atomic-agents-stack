@@ -397,6 +397,51 @@ class AgentProfileExists(AtomicAgentsError):
     """
 
 
+# ──────────────────────────────────────────────────────────────────
+# IdempotencyBackend exceptions (spec/45 — issue #520 PR2)
+
+
+class IdempotencyBackendError(AtomicAgentsError):
+    """Raised by an IdempotencyBackend on unrecoverable I/O failure.
+
+    NOT raised for duplicate-detection (FRESH/IN_FLIGHT/COMPLETED) — those
+    are expressed as DedupDecision value objects. Only raised when the backend
+    cannot determine the key's state due to a disk error, permission denial,
+    or symlink escape.
+
+    Callers that need to distinguish dedup from backend failure catch this
+    exception; callers that want to fail-closed on any error catch Exception.
+    This is the base class; ``FilesystemDedupLedger`` raises this directly.
+    Mirrored from ``atomic_agents.idempotency.filesystem`` for uniform import
+    in ``agent.py``, ``serve/_app.py``, etc. without a deep-module import.
+    """
+
+
+class DedupInFlight(AtomicAgentsError):
+    """Raised by agent.call() when the idempotency key is already IN_FLIGHT.
+
+    A peer to ``LockBusy``: signals that a concurrent call is already
+    executing under the same idempotency key. The caller should wait and
+    retry, or use the Queue DLQ / max-attempts stop valve for deterministic
+    failure.
+
+    Attributes:
+        prior_run_id: the run_id of the call that currently holds the
+            IN_FLIGHT lease, or ``None`` when the lease is unreadable
+            (fail-closed — the key is still treated as in-flight). Callers
+            that want to correlate the refusal with the in-flight JSONL record
+            can use this id.
+
+    The serve layer catches this and returns HTTP 409 Conflict carrying
+    ``prior_run_id`` so the HTTP caller can correlate. The queue consumer
+    should treat 409 as a signal to back off and retry.
+    """
+
+    def __init__(self, message: str, prior_run_id: str | None = None) -> None:
+        self.prior_run_id = prior_run_id
+        super().__init__(message)
+
+
 class SnapshotNotFound(AtomicAgentsError):
     """``restore(agent_id, snapshot_id)`` referenced an unknown snapshot.
 

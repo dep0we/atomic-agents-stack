@@ -82,6 +82,8 @@ def test_ledger_root_refuses_symlinked_idempotency_dir(tmp_path) -> None:
 def test_require_canonical_rejects_symlink_leaf(tmp_path) -> None:
     """_require_canonical_ledger_path() MUST raise PathTraversalError when the
     ledger file path is a symlink leaf (even if it resolves inside ledger_root).
+    spec/45 MUST 10 (canonical path containment — the consolidated symlink-leaf
+    branch of the every-sink guard).
 
     Negative-control verification: this test exercises the is_symlink() guard
     directly (Project Lesson 1 — per-guard negative control). To make the guard's
@@ -114,7 +116,9 @@ def test_require_canonical_rejects_symlink_leaf(tmp_path) -> None:
 
 def test_require_canonical_rejects_path_escaping_root(tmp_path) -> None:
     """_require_canonical_ledger_path() MUST raise PathTraversalError when the
-    resolved path escapes ledger_root (containment invariant).
+    resolved path escapes ledger_root (containment invariant). spec/45 MUST 10
+    (canonical path containment — the root-containment branch of the every-sink
+    guard).
 
     Negative-control verification: exercises the is_relative_to() guard directly.
     """
@@ -444,7 +448,8 @@ def test_lease_json_has_required_fields(tmp_path) -> None:
 
 
 def test_export_skips_symlinked_terminal_file(tmp_path) -> None:
-    """export() MUST skip terminal files that are symlinks (per-leaf containment guard).
+    """spec/45 MUST 12 (export per-leaf containment).
+    export() MUST skip terminal files that are symlinks (per-leaf containment guard).
 
     This is the leaf-escape class (#426/#427): a symlinked terminal file inside
     ledger_root pointing outside agent_root must not be read into the export.
@@ -1075,3 +1080,74 @@ def test_begin_after_vanished_raises_on_repeated_vanish(tmp_path) -> None:
                 terminal_path, lease_path, ledger_root, "repeat-key", lease_content
             )
     assert "vanished repeatedly" in str(exc_info.value)
+
+
+# ──────────────────────────────────────────────────────────────────
+# FS-27 — release_lease() symlink-leaf refusal (spec/45 MUST 13, PR2)
+
+
+def test_release_lease_refuses_symlink_leaf(tmp_path) -> None:
+    """release_lease() MUST refuse to unlink a SYMLINK lease leaf (it could unlink
+    a real file at the symlink target). It logs + returns without raising, and the
+    symlink target file is left intact. spec/45 MUST 13.
+    """
+    agent_root = tmp_path / "agent"
+    agent_root.mkdir()
+    ledger_root = agent_root / "idempotency"
+    ledger_root.mkdir()
+    backend = FilesystemDedupLedger(agent_root)
+
+    # A real file the symlink points at — must NOT be unlinked.
+    target_file = ledger_root / "real-target.json"
+    target_file.write_text("important", encoding="utf-8")
+
+    lease_path = ledger_root / f"{_key_hash('sym-key')}.lease.json"
+    lease_path.symlink_to(target_file)
+    # Precondition: leaf is actually a symlink resolving inside ledger_root,
+    # so only the is_symlink branch (not containment) can fire.
+    assert lease_path.is_symlink() is True
+
+    backend.release_lease("sym-key")  # must NOT raise
+
+    # The guard returns early WITHOUT touching the tampered leaf, so the symlink
+    # leaf itself MUST still be present (we refuse to operate on it at all). This
+    # is the true negative control: with the is_symlink guard stripped,
+    # unlink(missing_ok=True) removes the symlink leaf, so this assertion goes RED.
+    assert lease_path.is_symlink(), (
+        "release_lease() MUST NOT touch a symlink lease leaf — it must remain"
+    )
+    # And the symlink target is of course untouched.
+    assert target_file.exists()
+
+
+def test_release_lease_symlink_refusal_negative_real_leaf_is_unlinked(tmp_path) -> None:
+    """NEGATIVE control for the symlink refusal: a REAL (non-symlink) lease leaf
+    IS unlinked by release_lease(). Brackets the is_symlink guard — if the guard
+    were inverted, this would fail."""
+    agent_root = tmp_path / "agent"
+    agent_root.mkdir()
+    backend = FilesystemDedupLedger(agent_root)
+    backend.begin("real-leaf-key", run_id="run-1")
+    ledger_root = agent_root / "idempotency"
+    lease_path = ledger_root / f"{_key_hash('real-leaf-key')}.lease.json"
+    assert lease_path.exists() and not lease_path.is_symlink()
+
+    backend.release_lease("real-leaf-key")
+    assert not lease_path.exists(), "a real lease leaf MUST be unlinked"
+
+
+def test_release_lease_io_error_maps_to_backend_error(tmp_path) -> None:
+    """release_lease() MUST map a genuine I/O failure on unlink (not ENOENT) to
+    IdempotencyBackendError. spec/45 MUST 13."""
+    agent_root = tmp_path / "agent"
+    agent_root.mkdir()
+    backend = FilesystemDedupLedger(agent_root)
+    backend.begin("io-key", run_id="run-1")
+
+    # Force unlink() to raise an OSError that is NOT ENOENT (e.g. EACCES).
+    with patch(
+        "pathlib.Path.unlink",
+        side_effect=PermissionError("EACCES: simulated permission denied"),
+    ):
+        with pytest.raises(IdempotencyBackendError):
+            backend.release_lease("io-key")

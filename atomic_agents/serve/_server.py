@@ -145,11 +145,15 @@ def run_server(args: object) -> int:
         agents_root=agents_root,
         agent_name=agent_name if agent_name else None,
         identity_header=serve_config.identity_header,
+        idempotency_header=serve_config.idempotency_header,
     )
     # Override state in case make_app default differs (e.g. operator-configured
     # identity header from serve.md); make_app already sets the default but
     # _server owns the resolved config.
     app.state.identity_header = serve_config.identity_header
+    # spec/45 PR2: thread idempotency_header from resolved serve config into app
+    # state, mirroring the identity_header pattern above.
+    app.state.idempotency_header = serve_config.idempotency_header
 
     print(
         f"atomic-agents serve: starting on http://{serve_config.host}:{serve_config.port}/",

@@ -89,6 +89,10 @@ _CANONICAL_FIELDS = frozenset(
         "agent_name",
         "fallback",
         "critical",
+        # idempotency dedup fields (spec/45 PR2 — promoted to canonical so
+        # SQLite/Postgres backends can index on them and LogQuery can filter).
+        "idempotency_key",
+        "replayed_run_id",
     }
 )
 
@@ -194,6 +198,12 @@ class RunRecord:
     agent_name: str | None = None
     fallback: bool | None = None
     critical: bool | None = None
+    # spec/45 PR2 — idempotency audit fields (spec/22 versioned normative addendum).
+    # Absent on normal ok/skipped/lock_busy records; set on keyed runs.
+    idempotency_key: str | None = None
+    # replayed_run_id: the run_id of the original completed run, on status='deduped'.
+    # Absent on ok and in_flight records (no result is served from a prior run).
+    replayed_run_id: str | None = None
 
     # Primitive-specific catch-all
     extra: dict[str, Any] = field(default_factory=dict)
@@ -247,6 +257,16 @@ class RunRecord:
             out["fallback"] = self.fallback
         if self.critical is not None:
             out["critical"] = self.critical
+        # spec/45 PR2: idempotency audit fields. Omit when None (same None-omit
+        # pattern as other optionals). The spec/22 addendum requires cost_usd to be
+        # ABSENT (not 0.0) on deduped/in_flight records — the call sites OMIT
+        # cost_usd entirely from those record dicts; from_dict() coerces the absent
+        # key to None and to_dict() omits None, so the on-disk line has no
+        # cost_usd key (spec/22 addendum).
+        if self.idempotency_key is not None:
+            out["idempotency_key"] = self.idempotency_key
+        if self.replayed_run_id is not None:
+            out["replayed_run_id"] = self.replayed_run_id
         # Flatten extra last so caller's primitive-specific keys appear
         # after canonical fields in the JSONL line.
         for k, v in self.extra.items():
@@ -310,6 +330,11 @@ class RunRecord:
         agent_name = _coerce_optional_str(d.get("agent_name"))
         fallback = _coerce_optional_bool(d.get("fallback"))
         critical = _coerce_optional_bool(d.get("critical"))
+        # spec/45 PR2 — idempotency audit fields (spec/22 versioned normative addendum).
+        # Both are in _CANONICAL_FIELDS so they are excluded from extra on read-back;
+        # explicit extraction + passing ensures the dataclass fields are populated.
+        idempotency_key = _coerce_optional_str(d.get("idempotency_key"))
+        replayed_run_id = _coerce_optional_str(d.get("replayed_run_id"))
 
         # Everything not in the canonical set lands in extra.
         extra = {k: v for k, v in d.items() if k not in _CANONICAL_FIELDS}
@@ -335,6 +360,8 @@ class RunRecord:
             agent_name=agent_name,
             fallback=fallback,
             critical=critical,
+            idempotency_key=idempotency_key,
+            replayed_run_id=replayed_run_id,
             extra=extra,
         )
 
@@ -398,6 +425,11 @@ class LogQuery:
     since: datetime | None = None
     until: datetime | None = None
     limit: int | None = None
+    # spec/22 versioned normative addendum (spec/45 PR2): LogQuery.idempotency_key
+    # conforming backends MUST support as an AND-predicate returning only records
+    # whose idempotency_key matches. SQLite backends MUST index on this column
+    # (idx_idempotency_key). None = no filter (all records).
+    idempotency_key: str | None = None
 
 
 # Canonical aggregation metrics. Backends advertising
