@@ -23,7 +23,7 @@ For the Protocol-pattern template every backend follows, read `docs/spec/20-memo
 - `lock_backend` threading: factory threads through to registered backend so `apply_staging` and `agent.call()` share the same lock backend instance.
 - **Delegate threading deliberately absent**: memory is per-agent state (each agent owns its own `memory/` directory). `delegate()` never threads the coordinator's memory backend to children — each child resolves independently via the process-global env selection (distinct from fleet-scoped persona/corpus backends which are threaded). Cross-agent memory sharing is a Tier A design fork; the kwarg escape hatch on each agent's own construction is the expressible path.
 - `DreamRunner` guards against non-filesystem backends at construction (`NotImplementedError` rather than silent failure at apply time). Routing through a backend-agnostic staging-adopt path deferred to [#396](https://github.com/dep0we/atomic-agents-stack/issues/396).
-- `ATOMIC_AGENTS_MEMORY_BACKEND_URL` companion var deferred to [#258](https://github.com/dep0we/atomic-agents-stack/issues/258).
+- `ATOMIC_AGENTS_MEMORY_BACKEND_URL` companion var ships in [#258](https://github.com/dep0we/atomic-agents-stack/issues/258) PR 1 (Postgres). Set alongside `ATOMIC_AGENTS_MEMORY_BACKEND=postgres`.
 
 **Doctor checks** (two-check pair mirrors LockBackend):
 
@@ -35,6 +35,8 @@ For the Protocol-pattern template every backend follows, read `docs/spec/20-memo
 **Implementer Contract:** 7 MUSTs in spec/20 §"Implementer Contract" — uniform construction, `lock_backend` threading, impl identifiability, write-4-case semantics, `WritePolicy` enforcement, atomic writes, capability advertisement.
 
 **Closes:** the memory config→backend wiring seam (T5; gates Phase 2 Postgres/pgvector scale-out). Default stays filesystem; zero behavior change for existing deployments.
+
+**`PostgresMemoryBackend` (#258 PR 1):** Non-semantic Postgres reference impl (FTS/tsvector recall, `supports_semantic_search=False`). Ships alongside `FilesystemBackend` as the second MemoryBackend reference impl. Targets multi-host deployments (Cloud Run, shared Postgres). `ATOMIC_AGENTS_MEMORY_BACKEND_URL` companion env var. Tier B field-lossless export. Schema `_SCHEMA_VERSION=2` (v1→v2 `display_name` migration for cross-backend `Note.name` parity) independent of `PostgresLogBackend`. Advisory lock key distinct from log backend. pgvector + EmbeddingBackend (#200) deferred to PR 2/PR 3.
 
 ---
 

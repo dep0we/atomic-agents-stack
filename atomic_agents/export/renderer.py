@@ -153,6 +153,12 @@ def render_note_bytes_from_object(note: "Note") -> bytes:
         meta["archived"] = note.archived
     if note.superseded_by:
         meta["superseded_by"] = note.superseded_by
+    # C7: include merge_into when set so the field round-trips losslessly
+    # through the Tier-B export path (field-lossless gate requires ALL Note
+    # fields to survive; omitting merge_into would silently drop it and break
+    # the Tier-B hard-gate for notes carrying a merge_into value).
+    if note.merge_into:
+        meta["merge_into"] = note.merge_into
     # Merge in extra_frontmatter (operator-added custom fields)
     meta.update(note.extra_frontmatter)
 

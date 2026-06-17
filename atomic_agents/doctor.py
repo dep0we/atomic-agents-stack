@@ -3388,14 +3388,32 @@ def check_memory_backend_config(agent_root: Path) -> CheckResult:
     try:
         _config_backend = get_default_memory_backend(agent_root)
     except Exception as exc:
+        # S2: route the exception string through DSN redaction before surfacing
+        # in any CheckResult message or fix_hint. A raw psycopg error (e.g. from
+        # _ensure_schema's meta SELECT) may embed host/user/dbname. The memory
+        # backend's _redact_dsn helper is the canonical redactor for that module.
+        try:
+            from .memory.postgres import _redact_dsn as _mem_redact_dsn
+
+            safe_exc = _mem_redact_dsn(str(exc))
+        except Exception:
+            safe_exc = str(exc)
+        if backend_id == "postgres":
+            fix_hint = (
+                f"Check ATOMIC_AGENTS_MEMORY_BACKEND={backend_id!r} and "
+                f"ATOMIC_AGENTS_MEMORY_BACKEND_URL=postgresql://user:pass@host:5432/dbname. "
+                f"Error: {safe_exc}"
+            )
+        else:
+            fix_hint = (
+                f"Check ATOMIC_AGENTS_MEMORY_BACKEND={backend_id!r} and any "
+                f"required connection env vars. Error: {safe_exc}"
+            )
         return CheckResult(
             name="memory-backend-config",
             status=FAIL,
-            message=f"memory backend construction failed: {exc}",
-            fix_hint=(
-                f"Check ATOMIC_AGENTS_MEMORY_BACKEND={backend_id!r} and any "
-                f"required connection env vars."
-            ),
+            message=f"memory backend construction failed: {safe_exc}",
+            fix_hint=fix_hint,
         )
     finally:
         if _config_backend is not None and hasattr(_config_backend, "close"):
@@ -3413,7 +3431,7 @@ def check_memory_backend_config(agent_root: Path) -> CheckResult:
 
 
 def check_memory_backend(agent_root: Path) -> CheckResult:
-    """Operator-configured MemoryBackend resolves and stats() returns successfully.
+    """Operator-configured MemoryBackend resolves and the list_notes() liveness probe returns.
 
     Routes through ``get_default_memory_backend`` (the operator-config factory)
     so the liveness probe hits the SAME backend the runtime constructs — not
@@ -3425,8 +3443,8 @@ def check_memory_backend(agent_root: Path) -> CheckResult:
     # filesystem reference impl. This precheck is ONLY correct for the
     # filesystem default — a future non-filesystem backend (#258 Postgres/
     # pgvector) may legitimately have no local memory/ dir, so we skip the
-    # guard and let the factory + stats() probe be authoritative for any
-    # non-filesystem selection. (Without this gate the liveness check would
+    # guard and let the factory + list_notes() liveness probe be authoritative
+    # for any non-filesystem selection. (Without this gate the liveness check would
     # spuriously FAIL a healthy non-local backend, contradicting the
     # doctor-reuses-factory invariant.)
     backend_id = (
@@ -3446,6 +3464,14 @@ def check_memory_backend(agent_root: Path) -> CheckResult:
         from .exceptions import BackendNotRegistered
 
         backend = get_default_memory_backend(agent_root)
+        # Liveness probe: list_notes() RE-RAISES on an unrecoverable read
+        # (e.g. a dead/unreachable Postgres) as MemoryBackendError, so a broken
+        # connection surfaces here as a FAIL. stats() must NOT be the probe —
+        # connection-backed backends (PostgresMemoryBackend.stats) degrade
+        # silently to an empty MemoryStats on failure, which would false-PASS a
+        # dead backend (doctor dual-probe lesson: the swallowing op hides the
+        # error). We still call stats() afterwards for the note count.
+        backend.list_notes()
         stats = backend.stats()
     except BackendNotRegistered as e:
         return CheckResult(
@@ -3458,14 +3484,40 @@ def check_memory_backend(agent_root: Path) -> CheckResult:
             ),
         )
     except Exception as e:
+        # Match the fix_hint to the configured backend: a filesystem-specific
+        # "check memory/ + INDEX.md" hint is actively misleading for a
+        # connection-backed backend (Postgres) that has no local memory/ dir —
+        # the liveness probe FAILs there on a dead/unreachable connection, not
+        # on a malformed local file.
+        # S2: redact DSN before surfacing the exception string in any
+        # CheckResult field. A raw psycopg error may embed host/user/dbname.
+        try:
+            from .memory.postgres import _redact_dsn as _mem_redact_dsn
+
+            safe_e = _mem_redact_dsn(str(e))
+        except Exception:
+            safe_e = str(e)
+        if backend_id == "filesystem":
+            fix_hint = (
+                "Check that memory/ is readable and INDEX.md is well-formed. "
+                "See docs/spec/02-atomic-memory.md."
+            )
+        elif backend_id == "postgres":
+            fix_hint = (
+                "Check ATOMIC_AGENTS_MEMORY_BACKEND_URL and that the Postgres "
+                "host is reachable (network/credentials/schema). "
+                "See docs/spec/20-memory-backend.md."
+            )
+        else:
+            fix_hint = (
+                f"Check the {backend_id!r} backend's connection/config env vars "
+                "and reachability. See docs/spec/20-memory-backend.md."
+            )
         return CheckResult(
             name="memory-backend",
             status=FAIL,
-            message=f"backend stats() raised {type(e).__name__}: {e}",
-            fix_hint=(
-                "Check that memory/ is readable and INDEX.md is well-formed. "
-                "See docs/spec/02-atomic-memory.md."
-            ),
+            message=f"memory backend liveness probe raised {type(e).__name__}: {safe_e}",
+            fix_hint=fix_hint,
         )
     finally:
         # Release any connection/pool a future connection-backed backend (#258)
