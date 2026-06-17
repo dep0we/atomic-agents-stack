@@ -1,0 +1,312 @@
+# cloudtasks-queue.yaml.example - Cloud Tasks queue pattern for atomic-agents
+#
+# NOT YET DOGFOODED against the live GCP platform.
+# Claims verified against GCP documentation as of 2026-06-17.
+# See extras/gcp/README.md §External-claim verification status.
+#
+# WHAT THIS FILE IS:
+# This file shows gcloud CLI commands to create a Cloud Tasks queue and
+# illustrates how Cloud Tasks tasks are created with the correct Idempotency-Key
+# header. It is NOT a declarative Terraform/API resource file.
+#
+# WHY CLOUD TASKS IS SIMPLER THAN PUB/SUB FOR INGESTION:
+# Cloud Tasks HTTP targets control the full request (URL, headers, body) at
+# task-creation time. This means NO transform Cloud Function is needed. The
+# operator sets the Idempotency-Key header directly in the task definition.
+# The framework reads the Idempotency-Key header — NOT the X-CloudTasks-TaskName
+# header — so the operator must set it explicitly.
+#
+# ─── IDEMPOTENCY KEY — CRITICAL: DO NOT USE X-CloudTasks-TaskName DIRECTLY ───
+#
+# Cloud Tasks injects X-CloudTasks-TaskName on push requests to Cloud Run, but
+# the value IS the SHORT task name (the task ID segment), NOT the full resource
+# path. Example: if the task resource name is:
+#   projects/myproject/locations/us-central1/queues/myqueue/tasks/my-task-001
+# then X-CloudTasks-TaskName = "my-task-001"
+#
+# (Verified: X-CloudTasks-TaskName is "the short name of the task" at
+#  https://cloud.google.com/tasks/docs/creating-http-target-tasks)
+#
+# However, even if you set Idempotency-Key from X-CloudTasks-TaskName inside
+# a transform, the serve-layer Idempotency-Key validation (in serve/_app.py, a
+# strict SUPERSET of the backend's _validate_key in idempotency/filesystem.py;
+# it additionally rejects backslash as cross-platform defense) rejects any
+# Idempotency-Key value containing "/" with HTTP 422. The short name
+# (X-CloudTasks-TaskName) has NO slashes, so it is safe. The full resource path
+# would be rejected.
+#
+# CORRECT APPROACH: Set Idempotency-Key explicitly in the task's httpRequest.headers
+# at task-creation time. Use the bare task ID (no slashes):
+#
+#   httpRequest.headers["Idempotency-Key"] = "my-task-001"
+#
+# Do NOT rely on X-CloudTasks-TaskName as the dedup key. Two reasons, NEITHER of
+# which is a slash/422 problem (X-CloudTasks-TaskName is the SHORT name with no
+# slashes — see above):
+#   (1) The serve layer reads ONLY the configured Idempotency-Key header (default
+#       Idempotency-Key — see the §WHY CLOUD TASKS IS SIMPLER note above), not
+#       X-CloudTasks-TaskName — so the header must be set explicitly at task
+#       creation regardless.
+#   (2) The short name is unique only within a project+queue — see §CROSS-QUEUE
+#       UNIQUENESS below; multi-queue deployments would false-dedup.
+# (The full RESOURCE PATH does contain slashes and WOULD be rejected with HTTP 422,
+#  but you never inject that path as the header — so 422 is not the reason here.)
+#
+# ─── CROSS-QUEUE UNIQUENESS ───────────────────────────────────────────────────
+#
+# X-CloudTasks-TaskName is the short name, unique within a project+queue.
+# Two tasks in DIFFERENT queues MAY share the same short name — they are not
+# globally unique. If you have multiple queues routing to the same agent, the
+# Idempotency-Key must incorporate the queue name to avoid false dedup:
+#
+#   Idempotency-Key: "{queue-name}-{task-id}"   # e.g. "ingestion-my-task-001"
+#
+# For single-queue-per-agent deployments (the natural v0 shape), the bare task
+# ID is sufficient. Document this assumption explicitly for your deployment.
+# X-CloudTasks-QueueName is also injected and can be concatenated at transform time.
+#
+# ─── CLOUD TASKS DEDUP WINDOW ─────────────────────────────────────────────────
+#
+# Cloud Tasks enforces a name-based dedup window (best-effort): after a task with
+# a given name is successfully deleted or completed, a new task with the same name
+# cannot be created for a period.
+# DOC-LITERAL FIGURE: the Cloud Tasks overview states "Cloud Tasks remembers task
+#  names for up to 24 hours after the task has been deleted from the queue"
+#  (https://cloud.google.com/tasks/docs/dual-overview). The REST `name`-field
+#  reference gives NO figure (it only constrains the name format), so treat 24h as
+#  the doc-of-record window.
+# UNVERIFIED — the previously-cited ~1-hour (Cloud-Tasks-created queues) and
+#  ~9-day (legacy queue.yaml/App Engine queues) per-queue-type figures could NOT
+#  be located in the cited docs as of 2026-06-17 (the overview gives a single
+#  uniform "up to 24 hours"). Do NOT rely on a queue-type-specific window; treat
+#  the dedup window as best-effort and bounded by the doc-literal "up to 24 hours,"
+#  and lean on the agent-side ledger (below) for durable dedup.
+#
+# This dedup is at the Cloud Tasks level (task creation), NOT at the agent level.
+# The agent-side FilesystemDedupLedger is the DURABLE dedup layer (spec/45).
+# After the Cloud Tasks dedup window expires, a task with the same name CAN be
+# re-created, and the agent-side ledger still provides dedup until the ledger
+# entry expires or the container is replaced.
+#
+# Important: Cloud Tasks dedup by name is BEST-EFFORT and bounded (doc-literal:
+# "up to 24 hours" per the overview) — it is NOT an indefinite global uniqueness
+# guarantee. Rely on the agent-side ledger for durable dedup.
+#
+# ─── OIDC AUTH FOR PRIVATE CLOUD RUN ─────────────────────────────────────────
+#
+# Cloud Tasks HTTP tasks hitting a private Cloud Run service need OIDC auth.
+# The task's httpRequest.oidcToken must specify the service account email and
+# audience (the Cloud Run service URL, no trailing slash).
+#
+# IAM grant required (same pattern as Cloud Scheduler):
+#   gcloud run services add-iam-policy-binding <your-agent-name> \
+#     --member=serviceAccount:TASKS_SA@PROJECT.iam.gserviceaccount.com \
+#     --role=roles/run.invoker \
+#     --region=REGION
+#
+# ─── SINGLE-HOST DEDUP CONSTRAINT ────────────────────────────────────────────
+#
+# FilesystemDedupLedger uses O_EXCL atomicity (single-host only; spec/45
+# MUST 7 single_host_only=True). The Cloud Run service MUST remain at
+# max-instances=1 (see cloudrun-service.yaml). Two instances do not share a
+# filesystem idempotency/ directory — each would see every key as FRESH,
+# defeating dedup.
+#
+# ─── CONCURRENCY: maxConcurrentDispatches ────────────────────────────────────
+#
+# Cloud Tasks queues default to maxConcurrentDispatches=1000. On a Cloud Run
+# service with containerConcurrency=1 and max-instances=1 (the v0 default),
+# excess concurrent dispatches queue inside Cloud Run. The FilesystemLockBackend
+# holds thread-pool workers for up to 30s — enough concurrent same-agent Cloud
+# Tasks dispatches can saturate the pool (TENSIONS.md T2). Recommended:
+# set maxConcurrentDispatches=1 to serialize dispatches at the queue level.
+# (Verified field name: retryConfig does not control concurrency; the field is
+# maxConcurrentDispatches at the queue level —
+# https://cloud.google.com/tasks/docs/reference/rest/v2/projects.locations.queues)
+#
+# ─── X-CloudTasks-* INJECTED HEADERS ─────────────────────────────────────────
+#
+# Cloud Tasks injects these headers on HTTP-target task delivery to Cloud Run
+# (verified at https://cloud.google.com/tasks/docs/creating-http-target-tasks).
+#
+# ALWAYS injected:
+#   X-CloudTasks-QueueName          — short queue name
+#   X-CloudTasks-TaskName           — short task name (last path segment)
+#   X-CloudTasks-TaskRetryCount     — number of retries so far
+#   X-CloudTasks-TaskExecutionCount — number of executions so far
+#   X-CloudTasks-TaskETA            — task ETA in seconds since epoch
+#
+# CONDITIONALLY present ("additional headers that might be present" per the doc —
+# do NOT assume they exist; e.g. TaskPreviousResponse is ABSENT on the first
+# attempt, so reading it unconditionally raises KeyError):
+#   X-CloudTasks-TaskPreviousResponse — HTTP response code from previous attempt
+#   X-CloudTasks-TaskRetryReason      — why the task is being retried
+#
+# These headers are READ-ONLY on the serve side (the framework doesn't read them
+# — only the Idempotency-Key header is read for dedup). They are useful for
+# logging/debugging inside the agent's work_item processing.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── HOW TO RUN THESE COMMANDS ────────────────────────────────────────────────
+# Every command below is commented out (each line begins with `#`). To run one,
+# remove the leading `#` from the command lines — AND delete the interspersed
+# annotation lines (the `# Number of delivery attempts...`-style explanations
+# that sit between a flag's trailing `\` and the next flag). Those annotation
+# lines are documentation, NOT part of the command: left in place after
+# uncommenting, a comment line between two `\`-continued lines breaks the
+# backslash continuation in most shells. Uncomment the flag lines only.
+#
+# ── STEP 0: Set shared variables ──────────────────────────────────────────────
+# PROJECT_ID=your-project-id
+# LOCATION=us-central1
+# QUEUE_NAME=atomic-agents-queue
+# AGENT_NAME=your-agent-name
+# TASKS_SA=cloudtasks-sa@${PROJECT_ID}.iam.gserviceaccount.com
+# CLOUD_RUN_URL=https://YOUR_CLOUD_RUN_SERVICE_URL   # no trailing slash
+
+# ── STEP 1: Create the Cloud Tasks queue ──────────────────────────────────────
+#
+# Field names verified against the Cloud Tasks Queue REST API resource at
+# https://cloud.google.com/tasks/docs/reference/rest/v2/projects.locations.queues
+# (RetryConfig schema):
+#   retryConfig.maxAttempts:      integer (-1 for unlimited)
+#   retryConfig.maxRetryDuration: duration string e.g. "3600s"
+#   retryConfig.minBackoff:       duration string e.g. "10s"
+#   retryConfig.maxBackoff:       duration string e.g. "300s"
+#   retryConfig.maxDoublings:     integer
+#
+# gcloud CLI flag names differ from REST API field names:
+#   --max-attempts            → retryConfig.maxAttempts
+#   --max-retry-duration      → retryConfig.maxRetryDuration
+#   --min-backoff             → retryConfig.minBackoff
+#   --max-backoff             → retryConfig.maxBackoff
+#   --max-doublings           → retryConfig.maxDoublings
+#   --max-concurrent-dispatches → maxConcurrentDispatches (queue-level, not retryConfig)
+
+# gcloud tasks queues create ${QUEUE_NAME} \
+#   --location=${LOCATION} \
+#   --project=${PROJECT_ID} \
+#   \
+#   --max-attempts=5 \
+#   # Number of delivery attempts before the task fails permanently.
+#   # IMPORTANT: Cloud Tasks has NO built-in dead-letter queue. After
+#   # max-attempts (or max-retry-duration), the task is DROPPED — it is not
+#   # captured anywhere. (--log-sampling-ratio is unrelated: it controls the
+#   # FRACTION [0.0-1.0] of queue operations written to Cloud Logging, not
+#   # dead-lettering. Verified: gcloud tasks queues create reference.)
+#   # To capture terminal failures, the WORKER must detect exhaustion — e.g.
+#   # inspect X-CloudTasks-TaskRetryCount approaching max-attempts on the final
+#   # attempt — and persist/re-enqueue the work item itself; OR route through
+#   # Pub/Sub instead (which DOES have a native deadLetterPolicy). This matches
+#   # the README §When to use comparison table ("Dead-letter queue: Not built-in").
+#   #
+#   # REDELIVERY COST + NO TERMINAL ARTIFACT (the asymmetry vs Pub/Sub): Cloud
+#   # Tasks retries EVERY non-2xx serve response (402 cost-skip, 409 in-flight,
+#   # 422 bad-body, 503 lock-busy) up to max-attempts, re-spending any mid-loop
+#   # partial LLM budget on each attempt — exactly as the Pub/Sub 402 path warns,
+#   # but there is NO transform to ACK-route a deterministic 4xx away. And because
+#   # there is no DLQ, a task exhausted on a deterministic 402/422 is silently
+#   # DROPPED (work LOST) with NO terminal GCP-side artifact to inspect — only the
+#   # N per-attempt JSONL records (skipped/error). Correlate them by
+#   # Idempotency-Key (each redelivery shares the bare task ID) and treat the
+#   # attempt at X-CloudTasks-TaskRetryCount == max-attempts-1 as the terminal
+#   # drop. 503 (lock_busy) is the one TRANSIENT non-2xx — retry succeeds, but a
+#   # persistent 503 storm means lock-pool saturation (lower max-concurrent-
+#   # dispatches), not a poison task. For inspectable terminal failures, prefer
+#   # the Pub/Sub deadLetterPolicy path. See README §Redelivery behavior.
+#   \
+#   --max-retry-duration=3600s \
+#   # retryConfig.maxRetryDuration: total time Cloud Tasks keeps retrying.
+#   # Duration string required (e.g. "3600s", "1h" may not be accepted — use seconds).
+#   \
+#   --min-backoff=10s \
+#   # retryConfig.minBackoff: minimum wait between retries.
+#   \
+#   --max-backoff=300s \
+#   # retryConfig.maxBackoff: maximum wait between retries (caps exponential growth).
+#   \
+#   --max-doublings=4 \
+#   # retryConfig.maxDoublings: number of times backoff doubles before max-backoff is applied.
+#   \
+#   --max-concurrent-dispatches=1
+#   # Limit concurrent dispatches to 1 for Cloud Run containerConcurrency=1.
+#   # See §CONCURRENCY above. Increase only after verifying the serving topology.
+
+# ── STEP 2: Apply IAM grant ────────────────────────────────────────────────────
+
+# gcloud run services add-iam-policy-binding ${AGENT_NAME} \
+#   --member=serviceAccount:${TASKS_SA} \
+#   --role=roles/run.invoker \
+#   --region=${LOCATION}
+
+# ── STEP 3: Create a task (example — replace with your task creation logic) ───
+#
+# CRITICAL: Set Idempotency-Key in httpRequest.headers to the BARE TASK ID.
+# Do NOT pass the full resource path (contains slashes → HTTP 422 from serve).
+#
+# Using gcloud (for illustration — production code typically uses the Cloud Tasks
+# Python client library):
+#
+# TASK_ID=my-task-$(date +%s%N)   # bare alphanumeric ID, no slashes
+# WORK_ITEM_JSON='{"work_item": "Process batch 42"}'
+#
+# NOTE on gcloud flags (verified against the gcloud tasks create-http-task
+# reference, https://docs.cloud.google.com/sdk/gcloud/reference/tasks/create-http-task):
+#   - TASK_ID is a POSITIONAL argument, NOT a flag. There is no --task-name flag.
+#     Passing the task ID positionally is what ENABLES Cloud Tasks de-duplication
+#     (the best-effort name-dedup window; see §CLOUD TASKS DEDUP WINDOW above);
+#     omit it and Cloud Tasks auto-generates a random name and the dedup window
+#     does NOT apply.
+#   - The body flag is --body-content (or --body-file). There is no --body flag.
+#
+# gcloud tasks create-http-task ${TASK_ID} \
+#   --queue=${QUEUE_NAME} \
+#   --location=${LOCATION} \
+#   --project=${PROJECT_ID} \
+#   --url="${CLOUD_RUN_URL}/agents/${AGENT_NAME}/call" \
+#   --method=POST \
+#   --header="Content-Type: application/json" \
+#   --header="Idempotency-Key: ${TASK_ID}" \
+#   # Idempotency-Key = bare task ID (no slashes; same value as the positional TASK_ID).
+#   # Cloud Tasks dedup window for this name: best-effort, doc-literal "up to
+#   #   24 hours" (see §CLOUD TASKS DEDUP WINDOW above).
+#   # For single-queue deployments: task ID is unique enough.
+#   # For multi-queue deployments: prefix with queue name:
+#   #   --header="Idempotency-Key: ${QUEUE_NAME}-${TASK_ID}"
+#   --body-content="${WORK_ITEM_JSON}" \
+#   --oidc-service-account-email="${TASKS_SA}" \
+#   --oidc-token-audience="${CLOUD_RUN_URL}"
+#
+# Python client library equivalent (preferred for production):
+#
+#   import json
+#   from google.cloud import tasks_v2
+#   client = tasks_v2.CloudTasksClient()
+#   parent = client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
+#   task_id = "my-task-001"  # bare alphanumeric ID — no slashes
+#   task = {
+#       "name": f"{parent}/tasks/{task_id}",
+#       "http_request": {
+#           "http_method": tasks_v2.HttpMethod.POST,
+#           "url": f"{CLOUD_RUN_URL}/agents/{AGENT_NAME}/call",
+#           "headers": {
+#               "Content-Type": "application/json",
+#               # Idempotency-Key = bare task ID (no slashes).
+#               # The framework reads this header for dedup (spec/45).
+#               # It does NOT read X-CloudTasks-TaskName automatically.
+#               "Idempotency-Key": task_id,
+#           },
+#           "body": json.dumps({"work_item": "Process batch 42"}).encode(),
+#           "oidc_token": {
+#               "service_account_email": TASKS_SA,
+#               "audience": CLOUD_RUN_URL,  # no trailing slash
+#           },
+#       },
+#   }
+#   client.create_task(request={"parent": parent, "task": task})
+
+# ─────────────────────────────────────────────────────────────────────────────
+# See extras/gcp/README.md §Cloud Tasks ingestion runbook for the full operator
+# guide, idempotency contract, and comparison with the Pub/Sub path.
+# ─────────────────────────────────────────────────────────────────────────────

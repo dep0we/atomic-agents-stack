@@ -1,0 +1,384 @@
+# pubsub-ingestion.yaml.example - Pub/Sub push ingestion pattern for atomic-agents
+#
+# NOT YET DOGFOODED against the live GCP platform.
+# Claims verified against GCP documentation as of 2026-06-17.
+# See extras/gcp/README.md §External-claim verification status.
+#
+# WHAT THIS FILE IS:
+# This file shows gcloud CLI commands to provision Pub/Sub resources (topic +
+# dead-letter topic + DLQ pull subscription + push subscription). It is NOT a
+# declarative Terraform/API resource file. Pub/Sub has no equivalent of Cloud
+# Scheduler's YAML export format. The field names in comments reflect the
+# Pub/Sub REST API Subscription resource schema (camelCase), verified against
+# https://cloud.google.com/pubsub/docs/reference/rest/v1/projects.subscriptions.
+# The gcloud flag names differ; they are shown in the actual commands below.
+#
+# ─── TWO-HOP TOPOLOGY: PUSH → TRANSFORM → SERVE ──────────────────────────────
+#
+# Pub/Sub push CANNOT target the /call endpoint directly: push delivers a
+# base64 JSON ENVELOPE, and the Idempotency-Key must become an HTTP HEADER —
+# neither of which a raw push can do. So the push subscription's endpoint is the
+# pubsub-to-call-transform Cloud Function (TRANSFORM_URL), and the transform
+# forwards a flat body + Idempotency-Key header to Cloud Run /call. Two OIDC
+# hops result:
+#   HOP 1: Pub/Sub push SA → invokes the Cloud Function   (audience = TRANSFORM_URL)
+#   HOP 2: transform's own SA → invokes Cloud Run /call    (audience = CLOUD_RUN_URL)
+# The IAM grants below cover HOP 1. HOP 2 is handled inside the transform via
+# fetch_id_token(CLOUD_RUN_SERVICE_URL) and the transform SA's run.invoker grant
+# (see pubsub-to-call-transform.py.example deployment notes).
+#
+# ─── OIDC PUSH AUTH — REQUIRED IAM GRANTS ────────────────────────────────────
+#
+# Pub/Sub push OIDC auth requires BOTH of the following grants, not just one:
+#
+# GRANT 1: Allow the push SA to invoke the Cloud FUNCTION (the push endpoint).
+# The transform is a Cloud Functions GEN2 function. The Pub/Sub push-auth doc of
+# record prescribes roles/cloudfunctions.invoker for the push SA when push is
+# used as an HTTP trigger to a function, and the function-level invoker command
+# is the surface to use — it does NOT require you to know the function's backing
+# Cloud Run service name:
+#
+#   gcloud functions add-invoker-policy-binding <your-transform-function> \
+#     --member=serviceAccount:PUSH_SA@PROJECT.iam.gserviceaccount.com \
+#     --region=REGION
+#
+# (Verified: the push-auth doc states "Your push auth service account must have
+#  the roles/cloudfunctions.invoker role to invoke a function if you intend to
+#  use Pub/Sub push requests as HTTP triggers to the function" —
+#  https://cloud.google.com/pubsub/docs/authenticate-push-subscriptions . The
+#  add-invoker-policy-binding command "adds the Cloud Run Invoker binding to the
+#  IAM policy of the specified function's underlying Cloud Run service" for Gen2 —
+#  https://cloud.google.com/sdk/gcloud/reference/functions/add-invoker-policy-binding )
+#
+# EQUIVALENT LOWER-LEVEL ALTERNATIVE (Gen2 only): because a Gen2 function is
+# backed by a Cloud Run service, granting roles/run.invoker directly on that
+# backing service achieves the same invoke permission. The function-level command
+# above is preferred (it is the push-doc-of-record surface and is generation-
+# agnostic); use the run.invoker form only if you specifically need to bind the
+# backing service directly, and confirm at deploy time:
+#
+#   gcloud run services add-iam-policy-binding <transform-backing-run-service> \
+#     --member=serviceAccount:PUSH_SA@PROJECT.iam.gserviceaccount.com \
+#     --role=roles/run.invoker \
+#     --region=REGION
+#   # (Gen1 functions would instead use roles/cloudfunctions.invoker on the
+#   #  function resource; this reference uses Gen2.)
+#
+# GRANT 2: Allow the Pub/Sub service agent to mint OIDC tokens on the push SA's
+# behalf. Without this, Pub/Sub cannot generate the OIDC token for push delivery
+# and every push message fails immediately — all messages go to DLQ.
+#
+#   gcloud projects add-iam-policy-binding PROJECT_ID \
+#     --member=serviceAccount:service-PROJECT_NUMBER@gcp-sa-pubsub.iam.gserviceaccount.com \
+#     --role=roles/iam.serviceAccountTokenCreator
+#
+# To find your project number:
+#   gcloud projects describe PROJECT_ID --format="value(projectNumber)"
+#
+# Note: unlike Cloud Scheduler (which uses a simpler token path), Pub/Sub push
+# authentication has an extra hop through the Pub/Sub service agent to mint OIDC
+# tokens. Both grants are load-bearing. If you only do Grant 1 and see 403s,
+# check whether Grant 2 is also applied.
+# (Verified at: https://cloud.google.com/pubsub/docs/authenticate-push-subscriptions)
+#
+# GRANT 3 (DLQ): The Pub/Sub service agent also needs publisher rights on the
+# dead-letter topic so it can forward dead-lettered messages there:
+#
+#   gcloud pubsub topics add-iam-policy-binding atomic-agents-deadletter \
+#     --member=serviceAccount:service-PROJECT_NUMBER@gcp-sa-pubsub.iam.gserviceaccount.com \
+#     --role=roles/pubsub.publisher
+#
+# GRANT 4 (DLQ): The Pub/Sub service agent needs subscriber rights on the source
+# subscription so it can forward messages:
+#
+#   gcloud pubsub subscriptions add-iam-policy-binding atomic-agents-sub \
+#     --member=serviceAccount:service-PROJECT_NUMBER@gcp-sa-pubsub.iam.gserviceaccount.com \
+#     --role=roles/pubsub.subscriber
+#
+# (Grants 3 and 4 verified at:
+#  https://cloud.google.com/pubsub/docs/handling-failures#grant_forwarding_roles)
+#
+# ─── OIDC AUDIENCE ────────────────────────────────────────────────────────────
+#
+# The push subscription's OIDC token audience MUST match the PUSH ENDPOINT — and
+# the push endpoint is the Cloud Function transform (TRANSFORM_URL), NOT the
+# Cloud Run /call URL. A mismatch causes HTTP 401 on every push delivery — all
+# messages go to DLQ. Copy the function URL from the Cloud Functions console.
+# No trailing slash. Same rule as Cloud Scheduler (see
+# cloudscheduler-jobs.yaml.example §INGRESS RECONCILIATION).
+# (The CLOUD_RUN_URL audience is used by the SECOND hop, inside the transform,
+# not by the push subscription.)
+# For topology (a) same-project + direct function URL: audience = TRANSFORM_URL.
+# For topology (b) via LB/IAP fronting the function: audience = the ALB/custom domain URL.
+#
+# ─── INGRESS RECONCILIATION ───────────────────────────────────────────────────
+#
+# cloudrun-service.yaml sets run.googleapis.com/ingress =
+# internal-and-cloud-load-balancing, which admits same-project internal sources
+# AND traffic via an external ALB. The GCP internal-traffic source list (Cloud
+# Scheduler, Pub/Sub, Eventarc, ...) is defined under `internal` and inherited
+# under internal-and-cloud-load-balancing.
+#
+# Doc-literal: same-project Pub/Sub push to the default run.app URL is admitted
+# as internal traffic. (Verified: https://cloud.google.com/run/docs/securing/ingress)
+# Confirm at deploy time — same operational caveat as Cloud Scheduler.
+#
+# Two topology options (mirror of cloudscheduler-jobs.yaml.example):
+#   (a) SAME-PROJECT + DEFAULT run.app URL:
+#       Push SA OIDC token reaches Cloud Run as internal traffic.
+#       Audience: the run.app service URL (no trailing slash).
+#       If push returns 403/404, switch to (b) or bare `internal` ingress.
+#   (b) CROSS-PROJECT or SAFE DEFAULT:
+#       Route push through the external ALB / IAP.
+#       Cross-project Pub/Sub does NOT qualify as same-project internal traffic;
+#       must use topology (b) for any cross-project push subscription.
+#       Audience: the ALB/custom domain URL.
+#
+# ─── AUDIT RECORD — http_caller ABSENT ON PUSH CALLS ─────────────────────────
+#
+# Pub/Sub push deliveries carry the push SA OIDC token in the Authorization:
+# Bearer header — a header the serve layer NEVER reads. That OIDC token is
+# verified by Cloud Run's own infrastructure (the perimeter), not by serve.
+# Serve reads caller identity ONLY from the configured identity header
+# (default X-Goog-IAP-JWT-Assertion), and per spec/37 MUST 6 it reads that
+# header's value verbatim and MUST NOT attempt JWT verification of it. On a
+# Pub/Sub push delivery the identity header is ABSENT (the push carries an
+# Authorization bearer token, not an IAP assertion), so there is simply no
+# identity for serve to record.
+#
+# Result: push-triggered agent.call() runs have NO http_caller field in the
+# JSONL audit record. This is expected (same behavior as Cloud Scheduler calls).
+#
+# To distinguish push-ingestion runs from interactive runs:
+#   - filter on trigger='http' combined with absence of http_caller field, OR
+#   - correlate with Cloud Logging Pub/Sub delivery logs.
+#
+# For redelivered messages, the JSONL log will show multiple records sharing
+# the same idempotency_key value (when set). The first will have status='ok';
+# subsequent redeliveries will have status='deduped'. Filter on
+# idempotency_key to correlate all runs for a given message.
+#
+# ─── SINGLE-HOST DEDUP CONSTRAINT ────────────────────────────────────────────
+#
+# FilesystemDedupLedger uses O_EXCL atomicity (single-host only; spec/45
+# MUST 7 single_host_only=True). Two Cloud Run instances do not share a
+# filesystem idempotency/ directory — each would see every key as FRESH,
+# defeating dedup. The Cloud Run service MUST remain at max-instances=1
+# (see cloudrun-service.yaml).
+# Scale beyond 1 instance requires a Redis or Postgres IdempotencyBackend.
+#
+# ─── DEDUP LEDGER — EPHEMERAL ON CLOUD RUN ────────────────────────────────────
+#
+# On stateless Cloud Run, the idempotency/ directory lives in the container's
+# ephemeral writable layer and is LOST on every container replacement / redeploy.
+# After a container restart, all *.lease.json and *.terminal.json files are
+# gone: a redelivered message that arrives after the restart will see FRESH and
+# re-run, regardless of whether it previously completed.
+#
+# For dedup that survives restarts: use the Compute Engine VM topology
+# (extras/gcp/compute-vm/, persistent disk) or a future Redis/Postgres
+# IdempotencyBackend.
+#
+# On the VM topology, stale IN_FLIGHT leases require manual recovery after a
+# crash — see extras/gcp/README.md §Troubleshooting for the command.
+#
+# ─── ACK DEADLINE vs AGENT RUNTIME ───────────────────────────────────────────
+#
+# IMPORTANT: ackDeadlineSeconds MUST be greater than your expected
+# agent.call() wall-clock time. Cloud Run --timeout-seconds MUST be >=
+# ackDeadlineSeconds. If agent.call() takes longer than ackDeadlineSeconds:
+#
+#   Cloud Run returns HTTP 504 to the transform → transform NACKs (500)
+#   → Pub/Sub redelivers with the same Idempotency-Key
+#   → if the original run is still IN_FLIGHT, serve returns HTTP 409
+#   → the transform NACKs the 409 (correct — see below) → Pub/Sub redelivers
+#     again after retryPolicy backoff
+#   → once the original run terminates, the next redelivery dedups (200) or
+#     re-runs; a genuinely-wedged key reaches the DLQ after maxDeliveryAttempts
+#
+# NACKing the 409 is the SAFE behavior, not a bug: ACKing an in-flight delivery
+# would drop the only surviving copy of the work if the concurrent run later
+# fails/ESCALATEs (its lease releases WITHOUT committing, spec/45 W4). The
+# transform deliberately NACKs 409 (pubsub-to-call-transform.py.example STEP
+# status handling). Bound the redelivery pressure with retryPolicy backoff +
+# a long-enough ackDeadline so 504s are rare in the first place — do NOT try to
+# suppress redelivery by ACKing in-flight work.
+#
+# Recommended safe values: ackDeadlineSeconds=600 (maximum), Cloud Run
+# --timeout=3600. Set Cloud Run timeout >= ackDeadlineSeconds to avoid this loop.
+#
+# ─── DLQ DRAIN — DO NOT POINT AT /call ───────────────────────────────────────
+#
+# The pull subscription on the DLQ topic (atomic-agents-deadletter-sub below)
+# is for manual inspection and alerting — NOT for automatic re-processing.
+# Do NOT wire a DLQ drain push subscription to /call unless you specifically
+# understand the dedup consequences. When Pub/Sub forwards an undeliverable
+# message to the dead-letter topic, it "wraps the original message in a new one
+# and adds attributes that identify the source subscription"
+# (https://cloud.google.com/pubsub/docs/handling-failures) — i.e. the
+# dead-lettered message is a NEW envelope. INFERRED (NOT doc-stated, 2026-06-17):
+# the wrapped message is expected to carry its OWN messageId distinct from the
+# original — the cited handling-failures doc enumerates only the ADDED
+# CloudPubSubDeadLetterSource* attributes and does NOT explicitly state the
+# wrapped message gets a new messageId; treat this as an inference from "wraps
+# the original message in a new one." So a DLQ-drain push to /call with a
+# messageId-derived Idempotency-Key would (under that inference) carry a NEW
+# messageId and therefore RE-RUN the agent (duplicate external effects), NOT
+# dedup against the original run. The original publisher's explicit Tier-1
+# message.attributes.idempotency_key is EXPECTED to survive DLQ forwarding —
+# INFERRED, NOT doc-stated: the handling-failures doc lists the added
+# CloudPubSubDeadLetterSource* attributes but does NOT explicitly confirm
+# original-attribute preservation (2026-06-17). Confirm by inspecting a
+# dead-lettered message before relying on a Tier-1 key to dedup across the drain;
+# if attributes were stripped on wrapping, even a Tier-1 key would re-run. Under
+# the preservation assumption it is the ONLY key that dedups across the drain.
+# This matches README.md §"Idempotency-Key derivation"
+# (a republished/re-injected message gets a NEW messageId → re-runs if Tier 2
+# is used). Document and decide this deliberately.
+#
+# ─── PREREQUISITE ORDERING ────────────────────────────────────────────────────
+#
+# Create resources in this order (earlier resources must exist before later ones):
+#   1. Dead-letter topic
+#   2. DLQ pull subscription (REQUIRED — without this, dead-lettered messages are
+#      permanently lost AND the monitoring alert never fires)
+#   3. Source topic
+#   4. Push subscription (references dead-letter topic in deadLetterPolicy)
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── HOW TO RUN THESE COMMANDS ────────────────────────────────────────────────
+# Every command below is commented out (each line begins with `#`). To run one,
+# remove the leading `#` from the command lines — AND delete the interspersed
+# annotation lines (the `# ackDeadlineSeconds=600...`-style explanations that sit
+# between a flag's trailing `\` and the next flag). Those annotation lines are
+# documentation, NOT part of the command: left in place after uncommenting, a
+# comment line between two `\`-continued lines breaks the backslash continuation
+# in most shells. Uncomment the flag lines only.
+#
+# ── STEP 0: Set shared variables ──────────────────────────────────────────────
+# Substitute these into the commands below.
+#
+# PROJECT_ID=your-project-id
+# PROJECT_NUMBER=your-project-number  # gcloud projects describe $PROJECT_ID --format="value(projectNumber)"
+# REGION=us-central1
+# AGENT_NAME=your-agent-name
+# PUSH_SA=pubsub-push-sa@${PROJECT_ID}.iam.gserviceaccount.com
+# CLOUD_RUN_URL=https://YOUR_CLOUD_RUN_SERVICE_URL   # no trailing slash (audience for the transform→serve hop)
+# TRANSFORM_URL=https://YOUR_CLOUD_FUNCTION_URL      # the pubsub-to-call-transform Cloud Function URL; the PUSH endpoint
+# TOPIC=atomic-agents-work
+# DLQ_TOPIC=atomic-agents-deadletter
+# DLQ_SUB=atomic-agents-deadletter-sub
+# PUSH_SUB=atomic-agents-push-sub
+
+# ── STEP 1: Create the dead-letter topic (must exist BEFORE the push subscription) ──
+
+# gcloud pubsub topics create ${DLQ_TOPIC} --project=${PROJECT_ID}
+
+# ── STEP 2: Create the DLQ pull subscription (REQUIRED) ───────────────────────
+# This subscription is required for two reasons:
+#   (1) Without a subscription on the dead-letter topic, all dead-lettered
+#       messages are permanently lost — Pub/Sub discards unsubscribed messages.
+#   (2) The Cloud Monitoring alert (cloud-monitoring-policies.yaml, DLQ alert)
+#       measures num_undelivered_messages on THIS subscription — without it,
+#       the alert never fires even when messages are dead-lettered.
+#
+# This is a pull subscription for manual inspection. Do NOT add a push endpoint
+# here unless you explicitly want DLQ auto-retry (and understand the dedup
+# implications — see §DLQ DRAIN above).
+#
+# gcloud pubsub subscriptions create ${DLQ_SUB} \
+#   --topic=${DLQ_TOPIC} \
+#   --project=${PROJECT_ID}
+
+# ── STEP 3: Create the source topic ───────────────────────────────────────────
+
+# gcloud pubsub topics create ${TOPIC} --project=${PROJECT_ID}
+
+# ── STEP 4: Apply IAM grants (see §OIDC PUSH AUTH above) ─────────────────────
+
+# Grant 1: push SA → roles/cloudfunctions.invoker on the Cloud FUNCTION transform
+# (the push endpoint; the function-level command binds the Gen2 backing service).
+# gcloud functions add-invoker-policy-binding <your-transform-function> \
+#   --member=serviceAccount:${PUSH_SA} \
+#   --region=${REGION}
+# (Equivalent lower-level alternative: roles/run.invoker on the transform's
+#  backing Cloud Run service — see §OIDC PUSH AUTH Grant 1 above for the tradeoff.)
+#
+# Grant 1b: the TRANSFORM's own SA → roles/run.invoker on the agent service
+# (HOP 2; lets the transform call /call). Substitute the transform's runtime SA.
+# gcloud run services add-iam-policy-binding ${AGENT_NAME} \
+#   --member=serviceAccount:<transform-runtime-sa>@${PROJECT_ID}.iam.gserviceaccount.com \
+#   --role=roles/run.invoker \
+#   --region=${REGION}
+
+# Grant 2: Pub/Sub service agent → roles/iam.serviceAccountTokenCreator
+# gcloud projects add-iam-policy-binding ${PROJECT_ID} \
+#   --member=serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-pubsub.iam.gserviceaccount.com \
+#   --role=roles/iam.serviceAccountTokenCreator
+
+# Grant 3: Pub/Sub service agent → roles/pubsub.publisher on DLQ topic
+# gcloud pubsub topics add-iam-policy-binding ${DLQ_TOPIC} \
+#   --member=serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-pubsub.iam.gserviceaccount.com \
+#   --role=roles/pubsub.publisher
+
+# Grant 4: Pub/Sub service agent → roles/pubsub.subscriber on source subscription
+# (required AFTER the push subscription is created in Step 5; apply again if needed)
+# gcloud pubsub subscriptions add-iam-policy-binding ${PUSH_SUB} \
+#   --member=serviceAccount:service-${PROJECT_NUMBER}@gcp-sa-pubsub.iam.gserviceaccount.com \
+#   --role=roles/pubsub.subscriber
+
+# ── STEP 5: Create the push subscription ─────────────────────────────────────
+#
+# Pub/Sub REST API Subscription resource field reference (all verified at
+# https://cloud.google.com/pubsub/docs/reference/rest/v1/projects.subscriptions):
+#
+#   deadLetterPolicy.deadLetterTopic:    fully-qualified topic resource name
+#                                        format: projects/PROJECT/topics/TOPIC
+#   deadLetterPolicy.maxDeliveryAttempts: integer, valid range 5–100 (minimum 5;
+#                                        values below 5 are rejected by the API)
+#   retryPolicy.minimumBackoff:          duration string e.g. "10s" (max 600s)
+#   retryPolicy.maximumBackoff:          duration string e.g. "600s" (max 600s)
+#   pushConfig.pushEndpoint:             the Cloud Function TRANSFORM URL
+#                                        (NOT the Cloud Run /call URL — see
+#                                        §TWO-HOP TOPOLOGY above)
+#   pushConfig.oidcToken.serviceAccountEmail: the push SA email
+#   pushConfig.oidcToken.audience:       the TRANSFORM URL (no trailing slash)
+#
+# retryPolicy on push subscriptions is supported (verified: the Subscription
+# resource schema applies retryPolicy to both push and pull subscriptions).
+#
+# The gcloud CLI uses different flag names from the REST API field names.
+# CRITICAL: --push-endpoint is the TRANSFORM function URL, not /call. A direct
+# push to /call returns HTTP 422 (raw envelope, work_item missing) on EVERY
+# delivery → every message dead-lettered. The transform is mandatory.
+
+# gcloud pubsub subscriptions create ${PUSH_SUB} \
+#   --topic=${TOPIC} \
+#   --project=${PROJECT_ID} \
+#   \
+#   --push-endpoint="${TRANSFORM_URL}" \
+#   --push-auth-service-account="${PUSH_SA}" \
+#   --push-auth-token-audience="${TRANSFORM_URL}" \
+#   \
+#   --ack-deadline=600 \
+#   # ackDeadlineSeconds=600 (maximum); set >= your agent.call() expected runtime.
+#   # See §ACK DEADLINE above for the 504→NACK→storm failure mode.
+#   \
+#   --dead-letter-topic=projects/${PROJECT_ID}/topics/${DLQ_TOPIC} \
+#   --max-delivery-attempts=5 \
+#   # maxDeliveryAttempts minimum is 5; values below 5 rejected by API.
+#   # Range 5-100. After this many failed deliveries, the message is
+#   # forwarded to the dead-letter topic and the DLQ alert fires.
+#   \
+#   --min-retry-delay=10s \
+#   # retryPolicy.minimumBackoff; Duration string (e.g. "10s"). Range 0-600s.
+#   --max-retry-delay=600s
+#   # retryPolicy.maximumBackoff; Duration string (e.g. "600s"). Range 0-600s.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# See extras/gcp/README.md §Pub/Sub ingestion runbook for the full operator
+# guide, transform snippet, idempotency contract, and troubleshooting.
+# The DLQ depth monitoring alert is in extras/gcp/cloud-monitoring-policies.yaml
+# (policy 5 — "DLQ depth > 0").
+# ─────────────────────────────────────────────────────────────────────────────

@@ -588,6 +588,24 @@ allow check runs before `safe_resolve_under()`, so a traversal-shaped name that
 doesn't match the single agent returns HTTP 404 rather than 400; this is
 consistent with the "router may normalise first" property above.
 
+**MUST 11 — At-least-once redelivery is expected; dedup is opt-in:**
+`POST /agents/<name>/call` may receive at-least-once redelivery from any
+event-delivery source. The caller — or an interposed transform between the
+delivery source and this route — MUST supply the Idempotency-Key header (the
+header name configured via `## Idempotency Header` in `serve.md`) for dedup to
+apply; an absent header means no dedup — the run executes unconditionally
+(unless body-hash auto-derivation is enabled per spec/45). The framework
+deduplicates per spec/45 when the header is present. This spec does not
+prescribe how any particular delivery source maps its native delivery
+identifier to an Idempotency-Key; provider-specific reference patterns
+(e.g. managed message queues and task queues) live in `extras/`, outside
+this normative spec.
+
+Note for implementors: MUST 11 is a normative documentation of existing
+behaviour shipped in spec/45 PR2. No new code is required. Future arcs adding
+MUSTs to spec/37 (e.g. the /ingest route, issue #524) MUST pick up from
+MUST 12 onward.
+
 ---
 
 ## Cross-references
