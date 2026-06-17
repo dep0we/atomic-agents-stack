@@ -1,6 +1,6 @@
 # Backend protocols shipped
 
-Twelve backend protocols are locked for v1.0. A thirteenth, SecretBackend (#340), shipped for v1.5 with two reference implementations (FilesystemSecretBackend + GCPSecretManagerBackend) and LOCKED spec/38. A fourteenth, GoalBackend (#425 + #448 PR1/PR2/PR3 + #483 PR1 + #496 PR1), shipped for v1.5 with FilesystemGoalBackend and LOCKED spec/41 (arc-closer #448 PR3 locked the spec; #483 PR1 added clock injection + GoalManager thin shim + agent_root resolution + spec/41 normative addendum; #496 PR1 added backend-universe alignment — coordinator threads gate agent's log/policy/profile backends into OutcomeRunner). A fifteenth, OutcomeBackend (#426), shipped for v1.5 with FilesystemOutcomeBackend; write-path adopted in #448 PR2 and LOCKED spec/42. A sixteenth, JournalBackend (#427), shipped for v1.5 with FilesystemJournalBackend and DRAFT spec/43. A seventeenth, QueueBackend (#428), shipped for v1.5 with FilesystemQueueBackend and DRAFT spec/44. Each section captures the reference implementations shipped, the operator override surface, the doctor coherence check, the Implementer Contract location, and the architectural cliff the protocol closes.
+Twelve backend protocols are locked for v1.0. A thirteenth, SecretBackend (#340), shipped for v1.5 with two reference implementations (FilesystemSecretBackend + GCPSecretManagerBackend) and LOCKED spec/38. A fourteenth, GoalBackend (#425 + #448 PR1/PR2/PR3 + #483 PR1 + #496 PR1), shipped for v1.5 with FilesystemGoalBackend and LOCKED spec/41 (arc-closer #448 PR3 locked the spec; #483 PR1 added clock injection + GoalManager thin shim + agent_root resolution + spec/41 normative addendum; #496 PR1 added backend-universe alignment — coordinator threads gate agent's log/policy/profile backends into OutcomeRunner). A fifteenth, OutcomeBackend (#426), shipped for v1.5 with FilesystemOutcomeBackend; write-path adopted in #448 PR2 and LOCKED spec/42. A sixteenth, JournalBackend (#427), shipped for v1.5 with FilesystemJournalBackend and DRAFT spec/43. A seventeenth, QueueBackend (#428), shipped for v1.5 with FilesystemQueueBackend and DRAFT spec/44. An eighteenth, IdempotencyBackend (#520), shipped for v1.5 PR 1 with FilesystemDedupLedger and DRAFT spec/45 (SCAFFOLDING-ONLY; agent.call() wiring is PR 2). Each section captures the reference implementations shipped, the operator override surface, the doctor coherence check, the Implementer Contract location, and the architectural cliff the protocol closes.
 
 This file is the canonical reference for what the framework's storage seam looks like today. CLAUDE.md links here instead of inlining the detail so the session prompt stays under its char budget.
 
@@ -436,7 +436,33 @@ DRAFT spec/44 carries 12 normative MUSTs (base-8 PersonaBackend pattern + 4 queu
 
 ---
 
-## Why seventeen protocols, summarized
+## IdempotencyBackend (#520, DRAFT spec/45, the eighteenth)
+
+Filed as [#520](https://github.com/dep0we/atomic-agents-stack/issues/520). Shipped in 2 PRs (SCAFFOLDING-ONLY in PR 1 — Protocol + FilesystemDedupLedger + conformance tests + doctor + canonical export; agent.call() wiring is PR 2).
+
+**Reference implementation:** `FilesystemDedupLedger` (PR 1 of 2). Agent-scoped (`<agent_root>/idempotency/`). Provides at-most-once execution guarantees for agents that may receive the same trigger more than once (serve, queue, cron). A caller-supplied idempotency key gates execution: the first `begin()` for a key succeeds (FRESH); subsequent calls return IN_FLIGHT or COMPLETED without triggering re-execution.
+
+`FilesystemDedupLedger` stores state under `<agent_root>/idempotency/`. `begin()` atomicity is via `os.open(O_WRONLY|O_CREAT|O_EXCL)` on the lease file — exactly one concurrent `open()` succeeds; the loser gets `FileExistsError` (EEXIST) and returns IN_FLIGHT with no TOCTOU window between check and reserve. `commit()` writes a MARKER-ONLY terminal entry via `_io.atomic_write` (temp + fsync + rename): `key + prior_run_id + result_ref + terminal: true`. No result content is stored at any scale — the `result_ref` is an opaque reference string (run_id, path, URI) that the caller owns. `lookup()` is read-only with no side effects.
+
+**DedupDecision value object:** `DedupDecision(is_duplicate, state, prior_run_id, prior_result_ref)` — a frozen dataclass. FRESH, IN_FLIGHT, and COMPLETED are all expressed as `DedupDecision` fields, NEVER raised as exceptions. Only unrecoverable I/O errors (disk failure, symlink escape) raise `IdempotencyBackendError`.
+
+**Canonical-path containment:** every ledger read/write/claim sink applies the same `_require_canonical_source`-style containment invariant as QueueBackend: regular-file invariant + root containment + symlink-leaf + symlinked-parent rejection.
+
+**TTL + sweep:** `supports_ttl=True` capability axis; operator-configured retention via a sweep. TTL enforcement is a periodic sweep, not enforced inline on `begin()`.
+
+**Operator override:** `ATOMIC_AGENTS_IDEMPOTENCY_BACKEND` / `ATOMIC_AGENTS_IDEMPOTENCY_BACKEND_URL` env var OR constructor kwarg. NO markdown config (env-var + constructor-kwarg-only, matching QueueBackend's carve shape).
+
+**Doctor:** `check_idempotency_backend(agent_root)` uses the dual-probe pattern (write temp terminal entry, read back; claim-and-release a temp key) per `feedback_doctor_dual_probe_pattern`. `single_host_only=True` WARN (not FAIL) on `ATOMIC_AGENTS_MULTI_HOST=true`, mirroring `check_queue_backend`.
+
+**Exportable:** `IdempotencyExport` is an `ExportableResult` registered in the spec/40 export conformance harness (`tests/test_export_protocol_conformance.py` + `tests/test_export_capability_advertisement.py`). `FilesystemDedupLedger` implements `Exportable` with `supports_canonical_export=True`. The export emits TERMINAL entries only; in-flight leases are structurally EXCLUDED (same ephemeral-exclusion precedent as `LockExport.lock_file_names=[]` and QueueBackend's `claimed/` exclusion).
+
+DRAFT spec/45 carries normative MUSTs (capability advertisement + marker-only terminal-entry + lease/in-flight atomicity + TTL guarantee + atomic `begin()` + canonical-export terminal-only). Conformance suite: `tests/test_idempotency_backend_conformance.py` (~25 conformance tests covering all Implementer Contract MUSTs) + `tests/test_idempotency_filesystem.py` (~10 filesystem-specific tests: O_EXCL race, MARKER-ONLY invariant, symlink containment, TTL sweep, export ephemeral exclusion).
+
+**Closes the at-most-once cliff:** agents triggered by serve, queue, or cron had no framework-level dedup primitive. A durable idempotency ledger — swappable to Redis or Postgres for cross-host guarantees — closes this gap without forking the trigger layer. PR 2 wires it into `agent.call()`.
+
+---
+
+## Why eighteen protocols, summarized
 
 A person at home runs filesystem-everything with one agent. An organization runs the same agents over Postgres, behind an HTTP service, with a fleet of orchestrated roles. **Same agent definitions, same `call()` flow, same audit trail. Different backends.**
 
