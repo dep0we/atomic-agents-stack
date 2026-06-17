@@ -25,6 +25,15 @@ Checks (one CheckResult per check unless noted):
     locks           Agent's .lock file is not currently held by another
                     process. (flock releases on death; lingering files are
                     normal — only an actively-held lock is suspicious.)
+    goal-backend    Operator-configured GoalBackend resolves and reads cleanly.
+    outcome-backend Operator-configured OutcomeBackend resolves and reads cleanly.
+    journal-backend Operator-configured JournalBackend resolves and reads cleanly.
+    queue-backend   Cascade QueueBackend resolves; dual-probe (list_claimed +
+                    instantiation). Skipped for single-agent layouts.
+    idempotency-backend  Operator-configured IdempotencyBackend resolves; dual-probe
+                         (real-ledger lookup + real-ledger begin/commit/lookup
+                         round-trip). WARN when single_host_only in a declared
+                         multi-host deployment.
     memory-backend-config  ATOMIC_AGENTS_MEMORY_BACKEND coherence check (known
                             id; for non-default ids, also confirms the backend
                             constructs. filesystem needs no extras).
@@ -196,6 +205,7 @@ def run_doctor(
             "outcome-backend",
             "journal-backend",
             "queue-backend",
+            "idempotency-backend",
             "memory-backend-config",
             "memory-backend",
             "write-paths",
@@ -263,6 +273,7 @@ def run_doctor(
     results.append(check_outcome_backend(agent_root))
     results.append(check_journal_backend(agent_root))
     results.append(check_queue_backend(agent_root))
+    results.append(check_idempotency_backend(agent_root))
     # memory-backend-config (coherence) runs before memory-backend (liveness),
     # mirroring the check_lock_backend → check_locks ordering (#60 PR 3).
     results.append(check_memory_backend_config(agent_root))
@@ -4443,6 +4454,311 @@ def check_queue_backend(agent_root: Path) -> CheckResult:
             "single_host_only": caps.single_host_only,
             "supports_canonical_export": caps.supports_canonical_export,
             "active_claims": len(claimed),
+        },
+    )
+
+
+def _doctor_cleanup_idempotency_probe(backend: object, temp_key: str) -> None:
+    """Best-effort removal of a doctor probe's lease + terminal markers.
+
+    The dual-probe write round-trip mutates the operator's REAL ledger with a
+    uuid-keyed temp_key (so the heavy write path is actually exercised against
+    the real store — see feedback_doctor_dual_probe_pattern). This helper unlinks
+    the two marker files the probe may have created. Best-effort: any failure to
+    clean up is swallowed (a stale uuid-keyed probe marker is harmless — it can
+    never collide with a real idempotency key).
+
+    Only the filesystem reference backend exposes the path helpers used here; for
+    any other backend this is a no-op (the markers, if any, are left in place and
+    are harmless).
+    """
+    ledger_root_fn = getattr(backend, "_ledger_root", None)
+    lease_path_fn = getattr(backend, "_lease_path", None)
+    terminal_path_fn = getattr(backend, "_terminal_path", None)
+    if not (
+        callable(ledger_root_fn)
+        and callable(lease_path_fn)
+        and callable(terminal_path_fn)
+    ):
+        return
+    try:
+        ledger_root = ledger_root_fn()
+        for path_fn in (lease_path_fn, terminal_path_fn):
+            try:
+                path_fn(ledger_root, temp_key).unlink(missing_ok=True)
+            except OSError:
+                pass
+        # The begin() probe's mkdir creates agent_root/idempotency/. If the probe
+        # was the only writer, the directory is now empty — remove it so a doctor
+        # run leaves no residue. rmdir succeeds ONLY on an empty directory, so a
+        # ledger with real entries is never removed.
+        try:
+            ledger_root.rmdir()
+        except OSError:
+            pass
+    except Exception:
+        pass
+
+
+def check_idempotency_backend(agent_root: Path) -> CheckResult:
+    """IdempotencyBackend resolves and the configured backend passes a dual-probe.
+
+    Validates that ATOMIC_AGENTS_IDEMPOTENCY_BACKEND is correctly configured
+    and the backend can perform a full begin() + commit() + lookup() round-trip.
+
+    Doctor dual-probe pattern (MEMORY.md feedback_doctor_dual_probe_pattern):
+    Probes BOTH, against the operator's REAL configured backend:
+    1. lookup(temp_key) — lightweight read (must return FRESH for a new key)
+    2. begin(temp_key) + commit(temp_key) + lookup(temp_key) again —
+       full write-path round-trip (confirms O_EXCL create, atomic_write commit).
+       Runs against the real agent_root/idempotency/ store so a read-only or
+       mis-permissioned ledger FAILs here rather than false-PASSing. The probe
+       markers (uuid-keyed, never collides with a real key) are unlinked on every
+       exit path via _doctor_cleanup_idempotency_probe.
+
+    PASS / WARN / FAIL ladder:
+    FAIL when:
+    * get_default_idempotency_backend(agent_root) raises (bad env var or unknown).
+    * lookup(temp_key) raises.
+    * begin(temp_key) raises or does not return FRESH.
+    * commit(temp_key) raises.
+    * lookup(temp_key) post-commit does not return COMPLETED.
+    * _ledger_root() raises PathTraversalError (symlinked idempotency/ escape).
+
+    WARN when:
+    * capabilities().single_host_only=True AND ATOMIC_AGENTS_MULTI_HOST=true
+      (or '1'). A filesystem ledger in a declared multi-host deployment may
+      allow duplicate runs across hosts. Operators should switch to a
+      Redis/Postgres IdempotencyBackend for multi-host safety.
+
+    PASS otherwise.
+    """
+    import uuid  # noqa: PLC0415
+
+    from .idempotency import (  # noqa: PLC0415
+        get_default_idempotency_backend,
+        list_idempotency_backends,
+        _redact_for_error_message,
+    )
+    from .exceptions import PathTraversalError  # noqa: PLC0415
+
+    raw_backend_id = (
+        os.environ.get("ATOMIC_AGENTS_IDEMPOTENCY_BACKEND", "").strip().lower()
+        or "filesystem"
+    )
+    safe_backend_id = _redact_for_error_message(raw_backend_id)
+
+    try:
+        backend = get_default_idempotency_backend(agent_root)
+    except Exception as e:
+        return CheckResult(
+            name="idempotency-backend",
+            status=FAIL,
+            message=(
+                f"failed to instantiate idempotency backend "
+                f"(ATOMIC_AGENTS_IDEMPOTENCY_BACKEND={safe_backend_id!r}): {e}"
+            ),
+            fix_hint=(
+                "Unset ATOMIC_AGENTS_IDEMPOTENCY_BACKEND to use the filesystem default, "
+                f"or set it to a registered backend id (known: {list_idempotency_backends()}). "
+            ),
+            detail={"backend_id": safe_backend_id, "error": str(e)},
+        )
+
+    # Directory-escape probe: a symlinked idempotency/ DIRECTORY pointing outside
+    # agent_root is the real escape vector. Probe via _ledger_root() helper.
+    ledger_root_probe = getattr(backend, "_ledger_root", None)
+    if callable(ledger_root_probe):
+        try:
+            ledger_root_probe()
+        except PathTraversalError as e:
+            return CheckResult(
+                name="idempotency-backend",
+                status=FAIL,
+                message=(
+                    "idempotency/ directory escapes agent_root "
+                    "(symlink containment violation)"
+                ),
+                fix_hint=(
+                    "The agent's idempotency/ directory is a symlink resolving "
+                    "outside agent_root. Replace the symlink with a real "
+                    "directory under agent_root."
+                ),
+                detail={
+                    "backend_id": backend.backend_id,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                },
+            )
+
+    # Generate a unique temp key for the dual probe (no collision with real keys).
+    temp_key = f"__doctor_probe_{uuid.uuid4().hex}__"
+
+    # Dual-probe step 1: lightweight lookup (must return FRESH for new key).
+    try:
+        decision = backend.lookup(temp_key)
+    except Exception as e:
+        return CheckResult(
+            name="idempotency-backend",
+            status=FAIL,
+            message=f"idempotency backend lookup() raised: {type(e).__name__}",
+            detail={
+                "backend_id": backend.backend_id,
+                "error": str(e),
+                "error_type": type(e).__name__,
+            },
+        )
+    if decision.is_duplicate:
+        return CheckResult(
+            name="idempotency-backend",
+            status=FAIL,
+            message=(
+                "idempotency backend lookup() returned is_duplicate=True "
+                "for a brand-new key — ledger may be contaminated"
+            ),
+            detail={
+                "backend_id": backend.backend_id,
+                "state": decision.state,
+            },
+        )
+
+    # Dual-probe steps 2-4: begin() + commit() + lookup() round-trip.
+    #
+    # The write round-trip runs against the operator's REAL configured backend
+    # (agent_root/idempotency/) using a unique uuid-keyed probe, then cleans up
+    # the probe markers afterward. Probing the disposable instance of a temp dir
+    # would give ZERO assurance about the real store — a read-only or
+    # mis-permissioned real ledger would false-PASS while runtime begin() raises
+    # (feedback_doctor_dual_probe_pattern). Mutating-then-cleaning a uuid probe
+    # key is standard doctor practice (cf. check_bundle_cache_writable, which
+    # writes+unlinks a probe file in the real cache dir). The temp_key is
+    # uuid-suffixed so it cannot collide with a real idempotency key, and both
+    # the lease and terminal markers are unlinked on every exit path below.
+
+    # Step 2: begin() — must return FRESH (against the real store).
+    try:
+        decision = backend.begin(temp_key, run_id="__doctor__")
+    except Exception as e:
+        return CheckResult(
+            name="idempotency-backend",
+            status=FAIL,
+            message=f"idempotency backend begin() raised: {type(e).__name__}",
+            fix_hint=(
+                "The agent's idempotency/ ledger could not be written. Check that "
+                "agent_root/idempotency/ exists (or can be created) and is "
+                "writable: chmod u+w on the directory, or fix a read-only mount."
+            ),
+            detail={
+                "backend_id": backend.backend_id,
+                "error": str(e),
+                "error_type": type(e).__name__,
+            },
+        )
+    if decision.is_duplicate:
+        _doctor_cleanup_idempotency_probe(backend, temp_key)
+        return CheckResult(
+            name="idempotency-backend",
+            status=FAIL,
+            message=(
+                f"idempotency backend begin() returned is_duplicate=True "
+                f"for a brand-new key (state={decision.state!r})"
+            ),
+            detail={
+                "backend_id": backend.backend_id,
+                "state": decision.state,
+            },
+        )
+
+    # Step 3: commit() — must not raise.
+    try:
+        backend.commit(temp_key, result_ref="__doctor_probe__")
+    except Exception as e:
+        _doctor_cleanup_idempotency_probe(backend, temp_key)
+        return CheckResult(
+            name="idempotency-backend",
+            status=FAIL,
+            message=f"idempotency backend commit() raised: {type(e).__name__}",
+            detail={
+                "backend_id": backend.backend_id,
+                "error": str(e),
+                "error_type": type(e).__name__,
+            },
+        )
+
+    # Step 4: lookup() post-commit must return COMPLETED.
+    try:
+        decision = backend.lookup(temp_key)
+    except Exception as e:
+        _doctor_cleanup_idempotency_probe(backend, temp_key)
+        return CheckResult(
+            name="idempotency-backend",
+            status=FAIL,
+            message=(
+                f"idempotency backend lookup() post-commit raised: {type(e).__name__}"
+            ),
+            detail={
+                "backend_id": backend.backend_id,
+                "error": str(e),
+                "error_type": type(e).__name__,
+            },
+        )
+
+    # Step 5: cleanup — unlink the probe markers from the real ledger.
+    _doctor_cleanup_idempotency_probe(backend, temp_key)
+
+    if not decision.is_duplicate or decision.state != "completed":
+        return CheckResult(
+            name="idempotency-backend",
+            status=FAIL,
+            message=(
+                f"idempotency backend lookup() post-commit returned "
+                f"state={decision.state!r}, expected 'completed'"
+            ),
+            detail={
+                "backend_id": backend.backend_id,
+                "state": decision.state,
+                "is_duplicate": decision.is_duplicate,
+            },
+        )
+
+    # Single-host WARN: check if backend claims single_host_only=True in a
+    # declared multi-host deployment (ATOMIC_AGENTS_MULTI_HOST=true/1).
+    caps = backend.capabilities()
+    multi_host_declared = os.environ.get("ATOMIC_AGENTS_MULTI_HOST", "").lower() in (
+        "1",
+        "true",
+    )
+    if caps.single_host_only and multi_host_declared:
+        return CheckResult(
+            name="idempotency-backend",
+            status=WARN,
+            message=(
+                f"idempotency backend '{backend.backend_id}' is single-host-only "
+                f"but ATOMIC_AGENTS_MULTI_HOST is set. "
+                f"Duplicate runs are possible across hosts."
+            ),
+            fix_hint=(
+                "Switch to a Redis/Postgres IdempotencyBackend for multi-host safety. "
+                "Filesystem O_EXCL atomicity does not extend across hosts — two workers "
+                "on different hosts may both claim FRESH for the same key."
+            ),
+            detail={
+                "backend_id": backend.backend_id,
+                "single_host_only": caps.single_host_only,
+                "multi_host_declared": multi_host_declared,
+            },
+        )
+
+    return CheckResult(
+        name="idempotency-backend",
+        status=PASS,
+        message=f"idempotency backend '{backend.backend_id}' ready",
+        detail={
+            "backend_id": backend.backend_id,
+            "agent_root": str(agent_root),
+            "single_host_only": caps.single_host_only,
+            "atomic_claim": caps.atomic_claim,
+            "supports_canonical_export": caps.supports_canonical_export,
         },
     )
 
