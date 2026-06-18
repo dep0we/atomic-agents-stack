@@ -808,6 +808,38 @@ class CorpusCorrupted(CorpusError):
 
 
 # ──────────────────────────────────────────────────────────────────
+# EmbeddingBackend exceptions (spec/46 — issue #200)
+
+
+class EmbeddingError(AtomicAgentsError):
+    """Base class for all EmbeddingBackend failures.
+
+    Raised internally by EmbeddingBackend implementations for structured error
+    context and logging. NOT propagated from ``embed()`` or ``embed_batch()``
+    to callers -- those methods convert all exceptions to ``None`` return
+    values per the MUST-NOT-RAISE invariant (spec/46 MUST 4).
+
+    NOTE (NON-NORMATIVE): this exception hierarchy is for internal logging
+    only. ``embed()`` and ``embed_batch()`` MUST return ``None``, not raise
+    ``EmbeddingError`` or any subclass, as their public contract.
+    """
+
+
+class EmbeddingProviderUnavailable(EmbeddingError):
+    """The embedding provider is temporarily or permanently unreachable.
+
+    Raised internally when the SDK returns an authentication error, rate-limit
+    error, or service-unavailable response. Caught inside ``embed()`` and
+    converted to ``None`` return with a branch-distinctive WARNING log line.
+
+    Distinct from ``CorpusEmbeddingProviderUnavailable`` -- do NOT reuse that
+    class (it is scoped to corpus-query failures, not the embedding Protocol
+    itself). This hierarchy lives under ``AtomicAgentsError`` like every other
+    backend exception family (JudgeError, PersonaError, CorpusError, etc.).
+    """
+
+
+# ──────────────────────────────────────────────────────────────────
 # LogBackend exceptions (spec/22 read-failure posture addendum — issue #497)
 
 

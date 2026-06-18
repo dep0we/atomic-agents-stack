@@ -17,6 +17,11 @@ from atomic_agents._costs import (
     _fallback_pricing,
     _unknown_model_warned,
     _corruption_warned,
+    EMBEDDING_PRICING,
+    calc_embedding_cost,
+    _embedding_fallback_rate,
+    _unknown_embedding_model_warned,
+    _MAX_EMBEDDING_INPUT_TOKENS,
 )
 
 
@@ -1368,7 +1373,6 @@ class TestGateSiteMapping:
         from that gate) by sentinelling the immediately-following
         _resolve_delegated_agent_path."""
         from unittest.mock import patch
-        from atomic_agents.exceptions import CostGuardrailBlocked
         from atomic_agents.types import CostCheckResult
 
         agent = self._make_agent(
@@ -1512,3 +1516,281 @@ class TestGateSiteMapping:
 
         r_degraded = CostCheckResult(allow=False, cost_data_degraded=True)
         assert r_degraded.cost_data_degraded is True
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# EMBEDDING_PRICING + calc_embedding_cost() tests (spec/46 PR2, issue #200)
+
+
+class TestEmbeddingPricing:
+    """Tests for EMBEDDING_PRICING dict and calc_embedding_cost() helper."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_embedding_warn_set(self):
+        """Isolate the per-process embedding warn-dedup set between tests."""
+        _unknown_embedding_model_warned.clear()
+        yield
+        _unknown_embedding_model_warned.clear()
+
+    # ── Table isolation: EMBEDDING_PRICING must be separate from PRICING ──
+
+    def test_embedding_pricing_keys_not_in_chat_pricing(self):
+        """EMBEDDING_PRICING keys must not appear in the chat PRICING dict.
+
+        Critical isolation: merging the tables would cause an unknown embedding
+        model to fall back to the Opus output rate (~$75/1M vs ~$0.13/1M).
+        """
+        for model_id in EMBEDDING_PRICING:
+            assert model_id not in PRICING, (
+                f"Embedding model {model_id!r} appeared in PRICING (chat table). "
+                "EMBEDDING_PRICING must be a completely separate dict."
+            )
+
+    def test_embedding_fallback_rate_lower_than_chat_fallback(self):
+        """_embedding_fallback_rate() < _fallback_pricing()['output'].
+
+        Guards against accidental cross-table contamination: the max embedding
+        rate ($0.13/1M) must be far below the Opus output rate ($75/1M).
+        """
+        chat_max_output = _fallback_pricing()["output"]
+        embedding_max = _embedding_fallback_rate()
+        assert embedding_max < chat_max_output, (
+            f"Embedding fallback rate {embedding_max} >= chat max output rate "
+            f"{chat_max_output}. EMBEDDING_PRICING may be contaminated with "
+            "chat model rates."
+        )
+
+    def test_embedding_fallback_rate_is_max_of_embedding_pricing(self):
+        """_embedding_fallback_rate() returns max(EMBEDDING_PRICING.values())."""
+        expected = max(EMBEDDING_PRICING.values())
+        assert _embedding_fallback_rate() == expected
+
+    # ── Known model rates (verified against openai.com/api/pricing 2026-06-17) ──
+
+    def test_text_embedding_3_small_rate(self):
+        """text-embedding-3-small: $0.020/1M tokens (verified 2026-06-17)."""
+        assert EMBEDDING_PRICING["text-embedding-3-small"] == pytest.approx(0.020)
+
+    def test_text_embedding_3_large_rate(self):
+        """text-embedding-3-large: $0.130/1M tokens (verified 2026-06-17).
+
+        Note: historical discrepancy between openai.com/pricing ($0.130) and
+        some cached docs pages ($0.065). The $0.130 rate is authoritative per
+        the pages-per-dollar derivation (9,615 pp/$ × 800 tok/page = $0.130/1M).
+        """
+        assert EMBEDDING_PRICING["text-embedding-3-large"] == pytest.approx(0.130)
+
+    def test_text_embedding_ada_002_rate(self):
+        """text-embedding-ada-002: $0.100/1M tokens (verified 2026-06-17)."""
+        assert EMBEDDING_PRICING["text-embedding-ada-002"] == pytest.approx(0.100)
+
+    # ── calc_embedding_cost() known-model paths ──
+
+    def test_calc_embedding_cost_small_known(self):
+        """calc_embedding_cost with text-embedding-3-small: exact rate, not estimated."""
+        cost, estimated = calc_embedding_cost("text-embedding-3-small", 1_000_000)
+        expected = 1_000_000 * 0.020 / 1_000_000
+        assert abs(cost - expected) < 1e-6
+        assert estimated is False
+
+    def test_calc_embedding_cost_large_known(self):
+        """calc_embedding_cost with text-embedding-3-large: exact rate, not estimated."""
+        cost, estimated = calc_embedding_cost("text-embedding-3-large", 1_000_000)
+        expected = 1_000_000 * 0.130 / 1_000_000
+        assert abs(cost - expected) < 1e-6
+        assert estimated is False
+
+    def test_calc_embedding_cost_ada_known(self):
+        """calc_embedding_cost with text-embedding-ada-002: exact rate, not estimated."""
+        cost, estimated = calc_embedding_cost("text-embedding-ada-002", 500_000)
+        expected = 500_000 * 0.100 / 1_000_000
+        assert abs(cost - expected) < 1e-6
+        assert estimated is False
+
+    def test_calc_embedding_cost_zero_tokens(self):
+        """calc_embedding_cost with 0 tokens returns 0.0."""
+        cost, estimated = calc_embedding_cost("text-embedding-3-small", 0)
+        assert cost == 0.0
+        assert estimated is False
+
+    def test_calc_embedding_cost_negative_tokens_clamped(self, caplog):
+        """Negative input_tokens are clamped to 0 -- a reservation must never go
+        negative (Principle #4: no path escapes its cost guardrail).
+
+        Negative control: without the clamp, -100 * rate / 1e6 < 0, so the
+        ``cost == 0.0`` assertion below goes RED if the clamp is removed. That
+        is the load-bearing check -- a bare ``cost >= 0.0`` would be a tautology
+        once ``== 0.0`` holds, so it is intentionally NOT used.
+        """
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="atomic_agents._costs"):
+            cost, estimated = calc_embedding_cost("text-embedding-3-small", -100)
+        assert cost == 0.0  # bites if the clamp is removed (cost would be < 0)
+        assert estimated is False
+        assert any("negative input_tokens" in r.getMessage() for r in caplog.records)
+
+    def test_calc_embedding_cost_caps_implausibly_large_tokens(self, caplog):
+        """#4 (RedTeam + Codex): an implausibly large input_tokens is capped so
+        the float cost math cannot overflow to inf. Without the cap, a huge int *
+        rate raises OverflowError / yields inf -- an inf reservation would block
+        EVERY embedding call (a self-DoS via one bad token count).
+
+        Negative control: removing the cap makes ``10**400 * rate`` raise
+        OverflowError instead of returning a finite cost, so this test errors.
+        """
+        import logging
+        import math
+
+        with caplog.at_level(logging.WARNING, logger="atomic_agents._costs"):
+            cost, estimated = calc_embedding_cost("text-embedding-3-small", 10**400)
+        assert math.isfinite(cost)
+        # Capped at _MAX_EMBEDDING_INPUT_TOKENS, so cost == that cap's cost.
+        capped, _ = calc_embedding_cost(
+            "text-embedding-3-small", _MAX_EMBEDDING_INPUT_TOKENS
+        )
+        assert cost == capped
+        assert any("implausibly large" in r.getMessage() for r in caplog.records)
+
+    def test_calc_embedding_cost_non_int_treated_as_zero(self, caplog):
+        """#4: a non-integer input_tokens (NaN/inf float, bool, None) is a caller
+        bug -- treated as 0 with a warning rather than poisoning the reservation
+        (a NaN compares false against any cap -> fail-OPEN; an inf blocks all).
+
+        bool is explicitly excluded even though bool is an int subclass.
+        """
+        import logging
+        import math
+
+        with caplog.at_level(logging.WARNING, logger="atomic_agents._costs"):
+            cost_nan, _ = calc_embedding_cost("text-embedding-3-small", float("nan"))
+            cost_inf, _ = calc_embedding_cost("text-embedding-3-small", float("inf"))
+            cost_bool, _ = calc_embedding_cost("text-embedding-3-small", True)
+        assert cost_nan == 0.0 and math.isfinite(cost_nan)
+        assert cost_inf == 0.0 and math.isfinite(cost_inf)
+        assert cost_bool == 0.0  # True is NOT treated as 1 token
+        assert (
+            sum("non-integer input_tokens" in r.getMessage() for r in caplog.records)
+            == 3
+        )
+
+    # ── calc_embedding_cost() unknown-model fallback path ──
+
+    def test_calc_embedding_cost_unknown_model_uses_fallback(self):
+        """Unknown model falls back to max embedding rate, returns estimated=True."""
+        cost, estimated = calc_embedding_cost("text-embedding-4-future", 1_000_000)
+        max_rate = _embedding_fallback_rate()
+        expected = 1_000_000 * max_rate / 1_000_000
+        assert abs(cost - expected) < 1e-6
+        assert estimated is True
+
+    def test_calc_embedding_cost_unknown_model_NOT_chat_fallback(self):
+        """CRITICAL: unknown embedding model fallback cost must be far below Opus.
+
+        This is the load-bearing cross-table isolation test:
+        an unknown embedding model must NOT fall back to Opus output rate.
+        """
+        cost_per_million, estimated = calc_embedding_cost(
+            "text-embedding-unknown-future", 1_000_000
+        )
+        # Opus output: $75/1M. Max embedding: $0.13/1M. Ratio: ~577x.
+        # Any sane threshold of < $1/1M would catch cross-table contamination.
+        assert cost_per_million < 1.0, (
+            f"Unknown embedding model fallback cost {cost_per_million:.4f}/1M tokens "
+            f"exceeds $1.00 -- likely contaminated by chat model rates. "
+            f"_embedding_fallback_rate() must scan EMBEDDING_PRICING only."
+        )
+        assert estimated is True
+
+    def test_calc_embedding_cost_unknown_warns_once(self, caplog):
+        """Unknown embedding model emits WARNING exactly once (dedup by model_id)."""
+        import logging
+
+        model = "text-embedding-new-not-in-table"
+        _unknown_embedding_model_warned.discard(model)
+
+        with caplog.at_level(logging.WARNING, logger="atomic_agents._costs"):
+            calc_embedding_cost(model, 1_000)
+            calc_embedding_cost(model, 2_000)  # second call: no new warning
+
+        warning_msgs = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and model in r.getMessage()
+        ]
+        assert len(warning_msgs) == 1, (
+            f"Expected exactly 1 warning for unknown model {model!r}; "
+            f"got {len(warning_msgs)}"
+        )
+
+    def test_unknown_warned_set_capped_and_still_warns(self, caplog):
+        """The 1000-entry bound on _unknown_embedding_model_warned holds AND
+        warnings still fire past the cap (no silent suppression).
+
+        Negative control note: strip the `< 1000` guard in calc_embedding_cost
+        and the set-growth assertion below FAILS (the set grows past 1000).
+        """
+        import logging
+
+        # Pre-fill to exactly the cap with sentinel ids.
+        _unknown_embedding_model_warned.clear()
+        for i in range(1000):
+            _unknown_embedding_model_warned.add(f"sentinel-{i}")
+        assert len(_unknown_embedding_model_warned) == 1000
+
+        new_a = "capped-overflow-model-a"
+        new_b = "capped-overflow-model-b"
+        with caplog.at_level(logging.WARNING, logger="atomic_agents._costs"):
+            calc_embedding_cost(new_a, 1_000)
+            calc_embedding_cost(new_a, 1_000)  # repeat: cap means no dedup-add
+            calc_embedding_cost(new_b, 1_000)
+
+        # (a) The set did NOT grow past the cap (new ids were not added).
+        assert len(_unknown_embedding_model_warned) == 1000
+        assert new_a not in _unknown_embedding_model_warned
+        assert new_b not in _unknown_embedding_model_warned
+
+        # (b) Each call past the cap STILL warned (no suppression once capped).
+        warned_a = [r for r in caplog.records if new_a in r.getMessage()]
+        warned_b = [r for r in caplog.records if new_b in r.getMessage()]
+        assert len(warned_a) == 2  # both calls warned (not deduped past cap)
+        assert len(warned_b) == 1
+
+        _unknown_embedding_model_warned.clear()
+
+    def test_calc_embedding_cost_sub_threshold_reservation_nonzero(self):
+        """Reservation rounds UP: a tiny call never floors to 0.0.
+
+        Pre-fix, round(x, 6) floored a 3-small call under ~25 tokens to 0.0,
+        so a per-text reservation loop would systematically under-reserve. The
+        ceiling keeps every non-empty reservation strictly positive.
+        """
+        cost, _ = calc_embedding_cost("text-embedding-3-small", 1)
+        assert cost > 0.0
+        # ada-002 ($0.10/1M): 1 token = 1e-7, also floors to 0 under round().
+        cost_ada, _ = calc_embedding_cost("text-embedding-ada-002", 1)
+        assert cost_ada > 0.0
+        # Zero tokens still costs nothing (empty reservation).
+        cost_zero, _ = calc_embedding_cost("text-embedding-3-small", 0)
+        assert cost_zero == 0.0
+
+    # ── Return type: (float, bool) matching calc_cost() signature ──
+
+    def test_calc_embedding_cost_return_type(self):
+        """calc_embedding_cost returns (float, bool) matching calc_cost() shape."""
+        result = calc_embedding_cost("text-embedding-3-small", 1000)
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        cost, estimated = result
+        assert isinstance(cost, float)
+        assert isinstance(estimated, bool)
+
+    def test_estimated_false_for_known_model(self):
+        """cost_estimated=False for known models (rate is exact, not fallback)."""
+        _, estimated = calc_embedding_cost("text-embedding-3-small", 100)
+        assert estimated is False
+
+    def test_estimated_true_for_unknown_model(self):
+        """cost_estimated=True for unknown models (rate is pessimistic fallback)."""
+        _, estimated = calc_embedding_cost("text-embedding-future-xyz-9999", 100)
+        assert estimated is True

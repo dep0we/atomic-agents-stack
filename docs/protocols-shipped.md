@@ -1,6 +1,6 @@
 # Backend protocols shipped
 
-Twelve backend protocols are locked for v1.0. A thirteenth, SecretBackend (#340), shipped for v1.5 with two reference implementations (FilesystemSecretBackend + GCPSecretManagerBackend) and LOCKED spec/38. A fourteenth, GoalBackend (#425 + #448 PR1/PR2/PR3 + #483 PR1 + #496 PR1), shipped for v1.5 with FilesystemGoalBackend and LOCKED spec/41 (arc-closer #448 PR3 locked the spec; #483 PR1 added clock injection + GoalManager thin shim + agent_root resolution + spec/41 normative addendum; #496 PR1 added backend-universe alignment — coordinator threads gate agent's log/policy/profile backends into OutcomeRunner). A fifteenth, OutcomeBackend (#426), shipped for v1.5 with FilesystemOutcomeBackend; write-path adopted in #448 PR2 and LOCKED spec/42. A sixteenth, JournalBackend (#427), shipped for v1.5 with FilesystemJournalBackend and DRAFT spec/43. A seventeenth, QueueBackend (#428), shipped for v1.5 with FilesystemQueueBackend and DRAFT spec/44. An eighteenth, IdempotencyBackend (#520), shipped for v1.5 (PR 1 + PR 2 arc-closer) with FilesystemDedupLedger and LOCKED spec/45 — PR 2 wired the two-phase dedup gate into agent.call() (idempotency_key kwarg, lookup-before-lock COMPLETED short-circuit, begin-after-cost-gate, serve/queue/cron trigger integration, RunRecord audit fields, spec/22 versioned normative addendum). Each section captures the reference implementations shipped, the operator override surface, the doctor coherence check, the Implementer Contract location, and the architectural cliff the protocol closes.
+Twelve backend protocols are locked for v1.0. A thirteenth, SecretBackend (#340), shipped for v1.5 with two reference implementations (FilesystemSecretBackend + GCPSecretManagerBackend) and LOCKED spec/38. A fourteenth, GoalBackend (#425 + #448 PR1/PR2/PR3 + #483 PR1 + #496 PR1), shipped for v1.5 with FilesystemGoalBackend and LOCKED spec/41 (arc-closer #448 PR3 locked the spec; #483 PR1 added clock injection + GoalManager thin shim + agent_root resolution + spec/41 normative addendum; #496 PR1 added backend-universe alignment — coordinator threads gate agent's log/policy/profile backends into OutcomeRunner). A fifteenth, OutcomeBackend (#426), shipped for v1.5 with FilesystemOutcomeBackend; write-path adopted in #448 PR2 and LOCKED spec/42. A sixteenth, JournalBackend (#427), shipped for v1.5 with FilesystemJournalBackend and DRAFT spec/43. A seventeenth, QueueBackend (#428), shipped for v1.5 with FilesystemQueueBackend and DRAFT spec/44. An eighteenth, IdempotencyBackend (#520), shipped for v1.5 (PR 1 + PR 2 arc-closer) with FilesystemDedupLedger and LOCKED spec/45 — PR 2 wired the two-phase dedup gate into agent.call() (idempotency_key kwarg, lookup-before-lock COMPLETED short-circuit, begin-after-cost-gate, serve/queue/cron trigger integration, RunRecord audit fields, spec/22 versioned normative addendum). A nineteenth, EmbeddingBackend (#200), shipped for v1.5 PR 2 with OpenAIEmbeddingBackend and DRAFT spec/46 — ships the Protocol + OpenAI reference impl + EMBEDDING_PRICING cost table isolated from chat PRICING; registry + pgvector wiring ship in PR 3. Each section captures the reference implementations shipped, the operator override surface, the doctor coherence check, the Implementer Contract location, and the architectural cliff the protocol closes.
 
 This file is the canonical reference for what the framework's storage seam looks like today. CLAUDE.md links here instead of inlining the detail so the session prompt stays under its char budget.
 
@@ -36,7 +36,7 @@ For the Protocol-pattern template every backend follows, read `docs/spec/20-memo
 
 **Closes:** the memory config→backend wiring seam (T5; gates Phase 2 Postgres/pgvector scale-out). Default stays filesystem; zero behavior change for existing deployments.
 
-**`PostgresMemoryBackend` (#258 PR 1):** Non-semantic Postgres reference impl (FTS/tsvector recall, `supports_semantic_search=False`). Ships alongside `FilesystemBackend` as the second MemoryBackend reference impl. Targets multi-host deployments (Cloud Run, shared Postgres). `ATOMIC_AGENTS_MEMORY_BACKEND_URL` companion env var. Tier B field-lossless export. Schema `_SCHEMA_VERSION=2` (v1→v2 `display_name` migration for cross-backend `Note.name` parity) independent of `PostgresLogBackend`. Advisory lock key distinct from log backend. pgvector + EmbeddingBackend (#200) deferred to PR 2/PR 3.
+**`PostgresMemoryBackend` (#258 PR 1):** Non-semantic Postgres reference impl (FTS/tsvector recall, `supports_semantic_search=False`). Ships alongside `FilesystemBackend` as the second MemoryBackend reference impl. Targets multi-host deployments (Cloud Run, shared Postgres). `ATOMIC_AGENTS_MEMORY_BACKEND_URL` companion env var. Tier B field-lossless export. Schema `_SCHEMA_VERSION=2` (v1→v2 `display_name` migration for cross-backend `Note.name` parity) independent of `PostgresLogBackend`. Advisory lock key distinct from log backend. EmbeddingBackend Protocol (#200) shipped as `atomic_agents/embedding/` (DRAFT spec/46, PR 2); pgvector wiring in `PostgresMemoryBackend` deferred to #258 PR 2/PR 3.
 
 ---
 
@@ -464,7 +464,39 @@ LOCKED spec/45 carries normative MUSTs (capability advertisement + marker-only t
 
 ---
 
-## Why eighteen protocols, summarized
+## EmbeddingBackend (#200, DRAFT spec/46, the nineteenth)
+
+Filed as [#200](https://github.com/dep0we/atomic-agents-stack/issues/200). Shipped in PR 2 of a 3-PR arc (PR 1 = `PostgresMemoryBackend` FTS/#258; PR 2 = EmbeddingBackend Protocol + ref impl; PR 3 = pgvector wiring + registry + lock spec/46).
+
+**Reference implementation:** `OpenAIEmbeddingBackend` in `atomic_agents/embedding/openai.py`. Implements the `EmbeddingBackend` Protocol using the OpenAI embeddings API (`text-embedding-3-small` default, configurable via constructor). No subclassing — structural typing.
+
+**Protocol surface (spec/46 Implementer Contract):** `model_id` / `dimensions` / `provider_id` @properties; `capabilities() → EmbeddingCapabilities`; `embed(text) → list[float] | None`; `embed_batch(texts) → list[list[float] | None]`; `close() → None`. Key design decisions:
+
+- **MUST-NOT-RAISE invariant:** `embed()` and `embed_batch()` return `None` on any failure (network, rate-limit, token-length, auth). Callers zip with input texts safely regardless of partial failure.
+- **len(out)==len(in) invariant:** `embed_batch()` always returns a list of exactly `len(texts)` elements; failed items produce `None` at their index, not a shorter list. Empty input returns `[]`.
+- **No `input_type` parameter in PR 2:** `EmbeddingCapabilities.supports_input_type` flag is advertised (`False` in all PR 2 implementations — honest, since the Protocol surface doesn't include the parameter yet). PR 3 adds the kwarg and flips the flag.
+
+**Cost accounting (EMBEDDING_PRICING, isolated):** `EMBEDDING_PRICING` is a completely separate dict from `PRICING` (chat models). `calc_embedding_cost(model_id, input_tokens) → (cost_usd, cost_estimated: bool)` calls only `_embedding_fallback_rate()`, which scans `EMBEDDING_PRICING` exclusively. Unknown embedding models fall back to ~$0.13/1M (the max known embedding rate) — NOT Opus's $75/1M. The `cost_estimated=True` return flag means "unpriced model, used max known embedding rate" — distinct from `degraded=True` (I/O failure reading cost history). Rates verified 2026-06-17 against OpenAI's authoritative per-model docs pages (`developers.openai.com/api/docs/models/text-embedding-3-small` $0.02, `…/text-embedding-3-large` $0.13, `…/text-embedding-ada-002` $0.10), cross-checked via the embeddings guide's pages-per-dollar derivation.
+
+**Exception hierarchy:** `EmbeddingError(AtomicAgentsError)` and `EmbeddingProviderUnavailable(EmbeddingError)` in `atomic_agents/exceptions.py` — for internal logging only. The `embed()` and `embed_batch()` signatures MUST return `None`, not raise.
+
+**Key resolution:** `_get_key()` delegates to the framework SecretBackend (spec/38) via the same `_llm._get_key` resolver as `OpenAICompatibleLLMBackend` (KeySpec `ATOMIC_AGENTS_OPENAI_KEY` / `OPENAI_API_KEY`, keychain `atomic-agents-openai`, config key `openai`). Whatever backend is registered (Filesystem, GCP Secret Manager, …) resolves the key, so the embedding path is NOT a private cascade that bypasses an operator's `ATOMIC_AGENTS_SECRET_BACKEND` (the split-brain the /ship review army caught). Unresolved → `None` (graceful; embed() degrades to the None-fallback). The SDK-absence message constant is `MSG_NO_OPENAI_SDK` (named for its actual content; NOT `_API_KEY`/`_SECRET`/`_TOKEN`) to avoid CodeQL `py/clear-text-logging` false positives.
+
+**Per-call client construction:** `_build_client()` is called inside `embed()`/`embed_batch()`, not in `__init__`. Required for `sys.modules` patching in tests.
+
+**No production registry in PR 2:** constructor-injected by the consuming backend. Registry functions (`register_embedding_backend`, etc.) ship in PR 3 alongside pgvector wiring.
+
+**Test layout:** `tests/stub_embedding.py` (TEST-ONLY `StubEmbeddingBackend` + `_RaisingStubEmbeddingBackend` for negative controls; never in production imports) + `tests/test_embedding_protocol_conformance.py` (55 conformance tests, parametrized over [stub, openai-mocked]; includes typed-branch + MUST-1 + dimensions + MUST-9 truncation negative controls per feedback lesson, plus a mechanized stub-not-imported-by-production guard) + `tests/test_openai_embedding.py` (53 OpenAI impl-specific tests; 3 skipped pending `ATOMIC_AGENTS_TEST_OPENAI_KEY`) + 21 cost tests added to `tests/test_costs.py`. 129 new tests total.
+
+**Operator override:** no env-var selection in PR 2; constructor-injected only. PR 3 adds `ATOMIC_AGENTS_EMBEDDING_BACKEND` env var.
+
+**Doctor:** deferred to PR 3 (no billable probe in PR 2).
+
+**Closes:** the embedding abstraction cliff — both `PgvectorMemoryBackend` (#258 PR 2) and `PgvectorCorpusBackend` (#258 PR 3) share a single injected backend without duplicating provider logic. DRAFT spec/46 carries 9 normative MUSTs (MUST 1 input validation; MUST 2 side-effect-free construction; MUST 3 capability honesty; MUST 4 embed 4-case MUST-NOT-RAISE; MUST 5 URL/secret redaction; MUST 6 storage/key isolation; MUST 7 snapshot/vector determinism; MUST 8 backend_id stability + close() idempotency; MUST 9 len(out)==len(in) conformance invariant).
+
+---
+
+## Why nineteen protocols, summarized
 
 A person at home runs filesystem-everything with one agent. An organization runs the same agents over Postgres, behind an HTTP service, with a fleet of orchestrated roles. **Same agent definitions, same `call()` flow, same audit trail. Different backends.**
 

@@ -104,6 +104,181 @@ PRICING: dict[str, dict[str, float]] = {
     },  # $0.075/$0.30 per 1M
 }
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Embedding pricing — SEPARATE from PRICING (chat models).
+#
+# CRITICAL ISOLATION: _embedding_fallback_rate() scans ONLY this dict.
+# calc_embedding_cost() NEVER calls _fallback_pricing() (the chat-model
+# version). Embedding rates are input-only (no output column) and three to
+# five orders of magnitude smaller than chat rates. Merging the tables would
+# cause an unknown embedding model to fall back to the Opus output rate ($75/1M
+# instead of $0.13/1M) -- a ~577x overcount (75 / 0.13) that would spuriously block all
+# embedding calls via the spec/46 reservation mandate.
+#
+# Source verification (Principle #12 applied outward per MEMORY.md):
+# Rates verified 2026-06-17 against the authoritative OpenAI per-model docs
+# (each model's own docs page on developers.openai.com):
+#   https://developers.openai.com/api/docs/models/text-embedding-3-small  -> $0.02/1M
+#   https://developers.openai.com/api/docs/models/text-embedding-3-large  -> $0.13/1M
+#   https://developers.openai.com/api/docs/models/text-embedding-ada-002  -> $0.10/1M
+# All three confirmed directly on the authoritative pages (NOT community-only);
+# also consistent with the pages-per-dollar derivation below.
+# Pages-per-dollar derivation (developers.openai.com embeddings guide):
+#   3-small 62,500 pp/$ × 800 tok/page = 50M tok/$ → $0.020/1M;
+#   3-large 9,615 pp/$ × 800 tok/page = 7.69M tok/$ → $0.130/1M;
+#   ada-002 12,500 pp/$ × 800 tok/page = 10M tok/$ → $0.100/1M.
+# NOTE on the $0.065/1M figure seen elsewhere for text-embedding-3-large:
+# this was a historical/erroneous pricing-page entry for the SYNCHRONOUS rate
+# that has since been CORRECTED to $0.130/1M. It is NOT a Batch-API discount
+# rate: the authoritative per-model docs page (verified 2026-06-17) shows
+# text-embedding-3-large's standard AND Batch API price are BOTH $0.130/1M.
+# The $0.130/1M rate below is authoritative (per-model docs page, confirmed by
+# the pages-per-dollar derivation above). Disregard any $0.065/1M figure.
+#
+# All rates are USD per 1M INPUT tokens (embeddings are input-only; there is
+# no output token column for embedding models).
+
+EMBEDDING_PRICING: dict[str, float] = {
+    # USD per 1M input tokens (input-only; no output column for embedding models).
+    # Each rate verified against its authoritative OpenAI per-model docs page,
+    # accessed 2026-06-17 (Principle #12 applied outward).
+    # source: https://developers.openai.com/api/docs/models/text-embedding-3-small (Cost $0.02)
+    "text-embedding-3-small": 0.020,  # $0.020/1M tokens
+    # source: https://developers.openai.com/api/docs/models/text-embedding-3-large (Cost $0.13)
+    "text-embedding-3-large": 0.130,  # $0.130/1M tokens; see discrepancy note above
+    # source: https://developers.openai.com/api/docs/models/text-embedding-ada-002 (Cost $0.10)
+    "text-embedding-ada-002": 0.100,  # $0.100/1M tokens (legacy, still supported)
+}
+
+# Per-process dedup set for unknown embedding model warnings.
+_unknown_embedding_model_warned: set[str] = set()
+
+# Cap for per-process dedup-warning sets: beyond this many distinct keys, always
+# warn (no suppression) rather than growing a set without bound. Shared by the
+# embedding unknown-model set and the cost-corruption set so the two cannot drift.
+_WARNED_SET_CAP = 1000
+
+# Upper bound on a single embedding call's input_tokens. Real inputs are <= the
+# model max (~8192 tokens/item). A count far above this is a caller bug; capping
+# keeps the float cost math (input_tokens * rate) from overflowing to inf -- an
+# inf reservation would make the PR3 cap gate block EVERY embedding call (a
+# self-DoS via one bad token count).
+_MAX_EMBEDDING_INPUT_TOKENS = 100_000_000
+
+
+def _embedding_fallback_rate() -> float:
+    """Return the maximum known embedding input rate from EMBEDDING_PRICING.
+
+    Used when a model id is not in EMBEDDING_PRICING so unknown models are
+    over-counted (pessimistic) rather than silently treated as free.
+
+    CRITICAL: this function scans ONLY EMBEDDING_PRICING -- it NEVER reads
+    from PRICING (chat models). Merging the tables would make an unknown
+    embedding model fall back to the Opus output rate (~$75/1M) rather than
+    the correct embedding ceiling (~$0.13/1M). See the EMBEDDING_PRICING
+    docblock above for the isolation rationale.
+    """
+    return max(EMBEDDING_PRICING.values())
+
+
+def calc_embedding_cost(model_id: str, input_tokens: int) -> tuple[float, bool]:
+    """Compute USD cost for one embedding call (input-only; no output tokens).
+
+    Returns ``(cost_usd, cost_estimated)`` matching the shape of ``calc_cost()``:
+    - ``cost_usd``: USD cost rounded UP to 6 decimal places. Rounding up (not
+      ``round()``) is deliberate: this is the PR3 gate's worst-case RESERVATION
+      primitive, and ``round()`` floors any sub-$0.000001 call to 0.0 (e.g. a
+      3-small call under ~25 tokens), so a high-volume per-text reservation loop
+      would systematically under-reserve to 0. Ceiling keeps every non-empty
+      reservation strictly positive (Principle #4 -- no path under-reserves its
+      cost guardrail). The over-count is at most $0.000001 per call.
+    - ``cost_estimated``: True when ``model_id`` was not in ``EMBEDDING_PRICING``
+      and the cost used the fallback (max known embedding rate). False when the
+      model was priced exactly.
+
+    The caller distinction between 'estimated' and 'degraded' matters for the
+    PR3 ingestion gate (spec/46 MANDATE):
+    - ``cost_estimated=True`` means "unpriced model, used max known rate" --
+      the cost is pessimistic but usable. Fail-close only when a cap exists.
+    - A CostReadResult(degraded=True) (from sum_cost_for_period) means "I/O
+      failure reading cost history" -- a different signal entirely.
+    Do NOT conflate these; see MEMORY.md lesson "Fail-closed only where there's
+    something to protect" and the spec/46 MANDATE wording.
+
+    PR2 note: this function ships the pricing helper only. Live wiring to BOTH
+    the ingestion site (embed_batch_reservation / embed_batch_release) AND the
+    query-embedding site (embed_reservation / embed_release JSONL audit records)
+    ships at PR3 — gating only embed_batch() would leave query-time embed()
+    calls as an ungated billable path (Principle #4). See spec/46 §"Cost gate
+    mandate (DRAFT scope)".
+
+    Negative ``input_tokens`` are clamped to 0: this helper is the PR3 gate's
+    worst-case RESERVATION primitive, and a negative reservation would REDUCE
+    the reserved amount (a guardrail-escape shape per Principle #4 -- no path
+    escapes its cost guardrail). A bad token count must never lower the
+    reservation below zero.
+    """
+    if isinstance(input_tokens, bool) or not isinstance(input_tokens, int):
+        # Non-int (NaN/inf floats, None, bool, str) is a caller bug. A NaN
+        # reservation compares false against any cap (fail-OPEN); an inf blocks
+        # every call (fail-CLOSED-for-all). Neither is a valid reservation, so
+        # treat as 0 with a loud warning rather than poison the PR3 gate.
+        logger.warning(
+            "calc_embedding_cost received non-integer input_tokens=%r for model "
+            "%r; treating as 0 (a reservation must be a real token count).",
+            input_tokens,
+            model_id,
+        )
+        input_tokens = 0
+    elif input_tokens < 0:
+        logger.warning(
+            "calc_embedding_cost received negative input_tokens=%d for model %r; "
+            "clamping to 0 (a reservation must never go negative).",
+            input_tokens,
+            model_id,
+        )
+        input_tokens = 0
+    elif input_tokens > _MAX_EMBEDDING_INPUT_TOKENS:
+        logger.warning(
+            "calc_embedding_cost received implausibly large input_tokens=%d for "
+            "model %r; capping at %d so float cost math cannot overflow to inf.",
+            input_tokens,
+            model_id,
+            _MAX_EMBEDDING_INPUT_TOKENS,
+        )
+        input_tokens = _MAX_EMBEDDING_INPUT_TOKENS
+
+    if model_id not in EMBEDDING_PRICING:
+        estimated = True
+        if model_id not in _unknown_embedding_model_warned:
+            # Bound the dedup set (shared _WARNED_SET_CAP): beyond the cap of
+            # distinct unknown model ids, always warn (no suppression) rather
+            # than growing the set without bound. PR3 wires this into a
+            # high-volume ingestion loop, so the cap matters more here than on
+            # the chat path.
+            if len(_unknown_embedding_model_warned) < _WARNED_SET_CAP:
+                _unknown_embedding_model_warned.add(model_id)
+            logger.warning(
+                "unknown embedding model %r has no EMBEDDING_PRICING entry — "
+                "cost estimated via fallback (max known embedding rate). "
+                "Add it to EMBEDDING_PRICING to silence this warning.",
+                model_id,
+            )
+        rate = _embedding_fallback_rate()
+    else:
+        estimated = False
+        rate = EMBEDDING_PRICING[model_id]
+
+    # Round UP to 6 decimals (a reservation must never under-count -- see
+    # docstring). cost_usd == input_tokens * rate / 1_000_000, so
+    # input_tokens * rate is exactly cost_usd in micro-dollars; ceil that to
+    # whole micro-units, then divide back. Avoids importing math; -(-x // 1) is
+    # float ceil.
+    micro_dollars = input_tokens * rate
+    cost_usd = -(-micro_dollars // 1) / 1_000_000
+    return cost_usd, estimated
+
+
 # Cache hit pricing — Anthropic charges 10% of input rate for cache hits
 CACHE_HIT_DISCOUNT = 0.10
 
@@ -183,8 +358,9 @@ def _warn_corruption(path: Path, sub_reason: str, msg: str) -> None:
     key = (str(path), sub_reason)
     if key in _corruption_warned:
         return
-    # Bound dedup set size: beyond 1000 entries always warn (no suppression).
-    if len(_corruption_warned) < 1000:
+    # Bound dedup set size: beyond _WARNED_SET_CAP entries always warn (no
+    # suppression).
+    if len(_corruption_warned) < _WARNED_SET_CAP:
         _corruption_warned.add(key)
     logger.warning(msg)
 
