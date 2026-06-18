@@ -3,7 +3,8 @@
 This module is PR 1 of the 4-PR Postgres adapter arc for issue #258.
 PR1 ships: non-semantic FTS (tsvector) recall, Tier-B field-lossless export,
 spec/20 Postgres addendum, and conformance factory entry.
-PR2/PR3 (pgvector + EmbeddingBackend Protocol #200) are explicitly deferred.
+EmbeddingBackend Protocol (#200) shipped as atomic_agents/embedding/ (DRAFT spec/46, PR2 of #200).
+pgvector wiring into this module is explicitly deferred to PR2/PR3 of #258.
 
 Install:
     pip install 'atomic-agents-stack[postgres]'
@@ -39,8 +40,8 @@ supports_semantic_search = False:
     FTS (tsvector) search is NOT semantic/vector search. The search() method
     performs full-text search over tsvector computed inline on the
     display_name, name, description, and body columns. Callers requiring
-    embedding-based semantic recall must wait for PR2 (pgvector +
-    EmbeddingBackend Protocol #200).
+    embedding-based semantic recall must wait for #258 PR2 (pgvector wiring
+    using the EmbeddingBackend Protocol, now shipped as atomic_agents/embedding/).
     FTS is a non-semantic search mode (distinct from substring). LOCKED MUST 7
     requires search() on a non-semantic backend to raise NotImplementedError
     OR return an empty list consistently; returning FTS matches instead is the
@@ -2022,7 +2023,7 @@ class PostgresMemoryBackend:
 
         search() performs full-text search via to_tsvector + websearch_to_tsquery.
         This is a non-semantic mode; supports_semantic_search=False is correct.
-        Semantic recall (pgvector) ships in PR2 with EmbeddingBackend Protocol #200.
+        Semantic recall (pgvector) ships in #258 PR2 using the EmbeddingBackend Protocol (now shipped as atomic_agents/embedding/).
         """
         return False
 
