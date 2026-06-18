@@ -19,8 +19,6 @@ Memory note:
 from __future__ import annotations
 
 import os
-import sys
-import types
 
 import pytest
 
@@ -92,6 +90,146 @@ def test_pgvector_is_subclass_of_postgres():
     from atomic_agents.memory.postgres import PostgresMemoryBackend
 
     assert issubclass(PgvectorMemoryBackend, PostgresMemoryBackend)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# pgvector type-adapter registration (no real DB needed — pins the runtime fix)
+
+
+def test_pgvector_get_conn_registers_vector_adapter(monkeypatch):
+    """_get_conn MUST call pgvector.psycopg.register_vector on every conn it returns.
+
+    Without per-connection register_vector, a Python list[float] bound to a
+    ``%s::vector`` placeholder adapts to a Postgres array literal (``{...}``)
+    which the ``vector`` type rejects — every insert/query would fail at
+    runtime.  register_vector is idempotent per-connection, so the backend
+    calls it unconditionally.  Negative control: strip the call and this test
+    goes red (registered stays empty).
+    """
+    from atomic_agents.memory.pgvector import PgvectorMemoryBackend
+    from atomic_agents.memory.postgres import PostgresMemoryBackend
+
+    # Bypass __init__ (needs a live DB).
+    backend = PgvectorMemoryBackend.__new__(PgvectorMemoryBackend)
+
+    fake_conn = object()
+    monkeypatch.setattr(
+        PostgresMemoryBackend, "_get_conn", lambda self: fake_conn, raising=True
+    )
+
+    registered: list = []
+
+    import pgvector.psycopg as pv_psycopg
+
+    monkeypatch.setattr(
+        pv_psycopg, "register_vector", lambda conn: registered.append(conn)
+    )
+
+    out = backend._get_conn()
+    assert out is fake_conn
+    assert registered == [fake_conn], (
+        "register_vector must be called on the connection returned by _get_conn"
+    )
+
+
+def test_pgvector_get_conn_registers_on_reconnect_with_reused_id(monkeypatch):
+    """register_vector MUST run on a fresh conn even if it reuses a freed id().
+
+    Regression for the id()-keyed cache bug: an id-keyed set without eviction
+    on _discard_conn would SKIP register_vector when CPython recycles a freed
+    object's address for the replacement connection, silently producing
+    array-literal bind failures.  Calling register_vector unconditionally on
+    every returned connection removes the failure class.
+
+    We simulate a reconnect by having the parent _get_conn hand back a SECOND,
+    distinct connection object on the next call (the real reconnect path), and
+    assert register_vector ran for BOTH.  Negative control: re-introduce an
+    id-keyed skip and the second registration is dropped → this flips red.
+    """
+    from atomic_agents.memory.pgvector import PgvectorMemoryBackend
+    from atomic_agents.memory.postgres import PostgresMemoryBackend
+
+    backend = PgvectorMemoryBackend.__new__(PgvectorMemoryBackend)
+
+    conns = [object(), object()]
+    calls = {"n": 0}
+
+    def _fake_parent_get_conn(self):
+        # First call returns conns[0]; after a "reconnect" the parent returns
+        # conns[1] (a distinct fresh connection that needs its own adapter).
+        c = conns[min(calls["n"], 1)]
+        calls["n"] += 1
+        return c
+
+    monkeypatch.setattr(
+        PostgresMemoryBackend, "_get_conn", _fake_parent_get_conn, raising=True
+    )
+
+    registered: list = []
+    import pgvector.psycopg as pv_psycopg
+
+    monkeypatch.setattr(
+        pv_psycopg, "register_vector", lambda conn: registered.append(conn)
+    )
+
+    first = backend._get_conn()
+    second = backend._get_conn()  # the reconnected (fresh) connection
+    assert first is conns[0]
+    assert second is conns[1]
+    assert registered == [conns[0], conns[1]], (
+        "register_vector must run on the reconnected connection, not be skipped "
+        "by a stale id-keyed cache"
+    )
+
+    # Sanity: the module exposes the override (guards against silent removal).
+    assert "_get_conn" in PgvectorMemoryBackend.__dict__, (
+        "PgvectorMemoryBackend must override _get_conn to register the adapter"
+    )
+
+
+def test_pgvector_upsert_embedding_skips_on_dimension_mismatch(monkeypatch):
+    """_upsert_embedding MUST NOT touch the DB when len(vector) != dimensions.
+
+    Dimension-honesty backstop (#200 PR2 CRITICAL class): a backend whose
+    embed() produces a vector of the wrong length must not write a row whose
+    ``dimensions`` column lies about the stored vector.  Negative control:
+    strip the ``len(vector) != dimensions`` guard and this test goes red
+    (the DB path runs and the spy records a call).
+    """
+    from atomic_agents.memory.pgvector import PgvectorMemoryBackend
+
+    class _WrongLenBackend:
+        provider_id = "stub"
+        model_id = "stub-embedding-v1"
+        dimensions = 4  # declares 4 …
+
+        def embed(self, text, *, input_type=None):
+            return [0.0, 0.0]  # … but produces 2 (mismatch)
+
+    backend = PgvectorMemoryBackend.__new__(PgvectorMemoryBackend)
+    backend._embedding_backend = _WrongLenBackend()
+
+    calls: list = []
+    monkeypatch.setattr(
+        PgvectorMemoryBackend,
+        "_run_with_reconnect",
+        lambda self, op: calls.append(op),
+        raising=True,
+    )
+
+    backend._upsert_embedding("note-x", "a body to embed")
+    assert calls == [], (
+        "DB upsert must be skipped when produced vector length != declared dimensions"
+    )
+
+    # Positive control: a correct-length vector DOES reach the DB path.
+    class _RightLenBackend(_WrongLenBackend):
+        def embed(self, text, *, input_type=None):
+            return [0.0, 0.0, 0.0, 0.0]  # matches dimensions=4
+
+    backend._embedding_backend = _RightLenBackend()
+    backend._upsert_embedding("note-y", "another body")
+    assert len(calls) == 1, "a correct-length vector must reach the DB upsert path"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -294,7 +432,13 @@ def test_pgvector_live_hnsw_index_exists(pgv_backend):
 
 @requires_postgres
 def test_pgvector_live_write_note_stores_embedding(pgv_backend):
-    """write_note() upserts an embedding row into memory_note_embeddings."""
+    """write_note() upserts an embedding row into memory_note_embeddings.
+
+    The side table column is ``note_name`` (NOT ``page_name`` — that is the
+    corpus table's column) and write_note stores the DERIVED SLUG
+    (``derive_filename(type, name)``), not the human name. Query by the slug.
+    """
+    from atomic_agents._schema import derive_filename
     from atomic_agents.memory.backend import WritePolicy
     from atomic_agents.types import Capture
 
@@ -306,17 +450,130 @@ def test_pgvector_live_write_note_stores_embedding(pgv_backend):
         sources=["test"],
         body="Body text for embedding test.",
     )
-    pgv_backend.write_note(capture, WritePolicy.CREATE_OR_UPDATE)
+    ref = pgv_backend.write_note(capture, WritePolicy.CREATE_OR_UPDATE)
+    expected_note_name = derive_filename(capture.type, capture.name)
+    assert ref.name == expected_note_name
 
     conn = pgv_backend._get_conn()
     assert conn is not None
     cur = conn.execute(
-        "SELECT page_name FROM memory_note_embeddings WHERE page_name LIKE %s",
-        ("%Embedding test note%",),
+        "SELECT note_name FROM memory_note_embeddings WHERE note_name = %s",
+        (expected_note_name,),
     )
     row = cur.fetchone()
     conn.commit()
     assert row is not None, "write_note() did not upsert an embedding row"
+
+
+@requires_postgres
+def test_pgvector_live_reconnect_does_not_crash_on_v3_schema(pgv_backend):
+    """Constructing a SECOND backend against an already-v3 DB must not raise.
+
+    Regression for the warm-start schema-version crash: the parent's terminal
+    assertion is `existing < _SCHEMA_VERSION` (subclass-tolerant). A DB already
+    migrated to v3 by the first backend must reopen cleanly on a second
+    construction / reconnect — not raise 'db has v3, code expects v2'.
+
+    Negative control: revert postgres.py:901 to `existing != _SCHEMA_VERSION`
+    and this test flips red on the second construction.
+    """
+    import os
+
+    from atomic_agents.embedding.backend import EmbeddingBackend  # noqa: F401
+    from atomic_agents.memory.pgvector import PgvectorMemoryBackend
+
+    # First backend (the fixture) has already migrated the shared DB to v3.
+    conn = pgv_backend._get_conn()
+    cur = conn.execute("SELECT value FROM memory_meta WHERE key = 'schema_version'")
+    assert int(cur.fetchone()["value"]) == 3
+    conn.commit()
+
+    url = os.environ["ATOMIC_AGENTS_TEST_POSTGRES_URL"]
+    # Second construction against the same v3 DB — _get_conn runs _ensure_schema
+    # which calls super()._ensure_schema; the parent must tolerate existing=3.
+    second = PgvectorMemoryBackend(
+        pgv_backend._agent_root,
+        url=url,
+        embedding_backend=pgv_backend._embedding_backend,
+    )
+    try:
+        c2 = second._get_conn()  # must NOT raise
+        c2.execute("SELECT 1")
+        c2.commit()
+    finally:
+        # Do not close the shared embedding backend (owned by the fixture).
+        second._embedding_backend = None
+        second.close()
+
+
+@requires_postgres
+def test_pgvector_live_merge_embeds_post_merge_body(pgv_backend):
+    """A merge write must embed the POST-MERGE stored body, not the fragment.
+
+    Regression for the merge-corruption bug: write_note on a merge_into capture
+    preserves the target body and only appends sources. The override must
+    re-read the stored body and embed THAT — embedding the fragment would
+    overwrite the target's vector with a single-fragment embedding.
+
+    We assert the stored vector matches embed(full stored body), not
+    embed(fragment). Negative control: drop the merge_into re-read branch and
+    the stored vector becomes embed(fragment), failing this assertion.
+
+    Uses a CONTENT-DERIVED stub (vector varies by input). The fixture's
+    fixed-zero stub would make this false-green: embed(fragment) ==
+    embed(stored body) == all zeros regardless of the fix.
+    """
+    from atomic_agents._schema import derive_filename
+    from atomic_agents.memory.backend import WritePolicy
+    from atomic_agents.types import Capture
+    from tests.stub_embedding import ContentDerivedStubEmbeddingBackend
+
+    # Swap the fixture backend's embedding backend to a content-derived stub
+    # (same dimensions=4 as the v3 vector column the fixture already migrated).
+    pgv_backend._embedding_backend = ContentDerivedStubEmbeddingBackend(dimensions=4)
+
+    base = Capture(
+        type="preference",
+        name="Merge base note",
+        description="base",
+        confidence="high",
+        sources=["src-a"],
+        body="The original accumulated body of the base note.",
+    )
+    ref = pgv_backend.write_note(base, WritePolicy.CREATE_OR_UPDATE)
+    note_name = derive_filename(base.type, base.name)
+
+    # Merge a fragment into it (body differs; merge preserves target body).
+    frag = Capture(
+        type="preference",
+        name="Merge base note",
+        description="base",
+        confidence="high",
+        sources=["src-b"],
+        body="A SHORT incremental fragment that must NOT become the embedding.",
+        merge_into=ref.name,
+    )
+    pgv_backend.write_note(frag, WritePolicy.CREATE_OR_UPDATE)
+
+    # The stored body after merge is still the base body (merge only appends
+    # sources). The stored embedding must equal embed(stored body).
+    stored = pgv_backend.read_note(note_name)
+    expected_vec = pgv_backend._embedding_backend.embed(stored.body)
+
+    conn = pgv_backend._get_conn()
+    cur = conn.execute(
+        "SELECT embedding FROM memory_note_embeddings WHERE note_name = %s",
+        (note_name,),
+    )
+    row = cur.fetchone()
+    conn.commit()
+    assert row is not None
+    stored_vec = list(row["embedding"])
+    # Vectors are deterministic for the stub backend; compare elementwise.
+    assert len(stored_vec) == len(expected_vec)
+    assert stored_vec == [pytest.approx(v) for v in expected_vec], (
+        "merge stored the fragment embedding instead of the post-merge body embedding"
+    )
 
 
 @requires_postgres

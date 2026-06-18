@@ -898,10 +898,19 @@ class PostgresMemoryBackend:
             # Create indexes AFTER migrations so index columns exist.
             for stmt in _CREATE_MEMORY_INDEXES:
                 conn.execute(stmt)
-            if existing != _SCHEMA_VERSION:
+            # Subclass-tolerant assertion: the DB must be at LEAST this class's
+            # schema version. A HIGHER version set by a subclass that extends the
+            # schema (e.g. PgvectorMemoryBackend bumps to v3 via its own
+            # _ensure_schema after calling super()) is valid — the parent ran its
+            # v1->v2 ladder and the subclass migrated forward. Only a too-OLD
+            # version (migration failed to advance) is an error. The C5
+            # column-correction above already downgrades a stale meta row to its
+            # true version before this point, so `<` cannot false-positive on a
+            # genuinely-v1 DB whose meta row claimed v2.
+            if existing < _SCHEMA_VERSION:
                 raise RuntimeError(
                     f"PostgresMemoryBackend schema version mismatch: db has "
-                    f"v{existing}, code expects v{_SCHEMA_VERSION}. "
+                    f"v{existing}, code expects at least v{_SCHEMA_VERSION}. "
                     f"Open an issue at https://github.com/dep0we/atomic-agents-stack/issues"
                 )
             conn.commit()

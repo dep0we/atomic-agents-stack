@@ -99,7 +99,11 @@ class CorpusCapabilities:
     supports_canonical_export: bool = False
     # spec/34 PR-3 addendum: typed sibling for doctor / audit tooling.
     # Mirrors the mcp_servers_resolved pattern from spec/36 (#201 PR 2).
-    # MUST NOT be serialized in snapshots (spec/24 always-[] clamp).
+    # NOTE (forward constraint, no live serializer exists yet): if a
+    # capabilities-snapshot serializer is ever added, this field MUST be
+    # clamped out (it holds a live backend instance, potentially with an API
+    # client) — mirror the spec/36 mcp_servers_resolved always-[] clamp. There
+    # is no snapshot path today, so nothing currently serializes it.
     # When non-None, its provider_id MUST be consistent with
     # ``embedding_provider`` (string label stays UNCHANGED per LOCKED MUST 3).
     # Default None so all existing CorpusCapabilities instantiation sites

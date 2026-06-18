@@ -1,8 +1,8 @@
 """EmbeddingBackend Protocol and OpenAI reference implementation (spec/46).
 
 This package is the nineteenth open Protocol in the protocol-pattern series.
-It abstracts the embedding provider so both ``PgvectorMemoryBackend`` (#258 PR3)
-and ``PgvectorCorpusBackend`` (#258 PR3) can share a single injected backend
+It abstracts the embedding provider so both ``PgvectorMemoryBackend`` (#200 PR3)
+and ``PgvectorCorpusBackend`` (#200 PR3) can share a single injected backend
 without duplicating provider logic.
 
 Public surface:

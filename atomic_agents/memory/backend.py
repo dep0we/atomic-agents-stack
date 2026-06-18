@@ -45,9 +45,12 @@ class MemoryCapabilities:
         ``None`` when semantic search is not supported.  Consistent with
         ``CorpusCapabilities.embedding_provider`` semantics.
     ``embedding_backend_resolved``: the live ``EmbeddingBackend`` instance, or
-        ``None`` when no backend is configured.  NOT serialized in snapshots
-        (spec/24 always-[] clamp).  When non-None, its ``provider_id`` MUST
-        match ``embedding_provider``.
+        ``None`` when no backend is configured.  When non-None, its
+        ``provider_id`` MUST match ``embedding_provider``.  Forward constraint
+        (no live serializer exists yet): if a capabilities-snapshot serializer
+        is ever added, this field MUST be clamped out — it holds a live backend
+        instance (potentially with an API client) — mirroring the spec/36
+        ``mcp_servers_resolved`` always-[] clamp.  Nothing serializes it today.
 
     Compatibility alias
     -------------------

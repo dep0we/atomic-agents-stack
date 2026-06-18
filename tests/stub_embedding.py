@@ -85,6 +85,28 @@ class StubEmbeddingBackend:
         self.close_call_count += 1
 
 
+class ContentDerivedStubEmbeddingBackend(StubEmbeddingBackend):
+    """Stub whose embed() vector is DETERMINISTICALLY derived from the text.
+
+    Unlike StubEmbeddingBackend (fixed zero vector for every input), this stub
+    produces a distinct, reproducible vector per input string. Required for
+    tests that must distinguish embed(body_A) from embed(body_B) — e.g. the
+    merge-write regression test, where a fixed-zero stub would make the
+    negative control false-green (embed(fragment) == embed(stored body) == all
+    zeros regardless of the fix).
+
+    Deterministic: embed(same text) always returns the same vector, so a stored
+    vector can be reproduced and compared.
+    """
+
+    def embed(self, text: str, *, input_type: str | None = None) -> list[float] | None:
+        import hashlib
+
+        digest = hashlib.sha256((text or "").encode("utf-8")).digest()
+        # Map digest bytes deterministically to `dimensions` floats in [0, 1).
+        return [digest[i % len(digest)] / 255.0 for i in range(self._dimensions)]
+
+
 class _RaisingStubEmbeddingBackend:
     """Stub whose embed() raises internally -- used for NEGATIVE CONTROLS only.
 

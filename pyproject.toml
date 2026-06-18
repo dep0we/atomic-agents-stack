@@ -41,7 +41,7 @@ redis = ["redis>=5.0,<9.0"]
 # when installed.
 postgres = ["psycopg[binary]>=3.1,<4.0"]
 # pgvector extra — Python pgvector client (vector type adapter for psycopg 3).
-# SEPARATE from [postgres] per spec/46 decision (ci-pgvector-image A+B+C2).
+# SEPARATE from [postgres] so a Postgres-only deployment need not pull it in.
 # Required for PgvectorMemoryBackend and PgvectorCorpusBackend. Lazy-imported;
 # base package startup does NOT load pgvector even when installed.
 pgvector = ["pgvector>=0.3.0"]

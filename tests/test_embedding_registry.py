@@ -240,17 +240,44 @@ def test_get_default_uses_registered_custom_provider(monkeypatch):
     assert isinstance(result, _MinimalBackend)
 
 
-def test_get_default_unknown_provider_returns_none(monkeypatch):
-    """get_default_embedding_backend() returns None gracefully for an unknown provider id.
+def test_get_default_explicit_unknown_provider_raises(monkeypatch):
+    """An EXPLICITLY-pinned unknown provider_id fails loud (not silent FTS).
 
-    Graceful degradation: unknown backends log a warning, don't crash the agent.
+    Operator-pinned misconfiguration must surface — a typo'd provider id
+    silently disabling semantic search is the split-brain failure mode the
+    factory guards against (matches the SecretBackendNotRegistered re-raise
+    posture). The raised BackendNotRegistered carries the full known list.
+
+    Negative control: if the explicit-pin re-raise is stripped (the lookup
+    falls back to `return None`), this test flips from raises to None.
     """
+    from atomic_agents.exceptions import BackendNotRegistered
+
     monkeypatch.setenv(
         "ATOMIC_AGENTS_EMBEDDING_BACKEND", "totally-unknown-provider-xyz"
     )
 
+    with pytest.raises(BackendNotRegistered) as excinfo:
+        get_default_embedding_backend()
+    # The error names the provider list so the operator can fix the typo.
+    assert "totally-unknown-provider-xyz" in str(excinfo.value)
+
+
+def test_get_default_unset_provider_no_extra_returns_none(monkeypatch):
+    """An UNSET provider env var degrades gracefully to None when no extra.
+
+    Distinct from the explicit-typo case above: the implicit 'openai' default
+    with the extra absent must NOT raise — it falls back to FTS quietly. This
+    is the negative-control pair for the explicit-pin raise.
+    """
+    monkeypatch.delenv("ATOMIC_AGENTS_EMBEDDING_BACKEND", raising=False)
+    # Ensure 'openai' is not registered and the extra import fails.
+    from atomic_agents.embedding import registry as _reg
+
+    _reg.unregister_embedding_backend("openai")
+    monkeypatch.setitem(sys.modules, "openai", None)
+
     result = get_default_embedding_backend()
-    # Graceful fallback: unknown provider → None (caller falls back to FTS)
     assert result is None
 
 

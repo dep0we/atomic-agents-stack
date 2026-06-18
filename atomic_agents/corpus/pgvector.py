@@ -4,16 +4,14 @@ Wraps ``FilesystemCorpusBackend`` to inherit page storage, versioning,
 atomic writes, and name validation (MUST 1), while adding an injected
 ``EmbeddingBackend`` for ANN-based ``query()``.
 
-**Architecture decision recorded as open Tier A fork.**
-The parent class choice (``FilesystemCorpusBackend`` vs. a future
-``PostgresCorpusBackend`` base) was identified in the PR 3 prep as requiring
-maintainer confirmation (prep finding P2).  This implementation uses
-``FilesystemCorpusBackend`` as the parent — the only existing corpus backend
-providing ``supports_versioning=True`` (required by MUST) — with a
-pgvector-backed ``query()`` that queries a separate Postgres database for the
-embedding index.  If the maintainer rules for a ``PostgresCorpusBackend``
-base class (a separate issue), ``PgvectorCorpusBackend`` can be rebased onto
-it without changing the public API.
+**Architecture decision (RESOLVED by maintainer ruling).**
+``PgvectorCorpusBackend`` subclasses ``FilesystemCorpusBackend`` — the only
+existing corpus backend providing ``supports_versioning=True`` (required by
+MUST) — and adds a pgvector-backed ``query()`` that reads a separate Postgres
+database for the embedding index.  The corpus PAGES stay on the filesystem;
+only the embedding index lives in Postgres.  The full-Postgres corpus
+(a ``PostgresCorpusBackend`` page store, onto which this could later rebase
+without a public-API change) is tracked as follow-up #540.
 
 Embedding index storage
 -----------------------
@@ -23,8 +21,8 @@ backend URL to allow separate deployments).
 
 The corpus page files themselves remain on the filesystem (inherited from
 ``FilesystemCorpusBackend``).  The Postgres DB holds ONLY the embedding
-index — a regenerable derived state (note row is source of truth; ruling
-reembed-on-dimension-or-model-change Tier B).
+index — regenerable derived state (the filesystem page is the source of
+truth; the index is rebuilt on the next write or by a re-embed pass).
 
 When no Postgres URL is configured, ``query()`` falls back to the parent's
 substring + tag match (``supports_semantic_search=False``).
@@ -42,7 +40,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from .filesystem import FilesystemCorpusBackend
 from .types import CorpusCapabilities, CorpusRef
@@ -157,7 +155,16 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
             pgvector_url = os.environ.get("ATOMIC_AGENTS_PGVECTOR_URL") or None
         self._pgvector_url = pgvector_url
 
-        # Connection is lazy-initialized on first use
+        # Connection is lazy-initialized on first use.
+        #
+        # THREAD-SAFETY: this is a SINGLE shared connection, NOT thread-local
+        # (unlike PgvectorMemoryBackend, which uses a per-thread connection
+        # because psycopg connections are not safe to share across threads).
+        # PgvectorCorpusBackend is therefore SINGLE-THREADED-ONLY: do not call
+        # query()/write_page()/index_page() concurrently from multiple threads
+        # on one instance.  Mirroring the memory backend's thread-local model is
+        # a tracked follow-up (#540 scope); not done here because the corpus
+        # path is not yet on a hot concurrent path.
         self._pg_conn: Any = None
         self._schema_initialized = False
 
@@ -193,6 +200,12 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
             )
             return None
 
+        # Phase 1 — establish the connection + register the type adapter.
+        # ONLY genuine connection / adapter-import failures degrade to FTS here.
+        # The C2 missing-extension RuntimeError is raised in phase 2 (schema)
+        # and MUST propagate — it is NOT a connection error and must not be
+        # swallowed (matches the sibling PgvectorMemoryBackend, whose
+        # _ensure_schema RuntimeError propagates through _get_conn).
         try:
             from urllib.parse import unquote, urlparse
 
@@ -206,11 +219,28 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
                 autocommit=False,
                 row_factory=psycopg.rows.dict_row,
             )
-            self._pg_conn = conn
-            if not self._schema_initialized:
-                self._ensure_pg_schema(conn)
-                self._schema_initialized = True
-            return conn
+            # Register the pgvector psycopg type adapter on this connection so
+            # a Python ``list[float]`` bound to ``%s::vector`` is sent in the
+            # bracket text form the ``vector`` type accepts (a bare list would
+            # otherwise adapt to a Postgres array literal ``{...}`` and the cast
+            # would fail).  register_vector is per-connection.
+            try:
+                from pgvector.psycopg import register_vector  # noqa: PLC0415
+
+                register_vector(conn)
+            except ImportError:
+                # [pgvector] extra absent — degrade to substring query() rather
+                # than producing array-literal bind failures on every query.
+                _logger.warning(
+                    "PgvectorCorpusBackend: pgvector extra not installed; "
+                    "falling back to substring query()"
+                )
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                self._pg_conn = None
+                return None
         except Exception as exc:
             _logger.warning(
                 "PgvectorCorpusBackend: Postgres connection failed (%s); "
@@ -218,6 +248,24 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
                 type(exc).__name__,
             )
             return None
+
+        # Phase 2 — schema init.  A C2 missing-extension RuntimeError raised by
+        # _ensure_pg_schema FAILS HARD (close the conn, then re-raise) — it is
+        # NOT degraded to FTS.  Only the connection itself going broken mid-DDL
+        # (a real connection error) degrades.
+        if not self._schema_initialized:
+            try:
+                self._ensure_pg_schema(conn)
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                self._pg_conn = None
+                raise
+            self._schema_initialized = True
+        self._pg_conn = conn
+        return conn
 
     def _ensure_pg_schema(self, conn: Any) -> None:
         """Create embedding tables and HNSW index if missing.
@@ -231,7 +279,8 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
                 "PgvectorCorpusBackend: the 'vector' Postgres extension is not "
                 "installed.  Run `CREATE EXTENSION IF NOT EXISTS vector;` as a "
                 "superuser before connecting.  The backend never runs CREATE "
-                "EXTENSION itself (spec/46 decision ci-pgvector-image C2)."
+                "EXTENSION itself; provision the 'vector' extension during "
+                "database setup."
             )
 
         dimensions = (
@@ -270,17 +319,76 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
             embedding_backend_resolved=self._embedding_backend,
         )
 
+    # ── write_page() override ───────────────────────────────────────────────
+
+    def write_page(
+        self,
+        name: str,
+        content: str,
+        corpus: Literal["wiki", "raw"],
+        policy,
+        *,
+        frontmatter: dict | None = None,
+        expected_content_sha256: str | None = None,
+    ) -> CorpusRef:
+        """Write a page (canonical filesystem write) then index its embedding.
+
+        Without this override the inherited ``FilesystemCorpusBackend.write_page``
+        never populates ``corpus_page_embeddings``, so the ANN ``query()`` would
+        always read an empty index and semantic corpus search would be
+        non-functional on the happy path (capabilities advertises
+        ``supports_semantic_search=True`` while always returning nothing — a
+        capability-honesty violation).
+
+        Two-phase, mirroring ``PgvectorMemoryBackend.write_note``:
+
+        1. ``super().write_page(...)`` — canonical write via ``_io.atomic_write``
+           (CAS / four-case behavior preserved; the filesystem page is the
+           source of truth).
+        2. ``index_page(corpus, name, content)`` — embed OUTSIDE the page write
+           and upsert into the index.  Any failure here is logged + swallowed by
+           ``index_page``; the page still exists on disk and remains reachable
+           via the substring fallback.
+
+        Cost gate: NOT WIRED.  ``index_page`` calls ``embed()`` (a billable LLM
+        call) with no reservation, release, or JSONL audit record — same
+        deferred-to-orchestrator posture as ``PgvectorMemoryBackend`` (#544).  See the
+        module docstring's cost note; not dogfooded against a live pgvector
+        instance.
+        """
+        ref = super().write_page(
+            name,
+            content,
+            corpus,
+            policy,
+            frontmatter=frontmatter,
+            expected_content_sha256=expected_content_sha256,
+        )
+        # Index the POST-WRITE body. ``content`` is the canonical body just
+        # written (FilesystemCorpusBackend does not merge page bodies, so the
+        # incoming content IS the stored content — no merge-fragment hazard like
+        # the memory backend's merge_into path).
+        if self._embedding_backend is not None and self._pgvector_url is not None:
+            self.index_page(corpus, name, content)
+        return ref
+
     # ── query() override ──────────────────────────────────────────────────────
 
     def query(
         self,
-        corpus: str,
-        query_text: str,
+        text: str,
+        corpus: Literal["wiki", "raw"],
         *,
-        limit: int = 10,
-        offset: int = 0,
+        top_k: int = 10,
     ) -> list[CorpusRef]:
         """ANN cosine-distance query when embedding backend is configured.
+
+        Signature MUST match the ``CorpusBackend`` Protocol
+        (``query(text, corpus, *, top_k=10)``) — same as
+        ``FilesystemCorpusBackend`` and ``SQLiteCorpusBackend``.  An earlier
+        draft used ``(corpus, query_text, *, limit, offset)`` which broke the
+        Protocol contract AND every ``super().query(...)`` fallback call (the
+        parent has no ``limit``/``offset`` kwargs).
 
         Falls back to parent substring + tag match when:
         * No embedding backend configured.
@@ -288,26 +396,26 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
         * ``embed()`` returns None (provider unavailable).
         * ANN query fails.
 
-        ANN model filter (ruling reembed-on-dimension-or-model-change Tier B):
+        ANN model filter:
         Only rows matching the active backend's ``model_id`` and ``dimensions``
         are returned.  Stale rows from a different model fall back to FTS.
         """
         if self._embedding_backend is None or self._pgvector_url is None:
-            return super().query(corpus, query_text, limit=limit, offset=offset)
+            return super().query(text, corpus, top_k=top_k)
 
         conn = self._get_pg_conn()
         if conn is None:
-            return super().query(corpus, query_text, limit=limit, offset=offset)
+            return super().query(text, corpus, top_k=top_k)
 
         # Embed the query text
         vector = None
         try:
-            vector = self._embedding_backend.embed(query_text)
+            vector = self._embedding_backend.embed(text)
         except Exception:  # noqa: BLE001
             pass
 
         if vector is None:
-            return super().query(corpus, query_text, limit=limit, offset=offset)
+            return super().query(text, corpus, top_k=top_k)
 
         model_id = self._embedding_backend.model_id
         dimensions = self._embedding_backend.dimensions
@@ -321,7 +429,7 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
                     model_id,
                     dimensions,
                     vector,
-                    limit + offset,
+                    top_k,
                 ),
             )
             rows = cur.fetchall()
@@ -336,22 +444,26 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
                 "falling back to substring query()",
                 type(exc).__name__,
             )
-            return super().query(corpus, query_text, limit=limit, offset=offset)
+            return super().query(text, corpus, top_k=top_k)
 
         # Resolve page names to CorpusRef objects via parent read_page()
         result: list[CorpusRef] = []
-        for row in rows[offset:]:
-            ref = self._name_to_ref(row["corpus"], row["page_name"])
+        for row in rows:
+            ref = self._name_to_ref(row["page_name"], row["corpus"])
             if ref is not None:
                 result.append(ref)
-                if len(result) >= limit:
+                if len(result) >= top_k:
                     break
         return result
 
-    def _name_to_ref(self, corpus: str, page_name: str) -> CorpusRef | None:
-        """Load a page and return its CorpusRef, or None if not found."""
+    def _name_to_ref(self, page_name: str, corpus: str) -> CorpusRef | None:
+        """Load a page and return its CorpusRef, or None if not found.
+
+        ``read_page(name, corpus)`` — name first, corpus second (Protocol
+        order; matches ``FilesystemCorpusBackend.read_page``).
+        """
         try:
-            page = self.read_page(corpus, page_name)
+            page = self.read_page(page_name, corpus)  # type: ignore[arg-type]
             if page is None:
                 return None
             return page.ref
@@ -388,6 +500,22 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
 
         model_id = self._embedding_backend.model_id
         dimensions = self._embedding_backend.dimensions
+
+        # Produced-length backstop (dimension-honesty, #200 PR2 CRITICAL class):
+        # if embed() returns a vector whose length diverges from the declared
+        # dimensions, skip the upsert rather than store a row whose dimensions
+        # column lies about the vector it holds.
+        if len(vector) != dimensions:
+            _logger.warning(
+                "PgvectorCorpusBackend: embed() for page %r/%r produced a "
+                "vector of length %d but backend declares dimensions=%d; "
+                "skipping index upsert (dimension-honesty backstop)",
+                corpus,
+                page_name,
+                len(vector),
+                dimensions,
+            )
+            return
 
         try:
             conn.execute(

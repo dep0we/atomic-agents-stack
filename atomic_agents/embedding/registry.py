@@ -104,7 +104,7 @@ def get_default_embedding_backend() -> "EmbeddingBackend | None":
     3. ``ATOMIC_AGENTS_EMBEDDING_DIMENSIONS`` -- integer dimension override
     4. ``ATOMIC_AGENTS_EMBEDDING_URL``     -- base URL for non-OpenAI providers
 
-    Returns ``None`` (never raises) on graceful-degradation scenarios:
+    Returns ``None`` on graceful-degradation scenarios:
 
     * No ``ATOMIC_AGENTS_EMBEDDING_BACKEND`` set AND OpenAI extra not installed
       → returns ``None``.
@@ -115,6 +115,17 @@ def get_default_embedding_backend() -> "EmbeddingBackend | None":
       and returns ``None``.  The caller (``PgvectorMemoryBackend.__init__``)
       sets ``supports_semantic_search=False`` on ``None`` return, falling
       back to FTS.
+
+    Raises (operator misconfiguration — surfaced, never silently degraded):
+
+    * ``BackendNotRegistered`` when ``ATOMIC_AGENTS_EMBEDDING_BACKEND`` was
+      EXPLICITLY set to an unknown/typo'd provider_id (e.g. ``opena1``).  The
+      exception carries the full known-provider list.  A silent FTS fallback
+      here would leave an operator who opted into semantic search with no
+      semantic search and no error — the same split-brain the
+      ``SecretBackendNotRegistered`` re-raise below guards against.  (An UNSET
+      env var falling back to the implicit ``openai`` default still degrades
+      gracefully to ``None`` when the extra is absent.)
 
     ``SecretBackendNotRegistered`` is NOT swallowed — an operator who pinned
     ``ATOMIC_AGENTS_SECRET_BACKEND=gcp`` but hasn't configured GCP credentials
@@ -134,13 +145,18 @@ def get_default_embedding_backend() -> "EmbeddingBackend | None":
     * Empty env-var strings are coerced to ``None`` (``or None``) so they never
       reach the constructor as falsy non-None values.
     """
-    from ..exceptions import AtomicAgentsError
+    from ..exceptions import AtomicAgentsError, BackendNotRegistered
     from ..secret_backend import SecretBackendNotRegistered  # re-raised, not swallowed
 
-    provider_id = (
-        os.environ.get("ATOMIC_AGENTS_EMBEDDING_BACKEND", "openai").strip().lower()
-        or "openai"
-    )
+    # Distinguish "no provider pinned" (implicit default → graceful None on miss)
+    # from "operator explicitly pinned a provider" (typo → fail loud).  An
+    # operator who set ATOMIC_AGENTS_EMBEDDING_BACKEND=opena1 and silently lost
+    # semantic search with no error is the split-brain failure this guards
+    # against — it must surface, exactly like the SecretBackendNotRegistered
+    # re-raise below.
+    _raw_pin = os.environ.get("ATOMIC_AGENTS_EMBEDDING_BACKEND")
+    _explicitly_pinned = bool(_raw_pin and _raw_pin.strip())
+    provider_id = (_raw_pin or "openai").strip().lower() or "openai"
 
     # Lazy-register the OpenAI backend if not yet registered (the [openai]
     # extra may not be installed; lazy-import keeps the base package import
@@ -160,6 +176,21 @@ def get_default_embedding_backend() -> "EmbeddingBackend | None":
 
     try:
         cls = get_embedding_backend(provider_id)
+    except BackendNotRegistered:
+        if _explicitly_pinned:
+            # Operator pinned an unknown/typo'd provider_id → surface loudly with
+            # the full known-provider list (matches the SecretBackendNotRegistered
+            # re-raise posture below; an explicit misconfig must not silently
+            # degrade to FTS).  BackendNotRegistered already carries the list.
+            raise
+        # Implicit default 'openai' missing from the registry should not reach
+        # here (lazy-registered above), but if it does, degrade gracefully.
+        _logger.warning(
+            "get_default_embedding_backend: default provider_id=%r not "
+            "registered; returning None (FTS fallback)",
+            provider_id,
+        )
+        return None
     except Exception as exc:  # noqa: BLE001
         _logger.warning(
             "get_default_embedding_backend: registry lookup failed for "

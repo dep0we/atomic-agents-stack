@@ -46,10 +46,16 @@ Decision rulings applied
 * Q1  own-backend: distinct backend_id ``'pgvector-memory'``.
 * Q2  embedding-backend injection: constructor kwarg ``embedding_backend=None``
       + ``get_default_embedding_backend()`` factory.
-* Q3  cost-gate: wired at orchestration layer (PgvectorMemoryBackend.search()
-      and write_note() call sites emit embed_reservation/embed_release JSONL).
-      Cost gate lives HERE (not inside EmbeddingBackend — MUST 4 MUST-NOT-RAISE
-      makes a backend-internal refusing gate incoherent).
+* Q3  cost-gate: NOT YET WIRED.  The embed() calls in write_note()/search()
+      are currently UNGATED billable LLM calls (no reservation, no release, no
+      JSONL audit record).  The Q3 ruling is that the gate belongs at the
+      agent.call() orchestration layer (NOT inside EmbeddingBackend — MUST 4
+      MUST-NOT-RAISE makes a backend-internal refusing gate incoherent), so the
+      backend stays cost-unaware.  Wiring the reservation/release at agent.call()
+      (calc_embedding_cost() exists in _costs.py; the 4 JSONL triggers
+      embed_reservation/embed_release/embed_batch_reservation/embed_batch_release
+      do not yet emit anywhere) is tracked in #544.  ASSURANCE LABEL:
+      this embed path has not been dogfooded against a live pgvector instance.
 * C2  missing extension: FAIL-HARD with a clear error.  The backend NEVER runs
       ``CREATE EXTENSION``.
 
@@ -63,7 +69,8 @@ embed() is called OUTSIDE any Postgres transaction:
 This decouples the HTTP latency from the Postgres lock-hold time.
 If step 3 fails, the note row exists (visible via FTS) but has no embedding
 (invisible to ANN search) — acceptable because the side table is regenerable
-derived state (ruling reembed-on-dimension-or-model-change Tier B).
+derived state (the canonical note is the source of truth; the side table
+is regenerated on the next write or by a re-embed pass).
 
 ANN search filter
 -----------------
@@ -76,7 +83,6 @@ This prevents silent cosine-distance computation across mismatched vectors.
 from __future__ import annotations
 
 import logging
-from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -84,10 +90,7 @@ from .backend import NoteRef, WritePolicy
 from .postgres import (
     PostgresMemoryBackend,
     _ADVISORY_LOCK_KEY,
-    _compute_content_hash,
-    _note_insert_params,
 )
-from .._schema import derive_filename
 
 if TYPE_CHECKING:
     from ..embedding.backend import EmbeddingBackend
@@ -279,18 +282,65 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
                 "search() will use FTS fallback (supports_semantic_search=False)"
             )
 
+    # ── Connection adapter registration ─────────────────────────────
+
+    def _get_conn(self) -> Any:
+        """Return the thread-local connection with the pgvector adapter registered.
+
+        The parent ``PostgresMemoryBackend._get_conn`` creates and caches the
+        connection (running ``_ensure_schema`` on first use).  It does NOT
+        register pgvector's psycopg type adapter, so a Python ``list[float]``
+        bound to a ``%s::vector`` placeholder would adapt to a Postgres array
+        literal (``{...}``) — which the ``vector`` type does NOT accept (it
+        wants bracket syntax ``[...]``).  Every insert/query of a vector would
+        fail at runtime against a real Postgres.
+
+        We register ``pgvector.psycopg.register_vector`` on every fresh
+        connection returned by the parent.  ``register_vector`` is idempotent
+        per-connection, so registering unconditionally is safe — and it is the
+        ONLY correct approach across the reconnect lifecycle: an ``id(conn)``
+        cache cannot distinguish a genuinely-registered live connection from a
+        brand-new connection that happens to reuse a freed object's address
+        (CPython recycles ``id()`` values).  An id-keyed cache without eviction
+        on ``_discard_conn`` would skip ``register_vector`` on the replacement
+        connection after a reconnect, silently producing array-literal bind
+        failures on every subsequent ``%s::vector`` bind.  Calling it every
+        time removes that whole failure class.
+        """
+        conn = super()._get_conn()
+        if conn is not None:
+            try:
+                from pgvector.psycopg import register_vector  # noqa: PLC0415
+
+                register_vector(conn)
+            except ImportError as exc:
+                # [pgvector] extra not installed — surface loudly rather than
+                # silently producing array-literal bind failures downstream.
+                raise ImportError(
+                    "PgvectorMemoryBackend requires the 'pgvector' extra. "
+                    "Install via: pip install 'atomic-agents-stack[postgres,pgvector]'"
+                ) from exc
+        return conn
+
     # ── Schema versioning override ──────────────────────────────────
 
     def _ensure_schema(self, conn: Any) -> None:
         """Extend the inherited v1→v2 migration with a v2→v3 migration.
 
         Calls super()._ensure_schema(conn) first to handle the v1→v2 base
-        migration, then runs the v2→v3 ladder under the SAME advisory lock
-        and transaction (single lock, all DDL before commit).
+        migration.  IMPORTANT: super() COMMITS at the end of its run, which
+        RELEASES the transaction-scoped ``pg_advisory_xact_lock`` it held.  The
+        v2→v3 ladder below therefore runs in a SECOND transaction with the
+        advisory lock RE-ACQUIRED (same ``_ADVISORY_LOCK_KEY`` so memory DDL
+        phases still serialize against each other, just across two
+        transactions, not one).
 
-        The advisory lock key is the SAME as PostgresMemoryBackend's
-        (``_ADVISORY_LOCK_KEY``) so all memory DDL phases serialize under one
-        lock — no separate transaction for the side table.
+        Cross-phase atomicity is NOT provided by a single lock span — it is
+        provided by the idempotent ``IF NOT EXISTS`` / ``DO $$`` DDL.  If a
+        crash lands between the parent's commit (DB at v2, no embeddings table)
+        and the subclass's commit, the next connection's C5 stale-meta guard
+        (below, the ``existing >= 3`` arm) detects the missing side table and
+        re-runs the v2→v3 arm.
 
         v2→v3 migration (additive, no ALTER on memory_notes):
         * CREATE TABLE IF NOT EXISTS memory_note_embeddings (...)
@@ -298,13 +348,12 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
         * CREATE INDEX IF NOT EXISTS ... USING hnsw (embedding vector_cosine_ops)
         * UPDATE memory_meta SET schema_version = '3'
 
-        FAIL-HARD on missing extension (ruling C2): if pgvector's ``vector``
-        type is unavailable, every DDL involving ``vector(N)`` raises a
-        Postgres exception.  The error is NOT caught here — it propagates to
-        the caller with a clear Postgres error message identifying the missing
-        type.  The operator must run ``CREATE EXTENSION vector`` in their
-        managed Postgres instance (documented in spec/46).  The backend NEVER
-        runs CREATE EXTENSION itself.
+        FAIL-HARD on missing extension (ruling C2): the extension check below
+        raises a clear ``RuntimeError`` when pgvector's ``vector`` type is
+        unavailable, BEFORE any vector(N) DDL runs.  The error is NOT caught
+        here — it propagates to the caller.  The operator must run
+        ``CREATE EXTENSION vector`` in their managed Postgres instance.  The
+        backend NEVER runs CREATE EXTENSION itself.
         """
         # First: verify pgvector extension is present (C2 fail-hard posture).
         # This runs BEFORE calling super() so the error is diagnosed early.
@@ -318,8 +367,8 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
                 "Postgres (Cloud SQL, RDS, Azure Database), enable the extension "
                 "via your cloud console or migration tool before connecting.  "
                 "Run `atomic-agents doctor` to verify the embedding backend "
-                "configuration.  The backend will never run CREATE EXTENSION itself "
-                "(spec/46 decision ci-pgvector-image C2)."
+                "configuration.  The backend never runs CREATE EXTENSION itself; "
+                "provision the 'vector' extension during database setup."
             )
 
         # Run parent v1→v2 migration (advisory lock acquired inside super()).
@@ -465,20 +514,17 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
 
         If step 2 or 3 fails, the note still exists (visible via FTS).  The
         side table is regenerable derived state — the note is the source of
-        truth (ruling reembed-on-dimension-or-model-change Tier B).
+        truth.
 
         Cost gate
         ---------
-        embed() is called at the orchestration layer (this method) per the
-        Q3 ruling.  The reservation/release JSONL records are emitted from
-        this method via ``_emit_embed_cost_record()`` if a ``_log_backend``
-        is registered.  When no log backend is available (standalone use),
-        the embed call still executes but no JSONL is written.
-
-        Note: full cost-gate wiring (JSONL emit to LogBackend) requires the
-        agent.call() orchestration layer to register the log backend reference.
-        Standalone use of PgvectorMemoryBackend without agent.call() does NOT
-        emit cost records — the gate is architectural, not a backend concern.
+        NOT YET WIRED.  The embed() call here is an UNGATED billable LLM call:
+        no cost reservation, no release, and no JSONL audit record are emitted.
+        Per the Q3 ruling the gate belongs at the agent.call() orchestration
+        layer (the backend stays cost-unaware so MUST-4 MUST-NOT-RAISE holds);
+        that wiring is tracked in #544, not part of this backend.  Standalone
+        use of PgvectorMemoryBackend therefore makes uncapped, unaudited
+        embedding spend on every write — see the module docstring's Q3 note.
         """
         # Step 1: canonical write (parent handles CAS, merge, four cases).
         ref = super().write_note(
@@ -487,7 +533,24 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
 
         # Step 2+3: embed and upsert OUTSIDE parent's transaction.
         if self._embedding_backend is not None:
-            self._upsert_embedding(ref.name, capture.body)
+            # The embedding MUST represent the note's POST-WRITE STORED body, not
+            # the incoming fragment.  On a merge write (Case 1, capture.merge_into
+            # set) the parent PRESERVES the target's body and only appends
+            # sources — so capture.body is just the latest fragment, NOT the
+            # note's accumulated content.  Upserting embed(capture.body) would
+            # overwrite the target's vector with the embedding of a single
+            # fragment, silently diverging the stored body from its ANN vector
+            # and corrupting semantic recall for every merged note.  Re-read the
+            # canonical stored body and embed THAT.
+            embed_body = capture.body
+            if capture.merge_into:
+                try:
+                    stored = self.read_note(ref.name)
+                except Exception:  # noqa: BLE001
+                    stored = None
+                if stored is not None and getattr(stored, "body", None) is not None:
+                    embed_body = stored.body
+            self._upsert_embedding(ref.name, embed_body)
 
         return ref
 
@@ -533,6 +596,25 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
         model_id = backend.model_id
         dimensions = backend.dimensions
 
+        # Produced-length backstop (dimension-honesty, the CRITICAL class from
+        # #200 PR2): a backend MUST return a vector whose length equals its
+        # declared ``dimensions``.  If the produced length diverges (a buggy or
+        # mis-reduced backend), DO NOT store the row — the ``dimensions`` column
+        # would claim N while the vector held M, and the ANN model+dimension
+        # filter would later select a vector the cosine operator cannot compare.
+        # Skip + warn rather than let the vector(N) column constraint abort the
+        # whole transaction.
+        if len(vector) != dimensions:
+            _logger.warning(
+                "PgvectorMemoryBackend: embed() for note_name=%r produced a "
+                "vector of length %d but backend declares dimensions=%d; "
+                "skipping side-table upsert (dimension-honesty backstop)",
+                note_name,
+                len(vector),
+                dimensions,
+            )
+            return
+
         def _do(conn: Any) -> None:
             conn.execute(
                 _UPSERT_EMBEDDING_SQL,
@@ -567,8 +649,8 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
         When ``supports_semantic_search=False`` (no embedding backend):
         * Delegates directly to the parent FTS ``search()``.
 
-        ANN model filter (ruling reembed-on-dimension-or-model-change Tier B)
-        -----------------------------------------------------------------------
+        ANN model filter
+        ----------------
         The WHERE clause ``e.model_id = %s AND e.dimensions = %s`` ensures
         that cosine distance is computed only between vectors of the SAME
         dimensionality from the SAME model.  A query vector from
@@ -579,10 +661,11 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
 
         Cost gate note
         --------------
-        The embed() call here is the query-embedding site.  Full JSONL
-        cost-gate emission (``embed_reservation`` / ``embed_release``) is
-        handled at the agent.call() orchestration layer when this backend is
-        used inside an agent.  Standalone use does not emit cost records.
+        NOT YET WIRED.  The embed() call here (the query-embedding site) is an
+        UNGATED billable LLM call — no reservation, no release, no JSONL audit
+        record.  The Q3 ruling places the gate at the agent.call() orchestration
+        layer (backend stays cost-unaware); that wiring is tracked in #544.
+        See the module docstring's Q3 note.
         """
         if self._embedding_backend is None:
             return super().search(query, limit=limit)

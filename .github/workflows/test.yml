@@ -34,10 +34,9 @@ jobs:
     # NON-CONFORMANCE and always run regardless of the env var.
     services:
       postgres:
-        # pgvector/pgvector:pg16 provides the pgvector extension required by
+        # pgvector/pgvector:pg16 ships the pgvector extension required by
         # PgvectorMemoryBackend and PgvectorCorpusBackend (#200 PR 3).
-        # postgres:16-alpine does NOT ship the extension; the image swap is
-        # mandated by the ci-pgvector-image A+B+C2 decision.
+        # postgres:16-alpine does NOT ship the extension, so it is swapped here.
         image: pgvector/pgvector:pg16
         env:
           POSTGRES_PASSWORD: test
@@ -76,9 +75,9 @@ jobs:
         run: uv sync --extra dev --extra openai --extra validation --extra redis --extra http --extra postgres --extra pgvector --python ${{ matrix.python-version }}
 
       - name: Enable pgvector extension
-        # Decision ci-pgvector-image C2: CI runs CREATE EXTENSION as privileged
-        # test-setup. The backend itself MUST NOT run CREATE EXTENSION (fail-hard
-        # with a clear error if the extension is absent at runtime).
+        # CI runs CREATE EXTENSION as privileged test-setup. The backend itself
+        # never runs CREATE EXTENSION — it fails hard with a clear error if the
+        # extension is absent at runtime (provision it during DB setup).
         # PGPASSWORD prevents the psql password prompt in non-interactive CI.
         env:
           PGPASSWORD: test

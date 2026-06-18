@@ -122,12 +122,15 @@ class OpenAIEmbeddingBackend:
     Patch the ``openai`` module via ``sys.modules`` OR patch
     ``_build_client`` on the instance for the most direct interception.
 
-    supports_input_type: advertised as False in PR2. The OpenAI embedding API
-    DOES support input_type (query vs document) but the ``embed()``/
-    ``embed_batch()`` Protocol surface in PR2 does NOT include an
-    ``input_type`` parameter -- it is deliberately absent pending the
-    ``@runtime_checkable`` limitation analysis. PR3 adds the kwarg to the
-    Protocol and flips this flag to True. See spec/46 §"supports_input_type".
+    supports_input_type: honestly ``False`` (MUST 3 capability honesty).
+    Verified against the installed ``openai`` SDK (>= 1.30): its
+    ``embeddings.create()`` signature does NOT expose an ``input_type``
+    parameter, so there is nothing for the backend to forward.  The
+    ``embed()`` / ``embed_batch()`` Protocol surface DOES accept an
+    ``input_type`` kwarg (added for forward-compatibility with providers that
+    support it), but for OpenAI it is accepted-and-ignored — the flag stays
+    ``False`` so a caller never assumes query/document differentiation is in
+    effect.  See ``capabilities()`` and spec/46 §"supports_input_type".
     """
 
     def __init__(
