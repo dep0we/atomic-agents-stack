@@ -103,6 +103,11 @@ _logger = logging.getLogger(__name__)
 # INDEPENDENT of LogBackend's own _SCHEMA_VERSION constant.
 _SCHEMA_VERSION = 3
 
+# Sentinel attribute stamped on a live psycopg connection once register_vector
+# has run on it.  Travels with the connection object (not an id()-keyed cache),
+# so it is reconnect-safe and id()-reuse-safe — see _get_conn for the rationale.
+_VECTOR_REGISTERED_ATTR = "_atomic_agents_vector_registered"
+
 # ── DDL — memory_note_embeddings side table ────────────────────────
 # The vector column dimension N is fixed at construction time from the active
 # embedding backend's ``dimensions`` property.  The DDL template uses a Python
@@ -164,7 +169,7 @@ ON CONFLICT (note_name) DO UPDATE SET
 """
 
 # ANN search: cosine distance, filtered to matching model_id + dimensions.
-# Parameters: query_vector, model_id, dimensions, limit.
+# Parameters (in placeholder order): model_id, dimensions, query_vector, limit.
 _ANN_SEARCH_SQL = """
 SELECT
     n.name, n.type, n.description,
@@ -289,26 +294,36 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
 
         The parent ``PostgresMemoryBackend._get_conn`` creates and caches the
         connection (running ``_ensure_schema`` on first use).  It does NOT
-        register pgvector's psycopg type adapter, so a Python ``list[float]``
-        bound to a ``%s::vector`` placeholder would adapt to a Postgres array
-        literal (``{...}``) — which the ``vector`` type does NOT accept (it
-        wants bracket syntax ``[...]``).  Every insert/query of a vector would
-        fail at runtime against a real Postgres.
+        register pgvector's psycopg type adapter.
 
-        We register ``pgvector.psycopg.register_vector`` on every fresh
-        connection returned by the parent.  ``register_vector`` is idempotent
-        per-connection, so registering unconditionally is safe — and it is the
-        ONLY correct approach across the reconnect lifecycle: an ``id(conn)``
-        cache cannot distinguish a genuinely-registered live connection from a
-        brand-new connection that happens to reuse a freed object's address
-        (CPython recycles ``id()`` values).  An id-keyed cache without eviction
-        on ``_discard_conn`` would skip ``register_vector`` on the replacement
-        connection after a reconnect, silently producing array-literal bind
-        failures on every subsequent ``%s::vector`` bind.  Calling it every
-        time removes that whole failure class.
+        Why register_vector is needed
+        -----------------------------
+        ``register_vector`` installs the psycopg LOADER for the ``vector`` type:
+        without it, READING a ``vector`` column returns a Python ``str`` (e.g.
+        ``'[0.1,0.2,...]'``) instead of a numpy array, breaking callers that
+        materialize the stored vector (``list(row['embedding'])`` in the
+        merge-embed regression).  The ``%s::vector`` WRITE path already works
+        WITHOUT register_vector — psycopg sends a Python ``list[float]`` as a
+        typed ``float8[]`` array and the ``::vector`` cast accepts it
+        (``ARRAY[...]::vector`` is valid; only the bare text literal
+        ``'{...}'::vector`` fails, which is not what psycopg sends).  So
+        register_vector is load-bearing for reads, belt-and-suspenders for writes.
+
+        Once-per-connection registration
+        ---------------------------------
+        ``register_vector`` issues catalog ``pg_type`` queries (one per vector
+        type it fetches), so calling it on every ``_get_conn()`` would add
+        round-trips to every memory read/write — the framework's hottest path.
+        We register exactly once per live connection by stamping a sentinel
+        attribute ON the connection object itself.  This is reconnect-safe and
+        id()-reuse-safe: a replacement connection after a reconnect is a fresh
+        object that does not carry the sentinel, so it re-registers; CPython
+        recycling a freed ``id()`` cannot cause a false cache hit because the
+        marker travels with the object, not with its address.  (Same
+        once-per-connection posture as ``PgvectorCorpusBackend``.)
         """
         conn = super()._get_conn()
-        if conn is not None:
+        if conn is not None and not getattr(conn, _VECTOR_REGISTERED_ATTR, False):
             try:
                 from pgvector.psycopg import register_vector  # noqa: PLC0415
 
@@ -320,6 +335,13 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
                     "PgvectorMemoryBackend requires the 'pgvector' extra. "
                     "Install via: pip install 'atomic-agents-stack[postgres,pgvector]'"
                 ) from exc
+            try:
+                setattr(conn, _VECTOR_REGISTERED_ATTR, True)
+            except (AttributeError, TypeError):
+                # A connection object that forbids attribute assignment would
+                # mean re-registering every call — correct, just not optimized.
+                # Real psycopg connections accept the attribute.
+                pass
         return conn
 
     # ── Schema versioning override ──────────────────────────────────
@@ -550,6 +572,23 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
                     stored = None
                 if stored is not None and getattr(stored, "body", None) is not None:
                     embed_body = stored.body
+                else:
+                    # Re-read failed on a MERGE write: capture.body is only the
+                    # latest fragment, NOT the note's accumulated body.  Embedding
+                    # the fragment would overwrite the target's vector with a
+                    # single-fragment embedding — the exact corruption this branch
+                    # exists to prevent, just triggered by a transient read.
+                    # Skip the upsert entirely: the prior (correct) vector stays in
+                    # place and the note remains reachable via FTS.  Strictly better
+                    # than storing a fragment vector.
+                    _logger.warning(
+                        "PgvectorMemoryBackend: merge re-read failed for "
+                        "note_name=%r; skipping embedding upsert to avoid storing "
+                        "a fragment vector (prior vector preserved, note reachable "
+                        "via FTS)",
+                        ref.name,
+                    )
+                    return ref
             self._upsert_embedding(ref.name, embed_body)
 
         return ref

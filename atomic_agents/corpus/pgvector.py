@@ -346,9 +346,21 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
            (CAS / four-case behavior preserved; the filesystem page is the
            source of truth).
         2. ``index_page(corpus, name, content)`` — embed OUTSIDE the page write
-           and upsert into the index.  Any failure here is logged + swallowed by
-           ``index_page``; the page still exists on disk and remains reachable
-           via the substring fallback.
+           and upsert into the index.  Any failure here (including the C2
+           missing-extension ``RuntimeError`` raised by ``_get_pg_conn`` on a
+           misconfigured DB) is logged + swallowed HERE; the page is already
+           durably on disk and remains reachable via the substring fallback.
+           This keeps the write path symmetric with
+           ``PgvectorMemoryBackend.write_note`` (whose ``_upsert_embedding``
+           swallows the same C2 raise) — a successful page write must NOT report
+           total failure because a derived-index side-effect failed.  C2
+           fail-hard is preserved on the READ path (``query()``) where there is
+           no partial state to leave behind.
+
+        Note: on a content-identical idempotent write (parent Case 2, no file
+        rewrite) ``index_page`` still re-embeds the unchanged body, making a
+        redundant billable embed.  Accepted as index-self-heal insurance until
+        the orchestration-layer cost gate (#544) dedupes unchanged-body embeds.
 
         Cost gate: NOT WIRED.  ``index_page`` calls ``embed()`` (a billable LLM
         call) with no reservation, release, or JSONL audit record — same
@@ -367,9 +379,21 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
         # Index the POST-WRITE body. ``content`` is the canonical body just
         # written (FilesystemCorpusBackend does not merge page bodies, so the
         # incoming content IS the stored content — no merge-fragment hazard like
-        # the memory backend's merge_into path).
+        # the memory backend's merge_into path).  Swallow indexing failures so a
+        # durable page write is never masked by a derived-index side-effect
+        # error (write-path symmetry with the memory backend; see the docstring).
         if self._embedding_backend is not None and self._pgvector_url is not None:
-            self.index_page(corpus, name, content)
+            try:
+                self.index_page(corpus, name, content)
+            except Exception as exc:  # noqa: BLE001
+                _logger.warning(
+                    "PgvectorCorpusBackend: indexing failed after write_page for "
+                    "%r/%r: %s (page committed to disk; ANN recall degraded, "
+                    "substring fallback still works)",
+                    corpus,
+                    name,
+                    type(exc).__name__,  # MUST 5 redaction — type name only
+                )
         return ref
 
     # ── query() override ──────────────────────────────────────────────────────

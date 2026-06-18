@@ -66,6 +66,41 @@ def _seed_corpus(root: Path) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# C2 fail-hard on missing extension — DB-free (closes the CI assurance gap)
+#
+# CI's pgvector image always HAS the 'vector' extension, so the C2 RuntimeError
+# branch in _ensure_pg_schema is never exercised by the live suite.  This
+# DB-free test simulates the missing-extension probe (fetchone() is None).
+
+
+class _MissingExtCursor:
+    def fetchone(self):
+        return None
+
+
+class _MissingExtConn:
+    def execute(self, sql, params=None):
+        return _MissingExtCursor()
+
+    def commit(self):
+        pass
+
+
+def test_pgvector_corpus_ensure_schema_fails_hard_without_extension():
+    """_ensure_pg_schema raises RuntimeError (C2) when 'vector' extension absent.
+
+    Negative control: remove the C2 check and this flips from raises to running
+    the CREATE TABLE DDL against the fake conn.
+    """
+    from atomic_agents.corpus.pgvector import PgvectorCorpusBackend
+
+    backend = PgvectorCorpusBackend.__new__(PgvectorCorpusBackend)
+    backend._embedding_backend = None  # default dim path; not reached before C2 raise
+    with pytest.raises(RuntimeError, match="vector.*extension"):
+        backend._ensure_pg_schema(_MissingExtConn())
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Construction + capabilities (no DB; no URL configured)
 
 

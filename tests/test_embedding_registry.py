@@ -10,10 +10,9 @@ Tests cover:
 
 from __future__ import annotations
 
-import os
 import sys
 import types
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -171,12 +170,17 @@ def _make_fake_openai_module():
 
     class _FakeEmbeddings:
         def create(self, *, input, model, dimensions=4):
-            class _Resp:
-                class _Item:
-                    def __init__(self, i):
-                        self.index = i
-                        self.embedding = [0.1] * dimensions
+            # _Item is defined in create()'s function scope (NOT inside the _Resp
+            # class body): a comprehension running in a class body cannot resolve
+            # sibling class-level names, so an inner ``class _Item`` referenced by
+            # ``[_Item(i) for i in ...]`` would raise NameError.  Defining it here
+            # keeps it visible to the comprehension below.
+            class _Item:
+                def __init__(self, i):
+                    self.index = i
+                    self.embedding = [0.1] * dimensions
 
+            class _Resp:
                 data = [_Item(i) for i in range(len(input))]
 
             return _Resp()
@@ -279,6 +283,37 @@ def test_get_default_unset_provider_no_extra_returns_none(monkeypatch):
 
     result = get_default_embedding_backend()
     assert result is None
+
+
+def test_get_default_explicit_openai_missing_extra_raises(monkeypatch):
+    """An EXPLICITLY-pinned 'openai' with the [openai] extra absent fails loud.
+
+    Parity with the explicit-unknown-provider raise: an operator who pinned
+    ATOMIC_AGENTS_EMBEDDING_BACKEND=openai but never installed the extra opted
+    into semantic search and must NOT silently get FTS with no error. Only the
+    UNSET implicit-openai default degrades to None (the test just above).
+
+    Negative control: revert the registry to `return None` in the explicit-pin
+    branch of the openai lazy-register block and this flips from raises to None.
+    """
+    from atomic_agents.embedding import registry as _reg
+    from atomic_agents.exceptions import AtomicAgentsError
+
+    # The OpenAIEmbeddingBackend module imports the `openai` SDK lazily (inside
+    # __init__, not at module level), so the lazy-register `from .openai import`
+    # succeeds; the SDK-absent failure surfaces at CONSTRUCTION as an
+    # AtomicAgentsError (MSG_NO_OPENAI_SDK).  With sys.modules['openai']=None the
+    # construction `import openai` raises ImportError → wrapped AtomicAgentsError.
+    _reg.unregister_embedding_backend("openai")
+    monkeypatch.setitem(sys.modules, "openai", None)
+    monkeypatch.setenv("ATOMIC_AGENTS_EMBEDDING_BACKEND", "openai")
+    # No api_key path needed — construction fails on the SDK presence check first.
+
+    # Accept either failure surface: ImportError (lazy-register block, if the
+    # SDK were imported at module level) or AtomicAgentsError (construction-time
+    # SDK presence check, which is the actual path today).  Both are "fail loud".
+    with pytest.raises((AtomicAgentsError, ImportError)):
+        get_default_embedding_backend()
 
 
 # ──────────────────────────────────────────────────────────────────────────────

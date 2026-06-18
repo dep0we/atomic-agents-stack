@@ -96,15 +96,22 @@ def test_pgvector_is_subclass_of_postgres():
 # pgvector type-adapter registration (no real DB needed — pins the runtime fix)
 
 
-def test_pgvector_get_conn_registers_vector_adapter(monkeypatch):
-    """_get_conn MUST call pgvector.psycopg.register_vector on every conn it returns.
+class _FakeConn:
+    """A connection stand-in that accepts attribute assignment.
 
-    Without per-connection register_vector, a Python list[float] bound to a
-    ``%s::vector`` placeholder adapts to a Postgres array literal (``{...}``)
-    which the ``vector`` type rejects — every insert/query would fail at
-    runtime.  register_vector is idempotent per-connection, so the backend
-    calls it unconditionally.  Negative control: strip the call and this test
-    goes red (registered stays empty).
+    Real psycopg connections accept arbitrary attributes, which is what the
+    once-per-connection sentinel relies on.  A bare ``object()`` does NOT (it
+    has no ``__dict__``), so the optimization tests use this instead.
+    """
+
+
+def test_pgvector_get_conn_registers_vector_adapter(monkeypatch):
+    """_get_conn MUST call pgvector.psycopg.register_vector on a fresh conn.
+
+    Without register_vector's LOADER, READING a ``vector`` column returns a
+    ``str`` instead of a numpy array, breaking ``list(row['embedding'])`` in
+    callers that materialize the stored vector.  Negative control: strip the
+    register_vector call and this test goes red (registered stays empty).
     """
     from atomic_agents.memory.pgvector import PgvectorMemoryBackend
     from atomic_agents.memory.postgres import PostgresMemoryBackend
@@ -112,7 +119,7 @@ def test_pgvector_get_conn_registers_vector_adapter(monkeypatch):
     # Bypass __init__ (needs a live DB).
     backend = PgvectorMemoryBackend.__new__(PgvectorMemoryBackend)
 
-    fake_conn = object()
+    fake_conn = _FakeConn()
     monkeypatch.setattr(
         PostgresMemoryBackend, "_get_conn", lambda self: fake_conn, raising=True
     )
@@ -132,14 +139,51 @@ def test_pgvector_get_conn_registers_vector_adapter(monkeypatch):
     )
 
 
+def test_pgvector_get_conn_registers_once_per_connection(monkeypatch):
+    """register_vector MUST run exactly ONCE across N ops on one live connection.
+
+    register_vector issues catalog ``pg_type`` round-trips; calling it on every
+    _get_conn() (which fires per memory operation) would tax the hottest path.
+    The sentinel attribute stamped on the connection makes subsequent calls
+    skip registration.  Negative control: strip the
+    ``not getattr(conn, _VECTOR_REGISTERED_ATTR, False)`` guard (register every
+    call) and this asserts call_count==1 → flips red at 3.
+    """
+    from atomic_agents.memory.pgvector import PgvectorMemoryBackend
+    from atomic_agents.memory.postgres import PostgresMemoryBackend
+
+    backend = PgvectorMemoryBackend.__new__(PgvectorMemoryBackend)
+
+    # Same connection object returned every call (no reconnect).
+    fake_conn = _FakeConn()
+    monkeypatch.setattr(
+        PostgresMemoryBackend, "_get_conn", lambda self: fake_conn, raising=True
+    )
+
+    registered: list = []
+    import pgvector.psycopg as pv_psycopg
+
+    monkeypatch.setattr(
+        pv_psycopg, "register_vector", lambda conn: registered.append(conn)
+    )
+
+    for _ in range(3):
+        assert backend._get_conn() is fake_conn
+    assert registered == [fake_conn], (
+        "register_vector must run exactly once per live connection, not on "
+        f"every _get_conn() (ran {len(registered)} times)"
+    )
+
+
 def test_pgvector_get_conn_registers_on_reconnect_with_reused_id(monkeypatch):
     """register_vector MUST run on a fresh conn even if it reuses a freed id().
 
     Regression for the id()-keyed cache bug: an id-keyed set without eviction
     on _discard_conn would SKIP register_vector when CPython recycles a freed
     object's address for the replacement connection, silently producing
-    array-literal bind failures.  Calling register_vector unconditionally on
-    every returned connection removes the failure class.
+    array-literal bind failures.  The sentinel is stamped ON the connection
+    object, so a fresh replacement connection (a new object) does not carry it
+    and re-registers — even if CPython reuses the freed id().
 
     We simulate a reconnect by having the parent _get_conn hand back a SECOND,
     distinct connection object on the next call (the real reconnect path), and
@@ -151,7 +195,10 @@ def test_pgvector_get_conn_registers_on_reconnect_with_reused_id(monkeypatch):
 
     backend = PgvectorMemoryBackend.__new__(PgvectorMemoryBackend)
 
-    conns = [object(), object()]
+    # _FakeConn (not bare object()) so the once-per-connection sentinel attribute
+    # can actually be stamped — exercising the real production code path where a
+    # fresh reconnected conn lacks the sentinel and re-registers.
+    conns = [_FakeConn(), _FakeConn()]
     calls = {"n": 0}
 
     def _fake_parent_get_conn(self):
@@ -233,6 +280,47 @@ def test_pgvector_upsert_embedding_skips_on_dimension_mismatch(monkeypatch):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# C2 fail-hard on missing extension — DB-free (closes the CI assurance gap)
+#
+# The live C2 test (test_pgvector_live_fail_hard_without_extension) self-skips
+# unless a SECOND extension-less DB is configured, and CI's pgvector image
+# always HAS the extension — so the C2 RuntimeError branch falls through BOTH
+# gates.  This DB-free test exercises it by simulating the missing-extension
+# probe result (fetchone() is None), closing the gap CI cannot.
+
+
+class _MissingExtCursor:
+    def fetchone(self):
+        return None  # simulates: SELECT 1 FROM pg_extension WHERE extname='vector' → no row
+
+
+class _MissingExtConn:
+    """A conn whose extension-check probe reports the 'vector' extension absent."""
+
+    def execute(self, sql, params=None):
+        return _MissingExtCursor()
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+
+def test_pgvector_memory_ensure_schema_fails_hard_without_extension():
+    """_ensure_schema raises RuntimeError (C2) when the 'vector' extension is absent.
+
+    Negative control: remove the C2 check (the fetchone()-is-None raise) and
+    this flips from raises to falling through to super()._ensure_schema.
+    """
+    from atomic_agents.memory.pgvector import PgvectorMemoryBackend
+
+    backend = PgvectorMemoryBackend.__new__(PgvectorMemoryBackend)
+    with pytest.raises(RuntimeError, match="vector.*extension"):
+        backend._ensure_schema(_MissingExtConn())
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # make_pgvector_memory_backend_from_url — construction guard (no real DB needed)
 
 
@@ -276,8 +364,24 @@ def pgv_backend(tmp_path):
     deleting memory_notes cascades to memory_note_embeddings.  memory_note_versions
     has a note_name TEXT column with NO FK (notes can be deleted independently).
     CI always runs with a fresh DB; the broad DELETE ensures test isolation.
+
+    ORDER-INDEPENDENCE: the embeddings table column is ``vector(N)`` fixed at
+    first migration.  A no-embedding-backend test (which migrates at the default
+    1536) running FIRST against a fresh shared DB would create the column as
+    vector(1536), and this fixture's dim-4 writes would then fail the column
+    type check (swallowed by _upsert_embedding → a downstream assert finds no
+    row).  To remove the hidden ordering dependency (a real risk under
+    pytest-randomly / xdist, per feedback_db_gated_tests_skip_locally), the
+    fixture DROPs and re-creates the embeddings table at its own dimensions=4
+    before yielding.  DROP CASCADE also removes the FK + HNSW index; the v3
+    re-create below restores them.
     """
-    from atomic_agents.memory.pgvector import PgvectorMemoryBackend
+    from atomic_agents.memory.pgvector import (
+        _ADD_EMBEDDINGS_FK,
+        _CREATE_EMBEDDINGS_HNSW_INDEX,
+        _CREATE_EMBEDDINGS_TABLE,
+        PgvectorMemoryBackend,
+    )
 
     stub = _make_stub_embedding(dimensions=4)
     backend = PgvectorMemoryBackend(tmp_path, url=_POSTGRES_URL, embedding_backend=stub)
@@ -287,7 +391,12 @@ def pgv_backend(tmp_path):
     # Versions have note_name TEXT (no FK constraint) so order doesn't matter there.
     conn = backend._get_conn()
     if conn is not None:
-        conn.execute("DELETE FROM memory_note_embeddings")
+        # Recreate the embeddings table at THIS fixture's dimensions (4) so the
+        # column dimension is order-independent (see docstring).
+        conn.execute("DROP TABLE IF EXISTS memory_note_embeddings CASCADE")
+        conn.execute(_CREATE_EMBEDDINGS_TABLE.format(dimensions=4))
+        conn.execute(_ADD_EMBEDDINGS_FK)
+        conn.execute(_CREATE_EMBEDDINGS_HNSW_INDEX)
         conn.execute("DELETE FROM memory_note_versions")
         conn.execute("DELETE FROM memory_notes")
         conn.commit()
@@ -383,7 +492,7 @@ def test_pgvector_live_write_note_succeeds_without_embedding_backend(tmp_path):
         sources=["test"],
         body="Body without embedding.",
     )
-    b.write_note(capture, WritePolicy.CREATE_OR_UPDATE)
+    b.write_note(capture, WritePolicy(write_paths=[tmp_path]))
     notes = b.list_notes()
     assert any("No-embed note" in n.name for n in notes)
     b.close()
@@ -450,7 +559,9 @@ def test_pgvector_live_write_note_stores_embedding(pgv_backend):
         sources=["test"],
         body="Body text for embedding test.",
     )
-    ref = pgv_backend.write_note(capture, WritePolicy.CREATE_OR_UPDATE)
+    ref = pgv_backend.write_note(
+        capture, WritePolicy(write_paths=[pgv_backend._agent_root])
+    )
     expected_note_name = derive_filename(capture.type, capture.name)
     assert ref.name == expected_note_name
 
@@ -540,7 +651,9 @@ def test_pgvector_live_merge_embeds_post_merge_body(pgv_backend):
         sources=["src-a"],
         body="The original accumulated body of the base note.",
     )
-    ref = pgv_backend.write_note(base, WritePolicy.CREATE_OR_UPDATE)
+    ref = pgv_backend.write_note(
+        base, WritePolicy(write_paths=[pgv_backend._agent_root])
+    )
     note_name = derive_filename(base.type, base.name)
 
     # Merge a fragment into it (body differs; merge preserves target body).
@@ -553,7 +666,7 @@ def test_pgvector_live_merge_embeds_post_merge_body(pgv_backend):
         body="A SHORT incremental fragment that must NOT become the embedding.",
         merge_into=ref.name,
     )
-    pgv_backend.write_note(frag, WritePolicy.CREATE_OR_UPDATE)
+    pgv_backend.write_note(frag, WritePolicy(write_paths=[pgv_backend._agent_root]))
 
     # The stored body after merge is still the base body (merge only appends
     # sources). The stored embedding must equal embed(stored body).
@@ -578,9 +691,22 @@ def test_pgvector_live_merge_embeds_post_merge_body(pgv_backend):
 
 @requires_postgres
 def test_pgvector_live_search_returns_results(pgv_backend):
-    """search() with ANN returns a result list for notes that have been embedded."""
+    """search() with ANN positively returns the just-written + embedded note.
+
+    Uses a CONTENT-DERIVED stub so query/stored vectors are non-degenerate (the
+    fixture's all-zeros stub yields a zero-norm vector → cosine distance is NaN
+    → ORDER BY undefined, which would make a `len(results) >= 0` tautology pass
+    even on a broken ANN join).  We assert the written note's DERIVED SLUG
+    appears in the result set — a broken ANN ORDER BY / join cannot ship green.
+    """
+    from atomic_agents._schema import derive_filename
     from atomic_agents.memory.backend import WritePolicy
     from atomic_agents.types import Capture
+    from tests.stub_embedding import ContentDerivedStubEmbeddingBackend
+
+    # Non-degenerate vectors so cosine distance is well-defined (dimensions=4
+    # matches the v3 vector column the fixture already migrated).
+    pgv_backend._embedding_backend = ContentDerivedStubEmbeddingBackend(dimensions=4)
 
     capture = Capture(
         type="feedback",
@@ -590,13 +716,17 @@ def test_pgvector_live_search_returns_results(pgv_backend):
         sources=["test"],
         body="This note exists to be found by the ANN search.",
     )
-    pgv_backend.write_note(capture, WritePolicy.CREATE_OR_UPDATE)
+    pgv_backend.write_note(capture, WritePolicy(write_paths=[pgv_backend._agent_root]))
+    expected_name = derive_filename(capture.type, capture.name)
 
     results = pgv_backend.search("ANN search", limit=5)
-    # Result list must not be empty (the note we just wrote should be found)
     assert isinstance(results, list)
-    # At least one result expected; may be more depending on prior test state
-    assert len(results) >= 0  # conservative: ANN works if it doesn't raise
+    assert len(results) >= 1, "ANN search returned no results for an embedded note"
+    returned_names = [r.name for r in results]
+    assert expected_name in returned_names, (
+        "ANN search did not return the just-written + embedded note "
+        f"(expected slug {expected_name!r} in {returned_names!r})"
+    )
 
 
 @requires_postgres
@@ -619,7 +749,7 @@ def test_pgvector_live_search_model_filter(pgv_backend):
         sources=["test"],
         body="correct model",
     )
-    pgv_backend.write_note(capture, WritePolicy.CREATE_OR_UPDATE)
+    pgv_backend.write_note(capture, WritePolicy(write_paths=[pgv_backend._agent_root]))
 
     conn = pgv_backend._get_conn()
     assert conn is not None

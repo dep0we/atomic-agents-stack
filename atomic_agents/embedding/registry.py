@@ -111,10 +111,13 @@ def get_default_embedding_backend() -> "EmbeddingBackend | None":
     * Provider id set but ``ATOMIC_AGENTS_EMBEDDING_MODEL`` not set → uses
       provider's default (each backend specifies its own default model).
     * Construction fails (bad ``ATOMIC_AGENTS_EMBEDDING_DIMENSIONS``, SDK
-      absent) → logs WARNING by *exception type name only* (MUST 5 redaction)
+      absent) AND the provider was NOT explicitly pinned (implicit ``openai``
+      default) → logs WARNING by *exception type name only* (MUST 5 redaction)
       and returns ``None``.  The caller (``PgvectorMemoryBackend.__init__``)
       sets ``supports_semantic_search=False`` on ``None`` return, falling
-      back to FTS.
+      back to FTS.  When the provider WAS explicitly pinned, the construction
+      error is re-raised instead (see the Raises section) — an explicit opt-in
+      must not silently degrade.
 
     Raises (operator misconfiguration — surfaced, never silently degraded):
 
@@ -126,6 +129,11 @@ def get_default_embedding_backend() -> "EmbeddingBackend | None":
       ``SecretBackendNotRegistered`` re-raise below guards against.  (An UNSET
       env var falling back to the implicit ``openai`` default still degrades
       gracefully to ``None`` when the extra is absent.)
+    * ``ImportError`` when ``ATOMIC_AGENTS_EMBEDDING_BACKEND`` was EXPLICITLY set
+      to ``openai`` but the ``[openai]`` extra is not installed.  This is the
+      SAME split-brain guard as the typo case above (explicit opt-in must fail
+      loud, never silently FTS-fall-back).  Only the UNSET-env-var implicit
+      ``openai`` default degrades gracefully to ``None`` when the extra is absent.
 
     ``SecretBackendNotRegistered`` is NOT swallowed — an operator who pinned
     ``ATOMIC_AGENTS_SECRET_BACKEND=gcp`` but hasn't configured GCP credentials
@@ -166,8 +174,23 @@ def get_default_embedding_backend() -> "EmbeddingBackend | None":
             from .openai import OpenAIEmbeddingBackend  # noqa: PLC0415
 
             register_embedding_backend("openai", OpenAIEmbeddingBackend)
-        except (ImportError, AtomicAgentsError):
-            # [openai] extra not installed — graceful degradation.
+        except (ImportError, AtomicAgentsError) as exc:
+            if _explicitly_pinned:
+                # Operator EXPLICITLY pinned ATOMIC_AGENTS_EMBEDDING_BACKEND=openai
+                # but the [openai] extra is not installed.  Surface loudly — same
+                # split-brain guard as the typo'd-provider re-raise below: an
+                # operator who opted into semantic search must not silently lose
+                # it to an FTS fallback with no error.  (An UNSET env var falling
+                # back to the implicit 'openai' default still degrades gracefully
+                # to None — that path keeps the return None branch.)
+                raise ImportError(
+                    "ATOMIC_AGENTS_EMBEDDING_BACKEND=openai requires the [openai] "
+                    "extra; install via: pip install 'atomic-agents-stack[openai]'. "
+                    "An explicitly-pinned embedding provider that cannot be "
+                    "constructed fails loudly rather than silently falling back to "
+                    "FTS search."
+                ) from exc
+            # Implicit default 'openai' + extra absent — graceful degradation.
             _logger.debug(
                 "get_default_embedding_backend: 'openai' extra not installed; "
                 "returning None (FTS fallback)"
@@ -236,6 +259,14 @@ def get_default_embedding_backend() -> "EmbeddingBackend | None":
         raise
     except AtomicAgentsError as exc:
         # EmbeddingError (MUST-1 validation), SDK absent, etc.
+        if _explicitly_pinned:
+            # Operator EXPLICITLY pinned this provider but it cannot be
+            # constructed (e.g. [openai] extra/SDK absent, invalid dimensions).
+            # Surface loudly — same split-brain guard as the explicit-typo and
+            # SecretBackendNotRegistered raises: an explicit opt-in must not
+            # silently degrade to FTS.  Only the UNSET implicit default falls
+            # back to None below.
+            raise
         _logger.warning(
             "get_default_embedding_backend: construction failed for "
             "provider_id=%r: %s (FTS fallback)",
@@ -245,6 +276,8 @@ def get_default_embedding_backend() -> "EmbeddingBackend | None":
         return None
     except Exception as exc:  # noqa: BLE001
         # Unexpected error (bad kwarg name, etc.) — log type only.
+        if _explicitly_pinned:
+            raise
         _logger.warning(
             "get_default_embedding_backend: unexpected error constructing "
             "provider_id=%r: %s (FTS fallback)",
