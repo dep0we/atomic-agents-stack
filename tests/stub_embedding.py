@@ -63,13 +63,22 @@ class StubEmbeddingBackend:
             supports_input_type=False,
         )
 
-    def embed(self, text: str) -> list[float] | None:
-        """Return a fixed zero vector. Never raises."""
+    def embed(self, text: str, *, input_type: str | None = None) -> list[float] | None:
+        """Return a fixed zero vector. Never raises.
+
+        ``input_type`` is accepted per the PR-3 Protocol surface but ignored
+        (stub does not implement provider-side input_type logic).
+        """
         return [0.0] * self._dimensions
 
-    def embed_batch(self, texts: list[str]) -> list[list[float] | None]:
-        """Default implementation: loop embed() item-by-item."""
-        return [self.embed(t) for t in texts]
+    def embed_batch(
+        self, texts: list[str], *, input_type: str | None = None
+    ) -> list[list[float] | None]:
+        """Default implementation: loop embed() item-by-item.
+
+        ``input_type`` is forwarded to embed() (which accepts-but-ignores it).
+        """
+        return [self.embed(t, input_type=input_type) for t in texts]
 
     def close(self) -> None:
         """Record close() calls for idempotency conformance testing."""
@@ -109,11 +118,13 @@ class _RaisingStubEmbeddingBackend:
             supports_input_type=False,
         )
 
-    def embed(self, text: str) -> list[float] | None:
+    def embed(self, text: str, *, input_type: str | None = None) -> list[float] | None:
         """ALWAYS raises RuntimeError -- for negative control testing only."""
         raise RuntimeError("stub intentional raise for negative control testing")
 
-    def embed_batch(self, texts: list[str]) -> list[list[float] | None]:
+    def embed_batch(
+        self, texts: list[str], *, input_type: str | None = None
+    ) -> list[list[float] | None]:
         """ALWAYS raises RuntimeError -- for negative control testing only."""
         raise RuntimeError("stub intentional batch raise for negative control testing")
 

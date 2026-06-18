@@ -215,20 +215,47 @@ def test_capabilities_max_input_tokens_positive(backend):
     assert caps.max_input_tokens > 0
 
 
-def test_capabilities_supports_input_type_is_false_in_pr2(backend):
-    """MUST 3: supports_input_type=False in PR2 (Protocol surface lacks input_type param).
+def test_capabilities_supports_input_type_is_false(backend):
+    """MUST 3: supports_input_type=False for backends whose provider lacks input_type.
 
-    This is the honest value for PR2. The OpenAI API does support input_type
-    but the Protocol surface in PR2 does not expose the parameter yet.
-    PR3 will flip this to True when the input_type kwarg is added.
-    See spec/46 §"supports_input_type flag vs parameter deferral".
+    Both StubEmbeddingBackend and OpenAIEmbeddingBackend advertise False.
+    OpenAI SDK verified (Principle #12, 2026-06-18): openai.embeddings.create()
+    does NOT include input_type as a native parameter. The kwarg is accepted on
+    the Protocol surface (PR3 addition) and on both impls, but ignored on the
+    provider side (capability honesty: advertise what you can actually honour).
+    See spec/46 §"supports_input_type flag vs. parameter deferral".
     """
     caps = backend.capabilities()
     assert caps.supports_input_type is False, (
-        "supports_input_type must be False in PR2 -- the Protocol surface "
-        "does not include an input_type parameter yet (deferred to PR3). "
-        "Advertising True while the parameter is absent violates capability honesty."
+        "supports_input_type must be False for OpenAIEmbeddingBackend and "
+        "StubEmbeddingBackend -- the OpenAI SDK does not expose input_type, "
+        "and the stub honestly advertises what it implements. "
+        "A backend whose provider DOES support input_type should advertise True."
     )
+
+
+def test_embed_accepts_input_type_kwarg(backend):
+    """MUST 3 (PR3 Protocol surface): embed() accepts input_type kwarg without raising.
+
+    All backends MUST accept the input_type kwarg. Backends with
+    supports_input_type=False accept-but-ignore it; backends with True
+    forward it to the provider. Either way the call must not raise.
+    """
+    result = backend.embed("hello world", input_type=None)
+    # None is the 'no hint' value; embed should succeed normally
+    assert result is None or isinstance(result, list)
+
+    result2 = backend.embed("hello world", input_type="search_query")
+    assert result2 is None or isinstance(result2, list)
+
+
+def test_embed_batch_accepts_input_type_kwarg(backend):
+    """MUST 3 (PR3 Protocol surface): embed_batch() accepts input_type kwarg without raising."""
+    result = backend.embed_batch(["a", "b"], input_type=None)
+    assert len(result) == 2
+
+    result2 = backend.embed_batch(["a", "b"], input_type="search_document")
+    assert len(result2) == 2
 
 
 def test_capabilities_stable_across_calls(backend):
@@ -557,7 +584,7 @@ def test_embed_batch_length_invariant_all_fail(monkeypatch):
     """
 
     class _AllNoneStub(StubEmbeddingBackend):
-        def embed(self, text):
+        def embed(self, text, *, input_type: str | None = None):
             return None  # simulate total failure per item
 
     stub = _AllNoneStub()
@@ -578,7 +605,7 @@ def test_embed_batch_length_invariant_mixed_failure(monkeypatch):
             super().__init__(dimensions=4)
             self._call_count = 0
 
-        def embed(self, text):
+        def embed(self, text, *, input_type: str | None = None):
             result = None if self._call_count % 2 == 1 else [0.0] * self._dimensions
             self._call_count += 1
             return result

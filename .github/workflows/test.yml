@@ -34,7 +34,11 @@ jobs:
     # NON-CONFORMANCE and always run regardless of the env var.
     services:
       postgres:
-        image: postgres:16-alpine
+        # pgvector/pgvector:pg16 provides the pgvector extension required by
+        # PgvectorMemoryBackend and PgvectorCorpusBackend (#200 PR 3).
+        # postgres:16-alpine does NOT ship the extension; the image swap is
+        # mandated by the ci-pgvector-image A+B+C2 decision.
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_PASSWORD: test
           POSTGRES_DB: test_atomic_agents
@@ -69,7 +73,16 @@ jobs:
         # tests in test_judge_revise_jsonschema.py and the strict
         # end-to-end tests in test_agent_judge_revise_dispatch.py
         # exercise the real jsonschema dependency.
-        run: uv sync --extra dev --extra openai --extra validation --extra redis --extra http --extra postgres --python ${{ matrix.python-version }}
+        run: uv sync --extra dev --extra openai --extra validation --extra redis --extra http --extra postgres --extra pgvector --python ${{ matrix.python-version }}
+
+      - name: Enable pgvector extension
+        # Decision ci-pgvector-image C2: CI runs CREATE EXTENSION as privileged
+        # test-setup. The backend itself MUST NOT run CREATE EXTENSION (fail-hard
+        # with a clear error if the extension is absent at runtime).
+        # PGPASSWORD prevents the psql password prompt in non-interactive CI.
+        env:
+          PGPASSWORD: test
+        run: psql -h localhost -U postgres test_atomic_agents -c 'CREATE EXTENSION IF NOT EXISTS vector;'
 
       - name: Run tests
         run: uv run --python ${{ matrix.python-version }} pytest -v --tb=short

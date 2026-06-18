@@ -29,7 +29,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    # Imported under TYPE_CHECKING only to avoid a circular-import and to keep
+    # the corpus package side-effect-free at module load time (the [openai]
+    # extra may not be installed).  At runtime the field is annotated as a
+    # string via ``from __future__ import annotations`` (PEP 563 lazy eval).
+    # Callers that need to inspect the typed handle at runtime import directly
+    # from ``atomic_agents.embedding.backend``.
+    from ..embedding.backend import EmbeddingBackend
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -88,6 +97,15 @@ class CorpusCapabilities:
     # SQLiteCorpusBackend defaults False until its export impl ships.
     # Default False so existing instantiation sites without this kwarg keep working.
     supports_canonical_export: bool = False
+    # spec/34 PR-3 addendum: typed sibling for doctor / audit tooling.
+    # Mirrors the mcp_servers_resolved pattern from spec/36 (#201 PR 2).
+    # MUST NOT be serialized in snapshots (spec/24 always-[] clamp).
+    # When non-None, its provider_id MUST be consistent with
+    # ``embedding_provider`` (string label stays UNCHANGED per LOCKED MUST 3).
+    # Default None so all existing CorpusCapabilities instantiation sites
+    # (FilesystemCorpusBackend, SQLiteCorpusBackend, conformance fixtures)
+    # remain unbroken without modification.
+    embedding_backend_resolved: "EmbeddingBackend | None" = None
 
 
 # ──────────────────────────────────────────────────────────────────────────────

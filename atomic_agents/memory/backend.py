@@ -21,6 +21,47 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 if TYPE_CHECKING:
     from ..types import Capture
 
+    # EmbeddingBackend imported under TYPE_CHECKING only to avoid circular
+    # imports and keep memory package side-effect-free at module load.
+    from ..embedding.backend import EmbeddingBackend
+
+
+# ──────────────────────────────────────────────────────────────────
+# MemoryCapabilities (spec/20 PR-3 addendum)
+
+
+@dataclass(frozen=True)
+class MemoryCapabilities:
+    """Capability advertisement for semantic-search-capable MemoryBackend impls.
+
+    spec/20 PR-3 addendum: introduced alongside ``PgvectorMemoryBackend`` to
+    give doctor and audit tooling a single inspection pattern for the embedding
+    backend, mirroring ``CorpusCapabilities.embedding_backend_resolved`` from
+    spec/34.
+
+    Fields
+    ------
+    ``embedding_provider``: provider label string (e.g. ``"openai"``), or
+        ``None`` when semantic search is not supported.  Consistent with
+        ``CorpusCapabilities.embedding_provider`` semantics.
+    ``embedding_backend_resolved``: the live ``EmbeddingBackend`` instance, or
+        ``None`` when no backend is configured.  NOT serialized in snapshots
+        (spec/24 always-[] clamp).  When non-None, its ``provider_id`` MUST
+        match ``embedding_provider``.
+
+    Compatibility alias
+    -------------------
+    ``PgvectorMemoryBackend.supports_semantic_search`` returns
+    ``capabilities().embedding_provider is not None`` so callers using the
+    existing boolean property continue to work without modification.
+    ``FilesystemBackend`` and ``PostgresMemoryBackend`` are NOT required to
+    implement ``capabilities()`` in this PR — they retain the ``@property``
+    idiom for backward compatibility.
+    """
+
+    embedding_provider: str | None
+    embedding_backend_resolved: "EmbeddingBackend | None" = None
+
 
 # ──────────────────────────────────────────────────────────────────
 # Shared dataclasses

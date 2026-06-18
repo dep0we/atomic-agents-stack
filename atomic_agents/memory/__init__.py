@@ -42,7 +42,7 @@ _REGISTRY: dict[str, type] = {}
 # as a known id before the 'postgres' extra is installed.  Actual registration
 # happens inside get_default_memory_backend() when ATOMIC_AGENTS_MEMORY_BACKEND
 # =postgres is detected — same lazy-import pattern used by PostgresLogBackend.
-_LAZY_BACKEND_IDS: frozenset[str] = frozenset({"postgres"})
+_LAZY_BACKEND_IDS: frozenset[str] = frozenset({"postgres", "pgvector-memory"})
 
 
 def register_backend(name: str, cls: type) -> None:
@@ -163,6 +163,23 @@ def get_default_memory_backend(
 
             register_backend("postgres", PostgresMemoryBackend)
         return make_postgres_memory_backend_from_url(
+            raw_url, agent_root=agent_root, lock_backend=lock_backend
+        )
+
+    if backend_id == "pgvector-memory":
+        from .pgvector import make_pgvector_memory_backend_from_url  # noqa: PLC0415
+
+        raw_url = os.environ.get("ATOMIC_AGENTS_MEMORY_BACKEND_URL")
+        if not raw_url:
+            raise ValueError(
+                "ATOMIC_AGENTS_MEMORY_BACKEND=pgvector-memory requires "
+                "ATOMIC_AGENTS_MEMORY_BACKEND_URL=postgresql://user:pass@host:5432/dbname"
+            )
+        if "pgvector-memory" not in _REGISTRY:
+            from .pgvector import PgvectorMemoryBackend  # noqa: PLC0415
+
+            register_backend("pgvector-memory", PgvectorMemoryBackend)
+        return make_pgvector_memory_backend_from_url(
             raw_url, agent_root=agent_root, lock_backend=lock_backend
         )
 

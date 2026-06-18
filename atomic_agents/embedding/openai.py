@@ -264,7 +264,14 @@ class OpenAIEmbeddingBackend:
 
         self._model_id = model_id
         self._dimensions = dimensions
-        self._api_key = api_key or _get_key()
+        # MUST 3 / SecretBackend coherence: use `is not None` rather than the
+        # falsy `or` short-circuit. An empty string api_key='' is truthy-false
+        # and would incorrectly skip _get_key(); the `is not None` form honours
+        # "caller explicitly passed None (use the backend)" vs "caller passed
+        # an explicit value (use it literally, even '')".  This also prevents
+        # get_default_embedding_backend() from forwarding an empty env var
+        # directly — the factory should coerce '' to None before construction.
+        self._api_key = api_key if api_key is not None else _get_key()
 
     # ─── EmbeddingBackend Protocol surface ───────────────────────────────
 
@@ -283,17 +290,23 @@ class OpenAIEmbeddingBackend:
     def capabilities(self) -> EmbeddingCapabilities:
         """Return capability advertisement for this backend.
 
-        supports_input_type=False in PR2: the Protocol surface does not yet
-        include an input_type parameter (deferred to PR3). See the class
-        docstring and spec/46 §"supports_input_type flag vs parameter deferral".
+        supports_input_type=False: the OpenAI embeddings API (as exposed by the
+        installed openai SDK >= 1.30) does NOT offer an ``input_type`` parameter
+        on ``embeddings.create()`` (verified 2026-06-18 via installed SDK
+        signature -- parameters: input, model, dimensions, encoding_format, user).
+        The kwarg is accepted on ``embed()``/``embed_batch()`` per the Protocol
+        surface added in PR 3, but is NOT forwarded to the API.
+        ``supports_input_type=False`` is therefore capability-honest (MUST 3).
+        See class docstring and spec/46 §"supports_input_type flag vs. parameter
+        deferral".
         """
         return EmbeddingCapabilities(
             max_batch_size=_OPENAI_MAX_BATCH_SIZE,
             max_input_tokens=_OPENAI_MAX_INPUT_TOKENS,
-            supports_input_type=False,  # TODO(#200 PR3): set True + add input_type param
+            supports_input_type=False,
         )
 
-    def embed(self, text: str) -> list[float] | None:
+    def embed(self, text: str, *, input_type: str | None = None) -> list[float] | None:
         """Embed a single text string via the OpenAI embeddings API.
 
         Returns ``None`` on ANY failure (network error, rate limit, malformed
@@ -398,7 +411,9 @@ class OpenAIEmbeddingBackend:
             )
             return None
 
-    def embed_batch(self, texts: list[str]) -> list[list[float] | None]:
+    def embed_batch(
+        self, texts: list[str], *, input_type: str | None = None
+    ) -> list[list[float] | None]:
         """Embed a list of texts via a single batched OpenAI API call.
 
         Issues ONE ``client.embeddings.create(input=texts)`` call. On success,

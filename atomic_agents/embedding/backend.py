@@ -63,17 +63,20 @@ class EmbeddingCapabilities:
         distinguishing query-embedding from document-embedding mode (OpenAI
         ``input_type`` parameter, Cohere ``input_type``, etc.).
 
-        PR2 (DRAFT spec/46) advertises this flag only. The actual
-        ``input_type`` parameter on ``embed()``/``embed_batch()`` is
-        deliberately absent in PR2, pending ``@runtime_checkable``
-        limitation analysis. PR3 adds the kwarg when the flag semantics
-        are confirmed against the conformance suite. Until then,
-        implementations MUST advertise ``supports_input_type=False``
-        (honest -- the Protocol surface does not expose the parameter yet).
-        See spec/46 §"supports_input_type flag vs parameter deferral".
+        PR 3 added ``input_type`` as an accepted kwarg on ``embed()`` and
+        ``embed_batch()``.  Backends whose provider supports the parameter
+        SHOULD forward it and advertise ``True``; backends whose provider does
+        NOT expose the parameter MUST accept the kwarg without raising and keep
+        this flag ``False`` (capability honesty -- the kwarg is accepted but
+        not honoured).
 
-        ``TODO(#200 PR3)`` -- flip this to True in OpenAIEmbeddingBackend and
-        add the input_type kwarg to the Protocol surface.
+        **OpenAI note (Principle #12 verification, 2026-06-18):** the installed
+        OpenAI SDK (openai>=1.30) ``embeddings.create()`` signature does NOT
+        include ``input_type`` as a native parameter (verified against
+        ``.venv/lib/python3.12/site-packages/openai/resources/embeddings.py``).
+        ``OpenAIEmbeddingBackend`` therefore advertises ``supports_input_type=False``
+        and accepts the kwarg but does not forward it to the API.
+        See spec/46 §"supports_input_type flag vs. parameter deferral".
     """
 
     max_batch_size: int
@@ -167,12 +170,22 @@ class EmbeddingBackend(Protocol):
 
     # ─── Embedding operations ─────────────────────────────────────────────
 
-    def embed(self, text: str) -> list[float] | None:
+    def embed(self, text: str, *, input_type: str | None = None) -> list[float] | None:
         """Embed a single text string and return the vector, or ``None``.
 
         Returns ``None`` on ANY failure -- network error, rate limit,
         malformed input, provider unavailability, token-length exceeded.
         MUST NOT raise under any circumstances.
+
+        ``input_type``: optional hint distinguishing query embeddings from
+        document embeddings (e.g., Cohere's ``"search_query"`` /
+        ``"search_document"``).  Backends whose provider supports this
+        parameter SHOULD forward it (``supports_input_type=True``); backends
+        whose provider does NOT support it MUST accept the kwarg without
+        raising and ignore it (``supports_input_type=False`` remains honest
+        because the *Protocol surface* now carries the parameter but the
+        *implementation* cannot honour it).  See spec/46
+        §"supports_input_type flag vs. parameter deferral".
 
         This is a ``Protocol`` -- it provides no method body, so there is no
         inherited ``embed_batch()`` default. Every implementation MUST define
@@ -183,11 +196,17 @@ class EmbeddingBackend(Protocol):
         """
         ...
 
-    def embed_batch(self, texts: list[str]) -> list[list[float] | None]:
+    def embed_batch(
+        self, texts: list[str], *, input_type: str | None = None
+    ) -> list[list[float] | None]:
         """Embed a list of texts and return a list of vectors.
 
         Returns a list of the same length as ``texts``. Each element is either
         a vector ``list[float]`` (success) or ``None`` (failure for that item).
+
+        ``input_type``: same semantics as ``embed()`` -- forwarded to the
+        provider when ``supports_input_type=True``; accepted-but-ignored when
+        ``False``.
 
         CONFORMANCE INVARIANT: ``len(result) == len(texts)`` always holds,
         including when ``texts`` is empty (returns ``[]``) and when every

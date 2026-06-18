@@ -26,6 +26,12 @@ Public surface:
         get_default_corpus_backend,
     )
 
+``PgvectorCorpusBackend`` (backend_id ``"pgvector-corpus"``) is a lazy-
+imported extension that wraps ``FilesystemCorpusBackend`` with ANN-based
+``query()`` using a pgvector Postgres index.  Requires the ``[pgvector]``
+extra.  Dispatched from ``get_default_corpus_backend()`` when
+``ATOMIC_AGENTS_CORPUS_BACKEND=pgvector-corpus``.
+
 The registry is a process-local dict keyed by ``backend_id`` (a short
 operator-pin string like ``"filesystem"`` or ``"sqlite"``). Like the
 Log + Lock + Profile registries it stores backend *classes*, not
@@ -89,6 +95,8 @@ __all__ = [
     "list_corpus_backends",
     # Operator-config factory
     "get_default_corpus_backend",
+    # Lazy-imported extensions (not pre-imported — require [pgvector] extra)
+    # "PgvectorCorpusBackend",
 ]
 
 
@@ -277,6 +285,20 @@ def get_default_corpus_backend(agent_root: Path) -> CorpusBackend:
                 f"ATOMIC_AGENTS_CORPUS_BACKEND_URL=sqlite:///path/to/corpus.db "
                 f"to use a different path."
             ) from e
+
+    # pgvector-corpus: ANN-based corpus backend backed by pgvector Postgres
+    # index + FilesystemCorpusBackend page storage.  Requires the [pgvector]
+    # extra.  Lazy-imported like the postgres memory backend -- not registered
+    # at module load time.
+    if raw_backend_id == "pgvector-corpus":
+        from .pgvector import PgvectorCorpusBackend  # noqa: PLC0415
+
+        pgvector_url = os.environ.get("ATOMIC_AGENTS_PGVECTOR_URL", "").strip() or None
+        backend = PgvectorCorpusBackend(agent_root, pgvector_url=pgvector_url)
+        # Register so get_corpus_backend("pgvector-corpus") works after first use.
+        if "pgvector-corpus" not in _registry:
+            register_corpus_backend("pgvector-corpus", PgvectorCorpusBackend)
+        return backend
 
     # Unknown backend_id -- surface a fail-fast error with the FULL
     # known-id list so operators can spot the typo. Credential safety:
