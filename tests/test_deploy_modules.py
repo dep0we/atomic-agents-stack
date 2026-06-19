@@ -540,6 +540,32 @@ def test_check_doctor_well_formed_pass_still_passes():
     assert ok is True
 
 
+# round-2 Fix #2 — doctor predicate must fail-closed on empty / all-malformed
+# results. ``overall_exit_code([]) == 0`` would PASS; an empty or all-malformed
+# rebuilt list MUST FAIL ("no checks parsed" != "no checks failed").
+def test_check_doctor_empty_results_list_fails():
+    """A 200 ``{"results": []}`` is a FAIL, not a vacuous PASS.
+
+    Negative control: drop the ``if not rebuilt`` guard and overall_exit_code([])
+    returns 0 → this becomes a false PASS.
+    """
+    ok, msg = _verify._check_doctor(200, '{"results": []}')
+    assert ok is False
+    assert "no well-formed" in msg
+
+
+def test_check_doctor_all_malformed_items_fails():
+    """A 200 ``{"checks": [null]}`` (every item unrecognized) is a FAIL.
+
+    The recognized results key is present and a list, so the missing-key branch
+    does NOT catch it; only the empty-rebuilt guard does. Negative control: drop
+    the guard and the rebuilt list (all non-dicts filtered out → []) PASSes.
+    """
+    ok, msg = _verify._check_doctor(200, '{"checks": [null]}')
+    assert ok is False
+    assert "no well-formed" in msg
+
+
 # Fix #3 — env-var-only key injection (MUST 5), THROUGH the conductor.
 def test_deploy_env_only_key_injected_into_plist(tmp_path, monkeypatch):
     """When the provider key's sole source is an env var, deploy injects it into
@@ -586,7 +612,7 @@ def test_deploy_keychain_key_not_injected_into_plist(tmp_path, monkeypatch):
     """When the key is reachable from Keychain, deploy MUST NOT write it into the
     plist (serve reads Keychain at runtime).
 
-    Negative control: if _resolve_env_only_provider_key ignored the non-env
+    Negative control: if _resolve_env_only_provider_keys ignored the non-env
     sources and injected on any env hit, the keychain value would leak; here the
     env var IS set too, but the keychain hit must suppress injection.
     """
@@ -626,6 +652,58 @@ def test_deploy_keychain_key_not_injected_into_plist(tmp_path, monkeypatch):
     assert "sk-env-too" not in serialized
 
 
+# round-2 Fix #4 — ALL env-only provider keys injected, not just the first.
+def test_deploy_multi_provider_env_only_keys_both_injected(tmp_path, monkeypatch):
+    """An agent with default (anthropic) + fallback (openai) providers, both
+    env-only, gets BOTH keys injected into the plist.
+
+    Negative control: revert _resolve_env_only_provider_keys to return after the
+    first provider (one pair) and the fallback (OPENAI_API_KEY) is dropped — the
+    second assertion fails.
+    """
+    monkeypatch.setattr(
+        "atomic_agents.secret_backend.filesystem._resolve_from_keychain",
+        lambda name: None,
+    )
+    monkeypatch.setattr(
+        "atomic_agents.secret_backend.filesystem._resolve_from_keys_json",
+        lambda key: None,
+    )
+
+    root = tmp_path / "agents"
+    a = root / "myagent"
+    a.mkdir(parents=True)
+    (a / "model.md").write_text(
+        "## Default model\nclaude-opus-4-7\n\n## Fallback\ngpt-4o\n",
+        encoding="utf-8",
+    )
+
+    runner = FakeRunner(script={"print": (1, "")})
+    rc, _out, err = _run_full_deploy(
+        root,
+        tmp_path,
+        monkeypatch,
+        launchd_runner=runner,
+        environ={
+            "HOME": "/h",
+            "USER": "u",
+            "PATH": "/usr/bin",
+            "ANTHROPIC_API_KEY": "sk-anthropic-env",
+            "OPENAI_API_KEY": "sk-openai-env",
+        },
+        http_get=_healthz_ok_doctor_ok_modtest,
+    )
+    assert rc == 0
+    assert "cleartext" in err
+    import plistlib
+
+    plist = next((tmp_path / "LA").iterdir())
+    pd = plistlib.loads(plist.read_bytes())
+    env = pd["EnvironmentVariables"]
+    assert env.get("ANTHROPIC_API_KEY") == "sk-anthropic-env"  # default provider
+    assert env.get("OPENAI_API_KEY") == "sk-openai-env"  # fallback provider
+
+
 # Fix #4 — bootout errors ignored (MUST 7/8/12).
 def test_teardown_raises_on_real_bootout_failure(tmp_path):
     """A non-"not found" bootout failure raises; the plist is NOT removed.
@@ -652,6 +730,55 @@ def test_teardown_tolerates_service_not_found(tmp_path):
     _launchd.teardown_launchd_agent(
         "myagent", launch_agents_dir=tmp_path, runner=runner, remove_plist=True
     )
+
+
+# round-2 Fix #5 — bootout absence-tolerance must be CONJUNCTIVE (recognized code
+# AND recognized phrase). A bare matching code or a bare matching substring alone
+# is NOT proof of absence and must still surface as a real failure.
+def test_bootout_absent_requires_code_and_phrase():
+    """A recognized not-found code (3) + a recognized phrase → absent (tolerated)."""
+    cp = subprocess.CompletedProcess(["x"], 3, stdout="", stderr="No such process")
+    assert _launchd._bootout_indicates_absent(cp) is True
+
+
+def test_bootout_real_failure_with_absent_phrase_not_swallowed(tmp_path):
+    """A REAL failure (exit 1) whose text merely CONTAINS "could not find" must
+    still raise — a bare substring is not proof of absence.
+
+    Negative control: revert _bootout_indicates_absent to the substring-OR-code
+    form and this exit-1 failure is silently tolerated (no raise) and the plist
+    is wrongly removed.
+    """
+    label = _launchd.label_for("myagent")
+    plist = tmp_path / f"{label}.plist"
+    plist.write_bytes(b"<plist></plist>")
+    # exit 1 (NOT a known absent code) but stderr happens to contain the phrase.
+    runner = FakeRunner(
+        script={"bootout": (1, "error: could not find the config file at /x")}
+    )
+    with pytest.raises(_launchd.DeployLaunchdError):
+        _launchd.teardown_launchd_agent(
+            "myagent", launch_agents_dir=tmp_path, runner=runner, remove_plist=True
+        )
+    assert plist.exists()  # preserved — teardown could not confirm absence
+
+
+def test_bootout_absent_code_without_phrase_not_swallowed(tmp_path):
+    """A failure exiting with a known code (3) but NO recognized phrase must still
+    raise — a bare code is not proof of absence.
+
+    Negative control: revert to tolerating ``returncode in (3, 113)``
+    unconditionally and this raise never happens.
+    """
+    label = _launchd.label_for("myagent")
+    plist = tmp_path / f"{label}.plist"
+    plist.write_bytes(b"<plist></plist>")
+    runner = FakeRunner(script={"bootout": (3, "Operation not permitted")})
+    with pytest.raises(_launchd.DeployLaunchdError):
+        _launchd.teardown_launchd_agent(
+            "myagent", launch_agents_dir=tmp_path, runner=runner, remove_plist=True
+        )
+    assert plist.exists()
 
 
 # Fix #5 — shutil.which relative path (MUST 4).
@@ -710,6 +837,37 @@ def test_deploy_missing_agent_consent_hands_off_to_init(tmp_path, monkeypatch):
     assert rc == 0
 
 
+def test_deploy_init_exit2_reports_interactive_terminal(tmp_path, monkeypatch):
+    """When init returns 2 (needs a TTY), deploy's message names the real cause.
+
+    Negative control: revert _step_agent_exists to the single generic "did not
+    complete (exit 2)" message and the "interactive terminal" wording is gone.
+    """
+    _patch_doctor_pass(monkeypatch)
+    root = tmp_path / "agents"
+    root.mkdir()
+
+    def fake_init(agent, agents_root):
+        return 2  # init's non-TTY exit code; folder NOT created
+
+    out, err = io.StringIO(), io.StringIO()
+    rc = deploy_mod.deploy(
+        "ghost",
+        agents_root=root,
+        assume_yes=False,
+        prompter=lambda q: True,  # consent to the handoff
+        init_runner=fake_init,
+        out=out,
+        err=err,
+        launch_agents_dir=tmp_path / "LA",
+        binder=lambda h, p: True,
+        environ={"HOME": "/h", "USER": "u", "PATH": "/usr/bin"},
+    )
+    assert rc == 1
+    assert "interactive terminal" in err.getvalue()
+    assert "init ghost" in err.getvalue()
+
+
 def test_deploy_missing_agent_yes_fails_fast(tmp_path, monkeypatch):
     """With --yes, a missing agent fails fast and never invokes init."""
     _patch_doctor_pass(monkeypatch)
@@ -751,18 +909,26 @@ def test_resolve_port_accepts_valid(tmp_path):
     assert _ports.resolve_port(root, cli_port=8000, environ={}) == 8000
 
 
-# Fix #8 — post-bootstrap address-in-use.
-def test_deploy_verify_fail_reports_address_in_use(tmp_path, monkeypatch):
-    """On a verify failure where the port is now bound, deploy reports
-    "address in use :<port>" before rollback.
+# Fix #8 / round-2 Fix #1 — post-bootstrap address-in-use is TRANSPORT-gated.
+#
+# The diagnostic must fire ONLY when our serve was unreachable on the transport
+# (a foreign holder is plausible), NOT when our own serve bound the port and then
+# failed a real HTTP predicate (doctor-fail / healthz-503 — our serve IS holding
+# it, so "address in use" would be a false positive).
+def test_deploy_verify_transport_unreachable_reports_address_in_use(
+    tmp_path, monkeypatch
+):
+    """A TRANSPORT-level healthz failure (server unreachable) + a now-bound port
+    reports "address in use :<port>" before rollback.
 
-    Negative control: drop the re-probe in _rollback_and_report and the
-    address-in-use line is never printed (this assertion fails).
+    Negative control: drop the re-probe in _rollback_and_report (or the
+    transport-failure tracking in verify_deployment) and the address-in-use line
+    is never printed (this assertion fails).
     """
     root = _make_agent(tmp_path)
     runner = FakeRunner(script={"print": (1, "")})
     # binder: free at pre-bootstrap probe, then bound (False) at the rollback
-    # re-probe — simulate a port that got grabbed.
+    # re-probe — simulate a port that got grabbed by a foreign process.
     states = iter([True, False])
 
     def binder(h, p):
@@ -777,10 +943,45 @@ def test_deploy_verify_fail_reports_address_in_use(tmp_path, monkeypatch):
         monkeypatch,
         launchd_runner=runner,
         binder=binder,
-        http_get=_healthz_bad_modtest,
+        http_get=_healthz_transport_fail_modtest,
     )
     assert rc != 0
     assert "address in use" in err
+
+
+def test_deploy_doctor_fail_does_not_report_address_in_use(tmp_path, monkeypatch):
+    """A NON-transport verify failure (doctor fails while serve is UP) must NOT
+    print address-in-use — our own serve bound the port, so it is not a foreign
+    conflict (round-2 Fix #1).
+
+    Negative control: revert _rollback_and_report to fire address-in-use on any
+    bound port (the pre-fix behavior, ``addr_in_use = port_now_bound``) and this
+    assertion fails, because the rollback re-probe sees the port bound (our serve)
+    and would wrongly blame a foreign holder.
+    """
+    root = _make_agent(tmp_path)
+    runner = FakeRunner(script={"print": (1, "")})
+    # binder: free at pre-bootstrap probe, then bound at the rollback re-probe —
+    # the bound port is OUR serve (healthz answered 200, doctor failed).
+    states = iter([True, False])
+
+    def binder(h, p):
+        try:
+            return next(states)
+        except StopIteration:
+            return False
+
+    rc, _out, err = _run_full_deploy(
+        root,
+        tmp_path,
+        monkeypatch,
+        launchd_runner=runner,
+        binder=binder,
+        http_get=_doctor_fail_modtest,
+    )
+    assert rc != 0
+    assert "rolled back" in err  # rollback still happened
+    assert "address in use" not in err  # but NOT a false foreign-conflict claim
 
 
 # Fix #9 — launchctl runner timeout maps to launchd error.
@@ -844,3 +1045,25 @@ def _healthz_bad_modtest(url):
     if url.endswith("/healthz"):
         return 503, '{"status": "degraded"}'
     raise AssertionError(f"unexpected GET {url} after healthz fail")
+
+
+def _healthz_transport_fail_modtest(url):
+    """healthz unreachable: the transport-failure sentinel (server not bound)."""
+    if url.endswith("/healthz"):
+        return _verify.TRANSPORT_FAILURE_STATUS, ""
+    raise AssertionError(f"unexpected GET {url} after healthz transport fail")
+
+
+def _doctor_fail_modtest(url):
+    """healthz answers 200/ok (serve IS up) but the doctor predicate FAILS.
+
+    Uses an error-shaped doctor body so the failure is independent of the
+    test-patched ``overall_exit_code`` (the error-body branch of _check_doctor
+    returns False before reaching overall_exit_code). The point is a NON-transport
+    verify failure where our serve clearly bound the port.
+    """
+    if url.endswith("/healthz"):
+        return 200, '{"status": "ok"}'
+    if url.endswith("/doctor"):
+        return 200, '{"status": "error", "error": "doctor blew up"}'
+    raise AssertionError(f"unexpected GET {url}")

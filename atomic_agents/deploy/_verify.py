@@ -51,11 +51,19 @@ class VerifyResult:
     ``ok``        True iff every required predicate passed.
     ``checks``    ordered list of (name, passed, message) tuples for reporting.
     ``called``    True iff a real /call probe was fired (``--verify-call``).
+    ``healthz_transport_failure``  True iff the FINAL healthz probe could not
+                  reach the server at all (the transport sentinel, not a 503 or a
+                  bad JSON body). This distinguishes "server unreachable — a
+                  foreign holder of the port is plausible" from "our serve bound
+                  the port but failed healthz/doctor" — the conductor uses it to
+                  decide whether an address-in-use diagnostic is warranted on
+                  rollback (spec/48 MUST 10).
     """
 
     ok: bool
     checks: list[tuple[str, bool, str]] = field(default_factory=list)
     called: bool = False
+    healthz_transport_failure: bool = False
 
 
 def _default_http_get(url: str) -> "tuple[int, str]":
@@ -189,6 +197,17 @@ def _check_doctor(status: int, body_text: str) -> tuple[bool, str]:
         for item in results_raw
         if isinstance(item, dict)
     ]
+    # Fail-closed: an empty results list (``{"results": []}``) or one whose every
+    # item was malformed/unrecognized (``{"checks": [null]}`` → rebuilt == [])
+    # rebuilds to nothing. ``overall_exit_code([]) == 0`` would PASS, conflating
+    # "no checks parsed" with "no checks failed" — exactly the false-pass MUST 9
+    # forbids. We require at least one well-formed check before trusting the 0.
+    if not rebuilt:
+        return False, (
+            "doctor returned no well-formed check results "
+            f"(parsed {len(results_raw)} raw item(s)); cannot prove the "
+            "deployment is healthy"
+        )
     code = doctor_module.overall_exit_code(rebuilt)
     if code == 0:
         return True, "doctor overall_exit_code == 0"
@@ -220,8 +239,14 @@ def verify_deployment(
 
     # healthz — retried because launchd may not have bound the socket yet.
     h_ok, h_msg = False, "healthz not probed"
+    h_transport_fail = False
     for attempt in range(max(1, retries)):
         status, body = http_get(f"{base}/healthz")
+        # Track whether the FINAL probe was a transport failure (server
+        # unreachable) vs a real HTTP response (503 / bad body). Only the former
+        # is consistent with "a foreign process holds the port, our serve never
+        # bound" — the conductor's address-in-use diagnostic keys off this.
+        h_transport_fail = status == TRANSPORT_FAILURE_STATUS
         h_ok, h_msg = _check_healthz(status, body)
         if h_ok:
             break
@@ -231,7 +256,11 @@ def verify_deployment(
 
     if not h_ok:
         # Short-circuit: no point probing /doctor if the server is not even up.
-        return VerifyResult(ok=False, checks=checks)
+        return VerifyResult(
+            ok=False,
+            checks=checks,
+            healthz_transport_failure=h_transport_fail,
+        )
 
     # doctor predicate
     d_status, d_body = http_get(f"{base}/doctor")

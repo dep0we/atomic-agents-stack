@@ -317,10 +317,31 @@ def test_must5_plaintext_key_only_when_explicitly_injected():
         8000,
         agents_root=Path("/tmp/agents"),
         environ={"HOME": "/h", "USER": "u", "PATH": "/p"},
-        plaintext_key=("ANTHROPIC_API_KEY", "sk-only-source"),
+        plaintext_keys={"ANTHROPIC_API_KEY": "sk-only-source"},
     )
     assert rendered.wrote_plaintext_key is True
     assert rendered.environment_variables["ANTHROPIC_API_KEY"] == "sk-only-source"
+
+
+def test_must5_multiple_env_only_keys_all_injected():
+    """An agent with default + fallback env-only keys gets BOTH injected (Fix #4).
+
+    Negative control: revert _resolve_env_only_provider_keys to return one pair
+    (or render_plist to inject only the first) and the second key is missing.
+    """
+    rendered = _launchd.render_plist(
+        "myagent",
+        8000,
+        agents_root=Path("/tmp/agents"),
+        environ={"HOME": "/h", "USER": "u", "PATH": "/p"},
+        plaintext_keys={
+            "ANTHROPIC_API_KEY": "sk-anthropic",
+            "OPENAI_API_KEY": "sk-openai",
+        },
+    )
+    assert rendered.wrote_plaintext_key is True
+    assert rendered.environment_variables["ANTHROPIC_API_KEY"] == "sk-anthropic"
+    assert rendered.environment_variables["OPENAI_API_KEY"] == "sk-openai"
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -379,6 +400,36 @@ def test_must7_redeploy_bootout_then_bootstrap(launch_dir):
     verbs = [c[1] for c in runner.calls if len(c) > 1]
     assert "bootout" in verbs
     assert "bootstrap" in verbs
+    assert verbs.index("bootout") < verbs.index("bootstrap")
+
+
+def test_must7_redeploy_of_loaded_label_does_not_raise_port_conflict(
+    agent_root, launch_dir, monkeypatch
+):
+    """Re-deploying an already-loaded label restarts cleanly even with a busy port.
+
+    Our own loaded label holding the port is NOT a conflict — install's
+    bootout→bootstrap frees and rebinds it. The pre-bootstrap probe MUST be
+    skipped for this case (MUST 7), so a busy binder does NOT abort the deploy.
+
+    Negative control: remove the ``own_label_loaded`` guard in _step_supervise
+    and the busy binder makes the pre-probe raise PortConflictError → rc != 0 and
+    bootstrap never issues, failing both assertions below.
+    """
+    _patch_doctor_pass(monkeypatch)
+    # print → 0: our label IS already bootstrapped (a re-deploy).
+    runner = FakeRunner(script={"print": (0, "\tpid = 1\n")})
+    rc, _, _ = _run_deploy(
+        agent_root,
+        launch_dir,
+        launchd_runner=runner,
+        binder=_busy_binder,  # port held — but by OUR own loaded serve
+        http_get=_healthz_ok_doctor_ok,
+    )
+    assert rc == 0
+    # Clean restart happened: bootout BEFORE bootstrap (install's idempotent path).
+    verbs = [c[1] for c in runner.calls if len(c) > 1]
+    assert "bootout" in verbs and "bootstrap" in verbs
     assert verbs.index("bootout") < verbs.index("bootstrap")
 
 
@@ -517,9 +568,15 @@ def test_must10_bind_conflict_fails_loud_no_rebind():
 def test_must10_conflict_in_full_deploy_aborts_before_install(
     agent_root, launch_dir, monkeypatch
 ):
-    """A bind conflict during deploy aborts before any plist is written."""
+    """A FOREIGN bind conflict during deploy aborts before any plist is written.
+
+    Foreign = the port is busy AND our own launchd label is NOT loaded
+    (``print`` returns non-zero). The pre-bootstrap probe runs and fails loud.
+    """
     _patch_doctor_pass(monkeypatch)
-    runner = FakeRunner()
+    # print → non-zero: our label is NOT bootstrapped, so a busy port is a
+    # foreign holder → the pre-bootstrap probe MUST run and fail loud.
+    runner = FakeRunner(script={"print": (1, "")})
     rc, _, err = _run_deploy(
         agent_root, launch_dir, launchd_runner=runner, binder=_busy_binder
     )

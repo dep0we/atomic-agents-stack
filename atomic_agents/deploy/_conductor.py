@@ -245,6 +245,17 @@ def _step_agent_exists(
     print(f"      Handing off to `atomic-agents init {agent}`...", file=out)
     rc = init_runner(agent, agents_root)
     if rc != 0 or not agent_root.is_dir():
+        # init exits 2 when it needs an interactive terminal it can't get (the
+        # most common cause when deploy is driven from a pipe / non-TTY). Surface
+        # the actionable cause rather than a bare "did not complete (exit 2)".
+        if rc == 2:
+            raise DeployError(
+                f"`atomic-agents init {agent}` needs an interactive terminal and "
+                "could not get one (or its arguments were rejected). Run "
+                f"`atomic-agents init {agent}` yourself in a terminal, or re-run "
+                "deploy from an interactive terminal; then re-run deploy.",
+                exit_code=1,
+            )
         raise DeployError(
             f"`atomic-agents init {agent}` did not complete "
             f"(exit {rc}); the agent folder still does not exist at "
@@ -282,6 +293,8 @@ def _step_doctor_gate(
 def _step_provider_key(
     agent: str,
     agent_root: Path,
+    *,
+    model_data: dict,
 ) -> None:
     """Step 4 — a provider key must resolve (spec/48 step 4).
 
@@ -289,11 +302,13 @@ def _step_provider_key(
     runtime's key resolution can never disagree. deploy does NOT store the
     key (spec/38 SecretBackend is read-only); it only confirms one is
     reachable and otherwise prints the three setup options.
+
+    ``model_data`` is parsed ONCE by the caller and threaded through both the
+    provider-key gate and the env-only-key resolution (step 5), so model.md is
+    not re-parsed per step.
     """
     from .. import doctor as doctor_module
 
-    model_md = agent_root / "model.md"
-    model_data = parse_model_md(model_md if model_md.exists() else None)
     results = doctor_module.check_provider_keys(model_data)
 
     failed = [r for r in results if r.failed]
@@ -307,12 +322,13 @@ def _step_provider_key(
         )
 
 
-def _resolve_env_only_provider_key(
+def _resolve_env_only_provider_keys(
     agent_root: Path,
     *,
     environ: dict[str, str] | None = None,
-) -> tuple[str, str] | None:
-    """Return ``(env_name, value)`` iff a provider key's SOLE source is an env var.
+    model_data: dict | None = None,
+) -> dict[str, str]:
+    """Return ``{env_name: value}`` for EVERY provider key whose SOLE source is env.
 
     spec/48 MUST 5 / step list step 4 — the env-var-only operator path. The
     step-4 gate confirms a key resolves in the DEPLOYING shell, but a
@@ -322,6 +338,12 @@ def _resolve_env_only_provider_key(
     cleartext caveat). When the source is Keychain / keys.json, deploy MUST NOT
     inject it — serve's ``_llm._get_key()`` reads those at runtime.
 
+    An agent with a default AND a fallback provider may need MORE THAN ONE key.
+    We resolve ALL of them, not just the first: returning a single pair would
+    silently drop the fallback provider's env-only key and serve would fail to
+    use the fallback at runtime. The returned mapping is keyed by env-var name so
+    two providers that share an alias collapse to one entry (the same value).
+
     Detection reuses the production resolvers so deploy's verdict and the
     runtime's key resolution can never disagree:
       - find the winning env var (the highest-priority env alias that is set +
@@ -329,8 +351,9 @@ def _resolve_env_only_provider_key(
       - probe the NON-env sources (Keychain, keys.json) directly; if neither
         holds the key, env is the sole source → inject.
 
-    Returns None when no env-only key is found (key absent — already caught by
-    step 4 — or key also reachable from a non-env source).
+    Returns an empty mapping when no env-only key is found (every key absent —
+    already caught by step 4 — or reachable from a non-env source). ``model_data``
+    may be passed in to avoid re-parsing model.md (the caller already parsed it).
     """
     from .. import doctor as doctor_module
     from ..secret_backend.filesystem import (
@@ -340,8 +363,9 @@ def _resolve_env_only_provider_key(
 
     env = environ if environ is not None else dict(os.environ)
 
-    model_md = agent_root / "model.md"
-    model_data = parse_model_md(model_md if model_md.exists() else None)
+    if model_data is None:
+        model_md = agent_root / "model.md"
+        model_data = parse_model_md(model_md if model_md.exists() else None)
 
     # The providers deploy must supply a key for (default + fallback), mapped to
     # their (keychain_name, env_vars, config_key) triple via doctor's table.
@@ -356,6 +380,7 @@ def _resolve_env_only_provider_key(
             providers.append(prov)
             seen.add(prov)
 
+    injected: dict[str, str] = {}
     for provider in providers:
         spec = doctor_module._PROVIDER_KEYS.get(provider)
         if spec is None:
@@ -386,10 +411,10 @@ def _resolve_env_only_provider_key(
         if _resolve_from_keys_json(config_key) is not None:
             continue
 
-        # Env is the sole source for this provider's key — inject it.
-        return env_name, env_value
+        # Env is the sole source for this provider's key — inject it (all of them).
+        injected[env_name] = env_value
 
-    return None
+    return injected
 
 
 @dataclass
@@ -411,6 +436,7 @@ def _step_supervise(
     launchd_runner: _launchd.Runner,
     binder: _ports.Binder,
     launch_agents_dir: Path | None,
+    model_data: dict,
 ) -> _SupervisionResult:
     """Step 5 — resolve the port, probe it, render + bootstrap the agent.
 
@@ -426,26 +452,37 @@ def _step_supervise(
     except _ports.PortRangeError as exc:
         raise DeployError(str(exc), exit_code=1) from exc
 
-    # MUST 10 — pre-bootstrap bind probe. A conflict raises PortConflictError;
-    # we surface it loud and never silently rebind.
-    try:
-        _ports.probe_port_free(_LOOPBACK_HOST, port, binder=binder)
-    except _ports.PortConflictError as exc:
-        raise DeployError(str(exc), exit_code=1) from exc
+    # MUST 7 (idempotent re-deploy) vs MUST 10 (conflict fails loud): the
+    # pre-bootstrap bind probe must distinguish OUR OWN already-running serve
+    # holding the port (a clean restart — install's bootout will free it) from a
+    # FOREIGN process holding it (a real conflict). If our own launchd label is
+    # already bootstrapped, the port it holds is not a conflict — skip the probe
+    # and let install_launchd_agent's bootout→bootstrap do the clean restart.
+    # When the label is NOT loaded, any bind conflict is foreign → fail loud.
+    own_label_loaded = _launchd._is_bootstrapped(agent, runner=launchd_runner)
+    if not own_label_loaded:
+        # MUST 10 — pre-bootstrap bind probe. A conflict raises PortConflictError;
+        # we surface it loud and never silently rebind.
+        try:
+            _ports.probe_port_free(_LOOPBACK_HOST, port, binder=binder)
+        except _ports.PortConflictError as exc:
+            raise DeployError(str(exc), exit_code=1) from exc
 
-    # MUST 5 — env-var-only provider key. A gui/$UID launchd serve does NOT
-    # inherit the deploying shell, so if the key's sole source is an env var we
-    # inject it into the plist as KEY=VALUE (render_plist prints the cleartext
-    # caveat). Keychain/keys.json sources are read by serve at runtime — never
-    # injected.
-    plaintext_key = _resolve_env_only_provider_key(agent_root, environ=environ)
+    # MUST 5 — env-var-only provider keys. A gui/$UID launchd serve does NOT
+    # inherit the deploying shell, so for EVERY provider whose key's sole source
+    # is an env var (default AND fallback) we inject it into the plist as
+    # KEY=VALUE (render_plist prints the cleartext caveat). Keychain/keys.json
+    # sources are read by serve at runtime — never injected.
+    plaintext_keys = _resolve_env_only_provider_keys(
+        agent_root, environ=environ, model_data=model_data
+    )
 
     rendered = _launchd.render_plist(
         agent,
         port,
         agents_root=agents_root,
         environ=environ,
-        plaintext_key=plaintext_key,
+        plaintext_keys=plaintext_keys,
     )
 
     try:
@@ -475,6 +512,7 @@ def _rollback_and_report(
     launch_agents_dir: Path | None,
     binder: _ports.Binder,
     verify_exc: Exception | None,
+    healthz_unreachable: bool,
     out,
     err,
 ) -> int:
@@ -487,20 +525,30 @@ def _rollback_and_report(
     failure).
 
     MUST 10 (post-bootstrap address-in-use): before rolling back, re-probe the
-    port. If it is now bound and deploy does not own a healthy serve there, the
-    likely cause is another process holding the port — report
-    "address in use :<port>" explicitly so the operator does not chase a
-    phantom serve bug. Best-effort: a re-probe that itself errors is ignored.
+    port. The address-in-use diagnostic is emitted ONLY when BOTH hold:
+      1. the port is now bound (the re-probe says not-free), AND
+      2. the healthz probe never reached a server — ``healthz_unreachable`` is
+         True (the transport sentinel) or verify RAISED before any HTTP response.
+    When our own supervised serve clearly bound the port and then failed a real
+    HTTP predicate (a doctor failure, or a healthz 503 with a JSON body), the
+    port being held is OUR serve — NOT a foreign conflict — so we MUST NOT print
+    "address in use", which would send the operator chasing a phantom conflict.
+    Best-effort: a re-probe that itself errors is ignored.
     """
     # MUST 10 — post-bootstrap address-in-use detection (best-effort).
-    addr_in_use = False
+    port_now_bound = False
     try:
         # binder returns True when the port is FREE; False when bound. If the
         # port is now bound (not free) after our verify failed, something is
-        # holding it — surface that as the proximate cause.
-        addr_in_use = binder(_LOOPBACK_HOST, supervision.port) is False
+        # holding it.
+        port_now_bound = binder(_LOOPBACK_HOST, supervision.port) is False
     except Exception:  # noqa: BLE001 — re-probe is best-effort, never fatal
-        addr_in_use = False
+        port_now_bound = False
+
+    # A foreign holder is plausible ONLY when our serve never answered on the
+    # transport (unreachable / raised). A doctor-fail or a healthz-503 proves our
+    # serve DID bind, so a bound port is expected and NOT a foreign conflict.
+    addr_in_use = port_now_bound and healthz_unreachable
 
     # MUST 8 — bootout the just-installed agent and remove the plist. If the
     # bootout itself fails (a real launchctl error, not "already absent"),
@@ -629,13 +677,19 @@ def deploy(
             out=out,
         )
 
+        # Parse model.md ONCE (the agent folder now exists) and thread the result
+        # through step 4 (provider-key gate) and step 5 (env-only-key resolution)
+        # so model.md is not re-parsed per step.
+        model_md = agent_root / "model.md"
+        model_data = parse_model_md(model_md if model_md.exists() else None)
+
         # Step 3 — doctor gate.
         print("[3/7] Running the doctor gate (doctor --no-mcp)...", file=out)
         _step_doctor_gate(agent, resolved_root)
 
         # Step 4 — provider key (manual).
         print("[4/7] Checking a provider key resolves...", file=out)
-        _step_provider_key(agent, agent_root)
+        _step_provider_key(agent, agent_root, model_data=model_data)
 
         # Step 5 — supervise (consent): resolve port, probe, render, bootstrap.
         if not _consent(
@@ -655,6 +709,7 @@ def deploy(
             launchd_runner=launchd_runner,
             binder=binder,
             launch_agents_dir=launch_agents_dir,
+            model_data=model_data,
         )
         if supervision.wrote_plaintext_key:
             print(
@@ -698,6 +753,14 @@ def deploy(
             print(f"      [{mark}] {name}: {message}", file=out)
 
     if verify_exc is not None or (result is not None and not result.ok):
+        # A foreign port-holder is plausible only when our serve never answered
+        # on the transport: verify RAISED before any HTTP response, OR the final
+        # healthz probe hit the transport-failure sentinel (server unreachable).
+        # A doctor-fail / healthz-503 means our serve bound the port — not a
+        # foreign conflict (MUST 10).
+        healthz_unreachable = verify_exc is not None or (
+            result is not None and result.healthz_transport_failure
+        )
         return _rollback_and_report(
             agent,
             supervision=supervision,
@@ -705,6 +768,7 @@ def deploy(
             launch_agents_dir=launch_agents_dir,
             binder=binder,
             verify_exc=verify_exc,
+            healthz_unreachable=healthz_unreachable,
             out=out,
             err=err,
         )

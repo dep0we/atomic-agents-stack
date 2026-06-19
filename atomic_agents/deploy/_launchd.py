@@ -184,7 +184,7 @@ def render_plist(
     *,
     agents_root: Path,
     environ: dict[str, str] | None = None,
-    plaintext_key: tuple[str, str] | None = None,
+    plaintext_keys: dict[str, str] | tuple[str, str] | None = None,
 ) -> PlistRenderResult:
     """Render the launchd plist for an agent (pure function — no I/O).
 
@@ -194,13 +194,16 @@ def render_plist(
       - ``RunAtLoad`` + ``KeepAlive`` true.
       - ``EnvironmentVariables`` ALWAYS inject HOME / USER / PATH /
         ATOMIC_AGENTS_ROOT (MUST 5).
-      - The provider key is NOT written into the plist by default. It is
-        injected as a ``KEY=VALUE`` env var ONLY when ``plaintext_key`` is set
-        (its sole source is an env var); the caller decides that and documents
-        the cleartext caveat (MUST 5).
+      - Provider keys are NOT written into the plist by default. They are
+        injected as ``KEY=VALUE`` env vars ONLY for the keys in
+        ``plaintext_keys`` (each one's sole source is an env var); the caller
+        decides that and documents the cleartext caveat (MUST 5).
 
     ``environ`` defaults to ``os.environ`` (copied) so tests inject a controlled
-    map. ``plaintext_key`` is an optional ``(env_name, value)`` pair.
+    map. ``plaintext_keys`` is a mapping of ``{env_name: value}`` covering ALL
+    env-only provider keys (an agent with default + fallback providers may need
+    more than one). A single ``(env_name, value)`` tuple is accepted for
+    backward compatibility and normalized to a one-entry mapping.
     """
     env = dict(environ if environ is not None else os.environ)
     label = label_for(agent)
@@ -215,9 +218,15 @@ def render_plist(
         "ATOMIC_AGENTS_ROOT": str(agents_root),
     }
 
+    # Normalize a bare (name, value) tuple to a one-entry mapping.
+    keys_map: dict[str, str] = {}
+    if isinstance(plaintext_keys, tuple):
+        keys_map = {plaintext_keys[0]: plaintext_keys[1]}
+    elif plaintext_keys:
+        keys_map = dict(plaintext_keys)
+
     wrote_plaintext_key = False
-    if plaintext_key is not None:
-        env_name, env_value = plaintext_key
+    for env_name, env_value in keys_map.items():
         environment_variables[env_name] = env_value
         wrote_plaintext_key = True
 
@@ -314,28 +323,42 @@ def install_launchd_agent(
     return plist_path
 
 
+# launchctl's "service not loaded" signal: the small set of return codes it uses
+# for a bootout of an absent label, and the stderr phrases that accompany them.
+# Tolerating absence requires BOTH a recognized code AND a recognized phrase —
+# a bare code or a bare substring alone is not enough (see _bootout_indicates_absent).
+_BOOTOUT_ABSENT_CODES = frozenset({3, 113})
+_BOOTOUT_ABSENT_PHRASES = (
+    "no such process",
+    "could not find specified service",
+    "not find specified service",
+)
+
+
 def _bootout_indicates_absent(cp: "subprocess.CompletedProcess[str]") -> bool:
     """True iff a non-zero ``launchctl bootout`` means "service not loaded".
 
     A bootout of an absent label is benign (idempotent teardown). launchctl
-    signals this with a small set of known codes / messages, which vary across
-    macOS versions:
-      - exit 3 (ESRCH "No such process"),
-      - exit 113 ("Could not find specified service"),
-      - stderr naming "no such process" / "could not find" / "not find".
-    Any OTHER non-zero return is a REAL failure (e.g. EPERM, a domain error)
-    and MUST NOT be silently tolerated (spec/48 MUST 7/8/12).
+    signals this narrowly: a recognized not-found return code (3 == ESRCH
+    "No such process", 113 == "Could not find specified service") TOGETHER WITH a
+    recognized not-found phrase in its output.
+
+    The tolerance is deliberately conjunctive — neither a bare matching code nor a
+    bare matching substring alone is treated as absent:
+      - a real failure that happens to exit 3/113 for an unrelated reason MUST
+        still raise (a bare code is not proof of absence);
+      - a real failure whose error text merely CONTAINS "could not find" (e.g. a
+        domain/permission error mentioning a missing file) MUST still raise (a
+        bare substring is not proof of absence).
+    Any other non-zero return is a REAL failure (e.g. EPERM, a domain error) and
+    MUST NOT be silently tolerated (spec/48 MUST 7/8/12).
     """
     if cp.returncode == 0:
         return True
-    if cp.returncode in (3, 113):
-        return True
+    if cp.returncode not in _BOOTOUT_ABSENT_CODES:
+        return False
     text = ((cp.stderr or "") + " " + (cp.stdout or "")).lower()
-    return (
-        "no such process" in text
-        or "could not find" in text
-        or "not find specified service" in text
-    )
+    return any(phrase in text for phrase in _BOOTOUT_ABSENT_PHRASES)
 
 
 def teardown_launchd_agent(
