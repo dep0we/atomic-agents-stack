@@ -2,19 +2,16 @@
 
 ## Read paths
 
-- Own folder (under agents_root/${agent_name}/): full read access to own context
-- Own raw/ folder: source documents the operator drops here for investigation. This is the canonical intake point per spec/01 anatomy. Drop PDFs, markdown files, exported documents here.
-- <!-- Add more paths here as needed for your investigation domain. Examples: a shared reference folder,
-     a project data directory, an external document archive.
-     Format: path, then a brief description of what is there. -->
+- ./ -- full read access to own context (own agent folder)
+- raw/ -- source documents the operator drops here for investigation (canonical intake point per spec/01; drop PDFs, markdown files, exported documents here)
 
 ## Write paths (own folder ONLY)
 
-- Own memory/ (atomic note capture)
-- Own wiki/ (distilled wiki pages compiled from raw source documents)
-- Own journal/ (narrative journal entries recording investigation progress)
-- Own log/ (run history, JSONL)
-- Own output/ (published artifacts for downstream consumption)
+- memory/ -- atomic note capture
+- wiki/ -- distilled wiki pages compiled from raw source documents
+- journal/ -- narrative journal entries recording investigation progress
+- log/ -- run history, JSONL
+- output/ -- published artifacts for downstream consumption
 
 ## External APIs
 

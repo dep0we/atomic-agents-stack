@@ -2,17 +2,15 @@
 
 ## Read paths
 
-- Own folder (under agents_root/${agent_name}/): full read access to own context
-- <!-- Add additional read paths here. Examples: a shared reference folder, a data directory,
-     a project root the agent needs to consult. Format: path, then a brief description of what is there. -->
+- ./ -- full read access to own context (own agent folder)
 
 ## Write paths (own folder ONLY)
 
-- Own memory/ (atomic note capture)
-- Own wiki/ (wiki page authoring)
-- Own journal/ (narrative journal entries)
-- Own log/ (run history, JSONL)
-- Own output/ (published artifacts for downstream consumption)
+- memory/ -- atomic note capture
+- wiki/ -- wiki page authoring
+- journal/ -- narrative journal entries
+- log/ -- run history, JSONL
+- output/ -- published artifacts for downstream consumption
 
 ## External APIs
 

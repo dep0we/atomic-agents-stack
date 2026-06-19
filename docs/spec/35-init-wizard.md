@@ -148,9 +148,15 @@ validated via `_io.safe_resolve_under` before any write.
 | `<agent>/memory/INDEX.md` | Seven structured sections: Critical Feedback / Locked Decisions / User Profile / Active Projects / Reference / Recently Promoted to Persona / Archive (superseded) |
 | `<agent>/wiki/INDEX.md` | Three structured sections: Background and context / Reference material / How wiki pages cite sources |
 
-Two empty directories are created via `mkdir` only (no file written):
-`<agent>/journal/` and `<agent>/log/`. These are populated by the framework on
-first run.
+All write-paths declared in the rendered `tools.md` are created via `mkdir`
+(no file written). The set is derived by parsing the just-written `tools.md`
+rather than a hardcoded list, so a future template author who adds a write-path
+bullet gets the directory provisioned automatically. For the default `advisor`
+template this covers `memory/`, `wiki/`, `journal/`, `log/`, and `output/`;
+for `writer` it also covers `drafts/` and `revisions/`. Each resolved path is
+validated against `agent_dir` via `_io.safe_resolve_under` before `mkdir` —
+a bullet resolving outside the agent folder is refused with a warning. The
+directories are populated by the framework on first run.
 
 The 12 substitution variables (defined in `constants.py`) are:
 

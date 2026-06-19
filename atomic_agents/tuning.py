@@ -762,7 +762,9 @@ def _load_write_paths(agent_root: Path) -> list[Path]:
     """Load the agent's tools.md write_paths.  Falls back to [agent_root] if absent."""
     tools_path = agent_root / "tools.md"
     if tools_path.exists():
-        data = parse_tools_md(tools_path)
+        # Thread agent_root so bare-relative write_paths anchor to the agent
+        # folder, not the process CWD (#541 framework-wide anchoring).
+        data = parse_tools_md(tools_path, agent_root=agent_root)
         paths = [Path(p) for p in data.get("write_paths", [])]
         if paths:
             return paths

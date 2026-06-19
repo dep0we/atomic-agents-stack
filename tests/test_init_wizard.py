@@ -20,6 +20,7 @@ from __future__ import annotations
 import errno
 import sys
 import types
+import warnings
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -1400,7 +1401,6 @@ def test_compute_merged_content_preserves_orphan_h2_in_position(tmp_path):
     )
 
 
-
 # ---------------------------------------------------------------------------
 # R2-A. Round 2 Fix-A: h3-aware merge (C1), duplicate h2 (H1),
 #        setext detection (M2), HTML-comment tightening (M3),
@@ -1641,3 +1641,310 @@ def test_render_diff_preview_handles_exception_gracefully(tmp_path):
         "Fallback file list must include all relpaths"
     )
     assert "persona/SOUL.md" in output, "Fallback file list must include all relpaths"
+
+
+# ---------------------------------------------------------------------------
+# J. _create_empty_dirs — write_paths-driven mkdir + traversal containment (#541)
+# ---------------------------------------------------------------------------
+
+
+def test_create_empty_dirs_creates_every_declared_write_path(tmp_path):
+    """Every write_path bullet in the scaffolded tools.md becomes a real dir.
+
+    This is the #541 fix: the dir set is derived from tools.md, not hardcoded.
+    The writer template's drafts/ and revisions/ (which the old hardcoded set
+    omitted) must exist after _create_empty_dirs runs.
+    """
+    agent_dir = tmp_path / "agents" / "writer-agent"
+    agent_dir.mkdir(parents=True)
+    # Minimal tools.md declaring a write_path the old hardcoded set never made.
+    (agent_dir / "tools.md").write_text(
+        "## Write paths\n\n"
+        "- memory/ -- notes\n"
+        "- drafts/ -- WIP\n"
+        "- revisions/ -- archive\n"
+        "- output/ -- final\n",
+        encoding="utf-8",
+    )
+
+    W._create_empty_dirs(agent_dir)
+
+    for sub in ("memory", "drafts", "revisions", "output"):
+        assert (agent_dir / sub).is_dir(), (
+            f"{sub}/ declared as a write_path but not created by _create_empty_dirs"
+        )
+
+
+def test_create_empty_dirs_negative_control_drafts_requires_the_parse(tmp_path):
+    """Negative control: drafts/ only exists BECAUSE we parse tools.md.
+
+    Strip the tools.md write_path bullet and drafts/ must NOT appear — proving
+    the directory creation is driven by the parsed write_paths, not a constant.
+    """
+    agent_dir = tmp_path / "agents" / "writer-agent"
+    agent_dir.mkdir(parents=True)
+    # tools.md WITHOUT drafts/ — the negative control.
+    (agent_dir / "tools.md").write_text(
+        "## Write paths\n\n- memory/ -- notes\n",
+        encoding="utf-8",
+    )
+
+    W._create_empty_dirs(agent_dir)
+
+    assert (agent_dir / "memory").is_dir()
+    assert not (agent_dir / "drafts").exists(), (
+        "drafts/ must NOT be created when tools.md does not declare it; "
+        "if this fails the dir set is hardcoded, not parse-driven"
+    )
+
+
+def test_create_empty_dirs_refuses_path_traversal_escape(tmp_path):
+    """A write_path that resolves OUTSIDE the agent folder is refused, not created.
+
+    Security: _create_empty_dirs must contain every mkdir under agent_dir. A
+    '../escape' bullet (or absolute path) must NOT cause a directory to appear
+    outside the agent folder, and must emit a warning.
+    """
+    agent_dir = tmp_path / "agents" / "myagent"
+    agent_dir.mkdir(parents=True)
+    escape_target = tmp_path / "agents" / "ESCAPED"
+    absolute_target = tmp_path / "ABSOLUTE_ESCAPE"
+    # Bare-relative '../ESCAPED' anchors under agent_dir then climbs out;
+    # an absolute path bypasses agent_root anchoring entirely.
+    (agent_dir / "tools.md").write_text(
+        "## Write paths\n\n"
+        "- memory/ -- ok\n"
+        "- ../ESCAPED -- traversal attempt\n"
+        f"- {absolute_target} -- absolute escape\n",
+        encoding="utf-8",
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        W._create_empty_dirs(agent_dir)
+
+    # The contained path is created; both escapes are refused.
+    assert (agent_dir / "memory").is_dir()
+    assert not escape_target.exists(), (
+        "'../ESCAPED' resolved outside the agent folder but was created — "
+        "path-traversal containment failed"
+    )
+    assert not absolute_target.exists(), (
+        "an absolute write_path was created outside the agent folder — "
+        "path-traversal containment failed"
+    )
+    msgs = [str(w.message) for w in caught]
+    assert any("outside the agent folder" in m for m in msgs), (
+        f"expected a refusal warning for the escape attempt; got: {msgs}"
+    )
+
+
+def test_create_empty_dirs_traversal_negative_control(tmp_path):
+    """Negative control for the traversal guard: with containment stripped, the
+    escape WOULD land outside. We prove the target path is genuinely outside
+    agent_dir so the guard above is testing a real escape, not a no-op.
+    """
+    agent_dir = tmp_path / "agents" / "myagent"
+    escape = (agent_dir / ".." / "ESCAPED").resolve()
+    # The escape target is a sibling of agent_dir, i.e. genuinely outside it.
+    assert agent_dir.resolve() not in escape.parents
+    assert not str(escape).startswith(str(agent_dir.resolve()) + "/")
+
+
+def test_add_to_it_creates_write_path_dirs_for_backfilled_tools_md(tmp_path):
+    """Add-to-it backfills a MISSING tools.md from the writer template, declaring
+    drafts/ + revisions/ — and must create those directories so the merged agent
+    stays doctor-clean (#541 lockstep, Add-to-it entry).
+
+    A missing tools.md is the realistic case where Add-to-it introduces NEW
+    write_paths the existing agent never had: _compute_merged_content backfills
+    it entirely from the fresh template (operator-preamble-wins does not apply to
+    a file that does not exist).
+    """
+    schema = C.TEMPLATE_SECTION_SCHEMA["writer"]
+    agent_dir = tmp_path / "agents" / "writer-agent"
+    agent_dir.mkdir(parents=True)
+    # Seed every writer schema file EXCEPT tools.md, so tools.md is backfilled
+    # wholesale from the fresh template (which declares drafts/ + revisions/).
+    for relpath, headers in schema.items():
+        if relpath == "tools.md":
+            continue
+        target = agent_dir / relpath
+        target.parent.mkdir(parents=True, exist_ok=True)
+        body = "\n".join(f"## {h}\n\nContent.\n" for h in headers)
+        target.write_text(body, encoding="utf-8")
+
+    assert not (agent_dir / "tools.md").exists()
+    assert not (agent_dir / "drafts").exists()
+    assert not (agent_dir / "revisions").exists()
+
+    console = _FakeConsole()
+    rc = W._add_to_it(
+        agent_dir=agent_dir,
+        agents_root=tmp_path / "agents",
+        template_name="writer",
+        console=console,
+        Prompt=_prompt_sequence(),
+        Confirm=_confirm_factory(True),  # Apply these changes? -> yes
+        existing_headers=None,
+    )
+
+    assert rc == 0, f"_add_to_it returned {rc}; merge failed"
+    # tools.md was backfilled and declares drafts/ + revisions/ -> dirs created.
+    assert (agent_dir / "tools.md").is_file()
+    assert (agent_dir / "drafts").is_dir(), (
+        "drafts/ declared in backfilled tools.md but not created by Add-to-it"
+    )
+    assert (agent_dir / "revisions").is_dir(), (
+        "revisions/ declared in backfilled tools.md but not created by Add-to-it"
+    )
+
+
+def test_add_to_it_returns_nonzero_when_write_path_dir_creation_fails(
+    tmp_path, monkeypatch
+):
+    """If a declared write-path dir cannot be created after merge, Add-to-it must
+    return non-zero (the merged agent is NOT doctor-clean) — matching
+    _write_scaffold's contract — and must NOT print the green 'updated' line.
+
+    Negative control for the OSError->return 1 fix: _write_scaffold returns 1 on
+    the same _create_empty_dirs OSError; Add-to-it previously swallowed it and
+    returned 0, reporting success on an agent that would fail doctor.
+    """
+    schema = C.TEMPLATE_SECTION_SCHEMA["writer"]
+    agent_dir = tmp_path / "agents" / "writer-agent"
+    agent_dir.mkdir(parents=True)
+    for relpath, headers in schema.items():
+        if relpath == "tools.md":
+            continue
+        target = agent_dir / relpath
+        target.parent.mkdir(parents=True, exist_ok=True)
+        body = "\n".join(f"## {h}\n\nContent.\n" for h in headers)
+        target.write_text(body, encoding="utf-8")
+
+    # Force the post-merge dir creation to fail with an OSError.
+    def _boom(_agent_dir):
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(W, "_create_empty_dirs", _boom)
+
+    console = _FakeConsole()
+    rc = W._add_to_it(
+        agent_dir=agent_dir,
+        agents_root=tmp_path / "agents",
+        template_name="writer",
+        console=console,
+        Prompt=_prompt_sequence(),
+        Confirm=_confirm_factory(True),
+        existing_headers=None,
+    )
+
+    assert rc == 1, f"_add_to_it returned {rc}; expected 1 on dir-creation failure"
+    out = console.out.getvalue().lower()
+    assert "could not be created" in out, (
+        "expected the actionable 'could not be created' warning; "
+        f"got: {console.out.getvalue()!r}"
+    )
+    assert "updated at" not in out, (
+        "the green 'updated at' success line must be suppressed when the agent "
+        f"is not doctor-clean; got: {console.out.getvalue()!r}"
+    )
+
+
+def _seed_complete_writer_agent(agent_dir):
+    """Seed a writer agent whose every schema file already matches the fresh
+    template byte-for-byte, so Add-to-it computes a ZERO text diff.
+
+    Returns nothing; the caller deletes a write-path dir to set up the
+    zero-diff-but-missing-dir scenario.
+    """
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    fresh_vars = W._default_template_vars(agent_dir.name, "writer")
+    # Render the real fresh template into the agent dir so _compute_merged_content
+    # finds zero section-level differences.
+    W._render_files(agent_dir, "writer", fresh_vars)
+    W._create_empty_dirs(agent_dir)
+
+
+def test_add_to_it_zero_diff_creates_missing_write_path_dir(tmp_path):
+    """Zero TEXT diff must NOT short-circuit before reconciling declared
+    write-path dirs (#541). An up-to-date writer agent whose drafts/ dir was
+    deleted must have it re-created by Add-to-it, with rc 0 — never report
+    'up to date' while a declared dir is missing.
+
+    This closes the zero-change-branch gap: the #541 fix wired
+    _create_empty_dirs into the non-zero merge path and _write_scaffold, but the
+    files_changed == 0 branch returned 0 with a green 'up to date' line without
+    ever reconciling dirs.
+    """
+    agent_dir = tmp_path / "agents" / "writer-agent"
+    _seed_complete_writer_agent(agent_dir)
+
+    # Sanity: the fresh template declares drafts/ + revisions/ and they exist.
+    assert (agent_dir / "drafts").is_dir()
+    assert (agent_dir / "revisions").is_dir()
+
+    # Delete a declared write-path dir out from under the otherwise-current agent.
+    import shutil
+
+    shutil.rmtree(agent_dir / "drafts")
+    assert not (agent_dir / "drafts").exists()
+
+    console = _FakeConsole()
+    rc = W._add_to_it(
+        agent_dir=agent_dir,
+        agents_root=tmp_path / "agents",
+        template_name="writer",
+        console=console,
+        Prompt=_prompt_sequence(),
+        Confirm=_confirm_factory(True),
+        existing_headers=None,
+    )
+
+    assert rc == 0, f"_add_to_it returned {rc}; expected 0 (dir re-created)"
+    assert (agent_dir / "drafts").is_dir(), (
+        "drafts/ was deleted from an up-to-date agent; the zero-diff Add-to-it "
+        "branch must re-create it, but it is still missing"
+    )
+
+
+def test_add_to_it_zero_diff_returns_nonzero_when_dir_creation_fails(
+    tmp_path, monkeypatch
+):
+    """Negative control for the zero-change-branch fix: if reconciling declared
+    write-path dirs fails on the zero-diff path, Add-to-it must return non-zero
+    and must NOT print the green 'up to date' line — the same audit-honesty
+    contract the non-zero path and _write_scaffold enforce.
+    """
+    import shutil
+
+    agent_dir = tmp_path / "agents" / "writer-agent"
+    _seed_complete_writer_agent(agent_dir)
+    shutil.rmtree(agent_dir / "drafts")
+
+    def _boom(_agent_dir):
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(W, "_create_empty_dirs", _boom)
+
+    console = _FakeConsole()
+    rc = W._add_to_it(
+        agent_dir=agent_dir,
+        agents_root=tmp_path / "agents",
+        template_name="writer",
+        console=console,
+        Prompt=_prompt_sequence(),
+        Confirm=_confirm_factory(True),
+        existing_headers=None,
+    )
+
+    assert rc == 1, f"_add_to_it returned {rc}; expected 1 on zero-diff dir failure"
+    out = console.out.getvalue().lower()
+    assert "could not be created" in out, (
+        "expected the actionable 'could not be created' warning on the zero-diff "
+        f"path; got: {console.out.getvalue()!r}"
+    )
+    assert "up to date" not in out, (
+        "the green 'up to date' line must be suppressed when a declared dir is "
+        f"missing and cannot be created; got: {console.out.getvalue()!r}"
+    )
