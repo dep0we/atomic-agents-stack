@@ -242,9 +242,10 @@ def _build_v1_db(db_path: Path) -> None:
     conn.close()
 
 
-def test_sqlite_v1_to_v2_migration(tmp_path):
-    """Opening a v1 DB auto-migrates to v2 (adds idempotency_key + replayed_run_id)."""
-    from atomic_agents.logs.sqlite import SQLiteLogBackend
+def test_sqlite_v1_to_v3_migration(tmp_path):
+    """Opening a v1 DB auto-migrates to current schema version (adds idempotency_key,
+    replayed_run_id, and conversation_id columns through the v1→v2→v3 ladder)."""
+    from atomic_agents.logs.sqlite import SQLiteLogBackend, _SCHEMA_VERSION
 
     db = tmp_path / "logs.db"
     _build_v1_db(db)
@@ -253,11 +254,11 @@ def test_sqlite_v1_to_v2_migration(tmp_path):
     backend = SQLiteLogBackend(db)
     backend.append(_make_record(run_id="run-new", idempotency_key="key-after-migrate"))
 
-    # Verify schema_version bumped to 2
+    # Verify schema_version bumped to current (3 — v3 adds conversation_id, spec/47 PR1)
     conn = sqlite3.connect(db)
     row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
     assert row is not None
-    assert int(row[0]) == 2
+    assert int(row[0]) == _SCHEMA_VERSION  # currently 3
 
     # Verify legacy record survived (NULL idempotency_key — not backfilled)
     rows = conn.execute(
@@ -281,7 +282,7 @@ def test_sqlite_v1_db_baseline_lacks_column(tmp_path):
     migration fixture — a raw v1 DB built bypassing the backend has NO
     idempotency_key column. This is the precondition the v1→v2 migration test
     relies on; it does NOT go RED if the migration code is stripped (that
-    coverage is `test_sqlite_v1_to_v2_migration`, which fails with
+    coverage is `test_sqlite_v1_to_v3_migration`, which fails with
     `sqlite3.OperationalError: no such column` when the migration block is
     removed). Named 'baseline' so the 'negative control' label stays reserved
     for tests that verify by stripping the fix.

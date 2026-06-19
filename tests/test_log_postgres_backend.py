@@ -1085,11 +1085,18 @@ def test_postgres_schema_has_idempotency_columns_and_index():
     )
     assert "idempotency_key" in _INSERT_COLUMNS
     assert "replayed_run_id" in _INSERT_COLUMNS
+    assert "conversation_id" in _CREATE_RUN_RECORDS, (
+        "Postgres run_records MUST have a conversation_id column (spec/47 PR1)"
+    )
+    assert "conversation_id" in _INSERT_COLUMNS
     assert any("idx_idempotency_key" in stmt for stmt in _CREATE_INDEXES), (
         "Postgres MUST create idx_idempotency_key (spec/22 addendum)"
     )
-    # Schema bumped to v2 with the migration ladder.
-    assert _SCHEMA_VERSION == 2
+    assert any("idx_conversation_id" in stmt for stmt in _CREATE_INDEXES), (
+        "Postgres MUST create idx_conversation_id (spec/47 PR1 / spec/22 addendum)"
+    )
+    # Schema bumped to v3 with the v2→v3 migration (conversation_id, spec/47 PR1).
+    assert _SCHEMA_VERSION == 3
 
 
 def test_postgres_build_query_sql_includes_idempotency_key_predicate():
@@ -1142,18 +1149,22 @@ def test_postgres_build_query_sql_no_idempotency_predicate_when_absent():
     )
 
 
-def test_postgres_ensure_schema_v1_to_v2_migration_ladder_order():
-    """BEHAVIORAL coverage of the Postgres v1→v2 migration (not string-presence
-    on the constants): drive _ensure_schema() with a mock conn pre-seeded to
-    schema_version='1' and assert it issues BOTH idempotency ADD-COLUMN ALTERs
-    and the meta UPDATE BEFORE any idx_idempotency_key CREATE INDEX.
+def test_postgres_ensure_schema_v1_to_v3_migration_ladder_order():
+    """BEHAVIORAL coverage of the FULL Postgres v1→v2→v3 migration ladder (not
+    string-presence on the constants): drive _ensure_schema() with a mock conn
+    pre-seeded to schema_version='1'. Because `existing` is reassigned 1→2→3 in
+    the ladder, a v1-seeded run walks both steps, so this asserts:
+      * v1→v2: BOTH idempotency ADD-COLUMN ALTERs + UPDATE meta '2'
+      * v2→v3 (spec/47 PR1): conversation_id ADD-COLUMN ALTER + UPDATE meta '3'
+    and the ordering invariant that each ADD COLUMN precedes the CREATE INDEX
+    that references it (idx_idempotency_key / idx_conversation_id).
 
-    The ordering is load-bearing: idx_idempotency_key references the
-    idempotency_key column, so it MUST be created AFTER the ALTER that adds it.
-    No live Postgres required — mirrors the SQLite on-disk migration test for
-    cross-backend parity (the CHANGELOG/CLAUDE.md 'Postgres v1→v2 migration'
-    claim is otherwise unverified; static column-name string checks do not
-    exercise the ALTER/UPDATE ladder)."""
+    The ordering is load-bearing: an index references its column, so the index
+    MUST be created AFTER the ALTER that adds it. No live Postgres required —
+    mirrors the SQLite on-disk v1→v3 migration test for cross-backend parity
+    (the CHANGELOG/CLAUDE.md 'Postgres v1→v2 / v2→v3 migration' claims are
+    otherwise unverified; static column-name string checks do not exercise the
+    ALTER/UPDATE ladder)."""
     from atomic_agents.logs.postgres import PostgresLogBackend
 
     backend = PostgresLogBackend.__new__(PostgresLogBackend)
@@ -1211,11 +1222,109 @@ def test_postgres_ensure_schema_v1_to_v2_migration_ladder_order():
     assert update_idx < create_index_idx
     assert "idx_idempotency_key" in joined
 
+    # --- v2→v3 step (spec/47 PR1): the SAME v1-seeded run continues the ladder
+    # because `existing` is reassigned to 2 then 3. Assert it ALSO ADDs the
+    # conversation_id column and bumps meta to '3'. Without these asserts a
+    # regression that deleted the Postgres v2→v3 block would pass every test
+    # (only SQLite covered conversation_id migration before this).
+    assert any(
+        "ADD COLUMN IF NOT EXISTS" in s and "conversation_id" in s for s in executed
+    ), "v2→v3 migration MUST ALTER ... ADD COLUMN IF NOT EXISTS conversation_id"
+    assert any("UPDATE meta SET value = '3'" in s for s in executed), (
+        "v2→v3 migration MUST bump meta.schema_version to 3"
+    )
+    # Ordering invariant: the conversation_id ALTER MUST precede the
+    # idx_conversation_id CREATE INDEX (the partial index references the column).
+    conv_alter_idx = next(
+        i
+        for i, s in enumerate(executed)
+        if "ADD COLUMN IF NOT EXISTS" in s and "conversation_id" in s
+    )
+    conv_index_idx = next(
+        i for i, s in enumerate(executed) if "idx_conversation_id" in s
+    )
+    assert conv_alter_idx < conv_index_idx, (
+        "ADD COLUMN conversation_id MUST run BEFORE CREATE INDEX "
+        "idx_conversation_id (the partial index references the column)"
+    )
 
-def test_postgres_ensure_schema_v2_db_skips_migration_ladder():
-    """NEGATIVE control: when the meta row already reports v2, _ensure_schema
-    MUST NOT issue any ADD COLUMN ALTER (the ladder is gated on existing==1).
-    Without this gate a warm DB would re-run the migration on every connect."""
+
+def test_postgres_ensure_schema_v2_to_v3_migration_ladder_order():
+    """BEHAVIORAL coverage of the Postgres v2→v3 migration step in ISOLATION
+    (spec/47 PR1): drive _ensure_schema() with a mock conn pre-seeded to
+    schema_version='2' (idempotency columns already present) and assert it:
+      (a) ADDs the conversation_id column via ADD COLUMN IF NOT EXISTS,
+      (b) bumps meta.schema_version to '3',
+      (c) runs the conversation_id ALTER BEFORE idx_conversation_id CREATE INDEX,
+      (d) does NOT re-issue the v1→v2 idempotency_key/replayed_run_id ALTERs
+          (gate isolation — the v1→v2 block is gated on existing==1).
+
+    A v1-seeded ladder test walks BOTH steps, so a regression that mis-gated the
+    v2→v3 block (e.g. `if existing == 1` instead of `== 2`) could still pass
+    there. This isolates the v2→v3 entry point: it only fires when starting at
+    exactly v2. Mirrors the SQLite cross-backend parity coverage; no live
+    Postgres required."""
+    from atomic_agents.logs.postgres import PostgresLogBackend
+
+    backend = PostgresLogBackend.__new__(PostgresLogBackend)
+
+    executed: list[str] = []
+
+    def _execute(sql, params=None):
+        executed.append(sql)
+        cur = MagicMock()
+        if "SELECT value FROM meta" in sql:
+            cur.fetchone.return_value = {"value": "2"}
+        else:
+            cur.fetchone.return_value = None
+        return cur
+
+    conn = MagicMock()
+    conn.execute.side_effect = _execute
+
+    backend._ensure_schema(conn)
+
+    # (a) conversation_id column added.
+    assert any(
+        "ADD COLUMN IF NOT EXISTS" in s and "conversation_id" in s for s in executed
+    ), "v2→v3 migration MUST ALTER ... ADD COLUMN IF NOT EXISTS conversation_id"
+    # (b) meta bumped to '3'.
+    assert any("UPDATE meta SET value = '3'" in s for s in executed), (
+        "v2→v3 migration MUST bump meta.schema_version to 3"
+    )
+    # (c) ALTER precedes the partial index that references the column.
+    conv_alter_idx = next(
+        i
+        for i, s in enumerate(executed)
+        if "ADD COLUMN IF NOT EXISTS" in s and "conversation_id" in s
+    )
+    conv_index_idx = next(
+        i for i, s in enumerate(executed) if "idx_conversation_id" in s
+    )
+    assert conv_alter_idx < conv_index_idx, (
+        "ADD COLUMN conversation_id MUST run BEFORE CREATE INDEX "
+        "idx_conversation_id (the partial index references the column)"
+    )
+    # (d) gate isolation: starting at v2, the v1→v2 ALTERs MUST NOT re-fire and
+    # meta MUST NOT be bumped to '2'.
+    assert not any(
+        "ADD COLUMN IF NOT EXISTS" in s and "idempotency_key" in s for s in executed
+    ), "a v2-seeded run MUST NOT re-run the v1→v2 idempotency_key ALTER"
+    assert not any(
+        "ADD COLUMN IF NOT EXISTS" in s and "replayed_run_id" in s for s in executed
+    ), "a v2-seeded run MUST NOT re-run the v1→v2 replayed_run_id ALTER"
+    assert not any("UPDATE meta SET value = '2'" in s for s in executed), (
+        "a v2-seeded run MUST NOT bump meta back through '2'"
+    )
+
+
+def test_postgres_ensure_schema_current_version_skips_migration_ladder():
+    """NEGATIVE control: when the meta row already reports the CURRENT
+    _SCHEMA_VERSION, _ensure_schema MUST NOT issue any ADD COLUMN ALTER (the
+    ladder steps are gated on existing==1 / existing==2). Without this gate a
+    warm DB would re-run the migration on every connect. (Mock returns
+    str(_SCHEMA_VERSION), so this exercises the already-current path regardless
+    of which version is current — v3 today after the spec/47 PR1 bump.)"""
     from atomic_agents.logs.postgres import PostgresLogBackend, _SCHEMA_VERSION
 
     backend = PostgresLogBackend.__new__(PostgresLogBackend)
@@ -1236,10 +1345,11 @@ def test_postgres_ensure_schema_v2_db_skips_migration_ladder():
     backend._ensure_schema(conn)
 
     assert not any("ADD COLUMN" in s for s in executed), (
-        "a v2 DB MUST NOT re-run the ADD COLUMN migration ladder"
+        "a current-version DB MUST NOT re-run the ADD COLUMN migration ladder"
     )
     # Index creation still runs (idempotent CREATE INDEX IF NOT EXISTS).
     assert any("idx_idempotency_key" in s for s in executed)
+    assert any("idx_conversation_id" in s for s in executed)
 
 
 def test_aggregate_injection_guard_raises_on_bad_identifier():
@@ -1468,6 +1578,8 @@ def test_row_to_record_handles_jsonb_dict():
         # spec/45 PR2: post-migration these columns ALWAYS exist (NULL on old rows).
         "idempotency_key": None,
         "replayed_run_id": None,
+        # spec/47 PR1: post-v2→v3 migration this column ALWAYS exists.
+        "conversation_id": None,
         # JSONB returns a Python dict directly — must NOT json.loads this.
         "extra": {"iteration": 3, "nested": [1, 2]},
     }
@@ -1515,6 +1627,8 @@ def test_row_to_record_fallback_none_preserved():
         # spec/45 PR2: post-migration these columns ALWAYS exist (NULL on old rows).
         "idempotency_key": None,
         "replayed_run_id": None,
+        # spec/47 PR1: post-v2→v3 migration this column ALWAYS exists.
+        "conversation_id": None,
         "extra": {},
     }
 
@@ -1560,6 +1674,8 @@ def test_row_to_record_boolean_true_false():
         # spec/45 PR2: post-migration these columns ALWAYS exist (NULL on old rows).
         "idempotency_key": None,
         "replayed_run_id": None,
+        # spec/47 PR1: post-v2→v3 migration this column ALWAYS exists.
+        "conversation_id": None,
         "extra": {},
     }
 
@@ -1625,13 +1741,21 @@ def test_postgres_schema_created_on_first_append(pg_backend):
 
 @requires_postgres
 def test_postgres_schema_version_recorded(pg_backend):
-    """schema_version=2 must be written to the meta table on first init.
+    """The CURRENT _SCHEMA_VERSION must be written to the meta table on first init.
 
     Bumped to 2 in #520 PR2 (idempotency_key + replayed_run_id columns +
-    idx_idempotency_key). A fresh init inserts the CURRENT _SCHEMA_VERSION (2)
-    directly; the v1->v2 migration ladder is covered by the mock-conn test above.
+    idx_idempotency_key) and to 3 in #535 PR1 (conversation_id column +
+    idx_conversation_id partial index). A fresh init inserts the CURRENT
+    _SCHEMA_VERSION directly; the v1->v2->v3 migration ladder is covered by the
+    mock-conn tests above. Asserting against the imported _SCHEMA_VERSION constant
+    (rather than a hardcoded literal) keeps this test from going stale on the next
+    schema bump — see feedback_db_gated_tests_skip_locally_catch_schema_drift_in_ci
+    (this @requires_postgres test SKIPS locally; a hardcoded literal would only
+    fail in CI's Postgres lane).
     """
     import psycopg
+
+    from atomic_agents.logs.postgres import _SCHEMA_VERSION
 
     pg_backend.append(_make_record(run_id="version_test"))
 
@@ -1639,7 +1763,7 @@ def test_postgres_schema_version_recorded(pg_backend):
     row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
     conn.close()
     assert row is not None
-    assert int(row[0]) == 2
+    assert int(row[0]) == _SCHEMA_VERSION
 
 
 @requires_postgres

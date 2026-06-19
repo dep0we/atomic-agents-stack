@@ -248,6 +248,7 @@ def _make_record(
     mandate_id: str | None = None,
     idempotency_key: str | None = None,
     replayed_run_id: str | None = None,
+    conversation_id: str | None = None,
     parent_run_id: str | None = None,
     parent_agent: str | None = None,
     trigger: str | None = None,
@@ -275,6 +276,7 @@ def _make_record(
         mandate_id=mandate_id,
         idempotency_key=idempotency_key,
         replayed_run_id=replayed_run_id,
+        conversation_id=conversation_id,
         parent_run_id=parent_run_id,
         parent_agent=parent_agent,
         trigger=trigger,
@@ -554,6 +556,61 @@ def test_query_idempotency_key_round_trips_replayed_run_id(backend):
     assert len(out) == 1
     assert out[0].status == "deduped"
     assert out[0].replayed_run_id == "orig-run"
+
+
+def test_query_filters_by_conversation_id(backend):
+    """spec/22 versioned normative addendum (spec/47 PR1): every conforming
+    backend MUST support the ``conversation_id`` AND-predicate, returning ONLY
+    records whose conversation_id matches. Mirrors the ``idempotency_key``
+    precedent so a backend that ships the column + index but FORGETS the WHERE
+    clause fails this canonical gate instead of silently returning all records
+    (Design Principle #2/#10/#12 — the audit-trail filter promise must be real,
+    not a documented-but-unwired surface).
+
+    Negative-control shape: the third record has conversation_id=None. A backend
+    that skipped the predicate would return all three for LogQuery(conversation_id=
+    "c-1"); this asserts exactly one. The no-filter arm asserts the predicate is
+    not over-broad (returns all three).
+    """
+    backend.append(
+        _make_record(run_id="c1", conversation_id="c-1", ts=_ts_at(2026, 5, 15, 10))
+    )
+    backend.append(
+        _make_record(run_id="c2", conversation_id="c-2", ts=_ts_at(2026, 5, 15, 11))
+    )
+    backend.append(
+        _make_record(run_id="cn", conversation_id=None, ts=_ts_at(2026, 5, 15, 12))
+    )
+    out = backend.query(LogQuery(conversation_id="c-1"))
+    assert len(out) == 1, (
+        "conversation_id predicate MUST scope results to the matching record; "
+        "returning more means the WHERE/skip clause is missing (the SHORTCUT "
+        "this test guards against)"
+    )
+    assert out[0].run_id == "c1"
+    assert out[0].conversation_id == "c-1"
+    # Distinct second key returns only its own record (not a c-1 echo).
+    out_c2 = backend.query(LogQuery(conversation_id="c-2"))
+    assert len(out_c2) == 1 and out_c2[0].run_id == "c2"
+    # No predicate → all three records (predicate is not over-broad).
+    assert len(backend.query(LogQuery())) == 3
+
+
+def test_query_conversation_id_round_trips(backend):
+    """conversation_id is a canonical RunRecord field (spec/47 PR1) and MUST
+    survive the append → query round trip — present when set, absent (None)
+    when not.
+    """
+    backend.append(
+        _make_record(
+            run_id="conv-rt",
+            conversation_id="thread-7",
+            ts=_ts_at(2026, 5, 15, 13),
+        )
+    )
+    out = backend.query(LogQuery(conversation_id="thread-7"))
+    assert len(out) == 1
+    assert out[0].conversation_id == "thread-7"
 
 
 def test_query_filters_by_parent_run_id(backend):
