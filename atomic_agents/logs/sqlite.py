@@ -93,8 +93,10 @@ from .types import (
 # the file was created with; mismatches at open time raise. PR 3
 # ships ``v1``; spec/45 PR2 bumps to ``v2`` (adds idempotency_key +
 # replayed_run_id columns + idx_idempotency_key index, per the
-# spec/22 versioned normative addendum).
-_SCHEMA_VERSION = 2
+# spec/22 versioned normative addendum); spec/47 PR1 bumps to ``v3``
+# (adds conversation_id column + idx_conversation_id partial index,
+# per the spec/22 versioned normative addendum for ConversationBackend).
+_SCHEMA_VERSION = 3
 
 
 # SQL for schema creation. Idempotent — ``CREATE TABLE IF NOT EXISTS``
@@ -127,6 +129,8 @@ CREATE TABLE IF NOT EXISTS run_records (
     -- spec/45 PR2 / spec/22 addendum: idempotency audit fields.
     idempotency_key TEXT,
     replayed_run_id TEXT,
+    -- spec/47 PR1 / spec/22 versioned normative addendum: conversation audit field.
+    conversation_id TEXT,
     extra TEXT NOT NULL DEFAULT '{}'
 )
 """
@@ -158,6 +162,12 @@ _CREATE_INDEXES = [
     # the partial predicate). SQLite 3.8.0+ supports partial indexes.
     "CREATE INDEX IF NOT EXISTS idx_idempotency_key ON run_records(idempotency_key) "
     "WHERE idempotency_key IS NOT NULL",
+    # spec/22 versioned normative addendum (spec/47 PR1): MUST add this index
+    # to enable LogQuery.conversation_id AND-predicate as an index seek. PARTIAL
+    # index (WHERE conversation_id IS NOT NULL): conversation_id is NULL for the
+    # overwhelming majority of run records (only conversation-keyed runs set it).
+    "CREATE INDEX IF NOT EXISTS idx_conversation_id ON run_records(conversation_id) "
+    "WHERE conversation_id IS NOT NULL",
 ]
 
 
@@ -186,6 +196,7 @@ _INSERT_COLUMNS = (
     "critical",
     "idempotency_key",
     "replayed_run_id",
+    "conversation_id",
     "extra",
 )
 
@@ -408,6 +419,20 @@ class SQLiteLogBackend:
                 conn.execute("ALTER TABLE run_records ADD COLUMN replayed_run_id TEXT")
             conn.execute("UPDATE meta SET value='2' WHERE key='schema_version'")
             existing = 2
+        if existing == 2:
+            # v2 → v3 (spec/47 PR1): add conversation_id column +
+            # idx_conversation_id partial index (spec/22 versioned normative
+            # addendum for ConversationBackend). Guarded by PRAGMA table_info()
+            # existence check for crash-resumability (SQLite has no ADD COLUMN IF
+            # NOT EXISTS — same pattern as the v1→v2 migration above).
+            _cols_v3 = {
+                str(r[1])
+                for r in conn.execute("PRAGMA table_info(run_records)").fetchall()
+            }
+            if "conversation_id" not in _cols_v3:
+                conn.execute("ALTER TABLE run_records ADD COLUMN conversation_id TEXT")
+            conn.execute("UPDATE meta SET value='3' WHERE key='schema_version'")
+            existing = 3
         # Create/update indexes AFTER migrations so all columns they reference exist.
         for stmt in _CREATE_INDEXES:
             conn.execute(stmt)
@@ -457,6 +482,7 @@ class SQLiteLogBackend:
             None if record.critical is None else int(record.critical),
             record.idempotency_key,
             record.replayed_run_id,
+            record.conversation_id,
             json.dumps(record.extra) if record.extra else "{}",
         )
         conn.execute(_INSERT_SQL, values)
@@ -797,6 +823,13 @@ class SQLiteLogBackend:
         if filter.idempotency_key is not None:
             clauses.append("idempotency_key = ?")
             params.append(filter.idempotency_key)
+        # spec/22 versioned normative addendum (spec/47 PR1): conversation_id
+        # AND-predicate. Uses the idx_conversation_id partial index for an index
+        # seek. Without this clause LogQuery(conversation_id=...) would silently
+        # return ALL records — the spec MUST says it returns only matching ones.
+        if filter.conversation_id is not None:
+            clauses.append("conversation_id = ?")
+            params.append(filter.conversation_id)
 
         where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
@@ -856,6 +889,7 @@ class SQLiteLogBackend:
             critical=None if row["critical"] is None else bool(row["critical"]),
             idempotency_key=row["idempotency_key"],
             replayed_run_id=row["replayed_run_id"],
+            conversation_id=row["conversation_id"],
             extra=extra,
         )
 

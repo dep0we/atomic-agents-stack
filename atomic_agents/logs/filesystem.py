@@ -700,6 +700,14 @@ def _matches(
         and record.idempotency_key != filter.idempotency_key
     ):
         return False
+    # spec/22 versioned normative addendum (spec/47 PR1): conversation_id
+    # AND-predicate. Without this LogQuery(conversation_id=...) would silently
+    # match every record — the spec MUST says it returns only matching ones.
+    if (
+        filter.conversation_id is not None
+        and record.conversation_id != filter.conversation_id
+    ):
+        return False
     return True
 
 

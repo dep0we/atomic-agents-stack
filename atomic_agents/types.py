@@ -51,6 +51,15 @@ class AgentConfig:
     # precedence.
     dedup_body_hash_enabled: bool = False
 
+    # spec/47 PR1 (PROVISIONAL — field name and section syntax may change before LOCK):
+    # Backend id for the conversation backend, parsed from model.md
+    # '## Conversation Backend' section. None when the section is absent (single-shot
+    # default). The three-channel resolution order in agent.call() is:
+    # (1) constructor kwarg, (2) ATOMIC_AGENTS_CONVERSATION_BACKEND env var,
+    # (3) this field. All three resolve to None when unset (backward-compatible).
+    # DO NOT default to 'filesystem' — 'no backend == single-shot' is mandatory (rule #14).
+    conversation_backend_id: str | None = None
+
     # From roster.md (parsed) — agent names this coordinator may delegate to.
     # Empty list = no delegation allowed.
     roster: list[str] = field(default_factory=list)
@@ -135,6 +144,23 @@ class Response:
     prior_run_id: str | None = None
     replayed_run_id: str | None = None
     result_ref: str | None = None
+    # Conversation continuity fields (spec/47 PR1). Set when conversation_backend
+    # is configured and agent.call() is invoked with conversation_id.
+    #
+    # continuity_persisted=True: turn write-back succeeded (atomic_write committed),
+    #   OR no conversation_id was supplied (single-shot — the field is irrelevant
+    #   and True is the correct backward-compat sentinel).
+    # continuity_persisted=False: a conversation_id WAS supplied but the turn pair
+    #   was NOT persisted. Two cases: (1) write-back raised (I/O error / bad
+    #   conversation_id) — the LLM response is still returned (billed run); a
+    #   WARNING log with run_id is emitted for manual recovery; (2) the call
+    #   short-circuited BEFORE write-back (mid-loop cost cap) so no write was
+    #   attempted — the field is False so the caller is not misled into thinking
+    #   history was stored. On the pure refusal short-circuits (dedup, lock_busy,
+    #   pre-loop cost-skip, in_flight) the field keeps its True default: those are
+    #   refusal paths where no work and no write occurred and the field is not
+    #   meaningful (interpret it only on ok-path / skipped Responses).
+    continuity_persisted: bool = True
 
     @classmethod
     def skipped_response(cls, reason: str, model: str) -> "Response":

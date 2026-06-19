@@ -65,6 +65,11 @@ def parse_model_md_text(text: str) -> dict:
         # as sha256(work_item+model+max_tokens+temperature) when no explicit key is
         # supplied. Default False — operator must opt in via model.md.
         "dedup_body_hash_enabled": False,
+        # spec/47 PR1 (PROVISIONAL — see spec/47 §"Three-channel seam"): backend id
+        # for the conversation backend. None when the section is absent (single-shot
+        # default). The section name, key, and parsing location may change before
+        # spec/47 LOCK. Do NOT depend on this field for stable deployments until LOCKED.
+        "conversation_backend_id": None,
     }
 
     if not text:
@@ -148,5 +153,17 @@ def parse_model_md_text(text: str) -> dict:
     # the exact-equality discipline serve.md's "## Allow No Auth" parser uses.
     if re.search(r"^##\s+Dedup Body Hash\s*$", text, re.IGNORECASE | re.MULTILINE):
         defaults["dedup_body_hash_enabled"] = True
+
+    # spec/47 PR1 (PROVISIONAL): parse '## Conversation Backend' section.
+    # Value is the backend_id string on the next non-empty line (e.g. 'filesystem').
+    # The section name, key syntax, and parsing location are PROVISIONAL and may
+    # change before spec/47 LOCK. Do NOT depend on this for stable deployments.
+    m = re.search(
+        r"^##\s+Conversation Backend\s*$\n+\s*([a-zA-Z0-9_-]+)\s*$",
+        text,
+        re.IGNORECASE | re.MULTILINE,
+    )
+    if m:
+        defaults["conversation_backend_id"] = m.group(1).strip().lower()
 
     return defaults

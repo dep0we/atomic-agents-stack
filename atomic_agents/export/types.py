@@ -75,6 +75,14 @@ from ..queue.types import QueueExport as QueueExport  # noqa: F401 (re-export)
 # *.terminal.json entries (durable); exclude *.lease.json (ephemeral, phantom-block hazard).
 from ..idempotency.types import IdempotencyExport as IdempotencyExport  # noqa: F401 (re-export)
 
+# ConversationExport is defined in conversation/types.py (it subclasses ExportableResult
+# imported from the leaf module _export_base.py — same safe chain as the other v1.5
+# wave exports). Re-export here so callers can use
+# 'from atomic_agents.export import ConversationExport'.
+# spec/40 registration: supports_canonical_export=True; embed bytes for all *.json
+# turn files (durable); exclude stale *.tmp files (ephemeral, excluded by *.json glob).
+from ..conversation.types import ConversationExport as ConversationExport  # noqa: F401 (re-export)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Per-backend export result types

@@ -881,3 +881,63 @@ class LogBackendReadError(AtomicAgentsError):
     ``atomic_agents`` (top-level caller surface) and ``atomic_agents.logs``
     (backend-implementer surface).
     """
+
+
+# ──────────────────────────────────────────────────────────────────
+# ConversationBackend exceptions (spec/47 — issue #535)
+
+
+class ConversationBackendError(AtomicAgentsError):
+    """Base class for all ConversationBackend failures (spec/47).
+
+    Raised by ConversationBackend implementations for I/O failures, symlink
+    escapes, and path traversal violations. NOT raised for normal "no prior
+    turns" (absent conversations/ returns []); that is an authoritative FRESH
+    signal, not an error.
+
+    Callers in agent.py MUST catch this BASE class (not narrower subclasses)
+    per the feedback_fail_closed_catches_base_error_class lesson: a future
+    subclass added to the hierarchy would escape every existing catch site if
+    the narrow subclass were used. Preserves exception type on re-wrap via
+    ``type(exc)(...)`` when needed.
+
+    Two subclasses are defined:
+        - ConversationCorrupted: a turn file exists but cannot be parsed
+          (JSON decode failure, schema_version mismatch, missing required
+          fields). The turn is skipped; the backend MAY log a warning.
+        - ConversationAccessDenied: a caller attempted to read/write under a
+          principal that does not match the path component (cross-principal
+          isolation guard). Distinct from PathTraversalError (which is a
+          crafted-path escape) — ConversationAccessDenied is a semantically
+          valid path that belongs to a DIFFERENT principal.
+
+    Import note: available at ``atomic_agents.exceptions`` so agent.py and
+    serve can import without loading the full conversation package.
+    """
+
+
+class ConversationCorrupted(ConversationBackendError):
+    """A turn file is present but unreadable (JSON error, schema mismatch).
+
+    Raised when a per-turn file under conversations/<principal>/<conv_id>/
+    cannot be parsed or is missing required fields (role, content, ts, run_id).
+    The caller in agent.py treats this as a continuity degradation: the
+    corrupted turn is skipped, a WARNING is logged with the path and run_id,
+    and the call proceeds with the remaining loadable turns.
+    """
+
+
+class ConversationAccessDenied(ConversationBackendError):
+    """Principal B attempted to access a conversation owned by principal A.
+
+    Raised by FilesystemConversationBackend when the requesting principal's
+    identifier does not match the resolved directory component (cross-principal
+    isolation guard). Distinct from PathTraversalError:
+    - PathTraversalError: the path itself escapes the containment root.
+    - ConversationAccessDenied: the path is valid but belongs to a different
+      principal (the caller should not have access).
+
+    The agent.py integration treats this as a ConversationBackendError and
+    catches it at the base class — callers that need to distinguish access
+    denial from I/O failure can catch this subclass explicitly.
+    """
