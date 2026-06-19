@@ -23,6 +23,7 @@ See docs/spec/40-canonical-export.md for the full normative contract.
 
 from .backend import Exportable
 from .types import (
+    ConversationExport,
     CorpusExport,
     CorpusExportQuery,
     ExportableResult,
@@ -65,4 +66,5 @@ __all__ = [
     "JournalExport",
     "QueueExport",
     "IdempotencyExport",
+    "ConversationExport",
 ]
