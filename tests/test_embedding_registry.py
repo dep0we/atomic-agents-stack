@@ -60,12 +60,28 @@ class _MinimalBackend:
 
 @pytest.fixture(autouse=True)
 def _clean_test_registry():
-    """Ensure test-provider is removed before and after each test."""
-    unregister_embedding_backend("test-provider")
-    unregister_embedding_backend("test-provider-2")
-    yield
-    unregister_embedding_backend("test-provider")
-    unregister_embedding_backend("test-provider-2")
+    """Snapshot and restore the ENTIRE embedding registry around each test.
+
+    Several tests in this module call ``unregister_embedding_backend("openai")``
+    (or otherwise mutate the module-global ``_REGISTRY``) to exercise the
+    not-registered / lazy-register branches.  Popping only the two
+    ``test-provider`` keys would leak a removed ``openai`` (or any built-in)
+    into sibling tests AND into other modules that share the process-global
+    registry — exactly the cross-test isolation leak that produced a once-seen
+    intermittent ``_get_key`` flake in the conformance suite
+    (``feedback_db_gated_tests_skip_locally`` cousin: leaked global state).
+    Snapshotting the whole dict and replacing its contents on teardown makes any
+    register/unregister inside a test hermetic, in-place (so other modules that
+    imported the SAME ``_REGISTRY`` object see the restored contents).
+    """
+    from atomic_agents.embedding import registry as _registry_mod
+
+    saved = dict(_registry_mod._REGISTRY)
+    try:
+        yield
+    finally:
+        _registry_mod._REGISTRY.clear()
+        _registry_mod._REGISTRY.update(saved)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -143,22 +159,29 @@ def test_re_register_replaces_class():
 # get_default_embedding_backend() — no env var → returns None
 
 
-def test_get_default_returns_none_when_openai_sdk_absent(monkeypatch):
-    """get_default_embedding_backend() returns None when the openai SDK is not installed.
+def test_get_default_unset_returns_none_even_with_sdk_and_key(monkeypatch):
+    """OPT-IN COST-SAFETY (#200 PR3): an UNSET provider returns None even when
+    the openai SDK IS installed and an OPENAI_API_KEY IS reachable.
 
-    When ATOMIC_AGENTS_EMBEDDING_BACKEND is unset, the factory defaults to
-    'openai'. If the [openai] extra is absent, it returns None (graceful
-    degradation → FTS fallback).  Simulate by removing the openai registry
-    entry AND blocking the import so the lazy-register path also fails.
+    This is the surprise-spend footgun fix: semantic search must NOT auto-enable
+    (and start billing embeds on every write/search) merely because a key happens
+    to be present in the environment. Selecting the pgvector backend with no
+    explicit ATOMIC_AGENTS_EMBEDDING_BACKEND opt-in stays FTS-only.
+
+    Negative control: if the opt-in early-return is stripped (the factory
+    reverts to defaulting provider_id to 'openai' on an unset env var), this
+    flips from None to a constructed OpenAIEmbeddingBackend — i.e. the test goes
+    RED, proving it exercises the guard rather than a missing registration.
     """
+    # The SDK IS available and openai IS registered, and a key IS present —
+    # the ONLY thing missing is the explicit opt-in.
+    fake_openai = _make_fake_openai_module()
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-fake")
     monkeypatch.delenv("ATOMIC_AGENTS_EMBEDDING_BACKEND", raising=False)
-    # Remove the openai backend from the registry to force the lazy-register path
-    unregister_embedding_backend("openai")
-    # Block the openai SDK import so lazy registration fails gracefully
-    monkeypatch.setitem(sys.modules, "openai", None)  # type: ignore[arg-type]
 
     result = get_default_embedding_backend()
-    assert result is None
+    assert result is None  # opt-in default: no auto-construct on key presence
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -268,14 +291,16 @@ def test_get_default_explicit_unknown_provider_raises(monkeypatch):
 
 
 def test_get_default_unset_provider_no_extra_returns_none(monkeypatch):
-    """An UNSET provider env var degrades gracefully to None when no extra.
+    """An UNSET provider env var returns None (opt-in default) — and crucially
+    does NOT raise even when the [openai] extra is absent.
 
-    Distinct from the explicit-typo case above: the implicit 'openai' default
-    with the extra absent must NOT raise — it falls back to FTS quietly. This
-    is the negative-control pair for the explicit-pin raise.
+    Distinct from the explicit-typo / explicit-missing-extra raises above: an
+    operator who never opted in must get a quiet FTS fallback, never an error,
+    regardless of whether the SDK is installed. (The companion footgun test
+    above proves None even when the SDK IS present.)
     """
     monkeypatch.delenv("ATOMIC_AGENTS_EMBEDDING_BACKEND", raising=False)
-    # Ensure 'openai' is not registered and the extra import fails.
+    # Extra absent too — must STILL be a quiet None, never a raise.
     from atomic_agents.embedding import registry as _reg
 
     _reg.unregister_embedding_backend("openai")
