@@ -123,7 +123,7 @@ class OpenAIEmbeddingBackend:
     ``_build_client`` on the instance for the most direct interception.
 
     supports_input_type: honestly ``False`` (MUST 3 capability honesty).
-    Verified against the installed ``openai`` SDK (>= 1.30): its
+    Verified against the installed ``openai`` SDK (openai 2.35.1): its
     ``embeddings.create()`` signature does NOT expose an ``input_type``
     parameter, so there is nothing for the backend to forward.  The
     ``embed()`` / ``embed_batch()`` Protocol surface DOES accept an
@@ -294,9 +294,9 @@ class OpenAIEmbeddingBackend:
         """Return capability advertisement for this backend.
 
         supports_input_type=False: the OpenAI embeddings API (as exposed by the
-        installed openai SDK >= 1.30) does NOT offer an ``input_type`` parameter
-        on ``embeddings.create()`` (verified 2026-06-18 via installed SDK
-        signature -- parameters: input, model, dimensions, encoding_format, user).
+        installed openai SDK, openai 2.35.1) does NOT offer an ``input_type``
+        parameter on ``embeddings.create()`` (verified 2026-06-18 via installed
+        SDK signature -- parameters: input, model, dimensions, encoding_format, user).
         The kwarg is accepted on ``embed()``/``embed_batch()`` per the Protocol
         surface added in PR 3, but is NOT forwarded to the API.
         ``supports_input_type=False`` is therefore capability-honest (MUST 3).
@@ -482,7 +482,7 @@ class OpenAIEmbeddingBackend:
                     "embed()",
                     len(texts),
                 )
-                result = [self.embed(t) for t in texts]
+                result = [self.embed(t, input_type=input_type) for t in texts]
                 return self._normalize_length(result, len(texts))
             # Well-formed but incomplete (some indices absent from the response).
             missing_indices = [i for i in range(len(texts)) if i not in by_index]
@@ -500,7 +500,9 @@ class OpenAIEmbeddingBackend:
             # to FTS/substring) WITHOUT amplifying.
             if len(by_index) > len(texts) // 2:
                 result = [
-                    by_index[i] if i in by_index else self.embed(texts[i])
+                    by_index[i]
+                    if i in by_index
+                    else self.embed(texts[i], input_type=input_type)
                     for i in range(len(texts))
                 ]
                 _logger.warning(
@@ -545,7 +547,7 @@ class OpenAIEmbeddingBackend:
                 "embedding batch failed; degrading to per-item embed() for %d texts",
                 len(texts),
             )
-            result = [self.embed(t) for t in texts]
+            result = [self.embed(t, input_type=input_type) for t in texts]
             return self._normalize_length(result, len(texts))
 
     def close(self) -> None:

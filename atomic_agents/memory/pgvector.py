@@ -76,8 +76,22 @@ ANN search filter
 -----------------
 ``search()`` queries only embeddings where ``model_id`` and ``dimensions``
 match the active backend.  Stale embeddings (different model/dimension) are
-NOT re-embedded on read — they fall through to FTS recall at the parent class.
-This prevents silent cosine-distance computation across mismatched vectors.
+NOT re-embedded on read and are excluded from the ANN join — this prevents
+silent cosine-distance computation across mismatched vectors.
+
+IMPORTANT — no per-query FTS union: a note whose ONLY embedding is stale-model
+is excluded from the ANN result and is NOT recovered by a parallel FTS pass.
+``search()`` falls back to the parent FTS ``search()`` ONLY when the query
+embed() fails (returns None) or the ANN query raises — NOT when the ANN query
+succeeds with zero (or partial) rows.  A successful ANN result is authoritative
+(empty-is-authoritative, the split-brain guard from
+feedback_empty_resolved_list_authoritative): an empty ANN set returns ``[]``
+rather than silently surfacing FTS-only notes.  Consequence: a note embedded
+under a since-replaced model is reachable via the FTS-only code paths
+(``recall_notes`` / parent ``search()`` invoked directly) but NOT via this
+backend's semantic ``search()`` until it is re-embedded under the active model.
+Re-embedding happens on the note's next ``write_note``; a bulk re-embed pass
+after a model swap is tracked as operator tooling (see #544 / follow-up).
 """
 
 from __future__ import annotations
@@ -125,9 +139,121 @@ CREATE TABLE IF NOT EXISTS memory_note_embeddings (
 )
 """
 
+# pgvector's HNSW (and IVFFlat) indexes support a maximum of 2,000 dimensions
+# on the ``vector`` type (verified against pgvector's authoritative docs,
+# Principle #12 — "column cannot have more than 2000 dimensions for hnsw
+# index").  This backend ships ``text-embedding-3-large`` (3072 dims) as a
+# supported model, so an operator who selects it would otherwise crash
+# schema-init when ``CREATE INDEX ... USING hnsw`` is run on a vector(3072)
+# column.  Above this limit we SKIP the HNSW index: cosine ANN still works via
+# sequential scan with the ``<=>`` operator (correct, just slower recall), and
+# schema-init succeeds instead of failing the whole backend for a valid config.
+_HNSW_MAX_DIMENSIONS = 2000
+
+# Sentinel returned by _actual_embedding_dimension when an embedding column
+# EXISTS but its width is unknown (a dimensionless ``vector`` column reports
+# atttypmod -1).  It is deliberately > _HNSW_MAX_DIMENSIONS so the HNSW guard
+# treats "unknown width" as "do not attempt the index" (fail toward not
+# crashing) — an unqualified ``vector`` column cannot be HNSW-indexed anyway.
+_UNKNOWN_DIMENSION = _HNSW_MAX_DIMENSIONS + 1
+
+
+def _actual_embedding_dimension(conn: Any, table_name: str) -> int | None:
+    """Return the actual vector(N) width of ``<table_name>.embedding``.
+
+    pgvector stores the declared dimension directly in
+    ``pg_attribute.atttypmod`` (no varchar-style ``+4`` offset — verified).
+
+    Returns:
+        * ``None`` — the TABLE genuinely does not exist yet (fresh DB:
+          ``to_regclass`` resolved to NULL).  Callers then guard on the DECLARED
+          width alone, which is correct on a fresh DB.
+        * a positive ``int`` — the known fixed width of the existing column.
+        * ``_UNKNOWN_DIMENSION`` — any state where we cannot PROVE the width is
+          safe: the table exists but has no ``embedding`` column; the column is
+          a dimensionless ``vector`` (atttypmod -1, un-indexable); or the
+          catalog read itself failed.  All force the caller to SKIP the HNSW
+          index — fail toward not attempting unsafe DDL rather than trusting the
+          declared width against an unknown/mismatched column.
+
+    Resolves the table via ``to_regclass`` so the lookup is search_path-aware
+    (the DDL uses unqualified table names, so the column may live in a non-
+    ``public`` schema); a hardcoded ``nspname = 'public'`` filter would miss it
+    and wrongly fall through to the declared-width guard.  The relid resolution
+    (table existence) is read SEPARATELY from the attribute lookup (column
+    width) so "table absent" (→ None, fresh) is distinguished from "table
+    present but embedding column absent/odd" (→ sentinel, skip).
+    """
+    try:
+        # Phase 1: does the table exist (search_path-aware)?
+        cur = conn.execute("SELECT to_regclass(%s) AS relid", (table_name,))
+        rel_row = cur.fetchone()
+        relid = (
+            (rel_row["relid"] if isinstance(rel_row, dict) else rel_row[0])
+            if rel_row is not None
+            else None
+        )
+        if relid is None:
+            # Table genuinely absent — fresh DB; guard on declared width.
+            return None
+        # Phase 2: read the embedding column's declared width, but ONLY if the
+        # column is actually the pgvector ``vector`` type.  Joining on
+        # ``atttypid = 'vector'::regtype`` makes this one canonical invariant —
+        # "the embedding column IS a pgvector vector of width N" — instead of
+        # trusting atttypmod from whatever type happens to occupy the column.  A
+        # conflicting non-pgvector column (e.g. ``embedding varchar(100)``,
+        # positive typmod) therefore matches NO row → sentinel → skip, rather
+        # than feeding a foreign typmod into the width guard.  ``::regtype``
+        # resolves 'vector' search_path-aware (same path the DDL uses).
+        cur = conn.execute(
+            "SELECT a.atttypmod AS n "
+            "FROM pg_attribute a "
+            "WHERE a.attrelid = to_regclass(%s) "
+            "  AND a.attname = 'embedding' "
+            "  AND a.atttypid = 'vector'::regtype "
+            "  AND NOT a.attisdropped",
+            (table_name,),
+        )
+        row = cur.fetchone()
+    except Exception:  # noqa: BLE001
+        # Catalog read failed — we cannot prove the column width is within the
+        # HNSW limit, so report UNKNOWN (forces skip) rather than None (which
+        # would fall through to the declared-width guard and risk unsafe DDL).
+        # ('vector'::regtype itself raises if the extension is absent, but the
+        # C2 fail-hard check runs earlier so by here the type exists.)
+        return _UNKNOWN_DIMENSION
+    # Table exists but has no pgvector ``embedding vector`` column (operator-
+    # created conflicting table, wrong column type, or partial state):
+    # un-indexable; force skip.
+    if row is None:
+        return _UNKNOWN_DIMENSION
+    n = row["n"] if isinstance(row, dict) else row[0]
+    if n is None:
+        return _UNKNOWN_DIMENSION
+    n = int(n)
+    if n > 0:
+        return n
+    # atttypmod -1 (or any non-positive) → dimensionless/unknown vector column:
+    # present but un-indexable.  Force the caller to skip.
+    return _UNKNOWN_DIMENSION
+
+
+# ── Intentionally-shared pgvector catalog helpers (public aliases) ──────────
+# PgvectorCorpusBackend's HNSW guard needs the SAME catalog-width probe and the
+# SAME "unknown width" sentinel as this module.  Rather than have the corpus
+# backend import the leading-underscore names (a hidden cross-package coupling
+# on a private symbol — a rename here would only surface at runtime in the rare
+# shared-DB HNSW path), these public aliases declare the surface as an
+# intentional shared contract.  The corpus backend imports THESE names; the
+# underscore originals stay for in-module use.  Keep both in sync.
+actual_embedding_dimension = _actual_embedding_dimension
+UNKNOWN_DIMENSION = _UNKNOWN_DIMENSION
+
+
 # HNSW index — created WITH the column (not deferred).  ``IF NOT EXISTS``
 # makes re-runs idempotent.  ``vector_cosine_ops`` matches the ``<=>`` distance
-# operator used in search queries.
+# operator used in search queries.  ONLY created when dimensions <=
+# _HNSW_MAX_DIMENSIONS (see _maybe_create_hnsw_index).
 _CREATE_EMBEDDINGS_HNSW_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_memory_note_embeddings_hnsw
     ON memory_note_embeddings
@@ -260,8 +386,13 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
         self._embedding_backend: "EmbeddingBackend | None" = None
         self._pgvector_schema_ready = False
 
-        # Parent constructor: validates URL, sets up connection attributes,
-        # runs _get_conn() which calls _ensure_schema() on first connection.
+        # Parent constructor validates the URL and sets up connection
+        # attributes.  The connection (and _ensure_schema, which reads
+        # self._embedding_backend.dimensions to size the vector(N) column) is
+        # LAZY — it runs on the FIRST DB operation, which is always AFTER this
+        # __init__ completes and the embedding backend is resolved below.  So
+        # dimension resolution never races construction: the v2→v3 migration
+        # reads an already-set _embedding_backend, not the 1536 fallback.
         super().__init__(agent_root, lock_backend=lock_backend, url=url)
 
         # Resolve embedding backend AFTER parent __init__ so that a
@@ -298,16 +429,25 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
 
         Why register_vector is needed
         -----------------------------
-        ``register_vector`` installs the psycopg LOADER for the ``vector`` type:
-        without it, READING a ``vector`` column returns a Python ``str`` (e.g.
-        ``'[0.1,0.2,...]'``) instead of a numpy array, breaking callers that
-        materialize the stored vector (``list(row['embedding'])`` in the
-        merge-embed regression).  The ``%s::vector`` WRITE path already works
-        WITHOUT register_vector — psycopg sends a Python ``list[float]`` as a
-        typed ``float8[]`` array and the ``::vector`` cast accepts it
-        (``ARRAY[...]::vector`` is valid; only the bare text literal
-        ``'{...}'::vector`` fails, which is not what psycopg sends).  So
-        register_vector is load-bearing for reads, belt-and-suspenders for writes.
+        ``register_vector`` installs the psycopg LOADER for the ``vector`` type
+        (read path) AND the DUMPER for the ``pgvector.Vector`` / ``numpy.ndarray``
+        types (write path).  On READ, without it a ``vector`` column comes back as
+        a Python ``str`` (e.g. ``'[0.1,0.2,...]'``) instead of a numpy array,
+        breaking callers that materialize the stored vector
+        (``list(row['embedding'])`` in the merge-embed regression).
+
+        Write path — DO NOT bind a bare ``list``.  ``register_vector`` registers
+        dumpers ONLY for ``pgvector.Vector`` and ``numpy.ndarray`` (verified in
+        ``pgvector/psycopg/vector.py: register_vector_info``), NOT for ``list``.
+        A plain ``list[float]`` therefore falls through to psycopg's default array
+        dumper, which emits a curly-brace literal ``{0.1,0.2,...}`` (verified in
+        ``psycopg/types/array.py``).  pgvector's ``vector_in`` parser rejects the
+        curly form — it requires the bracket form ``[0.1,0.2,...]`` that
+        ``Vector._to_db`` emits.  So a bare-list bind raises server-side even with
+        register_vector installed.  Every ``%s::vector`` bind site in this module
+        wraps the value in ``pgvector.Vector(...)`` so the registered dumper fires
+        and emits the bracket form.  ``register_vector`` is load-bearing for BOTH
+        reads (loader) and writes (the Vector dumper).
 
         Once-per-connection registration
         ---------------------------------
@@ -344,6 +484,53 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
                 pass
         return conn
 
+    # ── HNSW index guard ────────────────────────────────────────────
+
+    def _maybe_create_hnsw_index(self, conn: Any, dimensions: int) -> None:
+        """Create the HNSW index only when the column width is within pgvector's limit.
+
+        pgvector's HNSW index supports at most ``_HNSW_MAX_DIMENSIONS`` (2,000)
+        dimensions on the ``vector`` type.  A supported model such as
+        ``text-embedding-3-large`` (3072 dims) exceeds that, and an
+        unconditional ``CREATE INDEX ... USING hnsw`` would raise server-side
+        ("column cannot have more than 2000 dimensions for hnsw index"), failing
+        schema-init for a valid configuration.  Above the limit we SKIP the
+        index and log a clear WARNING — cosine ANN still works via sequential
+        scan with the ``<=>`` operator (correct results, slower recall).
+
+        Guard on the EFFECTIVE (actual) column width, not just the caller's
+        declared ``dimensions``.  ``memory_note_embeddings`` is created once via
+        ``CREATE TABLE IF NOT EXISTS`` and keeps its original ``vector(N)``; a
+        later backend with a SMALLER declared dimension would otherwise pass the
+        ``dimensions <= limit`` check and run the index DDL against the existing
+        OVER-limit column, crashing.  Read the real width from the catalog
+        (search_path-aware via ``to_regclass``; pgvector stores N directly in
+        ``atttypmod``, no offset) and guard on ``max(declared, actual)``.  A
+        dimensionless ``vector`` column (atttypmod -1, un-indexable) also forces
+        a skip via the ``_UNKNOWN_DIMENSION`` sentinel.
+        """
+        actual = _actual_embedding_dimension(conn, "memory_note_embeddings")
+        # actual is None when the column does not yet exist (fresh DB) — guard on
+        # the declared width alone.  When the column exists with a KNOWN width we
+        # guard on max(declared, actual); when it exists with an UNKNOWN width
+        # (dimensionless ``vector`` column → atttypmod -1) actual is sentinel
+        # _UNKNOWN_DIMENSION (> limit) so we skip rather than attempt unsafe DDL.
+        effective = dimensions if actual is None else max(dimensions, actual)
+        if effective > _HNSW_MAX_DIMENSIONS:
+            _logger.warning(
+                "PgvectorMemoryBackend: embedding column width=%s exceeds "
+                "pgvector's HNSW index limit of %d (or is unknown/dimensionless); "
+                "skipping the HNSW index on memory_note_embeddings.  ANN cosine "
+                "search still works via sequential scan (correct results, slower "
+                "recall on large corpora).  Use a fixed-dimension vector column "
+                "with dimensions <= %d to enable HNSW indexing.",
+                "unknown" if actual == _UNKNOWN_DIMENSION else effective,
+                _HNSW_MAX_DIMENSIONS,
+                _HNSW_MAX_DIMENSIONS,
+            )
+            return
+        conn.execute(_CREATE_EMBEDDINGS_HNSW_INDEX)
+
     # ── Schema versioning override ──────────────────────────────────
 
     def _ensure_schema(self, conn: Any) -> None:
@@ -368,6 +555,9 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
         * CREATE TABLE IF NOT EXISTS memory_note_embeddings (...)
         * ADD FOREIGN KEY constraint (idempotent DO $$ ... $$)
         * CREATE INDEX IF NOT EXISTS ... USING hnsw (embedding vector_cosine_ops)
+          — ONLY when dimensions <= 2000 (pgvector's HNSW limit); above that the
+          index is skipped and ANN falls back to sequential scan (see
+          _maybe_create_hnsw_index)
         * UPDATE memory_meta SET schema_version = '3'
 
         FAIL-HARD on missing extension (ruling C2): the extension check below
@@ -424,8 +614,9 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
                 # Add FK constraint (idempotent DO block).
                 conn.execute(_ADD_EMBEDDINGS_FK)
 
-                # HNSW index — created WITH the column (ruling rejects deferred).
-                conn.execute(_CREATE_EMBEDDINGS_HNSW_INDEX)
+                # HNSW index — created WITH the column (ruling rejects deferred),
+                # guarded on pgvector's 2000-dim HNSW limit.
+                self._maybe_create_hnsw_index(conn, dimensions)
 
                 # Bump schema version.
                 conn.execute(
@@ -454,7 +645,7 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
                     )
                     conn.execute(_CREATE_EMBEDDINGS_TABLE.format(dimensions=dimensions))
                     conn.execute(_ADD_EMBEDDINGS_FK)
-                    conn.execute(_CREATE_EMBEDDINGS_HNSW_INDEX)
+                    self._maybe_create_hnsw_index(conn, dimensions)
                     conn.execute(
                         "UPDATE memory_meta SET value = %s WHERE key = %s",
                         ("3", "schema_version"),
@@ -611,9 +802,13 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
         if backend is None:
             return
 
+        # input_type="search_document": this is the WRITE/index path — the body
+        # is a stored document.  A query/document-aware provider embeds it in
+        # document mode; OpenAI ignores it (supports_input_type=False).  Pairs
+        # with the "search_query" hint at the search() query-embed site.
         vector = None
         try:
-            vector = backend.embed(body)
+            vector = backend.embed(body, input_type="search_document")
         except Exception:  # noqa: BLE001
             # embed() MUST-NOT-RAISE but we defend anyway — a subclassed stub
             # might violate the invariant in tests.
@@ -654,10 +849,19 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
             )
             return
 
+        # Wrap in pgvector.Vector so the registered dumper emits the bracket
+        # form ``[...]`` the vector type accepts (a bare list would adapt to a
+        # curly-brace array literal ``{...}`` that vector_in rejects — see
+        # _get_conn's "Write path" note).  Constructed INSIDE _do so a malformed
+        # vector (Vector() coerces via numpy and may raise on non-numeric content)
+        # is caught by the best-effort except below — a side-table failure must
+        # never break the already-committed canonical note write.
+        from pgvector import Vector  # noqa: PLC0415
+
         def _do(conn: Any) -> None:
             conn.execute(
                 _UPSERT_EMBEDDING_SQL,
-                (note_name, model_id, dimensions, vector),
+                (note_name, model_id, dimensions, Vector(vector)),
             )
             conn.commit()
 
@@ -713,9 +917,14 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
             return []
 
         # Embed the query text (MUST-NOT-RAISE — None on any failure).
+        # Pass input_type="search_query": the write path embeds documents, so a
+        # query/document-aware provider (supports_input_type=True) embeds this
+        # correctly as a QUERY.  OpenAI ignores the hint (supports_input_type=
+        # False), so this is a no-op today and forward-correct for the moment a
+        # query-aware backend is registered without re-touching this call site.
         vector = None
         try:
-            vector = self._embedding_backend.embed(query)
+            vector = self._embedding_backend.embed(query, input_type="search_query")
         except Exception:  # noqa: BLE001
             pass
 
@@ -730,11 +939,19 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
         model_id = self._embedding_backend.model_id
         dimensions = self._embedding_backend.dimensions
 
+        # Wrap in pgvector.Vector for the ANN ORDER BY bind — same reason as the
+        # write path (the registered dumper emits the bracket form vector_in
+        # accepts; a bare list adapts to a rejected curly-brace literal).
+        # Constructed INSIDE _do so a malformed query vector (Vector() coerces via
+        # numpy and may raise on non-numeric content) is treated as a query
+        # failure → None sentinel → FTS fallback, not an uncaught crash.
+        from pgvector import Vector  # noqa: PLC0415
+
         def _do(conn: Any) -> list[NoteRef]:
             try:
                 cur = conn.execute(
                     _ANN_SEARCH_SQL,
-                    (model_id, dimensions, vector, limit),
+                    (model_id, dimensions, Vector(vector), limit),
                 )
                 rows = cur.fetchall()
                 conn.commit()

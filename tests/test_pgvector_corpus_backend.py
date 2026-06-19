@@ -121,6 +121,40 @@ def test_pgvector_corpus_no_url_no_semantic_search(tmp_path):
     assert caps.supports_versioning is True
 
 
+def test_pgvector_corpus_agent_scope_distinguishes_same_basename_roots(tmp_path):
+    """Same-basename agent roots under different parents get DISTINCT agent_scopes.
+
+    The shared ``corpus_page_embeddings`` table is keyed UNIQUE(agent_scope,
+    corpus, page_name).  If ``_agent_scope`` were the directory BASENAME, two
+    agents rooted at .../team-a/researcher and .../team-b/researcher would
+    collide — one's UPSERT overwrites the other's vector, and query() cross-reads
+    rows across tenants (silent multi-tenant data mixing in the shared-DB fleet
+    deployment this table exists to support).  ``_agent_scope`` uses the resolved
+    absolute path, so distinct roots get distinct scopes.
+
+    Negative control (project lesson #3 / Principle 11): reverting line 161 to
+    ``Path(agent_root).name`` makes both scopes "researcher" and this assertion
+    goes RED.  DB-free: no pgvector_url configured.
+    """
+    from atomic_agents.corpus.pgvector import PgvectorCorpusBackend
+
+    root_a = tmp_path / "team-a" / "researcher"
+    root_b = tmp_path / "team-b" / "researcher"
+    root_a.mkdir(parents=True)
+    root_b.mkdir(parents=True)
+
+    b_a = PgvectorCorpusBackend(root_a, embedding_backend=None, pgvector_url=None)
+    b_b = PgvectorCorpusBackend(root_b, embedding_backend=None, pgvector_url=None)
+
+    assert b_a._agent_scope != b_b._agent_scope, (
+        "same-basename agent roots collided on agent_scope — multi-tenant leak; "
+        "_agent_scope must be the resolved absolute path, not the basename"
+    )
+    # Both end in the same basename — proof the distinction is the parent path.
+    assert b_a._agent_scope.endswith("researcher")
+    assert b_b._agent_scope.endswith("researcher")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # query() Protocol-signature conformance + graceful fallback
 
@@ -194,6 +228,47 @@ def test_get_default_corpus_backend_dispatches_pgvector(tmp_path):
         backend = get_default_corpus_backend(tmp_path)
     assert isinstance(backend, PgvectorCorpusBackend)
     assert backend.backend_id == "pgvector-corpus"
+
+
+def test_pgvector_corpus_is_a_known_lazy_id_before_registration(tmp_path):
+    """'pgvector-corpus' is surfaced as a known id even before the extra registers.
+
+    Mirrors the memory registry's _LAZY_BACKEND_IDS contract: an operator who
+    typos the id (or whose [pgvector] extra has not been touched yet) should see
+    'pgvector-corpus' in the "Available:" suggestion list, not a list missing the
+    real id.  The CorpusBackendNotRegistered message for an unknown id must
+    include it.
+
+    Negative control: dropping _LAZY_BACKEND_IDS from the unknown-id error's
+    known-set union removes 'pgvector-corpus' from the message and this flips red.
+    """
+    from atomic_agents.corpus import (
+        _LAZY_BACKEND_IDS,
+        unregister_corpus_backend,
+    )
+    from atomic_agents.corpus import get_default_corpus_backend
+    from atomic_agents.exceptions import CorpusBackendNotRegistered
+
+    assert "pgvector-corpus" in _LAZY_BACKEND_IDS
+
+    # Ensure the lazy id is NOT in the live registry for this assertion (a prior
+    # test in the session may have registered it on first dispatch).
+    unregister_corpus_backend("pgvector-corpus")
+    try:
+        env = {"ATOMIC_AGENTS_CORPUS_BACKEND": "totally-bogus-backend-id"}
+        with patch.dict(os.environ, env, clear=False):
+            with pytest.raises(CorpusBackendNotRegistered) as excinfo:
+                get_default_corpus_backend(tmp_path)
+        assert "pgvector-corpus" in str(excinfo.value), (
+            "unknown-backend error did not surface the lazy 'pgvector-corpus' id"
+        )
+    finally:
+        # Re-register so we don't leave the registry in a state that depends on
+        # test ordering (the dispatch test above registers it on construct).
+        from atomic_agents.corpus import register_corpus_backend
+        from atomic_agents.corpus.pgvector import PgvectorCorpusBackend
+
+        register_corpus_backend("pgvector-corpus", PgvectorCorpusBackend)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -343,17 +418,27 @@ def test_pgvector_corpus_live_write_query_roundtrip(tmp_path):
     from atomic_agents.corpus.pgvector import PgvectorCorpusBackend
     from atomic_agents.memory.backend import WritePolicy
 
+    from atomic_agents.corpus.pgvector import (
+        _CREATE_CORPUS_EMBEDDINGS_HNSW_INDEX,
+        _CREATE_CORPUS_EMBEDDINGS_TABLE,
+    )
+
     stub = ContentDerivedStubEmbeddingBackend(dimensions=4)
     backend = PgvectorCorpusBackend(
         tmp_path, embedding_backend=stub, pgvector_url=_POSTGRES_URL
     )
-    # Isolate from prior runs for this agent_scope.
     conn = backend._get_pg_conn()
     assert conn is not None
-    conn.execute(
-        "DELETE FROM corpus_page_embeddings WHERE agent_scope = %s",
-        (backend._agent_scope,),
-    )
+    # ORDER-INDEPENDENCE (feedback_db_gated_tests_skip_locally): the embedding
+    # column is ``vector(N)`` fixed at first migration.  A future corpus live
+    # test that migrates at the default 1536 (or pytest-randomly/xdist reorder
+    # against a persistent DB) would create the column at 1536 and silently fail
+    # this test's dim-4 writes.  DROP + recreate at dim=4 so the column dimension
+    # is order-independent — same guard the memory fixture applies.  DROP CASCADE
+    # also clears any prior rows, so a separate DELETE is not needed.
+    conn.execute("DROP TABLE IF EXISTS corpus_page_embeddings CASCADE")
+    conn.execute(_CREATE_CORPUS_EMBEDDINGS_TABLE.format(dimensions=4))
+    conn.execute(_CREATE_CORPUS_EMBEDDINGS_HNSW_INDEX)
     conn.commit()
 
     policy = WritePolicy(write_paths=[tmp_path])
@@ -378,4 +463,66 @@ def test_pgvector_corpus_live_write_query_roundtrip(tmp_path):
     results = backend.query("avalanche debt method", "wiki", top_k=5)
     names = {r.name for r in results}
     assert "avalanche" in names, "ANN query did not return the written page"
+    backend.close()
+
+
+@requires_postgres
+def test_pgvector_corpus_schema_init_succeeds_above_hnsw_dimension_limit(tmp_path):
+    """A >2000-dim embedding backend must NOT crash corpus schema-init.
+
+    pgvector's HNSW index supports at most 2000 dims; ``text-embedding-3-large``
+    (3072) is a supported model.  ``_ensure_pg_schema`` must create the
+    vector(3072) column and SKIP the HNSW index (ANN degrades to seq-scan)
+    rather than raising on ``CREATE INDEX ... USING hnsw``.
+
+    Negative control: remove the ``if dimensions > _HNSW_MAX_DIMENSIONS`` guard
+    in _maybe_create_hnsw_index and this test goes RED (schema-init raises).
+    """
+    from tests.stub_embedding import ContentDerivedStubEmbeddingBackend
+
+    from atomic_agents.corpus.pgvector import (
+        _HNSW_MAX_DIMENSIONS,
+        PgvectorCorpusBackend,
+    )
+
+    big_dim = _HNSW_MAX_DIMENSIONS + 1072  # 3072
+    stub = ContentDerivedStubEmbeddingBackend(dimensions=big_dim)
+    backend = PgvectorCorpusBackend(
+        tmp_path, embedding_backend=stub, pgvector_url=_POSTGRES_URL
+    )
+
+    # Drop the shared table so this test's schema-init sizes it at big_dim.
+    # _get_pg_conn() runs _ensure_pg_schema once; reset _schema_initialized so a
+    # second _get_pg_conn re-runs the DDL at big_dim after the DROP.
+    conn = backend._get_pg_conn()
+    assert conn is not None
+    conn.execute("DROP TABLE IF EXISTS corpus_page_embeddings CASCADE")
+    conn.commit()
+    backend._schema_initialized = False
+
+    # Re-run schema-init at big_dim: must NOT raise despite big_dim > 2000.
+    conn = backend._get_pg_conn()
+    assert conn is not None
+
+    cur = conn.execute(
+        "SELECT 1 FROM information_schema.tables "
+        "WHERE table_name = 'corpus_page_embeddings'"
+    )
+    assert cur.fetchone() is not None, "corpus embeddings table not created above limit"
+
+    cur = conn.execute(
+        "SELECT indexname FROM pg_indexes "
+        "WHERE tablename = 'corpus_page_embeddings' "
+        "  AND indexname LIKE '%hnsw%'"
+    )
+    assert cur.fetchone() is None, (
+        "HNSW index was created on a >2000-dim corpus vector column — guard "
+        "did not skip it"
+    )
+    conn.commit()
+
+    # Cleanup: drop the over-sized table so other corpus live tests recreate at
+    # their own (smaller) dimension.
+    conn.execute("DROP TABLE IF EXISTS corpus_page_embeddings CASCADE")
+    conn.commit()
     backend.close()

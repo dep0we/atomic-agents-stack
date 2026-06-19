@@ -34,10 +34,16 @@ if TYPE_CHECKING:
 class MemoryCapabilities:
     """Capability advertisement for semantic-search-capable MemoryBackend impls.
 
-    spec/20 PR-3 addendum: introduced alongside ``PgvectorMemoryBackend`` to
-    give doctor and audit tooling a single inspection pattern for the embedding
-    backend, mirroring ``CorpusCapabilities.embedding_backend_resolved`` from
-    spec/34.
+    Introduced alongside ``PgvectorMemoryBackend`` as the forward-facing dataclass
+    for the embedding backend, mirroring
+    ``CorpusCapabilities.embedding_backend_resolved`` from spec/34.  Doctor / audit
+    wiring that consumes it is deferred (no caller reads this field yet; the
+    spec/20 PR-3 normative addendum is authored at the LOCK ceremony to match the
+    shipped shape).  ``PgvectorMemoryBackend.capabilities()`` is the ONLY memory
+    backend that returns this dataclass today; ``FilesystemBackend`` and
+    ``PostgresMemoryBackend`` expose no ``capabilities`` surface at all (only the
+    ``supports_semantic_search`` boolean property), so callers cannot yet inspect
+    capabilities uniformly across all memory backends.
 
     Fields
     ------
@@ -58,8 +64,10 @@ class MemoryCapabilities:
     ``capabilities().embedding_provider is not None`` so callers using the
     existing boolean property continue to work without modification.
     ``FilesystemBackend`` and ``PostgresMemoryBackend`` are NOT required to
-    implement ``capabilities()`` in this PR — they retain the ``@property``
-    idiom for backward compatibility.
+    implement ``capabilities()`` in this PR — they expose only the
+    ``supports_semantic_search`` boolean property (both return ``False``), which
+    stays the backward-compatible way to ask "does this backend do semantic
+    recall?" without a ``capabilities()`` surface.
     """
 
     embedding_provider: str | None

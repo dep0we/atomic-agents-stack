@@ -540,6 +540,79 @@ def test_pgvector_live_hnsw_index_exists(pgv_backend):
 
 
 @requires_postgres
+def test_pgvector_live_schema_init_succeeds_above_hnsw_dimension_limit(tmp_path):
+    """A >2000-dim embedding backend (e.g. text-embedding-3-large at 3072) must
+    NOT crash schema-init: the vector(N) column is created, the HNSW index is
+    SKIPPED (pgvector's 2000-dim HNSW limit), and ANN falls back to seq-scan.
+
+    Without the _maybe_create_hnsw_index guard, ``CREATE INDEX ... USING hnsw``
+    on a vector(3072) column raises server-side ("column cannot have more than
+    2000 dimensions for hnsw index"), rolling back and re-raising — the ENTIRE
+    backend fails to initialize for a valid, documented model.
+
+    Negative control: remove the ``if dimensions > _HNSW_MAX_DIMENSIONS`` guard
+    in _maybe_create_hnsw_index and this test goes RED (schema-init raises).
+    """
+    from atomic_agents.memory.pgvector import (
+        _HNSW_MAX_DIMENSIONS,
+        PgvectorMemoryBackend,
+    )
+
+    big_dim = _HNSW_MAX_DIMENSIONS + 1072  # 3072 — text-embedding-3-large size
+    stub = _make_stub_embedding(dimensions=big_dim)
+
+    # Drop the shared embeddings table so this test's migration sizes the column
+    # at big_dim (the shared table is otherwise pinned at another test's dim).
+    bootstrap = PgvectorMemoryBackend(
+        tmp_path, url=_POSTGRES_URL, embedding_backend=stub
+    )
+    conn = bootstrap._get_conn()
+    assert conn is not None
+    conn.execute("DROP TABLE IF EXISTS memory_note_embeddings CASCADE")
+    # Roll the meta back so _ensure_schema re-runs the v2→v3 arm at big_dim.
+    conn.execute("UPDATE memory_meta SET value = '2' WHERE key = 'schema_version'")
+    conn.commit()
+    bootstrap.close()
+
+    # Re-construct: schema-init must NOT raise even though big_dim > 2000.
+    backend = PgvectorMemoryBackend(tmp_path, url=_POSTGRES_URL, embedding_backend=stub)
+    conn = backend._get_conn()  # triggers _ensure_schema; must not raise
+    assert conn is not None
+
+    # The side table exists at vector(big_dim).
+    cur = conn.execute(
+        "SELECT 1 FROM information_schema.tables "
+        "WHERE table_name = 'memory_note_embeddings'"
+    )
+    assert cur.fetchone() is not None, "embeddings table not created above HNSW limit"
+
+    # The HNSW index must be ABSENT (skipped for the over-limit dimension).
+    cur = conn.execute(
+        "SELECT indexname FROM pg_indexes "
+        "WHERE tablename = 'memory_note_embeddings' "
+        "  AND indexname LIKE '%hnsw%'"
+    )
+    assert cur.fetchone() is None, (
+        "HNSW index was created on a >2000-dim vector column — "
+        "_maybe_create_hnsw_index guard did not skip it"
+    )
+
+    # schema_version reached 3 despite the skipped index.
+    cur = conn.execute("SELECT value FROM memory_meta WHERE key = 'schema_version'")
+    assert int(cur.fetchone()["value"]) == 3
+    conn.commit()
+
+    # Cleanup: restore the shared table to a small dimension so order-independent
+    # fixtures that DROP+recreate at dim 4 are unaffected (pgv_backend already
+    # drops/recreates, but leave the DB tidy).
+    conn = backend._get_conn()
+    conn.execute("DROP TABLE IF EXISTS memory_note_embeddings CASCADE")
+    conn.execute("UPDATE memory_meta SET value = '2' WHERE key = 'schema_version'")
+    conn.commit()
+    backend.close()
+
+
+@requires_postgres
 def test_pgvector_live_write_note_stores_embedding(pgv_backend):
     """write_note() upserts an embedding row into memory_note_embeddings.
 
@@ -771,7 +844,12 @@ def test_pgvector_live_search_model_filter(pgv_backend):
     conn.commit()
 
     # Now insert an embedding row with a DIFFERENT model_id for this note.
-    stale_vector = [0.9] * pgv_backend._embedding_backend.dimensions
+    # Bind via pgvector.Vector (NOT a bare list) — register_vector only dumps
+    # Vector/ndarray, so a bare list would adapt to a curly-brace literal the
+    # vector type rejects (the same write-path contract the backend honors).
+    from pgvector import Vector
+
+    stale_vector = Vector([0.9] * pgv_backend._embedding_backend.dimensions)
     conn.execute(
         """
         INSERT INTO memory_note_embeddings
@@ -794,6 +872,68 @@ def test_pgvector_live_search_model_filter(pgv_backend):
     assert "Stale model note" not in returned_names, (
         "ANN model filter failed: stale row from different model_id was returned"
     )
+
+
+@requires_postgres
+def test_pgvector_live_search_empty_ann_is_authoritative_no_fts_fallback(pgv_backend):
+    """An ANN query that SUCCEEDS with zero rows is authoritative — NO FTS fallback.
+
+    Distinguishes the two empty cases (lesson #7, empty-is-authoritative):
+      * ANN query FAILED (exception / connection)  → None sentinel → FTS fallback.
+      * ANN query SUCCEEDED with zero matches       → [] → authoritative empty.
+
+    Setup: write a note via the canonical FTS path WITHOUT any embedding (so the
+    note is FTS-findable but absent from memory_note_embeddings), then run search
+    with a working embedding backend.  The ANN join finds zero rows; search() must
+    return [] and must NOT silently surface the FTS-only note.
+
+    Negative control: changing the search() guard from ``if result is None`` to
+    ``if not result`` (treating empty as failure) makes search() fall through to
+    FTS, the FTS-only note appears, and this assertion flips red.
+    """
+    from atomic_agents._schema import derive_filename
+    from atomic_agents.memory.backend import WritePolicy
+    from atomic_agents.types import Capture
+    from tests.stub_embedding import ContentDerivedStubEmbeddingBackend
+
+    # Write a note via the parent FTS path (no embedding upsert): temporarily
+    # detach the embedding backend so write_note skips _upsert_embedding, leaving
+    # the note FTS-findable but absent from memory_note_embeddings.
+    saved_backend = pgv_backend._embedding_backend
+    pgv_backend._embedding_backend = None
+    capture = Capture(
+        type="preference",
+        name="FTS only avalanche note",
+        description="findable via FTS, no embedding row",
+        confidence="high",
+        sources=["test"],
+        body="The avalanche method targets the highest-interest debt first.",
+    )
+    pgv_backend.write_note(capture, WritePolicy(write_paths=[pgv_backend._agent_root]))
+    fts_only_name = derive_filename(capture.type, capture.name)
+
+    # Confirm the FTS path WOULD surface this note (guards against a vacuous test:
+    # if FTS itself returned nothing, the no-fallback assertion would pass for the
+    # wrong reason).
+    fts_hits = pgv_backend.search("avalanche", limit=10)
+    assert any(r.name == fts_only_name for r in fts_hits), (
+        "precondition failed: FTS does not find the note, so the no-fallback "
+        "assertion below would be vacuous"
+    )
+
+    # Re-attach a working embedding backend.  The query embeds fine, but the ANN
+    # join against memory_note_embeddings finds ZERO rows (the note has no
+    # embedding).  Empty-authoritative: search() returns [] and must NOT fall back
+    # to FTS (which would surface fts_only_name).
+    pgv_backend._embedding_backend = ContentDerivedStubEmbeddingBackend(dimensions=4)
+    results = pgv_backend.search("avalanche", limit=10)
+    returned_names = [r.name for r in results]
+    assert fts_only_name not in returned_names, (
+        "empty ANN result was not authoritative: search() fell back to FTS and "
+        "surfaced an embedding-less note"
+    )
+
+    pgv_backend._embedding_backend = saved_backend
 
 
 @requires_postgres

@@ -62,6 +62,17 @@ def _provider_classifier_is_pristine():
         "leaked _raise_if_provider_unavailable monkeypatch from a prior test "
         f"(got {fn!r})"
     )
+    # Also assert _get_key is the module-defined resolver — a sibling test that
+    # leaks a tracking/counter wrapper for _get_key would otherwise poison the
+    # empty-api-key negative control below with a stale call count (the once-seen
+    # intermittent failure of test_openai_explicit_empty_api_key_does_not_call_
+    # get_key).  Convert that latent flake into a deterministic, attributable
+    # setup failure.
+    gk = _openai_mod._get_key
+    assert getattr(gk, "__name__", None) == "_get_key", (
+        "leaked _get_key monkeypatch from a prior test "
+        f"(got {gk!r}) — registry/credential isolation regression"
+    )
     yield
 
 
@@ -185,6 +196,46 @@ def test_openai_backend_construction_requires_openai_sdk():
     with patch.dict(sys.modules, {"openai": None}):
         with pytest.raises(AtomicAgentsError):
             OpenAIEmbeddingBackend(api_key="sk-fake")
+
+
+def test_openai_explicit_empty_api_key_does_not_call_get_key(monkeypatch):
+    """An explicit ``api_key=''`` is honored literally; ``_get_key()`` is NOT called.
+
+    SecretBackend coherence: ``__init__`` uses ``api_key if api_key is not None
+    else _get_key()`` rather than the falsy ``api_key or _get_key()``.  The
+    empty string is truthy-false, so the ``or`` form would silently fall through
+    to SecretBackend resolution — masking a caller who deliberately passed ''.
+
+    Negative control (project lesson #3): this test goes RED if line 277 is
+    reverted to ``api_key or _get_key()`` — the ``or`` form WOULD invoke
+    _get_key(), tripping the assertion.
+    """
+    import atomic_agents.embedding.openai as openai_mod
+
+    # The negative control raises IMMEDIATELY on any invocation rather than
+    # incrementing a shared counter.  A counter keyed on a test-local dict can
+    # be poisoned by a leaked binding from a sibling test (the once-seen
+    # intermittent failure); a fail-fast sentinel cannot — if _get_key runs at
+    # all the failure is attributed to THIS construction.  Negative control
+    # (project lesson #3): if openai.py line 277 regresses to
+    # ``api_key or _get_key()``, the empty-string api_key falls through, this
+    # raises, and the test goes RED.
+    def _must_not_be_called():
+        raise AssertionError(
+            "_get_key() was called despite an explicit empty-string api_key; the "
+            "falsy `or` short-circuit regressed (should be `is not None`)"
+        )
+
+    monkeypatch.setattr(openai_mod, "_get_key", _must_not_be_called)
+
+    fake_openai = _make_mock_openai_module()
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+
+    backend = OpenAIEmbeddingBackend(api_key="", dimensions=4)
+
+    assert backend._api_key == "", (
+        "explicit empty-string api_key was not honored literally"
+    )
 
 
 def test_stub_backend_constructs_with_no_side_effects():

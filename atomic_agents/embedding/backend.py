@@ -9,8 +9,8 @@ GoalBackend (#425), OutcomeBackend (#426), JournalBackend (#427),
 QueueBackend (#428), and IdempotencyBackend (#520).
 
 ``EmbeddingBackend`` abstracts the embedding provider behind a Protocol so
-both ``PgvectorMemoryBackend`` (#258 PR 2) and ``PgvectorCorpusBackend``
-(#258 PR 3) can share a single, injected embedding backend without duplicating
+both ``PgvectorMemoryBackend`` and ``PgvectorCorpusBackend`` (#200 PR 3) can
+share a single, injected embedding backend without duplicating
 provider logic. The standalone use case -- constructing any vector-capable
 backend -- is the primary justification identified when ``EmbeddingBackend``
 was reconsidered at issue #200 after spec/34 scope analysis.
@@ -55,9 +55,9 @@ class EmbeddingCapabilities:
     ``max_input_tokens``: maximum tokens the provider accepts per text
         input. A text exceeding this limit causes the provider to reject the
         call (a 4xx); ``embed()`` converts that rejection to ``None`` rather
-        than raising, per the MUST-NOT-RAISE invariant. (PR2 does not pre-flight
-        token length client-side; the explicit over-limit conformance test is
-        deferred to PR3 -- see spec/46 MUST 4 failure table.)
+        than raising, per the MUST-NOT-RAISE invariant. (The backend does not
+        pre-flight token length client-side; a dedicated over-limit conformance
+        test is not yet in the suite -- see spec/46 MUST 4 failure table.)
 
     ``supports_input_type``: True when the underlying provider supports
         distinguishing query-embedding from document-embedding mode (OpenAI
@@ -71,8 +71,8 @@ class EmbeddingCapabilities:
         not honoured).
 
         **OpenAI note (Principle #12 verification, 2026-06-18):** the installed
-        OpenAI SDK (openai>=1.30) ``embeddings.create()`` signature does NOT
-        include ``input_type`` as a native parameter (verified against
+        OpenAI SDK (verified against openai 2.35.1) ``embeddings.create()``
+        signature does NOT include ``input_type`` as a native parameter (against
         ``.venv/lib/python3.12/site-packages/openai/resources/embeddings.py``).
         ``OpenAIEmbeddingBackend`` therefore advertises ``supports_input_type=False``
         and accepts the kwarg but does not forward it to the API.
@@ -149,10 +149,12 @@ class EmbeddingBackend(Protocol):
         """Stable provider identifier, e.g. ``"openai"``, ``"local"``.
 
         Distinct from ``model_id`` -- the same provider (``"openai"``) may
-        serve multiple models. Used for registry lookup (PR3). The existing
+        serve multiple models. Used for registry lookup
+        (``atomic_agents/embedding/registry.py``). The existing
         ``embedding_provider`` display label on ``CorpusCapabilities``
-        (spec/34) carries a string family identifier; reconciling it with
-        this typed ``provider_id`` is deferred to PR3 (see spec/46).
+        (spec/34) carries a string family identifier; the typed
+        ``embedding_backend_resolved`` sibling field carries this instance, and
+        its ``provider_id`` MUST stay consistent with that string label.
         """
         ...
 

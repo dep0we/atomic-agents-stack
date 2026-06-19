@@ -107,6 +107,13 @@ __all__ = [
 # ``"filesystem"`` -> ``FilesystemCorpusBackend``.
 _registry: dict[str, type] = {}
 
+# Lazy-resolved backend ids (require the [pgvector] extra; not registered at
+# module load).  Listed here so the CorpusBackendNotRegistered "Available:"
+# message and doctor introspection surface them as known ids before the extra
+# is installed — mirrors ``_LAZY_BACKEND_IDS`` in ``atomic_agents.memory``.
+# Actual registration happens in get_default_corpus_backend() on first use.
+_LAZY_BACKEND_IDS: frozenset[str] = frozenset({"pgvector-corpus"})
+
 
 def register_corpus_backend(backend_id: str, cls: type) -> None:
     """Register a CorpusBackend implementation under ``backend_id``.
@@ -148,9 +155,9 @@ def get_corpus_backend(backend_id: str) -> type:
     ``SQLiteCorpusBackend``).
     """
     if backend_id not in _registry:
+        known = sorted(set(_registry.keys()) | _LAZY_BACKEND_IDS)
         raise CorpusBackendNotRegistered(
-            f"No CorpusBackend registered under {backend_id!r}. "
-            f"Available: {sorted(_registry.keys())}"
+            f"No CorpusBackend registered under {backend_id!r}. Available: {known}"
         )
     return _registry[backend_id]
 
@@ -293,12 +300,13 @@ def get_default_corpus_backend(agent_root: Path) -> CorpusBackend:
     if raw_backend_id == "pgvector-corpus":
         from .pgvector import PgvectorCorpusBackend  # noqa: PLC0415
 
-        pgvector_url = os.environ.get("ATOMIC_AGENTS_PGVECTOR_URL", "").strip() or None
-        backend = PgvectorCorpusBackend(agent_root, pgvector_url=pgvector_url)
-        # Register so get_corpus_backend("pgvector-corpus") works after first use.
+        # Register BEFORE constructing so list_corpus_backends() reports the id
+        # as known even if construction then fails — symmetric with the memory
+        # dispatcher's register-then-construct order (get_default_memory_backend).
         if "pgvector-corpus" not in _registry:
             register_corpus_backend("pgvector-corpus", PgvectorCorpusBackend)
-        return backend
+        pgvector_url = os.environ.get("ATOMIC_AGENTS_PGVECTOR_URL", "").strip() or None
+        return PgvectorCorpusBackend(agent_root, pgvector_url=pgvector_url)
 
     # Unknown backend_id -- surface a fail-fast error with the FULL
     # known-id list so operators can spot the typo. Credential safety:
@@ -311,9 +319,10 @@ def get_default_corpus_backend(agent_root: Path) -> CorpusBackend:
     # Same shape applies in ``logs/__init__.py`` and
     # ``profile/__init__.py`` (already fixed in their respective arcs).
     safe_backend_id = _redact_for_error_message(raw_backend_id)
+    known = sorted(set(list_corpus_backends()) | _LAZY_BACKEND_IDS)
     raise CorpusBackendNotRegistered(
         f"ATOMIC_AGENTS_CORPUS_BACKEND={safe_backend_id!r} is not a known "
-        f"backend. Available: {list_corpus_backends()}. Unset the env var "
+        f"backend. Available: {known}. Unset the env var "
         f"to use the filesystem default."
     )
 

@@ -219,6 +219,7 @@ __all__ = [
     "get_default_memory_backend",
     # Protocol + dataclasses
     "MemoryBackend",
+    "MemoryCapabilities",
     "Note",
     "NoteRef",
     "VersionRef",
@@ -239,6 +240,7 @@ def __getattr__(name: str):
     """Lazy attribute resolution for public types and exceptions."""
     _protocol_types = {
         "MemoryBackend",
+        "MemoryCapabilities",
         "Note",
         "NoteRef",
         "VersionRef",
@@ -256,6 +258,7 @@ def __getattr__(name: str):
     if name in _protocol_types:
         from .backend import (
             MemoryBackend,
+            MemoryCapabilities,
             Note,
             NoteRef,
             VersionRef,
@@ -266,6 +269,7 @@ def __getattr__(name: str):
 
         _locals = {
             "MemoryBackend": MemoryBackend,
+            "MemoryCapabilities": MemoryCapabilities,
             "Note": Note,
             "NoteRef": NoteRef,
             "VersionRef": VersionRef,

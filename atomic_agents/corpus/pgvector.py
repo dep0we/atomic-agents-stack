@@ -65,6 +65,15 @@ CREATE TABLE IF NOT EXISTS corpus_page_embeddings (
 )
 """
 
+# pgvector's HNSW index supports at most 2,000 dimensions on the ``vector``
+# type (verified against pgvector's authoritative docs, Principle #12).
+# ``text-embedding-3-large`` (3072 dims) is a supported model, so an
+# unconditional ``CREATE INDEX ... USING hnsw`` would raise server-side and
+# fail schema-init for a valid config.  Above the limit the index is skipped;
+# cosine ANN still works via sequential scan with the ``<=>`` operator
+# (correct results, slower recall).  See _maybe_create_hnsw_index.
+_HNSW_MAX_DIMENSIONS = 2000
+
 _CREATE_CORPUS_EMBEDDINGS_HNSW_INDEX = """
 CREATE INDEX IF NOT EXISTS idx_corpus_page_embeddings_hnsw
     ON corpus_page_embeddings
@@ -108,7 +117,7 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
 
     Inherits: page read/write, versioning, atomic writes, name validation.
     Adds: ANN ``query()`` against a Postgres embedding index when an embedding
-    backend and Postgres URL are configured; graceful FTS/substring fallback
+    backend and Postgres URL are configured; graceful substring fallback
     when not.
 
     ``capabilities.supports_semantic_search`` returns ``True`` only when both
@@ -140,7 +149,16 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
         import os
 
         super().__init__(agent_root)
-        self._agent_scope = Path(agent_root).name
+        # agent_scope partitions rows in the SHARED corpus_page_embeddings table
+        # (UNIQUE(agent_scope, corpus, page_name)).  It MUST be unique per agent
+        # root, NOT the directory basename: two agents rooted at
+        # /agents/team-a/researcher and /agents/team-b/researcher share the
+        # basename "researcher" and would collide on UPSERT (one overwrites the
+        # other's vector) and cross-read each other's rows in query() — silent
+        # multi-tenant data mixing in exactly the fleet/shared-DB deployment this
+        # table exists to support.  Use the resolved absolute path so distinct
+        # agent roots get distinct scopes.  (agent_scope is TEXT, no length cap.)
+        self._agent_scope = str(Path(agent_root).resolve())
 
         # Resolve embedding backend
         if embedding_backend is not None:
@@ -174,7 +192,7 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
         """Return a Postgres connection, lazy-creating on first call.
 
         Returns None (not raising) when no URL is configured — callers
-        treat None as "pgvector not available, use FTS fallback".
+        treat None as "pgvector not available, use substring fallback".
         """
         if self._pgvector_url is None:
             return None
@@ -201,7 +219,7 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
             return None
 
         # Phase 1 — establish the connection + register the type adapter.
-        # ONLY genuine connection / adapter-import failures degrade to FTS here.
+        # ONLY genuine connection / adapter-import failures degrade to substring here.
         # The C2 missing-extension RuntimeError is raised in phase 2 (schema)
         # and MUST propagate — it is NOT a connection error and must not be
         # swallowed (matches the sibling PgvectorMemoryBackend, whose
@@ -219,11 +237,14 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
                 autocommit=False,
                 row_factory=psycopg.rows.dict_row,
             )
-            # Register the pgvector psycopg type adapter on this connection so
-            # a Python ``list[float]`` bound to ``%s::vector`` is sent in the
-            # bracket text form the ``vector`` type accepts (a bare list would
-            # otherwise adapt to a Postgres array literal ``{...}`` and the cast
-            # would fail).  register_vector is per-connection.
+            # Register the pgvector psycopg type adapter on this connection.
+            # register_vector installs the LOADER (read path) and the DUMPER for
+            # ``pgvector.Vector`` / ``numpy.ndarray`` (write path) — it does NOT
+            # register a dumper for plain ``list``.  So every ``%s::vector`` bind
+            # in this module wraps the value in ``pgvector.Vector(...)``; the
+            # registered dumper then emits the bracket form ``[...]`` the vector
+            # type accepts.  A bare list would adapt to a curly-brace array literal
+            # ``{...}`` that pgvector's vector_in parser rejects.  Per-connection.
             try:
                 from pgvector.psycopg import register_vector  # noqa: PLC0415
 
@@ -251,7 +272,7 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
 
         # Phase 2 — schema init.  A C2 missing-extension RuntimeError raised by
         # _ensure_pg_schema FAILS HARD (close the conn, then re-raise) — it is
-        # NOT degraded to FTS.  Only the connection itself going broken mid-DDL
+        # NOT degraded to substring.  Only the connection itself going broken mid-DDL
         # (a real connection error) degrades.
         if not self._schema_initialized:
             try:
@@ -290,8 +311,58 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
         )
         conn.execute(_CREATE_CORPUS_META_TABLE)
         conn.execute(_CREATE_CORPUS_EMBEDDINGS_TABLE.format(dimensions=dimensions))
-        conn.execute(_CREATE_CORPUS_EMBEDDINGS_HNSW_INDEX)
+        self._maybe_create_hnsw_index(conn, dimensions)
         conn.commit()
+
+    def _maybe_create_hnsw_index(self, conn: Any, dimensions: int) -> None:
+        """Create the HNSW index only when the column width is within pgvector's limit.
+
+        pgvector's HNSW index supports at most ``_HNSW_MAX_DIMENSIONS`` (2,000)
+        dimensions.  ``text-embedding-3-large`` (3072 dims) exceeds that, and an
+        unconditional ``CREATE INDEX ... USING hnsw`` would raise server-side
+        ("column cannot have more than 2000 dimensions for hnsw index"), failing
+        schema-init for a valid config.  Above the limit we SKIP the index and
+        log a WARNING — cosine ANN still works via sequential scan with the
+        ``<=>`` operator (correct results, slower recall).
+
+        Guard on the EFFECTIVE (actual) column width, not the caller's declared
+        ``dimensions``.  On a shared DB the ``corpus_page_embeddings`` table is
+        created once via ``CREATE TABLE IF NOT EXISTS`` and keeps its original
+        ``vector(N)``; a later backend with a SMALLER declared dimension would
+        otherwise pass the ``dimensions <= limit`` check and run the index DDL
+        against the existing OVER-limit column, crashing.  We read the real
+        column width from the catalog (pgvector stores N directly in
+        ``atttypmod``, no offset — verified) and guard on ``max(declared,
+        actual)`` so the index is created only when BOTH are within the limit.
+        """
+        # Import the intentionally-shared public catalog helpers from the memory
+        # pgvector module (public names — NOT the leading-underscore originals —
+        # so this cross-package dependency is explicit and rename-safe).
+        from ..memory.pgvector import (  # noqa: PLC0415
+            UNKNOWN_DIMENSION,
+            actual_embedding_dimension,
+        )
+
+        actual = actual_embedding_dimension(conn, "corpus_page_embeddings")
+        # actual is None when the column does not exist yet (fresh DB) — guard on
+        # the declared width alone.  Known width → max(declared, actual).  Unknown
+        # width (dimensionless ``vector`` column, atttypmod -1) → UNKNOWN_DIMENSION
+        # (> limit) so we skip rather than attempt unsafe HNSW DDL.
+        effective = dimensions if actual is None else max(dimensions, actual)
+        if effective > _HNSW_MAX_DIMENSIONS:
+            _logger.warning(
+                "PgvectorCorpusBackend: embedding column width=%s exceeds "
+                "pgvector's HNSW index limit of %d (or is unknown/dimensionless); "
+                "skipping the HNSW index on corpus_page_embeddings.  ANN cosine "
+                "search still works via sequential scan (correct results, slower "
+                "recall).  Use a fixed-dimension vector column with dimensions "
+                "<= %d to enable HNSW indexing.",
+                "unknown" if actual == UNKNOWN_DIMENSION else effective,
+                _HNSW_MAX_DIMENSIONS,
+                _HNSW_MAX_DIMENSIONS,
+            )
+            return
+        conn.execute(_CREATE_CORPUS_EMBEDDINGS_HNSW_INDEX)
 
     # ── Capabilities ──────────────────────────────────────────────────────────
 
@@ -300,7 +371,7 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
         """Capability advertisement.
 
         ``supports_semantic_search=True`` when both an embedding backend AND
-        a Postgres URL are configured; ``False`` otherwise (FTS fallback).
+        a Postgres URL are configured; ``False`` otherwise (substring fallback).
         """
         has_semantic = (
             self._embedding_backend is not None and self._pgvector_url is not None
@@ -418,11 +489,23 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
         * No embedding backend configured.
         * No Postgres URL configured.
         * ``embed()`` returns None (provider unavailable).
-        * ANN query fails.
+        * ANN query raises.
+
+        It does NOT fall back when the ANN query SUCCEEDS with zero (or
+        partial) rows — a successful ANN result is authoritative
+        (empty-is-authoritative, feedback_empty_resolved_list_authoritative);
+        an empty ANN set returns ``[]`` rather than silently surfacing
+        substring-only pages.
 
         ANN model filter:
         Only rows matching the active backend's ``model_id`` and ``dimensions``
-        are returned.  Stale rows from a different model fall back to FTS.
+        are returned; stale rows from a since-replaced model are EXCLUDED from
+        the ANN join.  There is no per-query substring union, so a page whose
+        only embedding is stale-model is NOT recovered here — it remains
+        reachable via the substring code path (when no embedding backend/URL is
+        configured) but not via this semantic ``query()`` until re-indexed under
+        the active model (re-indexing happens on the page's next
+        ``write_page``).
         """
         if self._embedding_backend is None or self._pgvector_url is None:
             return super().query(text, corpus, top_k=top_k)
@@ -431,10 +514,13 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
         if conn is None:
             return super().query(text, corpus, top_k=top_k)
 
-        # Embed the query text
+        # Embed the query text.  input_type="search_query": index_page() embeds
+        # documents, so a query/document-aware provider (supports_input_type=
+        # True) embeds this correctly as a QUERY.  OpenAI ignores it
+        # (supports_input_type=False); forward-correct for a query-aware backend.
         vector = None
         try:
-            vector = self._embedding_backend.embed(text)
+            vector = self._embedding_backend.embed(text, input_type="search_query")
         except Exception:  # noqa: BLE001
             pass
 
@@ -444,6 +530,14 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
         model_id = self._embedding_backend.model_id
         dimensions = self._embedding_backend.dimensions
 
+        # Wrap in pgvector.Vector so the registered dumper emits the bracket form
+        # ``[...]`` the vector type accepts (a bare list adapts to a curly-brace
+        # literal ``{...}`` that vector_in rejects — see _get_pg_conn's note).
+        # Constructed INSIDE the try so a malformed query vector (Vector() coerces
+        # via numpy and may raise on non-numeric content) degrades to the
+        # substring fallback below rather than crashing query().
+        from pgvector import Vector  # noqa: PLC0415
+
         try:
             cur = conn.execute(
                 _ANN_CORPUS_SEARCH_SQL,
@@ -452,7 +546,7 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
                     corpus,
                     model_id,
                     dimensions,
-                    vector,
+                    Vector(vector),
                     top_k,
                 ),
             )
@@ -497,9 +591,18 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
     def index_page(self, corpus: str, page_name: str, body: str) -> None:
         """Embed and index a corpus page for ANN retrieval.
 
-        Called after a page write to update the embedding index.  If the
-        embedding backend or Postgres is unavailable, this is a no-op
-        (the page still exists on the filesystem; only ANN recall is affected).
+        Called after a page write to update the embedding index.  When no
+        embedding backend is configured, or no Postgres URL is configured, or
+        the connection cannot be established, this is a no-op (the page still
+        exists on the filesystem; only ANN recall is affected).
+
+        NOT swallowed here: a C2 missing-extension ``RuntimeError`` raised by
+        ``_get_pg_conn`` (the database is reachable but the ``vector`` extension
+        is absent) PROPAGATES — it is an operator-actionable misconfiguration,
+        not a transient outage.  The ``write_page`` caller wraps this method in
+        its own try/except so a durable page write is never masked by the
+        derived-index side-effect; a DIRECT caller of ``index_page`` sees the
+        ``RuntimeError``.
 
         Two-phase: embed() OUTSIDE any transaction, then UPSERT.
         """
@@ -513,9 +616,12 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
         if not body or not body.strip():
             return
 
+        # input_type="search_document": index path — body is a stored document.
+        # Query/document-aware providers embed in document mode; OpenAI ignores
+        # it.  Pairs with the "search_query" hint at the query() site.
         vector = None
         try:
-            vector = self._embedding_backend.embed(body)
+            vector = self._embedding_backend.embed(body, input_type="search_document")
         except Exception:  # noqa: BLE001
             return
 
@@ -541,6 +647,14 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
             )
             return
 
+        # Wrap in pgvector.Vector so the registered dumper emits the bracket form
+        # the vector type accepts (a bare list would adapt to a rejected
+        # curly-brace literal — see _get_pg_conn's note).  Constructed INSIDE the
+        # try so a malformed vector (Vector() coerces via numpy and may raise on
+        # non-numeric content) is caught by the rollback/log path below rather
+        # than escaping a best-effort index update.
+        from pgvector import Vector  # noqa: PLC0415
+
         try:
             conn.execute(
                 _UPSERT_CORPUS_EMBEDDING_SQL,
@@ -550,7 +664,7 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
                     page_name,
                     model_id,
                     dimensions,
-                    vector,
+                    Vector(vector),
                 ),
             )
             conn.commit()
