@@ -336,6 +336,42 @@ The registered backend is the **store of record for its own data in that deploym
 
 ---
 
+### 🟡 T16. Raw immediate-continuity transcript as a bounded Rule #6 flex
+
+**One-sentence:** ConversationBackend injects prior turn messages verbatim into the `messages[]` array, a deliberate and bounded flex of Rule #6 (load capability *awareness*, not capability *content*); this entry records why the flex is legitimate and where its edges are, so a future contributor reading Rule #6 as absolute does not "fix" conversation continuity away.
+
+**Rule #6 restated:** load capability metadata, not capability content; the LLM pays context tokens for *awareness*, not for the material itself. The progressive-disclosure pattern (INDEX-guided selective recall of 1-3 notes) is the canonical application. ConversationBackend injects prior turn messages directly into the `messages[]` array (verbatim role-tagged content) before the current work_item. That is the flex.
+
+**Why it does not violate the rule's intent:**
+- Scope: current-run only, bounded to the active `agent.call()` invocation. Turns are not cached beyond the call, not promoted to memory, and not part of the system prompt.
+- Token cap: a token-budget window is enforced. Only turns that fit within `model_context_limit - system_prompt_tokens - max_output_tokens` are loaded. Oldest-first eviction on overflow. Never unbounded.
+- Ephemeral: when the call ends, the injected turns are gone from context. The conversation log on disk is the durable artifact; the in-context array is the working copy.
+- Hard turn/token limit: the budget window is the hard cap. The system never auto-loads the full conversation log.
+- Summarization gate (PR3): the bounded-window invariant holds after summarization ships. PR3 replaces old turns with a summary token that fits the same window, not a lifted cap.
+
+**Why Rule #6 must flex here:**
+- Conversation continuity requires immediate context. The INDEX-guided selective recall pattern (designed for potentially 30K+ tokens across many past calls) does not apply to the prior 3-5 turns of the current exchange. An INDEX of "I said X, you replied Y" provides no compression benefit and breaks the conversational coherence callers expect.
+- The alternative, flattening turns into the system prompt, would break T14's cacheable prefix: a billing regression on every turn.
+
+**What this flex does NOT authorize:**
+- Auto-loading the full conversation log without a token-budget window.
+- Injecting turn content into `assemble_system_prompt()` (the cacheable prefix must remain stable).
+- Bypassing the window to fit "important" turns (no turn-priority mechanism in this spec).
+- Using the conversation transcript as a substitute for proper Notes recall for durable facts.
+
+**What to watch for (named triggers that distinguish this from a Rule #6 violation):**
+1. `conversation_backend` is not None AND `conversation_id` is not None: both must be set for any transcript to load.
+2. Token-budget window in force: load stops when `remaining_context_tokens <= 0`; no override path bypasses this.
+3. Current-run bounded: turns appear in `messages[]` only; they do not persist into `assemble_system_prompt()` output.
+4. No auto-promote: turns are NOT automatically promoted to Notes/Wiki/INDEX. Promotion happens only through the explicit `atomic_capture` tool.
+5. Oldest-first eviction on overflow: when the window is tight, oldest turns are dropped, not the system prompt.
+
+When transcript tokens regularly dwarf INDEX + selected notes, or multi-session transcript replay appears, or raw logs become auto-loaded, the flex has outgrown its bounds and this entry needs revisiting.
+
+**Related:** Rule #6 (CLAUDE.md, progressive disclosure), T14 (cacheable system-prompt prefix), spec/47 (ConversationBackend), spec/02 + spec/04 (atomic memory + runtime assembly), #535 (ConversationBackend protocol), the throughline.
+
+---
+
 ## Resolved tensions
 
 *(Move items here when resolved, with date + how it resolved.)*
@@ -357,6 +393,7 @@ The registered backend is the **store of record for its own data in that deploym
 | 2026-06-10 | T15 | spec/40 (`docs/spec/40-canonical-export.md`) delivered + **LOCKED** — the export-contract commitment in the Position B ruling is now a tested contract, not a promise | #379 PR 1 shipped the `Exportable` companion Protocol, `supports_canonical_export` capability field on all six PR1 state backends, filesystem identity export impls for Memory/Log/Mandate/Corpus/Lock/Secret, a 91-test round-trip conformance suite, and spec/40 (LOCKED on filesystem proof per the contract-first ruling). CLAUDE.md Principle #1 now carries the spec/40 pointer. Per-backend SQLite/Postgres/Redis/GCP/HTTP export impls are later PRs that conform to the locked contract. |
 | 2026-06-11 | T13 | **Resolved** — migration runner refactored path-shaped → backend-shaped: dedicated `MigrationBackend` Protocol + `MigratableUnit` handle + `FilesystemMigrationBackend` reference impl; clean break (BREAKING — old `applies_to(path)`/`migrate(path)` removed); read-only `read_schema_version()`; full `snapshot()`/`restore()` protocol methods + fail-close on no-rollback. | #429 (PR #446, merged). Same root cause as T15 — the last path-shaped storage primitive becomes backend-shaped so backend #2 (Postgres/SQLite) satisfies the migration contract without forking the runner. spec/03 §Schema-migration DRAFT→re-LOCK (full drift-gate, 8 MUSTs); `python -m atomic_agents.migrate` CLI entrypoint unchanged (subcommand promotion → #438; legacy v0→v1 → #439). Closes the T13 "must also become backend-shaped" cross-reference flagged in T15's Related list. |
 | 2026-06-12 | T4 | **Resolved** — queue cluster carved from `_cascade.py` into `atomic_agents/queue/` as `QueueBackend` Protocol + `FilesystemQueueBackend` reference impl (SCAFFOLDING-ONLY; zero internal runtime callers wired). | #428 PR 1. Thin non-deprecated re-export shim in `_cascade.py` preserves verbatim free-function signatures for existing callers. DRAFT spec/44 ships; 12-MUST Implementer Contract. `single_host_only` capability flag mirrors `LockCapabilities` pattern. `recover_stale_claims()` is a free function above the Protocol, calling only Protocol methods. spec/40 export whitelist (queued/ + done/ + dead-letter/ only; claimed/ excluded). Doctor check SKIP for single-agent layouts (detect_cascade → None); WARN on ATOMIC_AGENTS_MULTI_HOST. Runtime adoption (cascade runner wiring) deferred to follow-up issue. |
+| 2026-06-19 | T16 | **Added** — raw immediate-continuity transcript injection recorded as a bounded, deliberate flex of Rule #6, with named triggers + a "does NOT authorize" boundary. | #535 ConversationBackend PR1. Conversation turns load into `messages[]` (not the system prompt, preserving T14's cacheable prefix), bounded by a token-budget window with oldest-first eviction, current-run-only, never auto-promoted to memory. Distinct from distilled INDEX-driven recall: immediate continuity for the prior few turns, ephemeral, not accumulating cross-session. Maintainer-approved wording (Dan, 2026-06-19). |
 
 ---
 
