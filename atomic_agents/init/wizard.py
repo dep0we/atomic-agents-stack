@@ -11,12 +11,13 @@ import os
 import re
 import string
 import sys
+import warnings
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .. import _io, _llm, _platform
+from .. import _io, _llm, _platform, _tools
 from ..exceptions import PathTraversalError
 from . import constants as C
 
@@ -464,7 +465,7 @@ def _ask_q4_autonomy(
 ) -> tuple[dict[str, str], str]:
     """Q4: autonomy preset table + customize sub-flow.
 
-    Returns (policies_dict, preset_label). Renders a rich Table (max_width=78).
+    Returns (policies_dict, preset_label). Renders a rich Table (width=78).
     Falls back to plain text when Console.is_dumb_terminal is True (M8).
     """
     is_dumb = getattr(console, "is_dumb_terminal", False)
@@ -489,7 +490,7 @@ def _ask_q4_autonomy(
         table = Table(
             title="Q4. How much should this agent act on its own?",
             show_header=True,
-            max_width=78,
+            width=78,
         )
         table.add_column("Choice", style="bold")
         table.add_column("read_only")
@@ -708,8 +709,6 @@ def _walk_traversable(
         node, parts, depth = stack.popleft()
         if _traversable_is_dir(node):
             if depth > C.MAX_TEMPLATE_DEPTH:
-                import warnings
-
                 warnings.warn(
                     f"Template tree exceeds MAX_TEMPLATE_DEPTH={C.MAX_TEMPLATE_DEPTH}; "
                     f"stopping walk at {parts}. Review the template for deep nesting.",
@@ -1460,6 +1459,26 @@ def _add_to_it(
         )
         return 1
 
+    # Add-to-it may backfill a tools.md that declares write_paths the existing
+    # agent never had a directory for (e.g. switching to the writer template
+    # introduces drafts/ + revisions/). Create any newly-declared write-path
+    # dirs so the merged agent stays doctor-clean — same #541 lockstep the
+    # fresh/overwrite scaffold relies on. Idempotent: exist_ok=True.
+    try:
+        _create_empty_dirs(agent_dir)
+    except OSError as e:
+        # A declared write-path dir could not be created: the merged agent is
+        # NOT doctor-clean, so return non-zero — matching _write_scaffold's
+        # contract (don't report success when the agent will fail doctor).
+        # Suppress the green "updated" line so the message and exit code agree.
+        console.print(
+            f"[yellow]Files merged, but a declared write-path directory could "
+            f"not be created: {_translate_oserror(e, agent_dir)} Run "
+            f"`atomic-agents doctor --agent {agent_dir.name}` and create any "
+            "missing directories by hand.[/yellow]"
+        )
+        return 1
+
     console.print(
         f"\n[green]Agent '{agent_dir.name}' updated at {agent_dir}.[/green]\n"
     )
@@ -1581,12 +1600,60 @@ def _collision_overwrite_backup_restore(
 
 
 def _create_empty_dirs(agent_dir: Path) -> None:
-    """Create journal/ and log/ directories (MUST 3: OSError caught by caller).
+    """Create every directory the scaffolded tools.md declares as a write path.
 
-    The framework populates these on first run. We only mkdir here.
+    These directories are required by the doctor's write-paths check (every
+    declared write_path must exist on disk). memory/ and wiki/ are created
+    implicitly by atomic_write(memory/INDEX.md) and atomic_write(wiki/INDEX.md),
+    but the remaining write-path subdirectories must be created explicitly.
+
+    Rather than hardcode a fixed subdir set (which silently broke the writer
+    template's drafts/ + revisions/ when those bullets were added, #541), this
+    parses the just-written ``tools.md`` and creates each declared write_path.
+    A future template author who adds a write-path bullet gets the directory
+    created automatically — the scaffold and the doctor's write-paths check
+    stay in lockstep with a single source of truth (the rendered tools.md).
+
+    Security (path traversal): the parser is given ``agent_root=agent_dir`` so
+    bare-relative tokens resolve under the agent folder. Every resolved path is
+    re-validated with ``_io.safe_resolve_under`` against agent_dir before any
+    mkdir. A write_path bullet that resolves OUTSIDE the agent folder (an
+    absolute path, a ``~`` path, or a ``../escape``) is REFUSED — never created
+    — and a warning is emitted. The wizard only ever creates directories inside
+    the agent it is scaffolding; it does not provision arbitrary filesystem
+    locations a tools.md might name.
+
+    read_paths and read_only_paths (e.g. researcher's raw/, writer's sources/)
+    are intentionally NOT created here — only write_paths are.
+
+    MUST 3: OSError from mkdir propagates and is caught/translated by the
+    caller (_write_scaffold).
     """
-    for subdir in ("journal", "log"):
-        (agent_dir / subdir).mkdir(parents=True, exist_ok=True)
+    tools_path = agent_dir / "tools.md"
+    parsed = _tools.parse_tools_md(tools_path, agent_root=agent_dir)
+    write_paths = parsed.get("write_paths", [])
+
+    for resolved in write_paths:
+        # parse_tools_md already resolved each bullet (absolute Path) using
+        # agent_root=agent_dir for bare-relative tokens. Re-validate containment
+        # under agent_dir before creating anything: a bullet that resolves
+        # outside the agent folder is refused, not created. safe_resolve_under
+        # accepts an absolute child directly (root / abs == abs), so pass the
+        # already-resolved path straight through — no relpath round-trip (which
+        # would crash on Windows with a cross-drive ValueError that the OSError
+        # caller does not catch).
+        try:
+            safe = _io.safe_resolve_under(resolved, agent_dir)
+        except PathTraversalError:
+            warnings.warn(
+                f"init: tools.md write_path {str(resolved)!r} resolves outside "
+                f"the agent folder {agent_dir}; refusing to create it. The "
+                "wizard only provisions directories inside the agent it "
+                "scaffolds. Remove or correct this write_path bullet.",
+                stacklevel=2,
+            )
+            continue
+        safe.mkdir(parents=True, exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1622,7 +1689,11 @@ def _write_scaffold(
     Confirm: Any,
     existing: bool,
 ) -> int:
-    """Write the seven template files + create journal/ and log/ directories.
+    """Write the template files + create every write-path directory tools.md declares.
+
+    Write-path directories are derived from the just-rendered tools.md via
+    _create_empty_dirs (single source of truth; #541), so any template's
+    declared write_paths exist on disk for the doctor's write-paths check.
 
     Handles the backup+restore pattern on overwrite. Every OSError is caught
     and translated to plain English (MUST 3). Returns 0 on success, 1 on error.
@@ -1668,7 +1739,8 @@ def _write_scaffold(
         "Files written:\n"
         "  persona/IDENTITY.md, persona/SOUL.md, persona/USER.md\n"
         "  tools.md, model.md, memory/INDEX.md, wiki/INDEX.md\n"
-        "  journal/ (empty), log/ (empty)\n"
+        "  plus the empty write-path directories declared in tools.md "
+        "(e.g. journal/, log/, output/)\n"
     )
 
     # MUST 8: doctor handoff.

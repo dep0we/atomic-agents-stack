@@ -1,10 +1,11 @@
 """Tests for atomic_agents._tools and ._model parsers."""
 
+import os
+import warnings
 from pathlib import Path
 
-import pytest
-
-from atomic_agents._tools import parse_tools_md
+from atomic_agents._platform import resolve_under_agent_root
+from atomic_agents._tools import parse_tools_md, parse_tools_md_text
 from atomic_agents._model import parse_model_md
 
 
@@ -206,7 +207,9 @@ cost_guardrails:
     assert parsed["provider"] is None
 
 
-def test_parse_model_md_provider_outside_yaml_still_matches_when_yaml_also_has_provider(tmp_path):
+def test_parse_model_md_provider_outside_yaml_still_matches_when_yaml_also_has_provider(
+    tmp_path,
+):
     """Even if a YAML block contains a ``provider:`` line, a top-level
     ``provider:`` outside the block still wins. Confirms the YAML-strip
     doesn't accidentally consume the top-level line.
@@ -225,3 +228,198 @@ cost_guardrails:
 """)
     parsed = parse_model_md(model_path)
     assert parsed["provider"] == "openai"
+
+
+# ──────────────────────────────────────────────────────────────────
+# resolve_under_agent_root unit tests (issue #541)
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_resolve_under_agent_root_bare_relative(tmp_path):
+    """Bare-relative paths resolve under agent_root, not process CWD."""
+    agent_root = tmp_path / "agents" / "myagent"
+    result = resolve_under_agent_root("memory/", agent_root)
+    assert result == (agent_root / "memory").resolve()
+    assert result != (Path(os.getcwd()) / "memory").resolve()
+
+
+def test_resolve_under_agent_root_dot_slash(tmp_path):
+    """'./' resolves to agent_root itself."""
+    agent_root = tmp_path / "agents" / "myagent"
+    result = resolve_under_agent_root("./", agent_root)
+    assert result == agent_root.resolve()
+
+
+def test_resolve_under_agent_root_absolute_path_untouched(tmp_path):
+    """Absolute paths are not re-anchored to agent_root."""
+    agent_root = tmp_path / "agents" / "myagent"
+    result = resolve_under_agent_root("/some/absolute/path", agent_root)
+    assert result == Path("/some/absolute/path").resolve()
+
+
+def test_resolve_under_agent_root_tilde_path_untouched(tmp_path):
+    """Tilde paths are expanded normally, not re-anchored to agent_root."""
+    agent_root = tmp_path / "agents" / "myagent"
+    result = resolve_under_agent_root("~/docs/shared", agent_root)
+    assert result == Path("~/docs/shared").expanduser().resolve()
+    assert not str(result).startswith(str(agent_root))
+
+
+def test_resolve_under_agent_root_expands_unexpanded_agent_root():
+    """An unexpanded '~'-prefixed agent_root is expanded before the join.
+
+    The helper bills itself as the framework-wide anchor, so it must be robust
+    to any agent_root form. Passing 'agent_root=~/agents/foo' (literal tilde)
+    must NOT leave a '~' segment under the process CWD — it must resolve under
+    the real home directory.
+    """
+    result = resolve_under_agent_root("memory/", Path("~/agents/myagent"))
+    expected = (Path("~/agents/myagent").expanduser() / "memory").resolve()
+    assert result == expected
+    assert "~" not in str(result), (
+        f"literal '~' leaked into the resolved path: {result}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# parse_tools_md agent_root anchoring tests (issue #541)
+# ──────────────────────────────────────────────────────────────────
+
+_TEMPLATE_TOOLS_TEXT = """\
+## Write paths (own folder ONLY)
+
+- memory/ -- atomic note capture
+- wiki/ -- wiki page authoring
+
+## Read paths
+
+- ./ -- full read access to own context
+- raw/ -- source intake
+"""
+
+
+def test_parse_tools_md_bare_relative_anchors_to_agent_root(tmp_path):
+    """Bare-relative write/read paths resolve under agent_root when supplied."""
+    agent_root = tmp_path / "agents" / "myagent"
+    result = parse_tools_md_text(_TEMPLATE_TOOLS_TEXT, agent_root=agent_root)
+
+    write_paths = result["write_paths"]
+    assert len(write_paths) == 2
+    assert (agent_root / "memory").resolve() in write_paths
+    assert (agent_root / "wiki").resolve() in write_paths
+
+    read_paths = result["read_paths"]
+    assert agent_root.resolve() in read_paths
+    assert (agent_root / "raw").resolve() in read_paths
+
+
+def test_parse_tools_md_re_anchor_emits_audit_log(tmp_path, caplog):
+    """Anchoring a bare-relative path under agent_root emits a DEBUG audit line.
+
+    The audit trail is structural (CLAUDE.md principle 5): an operator who
+    enables DEBUG must be able to trace that a bare-relative token was anchored
+    under agent_root. Assert the distinctive 'anchored bare-relative path' log
+    message, not just the result — a layered/silent anchor would otherwise be
+    false-green.
+
+    The level is DEBUG (not WARNING): bare-relative tokens are the canonical
+    default-template shape, so this is the correct happy path, not an operator
+    warning — a WARNING here would spam stderr on every agent load.
+    """
+    import logging
+
+    agent_root = tmp_path / "agents" / "myagent"
+    with caplog.at_level(logging.DEBUG, logger="atomic_agents._tools"):
+        parse_tools_md_text(_TEMPLATE_TOOLS_TEXT, agent_root=agent_root)
+
+    anchor_lines = [
+        r for r in caplog.records if "anchored bare-relative path" in r.getMessage()
+    ]
+    assert anchor_lines, (
+        "expected an 'anchored bare-relative path' audit log line for bare-"
+        f"relative paths; got: {[r.getMessage() for r in caplog.records]}"
+    )
+    # The audit line is emitted at DEBUG (the happy-path level), not WARNING.
+    assert all(r.levelno == logging.DEBUG for r in anchor_lines), (
+        "anchor audit line must be DEBUG (correct happy path, not a warning); "
+        f"got levels: {[r.levelname for r in anchor_lines]}"
+    )
+    # The specific path token must appear in the audit line.
+    assert any("memory/" in r.getMessage() for r in anchor_lines)
+
+
+def test_parse_tools_md_no_re_anchor_log_for_absolute(tmp_path, caplog):
+    """Negative control: absolute paths are NOT anchored, so NO audit line.
+
+    Pairs with the audit-log test above: if the anchor log fired
+    unconditionally (not gated on bare-relative), this would also see it.
+    Captures at DEBUG (the audit-line level) so the control genuinely bites —
+    a WARNING-level capture would vacuously miss a stray DEBUG anchor line.
+    """
+    import logging
+
+    agent_root = tmp_path / "agents" / "myagent"
+    text = "## Write paths\n\n- /absolute/only -- already absolute\n"
+    with caplog.at_level(logging.DEBUG, logger="atomic_agents._tools"):
+        parse_tools_md_text(text, agent_root=agent_root)
+
+    anchor_lines = [
+        r for r in caplog.records if "anchored bare-relative path" in r.getMessage()
+    ]
+    assert not anchor_lines, (
+        "absolute paths must NOT trigger an anchor audit line; "
+        f"got: {[r.getMessage() for r in anchor_lines]}"
+    )
+
+
+def test_parse_tools_md_bare_relative_without_agent_root_warns(tmp_path):
+    """When agent_root is omitted, bare-relative paths emit a UserWarning."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = parse_tools_md_text(_TEMPLATE_TOOLS_TEXT, agent_root=None)
+
+    warning_messages = [str(w.message) for w in caught]
+    assert any("agent_root" in m for m in warning_messages), (
+        f"Expected a warning mentioning agent_root; got: {warning_messages}"
+    )
+    assert len(result["write_paths"]) == 2
+
+
+def test_parse_tools_md_tilde_path_not_re_anchored(tmp_path):
+    """Tilde paths in tools.md are expanded to home, not re-anchored to agent_root."""
+    agent_root = tmp_path / "agents" / "myagent"
+    text = "## Write paths\n\n- ~/docs/shared -- shared reference\n"
+    result = parse_tools_md_text(text, agent_root=agent_root)
+    assert len(result["write_paths"]) == 1
+    assert result["write_paths"][0] == Path("~/docs/shared").expanduser().resolve()
+    assert not str(result["write_paths"][0]).startswith(str(agent_root))
+
+
+def test_parse_tools_md_absolute_path_not_re_anchored(tmp_path):
+    """Absolute paths in tools.md are returned unchanged regardless of agent_root."""
+    agent_root = tmp_path / "agents" / "myagent"
+    text = "## Write paths\n\n- /absolute/shared -- shared\n"
+    result = parse_tools_md_text(text, agent_root=agent_root)
+    assert result["write_paths"][0] == Path("/absolute/shared").resolve()
+
+
+def test_parse_tools_md_file_with_agent_root(tmp_path):
+    """parse_tools_md() on-disk function threads agent_root correctly."""
+    agent_root = tmp_path / "agents" / "myagent"
+    tools_path = tmp_path / "tools.md"
+    tools_path.write_text(_TEMPLATE_TOOLS_TEXT, encoding="utf-8")
+    result = parse_tools_md(tools_path, agent_root=agent_root)
+    assert (agent_root / "memory").resolve() in result["write_paths"]
+
+
+def test_parse_tools_md_bare_relative_negative_control_no_agent_root(tmp_path):
+    """Without agent_root, 'memory/' must NOT resolve under agent_root."""
+    agent_root = tmp_path / "agents" / "myagent"
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        result = parse_tools_md_text(_TEMPLATE_TOOLS_TEXT, agent_root=None)
+
+    expected_under_agent_root = (agent_root / "memory").resolve()
+    assert expected_under_agent_root not in result["write_paths"], (
+        "Without agent_root, paths must NOT resolve under agent_root"
+    )

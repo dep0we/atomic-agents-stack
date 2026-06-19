@@ -6,10 +6,14 @@ and extracts bullet items as plain strings (paths get expanded).
 """
 
 from __future__ import annotations
+import logging
 import re
+import warnings
 from pathlib import Path
 
-from ._platform import expand
+from ._platform import expand, resolve_under_agent_root
+
+_logger = logging.getLogger(__name__)
 
 
 # Match exact phrases (case-insensitive). The section ends at the next "## " header,
@@ -38,27 +42,41 @@ _TOOL_CLASSIFICATION_HEADER = re.compile(
 # Kept as a literal here to keep _tools.py free of judge-module imports
 # (would otherwise force tools.py → judge → memory load order at parse
 # time). The judge layer asserts parity in its conformance suite.
-_VALID_ACTION_CLASSES: frozenset[str] = frozenset({
-    "read_only",
-    "reversible_write",
-    "external_side_effect",
-    "high_risk",
-})
+_VALID_ACTION_CLASSES: frozenset[str] = frozenset(
+    {
+        "read_only",
+        "reversible_write",
+        "external_side_effect",
+        "high_risk",
+    }
+)
 
 
-def parse_tools_md(path: Path) -> dict:
-    """Parse tools.md from disk. Thin wrapper around parse_tools_md_text."""
+def parse_tools_md(path: Path, agent_root: Path | None = None) -> dict:
+    """Parse tools.md from disk. Thin wrapper around parse_tools_md_text.
+
+    When agent_root is supplied, bare-relative path tokens (not starting with
+    / or ~) are resolved under agent_root rather than the process CWD.
+    """
     if not path.exists():
-        return parse_tools_md_text("")
-    return parse_tools_md_text(path.read_text(encoding="utf-8"))
+        return parse_tools_md_text("", agent_root=agent_root)
+    return parse_tools_md_text(path.read_text(encoding="utf-8"), agent_root=agent_root)
 
 
-def parse_tools_md_text(text: str) -> dict:
+def parse_tools_md_text(text: str, agent_root: Path | None = None) -> dict:
     """Parse tools.md content into a dict of section -> list of items.
 
     Items are stripped bullet-point text. Paths are expanded (~/, etc.).
+
+    When agent_root is supplied, bare-relative path tokens (not starting with
+    / or ~) are resolved under agent_root instead of the process CWD. This is
+    the correct behavior for tools.md paths: a token like 'memory/' always
+    means <agent_folder>/memory/, not <process_cwd>/memory/. Callers that
+    have agent_root in scope MUST pass it; callers without it (e.g. DB
+    round-trip reconstruction) fall back to CWD-anchor and emit a warning.
+
     Sections we don't recognize (e.g., "## Read budget", "## Helpers") are
-    skipped — current_section resets when we hit any unrecognized H2.
+    skipped -- current_section resets when we hit any unrecognized H2.
 
     Use this when the source is cascade-merged content (role + instance
     override) rather than a single file on disk.
@@ -79,7 +97,7 @@ def parse_tools_md_text(text: str) -> dict:
                 if pattern.match(stripped):
                     matched = key
                     break
-            current_section = matched  # None if unrecognized — exits collection mode
+            current_section = matched  # None if unrecognized -- exits collection mode
             continue
 
         # Skip H1 / H3+ headers, blank lines, prose
@@ -98,7 +116,34 @@ def parse_tools_md_text(text: str) -> dict:
             # Take everything up to a comma, paren, or em-dash divider
             item = re.split(r"\s+(?:—|--|\(|,)\s*", item, maxsplit=1)[0].strip()
             if item:
-                sections[current_section].append(expand(item))
+                is_bare_relative = not (
+                    item.startswith("~") or Path(item).is_absolute()
+                )
+                if is_bare_relative and agent_root is not None:
+                    resolved = resolve_under_agent_root(item, agent_root)
+                    # Debug-level provenance, not an operator warning: bare-
+                    # relative tokens are the canonical default-template shape
+                    # (spec/01), so anchoring them under agent_root is the
+                    # correct happy path — nothing was misconfigured. A WARNING
+                    # here would spam stderr on every agent load / doctor run.
+                    # Operators who want to trace path resolution enable DEBUG.
+                    _logger.debug(
+                        "tools.md: anchored bare-relative path %r under agent_root %s",
+                        item,
+                        agent_root,
+                    )
+                    sections[current_section].append(resolved)
+                elif is_bare_relative and agent_root is None:
+                    warnings.warn(
+                        f"tools.md: bare-relative path {item!r} resolved "
+                        "against process CWD because agent_root was not "
+                        "supplied to parse_tools_md_text(). Thread agent_root "
+                        "for correct anchor (spec/01 portability).",
+                        stacklevel=3,
+                    )
+                    sections[current_section].append(expand(item))
+                else:
+                    sections[current_section].append(expand(item))
         else:
             sections[current_section].append(item)
 

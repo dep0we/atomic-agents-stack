@@ -2,20 +2,18 @@
 
 ## Read paths
 
-- Own folder (under agents_root/${agent_name}/): full read access to own context
-- Own sources/ directory: reference materials the operator drops here for the agent to consult during drafting. This is the canonical intake point for research, style guides, reference documents, and source texts. Drop PDFs, markdown files, exported documents, and background reading here.
-- <!-- Add additional read paths here. Examples: a shared project folder, a research archive,
-     a product specification directory. Format: path, then a brief description of what is there. -->
+- ./ -- full read access to own context (own agent folder)
+- sources/ -- reference materials the operator drops here for drafting (canonical intake for research, style guides, reference documents, and source texts; drop PDFs, markdown files, exported documents here)
 
 ## Write paths (own folder ONLY)
 
-- Own memory/ (atomic note capture)
-- Own wiki/ (style guide, world-building, terminology, and reference distillations)
-- Own journal/ (narrative journal entries)
-- Own log/ (run history, JSONL)
-- Own drafts/ (active work-in-progress; never overwrite a draft without writing the prior version to revisions/ first)
-- Own revisions/ (archived prior versions of drafts; name files by version number or date so the history is navigable, e.g. chapter-01-v2.md or chapter-01-2026-06-01.md)
-- Own output/ (operator-ready final artifacts only; content in output/ is considered approved and ready for downstream use)
+- memory/ -- atomic note capture
+- wiki/ -- style guide, world-building, terminology, and reference distillations
+- journal/ -- narrative journal entries
+- log/ -- run history, JSONL
+- drafts/ -- active work-in-progress; never overwrite a draft without writing the prior version to revisions/ first
+- revisions/ -- archived prior versions of drafts; name files by version number or date so the history is navigable
+- output/ -- operator-ready final artifacts only; content in output/ is considered approved and ready for downstream use
 
 ## External APIs
 

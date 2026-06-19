@@ -310,7 +310,7 @@ class FilesystemAgentProfileBackend:
             )
 
         model_config = parse_model_md_text(model_md_raw)
-        tool_config = parse_tools_md_text(tools_md_raw)
+        tool_config = parse_tools_md_text(tools_md_raw, agent_root=agent_root)
         tool_classifications = parse_tool_classifications_text(tools_md_raw)
 
         # ── judges.md — cascade-aware via load_judges_config ──

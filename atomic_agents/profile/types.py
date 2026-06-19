@@ -293,6 +293,12 @@ class AgentProfile:
                 model_config = parse_model_md_text("")
 
         if tools_md_raw:
+            # agent_root is not available in the DB round-trip context (from_dict
+            # receives only the serialised dict, not the filesystem path). Bare-
+            # relative paths in tools_md_raw will be resolved against the process
+            # CWD and emit a warning. Operators using DB backends should use
+            # absolute or ~-prefixed paths in tools.md, or rely on the filesystem
+            # backend's load_profile() which does pass agent_root correctly.
             tool_config = parse_tools_md_text(tools_md_raw)
             tool_classifications = parse_tool_classifications_text(tools_md_raw)
         else:

@@ -365,10 +365,12 @@ def _safe_parse_tools(agent_root: Path, cascade) -> tuple[dict, CheckResult | No
     try:
         if cascade is not None:
             _, tools_text = _cascade.resolve_tools_md(cascade)
-            data = _tools.parse_tools_md_text(tools_text)
+            data = _tools.parse_tools_md_text(tools_text, agent_root=agent_root)
         else:
             tp = agent_root / "tools.md"
-            data = _tools.parse_tools_md(tp) if tp.exists() else {}
+            data = (
+                _tools.parse_tools_md(tp, agent_root=agent_root) if tp.exists() else {}
+            )
         return data, None
     except Exception as e:  # noqa: BLE001 — operator config issue, not a doctor bug
         return {}, CheckResult(
@@ -3628,7 +3630,9 @@ def check_write_paths(
             message="tools.md declares no write_paths; every capture write would be rejected",
             fix_hint=(
                 "Add a `## Write paths` section to tools.md listing at least "
-                "the agent's memory/ directory. See docs/spec/01-anatomy.md "
+                "the agent's memory/ directory. Paths starting with / or ~/ "
+                "are absolute. Bare relative paths (e.g. memory/) are resolved "
+                "relative to the agent folder. See docs/spec/01-anatomy.md "
                 "for the format."
             ),
         )
@@ -3687,7 +3691,9 @@ def check_write_paths(
                 "Create the missing directories or fix permissions. "
                 "Every path in tools.md write_paths must exist and be "
                 "writable, and the agent's memory/ directory must be "
-                "covered by a write_path and not by a read_only_path."
+                "covered by a write_path and not by a read_only_path. "
+                "Paths starting with / or ~/ are absolute. Bare relative "
+                "paths (e.g. memory/) are resolved relative to the agent folder."
             ),
             detail={"failures": [{"path": p, "reason": w} for p, w in failures]},
         )
