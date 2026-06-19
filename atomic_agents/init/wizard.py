@@ -1433,6 +1433,23 @@ def _add_to_it(
 
     # If the preview computed successfully and showed zero changes, skip Confirm.
     if files_changed == 0:
+        # Zero TEXT diff does not mean the agent is doctor-clean: a declared
+        # write-path dir (e.g. drafts/) may have been deleted out from under an
+        # otherwise up-to-date agent. Reconcile declared write-paths the same
+        # way the non-zero merge path and _write_scaffold do (#541 lockstep),
+        # so Add-to-it never reports "up to date" while a declared dir is
+        # missing. Idempotent: exist_ok=True, so this is a no-op when every
+        # dir already exists.
+        try:
+            _create_empty_dirs(agent_dir)
+        except OSError as e:
+            console.print(
+                f"[yellow]No text changes to apply, but a declared write-path "
+                f"directory could not be created: {_translate_oserror(e, agent_dir)} "
+                f"Run `atomic-agents doctor --agent {agent_dir.name}` and create "
+                "any missing directories by hand.[/yellow]"
+            )
+            return 1
         console.print(
             "[green]No changes to apply. Existing scaffold is up to date.[/green]"
         )
@@ -1603,9 +1620,13 @@ def _create_empty_dirs(agent_dir: Path) -> None:
     """Create every directory the scaffolded tools.md declares as a write path.
 
     These directories are required by the doctor's write-paths check (every
-    declared write_path must exist on disk). memory/ and wiki/ are created
-    implicitly by atomic_write(memory/INDEX.md) and atomic_write(wiki/INDEX.md),
-    but the remaining write-path subdirectories must be created explicitly.
+    declared write_path must exist on disk). This iterates EVERY parsed
+    write_path and mkdirs each with exist_ok=True. memory/ and wiki/ are
+    typically already present (atomic_write(memory/INDEX.md) and
+    atomic_write(wiki/INDEX.md) created them on render), so their mkdir here is
+    an idempotent no-op; the remaining declared subdirectories (journal/, log/,
+    output/, drafts/, revisions/, ...) are created by this same parse-driven
+    loop.
 
     Rather than hardcode a fixed subdir set (which silently broke the writer
     template's drafts/ + revisions/ when those bullets were added, #541), this

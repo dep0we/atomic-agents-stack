@@ -45,9 +45,11 @@ def resolve_under_agent_root(path_str: str, agent_root: Path) -> Path:
     - Bare-relative paths (everything else, e.g. 'memory/', './') are resolved
       as agent_root / path_str, returning an absolute resolved Path.
 
-    This is the framework-wide anchor for tools.md path resolution (spec/01).
+    This is the framework-wide anchor for tools.md path resolution.
     Bare-relative paths in tools.md always mean relative to the agent's own
-    folder, never relative to the process CWD.
+    folder, never relative to the process CWD. (Documenting this convention
+    in spec/01 is tracked in #549; spec/01 today only shows the
+    placeholder-absolute <agents_root>/<name>/... form.)
 
     Note: this helper does NOT guard against path traversal (e.g. '../escape'
     resolves to the parent of agent_root). Path containment is a separate

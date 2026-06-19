@@ -122,9 +122,9 @@ def parse_tools_md_text(text: str, agent_root: Path | None = None) -> dict:
                 if is_bare_relative and agent_root is not None:
                     resolved = resolve_under_agent_root(item, agent_root)
                     # Debug-level provenance, not an operator warning: bare-
-                    # relative tokens are the canonical default-template shape
-                    # (spec/01), so anchoring them under agent_root is the
-                    # correct happy path — nothing was misconfigured. A WARNING
+                    # relative tokens are the canonical default-template shape,
+                    # so anchoring them under agent_root is the correct happy
+                    # path — nothing was misconfigured. A WARNING
                     # here would spam stderr on every agent load / doctor run.
                     # Operators who want to trace path resolution enable DEBUG.
                     _logger.debug(
@@ -138,7 +138,7 @@ def parse_tools_md_text(text: str, agent_root: Path | None = None) -> dict:
                         f"tools.md: bare-relative path {item!r} resolved "
                         "against process CWD because agent_root was not "
                         "supplied to parse_tools_md_text(). Thread agent_root "
-                        "for correct anchor (spec/01 portability).",
+                        "for the correct agent-folder anchor (portability).",
                         stacklevel=3,
                     )
                     sections[current_section].append(expand(item))

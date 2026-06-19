@@ -298,19 +298,38 @@ _TEMPLATE_TOOLS_TEXT = """\
 """
 
 
-def test_parse_tools_md_bare_relative_anchors_to_agent_root(tmp_path):
-    """Bare-relative write/read paths resolve under agent_root when supplied."""
+def test_parse_tools_md_bare_relative_anchors_to_agent_root(tmp_path, monkeypatch):
+    """Bare-relative write/read paths resolve under agent_root when supplied.
+
+    Runs from a decoy CWD that is NOT under agent_root, and asserts both the
+    positive (anchored-under-agent_root) AND the negative (CWD-anchored form
+    ABSENT) so the negative control bites regardless of collection order or the
+    process CWD a prior test leaked. If the agent_root branch were dead, every
+    bare-relative token would CWD-anchor to <decoy>/memory and these
+    assertions would fail deterministically.
+    """
     agent_root = tmp_path / "agents" / "myagent"
+    decoy_cwd = tmp_path / "decoy_cwd"
+    decoy_cwd.mkdir(parents=True)
+    monkeypatch.chdir(decoy_cwd)
+
     result = parse_tools_md_text(_TEMPLATE_TOOLS_TEXT, agent_root=agent_root)
 
     write_paths = result["write_paths"]
     assert len(write_paths) == 2
     assert (agent_root / "memory").resolve() in write_paths
     assert (agent_root / "wiki").resolve() in write_paths
+    # Negative control: the CWD-anchored form must be ABSENT.
+    assert (Path.cwd() / "memory").resolve() not in write_paths, (
+        "bare-relative 'memory/' CWD-anchored instead of anchoring under "
+        "agent_root — the agent_root branch is dead"
+    )
+    assert (Path.cwd() / "wiki").resolve() not in write_paths
 
     read_paths = result["read_paths"]
     assert agent_root.resolve() in read_paths
     assert (agent_root / "raw").resolve() in read_paths
+    assert (Path.cwd() / "raw").resolve() not in read_paths
 
 
 def test_parse_tools_md_re_anchor_emits_audit_log(tmp_path, caplog):
@@ -385,6 +404,50 @@ def test_parse_tools_md_bare_relative_without_agent_root_warns(tmp_path):
     assert len(result["write_paths"]) == 2
 
 
+def test_from_dict_bare_relative_tools_md_warns_no_agent_root():
+    """AgentProfile.from_dict re-parses tools_md_raw WITHOUT agent_root (the DB
+    round-trip context has no filesystem path), so a bare-relative write_path
+    must trigger the documented CWD-anchoring UserWarning (#546).
+
+    Pins the distinctive typed behavior of the documented fallback contract at
+    the from_dict call site, not just the parser: a future refactor that
+    silently drops the warning, or accidentally threads agent_root from a
+    pathless dict, would otherwise pass unnoticed. The parser-level warning is
+    tested separately; this asserts the call site that relies on it.
+    """
+    from atomic_agents.profile import AgentProfile
+
+    d = {
+        "name": "db-agent",
+        "agent_mode": "operator",
+        "persona_identity": "# Identity\n\nA test agent.\n",
+        "persona_soul": "",
+        "persona_user": "",
+        "goal_text": "",
+        "model_md_raw": "",
+        "tools_md_raw": "## Write paths\n\n- memory/ -- bare-relative token\n",
+        "judges_md_raw": None,
+        "roster_md_raw": "",
+        "mcp_md_raw": "",
+        "model_config": {},
+        "tool_config": {},
+        "tool_classifications": {},
+        "judges_config": None,
+        "roster": [],
+        "mcp_servers": [],
+    }
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        AgentProfile.from_dict(d)
+
+    warning_messages = [str(w.message) for w in caught]
+    assert any("agent_root" in m for m in warning_messages), (
+        "from_dict re-parse of a bare-relative tools.md must emit the documented "
+        f"agent_root CWD-anchoring warning; got: {warning_messages}"
+    )
+
+
 def test_parse_tools_md_tilde_path_not_re_anchored(tmp_path):
     """Tilde paths in tools.md are expanded to home, not re-anchored to agent_root."""
     agent_root = tmp_path / "agents" / "myagent"
@@ -403,13 +466,24 @@ def test_parse_tools_md_absolute_path_not_re_anchored(tmp_path):
     assert result["write_paths"][0] == Path("/absolute/shared").resolve()
 
 
-def test_parse_tools_md_file_with_agent_root(tmp_path):
-    """parse_tools_md() on-disk function threads agent_root correctly."""
+def test_parse_tools_md_file_with_agent_root(tmp_path, monkeypatch):
+    """parse_tools_md() on-disk function threads agent_root correctly.
+
+    Runs from a decoy CWD and asserts the CWD-anchored form is ABSENT so the
+    negative control bites regardless of process CWD.
+    """
     agent_root = tmp_path / "agents" / "myagent"
     tools_path = tmp_path / "tools.md"
     tools_path.write_text(_TEMPLATE_TOOLS_TEXT, encoding="utf-8")
+    decoy_cwd = tmp_path / "decoy_cwd"
+    decoy_cwd.mkdir(parents=True)
+    monkeypatch.chdir(decoy_cwd)
+
     result = parse_tools_md(tools_path, agent_root=agent_root)
     assert (agent_root / "memory").resolve() in result["write_paths"]
+    assert (Path.cwd() / "memory").resolve() not in result["write_paths"], (
+        "on-disk parse CWD-anchored 'memory/' instead of anchoring under agent_root"
+    )
 
 
 def test_parse_tools_md_bare_relative_negative_control_no_agent_root(tmp_path):

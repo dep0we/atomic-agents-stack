@@ -1849,3 +1849,102 @@ def test_add_to_it_returns_nonzero_when_write_path_dir_creation_fails(
         "the green 'updated at' success line must be suppressed when the agent "
         f"is not doctor-clean; got: {console.out.getvalue()!r}"
     )
+
+
+def _seed_complete_writer_agent(agent_dir):
+    """Seed a writer agent whose every schema file already matches the fresh
+    template byte-for-byte, so Add-to-it computes a ZERO text diff.
+
+    Returns nothing; the caller deletes a write-path dir to set up the
+    zero-diff-but-missing-dir scenario.
+    """
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    fresh_vars = W._default_template_vars(agent_dir.name, "writer")
+    # Render the real fresh template into the agent dir so _compute_merged_content
+    # finds zero section-level differences.
+    W._render_files(agent_dir, "writer", fresh_vars)
+    W._create_empty_dirs(agent_dir)
+
+
+def test_add_to_it_zero_diff_creates_missing_write_path_dir(tmp_path):
+    """Zero TEXT diff must NOT short-circuit before reconciling declared
+    write-path dirs (#541). An up-to-date writer agent whose drafts/ dir was
+    deleted must have it re-created by Add-to-it, with rc 0 — never report
+    'up to date' while a declared dir is missing.
+
+    This closes the zero-change-branch gap: the #541 fix wired
+    _create_empty_dirs into the non-zero merge path and _write_scaffold, but the
+    files_changed == 0 branch returned 0 with a green 'up to date' line without
+    ever reconciling dirs.
+    """
+    agent_dir = tmp_path / "agents" / "writer-agent"
+    _seed_complete_writer_agent(agent_dir)
+
+    # Sanity: the fresh template declares drafts/ + revisions/ and they exist.
+    assert (agent_dir / "drafts").is_dir()
+    assert (agent_dir / "revisions").is_dir()
+
+    # Delete a declared write-path dir out from under the otherwise-current agent.
+    import shutil
+
+    shutil.rmtree(agent_dir / "drafts")
+    assert not (agent_dir / "drafts").exists()
+
+    console = _FakeConsole()
+    rc = W._add_to_it(
+        agent_dir=agent_dir,
+        agents_root=tmp_path / "agents",
+        template_name="writer",
+        console=console,
+        Prompt=_prompt_sequence(),
+        Confirm=_confirm_factory(True),
+        existing_headers=None,
+    )
+
+    assert rc == 0, f"_add_to_it returned {rc}; expected 0 (dir re-created)"
+    assert (agent_dir / "drafts").is_dir(), (
+        "drafts/ was deleted from an up-to-date agent; the zero-diff Add-to-it "
+        "branch must re-create it, but it is still missing"
+    )
+
+
+def test_add_to_it_zero_diff_returns_nonzero_when_dir_creation_fails(
+    tmp_path, monkeypatch
+):
+    """Negative control for the zero-change-branch fix: if reconciling declared
+    write-path dirs fails on the zero-diff path, Add-to-it must return non-zero
+    and must NOT print the green 'up to date' line — the same audit-honesty
+    contract the non-zero path and _write_scaffold enforce.
+    """
+    import shutil
+
+    agent_dir = tmp_path / "agents" / "writer-agent"
+    _seed_complete_writer_agent(agent_dir)
+    shutil.rmtree(agent_dir / "drafts")
+
+    def _boom(_agent_dir):
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(W, "_create_empty_dirs", _boom)
+
+    console = _FakeConsole()
+    rc = W._add_to_it(
+        agent_dir=agent_dir,
+        agents_root=tmp_path / "agents",
+        template_name="writer",
+        console=console,
+        Prompt=_prompt_sequence(),
+        Confirm=_confirm_factory(True),
+        existing_headers=None,
+    )
+
+    assert rc == 1, f"_add_to_it returned {rc}; expected 1 on zero-diff dir failure"
+    out = console.out.getvalue().lower()
+    assert "could not be created" in out, (
+        "expected the actionable 'could not be created' warning on the zero-diff "
+        f"path; got: {console.out.getvalue()!r}"
+    )
+    assert "up to date" not in out, (
+        "the green 'up to date' line must be suppressed when a declared dir is "
+        f"missing and cannot be created; got: {console.out.getvalue()!r}"
+    )
