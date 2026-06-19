@@ -586,6 +586,27 @@ def test_must10_conflict_in_full_deploy_aborts_before_install(
     assert not runner.issued("bootstrap")  # never installed
 
 
+def test_must7_bootstrapped_but_not_running_busy_port_fails_loud(
+    agent_root, launch_dir, monkeypatch
+):
+    """A bootstrapped-but-NOT-running own label (loaded/crashed, no live PID)
+    does NOT hold the port, so a busy port is a FOREIGN conflict that must still
+    fail loud. The probe-skip keys on RUNNING, not merely bootstrapped (round-3
+    cross-family P1). Negative control: under the old ``_is_bootstrapped`` skip,
+    this busy port was silently swallowed.
+    """
+    _patch_doctor_pass(monkeypatch)
+    # print → rc 0 but NO pid line → bootstrapped + LOADED (not RUNNING).
+    runner = FakeRunner(script={"print": (0, "")})
+    rc, _, err = _run_deploy(
+        agent_root, launch_dir, launchd_runner=runner, binder=_busy_binder
+    )
+    assert rc != 0
+    assert "already in use" in err
+    assert list(launch_dir.iterdir()) == []  # no plist written
+    assert not runner.issued("bootstrap")  # never installed
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # MUST 11 — exposure is guided, never performed
 # ──────────────────────────────────────────────────────────────────────────

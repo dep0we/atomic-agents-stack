@@ -456,11 +456,17 @@ def _step_supervise(
     # pre-bootstrap bind probe must distinguish OUR OWN already-running serve
     # holding the port (a clean restart — install's bootout will free it) from a
     # FOREIGN process holding it (a real conflict). If our own launchd label is
-    # already bootstrapped, the port it holds is not a conflict — skip the probe
-    # and let install_launchd_agent's bootout→bootstrap do the clean restart.
-    # When the label is NOT loaded, any bind conflict is foreign → fail loud.
-    own_label_loaded = _launchd._is_bootstrapped(agent, runner=launchd_runner)
-    if not own_label_loaded:
+    # actually RUNNING (live PID) it holds the port, which is not a conflict —
+    # skip the probe and let install_launchd_agent's bootout→bootstrap do the
+    # clean restart. A bootstrapped-but-crashed/loaded label does NOT hold the
+    # port, so a busy port in that state is a FOREIGN conflict → fail loud.
+    own_serve_running = (
+        _launchd.read_launchd_status(
+            agent, launch_agents_dir=launch_agents_dir, runner=launchd_runner
+        ).state
+        == DeployState.RUNNING
+    )
+    if not own_serve_running:
         # MUST 10 — pre-bootstrap bind probe. A conflict raises PortConflictError;
         # we surface it loud and never silently rebind.
         try:
