@@ -543,17 +543,17 @@ def test_pgvector_corpus_schema_init_succeeds_above_hnsw_dimension_limit(tmp_pat
     )
 
     # Drop the shared table so this test's schema-init sizes it at big_dim.
-    # _get_pg_conn() runs _ensure_pg_schema once; reset _schema_initialized so a
-    # second _get_pg_conn re-runs the DDL at big_dim after the DROP.
+    # _get_pg_conn() caches the connection and only runs _ensure_pg_schema when
+    # it FIRST establishes one, so a second _get_pg_conn() would return the same
+    # conn WITHOUT re-running the DDL. Re-run schema-init explicitly on the open
+    # conn instead — it recreates corpus_page_embeddings at the backend's big_dim.
     conn = backend._get_pg_conn()
     assert conn is not None
     conn.execute("DROP TABLE IF EXISTS corpus_page_embeddings CASCADE")
     conn.commit()
-    backend._schema_initialized = False
 
     # Re-run schema-init at big_dim: must NOT raise despite big_dim > 2000.
-    conn = backend._get_pg_conn()
-    assert conn is not None
+    backend._ensure_pg_schema(conn)
 
     cur = conn.execute(
         "SELECT 1 FROM information_schema.tables "
