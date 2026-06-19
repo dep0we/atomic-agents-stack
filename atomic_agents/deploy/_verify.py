@@ -23,11 +23,20 @@ without a real network call or a running server.
 from __future__ import annotations
 
 import json as _json
+import socket
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Callable
+
+# Sentinel HTTP status returned by the production http_get/http_post when the
+# transport itself failed (connection refused, DNS, timeout) — i.e. the server
+# was not reachable at all. It is NOT a real HTTP status; the predicate helpers
+# below treat it as a clean FAIL (the body is empty), never an exception. This
+# is what keeps a not-yet-bound launchd serve from crashing verify uncaught and
+# leaving the agent installed (spec/48 MUST 8).
+TRANSPORT_FAILURE_STATUS = 0
 
 # An http_get takes a URL and returns (status_code, body_text).
 HttpGet = Callable[[str], "tuple[int, str]"]
@@ -50,11 +59,19 @@ class VerifyResult:
 
 
 def _default_http_get(url: str) -> "tuple[int, str]":
-    """Production GET: returns (status, body). Never raises on HTTP error codes.
+    """Production GET: returns (status, body). Never raises.
 
     urllib raises ``HTTPError`` for 4xx/5xx; we catch it and return its code +
     body so the predicate logic (which inspects the JSON body) can run on a
     non-2xx response (e.g. /healthz returns 503 with a JSON body).
+
+    A freshly-``bootstrap``ed serve may not have bound the socket when the first
+    probe fires, so the GET raises ``URLError`` (connection refused) or times
+    out — a TRANSPORT failure, not an HTTP status. We MUST catch those too and
+    return ``(TRANSPORT_FAILURE_STATUS, "")`` so the predicate FAILS cleanly
+    rather than propagating an exception that would skip rollback and leave the
+    launchd agent installed (spec/48 MUST 8). The retry loop then re-probes
+    within the warm-up window.
     """
     try:
         with urllib.request.urlopen(url, timeout=10) as resp:  # noqa: S310
@@ -62,6 +79,10 @@ def _default_http_get(url: str) -> "tuple[int, str]":
     except urllib.error.HTTPError as e:  # 4xx / 5xx still carry a JSON body
         body = e.read().decode("utf-8", "replace") if e.fp else ""
         return e.code, body
+    except (urllib.error.URLError, TimeoutError, socket.timeout, OSError):
+        # Connection refused / DNS / timeout — the server is not reachable yet.
+        # Return a sentinel so the predicate fails cleanly (never throws).
+        return TRANSPORT_FAILURE_STATUS, ""
 
 
 def _default_http_post(url: str, body: dict) -> "tuple[int, str]":
@@ -79,6 +100,8 @@ def _default_http_post(url: str, body: dict) -> "tuple[int, str]":
     except urllib.error.HTTPError as e:
         body_text = e.read().decode("utf-8", "replace") if e.fp else ""
         return e.code, body_text
+    except (urllib.error.URLError, TimeoutError, socket.timeout, OSError):
+        return TRANSPORT_FAILURE_STATUS, ""
 
 
 def _check_healthz(status: int, body_text: str) -> tuple[bool, str]:
@@ -103,27 +126,56 @@ def _check_doctor(status: int, body_text: str) -> tuple[bool, str]:
     checks fail, so we MUST recompute the exit code from the result list rather
     than trust the HTTP status. We import doctor lazily and feed it parsed
     CheckResult-shaped dicts.
+
+    Fail-closed posture (spec/48 MUST 9 — a non-2xx or error-shaped body MUST
+    NOT pass): we MUST NOT conflate "no checks parsed" with "no checks failed".
+    A non-2xx HTTP status (the route errored / a transport sentinel), an
+    error-shaped body (``{"status":"error"}`` / ``{"error":...}`` / ``{"detail":
+    ...}``), or a payload that carries NO recognizable results key are all FAILs
+    — only a well-formed results list whose ``overall_exit_code`` is 0 passes.
     """
     from .. import doctor as doctor_module
+
+    # A non-2xx status means the /doctor route itself did not return its normal
+    # 200+results payload (it returns 200 even when checks fail). Treat any
+    # non-2xx — including the transport-failure sentinel (0) — as a FAIL.
+    if not (200 <= status < 300):
+        return False, f"doctor returned HTTP {status} (expected 2xx with results)"
 
     try:
         payload = _json.loads(body_text)
     except (ValueError, TypeError):
         return False, f"doctor returned non-JSON body (HTTP {status})"
 
-    # render_json emits a top-level object; tolerate either a bare list of
-    # checks or an object with a "checks"/"results" key.
+    # An error-shaped body is a FAIL even at HTTP 200 (e.g. a serve handler that
+    # caught an exception and rendered {"status":"error","error":...}).
     if isinstance(payload, dict):
-        results_raw = (
-            payload.get("checks")
-            or payload.get("results")
-            or payload.get("checks_results")
-            or []
-        )
-    elif isinstance(payload, list):
+        if payload.get("status") == "error" or "error" in payload:
+            reason = payload.get("error") or payload.get("detail") or "unknown error"
+            return False, f"doctor reported an error body (HTTP {status}): {reason}"
+
+    # render_json emits a top-level object; tolerate either a bare list of
+    # checks or an object with a "checks"/"results" key. A MISSING/unrecognized
+    # results key is NOT "zero failures" — it is a FAIL, because we cannot prove
+    # the deployment is healthy from a body we could not parse into checks.
+    if isinstance(payload, list):
         results_raw = payload
+    elif isinstance(payload, dict):
+        results_raw = None
+        for candidate in ("checks", "results", "checks_results"):
+            if candidate in payload:
+                results_raw = payload[candidate]
+                break
+        if results_raw is None:
+            return False, (
+                "doctor body had no recognizable results key "
+                "(checks/results/checks_results)"
+            )
     else:
-        results_raw = []
+        return False, "doctor body was neither a results list nor an object"
+
+    if not isinstance(results_raw, list):
+        return False, "doctor results key was not a list"
 
     # Rebuild CheckResult objects so we reuse the canonical predicate
     # (overall_exit_code) rather than re-implementing "any failed" here — keeps

@@ -40,6 +40,7 @@ full deploy without touching the host.
 
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -69,6 +70,12 @@ class DeployError(Exception):
 # The production default reads from stdin; tests inject a fake.
 Prompter = Callable[[str], bool]
 
+# An init_runner takes (agent, agents_root) and runs `atomic-agents init`,
+# returning a process exit code (0 = success). The production default invokes
+# the existing init wizard entry point; tests inject a fake so the consent
+# handoff is exercised without launching the interactive wizard.
+InitRunner = Callable[[str, Path], int]
+
 
 def _default_prompter(question: str) -> bool:
     """Production consent prompt: ask on stdout, read y/N from stdin."""
@@ -77,6 +84,28 @@ def _default_prompter(question: str) -> bool:
     except EOFError:
         return False
     return answer in ("y", "yes")
+
+
+def _default_init_runner(agent: str, agents_root: Path) -> int:
+    """Production init handoff: invoke the existing `atomic-agents init` wizard.
+
+    spec/48 MUST 1 — deploy drives ``init`` through its existing entry point; it
+    does NOT reimplement scaffolding. Builds the args-shaped object the wizard
+    expects (``agent_name`` / ``from_template`` / ``list_templates`` /
+    ``agents_root``) and returns its exit code.
+    """
+    from types import SimpleNamespace
+
+    from ..init import run_init
+
+    return run_init(
+        SimpleNamespace(
+            agent_name=agent,
+            from_template=None,
+            list_templates=False,
+            agents_root=str(agents_root),
+        )
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -174,23 +203,54 @@ def _consent(
 def _step_agent_exists(
     agent: str,
     agent_root: Path,
+    agents_root: Path,
     *,
     assume_yes: bool,
+    prompter: Prompter,
+    init_runner: "InitRunner",
+    out,
 ) -> None:
     """Step 2 — the agent folder must exist (spec/48 step 2).
 
-    ``init`` is interactive and writes files, so it is never an ``auto`` step.
-    With ``--yes`` (non-interactive), a missing folder fails loud with the
-    exact ``init`` command rather than launching the interactive wizard.
+    ``init`` is interactive and writes files, so it is never an ``auto`` step
+    (it is tagged ``consent``). spec/48 step 2:
+      - Without ``--yes``: hand off to ``atomic-agents init <agent>`` after the
+        operator consents (the wizard itself is interactive). If the handoff
+        succeeds and the folder now exists, the step passes.
+      - With ``--yes`` (non-interactive): fail-fast with the exact ``init``
+        command — deploy will NOT launch the interactive wizard unattended.
     """
     if agent_root.is_dir():
         return
-    raise DeployError(
-        f"agent {agent!r} not found at {agent_root}.\n"
-        f"Run `atomic-agents init {agent}` first (it is interactive and "
-        f"writes files, so deploy will not run it for you in --yes mode).",
-        exit_code=1,
-    )
+
+    if assume_yes:
+        raise DeployError(
+            f"agent {agent!r} not found at {agent_root}.\n"
+            f"Run `atomic-agents init {agent}` first (it is interactive and "
+            f"writes files, so deploy will not run it for you in --yes mode).",
+            exit_code=1,
+        )
+
+    # Interactive consent before handing off to the init wizard (consent step).
+    if not prompter(
+        f"agent {agent!r} not found at {agent_root}. "
+        f"Run `atomic-agents init {agent}` now?"
+    ):
+        raise DeployError(
+            f"agent {agent!r} not found and init declined. "
+            f"Run `atomic-agents init {agent}` first, then re-run deploy.",
+            exit_code=1,
+        )
+
+    print(f"      Handing off to `atomic-agents init {agent}`...", file=out)
+    rc = init_runner(agent, agents_root)
+    if rc != 0 or not agent_root.is_dir():
+        raise DeployError(
+            f"`atomic-agents init {agent}` did not complete "
+            f"(exit {rc}); the agent folder still does not exist at "
+            f"{agent_root}. Fix init, then re-run deploy.",
+            exit_code=1,
+        )
 
 
 def _step_doctor_gate(
@@ -247,6 +307,91 @@ def _step_provider_key(
         )
 
 
+def _resolve_env_only_provider_key(
+    agent_root: Path,
+    *,
+    environ: dict[str, str] | None = None,
+) -> tuple[str, str] | None:
+    """Return ``(env_name, value)`` iff a provider key's SOLE source is an env var.
+
+    spec/48 MUST 5 / step list step 4 — the env-var-only operator path. The
+    step-4 gate confirms a key resolves in the DEPLOYING shell, but a
+    ``gui/$UID`` launchd agent does NOT inherit that shell's env. When the key's
+    only source is an env var, serve started by launchd would not find it, so
+    deploy MUST inject it into the plist as ``KEY=VALUE`` (with the documented
+    cleartext caveat). When the source is Keychain / keys.json, deploy MUST NOT
+    inject it — serve's ``_llm._get_key()`` reads those at runtime.
+
+    Detection reuses the production resolvers so deploy's verdict and the
+    runtime's key resolution can never disagree:
+      - find the winning env var (the highest-priority env alias that is set +
+        non-empty) for each provider in model.md;
+      - probe the NON-env sources (Keychain, keys.json) directly; if neither
+        holds the key, env is the sole source → inject.
+
+    Returns None when no env-only key is found (key absent — already caught by
+    step 4 — or key also reachable from a non-env source).
+    """
+    from .. import doctor as doctor_module
+    from ..secret_backend.filesystem import (
+        _resolve_from_keychain,
+        _resolve_from_keys_json,
+    )
+
+    env = environ if environ is not None else dict(os.environ)
+
+    model_md = agent_root / "model.md"
+    model_data = parse_model_md(model_md if model_md.exists() else None)
+
+    # The providers deploy must supply a key for (default + fallback), mapped to
+    # their (keychain_name, env_vars, config_key) triple via doctor's table.
+    providers: list[str] = []
+    seen: set[str] = set()
+    for key in ("default_model", "fallback_model"):
+        mid = model_data.get(key)
+        if not mid:
+            continue
+        prov = doctor_module._provider_for_model(mid)
+        if prov and prov not in seen:
+            providers.append(prov)
+            seen.add(prov)
+
+    for provider in providers:
+        spec = doctor_module._PROVIDER_KEYS.get(provider)
+        if spec is None:
+            continue
+        keychain_name, env_vars, config_key, _sdk = spec
+        if not env_vars:
+            # e.g. vertex-gemini uses ADC, not an env-var key — nothing to inject.
+            continue
+
+        # The winning env var: first alias that is set + non-empty (matches the
+        # resolver's env-first, alias-order precedence).
+        env_name: str | None = None
+        env_value: str | None = None
+        for candidate in env_vars:
+            val = env.get(candidate)
+            if val is not None and val.strip():
+                env_name, env_value = candidate, val.strip()
+                break
+        if env_name is None:
+            # No env source for this provider — either absent (step 4 catches
+            # it) or it lives only in Keychain/keys.json (no injection needed).
+            continue
+
+        # Probe the NON-env sources. If EITHER holds the key, env is not the
+        # sole source → serve will find it at runtime → do NOT inject.
+        if _resolve_from_keychain(keychain_name) is not None:
+            continue
+        if _resolve_from_keys_json(config_key) is not None:
+            continue
+
+        # Env is the sole source for this provider's key — inject it.
+        return env_name, env_value
+
+    return None
+
+
 @dataclass
 class _SupervisionResult:
     """Outcome of the supervise step: the resolved port + the plist path."""
@@ -274,7 +419,12 @@ def _step_supervise(
       - pre-bootstrap socket-bind probe (MUST 10 — conflict fails loud),
       - render the plist (MUST 4/5), then bootstrap (MUST 7 idempotent).
     """
-    port = _ports.resolve_port(agent_root, cli_port=cli_port, environ=environ)
+    # MUST 10 — port validation precedes probing: an out-of-range port (0 or
+    # >65535) fails loud here, before the bind probe / launchd ever sees it.
+    try:
+        port = _ports.resolve_port(agent_root, cli_port=cli_port, environ=environ)
+    except _ports.PortRangeError as exc:
+        raise DeployError(str(exc), exit_code=1) from exc
 
     # MUST 10 — pre-bootstrap bind probe. A conflict raises PortConflictError;
     # we surface it loud and never silently rebind.
@@ -283,11 +433,19 @@ def _step_supervise(
     except _ports.PortConflictError as exc:
         raise DeployError(str(exc), exit_code=1) from exc
 
+    # MUST 5 — env-var-only provider key. A gui/$UID launchd serve does NOT
+    # inherit the deploying shell, so if the key's sole source is an env var we
+    # inject it into the plist as KEY=VALUE (render_plist prints the cleartext
+    # caveat). Keychain/keys.json sources are read by serve at runtime — never
+    # injected.
+    plaintext_key = _resolve_env_only_provider_key(agent_root, environ=environ)
+
     rendered = _launchd.render_plist(
         agent,
         port,
         agents_root=agents_root,
         environ=environ,
+        plaintext_key=plaintext_key,
     )
 
     try:
@@ -309,6 +467,89 @@ def _step_supervise(
     )
 
 
+def _rollback_and_report(
+    agent: str,
+    *,
+    supervision: _SupervisionResult,
+    launchd_runner: _launchd.Runner,
+    launch_agents_dir: Path | None,
+    binder: _ports.Binder,
+    verify_exc: Exception | None,
+    out,
+    err,
+) -> int:
+    """Tear down a just-installed agent after a failed verify (spec/48 MUST 8).
+
+    Boots out the launchd agent and removes the plist deploy wrote — no
+    bootstrapped-but-broken service is left behind. Returns the non-zero exit
+    code. Called for BOTH a False verify predicate and a verify that raised
+    (``verify_exc`` is the raised exception, or None for a clean predicate
+    failure).
+
+    MUST 10 (post-bootstrap address-in-use): before rolling back, re-probe the
+    port. If it is now bound and deploy does not own a healthy serve there, the
+    likely cause is another process holding the port — report
+    "address in use :<port>" explicitly so the operator does not chase a
+    phantom serve bug. Best-effort: a re-probe that itself errors is ignored.
+    """
+    # MUST 10 — post-bootstrap address-in-use detection (best-effort).
+    addr_in_use = False
+    try:
+        # binder returns True when the port is FREE; False when bound. If the
+        # port is now bound (not free) after our verify failed, something is
+        # holding it — surface that as the proximate cause.
+        addr_in_use = binder(_LOOPBACK_HOST, supervision.port) is False
+    except Exception:  # noqa: BLE001 — re-probe is best-effort, never fatal
+        addr_in_use = False
+
+    # MUST 8 — bootout the just-installed agent and remove the plist. If the
+    # bootout itself fails (a real launchctl error, not "already absent"),
+    # teardown raises and leaves the plist in place — surface that rather than
+    # claim a clean rollback we could not perform.
+    try:
+        _launchd.teardown_launchd_agent(
+            agent,
+            launch_agents_dir=launch_agents_dir,
+            runner=launchd_runner,
+            remove_plist=True,
+        )
+    except _launchd.DeployLaunchdError as exc:
+        print(
+            f"Error: verification failed AND rollback could not complete: {exc}\n"
+            f"The launchd agent {_launchd.label_for(agent)} may still be loaded; "
+            f"run `atomic-agents deploy down {agent}` to retry teardown.",
+            file=err,
+        )
+        return 1
+
+    if addr_in_use:
+        print(
+            f"Error: address in use :{supervision.port} — another process is "
+            f"bound to {_LOOPBACK_HOST}:{supervision.port}, so the supervised "
+            "serve could not bind it.",
+            file=err,
+        )
+
+    if verify_exc is not None:
+        print(
+            "Error: verification raised an unexpected error "
+            f"({type(verify_exc).__name__}: {verify_exc}); rolled back the "
+            f"launchd agent (booted out + removed {supervision.plist_path}).\n"
+            f"Inspect logs at ~/Library/Logs/{_launchd.label_for(agent)}.err.log, "
+            f"then re-run `atomic-agents deploy {agent}`.",
+            file=err,
+        )
+    else:
+        print(
+            "Error: verification failed; rolled back the launchd agent "
+            f"(booted out + removed {supervision.plist_path}).\n"
+            f"Inspect logs at ~/Library/Logs/{_launchd.label_for(agent)}.err.log, "
+            f"then re-run `atomic-agents deploy {agent}`.",
+            file=err,
+        )
+    return 1
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Entry point: deploy
 # ──────────────────────────────────────────────────────────────────────────
@@ -326,14 +567,15 @@ def deploy(
     out=None,
     err=None,
     prompter: Prompter = _default_prompter,
+    init_runner: InitRunner = _default_init_runner,
     launchd_runner: _launchd.Runner = _launchd._default_runner,
     binder: _ports.Binder = _ports._socket_binder,
     exposure_runner: _exposure.Runner = _exposure._default_runner,
     http_get: _verify.HttpGet = _verify._default_http_get,
     http_post: _verify.HttpPost = _verify._default_http_post,
     launch_agents_dir: Path | None = None,
-    verify_retries: int = 1,
-    verify_retry_delay_s: float = 0.0,
+    verify_retries: int = 10,
+    verify_retry_delay_s: float = 0.5,
 ) -> int:
     """Plan + execute a loopback deployment, verify, then guide exposure.
 
@@ -377,7 +619,15 @@ def deploy(
 
         # Step 2 — agent folder must exist (consent: init handoff).
         print("[2/7] Checking the agent folder exists...", file=out)
-        _step_agent_exists(agent, agent_root, assume_yes=assume_yes)
+        _step_agent_exists(
+            agent,
+            agent_root,
+            resolved_root,
+            assume_yes=assume_yes,
+            prompter=prompter,
+            init_runner=init_runner,
+            out=out,
+        )
 
         # Step 3 — doctor gate.
         print("[3/7] Running the doctor gate (doctor --no-mcp)...", file=out)
@@ -389,8 +639,7 @@ def deploy(
 
         # Step 5 — supervise (consent): resolve port, probe, render, bootstrap.
         if not _consent(
-            "Install a user-level launchd agent for "
-            f"{agent!r} (no sudo)?",
+            f"Install a user-level launchd agent for {agent!r} (no sudo)?",
             assume_yes=assume_yes,
             prompter=prompter,
         ):
@@ -420,36 +669,45 @@ def deploy(
 
     # ── Step 6 — verify on loopback. Rollback on failure (MUST 8). ──────────
     print("[6/7] Verifying on loopback (healthz + doctor)...", file=out)
-    result = _verify.verify_deployment(
-        agent,
-        _LOOPBACK_HOST,
-        supervision.port,
-        verify_call=verify_call,
-        http_get=http_get,
-        http_post=http_post,
-        retries=verify_retries,
-        retry_delay_s=verify_retry_delay_s,
-    )
-    for name, passed, message in result.checks:
-        mark = "ok" if passed else "FAIL"
-        print(f"      [{mark}] {name}: {message}", file=out)
 
-    if not result.ok:
-        # MUST 8 — bootout the just-installed agent and remove the plist.
-        _launchd.teardown_launchd_agent(
+    # MUST 8 — verify MUST NOT be able to leave the launchd agent installed.
+    # ``verify_deployment``'s production http_get already converts transport
+    # failures (connection-refused on a not-yet-bound serve) into a clean FAIL
+    # sentinel, but a custom http seam or a downstream bug could still raise.
+    # Wrap the WHOLE verify so ANY exception — not just a False predicate, not
+    # just DeployError — triggers rollback + non-zero exit before we return.
+    verify_exc: Exception | None = None
+    result: _verify.VerifyResult | None = None
+    try:
+        result = _verify.verify_deployment(
             agent,
+            _LOOPBACK_HOST,
+            supervision.port,
+            verify_call=verify_call,
+            http_get=http_get,
+            http_post=http_post,
+            retries=verify_retries,
+            retry_delay_s=verify_retry_delay_s,
+        )
+    except Exception as exc:  # noqa: BLE001 — rollback must catch everything
+        verify_exc = exc
+
+    if result is not None:
+        for name, passed, message in result.checks:
+            mark = "ok" if passed else "FAIL"
+            print(f"      [{mark}] {name}: {message}", file=out)
+
+    if verify_exc is not None or (result is not None and not result.ok):
+        return _rollback_and_report(
+            agent,
+            supervision=supervision,
+            launchd_runner=launchd_runner,
             launch_agents_dir=launch_agents_dir,
-            runner=launchd_runner,
-            remove_plist=True,
+            binder=binder,
+            verify_exc=verify_exc,
+            out=out,
+            err=err,
         )
-        print(
-            "Error: verification failed; rolled back the launchd agent "
-            f"(booted out + removed {supervision.plist_path}).\n"
-            f"Inspect logs at ~/Library/Logs/{_launchd.label_for(agent)}.err.log, "
-            f"then re-run `atomic-agents deploy {agent}`.",
-            file=err,
-        )
-        return 1
 
     # ── Step 7 — exposure guidance (GUIDE, NEVER PERFORM). MUST 11. ─────────
     print("[7/7] Exposure guidance:", file=out)

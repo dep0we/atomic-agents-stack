@@ -43,18 +43,39 @@ class DeployLaunchdError(Exception):
     """Raised when a launchctl interaction fails in a way deploy must surface."""
 
 
+# launchctl interactions are local and fast; a hang means launchd is wedged.
+# Bound every call so deploy cannot block indefinitely (spec/48 — no hung
+# deploy). A timeout is mapped to the launchd error type by the caller.
+_LAUNCHCTL_TIMEOUT_S = 30
+
+
 def _default_runner(argv: list[str]) -> "subprocess.CompletedProcess[str]":
     """Production runner: run a subprocess, capture text output, never raise.
 
     We deliberately do NOT pass ``check=True`` — callers inspect ``returncode``
     so they can distinguish "label absent" (a benign non-zero from
     ``launchctl print``) from a real failure.
+
+    A ``timeout`` bounds the call so a wedged launchd cannot hang deploy
+    forever. On ``TimeoutExpired`` we return a non-zero CompletedProcess whose
+    stderr names the timeout, so the returncode-inspecting callers treat it as a
+    REAL failure (``DeployLaunchdError``) — never as the benign "label absent"
+    case.
     """
-    return subprocess.run(  # noqa: PLW1510 -- returncode inspected by caller
-        argv,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        return subprocess.run(  # noqa: PLW1510 -- returncode inspected by caller
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=_LAUNCHCTL_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            argv,
+            returncode=124,  # conventional timeout exit code
+            stdout="",
+            stderr=f"launchctl timed out after {_LAUNCHCTL_TIMEOUT_S}s: {' '.join(argv)}",
+        )
 
 
 def label_for(agent: str) -> str:
@@ -102,19 +123,31 @@ def resolve_program_arguments(agent: str, port: int) -> list[str]:
     so the executable MUST be an ABSOLUTE path, not the bare ``atomic-agents``.
     Resolve via ``shutil.which("atomic-agents")``; fall back to the current
     interpreter running the module entry point.
+
+    ``shutil.which`` can return a RELATIVE path when a relative entry (e.g. ``.``
+    or ``./bin``) is on ``PATH``. A relative ProgramArguments[0] would not
+    resolve under launchd (whose working directory is not the deploying shell's
+    cwd), so we ``resolve()`` the hit and REQUIRE it to be absolute; if it is
+    not (or which found nothing), fall back to ``sys.executable -m`` which is
+    always absolute.
     """
     host = "127.0.0.1"
     console = shutil.which("atomic-agents")
-    if console:
-        return [
-            console,
-            "serve",
-            agent,
-            "--host",
-            host,
-            "--port",
-            str(port),
-        ]
+    # A relative which() hit (a relative PATH entry was matched) is NOT usable
+    # under launchd, whose cwd is not the deploying shell's. Only trust an
+    # already-absolute hit; otherwise fall through to the sys.executable form.
+    if console and Path(console).is_absolute():
+        resolved = Path(console).resolve()
+        if resolved.is_absolute():  # defensive; resolve() is always absolute
+            return [
+                str(resolved),
+                "serve",
+                agent,
+                "--host",
+                host,
+                "--port",
+                str(port),
+            ]
     # Fallback: the running interpreter + module entry point. sys.executable is
     # always absolute.
     return [
@@ -178,9 +211,7 @@ def render_plist(
     environment_variables: dict[str, str] = {
         "HOME": env.get("HOME", str(Path.home())),
         "USER": env.get("USER", env.get("LOGNAME", "")),
-        "PATH": env.get(
-            "PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        ),
+        "PATH": env.get("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"),
         "ATOMIC_AGENTS_ROOT": str(agents_root),
     }
 
@@ -199,10 +230,7 @@ def render_plist(
         # StandardOut/Error to a per-label log so a crashing serve leaves a
         # recoverable artifact (CLAUDE.md rule 8). Under HOME so it is user-space.
         "StandardOutPath": str(
-            Path(environment_variables["HOME"])
-            / "Library"
-            / "Logs"
-            / f"{label}.log"
+            Path(environment_variables["HOME"]) / "Library" / "Logs" / f"{label}.log"
         ),
         "StandardErrorPath": str(
             Path(environment_variables["HOME"])
@@ -226,9 +254,7 @@ def _uid() -> int:
     return os.getuid()
 
 
-def _is_bootstrapped(
-    agent: str, *, runner: Runner = _default_runner
-) -> bool:
+def _is_bootstrapped(agent: str, *, runner: Runner = _default_runner) -> bool:
     """Return True if the label is currently bootstrapped in ``gui/$UID``.
 
     Uses ``launchctl print gui/$UID/<label>`` — exit 0 means the label is
@@ -288,6 +314,30 @@ def install_launchd_agent(
     return plist_path
 
 
+def _bootout_indicates_absent(cp: "subprocess.CompletedProcess[str]") -> bool:
+    """True iff a non-zero ``launchctl bootout`` means "service not loaded".
+
+    A bootout of an absent label is benign (idempotent teardown). launchctl
+    signals this with a small set of known codes / messages, which vary across
+    macOS versions:
+      - exit 3 (ESRCH "No such process"),
+      - exit 113 ("Could not find specified service"),
+      - stderr naming "no such process" / "could not find" / "not find".
+    Any OTHER non-zero return is a REAL failure (e.g. EPERM, a domain error)
+    and MUST NOT be silently tolerated (spec/48 MUST 7/8/12).
+    """
+    if cp.returncode == 0:
+        return True
+    if cp.returncode in (3, 113):
+        return True
+    text = ((cp.stderr or "") + " " + (cp.stdout or "")).lower()
+    return (
+        "no such process" in text
+        or "could not find" in text
+        or "not find specified service" in text
+    )
+
+
 def teardown_launchd_agent(
     agent: str,
     *,
@@ -300,11 +350,23 @@ def teardown_launchd_agent(
     spec/48 MUST 12 (``down`` is complete): ``remove_plist=True`` removes the
     plist so the deployment record is fully torn down. Idempotent: a bootout of
     an absent label is a no-op (CLAUDE.md rule 8).
+
+    MUST 7/8/12 — bootout failures MUST NOT be ignored. Only the known
+    "service not loaded" case is tolerated; ANY other non-zero return raises
+    ``DeployLaunchdError`` so redeploy / rollback / down cannot falsely claim
+    success while the old service is still loaded. The plist is removed ONLY
+    after a clean bootout, so a failed teardown does not orphan the launchd
+    record while erasing its on-disk evidence.
     """
     label = label_for(agent)
-    # bootout is best-effort: an already-absent label returns non-zero, which is
-    # benign for teardown. We do not raise on bootout failure.
-    runner(["launchctl", "bootout", f"gui/{_uid()}/{label}"])
+    cp = runner(["launchctl", "bootout", f"gui/{_uid()}/{label}"])
+    if not _bootout_indicates_absent(cp):
+        stderr = (cp.stderr or "").strip()
+        raise DeployLaunchdError(
+            f"launchctl bootout failed for {label!r} (exit {cp.returncode}): "
+            f"{stderr or '<no stderr>'}. The old service may still be loaded; "
+            "deploy will not remove the plist while it cannot confirm teardown."
+        )
 
     if remove_plist:
         plist_path = plist_path_for(agent, launch_agents_dir=launch_agents_dir)

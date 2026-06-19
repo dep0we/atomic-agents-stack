@@ -32,6 +32,31 @@ DEFAULT_PORT = ServeConfig.port
 Binder = Callable[[str, int], bool]
 
 
+class PortRangeError(ValueError):
+    """Raised when a resolved port is outside the valid 1..65535 range.
+
+    spec/48 MUST 10 / serve.md — a port of 0 (kernel-assigned) or a value above
+    65535 is not a usable explicit bind target for a supervised serve, so we
+    reject it loud BEFORE probing rather than letting the bind probe or launchd
+    fail opaquely.
+    """
+
+    def __init__(self, port: int, *, source: str = "") -> None:
+        self.port = port
+        suffix = f" (from {source})" if source else ""
+        super().__init__(
+            f"port {port}{suffix} is out of range; a port must be 1..65535. "
+            f"Override with `deploy --port <N>` or ATOMIC_AGENTS_SERVE_PORT."
+        )
+
+
+def _validate_port_range(port: int, *, source: str = "") -> int:
+    """Return ``port`` iff it is in 1..65535; else raise ``PortRangeError``."""
+    if not (1 <= port <= 65535):
+        raise PortRangeError(port, source=source)
+    return port
+
+
 class PortConflictError(Exception):
     """Raised when the resolved port is already in use (spec/48 MUST 10).
 
@@ -69,21 +94,21 @@ def resolve_port(
     the env var carries a malformed integer — MUST NOT silently fall back.
     """
     if cli_port is not None:
-        return cli_port
+        return _validate_port_range(cli_port, source="deploy --port")
 
     # Temporarily honour a passed-in environ for testability without mutating
     # the real process env. load_serve_config reads os.environ directly, so we
     # swap it for the duration of the call when an override is supplied.
     if environ is None:
         cfg = load_serve_config(agent_root)
-        return cfg.port
+        return _validate_port_range(cfg.port, source="env / serve.md / default")
 
     saved = dict(os.environ)
     try:
         os.environ.clear()
         os.environ.update(environ)
         cfg = load_serve_config(agent_root)
-        return cfg.port
+        return _validate_port_range(cfg.port, source="env / serve.md / default")
     finally:
         os.environ.clear()
         os.environ.update(saved)

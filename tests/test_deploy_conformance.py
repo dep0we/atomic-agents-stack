@@ -135,6 +135,13 @@ def _run_deploy(agent_root, launch_dir, **overrides):
         launch_agents_dir=launch_dir,
         binder=_free_binder,
         http_get=_healthz_ok_doctor_ok,
+        # Hermetic: an explicit empty environ keeps the env-only-key detection
+        # (MUST 5) from probing the host's real env / Keychain during tests.
+        environ={"HOME": "/h", "USER": "u", "PATH": "/usr/bin"},
+        # Determinism: tests pin retries=1 so a forced-fail verify does not loop
+        # through the production warm-up window (retries=10, delay=0.5s).
+        verify_retries=1,
+        verify_retry_delay_s=0.0,
         exposure_runner=lambda argv, *a, **k: subprocess.CompletedProcess(
             argv, 1, stdout="", stderr=""
         ),
