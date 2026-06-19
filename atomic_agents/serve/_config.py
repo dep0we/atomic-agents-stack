@@ -39,6 +39,19 @@ class ServeConfig:
     # serve.md '## Idempotency Header' section or ATOMIC_AGENTS_SERVE_IDEMPOTENCY_HEADER
     # env var, mirroring identity_header resolution order.
     idempotency_header: str = "Idempotency-Key"
+    # spec/48 — Opt-in: treat the identity header as a perimeter-VERIFIED claim.
+    # Default False (fail-closed). When False, a present identity header is
+    # treated as an UNVERIFIED claim — a non-local caller that supplies a
+    # conversation_id is HARD-REFUSED by agent.call() (spec/48). This default
+    # exists because the raw identity header is client-settable; trusting it as
+    # a verified sub claim is a deliberate deployment decision that requires (a)
+    # a perimeter (IAP/OIDC middleware) that strips/re-injects the header and
+    # (b) a non-loopback bind (a loopback dev server has no perimeter in front
+    # of it). Operators enable it via serve.md '## Identity Is Perimeter Verified'
+    # or ATOMIC_AGENTS_SERVE_IDENTITY_PERIMETER_VERIFIED. Even when True, the
+    # serve layer additionally refuses to mint a verified claim on a loopback
+    # bind (see _app.py) — the two conditions compose (CWE-290 mitigations).
+    identity_is_perimeter_verified: bool = False
 
 
 # Explicit loopback hostnames recognised in addition to the 127.0.0.0/8 range.
@@ -100,6 +113,11 @@ def _parse_serve_md(text: str) -> ServeConfig:
             # Presence with non-empty body sets the header name.
             if body:
                 cfg.idempotency_header = body
+        elif sn_lower == "identity is perimeter verified":
+            # spec/48: presence of this section (any value or empty) opts in to
+            # treating the identity header as a perimeter-verified claim. Mirrors
+            # the '## Allow No Auth' presence-toggle shape.
+            cfg.identity_is_perimeter_verified = True
 
     # Apply env var overrides (highest priority). spec/37 resolution order.
     env_host = os.environ.get("ATOMIC_AGENTS_SERVE_HOST")
@@ -124,6 +142,18 @@ def _parse_serve_md(text: str) -> ServeConfig:
     env_idemp_header = os.environ.get("ATOMIC_AGENTS_SERVE_IDEMPOTENCY_HEADER")
     if env_idemp_header:
         cfg.idempotency_header = env_idemp_header
+
+    # spec/48: perimeter-verified opt-in env override. Any truthy value
+    # ('1', 'true', 'yes', case-insensitive) enables it; everything else
+    # (including unset) leaves the fail-closed default. Highest priority.
+    env_perimeter = os.environ.get("ATOMIC_AGENTS_SERVE_IDENTITY_PERIMETER_VERIFIED")
+    if env_perimeter is not None:
+        cfg.identity_is_perimeter_verified = env_perimeter.strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
 
     return cfg
 

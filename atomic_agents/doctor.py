@@ -206,6 +206,7 @@ def run_doctor(
             "journal-backend",
             "queue-backend",
             "idempotency-backend",
+            "principal-backend",
             "memory-backend-config",
             "memory-backend",
             "write-paths",
@@ -274,6 +275,13 @@ def run_doctor(
     results.append(check_journal_backend(agent_root))
     results.append(check_queue_backend(agent_root))
     results.append(check_idempotency_backend(agent_root))
+    # spec/48: principal-backend coherence + fail-closed negative probe. Takes no
+    # agent_root (reads ATOMIC_AGENTS_PRINCIPAL_BACKEND + the registry), like
+    # check_secret_backend(). A defined-but-unregistered check is the same
+    # false-PASS-by-omission class as the list-vs-load_all gap
+    # (feedback_doctor_dual_probe_pattern) — so it MUST be appended here, not just
+    # defined.
+    results.append(check_principal_backend())
     # memory-backend-config (coherence) runs before memory-backend (liveness),
     # mirroring the check_lock_backend → check_locks ordering (#60 PR 3).
     results.append(check_memory_backend_config(agent_root))
@@ -4887,6 +4895,179 @@ def check_idempotency_backend(agent_root: Path) -> CheckResult:
             "single_host_only": caps.single_host_only,
             "atomic_claim": caps.atomic_claim,
             "supports_canonical_export": caps.supports_canonical_export,
+        },
+    )
+
+
+def check_principal_backend() -> CheckResult:
+    """PrincipalBackend resolves and the configured backend operates correctly.
+
+    Probes the registered backend via ``get_default_principal_backend()`` and
+    verifies the construction, capability advertisement, and fail-closed behavior.
+
+    Dual-probe pattern (MEMORY.md):
+    1. Construction probe — get_default_principal_backend() must not raise.
+    2. Positive probe — derive_principal({"provider": "test", "sub": "probe"})
+       must return a Principal without raising.
+    3. Negative probe (SKIPPED for is_local_only backends like LocalPrincipalBackend):
+       derive_principal({}) must return Principal(is_verified=False).
+       LocalPrincipalBackend always returns LOCAL_PRINCIPAL (is_verified=True) by design;
+       a naive negative probe would false-FAIL it. The negative probe is only meaningful
+       for claim-mapping backends (e.g. StaticClaimsPrincipalBackend).
+    4. capabilities() honesty check — WARN (not FAIL) when
+       produces_verified_principals is False. A backend that never produces a
+       verified principal simply refuses every conversation caller; that is a
+       legitimate (if niche) configuration, so it is advisory, not a hard fault.
+
+    Does NOT call agent.call() or touch the filesystem.
+    """
+    from .exceptions import BackendNotRegistered, PrincipalBackendError
+    from .principal import get_default_principal_backend
+    from .conversation.types import Principal
+
+    raw_backend_id = (
+        os.environ.get("ATOMIC_AGENTS_PRINCIPAL_BACKEND", "").strip().lower() or "local"
+    )
+
+    try:
+        backend = get_default_principal_backend()
+    except BackendNotRegistered as e:
+        return CheckResult(
+            name="principal-backend",
+            status=FAIL,
+            message=(
+                f"ATOMIC_AGENTS_PRINCIPAL_BACKEND={raw_backend_id!r} is not a "
+                f"registered backend: {e}"
+            ),
+            fix_hint=(
+                "Unset ATOMIC_AGENTS_PRINCIPAL_BACKEND to use the local default, "
+                "or set it to a registered backend id (known: 'local', 'static_claims')."
+            ),
+            detail={"backend_id": raw_backend_id, "error": str(e)},
+        )
+    except PrincipalBackendError as e:
+        return CheckResult(
+            name="principal-backend",
+            status=FAIL,
+            message=f"principal backend '{raw_backend_id}' raised PrincipalBackendError: {e}",
+            fix_hint="Check the backend's configuration and dependencies.",
+            detail={"backend_id": raw_backend_id, "error": str(e)},
+        )
+    except Exception as e:
+        return CheckResult(
+            name="principal-backend",
+            status=FAIL,
+            message=f"principal backend raised unexpected error: {type(e).__name__}: {e}",
+            detail={"backend_id": raw_backend_id, "error_type": type(e).__name__},
+        )
+
+    caps = backend.capabilities()
+
+    # Positive probe: derive_principal with valid-shaped claims must not raise.
+    try:
+        positive_result = backend.derive_principal({"provider": "test", "sub": "probe"})
+    except Exception as e:
+        return CheckResult(
+            name="principal-backend",
+            status=FAIL,
+            message=(
+                f"principal backend '{backend.backend_id}' raised {type(e).__name__} "
+                f"on derive_principal(positive probe): {e}"
+            ),
+            fix_hint="derive_principal() must never raise for any input.",
+            detail={"backend_id": backend.backend_id, "error_type": type(e).__name__},
+        )
+
+    if not isinstance(positive_result, Principal):
+        return CheckResult(
+            name="principal-backend",
+            status=FAIL,
+            message=(
+                f"principal backend '{backend.backend_id}' returned "
+                f"{type(positive_result).__name__} from derive_principal() — "
+                f"expected Principal"
+            ),
+            detail={"backend_id": backend.backend_id},
+        )
+
+    # Negative probe: derive_principal with empty claims must return is_verified=False.
+    # SKIP for is_local_only backends — LocalPrincipalBackend always returns
+    # LOCAL_PRINCIPAL (is_verified=True), which is CORRECT for that backend.
+    if not caps.is_local_only:
+        try:
+            negative_result = backend.derive_principal({})
+        except Exception as e:
+            return CheckResult(
+                name="principal-backend",
+                status=FAIL,
+                message=(
+                    f"principal backend '{backend.backend_id}' raised {type(e).__name__} "
+                    f"on derive_principal(empty claims — negative probe): {e}"
+                ),
+                fix_hint=(
+                    "derive_principal() MUST NOT raise for absent/malformed claims "
+                    "(spec/48 MUST 1). Return Principal(is_verified=False) instead."
+                ),
+                detail={
+                    "backend_id": backend.backend_id,
+                    "error_type": type(e).__name__,
+                },
+            )
+
+        if not isinstance(negative_result, Principal):
+            return CheckResult(
+                name="principal-backend",
+                status=FAIL,
+                message=(
+                    f"principal backend '{backend.backend_id}' returned "
+                    f"{type(negative_result).__name__} from derive_principal(empty) — "
+                    f"expected Principal"
+                ),
+                detail={"backend_id": backend.backend_id},
+            )
+
+        if negative_result.is_verified:
+            return CheckResult(
+                name="principal-backend",
+                status=FAIL,
+                message=(
+                    f"principal backend '{backend.backend_id}' returned is_verified=True "
+                    f"for empty claims — fail-closed invariant violated (spec/48 MUST 1 + MUST 3)"
+                ),
+                fix_hint=(
+                    "Absent or malformed claims MUST return Principal(is_verified=False). "
+                    "If this backend is always-local (home-user singleton), set "
+                    "capabilities().is_local_only=True to skip the negative probe."
+                ),
+                detail={"backend_id": backend.backend_id},
+            )
+
+    # Capability honesty check: backend claims produces_verified_principals=True.
+    if not caps.produces_verified_principals:
+        return CheckResult(
+            name="principal-backend",
+            status=WARN,
+            message=(
+                f"principal backend '{backend.backend_id}' reports "
+                f"produces_verified_principals=False — no principal will pass the "
+                f"HARD-REFUSE gate with conversation_id"
+            ),
+            fix_hint=(
+                "If this backend is expected to produce verified principals, set "
+                "capabilities().produces_verified_principals=True."
+            ),
+            detail={"backend_id": backend.backend_id},
+        )
+
+    return CheckResult(
+        name="principal-backend",
+        status=PASS,
+        message=f"principal backend '{backend.backend_id}' ready",
+        detail={
+            "backend_id": backend.backend_id,
+            "is_local_only": caps.is_local_only,
+            "supports_token_verification": caps.supports_token_verification,
+            "produces_verified_principals": caps.produces_verified_principals,
         },
     )
 

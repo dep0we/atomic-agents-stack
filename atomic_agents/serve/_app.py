@@ -25,9 +25,14 @@ from starlette.routing import Route
 from .._io import safe_resolve_under
 from .._model import parse_model_md
 from .._platform import get_agents_root
-from ..exceptions import AtomicAgentsError, LockBusy, PathTraversalError
+from ..exceptions import (
+    AtomicAgentsError,
+    LockBusy,
+    PathTraversalError,
+    UnverifiedPrincipalConversationAccess,
+)
 from ..idempotency.filesystem import _MAX_KEY_LEN as _IDEMPOTENCY_KEY_MAX_LEN
-from ._config import ServeConfig
+from ._config import ServeConfig, is_loopback
 from ._runner import (
     DedupInFlightWithRunId,
     LockBusyWithRunId,
@@ -44,6 +49,8 @@ def make_app(
     identity_header: str = ServeConfig.identity_header,
     max_body_bytes: int = ServeConfig.max_body_bytes,
     idempotency_header: str = ServeConfig.idempotency_header,
+    identity_is_perimeter_verified: bool = ServeConfig.identity_is_perimeter_verified,
+    bind_host: str = ServeConfig.host,
 ) -> Starlette:
     """Build and return the Starlette app.
 
@@ -68,10 +75,30 @@ def make_app(
     ``idempotency_header``: the HTTP header name from which the caller-supplied
     idempotency key is extracted (default: ``Idempotency-Key``). Absent header
     → no deduplication (zero-change path). spec/45 PR2.
+
+    ``identity_is_perimeter_verified``: opt-in (default ``False``) to treat the
+    identity header as a perimeter-VERIFIED claim (spec/48). When ``False`` (the
+    fail-closed default), a present identity header is treated as UNVERIFIED — a
+    caller that also sends a conversation_id is HARD-REFUSED by agent.call().
+    This default exists because the identity header is client-settable; trusting
+    it as a verified sub claim requires a perimeter that strips/re-injects it.
+    Even when ``True``, a loopback ``bind_host`` still refuses to mint a verified
+    claim (a loopback dev server has no perimeter in front of it).
+
+    ``bind_host``: the host the server binds to. Used only to refuse minting a
+    verified claim on a loopback bind (see ``identity_is_perimeter_verified``).
     """
     _agents_root: Path | None = agents_root
     _single_agent: str | None = agent_name
     _max_body_bytes: int = max_body_bytes
+    # spec/48: resolve the effective perimeter-trust posture ONCE at app build.
+    # A loopback bind can never be perimeter-trusted (no perimeter in front of a
+    # loopback dev server), so the operator opt-in is ANDed with non-loopback.
+    # This is the compensating control the verified_claims comment describes —
+    # and it actually exists now (CWE-290).
+    _identity_perimeter_verified: bool = bool(identity_is_perimeter_verified) and (
+        not is_loopback(bind_host)
+    )
 
     def _root() -> Path:
         return _agents_root or get_agents_root()
@@ -409,6 +436,90 @@ def make_app(
                 )
             idempotency_key = raw_idemp_key
 
+        # spec/48: extract and validate conversation_id from request body.
+        # Same validation rules as idempotency_key (bare component, no separators,
+        # no control chars). An invalid conversation_id returns 422 here so
+        # PathTraversalError never surfaces from agent.call() as a misleading 500.
+        raw_conv_id: str | None = (
+            body.get("conversation_id") if isinstance(body, dict) else None
+        )
+        conversation_id: str | None = None
+        if raw_conv_id is not None:
+            if not isinstance(raw_conv_id, str):
+                return JSONResponse(
+                    {"status": "error", "error": "conversation_id must be a string"},
+                    status_code=422,
+                )
+            _bad_conv_id = (
+                raw_conv_id == ""
+                or raw_conv_id in (".", "..")
+                or "/" in raw_conv_id
+                or "\\" in raw_conv_id
+                or any(ord(ch) < 32 for ch in raw_conv_id)
+            )
+            if _bad_conv_id:
+                return JSONResponse(
+                    {
+                        "status": "error",
+                        "error": (
+                            "conversation_id is invalid: must be a non-empty bare "
+                            "string, not '.'/'..', and must not contain path "
+                            "separators or control characters"
+                        ),
+                    },
+                    status_code=422,
+                )
+            if len(raw_conv_id) > 512:
+                return JSONResponse(
+                    {
+                        "status": "error",
+                        "error": "conversation_id is too long: must not exceed 512 characters",
+                    },
+                    status_code=422,
+                )
+            conversation_id = raw_conv_id
+
+        # spec/48 HYBRID: build verified_claims from the perimeter-verified
+        # identity — but ONLY when the operator has explicitly opted in
+        # (identity_is_perimeter_verified) AND the bind is non-loopback. Both
+        # conditions are folded into _identity_perimeter_verified at app build.
+        #
+        # The serve layer NEVER verifies tokens itself — it trusts the perimeter
+        # (IAP, OIDC middleware) to have authenticated the caller and to strip
+        # any client-supplied copy of the identity header. That trust is a
+        # deliberate deployment decision, so it is OFF by default: a raw identity
+        # header is client-settable, and stamping it is_verified=True by fiat
+        # would let any client forge a verified Principal and read another
+        # principal's conversation turns (CWE-290 / CWE-807).
+        #
+        # Three cases:
+        #   (1) caller_identity is None → home-user / no identity header →
+        #       verified_claims stays None and identity_perimeter_verified=False →
+        #       _runner.py falls back to LOCAL_PRINCIPAL (is_verified=True, local).
+        #   (2) caller_identity present but perimeter-trust NOT enabled (default,
+        #       or loopback bind) → verified_claims stays None but
+        #       identity_perimeter_verified=False signals the runner to produce a
+        #       fail-closed UNVERIFIED Principal — a conversation_id caller is then
+        #       HARD-REFUSED by agent.call(). (Fail-closed: we do NOT silently fall
+        #       back to LOCAL_PRINCIPAL, which would wrongly pass the gate.)
+        #   (3) caller_identity present AND perimeter-trust enabled (non-loopback)
+        #       → build verified_claims and let the registered PrincipalBackend
+        #       derive a (potentially verified) Principal.
+        # NOTE: 'sub' carries the raw identity-header value. For the default IAP
+        # header (a rotating signed JWT assertion) the operator should configure a
+        # STABLE subject header (e.g. X-Goog-Authenticated-User-ID) so the derived
+        # storage key is stable across token refresh (spec/48 MUST 7 / MUST 11).
+        # SECURITY: the storage-key 'sub' MUST be the FULL identity value, NOT the
+        # 512-char-truncated caller_identity. caller_identity is capped only to
+        # bound the AUDIT log (log-amplification defense); reusing that truncated
+        # value as the authz key would collide two distinct subjects sharing the
+        # first 512 chars onto one Principal.identifier — a cross-principal
+        # conversation-access break (spec/48 MUST 11). raw_identity is hashed
+        # immediately in derive_principal, so its length is bounded on output.
+        verified_claims: dict | None = None
+        if raw_identity is not None and _identity_perimeter_verified:
+            verified_claims = {"provider": "http", "sub": raw_identity}
+
         try:
             run_id, response = await run_agent_call(
                 name=name,
@@ -419,6 +530,22 @@ def make_app(
                 caller_identity=caller_identity,
                 agents_root=root,
                 idempotency_key=idempotency_key,
+                verified_claims=verified_claims,
+                identity_perimeter_verified=_identity_perimeter_verified,
+                conversation_id=conversation_id,
+            )
+        except UnverifiedPrincipalConversationAccess as e:
+            # spec/48 HARD-REFUSE: non-local unverified principal attempted
+            # conversation access. HTTP 401 Unauthorized — the caller must supply
+            # a verifiable identity before using conversation_id.
+            return JSONResponse(
+                {
+                    "status": "error",
+                    "error": "Principal not verified for conversation access",
+                    "conversation_id": e.conversation_id,
+                    "principal_id": e.principal_id,
+                },
+                status_code=401,
             )
         except DedupInFlightWithRunId as e:
             # spec/45 PR2: idempotency key is currently IN_FLIGHT in another call.
