@@ -385,6 +385,9 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
         # GC-safe teardown works even if super().__init__ raises mid-way.
         self._embedding_backend: "EmbeddingBackend | None" = None
         self._pgvector_schema_ready = False
+        # Lazily-validated-once: the side-table column width matches the active
+        # model's dimensions (cost-safety guard, checked before the first embed).
+        self._embedding_dim_validated = False
 
         # Parent constructor validates the URL and sets up connection
         # attributes.  The connection (and _ensure_schema, which reads
@@ -664,42 +667,6 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
                     f"https://github.com/dep0we/atomic-agents-stack/issues"
                 )
 
-            # Dimension-width fail-hard (cross-family review #1; ruling
-            # 2026-06-18 "fix now").  The side table may have been created at a
-            # different width than the active model produces — e.g. it was
-            # created during FTS-only use (the 1536 default) or under a
-            # previously-pinned model, and the operator has since pinned a
-            # different-dimension model.  Left unguarded, every write/search
-            # would BILL an embed and then silently fail to store/query against
-            # the mismatched ``vector(N)`` column (wasted spend, no error).
-            # Fail LOUD here at schema-init, BEFORE any billable embed runs,
-            # matching the C2 extension fail-hard posture above.  Only checks
-            # when a backend is attached AND the column width is provable.
-            if self._embedding_backend is not None:
-                actual = _actual_embedding_dimension(conn, "memory_note_embeddings")
-                expected = self._embedding_backend.dimensions
-                if (
-                    actual is not None
-                    and actual != _UNKNOWN_DIMENSION
-                    and actual != expected
-                ):
-                    raise RuntimeError(
-                        f"PgvectorMemoryBackend: the memory_note_embeddings."
-                        f"embedding column is vector({actual}), but the active "
-                        f"embedding model ({self._embedding_backend.model_id}) "
-                        f"produces {expected}-dimension vectors.  Writing or "
-                        f"searching would bill embeddings that then fail to store "
-                        f"or query against the mismatched column (silent wasted "
-                        f"spend).  This happens when the side table was created at "
-                        f"a different dimension (the FTS-only default, or a "
-                        f"previously-pinned model).  To fix: drop the side table "
-                        f"(`DROP TABLE memory_note_embeddings;`) so it is "
-                        f"re-created at {expected} dims on next start, or pin the "
-                        f"embedding model whose dimension matches the existing "
-                        f"column.  (Automatic re-index on a dimension change is "
-                        f"tracked in #544.)"
-                    )
-
             conn.commit()
             self._pgvector_schema_ready = True
         except Exception:
@@ -820,6 +787,49 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
 
         return ref
 
+    def _assert_embedding_dim_matches(self) -> None:
+        """Fail LOUD before any billable embed if the side-table column width
+        does not match the active model's dimensions.
+
+        Cross-family review #1 / ruling 2026-06-18 "fix now".  The side table may
+        have been created at a different width than the active model produces
+        (created during FTS-only use at the 1536 default, or under a
+        previously-pinned model, then a different-dimension model pinned).  Left
+        unguarded, write/search would BILL an embed and then silently fail to
+        store/query against the mismatched ``vector(N)`` column (wasted spend,
+        no error).  Checked at the EMBED SITE (not schema-init) so the legitimate
+        construct-then-reprovision flow — a migration, or a test that drops and
+        recreates the side table at its own dimension — is never blocked; the
+        guard fires only when an embed is actually about to be billed.
+
+        Validated once per instance and cached (the column width is fixed for
+        the instance's lifetime).  The holistic validate-before-bill lands with
+        the cost gate in #544.
+        """
+        if self._embedding_dim_validated or self._embedding_backend is None:
+            return
+        conn = self._get_conn()
+        if conn is None:
+            return
+        actual = _actual_embedding_dimension(conn, "memory_note_embeddings")
+        expected = self._embedding_backend.dimensions
+        if actual is not None and actual != _UNKNOWN_DIMENSION and actual != expected:
+            raise RuntimeError(
+                f"PgvectorMemoryBackend: the memory_note_embeddings.embedding "
+                f"column is vector({actual}), but the active embedding model "
+                f"({self._embedding_backend.model_id}) produces {expected}-"
+                f"dimension vectors.  Writing or searching would bill embeddings "
+                f"that then fail to store or query against the mismatched column "
+                f"(silent wasted spend).  This happens when the side table was "
+                f"created at a different dimension (the FTS-only default, or a "
+                f"previously-pinned model).  To fix: drop the side table "
+                f"(`DROP TABLE memory_note_embeddings;`) so it is re-created at "
+                f"{expected} dims on next start, or pin the embedding model whose "
+                f"dimension matches the existing column.  (Automatic re-index on "
+                f"a dimension change is tracked in #544.)"
+            )
+        self._embedding_dim_validated = True
+
     def _upsert_embedding(self, note_name: str, body: str) -> None:
         """Embed ``body`` and upsert the vector into ``memory_note_embeddings``.
 
@@ -837,6 +847,10 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
         backend = self._embedding_backend
         if backend is None:
             return
+
+        # Cost-safety: fail LOUD before billing an embed if the side-table column
+        # width mismatches the active model's dimensions (cross-family review #1).
+        self._assert_embedding_dim_matches()
 
         # input_type="search_document": this is the WRITE/index path — the body
         # is a stored document.  A query/document-aware provider embeds it in
@@ -951,6 +965,11 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
 
         if not query or not query.strip():
             return []
+
+        # Cost-safety: fail LOUD before billing the query embed if the side-table
+        # column width mismatches the active model's dimensions (cross-family
+        # review #1).
+        self._assert_embedding_dim_matches()
 
         # Embed the query text (MUST-NOT-RAISE — None on any failure).
         # Pass input_type="search_query": the write path embeds documents, so a

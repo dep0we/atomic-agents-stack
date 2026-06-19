@@ -255,6 +255,10 @@ def test_pgvector_upsert_embedding_skips_on_dimension_mismatch(monkeypatch):
 
     backend = PgvectorMemoryBackend.__new__(PgvectorMemoryBackend)
     backend._embedding_backend = _WrongLenBackend()
+    # Short-circuit the embed-site column-width guard (this DB-free unit test
+    # targets the per-row produced-length skip, not the column-width check, and
+    # uses no real connection).
+    backend._embedding_dim_validated = True
 
     calls: list = []
     monkeypatch.setattr(
@@ -442,27 +446,31 @@ def test_pgvector_live_capabilities_embedding_provider_none_when_no_backend(tmp_
 
 @requires_postgres
 def test_pgvector_live_dimension_mismatch_fails_hard(tmp_path):
-    """Schema-init fails LOUD when the existing column width != active model dims.
+    """write_note() fails LOUD when the side-table column width != model dims.
 
     Cross-family review #1 / ruling 2026-06-18 "fix now": a side table created at
     one width (the FTS-only 1536 default, or a previously-pinned model) plus a
     now-pinned different-dimension model would otherwise BILL embeds that then
     silently fail to store/query against the mismatched vector(N) column (wasted
-    spend, no error). The guard raises at schema-init BEFORE any billable embed.
+    spend, no error). The guard fires at the EMBED SITE (not schema-init, so
+    construct-then-reprovision flows are never blocked), BEFORE the billable
+    embed. The canonical note IS still written (source of truth); only the
+    embed/upsert fails hard.
 
-    Negative control: if the dimension-width guard at the end of _ensure_schema is
-    removed, this construction succeeds (no raise) and the wasted-spend hole
-    reopens.
+    Negative control: if the _assert_embedding_dim_matches guard is removed, the
+    write succeeds with no raise and the wasted-spend hole reopens.
     """
+    from atomic_agents.memory.backend import WritePolicy
     from atomic_agents.memory.pgvector import (
         _ADD_EMBEDDINGS_FK,
         _CREATE_EMBEDDINGS_TABLE,
         PgvectorMemoryBackend,
     )
+    from atomic_agents.types import Capture
 
     # Normalize the SHARED side table to vector(4) using a NO-backend instance
-    # (the dimension guard is skipped when no embedding backend is attached, so
-    # this setup is safe regardless of what width a prior test left behind).
+    # (the dimension guard never fires without an embedding backend, so this
+    # setup is safe regardless of what width a prior test left behind).
     setup = PgvectorMemoryBackend(tmp_path, url=_POSTGRES_URL)
     conn = setup._get_conn()
     conn.execute("DROP TABLE IF EXISTS memory_note_embeddings CASCADE")
@@ -472,15 +480,23 @@ def test_pgvector_live_dimension_mismatch_fails_hard(tmp_path):
     conn.commit()
     setup.close()
 
-    # A backend whose model produces dim 8 must FAIL HARD at schema-init,
+    # A backend whose model produces dim 8 must FAIL HARD on the first embed,
     # naming the existing vector(4) column.
     mismatched = PgvectorMemoryBackend(
         tmp_path,
         url=_POSTGRES_URL,
         embedding_backend=_make_stub_embedding(dimensions=8),
     )
+    capture = Capture(
+        type="preference",
+        name="Dimension mismatch probe",
+        description="probe",
+        confidence="high",
+        sources=["test"],
+        body="A body long enough to embed.",
+    )
     with pytest.raises(RuntimeError, match=r"vector\(4\)"):
-        mismatched._get_conn()
+        mismatched.write_note(capture, WritePolicy(write_paths=[tmp_path]))
     try:
         mismatched.close()
     except Exception:
@@ -539,9 +555,14 @@ def test_pgvector_live_write_note_succeeds_without_embedding_backend(tmp_path):
         sources=["test"],
         body="Body without embedding.",
     )
-    b.write_note(capture, WritePolicy(write_paths=[tmp_path]))
-    notes = b.list_notes()
-    assert any("No-embed note" in n.name for n in notes)
+    ref = b.write_note(capture, WritePolicy(write_paths=[tmp_path]))
+    # NoteRef.name is the lookup KEY (the row-address slug), not the human name —
+    # read the note back BY that key and assert the human name round-trips via
+    # display_name (matches the protocol conformance contract: read_note(ref.name)
+    # .name == capture.name). The note must persist even with no embedding backend.
+    note = b.read_note(ref.name)
+    assert note is not None, "note not stored without embedding backend"
+    assert note.name == "No-embed note"
     b.close()
 
 

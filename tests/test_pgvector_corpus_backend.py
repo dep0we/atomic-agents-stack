@@ -309,6 +309,10 @@ def test_pgvector_corpus_index_page_skips_on_dimension_mismatch(tmp_path):
         embedding_backend=_WrongLenBackend(),
         pgvector_url="postgresql://localhost/test",
     )
+    # Short-circuit the embed-site column-width guard (this DB-free unit test
+    # targets the per-row produced-length skip, not the column-width check; the
+    # spy conn does not support the catalog probe).
+    backend._embedding_dim_validated = True
     spy = _SpyConn()
     backend._get_pg_conn = lambda: spy  # type: ignore[method-assign]
 
@@ -468,16 +472,17 @@ def test_pgvector_corpus_live_write_query_roundtrip(tmp_path):
 
 @requires_postgres
 def test_pgvector_corpus_dimension_mismatch_fails_hard(tmp_path):
-    """Corpus schema-init fails LOUD when the existing column width != model dims.
+    """index_page() fails LOUD when the existing column width != model dims.
 
     Cross-family review #1 / ruling 2026-06-18 "fix now": a corpus_page_embeddings
     column created at one width (the FTS-only 1536 default, or a previously-pinned
     model) plus a now-pinned different-dimension model would otherwise BILL embeds
     in index_page()/query() that then silently fail against the mismatched column.
-    The guard raises at schema-init BEFORE any billable embed.
+    The guard fires at the EMBED SITE (not schema-init, so construct-then-
+    reprovision flows are never blocked), BEFORE the billable embed.
 
-    Negative control: remove the dimension-width guard at the end of
-    _ensure_pg_schema and this construction succeeds (no raise).
+    Negative control: remove the _assert_embedding_dim_matches guard and the
+    index call succeeds with no raise.
     """
     import psycopg
 
@@ -489,8 +494,7 @@ def test_pgvector_corpus_dimension_mismatch_fails_hard(tmp_path):
     )
 
     # Normalize the SHARED embeddings table to vector(4) via a RAW connection so
-    # the dimension guard does not fire during setup (it only runs through the
-    # backend's _ensure_pg_schema).
+    # the setup itself never triggers the embed-site guard.
     raw = psycopg.connect(_POSTGRES_URL)
     try:
         raw.execute("DROP TABLE IF EXISTS corpus_page_embeddings CASCADE")
@@ -499,14 +503,14 @@ def test_pgvector_corpus_dimension_mismatch_fails_hard(tmp_path):
     finally:
         raw.close()
 
-    # A backend whose model produces dim 8 must FAIL HARD at schema-init.
+    # A backend whose model produces dim 8 must FAIL HARD on the first embed.
     mismatched = PgvectorCorpusBackend(
         tmp_path,
         embedding_backend=ContentDerivedStubEmbeddingBackend(dimensions=8),
         pgvector_url=_POSTGRES_URL,
     )
     with pytest.raises(RuntimeError, match=r"vector\(4\)"):
-        mismatched._get_pg_conn()
+        mismatched.index_page("wiki", "mismatch-probe", "A body long enough to embed.")
     try:
         mismatched.close()
     except Exception:

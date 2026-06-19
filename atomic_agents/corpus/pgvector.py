@@ -168,6 +168,10 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
 
             self._embedding_backend = get_default_embedding_backend()
 
+        # Lazily-validated-once: the side-table column width matches the active
+        # model's dimensions (cost-safety guard, checked before the first embed).
+        self._embedding_dim_validated = False
+
         # Resolve Postgres URL
         if pgvector_url is None:
             pgvector_url = os.environ.get("ATOMIC_AGENTS_PGVECTOR_URL") or None
@@ -312,42 +316,6 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
         conn.execute(_CREATE_CORPUS_META_TABLE)
         conn.execute(_CREATE_CORPUS_EMBEDDINGS_TABLE.format(dimensions=dimensions))
         self._maybe_create_hnsw_index(conn, dimensions)
-
-        # Dimension-width fail-hard (cross-family review #1; ruling 2026-06-18
-        # "fix now").  The corpus_page_embeddings.embedding column may have been
-        # created at a different width than the active model produces (created at
-        # the 1536 default with no backend, or under a previously-pinned model).
-        # Left unguarded, index_page()/query() would BILL an embed and then
-        # silently fail to store/query against the mismatched vector(N) column
-        # (wasted spend, no error).  Fail LOUD at schema-init, before any
-        # billable embed, matching the C2 extension fail-hard posture above.
-        if self._embedding_backend is not None:
-            from ..memory.pgvector import (  # noqa: PLC0415
-                UNKNOWN_DIMENSION,
-                actual_embedding_dimension,
-            )
-
-            actual = actual_embedding_dimension(conn, "corpus_page_embeddings")
-            expected = self._embedding_backend.dimensions
-            if (
-                actual is not None
-                and actual != UNKNOWN_DIMENSION
-                and actual != expected
-            ):
-                raise RuntimeError(
-                    f"PgvectorCorpusBackend: the corpus_page_embeddings.embedding "
-                    f"column is vector({actual}), but the active embedding model "
-                    f"({self._embedding_backend.model_id}) produces {expected}-"
-                    f"dimension vectors.  Indexing or querying would bill "
-                    f"embeddings that then fail to store or query against the "
-                    f"mismatched column (silent wasted spend).  To fix: drop the "
-                    f"side table (`DROP TABLE corpus_page_embeddings;`) so it is "
-                    f"re-created at {expected} dims on next start, or pin the "
-                    f"embedding model whose dimension matches the existing column. "
-                    f" (Automatic re-index on a dimension change is tracked in "
-                    f"#544.)"
-                )
-
         conn.commit()
 
     def _maybe_create_hnsw_index(self, conn: Any, dimensions: int) -> None:
@@ -503,6 +471,49 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
                 )
         return ref
 
+    def _assert_embedding_dim_matches(self) -> None:
+        """Fail LOUD before any billable embed if the side-table column width
+        does not match the active model's dimensions.
+
+        Cross-family review #1 / ruling 2026-06-18 "fix now".  The
+        ``corpus_page_embeddings.embedding`` column may have been created at a
+        different width than the active model produces (the 1536 default with no
+        backend, or a previously-pinned model, then a different-dimension model
+        pinned).  Left unguarded, index_page()/query() would BILL an embed and
+        then silently fail to store/query against the mismatched ``vector(N)``
+        column (wasted spend, no error).  Checked at the EMBED SITE (not
+        schema-init) so the legitimate construct-then-reprovision flow — a
+        migration, or a test that drops and recreates the table at its own
+        dimension — is never blocked.  Validated once per instance and cached.
+        The holistic validate-before-bill lands with the cost gate in #544.
+        """
+        if self._embedding_dim_validated or self._embedding_backend is None:
+            return
+        conn = self._get_pg_conn()
+        if conn is None:
+            return
+        from ..memory.pgvector import (  # noqa: PLC0415
+            UNKNOWN_DIMENSION,
+            actual_embedding_dimension,
+        )
+
+        actual = actual_embedding_dimension(conn, "corpus_page_embeddings")
+        expected = self._embedding_backend.dimensions
+        if actual is not None and actual != UNKNOWN_DIMENSION and actual != expected:
+            raise RuntimeError(
+                f"PgvectorCorpusBackend: the corpus_page_embeddings.embedding "
+                f"column is vector({actual}), but the active embedding model "
+                f"({self._embedding_backend.model_id}) produces {expected}-"
+                f"dimension vectors.  Indexing or querying would bill embeddings "
+                f"that then fail to store or query against the mismatched column "
+                f"(silent wasted spend).  To fix: drop the side table "
+                f"(`DROP TABLE corpus_page_embeddings;`) so it is re-created at "
+                f"{expected} dims on next start, or pin the embedding model whose "
+                f"dimension matches the existing column.  (Automatic re-index on "
+                f"a dimension change is tracked in #544.)"
+            )
+        self._embedding_dim_validated = True
+
     # ── query() override ──────────────────────────────────────────────────────
 
     def query(
@@ -549,6 +560,10 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
         conn = self._get_pg_conn()
         if conn is None:
             return super().query(text, corpus, top_k=top_k)
+
+        # Cost-safety: fail LOUD before billing the query embed on a column-width
+        # mismatch (cross-family review #1).
+        self._assert_embedding_dim_matches()
 
         # Embed the query text.  input_type="search_query": index_page() embeds
         # documents, so a query/document-aware provider (supports_input_type=
@@ -651,6 +666,10 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
 
         if not body or not body.strip():
             return
+
+        # Cost-safety: fail LOUD before billing the embed on a column-width
+        # mismatch (cross-family review #1).
+        self._assert_embedding_dim_matches()
 
         # input_type="search_document": index path — body is a stored document.
         # Query/document-aware providers embed in document mode; OpenAI ignores
