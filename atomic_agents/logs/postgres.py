@@ -115,9 +115,12 @@ Paramstyle note:
     statement in this module uses %s. Do NOT port ? placeholders from sqlite.py.
 
 Schema versions:
-    _SCHEMA_VERSION = 1. Independent of SQLite's _SCHEMA_VERSION = 1.
-    Bumping SQLite v1→v2 does NOT require bumping Postgres v1→v2 and vice
-    versa. Each backend owns its own schema version ladder.
+    _SCHEMA_VERSION = 3 (v1→v2→v3 ladder: v2 added idempotency_key +
+    replayed_run_id columns + idx_idempotency_key #520 PR2; v3 adds
+    conversation_id column + idx_conversation_id partial index #535 PR1).
+    See the inline comment block at the _SCHEMA_VERSION constant for the
+    authoritative ladder. Independent of SQLite's ladder — bumping one backend
+    does NOT require bumping the other; each owns its own schema version ladder.
 
 autocommit mode:
     Connections use autocommit=False (psycopg 3 default). Every write
@@ -183,7 +186,10 @@ def _psycopg_error() -> type[BaseException]:
 # but spec/45 PR2's spec/22 versioned normative addendum (idempotency_key +
 # replayed_run_id columns + idx_idempotency_key) lands on BOTH backends, so
 # Postgres also moves to v2 with a v1→v2 ALTER-TABLE migration ladder.
-_SCHEMA_VERSION = 2
+# spec/47 PR1 bumps to v3 (adds conversation_id column + idx_conversation_id
+# partial index, per the spec/22 versioned normative addendum for
+# ConversationBackend). Both SQLite and Postgres move to v3 in this PR.
+_SCHEMA_VERSION = 3
 
 # Advisory lock key — stable int64 derived from a fixed constant string.
 # All processes using this backend target the same key, so the cold-start
@@ -226,6 +232,8 @@ CREATE TABLE IF NOT EXISTS run_records (
     -- spec/45 PR2 / spec/22 versioned normative addendum: idempotency audit fields.
     idempotency_key TEXT,
     replayed_run_id TEXT,
+    -- spec/47 PR1 / spec/22 versioned normative addendum: conversation audit field.
+    conversation_id TEXT,
     extra JSONB NOT NULL DEFAULT '{}'::jsonb
 )
 """
@@ -256,6 +264,12 @@ _CREATE_INDEXES = [
     # as an index seek (the AND-predicate matches the partial predicate).
     "CREATE INDEX IF NOT EXISTS idx_idempotency_key ON run_records(idempotency_key) "
     "WHERE idempotency_key IS NOT NULL",
+    # spec/22 versioned normative addendum (spec/47 PR1): MUST index for the
+    # LogQuery.conversation_id AND-predicate (index seek, not table scan).
+    # PARTIAL index (WHERE conversation_id IS NOT NULL): the column is NULL for
+    # nearly every run (only conversation-keyed runs set it).
+    "CREATE INDEX IF NOT EXISTS idx_conversation_id ON run_records(conversation_id) "
+    "WHERE conversation_id IS NOT NULL",
 ]
 
 # Column names in INSERT order (matches CREATE TABLE column order minus id).
@@ -282,6 +296,7 @@ _INSERT_COLUMNS = (
     "critical",
     "idempotency_key",
     "replayed_run_id",
+    "conversation_id",
     "extra",
 )
 
@@ -746,8 +761,10 @@ class PostgresLogBackend:
             # are applied first. v1 → v2 (spec/45 PR2): add idempotency_key +
             # replayed_run_id columns (spec/22 versioned normative addendum).
             # ADD COLUMN IF NOT EXISTS is idempotent + safe (existing rows get NULL).
-            # On a fresh DB the CREATE TABLE already includes the columns and the
-            # meta row is already v2, so this block is skipped.
+            # On a fresh DB the CREATE TABLE already includes ALL columns
+            # (idempotency_key, replayed_run_id, AND conversation_id) and the meta
+            # row is inserted at the CURRENT _SCHEMA_VERSION (3 today), so BOTH
+            # migration blocks below are skipped (existing != 1 and != 2).
             if existing == 1:
                 conn.execute(
                     "ALTER TABLE run_records ADD COLUMN IF NOT EXISTS "
@@ -759,7 +776,18 @@ class PostgresLogBackend:
                 )
                 conn.execute("UPDATE meta SET value = '2' WHERE key = 'schema_version'")
                 existing = 2
-            # Create indexes AFTER migrations so idx_idempotency_key's column exists.
+            if existing == 2:
+                # v2 → v3 (spec/47 PR1): add conversation_id column +
+                # idx_conversation_id partial index (spec/22 versioned normative
+                # addendum for ConversationBackend). ADD COLUMN IF NOT EXISTS is
+                # idempotent + safe (existing rows get NULL).
+                conn.execute(
+                    "ALTER TABLE run_records ADD COLUMN IF NOT EXISTS "
+                    "conversation_id TEXT"
+                )
+                conn.execute("UPDATE meta SET value = '3' WHERE key = 'schema_version'")
+                existing = 3
+            # Create indexes AFTER migrations so all indexed columns exist.
             for stmt in _CREATE_INDEXES:
                 conn.execute(stmt)
             if existing != _SCHEMA_VERSION:
@@ -948,6 +976,7 @@ class PostgresLogBackend:
             record.critical,
             record.idempotency_key,
             record.replayed_run_id,
+            record.conversation_id,
             _pj.Jsonb(record.extra if record.extra is not None else {}),
         )
 
@@ -1432,6 +1461,13 @@ class PostgresLogBackend:
         if filter.idempotency_key is not None:
             clauses.append("idempotency_key = %s")
             params.append(filter.idempotency_key)
+        # spec/22 versioned normative addendum (spec/47 PR1): conversation_id
+        # AND-predicate. Uses the idx_conversation_id partial index for an index
+        # seek. Without this clause LogQuery(conversation_id=...) would silently
+        # return ALL records — the spec MUST says it returns only matching ones.
+        if filter.conversation_id is not None:
+            clauses.append("conversation_id = %s")
+            params.append(filter.conversation_id)
 
         where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
@@ -1503,6 +1539,11 @@ class PostgresLogBackend:
             # two) for the same reason — prod shape is not bent to test convenience.
             idempotency_key=row["idempotency_key"],
             replayed_run_id=row["replayed_run_id"],
+            # spec/47 PR1 / spec/22 addendum: conversation audit field. After the
+            # v2→v3 migration this column ALWAYS exists (NULL on old rows, never
+            # absent), so direct subscript is correct and symmetric with SQLite's
+            # _row_to_record.
+            conversation_id=row["conversation_id"],
             extra=extra,
         )
 

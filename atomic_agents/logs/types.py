@@ -93,6 +93,11 @@ _CANONICAL_FIELDS = frozenset(
         # SQLite/Postgres backends can index on them and LogQuery can filter).
         "idempotency_key",
         "replayed_run_id",
+        # conversation continuity field (spec/47 PR1 — promoted to canonical so
+        # SQLite/Postgres backends can index on it and LogQuery can filter).
+        # conversation_id is tagged on every terminal JSONL record when agent.call()
+        # is invoked with a conversation_id kwarg.
+        "conversation_id",
     }
 )
 
@@ -204,6 +209,12 @@ class RunRecord:
     # replayed_run_id: the run_id of the original completed run, on status='deduped'.
     # Absent on ok and in_flight records (no result is served from a prior run).
     replayed_run_id: str | None = None
+    # spec/47 PR1 — conversation continuity field (spec/22 versioned normative addendum).
+    # Absent on calls that do not supply a conversation_id. Present on EVERY terminal
+    # JSONL record when conversation_id is set — all seven sites: ok, dedup,
+    # lock_busy, pre-loop cost-skip, in_flight, mid-loop cost-skip, and
+    # security-abort. LogQuery.conversation_id filters on this field.
+    conversation_id: str | None = None
 
     # Primitive-specific catch-all
     extra: dict[str, Any] = field(default_factory=dict)
@@ -267,6 +278,10 @@ class RunRecord:
             out["idempotency_key"] = self.idempotency_key
         if self.replayed_run_id is not None:
             out["replayed_run_id"] = self.replayed_run_id
+        # spec/47 PR1: conversation_id — omit when None (same None-omit pattern
+        # as idempotency fields). LogQuery-queryable via canonical field index.
+        if self.conversation_id is not None:
+            out["conversation_id"] = self.conversation_id
         # Flatten extra last so caller's primitive-specific keys appear
         # after canonical fields in the JSONL line.
         for k, v in self.extra.items():
@@ -335,6 +350,9 @@ class RunRecord:
         # explicit extraction + passing ensures the dataclass fields are populated.
         idempotency_key = _coerce_optional_str(d.get("idempotency_key"))
         replayed_run_id = _coerce_optional_str(d.get("replayed_run_id"))
+        # spec/47 PR1 — conversation continuity field (spec/22 versioned normative
+        # addendum). In _CANONICAL_FIELDS so excluded from extra on read-back.
+        conversation_id = _coerce_optional_str(d.get("conversation_id"))
 
         # Everything not in the canonical set lands in extra.
         extra = {k: v for k, v in d.items() if k not in _CANONICAL_FIELDS}
@@ -362,6 +380,7 @@ class RunRecord:
             critical=critical,
             idempotency_key=idempotency_key,
             replayed_run_id=replayed_run_id,
+            conversation_id=conversation_id,
             extra=extra,
         )
 
@@ -430,6 +449,11 @@ class LogQuery:
     # whose idempotency_key matches. SQLite backends MUST index on this column
     # (idx_idempotency_key). None = no filter (all records).
     idempotency_key: str | None = None
+    # spec/22 versioned normative addendum (spec/47 PR1): LogQuery.conversation_id
+    # conforming backends MUST support as an AND-predicate returning only records
+    # whose conversation_id matches. SQLite backends MUST index on this column
+    # (idx_conversation_id). None = no filter (all records).
+    conversation_id: str | None = None
 
 
 # Canonical aggregation metrics. Backends advertising

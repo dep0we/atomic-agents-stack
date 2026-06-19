@@ -93,6 +93,12 @@ from .idempotency import (
     get_default_idempotency_backend,
 )
 from .idempotency.types import DedupDecision
+
+# ConversationBackend imported at module level (mirrors JournalBackend / IdempotencyBackend)
+# so the `conversation_backend: ConversationBackend | None` annotation on __init__
+# resolves under typing.get_type_hints() and for mypy/pyright.
+# conversation.backend imports only from .types + stdlib — circular-import safe.
+from .conversation.backend import ConversationBackend
 from .mcp_registry import (
     MCPRegistryError,
     MCPRegistryUnavailable,
@@ -214,6 +220,11 @@ _PRIMITIVE_BY_TRIGGER: dict[str, str] = {
 # trigger; only the implicit body-hash AUTO derivation is gated to this set.
 _BODY_HASH_AUTO_DERIVE_TRIGGERS: frozenset[str] = frozenset({"http", "queue", "cron"})
 
+# Sentinel for the lazily-resolved conversation_backend cache in __init__.
+# Distinct from None (which means "no backend configured") so the first
+# call() invocation can detect "not yet resolved" vs "resolved to no backend".
+_CONV_BACKEND_UNRESOLVED = object()
+
 
 def _derive_primitive_from_trigger(trigger: str | None) -> str:
     """Map the legacy ``trigger`` string to spec/22 ``primitive`` taxonomy.
@@ -327,6 +338,11 @@ class AtomicAgent:
     # operator-pinned-Postgres/custom case when memory_backend= kwarg is
     # supplied.
     memory: MemoryBackend
+    # Same class-level annotation rationale for ``conversation_backend`` (spec/47 PR1).
+    # Optional — None == single-shot (backward-compatible default, rule #14).
+    # When set, agent.call(conversation_id=...) loads prior turns and writes back
+    # the new turn. When None (the default), agent.call() is unchanged single-shot.
+    conversation_backend: "ConversationBackend | None"
     """The main agent runtime.
 
     Responsible for:
@@ -359,6 +375,7 @@ class AtomicAgent:
         journal_backend: JournalBackend | None = None,
         goal_backend: GoalBackend | None = None,
         idempotency_backend: IdempotencyBackend | None = None,
+        conversation_backend: "ConversationBackend | None" = None,
     ):
         self.name = name
         self.trigger = trigger
@@ -732,6 +749,26 @@ class AtomicAgent:
             )
         else:
             self.idempotency_backend = idempotency_backend
+
+        # spec/47 PR1: conversation backend — NULLABLE OPTIONAL (rule #14).
+        # 'No backend configured (default None) == today's exact single-shot.'
+        # IMPORTANT: do NOT call get_default_conversation_backend() unconditionally
+        # here — that would create conversations/ on every agent construction,
+        # breaking backward compatibility. The kwarg default is None; when None
+        # and no env var / model.md field is set, self.conversation_backend stays None.
+        # Three-channel resolution:
+        #   (1) constructor kwarg wins (if not None)
+        #   (2) ATOMIC_AGENTS_CONVERSATION_BACKEND env var (resolved lazily in call())
+        #   (3) AgentConfig.conversation_backend_id from model.md (resolved lazily in call())
+        # Channels (2) and (3) are resolved lazily in _resolve_conversation_backend()
+        # called from call() after lazy load, to avoid the __init__/config chicken-and-egg.
+        self.conversation_backend: "ConversationBackend | None" = conversation_backend
+        # Cache for the lazily-resolved backend (channels 2 + 3). Set by
+        # _resolve_conversation_backend() on the first call() invocation.
+        # Sentinel: _CONV_BACKEND_UNRESOLVED (distinct from None, which means 'no backend').
+        self._conversation_backend_resolved: "ConversationBackend | None | object" = (
+            _CONV_BACKEND_UNRESOLVED
+        )
 
         # Per-agent target extractor registry (spec/29 §"Target extraction",
         # #124 PR 3a). MUST initialize BEFORE tool_registry loading below so
@@ -3107,6 +3144,12 @@ class AtomicAgent:
             # snapshots that pre-date this field (no 'dedup_body_hash_enabled'
             # in their model_config dict).
             dedup_body_hash_enabled=model_data.get("dedup_body_hash_enabled", False),
+            # spec/47 PR1 (PROVISIONAL): channel-3 conversation backend selection
+            # parsed from model.md's '## Conversation Backend' section. .get() with
+            # None default for backward compat with AgentProfile snapshots that
+            # pre-date this field. Without threading it here _resolve_conversation_backend()
+            # channel (3) can never fire (the field would always read None).
+            conversation_backend_id=model_data.get("conversation_backend_id"),
             read_paths=tools_data["read_paths"],
             write_paths=tools_data["write_paths"],
             read_only_paths=tools_data.get("read_only_paths", []),
@@ -3391,6 +3434,108 @@ class AtomicAgent:
         return "\n\n═══════════════════════════\n\n".join(sections)
 
     # ────────────────────────────────────────────────────────────
+    # Conversation backend resolution (spec/47 PR1 — three-channel seam)
+
+    def _resolve_conversation_backend(self) -> "ConversationBackend | None":
+        """Resolve the effective conversation backend for this agent.
+
+        Three-channel resolution (spec/47 §"Three-channel seam"):
+          (1) constructor kwarg wins — if self.conversation_backend is not None,
+              use it directly. (No lazy resolution needed.)
+          (2) ATOMIC_AGENTS_CONVERSATION_BACKEND env var — instantiate the
+              named backend_id via the registry.
+          (3) model.md field — AgentConfig.conversation_backend_id (PROVISIONAL).
+              (4) None when all three are absent — single-shot default (rule #14).
+
+        The result is cached on self._conversation_backend_resolved to avoid
+        repeated env-var reads and to share the instance across the multi-turn
+        loop. The sentinel _CONV_BACKEND_UNRESOLVED distinguishes "not yet
+        resolved" from None (no backend).
+
+        Called from call() after lazy load() so self.config is available for
+        channel (3). The model.md field is marked PROVISIONAL in DRAFT spec/47
+        — its section name and syntax may change before LOCK.
+
+        Returns:
+            ConversationBackend instance or None (single-shot).
+        """
+        if self._conversation_backend_resolved is not _CONV_BACKEND_UNRESOLVED:
+            # Already resolved — return cached result.
+            return self._conversation_backend_resolved  # type: ignore[return-value]
+
+        # Channel (1): constructor kwarg wins.
+        if self.conversation_backend is not None:
+            self._conversation_backend_resolved = self.conversation_backend
+            return self.conversation_backend
+
+        # Channel (2): env var.
+        import os as _os  # noqa: PLC0415
+
+        raw_env = (
+            _os.environ.get("ATOMIC_AGENTS_CONVERSATION_BACKEND", "").strip().lower()
+        )
+        if raw_env:
+            from .conversation import (  # noqa: PLC0415
+                BackendNotRegistered as _BackendNotRegistered,
+                get_default_conversation_backend,
+            )
+
+            # Fail soft: a misconfigured ATOMIC_AGENTS_CONVERSATION_BACKEND must
+            # never hard-crash a call. Degrade to None (single-shot) + WARNING so
+            # the operator sees the bad config without losing the run. (The call
+            # site also gates resolution on conversation_id, so this only fires
+            # for a conversation call with a bad env var — still a degrade, not a
+            # crash.)
+            try:
+                resolved = get_default_conversation_backend(self.agent_root)
+            except _BackendNotRegistered as _exc:
+                _logger.warning(
+                    "ATOMIC_AGENTS_CONVERSATION_BACKEND=%r is not a registered "
+                    "conversation backend — falling back to single-shot (no "
+                    "conversation persistence): %s",
+                    raw_env,
+                    _exc,
+                )
+                self._conversation_backend_resolved = None
+                return None
+            self._conversation_backend_resolved = resolved
+            return resolved
+
+        # Channel (3): model.md field (PROVISIONAL — shape may change before LOCK).
+        # self.config is available here (called after load()).
+        backend_id = getattr(self.config, "conversation_backend_id", None)
+        if backend_id:
+            # TODO(#535 LOCK PR): firm up exact section name and parser semantics.
+            # The model.md field is PROVISIONAL per spec/47 DRAFT; do not depend
+            # on this for stable deployments until spec/47 is LOCKED.
+            from .conversation import (  # noqa: PLC0415
+                BackendNotRegistered as _BackendNotRegistered,
+                get_conversation_backend,
+            )
+
+            # Fail soft: a misconfigured model.md conversation_backend_id must not
+            # hard-crash a call. Degrade to None (single-shot) + WARNING.
+            try:
+                cls = get_conversation_backend(backend_id)
+            except _BackendNotRegistered as _exc:
+                _logger.warning(
+                    "model.md conversation_backend_id=%r is not a registered "
+                    "conversation backend — falling back to single-shot (no "
+                    "conversation persistence): %s",
+                    backend_id,
+                    _exc,
+                )
+                self._conversation_backend_resolved = None
+                return None
+            resolved_backend = cls(self.agent_root)
+            self._conversation_backend_resolved = resolved_backend
+            return resolved_backend
+
+        # None — single-shot default (backward-compatible).
+        self._conversation_backend_resolved = None
+        return None
+
+    # ────────────────────────────────────────────────────────────
     # The main call
 
     def call(
@@ -3405,6 +3550,7 @@ class AtomicAgent:
         caller_identity: str | None = None,
         *,
         idempotency_key: str | None = None,
+        conversation_id: str | None = None,
     ) -> Response:
         """Make the LLM call. Returns a Response with captures populated.
 
@@ -3418,6 +3564,28 @@ class AtomicAgent:
             this agent at time T?" without requiring cross-reference with
             perimeter logs. The serve layer sets this; all other callers leave it
             None (zero behavioral change). See spec/37 §"Audit record shape".
+
+        ``conversation_id``: optional conversation key that activates multi-turn
+        continuity (spec/47 PR1). When set and self.conversation_backend is
+        configured (via kwarg, ATOMIC_AGENTS_CONVERSATION_BACKEND env var, or
+        model.md '## Conversation Backend' field), prior turns for this
+        conversation_id are loaded and injected as real role-tagged entries in
+        the MESSAGES array BEFORE the current work_item turn. After a successful
+        LLM call, the new turn pair (user: work_item, assistant: response.text)
+        is written back atomically.
+        ``None`` (the default) = no conversation continuity — zero behavioral
+        change for all existing callers (backward-compatible, rule #14).
+        Principal: PR1 always uses the default LOCAL_PRINCIPAL (home-user shape,
+        zero config). Per-principal call() wiring for org/serve deployments
+        (deriving a verified Principal from a token at the serve boundary) is
+        DEFERRED to a later PR — see spec/47 §"DEFERRED". PR1 does not expose a
+        principal kwarg.
+        NOTE: raw-immediate-continuity transcript injection is a bounded flex of
+        Rule #6 (progressive disclosure) — bounded by the token budget window,
+        current-run-only, and ephemeral. See T16 in TENSIONS.md (approved —
+        committed on docs/tensions-t16-conversation-flex, merges with this PR).
+        Do NOT inject into assemble_system_prompt() — the T14 cache prefix must
+        remain stable across turns.
 
         ``model_override``: per-call model selection that supersedes ``model.md``'s
         default. Policy's ``get_effective_model`` (when set) takes precedence over
@@ -3680,6 +3848,16 @@ class AtomicAgent:
             idempotency_key is None
             and self.config.dedup_body_hash_enabled
             and self.trigger in _BODY_HASH_AUTO_DERIVE_TRIGGERS
+            # spec/47 PR1: the implicit body hash covers ONLY work_item + model +
+            # max_tokens + temperature. When conversation_id is set, the prior
+            # turns loaded below (after this gate) are part of the effective LLM
+            # input but are NOT in the hash — so two different conversations with
+            # the same work_item text, or the same conversation after its history
+            # grows, would hash-collide and replay a stale/cross-conversation
+            # result. Auto body-hash dedup is therefore unsafe for conversation
+            # calls; skip it. An explicit caller-supplied idempotency_key still
+            # works on any trigger (the caller owns its correctness).
+            and conversation_id is None
         ):
             import hashlib as _hashlib
 
@@ -3748,6 +3926,10 @@ class AtomicAgent:
                 }
                 if caller_identity is not None:
                     _dedup_record["http_caller"] = caller_identity
+                # spec/47 PR1 / spec/22 addendum: tag conversation_id on all terminal
+                # JSONL records, including dedup short-circuit paths.
+                if conversation_id is not None:
+                    _dedup_record["conversation_id"] = conversation_id
                 self._log(_dedup_record)
                 _resp = Response.deduped_response(
                     prior_run_id=_decision.prior_run_id,
@@ -3812,6 +3994,10 @@ class AtomicAgent:
             # so the audit trail can attribute lock-busy events to an HTTP caller.
             if caller_identity is not None:
                 _lock_busy_record["http_caller"] = caller_identity
+            # spec/47 PR1 / spec/22 addendum: tag conversation_id on ALL terminal
+            # JSONL records (lock_busy, cost-skip, dedup, in_flight, ok).
+            if conversation_id is not None:
+                _lock_busy_record["conversation_id"] = conversation_id
             self._log(_lock_busy_record)
             # spec/39 MUST 3: end span on lock_busy path. This path raises BEFORE
             # the body try/finally is entered, so it finalizes its own span here.
@@ -3925,6 +4111,10 @@ class AtomicAgent:
                 # so audit can attribute refused HTTP calls to their principals.
                 if caller_identity is not None:
                     _skip_record["http_caller"] = caller_identity
+                # spec/47 PR1 / spec/22 addendum: tag conversation_id on all
+                # terminal JSONL records, including cost-skip refused paths.
+                if conversation_id is not None:
+                    _skip_record["conversation_id"] = conversation_id
                 self._log(_skip_record)
                 # spec/39 MUST 9: cost-skip carries OUTCOME_SKIPPED + ERROR
                 # status. _call_total_cost stays 0.0 (no LLM call was made), so
@@ -3989,6 +4179,10 @@ class AtomicAgent:
                     }
                     if caller_identity is not None:
                         _in_flight_record["http_caller"] = caller_identity
+                    # spec/47 PR1 / spec/22 addendum: tag conversation_id on all terminal
+                    # JSONL records, including in_flight dedup paths.
+                    if conversation_id is not None:
+                        _in_flight_record["conversation_id"] = conversation_id
                     self._log(_in_flight_record)
                     # Finalize span as IN_FLIGHT (a refusal, not an error — mirrors
                     # lock_busy span semantics per spec/39).
@@ -4212,7 +4406,124 @@ class AtomicAgent:
 
             # Build prompt
             system_prompt = self.assemble_system_prompt()
-            messages: list[dict] = [{"role": "user", "content": work_item}]
+
+            # spec/47 PR1: resolve conversation backend (three-channel seam).
+            # Called here (after system_prompt is assembled) so the backend
+            # resolver can read self.config which is set during self.load().
+            # Cached on self._conversation_backend_resolved after first call.
+            #
+            # GATED on conversation_id: a single-shot call (conversation_id=None)
+            # MUST NOT be broken by a conversation-backend misconfiguration (MUST 9
+            # backward-compatibility). Resolution can raise BackendNotRegistered
+            # for a bad ATOMIC_AGENTS_CONVERSATION_BACKEND env var / model.md field;
+            # if we resolved unconditionally that would crash EVERY call — even
+            # ones that never asked for a conversation. So only resolve when a
+            # conversation_id was supplied. (_resolve_conversation_backend() ALSO
+            # fails soft to None internally for channels (2)/(3) — defense in depth.)
+            if conversation_id is not None:
+                _conv_backend = self._resolve_conversation_backend()
+            else:
+                _conv_backend = None
+
+            # spec/47 PR1: inject prior turns as real role-tagged message entries
+            # BEFORE the current work_item turn. This preserves the T14 cacheable
+            # prefix (assemble_system_prompt() is NOT touched — see TENSIONS T16,
+            # approved). The token budget is conservative for PR1 (8000 tokens);
+            # model-aware derivation (model_context_limit - system_prompt_tokens
+            # - max_output_tokens) is deferred to the spec/47 LOCK PR.
+            # Fail-open on load failure: prior turns are non-critical context;
+            # if the backend is degraded the call still runs with single-shot behavior.
+            _prior_turns_as_messages: list[dict] = []
+            if conversation_id is not None and _conv_backend is not None:
+                from .conversation import (  # noqa: PLC0415
+                    ConversationBackendError as _ConvBackendError,
+                    LOCAL_PRINCIPAL as _LOCAL_PRINCIPAL,
+                )
+
+                # TODO(spec/47 LOCK): derive budget from model_context_limit
+                # per-model table. For PR1 DRAFT use a conservative static budget
+                # (8000 tokens) — well below any model's context limit, large
+                # enough for ~30 turns of typical conversation. This avoids
+                # silent token-overflow before the per-model table ships.
+                _conv_budget_tokens = 8000
+                try:
+                    _prior_turns = _conv_backend.load_turns(
+                        _LOCAL_PRINCIPAL,
+                        conversation_id,
+                        budget_tokens=_conv_budget_tokens,
+                    )
+                    _prior_turns_as_messages = [
+                        {"role": t.role, "content": t.content} for t in _prior_turns
+                    ]
+                # Catch BOTH the backend base error AND PathTraversalError: a
+                # malformed caller-supplied conversation_id makes load_turns()
+                # raise PathTraversalError, which is a SIBLING of AtomicAgentsError
+                # (NOT a ConversationBackendError subclass). The comment above
+                # promises fail-open to single-shot on load failure; a bad
+                # conversation_id is the realistic caller-input case and must
+                # degrade, not crash the billed call. (lesson: catch the base/
+                # widest class a use-site can raise.)
+                except (_ConvBackendError, PathTraversalError) as _load_exc:
+                    _logger.warning(
+                        "ConversationBackend load_turns() failed for conversation_id=%r "
+                        "(run_id=%s) — falling back to single-shot (no prior context): %s",
+                        conversation_id,
+                        self.run_id,
+                        _load_exc,
+                    )
+                    _prior_turns_as_messages = []
+
+            # Normalize the injected prior-turn sequence before building messages[]
+            # so the provider API does not reject the request:
+            #   (a) drop empty-content turns (an assistant turn that only emitted
+            #       tool calls persists content='' — an empty content block is
+            #       rejected by Anthropic);
+            #   (b) collapse consecutive same-role entries (keep the latest).
+            #       CONTEXT-LOSS CAVEAT (PR1, tracked for spec/47 §normalization):
+            #       this is NOT just formatting dedupe — it can silently DROP a
+            #       real prior turn. When step (a) removes an empty-content turn
+            #       BETWEEN two same-role turns (e.g. [user_a, assistant_'',
+            #       user_b] -> after (a): [user_a, user_b]), step (b) then keeps
+            #       only user_b and discards user_a's message. The drop is silent:
+            #       continuity_persisted stays True and the caller cannot detect
+            #       the lost turn. This only fires on an empty-content adjacency
+            #       (tool-only assistant turn between two user turns), is rare in
+            #       PR1, and keeps output alternation valid (no provider 400). The
+            #       LOCK PR's model-aware budget work should revisit whether to
+            #       concatenate same-role content instead of discarding the older;
+            #   (c) drop a trailing user turn — it would sit immediately before
+            #       the new work_item user turn (consecutive same-role, rejected),
+            #       and the orphan trailing-user case (failed assistant write-back)
+            #       is documented as possible in the PR1 crash boundary.
+            _normalized_prior: list[dict] = []
+            for _m in _prior_turns_as_messages:
+                if not _m.get("content"):
+                    continue  # (a) drop empty content
+                if _normalized_prior and _normalized_prior[-1]["role"] == _m["role"]:
+                    _normalized_prior[-1] = _m  # (b) collapse same-role, keep latest
+                    continue
+                _normalized_prior.append(_m)
+            # (c) a trailing user turn would collide with the work_item user turn.
+            if _normalized_prior and _normalized_prior[-1]["role"] == "user":
+                _normalized_prior.pop()
+            # (d) drop LEADING assistant turns. The provider rejects a request
+            #     whose first message role is 'assistant' (Anthropic: "first
+            #     message must use the user role"). This is the SYMMETRIC case to
+            #     (c): budget eviction is newest-first, so when it cuts mid-pair
+            #     the oldest KEPT turn can be an assistant turn (kept order
+            #     [assistant,user,assistant,...]); a corruption-skipped leading
+            #     user turn can also orphan a leading assistant. None of the LLM
+            #     backends normalize a leading-assistant array, so drop it here.
+            while _normalized_prior and _normalized_prior[0]["role"] == "assistant":
+                _normalized_prior.pop(0)
+
+            # Build messages: normalized prior turns (oldest first) then the
+            # current work_item. The LLM sees the full conversation history
+            # followed by the new user turn, with strict role alternation.
+            messages: list[dict] = [
+                *_normalized_prior,
+                {"role": "user", "content": work_item},
+            ]
 
             # Tool definitions for the LLM — includes atomic_capture + custom tools.
             # None for providers without tool-call support.
@@ -4297,6 +4608,11 @@ class AtomicAgent:
                             skip_reason=skip_reason,
                             tool_calls=all_tool_call_results,
                             tool_iterations=iteration_count - 1,
+                            # No turn write-back runs on the mid-loop cost-cap
+                            # early return — do NOT over-claim continuity. When a
+                            # conversation_id was supplied, report that history was
+                            # NOT persisted so a caller can decide to retry/repair.
+                            continuity_persisted=(conversation_id is None),
                         )
                         _mid_loop_skip: dict = {
                             "trigger": self.trigger,
@@ -4330,6 +4646,13 @@ class AtomicAgent:
                         # record that must also carry it.
                         if caller_identity is not None:
                             _mid_loop_skip["http_caller"] = caller_identity
+                        # spec/47 PR1 / spec/22 addendum: tag conversation_id on
+                        # this terminal record too — a keyed conversation that
+                        # spends money then hits the cap mid-loop must still be
+                        # visible to LogQuery(conversation_id=...). Mirrors the
+                        # idempotency_key/http_caller tagging just above.
+                        if conversation_id is not None:
+                            _mid_loop_skip["conversation_id"] = conversation_id
                         self._log(_mid_loop_skip)
                         # spec/39 MUST 1 / MUST 9: mid-loop cost-cap. Sync the
                         # span accumulators from the local loop accumulators so
@@ -4911,6 +5234,16 @@ class AtomicAgent:
                 tool_iterations_maxed=tool_iterations_maxed,
                 deferred=bool(accumulated_escalation_queue_ids),
                 escalation_queue_ids=accumulated_escalation_queue_ids,
+                # continuity_persisted is True only when continuity was not
+                # requested (conversation_id is None) OR a backend exists to
+                # persist into. When a conversation_id IS supplied but no backend
+                # is configured, NOTHING is written back below — so True would
+                # mislead the caller into thinking history was stored. Start from
+                # the honest value; the write-back block flips it to False on a
+                # persistence failure when a backend DOES exist.
+                continuity_persisted=(
+                    conversation_id is None or _conv_backend is not None
+                ),
             )
 
             # Log run record
@@ -4990,6 +5323,11 @@ class AtomicAgent:
             # in_flight). replayed_run_id is absent on ok records (no prior result).
             if idempotency_key is not None:
                 log_record["idempotency_key"] = idempotency_key
+            # spec/47 PR1: tag conversation_id on every keyed ok-path run record
+            # (spec/22 versioned normative addendum: MUST be recorded on every run
+            # that sets conversation_id so LogQuery.conversation_id filtering works).
+            if conversation_id is not None:
+                log_record["conversation_id"] = conversation_id
             # spec/45 PR2 / spec/22 addendum: JSONL audit record FIRST (durable),
             # THEN commit() the ledger terminal. A crash between the two leaves the
             # JSONL intact and the ledger uncommitted — the next delivery re-runs
@@ -4998,6 +5336,85 @@ class AtomicAgent:
             # violates Principle 5 (audit trail is structural). Write order is load-
             # bearing; changing it is a P0.
             self._log(log_record)
+            # spec/47 PR1: write turn pair back AFTER _log() (JSONL-first principle).
+            # Write user turn first, then assistant turn. On failure in either:
+            # - set response.continuity_persisted = False
+            # - log WARNING with run_id (so the operator can locate the orphaned turn)
+            # - return the billed Response unchanged (the LLM work succeeded)
+            # NOTE: a crash between user-turn write and assistant-turn write leaves an
+            # orphaned user turn. The orphan is identified by run_id in the filename.
+            # Manual recovery: delete the dangling file. A two-turn atomic path ships
+            # in a future PR (spec/47 §"PR1 crash boundary"). See prep finding P0-6.
+            # NOTE (#553): this write-back also runs on deferred/escalated runs,
+            # so a deferred run persists its turn pair + reports
+            # continuity_persisted=True while the idempotency layer treats the run
+            # as not-completed. Self-heals on retry (read-path normalization
+            # collapses the duplicate user turn + drops the empty assistant turn),
+            # so it is not a wrong-LLM-input bug; tracked for the gate fix.
+            if conversation_id is not None and _conv_backend is not None:
+                from .conversation import (  # noqa: PLC0415 — lazy import (circular-safety)
+                    ConversationBackendError as _ConvBackendError2,
+                    LOCAL_PRINCIPAL as _LOCAL_PRINCIPAL2,
+                    Turn as _Turn,
+                )
+
+                # datetime/timezone are imported at module scope (no circular-import
+                # risk for stdlib) — use them directly, no shadow re-import.
+                _now_utc = datetime.now(timezone.utc).isoformat()
+                # seq disambiguates the two same-call turns (same run_id AND ts):
+                # user=0, assistant=1. Without it the assistant file overwrites the
+                # user file and every user turn is silently lost (spec/47 §"Turn").
+                _user_turn = _Turn(
+                    role="user",
+                    content=work_item,
+                    ts=_now_utc,
+                    run_id=self.run_id,
+                    seq=0,
+                )
+                _assistant_content = response.text if response.text else ""
+                _assistant_turn = _Turn(
+                    role="assistant",
+                    content=_assistant_content,
+                    ts=_now_utc,
+                    run_id=self.run_id,
+                    seq=1,
+                )
+                # Catch BOTH ConversationBackendError AND PathTraversalError on the
+                # write-back: a bad conversation_id raises PathTraversalError (a
+                # sibling, not a ConversationBackendError subclass). The contract is
+                # "on failure still return the billed Response but set
+                # continuity_persisted=False" — that must hold for EVERY failure
+                # class, including path-validation. (lesson: catch the base/widest
+                # class a use-site can raise.)
+                _ConvWriteErrors = (_ConvBackendError2, PathTraversalError)
+                try:
+                    _conv_backend.write_turn(
+                        _LOCAL_PRINCIPAL2, conversation_id, _user_turn
+                    )
+                except _ConvWriteErrors as _write_exc:
+                    response.continuity_persisted = False
+                    _logger.warning(
+                        "ConversationBackend write_turn(user) failed for "
+                        "conversation_id=%r (run_id=%s): %s",
+                        conversation_id,
+                        self.run_id,
+                        _write_exc,
+                    )
+                else:
+                    # Only attempt assistant turn if user turn succeeded.
+                    try:
+                        _conv_backend.write_turn(
+                            _LOCAL_PRINCIPAL2, conversation_id, _assistant_turn
+                        )
+                    except _ConvWriteErrors as _write_exc2:
+                        response.continuity_persisted = False
+                        _logger.warning(
+                            "ConversationBackend write_turn(assistant) failed for "
+                            "conversation_id=%r (run_id=%s): %s",
+                            conversation_id,
+                            self.run_id,
+                            _write_exc2,
+                        )
             # commit() AFTER _log(). Wrap in try/except so a commit failure
             # logs a warning but does NOT fail the call (the LLM work is done;
             # the run completed; only the dedup ledger is unmarked).
@@ -5077,6 +5494,12 @@ class AtomicAgent:
                 }
                 if caller_identity is not None:
                     _security_abort_record["http_caller"] = caller_identity
+                # spec/47 PR1 / spec/22 addendum: tag conversation_id on the
+                # security-abort terminal record too. A keyed conversation refused
+                # at the MCP spawn gate must still surface under
+                # LogQuery(conversation_id=...) — audit completeness (Principle #5).
+                if conversation_id is not None:
+                    _security_abort_record["conversation_id"] = conversation_id
                 # Best-effort: an audit-write failure must not mask the original
                 # security refusal (the refusal is the load-bearing signal).
                 try:
