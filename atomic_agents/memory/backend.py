@@ -21,6 +21,58 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 if TYPE_CHECKING:
     from ..types import Capture
 
+    # EmbeddingBackend imported under TYPE_CHECKING only to avoid circular
+    # imports and keep memory package side-effect-free at module load.
+    from ..embedding.backend import EmbeddingBackend
+
+
+# ──────────────────────────────────────────────────────────────────
+# MemoryCapabilities (spec/20 PR-3 addendum)
+
+
+@dataclass(frozen=True)
+class MemoryCapabilities:
+    """Capability advertisement for semantic-search-capable MemoryBackend impls.
+
+    Introduced alongside ``PgvectorMemoryBackend`` as the forward-facing dataclass
+    for the embedding backend, mirroring
+    ``CorpusCapabilities.embedding_backend_resolved`` from spec/34.  Doctor / audit
+    wiring that consumes it is deferred (no caller reads this field yet; the
+    spec/20 PR-3 normative addendum is authored at the LOCK ceremony to match the
+    shipped shape).  ``PgvectorMemoryBackend.capabilities()`` is the ONLY memory
+    backend that returns this dataclass today; ``FilesystemBackend`` and
+    ``PostgresMemoryBackend`` expose no ``capabilities`` surface at all (only the
+    ``supports_semantic_search`` boolean property), so callers cannot yet inspect
+    capabilities uniformly across all memory backends.
+
+    Fields
+    ------
+    ``embedding_provider``: provider label string (e.g. ``"openai"``), or
+        ``None`` when semantic search is not supported.  Consistent with
+        ``CorpusCapabilities.embedding_provider`` semantics.
+    ``embedding_backend_resolved``: the live ``EmbeddingBackend`` instance, or
+        ``None`` when no backend is configured.  When non-None, its
+        ``provider_id`` MUST match ``embedding_provider``.  Forward constraint
+        (no live serializer exists yet): if a capabilities-snapshot serializer
+        is ever added, this field MUST be clamped out — it holds a live backend
+        instance (potentially with an API client) — mirroring the spec/36
+        ``mcp_servers_resolved`` always-[] clamp.  Nothing serializes it today.
+
+    Compatibility alias
+    -------------------
+    ``PgvectorMemoryBackend.supports_semantic_search`` returns
+    ``capabilities().embedding_provider is not None`` so callers using the
+    existing boolean property continue to work without modification.
+    ``FilesystemBackend`` and ``PostgresMemoryBackend`` are NOT required to
+    implement ``capabilities()`` in this PR — they expose only the
+    ``supports_semantic_search`` boolean property (both return ``False``), which
+    stays the backward-compatible way to ask "does this backend do semantic
+    recall?" without a ``capabilities()`` surface.
+    """
+
+    embedding_provider: str | None
+    embedding_backend_resolved: "EmbeddingBackend | None" = None
+
 
 # ──────────────────────────────────────────────────────────────────
 # Shared dataclasses

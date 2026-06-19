@@ -1348,12 +1348,20 @@ def test_pg_export_include_versions_warns(tmp_path):
 
 @requires_postgres
 def test_pg_schema_version_in_meta(pg_backend):
-    """memory_meta table must have schema_version = 2 after _ensure_schema."""
+    """memory_meta schema_version is AT LEAST 2 after _ensure_schema.
+
+    Order-fragility fix (feedback_db_gated_tests_skip_locally): on the shared CI
+    Postgres DB, a PgvectorMemoryBackend test may bump schema_version to 3. A
+    PostgresMemoryBackend construction tolerates a higher version
+    (existing < _SCHEMA_VERSION is the parent assertion), so this test must not
+    pin an exact 2 — that would flake if a pgvector test ran first. The exact
+    parent constant is pinned separately in test_schema_version_is_2().
+    """
     conn = pg_backend._get_conn()
     cur = conn.execute("SELECT value FROM memory_meta WHERE key = 'schema_version'")
     row = cur.fetchone()
     assert row is not None
-    assert int(row["value"]) == 2
+    assert int(row["value"]) >= 2
 
 
 @requires_postgres
