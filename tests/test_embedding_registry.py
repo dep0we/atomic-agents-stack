@@ -200,6 +200,30 @@ def test_get_default_blank_provider_returns_none(monkeypatch):
     assert result is None
 
 
+def test_get_default_explicit_pin_malformed_dimensions_raises(monkeypatch):
+    """A malformed ATOMIC_AGENTS_EMBEDDING_DIMENSIONS on an explicit pin fails loud.
+
+    Cross-family (Codex) finding: warning-and-defaulting silently changes the
+    stored/queried vector shape (and bills embeds against it) without the
+    operator's knowledge. An explicit opt-in must fail loud, consistent with the
+    typo/missing-extra branches.
+
+    Negative control: if the raise is reverted to warn-and-set-None, this flips
+    from raises to a constructed backend at the provider default dimension.
+    """
+    from atomic_agents.exceptions import EmbeddingError
+
+    fake_openai = _make_fake_openai_module()
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-fake")
+    monkeypatch.setenv("ATOMIC_AGENTS_EMBEDDING_BACKEND", "openai")
+    monkeypatch.setenv("ATOMIC_AGENTS_EMBEDDING_DIMENSIONS", "not-an-int")
+
+    with pytest.raises(EmbeddingError) as excinfo:
+        get_default_embedding_backend()
+    assert "not-an-int" in str(excinfo.value)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # get_default_embedding_backend() — openai provider via env vars
 

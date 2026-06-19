@@ -312,6 +312,42 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
         conn.execute(_CREATE_CORPUS_META_TABLE)
         conn.execute(_CREATE_CORPUS_EMBEDDINGS_TABLE.format(dimensions=dimensions))
         self._maybe_create_hnsw_index(conn, dimensions)
+
+        # Dimension-width fail-hard (cross-family review #1; ruling 2026-06-18
+        # "fix now").  The corpus_page_embeddings.embedding column may have been
+        # created at a different width than the active model produces (created at
+        # the 1536 default with no backend, or under a previously-pinned model).
+        # Left unguarded, index_page()/query() would BILL an embed and then
+        # silently fail to store/query against the mismatched vector(N) column
+        # (wasted spend, no error).  Fail LOUD at schema-init, before any
+        # billable embed, matching the C2 extension fail-hard posture above.
+        if self._embedding_backend is not None:
+            from ..memory.pgvector import (  # noqa: PLC0415
+                UNKNOWN_DIMENSION,
+                actual_embedding_dimension,
+            )
+
+            actual = actual_embedding_dimension(conn, "corpus_page_embeddings")
+            expected = self._embedding_backend.dimensions
+            if (
+                actual is not None
+                and actual != UNKNOWN_DIMENSION
+                and actual != expected
+            ):
+                raise RuntimeError(
+                    f"PgvectorCorpusBackend: the corpus_page_embeddings.embedding "
+                    f"column is vector({actual}), but the active embedding model "
+                    f"({self._embedding_backend.model_id}) produces {expected}-"
+                    f"dimension vectors.  Indexing or querying would bill "
+                    f"embeddings that then fail to store or query against the "
+                    f"mismatched column (silent wasted spend).  To fix: drop the "
+                    f"side table (`DROP TABLE corpus_page_embeddings;`) so it is "
+                    f"re-created at {expected} dims on next start, or pin the "
+                    f"embedding model whose dimension matches the existing column. "
+                    f" (Automatic re-index on a dimension change is tracked in "
+                    f"#544.)"
+                )
+
         conn.commit()
 
     def _maybe_create_hnsw_index(self, conn: Any, dimensions: int) -> None:

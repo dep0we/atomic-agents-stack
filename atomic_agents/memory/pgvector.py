@@ -664,6 +664,42 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
                     f"https://github.com/dep0we/atomic-agents-stack/issues"
                 )
 
+            # Dimension-width fail-hard (cross-family review #1; ruling
+            # 2026-06-18 "fix now").  The side table may have been created at a
+            # different width than the active model produces — e.g. it was
+            # created during FTS-only use (the 1536 default) or under a
+            # previously-pinned model, and the operator has since pinned a
+            # different-dimension model.  Left unguarded, every write/search
+            # would BILL an embed and then silently fail to store/query against
+            # the mismatched ``vector(N)`` column (wasted spend, no error).
+            # Fail LOUD here at schema-init, BEFORE any billable embed runs,
+            # matching the C2 extension fail-hard posture above.  Only checks
+            # when a backend is attached AND the column width is provable.
+            if self._embedding_backend is not None:
+                actual = _actual_embedding_dimension(conn, "memory_note_embeddings")
+                expected = self._embedding_backend.dimensions
+                if (
+                    actual is not None
+                    and actual != _UNKNOWN_DIMENSION
+                    and actual != expected
+                ):
+                    raise RuntimeError(
+                        f"PgvectorMemoryBackend: the memory_note_embeddings."
+                        f"embedding column is vector({actual}), but the active "
+                        f"embedding model ({self._embedding_backend.model_id}) "
+                        f"produces {expected}-dimension vectors.  Writing or "
+                        f"searching would bill embeddings that then fail to store "
+                        f"or query against the mismatched column (silent wasted "
+                        f"spend).  This happens when the side table was created at "
+                        f"a different dimension (the FTS-only default, or a "
+                        f"previously-pinned model).  To fix: drop the side table "
+                        f"(`DROP TABLE memory_note_embeddings;`) so it is "
+                        f"re-created at {expected} dims on next start, or pin the "
+                        f"embedding model whose dimension matches the existing "
+                        f"column.  (Automatic re-index on a dimension change is "
+                        f"tracked in #544.)"
+                    )
+
             conn.commit()
             self._pgvector_schema_ready = True
         except Exception:

@@ -152,7 +152,7 @@ def get_default_embedding_backend() -> "EmbeddingBackend | None":
     * Empty env-var strings are coerced to ``None`` (``or None``) so they never
       reach the constructor as falsy non-None values.
     """
-    from ..exceptions import AtomicAgentsError
+    from ..exceptions import AtomicAgentsError, EmbeddingError
 
     # OPT-IN DEFAULT (#200 PR3 cost-safety ruling, 2026-06-18): semantic search
     # is OFF unless the operator EXPLICITLY pins a provider via
@@ -206,13 +206,20 @@ def get_default_embedding_backend() -> "EmbeddingBackend | None":
     if dimensions_raw is not None:
         try:
             dimensions = int(dimensions_raw)
-        except (ValueError, TypeError):
-            _logger.warning(
-                "get_default_embedding_backend: invalid ATOMIC_AGENTS_EMBEDDING_DIMENSIONS=%r "
-                "(must be a positive integer); ignoring",
-                dimensions_raw,
-            )
-            dimensions = None
+        except (ValueError, TypeError) as exc:
+            # We are PAST the opt-in guard, so the provider was EXPLICITLY pinned.
+            # A malformed dimension must fail LOUD, not silently fall back to the
+            # provider default — silently constructing a different vector width
+            # than the operator asked for would change the stored/queried shape
+            # (and bill embeds against it) without their knowledge. Consistent
+            # with the explicit-pin fail-loud posture of the typo/missing-extra
+            # branches above.
+            raise EmbeddingError(
+                f"ATOMIC_AGENTS_EMBEDDING_DIMENSIONS={dimensions_raw!r} is not a "
+                "valid integer. An explicitly-pinned embedding backend must not "
+                "silently fall back to a different vector dimension — fix the "
+                "value or unset it to use the provider default."
+            ) from exc
 
     # Construct the backend.  Pass api_key=None so the backend calls _get_key()
     # which routes through the registered SecretBackend (not a private env

@@ -441,6 +441,53 @@ def test_pgvector_live_capabilities_embedding_provider_none_when_no_backend(tmp_
 
 
 @requires_postgres
+def test_pgvector_live_dimension_mismatch_fails_hard(tmp_path):
+    """Schema-init fails LOUD when the existing column width != active model dims.
+
+    Cross-family review #1 / ruling 2026-06-18 "fix now": a side table created at
+    one width (the FTS-only 1536 default, or a previously-pinned model) plus a
+    now-pinned different-dimension model would otherwise BILL embeds that then
+    silently fail to store/query against the mismatched vector(N) column (wasted
+    spend, no error). The guard raises at schema-init BEFORE any billable embed.
+
+    Negative control: if the dimension-width guard at the end of _ensure_schema is
+    removed, this construction succeeds (no raise) and the wasted-spend hole
+    reopens.
+    """
+    from atomic_agents.memory.pgvector import (
+        _ADD_EMBEDDINGS_FK,
+        _CREATE_EMBEDDINGS_TABLE,
+        PgvectorMemoryBackend,
+    )
+
+    # Normalize the SHARED side table to vector(4) using a NO-backend instance
+    # (the dimension guard is skipped when no embedding backend is attached, so
+    # this setup is safe regardless of what width a prior test left behind).
+    setup = PgvectorMemoryBackend(tmp_path, url=_POSTGRES_URL)
+    conn = setup._get_conn()
+    conn.execute("DROP TABLE IF EXISTS memory_note_embeddings CASCADE")
+    conn.execute(_CREATE_EMBEDDINGS_TABLE.format(dimensions=4))
+    conn.execute(_ADD_EMBEDDINGS_FK)
+    conn.execute("UPDATE memory_meta SET value = '3' WHERE key = 'schema_version'")
+    conn.commit()
+    setup.close()
+
+    # A backend whose model produces dim 8 must FAIL HARD at schema-init,
+    # naming the existing vector(4) column.
+    mismatched = PgvectorMemoryBackend(
+        tmp_path,
+        url=_POSTGRES_URL,
+        embedding_backend=_make_stub_embedding(dimensions=8),
+    )
+    with pytest.raises(RuntimeError, match=r"vector\(4\)"):
+        mismatched._get_conn()
+    try:
+        mismatched.close()
+    except Exception:
+        pass
+
+
+@requires_postgres
 def test_pgvector_live_capabilities_embedding_provider_set(pgv_backend):
     """capabilities().embedding_provider matches stub provider_id."""
     caps = pgv_backend.capabilities()
