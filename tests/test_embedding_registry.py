@@ -184,6 +184,22 @@ def test_get_default_unset_returns_none_even_with_sdk_and_key(monkeypatch):
     assert result is None  # opt-in default: no auto-construct on key presence
 
 
+def test_get_default_blank_provider_returns_none(monkeypatch):
+    """A whitespace-only ATOMIC_AGENTS_EMBEDDING_BACKEND is treated as unset.
+
+    The opt-in guard strips the value, so `"   "` is NOT an explicit pin — it
+    returns None (FTS only) rather than attempting to construct a provider named
+    `"   "` and failing loud. Covers the `.strip()` branch of the guard.
+    """
+    fake_openai = _make_fake_openai_module()
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-fake")
+    monkeypatch.setenv("ATOMIC_AGENTS_EMBEDDING_BACKEND", "   ")
+
+    result = get_default_embedding_backend()
+    assert result is None
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # get_default_embedding_backend() — openai provider via env vars
 

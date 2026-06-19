@@ -216,10 +216,6 @@ def get_default_embedding_backend() -> "EmbeddingBackend | None":
 
     # Construct the backend.  Pass api_key=None so the backend calls _get_key()
     # which routes through the registered SecretBackend (not a private env
-    # cascade).  SecretBackendNotRegistered is propagated (not swallowed) so
-    # a misconfigured GCP backend surfaces loudly.
-    # Construct the backend.  Pass api_key=None so the backend calls _get_key()
-    # which routes through the registered SecretBackend (not a private env
     # cascade).  Explicit pin → any construction error (SecretBackendNotRegistered,
     # EmbeddingError/MUST-1 validation, SDK absent, invalid dimensions) propagates
     # loudly; an opt-in must not silently degrade to FTS.
