@@ -856,3 +856,19 @@ impl-level identifier (that name denotes note/version/staging handles).
 purpose (#397). (`FilesystemBackend` predates #397 and still exposes
 `backend_id="filesystem"`; reconciling the reference impl is tracked in #528 and
 is out of scope for the Postgres adapter PR.)
+
+---
+
+### Versioned normative addendum — MemoryCapabilities embedding fields on PgvectorMemoryBackend (spec/20 PR-3 addendum, issue #200 PR3 / #544)
+
+`PgvectorMemoryBackend` is the only MemoryBackend reference implementation that may embed vectors at write-time and at search-time. It exposes two additional fields in its `capabilities()` return value:
+
+**`embedding_provider: str | None`** — a provider LABEL string (e.g. `"openai"`, `"local"`, `"ollama"`), matching the `MemoryCapabilities` dataclass docstring (`atomic_agents/memory/backend.py`) and `CorpusCapabilities.embedding_provider` (spec/34). `PgvectorMemoryBackend` sets it to `self._embedding_backend.provider_id`. It is a provider label, not a model id; the embed cost gate in `agent.call()` reads `model_id` from `embedding_backend_resolved.model_id` (see below) for pricing — this label is never the *preferred* pricing key. Only when no resolved backend is available (`embedding_backend_resolved is None`) does the gate fall back to passing this label to `calc_embedding_cost()`, which — because a bare provider label is not a key in `EMBEDDING_PRICING` — prices it via the max-rate fallback (`cost_estimated=True`): a deliberate conservative last resort that never under-reserves, NOT a preferred path. Non-None when an `EmbeddingBackend` was injected or resolved from the registry at construction. `None` when no embedding backend is configured (`supports_semantic_search=False`; FTS-only mode).
+
+**`embedding_backend_resolved: EmbeddingBackend | None`** — the live `EmbeddingBackend` instance. Non-None when `supports_semantic_search=True`. **SNAPSHOT SECURITY CLAMP:** this field MUST serialize as `None` (or be absent) in any JSONL log record, profile snapshot, or network response. The live instance may carry API credentials (e.g. `OpenAIEmbeddingBackend._api_key`); leaking it into the audit trail violates Principle 5 (audit trail is structural, not a credential store). Callers that need the live backend object MUST read it from the backend's runtime attributes, not from a snapshot.
+
+`MemoryCapabilities` carries exactly two fields — `embedding_provider: str | None` and `embedding_backend_resolved: EmbeddingBackend | None` — and `PgvectorMemoryBackend.capabilities()` is the ONLY reference implementation that returns it today. `FilesystemBackend` and `PostgresMemoryBackend` do NOT implement `capabilities()` at all; they expose only the `supports_semantic_search` boolean `@property` (both return `False`), which is the backward-compatible way to ask "does this backend do semantic recall?". Callers that need a `MemoryCapabilities` surface MUST first gate on `getattr(backend, "supports_semantic_search", False)` (or `hasattr(backend, "capabilities")`) and treat a backend without `capabilities()` as `embedding_provider=None`, `embedding_backend_resolved=None`.
+
+Uniform convergence of `capabilities()` across all MemoryBackend implementations (so callers can rely on a consistent interface) is deferred to issue #431.
+
+Added OUTSIDE the 8-MUST count, following the versioned-addendum precedent of spec/22 §Read-failure contract (#497) and spec/45 PR2 (#520).

@@ -441,7 +441,10 @@ def test_write_paths_fail_when_unwritable(tmp_path):
 # run_doctor — host-only mode
 
 
-def test_run_doctor_no_agent_skips_agent_checks(tmp_path):
+def test_run_doctor_no_agent_skips_agent_checks(tmp_path, monkeypatch):
+    # embedding-backend SKIPs only when the opt-in env var is unset; clear it so
+    # this enumeration is deterministic regardless of the ambient environment.
+    monkeypatch.delenv("ATOMIC_AGENTS_EMBEDDING_BACKEND", raising=False)
     results = run_doctor(agent_name=None, agents_root=tmp_path)
     names = {r.name for r in results}
     assert "env" in names and "python" in names
@@ -474,6 +477,7 @@ def test_run_doctor_no_agent_skips_agent_checks(tmp_path):
         "queue-backend",
         "idempotency-backend",
         "principal-backend",
+        "embedding-backend",
         "memory-backend-config",
         "memory-backend",
         "write-paths",

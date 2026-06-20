@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 import concurrent.futures
 import logging
+import math
 import os
 import re
 import time
@@ -122,6 +123,7 @@ from .logs.types import (
     PRIMITIVE_COST_WARNING,
     PRIMITIVE_DELEGATE,
     PRIMITIVE_DREAM,
+    PRIMITIVE_EMBED,
     PRIMITIVE_ESCALATION,
     PRIMITIVE_EVAL,
     PRIMITIVE_HELPER,
@@ -190,6 +192,32 @@ RECENT_JOURNAL_DEFAULT = 1
 # (spec/22 §"Canonical primitive taxonomy" — the closed set is
 # documentation, not enforcement).
 
+# Embed cost-gate worst-case constants (#544 PR1). Shared by the reservation
+# loop and the true-up loop so the two estimates can never drift.
+#   _EMBED_BYTES_PER_TOKEN: BPE tokens are bounded by UTF-8 BYTE length. For
+#     natural-language text bytes/3 is conservative (covers CJK/emoji, where a
+#     code-point count under-counts ~3x). It is NOT a strict upper bound for
+#     incompressible/adversarial byte sequences (which can approach ~1 token/
+#     byte), but the provider rejects any single text over the model token cap
+#     and embedding is sub-cent per token, so the residual under-reservation is
+#     bounded and small. See spec/46 fail-closed section.
+#   _EMBED_BATCH_FANOUT_BUFFER: the MemoryBackend protocol does not advertise
+#     whether write_note() calls embed() (per-item) or embed_batch(); the 2x
+#     buffer is headroom against an embed_batch() path that degrades per-item
+#     (batch call + N retries).
+_EMBED_BYTES_PER_TOKEN = 3
+_EMBED_BATCH_FANOUT_BUFFER = 2.0
+
+
+def _estimate_embed_tokens(body: str | None) -> int:
+    """Worst-case embed token estimate for a note body (UTF-8 bytes / 3).
+
+    Single source of truth for the reservation loop and the true-up loop so a
+    future tweak cannot desync the reserved amount from the charged actual.
+    """
+    return math.ceil(len((body or "").encode("utf-8")) / _EMBED_BYTES_PER_TOKEN)
+
+
 _PRIMITIVE_BY_TRIGGER: dict[str, str] = {
     "agent_call": PRIMITIVE_AGENT_CALL,
     # HTTP-served calls (trigger='http', set by atomic_agents.serve) map to the
@@ -215,6 +243,16 @@ _PRIMITIVE_BY_TRIGGER: dict[str, str] = {
     "escalation_operator_revise_executed": PRIMITIVE_ESCALATION,
     "escalation_operator_revise_invalid_amendment": PRIMITIVE_ESCALATION,
     "escalation_resolved": PRIMITIVE_ESCALATION,
+    # spec/46 (#544 PR1) — embedding reservation/release audit triggers.
+    # ALL FOUR triggers map to PRIMITIVE_EMBED (not PRIMITIVE_HELPER or any
+    # existing bucket) because embedding bills from EMBEDDING_PRICING, isolated
+    # from chat PRICING. Folding into a shared bucket is IRREVERSIBLY lossy once
+    # records are on disk (Principle #5 — GROUP BY primitive cost attribution).
+    # output_tokens=0 always (embedding is input-only); cost_source='actor'.
+    "embed_reservation": PRIMITIVE_EMBED,
+    "embed_release": PRIMITIVE_EMBED,
+    "embed_batch_reservation": PRIMITIVE_EMBED,
+    "embed_batch_release": PRIMITIVE_EMBED,
 }
 
 # spec/45 PR2 — body-hash auto-derivation gate. dedup_body_hash_enabled
@@ -5288,25 +5326,190 @@ class AtomicAgent:
                     write_paths=self.config.write_paths,
                     read_only_paths=self.config.read_only_paths,
                 )
-                for c in all_captures:
-                    key = (c.type, c.name, hash(c.body))
-                    if key in seen_capture_keys:
-                        continue
-                    seen_capture_keys.add(key)
+
+                # spec/46 (#544 PR1) — embed batch cost gate.
+                # PgvectorMemoryBackend.write_note() calls embed() internally
+                # (an ungated billable call before this gate shipped). Gate the
+                # ENTIRE write_note() batch here so no embed() call escapes the
+                # cost reservation. Only wire when the backend will actually embed.
+                _embed_gate_active = getattr(
+                    self.memory, "supports_semantic_search", False
+                )
+                _embed_model_id = "unknown"
+                _embed_reserved_usd = 0.0
+                _embed_cost_estimated = False
+                _embed_actual_usd = 0.0
+                _embed_batch_size = 0
+
+                if _embed_gate_active and all_captures:
+                    # Resolve the embedding MODEL ID for cost pricing (opt-in).
+                    # The pricing key fed to calc_embedding_cost() is a MODEL ID
+                    # ("text-embedding-3-small"), which lives on the live backend's
+                    # .model_id property (embedding/backend.py:129 documents this is
+                    # what the cost gate must read). MemoryCapabilities.embedding_provider
+                    # is a PROVIDER LABEL ("openai") — never a model id — so it is
+                    # only the last-resort fallback when no resolved backend exists.
                     try:
-                        self.memory.write_note(c, policy)
-                        written_captures.append(c)
-                    except Exception as e:
-                        self._log(
-                            {
-                                "trigger": "capture_write_error",
-                                "parent_run_id": self.run_id,
-                                "model": "n/a",
-                                "input_tokens": 0,
-                                "output_tokens": 0,
-                                "status": "error",
-                                "summary": f"capture write failed for {c.name}: {e}",
-                            }
+                        _mem_caps = self.memory.capabilities()
+                        _resolved_be = getattr(
+                            _mem_caps, "embedding_backend_resolved", None
+                        )
+                        if _resolved_be is not None and getattr(
+                            _resolved_be, "model_id", None
+                        ):
+                            _embed_model_id = _resolved_be.model_id
+                        else:
+                            # No resolved backend — fall back to the provider label
+                            # (priced via the EMBEDDING_PRICING max-rate fallback).
+                            _embed_model_id = _mem_caps.embedding_provider or "unknown"
+                    except Exception:
+                        _embed_model_id = "unknown"
+
+                    # Worst-case token estimate via _estimate_embed_tokens
+                    # (UTF-8 bytes / _EMBED_BYTES_PER_TOKEN). bytes/3 is
+                    # conservative for natural-language text (covers CJK/emoji,
+                    # where a code-point count under-counts ~3x); it is NOT a
+                    # strict upper bound for incompressible/adversarial byte
+                    # sequences, but the provider caps any single text at the
+                    # model token limit and embedding is sub-cent per token, so
+                    # the residual under-reservation is bounded and small.
+                    # Batch-fanout formula: per_item_sum * _EMBED_BATCH_FANOUT_BUFFER
+                    # (~2x) because the protocol doesn't advertise whether
+                    # write_note() calls embed()/embed_batch().
+                    _per_item_sum = 0.0
+                    _embed_batch_size = 0
+                    _seen_keys_for_estimate: set[tuple] = set()
+                    for _c in all_captures:
+                        _k = (_c.type, _c.name, hash(_c.body))
+                        if _k in _seen_keys_for_estimate:
+                            continue
+                        _seen_keys_for_estimate.add(_k)
+                        _tokens_est = _estimate_embed_tokens(_c.body)
+                        _per_item_cost, _per_item_est = _costs.calc_embedding_cost(
+                            _embed_model_id, _tokens_est
+                        )
+                        _per_item_sum += _per_item_cost
+                        if _per_item_est:
+                            _embed_cost_estimated = True
+                        _embed_batch_size += 1
+
+                    # 2x conservative buffer: the MemoryBackend protocol does not
+                    # advertise whether write_note() calls embed() (per-item) or
+                    # embed_batch(). The reference impl (PgvectorMemoryBackend) uses
+                    # per-item embed(), so per_item_sum already covers actual spend;
+                    # the 2x is headroom against an embed_batch() path that could
+                    # degrade per-item (batch call + N retries).
+                    _embed_reserved_usd = _EMBED_BATCH_FANOUT_BUFFER * _per_item_sum
+
+                    # Fail-closed gate: deferred until AFTER effective-cap
+                    # resolution so uncapped agents are never spuriously blocked
+                    # (lesson: fail-closed only where there's something to protect).
+                    _log_dir_embed = self.agent_root / "log"
+                    _today_r = _costs.sum_cost_for_period(
+                        _log_dir_embed,
+                        "today",
+                        source="actor",
+                        backend=self.log_backend,
+                        agent_name=self.name,
+                    )
+                    _month_r = _costs.sum_cost_for_period(
+                        _log_dir_embed,
+                        "this_month",
+                        source="actor",
+                        backend=self.log_backend,
+                        agent_name=self.name,
+                    )
+                    _embed_is_degraded = _today_r.degraded or _month_r.degraded
+                    _embed_has_cap = self._has_effective_embed_cap(
+                        parent_remaining_headroom_usd
+                    )
+                    if _embed_is_degraded and _embed_has_cap:
+                        raise CostGuardrailBlocked(
+                            "embed batch blocked: cost log degraded and agent "
+                            "has an active cost cap — cannot safely reserve "
+                            f"${_embed_reserved_usd:.6f} for {_embed_batch_size} "
+                            "captures without a reliable spend baseline"
+                        )
+
+                    # Enforce the cap: when the read is reliable AND a cap exists,
+                    # block a batch whose worst-case reservation exceeds remaining
+                    # headroom. Mirrors _check_batch_reservation so an embed batch
+                    # is a real guardrail, not an audit-only log (Principle #4 — no
+                    # code path that bills an LLM escapes its cost gate). NOTE: embed
+                    # actual_usd is audit-only this PR — it is NOT folded into the
+                    # cost_usd that sum_cost_for_period aggregates, so prior embed
+                    # spend does not yet count toward the cap across calls. That
+                    # cross-call accounting is deferred to #544 PR2; this gate caps
+                    # the single batch against the chat-spend baseline only. The
+                    # baseline also EXCLUDES this call's own in-flight chat spend
+                    # (_call_total_cost), which is written to the ledger later at
+                    # the success-path run record (~5524) — so the headroom read
+                    # here is the cap minus prior-calls spend, not minus this
+                    # call's chat spend. Direction is conservative-toward-permissive
+                    # and this call's chat cap was already enforced at call entry,
+                    # so it is not a guardrail escape, only a documented imprecision.
+                    if _embed_has_cap and _embed_reserved_usd > 0:
+                        _embed_headroom = self._embed_remaining_headroom(
+                            _today_r.total_usd,
+                            _month_r.total_usd,
+                            parent_remaining_headroom_usd,
+                        )
+                        if _embed_reserved_usd > _embed_headroom:
+                            raise CostGuardrailBlocked(
+                                f"embed batch reservation ${_embed_reserved_usd:.6f} "
+                                f"exceeds remaining headroom ${_embed_headroom:.6f} "
+                                f"for {_embed_batch_size} captures"
+                            )
+
+                    # Reserve before entering the write_note() loop.
+                    self._emit_embed_batch_reservation(
+                        model_id=_embed_model_id,
+                        reserved_usd=_embed_reserved_usd,
+                        batch_size=_embed_batch_size,
+                        cost_estimated=_embed_cost_estimated,
+                    )
+
+                try:
+                    for c in all_captures:
+                        key = (c.type, c.name, hash(c.body))
+                        if key in seen_capture_keys:
+                            continue
+                        seen_capture_keys.add(key)
+                        try:
+                            self.memory.write_note(c, policy)
+                            written_captures.append(c)
+                            # True-up actual embed cost per written note. Same
+                            # _estimate_embed_tokens basis as the reservation loop
+                            # so the true-up never disagrees with the worst case.
+                            if _embed_gate_active:
+                                _tok = _estimate_embed_tokens(c.body)
+                                _note_cost, _ = _costs.calc_embedding_cost(
+                                    _embed_model_id, _tok
+                                )
+                                _embed_actual_usd += _note_cost
+                        except Exception as e:
+                            self._log(
+                                {
+                                    "trigger": "capture_write_error",
+                                    "parent_run_id": self.run_id,
+                                    "model": "n/a",
+                                    "input_tokens": 0,
+                                    "output_tokens": 0,
+                                    "status": "error",
+                                    "summary": f"capture write failed for {c.name}: {e}",
+                                }
+                            )
+                finally:
+                    # Emit release even on exception (actual_usd=0 if nothing
+                    # succeeded or gate was never armed). Mirrors helper_batch_release.
+                    if _embed_gate_active and _embed_batch_size > 0:
+                        self._emit_embed_batch_release(
+                            model_id=_embed_model_id,
+                            reserved_usd=_embed_reserved_usd,
+                            actual_usd=_embed_actual_usd,
+                            batch_size=_embed_batch_size,
+                            written_count=len(written_captures),
+                            cost_estimated=_embed_cost_estimated,
                         )
 
             # Build response
@@ -5614,6 +5817,66 @@ class AtomicAgent:
                     # every other log line + the audit record for this run.
                     _logger.warning(
                         "failed to write spawn-gate refusal audit record "
+                        "(the refusal still propagates)",
+                        exc_info=True,
+                    )
+            # spec/46 (#544 PR1) — embed batch cost-cap refusal audit record.
+            # The embed gate (capture-commit block) raises CostGuardrailBlocked
+            # AFTER the multi-turn LLM loop but BEFORE the success-path terminal
+            # run record (~5517), so without this handler the chat spend already
+            # incurred this call (_call_total_cost, last synced at loop exit)
+            # would vanish from the ledger and the block would leave only an OTel
+            # error span with no JSONL line. A cost-cap block is the same audit
+            # class as the MCP refusal above (the code's own comment: "exactly the
+            # event that most needs an audit trail"). The only CostGuardrailBlocked
+            # reachable inside the call() body is the embed gate (verified: the
+            # primary/mid-loop cost gates RETURN a skipped Response, they do not
+            # raise), so this branch is unambiguous. LOAD-BEARING INVARIANT: this
+            # unambiguity also relies on ToolRegistry.execute (tools.py) catching
+            # handler exceptions broadly (except Exception -> ToolCallResult.error),
+            # which absorbs any CostGuardrailBlocked a tool's internal
+            # helper_call()/delegate() might raise before it reaches here. If that
+            # except clause is ever narrowed, revisit this handler — otherwise a
+            # non-embed cost block would be mis-attributed as an embed block
+            # (embed_batch_blocked=True written for a helper/delegate refusal).
+            #
+            # cost_usd carries the chat spend so it lands in the ledger (Principle
+            # #5 + the #495/#497/#498 under-counting guard). trigger is self.trigger
+            # (NOT a new embed bucket): the recorded cost IS chat spend, so it must
+            # attribute to the same primitive a successful chat run would (the
+            # success record at ~5518 also uses self.trigger). The embed-block
+            # nature is conveyed by status=error + the embed_batch_blocked=True
+            # marker field, mirroring how the MCP handler keeps self.trigger.
+            elif isinstance(_call_exc, CostGuardrailBlocked):
+                _embed_block_record: dict = {
+                    "trigger": self.trigger,
+                    # _call_model (not config.default_model): the carried
+                    # cost_usd (_call_total_cost) was billed on the model
+                    # actually used this call, which a mid-loop fallback may
+                    # have changed. Matches the OTel error span (line ~3836).
+                    "model": _call_model,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cost_usd": _call_total_cost,
+                    "cost_source": "actor",
+                    "status": "error",
+                    "error": type(_call_exc).__name__,
+                    "error_detail": str(_call_exc),
+                    "embed_batch_blocked": True,
+                    "summary": f"embed batch cost gate refused: {_call_exc}",
+                    "run_id": self.run_id,
+                }
+                if caller_identity is not None:
+                    _embed_block_record["http_caller"] = caller_identity
+                if conversation_id is not None:
+                    _embed_block_record["conversation_id"] = conversation_id
+                # Best-effort: an audit-write failure must not mask the original
+                # cost refusal (the refusal is the load-bearing signal).
+                try:
+                    self._log(_embed_block_record)
+                except Exception:  # noqa: BLE001 — never shadow the refusal
+                    _logger.warning(
+                        "failed to write embed-batch cost-block audit record "
                         "(the refusal still propagates)",
                         exc_info=True,
                     )
@@ -6432,6 +6695,198 @@ class AtomicAgent:
                 f"Parallel helper batch reservation ${reserved_usd:.6f} exceeds "
                 f"remaining headroom ${headroom:.6f}"
             )
+
+    def _effective_embed_caps(self) -> tuple[float | None, float | None]:
+        """Resolve the effective (daily, monthly) embed cost caps.
+
+        Single source of truth for the embed gate's fail-closed predicate
+        (_has_effective_embed_cap) and its enforcement math
+        (_embed_remaining_headroom), so the block decision and the headroom
+        subtraction gate on the SAME caps and cannot drift. Composes model.md
+        caps (0 = disabled/unlimited) with Policy caps via min() (#512 lesson:
+        gate on the EFFECTIVE control, not one source). None on either side means
+        no binding cap at that period.
+        """
+        from .policy.types import CostCaps as _CostCaps
+
+        _model_daily: float | None = (
+            self.config.daily_cap_usd if self.config.daily_cap_usd > 0 else None
+        )
+        _model_monthly: float | None = (
+            self.config.monthly_cap_usd if self.config.monthly_cap_usd > 0 else None
+        )
+        _policy_caps: _CostCaps = (
+            self._policy_snapshot_this_call.effective_caps
+            if self._policy_snapshot_this_call is not None
+            else _CostCaps()
+        )
+        return (
+            self._min_or_other(_model_daily, _policy_caps.daily_usd),
+            self._min_or_other(_model_monthly, _policy_caps.monthly_usd),
+        )
+
+    def _has_effective_embed_cap(
+        self, parent_remaining_headroom_usd: float | None = None
+    ) -> bool:
+        """Return True when the agent has any binding cost cap for fail-closed embed gate.
+
+        Resolves the FULL effective cap hierarchy (model.md caps OR Policy-composed
+        caps OR delegated parent tree-cap) via _effective_embed_caps, matching the
+        effective-cap logic in _check_cost_guardrails (#512 lesson: gate on the
+        EFFECTIVE control, not one source). Distinct from _check_batch_reservation
+        which uses model.md caps only.
+
+        Used by the embed cost gate fail-closed predicate:
+            if degraded AND _has_effective_embed_cap(): raise CostGuardrailBlocked
+
+        Returns False when the agent has no binding cap at any layer — in that case a
+        degraded cost read cannot block an embed call (no budget to protect).
+        """
+        if not self.config.cost_guardrails_enabled:
+            return False
+        _effective_daily, _effective_monthly = self._effective_embed_caps()
+        # Any binding cap — own (daily/monthly) or parent tree-cap — means the
+        # fail-closed predicate applies.
+        return (
+            _effective_daily is not None
+            or _effective_monthly is not None
+            or parent_remaining_headroom_usd is not None
+        )
+
+    def _embed_remaining_headroom(
+        self,
+        today_cost: float,
+        month_cost: float,
+        parent_remaining_headroom_usd: float | None = None,
+    ) -> float:
+        """Remaining cost headroom for the embed gate's enforcement check.
+
+        Resolves the FULL effective cap hierarchy via _effective_embed_caps (the
+        same surface ``_has_effective_embed_cap`` gates on, so the block decision
+        and the headroom math agree on the same caps), plus the delegated parent
+        tree-cap. Unset caps are ``inf`` (a reservation can never exceed an
+        unbounded budget); the returned headroom is the minimum across daily,
+        monthly, and tree-cap.
+
+        Called only when ``_has_effective_embed_cap`` is True and the cost read is
+        NOT degraded — a reliable spend baseline is required for this subtraction.
+        """
+        _effective_daily, _effective_monthly = self._effective_embed_caps()
+        daily_remaining = (
+            _effective_daily - today_cost
+            if _effective_daily is not None
+            else float("inf")
+        )
+        monthly_remaining = (
+            _effective_monthly - month_cost
+            if _effective_monthly is not None
+            else float("inf")
+        )
+        tree_remaining = (
+            parent_remaining_headroom_usd
+            if parent_remaining_headroom_usd is not None
+            else float("inf")
+        )
+        return min(daily_remaining, monthly_remaining, tree_remaining)
+
+    def _emit_embed_batch_reservation(
+        self,
+        model_id: str,
+        reserved_usd: float,
+        batch_size: int,
+        cost_estimated: bool,
+    ) -> None:
+        """Log an embed_batch_reservation JSONL record.
+
+        Called BEFORE the write_note() loop so the audit trail shows what was
+        reserved before any spend. parent_run_id links this sub-record to its
+        parent agent.call() run (mirrors helper_batch_reservation shape).
+
+        output_tokens=0 always (embedding is input-only).
+        cost_source='actor' (embedding spend is the agent's own spend).
+        cost_estimated=True when model_id was not in EMBEDDING_PRICING (stored in
+        extra so the release record matches and cost readers can signal uncertainty).
+        """
+        self._log(
+            {
+                "trigger": "embed_batch_reservation",
+                "parent_run_id": self.run_id,
+                "parent_agent": self.name,
+                "model": model_id,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "reserved_usd": reserved_usd,
+                "batch_size": batch_size,
+                "cost_estimated": cost_estimated,
+                "cost_source": "actor",
+                "status": "ok",
+                "summary": (
+                    f"embed batch: reserved worst-case ${reserved_usd:.6f} "
+                    f"for {batch_size}-capture batch (model={model_id})"
+                ),
+            }
+        )
+
+    def _emit_embed_batch_release(
+        self,
+        model_id: str,
+        reserved_usd: float,
+        actual_usd: float,
+        batch_size: int,
+        written_count: int,
+        cost_estimated: bool,
+    ) -> None:
+        """Log an embed_batch_release JSONL record.
+
+        Called in a finally block AFTER the write_note() loop so the release
+        fires regardless of success or exception. actual_usd is an ESTIMATE
+        charged per successfully-written note (the same UTF-8-byte token
+        estimate as the reservation basis), NOT the reserved amount and NOT a
+        provider-confirmed figure.
+
+        IMPORTANT — actual_usd is NOT conditioned on whether the underlying
+        embed() returned None. write_note() (memory/pgvector.py) returns a
+        NoteRef and does not surface whether its internal embed() degraded to
+        None (e.g. no API key) — when that happens the note is still written via
+        FTS and write_note() succeeds, so actual_usd is charged the full
+        estimate for that note. The orchestrator has no embed-None signal, so a
+        true embed-None→$0.0 accounting is not possible at this layer this PR;
+        it would require write_note() to report whether it embedded (deferred to
+        a follow-up, NOT PR1 scope).
+        On partial batch: actual_usd = estimate for the notes successfully
+        written (written_count), excluding notes whose write_note() raised.
+        cost_estimated=True when the per-note cost was estimated from the byte
+        token count rather than confirmed from provider-reported usage
+        (EmbeddingBackend returns no token usage).
+
+        KNOWN LIMITATION (#544 PR1, documented in spec/46 fail-closed section):
+        actual_usd is estimated from the INCOMING capture body (c.body). On a merge
+        write (capture.merge_into set) PgvectorMemoryBackend embeds the full merged
+        body, which can exceed the fragment — so actual_usd understates merge-write
+        embed cost. The gate caps against the fragment estimate; estimating from the
+        post-write stored body is deferred.
+        """
+        self._log(
+            {
+                "trigger": "embed_batch_release",
+                "parent_run_id": self.run_id,
+                "parent_agent": self.name,
+                "model": model_id,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "reserved_usd": reserved_usd,
+                "actual_usd": actual_usd,
+                "batch_size": batch_size,
+                "written_count": written_count,
+                "cost_estimated": cost_estimated,
+                "cost_source": "actor",
+                "status": "ok",
+                "summary": (
+                    f"embed batch: actual ${actual_usd:.6f} vs "
+                    f"reserved ${reserved_usd:.6f} ({written_count}/{batch_size} written)"
+                ),
+            }
+        )
 
     def _build_helper_system_prompt(self, sources: list[str]) -> str:
         """Build the helper's system prompt. Empty when no sources are passed."""
