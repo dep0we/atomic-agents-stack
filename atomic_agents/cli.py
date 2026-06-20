@@ -1831,8 +1831,12 @@ def _cmd_deploy(args) -> int:
     if positionals and positionals[0] in ("status", "down"):
         action = positionals[0]
         if len(positionals) != 2:
+            # Do not echo the user-supplied action back into the message — the
+            # two valid actions are named statically here, which also avoids a
+            # CodeQL clear-text-logging false positive on the argv-derived value.
             print(
-                f"Error: `deploy {action}` requires exactly one agent name.\n{_USAGE}",
+                "Error: `deploy status` and `deploy down` each require exactly "
+                f"one agent name.\n{_USAGE}",
                 file=sys.stderr,
             )
             return 1
