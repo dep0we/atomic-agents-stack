@@ -399,6 +399,159 @@ def test_call_agent_identity_header_passed_through(tmp_path: Path):
     assert captured_identity == ["alice@example.com"]
 
 
+def _capture_principal_kwargs(captured: dict):
+    """Build a fake run_agent_call that records the principal-related kwargs."""
+
+    async def fake_run_agent_call(**kwargs: Any) -> Any:
+        captured["caller_identity"] = kwargs.get("caller_identity")
+        captured["verified_claims"] = kwargs.get("verified_claims")
+        captured["identity_perimeter_verified"] = kwargs.get(
+            "identity_perimeter_verified"
+        )
+        return (
+            "run-xyz",
+            MagicMock(
+                skipped=False,
+                text="ok",
+                model="m",
+                cost_usd=0.0,
+                input_tokens=1,
+                output_tokens=1,
+            ),
+        )
+
+    return fake_run_agent_call
+
+
+def test_serve_identity_not_trusted_by_default_no_verified_claims(tmp_path: Path):
+    """spec/48 (P0 fix): a present identity header is NOT promoted to a verified
+    claim by default. verified_claims stays None and identity_perimeter_verified
+    is False — so a non-loopback caller is fail-closed (HARD-REFUSE on conv_id).
+    """
+    agents_root = _build_agent_root(tmp_path, "testbot")
+    captured: dict = {}
+    # Non-loopback bind, but opt-in OFF (default) → still untrusted.
+    app = make_app(
+        agents_root=agents_root,
+        identity_header="X-Test-Identity",
+        identity_is_perimeter_verified=False,
+        bind_host="0.0.0.0",
+    )
+    with patch(
+        "atomic_agents.serve._app.run_agent_call",
+        side_effect=_capture_principal_kwargs(captured),
+    ):
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.post(
+                "/agents/testbot/call",
+                json={"work_item": "ping"},
+                headers={"X-Test-Identity": "attacker@example.com"},
+            )
+    assert resp.status_code == 200
+    # Identity is still passed through for the audit trail (MUST 6)...
+    assert captured["caller_identity"] == "attacker@example.com"
+    # ...but it is NOT promoted to a verified claim (fail-closed default).
+    assert captured["verified_claims"] is None
+    assert captured["identity_perimeter_verified"] is False
+
+
+def test_serve_identity_trusted_when_opt_in_and_non_loopback(tmp_path: Path):
+    """When the operator opts in AND the bind is non-loopback, the identity header
+    IS promoted to a verified claim and identity_perimeter_verified is True.
+    """
+    agents_root = _build_agent_root(tmp_path, "testbot")
+    captured: dict = {}
+    app = make_app(
+        agents_root=agents_root,
+        identity_header="X-Test-Identity",
+        identity_is_perimeter_verified=True,
+        bind_host="0.0.0.0",  # non-loopback
+    )
+    with patch(
+        "atomic_agents.serve._app.run_agent_call",
+        side_effect=_capture_principal_kwargs(captured),
+    ):
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.post(
+                "/agents/testbot/call",
+                json={"work_item": "ping"},
+                headers={"X-Test-Identity": "alice@example.com"},
+            )
+    assert resp.status_code == 200
+    assert captured["identity_perimeter_verified"] is True
+    assert captured["verified_claims"] == {
+        "provider": "http",
+        "sub": "alice@example.com",
+    }
+
+
+def test_serve_loopback_bind_refuses_to_trust_even_with_opt_in(tmp_path: Path):
+    """Even with the opt-in ON, a LOOPBACK bind never mints a verified claim
+    (a loopback dev server has no perimeter in front of it). Fail-closed.
+    """
+    agents_root = _build_agent_root(tmp_path, "testbot")
+    captured: dict = {}
+    app = make_app(
+        agents_root=agents_root,
+        identity_header="X-Test-Identity",
+        identity_is_perimeter_verified=True,
+        bind_host="127.0.0.1",  # loopback — overrides the opt-in
+    )
+    with patch(
+        "atomic_agents.serve._app.run_agent_call",
+        side_effect=_capture_principal_kwargs(captured),
+    ):
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.post(
+                "/agents/testbot/call",
+                json={"work_item": "ping"},
+                headers={"X-Test-Identity": "alice@example.com"},
+            )
+    assert resp.status_code == 200
+    assert captured["identity_perimeter_verified"] is False
+    assert captured["verified_claims"] is None
+
+
+def test_serve_verified_sub_uses_full_identity_not_truncated(tmp_path: Path):
+    """Codex #1 fix — the verified_claims 'sub' (the authz/storage key input) MUST
+    be the FULL identity header, NOT the 512-char-truncated caller_identity. Two
+    distinct subjects sharing the first 512 chars would otherwise collide onto one
+    Principal.identifier — a cross-principal conversation-access break (spec/48
+    MUST 11). caller_identity stays capped at 512 for the AUDIT log only.
+
+    Strip control: revert `"sub": raw_identity` -> `caller_identity` in _app.py and
+    the captured sub is truncated to 512, so two >512 identities sharing a 512-char
+    prefix collide.
+    """
+    agents_root = _build_agent_root(tmp_path, "testbot")
+    long_id = (
+        "x" * 512 + "DISTINCT-SUFFIX"
+    )  # 527 chars; first 512 shared with a sibling
+    captured: dict = {}
+    app = make_app(
+        agents_root=agents_root,
+        identity_header="X-Test-Identity",
+        identity_is_perimeter_verified=True,
+        bind_host="0.0.0.0",  # non-loopback
+    )
+    with patch(
+        "atomic_agents.serve._app.run_agent_call",
+        side_effect=_capture_principal_kwargs(captured),
+    ):
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.post(
+                "/agents/testbot/call",
+                json={"work_item": "ping"},
+                headers={"X-Test-Identity": long_id},
+            )
+    assert resp.status_code == 200
+    # The authz sub is the FULL untruncated identity (distinct >512 subjects stay
+    # distinct after the storage-key hash); the audit caller_identity is capped.
+    assert captured["verified_claims"]["sub"] == long_id
+    assert len(captured["verified_claims"]["sub"]) > 512
+    assert captured["caller_identity"] == long_id[:512]
+
+
 def test_make_app_self_contained_identity_header(tmp_path: Path):
     """make_app() without _server.py wiring sets identity_header on state (P2 shortcut fix)."""
     agents_root = _build_agent_root(tmp_path, "testbot")

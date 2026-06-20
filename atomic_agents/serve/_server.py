@@ -146,6 +146,12 @@ def run_server(args: object) -> int:
         agent_name=agent_name if agent_name else None,
         identity_header=serve_config.identity_header,
         idempotency_header=serve_config.idempotency_header,
+        # spec/48: thread the resolved perimeter-trust posture + bind host so the
+        # app's verified-claims gate uses the operator's actual config (not the
+        # make_app defaults). bind_host lets make_app refuse to mint a verified
+        # claim on a loopback bind even when the opt-in flag is set.
+        identity_is_perimeter_verified=serve_config.identity_is_perimeter_verified,
+        bind_host=serve_config.host,
     )
     # Override state in case make_app default differs (e.g. operator-configured
     # identity header from serve.md); make_app already sets the default but

@@ -57,6 +57,27 @@ def test_parse_serve_md_allow_no_auth_empty_body_also_enables():
     assert cfg.port == 8001
 
 
+def test_parse_serve_md_identity_perimeter_verified_default_false():
+    """spec/48: identity_is_perimeter_verified defaults to False (fail-closed)."""
+    cfg = _parse_serve_md("")
+    assert cfg.identity_is_perimeter_verified is False
+
+
+def test_parse_serve_md_identity_perimeter_verified_presence_enables():
+    """## Identity Is Perimeter Verified (any body) opts in."""
+    cfg = _parse_serve_md("## Identity Is Perimeter Verified\n")
+    assert cfg.identity_is_perimeter_verified is True
+
+
+def test_parse_serve_md_identity_perimeter_verified_env_override(monkeypatch):
+    """ATOMIC_AGENTS_SERVE_IDENTITY_PERIMETER_VERIFIED truthy values opt in."""
+    monkeypatch.setenv("ATOMIC_AGENTS_SERVE_IDENTITY_PERIMETER_VERIFIED", "true")
+    assert _parse_serve_md("").identity_is_perimeter_verified is True
+    # Negative control: a non-truthy value leaves it False.
+    monkeypatch.setenv("ATOMIC_AGENTS_SERVE_IDENTITY_PERIMETER_VERIFIED", "no")
+    assert _parse_serve_md("").identity_is_perimeter_verified is False
+
+
 def test_parse_serve_md_unknown_section_ignored():
     """Unknown ## sections are silently ignored."""
     text = "## Unknown Section\nsome value\n\n## Bind Port\n8500\n"
