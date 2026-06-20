@@ -222,6 +222,33 @@ def _fake_llm_response_no_capture():
     return resp
 
 
+def _fake_llm_response_multi_capture(items: list[tuple[str, str]]):
+    """LLM response emitting one atomic_capture tool_use per (name, body) tuple."""
+    resp = MagicMock()
+    resp.text = ""
+    resp.tool_uses = [
+        {
+            "name": "atomic_capture",
+            "id": f"tu-{i}",
+            "input": {
+                "type": "user",
+                "name": name,
+                "description": "multi-capture embed gate test",
+                "confidence": "high",
+                "sources": ["embed gate test"],
+                "body": body,
+            },
+        }
+        for i, (name, body) in enumerate(items)
+    ]
+    resp.input_tokens = 7
+    resp.output_tokens = 3
+    resp.cache_hit_tokens = 0
+    resp.cache_miss_tokens = 0
+    resp.raw = {}
+    return resp
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Fake memory backend that simulates supports_semantic_search=True
 
@@ -236,9 +263,15 @@ class _FakeSemanticMemoryBackend:
     backend_id = "fake-semantic"
     _written: list[Any]
 
-    def __init__(self, write_should_fail: bool = False) -> None:
+    def __init__(
+        self,
+        write_should_fail: bool = False,
+        fail_names: frozenset[str] | None = None,
+    ) -> None:
         self._written = []
         self._write_should_fail = write_should_fail
+        # Names that should raise in write_note() (partial-batch true-up tests).
+        self._fail_names = fail_names or frozenset()
 
     @property
     def supports_semantic_search(self) -> bool:
@@ -251,14 +284,19 @@ class _FakeSemanticMemoryBackend:
     def capabilities(self):
         from atomic_agents.memory.backend import MemoryCapabilities
 
+        # MemoryCapabilities has NO supports_semantic_search field (that lives on
+        # the boolean @property). Passing it raised TypeError, which the gate's
+        # try/except swallowed -> model_id silently fell back to "unknown". Match
+        # the real dataclass shape so the gate reads a real embedding_provider.
         return MemoryCapabilities(
-            supports_semantic_search=True,
             embedding_provider="text-embedding-3-small",
         )
 
     def write_note(self, capture, policy):
         if self._write_should_fail:
             raise RuntimeError("write_note forced failure for test")
+        if capture.name in self._fail_names:
+            raise RuntimeError(f"write_note forced failure for {capture.name}")
         self._written.append(capture.name)
 
     def list_notes(self, path=None):
@@ -293,7 +331,8 @@ class _FakeNonSemanticMemoryBackend:
     def capabilities(self):
         from atomic_agents.memory.backend import MemoryCapabilities
 
-        return MemoryCapabilities(supports_semantic_search=False)
+        # No semantic search -> no embedding provider.
+        return MemoryCapabilities(embedding_provider=None)
 
     def write_note(self, capture, policy):
         pass  # no embed
@@ -528,12 +567,52 @@ def test_embed_batch_release_emitted_even_when_write_note_fails(tmp_path):
     assert rel_records[0].get("written_count") == 0
 
 
+def test_embed_batch_partial_failure_trues_up_only_written(tmp_path):
+    """On a partial batch (some write_note() raise), actual_usd reflects ONLY the
+    successfully-written notes — NOT the full reserved amount, NOT zero.
+
+    Two captures of equal size; one write_note() fails. actual_usd MUST equal the
+    single-item cost (one written), and written_count MUST be 1.
+
+    Per-invocation negative control: if the true-up summed cost for failed items
+    too (actual += cost before write_note succeeds), actual_usd would be 2x and
+    written_count would mismatch. Verified by strip in the run notes for #544.
+    """
+    from atomic_agents._costs import calc_embedding_cost
+
+    body = "B" * 300  # 100 tokens each
+    fake_mem = _FakeSemanticMemoryBackend(fail_names=frozenset({"note-bad"}))
+    agent = _make_agent(tmp_path, memory_backend=fake_mem)
+    log_sink: list[dict] = []
+
+    llm_resp = _fake_llm_response_multi_capture(
+        [("note-good", body), ("note-bad", body)]
+    )
+    _run_call(agent, llm_response=llm_resp, log_sink=log_sink)
+
+    rel = next(r for r in log_sink if r.get("trigger") == "embed_batch_release")
+    res = next(r for r in log_sink if r.get("trigger") == "embed_batch_reservation")
+
+    assert rel.get("written_count") == 1, "exactly one note should be written"
+    assert res.get("batch_size") == 2, "both captures should be in the reservation"
+
+    one_item_cost, est = calc_embedding_cost("text-embedding-3-small", 100)
+    assert est is False
+    actual_usd = rel.get("actual_usd", 0.0)
+    assert actual_usd == pytest.approx(one_item_cost), (
+        f"actual_usd {actual_usd} should be the single-written-item cost "
+        f"{one_item_cost}, not the full 2-item spend and not zero"
+    )
+
+
 def test_embed_batch_release_actual_usd_nonzero_on_success(tmp_path):
     """actual_usd in release > 0 when at least one note is written.
 
     Negative control: actual_usd stays 0 when write_note() fails (proven
     in test_embed_batch_release_emitted_even_when_write_note_fails).
     """
+    from atomic_agents._costs import calc_embedding_cost
+
     fake_mem = _FakeSemanticMemoryBackend(write_should_fail=False)
     agent = _make_agent(tmp_path, memory_backend=fake_mem)
     log_sink: list[dict] = []
@@ -546,11 +625,57 @@ def test_embed_batch_release_actual_usd_nonzero_on_success(tmp_path):
 
     rel_records = [r for r in log_sink if r.get("trigger") == "embed_batch_release"]
     assert len(rel_records) == 1
-    actual_usd = rel_records[0].get("actual_usd", 0.0)
-    assert actual_usd >= 0.0, "actual_usd must be non-negative"
-    # For the stub model_id ("text-embedding-3-small") 100 tokens is $0.000002:
-    # 100 * 0.020 / 1_000_000 = 0.000002. With cost_estimated=True the amount
-    # may be zero if the model is unknown; the key invariant is no exception.
+    rec = rel_records[0]
+
+    # The model_id MUST flow through from capabilities().embedding_provider — a
+    # regression that swallows the read (e.g. fake misconfig) falls back to
+    # "unknown" + the fallback estimate. Assert the real model so that gap is
+    # caught here, not silently masked.
+    assert rec.get("model") == "text-embedding-3-small", (
+        "model_id did not resolve from capabilities().embedding_provider; "
+        f"got {rec.get('model')!r}"
+    )
+    assert rec.get("cost_estimated") is False, "known model must not be cost_estimated"
+
+    # 100 tokens at text-embedding-3-small: deterministic, NOT a fallback estimate.
+    expected_cost, est = calc_embedding_cost("text-embedding-3-small", 100)
+    assert est is False
+    actual_usd = rec.get("actual_usd", 0.0)
+    assert actual_usd == pytest.approx(expected_cost), (
+        f"actual_usd {actual_usd} != expected per-item cost {expected_cost}"
+    )
+    assert actual_usd > 0.0, "one written note must produce positive actual spend"
+
+
+def test_embed_batch_reservation_is_2x_fanout_of_actual(tmp_path):
+    """reserved_usd is the worst-case 2x fan-out (per_item_sum + batch_sum) of the
+    single-item actual when the whole batch writes.
+
+    The reservation MUST never under-reserve: for a fully-written single-item
+    batch, reserved == 2 * actual (per-item path + batch path, same input tokens).
+
+    Per-invocation negative control: if the gate dropped the fan-out term
+    (reserved = 1 * per_item_sum), this assertion goes RED. Verified by strip in
+    the run notes for #544.
+    """
+    fake_mem = _FakeSemanticMemoryBackend(write_should_fail=False)
+    agent = _make_agent(tmp_path, memory_backend=fake_mem)
+    log_sink: list[dict] = []
+
+    body = "A" * 300  # 100 tokens
+    llm_resp = _fake_llm_response_with_capture("note-2x", body)
+    _run_call(agent, llm_response=llm_resp, log_sink=log_sink)
+
+    res = next(r for r in log_sink if r.get("trigger") == "embed_batch_reservation")
+    rel = next(r for r in log_sink if r.get("trigger") == "embed_batch_release")
+
+    reserved = res.get("reserved_usd", 0.0)
+    actual = rel.get("actual_usd", 0.0)
+    assert reserved == pytest.approx(2.0 * actual), (
+        f"reserved {reserved} should be 2x the single-item actual {actual} "
+        "(per-item + batch fan-out worst case); a 1x reservation under-reserves"
+    )
+    assert reserved > actual, "worst-case reservation must exceed actual spend"
 
 
 # ──────────────────────────────────────────────────────────────────────────────

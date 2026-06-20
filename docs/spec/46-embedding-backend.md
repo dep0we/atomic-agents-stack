@@ -20,7 +20,7 @@ query-embed gate ships and both gate sites exist.
 > the operator explicitly pins `ATOMIC_AGENTS_EMBEDDING_BACKEND` or injects a
 > backend — preventing surprise billable spend from a merely-present API key).
 >
-> **PR-slicing update (#544 PR1, shipped 2026-06-19).** PR1 shipped: the
+> **PR-slicing update (#544 PR1, shipped 2026-06-20).** PR1 shipped: the
 > batch embed cost gate at the `agent.call()` capture-commit site (post-loop,
 > `write_note()` batch reservation + release), `PRIMITIVE_EMBED = 'embed'` with
 > 4 trigger mappings (`embed_batch_reservation`, `embed_batch_release`,
@@ -510,5 +510,5 @@ consumers share — a Protocol-typed abstraction, not a capability flag.
 
 **spec/34 was NOT edited by PR 2.** This supersession was recorded here only.
 The LOCKED spec/34 and spec/20 took their normative addenda at #544 PR1 (shipped
-2026-06-19) — see the versioned addenda at the end of each doc. spec/34's table
+2026-06-20) — see the versioned addenda at the end of each doc. spec/34's table
 entry stands as historical provenance of the original rationale.
