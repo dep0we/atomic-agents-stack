@@ -369,7 +369,7 @@ def test_cli_deploy_status_missing_agent_errors(monkeypatch, capsys):
     _fake_deploy_module(monkeypatch)
     rc = cli.main(["deploy", "status"])
     assert rc == 1
-    assert "requires exactly one agent" in capsys.readouterr().err
+    assert "exactly one agent name" in capsys.readouterr().err
 
 
 def test_cli_deploy_too_many_positionals_errors(monkeypatch, capsys):
