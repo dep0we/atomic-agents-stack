@@ -646,6 +646,73 @@ def main(argv: list[str] | None = None) -> int:
         help="override ATOMIC_AGENTS_ROOT",
     )
 
+    # ── deploy subcommand ─────────────────────────────────────────────────
+    # The deployment conductor (spec/48). Takes a POSITIONAL agent like
+    # init/serve. `deploy <agent>` plans + installs a supervised loopback
+    # deployment, verifies it, then GUIDES exposure (never performs it).
+    # `deploy status <agent>` / `deploy down <agent>` are nested subcommands.
+    deploy_cmd = sub.add_parser(
+        "deploy",
+        help="Plan, install, and verify a supervised loopback deployment (macOS)",
+        description=(
+            "Conductor that sequences init/doctor/serve to get an agent "
+            "running, supervised (user-level launchd, no sudo), and verified "
+            "on loopback, then prints tailored network-exposure guidance. It "
+            "never performs the exposure step (the operator owns the "
+            "perimeter; see docs/spec/48-deploy.md and spec/37)."
+        ),
+    )
+    # `deploy <agent>` is the primary form; `deploy status <agent>` and
+    # `deploy down <agent>` are the read/teardown variants. argparse cannot
+    # natively express "a bare positional OR a nested subcommand without
+    # collision", so we capture the positionals generically (1-2 tokens) and
+    # disambiguate in the dispatcher (_cmd_deploy): if the first token is
+    # "status"/"down" it is the action and the second is the agent; otherwise
+    # the first token is the agent and the action is the implicit full deploy.
+    deploy_cmd.add_argument(
+        "deploy_args",
+        nargs="*",
+        metavar="[status|down] <agent>",
+        help=("either `<agent>` (full deploy) or `status <agent>` / `down <agent>`"),
+    )
+    deploy_cmd.add_argument(
+        "--plan",
+        dest="deploy_plan",
+        action="store_true",
+        help="print the tagged plan and exit (no side effects, no billed call)",
+    )
+    deploy_cmd.add_argument(
+        "--yes",
+        dest="deploy_yes",
+        action="store_true",
+        help="assume yes for consent steps (non-interactive)",
+    )
+    deploy_cmd.add_argument(
+        "--verify-call",
+        dest="deploy_verify_call",
+        action="store_true",
+        help=(
+            "after the free healthz+doctor verify, fire a real POST /call "
+            "(bills tokens + writes a capture; opt-in only)"
+        ),
+    )
+    deploy_cmd.add_argument(
+        "--port",
+        dest="deploy_port",
+        type=int,
+        default=None,
+        help=(
+            "bind port (precedence: --port > ATOMIC_AGENTS_SERVE_PORT > "
+            "serve.md Bind Port > default 8000)"
+        ),
+    )
+    deploy_cmd.add_argument(
+        "--agents-root",
+        dest="agents_root",
+        default=None,
+        help="override ATOMIC_AGENTS_ROOT",
+    )
+
     args = parser.parse_args(argv)
 
     # `review` is a host-only subcommand — no agents-root needed (operates on
@@ -686,6 +753,12 @@ def main(argv: list[str] | None = None) -> int:
     # on every CLI invocation (spec/37 MUST 1 — progressive disclosure).
     if args.cmd == "serve":
         return _cmd_serve(args)
+
+    # `deploy` resolves its own agents_root from --agents-root or env var.
+    # Lazy-imports the deploy module so launchd/socket machinery is not
+    # imported for any other CLI invocation.
+    if args.cmd == "deploy":
+        return _cmd_deploy(args)
 
     agents_root = (
         Path(args.agents_root).expanduser().resolve()
@@ -1729,6 +1802,71 @@ def _cmd_serve(args) -> int:
     from .serve import run_serve  # noqa: PLC0415 -- intentional lazy import
 
     return run_serve(args)
+
+
+def _cmd_deploy(args) -> int:
+    """Dispatch the `atomic-agents deploy` subcommand (spec/48).
+
+    Forms:
+      deploy <agent> [--plan] [--yes] [--verify-call] [--port N] [--agents-root]
+      deploy status <agent> [--agents-root]
+      deploy down <agent> [--agents-root]
+
+    Lazy-imports the deploy module so launchd/socket/urllib machinery is not
+    imported on every CLI invocation. Matches the lazy-import pattern from
+    _cmd_serve / _cmd_init.
+    """
+    from . import deploy as deploy_mod  # noqa: PLC0415 -- intentional lazy import
+
+    positionals = list(args.deploy_args or [])
+
+    _USAGE = (
+        "Usage: atomic-agents deploy <agent> [--plan] [--yes] [--verify-call] "
+        "[--port N]\n"
+        "       atomic-agents deploy status <agent>\n"
+        "       atomic-agents deploy down <agent>"
+    )
+
+    # status / down variants: first token is the action, second is the agent.
+    if positionals and positionals[0] in ("status", "down"):
+        action = positionals[0]
+        if len(positionals) != 2:
+            # Do not echo the user-supplied action back into the message — the
+            # two valid actions are named statically here, which also avoids a
+            # CodeQL clear-text-logging false positive on the argv-derived value.
+            print(
+                "Error: `deploy status` and `deploy down` each require exactly "
+                f"one agent name.\n{_USAGE}",
+                file=sys.stderr,
+            )
+            return 1
+        agent = positionals[1]
+        if action == "status":
+            return deploy_mod.deploy_status(agent)
+        return deploy_mod.deploy_down(agent)
+
+    # Implicit full-deploy form: `deploy <agent>`.
+    if len(positionals) != 1:
+        print(
+            "Error: deploy requires exactly one agent name "
+            f"(got {len(positionals)} positional arguments).\n{_USAGE}",
+            file=sys.stderr,
+        )
+        return 1
+    agent = positionals[0]
+
+    try:
+        return deploy_mod.deploy(
+            agent,
+            agents_root=args.agents_root,
+            cli_port=args.deploy_port,
+            plan_only=args.deploy_plan,
+            assume_yes=args.deploy_yes,
+            verify_call=args.deploy_verify_call,
+        )
+    except deploy_mod.DeployError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return e.exit_code
 
 
 if __name__ == "__main__":

@@ -289,6 +289,10 @@ AGENT_NAME_MAX_LEN: Final = 64
 
 # CLI subcommand names that would shadow the wizard-created agent.
 # Sourced from cli.py sub.add_parser() calls + "init" (this new subcommand).
+# "deploy" and its nested actions "status"/"down" are reserved too: an agent
+# named "status" or "down" would be unreachable via `deploy <agent>` because
+# the deploy dispatcher reads those tokens as the action, not the agent name
+# (spec/48 — `deploy status <agent>` / `deploy down <agent>`).
 RESERVED_AGENT_NAMES: Final = frozenset(
     {
         "init",
@@ -302,6 +306,9 @@ RESERVED_AGENT_NAMES: Final = frozenset(
         "review",
         "persona",
         "corpus",
+        "deploy",
+        "status",
+        "down",
     }
 )
 
