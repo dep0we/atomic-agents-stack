@@ -985,11 +985,11 @@ Added OUTSIDE the 8-MUST count, following the versioned-addendum precedent of sp
 
 ---
 
-### Versioned normative addendum — 'embed' primitive bucket and embed audit triggers (spec/44 PR1, issue #544)
+### Versioned normative addendum — 'embed' primitive bucket and embed audit triggers (spec/46, issue #544 PR1)
 
 The canonical primitive taxonomy (§"Canonical primitive taxonomy") is extended with one new bucket:
 
-* `embed` — embedding reservation/release audit records, emitted by the agent.call() embed cost gate (spec/44 PR1). Billing is ISOLATED from the chat `PRIMITIVE_HELPER` bucket because embedding uses `EMBEDDING_PRICING` (distinct from chat `PRICING`). Folding into `helper` or any existing bucket is irreversibly lossy once records are on disk — a `GROUP BY primitive` cost attribution query for embedding spend would be permanently ambiguous (Principle 5).
+* `embed` — embedding reservation/release audit records, emitted by the agent.call() embed cost gate (spec/46, #544 PR1). Billing is ISOLATED from the chat `PRIMITIVE_HELPER` bucket because embedding uses `EMBEDDING_PRICING` (distinct from chat `PRICING`). Folding into `helper` or any existing bucket is irreversibly lossy once records are on disk — a `GROUP BY primitive` cost attribution query for embedding spend would be permanently ambiguous (Principle 5).
 
 Four triggers map to `PRIMITIVE_EMBED = 'embed'` in `_PRIMITIVE_BY_TRIGGER`:
 
@@ -997,8 +997,8 @@ Four triggers map to `PRIMITIVE_EMBED = 'embed'` in `_PRIMITIVE_BY_TRIGGER`:
 |---------|-------------|
 | `embed_batch_reservation` | Before the write_note() batch loop — worst-case cost reserved |
 | `embed_batch_release` | In finally after the loop — actual cost recorded |
-| `embed_reservation` | Before a single embed() call (query-embed gate, shipped in a future PR) |
-| `embed_release` | In finally after a single embed() call |
+| `embed_reservation` | Before a single embed() call (query-embed gate at the CLI corpus-query site (#564), NOT inside agent.call() — wired in #544 PR2) |
+| `embed_release` | In finally after a single embed() call (query-embed gate at the CLI corpus-query site (#564), NOT inside agent.call() — wired in #544 PR2) |
 
 **Canonical shape for embed records (all four triggers):**
 
@@ -1008,14 +1008,17 @@ cost_source: "actor"     (embedding spend is the agent's own spend)
 cost_estimated: bool     (True when model_id not in EMBEDDING_PRICING)
 batch_size: int          (for batch triggers; 1 for per-call triggers)
 reserved_usd: float      (reservation records)
-actual_usd: float        (release records; 0.0 when embed() returns None)
+actual_usd: float        (release records; per-written-note byte-token estimate)
 written_count: int       (embed_batch_release: notes successfully written)
+cost_usd: ABSENT         (embed spend is audit-only this PR; NOT folded into the
+                          cost_usd that sum_cost_for_period aggregates —
+                          cross-call embed accounting deferred to #544 PR2)
 ```
 
 `cost_estimated=True` NEVER gates — it only affects the reserved amount. The fail-closed gate is `if CostReadResult.degraded AND effective_cap is not None`, not a function of cost_estimated.
 
-On None-return from embed(): `actual_usd=0.0` in the release record. The provider billed nothing; the reservation was a worst-case buffer.
+`actual_usd` on a release record is a per-written-note ESTIMATE (the same UTF-8-byte token estimate as the reservation basis), summed over the notes successfully written. It is NOT conditioned on whether the underlying `embed()` returned `None`: `write_note()` returns a `NoteRef` and does not surface whether its internal `embed()` degraded to `None` (e.g. no API key — the note is still written via FTS and `write_note()` succeeds), so the orchestrator has no embed-None signal and charges the full per-note estimate. A true embed-None→`$0.0` accounting would require `write_note()` to report whether it embedded; that is deferred to a follow-up, not PR1.
 
-The `embed_reservation` and `embed_release` triggers are defined here for completeness but not yet emitted by a shipped code path. They will be wired when the query-embed gate ships.
+The `embed_reservation` and `embed_release` triggers are defined here for completeness but not yet emitted by a shipped code path. There is no query-embed call site inside `agent.call()` to gate (neither `memory.search()` nor `corpus.query()` is invoked by the orchestrator — confirmed by grep over `agent.py`); the real ungated query-embed path is the CLI corpus-query command (#564). These two triggers will be emitted when that gate ships in #544 PR2.
 
 Added OUTSIDE the 8-MUST count, following the versioned-addendum precedent of spec/45 PR2 (#520) and spec/22 §Read-failure contract (#497).

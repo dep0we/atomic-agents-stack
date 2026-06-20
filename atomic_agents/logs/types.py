@@ -58,7 +58,7 @@ PRIMITIVE_ESCALATION = "escalation"
 PRIMITIVE_JUDGMENT = "judgment"
 PRIMITIVE_MANDATE_RESERVATION = "mandate_reservation"  # #124 PR 3b — reservation event family (granted/used/committed/rolled_back/expired/_on_recovery/_external_unverified) all share this primitive so LogQuery(primitive=PRIMITIVE_MANDATE_RESERVATION, mandate_id=...) is an indexed query on SQLite backends and a bounded scan on filesystem
 PRIMITIVE_POLICY_DECISION = "policy_decision"  # #89 PR 3a — Policy/Mandate cap denial + model override audit events; PolicyDecision schema in atomic_agents.policy.types
-# spec/44 PR1 (#544) — embedding reservation/release audit records.
+# spec/46 (#544 PR1) — embedding reservation/release audit records.
 # ALL FOUR triggers (embed_reservation, embed_release, embed_batch_reservation,
 # embed_batch_release) map to this bucket. Embedding bills from EMBEDDING_PRICING
 # (isolated from chat PRICING); folding into PRIMITIVE_HELPER or any existing

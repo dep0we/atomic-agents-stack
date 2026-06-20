@@ -38,6 +38,10 @@ Checks (one CheckResult per check unless noted):
                             id; for non-default ids, also confirms the backend
                             constructs. filesystem needs no extras).
     memory-backend  Operator-configured MemoryBackend resolves and stats() returns.
+    embedding-backend  Operator-pinned EmbeddingBackend resolves; dual-probe
+                       (construct + API-key resolution). SKIP when
+                       ATOMIC_AGENTS_EMBEDDING_BACKEND is unset (semantic search
+                       off by default).
     write-paths     Each tools.md write_paths entry exists and is writable.
 
 Exit code mapping (set by the CLI, not this module):
@@ -276,7 +280,7 @@ def run_doctor(
     results.append(check_journal_backend(agent_root))
     results.append(check_queue_backend(agent_root))
     results.append(check_idempotency_backend(agent_root))
-    # spec/44 PR1 (#544): embedding-backend check. Takes no agent_root (reads
+    # spec/46 (#544 PR1): embedding-backend check. Takes no agent_root (reads
     # ATOMIC_AGENTS_EMBEDDING_BACKEND + the registry), like check_secret_backend().
     # A defined-but-unregistered check is the same false-PASS-by-omission class as
     # the list-vs-load_all gap (feedback_doctor_dual_probe_pattern) — so it MUST be
@@ -5098,11 +5102,17 @@ def check_embedding_backend() -> CheckResult:
        every embed() call to None; that is valid-but-degraded, so it WARN
        rather than FAIL -- the operator can see semantic search is impaired.
 
-    Dual-probe pattern (MEMORY.md): construction and key-resolution are
-    two distinct failure modes.  A backend that imports correctly may still
-    fail at the use-site if ``_get_key()`` returned None.  This check probes
-    the backend's ``_api_key`` attribute after construction to catch that gap
-    without making a billable embed() call.
+    Construction probe + key-resolution probe (a billing-free proxy for
+    use-site readiness): construction and key-resolution are two distinct
+    failure modes.  A backend that imports correctly may still fail at the
+    use-site if ``_get_key()`` returned None.  This check probes the backend's
+    ``_api_key`` attribute after construction to catch that gap WITHOUT making a
+    live embed() call.  Because it never calls embed(), a backend that
+    constructs and has a key but fails at the embed API (e.g. a 400/auth error
+    on the wire) is reported PASS — the key-attribute probe is a proxy for, not
+    a live exercise of, the billable path.  An opt-in ``--probe-embed`` flag
+    that makes one real (cheap) embed call when the operator accepts the spend
+    is a possible follow-up.
 
     ATOMIC_AGENTS_EMBEDDING_BACKEND unset → SKIP (opt-in default).
     """
@@ -5201,7 +5211,7 @@ def check_embedding_backend() -> CheckResult:
             name="embedding-backend",
             status=WARN,
             message=(
-                f"embedding backend '{backend.backend_id}' (provider_id={backend.provider_id!r}, "
+                f"embedding backend '{backend.provider_id}' (provider_id={backend.provider_id!r}, "
                 f"model={backend.model_id!r}) constructed successfully but has no API key. "
                 "embed() calls will degrade to None — semantic search is impaired."
             ),
@@ -5221,6 +5231,13 @@ def check_embedding_backend() -> CheckResult:
         )
 
     caps = backend.capabilities()
+    # Tri-state key probe: a backend WITHOUT a _api_key attribute (any non-OpenAI
+    # EmbeddingBackend, or one that resolves credentials differently) is not "key
+    # not resolved" — key resolution simply does not apply. Reporting False there
+    # would mislabel a fully-usable PASS backend. "n/a" when the attribute is
+    # absent; "resolved" when present and non-None (the WARN branch above already
+    # caught present-and-None).
+    api_key_probe = "n/a" if api_key is _SENTINEL else "resolved"
     return CheckResult(
         name="embedding-backend",
         status=PASS,
@@ -5236,7 +5253,7 @@ def check_embedding_backend() -> CheckResult:
             "dimensions": backend.dimensions,
             "max_batch_size": caps.max_batch_size,
             "supports_input_type": caps.supports_input_type,
-            "api_key_resolved": api_key is not _SENTINEL,
+            "api_key_probe": api_key_probe,
         },
     )
 

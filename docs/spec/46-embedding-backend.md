@@ -26,14 +26,21 @@ query-embed gate ships and both gate sites exist.
 > 4 trigger mappings (`embed_batch_reservation`, `embed_batch_release`,
 > `embed_reservation`, `embed_release`) in `_PRIMITIVE_BY_TRIGGER`,
 > `check_embedding_backend()` doctor check (SKIP/PASS/WARN/FAIL), and versioned
-> normative addenda to spec/20, spec/22, and spec/34. The query-embed gate
-> (per-call reservation before `memory.search()` / `corpus.query()` calls) and
+> normative addenda to spec/20, spec/22, and spec/34. The query-embed gate and
 > the DRAFT→LOCKED ceremony are deferred to PR2.
 >
-> spec/46 STAYS DRAFT until the query-embed gate ships (the LOCK precondition
-> below). The opt-in default (`ATOMIC_AGENTS_EMBEDDING_BACKEND` unset → FTS only)
-> ensures no ungated billable path runs without explicit operator opt-in
-> (Principle #4).
+> **The query-embed billable path is NOT inside `agent.call()`.** There is no
+> `memory.search()` or `corpus.query()` call site in the orchestrator (verified
+> by grep over `agent.py`), so there is no orchestrator query-embed path to gate
+> and PR2 MUST NOT add a speculative pre-loop search call or tool interceptor.
+> The real ungated query-embed path is the CLI corpus-query command, tracked in
+> [#564](https://github.com/dep0we/atomic-agents-stack/issues/564); that is the
+> PR2 gate site.
+>
+> spec/46 STAYS DRAFT until the query-embed (CLI corpus-query) gate ships (the
+> LOCK precondition below). The opt-in default (`ATOMIC_AGENTS_EMBEDDING_BACKEND`
+> unset → FTS only) ensures no ungated billable path runs without explicit
+> operator opt-in (Principle #4).
 
 ---
 
@@ -203,6 +210,18 @@ is ONE billed call (no per-item fan-out, unlike `embed_batch()`).
 > docstring on `OpenAIEmbeddingBackend.embed_batch()` for the matching code-side
 > note.
 
+> **Merge-write reservations are fragment-sized, not merged-body-sized (#544 PR1
+> known limitation).** The capture-commit batch gate in `agent.call()` estimates
+> both the reservation and the per-note true-up from the INCOMING capture body
+> (`c.body`). On a merge write (`capture.merge_into` set), `PgvectorMemoryBackend`
+> re-reads the full accumulated note body and embeds THAT — which can be larger
+> than the incoming fragment. So for merge writes the reservation under-estimates
+> worst-case spend and the audit `actual_usd` understates the true embed cost; the
+> 2x fan-out buffer is the only cushion and is unrelated to merged-body growth.
+> This is a documented PR1 limitation: the gate caps against the fragment estimate.
+> Estimating from the post-write stored body is deferred (it requires reading back
+> the merged note after the write).
+
 ```
 trigger="embed_reservation"          output_tokens=0    cost_source="actor"  # single embed()
 trigger="embed_release"              output_tokens=0    cost_source="actor"
@@ -215,9 +234,12 @@ and this normative mandate only.** **#544 PR1 shipped the `embed_batch()`
 ingestion gate** (post-loop capture-commit site in `agent.call()`) + `PRIMITIVE_EMBED`
 + `check_embedding_backend()` doctor check. The DRAFT status of spec/46 reflects
 the remaining gap — the single-call `embed()` query-embedding reservation is not yet
-wired. The LOCK ceremony on this spec (#544 PR2) MUST verify that BOTH wiring sites
-exist — the `embed_batch()` ingestion reservation AND the single-call `embed()`
-query-embedding reservation — before removing the DRAFT marker, not just the batch one.
+wired. That gap is NOT inside `agent.call()` (no `memory.search()`/`corpus.query()`
+call site exists in the orchestrator); the ungated query-embed path is the CLI
+corpus-query command (#564). The LOCK ceremony on this spec (#544 PR2) MUST verify
+that BOTH wiring sites exist — the `embed_batch()` ingestion reservation AND the
+single-call `embed()` query-embedding reservation at the CLI corpus-query site —
+before removing the DRAFT marker, not just the batch one.
 
 ### Fail-closed posture (non-normative guidance — now partially shipped)
 
@@ -491,7 +513,7 @@ backend (e.g., `PgvectorCorpusBackend` receives an `EmbeddingBackend` at
 | Batch embed cost gate (post-loop capture-commit, `embed_batch_reservation` + `embed_batch_release`) | — | — | ✅ Shipped | — |
 | Doctor check (`check_embedding_backend()`, no billable probe) | — | — | ✅ Shipped | — |
 | Normative addenda: spec/20 MemoryCapabilities, spec/22 primitive taxonomy, spec/34 CorpusCapabilities | — | — | ✅ Shipped | — |
-| Query-embed gate (per-call `embed_reservation` + `embed_release` before `memory.search()` / `corpus.query()`) | — | — | — | ✅ Ships |
+| Query-embed gate (per-call `embed_reservation` + `embed_release` at the CLI corpus-query site (#564) — NOT inside `agent.call()`, which has no orchestrator query-embed path) | — | — | — | ✅ Ships |
 | Spec/46 DRAFT→LOCKED | — | — | — | ✅ Locks |
 | Local embedding backend (sentence-transformers/Ollama) | — | — | — | Separate arc ([#534](https://github.com/dep0we/atomic-agents-stack/issues/534)) |
 

@@ -883,4 +883,4 @@ For the full normative export contract, see `docs/spec/40-canonical-export.md`.
 
 **Forward-compat note:** `CorpusCapabilities.embedding_backend_resolved` is populated only by `PgvectorCorpusBackend`. `FilesystemCorpusBackend` and `SQLiteCorpusBackend` return it as `None` (the dataclass default). Callers that inspect this field MUST treat a missing / `None` value as "no live embedding backend." Uniform convergence of the `capabilities()` surface across all backends is deferred to issue #431.
 
-Added OUTSIDE the 9-MUST count, following the versioned-addendum precedent of spec/20 PR-3 addendum (#544).
+Added OUTSIDE the 9-MUST count, following the versioned-addendum precedent of spec/45 PR2 (#520) and spec/22 §Read-failure contract (#497), and mirroring the sibling spec/20 PR-3 addendum shipped in this same PR.

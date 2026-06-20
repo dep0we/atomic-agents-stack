@@ -1,4 +1,4 @@
-"""Embed cost gate integration tests (spec/44 PR1, issue #544).
+"""Embed cost gate integration tests (spec/46, issue #544 PR1).
 
 Covers:
 - PRIMITIVE_EMBED constant and _PRIMITIVE_BY_TRIGGER routing
@@ -253,6 +253,23 @@ def _fake_llm_response_multi_capture(items: list[tuple[str, str]]):
 # Fake memory backend that simulates supports_semantic_search=True
 
 
+class _StubEmbeddingBackend:
+    """Minimal EmbeddingBackend stub exposing only .model_id / .provider_id.
+
+    Matches the live-backend surface the embed cost gate reads from
+    MemoryCapabilities.embedding_backend_resolved: the gate prices on .model_id
+    (the model id), and .provider_id is the provider label. No billable methods
+    are exercised by the gate (it only reads attributes), so embed()/embed_batch()
+    are intentionally absent.
+    """
+
+    def __init__(
+        self, model_id: str = "text-embedding-3-small", provider_id: str = "openai"
+    ) -> None:
+        self.model_id = model_id
+        self.provider_id = provider_id
+
+
 class _FakeSemanticMemoryBackend:
     """Minimal MemoryBackend fake that advertises supports_semantic_search=True.
 
@@ -284,12 +301,19 @@ class _FakeSemanticMemoryBackend:
     def capabilities(self):
         from atomic_agents.memory.backend import MemoryCapabilities
 
-        # MemoryCapabilities has NO supports_semantic_search field (that lives on
-        # the boolean @property). Passing it raised TypeError, which the gate's
-        # try/except swallowed -> model_id silently fell back to "unknown". Match
-        # the real dataclass shape so the gate reads a real embedding_provider.
+        # Match the PRODUCTION contract of PgvectorMemoryBackend.capabilities():
+        #   embedding_provider = a provider LABEL ("openai") — provider_id, NOT a
+        #     model id (pgvector.py sets it to self._embedding_backend.provider_id).
+        #   embedding_backend_resolved = the live EmbeddingBackend whose .model_id
+        #     ("text-embedding-3-small") is the pricing key the cost gate reads.
+        # The gate MUST resolve the model id from embedding_backend_resolved.model_id,
+        # never from the provider label. A fake that puts a model id into
+        # embedding_provider would be a false-green that does not match production.
         return MemoryCapabilities(
-            embedding_provider="text-embedding-3-small",
+            embedding_provider="openai",
+            embedding_backend_resolved=_StubEmbeddingBackend(
+                model_id="text-embedding-3-small"
+            ),
         )
 
     def write_note(self, capture, policy):
@@ -351,6 +375,27 @@ class _FakeNonSemanticMemoryBackend:
 
     def close(self):
         pass
+
+
+class _ProviderLabelOnlyMemoryBackend(_FakeSemanticMemoryBackend):
+    """Semantic backend whose capabilities() returns a provider LABEL but NO
+    resolved EmbeddingBackend (embedding_backend_resolved=None).
+
+    Models the degraded/older shape where the live backend is not exposed. The
+    gate MUST fall back to the provider label as the pricing key — which is not a
+    model id, so calc_embedding_cost() falls back to the max-rate estimate and
+    cost_estimated=True. Used as the per-invocation negative control proving the
+    model id genuinely flows from embedding_backend_resolved.model_id, not the
+    provider label.
+    """
+
+    def capabilities(self):
+        from atomic_agents.memory.backend import MemoryCapabilities
+
+        return MemoryCapabilities(
+            embedding_provider="openai",
+            embedding_backend_resolved=None,
+        )
 
 
 def _make_agent(
@@ -574,9 +619,12 @@ def test_embed_batch_partial_failure_trues_up_only_written(tmp_path):
     Two captures of equal size; one write_note() fails. actual_usd MUST equal the
     single-item cost (one written), and written_count MUST be 1.
 
-    Per-invocation negative control: if the true-up summed cost for failed items
-    too (actual += cost before write_note succeeds), actual_usd would be 2x and
-    written_count would mismatch. Verified by strip in the run notes for #544.
+    Per-invocation negative control (reproducible strip): move the
+    ``_embed_actual_usd += _note_cost`` true-up in agent.py to BEFORE
+    ``self.memory.write_note(c, policy)`` (so it sums failed items too). With two
+    equal-size captures and one failing, actual_usd becomes 2x one_item_cost while
+    written_count stays 1 — the assertions below go RED. The true-up is placed
+    AFTER the successful write specifically to keep this invariant.
     """
     from atomic_agents._costs import calc_embedding_cost
 
@@ -627,12 +675,17 @@ def test_embed_batch_release_actual_usd_nonzero_on_success(tmp_path):
     assert len(rel_records) == 1
     rec = rel_records[0]
 
-    # The model_id MUST flow through from capabilities().embedding_provider — a
-    # regression that swallows the read (e.g. fake misconfig) falls back to
-    # "unknown" + the fallback estimate. Assert the real model so that gap is
-    # caught here, not silently masked.
+    # The model_id MUST flow through from
+    # capabilities().embedding_backend_resolved.model_id — NOT from the
+    # embedding_provider label ("openai"). A regression that reads the provider
+    # label instead (or swallows the resolved-backend read) falls back to the
+    # EMBEDDING_PRICING max-rate estimate with model="openai". Assert the real
+    # model id so that gap is caught here, not silently masked. See
+    # test_embed_model_id_resolves_from_resolved_backend_not_provider_label for
+    # the per-invocation strip negative control.
     assert rec.get("model") == "text-embedding-3-small", (
-        "model_id did not resolve from capabilities().embedding_provider; "
+        "model_id did not resolve from "
+        "capabilities().embedding_backend_resolved.model_id; "
         f"got {rec.get('model')!r}"
     )
     assert rec.get("cost_estimated") is False, "known model must not be cost_estimated"
@@ -654,9 +707,10 @@ def test_embed_batch_reservation_is_2x_fanout_of_actual(tmp_path):
     The reservation MUST never under-reserve: for a fully-written single-item
     batch, reserved == 2 * actual (per-item path + batch path, same input tokens).
 
-    Per-invocation negative control: if the gate dropped the fan-out term
-    (reserved = 1 * per_item_sum), this assertion goes RED. Verified by strip in
-    the run notes for #544.
+    Per-invocation negative control (reproducible strip): change
+    ``_embed_reserved_usd = 2.0 * _per_item_sum`` in agent.py to ``1.0 *`` and the
+    ``reserved == 2 * actual`` assertion below goes RED (reserved would equal
+    actual). The 2x term is the fan-out buffer this asserts.
     """
     fake_mem = _FakeSemanticMemoryBackend(write_should_fail=False)
     agent = _make_agent(tmp_path, memory_backend=fake_mem)
@@ -676,6 +730,313 @@ def test_embed_batch_reservation_is_2x_fanout_of_actual(tmp_path):
         "(per-item + batch fan-out worst case); a 1x reservation under-reserves"
     )
     assert reserved > actual, "worst-case reservation must exceed actual spend"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Model-id resolution: from embedding_backend_resolved.model_id, NOT the label
+
+
+def test_embed_model_id_resolves_from_resolved_backend_not_provider_label(tmp_path):
+    """The pricing model id MUST come from
+    capabilities().embedding_backend_resolved.model_id, NOT embedding_provider.
+
+    Production contract (PgvectorMemoryBackend): embedding_provider is the
+    provider LABEL ("openai") and the model id lives on the resolved backend.
+    The audit record's `model` field must be the model id ("text-embedding-3-small")
+    and cost_estimated must be False for a priced model.
+
+    Per-invocation negative control: _ProviderLabelOnlyMemoryBackend returns the
+    SAME provider label but NO resolved backend, so the gate falls back to the
+    label as the pricing key — which is not in EMBEDDING_PRICING — yielding
+    model="openai" and cost_estimated=True. That divergence proves the model id
+    is genuinely read from the resolved backend, not the label (strip the
+    resolved-backend read in agent.py and this test's first assertion goes RED).
+    """
+    body = "A" * 300  # 100 tokens
+
+    # Resolved-backend path → real model id, exact pricing.
+    agent_ok = _make_agent(
+        tmp_path, memory_backend=_FakeSemanticMemoryBackend(), name="resolvedbot"
+    )
+    sink_ok: list[dict] = []
+    _run_call(
+        agent_ok,
+        llm_response=_fake_llm_response_with_capture("note-r", body),
+        log_sink=sink_ok,
+    )
+    rec_ok = next(r for r in sink_ok if r.get("trigger") == "embed_batch_release")
+    assert rec_ok.get("model") == "text-embedding-3-small", (
+        "model id must resolve from embedding_backend_resolved.model_id; "
+        f"got {rec_ok.get('model')!r}"
+    )
+    assert rec_ok.get("cost_estimated") is False, (
+        "priced model must not be flagged cost_estimated"
+    )
+
+    # Provider-label-only path (no resolved backend) → fallback estimate.
+    agent_label = _make_agent(
+        tmp_path,
+        memory_backend=_ProviderLabelOnlyMemoryBackend(),
+        name="labelbot",
+    )
+    sink_label: list[dict] = []
+    _run_call(
+        agent_label,
+        llm_response=_fake_llm_response_with_capture("note-l", body),
+        log_sink=sink_label,
+    )
+    rec_label = next(r for r in sink_label if r.get("trigger") == "embed_batch_release")
+    assert rec_label.get("model") == "openai", (
+        "with no resolved backend the gate falls back to the provider label as "
+        f"the pricing key; got {rec_label.get('model')!r}"
+    )
+    assert rec_label.get("cost_estimated") is True, (
+        "an unpriced provider label must flag cost_estimated=True (max-rate fallback)"
+    )
+
+
+def test_embed_token_estimate_uses_utf8_bytes_not_code_points(tmp_path):
+    """The token estimate is math.ceil(utf8_bytes / 3), NOT len(str)/3.
+
+    Multibyte scripts (CJK) are ≥1 BPE token per char and ≥3 UTF-8 bytes per char,
+    so a code-point estimate under-reserves ~3x. The byte-based estimate must be
+    >= the code-point count (a conservative real-token lower bound).
+
+    Per-invocation negative control: a 100-CJK-char body has 300 UTF-8 bytes →
+    ceil(300/3)=100-token estimate, vs the code-point estimate ceil(100/3)=34.
+    The reserved cost (built on the byte estimate) MUST equal the cost of >=100
+    tokens, NOT 34. Strip the `.encode("utf-8")` in agent.py (revert to code
+    points) and this assertion goes RED.
+    """
+    from atomic_agents._costs import calc_embedding_cost
+
+    cjk = "語" * 100  # 100 code points, 300 UTF-8 bytes
+    assert len(cjk) == 100
+    assert len(cjk.encode("utf-8")) == 300
+
+    fake_mem = _FakeSemanticMemoryBackend()
+    agent = _make_agent(tmp_path, memory_backend=fake_mem)
+    sink: list[dict] = []
+    _run_call(
+        agent,
+        llm_response=_fake_llm_response_with_capture("note-cjk", cjk),
+        log_sink=sink,
+    )
+    rel = next(r for r in sink if r.get("trigger") == "embed_batch_release")
+    res = next(r for r in sink if r.get("trigger") == "embed_batch_reservation")
+    actual = rel.get("actual_usd", 0.0)
+    reserved = res.get("reserved_usd", 0.0)
+
+    # Byte-based estimate: 300 bytes / 3 = 100 tokens.
+    cost_byte_based, _ = calc_embedding_cost("text-embedding-3-small", 100)
+    # Code-point estimate (the bug): 100 chars / 3 → 34 tokens.
+    cost_code_point, _ = calc_embedding_cost("text-embedding-3-small", 34)
+
+    # There are TWO independent encode sites in agent.py (the reservation loop and
+    # the per-note true-up loop). Assert on BOTH outputs so a strip of EITHER
+    # site's .encode("utf-8") is independently caught (per the lesson: strip each
+    # independent part separately). actual_usd exercises the true-up loop;
+    # reserved_usd (= 2x per_item_sum) exercises the reservation loop.
+    assert actual == pytest.approx(cost_byte_based), (
+        f"actual_usd {actual} must reflect the UTF-8-byte token estimate "
+        f"({cost_byte_based}), not the code-point estimate ({cost_code_point}) — "
+        "true-up-loop encode site"
+    )
+    assert reserved == pytest.approx(2.0 * cost_byte_based), (
+        f"reserved_usd {reserved} must reflect 2x the UTF-8-byte estimate "
+        f"({2.0 * cost_byte_based}), not 2x the code-point estimate "
+        f"({2.0 * cost_code_point}) — reservation-loop encode site"
+    )
+    assert cost_byte_based > cost_code_point, (
+        "byte-based estimate must exceed code-point estimate for multibyte text "
+        "(otherwise the test topology is not load-bearing)"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Enforcement: reserved > headroom raises (gate is a real cap, not audit-only)
+
+
+def test_embed_gate_blocks_when_reservation_exceeds_headroom(tmp_path):
+    """The embed gate RAISES CostGuardrailBlocked when the worst-case reservation
+    exceeds remaining headroom — it is a real guardrail, not an audit-only log.
+
+    A capped agent ($1.00 daily) whose chat spend is already $0.999999 has ~$1e-6
+    headroom; a batch reserving more than that must be refused.
+
+    Per-invocation negative control: test_embed_gate_passes_within_headroom proves
+    the same batch is allowed when headroom is ample. Strip the headroom-enforce
+    block in agent.py and this test stops raising.
+    """
+    from atomic_agents.exceptions import CostGuardrailBlocked
+    from atomic_agents._costs import CostReadResult
+
+    fake_mem = _FakeSemanticMemoryBackend()
+    agent = _make_agent(tmp_path, memory_backend=fake_mem, daily_cap_usd=1.0)
+    agent.config = dc_replace(
+        agent.config, cost_guardrails_enabled=True, daily_cap_usd=1.0
+    )
+    agent._policy_snapshot_this_call = None
+
+    # Reliable (non-degraded) read showing the agent is at $0.999999 of its $1 cap.
+    near_cap = CostReadResult(total_usd=0.999999, degraded=False, dropped_records=0)
+
+    body = "B" * 30000  # large body → reservation well above $1e-6 headroom
+    llm_resp = _fake_llm_response_with_capture("note-big", body)
+
+    with pytest.raises(CostGuardrailBlocked, match="exceeds remaining headroom"):
+        with (
+            patch("atomic_agents._llm.call_llm", return_value=llm_resp),
+            patch.object(agent, "load"),
+            patch.object(
+                agent, "assemble_system_prompt", return_value="You are EmbedBot."
+            ),
+            patch.object(
+                agent,
+                "_check_cost_guardrails",
+                return_value=MagicMock(
+                    allow=True, action="ok", reason="cap", cost_data_degraded=False
+                ),
+            ),
+            patch("atomic_agents._costs.sum_cost_for_period", return_value=near_cap),
+        ):
+            agent.call("embed test")
+
+
+def test_embed_gate_passes_within_headroom(tmp_path):
+    """Negative control for the enforcement block: the same capped agent with
+    ample headroom completes without raising."""
+    from atomic_agents._costs import CostReadResult
+
+    fake_mem = _FakeSemanticMemoryBackend()
+    agent = _make_agent(tmp_path, memory_backend=fake_mem, daily_cap_usd=1.0)
+    agent.config = dc_replace(
+        agent.config, cost_guardrails_enabled=True, daily_cap_usd=1.0
+    )
+    agent._policy_snapshot_this_call = None
+
+    ample = CostReadResult(total_usd=0.0, degraded=False, dropped_records=0)
+    body = "B" * 30000
+    llm_resp = _fake_llm_response_with_capture("note-big", body)
+
+    with (
+        patch("atomic_agents._llm.call_llm", return_value=llm_resp),
+        patch.object(agent, "load"),
+        patch.object(agent, "assemble_system_prompt", return_value="You are EmbedBot."),
+        patch.object(
+            agent,
+            "_check_cost_guardrails",
+            return_value=MagicMock(
+                allow=True, action="ok", reason="cap", cost_data_degraded=False
+            ),
+        ),
+        patch("atomic_agents._costs.sum_cost_for_period", return_value=ample),
+    ):
+        resp = agent.call("embed test")
+    assert resp is not None
+
+
+def test_embed_block_writes_refusal_audit_record_with_run_id(tmp_path):
+    """When the embed gate raises CostGuardrailBlocked, the call() except handler
+    MUST write exactly one terminal refusal JSONL record carrying a run_id, the
+    chat cost_usd already incurred this call, status=error, and the distinctive
+    embed_batch_blocked=True marker — Principle #5 (a cost block is exactly the
+    event that most needs an audit trail) + the #495/#497/#498 under-counting
+    guard (the chat spend must not vanish from the ledger).
+
+    Per-invocation negative control: strip the `elif isinstance(_call_exc,
+    CostGuardrailBlocked)` branch in agent.py and this test goes RED — no record
+    with embed_batch_blocked carries a run_id; the block leaves no JSONL line.
+    The marker (not the trigger) is the branch-distinctive assertion per
+    feedback_layered_except_typed_branch_false_green: the success record uses the
+    same self.trigger, so only the marker + status=error distinguishes the refusal.
+    """
+    from atomic_agents.exceptions import CostGuardrailBlocked
+    from atomic_agents._costs import CostReadResult
+
+    fake_mem = _FakeSemanticMemoryBackend()
+    agent = _make_agent(tmp_path, memory_backend=fake_mem, daily_cap_usd=1.0)
+    agent.config = dc_replace(
+        agent.config, cost_guardrails_enabled=True, daily_cap_usd=1.0
+    )
+    agent._policy_snapshot_this_call = None
+
+    sink: list[dict] = []
+
+    def fake_log(record: dict) -> None:
+        sink.append(dict(record))
+
+    # Reliable read at $0.999999 of a $1 cap → tiny headroom; large batch refused.
+    near_cap = CostReadResult(total_usd=0.999999, degraded=False, dropped_records=0)
+    body = "B" * 30000
+    llm_resp = _fake_llm_response_with_capture("note-big", body)
+
+    with pytest.raises(CostGuardrailBlocked, match="exceeds remaining headroom"):
+        with (
+            patch("atomic_agents._llm.call_llm", return_value=llm_resp),
+            patch.object(agent, "_log", side_effect=fake_log),
+            patch.object(agent, "load"),
+            patch.object(
+                agent, "assemble_system_prompt", return_value="You are EmbedBot."
+            ),
+            patch.object(
+                agent,
+                "_check_cost_guardrails",
+                return_value=MagicMock(
+                    allow=True, action="ok", reason="cap", cost_data_degraded=False
+                ),
+            ),
+            patch("atomic_agents._costs.sum_cost_for_period", return_value=near_cap),
+        ):
+            agent.call("embed test")
+
+    blocked = [r for r in sink if r.get("embed_batch_blocked") is True]
+    assert len(blocked) == 1, (
+        "expected exactly one embed_batch_blocked refusal audit record after the "
+        f"gate raised; got {[r.get('trigger') for r in sink]}"
+    )
+    rec = blocked[0]
+    assert rec.get("run_id") == agent.run_id, "refusal record must carry the run_id"
+    assert rec.get("status") == "error"
+    assert "cost_usd" in rec, (
+        "refusal record MUST carry the chat cost_usd so the spend already incurred "
+        "this call lands in the ledger (#495/#497/#498 under-counting guard)"
+    )
+    assert rec.get("cost_source") == "actor"
+    # No success-path terminal record (status=ok) is written — the call did not
+    # complete. The only terminal record is the refusal.
+    ok_records = [r for r in sink if r.get("status") == "ok" and "run_id" in r]
+    assert not ok_records, (
+        "a blocked call must not also write a status=ok terminal run record"
+    )
+
+
+def test_embed_actual_usd_not_folded_into_cost_usd_this_pr(tmp_path):
+    """Embed records are audit-only this PR: they carry reserved_usd/actual_usd,
+    NOT a `cost_usd` field, so embed spend does not enter sum_cost_for_period's
+    running total (which aggregates only `cost_usd`). Cross-call embed accounting
+    is deferred to #544 PR2; this asserts the documented current behavior so it is
+    not silently assumed enforced.
+    """
+    fake_mem = _FakeSemanticMemoryBackend()
+    agent = _make_agent(tmp_path, memory_backend=fake_mem)
+    sink: list[dict] = []
+    _run_call(
+        agent,
+        llm_response=_fake_llm_response_with_capture("note-1", "A" * 300),
+        log_sink=sink,
+    )
+    embed_records = [
+        r
+        for r in sink
+        if r.get("trigger") in {"embed_batch_reservation", "embed_batch_release"}
+    ]
+    assert embed_records, "expected embed audit records"
+    for rec in embed_records:
+        assert "cost_usd" not in rec, (
+            "embed records must NOT carry cost_usd this PR (audit-only; embed "
+            "spend is not yet folded into the cross-call cost total — #544 PR2)"
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -736,6 +1097,45 @@ def test_has_effective_embed_cap_guardrails_disabled(tmp_path):
     )
     result = agent._has_effective_embed_cap(parent_remaining_headroom_usd=None)
     assert result is False
+
+
+def test_has_effective_embed_cap_with_policy_only_cap(tmp_path):
+    """_has_effective_embed_cap() returns True when the ONLY cap is a
+    Policy-composed cap (no model.md cap, no tree-cap).
+
+    Covers the effective-cap branch that reads
+    _policy_snapshot_this_call.effective_caps (#512 lesson: gate on the EFFECTIVE
+    control, not one source). Without this, a Policy-only-capped agent would be
+    wrongly treated as uncapped by the fail-closed predicate.
+
+    Negative control: effective_caps all-None with no model.md cap and no tree-cap
+    returns False (the no-cap case).
+    """
+    from atomic_agents.policy.types import CostCaps
+
+    agent = _make_agent(tmp_path)
+    agent.config = dc_replace(
+        agent.config,
+        cost_guardrails_enabled=True,
+        daily_cap_usd=0.0,
+        monthly_cap_usd=0.0,
+    )
+
+    # Policy snapshot with a daily cap only.
+    agent._policy_snapshot_this_call = MagicMock(
+        effective_caps=CostCaps(daily_usd=2.5, monthly_usd=None)
+    )
+    assert agent._has_effective_embed_cap(parent_remaining_headroom_usd=None) is True, (
+        "a Policy-composed daily cap must register as an effective cap"
+    )
+
+    # Negative control: no Policy cap either → no effective cap.
+    agent._policy_snapshot_this_call = MagicMock(
+        effective_caps=CostCaps(daily_usd=None, monthly_usd=None)
+    )
+    assert (
+        agent._has_effective_embed_cap(parent_remaining_headroom_usd=None) is False
+    ), "all-None Policy caps with no model.md cap must NOT register an effective cap"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -899,7 +1299,11 @@ def test_doctor_embedding_backend_warn_when_api_key_missing(monkeypatch):
     from atomic_agents.embedding.backend import EmbeddingCapabilities
 
     class _KeylessFakeBackend:
-        backend_id = "openai"
+        # No backend_id: the real EmbeddingBackend / OpenAIEmbeddingBackend
+        # surface exposes provider_id / model_id / dimensions, NOT backend_id.
+        # Carrying a phantom backend_id here false-greens the WARN branch (which
+        # builds its message from provider_id) — removing it makes this a real
+        # negative control for the doctor.py:5208 message string.
         provider_id = "openai"
         model_id = "text-embedding-3-small"
         dimensions = 1536
@@ -936,7 +1340,8 @@ def test_doctor_embedding_backend_pass_when_key_present(monkeypatch):
     from atomic_agents.embedding.backend import EmbeddingCapabilities
 
     class _ReadyFakeBackend:
-        backend_id = "openai"
+        # No backend_id: mirrors the real EmbeddingBackend surface (provider_id /
+        # model_id / dimensions). See _KeylessFakeBackend rationale.
         provider_id = "openai"
         model_id = "text-embedding-3-small"
         dimensions = 1536
@@ -958,6 +1363,50 @@ def test_doctor_embedding_backend_pass_when_key_present(monkeypatch):
     assert result.status == PASS
     assert result.name == "embedding-backend"
     assert "text-embedding-3-small" in result.message
+
+
+def test_doctor_embedding_backend_pass_without_api_key_attr_is_not_unresolved(
+    monkeypatch,
+):
+    """A backend WITHOUT a _api_key attribute (non-OpenAI EmbeddingBackend) PASSes
+    and MUST NOT be labeled key-not-resolved.
+
+    The tri-state probe reports api_key_probe='n/a' (key resolution does not apply),
+    never api_key_resolved=False, which would misrepresent a fully-usable backend.
+    """
+    from atomic_agents.doctor import check_embedding_backend, PASS
+    from atomic_agents.embedding.backend import EmbeddingCapabilities
+
+    monkeypatch.setenv("ATOMIC_AGENTS_EMBEDDING_BACKEND", "local")
+
+    class _NoKeyAttrBackend:
+        # No backend_id: mirrors the real EmbeddingBackend surface.
+        provider_id = "local"
+        model_id = "all-MiniLM-L6-v2"
+        dimensions = 384
+        # No _api_key attribute at all.
+
+        def capabilities(self):
+            return EmbeddingCapabilities(
+                max_batch_size=64,
+                max_input_tokens=512,
+                supports_input_type=False,
+            )
+
+    with patch(
+        "atomic_agents.embedding.registry.get_default_embedding_backend",
+        return_value=_NoKeyAttrBackend(),
+    ):
+        result = check_embedding_backend()
+
+    assert result.status == PASS
+    assert result.detail.get("api_key_probe") == "n/a", (
+        "a backend without _api_key must report api_key_probe='n/a', not a "
+        "misleading key-unresolved signal"
+    )
+    assert result.detail.get("api_key_resolved") is None, (
+        "the misleading api_key_resolved=False detail must be gone"
+    )
 
 
 def test_doctor_embedding_backend_fail_on_embedding_error(monkeypatch):
