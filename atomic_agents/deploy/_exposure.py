@@ -1,6 +1,6 @@
 """deploy/_exposure.py — exposure guidance (GUIDE, NEVER PERFORM).
 
-spec/48 §"Exposure guidance" + MUST 11. After a verified loopback deployment,
+spec/49 §"Exposure guidance" + MUST 11. After a verified loopback deployment,
 deploy prints the operator's next step to reach the agent from another device.
 It DETECTS the environment to tailor the guidance, but it NEVER performs the
 exposure — it does not run ``tailscale serve``, edit a perimeter config, open a
@@ -41,7 +41,7 @@ def _default_runner(argv: list[str]) -> "subprocess.CompletedProcess[str]":
 def detect_tailscale(*, runner: Runner = _default_runner) -> bool:
     """Return True if Tailscale is present and reporting status (READ-ONLY).
 
-    spec/48 MUST 11: detection is ``tailscale status --json`` succeeding. This
+    spec/49 MUST 11: detection is ``tailscale status --json`` succeeding. This
     is a read-only probe — it never configures or runs an exposure command. If
     the ``tailscale`` binary is absent, returns False without running anything.
     """
@@ -59,7 +59,7 @@ def exposure_guidance(
     *,
     tailscale_present: bool,
 ) -> str:
-    """Build the exposure guidance TEXT (spec/48 MUST 11 — guide, not perform).
+    """Build the exposure guidance TEXT (spec/49 MUST 11 — guide, not perform).
 
     ``tailscale_present`` is the result of ``detect_tailscale``; this function
     is pure (no subprocess), so the guidance text is unit-testable on its own.

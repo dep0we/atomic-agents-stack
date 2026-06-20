@@ -1,6 +1,6 @@
 """Conformance tests for atomic_agents.deploy — the deployment conductor.
 
-spec/48 §"Conformance test outline". One test (at least) per MUST row in the
+spec/49 §"Conformance test outline". One test (at least) per MUST row in the
 table. Every system interaction is mocked: launchctl, tailscale, the socket
 bind probe, and the HTTP probes are all routed through injectable seams so no
 test installs a real launchd agent, runs real tailscale, binds a real

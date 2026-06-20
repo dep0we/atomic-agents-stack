@@ -1,4 +1,4 @@
-"""atomic_agents.deploy — the deployment conductor (spec/48).
+"""atomic_agents.deploy — the deployment conductor (spec/49).
 
 `atomic-agents deploy <agent>` takes an operator from "I have an agent folder"
 to "the agent is running, supervised, and verified on this machine," then
@@ -7,7 +7,7 @@ GUIDES (never performs) the network-exposure step.
 This package owns no new runtime. It sequences the surfaces that already exist
 (`init`, `doctor`, `serve`), installs a per-user launchd agent that runs
 `atomic-agents serve`, verifies it on loopback, and prints tailored exposure
-guidance. See spec/48 for the Implementer Contract (12 MUSTs).
+guidance. See spec/49 for the Implementer Contract (12 MUSTs).
 
 Public surface (the orchestrator entry points wired into cli.py):
 

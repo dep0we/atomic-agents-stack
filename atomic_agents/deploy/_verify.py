@@ -1,6 +1,6 @@
 """deploy/_verify.py — non-mutating, unbilled, predicate-based verification.
 
-spec/48 §"Verification" + MUST 9. After the launchd agent is installed, deploy
+spec/49 §"Verification" + MUST 9. After the launchd agent is installed, deploy
 verifies the running serve on loopback with a DEFINED pass predicate (a 200
 response is NOT enough — ``/doctor`` returns 200 even when checks fail):
 
@@ -35,7 +35,7 @@ from typing import Callable
 # was not reachable at all. It is NOT a real HTTP status; the predicate helpers
 # below treat it as a clean FAIL (the body is empty), never an exception. This
 # is what keeps a not-yet-bound launchd serve from crashing verify uncaught and
-# leaving the agent installed (spec/48 MUST 8).
+# leaving the agent installed (spec/49 MUST 8).
 TRANSPORT_FAILURE_STATUS = 0
 
 # An http_get takes a URL and returns (status_code, body_text).
@@ -57,7 +57,7 @@ class VerifyResult:
                   foreign holder of the port is plausible" from "our serve bound
                   the port but failed healthz/doctor" — the conductor uses it to
                   decide whether an address-in-use diagnostic is warranted on
-                  rollback (spec/48 MUST 10).
+                  rollback (spec/49 MUST 10).
     """
 
     ok: bool
@@ -78,7 +78,7 @@ def _default_http_get(url: str) -> "tuple[int, str]":
     out — a TRANSPORT failure, not an HTTP status. We MUST catch those too and
     return ``(TRANSPORT_FAILURE_STATUS, "")`` so the predicate FAILS cleanly
     rather than propagating an exception that would skip rollback and leave the
-    launchd agent installed (spec/48 MUST 8). The retry loop then re-probes
+    launchd agent installed (spec/49 MUST 8). The retry loop then re-probes
     within the warm-up window.
     """
     try:
@@ -113,7 +113,7 @@ def _default_http_post(url: str, body: dict) -> "tuple[int, str]":
 
 
 def _check_healthz(status: int, body_text: str) -> tuple[bool, str]:
-    """Pass iff the JSON ``status`` field == "ok" (spec/48 MUST 9).
+    """Pass iff the JSON ``status`` field == "ok" (spec/49 MUST 9).
 
     A 200 alone is not sufficient; the predicate is the body field.
     """
@@ -128,14 +128,14 @@ def _check_healthz(status: int, body_text: str) -> tuple[bool, str]:
 
 
 def _check_doctor(status: int, body_text: str) -> tuple[bool, str]:
-    """Pass iff ``overall_exit_code(results) == 0`` (spec/48 MUST 9).
+    """Pass iff ``overall_exit_code(results) == 0`` (spec/49 MUST 9).
 
     The /doctor route returns 200 with a JSON list of check results even when
     checks fail, so we MUST recompute the exit code from the result list rather
     than trust the HTTP status. We import doctor lazily and feed it parsed
     CheckResult-shaped dicts.
 
-    Fail-closed posture (spec/48 MUST 9 — a non-2xx or error-shaped body MUST
+    Fail-closed posture (spec/49 MUST 9 — a non-2xx or error-shaped body MUST
     NOT pass): we MUST NOT conflate "no checks parsed" with "no checks failed".
     A non-2xx HTTP status (the route errored / a transport sentinel), an
     error-shaped body (``{"status":"error"}`` / ``{"error":...}`` / ``{"detail":
@@ -226,7 +226,7 @@ def verify_deployment(
     retries: int = 1,
     retry_delay_s: float = 0.0,
 ) -> VerifyResult:
-    """Verify a deployed agent on loopback (spec/48 MUST 9).
+    """Verify a deployed agent on loopback (spec/49 MUST 9).
 
     Runs healthz + doctor predicates; both must pass. With ``verify_call``,
     additionally fires a real billed ``POST /call`` (opt-in only).
@@ -270,7 +270,7 @@ def verify_deployment(
     overall = h_ok and d_ok
     called = False
     if verify_call and overall:
-        # Opt-in billed end-to-end probe (spec/48 §"Verification").
+        # Opt-in billed end-to-end probe (spec/49 §"Verification").
         c_status, c_body = http_post(
             f"{base}/call",
             {"work_item": "deploy verify ping"},

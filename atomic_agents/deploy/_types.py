@@ -1,9 +1,9 @@
 """deploy/_types.py — dataclasses + enums for the deployment conductor.
 
-spec/48 §"Execution model — planner → executor". These types are the shared
+spec/49 §"Execution model — planner → executor". These types are the shared
 vocabulary between the planner (builds an ordered list of `Step`s) and the
 executor (runs them). They carry no behaviour beyond trivial helpers so the
-planner can be tested in isolation from the executor (spec/48 MUST 6 —
+planner can be tested in isolation from the executor (spec/49 MUST 6 —
 `--plan` is side-effect-free).
 """
 
@@ -14,7 +14,7 @@ from enum import Enum
 
 
 class StepTag(str, Enum):
-    """How a plan step is allowed to run (spec/48 §"Execution model").
+    """How a plan step is allowed to run (spec/49 §"Execution model").
 
     ``AUTO``    — user-space, no consequence beyond the agent's own
                   folder/process. Runs silently.
@@ -51,7 +51,7 @@ class Plan:
     """An ordered list of tagged steps for one ``deploy <agent>`` invocation.
 
     The plan is pure data: building it makes no billed/LLM call and no
-    filesystem mutation (spec/48 MUST 6). The executor consumes it.
+    filesystem mutation (spec/49 MUST 6). The executor consumes it.
     """
 
     agent: str
@@ -89,7 +89,7 @@ class Plan:
 class DeployState(str, Enum):
     """The live state of a deployment, derived from launchd at call time.
 
-    spec/48 MUST 12. Never inferred from a cached sidecar file.
+    spec/49 MUST 12. Never inferred from a cached sidecar file.
 
     ``ABSENT``  — no plist on disk; the agent is not deployed.
     ``LOADED``  — plist present and bootstrapped, but no running PID (e.g. it

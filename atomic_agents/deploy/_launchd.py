@@ -1,11 +1,11 @@
 """deploy/_launchd.py — macOS launchd renderer + install/teardown/status.
 
-This module is **macOS-only by design** (spec/48 §"Supervision"). There is NO
+This module is **macOS-only by design** (spec/49 §"Supervision"). There is NO
 host-adapter abstraction: the MVP optimizes the home/Mac path and adding a
 Linux/systemd renderer is a later phase (CLAUDE.md: "Don't add abstractions for
 hypothetical future needs").
 
-Testability (spec/48 §"TESTABILITY"): every subprocess call (``launchctl``) is
+Testability (spec/49 §"TESTABILITY"): every subprocess call (``launchctl``) is
 routed through an injectable ``runner`` callable so unit tests can mock the
 launchctl interactions without installing a real launchd agent. The plist
 renderer is a pure function; the install/teardown functions accept a ``runner``
@@ -44,7 +44,7 @@ class DeployLaunchdError(Exception):
 
 
 # launchctl interactions are local and fast; a hang means launchd is wedged.
-# Bound every call so deploy cannot block indefinitely (spec/48 — no hung
+# Bound every call so deploy cannot block indefinitely (spec/49 — no hung
 # deploy). A timeout is mapped to the launchd error type by the caller.
 _LAUNCHCTL_TIMEOUT_S = 30
 
@@ -82,7 +82,7 @@ def label_for(agent: str) -> str:
     """Return the launchd label for an agent, validating the slug.
 
     The label is ``ai.atomic-agents.serve.<slug>`` where ``<slug>`` is the agent
-    name run through the SAME charset/validation ``init`` enforces (spec/48
+    name run through the SAME charset/validation ``init`` enforces (spec/49
     §"Supervision" — a route/path segment is not guaranteed launchd-label-safe).
 
     Raises ``ValueError`` if the agent name is empty, too long, reserved, or
@@ -108,7 +108,7 @@ def label_for(agent: str) -> str:
 def plist_path_for(agent: str, *, launch_agents_dir: Path | None = None) -> Path:
     """Return the plist path for an agent's launchd label.
 
-    Default location: ``~/Library/LaunchAgents/<label>.plist`` (spec/48). Tests
+    Default location: ``~/Library/LaunchAgents/<label>.plist`` (spec/49). Tests
     pass ``launch_agents_dir`` pointed at a tmp dir.
     """
     label = label_for(agent)
@@ -119,7 +119,7 @@ def plist_path_for(agent: str, *, launch_agents_dir: Path | None = None) -> Path
 def resolve_program_arguments(agent: str, port: int) -> list[str]:
     """Resolve the launchd ``ProgramArguments`` for ``serve``.
 
-    spec/48 MUST 4: a ``gui/$UID`` agent does NOT inherit the interactive PATH,
+    spec/49 MUST 4: a ``gui/$UID`` agent does NOT inherit the interactive PATH,
     so the executable MUST be an ABSOLUTE path, not the bare ``atomic-agents``.
     Resolve via ``shutil.which("atomic-agents")``; fall back to the current
     interpreter running the module entry point.
@@ -168,7 +168,7 @@ class PlistRenderResult:
     """The rendered plist plus a flag noting whether a plaintext key was written.
 
     ``wrote_plaintext_key`` is True only when the provider key's sole source is
-    an env var and it was injected as a ``KEY=VALUE`` env var (spec/48 MUST 5).
+    an env var and it was injected as a ``KEY=VALUE`` env var (spec/49 MUST 5).
     Callers print the documented cleartext caveat when this is True.
     """
 
@@ -188,7 +188,7 @@ def render_plist(
 ) -> PlistRenderResult:
     """Render the launchd plist for an agent (pure function — no I/O).
 
-    spec/48 §"Supervision":
+    spec/49 §"Supervision":
       - Label ``ai.atomic-agents.serve.<slug>``.
       - ABSOLUTE ``ProgramArguments`` (``shutil.which`` or ``sys.executable``).
       - ``RunAtLoad`` + ``KeepAlive`` true.
@@ -281,7 +281,7 @@ def install_launchd_agent(
     launch_agents_dir: Path | None = None,
     runner: Runner = _default_runner,
 ) -> Path:
-    """Write the plist and bootstrap the launchd agent (spec/48 §"Supervision").
+    """Write the plist and bootstrap the launchd agent (spec/49 §"Supervision").
 
     MUST 7 (idempotent re-deploy): if the label is already bootstrapped, bootout
     it FIRST, then bootstrap the freshly-written plist — a clean restart, never
@@ -351,7 +351,7 @@ def _bootout_indicates_absent(cp: "subprocess.CompletedProcess[str]") -> bool:
         domain/permission error mentioning a missing file) MUST still raise (a
         bare substring is not proof of absence).
     Any other non-zero return is a REAL failure (e.g. EPERM, a domain error) and
-    MUST NOT be silently tolerated (spec/48 MUST 7/8/12).
+    MUST NOT be silently tolerated (spec/49 MUST 7/8/12).
     """
     if cp.returncode == 0:
         return True
@@ -370,7 +370,7 @@ def teardown_launchd_agent(
 ) -> None:
     """Bootout the launchd agent and (optionally) remove its plist.
 
-    spec/48 MUST 12 (``down`` is complete): ``remove_plist=True`` removes the
+    spec/49 MUST 12 (``down`` is complete): ``remove_plist=True`` removes the
     plist so the deployment record is fully torn down. Idempotent: a bootout of
     an absent label is a no-op (CLAUDE.md rule 8).
 
@@ -434,7 +434,7 @@ def read_launchd_status(
     launch_agents_dir: Path | None = None,
     runner: Runner = _default_runner,
 ) -> LaunchdStatus:
-    """Derive the live DeployState for an agent from launchd (spec/48 MUST 12).
+    """Derive the live DeployState for an agent from launchd (spec/49 MUST 12).
 
     State is derived at call time from:
       - plist existence on disk,

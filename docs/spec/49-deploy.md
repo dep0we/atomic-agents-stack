@@ -1,12 +1,12 @@
 ---
-spec: 48
+spec: 49
 title: atomic-agents deploy — the deployment conductor
 status: DRAFT
 created: 2026-06-19
 issue: 558
 ---
 
-# spec/48 — `atomic-agents deploy`: the deployment conductor
+# spec/49 — `atomic-agents deploy`: the deployment conductor
 
 **Status:** DRAFT — ships with issue #558; locked after conformance tests pass.
 Revised after a cross-family (Codex) review and a plan-eng-review architecture finding

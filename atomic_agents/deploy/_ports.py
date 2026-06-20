@@ -1,6 +1,6 @@
 """deploy/_ports.py — port resolution + pre-bootstrap socket-bind probe.
 
-spec/48 §"Port resolution" + MUST 10. Port precedence (highest first):
+spec/49 §"Port resolution" + MUST 10. Port precedence (highest first):
 
     deploy --port  >  ATOMIC_AGENTS_SERVE_PORT  >  serve.md Bind Port  >  default
 
@@ -35,7 +35,7 @@ Binder = Callable[[str, int], bool]
 class PortRangeError(ValueError):
     """Raised when a resolved port is outside the valid 1..65535 range.
 
-    spec/48 MUST 10 / serve.md — a port of 0 (kernel-assigned) or a value above
+    spec/49 MUST 10 / serve.md — a port of 0 (kernel-assigned) or a value above
     65535 is not a usable explicit bind target for a supervised serve, so we
     reject it loud BEFORE probing rather than letting the bind probe or launchd
     fail opaquely.
@@ -58,7 +58,7 @@ def _validate_port_range(port: int, *, source: str = "") -> int:
 
 
 class PortConflictError(Exception):
-    """Raised when the resolved port is already in use (spec/48 MUST 10).
+    """Raised when the resolved port is already in use (spec/49 MUST 10).
 
     Carries the conflicting port so callers can name it in the failure message
     and never silently rebind.
@@ -80,7 +80,7 @@ def resolve_port(
     cli_port: int | None = None,
     environ: dict[str, str] | None = None,
 ) -> int:
-    """Resolve the serve port using serve's own precedence (spec/48 MUST 10).
+    """Resolve the serve port using serve's own precedence (spec/49 MUST 10).
 
     Order: ``cli_port`` (deploy --port) > ``ATOMIC_AGENTS_SERVE_PORT`` env >
     ``serve.md`` Bind Port > ``DEFAULT_PORT``.
@@ -140,7 +140,7 @@ def probe_port_free(
 ) -> None:
     """Pre-bootstrap probe: raise ``PortConflictError`` if the port is taken.
 
-    spec/48 MUST 10: a bind conflict detected by this probe MUST fail loud
+    spec/49 MUST 10: a bind conflict detected by this probe MUST fail loud
     naming the port and MUST NOT silently rebind.
     """
     if not binder(host, port):

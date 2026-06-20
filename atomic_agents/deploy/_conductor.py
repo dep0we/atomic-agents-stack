@@ -1,4 +1,4 @@
-"""deploy/_conductor.py — the planner + executor (spec/48).
+"""deploy/_conductor.py — the planner + executor (spec/49).
 
 This module ties the deploy sub-modules together. It builds an ordered, tagged
 :class:`Plan` (the *planner*), then runs each step (the *executor*), then
@@ -89,7 +89,7 @@ def _default_prompter(question: str) -> bool:
 def _default_init_runner(agent: str, agents_root: Path) -> int:
     """Production init handoff: invoke the existing `atomic-agents init` wizard.
 
-    spec/48 MUST 1 — deploy drives ``init`` through its existing entry point; it
+    spec/49 MUST 1 — deploy drives ``init`` through its existing entry point; it
     does NOT reimplement scaffolding. Builds the args-shaped object the wizard
     expects (``agent_name`` / ``from_template`` / ``list_templates`` /
     ``agents_root``) and returns its exit code.
@@ -114,13 +114,13 @@ def _default_init_runner(agent: str, agents_root: Path) -> int:
 
 
 def plan_deploy(agent: str) -> Plan:
-    """Build the ordered, tagged deployment plan for ``agent`` (spec/48).
+    """Build the ordered, tagged deployment plan for ``agent`` (spec/49).
 
     Pure function: NO filesystem mutation, NO subprocess, NO billed/LLM call
     (MUST 6). The executor consumes the returned :class:`Plan`; ``--plan``
     renders it and exits.
 
-    The step tags encode the predicate from spec/48 §"Execution model":
+    The step tags encode the predicate from spec/49 §"Execution model":
       - ``auto``    user-space, no shared consequence — runs silently.
       - ``consent`` touches shared/user state — prompts unless ``--yes``.
       - ``manual``  operator-owned — print instructions, pause/finish.
@@ -192,7 +192,7 @@ def _consent(
 ) -> bool:
     """Return True if a consent step may proceed.
 
-    ``--yes`` (assume_yes) auto-approves consent steps (spec/48 §"Execution
+    ``--yes`` (assume_yes) auto-approves consent steps (spec/49 §"Execution
     model"). Otherwise the operator is prompted.
     """
     if assume_yes:
@@ -210,10 +210,10 @@ def _step_agent_exists(
     init_runner: "InitRunner",
     out,
 ) -> None:
-    """Step 2 — the agent folder must exist (spec/48 step 2).
+    """Step 2 — the agent folder must exist (spec/49 step 2).
 
     ``init`` is interactive and writes files, so it is never an ``auto`` step
-    (it is tagged ``consent``). spec/48 step 2:
+    (it is tagged ``consent``). spec/49 step 2:
       - Without ``--yes``: hand off to ``atomic-agents init <agent>`` after the
         operator consents (the wizard itself is interactive). If the handoff
         succeeds and the folder now exists, the step passes.
@@ -268,7 +268,7 @@ def _step_doctor_gate(
     agent: str,
     agents_root: Path,
 ) -> None:
-    """Step 3 — doctor must pass (spec/48 step 3).
+    """Step 3 — doctor must pass (spec/49 step 3).
 
     Runs ``doctor --no-mcp`` through the existing entry point (MUST 1) and
     fails loud when any check fails. No LLM call: doctor is unbilled.
@@ -296,7 +296,7 @@ def _step_provider_key(
     *,
     model_data: dict,
 ) -> None:
-    """Step 4 — a provider key must resolve (spec/48 step 4).
+    """Step 4 — a provider key must resolve (spec/49 step 4).
 
     Reuses doctor's ``check_provider_keys`` so deploy's verdict and the
     runtime's key resolution can never disagree. deploy does NOT store the
@@ -330,7 +330,7 @@ def _resolve_env_only_provider_keys(
 ) -> dict[str, str]:
     """Return ``{env_name: value}`` for EVERY provider key whose SOLE source is env.
 
-    spec/48 MUST 5 / step list step 4 — the env-var-only operator path. The
+    spec/49 MUST 5 / step list step 4 — the env-var-only operator path. The
     step-4 gate confirms a key resolves in the DEPLOYING shell, but a
     ``gui/$UID`` launchd agent does NOT inherit that shell's env. When the key's
     only source is an env var, serve started by launchd would not find it, so
@@ -440,7 +440,7 @@ def _step_supervise(
 ) -> _SupervisionResult:
     """Step 5 — resolve the port, probe it, render + bootstrap the agent.
 
-    spec/48 §"Port resolution" + §"Supervision":
+    spec/49 §"Port resolution" + §"Supervision":
       - resolve port (deploy --port > env > serve.md > default),
       - pre-bootstrap socket-bind probe (MUST 10 — conflict fails loud),
       - render the plist (MUST 4/5), then bootstrap (MUST 7 idempotent).
@@ -522,7 +522,7 @@ def _rollback_and_report(
     out,
     err,
 ) -> int:
-    """Tear down a just-installed agent after a failed verify (spec/48 MUST 8).
+    """Tear down a just-installed agent after a failed verify (spec/49 MUST 8).
 
     Boots out the launchd agent and removes the plist deploy wrote — no
     bootstrapped-but-broken service is left behind. Returns the non-zero exit
@@ -633,7 +633,7 @@ def deploy(
 ) -> int:
     """Plan + execute a loopback deployment, verify, then guide exposure.
 
-    spec/48 — the conductor. Returns a process exit code (0 = success).
+    spec/49 — the conductor. Returns a process exit code (0 = success).
 
     With ``plan_only`` (the ``--plan`` flag) this prints the tagged plan and
     returns 0 with ZERO side effects: no filesystem write, no launchctl call,
@@ -720,7 +720,7 @@ def deploy(
         if supervision.wrote_plaintext_key:
             print(
                 "  Caveat: the provider key's only source was an env var, so it "
-                "was written into the plist in cleartext (spec/48 MUST 5).",
+                "was written into the plist in cleartext (spec/49 MUST 5).",
                 file=err,
             )
 
@@ -810,7 +810,7 @@ def deploy_status(
     launchd_runner: _launchd.Runner = _launchd._default_runner,
     launch_agents_dir: Path | None = None,
 ) -> int:
-    """Report the live deployment state, derived from launchd (spec/48 MUST 12).
+    """Report the live deployment state, derived from launchd (spec/49 MUST 12).
 
     State is read at call time from plist existence + ``launchctl print``;
     NEVER from a cached sidecar. Prints one of ``absent`` / ``loaded`` /
@@ -860,7 +860,7 @@ def deploy_down(
     launchd_runner: _launchd.Runner = _launchd._default_runner,
     launch_agents_dir: Path | None = None,
 ) -> int:
-    """Tear a deployment down: bootout + remove the plist (spec/48 MUST 12).
+    """Tear a deployment down: bootout + remove the plist (spec/49 MUST 12).
 
     Full teardown — the launchd label is booted out of ``gui/$UID`` and the
     plist is removed so no deployment record remains (the plist IS the record,
