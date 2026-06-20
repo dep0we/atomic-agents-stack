@@ -99,6 +99,16 @@ from .idempotency.types import DedupDecision
 # resolves under typing.get_type_hints() and for mypy/pyright.
 # conversation.backend imports only from .types + stdlib — circular-import safe.
 from .conversation.backend import ConversationBackend
+
+# PrincipalBackend imported at module level so the annotation on __init__ resolves.
+# principal.backend imports only from .types + stdlib — circular-import safe.
+# Principal and LOCAL_PRINCIPAL imported here because they appear as default argument
+# values in call() — default values are evaluated at function-definition time, so they
+# MUST be module-level imports (not lazy inline imports).
+from .principal.backend import PrincipalBackend
+from .principal import get_default_principal_backend
+from .conversation.types import LOCAL_PRINCIPAL, Principal
+from .exceptions import UnverifiedPrincipalConversationAccess
 from .mcp_registry import (
     MCPRegistryError,
     MCPRegistryUnavailable,
@@ -376,6 +386,7 @@ class AtomicAgent:
         goal_backend: GoalBackend | None = None,
         idempotency_backend: IdempotencyBackend | None = None,
         conversation_backend: "ConversationBackend | None" = None,
+        principal_backend: "PrincipalBackend | None" = None,
     ):
         self.name = name
         self.trigger = trigger
@@ -769,6 +780,20 @@ class AtomicAgent:
         self._conversation_backend_resolved: "ConversationBackend | None | object" = (
             _CONV_BACKEND_UNRESOLVED
         )
+
+        # spec/48: principal backend — kwarg-wins-over-env-var pattern.
+        # Unlike ConversationBackend (which is nullable optional), PrincipalBackend
+        # is always non-null: the home-user default is LocalPrincipalBackend (not None).
+        # LocalPrincipalBackend.__init__ is side-effect-free (no I/O), so
+        # agent construction stays cheap even when no explicit backend is supplied.
+        # Three-channel resolution:
+        #   (1) constructor kwarg wins (if not None)
+        #   (2) ATOMIC_AGENTS_PRINCIPAL_BACKEND env var (in get_default_principal_backend)
+        #   (3) Default: LocalPrincipalBackend (home-user zero-config)
+        if principal_backend is None:
+            self.principal_backend: PrincipalBackend = get_default_principal_backend()
+        else:
+            self.principal_backend = principal_backend
 
         # Per-agent target extractor registry (spec/29 §"Target extraction",
         # #124 PR 3a). MUST initialize BEFORE tool_registry loading below so
@@ -3551,6 +3576,7 @@ class AtomicAgent:
         *,
         idempotency_key: str | None = None,
         conversation_id: str | None = None,
+        principal: Principal = LOCAL_PRINCIPAL,
     ) -> Response:
         """Make the LLM call. Returns a Response with captures populated.
 
@@ -3565,6 +3591,20 @@ class AtomicAgent:
             perimeter logs. The serve layer sets this; all other callers leave it
             None (zero behavioral change). See spec/37 §"Audit record shape".
 
+        ``principal``: the caller's verified identity (spec/48 PR1). Defaults to
+        LOCAL_PRINCIPAL (home-user zero-config, is_verified=True). Org/serve
+        deployments supply a Principal derived from the registered PrincipalBackend
+        (the serve layer calls agent.principal_backend.derive_principal(verified_claims)
+        and passes the result here). HARD-REFUSE gate: when a non-local caller
+        sets conversation_id but principal.is_verified is False, call() raises
+        UnverifiedPrincipalConversationAccess BEFORE any LLM spend, before the
+        cost gate, and before storage I/O. The gate condition is exactly:
+            if conversation_id is not None and not principal.is_verified: raise
+        Gate keys on is_verified ONLY — never on object identity with LOCAL_PRINCIPAL.
+        The threaded principal replaces the previously hardcoded LOCAL_PRINCIPAL
+        in load_turns() and write_turn() so conversation turns are isolated by
+        principal.identifier.
+
         ``conversation_id``: optional conversation key that activates multi-turn
         continuity (spec/47 PR1). When set and self.conversation_backend is
         configured (via kwarg, ATOMIC_AGENTS_CONVERSATION_BACKEND env var, or
@@ -3575,11 +3615,6 @@ class AtomicAgent:
         is written back atomically.
         ``None`` (the default) = no conversation continuity — zero behavioral
         change for all existing callers (backward-compatible, rule #14).
-        Principal: PR1 always uses the default LOCAL_PRINCIPAL (home-user shape,
-        zero config). Per-principal call() wiring for org/serve deployments
-        (deriving a verified Principal from a token at the serve boundary) is
-        DEFERRED to a later PR — see spec/47 §"DEFERRED". PR1 does not expose a
-        principal kwarg.
         NOTE: raw-immediate-continuity transcript injection is a bounded flex of
         Rule #6 (progressive disclosure) — bounded by the token budget window,
         current-run-only, and ephemeral. See T16 in TENSIONS.md (approved —
@@ -3886,6 +3921,62 @@ class AtomicAgent:
             )
             idempotency_key = _hashlib.sha256(_hash_input.encode("utf-8")).hexdigest()
 
+        # spec/48 HARD-REFUSE gate: a non-local (is_verified=False) caller that
+        # sets conversation_id is refused at the door — BEFORE the idempotency
+        # COMPLETED short-circuit, BEFORE lock acquisition, BEFORE the cost gate,
+        # and BEFORE any storage I/O. The gate keys exclusively on is_verified —
+        # never on object identity with LOCAL_PRINCIPAL (a fabricated
+        # LOCAL_PRINCIPAL-shaped object with is_verified=False would bypass an
+        # identity check but is correctly caught here). A caller without
+        # conversation_id passes through unconditionally (single-shot calls are
+        # always allowed).
+        #
+        # Placement (security-critical): this MUST run BEFORE the idempotency
+        # Phase-1 lookup() short-circuit below. An unverified caller that supplies
+        # BOTH a conversation_id AND an idempotency_key mapping to a COMPLETED
+        # ledger record would otherwise be served the prior run's cached
+        # result_ref + replayed_run_id WITHOUT the principal check ever firing —
+        # letting a non-local caller replay/confirm another principal's completed
+        # conversation-bearing run by guessing/replaying a caller-supplied key.
+        # Gating identity FIRST (spec/48: "enforce is_verified at the door BEFORE
+        # storage", "verify identity BEFORE the spend/audit path") closes that
+        # hole and uniformly protects both the Phase-1 lookup-COMPLETED and the
+        # Phase-2 begin-COMPLETED dedup-serve sites. No lock held, no lease
+        # claimed, no idempotency lookup performed yet — nothing to unwind on
+        # refuse.
+        if conversation_id is not None and not principal.is_verified:
+            _principal_refused_record: dict = {
+                "trigger": self.trigger,
+                "model": self.config.default_model,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "status": "principal_not_verified",
+                "conversation_id": conversation_id,
+                "principal_id": principal.identifier,
+            }
+            if caller_identity is not None:
+                _principal_refused_record["http_caller"] = caller_identity
+            if idempotency_key is not None:
+                _principal_refused_record["idempotency_key"] = idempotency_key
+            try:
+                self._log(_principal_refused_record)
+            except Exception:
+                pass  # best-effort audit write — never mask the security refusal
+            _finalize_call_span(
+                error=UnverifiedPrincipalConversationAccess(
+                    f"Principal is_verified=False for conversation_id={conversation_id!r}"
+                )
+            )
+            raise UnverifiedPrincipalConversationAccess(
+                f"Unverified principal attempted conversation access. "
+                f"principal_id={principal.identifier!r}, "
+                f"conversation_id={conversation_id!r}. "
+                f"Derive a verified Principal via the registered PrincipalBackend "
+                f"before passing conversation_id.",
+                conversation_id=conversation_id,
+                principal_id=principal.identifier,
+            )
+
         # spec/45 PR2 — Phase 1: lookup() BEFORE lock acquire (reconciled order).
         # An idempotency_key lookup is a read-only probe that should short-circuit
         # BEFORE paying the lock-acquire cost. A COMPLETED decision returns the
@@ -3959,6 +4050,10 @@ class AtomicAgent:
                 raise
             if _lookup_decision.state == _DEDUP_COMPLETED:
                 # COMPLETED: serve the cached result without running the LLM.
+                # The spec/48 HARD-REFUSE gate above has ALREADY refused any
+                # unverified conversation-bearing caller before this point, so a
+                # cached result is only ever served to a caller that passed the
+                # identity gate (verified principal, or no conversation_id at all).
                 return _serve_completed_dedup(_lookup_decision)
 
         # Acquire agent lock via the bound LockBackend. Empty name maps
@@ -4437,7 +4532,6 @@ class AtomicAgent:
             if conversation_id is not None and _conv_backend is not None:
                 from .conversation import (  # noqa: PLC0415
                     ConversationBackendError as _ConvBackendError,
-                    LOCAL_PRINCIPAL as _LOCAL_PRINCIPAL,
                 )
 
                 # TODO(spec/47 LOCK): derive budget from model_context_limit
@@ -4448,7 +4542,7 @@ class AtomicAgent:
                 _conv_budget_tokens = 8000
                 try:
                     _prior_turns = _conv_backend.load_turns(
-                        _LOCAL_PRINCIPAL,
+                        principal,  # spec/48: use caller-supplied principal (not hardcoded LOCAL_PRINCIPAL)
                         conversation_id,
                         budget_tokens=_conv_budget_tokens,
                     )
@@ -5328,6 +5422,12 @@ class AtomicAgent:
             # that sets conversation_id so LogQuery.conversation_id filtering works).
             if conversation_id is not None:
                 log_record["conversation_id"] = conversation_id
+            # spec/48 PR1: tag principal_id on ok-path records when a non-local
+            # principal is used, so audit answers "which principal ran this turn?"
+            # Omit for LOCAL_PRINCIPAL to preserve backward compatibility with
+            # existing log-parsing tools that don't expect the field on home-user runs.
+            if principal is not LOCAL_PRINCIPAL:
+                log_record["principal_id"] = principal.identifier
             # spec/45 PR2 / spec/22 addendum: JSONL audit record FIRST (durable),
             # THEN commit() the ledger terminal. A crash between the two leaves the
             # JSONL intact and the ledger uncommitted — the next delivery re-runs
@@ -5354,7 +5454,6 @@ class AtomicAgent:
             if conversation_id is not None and _conv_backend is not None:
                 from .conversation import (  # noqa: PLC0415 — lazy import (circular-safety)
                     ConversationBackendError as _ConvBackendError2,
-                    LOCAL_PRINCIPAL as _LOCAL_PRINCIPAL2,
                     Turn as _Turn,
                 )
 
@@ -5389,7 +5488,9 @@ class AtomicAgent:
                 _ConvWriteErrors = (_ConvBackendError2, PathTraversalError)
                 try:
                     _conv_backend.write_turn(
-                        _LOCAL_PRINCIPAL2, conversation_id, _user_turn
+                        principal,  # spec/48: use caller-supplied principal (not hardcoded LOCAL_PRINCIPAL)
+                        conversation_id,
+                        _user_turn,
                     )
                 except _ConvWriteErrors as _write_exc:
                     response.continuity_persisted = False
@@ -5404,7 +5505,9 @@ class AtomicAgent:
                     # Only attempt assistant turn if user turn succeeded.
                     try:
                         _conv_backend.write_turn(
-                            _LOCAL_PRINCIPAL2, conversation_id, _assistant_turn
+                            principal,  # spec/48: use caller-supplied principal
+                            conversation_id,
+                            _assistant_turn,
                         )
                     except _ConvWriteErrors as _write_exc2:
                         response.continuity_persisted = False

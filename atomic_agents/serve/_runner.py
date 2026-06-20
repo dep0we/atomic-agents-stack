@@ -24,7 +24,8 @@ from typing import Any
 
 from .._platform import get_agents_root
 from ..agent import AtomicAgent
-from ..exceptions import DedupInFlight, LockBusy
+from ..conversation.types import LOCAL_PRINCIPAL, Principal
+from ..exceptions import DedupInFlight, LockBusy, UnverifiedPrincipalConversationAccess
 
 # Module-level thread pool. Shared across all requests; sized by the OS default
 # (min(32, os.cpu_count() + 4) on CPython 3.8+).
@@ -88,6 +89,9 @@ async def run_agent_call(
     caller_identity: str | None = None,
     agents_root: Path | None = None,
     idempotency_key: str | None = None,
+    verified_claims: dict | None = None,
+    identity_perimeter_verified: bool = False,
+    conversation_id: str | None = None,
 ) -> tuple[str, Any]:
     """Dispatch agent.call() in a thread-pool executor.
 
@@ -115,6 +119,71 @@ async def run_agent_call(
         # call() resets self.run_id at the start of each invocation (MUST 8).
         # trigger='http' maps to primitive='agent_call' in _PRIMITIVE_BY_TRIGGER.
         agent = AtomicAgent(name=name, trigger="http", agents_root=_root)
+
+        # spec/48 HYBRID: derive Principal from perimeter-verified claims.
+        # The serve layer NEVER re-verifies — it trusts that the perimeter
+        # (IAP, OIDC middleware) already verified the identity. Whether the raw
+        # identity header may be TRUSTED as a verified claim is an explicit
+        # operator opt-in resolved in _app.py (identity_is_perimeter_verified AND
+        # non-loopback bind) and surfaced here as identity_perimeter_verified +
+        # the presence of verified_claims. Resolution happens inside _runner
+        # (where the AtomicAgent instance is already constructed) so the per-agent
+        # principal_backend is the resolution authority, not a throw-away backend
+        # in _app.py.
+        #
+        # Three cases (mirroring _app.py's verified_claims construction):
+        #   (1) caller_identity is None AND perimeter-trust NOT enabled → home-user
+        #       / no identity header, no perimeter → LOCAL_PRINCIPAL (is_verified=
+        #       True, local single-user). NOTE: the `not identity_perimeter_verified`
+        #       conjunct is SECURITY-LOAD-BEARING — in a perimeter-trusted (non-
+        #       loopback multi-tenant) deployment, a request that OMITS the identity
+        #       header must NOT collapse to the shared verified 'local' namespace
+        #       (a fail-open). When perimeter-trust is on and the header is absent,
+        #       this falls through to the fail-closed UNVERIFIED branch below.
+        #   (2) caller_identity present but perimeter-trust NOT enabled (default,
+        #       or loopback bind), OR perimeter-trust ON but the identity header is
+        #       absent (verified_claims is None) → produce a fail-closed UNVERIFIED
+        #       Principal (NOT LOCAL_PRINCIPAL — that would wrongly pass the
+        #       HARD-REFUSE gate). A conversation_id caller is then refused.
+        #   (3) caller_identity present AND perimeter-trust enabled → derive via
+        #       the registered PrincipalBackend (may be is_verified=True).
+        # The fail-closed Principal in case (2) is constructed directly (not via a
+        # backend) so the posture does NOT depend on which backend is registered —
+        # LocalPrincipalBackend would otherwise return LOCAL_PRINCIPAL (verified)
+        # for any input and silently re-open the hole.
+        if caller_identity is None and not identity_perimeter_verified:
+            principal = LOCAL_PRINCIPAL
+        elif identity_perimeter_verified and verified_claims is not None:
+            # Misconfiguration guard (cross-tenant collapse): perimeter-trust is
+            # enabled, but if the registered backend is is_local_only (e.g. the
+            # operator turned on identity_is_perimeter_verified but forgot to set
+            # ATOMIC_AGENTS_PRINCIPAL_BACKEND, leaving the default
+            # LocalPrincipalBackend), derive_principal() IGNORES the claims and
+            # returns LOCAL_PRINCIPAL (is_verified=True) for EVERY distinct caller
+            # — collapsing all tenants onto conversation 'local' and silently
+            # mixing their turns. Fail closed: a local-only backend cannot honor a
+            # perimeter-verified multi-tenant claim, so mint an unverified
+            # Principal and let the agent.call() HARD-REFUSE gate fire instead of
+            # leaking. (doctor.check_principal_backend stays advisory; this is the
+            # load-bearing runtime guard.)
+            if agent.principal_backend.capabilities().is_local_only:
+                principal = Principal(
+                    identifier="unverified",
+                    derivation_source="serve_local_backend_misconfig",
+                    is_verified=False,
+                )
+            else:
+                principal = agent.principal_backend.derive_principal(verified_claims)
+        else:
+            # Identity header present but the perimeter is not trusted: refuse to
+            # mint a verified principal. is_verified=False → HARD-REFUSE on any
+            # conversation_id at the agent.call() door.
+            principal = Principal(
+                identifier="unverified",
+                derivation_source="serve_untrusted_perimeter",
+                is_verified=False,
+            )
+
         try:
             response = agent.call(
                 work_item=work_item,
@@ -126,6 +195,8 @@ async def run_agent_call(
                 critical=False,
                 caller_identity=caller_identity,
                 idempotency_key=idempotency_key,
+                principal=principal,
+                conversation_id=conversation_id,
             )
         except LockBusy as e:
             # Attach run_id to the exception so the HTTP handler can include it

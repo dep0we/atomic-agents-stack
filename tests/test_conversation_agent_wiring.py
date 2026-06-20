@@ -704,3 +704,505 @@ def test_conversation_call_skips_auto_body_hash_dedup(tmp_path):
 
     spy_idem.lookup.assert_not_called()
     spy_idem.begin.assert_not_called()
+
+
+# ──────────────────────────────────────────────────────────────────
+# Issue #557 backfill: conversation_id JSONL tag-sites — 5 untested paths
+#
+# Each test covers a terminal record path NOT yet exercised by this file,
+# with a per-invocation negative control: same terminal path WITHOUT
+# conversation_id → field ABSENT; WITH → present.
+#
+# Tag-sites in scope (per issue #557):
+#   (A) pre-loop cost-skip  (status='skipped', cost gate fires before loop)
+#   (B) lock_busy           (status='lock_busy')
+#   (C) dedup               (status='deduped', idempotency Phase-1 COMPLETED)
+#   (D) in_flight           (status='in_flight', idempotency Phase-2 IN_FLIGHT)
+#   (E) security-abort      (status='error', error='MCPCommandNotAllowed')
+#
+# Notes on harness interaction:
+#   - _run_call patches _check_cost_guardrails; cost-allow=False drives (A).
+#   - _FakeLockBackend._held=True drives (B); call raises LockBusy.
+#   - (C)/(D) require agent.idempotency_backend + idempotency_key kwarg;
+#     _run_call is not used (it does not thread idempotency_key).
+#   - (E) requires non-empty mcp_servers_resolved + MCPClientPool mock.
+#
+# Hard contingency (Principle #12 + #5): if any site were found UNTAGGED in
+# the real code, the test would assert the TRUE absent behavior and this
+# comment would document the gap — NOT self-fix agent.call() control flow.
+# Governing normative source is spec/47 §"conversation_id tag-sites" (the
+# seven terminal records: ok, dedup, lock_busy, pre-loop cost-skip, in_flight,
+# mid-loop cost-skip, security-abort). Literal agent.py line numbers are
+# deliberately NOT cited here — they drift on any edit and carry no test
+# enforcement; each test below pins its site empirically via a strip control.
+# ──────────────────────────────────────────────────────────────────
+
+
+# ──── Cross-module isolation guard (Issue #557 P1 flake) ────────────
+#
+# Two of the tag-site tests (dedup, security-abort) were observed to flake
+# only when this file was co-selected with test_conversation_filesystem.py.
+# The mechanism is shared PROCESS state bleeding in from another module:
+#   - atomic_agents.agent.MCPClientPool is a module global; a leaked patch
+#     from elsewhere perturbs which branch writes the terminal record.
+#   - the ATOMIC_AGENTS_CONVERSATION_BACKEND env var, if leaked, changes
+#     get_default_conversation_backend() for every agent constructed here.
+# This autouse fixture snapshots/restores BOTH around every test in the
+# module so neither can be perturbed by (or leak into) a sibling module.
+# (Principle #8 — atomic + idempotent, applied to test isolation.)
+
+
+@pytest.fixture(autouse=True)
+def _neutralize_shared_process_state():
+    import atomic_agents.agent as _agent_mod
+
+    _saved_pool = _agent_mod.MCPClientPool
+    _saved_env = os.environ.get("ATOMIC_AGENTS_CONVERSATION_BACKEND")
+    try:
+        yield
+    finally:
+        _agent_mod.MCPClientPool = _saved_pool
+        if _saved_env is None:
+            os.environ.pop("ATOMIC_AGENTS_CONVERSATION_BACKEND", None)
+        else:
+            os.environ["ATOMIC_AGENTS_CONVERSATION_BACKEND"] = _saved_env
+
+
+# ──── (A) Pre-loop cost-skip ────────────────────────────────────────
+
+
+def test_preloop_cost_skip_record_carries_conversation_id(tmp_path):
+    """Pre-loop cost-skip (status='skipped', cost_allow=False before loop) tags
+    conversation_id on the terminal record (tag-site A).
+
+    Negative control: same call WITHOUT conversation_id → field ABSENT.
+    Distinguish from mid-loop test: LLM must NOT be called on a pre-loop skip.
+    """
+    backend = FilesystemConversationBackend(tmp_path / "convbot")
+    agent = _make_agent(tmp_path, conversation_backend=backend)
+    sink: list[dict] = []
+    llm_spy = MagicMock()
+
+    _run_call(
+        agent,
+        work_item="q",
+        conversation_id="c-preskip",
+        cost_allow=False,
+        log_sink=sink,
+        llm_mock=llm_spy,
+    )
+
+    skip_records = [r for r in sink if r.get("status") == "skipped"]
+    # Exactly-one matching record, asserted directly (not any() over a list):
+    # an any() window silently passes/fails on a foreign leaked record. See
+    # Issue #557 P1 flake analysis.
+    assert len(skip_records) == 1, (
+        f"expected exactly one skipped record; got {skip_records!r}"
+    )
+    assert skip_records[0].get("conversation_id") == "c-preskip", (
+        f"pre-loop skip record must carry conversation_id; sink={sink!r}"
+    )
+    # LLM must NOT have been called (pre-loop skip fires before the LLM).
+    assert llm_spy.call_count == 0, "LLM must NOT be called on pre-loop cost-skip"
+
+
+def test_preloop_cost_skip_absent_without_conversation_id(tmp_path):
+    """Negative control (tag-site A): WITH NO conversation_id, the skipped
+    record must NOT contain conversation_id."""
+    backend = FilesystemConversationBackend(tmp_path / "convbot")
+    agent = _make_agent(tmp_path, conversation_backend=backend)
+    sink: list[dict] = []
+
+    _run_call(agent, work_item="q", cost_allow=False, log_sink=sink)
+
+    skip_records = [r for r in sink if r.get("status") == "skipped"]
+    assert len(skip_records) == 1, (
+        f"expected exactly one skipped record; got {skip_records!r}"
+    )
+    assert "conversation_id" not in skip_records[0], (
+        f"conversation_id MUST be absent when not supplied; sink={sink!r}"
+    )
+
+
+# ──── (B) Lock-busy ────────────────────────────────────────────────
+
+
+def test_lock_busy_record_carries_conversation_id(tmp_path):
+    """Lock-busy terminal record (tag-site B) tags conversation_id.
+
+    Pre-hold the fake lock so agent.call() raises LockBusy on acquire.
+    The record is written BEFORE the raise; assert it afterwards.
+    """
+    from atomic_agents.exceptions import LockBusy
+
+    backend = FilesystemConversationBackend(tmp_path / "convbot")
+    agent = _make_agent(tmp_path, conversation_backend=backend)
+    # Pre-hold the fake lock to trigger LockBusy on the next acquire().
+    agent.lock_backend._held = True
+    sink: list[dict] = []
+
+    with patch.object(agent, "_log", side_effect=lambda r: sink.append(dict(r))):
+        with pytest.raises(LockBusy):
+            agent.call(work_item="q", conversation_id="c-lockbusy")
+
+    lock_records = [r for r in sink if r.get("status") == "lock_busy"]
+    assert len(lock_records) == 1, (
+        f"expected exactly one lock_busy record; got {lock_records!r}"
+    )
+    assert lock_records[0].get("conversation_id") == "c-lockbusy", (
+        f"lock_busy record must carry conversation_id; sink={sink!r}"
+    )
+
+
+def test_lock_busy_record_absent_without_conversation_id(tmp_path):
+    """Negative control (tag-site B): WITHOUT conversation_id the lock_busy
+    record must NOT contain conversation_id."""
+    from atomic_agents.exceptions import LockBusy
+
+    backend = FilesystemConversationBackend(tmp_path / "convbot")
+    agent = _make_agent(tmp_path, conversation_backend=backend)
+    agent.lock_backend._held = True
+    sink: list[dict] = []
+
+    with patch.object(agent, "_log", side_effect=lambda r: sink.append(dict(r))):
+        with pytest.raises(LockBusy):
+            agent.call(work_item="q")  # no conversation_id
+
+    lock_records = [r for r in sink if r.get("status") == "lock_busy"]
+    assert len(lock_records) == 1, (
+        f"expected exactly one lock_busy record; got {lock_records!r}"
+    )
+    assert "conversation_id" not in lock_records[0], (
+        f"conversation_id MUST be absent when not supplied; sink={sink!r}"
+    )
+
+
+# ──── (C) Dedup (Phase-1 COMPLETED) ────────────────────────────────
+
+
+def test_dedup_record_carries_conversation_id(tmp_path):
+    """Dedup terminal record (tag-site C, status='deduped') tags conversation_id.
+
+    Phase-1 lookup() → COMPLETED short-circuits before the lock and LLM.
+    idempotency_key must be passed explicitly; idempotency_backend must return
+    DedupDecision(state=COMPLETED).
+    """
+    from atomic_agents.idempotency.types import COMPLETED, DedupDecision
+
+    backend = FilesystemConversationBackend(tmp_path / "convbot")
+    agent = _make_agent(tmp_path, conversation_backend=backend)
+
+    # Inject a spy backend that returns COMPLETED on lookup.
+    idem_spy = MagicMock()
+    idem_spy.lookup.return_value = DedupDecision(
+        is_duplicate=True,
+        state=COMPLETED,
+        prior_run_id="prior-run-1",
+        prior_result_ref="prior-run-1",
+    )
+    agent.idempotency_backend = idem_spy
+
+    sink: list[dict] = []
+    llm_spy = MagicMock()
+    with (
+        patch("atomic_agents._llm.call_llm", llm_spy),
+        patch.object(agent, "_log", side_effect=lambda r: sink.append(dict(r))),
+        patch.object(agent, "load"),
+        patch.object(agent, "assemble_system_prompt", return_value="sp"),
+    ):
+        resp = agent.call(
+            work_item="q",
+            conversation_id="c-dedup",
+            idempotency_key="k1",
+        )
+
+    assert resp.deduped is True
+    dedup_records = [r for r in sink if r.get("status") == "deduped"]
+    # Exactly-one matching record, asserted directly (not any() over a list):
+    # the any() window silently passes/fails on a foreign leaked record. See
+    # Issue #557 P1 flake analysis.
+    assert len(dedup_records) == 1, (
+        f"expected exactly one deduped record; got {dedup_records!r}"
+    )
+    assert dedup_records[0].get("conversation_id") == "c-dedup", (
+        f"deduped record must carry conversation_id; sink={sink!r}"
+    )
+    # Phase-1 lookup() is consulted exactly once with the idempotency key, and
+    # the COMPLETED short-circuit fires BEFORE the loop — so the LLM is never
+    # called.
+    idem_spy.lookup.assert_called_once_with("k1")
+    assert llm_spy.call_count == 0, "LLM must NOT be called on a dedup short-circuit"
+
+
+def test_dedup_record_absent_without_conversation_id(tmp_path):
+    """Negative control (tag-site C): WITHOUT conversation_id, the deduped
+    record must NOT contain conversation_id."""
+    from atomic_agents.idempotency.types import COMPLETED, DedupDecision
+
+    backend = FilesystemConversationBackend(tmp_path / "convbot")
+    agent = _make_agent(tmp_path, conversation_backend=backend)
+
+    idem_spy = MagicMock()
+    idem_spy.lookup.return_value = DedupDecision(
+        is_duplicate=True,
+        state=COMPLETED,
+        prior_run_id="prior-run-2",
+        prior_result_ref="prior-run-2",
+    )
+    agent.idempotency_backend = idem_spy
+
+    sink: list[dict] = []
+    with (
+        patch("atomic_agents._llm.call_llm"),
+        patch.object(agent, "_log", side_effect=lambda r: sink.append(dict(r))),
+        patch.object(agent, "load"),
+        patch.object(agent, "assemble_system_prompt", return_value="sp"),
+    ):
+        resp = agent.call(work_item="q", idempotency_key="k2")  # no conversation_id
+
+    assert resp.deduped is True
+    dedup_records = [r for r in sink if r.get("status") == "deduped"]
+    assert len(dedup_records) == 1, (
+        f"expected exactly one deduped record; got {dedup_records!r}"
+    )
+    assert "conversation_id" not in dedup_records[0], (
+        f"conversation_id MUST be absent when not supplied; sink={sink!r}"
+    )
+
+
+# ──── (D) In-flight (Phase-2 IN_FLIGHT) ─────────────────────────────
+
+
+def test_in_flight_record_carries_conversation_id(tmp_path):
+    """In-flight terminal record (tag-site D, status='in_flight') tags
+    conversation_id. Phase-2 begin() → IN_FLIGHT raises DedupInFlight after
+    writing the in_flight record.
+
+    Requires: cost gate allows (patched), lock acquired (lock not pre-held),
+    idempotency_backend.lookup→FRESH, idempotency_backend.begin→IN_FLIGHT.
+    """
+    from atomic_agents.exceptions import DedupInFlight
+    from atomic_agents.idempotency.types import DedupDecision, FRESH, IN_FLIGHT
+
+    backend = FilesystemConversationBackend(tmp_path / "convbot")
+    agent = _make_agent(tmp_path, conversation_backend=backend)
+
+    idem_spy = MagicMock()
+    idem_spy.lookup.return_value = DedupDecision(
+        is_duplicate=False, state=FRESH, prior_run_id=None, prior_result_ref=None
+    )
+    idem_spy.begin.return_value = DedupDecision(
+        is_duplicate=True,
+        state=IN_FLIGHT,
+        prior_run_id="other-run-1",
+        prior_result_ref=None,
+    )
+    agent.idempotency_backend = idem_spy
+
+    sink: list[dict] = []
+    with (
+        patch("atomic_agents._llm.call_llm"),
+        patch.object(agent, "_log", side_effect=lambda r: sink.append(dict(r))),
+        patch.object(agent, "load"),
+        patch.object(agent, "assemble_system_prompt", return_value="sp"),
+        patch.object(
+            agent,
+            "_check_cost_guardrails",
+            return_value=MagicMock(
+                allow=True, action="ok", reason="cap", cost_data_degraded=False
+            ),
+        ),
+    ):
+        with pytest.raises(DedupInFlight):
+            agent.call(
+                work_item="q",
+                conversation_id="c-inflight",
+                idempotency_key="k3",
+            )
+
+    inflight_records = [r for r in sink if r.get("status") == "in_flight"]
+    assert len(inflight_records) == 1, (
+        f"expected exactly one in_flight record; got {inflight_records!r}"
+    )
+    assert inflight_records[0].get("conversation_id") == "c-inflight", (
+        f"in_flight record must carry conversation_id; sink={sink!r}"
+    )
+
+
+def test_in_flight_record_absent_without_conversation_id(tmp_path):
+    """Negative control (tag-site D): WITHOUT conversation_id, the in_flight
+    record must NOT contain conversation_id."""
+    from atomic_agents.exceptions import DedupInFlight
+    from atomic_agents.idempotency.types import DedupDecision, FRESH, IN_FLIGHT
+
+    backend = FilesystemConversationBackend(tmp_path / "convbot")
+    agent = _make_agent(tmp_path, conversation_backend=backend)
+
+    idem_spy = MagicMock()
+    idem_spy.lookup.return_value = DedupDecision(
+        is_duplicate=False, state=FRESH, prior_run_id=None, prior_result_ref=None
+    )
+    idem_spy.begin.return_value = DedupDecision(
+        is_duplicate=True,
+        state=IN_FLIGHT,
+        prior_run_id="other-run-2",
+        prior_result_ref=None,
+    )
+    agent.idempotency_backend = idem_spy
+
+    sink: list[dict] = []
+    with (
+        patch("atomic_agents._llm.call_llm"),
+        patch.object(agent, "_log", side_effect=lambda r: sink.append(dict(r))),
+        patch.object(agent, "load"),
+        patch.object(agent, "assemble_system_prompt", return_value="sp"),
+        patch.object(
+            agent,
+            "_check_cost_guardrails",
+            return_value=MagicMock(
+                allow=True, action="ok", reason="cap", cost_data_degraded=False
+            ),
+        ),
+    ):
+        with pytest.raises(DedupInFlight):
+            agent.call(work_item="q", idempotency_key="k4")  # no conversation_id
+
+    inflight_records = [r for r in sink if r.get("status") == "in_flight"]
+    assert len(inflight_records) == 1, (
+        f"expected exactly one in_flight record; got {inflight_records!r}"
+    )
+    assert "conversation_id" not in inflight_records[0], (
+        f"conversation_id MUST be absent when not supplied; sink={sink!r}"
+    )
+
+
+# ──── (E) Security-abort (MCPCommandNotAllowed) ─────────────────────
+
+
+def test_security_abort_record_carries_conversation_id(tmp_path):
+    """Security-abort terminal record (tag-site E, status='error',
+    error='MCPCommandNotAllowed') tags conversation_id.
+
+    Approach: inject a fake MCPServerSpec into agent._profile so
+    _resolved_mcp_specs is non-empty, then patch MCPClientPool.connect_all
+    to raise MCPCommandNotAllowed. The except-BaseException block writes
+    the security-abort record (agent.py:5484-5506) and re-raises.
+
+    Prep finding P0/P1 compliance: do NOT use _run_call (it patches load
+    and assemble_system_prompt but not the MCP pool). Call agent.call()
+    directly with _log + _check_cost_guardrails patched manually. Wrap in
+    pytest.raises(MCPCommandNotAllowed).
+    """
+    from atomic_agents.mcp import MCPClientPool, MCPCommandNotAllowed, MCPServerSpec
+
+    backend = FilesystemConversationBackend(tmp_path / "convbot")
+    agent = _make_agent(tmp_path, conversation_backend=backend)
+
+    # Inject a fake MCPServerSpec so _resolved_mcp_specs is non-empty (the
+    # guard at agent.py:4234 requires a non-empty list to enter the pool path).
+    evil_spec = MCPServerSpec(name="evil", command="bash", args=["-c", "echo hi"])
+    agent._profile = agent._profile.replace(mcp_servers_resolved=[evil_spec])
+
+    sink: list[dict] = []
+
+    # Patch MCPClientPool at the agent module's import site so the pool
+    # constructor runs (reaching connect_all) then connect_all raises.
+    #
+    # Determinism (Issue #557 P1): spec= the mock to MCPClientPool AND stub
+    # discover_tools()→[] so that even if connect_all's side_effect ordering
+    # were perturbed, the tool-discovery loop cannot iterate a bare MagicMock
+    # and emit a FOREIGN in-loop error record that the filter would mistake
+    # for the security-abort record.
+    mock_pool_instance = MagicMock(spec=MCPClientPool)
+    mock_pool_instance.connect_all.side_effect = MCPCommandNotAllowed(
+        "bash is not allowed"
+    )
+    mock_pool_instance.discover_tools.return_value = []
+
+    with (
+        patch("atomic_agents._llm.call_llm"),
+        patch.object(agent, "_log", side_effect=lambda r: sink.append(dict(r))),
+        patch.object(agent, "load"),
+        patch.object(agent, "assemble_system_prompt", return_value="sp"),
+        patch.object(
+            agent,
+            "_check_cost_guardrails",
+            return_value=MagicMock(
+                allow=True, action="ok", reason="cap", cost_data_degraded=False
+            ),
+        ),
+        patch("atomic_agents.agent.MCPClientPool", return_value=mock_pool_instance),
+    ):
+        with pytest.raises(MCPCommandNotAllowed):
+            agent.call(work_item="q", conversation_id="c-secabort")
+
+    # Identify the security-abort record by its FULL shape (status + error +
+    # summary prefix), not just error== — a foreign in-loop error record could
+    # otherwise satisfy a looser filter. Assert exactly one such record exists
+    # and assert directly on it (no any() silent-pass-on-wrong-record window).
+    abort_records = [
+        r
+        for r in sink
+        if r.get("status") == "error"
+        and r.get("error") == "MCPCommandNotAllowed"
+        and str(r.get("summary", "")).startswith("MCP spawn gate refused")
+    ]
+    assert len(abort_records) == 1, (
+        f"expected exactly one security-abort record; sink={sink!r}"
+    )
+    assert abort_records[0].get("conversation_id") == "c-secabort", (
+        f"security-abort record must carry conversation_id; sink={sink!r}"
+    )
+    # connect_all raised before discovery — lock the invariant that the foreign
+    # tool-loop path was never reached.
+    mock_pool_instance.discover_tools.assert_not_called()
+
+
+def test_security_abort_record_absent_without_conversation_id(tmp_path):
+    """Negative control (tag-site E): WITHOUT conversation_id, the
+    security-abort record must NOT contain conversation_id."""
+    from atomic_agents.mcp import MCPClientPool, MCPCommandNotAllowed, MCPServerSpec
+
+    backend = FilesystemConversationBackend(tmp_path / "convbot")
+    agent = _make_agent(tmp_path, conversation_backend=backend)
+
+    evil_spec = MCPServerSpec(name="evil2", command="bash", args=["-c", "echo"])
+    agent._profile = agent._profile.replace(mcp_servers_resolved=[evil_spec])
+
+    sink: list[dict] = []
+    # Same determinism hardening as the positive test (Issue #557 P1).
+    mock_pool_instance = MagicMock(spec=MCPClientPool)
+    mock_pool_instance.connect_all.side_effect = MCPCommandNotAllowed("bash blocked")
+    mock_pool_instance.discover_tools.return_value = []
+
+    with (
+        patch("atomic_agents._llm.call_llm"),
+        patch.object(agent, "_log", side_effect=lambda r: sink.append(dict(r))),
+        patch.object(agent, "load"),
+        patch.object(agent, "assemble_system_prompt", return_value="sp"),
+        patch.object(
+            agent,
+            "_check_cost_guardrails",
+            return_value=MagicMock(
+                allow=True, action="ok", reason="cap", cost_data_degraded=False
+            ),
+        ),
+        patch("atomic_agents.agent.MCPClientPool", return_value=mock_pool_instance),
+    ):
+        with pytest.raises(MCPCommandNotAllowed):
+            agent.call(work_item="q")  # no conversation_id
+
+    abort_records = [
+        r
+        for r in sink
+        if r.get("status") == "error"
+        and r.get("error") == "MCPCommandNotAllowed"
+        and str(r.get("summary", "")).startswith("MCP spawn gate refused")
+    ]
+    assert len(abort_records) == 1, (
+        f"expected exactly one security-abort record; sink={sink!r}"
+    )
+    assert "conversation_id" not in abort_records[0], (
+        f"conversation_id MUST be absent when not supplied; sink={sink!r}"
+    )
+    mock_pool_instance.discover_tools.assert_not_called()

@@ -545,6 +545,19 @@ through to `agent.call(caller_identity=...)`. It MUST NOT attempt JWT
 verification, signature parsing, or claims decoding. This is a security
 invariant: the perimeter's authentication decision is final.
 
+> **NOTE (non-normative, added by spec/48 — NOT a change to MUST 6):**
+> MUST 6 stays exactly as written: `caller_identity` is read, logged, and passed
+> through, and the serve layer NEVER re-verifies it. spec/48 (PrincipalBackend)
+> adds a SEPARATE, OPT-IN path on top of this: when an operator declares the
+> identity header perimeter-authenticated (`identity_is_perimeter_verified`, off
+> by default, and only on a non-loopback bind), the serve layer MAY ALSO map the
+> already-perimeter-verified claims into a `Principal` via the registered
+> `PrincipalBackend` and thread it to `agent.call(principal=...)` for conversation
+> ownership. This mapping is NOT verification — it never inspects a token. By
+> default (opt-in off) the identity header yields an `is_verified=False`
+> Principal, so a `conversation_id` caller is HARD-REFUSED. `caller_identity`
+> remains the unverified pass-through audit header in all cases. See spec/48.
+
 **MUST 7 — Identity in audit trail:**
 When `caller_identity` is not None, `agent.call()` MUST write the value into
 the JSONL run record under the key `http_caller`. The field MUST be present in

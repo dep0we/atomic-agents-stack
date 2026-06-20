@@ -1,7 +1,11 @@
 # spec/47 — ConversationBackend Protocol (DRAFT)
 
 **Status:** DRAFT — implementation complete for PR1; LOCK ceremony pending PR2 hardening
-(model-aware token-budget derivation, doctor check, serve wiring, PostgresConversationBackend).
+(model-aware token-budget derivation, doctor check, PostgresConversationBackend). The
+per-principal serve wiring — deriving a verified `Principal` at the serve perimeter and
+threading it through `agent.call()` to gate conversation access — SHIPPED with PrincipalBackend
+(#556, spec/48): the serve layer's fail-closed opt-in HYBRID flow now produces the `Principal`
+that `load_turns()` / `write_turn()` here consume.
 
 **Issue:** [#535](https://github.com/dep0we/atomic-agents-stack/issues/535)
 **Protocol number:** 20 (the twentieth backend Protocol, v1.5 wave)
@@ -434,7 +438,11 @@ lane if any assertion hardcodes `schema_version == 2`.
 ## Deferred to later PRs
 
 - `PostgresConversationBackend` (pgvector for semantic conversation search).
-- spec/37 serve `conversation_id` wiring (HTTP path).
+- ~~spec/37 serve `conversation_id` wiring (HTTP path).~~ **SHIPPED with PrincipalBackend
+  (#556):** `serve/_app.py` now extracts + validates `conversation_id` from the request body
+  (bare component, no separators/control chars, max 512 chars; 422 on violation) and threads
+  it through `run_agent_call()` to `agent.call()`, gated by the verified `Principal` from the
+  serve HYBRID flow.
 - Summarization (PR3, budget-bounded same contract).
 - Doctor check for orphaned `.tmp` turn files.
 - `write_turns(list[Turn])` — atomic two-turn write path (eliminates PR1 crash boundary).
@@ -458,10 +466,33 @@ lane if any assertion hardcodes `schema_version == 2`.
 
 ---
 
+## Serve HYBRID flow — principal threading (spec/48 clarifying note)
+
+> **NOTE (non-normative, added spec/48 PR 1):** When the serve layer threads a
+> non-local `Principal` to `agent.call()`, the `principal` arg replaces the
+> hardcoded `LOCAL_PRINCIPAL` that was previously passed to `conversation_backend.load_turns()`
+> and `conversation_backend.write_turn()`. This is the mechanism by which conversation
+> isolation (this spec) becomes multi-principal in a served deployment.
+>
+> No normative rule in this spec changes. The `Principal` parameter type in `load_turns`
+> and `write_turn` was already present in spec/47 to support exactly this extension.
+> The thread: `serve/_app.py` extracts `verified_claims` (using the FULL untruncated
+> identity header as `sub`) from the perimeter-verified identity header, `serve/_runner.py`
+> calls `agent.principal_backend.derive_principal(verified_claims)` — but ONLY on the trusted
+> path; the serve flow is fail-closed opt-in, so an untrusted-perimeter, header-absent-under-
+> perimeter, or `is_local_only`-backend-under-perimeter case instead yields an unverified
+> `Principal` directly (see spec/48 "Serve layer HYBRID flow"). The resulting `Principal` is
+> passed to `agent.call(principal=...)`. The HARD-REFUSE gate (spec/48) fires before lock
+> acquisition when `conversation_id is not None and not principal.is_verified`, returning HTTP
+> 401 before any storage or LLM spend.
+
+---
+
 ## Cross-references
 
 - TENSIONS T16 (raw-transcript injection — approved, committed on `docs/tensions-t16-conversation-flex`)
 - spec/22 (LogBackend — `conversation_id` versioned normative addendum)
 - spec/40 (canonical export — `ConversationExport` companion)
 - spec/45 (IdempotencyBackend — `continuity_persisted` field precedent)
+- spec/48 (PrincipalBackend — identity derivation + HARD-REFUSE gate; the `Principal` type and `LOCAL_PRINCIPAL` live in `conversation/types.py` and are re-exported from `principal/`)
 - spec/37 (serve — `caller_identity` vs `Principal` distinction)

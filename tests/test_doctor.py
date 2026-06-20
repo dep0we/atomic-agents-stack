@@ -473,6 +473,7 @@ def test_run_doctor_no_agent_skips_agent_checks(tmp_path):
         "journal-backend",
         "queue-backend",
         "idempotency-backend",
+        "principal-backend",
         "memory-backend-config",
         "memory-backend",
         "write-paths",
@@ -503,6 +504,41 @@ def test_run_doctor_skip_mcp_emits_skip(monkeypatch, tmp_path):
     mcp_results = [r for r in results if r.name == "mcp"]
     assert len(mcp_results) == 1
     assert mcp_results[0].status == SKIP
+
+
+def test_run_doctor_includes_principal_backend_check(monkeypatch, tmp_path):
+    """spec/48 (G): check_principal_backend() is WIRED into run_doctor() — not dead
+    code. A 'principal-backend' result must appear in a real doctor run.
+
+    Round 1 finding: the check was defined but never appended to run_doctor(), so
+    `atomic-agents doctor` never ran the principal coherence/negative probe.
+    """
+    _isolate_keys(monkeypatch, tmp_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.delenv("ATOMIC_AGENTS_PRINCIPAL_BACKEND", raising=False)
+    _make_agent(tmp_path, "agent-p")
+    results = run_doctor(agent_name="agent-p", agents_root=tmp_path, skip_mcp=True)
+    principal_results = [r for r in results if r.name == "principal-backend"]
+    assert len(principal_results) == 1, (
+        "principal-backend check must appear in a real doctor run "
+        "(check_principal_backend wired into run_doctor)"
+    )
+    # Default (no env var) → LocalPrincipalBackend → PASS.
+    assert principal_results[0].status == PASS
+
+
+def test_run_doctor_principal_backend_fails_on_unknown_env(monkeypatch, tmp_path):
+    """An unknown ATOMIC_AGENTS_PRINCIPAL_BACKEND yields a FAIL principal-backend
+    result (negative control for the wired-in check).
+    """
+    _isolate_keys(monkeypatch, tmp_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setenv("ATOMIC_AGENTS_PRINCIPAL_BACKEND", "no-such-backend")
+    _make_agent(tmp_path, "agent-q")
+    results = run_doctor(agent_name="agent-q", agents_root=tmp_path, skip_mcp=True)
+    principal_results = [r for r in results if r.name == "principal-backend"]
+    assert len(principal_results) == 1
+    assert principal_results[0].status == FAIL
 
 
 # ──────────────────────────────────────────────────────────────────

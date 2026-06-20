@@ -110,6 +110,8 @@ Fail-closed vs fail-open boundary:
     - per-turn file absent between listing and open (TOCTOU) → skip (continue)
     - per-turn file present but unreadable (JSON parse error, missing field) →
       log WARNING, skip the corrupted turn (ConversationCorrupted, caught internally)
+    - per-turn file read fails with a NON-ENOENT OSError (e.g. EACCES) →
+      ConversationBackendError (fail-loud — a real I/O fault is not silently degraded)
     - symlink escape on directory check → PathTraversalError (fail-loud on write,
       [] on read — 'absent conversations' semantics)
     - symlink escape on per-entry check → PathTraversalError (raised at sink)

@@ -941,3 +941,80 @@ class ConversationAccessDenied(ConversationBackendError):
     catches it at the base class — callers that need to distinguish access
     denial from I/O failure can catch this subclass explicitly.
     """
+
+
+# ──────────────────────────────────────────────────────────────────
+# PrincipalBackend exceptions (spec/48 — issue #556)
+
+
+class PrincipalBackendError(AtomicAgentsError):
+    """Raised by a PrincipalBackend on an unrecoverable backend fault.
+
+    NOT raised for absent/malformed claims — those return is_verified=False
+    per the fail-closed contract (spec/48 MUST 1). Only raised when the backend
+    cannot service the request due to an unrecoverable backend-level failure
+    (e.g. a database-backed PrincipalBackend with a broken connection that
+    cannot read the claims-to-principal mapping table).
+
+    LocalPrincipalBackend and StaticClaimsPrincipalBackend NEVER raise this
+    exception (both perform no I/O). The exception is defined here for future
+    backends that perform I/O (e.g. database-backed principal stores).
+
+    Boundary rule (per spec/48):
+        - Absent/malformed claims -> is_verified=False (never raises)
+        - Genuine backend I/O failure -> raises PrincipalBackendError
+
+    Callers that want to distinguish backend failure from unverified input
+    catch PrincipalBackendError. Callers wanting fail-closed on any error
+    catch Exception (or AtomicAgentsError for framework errors only).
+
+    Import note: available at atomic_agents.exceptions so agent.py and serve
+    can import without loading the full principal package. Re-exported from
+    atomic_agents.principal for backend-implementer convenience.
+    """
+
+
+class UnverifiedPrincipalConversationAccess(AtomicAgentsError):
+    """Raised by agent.call() HARD-REFUSE gate (spec/48 MUST 10).
+
+    Fired when a non-local (is_verified=False) caller supplies conversation_id
+    to agent.call(). The gate is a security policy enforcement — the call is
+    refused BEFORE any storage I/O (including the idempotency dedup lookup),
+    before lock acquisition, before the cost gate, and before any LLM spend.
+
+    NOT a backend fault (that is PrincipalBackendError). NOT raised because
+    claims were absent/malformed (those return is_verified=False, which only
+    triggers this exception if the caller ALSO sets conversation_id).
+
+    Gate condition (spec/48 MUST 10):
+        if conversation_id is not None and not principal.is_verified:
+            raise UnverifiedPrincipalConversationAccess(...)
+
+    MUST NOT gate on `principal is not LOCAL_PRINCIPAL` or object identity —
+    gate exclusively on is_verified. A fabricated LOCAL_PRINCIPAL-shaped object
+    (same field values, different object identity) would bypass an identity
+    check but is correctly caught by the is_verified boolean check.
+
+    Attributes:
+        conversation_id: the conversation_id that triggered the gate (for audit
+            logging and operator triage).
+        principal_id: the identifier from the unverified Principal (may be
+            'anonymous' for absent/malformed claims).
+
+    The serve layer maps this to HTTP 401 (unauthorized). Distinct from
+    PrincipalBackendError (→ HTTP 500) — two different status codes mean
+    these two exception types MUST remain distinct.
+
+    Importable from both atomic_agents.exceptions (caller surface) and
+    atomic_agents.principal (backend-implementer surface).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        conversation_id: str | None = None,
+        principal_id: str | None = None,
+    ) -> None:
+        self.conversation_id = conversation_id
+        self.principal_id = principal_id
+        super().__init__(message)
