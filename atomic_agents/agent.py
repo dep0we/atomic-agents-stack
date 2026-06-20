@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 import concurrent.futures
 import logging
+import math
 import os
 import re
 import time
@@ -190,6 +191,32 @@ RECENT_JOURNAL_DEFAULT = 1
 # fallback bucket is ``PRIMITIVE_OTHER`` — backends MUST accept it
 # (spec/22 §"Canonical primitive taxonomy" — the closed set is
 # documentation, not enforcement).
+
+# Embed cost-gate worst-case constants (#544 PR1). Shared by the reservation
+# loop and the true-up loop so the two estimates can never drift.
+#   _EMBED_BYTES_PER_TOKEN: BPE tokens are bounded by UTF-8 BYTE length. For
+#     natural-language text bytes/3 is conservative (covers CJK/emoji, where a
+#     code-point count under-counts ~3x). It is NOT a strict upper bound for
+#     incompressible/adversarial byte sequences (which can approach ~1 token/
+#     byte), but the provider rejects any single text over the model token cap
+#     and embedding is sub-cent per token, so the residual under-reservation is
+#     bounded and small. See spec/46 fail-closed section.
+#   _EMBED_BATCH_FANOUT_BUFFER: the MemoryBackend protocol does not advertise
+#     whether write_note() calls embed() (per-item) or embed_batch(); the 2x
+#     buffer is headroom against an embed_batch() path that degrades per-item
+#     (batch call + N retries).
+_EMBED_BYTES_PER_TOKEN = 3
+_EMBED_BATCH_FANOUT_BUFFER = 2.0
+
+
+def _estimate_embed_tokens(body: str | None) -> int:
+    """Worst-case embed token estimate for a note body (UTF-8 bytes / 3).
+
+    Single source of truth for the reservation loop and the true-up loop so a
+    future tweak cannot desync the reserved amount from the charged actual.
+    """
+    return math.ceil(len((body or "").encode("utf-8")) / _EMBED_BYTES_PER_TOKEN)
+
 
 _PRIMITIVE_BY_TRIGGER: dict[str, str] = {
     "agent_call": PRIMITIVE_AGENT_CALL,
@@ -5295,8 +5322,6 @@ class AtomicAgent:
             written_captures: list[Capture] = []
             seen_capture_keys: set[tuple] = set()
             if write_captures:
-                import math as _math
-
                 policy = WritePolicy(
                     write_paths=self.config.write_paths,
                     read_only_paths=self.config.read_only_paths,
@@ -5340,41 +5365,41 @@ class AtomicAgent:
                     except Exception:
                         _embed_model_id = "unknown"
 
-                    # Worst-case token estimate: math.ceil(utf8_bytes / 3) per item.
-                    # BPE tokens are bounded by UTF-8 BYTE length, not Unicode code
-                    # points — len() (code points) under-counts ~3x for CJK/emoji
-                    # because each multibyte char is ≥1 token. bytes/3 is a
-                    # conservative worst-case that never under-reserves (Principle #4).
-                    # Batch-fanout formula: per_item_sum + batch_sum (~2x) because
-                    # the protocol doesn't advertise whether write_note() calls
-                    # embed()/embed_batch().
+                    # Worst-case token estimate via _estimate_embed_tokens
+                    # (UTF-8 bytes / _EMBED_BYTES_PER_TOKEN). bytes/3 is
+                    # conservative for natural-language text (covers CJK/emoji,
+                    # where a code-point count under-counts ~3x); it is NOT a
+                    # strict upper bound for incompressible/adversarial byte
+                    # sequences, but the provider caps any single text at the
+                    # model token limit and embedding is sub-cent per token, so
+                    # the residual under-reservation is bounded and small.
+                    # Batch-fanout formula: per_item_sum * _EMBED_BATCH_FANOUT_BUFFER
+                    # (~2x) because the protocol doesn't advertise whether
+                    # write_note() calls embed()/embed_batch().
                     _per_item_sum = 0.0
-                    _unique_bodies: list[str] = []
+                    _embed_batch_size = 0
                     _seen_keys_for_estimate: set[tuple] = set()
                     for _c in all_captures:
                         _k = (_c.type, _c.name, hash(_c.body))
                         if _k in _seen_keys_for_estimate:
                             continue
                         _seen_keys_for_estimate.add(_k)
-                        _tokens_est = _math.ceil(
-                            len((_c.body or "").encode("utf-8")) / 3
-                        )
+                        _tokens_est = _estimate_embed_tokens(_c.body)
                         _per_item_cost, _per_item_est = _costs.calc_embedding_cost(
                             _embed_model_id, _tokens_est
                         )
                         _per_item_sum += _per_item_cost
                         if _per_item_est:
                             _embed_cost_estimated = True
-                        _unique_bodies.append(_c.body or "")
+                        _embed_batch_size += 1
 
-                    _embed_batch_size = len(_unique_bodies)
                     # 2x conservative buffer: the MemoryBackend protocol does not
                     # advertise whether write_note() calls embed() (per-item) or
                     # embed_batch(). The reference impl (PgvectorMemoryBackend) uses
                     # per-item embed(), so per_item_sum already covers actual spend;
                     # the 2x is headroom against an embed_batch() path that could
-                    # degrade per-item (batch call + N retries). Never under-reserves.
-                    _embed_reserved_usd = 2.0 * _per_item_sum
+                    # degrade per-item (batch call + N retries).
+                    _embed_reserved_usd = _EMBED_BATCH_FANOUT_BUFFER * _per_item_sum
 
                     # Fail-closed gate: deferred until AFTER effective-cap
                     # resolution so uncapped agents are never spuriously blocked
@@ -5454,12 +5479,10 @@ class AtomicAgent:
                             self.memory.write_note(c, policy)
                             written_captures.append(c)
                             # True-up actual embed cost per written note. Same
-                            # UTF-8-byte token estimate as the reservation loop so
-                            # the true-up never disagrees with the worst-case basis.
+                            # _estimate_embed_tokens basis as the reservation loop
+                            # so the true-up never disagrees with the worst case.
                             if _embed_gate_active:
-                                _tok = _math.ceil(
-                                    len((c.body or "").encode("utf-8")) / 3
-                                )
+                                _tok = _estimate_embed_tokens(c.body)
                                 _note_cost, _ = _costs.calc_embedding_cost(
                                     _embed_model_id, _tok
                                 )
@@ -6673,15 +6696,45 @@ class AtomicAgent:
                 f"remaining headroom ${headroom:.6f}"
             )
 
+    def _effective_embed_caps(self) -> tuple[float | None, float | None]:
+        """Resolve the effective (daily, monthly) embed cost caps.
+
+        Single source of truth for the embed gate's fail-closed predicate
+        (_has_effective_embed_cap) and its enforcement math
+        (_embed_remaining_headroom), so the block decision and the headroom
+        subtraction gate on the SAME caps and cannot drift. Composes model.md
+        caps (0 = disabled/unlimited) with Policy caps via min() (#512 lesson:
+        gate on the EFFECTIVE control, not one source). None on either side means
+        no binding cap at that period.
+        """
+        from .policy.types import CostCaps as _CostCaps
+
+        _model_daily: float | None = (
+            self.config.daily_cap_usd if self.config.daily_cap_usd > 0 else None
+        )
+        _model_monthly: float | None = (
+            self.config.monthly_cap_usd if self.config.monthly_cap_usd > 0 else None
+        )
+        _policy_caps: _CostCaps = (
+            self._policy_snapshot_this_call.effective_caps
+            if self._policy_snapshot_this_call is not None
+            else _CostCaps()
+        )
+        return (
+            self._min_or_other(_model_daily, _policy_caps.daily_usd),
+            self._min_or_other(_model_monthly, _policy_caps.monthly_usd),
+        )
+
     def _has_effective_embed_cap(
         self, parent_remaining_headroom_usd: float | None = None
     ) -> bool:
         """Return True when the agent has any binding cost cap for fail-closed embed gate.
 
         Resolves the FULL effective cap hierarchy (model.md caps OR Policy-composed
-        caps OR delegated parent tree-cap), matching the effective-cap logic in
-        _check_cost_guardrails (#512 lesson: gate on the EFFECTIVE control, not one
-        source). Distinct from _check_batch_reservation which uses model.md caps only.
+        caps OR delegated parent tree-cap) via _effective_embed_caps, matching the
+        effective-cap logic in _check_cost_guardrails (#512 lesson: gate on the
+        EFFECTIVE control, not one source). Distinct from _check_batch_reservation
+        which uses model.md caps only.
 
         Used by the embed cost gate fail-closed predicate:
             if degraded AND _has_effective_embed_cap(): raise CostGuardrailBlocked
@@ -6691,25 +6744,7 @@ class AtomicAgent:
         """
         if not self.config.cost_guardrails_enabled:
             return False
-        # model.md caps: 0 means disabled (unlimited).
-        _model_daily: float | None = (
-            self.config.daily_cap_usd if self.config.daily_cap_usd > 0 else None
-        )
-        _model_monthly: float | None = (
-            self.config.monthly_cap_usd if self.config.monthly_cap_usd > 0 else None
-        )
-        # Policy-composed caps: None on either side = no opinion at that layer.
-        from .policy.types import CostCaps as _CostCaps
-
-        _policy_caps: _CostCaps = (
-            self._policy_snapshot_this_call.effective_caps
-            if self._policy_snapshot_this_call is not None
-            else _CostCaps()
-        )
-        _effective_daily = self._min_or_other(_model_daily, _policy_caps.daily_usd)
-        _effective_monthly = self._min_or_other(
-            _model_monthly, _policy_caps.monthly_usd
-        )
+        _effective_daily, _effective_monthly = self._effective_embed_caps()
         # Any binding cap — own (daily/monthly) or parent tree-cap — means the
         # fail-closed predicate applies.
         return (
@@ -6726,33 +6761,17 @@ class AtomicAgent:
     ) -> float:
         """Remaining cost headroom for the embed gate's enforcement check.
 
-        Resolves the FULL effective cap hierarchy (model.md caps composed with
-        Policy caps via min(), plus the delegated parent tree-cap), matching the
-        effective-cap surface that ``_has_effective_embed_cap`` gates on, so the
-        block decision and the headroom math agree on the same caps. Unset caps
-        are ``inf`` (a reservation can never exceed an unbounded budget); the
-        returned headroom is the minimum across daily, monthly, and tree-cap.
+        Resolves the FULL effective cap hierarchy via _effective_embed_caps (the
+        same surface ``_has_effective_embed_cap`` gates on, so the block decision
+        and the headroom math agree on the same caps), plus the delegated parent
+        tree-cap. Unset caps are ``inf`` (a reservation can never exceed an
+        unbounded budget); the returned headroom is the minimum across daily,
+        monthly, and tree-cap.
 
         Called only when ``_has_effective_embed_cap`` is True and the cost read is
         NOT degraded — a reliable spend baseline is required for this subtraction.
         """
-        from .policy.types import CostCaps as _CostCaps
-
-        _model_daily: float | None = (
-            self.config.daily_cap_usd if self.config.daily_cap_usd > 0 else None
-        )
-        _model_monthly: float | None = (
-            self.config.monthly_cap_usd if self.config.monthly_cap_usd > 0 else None
-        )
-        _policy_caps: _CostCaps = (
-            self._policy_snapshot_this_call.effective_caps
-            if self._policy_snapshot_this_call is not None
-            else _CostCaps()
-        )
-        _effective_daily = self._min_or_other(_model_daily, _policy_caps.daily_usd)
-        _effective_monthly = self._min_or_other(
-            _model_monthly, _policy_caps.monthly_usd
-        )
+        _effective_daily, _effective_monthly = self._effective_embed_caps()
         daily_remaining = (
             _effective_daily - today_cost
             if _effective_daily is not None
@@ -6792,6 +6811,7 @@ class AtomicAgent:
             {
                 "trigger": "embed_batch_reservation",
                 "parent_run_id": self.run_id,
+                "parent_agent": self.name,
                 "model": model_id,
                 "input_tokens": 0,
                 "output_tokens": 0,
@@ -6850,6 +6870,7 @@ class AtomicAgent:
             {
                 "trigger": "embed_batch_release",
                 "parent_run_id": self.run_id,
+                "parent_agent": self.name,
                 "model": model_id,
                 "input_tokens": 0,
                 "output_tokens": 0,

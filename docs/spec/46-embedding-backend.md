@@ -222,6 +222,18 @@ is ONE billed call (no per-item fan-out, unlike `embed_batch()`).
 > Estimating from the post-write stored body is deferred (it requires reading back
 > the merged note after the write).
 
+> **Token estimate basis: `ceil(utf8_bytes / 3)` is conservative, not a strict
+> upper bound.** The capture-commit gate estimates tokens from the UTF-8 byte
+> length divided by 3. This is conservative for natural-language text (a Unicode
+> code-point count under-counts ~3x for CJK/emoji, where each multibyte char is
+> ≥1 token; the byte basis covers that). It is NOT a strict upper bound for
+> incompressible or adversarial byte sequences, which can tokenize closer to
+> ~1 token/byte and so under-reserve by up to ~3x before the 2x fan-out buffer.
+> The residual is bounded and small in practice: the provider rejects any single
+> text exceeding the model's per-text token cap, and embedding pricing is sub-cent
+> per token. A tokenizer-exact estimate is deferred (it would add a tokenizer
+> dependency); the documented basis matches the shipped code.
+
 ```
 trigger="embed_reservation"          output_tokens=0    cost_source="actor"  # single embed()
 trigger="embed_release"              output_tokens=0    cost_source="actor"

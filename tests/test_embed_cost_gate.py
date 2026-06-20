@@ -1272,11 +1272,6 @@ def test_doctor_embedding_backend_fail_when_unknown_provider(monkeypatch):
     from atomic_agents.exceptions import BackendNotRegistered
 
     with patch(
-        "atomic_agents.doctor.check_embedding_backend.__module__",
-        create=True,
-    ):
-        pass
-    with patch(
         "atomic_agents.embedding.registry.get_default_embedding_backend",
         side_effect=BackendNotRegistered("not-a-real-provider not found"),
     ):
@@ -1284,6 +1279,10 @@ def test_doctor_embedding_backend_fail_when_unknown_provider(monkeypatch):
     assert result.status == FAIL
     assert result.name == "embedding-backend"
     assert "not-a-real-provider" in result.message
+    # Branch-distinctive: the BackendNotRegistered branch is the only one whose
+    # fix_hint lists the registered backends; the broad except sets no fix_hint.
+    assert result.fix_hint is not None
+    assert "registered" in result.fix_hint.lower()
 
 
 def test_doctor_embedding_backend_warn_when_api_key_missing(monkeypatch):
@@ -1424,7 +1423,15 @@ def test_doctor_embedding_backend_fail_on_embedding_error(monkeypatch):
 
     assert result.status == FAIL
     assert result.name == "embedding-backend"
-    assert "EmbeddingError" in result.message or "bad dimensions" in result.message
+    # Branch-distinctive assertion (NOT just the type name, which the broad
+    # `except Exception` branch also emits — that would be a layered-except
+    # false-green per feedback_layered_except_typed_branch_false_green). Only the
+    # EmbeddingError branch names the model/dimensions env vars in fix_hint;
+    # stripping it falls through to the broad branch, which sets no fix_hint, so
+    # this assertion goes red.
+    assert result.fix_hint is not None
+    assert "ATOMIC_AGENTS_EMBEDDING_MODEL" in result.fix_hint
+    assert "ATOMIC_AGENTS_EMBEDDING_DIMENSIONS" in result.fix_hint
 
 
 def test_doctor_embedding_backend_fail_on_import_error(monkeypatch):
@@ -1441,21 +1448,56 @@ def test_doctor_embedding_backend_fail_on_import_error(monkeypatch):
 
     assert result.status == FAIL
     assert result.name == "embedding-backend"
+    # Branch-distinctive: only the ImportError branch's fix_hint names the
+    # pip-install extra; the broad except sets no fix_hint, so stripping the
+    # typed branch turns this red (layered-except false-green guard).
+    assert result.fix_hint is not None
+    assert "pip install" in result.fix_hint
+
+
+def test_doctor_embedding_backend_fail_on_generic_exception(monkeypatch):
+    """Broad `except Exception` branch: FAIL with branch-distinctive error_type detail.
+
+    The typed branches (BackendNotRegistered/EmbeddingError/ImportError) all set a
+    fix_hint; the broad fallback sets none and instead records detail['error_type'].
+    Asserting error_type keys this test to the broad branch specifically (a generic
+    RuntimeError matches no typed branch).
+    """
+    from atomic_agents.doctor import check_embedding_backend, FAIL
+
+    monkeypatch.setenv("ATOMIC_AGENTS_EMBEDDING_BACKEND", "openai")
+
+    with patch(
+        "atomic_agents.embedding.registry.get_default_embedding_backend",
+        side_effect=RuntimeError("boom"),
+    ):
+        result = check_embedding_backend()
+
+    assert result.status == FAIL
+    assert result.name == "embedding-backend"
+    assert "RuntimeError" in result.message
+    assert result.detail is not None
+    assert result.detail.get("error_type") == "RuntimeError"
 
 
 def test_doctor_run_includes_embedding_backend_check():
-    """run_doctor() result list includes the 'embedding-backend' check.
+    """No-agent run_doctor() lists 'embedding-backend' via the hardcoded SKIP set.
 
-    No --agent → returns SKIP. Negative control: the name is not omitted.
+    NOTE: this exercises the no-agent SKIP path, where the name comes from a
+    hardcoded tuple (doctor.py), NOT from check_embedding_backend() being wired.
+    The real wiring is guarded by test_doctor_run_agent_includes_embedding_backend_check
+    (the agent path, which goes red if `results.append(check_embedding_backend())`
+    is removed). Asserting the placeholder SKIP message here keeps this test honest
+    about which path it covers.
     """
-    from atomic_agents.doctor import run_doctor
+    from atomic_agents.doctor import run_doctor, SKIP
 
     results = run_doctor()
-    names = [r.name for r in results]
-    assert "embedding-backend" in names, (
-        "embedding-backend check missing from run_doctor() output; "
-        "check that check_embedding_backend() is appended in run_doctor()"
-    )
+    by_name = {r.name: r for r in results}
+    assert "embedding-backend" in by_name
+    emb = by_name["embedding-backend"]
+    assert emb.status == SKIP
+    assert "no --agent supplied" in emb.message
 
 
 def test_doctor_run_agent_includes_embedding_backend_check(tmp_path):
