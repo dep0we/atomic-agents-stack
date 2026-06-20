@@ -982,3 +982,40 @@ When agent.call() is invoked with an idempotency_key, the framework may short-ci
 4. LogQuery.idempotency_key — conforming backends MUST support it as an AND-predicate returning only matching records; SQLite and Postgres backends MUST add a PARTIAL index, CREATE INDEX IF NOT EXISTS idx_idempotency_key ON run_records(idempotency_key) WHERE idempotency_key IS NOT NULL. The column is NULL for nearly every run (only keyed runs set it), so a partial index keeps the index small and the append hot-path cheap; the AND-predicate is an equality (`= ?`) lookup that matches the partial predicate, so it still resolves as an index seek.
 
 Added OUTSIDE the 8-MUST count, following the versioned-addendum precedent of spec/09 §Cost-read error posture (#495) and spec/22 §Read-failure contract (#497).
+
+---
+
+### Versioned normative addendum — 'embed' primitive bucket and embed audit triggers (spec/44 PR1, issue #544)
+
+The canonical primitive taxonomy (§"Canonical primitive taxonomy") is extended with one new bucket:
+
+* `embed` — embedding reservation/release audit records, emitted by the agent.call() embed cost gate (spec/44 PR1). Billing is ISOLATED from the chat `PRIMITIVE_HELPER` bucket because embedding uses `EMBEDDING_PRICING` (distinct from chat `PRICING`). Folding into `helper` or any existing bucket is irreversibly lossy once records are on disk — a `GROUP BY primitive` cost attribution query for embedding spend would be permanently ambiguous (Principle 5).
+
+Four triggers map to `PRIMITIVE_EMBED = 'embed'` in `_PRIMITIVE_BY_TRIGGER`:
+
+| Trigger | Emitted when |
+|---------|-------------|
+| `embed_batch_reservation` | Before the write_note() batch loop — worst-case cost reserved |
+| `embed_batch_release` | In finally after the loop — actual cost recorded |
+| `embed_reservation` | Before a single embed() call (query-embed gate, shipped in a future PR) |
+| `embed_release` | In finally after a single embed() call |
+
+**Canonical shape for embed records (all four triggers):**
+
+```
+output_tokens: 0         (embedding is input-only; no output tokens)
+cost_source: "actor"     (embedding spend is the agent's own spend)
+cost_estimated: bool     (True when model_id not in EMBEDDING_PRICING)
+batch_size: int          (for batch triggers; 1 for per-call triggers)
+reserved_usd: float      (reservation records)
+actual_usd: float        (release records; 0.0 when embed() returns None)
+written_count: int       (embed_batch_release: notes successfully written)
+```
+
+`cost_estimated=True` NEVER gates — it only affects the reserved amount. The fail-closed gate is `if CostReadResult.degraded AND effective_cap is not None`, not a function of cost_estimated.
+
+On None-return from embed(): `actual_usd=0.0` in the release record. The provider billed nothing; the reservation was a worst-case buffer.
+
+The `embed_reservation` and `embed_release` triggers are defined here for completeness but not yet emitted by a shipped code path. They will be wired when the query-embed gate ships.
+
+Added OUTSIDE the 8-MUST count, following the versioned-addendum precedent of spec/45 PR2 (#520) and spec/22 §Read-failure contract (#497).

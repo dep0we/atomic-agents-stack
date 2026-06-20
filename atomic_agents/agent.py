@@ -122,6 +122,7 @@ from .logs.types import (
     PRIMITIVE_COST_WARNING,
     PRIMITIVE_DELEGATE,
     PRIMITIVE_DREAM,
+    PRIMITIVE_EMBED,
     PRIMITIVE_ESCALATION,
     PRIMITIVE_EVAL,
     PRIMITIVE_HELPER,
@@ -215,6 +216,16 @@ _PRIMITIVE_BY_TRIGGER: dict[str, str] = {
     "escalation_operator_revise_executed": PRIMITIVE_ESCALATION,
     "escalation_operator_revise_invalid_amendment": PRIMITIVE_ESCALATION,
     "escalation_resolved": PRIMITIVE_ESCALATION,
+    # spec/44 PR1 (#544) — embedding reservation/release audit triggers.
+    # ALL FOUR triggers map to PRIMITIVE_EMBED (not PRIMITIVE_HELPER or any
+    # existing bucket) because embedding bills from EMBEDDING_PRICING, isolated
+    # from chat PRICING. Folding into a shared bucket is IRREVERSIBLY lossy once
+    # records are on disk (Principle #5 — GROUP BY primitive cost attribution).
+    # output_tokens=0 always (embedding is input-only); cost_source='actor'.
+    "embed_reservation": PRIMITIVE_EMBED,
+    "embed_release": PRIMITIVE_EMBED,
+    "embed_batch_reservation": PRIMITIVE_EMBED,
+    "embed_batch_release": PRIMITIVE_EMBED,
 }
 
 # spec/45 PR2 — body-hash auto-derivation gate. dedup_body_hash_enabled
@@ -5284,29 +5295,138 @@ class AtomicAgent:
             written_captures: list[Capture] = []
             seen_capture_keys: set[tuple] = set()
             if write_captures:
+                import math as _math
+
                 policy = WritePolicy(
                     write_paths=self.config.write_paths,
                     read_only_paths=self.config.read_only_paths,
                 )
-                for c in all_captures:
-                    key = (c.type, c.name, hash(c.body))
-                    if key in seen_capture_keys:
-                        continue
-                    seen_capture_keys.add(key)
+
+                # spec/44 PR1 (#544) — embed batch cost gate.
+                # PgvectorMemoryBackend.write_note() calls embed() internally
+                # (an ungated billable call before this gate shipped). Gate the
+                # ENTIRE write_note() batch here so no embed() call escapes the
+                # cost reservation. Only wire when the backend will actually embed.
+                _embed_gate_active = getattr(
+                    self.memory, "supports_semantic_search", False
+                )
+                _embed_model_id = "unknown"
+                _embed_reserved_usd = 0.0
+                _embed_cost_estimated = False
+                _embed_actual_usd = 0.0
+                _embed_batch_size = 0
+
+                if _embed_gate_active and all_captures:
+                    # Resolve embedding model_id from capabilities (opt-in).
                     try:
-                        self.memory.write_note(c, policy)
-                        written_captures.append(c)
-                    except Exception as e:
-                        self._log(
-                            {
-                                "trigger": "capture_write_error",
-                                "parent_run_id": self.run_id,
-                                "model": "n/a",
-                                "input_tokens": 0,
-                                "output_tokens": 0,
-                                "status": "error",
-                                "summary": f"capture write failed for {c.name}: {e}",
-                            }
+                        _mem_caps = self.memory.capabilities()
+                        _embed_model_id = _mem_caps.embedding_provider or "unknown"
+                    except Exception:
+                        _embed_model_id = "unknown"
+
+                    # Worst-case token estimate: math.ceil(len(body) / 3) per
+                    # item (chars//3 ceiling — safe for all UTF-8, no tiktoken
+                    # needed, conservative for non-ASCII). Batch-fanout formula:
+                    # per_item_sum + batch_sum (~2x) because the protocol doesn't
+                    # advertise whether write_note() calls embed()/embed_batch().
+                    _per_item_sum = 0.0
+                    _unique_bodies: list[str] = []
+                    _seen_keys_for_estimate: set[tuple] = set()
+                    for _c in all_captures:
+                        _k = (_c.type, _c.name, hash(_c.body))
+                        if _k in _seen_keys_for_estimate:
+                            continue
+                        _seen_keys_for_estimate.add(_k)
+                        _tokens_est = _math.ceil(len(_c.body or "") / 3)
+                        _per_item_cost, _per_item_est = _costs.calc_embedding_cost(
+                            _embed_model_id, _tokens_est
+                        )
+                        _per_item_sum += _per_item_cost
+                        if _per_item_est:
+                            _embed_cost_estimated = True
+                        _unique_bodies.append(_c.body or "")
+
+                    _embed_batch_size = len(_unique_bodies)
+                    # 2x: per_item_sum (potential per-call path) + batch_sum
+                    # (same input tokens in batch path) = worst-case reservation.
+                    _embed_reserved_usd = 2.0 * _per_item_sum
+
+                    # Fail-closed gate: deferred until AFTER effective-cap
+                    # resolution so uncapped agents are never spuriously blocked
+                    # (lesson: fail-closed only where there's something to protect).
+                    _log_dir_embed = self.agent_root / "log"
+                    _today_r = _costs.sum_cost_for_period(
+                        _log_dir_embed,
+                        "today",
+                        source="actor",
+                        backend=self.log_backend,
+                        agent_name=self.name,
+                    )
+                    _month_r = _costs.sum_cost_for_period(
+                        _log_dir_embed,
+                        "this_month",
+                        source="actor",
+                        backend=self.log_backend,
+                        agent_name=self.name,
+                    )
+                    _embed_is_degraded = _today_r.degraded or _month_r.degraded
+                    if _embed_is_degraded and self._has_effective_embed_cap(
+                        parent_remaining_headroom_usd
+                    ):
+                        raise CostGuardrailBlocked(
+                            "embed batch blocked: cost log degraded and agent "
+                            "has an active cost cap — cannot safely reserve "
+                            f"${_embed_reserved_usd:.6f} for {_embed_batch_size} "
+                            "captures without a reliable spend baseline"
+                        )
+
+                    # Reserve before entering the write_note() loop.
+                    self._emit_embed_batch_reservation(
+                        model_id=_embed_model_id,
+                        reserved_usd=_embed_reserved_usd,
+                        batch_size=_embed_batch_size,
+                        cost_estimated=_embed_cost_estimated,
+                    )
+
+                try:
+                    for c in all_captures:
+                        key = (c.type, c.name, hash(c.body))
+                        if key in seen_capture_keys:
+                            continue
+                        seen_capture_keys.add(key)
+                        try:
+                            self.memory.write_note(c, policy)
+                            written_captures.append(c)
+                            # True-up actual embed cost per written note.
+                            if _embed_gate_active:
+                                _tok = _math.ceil(len(c.body or "") / 3)
+                                _note_cost, _ = _costs.calc_embedding_cost(
+                                    _embed_model_id, _tok
+                                )
+                                _embed_actual_usd += _note_cost
+                        except Exception as e:
+                            self._log(
+                                {
+                                    "trigger": "capture_write_error",
+                                    "parent_run_id": self.run_id,
+                                    "model": "n/a",
+                                    "input_tokens": 0,
+                                    "output_tokens": 0,
+                                    "status": "error",
+                                    "summary": f"capture write failed for {c.name}: {e}",
+                                }
+                            )
+                finally:
+                    # Emit release even on exception (actual_usd=0 if nothing
+                    # succeeded or gate was never armed). Mirrors helper_batch_release.
+                    if _embed_gate_active and _embed_batch_size > 0:
+                        self._emit_embed_batch_release(
+                            model_id=_embed_model_id,
+                            reserved_usd=_embed_reserved_usd,
+                            actual_usd=_embed_actual_usd,
+                            batch_size=_embed_batch_size,
+                            written_count=len(written_captures),
+                            cost_estimated=_embed_cost_estimated,
                         )
 
             # Build response
@@ -6432,6 +6552,129 @@ class AtomicAgent:
                 f"Parallel helper batch reservation ${reserved_usd:.6f} exceeds "
                 f"remaining headroom ${headroom:.6f}"
             )
+
+    def _has_effective_embed_cap(
+        self, parent_remaining_headroom_usd: float | None = None
+    ) -> bool:
+        """Return True when the agent has any binding cost cap for fail-closed embed gate.
+
+        Resolves the FULL effective cap hierarchy (model.md caps OR Policy-composed
+        caps OR delegated parent tree-cap), matching the effective-cap logic in
+        _check_cost_guardrails (#512 lesson: gate on the EFFECTIVE control, not one
+        source). Distinct from _check_batch_reservation which uses model.md caps only.
+
+        Used by the embed cost gate fail-closed predicate:
+            if degraded AND _has_effective_embed_cap(): raise CostGuardrailBlocked
+
+        Returns False when the agent has no binding cap at any layer — in that case a
+        degraded cost read cannot block an embed call (no budget to protect).
+        """
+        if not self.config.cost_guardrails_enabled:
+            return False
+        # model.md caps: 0 means disabled (unlimited).
+        _model_daily: float | None = (
+            self.config.daily_cap_usd if self.config.daily_cap_usd > 0 else None
+        )
+        _model_monthly: float | None = (
+            self.config.monthly_cap_usd if self.config.monthly_cap_usd > 0 else None
+        )
+        # Policy-composed caps: None on either side = no opinion at that layer.
+        from .policy.types import CostCaps as _CostCaps
+
+        _policy_caps: _CostCaps = (
+            self._policy_snapshot_this_call.effective_caps
+            if self._policy_snapshot_this_call is not None
+            else _CostCaps()
+        )
+        _effective_daily = self._min_or_other(_model_daily, _policy_caps.daily_usd)
+        _effective_monthly = self._min_or_other(
+            _model_monthly, _policy_caps.monthly_usd
+        )
+        # Any binding cap — own (daily/monthly) or parent tree-cap — means the
+        # fail-closed predicate applies.
+        return (
+            _effective_daily is not None
+            or _effective_monthly is not None
+            or parent_remaining_headroom_usd is not None
+        )
+
+    def _emit_embed_batch_reservation(
+        self,
+        model_id: str,
+        reserved_usd: float,
+        batch_size: int,
+        cost_estimated: bool,
+    ) -> None:
+        """Log an embed_batch_reservation JSONL record.
+
+        Called BEFORE the write_note() loop so the audit trail shows what was
+        reserved before any spend. parent_run_id links this sub-record to its
+        parent agent.call() run (mirrors helper_batch_reservation shape).
+
+        output_tokens=0 always (embedding is input-only).
+        cost_source='actor' (embedding spend is the agent's own spend).
+        cost_estimated=True when model_id was not in EMBEDDING_PRICING (stored in
+        extra so the release record matches and cost readers can signal uncertainty).
+        """
+        self._log(
+            {
+                "trigger": "embed_batch_reservation",
+                "parent_run_id": self.run_id,
+                "model": model_id,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "reserved_usd": reserved_usd,
+                "batch_size": batch_size,
+                "cost_estimated": cost_estimated,
+                "cost_source": "actor",
+                "status": "ok",
+                "summary": (
+                    f"embed batch: reserved worst-case ${reserved_usd:.6f} "
+                    f"for {batch_size}-capture batch (model={model_id})"
+                ),
+            }
+        )
+
+    def _emit_embed_batch_release(
+        self,
+        model_id: str,
+        reserved_usd: float,
+        actual_usd: float,
+        batch_size: int,
+        written_count: int,
+        cost_estimated: bool,
+    ) -> None:
+        """Log an embed_batch_release JSONL record.
+
+        Called in a finally block AFTER the write_note() loop so the release
+        fires regardless of success or exception. actual_usd reflects the
+        true spend (0.0 when no embeds succeeded), NOT the reserved amount.
+
+        On None-return from embed(): actual_usd=0.0 (provider billed nothing).
+        On partial batch: actual_usd = cost of successfully-embedded items only.
+        cost_estimated=True when actual cost was estimated rather than confirmed
+        from provider-reported usage (EmbeddingBackend returns no token usage).
+        """
+        self._log(
+            {
+                "trigger": "embed_batch_release",
+                "parent_run_id": self.run_id,
+                "model": model_id,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "reserved_usd": reserved_usd,
+                "actual_usd": actual_usd,
+                "batch_size": batch_size,
+                "written_count": written_count,
+                "cost_estimated": cost_estimated,
+                "cost_source": "actor",
+                "status": "ok",
+                "summary": (
+                    f"embed batch: actual ${actual_usd:.6f} vs "
+                    f"reserved ${reserved_usd:.6f} ({written_count}/{batch_size} written)"
+                ),
+            }
+        )
 
     def _build_helper_system_prompt(self, sources: list[str]) -> str:
         """Build the helper's system prompt. Empty when no sources are passed."""

@@ -856,3 +856,19 @@ impl-level identifier (that name denotes note/version/staging handles).
 purpose (#397). (`FilesystemBackend` predates #397 and still exposes
 `backend_id="filesystem"`; reconciling the reference impl is tracked in #528 and
 is out of scope for the Postgres adapter PR.)
+
+---
+
+### Versioned normative addendum — MemoryCapabilities embedding fields on PgvectorMemoryBackend (spec/20 PR-3 addendum, issue #200 PR3 / #544)
+
+`PgvectorMemoryBackend` is the only MemoryBackend reference implementation that may embed vectors at write-time and at search-time. It exposes two additional fields in its `capabilities()` return value:
+
+**`embedding_provider: str | None`** — the `model_id` of the `EmbeddingBackend` that is (or would be) used for embed calls. Non-None when an `EmbeddingBackend` was injected or resolved from the registry at construction. `None` when no embedding backend is configured (`supports_semantic_search=False`; FTS-only mode).
+
+**`embedding_backend_resolved: EmbeddingBackend | None`** — the live `EmbeddingBackend` instance. Non-None when `supports_semantic_search=True`. **SNAPSHOT SECURITY CLAMP:** this field MUST serialize as `None` (or be absent) in any JSONL log record, profile snapshot, or network response. The live instance may carry API credentials (e.g. `OpenAIEmbeddingBackend._api_key`); leaking it into the audit trail violates Principle 5 (audit trail is structural, not a credential store). Callers that need the live backend object MUST read it from the backend's runtime attributes, not from a snapshot.
+
+These fields are NOT part of the base `MemoryCapabilities` dataclass for all backends. `FilesystemBackend` and `PostgresMemoryBackend` return `MemoryCapabilities(supports_semantic_search=False, embedding_provider=None, embedding_backend_resolved=None)` (the defaults) — callers MUST treat absent values as `None`.
+
+Uniform convergence of `capabilities()` across all MemoryBackend implementations (so callers can rely on a consistent interface) is deferred to issue #431.
+
+Added OUTSIDE the 8-MUST count, following the versioned-addendum precedent of spec/22 §Read-failure contract (#497) and spec/45 PR2 (#520).

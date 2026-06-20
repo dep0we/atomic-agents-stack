@@ -870,3 +870,17 @@ filters to one. Export enumerates via `list_pages()` — NOT `query(text)` (MUST
 state extraction, not semantic retrieval).
 
 For the full normative export contract, see `docs/spec/40-canonical-export.md`.
+
+---
+
+## Versioned normative addendum — CorpusCapabilities.embedding_backend_resolved (spec/34 PR-2 addendum, issue #200 PR3 / #544)
+
+`CorpusCapabilities` already documents `embedding_provider: str | None` (line 75). `PgvectorCorpusBackend` exposes one additional field that was shipped in #200 PR3 but not yet documented:
+
+**`embedding_backend_resolved: EmbeddingBackend | None`** — the live `EmbeddingBackend` instance held by the backend. Non-None when `supports_semantic_search=True`. Mirrors the same field on `MemoryCapabilities` (spec/20 PR-3 addendum).
+
+**SNAPSHOT SECURITY CLAMP:** `embedding_backend_resolved` MUST serialize as `None` (or be absent) in any JSONL log record, profile snapshot, or network response. The live instance may carry API credentials (e.g. `OpenAIEmbeddingBackend._api_key`); leaking it into the audit trail violates Principle 5.
+
+**Forward-compat note:** `CorpusCapabilities.embedding_backend_resolved` is populated only by `PgvectorCorpusBackend`. `FilesystemCorpusBackend` and `SQLiteCorpusBackend` return it as `None` (the dataclass default). Callers that inspect this field MUST treat a missing / `None` value as "no live embedding backend." Uniform convergence of the `capabilities()` surface across all backends is deferred to issue #431.
+
+Added OUTSIDE the 9-MUST count, following the versioned-addendum precedent of spec/20 PR-3 addendum (#544).

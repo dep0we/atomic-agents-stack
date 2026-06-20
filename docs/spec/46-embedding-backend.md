@@ -1,29 +1,39 @@
 # spec/46 — EmbeddingBackend Protocol
 
-**Status:** DRAFT (locks at #544 — see the PR-slicing note below)
+**Status:** DRAFT (locks at #544 PR2 — see the PR-slicing note below)
 **Issue:** [#200](https://github.com/dep0we/atomic-agents-stack/issues/200)
 **Implementer Contract MUSTs:** 9 <!-- conformance tests: TBD at lock -->
-**Arc:** PR 2 ships Protocol + reference impl + spec + cost helpers (DRAFT).
-PR 3 ships the pgvector backends + registry + `input_type` kwarg + opt-in guard.
-The live cost-gate wiring + spec reconciliation + DRAFT→LOCKED ceremony land at
-[#544](https://github.com/dep0we/atomic-agents-stack/issues/544).
+**Arc:** PR 2 shipped Protocol + reference impl + spec + cost helpers (DRAFT).
+PR 3 shipped the pgvector backends + registry + `input_type` kwarg + opt-in guard.
+[#544](https://github.com/dep0we/atomic-agents-stack/issues/544) PR1 shipped the
+live batch embed cost-gate at the orchestrator layer, `PRIMITIVE_EMBED`, the doctor
+check, and the spec/20 + spec/34 addenda. The DRAFT→LOCKED ceremony lands at
+[#544](https://github.com/dep0we/atomic-agents-stack/issues/544) PR2 when the
+query-embed gate ships and both gate sites exist.
 
-> **PR-slicing update (#200 PR3, 2026-06-18).** PR3 shipped: `PgvectorMemoryBackend`
-> + `PgvectorCorpusBackend` (the latter subclasses `FilesystemCorpusBackend` —
-> FS pages + Postgres vectors; full-Postgres corpus tracked in
-> [#540](https://github.com/dep0we/atomic-agents-stack/issues/540)), the
-> `EmbeddingBackend` registry, the `input_type` kwarg on the Protocol surface,
+> **PR-slicing update (#200 PR3, shipped 2026-06-18).** PR3 shipped:
+> `PgvectorMemoryBackend` + `PgvectorCorpusBackend` (the latter subclasses
+> `FilesystemCorpusBackend` — FS pages + Postgres vectors; full-Postgres corpus
+> tracked in [#540](https://github.com/dep0we/atomic-agents-stack/issues/540)),
+> the `EmbeddingBackend` registry, the `input_type` kwarg on the Protocol surface,
 > and an **opt-in-by-default cost-safety guard** (semantic search is OFF unless
 > the operator explicitly pins `ATOMIC_AGENTS_EMBEDDING_BACKEND` or injects a
 > backend — preventing surprise billable spend from a merely-present API key).
-> DEFERRED to [#544](https://github.com/dep0we/atomic-agents-stack/issues/544):
-> the live cost-gate reservation/release + JSONL audit at the orchestrator layer
-> (its placement needs a dedicated design pass), the doctor check, the normative
-> spec/20 + spec/34 reconciliation, and this spec's DRAFT→LOCKED ceremony.
-> spec/46 STAYS DRAFT until both gate sites exist (the LOCK precondition below).
-> Because the embed paths are not yet gated, the shipped opt-in default leaves
-> semantic search OFF so no ungated billable path runs without explicit operator
-> opt-in (Principle #4).
+>
+> **PR-slicing update (#544 PR1, shipped 2026-06-19).** PR1 shipped: the
+> batch embed cost gate at the `agent.call()` capture-commit site (post-loop,
+> `write_note()` batch reservation + release), `PRIMITIVE_EMBED = 'embed'` with
+> 4 trigger mappings (`embed_batch_reservation`, `embed_batch_release`,
+> `embed_reservation`, `embed_release`) in `_PRIMITIVE_BY_TRIGGER`,
+> `check_embedding_backend()` doctor check (SKIP/PASS/WARN/FAIL), and versioned
+> normative addenda to spec/20, spec/22, and spec/34. The query-embed gate
+> (per-call reservation before `memory.search()` / `corpus.query()` calls) and
+> the DRAFT→LOCKED ceremony are deferred to PR2.
+>
+> spec/46 STAYS DRAFT until the query-embed gate ships (the LOCK precondition
+> below). The opt-in default (`ATOMIC_AGENTS_EMBEDDING_BACKEND` unset → FTS only)
+> ensures no ungated billable path runs without explicit operator opt-in
+> (Principle #4).
 
 ---
 
@@ -200,15 +210,16 @@ trigger="embed_batch_reservation"    output_tokens=0    cost_source="actor"  # e
 trigger="embed_batch_release"        output_tokens=0    cost_source="actor"
 ```
 
-**PR 2 ships the pricing helper (`EMBEDDING_PRICING` + `calc_embedding_cost()`)
-and this normative mandate only.** The live wiring to ingestion and
-query-embedding sites is PR 3. The DRAFT status of spec/46 reflects this gap —
-the mandate exists but no production code enforces it yet. The LOCK ceremony on
-this spec (PR 3) MUST verify that BOTH wiring sites exist — the `embed_batch()`
-ingestion reservation AND the single-call `embed()` query-embedding reservation
-— before removing the DRAFT marker, not just the batch one.
+**PR 2 shipped the pricing helper (`EMBEDDING_PRICING` + `calc_embedding_cost()`)
+and this normative mandate only.** **#544 PR1 shipped the `embed_batch()`
+ingestion gate** (post-loop capture-commit site in `agent.call()`) + `PRIMITIVE_EMBED`
++ `check_embedding_backend()` doctor check. The DRAFT status of spec/46 reflects
+the remaining gap — the single-call `embed()` query-embedding reservation is not yet
+wired. The LOCK ceremony on this spec (#544 PR2) MUST verify that BOTH wiring sites
+exist — the `embed_batch()` ingestion reservation AND the single-call `embed()`
+query-embedding reservation — before removing the DRAFT marker, not just the batch one.
 
-### Fail-closed posture (non-normative guidance for PR 3)
+### Fail-closed posture (non-normative guidance — now partially shipped)
 
 Per MEMORY.md lesson "Fail-closed only where there's something to protect":
 
@@ -290,15 +301,14 @@ return the same sentinel without the correct log.
 The existing `embedding_provider: str | None` field on `CorpusCapabilities`
 (spec/34, `atomic_agents/corpus/types.py`) is a **display label** identifying
 the provider family — not a typed reference to an `EmbeddingBackend` instance.
-Examples: `"openai"`, `"local"`, `"ollama"`. (There is no analogous field on a
-`MemoryCapabilities` dataclass today; spec/20 does not define one. If PR 3
-needs a memory-side provider label it will add it then, as new scope.)
+Examples: `"openai"`, `"local"`, `"ollama"`. (`MemoryCapabilities` gained the analogous `embedding_provider` field as part of
+#200 PR3 / #544 PR1 — see spec/20 PR-3 addendum.)
 
-This field is left UNTOUCHED by PR 2 — no normative amendment to the LOCKED
-spec/34. Normative reconciliation (string-stays-as-label + sibling
-`EmbeddingBackend` reference field) is deferred to #544 (the LOCK PR), per the
-#201 precedent where `mcp_servers_resolved` was added as a sibling field in PR 2
-and the display label remained for backwards compatibility.
+This field was left UNTOUCHED by PR 2. Normative reconciliation (string-stays-as-label
++ sibling `EmbeddingBackend` reference field) shipped at #544 PR1 — see the versioned
+normative addenda in spec/34 and spec/20, following the #201 precedent where
+`mcp_servers_resolved` was added as a sibling field and the display label remained
+for backwards compatibility.
 
 ---
 
@@ -462,26 +472,28 @@ instead of MagicMock for conformance assertions.
 **No production registry in PR 2.** Constructor-injected by the consuming
 backend (e.g., `PgvectorCorpusBackend` receives an `EmbeddingBackend` at
 `__init__`). Registry functions (`register_embedding_backend`,
-`get_embedding_backend`, etc.) ship in PR 3.
+`get_embedding_backend`, etc.) shipped in PR 3 (#200).
 
 ---
 
 ## PR scope boundary
 
-| Scope | PR 2 | PR 3 (#200) | #544 |
-|-------|------|------------|------|
-| Protocol + dataclasses | ✅ Ships | — | — |
-| `OpenAIEmbeddingBackend` ref impl | ✅ Ships | — | — |
-| `EMBEDDING_PRICING` + `calc_embedding_cost()` | ✅ Ships | — | — |
-| Registry (`register_/get_/list_embedding_backend`) | — | ✅ Ships | — |
-| pgvector wiring (`PgvectorCorpusBackend`, `PgvectorMemoryBackend`) | — | ✅ Ships | — |
-| `input_type` kwarg on Protocol surface | — | ✅ Ships | — |
-| Opt-in-by-default cost-safety guard (semantic OFF unless pinned) | — | ✅ Ships | — |
-| Live cost reservation at BOTH ingestion (`embed_batch()`) and query-embedding (`embed()`) sites | — | — | ✅ Ships |
-| Doctor check (no billable probe) | — | — | ✅ Ships |
-| Normative reconciliation of `embedding_provider` on spec/20 + spec/34 | — | — | ✅ Ships |
-| Spec/46 DRAFT→LOCKED | — | — | ✅ Locks |
-| Local embedding backend (sentence-transformers/Ollama) | — | — | Separate arc ([#534](https://github.com/dep0we/atomic-agents-stack/issues/534)) |
+| Scope | PR 2 (shipped) | PR 3 / #200 (shipped) | #544 PR1 (shipped) | #544 PR2 |
+|-------|------|------------|------|------|
+| Protocol + dataclasses | ✅ Shipped | — | — | — |
+| `OpenAIEmbeddingBackend` ref impl | ✅ Shipped | — | — | — |
+| `EMBEDDING_PRICING` + `calc_embedding_cost()` | ✅ Shipped | — | — | — |
+| Registry (`register_/get_/list_embedding_backend`) | — | ✅ Shipped | — | — |
+| pgvector wiring (`PgvectorCorpusBackend`, `PgvectorMemoryBackend`) | — | ✅ Shipped | — | — |
+| `input_type` kwarg on Protocol surface | — | ✅ Shipped | — | — |
+| Opt-in-by-default cost-safety guard (semantic OFF unless pinned) | — | ✅ Shipped | — | — |
+| `PRIMITIVE_EMBED` + 4 trigger mappings in `_PRIMITIVE_BY_TRIGGER` | — | — | ✅ Shipped | — |
+| Batch embed cost gate (post-loop capture-commit, `embed_batch_reservation` + `embed_batch_release`) | — | — | ✅ Shipped | — |
+| Doctor check (`check_embedding_backend()`, no billable probe) | — | — | ✅ Shipped | — |
+| Normative addenda: spec/20 MemoryCapabilities, spec/22 primitive taxonomy, spec/34 CorpusCapabilities | — | — | ✅ Shipped | — |
+| Query-embed gate (per-call `embed_reservation` + `embed_release` before `memory.search()` / `corpus.query()`) | — | — | — | ✅ Ships |
+| Spec/46 DRAFT→LOCKED | — | — | — | ✅ Locks |
+| Local embedding backend (sentence-transformers/Ollama) | — | — | — | Separate arc ([#534](https://github.com/dep0we/atomic-agents-stack/issues/534)) |
 
 ---
 
@@ -496,8 +508,7 @@ standalone use case: constructing `PgvectorCorpusBackend` (and future
 consumers share — a Protocol-typed abstraction, not a capability flag.
 `EmbeddingBackend` ships as `atomic_agents/embedding/` (spec/46, DRAFT).
 
-**spec/34 is NOT edited by PR 2.** This supersession is recorded here only;
-the LOCKED spec/34 (and spec/20) take their normative addenda at #544 (the LOCK
-PR), when the live cost-gate wiring ships and a re-lock ceremony covers them.
-Until then,
-spec/34's table entry stands as historical provenance.
+**spec/34 was NOT edited by PR 2.** This supersession was recorded here only.
+The LOCKED spec/34 and spec/20 took their normative addenda at #544 PR1 (shipped
+2026-06-19) — see the versioned addenda at the end of each doc. spec/34's table
+entry stands as historical provenance of the original rationale.

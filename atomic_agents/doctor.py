@@ -206,6 +206,7 @@ def run_doctor(
             "journal-backend",
             "queue-backend",
             "idempotency-backend",
+            "embedding-backend",
             "principal-backend",
             "memory-backend-config",
             "memory-backend",
@@ -275,6 +276,13 @@ def run_doctor(
     results.append(check_journal_backend(agent_root))
     results.append(check_queue_backend(agent_root))
     results.append(check_idempotency_backend(agent_root))
+    # spec/44 PR1 (#544): embedding-backend check. Takes no agent_root (reads
+    # ATOMIC_AGENTS_EMBEDDING_BACKEND + the registry), like check_secret_backend().
+    # A defined-but-unregistered check is the same false-PASS-by-omission class as
+    # the list-vs-load_all gap (feedback_doctor_dual_probe_pattern) — so it MUST be
+    # appended here, not just defined. Returns SKIP when the env var is unset (opt-in
+    # default: semantic search off unless explicitly enabled).
+    results.append(check_embedding_backend())
     # spec/48: principal-backend coherence + fail-closed negative probe. Takes no
     # agent_root (reads ATOMIC_AGENTS_PRINCIPAL_BACKEND + the registry), like
     # check_secret_backend(). A defined-but-unregistered check is the same
@@ -5068,6 +5076,167 @@ def check_principal_backend() -> CheckResult:
             "is_local_only": caps.is_local_only,
             "supports_token_verification": caps.supports_token_verification,
             "produces_verified_principals": caps.produces_verified_principals,
+        },
+    )
+
+
+# Sentinel for attribute-absence detection (distinct from None so we can
+# distinguish "attribute present but None" from "attribute absent"). Used by
+# check_embedding_backend() to detect _api_key=None vs _api_key absent.
+_SENTINEL = object()
+
+
+def check_embedding_backend() -> CheckResult:
+    """EmbeddingBackend resolves and has a usable API key.
+
+    Probes the operator-pinned EmbeddingBackend via
+    ``get_default_embedding_backend()`` and verifies that:
+    1. The backend constructs without error (or returns SKIP when no backend
+       is pinned -- opt-in default, semantic search stays off).
+    2. The API key is resolved (uses the same SecretBackend path as embed()).
+       A backend that constructed successfully but has no key will degrade
+       every embed() call to None; that is valid-but-degraded, so it WARN
+       rather than FAIL -- the operator can see semantic search is impaired.
+
+    Dual-probe pattern (MEMORY.md): construction and key-resolution are
+    two distinct failure modes.  A backend that imports correctly may still
+    fail at the use-site if ``_get_key()`` returned None.  This check probes
+    the backend's ``_api_key`` attribute after construction to catch that gap
+    without making a billable embed() call.
+
+    ATOMIC_AGENTS_EMBEDDING_BACKEND unset → SKIP (opt-in default).
+    """
+    from .embedding.registry import (
+        get_default_embedding_backend,
+        list_embedding_backends,
+    )
+    from .exceptions import BackendNotRegistered, EmbeddingError
+
+    raw_backend_id = (
+        os.environ.get("ATOMIC_AGENTS_EMBEDDING_BACKEND", "").strip().lower()
+    )
+
+    if not raw_backend_id:
+        return CheckResult(
+            name="embedding-backend",
+            status=SKIP,
+            message=(
+                "ATOMIC_AGENTS_EMBEDDING_BACKEND is not set — semantic search is "
+                "disabled (FTS only). Set this env var to opt in to semantic search."
+            ),
+        )
+
+    try:
+        backend = get_default_embedding_backend()
+    except BackendNotRegistered as e:
+        known = list_embedding_backends()
+        return CheckResult(
+            name="embedding-backend",
+            status=FAIL,
+            message=(
+                f"ATOMIC_AGENTS_EMBEDDING_BACKEND={raw_backend_id!r} is not a "
+                f"registered backend: {e}"
+            ),
+            fix_hint=(
+                "Set ATOMIC_AGENTS_EMBEDDING_BACKEND to a registered provider id. "
+                f"Currently registered: {known!r}. "
+                "For OpenAI: install with 'pip install atomic-agents-stack[openai]'."
+            ),
+            detail={"backend_id": raw_backend_id, "error": str(e)},
+        )
+    except EmbeddingError as e:
+        return CheckResult(
+            name="embedding-backend",
+            status=FAIL,
+            message=(
+                f"embedding backend '{raw_backend_id}' raised EmbeddingError "
+                f"during construction: {e}"
+            ),
+            fix_hint=(
+                "Check ATOMIC_AGENTS_EMBEDDING_MODEL (model id) and "
+                "ATOMIC_AGENTS_EMBEDDING_DIMENSIONS (must be a positive integer)."
+            ),
+            detail={"backend_id": raw_backend_id, "error": str(e)},
+        )
+    except ImportError as e:
+        return CheckResult(
+            name="embedding-backend",
+            status=FAIL,
+            message=(
+                f"embedding backend '{raw_backend_id}' could not be imported: {e}"
+            ),
+            fix_hint=(
+                f"Install the required extra: "
+                f"'pip install atomic-agents-stack[{raw_backend_id}]'."
+            ),
+            detail={"backend_id": raw_backend_id, "error": str(e)},
+        )
+    except Exception as e:
+        return CheckResult(
+            name="embedding-backend",
+            status=FAIL,
+            message=(
+                f"embedding backend '{raw_backend_id}' raised "
+                f"{type(e).__name__} during construction: {e}"
+            ),
+            detail={"backend_id": raw_backend_id, "error_type": type(e).__name__},
+        )
+
+    # backend should not be None here (opt-in guard fired above), but be safe.
+    if backend is None:
+        return CheckResult(
+            name="embedding-backend",
+            status=SKIP,
+            message="no embedding backend configured (opt-in default)",
+        )
+
+    # Dual-probe: check that the API key was resolved at construction.
+    # OpenAIEmbeddingBackend stores _api_key=None when _get_key() returned None
+    # (no key in any configured SecretBackend). Other backends may not have this
+    # attribute; skip the key check for them (graceful degradation).
+    api_key = getattr(backend, "_api_key", _SENTINEL)
+    if api_key is not _SENTINEL and api_key is None:
+        caps = backend.capabilities()
+        return CheckResult(
+            name="embedding-backend",
+            status=WARN,
+            message=(
+                f"embedding backend '{backend.backend_id}' (provider_id={backend.provider_id!r}, "
+                f"model={backend.model_id!r}) constructed successfully but has no API key. "
+                "embed() calls will degrade to None — semantic search is impaired."
+            ),
+            fix_hint=(
+                "Set the API key for the embedding provider. For OpenAI: set "
+                "ATOMIC_AGENTS_OPENAI_KEY or OPENAI_API_KEY in your environment, "
+                "keys.json, or configured SecretBackend."
+            ),
+            detail={
+                "backend_id": raw_backend_id,
+                "provider_id": backend.provider_id,
+                "model_id": backend.model_id,
+                "dimensions": backend.dimensions,
+                "max_batch_size": caps.max_batch_size,
+                "api_key_resolved": False,
+            },
+        )
+
+    caps = backend.capabilities()
+    return CheckResult(
+        name="embedding-backend",
+        status=PASS,
+        message=(
+            f"embedding backend '{backend.provider_id}' ready "
+            f"(model={backend.model_id!r}, dimensions={backend.dimensions}, "
+            f"max_batch_size={caps.max_batch_size})"
+        ),
+        detail={
+            "backend_id": raw_backend_id,
+            "provider_id": backend.provider_id,
+            "model_id": backend.model_id,
+            "dimensions": backend.dimensions,
+            "max_batch_size": caps.max_batch_size,
+            "supports_input_type": caps.supports_input_type,
+            "api_key_resolved": api_key is not _SENTINEL,
         },
     )
 
