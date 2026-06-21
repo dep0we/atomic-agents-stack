@@ -49,6 +49,8 @@ CHANGELOG entry.
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-06-21
+
 ### Fixed
 
 - **`deploy` port resolution no longer mutates the global `os.environ` ([#560](https://github.com/dep0we/atomic-agents-stack/issues/560)).** `deploy._ports.resolve_port` previously honored an explicit `environ` override by save/clear/update/restoring the live process environment around the `load_serve_config` call — not thread-safe (a concurrent reader during the call saw a cleared env with the override swapped in). The mapping is now threaded straight through: `load_serve_config(agent_root, environ=...)` and `_parse_serve_md(text, environ=...)` accept an optional `environ` (defaulting to `os.environ`) and read overrides from it, so `resolve_port` passes the dict cleanly and the global env is never touched. Regression test snapshots the global env at loader-invocation time (the only point old/new behavior diverge) with a verified strip-RED negative control.

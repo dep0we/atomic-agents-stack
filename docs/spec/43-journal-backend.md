@@ -10,7 +10,7 @@
 
 Prior to spec/43, journal I/O was three hand-synced duplicate `rglob` blocks scattered across bundle.py, agent.py, and dream.py. Each block re-implemented the same `sorted(journal_dir.rglob("*.md"), reverse=True)` sort, the same date-window filter, and the same include-on-unparse fallback. Any behavioral fix had to be applied three times.
 
-Filed as [#427](https://github.com/dep0we/atomic-agents-stack/issues/427) as the sixteenth backend protocol for v1.5.
+Filed as [#427](https://github.com/dep0we/atomic-agents-stack/issues/427) as the sixteenth backend protocol, shipping in v2.0.0.
 
 **Cross-links:**
 
@@ -18,7 +18,7 @@ Filed as [#427](https://github.com/dep0we/atomic-agents-stack/issues/427) as the
 - spec/24. AgentProfileBackend. journal/ ownership claim corrected (was MemoryBackend) — updated in PR 1.
 - spec/27. Doctor. `check_journal_backend()` uses the dual-probe pattern (list_entries + read_bytes).
 - spec/40. Canonical Export. `JournalExport` is a first-class `ExportableResult`; `FilesystemJournalBackend` implements `Exportable`.
-- spec/43 completes the v1.5 backend arc (alongside GoalBackend spec/41 and OutcomeBackend spec/42).
+- spec/43 completes the v2.0.0 backend arc (alongside GoalBackend spec/41 and OutcomeBackend spec/42).
 
 ---
 

@@ -11,14 +11,14 @@
 Prior to spec/44, queue-claim atomicity was locked to POSIX `Path.rename()` (T4 in `docs/TENSIONS.md`). The logic was embedded in free functions in `_cascade.py`:
 `_sidecar_path`, `_write_sidecar`, `claim_next_queued`, `release_claim`, `move_to_dead_letter`, `recover_stale_claims`, `renew_lease`.
 
-Filed as [#428](https://github.com/dep0we/atomic-agents-stack/issues/428) as the seventeenth backend protocol for v1.5.
+Filed as [#428](https://github.com/dep0we/atomic-agents-stack/issues/428) as the seventeenth backend protocol, shipping in v2.0.0.
 
 **Cross-links:**
 
 - spec/06. Multi-agent projects. Queue state vocabulary defined here (see §State vocabulary mapping).
 - spec/27. Doctor. `check_queue_backend()` uses the dual-probe pattern + single_host_only WARN.
 - spec/40. Canonical Export. `QueueExport` is a first-class `ExportableResult`; `FilesystemQueueBackend` implements `Exportable`.
-- spec/44 completes the v1.5 backend arc (alongside GoalBackend spec/41, OutcomeBackend spec/42, JournalBackend spec/43).
+- spec/44 completes the v2.0.0 backend arc (alongside GoalBackend spec/41, OutcomeBackend spec/42, JournalBackend spec/43).
 
 ---
 
