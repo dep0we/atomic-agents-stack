@@ -99,7 +99,7 @@ The factual_accuracy rubric dimension (20% of Caldwell's eval score) and HF8 (co
 
 ## Reference pricing (informational)
 
-Opus pricing (claude-opus-4-7): roughly $15/MTok input, $75/MTok output. With a 12K system prompt and 4K output per turn, each turn is ~$0.18-0.30 uncached, ~$0.10-0.15 with 80% cache hit.
+Opus pricing (claude-opus-4-7): roughly $5/MTok input, $25/MTok output. With a 12K system prompt and 4K output per turn, each turn is ~$0.16 uncached, ~$0.12 with 80% cache hit.
 
 For a typical Caldwell day (1-3 cron runs + 0-5 skill invocations), expected daily cost is $0.50-$3.00. Monthly: $15-90. Actual numbers populate from log data after ~14 days; the dashboard will then suggest realistic cap values.
 
