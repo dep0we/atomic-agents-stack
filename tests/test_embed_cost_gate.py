@@ -2200,6 +2200,113 @@ def test_merge_write_reserves_on_target_body(tmp_path):
     )
 
 
+def test_merge_write_empty_target_body_falls_back_to_fragment(tmp_path):
+    """A merge target whose stored body is EMPTY must size from the fragment.
+
+    Covers the SECOND operand of the compound guard
+    ``if _stored_note is not None and _stored_note.body:`` (agent.py). When the
+    target note exists (read_note returns a Note) but its body is empty/falsy, the
+    pre-read must NOT cache an empty target body and must NOT size the reservation
+    from zero tokens — it falls through to fragment-only sizing.
+
+    Per-invocation negative control (per the project's compound-boolean
+    discipline — each operand of an `and` gets its own strip control): if the
+    ``and _stored_note.body`` operand is removed (guard becomes
+    ``if _stored_note is not None:``), an empty-body target sets _sizing_body=""
+    → ~0-token reservation, which is drastically smaller than the fragment
+    reservation. So this test goes RED if the second operand is stripped.
+    """
+    fragment_body = "F" * 300  # non-trivial fragment so its reservation is clearly > 0
+    merge_target = "base-note"
+    capture_name = "incremental-note"
+
+    # Target note EXISTS but has an empty stored body.
+    fake_mem = _FakeMergeTargetMemoryBackend(stored_notes={merge_target: ""})
+    assert fake_mem.supports_semantic_search is True  # guard: gate must arm
+
+    agent = _make_agent(tmp_path, memory_backend=fake_mem)
+    sink: list[dict] = []
+
+    _run_call(
+        agent,
+        llm_response=_fake_llm_response_with_merge_capture(
+            name=capture_name,
+            body=fragment_body,
+            merge_into=merge_target,
+        ),
+        log_sink=sink,
+    )
+
+    res_recs = [r for r in sink if r.get("trigger") == "embed_batch_reservation"]
+    assert len(res_recs) == 1
+    reserved_usd = res_recs[0]["reserved_usd"]
+
+    from atomic_agents.agent import _estimate_embed_tokens, _EMBED_BATCH_FANOUT_BUFFER
+    from atomic_agents._costs import calc_embedding_cost
+
+    fragment_tokens = _estimate_embed_tokens(fragment_body)
+    fragment_cost, _ = calc_embedding_cost("text-embedding-3-small", fragment_tokens)
+    fragment_reservation = _EMBED_BATCH_FANOUT_BUFFER * fragment_cost
+
+    # Empty target body → fall back to fragment sizing (NOT zero, NOT cached).
+    assert reserved_usd == pytest.approx(fragment_reservation, rel=1e-6), (
+        f"reserved_usd {reserved_usd:.8f} must fall back to the fragment "
+        f"reservation (~{fragment_reservation:.8f}) when the merge target body is "
+        f"empty. A near-zero value means the `and _stored_note.body` operand was "
+        f"stripped and an empty target body was sized at zero tokens."
+    )
+    assert reserved_usd > 0, (
+        "empty-body merge target must not produce a zero-token reservation"
+    )
+
+
+def test_merge_write_missing_target_falls_back_to_fragment(tmp_path):
+    """A merge target that does not exist (read_note → None) sizes from the fragment.
+
+    Covers the FIRST operand of the compound guard: when read_note(merge_into)
+    returns None (target note absent), the pre-read skips and the reservation is
+    sized from the incoming fragment. This is the conservative-toward-permissive
+    fallback for a merge_into pointing at a note that is not present.
+    """
+    fragment_body = "F" * 300
+    capture_name = "incremental-note"
+
+    # stored_notes is empty → read_note(merge_into) returns None for any target.
+    fake_mem = _FakeMergeTargetMemoryBackend(stored_notes={})
+    assert fake_mem.supports_semantic_search is True
+    assert fake_mem.read_note("absent-target") is None  # guard: None branch armed
+
+    agent = _make_agent(tmp_path, memory_backend=fake_mem)
+    sink: list[dict] = []
+
+    _run_call(
+        agent,
+        llm_response=_fake_llm_response_with_merge_capture(
+            name=capture_name,
+            body=fragment_body,
+            merge_into="absent-target",
+        ),
+        log_sink=sink,
+    )
+
+    res_recs = [r for r in sink if r.get("trigger") == "embed_batch_reservation"]
+    assert len(res_recs) == 1
+    reserved_usd = res_recs[0]["reserved_usd"]
+
+    from atomic_agents.agent import _estimate_embed_tokens, _EMBED_BATCH_FANOUT_BUFFER
+    from atomic_agents._costs import calc_embedding_cost
+
+    fragment_tokens = _estimate_embed_tokens(fragment_body)
+    fragment_cost, _ = calc_embedding_cost("text-embedding-3-small", fragment_tokens)
+    fragment_reservation = _EMBED_BATCH_FANOUT_BUFFER * fragment_cost
+
+    assert reserved_usd == pytest.approx(fragment_reservation, rel=1e-6), (
+        f"reserved_usd {reserved_usd:.8f} must be sized from the fragment "
+        f"(~{fragment_reservation:.8f}) when the merge target is absent "
+        f"(read_note → None)."
+    )
+
+
 def test_merge_write_under_reserve_regression(tmp_path):
     """A large stored target body + small fragment must be REFUSED when target > cap.
 
