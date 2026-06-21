@@ -214,10 +214,10 @@ def test_helper_savings(tmp_path):
     assert savings is not None
     assert savings.helper_calls == 2
     assert savings.helper_actual_cost == pytest.approx(0.002, rel=1e-3)
-    # Hypothetical: each helper would have cost 1000 * 15 / 1M + 100 * 75 / 1M = 0.015 + 0.0075 = 0.0225
-    # Two of them = 0.045
-    assert savings.hypothetical_main_cost == pytest.approx(0.045, rel=1e-2)
-    assert savings.saved == pytest.approx(0.043, rel=1e-2)
+    # Hypothetical: each helper would have cost 1000 * 5 / 1M + 100 * 25 / 1M = 0.005 + 0.0025 = 0.0075
+    # Two of them = 0.015
+    assert savings.hypothetical_main_cost == pytest.approx(0.015, rel=1e-2)
+    assert savings.saved == pytest.approx(0.013, rel=1e-2)
     assert savings.cost_ratio > 1.0  # helpers cheaper
 
 
@@ -252,8 +252,8 @@ def test_cache_savings_usd(tmp_path):
     )
     runs = load_runs(tmp_path, "alice", today, today)
     saved = cache_savings_usd(runs)
-    # 10000 cached tokens at $15/MTok with 90% discount saved = 10000 * 15 * 0.9 / 1M = 0.135
-    assert saved == pytest.approx(0.135, rel=1e-3)
+    # 10000 cached tokens at $5/MTok with 90% discount saved = 10000 * 5 * 0.9 / 1M = 0.045
+    assert saved == pytest.approx(0.045, rel=1e-3)
 
 
 def test_suggest_caps_insufficient_data(tmp_path):
