@@ -730,7 +730,7 @@ public surface) is internal. Specifically:
 The protocol pattern from
 [`spec/20-memory-backend.md`](../spec/20-memory-backend.md) is the
 template every backend follows. Seventeen backend protocols have shipped
-(twelve at v1.0 + five for v1.5): `MemoryBackend`, `LLMBackend`, `JudgeBackend`, `LockBackend`,
+(twelve at v1.0 + nine added in v2.0.0): `MemoryBackend`, `LLMBackend`, `JudgeBackend`, `LockBackend`,
 `LogBackend`, `AgentProfileBackend`, `ToolRegistryBackend`,
 `MandateBackend`, `PolicyBackend`, `PersonaBackend`, `CorpusBackend`,
 `MCPServerRegistryBackend`, `SecretBackend`, `GoalBackend`,
