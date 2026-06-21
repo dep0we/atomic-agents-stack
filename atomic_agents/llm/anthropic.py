@@ -43,14 +43,25 @@ _logger = logging.getLogger(__name__)
 # vision varies by model. Keep this honest: a False here disables a code
 # path, a True here means the backend MUST accept that input.
 _CLAUDE_CAPABILITIES: dict[str, dict] = {
+    "claude-opus-4-8": {
+        "vision": True,
+        "max_input_tokens": 1_000_000,
+        "max_output_tokens": 128_000,
+    },
     "claude-opus-4-7": {
-        "vision": True, "max_input_tokens": 200_000, "max_output_tokens": 32_000,
+        "vision": True,
+        "max_input_tokens": 200_000,
+        "max_output_tokens": 32_000,
     },
     "claude-sonnet-4-6": {
-        "vision": True, "max_input_tokens": 200_000, "max_output_tokens": 64_000,
+        "vision": True,
+        "max_input_tokens": 200_000,
+        "max_output_tokens": 64_000,
     },
     "claude-haiku-4-5": {
-        "vision": True, "max_input_tokens": 200_000, "max_output_tokens": 8_192,
+        "vision": True,
+        "max_input_tokens": 200_000,
+        "max_output_tokens": 8_192,
     },
 }
 
@@ -121,10 +132,15 @@ class AnthropicLLMBackend:
             # supports_model returned True then capabilities is called
             # with a different model. Don't crash; return cautious values.
             return LLMCapabilities(
-                tools=True, tool_results=True, cache_control=True,
-                streaming=False, vision=False,
-                max_input_tokens=200_000, max_output_tokens=4_096,
-                usage_reporting=True, structured_output=False,
+                tools=True,
+                tool_results=True,
+                cache_control=True,
+                streaming=False,
+                vision=False,
+                max_input_tokens=200_000,
+                max_output_tokens=4_096,
+                usage_reporting=True,
+                structured_output=False,
             )
         cfg = _CLAUDE_CAPABILITIES[family]
         return LLMCapabilities(
@@ -224,6 +240,7 @@ class AnthropicLLMBackend:
         change in ``_llm.call_llm``.
         """
         from ..exceptions import AtomicAgentsError as _AAE  # local import for re-raise
+
         client = self._build_client()
 
         # System prompt block(s) with cache_control when any directive is
@@ -233,11 +250,13 @@ class AnthropicLLMBackend:
         # on long persona prompts). Future Protocol extension can map
         # multiple directives to multiple blocks.
         if cache_directives:
-            system_blocks: list[dict[str, Any]] = [{
-                "type": "text",
-                "text": system_prompt,
-                "cache_control": {"type": "ephemeral"},
-            }]
+            system_blocks: list[dict[str, Any]] = [
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
         else:
             system_blocks = [{"type": "text", "text": system_prompt}]
 
@@ -260,11 +279,13 @@ class AnthropicLLMBackend:
         for block in response.content:
             block_type = getattr(block, "type", None)
             if block_type == "tool_use":
-                tool_uses_dicts.append({
-                    "id": getattr(block, "id", ""),
-                    "name": getattr(block, "name", ""),
-                    "input": getattr(block, "input", {}) or {},
-                })
+                tool_uses_dicts.append(
+                    {
+                        "id": getattr(block, "id", ""),
+                        "name": getattr(block, "name", ""),
+                        "input": getattr(block, "input", {}) or {},
+                    }
+                )
             elif block_type == "text" or hasattr(block, "text"):
                 text_parts.append(getattr(block, "text", ""))
         text = "".join(text_parts)
@@ -315,12 +336,14 @@ class AnthropicLLMBackend:
         for tu in tool_uses:
             if tu.name == "atomic_capture":
                 continue
-            assistant_content.append({
-                "type": "tool_use",
-                "id": tu.id,
-                "name": tu.name,
-                "input": tu.input,
-            })
+            assistant_content.append(
+                {
+                    "type": "tool_use",
+                    "id": tu.id,
+                    "name": tu.name,
+                    "input": tu.input,
+                }
+            )
         if assistant_content:
             out.append({"role": "assistant", "content": assistant_content})
 
@@ -372,6 +395,7 @@ class AnthropicLLMBackend:
         """
         from .._llm import _get_anthropic_key
         import anthropic
+
         return anthropic.Anthropic(api_key=_get_anthropic_key())
 
     @staticmethod

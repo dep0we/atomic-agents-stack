@@ -116,7 +116,7 @@ USD per 1M tokens:
 
 | Model ID                         | Input  | Output | Notes                                          |
 |----------------------------------|--------|--------|------------------------------------------------|
-| `claude-opus-4-7-20260101`       | $15.00 | $75.00 | Anthropic, reasoning-heavy default             |
+| `claude-opus-4-7-20260101`       | $5.00  | $25.00 | Anthropic, reasoning-heavy default             |
 | `claude-sonnet-4-6-20260101`     | $3.00  | $15.00 | Anthropic, common fallback for Opus            |
 | `claude-haiku-4-5-20251001`      | $0.80  | $4.00  | Anthropic, helper / summarizer default         |
 | `gpt-5`                          | $5.00  | $20.00 | OpenAI                                         |

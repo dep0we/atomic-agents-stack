@@ -2,7 +2,7 @@
 
 ## Default model
 
-**`claude-opus-4-7`**
+**`claude-opus-4-8`**
 
 Chosen for: reasoning depth, judgment under uncertainty, ability to hold multiple constraints simultaneously. Use Opus when quality matters more than speed and the task requires careful thinking.
 

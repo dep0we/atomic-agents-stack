@@ -418,7 +418,7 @@ MSG_TEST_CALL_GENERIC_FALLBACK: Final = (
 # Default agent values written into model.md
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODEL_PRIMARY: Final = "claude-opus-4-7"
+DEFAULT_MODEL_PRIMARY: Final = "claude-opus-4-8"
 DEFAULT_MODEL_FALLBACK: Final = "claude-sonnet-4-6"
 DEFAULT_DAILY_CAP_USD: Final = 0.50
 DEFAULT_MONTHLY_CAP_USD: Final = 7.00

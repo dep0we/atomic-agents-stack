@@ -59,8 +59,9 @@ class CostReadResult:
 # USD per 1M tokens — input / output
 PRICING: dict[str, dict[str, float]] = {
     # Anthropic
-    "claude-opus-4-7-20260101": {"input": 15.0, "output": 75.0},
-    "claude-opus-4-7": {"input": 15.0, "output": 75.0},  # alias
+    "claude-opus-4-8": {"input": 5.0, "output": 25.0},  # current Opus-tier default
+    "claude-opus-4-7-20260101": {"input": 5.0, "output": 25.0},
+    "claude-opus-4-7": {"input": 5.0, "output": 25.0},  # alias
     "claude-sonnet-4-6-20260101": {"input": 3.0, "output": 15.0},
     "claude-sonnet-4-6": {"input": 3.0, "output": 15.0},
     "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.0},
@@ -90,7 +91,7 @@ PRICING: dict[str, dict[str, float]] = {
     # changes.
     # NOTE: Unknown vertex/* models (not listed below) fall through to
     # _fallback_pricing(), which uses the GLOBAL max input/output rates across
-    # PRICING (currently claude-opus at 15/75) — far above any Vertex rate. So an
+    # PRICING (currently claude-opus at 5/25) — above any Vertex rate. So an
     # unpriced Vertex model is costed pessimistically, not cheaply. These entries
     # do NOT change the fallback sentinel (all are below the existing opus max);
     # operators wanting accurate cost on a new Vertex model should add an explicit
@@ -111,8 +112,8 @@ PRICING: dict[str, dict[str, float]] = {
 # calc_embedding_cost() NEVER calls _fallback_pricing() (the chat-model
 # version). Embedding rates are input-only (no output column) and three to
 # five orders of magnitude smaller than chat rates. Merging the tables would
-# cause an unknown embedding model to fall back to the Opus output rate ($75/1M
-# instead of $0.13/1M) -- a ~577x overcount (75 / 0.13) that would spuriously block all
+# cause an unknown embedding model to fall back to the Opus output rate ($25/1M
+# instead of $0.13/1M) -- a ~192x overcount (25 / 0.13) that would spuriously block all
 # embedding calls via the spec/46 reservation mandate.
 #
 # Source verification (Principle #12 applied outward per MEMORY.md):

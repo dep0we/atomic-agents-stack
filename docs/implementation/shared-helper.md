@@ -330,7 +330,7 @@ Pull pricing from a constant in the helper:
 
 ```python
 PRICING = {
-    "claude-opus-4-7-20260101": {"input": 15.0, "output": 75.0},  # per MTok
+    "claude-opus-4-7-20260101": {"input": 5.0, "output": 25.0},  # per MTok
     "claude-sonnet-4-6-20260101": {"input": 3.0, "output": 15.0},
     "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.0},
 }

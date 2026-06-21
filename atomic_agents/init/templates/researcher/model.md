@@ -2,7 +2,7 @@
 
 ## Default model
 
-**`claude-opus-4-7`**
+**`claude-opus-4-8`**
 
 Chosen for: multi-source synthesis, sustained reasoning across long source documents, holding conflicting evidence in tension while forming a calibrated conclusion. Use Opus when the investigation requires careful weighing of evidence rather than quick retrieval.
 

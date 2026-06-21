@@ -35,8 +35,9 @@ def _make_anthropic_block(block_type, **kwargs):
     return types.SimpleNamespace(type=block_type, **kwargs)
 
 
-def _make_anthropic_response(blocks, *, input_tokens=10, output_tokens=20,
-                              cache_read=0, cache_creation=0):
+def _make_anthropic_response(
+    blocks, *, input_tokens=10, output_tokens=20, cache_read=0, cache_creation=0
+):
     """Anthropic messages.create() response stub."""
     usage = types.SimpleNamespace(
         input_tokens=input_tokens,
@@ -44,8 +45,9 @@ def _make_anthropic_response(blocks, *, input_tokens=10, output_tokens=20,
         cache_read_input_tokens=cache_read,
         cache_creation_input_tokens=cache_creation,
     )
-    return types.SimpleNamespace(content=blocks, usage=usage,
-                                  model_dump=lambda: {"id": "msg_test"})
+    return types.SimpleNamespace(
+        content=blocks, usage=usage, model_dump=lambda: {"id": "msg_test"}
+    )
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -139,8 +141,8 @@ def test_pricing_known_model_returns_real_rates():
     copy (avoids drift)."""
     pi = AnthropicLLMBackend().pricing("claude-opus-4-7-20260101")
     assert isinstance(pi, PricingInfo)
-    assert pi.input_per_million_usd == 15.0
-    assert pi.output_per_million_usd == 75.0
+    assert pi.input_per_million_usd == 5.0
+    assert pi.output_per_million_usd == 25.0
     assert pi.cache_hit_discount == 0.10
 
 
@@ -148,6 +150,22 @@ def test_pricing_unknown_model_returns_none():
     """When _costs.PRICING doesn't know the model, return None — caller
     (cost gates) falls back to _fallback_pricing()."""
     assert AnthropicLLMBackend().pricing("claude-unknown-9-9-99999999") is None
+
+
+def test_opus_4_8_is_registered_priced_and_capable():
+    """claude-opus-4-8 is the init scaffold default (DEFAULT_MODEL_PRIMARY).
+    It MUST be a known model in both PRICING and _CLAUDE_CAPABILITIES, or a
+    scaffolded agent silently over-bills via the most-expensive fallback rate
+    and emits an unknown-model warning every run. Guards the actual default."""
+    b = AnthropicLLMBackend()
+    pi = b.pricing("claude-opus-4-8")
+    assert pi is not None, "opus-4-8 must be in PRICING (not fall back)"
+    assert pi.input_per_million_usd == 5.0
+    assert pi.output_per_million_usd == 25.0
+    caps = b.capabilities("claude-opus-4-8")
+    assert caps.vision is True
+    assert caps.max_input_tokens == 1_000_000
+    assert caps.max_output_tokens == 128_000
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -203,9 +221,11 @@ def test_count_tokens_uses_sdk_when_available():
 def test_call_returns_normalized_response_text_only():
     """Pure-text response → text populated, tool_uses empty."""
     fake_client = MagicMock()
-    fake_client.messages.create.return_value = _make_anthropic_response([
-        _make_anthropic_block("text", text="Hello world"),
-    ])
+    fake_client.messages.create.return_value = _make_anthropic_response(
+        [
+            _make_anthropic_block("text", text="Hello world"),
+        ]
+    )
     fake_anthropic = types.SimpleNamespace(Anthropic=lambda api_key: fake_client)
     with patch.dict(sys.modules, {"anthropic": fake_anthropic}):
         b = AnthropicLLMBackend()
@@ -227,11 +247,17 @@ def test_call_extracts_tool_use_blocks_to_normalized_dicts():
     response.tool_uses (matches the pre-#87 procedural shape so callers
     upstream continue to work)."""
     fake_client = MagicMock()
-    fake_client.messages.create.return_value = _make_anthropic_response([
-        _make_anthropic_block("text", text="Capturing."),
-        _make_anthropic_block("tool_use", id="tu_1", name="atomic_capture",
-                              input={"type": "feedback", "name": "x"}),
-    ])
+    fake_client.messages.create.return_value = _make_anthropic_response(
+        [
+            _make_anthropic_block("text", text="Capturing."),
+            _make_anthropic_block(
+                "tool_use",
+                id="tu_1",
+                name="atomic_capture",
+                input={"type": "feedback", "name": "x"},
+            ),
+        ]
+    )
     fake_anthropic = types.SimpleNamespace(Anthropic=lambda api_key: fake_client)
     with patch.dict(sys.modules, {"anthropic": fake_anthropic}):
         b = AnthropicLLMBackend()
@@ -256,9 +282,11 @@ def test_call_translates_canonical_tools_to_anthropic_dict_format():
     The backend's job: never let provider-shape leak out of `call()`.
     """
     fake_client = MagicMock()
-    fake_client.messages.create.return_value = _make_anthropic_response([
-        _make_anthropic_block("text", text=""),
-    ])
+    fake_client.messages.create.return_value = _make_anthropic_response(
+        [
+            _make_anthropic_block("text", text=""),
+        ]
+    )
     fake_anthropic = types.SimpleNamespace(Anthropic=lambda api_key: fake_client)
     canonical = [
         LLMToolDefinition(
@@ -278,11 +306,13 @@ def test_call_translates_canonical_tools_to_anthropic_dict_format():
             tools=canonical,
         )
     _, kw = fake_client.messages.create.call_args
-    assert kw["tools"] == [{
-        "name": "atomic_capture",
-        "description": "capture a memory",
-        "input_schema": {"type": "object", "properties": {}},
-    }]
+    assert kw["tools"] == [
+        {
+            "name": "atomic_capture",
+            "description": "capture a memory",
+            "input_schema": {"type": "object", "properties": {}},
+        }
+    ]
 
 
 def test_call_omits_tools_kwarg_when_none_passed():
@@ -290,9 +320,11 @@ def test_call_omits_tools_kwarg_when_none_passed():
     cleanest call path and matches pre-#87 _call_anthropic behavior).
     """
     fake_client = MagicMock()
-    fake_client.messages.create.return_value = _make_anthropic_response([
-        _make_anthropic_block("text", text=""),
-    ])
+    fake_client.messages.create.return_value = _make_anthropic_response(
+        [
+            _make_anthropic_block("text", text=""),
+        ]
+    )
     fake_anthropic = types.SimpleNamespace(Anthropic=lambda api_key: fake_client)
     with patch.dict(sys.modules, {"anthropic": fake_anthropic}):
         b = AnthropicLLMBackend()
@@ -315,9 +347,11 @@ def test_call_applies_cache_control_when_directives_present():
     long-persona cache-hit rates are preserved.
     """
     fake_client = MagicMock()
-    fake_client.messages.create.return_value = _make_anthropic_response([
-        _make_anthropic_block("text", text=""),
-    ])
+    fake_client.messages.create.return_value = _make_anthropic_response(
+        [
+            _make_anthropic_block("text", text=""),
+        ]
+    )
     fake_anthropic = types.SimpleNamespace(Anthropic=lambda api_key: fake_client)
     with patch.dict(sys.modules, {"anthropic": fake_anthropic}):
         b = AnthropicLLMBackend()
@@ -339,9 +373,11 @@ def test_call_no_cache_directives_no_cache_control():
     """Without cache_directives, the system block is plain text — no
     cache_control field appended."""
     fake_client = MagicMock()
-    fake_client.messages.create.return_value = _make_anthropic_response([
-        _make_anthropic_block("text", text=""),
-    ])
+    fake_client.messages.create.return_value = _make_anthropic_response(
+        [
+            _make_anthropic_block("text", text=""),
+        ]
+    )
     fake_anthropic = types.SimpleNamespace(Anthropic=lambda api_key: fake_client)
     with patch.dict(sys.modules, {"anthropic": fake_anthropic}):
         b = AnthropicLLMBackend()
@@ -363,7 +399,10 @@ def test_call_propagates_cache_tokens():
     fake_client = MagicMock()
     fake_client.messages.create.return_value = _make_anthropic_response(
         [_make_anthropic_block("text", text="")],
-        input_tokens=100, output_tokens=20, cache_read=500, cache_creation=10,
+        input_tokens=100,
+        output_tokens=20,
+        cache_read=500,
+        cache_creation=10,
     )
     fake_anthropic = types.SimpleNamespace(Anthropic=lambda api_key: fake_client)
     with patch.dict(sys.modules, {"anthropic": fake_anthropic}):
@@ -398,7 +437,8 @@ def test_format_tool_results_builds_assistant_echo_and_user_results():
         LLMToolResult(tool_use_id="tu_1", content="search results here"),
     ]
     out = b.format_tool_results(
-        tool_uses=tool_uses, tool_results=tool_results,
+        tool_uses=tool_uses,
+        tool_results=tool_results,
         assistant_text="I'll search.",
     )
     assert len(out) == 2
@@ -407,7 +447,10 @@ def test_format_tool_results_builds_assistant_echo_and_user_results():
     assert asst["role"] == "assistant"
     assert asst["content"][0] == {"type": "text", "text": "I'll search."}
     assert asst["content"][1] == {
-        "type": "tool_use", "id": "tu_1", "name": "search", "input": {"q": "atomic"},
+        "type": "tool_use",
+        "id": "tu_1",
+        "name": "search",
+        "input": {"q": "atomic"},
     }
     # User turn — tool_result blocks. String content is json-encoded
     # (so the wire content is the quoted form `"..."`), matching
@@ -416,7 +459,8 @@ def test_format_tool_results_builds_assistant_echo_and_user_results():
     # for the serialization rules.
     assert usr["role"] == "user"
     assert usr["content"][0] == {
-        "type": "tool_result", "tool_use_id": "tu_1",
+        "type": "tool_result",
+        "tool_use_id": "tu_1",
         "content": '"search results here"',
     }
 
@@ -463,8 +507,7 @@ def test_format_tool_results_marks_is_error_block():
     b = AnthropicLLMBackend()
     out = b.format_tool_results(
         tool_uses=[LLMToolUse(id="tu_1", name="search", input={})],
-        tool_results=[LLMToolResult(tool_use_id="tu_1", content="boom",
-                                     is_error=True)],
+        tool_results=[LLMToolResult(tool_use_id="tu_1", content="boom", is_error=True)],
     )
     usr = out[1]
     block = usr["content"][0]
@@ -493,6 +536,7 @@ def test_format_tool_results_non_json_serializable_content_falls_back_to_str():
     ``try: json.dumps except: str()`` fallback; the backend preserves it.
     """
     import datetime as _dt
+
     b = AnthropicLLMBackend()
     t = _dt.datetime(2026, 1, 2, 3, 4, 5)
     out = b.format_tool_results(
@@ -513,9 +557,13 @@ def test_format_tool_results_error_string_passes_through():
     b = AnthropicLLMBackend()
     out = b.format_tool_results(
         tool_uses=[LLMToolUse(id="tu_1", name="search", input={})],
-        tool_results=[LLMToolResult(
-            tool_use_id="tu_1", content="[tool error] boom", is_error=True,
-        )],
+        tool_results=[
+            LLMToolResult(
+                tool_use_id="tu_1",
+                content="[tool error] boom",
+                is_error=True,
+            )
+        ],
     )
     block = out[1]["content"][0]
     assert block["content"] == "[tool error] boom"  # raw, no quotes
@@ -529,8 +577,7 @@ def test_format_tool_results_serializes_dict_content_as_json():
     b = AnthropicLLMBackend()
     out = b.format_tool_results(
         tool_uses=[LLMToolUse(id="tu_1", name="search", input={})],
-        tool_results=[LLMToolResult(tool_use_id="tu_1",
-                                     content={"hits": [1, 2, 3]})],
+        tool_results=[LLMToolResult(tool_use_id="tu_1", content={"hits": [1, 2, 3]})],
     )
     block = out[1]["content"][0]
     assert json.loads(block["content"]) == {"hits": [1, 2, 3]}
@@ -561,18 +608,23 @@ def test_legacy_dict_tool_with_cache_control_drops_field_pins_known_gap(monkeypa
     issue filed alongside this PR.
     """
     from atomic_agents import _llm
+
     fake_client = MagicMock()
-    fake_client.messages.create.return_value = _make_anthropic_response([
-        _make_anthropic_block("text", text=""),
-    ])
+    fake_client.messages.create.return_value = _make_anthropic_response(
+        [
+            _make_anthropic_block("text", text=""),
+        ]
+    )
     fake_anthropic = types.SimpleNamespace(Anthropic=lambda api_key: fake_client)
 
-    tools_with_cache = [{
-        "name": "search",
-        "description": "search the web",
-        "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}},
-        "cache_control": {"type": "ephemeral"},  # <- this is what gets dropped
-    }]
+    tools_with_cache = [
+        {
+            "name": "search",
+            "description": "search the web",
+            "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}},
+            "cache_control": {"type": "ephemeral"},  # <- this is what gets dropped
+        }
+    ]
     with patch.dict(sys.modules, {"anthropic": fake_anthropic}):
         _llm.call_llm(
             model="claude-haiku-4-5-20251001",
@@ -608,6 +660,7 @@ def test_future_claude_model_id_routes_to_backend_with_conservative_defaults():
     assert caps.max_output_tokens == 4_096
     # The framework keeps working — the registry routes the call.
     from atomic_agents.llm import find_backend_for_model
+
     routed = find_backend_for_model("claude-future-99-99-99999999")
     assert routed is b or routed.provider_id == "anthropic"
 

@@ -37,10 +37,10 @@ def _clear_cost_warn_dedup_sets():
 
 
 def test_calc_cost_known_model():
-    # claude-opus-4-7: $15/MTok input, $75/MTok output
+    # claude-opus-4-7: $5/MTok input, $25/MTok output
     # 1000 input + 500 output, no cache
     cost, fallback = calc_cost("claude-opus-4-7-20260101", 1000, 500)
-    expected = 1000 * 15.0 / 1_000_000 + 500 * 75.0 / 1_000_000
+    expected = 1000 * 5.0 / 1_000_000 + 500 * 25.0 / 1_000_000
     assert abs(cost - expected) < 1e-6
     assert fallback is False
 
@@ -49,8 +49,8 @@ def test_calc_cost_with_cache_hit():
     cost, fallback = calc_cost(
         "claude-opus-4-7-20260101", 1000, 0, cache_hit_tokens=800
     )
-    cache_cost = 800 * 15.0 * CACHE_HIT_DISCOUNT / 1_000_000
-    miss_cost = 200 * 15.0 / 1_000_000
+    cache_cost = 800 * 5.0 * CACHE_HIT_DISCOUNT / 1_000_000
+    miss_cost = 200 * 5.0 / 1_000_000
     assert abs(cost - (cache_cost + miss_cost)) < 1e-6
     assert fallback is False
 

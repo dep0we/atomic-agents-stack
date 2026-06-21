@@ -153,7 +153,7 @@ validated via `_io.safe_resolve_under` before any write.
 | `<agent>/persona/SOUL.md` | Q5 `${voice}` |
 | `<agent>/persona/USER.md` | Q6 `${comm_prefs}`, Q7 `${hard_refusals}` (behavioral framing) |
 | `<agent>/tools.md` | Q7 `${hard_refusals}` (policy phrasing) + locked defaults |
-| `<agent>/model.md` | claude-opus-4-7 default, claude-sonnet-4-6 fallback, $0.50 daily / $7 monthly cost guardrails |
+| `<agent>/model.md` | claude-opus-4-8 default, claude-sonnet-4-6 fallback, $0.50 daily / $7 monthly cost guardrails |
 | `<agent>/memory/INDEX.md` | Seven structured sections: Critical Feedback / Locked Decisions / User Profile / Active Projects / Reference / Recently Promoted to Persona / Archive (superseded) |
 | `<agent>/wiki/INDEX.md` | Three structured sections: Background and context / Reference material / How wiki pages cite sources |
 
