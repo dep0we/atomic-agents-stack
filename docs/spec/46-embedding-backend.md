@@ -29,6 +29,28 @@ query-embed gate ships and both gate sites exist.
 > normative addenda to spec/20, spec/22, and spec/34. The query-embed gate and
 > the DRAFT→LOCKED ceremony are deferred to PR2.
 >
+> **PR-slicing update (#544 PR2a, shipped 2026-06-20).** PR2a shipped two
+> accounting correctness fixes (spec/46 STAYS DRAFT): (1) dedicated `embed_cost`
+> JSONL record (`trigger='embed_cost'`, `cost_usd=actual_usd`, `cost_source='actor'`,
+> `model`, `cost_estimated`, `parent_run_id`, `parent_agent`) emitted after
+> `embed_batch_release` in the same `finally` block conditioned on `actual_usd > 0`
+> — now `sum_cost_for_period` sees prior embed spend across calls; `'embed_cost':
+> PRIMITIVE_EMBED` registered in `_PRIMITIVE_BY_TRIGGER`; only the dedicated
+> record carries `cost_usd` (release/reservation remain audit-only). (2)
+> merge-write pre-read reservation: a merge PRESERVES the target body verbatim
+> (the backend re-embeds the stored target body ALONE; the fragment lands in
+> sources metadata, NOT the body — backend.py:316-317, pgvector.py:761-768), so
+> the reservation and true-up loops now call `read_note(merge_into)` before the
+> write loop and size the estimate from the PRESERVED TARGET body. PR1 sized from
+> the small incoming fragment, under-reserving/under-charging a merge whose stored
+> target body is large; sizing from the target body refuses an over-cap merge
+> before billing (Principle #4). On read failure falls back gracefully to
+> fragment-only with a WARNING; `_merge_body_cache` (keyed by the same dedup
+> 4-tuple) shared by both loops prevents reserve/actual desync. Write-loop dedup
+> key extended to include `merge_into`. The `embed_cost` record shape and the
+> merge-write resolution land as a spec/22 versioned normative addendum at the
+> #544 PR2 LOCK ceremony (spec/22 is LOCKED; PR2a does not edit it).
+>
 > **The query-embed billable path is NOT inside `agent.call()`.** There is no
 > `memory.search()` or `corpus.query()` call site in the orchestrator (verified
 > by grep over `agent.py`), so there is no orchestrator query-embed path to gate
@@ -210,17 +232,24 @@ is ONE billed call (no per-item fan-out, unlike `embed_batch()`).
 > docstring on `OpenAIEmbeddingBackend.embed_batch()` for the matching code-side
 > note.
 
-> **Merge-write reservations are fragment-sized, not merged-body-sized (#544 PR1
-> known limitation).** The capture-commit batch gate in `agent.call()` estimates
-> both the reservation and the per-note true-up from the INCOMING capture body
-> (`c.body`). On a merge write (`capture.merge_into` set), `PgvectorMemoryBackend`
-> re-reads the full accumulated note body and embeds THAT — which can be larger
-> than the incoming fragment. So for merge writes the reservation under-estimates
-> worst-case spend and the audit `actual_usd` understates the true embed cost; the
-> 2x fan-out buffer is the only cushion and is unrelated to merged-body growth.
-> This is a documented PR1 limitation: the gate caps against the fragment estimate.
-> Estimating from the post-write stored body is deferred (it requires reading back
-> the merged note after the write).
+> **Merge-write reservations are now target-body-sized (RESOLVED in #544 PR2a).**
+> A merge write PRESERVES the target body verbatim — the backend re-embeds the
+> stored TARGET body alone; the incoming fragment updates sources/last_seen
+> metadata, NOT the body (backend.py:316-317; filesystem `_merge_into_existing`
+> leaves the content untouched; pgvector.py:761-768 embeds `stored.body`). PR1
+> sized both the reservation and the true-up from the small incoming fragment,
+> under-reserving and under-charging a merge whose stored target body is large.
+> The reservation loop now calls `self.memory.read_note(merge_into)` BEFORE the
+> write loop and sizes the estimate from the PRESERVED TARGET body. An over-cap
+> merge is now refused before billing (Principle #4 — enforce-before-pay). On read
+> failure the gate falls back to fragment-only with a WARNING (conservative-toward-
+> permissive — an analogous failure posture to pgvector.py:778-785 in that both
+> refuse to act on a target body they couldn't read; the mechanics differ — the
+> gate still charges the fragment, whereas pgvector skips the upsert). The pre-read
+> result is cached in `_merge_body_cache` (keyed by the
+> same dedup 4-tuple) and reused in the true-up loop so `reserve` and `actual_usd`
+> share the same estimate. The 2x fan-out buffer still applies on top of the
+> target-body estimate.
 
 > **Token estimate basis: `ceil(utf8_bytes / 3)` is conservative, not a strict
 > upper bound.** The capture-commit gate estimates tokens from the UTF-8 byte
@@ -239,6 +268,8 @@ trigger="embed_reservation"          output_tokens=0    cost_source="actor"  # s
 trigger="embed_release"              output_tokens=0    cost_source="actor"
 trigger="embed_batch_reservation"    output_tokens=0    cost_source="actor"  # embed_batch()
 trigger="embed_batch_release"        output_tokens=0    cost_source="actor"
+trigger="embed_cost"                 output_tokens=0    cost_source="actor"  # cross-call accounting (#544 PR2a)
+                                     cost_usd=actual_usd  parent_agent=<name>  # ONLY embed trigger with cost_usd
 ```
 
 **PR 2 shipped the pricing helper (`EMBEDDING_PRICING` + `calc_embedding_cost()`)
@@ -512,22 +543,24 @@ backend (e.g., `PgvectorCorpusBackend` receives an `EmbeddingBackend` at
 
 ## PR scope boundary
 
-| Scope | PR 2 (shipped) | PR 3 / #200 (shipped) | #544 PR1 (shipped) | #544 PR2 |
-|-------|------|------------|------|------|
-| Protocol + dataclasses | ✅ Shipped | — | — | — |
-| `OpenAIEmbeddingBackend` ref impl | ✅ Shipped | — | — | — |
-| `EMBEDDING_PRICING` + `calc_embedding_cost()` | ✅ Shipped | — | — | — |
-| Registry (`register_/get_/list_embedding_backend`) | — | ✅ Shipped | — | — |
-| pgvector wiring (`PgvectorCorpusBackend`, `PgvectorMemoryBackend`) | — | ✅ Shipped | — | — |
-| `input_type` kwarg on Protocol surface | — | ✅ Shipped | — | — |
-| Opt-in-by-default cost-safety guard (semantic OFF unless pinned) | — | ✅ Shipped | — | — |
-| `PRIMITIVE_EMBED` + 4 trigger mappings in `_PRIMITIVE_BY_TRIGGER` | — | — | ✅ Shipped | — |
-| Batch embed cost gate (post-loop capture-commit, `embed_batch_reservation` + `embed_batch_release`) | — | — | ✅ Shipped | — |
-| Doctor check (`check_embedding_backend()`, no billable probe) | — | — | ✅ Shipped | — |
-| Normative addenda: spec/20 MemoryCapabilities, spec/22 primitive taxonomy, spec/34 CorpusCapabilities | — | — | ✅ Shipped | — |
-| Query-embed gate (per-call `embed_reservation` + `embed_release` at the CLI corpus-query site (#564) — NOT inside `agent.call()`, which has no orchestrator query-embed path) | — | — | — | ✅ Ships |
-| Spec/46 DRAFT→LOCKED | — | — | — | ✅ Locks |
-| Local embedding backend (sentence-transformers/Ollama) | — | — | — | Separate arc ([#534](https://github.com/dep0we/atomic-agents-stack/issues/534)) |
+| Scope | PR 2 (shipped) | PR 3 / #200 (shipped) | #544 PR1 (shipped) | #544 PR2a (shipped) | #544 PR2 |
+|-------|------|------------|------|------|------|
+| Protocol + dataclasses | ✅ Shipped | — | — | — | — |
+| `OpenAIEmbeddingBackend` ref impl | ✅ Shipped | — | — | — | — |
+| `EMBEDDING_PRICING` + `calc_embedding_cost()` | ✅ Shipped | — | — | — | — |
+| Registry (`register_/get_/list_embedding_backend`) | — | ✅ Shipped | — | — | — |
+| pgvector wiring (`PgvectorCorpusBackend`, `PgvectorMemoryBackend`) | — | ✅ Shipped | — | — | — |
+| `input_type` kwarg on Protocol surface | — | ✅ Shipped | — | — | — |
+| Opt-in-by-default cost-safety guard (semantic OFF unless pinned) | — | ✅ Shipped | — | — | — |
+| `PRIMITIVE_EMBED` + 4 trigger mappings in `_PRIMITIVE_BY_TRIGGER` | — | — | ✅ Shipped | — | — |
+| Batch embed cost gate (post-loop capture-commit, `embed_batch_reservation` + `embed_batch_release`) | — | — | ✅ Shipped | — | — |
+| Doctor check (`check_embedding_backend()`, no billable probe) | — | — | ✅ Shipped | — | — |
+| Normative addenda: spec/20 MemoryCapabilities, spec/22 primitive taxonomy, spec/34 CorpusCapabilities | — | — | ✅ Shipped | — | — |
+| Cross-call embed accounting: dedicated `embed_cost` record with `cost_usd=actual_usd` — now visible to `sum_cost_for_period` across calls; `'embed_cost': PRIMITIVE_EMBED` in `_PRIMITIVE_BY_TRIGGER` | — | — | — | ✅ Shipped | — |
+| Merge-write pre-read reservation: `read_note(merge_into)` before gate; reservation and true-up sized from the PRESERVED TARGET body (merge preserves body verbatim — fragment lands in sources, not the body); Principle #4 enforce-before-pay on the target size | — | — | — | ✅ Shipped | — |
+| Query-embed gate (per-call `embed_reservation` + `embed_release` at the CLI corpus-query site (#564) — NOT inside `agent.call()`, which has no orchestrator query-embed path) | — | — | — | — | ✅ Ships |
+| Spec/46 DRAFT→LOCKED | — | — | — | — | ✅ Locks |
+| Local embedding backend (sentence-transformers/Ollama) | — | — | — | — | Separate arc ([#534](https://github.com/dep0we/atomic-agents-stack/issues/534)) |
 
 ---
 
