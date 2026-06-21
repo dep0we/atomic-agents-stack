@@ -2,6 +2,7 @@ export const meta = {
   name: 'arc-execute',
   description: 'Phase 2 of the quality loop. Takes the maintainer\'s rulings on the Tier A forks and builds the change: parallel prep fan-out -> implement -> adversarial review IN ROUNDS (including a dedicated shortcut-hunter) -> doc-release stale-marker sweep. Stops at PR-ready; never merges, tags, or publishes. Halts and returns any NEW unforeseen Tier A fork instead of deciding it.',
   phases: [
+    { title: 'Lessons' },
     { title: 'Prep' },
     { title: 'Implement' },
     { title: 'Review' },
@@ -20,6 +21,27 @@ const ISSUE = A.issue ?? 'the scope on the current branch'
 const DECISIONS = A.decisions ?? {}
 const MAX_ROUNDS = Math.max(2, A.maxRounds ?? 3)
 const RULINGS = Object.entries(DECISIONS).map(([k, v]) => `  - ${k}: ${v}`).join('\n') || '  (none — no Tier A forks)'
+
+// ---- Phase 0: load the project's hard-won lessons (close the leverage loop) ----
+// Workflow scripts are sandboxed (no fs access), but a subagent reads the project
+// memory dir and distills the relevant feedback_*.md lessons into a compact brief,
+// which is injected into every prep/implement/review prompt below — so the build
+// APPLIES hard-won lessons instead of repeating what already failed. The retrieval
+// path used to be fragile (it depended on the main loop remembering to hand-inject
+// the right lesson into the right subagent); this makes it structural. Degrades to
+// an empty string if the memory dir is absent (e.g. a fresh clone / other machine).
+phase('Lessons')
+const LESSONS_RAW = await agent(
+  `Load this project's hard-won engineering lessons so this build can APPLY them instead of repeating what already failed.
+Compute the memory dir: \`DIR="$HOME/.claude/projects/$(pwd | sed 's#/#-#g')/memory"\`. Read "$DIR/MEMORY.md" (the index — one line per lesson). Then read the feedback_*.md bodies MOST relevant to building AND adversarially reviewing issue ${ISSUE} — ALWAYS include the test-discipline lessons (false-green / per-invocation negative control, layered-except typed-branch false-green, mock side-effect shape-keying), the review-discipline lessons (round-2 catches round-1 fix regressions, /ship gates discover past arc convergence), and the git-safety lessons (never git-checkout uncommitted work); PLUS any whose index line matches this issue's domain.
+Distill into a COMPACT, actionable brief: one bullet per lesson = the rule + the one-line "how to apply" + (if present) the concrete shape/file it bites. Max ~14 bullets, terse, imperative ("When X, do Y — verified by Z"), NOT prose. This brief is injected verbatim into every downstream prep / implement / review subagent.
+If the dir or MEMORY.md does not exist, return EXACTLY: NO PROJECT LESSONS FOUND`,
+  { label: 'load-lessons', phase: 'Lessons', model: 'sonnet' },
+)
+const LESSONS = (LESSONS_RAW && !/^NO PROJECT LESSONS FOUND/.test(String(LESSONS_RAW).trim()))
+  ? `\nPROJECT LESSONS (hard-won — APPLY these; do NOT repeat what they warn against):\n${String(LESSONS_RAW).trim()}\n`
+  : ''
+log(LESSONS ? 'Loaded project lessons brief — injecting into prep/implement/review' : 'No project lessons found — proceeding without a lessons brief')
 
 // The failure-mode dimensions the prep fan-out parametrizes on (the project's pre-impl prep pattern).
 const PREP_DIMENSIONS = [
@@ -141,7 +163,7 @@ const prep = (await parallel(PREP_DIMENSIONS.map(d => () =>
 DIMENSION: ${d.prompt}
 the maintainer has already ruled on these material forks — treat them as fixed constraints, do not re-litigate:
 ${RULINGS}
-List concrete risks the implementer must handle, each with a severity and a fix. Empty list if none.`,
+${LESSONS}List concrete risks the implementer must handle, each with a severity and a fix. Empty list if none.`,
     { schema: FINDINGS_SCHEMA, label: `prep:${d.key}`, phase: 'Prep', model: 'sonnet' },
   ),
 ))).filter(Boolean).flatMap(r => r.findings)
@@ -155,7 +177,7 @@ THE MAINTAINER'S RULINGS on the material forks (these are FIXED — build exactl
 ${RULINGS}
 PREP FINDINGS to address as you build:
 ${JSON.stringify(prep, null, 2)}
-Follow every design principle in CLAUDE.md. Write tests that EXERCISE EVERY NEW SURFACE END-TO-END — if you add an HTTP
+${LESSONS}Follow every design principle in CLAUDE.md. Write tests that EXERCISE EVERY NEW SURFACE END-TO-END — if you add an HTTP
 route, hit it with a test client; if you add a CLI command, invoke it; do NOT test only helper functions while the real
 surface goes unrun. A green suite that never executes the new code path is NOT acceptance — it is the exact gap an
 adversarial reviewer will expose. Run \`uv run pytest\` on your new tests AND confirm they actually invoke the new code.
@@ -222,7 +244,7 @@ while (round < MAX_ROUNDS) {
     agent(
       `Adversarial review round ${round} of issue ${ISSUE}. This round, scrutinize the most recent change especially: ${lastFixDiff}.
 LENS: ${l.prompt}
-Read the diff yourself (\`git diff\`) and run whatever commands you need. Report real findings only, each with severity and a concrete fix.`,
+${LESSONS}Read the diff yourself (\`git diff\`) and run whatever commands you need. Report real findings only, each with severity and a concrete fix. Where a PROJECT LESSON above names a failure mode this lens could hit (e.g. a false-green test that would pass with the fix stripped, esp. a compound boolean where each operand needs its own negative control), actively check for it.`,
       { schema: l.key === 'shortcut-hunt' ? SHORTCUT_SCHEMA : FINDINGS_SCHEMA, label: `review:${l.key}:r${round}`, phase: 'Review', model: 'opus' },
     ),
   ))).filter(Boolean)
@@ -252,7 +274,7 @@ Read the diff yourself (\`git diff\`) and run whatever commands you need. Report
 STEP 2 APPLY. STEP 3 SELF-VERIFY before returning: run the affected tests AND re-read your own diff hunting for the
 failure CLASS each finding belongs to (precision/type, charset, comment-vs-code honesty, test vacuity, cross-backend
 parity); if your fix introduced a new instance, fix it now, not next round.
-BLOCKING (P0/P1) findings — all must be fixed: ${JSON.stringify(blocking, null, 2)}
+${LESSONS}BLOCKING (P0/P1) findings — all must be fixed: ${JSON.stringify(blocking, null, 2)}
 BLOCKING (P0/P1) shortcuts — non-negotiable, all must be fixed: ${JSON.stringify(blockingShortcuts, null, 2)}
 NON-BLOCKING P2s (findings + shortcuts) — fix if cheap, fine to skip: ${JSON.stringify(p2s, null, 2)}
 Return a one-line description of the diff you produced (this becomes the next round's focus).`,

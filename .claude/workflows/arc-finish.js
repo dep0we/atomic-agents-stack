@@ -2,6 +2,7 @@ export const meta = {
   name: 'arc-finish',
   description: 'Drive an EXISTING build (already on the current branch) to a clean, converged state: adversarial review IN ROUNDS (incl. shortcut-hunter) until a full round finds zero findings, then a doc-release sweep. Does NOT re-run prep or re-implement — use this to finish a branch arc-execute left short of convergence. Stops at PR-ready; never merges. Escalates open findings if it still cannot converge.',
   phases: [
+    { title: 'Lessons' },
     { title: 'Review' },
     { title: 'DocSweep' },
   ],
@@ -15,6 +16,24 @@ const BASE = A.base ?? 'main'
 const MAX_ROUNDS = Math.max(2, A.maxRounds ?? 5)
 // Optional: known residual findings to seed round 1 so we don't burn a round rediscovering them.
 const SEED = Array.isArray(A.seedFindings) ? A.seedFindings : []
+
+// ---- Phase 0: load the project's hard-won lessons (close the leverage loop) ----
+// Same structural fix as arc-execute: a subagent reads the project memory dir and
+// distills the relevant feedback_*.md lessons into a compact brief, injected into
+// the seed-fix / review / convergence-fix prompts below so the finish pass APPLIES
+// hard-won lessons instead of repeating them. Degrades to '' if the dir is absent.
+phase('Lessons')
+const LESSONS_RAW = await agent(
+  `Load this project's hard-won engineering lessons so this convergence pass can APPLY them instead of repeating what already failed.
+Compute the memory dir: \`DIR="$HOME/.claude/projects/$(pwd | sed 's#/#-#g')/memory"\`. Read "$DIR/MEMORY.md" (the index). Then read the feedback_*.md bodies MOST relevant to adversarially reviewing AND fixing issue ${ISSUE} — ALWAYS include the test-discipline lessons (false-green / per-invocation negative control, layered-except typed-branch false-green, mock side-effect shape-keying), the review-discipline lessons (round-2 catches round-1 fix regressions, /ship gates discover past arc convergence), and the git-safety lessons (never git-checkout uncommitted work); PLUS any whose index line matches this issue's domain.
+Distill into a COMPACT, actionable brief: one bullet per lesson = the rule + the one-line "how to apply" + (if present) the concrete shape/file it bites. Max ~14 bullets, terse, imperative, NOT prose. This brief is injected verbatim into every downstream review / fix subagent.
+If the dir or MEMORY.md does not exist, return EXACTLY: NO PROJECT LESSONS FOUND`,
+  { label: 'load-lessons', phase: 'Lessons', model: 'sonnet' },
+)
+const LESSONS = (LESSONS_RAW && !/^NO PROJECT LESSONS FOUND/.test(String(LESSONS_RAW).trim()))
+  ? `\nPROJECT LESSONS (hard-won — APPLY these; do NOT repeat what they warn against):\n${String(LESSONS_RAW).trim()}\n`
+  : ''
+log(LESSONS ? 'Loaded project lessons brief — injecting into review/fix' : 'No project lessons found — proceeding without a lessons brief')
 
 const FINDINGS_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['findings'],
@@ -74,7 +93,7 @@ if (SEED.length) {
 affected tests and confirm they pass AND actually exercise the changed code path (a missing-coverage finding must add a
 test that invokes the real surface, not just imports it). For any item you judge already-resolved, verify it against the
 current code (\`git diff ${BASE}\`) before dismissing it.
-KNOWN-OPEN: ${JSON.stringify(SEED, null, 2)}
+${LESSONS}KNOWN-OPEN: ${JSON.stringify(SEED, null, 2)}
 HARD RULE — NO EXCEPTIONS: never edit a governing doc to satisfy a finding. Do not touch docs/TENSIONS.md, and do not edit
 CLAUDE.md's throughline, "## Design principles" section, any "### N." principle, or the aesthetic rules (the status /
 backend-count table is fine). If a finding seems to require amending a principle, leave it unfixed and say so in your summary —
@@ -99,7 +118,7 @@ while (round < MAX_ROUNDS) {
     agent(
       `Adversarial review round ${round} of issue ${ISSUE} on the current branch (diff vs ${BASE}). This round, scrutinize especially: ${lastFixDiff}.
 LENS: ${l.prompt}
-Read the diff yourself (\`git diff ${BASE}\`) and RUN whatever commands you need (build the app, hit the routes, run the tests). Report real findings only, each with severity and a concrete fix.`,
+${LESSONS}Read the diff yourself (\`git diff ${BASE}\`) and RUN whatever commands you need (build the app, hit the routes, run the tests). Report real findings only, each with severity and a concrete fix. Where a PROJECT LESSON above names a failure mode this lens could hit (e.g. a false-green test that would pass with the fix stripped, esp. a compound boolean where each operand needs its own negative control), actively check for it.`,
       { schema: l.key === 'shortcut-hunt' ? SHORTCUT_SCHEMA : FINDINGS_SCHEMA, label: `review:${l.key}:r${round}`, phase: 'Review', model: 'opus' },
     ),
   ))).filter(Boolean)
@@ -142,7 +161,7 @@ STEP 3 — SELF-VERIFY before returning: run the affected tests AND re-read your
 failure CLASS each finding belongs to (e.g. precision/type mismatches, charset rules, comment-vs-code honesty,
 test vacuity, cross-backend parity). If your own fix introduced a new instance of any class, fix it now — do not leave
 it for the next round. A fix that passes tests but says one thing while doing another is not done.
-
+${LESSONS}
 RECURRING findings (a prior round already 'fixed' these and the fix did NOT hold — find and fix the ROOT cause, and say
 in your summary why the earlier attempt failed): ${JSON.stringify(recurring, null, 2)}
 BLOCKING (P0/P1) findings — all must be fixed: ${JSON.stringify(blocking, null, 2)}
