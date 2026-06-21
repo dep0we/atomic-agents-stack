@@ -12,6 +12,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -62,7 +63,7 @@ _LOOPBACK_HOSTNAMES = {"localhost"}
 _SECTION_RE = re.compile(r"^##\s+(.+)$", re.MULTILINE)
 
 
-def _parse_serve_md(text: str) -> ServeConfig:
+def _parse_serve_md(text: str, environ: Mapping[str, str] | None = None) -> ServeConfig:
     """Parse serve.md text into a ServeConfig.
 
     Section bodies are stripped of whitespace. A missing section uses the
@@ -120,11 +121,16 @@ def _parse_serve_md(text: str) -> ServeConfig:
             cfg.identity_is_perimeter_verified = True
 
     # Apply env var overrides (highest priority). spec/37 resolution order.
-    env_host = os.environ.get("ATOMIC_AGENTS_SERVE_HOST")
+    # Read from the caller-supplied mapping when given (so deploy's resolve_port
+    # can pass an explicit environ WITHOUT mutating the global process env —
+    # #560); default to the live process environment otherwise.
+    env = environ if environ is not None else os.environ
+
+    env_host = env.get("ATOMIC_AGENTS_SERVE_HOST")
     if env_host:
         cfg.host = env_host
 
-    env_port = os.environ.get("ATOMIC_AGENTS_SERVE_PORT")
+    env_port = env.get("ATOMIC_AGENTS_SERVE_PORT")
     if env_port:
         try:
             cfg.port = int(env_port)
@@ -134,19 +140,19 @@ def _parse_serve_md(text: str) -> ServeConfig:
                 f"ATOMIC_AGENTS_SERVE_PORT is not a valid integer: {env_port!r}"
             ) from None
 
-    env_header = os.environ.get("ATOMIC_AGENTS_SERVE_IDENTITY_HEADER")
+    env_header = env.get("ATOMIC_AGENTS_SERVE_IDENTITY_HEADER")
     if env_header:
         cfg.identity_header = env_header
 
     # spec/45 PR2: idempotency_header env override.
-    env_idemp_header = os.environ.get("ATOMIC_AGENTS_SERVE_IDEMPOTENCY_HEADER")
+    env_idemp_header = env.get("ATOMIC_AGENTS_SERVE_IDEMPOTENCY_HEADER")
     if env_idemp_header:
         cfg.idempotency_header = env_idemp_header
 
     # spec/48: perimeter-verified opt-in env override. Any truthy value
     # ('1', 'true', 'yes', case-insensitive) enables it; everything else
     # (including unset) leaves the fail-closed default. Highest priority.
-    env_perimeter = os.environ.get("ATOMIC_AGENTS_SERVE_IDENTITY_PERIMETER_VERIFIED")
+    env_perimeter = env.get("ATOMIC_AGENTS_SERVE_IDENTITY_PERIMETER_VERIFIED")
     if env_perimeter is not None:
         cfg.identity_is_perimeter_verified = env_perimeter.strip().lower() in (
             "1",
@@ -158,18 +164,25 @@ def _parse_serve_md(text: str) -> ServeConfig:
     return cfg
 
 
-def load_serve_config(agent_root: Path) -> ServeConfig:
+def load_serve_config(
+    agent_root: Path, environ: Mapping[str, str] | None = None
+) -> ServeConfig:
     """Load and parse serve.md from the agent folder.
 
     A missing serve.md is not an error — returns defaults. A present but
     unreadable serve.md raises OSError (caller handles startup refusal).
+
+    ``environ`` lets a caller supply an explicit environment mapping for the
+    env-var overrides instead of the live process env (used by deploy's
+    ``resolve_port`` so it never mutates the global ``os.environ`` — #560).
+    Defaults to the live process environment.
     """
     serve_md = agent_root / "serve.md"
     if not serve_md.exists():
         # No file: start from defaults, still apply env vars.
-        return _parse_serve_md("")
+        return _parse_serve_md("", environ=environ)
     text = serve_md.read_text(encoding="utf-8")
-    return _parse_serve_md(text)
+    return _parse_serve_md(text, environ=environ)
 
 
 def is_loopback(host: str) -> bool:

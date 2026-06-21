@@ -170,18 +170,63 @@ def test_resolve_port_malformed_servemd_raises(tmp_path):
         _ports.resolve_port(root, cli_port=None, environ={})
 
 
-def test_resolve_port_does_not_leak_environ(tmp_path, monkeypatch):
-    """resolve_port restores os.environ after the temporary swap."""
+def test_resolve_port_does_not_mutate_global_environ_during_call(tmp_path, monkeypatch):
+    """resolve_port threads the explicit environ through load_serve_config and
+    NEVER mutates the global os.environ, even DURING the call — #560.
+
+    The old implementation save/clear/update/restored os.environ around the loader
+    call. That is not thread-safe: a concurrent reader during the call sees a
+    cleared env (the sentinel gone) with the override swapped in. A post-call
+    assertion can't catch this — the old code restored the env afterward, so it
+    would false-green. So we spy on load_serve_config and snapshot the GLOBAL env
+    AT INVOCATION TIME, which is the only moment old and new behavior diverge.
+    """
     import os
+    from types import SimpleNamespace
 
     root = tmp_path / "a"
     root.mkdir()
     monkeypatch.setenv("SENTINEL_KEEP", "1")
-    _ports.resolve_port(
+    monkeypatch.delenv("ATOMIC_AGENTS_SERVE_PORT", raising=False)
+
+    captured: dict = {}
+
+    def spy(agent_root, environ=None):
+        # Snapshot the live process env at the exact moment the loader runs.
+        captured["sentinel_during_call"] = os.environ.get("SENTINEL_KEEP")
+        captured["global_port_during_call"] = os.environ.get("ATOMIC_AGENTS_SERVE_PORT")
+        captured["environ_kwarg"] = environ
+        return SimpleNamespace(port=7001)
+
+    monkeypatch.setattr(_ports, "load_serve_config", spy)
+
+    port = _ports.resolve_port(
         root, cli_port=None, environ={"ATOMIC_AGENTS_SERVE_PORT": "7001"}
     )
-    # The real environ is restored (the temporary swap did not clobber it).
-    assert os.environ.get("SENTINEL_KEEP") == "1"
+
+    # All three assertions below strip-RED against the pre-#560 swap (verified):
+    # old code called the loader with no environ kwarg (-> None), and cleared +
+    # swapped the global env for the call's duration (sentinel -> None,
+    # global_port -> "7001"). The kwarg assertion happens to fire first under the
+    # old impl, but each line independently encodes a property the fix restores.
+    assert port == 7001  # override honored (threaded through, not ignored)
+    assert captured["environ_kwarg"] == {"ATOMIC_AGENTS_SERVE_PORT": "7001"}
+    assert captured["sentinel_during_call"] == "1"  # global env untouched mid-call
+    assert captured["global_port_during_call"] is None  # override never hit the global
+
+
+def test_resolve_port_reads_passed_environ_not_global(tmp_path, monkeypatch):
+    """End-to-end (no mock): the override comes from the passed environ, not the
+    global env — load_serve_config reads the threaded mapping. Proves the real
+    integration, complementing the spy test above."""
+    root = tmp_path / "a"
+    root.mkdir()
+    # A different value in the GLOBAL env must be ignored in favor of the passed one.
+    monkeypatch.setenv("ATOMIC_AGENTS_SERVE_PORT", "8000")
+    port = _ports.resolve_port(
+        root, cli_port=None, environ={"ATOMIC_AGENTS_SERVE_PORT": "7001"}
+    )
+    assert port == 7001
 
 
 # ── _verify: doctor predicate recomputes exit code from body ─────────────

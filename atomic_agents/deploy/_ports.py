@@ -17,7 +17,6 @@ socket.
 
 from __future__ import annotations
 
-import os
 import socket
 from pathlib import Path
 from typing import Callable
@@ -96,22 +95,12 @@ def resolve_port(
     if cli_port is not None:
         return _validate_port_range(cli_port, source="deploy --port")
 
-    # Temporarily honour a passed-in environ for testability without mutating
-    # the real process env. load_serve_config reads os.environ directly, so we
-    # swap it for the duration of the call when an override is supplied.
-    if environ is None:
-        cfg = load_serve_config(agent_root)
-        return _validate_port_range(cfg.port, source="env / serve.md / default")
-
-    saved = dict(os.environ)
-    try:
-        os.environ.clear()
-        os.environ.update(environ)
-        cfg = load_serve_config(agent_root)
-        return _validate_port_range(cfg.port, source="env / serve.md / default")
-    finally:
-        os.environ.clear()
-        os.environ.update(saved)
+    # Thread the (optional) explicit environ straight through to the serve-config
+    # loader. When None, load_serve_config reads the live process env. Either way
+    # the global os.environ is never mutated — #560 (the old swap-and-restore
+    # dance was not thread-safe and could clobber env state for concurrent work).
+    cfg = load_serve_config(agent_root, environ=environ)
+    return _validate_port_range(cfg.port, source="env / serve.md / default")
 
 
 def _socket_binder(host: str, port: int) -> bool:
