@@ -1015,6 +1015,11 @@ cost_usd: ABSENT         (embed spend is audit-only this PR; NOT folded into the
                           cross-call embed accounting deferred to #544 PR2)
 ```
 
+> **SUPERSEDED for `cost_usd` by the #544 PR2a addendum below.** The `cost_usd: ABSENT`
+> / "audit-only" line above describes the PR1 state. As of #544 PR2a a dedicated
+> `embed_cost` record carries `cost_usd` (`cost_source: "actor"`) so embed spend now
+> folds into `sum_cost_for_period` across calls. See the addendum for the live shape.
+
 `cost_estimated=True` NEVER gates — it only affects the reserved amount. The fail-closed gate is `if CostReadResult.degraded AND effective_cap is not None`, not a function of cost_estimated.
 
 `actual_usd` on a release record is a per-written-note ESTIMATE (the same UTF-8-byte token estimate as the reservation basis), summed over the notes successfully written. It is NOT conditioned on whether the underlying `embed()` returned `None`: `write_note()` returns a `NoteRef` and does not surface whether its internal `embed()` degraded to `None` (e.g. no API key — the note is still written via FTS and `write_note()` succeeds), so the orchestrator has no embed-None signal and charges the full per-note estimate. A true embed-None→`$0.0` accounting would require `write_note()` to report whether it embedded; that is deferred to a follow-up, not PR1.

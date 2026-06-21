@@ -5446,9 +5446,7 @@ class AtomicAgent:
                                     _merge_body_cache[_k] = _target_body
                                     _sizing_body = _target_body
                             except Exception as _pre_read_exc:
-                                import logging as _logging
-
-                                _logging.getLogger(__name__).warning(
+                                _logger.warning(
                                     "embed gate: pre-read of merge target %r failed "
                                     "(%s) — falling back to fragment-only reservation "
                                     "(conservative-toward-permissive)",
@@ -6978,9 +6976,14 @@ class AtomicAgent:
         KNOWN LIMITATION (#566): the pre-read precedes every write in the batch, so
         a capture that merges into a note ANOTHER capture creates fresh in the SAME
         batch falls back to fragment-only sizing (the target does not exist yet at
-        pre-read time). Direction is conservative-toward-permissive (under-reserve,
-        never over-charge), bounded by the 2x fan-out buffer; merge targets are
-        normally pre-existing notes, so incidence is low. Tracked in #566.
+        pre-read time). Direction is UNDER-count: at write time the backend re-embeds
+        the (now large) target body while the gate sized only the fragment. This is
+        NOT bounded by the 2x fan-out buffer — that buffer is sized on the fragment,
+        not the target body — so the under-count is ~embed(target_body) per same-batch
+        merge and scales with the count of such merges. Absolute magnitude is small
+        given embedding pricing (sub-cent per large body), but it is a genuine
+        ledger/cap under-count, not a bounded rounding imprecision. Incidence is low:
+        merge targets are normally pre-existing notes. Fix options + analysis in #566.
         """
         self._log(
             {
@@ -7044,7 +7047,7 @@ class AtomicAgent:
                 "cost_estimated": cost_estimated,
                 "status": "ok",
                 "summary": (
-                    f"embed cost: actual ${actual_usd:.6f} ({batch_size} notes)"
+                    f"embed cost: actual ${actual_usd:.6f} (batch of {batch_size})"
                 ),
             }
         )
