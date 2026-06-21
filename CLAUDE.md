@@ -304,7 +304,7 @@ If the project ever needs to optimize differently, `docs/methodology.md` is the 
 |-----|---------|
 | `docs/architecture.md` | Mental model in diagrams. Read first. |
 | `docs/protocols-shipped.md` | Per-protocol summary of the twenty-one shipped backends — reference impls, capabilities, operator overrides, doctor checks, Implementer Contracts, and the cliff each closes. |
-| `docs/spec/01-...48-principal-backend.md` | Locked spec (47 docs today, 37 locked + 10 DRAFTs/RFCs at spec/26 (cascade bundle), spec/30 (responsibility audit), spec/35 (init wizard), spec/37 (serve), spec/39 (otel-export), spec/43 (journal-backend), spec/44 (queue-backend), spec/46 (embedding-backend), spec/47 (conversation-backend), and spec/48 (principal-backend)). The product. |
+| `docs/spec/01-...49-deploy.md` | Locked spec (48 docs today, 38 locked + 10 DRAFTs/RFCs at spec/26 (cascade bundle), spec/30 (responsibility audit), spec/37 (serve), spec/39 (otel-export), spec/43 (journal-backend), spec/44 (queue-backend), spec/46 (embedding-backend), spec/47 (conversation-backend), spec/48 (principal-backend), and spec/49 (deploy)). The product. |
 | `docs/implementation/` | Build guides per runtime (cron, Claude skill, dashboard) |
 | `docs/deployment/versioning.md`, `upgrading.md` | SemVer + operator runbook |
 | `docs/deployment/release-runbook.md` | Maintainer `/ship` runbook: two-mode workflow + manual surface check |

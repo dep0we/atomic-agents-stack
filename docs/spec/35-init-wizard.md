@@ -1,6 +1,15 @@
 # 35: atomic-agents init wizard
 
-Status: RFC (locks at PR 2 of init-wizard arc, per #94 + design doc)
+**Status:** LOCKED at PR 2 of the init-wizard arc (issue #94). PR 1 (#317)
+shipped the `atomic-agents init` command + the advisor template; PR 2 (#323)
+shipped the researcher + writer templates and the Add-to-it recovery merge;
+#541 fixed framework-wide relative `tools.md` path anchoring so every
+scaffolded template passes the real `doctor`. Conformance:
+`tests/test_init_wizard.py` (72 tests) covering the seven-question flow, the
+entry guards, the Overwrite backup+restore and Add-to-it section-merge recovery
+paths, and the test-call exception catalog, plus
+`tests/test_init_doctor_conformance.py` (2 tests) running the UNMOCKED `doctor`
+on every scaffolded template from a decoy CWD (2026-06-21).
 Implements: home-user onboarding compression
 Closes: #94
 
@@ -274,8 +283,7 @@ The import is lazy in cli.py: `from .init import run_init` lives inside the
 cli.py:703 (`from . import doctor as doctor_module`) and cli.py:738
 (`from .persona.backend import get_default_persona_backend`).
 
-Future arcs migrate doctor / bundle / corpus output to rich (TODO-3 filed at PR
-1 close).
+Future arcs migrate doctor / bundle / corpus output to rich (#320).
 
 ---
 
@@ -448,13 +456,15 @@ at the top. Tiebreaker for ambiguous order: alphabetical by issue number.
 
 ## Future work
 
-PR 2 of arc: researcher + writer templates; "Add to it" recovery merge
-contract.
+The init-wizard arc is complete: PR 1 (#317) shipped the command + advisor
+template; PR 2 (#323) shipped the researcher + writer templates and the
+"Add to it" recovery merge contract; #541 fixed relative-path anchoring so
+scaffolded agents pass the real `doctor`.
 
-Fast-follows filed at PR 1 close: `--ai-assist` LLM-drafted persona (issue),
-`/atomic-init` Claude Code skill (v1.1 issue), rich migration for
-doctor/bundle/corpus output (polish umbrella issue).
+Open fast-follows (deferred, not dropped): `--ai-assist` LLM-drafted persona
+bodies (#318), the `/atomic-init` Claude Code skill wrapping the CLI (#319),
+and the rich migration for doctor / bundle / corpus output (#320).
 
-v1.1+ when the registry expands beyond the filesystem: tighten MUST 6 to also
-warn on non-filesystem backend URLs registered in
+v1.1+ when the persona registry expands beyond the filesystem: tighten MUST 6
+to also warn on non-filesystem backend URLs registered in
 `ATOMIC_AGENTS_PERSONA_BACKEND_URL`.
