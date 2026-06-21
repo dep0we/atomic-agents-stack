@@ -53,7 +53,7 @@ def test_primitive_embed_exported_from_logs_package():
 
 
 def test_embed_trigger_routes_to_primitive_embed():
-    """All four embed triggers map to PRIMITIVE_EMBED in _PRIMITIVE_BY_TRIGGER."""
+    """All five embed triggers map to PRIMITIVE_EMBED in _PRIMITIVE_BY_TRIGGER."""
     from atomic_agents.agent import _PRIMITIVE_BY_TRIGGER
 
     for trigger in (
@@ -61,6 +61,7 @@ def test_embed_trigger_routes_to_primitive_embed():
         "embed_release",
         "embed_batch_reservation",
         "embed_batch_release",
+        "embed_cost",
     ):
         assert _PRIMITIVE_BY_TRIGGER.get(trigger) == PRIMITIVE_EMBED, (
             f"trigger {trigger!r} should map to PRIMITIVE_EMBED but maps to "
@@ -381,17 +382,26 @@ class _FakeMergeTargetMemoryBackend(_FakeSemanticMemoryBackend):
     """Semantic backend whose read_note() returns a pre-seeded stored body.
 
     Used for the merge-write pre-read tests (PR2a). The gate calls
-    read_note(merge_into) before the write loop to size the reservation from
-    target_body + fragment_body instead of fragment_body alone.
+    read_note(merge_into) before the write loop to size the reservation from the
+    PRESERVED TARGET body, NOT the small incoming fragment.
+
+    This fake models the REAL merge contract (verified against the shipped
+    backends): a merge write PRESERVES the target's stored body VERBATIM and only
+    updates sources/last_seen metadata — the incoming fragment (capture.body) is
+    NOT folded into the body (backend.py write contract "preserve body verbatim";
+    filesystem._merge_into_existing leaves parsed.content untouched;
+    pgvector.write_note re-embeds stored.body ALONE). A fake that ACCUMULATED the
+    fragment into the body would be a false-green: it would agree with PR1's wrong
+    target_body+fragment_body sizing instead of the framework's actual contract
+    (feedback_false_green_test_needs_per_invocation_negative_control).
 
     Without this variant, every merge-write test would only exercise the
-    read_note()→None fallback path, masking a missing or mis-sized pre-read
-    (false-green per feedback_false_green_test_needs_per_invocation_negative_control).
+    read_note()→None fallback path, masking a missing or mis-sized pre-read.
 
     ``stored_notes`` maps note-name → stored body string. read_note(name) returns
     a Note with that body when name is in the dict, else None (same as the base
-    class). write_note() appends the new body to the stored dict so a post-write
-    read_note() returns the accumulated content.
+    class). write_note() on a merge PRESERVES the target body (does not accumulate)
+    so a post-write read_note(merge_into) returns the unchanged target content.
     """
 
     def __init__(
@@ -430,11 +440,15 @@ class _FakeMergeTargetMemoryBackend(_FakeSemanticMemoryBackend):
 
     def write_note(self, capture, policy):
         super().write_note(capture, policy)
-        # Simulate merge: accumulate the new body into the stored note.
+        # Model the REAL merge contract: a merge PRESERVES the target body
+        # verbatim (sources/last_seen grow; body untouched). The fragment is NOT
+        # accumulated into the body. A non-merge write stores the fragment as the
+        # note body.
         if capture.merge_into and capture.merge_into in self._stored_notes:
-            self._stored_notes[capture.name] = self._stored_notes[
-                capture.merge_into
-            ] + (capture.body or "")
+            # Body preserved — the target's stored body is unchanged. (Real
+            # backends only update metadata here.) Record the target body under
+            # the capture name so a post-write read_note(name) returns it.
+            self._stored_notes[capture.name] = self._stored_notes[capture.merge_into]
         else:
             self._stored_notes[capture.name] = capture.body or ""
 
@@ -1084,12 +1098,13 @@ def test_embed_block_writes_refusal_audit_record_with_run_id(tmp_path):
     )
 
 
-def test_embed_actual_usd_not_folded_into_cost_usd_this_pr(tmp_path):
-    """Embed records are audit-only this PR: they carry reserved_usd/actual_usd,
-    NOT a `cost_usd` field, so embed spend does not enter sum_cost_for_period's
-    running total (which aggregates only `cost_usd`). Cross-call embed accounting
-    is deferred to #544 PR2; this asserts the documented current behavior so it is
-    not silently assumed enforced.
+def test_embed_reservation_and_release_records_carry_no_cost_usd(tmp_path):
+    """The reservation and release records are audit/reconciliation only: they
+    carry reserved_usd/actual_usd but NOT a `cost_usd` field. cost_usd lives
+    EXCLUSIVELY on the dedicated embed_cost record (#544 PR2a), so embed spend
+    folds into sum_cost_for_period EXACTLY ONCE. This pins the double-count split
+    at the record-shape level (the end-to-end fold is verified by
+    test_embed_cost_folds_into_sum_cost_for_period_exactly_once).
     """
     fake_mem = _FakeSemanticMemoryBackend()
     agent = _make_agent(tmp_path, memory_backend=fake_mem)
@@ -1107,8 +1122,8 @@ def test_embed_actual_usd_not_folded_into_cost_usd_this_pr(tmp_path):
     assert embed_records, "expected embed audit records"
     for rec in embed_records:
         assert "cost_usd" not in rec, (
-            "embed records must NOT carry cost_usd this PR (audit-only; embed "
-            "spend is not yet folded into the cross-call cost total — #544 PR2)"
+            "embed reservation/release records must NOT carry cost_usd — only the "
+            "dedicated embed_cost record does (double-count split, #544 PR2a)"
         )
 
 
@@ -1909,16 +1924,225 @@ def test_embed_cost_no_double_count(tmp_path):
         assert "cost_usd" not in rec, "embed_batch_reservation must not carry cost_usd"
 
 
+def _run_call_real_log(agent, *, llm_response):
+    """Run agent.call() WITHOUT patching agent._log so records hit the real
+    log_backend (a FilesystemLogBackend rooted at agent.agent_root). Used by the
+    end-to-end double-count test so the REAL sum_cost_for_period aggregates the
+    emitted embed_cost records off disk.
+    """
+    with (
+        patch("atomic_agents._llm.call_llm", return_value=llm_response),
+        patch.object(agent, "load"),
+        patch.object(agent, "assemble_system_prompt", return_value="You are EmbedBot."),
+        patch.object(
+            agent,
+            "_check_cost_guardrails",
+            return_value=MagicMock(
+                allow=True, action="ok", reason="cap", cost_data_degraded=False
+            ),
+        ),
+    ):
+        return agent.call(work_item="embed e2e")
+
+
+def test_embed_cost_folds_into_sum_cost_for_period_exactly_once(tmp_path):
+    """End-to-end: the dedicated embed_cost record folds into the REAL
+    actor-source cost total EXACTLY ONCE (PROJECT LESSON #14 — drive the real
+    aggregator over EVERY actor record, not a trigger-filtered proxy).
+
+    The aggregate summed here is the SAME quantity ``sum_cost_for_period`` folds:
+    ``cost_usd`` over ALL actor-source records (chat run record + embed_cost +
+    any record that erroneously carries cost_usd). It is deliberately NOT
+    filtered to ``trigger == 'embed_cost'`` — a trigger filter would HIDE a
+    release/reservation record that leaked cost_usd, making the double-count
+    strip-control a no-op (the exact false-green this test was rewritten to
+    remove). The embed contribution is isolated by subtracting a chat baseline,
+    so a leaked cost_usd anywhere in the actor stream inflates the embed delta
+    and the test goes RED.
+
+    Asserts:
+      (a) one embed-gated call adds exactly ONE embed_cost record's cost_usd to
+          the actor total above the chat baseline;
+      (b) a second call adds exactly the same increment again (per-call linear,
+          NOT doubled by a second record carrying cost_usd).
+
+    Per-invocation strip controls (each verified to go RED in this round):
+      * remove cost_usd from the embed_cost record  → embed delta drops to ~0;
+      * add cost_usd to the embed_batch_release record → embed delta ~2x (the
+        release leak is now SUMMED because the aggregate is unfiltered).
+    Uses query(LogQuery()) (scans every day file) so a midnight bucket boundary
+    cannot flake the read.
+    """
+    from atomic_agents.logs.filesystem import FilesystemLogBackend
+    from atomic_agents.logs import LogQuery
+    from atomic_agents._costs import sum_cost_for_period
+
+    name = "embedbot"
+    agents_root = _build_agent_root(tmp_path, name)
+    from atomic_agents.agent import AtomicAgent
+
+    agent = AtomicAgent(
+        name=name,
+        trigger="manual",
+        agents_root=agents_root,
+        lock_backend=_FakeLockBackend(),
+        log_backend=FilesystemLogBackend(scope_root=agents_root / name),
+    )
+    agent.memory = _FakeSemanticMemoryBackend()
+
+    log_dir = agent.agent_root / "log"
+
+    def _actor_cost_total() -> float:
+        # The REAL aggregate sum_cost_for_period folds: cost_usd over ALL
+        # actor-source records (no trigger filter). A release record leaking
+        # cost_usd is counted here exactly as the production aggregator would
+        # count it — that is what makes the release double-count strip go RED.
+        # query(LogQuery()) scans every day file, so the read is midnight-safe.
+        recs = agent.log_backend.query(LogQuery())
+        return sum(
+            (r.cost_usd or 0.0)
+            for r in recs
+            if (getattr(r, "cost_source", None) or "actor") == "actor"
+        )
+
+    def _embed_cost_record_sum() -> float:
+        # Independent record-shape cross-check: the cost carried by the
+        # dedicated embed_cost records alone (used only to assert the delta is
+        # attributable to those records, never as the double-count guard).
+        recs = agent.log_backend.query(LogQuery())
+        return sum(
+            (r.cost_usd or 0.0)
+            for r in recs
+            if getattr(r, "trigger", None) == "embed_cost"
+        )
+
+    # Sanity: the full aggregator runs clean (not degraded) over the real dir.
+    pre = sum_cost_for_period(
+        log_dir, "today", source="actor", backend=agent.log_backend, agent_name=name
+    )
+    assert pre.degraded is False
+    assert _actor_cost_total() == pytest.approx(0.0)
+
+    # Chat baseline measured INDEPENDENTLY of any embed record: a no-capture call
+    # with the SAME fake token usage as the capture calls (input=7, output=3)
+    # writes ONLY the chat run record — no embed records to contaminate the
+    # measurement. Because the capture calls reuse that exact token usage, their
+    # chat run record costs the same, so per_call_chat is an embed-free constant
+    # the double-count algebra below cannot cancel. (Matching tokens matters:
+    # _fake_llm_response_no_capture uses 5/2, which would NOT match.)
+    baseline_resp = _fake_llm_response_no_capture()
+    baseline_resp.input_tokens = 7
+    baseline_resp.output_tokens = 3
+    _run_call_real_log(agent, llm_response=baseline_resp)
+    per_call_chat = _actor_cost_total()
+    assert _embed_cost_record_sum() == pytest.approx(0.0), (
+        "a no-capture call must emit NO embed_cost record"
+    )
+
+    # Two IDENTICAL-shape capture calls, each adding one chat run record (cost ==
+    # per_call_chat) plus the embed audit records.
+    _run_call_real_log(
+        agent, llm_response=_fake_llm_response_with_capture("note-1", "A" * 300)
+    )
+    after_one = _actor_cost_total()
+    one_embed_record_cost = _embed_cost_record_sum()
+    assert one_embed_record_cost > 0, (
+        "embed_cost must fold actual_usd into the actor total"
+    )
+
+    embed_cost_recs = [
+        r
+        for r in agent.log_backend.query(LogQuery())
+        if getattr(r, "trigger", None) == "embed_cost"
+    ]
+    assert len(embed_cost_recs) == 1
+
+    # The first capture call's embed contribution = its actor delta minus the
+    # embed-free chat cost. Because per_call_chat is measured WITHOUT any embed
+    # record, a release/reservation record leaking cost_usd inflates this delta
+    # above one embed_cost record and the algebra CANNOT cancel it → RED.
+    embed_contribution_one = (after_one - per_call_chat) - per_call_chat
+    assert embed_contribution_one == pytest.approx(one_embed_record_cost), (
+        f"the real actor total's embed contribution for one call "
+        f"({embed_contribution_one:.8f}) must equal exactly one dedicated embed_cost "
+        f"record ({one_embed_record_cost:.8f}) — a larger value means a "
+        "release/reservation record also carries cost_usd (double-count)"
+    )
+
+    _run_call_real_log(
+        agent, llm_response=_fake_llm_response_with_capture("note-2", "B" * 300)
+    )
+    after_two = _actor_cost_total()
+    # After two capture calls + one baseline: total = 3*chat + 2*embed. The embed
+    # contribution must be exactly 2 embed_cost records (each call folded once).
+    embed_contribution_two = after_two - 3 * per_call_chat
+    assert embed_contribution_two == pytest.approx(2 * one_embed_record_cost), (
+        f"two capture calls must fold embed spend exactly twice "
+        f"({2 * one_embed_record_cost:.8f}), got {embed_contribution_two:.8f} — a "
+        "record carrying cost_usd twice would double-count, a broken fold would zero it"
+    )
+
+    # The real period aggregator stays non-degraded (no fail-closed false-positive).
+    post = sum_cost_for_period(
+        log_dir, "today", source="actor", backend=agent.log_backend, agent_name=name
+    )
+    assert post.degraded is False
+
+
+def test_embed_cost_record_not_summed_when_only_release_has_cost(tmp_path):
+    """Strip-control companion: prove the audit release record is NOT summed.
+
+    Drives the same real-aggregator path but inspects the release records — they
+    must carry no cost_usd, so the embed_cost fold is the ONLY embed contribution.
+    If a future change moved cost_usd onto embed_batch_release, the actor-embed
+    total computed in the sibling test would silently double; this test pins the
+    release record's cost_usd absence at the on-disk level.
+    """
+    from atomic_agents.logs.filesystem import FilesystemLogBackend
+    from atomic_agents.logs import LogQuery
+
+    name = "embedbot"
+    agents_root = _build_agent_root(tmp_path, name)
+    from atomic_agents.agent import AtomicAgent
+
+    agent = AtomicAgent(
+        name=name,
+        trigger="manual",
+        agents_root=agents_root,
+        lock_backend=_FakeLockBackend(),
+        log_backend=FilesystemLogBackend(scope_root=agents_root / name),
+    )
+    agent.memory = _FakeSemanticMemoryBackend()
+
+    _run_call_real_log(
+        agent, llm_response=_fake_llm_response_with_capture("note-1", "A" * 300)
+    )
+
+    recs = list(agent.log_backend.query(LogQuery()))
+    release = [r for r in recs if getattr(r, "trigger", None) == "embed_batch_release"]
+    assert len(release) == 1
+    assert release[0].cost_usd is None, (
+        "embed_batch_release must carry NO cost_usd on disk — only embed_cost does "
+        "(double-count guard at the persistence layer)"
+    )
+    embed_cost = [r for r in recs if getattr(r, "trigger", None) == "embed_cost"]
+    assert len(embed_cost) == 1
+    assert embed_cost[0].cost_usd and embed_cost[0].cost_usd > 0
+
+
 # ──────────────────────────────────────────────────────────────────────────────
-# PR2a: merge-write pre-read — reservation sized from merged body
+# PR2a: merge-write pre-read — reservation sized from the preserved target body
 
 
-def test_merge_write_reserves_on_merged_body(tmp_path):
-    """Reservation is sized from stored_body + fragment_body, not fragment_body alone.
+def test_merge_write_reserves_on_target_body(tmp_path):
+    """Reservation is sized from the PRESERVED TARGET body, not the fragment.
+
+    A merge write preserves the target body verbatim — the backend re-embeds the
+    stored target body ALONE; the fragment is NOT folded in. So the reservation
+    must reflect the target body size, not the small incoming fragment.
 
     Uses _FakeMergeTargetMemoryBackend with a large stored body (3000 chars)
-    and a tiny fragment (30 chars). The reservation must reflect the merged size,
-    not the fragment.
+    and a tiny fragment (30 chars).
 
     Per-invocation negative control (strip): if the pre-read is removed, the
     reservation is sized from the 30-char fragment only — a drastically smaller
@@ -1957,15 +2181,17 @@ def test_merge_write_reserves_on_merged_body(tmp_path):
     fragment_cost, _ = calc_embedding_cost("text-embedding-3-small", fragment_tokens)
     fragment_reservation = _EMBED_BATCH_FANOUT_BUFFER * fragment_cost
 
-    merged_tokens = _estimate_embed_tokens(stored_body + fragment_body)
-    merged_cost, _ = calc_embedding_cost("text-embedding-3-small", merged_tokens)
-    merged_reservation = _EMBED_BATCH_FANOUT_BUFFER * merged_cost
+    # The backend re-embeds the preserved TARGET body alone (NOT target+fragment).
+    target_tokens = _estimate_embed_tokens(stored_body)
+    target_cost, _ = calc_embedding_cost("text-embedding-3-small", target_tokens)
+    target_reservation = _EMBED_BATCH_FANOUT_BUFFER * target_cost
 
-    # The reservation must be at least the merged-size reservation.
-    assert reserved_usd >= merged_reservation * 0.99, (
-        f"reserved_usd {reserved_usd:.8f} must be sized from the merged body "
-        f"(~{merged_reservation:.8f}), not the fragment ({fragment_reservation:.8f}). "
-        "The pre-read is likely not running."
+    # The reservation must equal the target-body reservation (the body the backend
+    # actually re-embeds), NOT target+fragment and NOT the fragment alone.
+    assert reserved_usd == pytest.approx(target_reservation, rel=1e-6), (
+        f"reserved_usd {reserved_usd:.8f} must be sized from the PRESERVED TARGET "
+        f"body (~{target_reservation:.8f}), not the fragment "
+        f"({fragment_reservation:.8f}). The pre-read is likely not running."
     )
     # And it must be significantly larger than the fragment-only amount.
     assert reserved_usd > fragment_reservation * 2, (
@@ -1975,10 +2201,11 @@ def test_merge_write_reserves_on_merged_body(tmp_path):
 
 
 def test_merge_write_under_reserve_regression(tmp_path):
-    """A large stored body + small fragment must be REFUSED when merged size > cap.
+    """A large stored target body + small fragment must be REFUSED when target > cap.
 
     Without the pre-read fix, the gate only sees the tiny fragment and incorrectly
-    allows the call. With the fix, the gate computes the merged size and blocks it.
+    allows the call. With the fix, the gate sizes from the preserved target body
+    and blocks it.
 
     Per-invocation negative control: using the base _FakeSemanticMemoryBackend
     (read_note→None, falls back to fragment-only) means the under-sized fragment
@@ -1992,12 +2219,13 @@ def test_merge_write_under_reserve_regression(tmp_path):
     from atomic_agents.agent import _estimate_embed_tokens, _EMBED_BATCH_FANOUT_BUFFER
     from atomic_agents._costs import calc_embedding_cost
 
-    merged_tokens = _estimate_embed_tokens(stored_body + fragment_body)
-    merged_cost, _ = calc_embedding_cost("text-embedding-3-small", merged_tokens)
-    merged_reservation = _EMBED_BATCH_FANOUT_BUFFER * merged_cost
+    # The backend re-embeds the preserved TARGET body alone on a merge.
+    target_tokens = _estimate_embed_tokens(stored_body)
+    target_cost, _ = calc_embedding_cost("text-embedding-3-small", target_tokens)
+    target_reservation = _EMBED_BATCH_FANOUT_BUFFER * target_cost
 
-    # Cap is set just below the merged reservation so the merged batch is refused.
-    cap = merged_reservation * 0.5
+    # Cap is set just below the target reservation so the merge batch is refused.
+    cap = target_reservation * 0.5
 
     fake_mem = _FakeMergeTargetMemoryBackend(stored_notes={"base-note": stored_body})
     assert fake_mem.supports_semantic_search is True
@@ -2087,15 +2315,17 @@ def test_merge_write_under_reserve_fallback_when_read_note_raises(tmp_path):
     assert len(res_recs) == 1, "reservation must still be emitted on pre-read failure"
 
 
-def test_merge_write_trueup_uses_merged_body(tmp_path):
-    """actual_usd on embed_cost reflects the merged body, not the fragment.
+def test_merge_write_trueup_uses_target_body(tmp_path):
+    """actual_usd on embed_cost reflects the PRESERVED TARGET body, not the fragment.
 
-    The true-up loop uses _merge_body_cache (populated by the reservation loop's
-    pre-read) so the same estimate drives both the reservation and actual_usd.
+    A merge preserves the target body verbatim, so the backend re-embeds the
+    target body alone. The true-up loop uses _merge_body_cache (populated by the
+    reservation loop's pre-read) so the same target-body estimate drives both the
+    reservation and actual_usd.
 
     Per-invocation negative control: using the base _FakeSemanticMemoryBackend
     (no pre-read) makes actual_usd reflect the fragment only, which is much
-    smaller than the merged estimate — proving the _FakeMergeTargetMemoryBackend
+    smaller than the target estimate — proving the _FakeMergeTargetMemoryBackend
     path is load-bearing.
     """
     stored_body = "S" * 2000
@@ -2128,19 +2358,141 @@ def test_merge_write_trueup_uses_merged_body(tmp_path):
     fragment_cost, _ = calc_embedding_cost(
         "text-embedding-3-small", _estimate_embed_tokens(fragment_body)
     )
-    merged_cost, _ = calc_embedding_cost(
-        "text-embedding-3-small", _estimate_embed_tokens(stored_body + fragment_body)
+    # The backend re-embeds the preserved TARGET body alone (NOT target+fragment).
+    target_cost, _ = calc_embedding_cost(
+        "text-embedding-3-small", _estimate_embed_tokens(stored_body)
     )
 
     actual_usd = cost_recs[0]["cost_usd"]
 
-    # actual_usd must be at least the merged-body cost (not the fragment-only cost).
-    assert actual_usd >= merged_cost * 0.99, (
-        f"actual_usd {actual_usd:.8f} must reflect the merged body cost "
-        f"(~{merged_cost:.8f}), not the fragment-only cost ({fragment_cost:.8f}). "
+    # actual_usd must equal the target-body cost (NOT target+fragment, NOT fragment).
+    assert actual_usd == pytest.approx(target_cost, rel=1e-6), (
+        f"actual_usd {actual_usd:.8f} must reflect the PRESERVED TARGET body cost "
+        f"(~{target_cost:.8f}), not the fragment-only cost ({fragment_cost:.8f}). "
         "The true-up may not be reading from _merge_body_cache."
     )
     assert actual_usd > fragment_cost * 2, (
         f"actual_usd {actual_usd:.8f} is barely above fragment cost "
         f"{fragment_cost:.8f} — true-up cache lookup may not be firing"
+    )
+
+
+def _fake_llm_response_two_merge_captures_same_name(
+    name: str,
+    body_a: str,
+    merge_into_a: str,
+    body_b: str,
+    merge_into_b: str,
+):
+    """Two atomic_capture tool_uses sharing a `name` but with different bodies and
+    different merge targets. Both survive upstream dedup (keyed on
+    (type, name, hash(body)) WITHOUT merge_into), so the gate sees two captures
+    with the same name targeting different notes — the cache-key collision vector.
+    """
+    resp = MagicMock()
+    resp.text = ""
+    resp.tool_uses = [
+        {
+            "name": "atomic_capture",
+            "id": "tu-merge-a",
+            "input": {
+                "type": "user",
+                "name": name,
+                "description": "merge a",
+                "confidence": "high",
+                "sources": ["pr2a collision test"],
+                "body": body_a,
+                "merge_into": merge_into_a,
+            },
+        },
+        {
+            "name": "atomic_capture",
+            "id": "tu-merge-b",
+            "input": {
+                "type": "user",
+                "name": name,
+                "description": "merge b",
+                "confidence": "high",
+                "sources": ["pr2a collision test"],
+                "body": body_b,
+                "merge_into": merge_into_b,
+            },
+        },
+    ]
+    resp.input_tokens = 7
+    resp.output_tokens = 3
+    resp.cache_hit_tokens = 0
+    resp.cache_miss_tokens = 0
+    resp.raw = {}
+    return resp
+
+
+def test_merge_cache_keyed_by_tuple_not_name_no_collision(tmp_path):
+    """Two same-name captures with different merge targets are each trued-up at
+    their OWN target body (cache-key collision regression — Root Cause B).
+
+    The reservation/true-up loops dedup on (type, name, hash(body), merge_into),
+    so two captures sharing a `name` but with different fragments AND different
+    merge targets both survive and are both written. _merge_body_cache MUST be
+    keyed by the same 4-tuple: keying by `name` alone would overwrite the first
+    capture's cached target body with the second's, so the true-up would charge
+    the EARLIER capture at the LATER capture's target-body size — a reserve/true-up
+    desync that silently mis-charges embed spend.
+
+    Per-invocation negative control: revert _merge_body_cache to name-keying and
+    this test goes RED (both embed_cost contributions collapse to the
+    last-written target body, so the summed cost != cost(target_big)+cost(target_small)).
+    """
+    target_big = "BIG" * 2000  # ~6000 chars
+    target_small = "sm" * 5  # 10 chars
+    name = "shared-name"
+
+    fake_mem = _FakeMergeTargetMemoryBackend(
+        stored_notes={"note-big": target_big, "note-small": target_small}
+    )
+    assert fake_mem.supports_semantic_search is True
+
+    agent = _make_agent(tmp_path, memory_backend=fake_mem)
+    sink: list[dict] = []
+
+    _run_call(
+        agent,
+        llm_response=_fake_llm_response_two_merge_captures_same_name(
+            name=name,
+            body_a="frag-a",
+            merge_into_a="note-big",
+            body_b="frag-b-different",
+            merge_into_b="note-small",
+        ),
+        log_sink=sink,
+    )
+
+    # Both captures wrote (distinct merge targets → not collapsed by dedup).
+    assert len(fake_mem._written) == 2, (
+        f"expected both same-name captures written, got {fake_mem._written}"
+    )
+
+    cost_recs = [r for r in sink if r.get("trigger") == "embed_cost"]
+    assert len(cost_recs) == 1, "one batch → one embed_cost record"
+    actual_total = cost_recs[0]["cost_usd"]
+
+    from atomic_agents.agent import _estimate_embed_tokens
+    from atomic_agents._costs import calc_embedding_cost
+
+    cost_big, _ = calc_embedding_cost(
+        "text-embedding-3-small", _estimate_embed_tokens(target_big)
+    )
+    cost_small, _ = calc_embedding_cost(
+        "text-embedding-3-small", _estimate_embed_tokens(target_small)
+    )
+    expected_total = cost_big + cost_small
+
+    # The summed actual_usd must equal cost(target_big) + cost(target_small).
+    # A name-keyed cache would charge BOTH captures at target_small (last write),
+    # collapsing the total to ~2*cost_small — strictly less, going RED here.
+    assert actual_total == pytest.approx(expected_total, rel=1e-6), (
+        f"actual_usd {actual_total:.8f} must equal cost(target_big)+cost(target_small) "
+        f"({expected_total:.8f}); a name-keyed cache would collapse both to the "
+        f"last-written target (~{2 * cost_small:.8f}), proving the 4-tuple key is "
+        "load-bearing"
     )

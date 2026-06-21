@@ -5384,45 +5384,67 @@ class AtomicAgent:
                     # (~2x) because the protocol doesn't advertise whether
                     # write_note() calls embed()/embed_batch().
                     #
-                    # (#544 PR2a) — merge-write pre-read: for captures with
-                    # merge_into set, PgvectorMemoryBackend embeds the full
-                    # accumulated stored body, not the incoming fragment. Pre-read
-                    # the target via read_note(merge_into) so the reservation is
-                    # sized from target_body + fragment_body (Principle #4 —
-                    # enforce-before-pay; the gate must reflect the true worst-case
-                    # merged size so an over-cap merge is refused before billing).
-                    # On read failure, fall back to fragment-only (conservative-
-                    # toward-permissive — same pattern as pgvector.py:764-785).
-                    # The pre-read result is cached in _merge_body_cache and reused
-                    # in the true-up loop so reserve<->actual_usd cannot desync.
-                    # No cross-capture caching — each capture's merge_into is read
-                    # independently to avoid stale-cache bugs when two captures
-                    # target different notes.
+                    # (#544 PR2a) — merge-write pre-read: for a merge write
+                    # (capture.merge_into set), the backend PRESERVES the target's
+                    # stored body verbatim and only appends sources/last_seen — the
+                    # incoming fragment (capture.body) is NOT folded into the body.
+                    # The re-embed therefore targets the PRESERVED TARGET BODY ALONE
+                    # (verified: backend.py:316-317 "preserve body verbatim";
+                    # filesystem.py _merge_into_existing leaves parsed.content
+                    # untouched; pgvector.py:761-768 embeds stored.body, NOT
+                    # stored.body + fragment). PR1 sized the reservation from the
+                    # small incoming fragment, which under-reserves AND under-charges
+                    # a merge whose stored target body is large. Pre-read the target
+                    # via read_note(merge_into) so both the reservation and the
+                    # true-up are sized from the target body the backend actually
+                    # embeds (Principle #4 — enforce-before-pay; an over-cap merge
+                    # is refused before billing). On read failure, fall back to
+                    # fragment-only (conservative-toward-permissive — analogous
+                    # FAILURE POSTURE to pgvector.py:778-785 (both refuse to act on
+                    # a target body they couldn't read), though the mechanics differ:
+                    # the gate still charges the fragment, whereas pgvector skips the
+                    # upsert entirely). The pre-read result is cached in
+                    # _merge_body_cache and reused in the true-up loop so
+                    # reserve<->actual_usd cannot desync.
                     _per_item_sum = 0.0
                     _embed_batch_size = 0
-                    # Dedup key includes merge_into so two captures with the same
-                    # (type, name, fragment-hash) but different merge targets are
-                    # both reserved (not silently collapsed to the first).
+                    # Dedup key includes merge_into. Upstream extract_all_captures
+                    # already collapses captures sharing (type, name, hash(body)),
+                    # so for IDENTICAL-body captures the merge_into component is
+                    # inert (defense-in-depth). It IS load-bearing for two captures
+                    # that share (type, name) but carry DIFFERENT bodies targeting
+                    # DIFFERENT merge notes — those survive upstream (distinct
+                    # hash(body)) and must be sized/cached SEPARATELY here, else the
+                    # cache key collides and the true-up desyncs from the
+                    # reservation (regression-tested:
+                    # test_merge_cache_keyed_by_tuple_not_name_no_collision).
                     _seen_keys_for_estimate: set[tuple] = set()
-                    # Cache of pre-read merge target bodies: capture.name → stored body
-                    # (the merge target body, NOT the post-write body). Used in both
-                    # the reservation and the true-up loops so the two estimates share
-                    # the same read result and cannot drift.
-                    _merge_body_cache: dict[str, str] = {}
+                    # Cache of pre-read merge target bodies, keyed by the SAME 4-tuple
+                    # the reservation/true-up loops dedup on — (type, name,
+                    # hash(body), merge_into). Keying by name alone would collide two
+                    # distinct same-name captures with different merge targets, so
+                    # the true-up would read the wrong cached body and desync from the
+                    # reservation. Value is the preserved target body (the body the
+                    # backend re-embeds), NOT target+fragment and NOT the post-write
+                    # body. Shared by the reservation and true-up loops so the two
+                    # estimates use one read result and cannot drift.
+                    _merge_body_cache: dict[tuple, str] = {}
                     for _c in all_captures:
                         _k = (_c.type, _c.name, hash(_c.body), _c.merge_into)
                         if _k in _seen_keys_for_estimate:
                             continue
                         _seen_keys_for_estimate.add(_k)
-                        # (#544 PR2a) merge-write pre-read: size from accumulated body.
+                        # (#544 PR2a) merge-write pre-read: size from the preserved
+                        # target body (the body the backend actually re-embeds), not
+                        # the incoming fragment.
                         _sizing_body = _c.body
                         if _c.merge_into:
                             try:
                                 _stored_note = self.memory.read_note(_c.merge_into)
                                 if _stored_note is not None and _stored_note.body:
-                                    _merged_body = _stored_note.body + (_c.body or "")
-                                    _merge_body_cache[_c.name] = _merged_body
-                                    _sizing_body = _merged_body
+                                    _target_body = _stored_note.body
+                                    _merge_body_cache[_k] = _target_body
+                                    _sizing_body = _target_body
                             except Exception as _pre_read_exc:
                                 import logging as _logging
 
@@ -5516,9 +5538,12 @@ class AtomicAgent:
 
                 try:
                     for c in all_captures:
-                        # (#544 PR2a) dedup key includes merge_into so two captures
-                        # with the same (type, name, fragment-hash) but different
-                        # merge targets are each written (not silently collapsed).
+                        # (#544 PR2a) dedup key includes merge_into to match the
+                        # reservation/cache key (see the reservation-loop comment).
+                        # Inert for identical-body captures (upstream already
+                        # collapsed them); load-bearing for same-name DIFFERENT-body
+                        # captures targeting different notes, so each is written and
+                        # trued-up against its own target body.
                         key = (c.type, c.name, hash(c.body), c.merge_into)
                         if key in seen_capture_keys:
                             continue
@@ -5527,16 +5552,19 @@ class AtomicAgent:
                             self.memory.write_note(c, policy)
                             written_captures.append(c)
                             # True-up actual embed cost per written note.
-                            # (#544 PR2a) merge writes: use the pre-read merged body
+                            # (#544 PR2a) merge writes: use the pre-read target body
                             # from _merge_body_cache (populated in the reservation
-                            # loop) so the true-up reflects the same merged-body
-                            # estimate as the reservation. Fallback to fragment body
-                            # when the cache miss (read failed or merge_into unset).
-                            # The fallback is conservative-toward-permissive and
-                            # must never be zero — we always charge the fragment.
+                            # loop, keyed by the same 4-tuple) so the true-up reflects
+                            # the same preserved-target-body estimate the backend
+                            # actually re-embeds. Fallback to the fragment body on a
+                            # cache miss (read failed, or no merge_into). The fallback
+                            # is conservative-toward-permissive and must never be
+                            # zero — we always charge at least the fragment.
                             if _embed_gate_active:
                                 _trueup_body = (
-                                    _merge_body_cache.get(c.name)
+                                    _merge_body_cache.get(
+                                        (c.type, c.name, hash(c.body), c.merge_into)
+                                    )
                                     if c.merge_into
                                     else None
                                 ) or c.body
@@ -6936,12 +6964,23 @@ class AtomicAgent:
         token count rather than confirmed from provider-reported usage
         (EmbeddingBackend returns no token usage).
 
-        RESOLVED in #544 PR2a: merge writes now pre-read the stored body in the
-        reservation and true-up loops via read_note(merge_into) BEFORE the write
-        loop. actual_usd for a merge write reflects the merged body estimate
-        (target_body + fragment_body), not the fragment alone. The pre-read result
-        is cached in _merge_body_cache so reserve and actual_usd share the same
-        estimate and cannot desync.
+        RESOLVED in #544 PR2a: merge writes now pre-read the stored target body in
+        the reservation and true-up loops via read_note(merge_into) BEFORE the write
+        loop. A merge PRESERVES the target body verbatim (the backend re-embeds the
+        stored target body ALONE; the incoming fragment lands in sources metadata,
+        NOT the body — backend.py:316-317, pgvector.py:761-768), so actual_usd for a
+        merge write reflects the PRESERVED TARGET body estimate, not the small
+        incoming fragment. PR1's fragment-only sizing under-charged a merge whose
+        stored target body was large. The pre-read result is cached in
+        _merge_body_cache so reserve and actual_usd share the same estimate and
+        cannot desync.
+
+        KNOWN LIMITATION (#566): the pre-read precedes every write in the batch, so
+        a capture that merges into a note ANOTHER capture creates fresh in the SAME
+        batch falls back to fragment-only sizing (the target does not exist yet at
+        pre-read time). Direction is conservative-toward-permissive (under-reserve,
+        never over-charge), bounded by the 2x fan-out buffer; merge targets are
+        normally pre-existing notes, so incidence is low. Tracked in #566.
         """
         self._log(
             {

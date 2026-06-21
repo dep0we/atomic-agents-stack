@@ -1000,7 +1000,7 @@ Four triggers map to `PRIMITIVE_EMBED = 'embed'` in `_PRIMITIVE_BY_TRIGGER`:
 | `embed_reservation` | Before a single embed() call (query-embed gate at the CLI corpus-query site (#564), NOT inside agent.call() — wired in #544 PR2) |
 | `embed_release` | In finally after a single embed() call (query-embed gate at the CLI corpus-query site (#564), NOT inside agent.call() — wired in #544 PR2) |
 
-**Canonical shape for embed records (reservation/release triggers):**
+**Canonical shape for embed records (all four triggers):**
 
 ```
 output_tokens: 0         (embedding is input-only; no output tokens)
@@ -1010,35 +1010,47 @@ batch_size: int          (for batch triggers; 1 for per-call triggers)
 reserved_usd: float      (reservation records)
 actual_usd: float        (release records; per-written-note byte-token estimate)
 written_count: int       (embed_batch_release: notes successfully written)
-cost_usd: ABSENT         (reservation and release records are audit/reconciliation
-                          only — cost_usd lives on the dedicated embed_cost record)
+cost_usd: ABSENT         (embed spend is audit-only this PR; NOT folded into the
+                          cost_usd that sum_cost_for_period aggregates —
+                          cross-call embed accounting deferred to #544 PR2)
 ```
-
-**Versioned normative addendum — cross-call embed accounting (spec/46, issue #544 PR2a)**
-
-A dedicated `embed_cost` JSONL record is now emitted in the same `finally` block IMMEDIATELY AFTER `embed_batch_release`, conditioned on `actual_usd > 0`. This is the ONLY embed record that carries `cost_usd` — `embed_batch_release` and `embed_batch_reservation` intentionally do not, preventing double-count.
-
-| Field | Value |
-|-------|-------|
-| `trigger` | `"embed_cost"` |
-| `cost_usd` | `actual_usd` (the per-written-note byte-token estimate) |
-| `cost_source` | `"actor"` |
-| `cost_estimated` | bool (True when model_id not in EMBEDDING_PRICING) |
-| `model` | embedding model id |
-| `parent_run_id` | links this record to the parent `agent.call()` run |
-| `parent_agent` | agent name for audit-join (Principle #5) |
-| `output_tokens` | `0` (embedding is input-only) |
-
-`'embed_cost': PRIMITIVE_EMBED` registered in `_PRIMITIVE_BY_TRIGGER` so `GROUP BY primitive` attribution is correct on disk.
-
-`sum_cost_for_period(source='actor')` now includes prior embed spend on subsequent calls via the `embed_cost` records in the log. The gate baseline is accurate across calls.
-
-Merge-write reservations are now sized from `target_body + fragment_body` (RESOLVED — see #544 PR2a). The reservation loop calls `self.memory.read_note(merge_into)` before the write loop. On read failure, falls back to fragment-only with a WARNING. `actual_usd` in the `embed_cost` record also reflects the merged-body estimate (pre-read cached in `_merge_body_cache`; reused in the true-up loop so reserve and actual_usd share the same estimate).
 
 `cost_estimated=True` NEVER gates — it only affects the reserved amount. The fail-closed gate is `if CostReadResult.degraded AND effective_cap is not None`, not a function of cost_estimated.
 
-`actual_usd` on a release record is a per-written-note ESTIMATE (the same UTF-8-byte token estimate as the reservation basis), summed over the notes successfully written. It is NOT conditioned on whether the underlying `embed()` returned `None`: `write_note()` returns a `NoteRef` and does not surface whether its internal `embed()` degraded to `None` (e.g. no API key — the note is still written via FTS and `write_note()` succeeds), so the orchestrator has no embed-None signal and charges the full per-note estimate. A true embed-None→`$0.0` accounting would require `write_note()` to report whether it embedded; that is deferred to a follow-up.
+`actual_usd` on a release record is a per-written-note ESTIMATE (the same UTF-8-byte token estimate as the reservation basis), summed over the notes successfully written. It is NOT conditioned on whether the underlying `embed()` returned `None`: `write_note()` returns a `NoteRef` and does not surface whether its internal `embed()` degraded to `None` (e.g. no API key — the note is still written via FTS and `write_note()` succeeds), so the orchestrator has no embed-None signal and charges the full per-note estimate. A true embed-None→`$0.0` accounting would require `write_note()` to report whether it embedded; that is deferred to a follow-up, not PR1.
 
 The `embed_reservation` and `embed_release` triggers are defined here for completeness but not yet emitted by a shipped code path. There is no query-embed call site inside `agent.call()` to gate (neither `memory.search()` nor `corpus.query()` is invoked by the orchestrator — confirmed by grep over `agent.py`); the real ungated query-embed path is the CLI corpus-query command (#564). These two triggers will be emitted when that gate ships in #544 PR2.
 
 Added OUTSIDE the 8-MUST count, following the versioned-addendum precedent of spec/45 PR2 (#520) and spec/22 §Read-failure contract (#497).
+
+### Versioned normative addendum — `embed_cost` cross-call accounting record (spec/46, issue #544 PR2a)
+
+This addendum SUPERSEDES the PR1 statement above that "cost_usd: ABSENT (embed spend is audit-only this PR; ... cross-call embed accounting deferred to #544 PR2)". As of #544 PR2a, embed spend IS folded into the cost total that `sum_cost_for_period` aggregates across calls. The mechanism is a dedicated record, NOT a change to the reservation/release records.
+
+A FIFTH trigger maps to `PRIMITIVE_EMBED = 'embed'` in `_PRIMITIVE_BY_TRIGGER`:
+
+| Trigger | Emitted when |
+|---------|-------------|
+| `embed_cost` | In the same `finally` block IMMEDIATELY AFTER `embed_batch_release`, conditioned on `actual_usd > 0` — the cross-call accounting event |
+
+The PR1 statement "Four triggers map to `PRIMITIVE_EMBED`" now reads "Five triggers" with `embed_cost` added.
+
+**Canonical shape for the `embed_cost` record:**
+
+```
+trigger: "embed_cost"
+parent_run_id: str       (the agent.call() run_id — audit-join anchor)
+parent_agent: str        (the agent name — audit-join correctness, Principle 5)
+model: str               (the resolved embedding model_id)
+input_tokens: 0
+output_tokens: 0
+cost_usd: float          (== actual_usd; the ONLY embed record carrying cost_usd)
+cost_source: "actor"     (the agent's own embedding spend)
+cost_estimated: bool     (True when the per-note cost was byte-token estimated)
+```
+
+**The double-count invariant.** `embed_cost` is the ONLY embed trigger that carries `cost_usd`. `embed_batch_reservation` and `embed_batch_release` carry `reserved_usd` / `actual_usd` for reservation-reconciliation accounting but DO NOT carry `cost_usd`, so `sum_cost_for_period` (which sums `cost_usd` exclusively) folds embed spend in EXACTLY ONCE per batch. The `embed_batch_release` record remains the reservation-reconciliation anchor; `embed_cost` is the accounting event. This mirrors the helper/delegate pattern (leaf events carry `cost_usd`; release records carry accounting metadata).
+
+`sum_cost_for_period(source='actor')` now includes prior embed spend on subsequent calls via the `embed_cost` records, so the embed cost gate's headroom baseline is accurate across calls (Principle 4).
+
+Added OUTSIDE the 8-MUST count, same versioned-addendum precedent as the PR1 addendum above.
