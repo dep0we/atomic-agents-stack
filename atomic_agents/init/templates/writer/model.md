@@ -4,7 +4,7 @@
 
 **`claude-sonnet-4-6`**
 
-<!-- For deep drafting passes on complex long-form work, swap default_model to claude-opus-4-7 and raise daily_cap_usd to 2.00 / monthly_cap_usd to 20.00. Sonnet is the default because it produces fluent prose at lower cost for typical writing workloads. -->
+<!-- For deep drafting passes on complex long-form work, swap default_model to claude-opus-4-8 and raise daily_cap_usd to 2.00 / monthly_cap_usd to 20.00. Sonnet is the default because it produces fluent prose at lower cost for typical writing workloads. -->
 
 Chosen for: fluent prose generation, strong instruction-following for voice consistency, efficient revision passes. Sonnet handles the large majority of writing tasks well and keeps daily costs predictable on the advisor guardrail settings.
 
