@@ -244,7 +244,7 @@ _PRIMITIVE_BY_TRIGGER: dict[str, str] = {
     "escalation_operator_revise_invalid_amendment": PRIMITIVE_ESCALATION,
     "escalation_resolved": PRIMITIVE_ESCALATION,
     # spec/46 (#544 PR1) — embedding reservation/release audit triggers.
-    # ALL FOUR triggers map to PRIMITIVE_EMBED (not PRIMITIVE_HELPER or any
+    # ALL FIVE triggers map to PRIMITIVE_EMBED (not PRIMITIVE_HELPER or any
     # existing bucket) because embedding bills from EMBEDDING_PRICING, isolated
     # from chat PRICING. Folding into a shared bucket is IRREVERSIBLY lossy once
     # records are on disk (Principle #5 — GROUP BY primitive cost attribution).
@@ -253,6 +253,13 @@ _PRIMITIVE_BY_TRIGGER: dict[str, str] = {
     "embed_release": PRIMITIVE_EMBED,
     "embed_batch_reservation": PRIMITIVE_EMBED,
     "embed_batch_release": PRIMITIVE_EMBED,
+    # spec/46 (#544 PR2a) — dedicated cross-call accounting record. Carries
+    # cost_usd=actual_usd so sum_cost_for_period folds embed spend into the
+    # running cost total. embed_batch_release retains NO cost_usd (audit-only).
+    # The two records serve distinct roles: release is the reservation-
+    # reconciliation anchor; embed_cost is the accounting event. Only the
+    # dedicated record is summed — the double-count guard depends on this split.
+    "embed_cost": PRIMITIVE_EMBED,
 }
 
 # spec/45 PR2 — body-hash auto-derivation gate. dedup_body_hash_enabled
@@ -5376,15 +5383,57 @@ class AtomicAgent:
                     # Batch-fanout formula: per_item_sum * _EMBED_BATCH_FANOUT_BUFFER
                     # (~2x) because the protocol doesn't advertise whether
                     # write_note() calls embed()/embed_batch().
+                    #
+                    # (#544 PR2a) — merge-write pre-read: for captures with
+                    # merge_into set, PgvectorMemoryBackend embeds the full
+                    # accumulated stored body, not the incoming fragment. Pre-read
+                    # the target via read_note(merge_into) so the reservation is
+                    # sized from target_body + fragment_body (Principle #4 —
+                    # enforce-before-pay; the gate must reflect the true worst-case
+                    # merged size so an over-cap merge is refused before billing).
+                    # On read failure, fall back to fragment-only (conservative-
+                    # toward-permissive — same pattern as pgvector.py:764-785).
+                    # The pre-read result is cached in _merge_body_cache and reused
+                    # in the true-up loop so reserve<->actual_usd cannot desync.
+                    # No cross-capture caching — each capture's merge_into is read
+                    # independently to avoid stale-cache bugs when two captures
+                    # target different notes.
                     _per_item_sum = 0.0
                     _embed_batch_size = 0
+                    # Dedup key includes merge_into so two captures with the same
+                    # (type, name, fragment-hash) but different merge targets are
+                    # both reserved (not silently collapsed to the first).
                     _seen_keys_for_estimate: set[tuple] = set()
+                    # Cache of pre-read merge target bodies: capture.name → stored body
+                    # (the merge target body, NOT the post-write body). Used in both
+                    # the reservation and the true-up loops so the two estimates share
+                    # the same read result and cannot drift.
+                    _merge_body_cache: dict[str, str] = {}
                     for _c in all_captures:
-                        _k = (_c.type, _c.name, hash(_c.body))
+                        _k = (_c.type, _c.name, hash(_c.body), _c.merge_into)
                         if _k in _seen_keys_for_estimate:
                             continue
                         _seen_keys_for_estimate.add(_k)
-                        _tokens_est = _estimate_embed_tokens(_c.body)
+                        # (#544 PR2a) merge-write pre-read: size from accumulated body.
+                        _sizing_body = _c.body
+                        if _c.merge_into:
+                            try:
+                                _stored_note = self.memory.read_note(_c.merge_into)
+                                if _stored_note is not None and _stored_note.body:
+                                    _merged_body = _stored_note.body + (_c.body or "")
+                                    _merge_body_cache[_c.name] = _merged_body
+                                    _sizing_body = _merged_body
+                            except Exception as _pre_read_exc:
+                                import logging as _logging
+
+                                _logging.getLogger(__name__).warning(
+                                    "embed gate: pre-read of merge target %r failed "
+                                    "(%s) — falling back to fragment-only reservation "
+                                    "(conservative-toward-permissive)",
+                                    _c.merge_into,
+                                    _pre_read_exc,
+                                )
+                        _tokens_est = _estimate_embed_tokens(_sizing_body)
                         _per_item_cost, _per_item_est = _costs.calc_embedding_cost(
                             _embed_model_id, _tokens_est
                         )
@@ -5435,19 +5484,15 @@ class AtomicAgent:
                     # block a batch whose worst-case reservation exceeds remaining
                     # headroom. Mirrors _check_batch_reservation so an embed batch
                     # is a real guardrail, not an audit-only log (Principle #4 — no
-                    # code path that bills an LLM escapes its cost gate). NOTE: embed
-                    # actual_usd is audit-only this PR — it is NOT folded into the
-                    # cost_usd that sum_cost_for_period aggregates, so prior embed
-                    # spend does not yet count toward the cap across calls. That
-                    # cross-call accounting is deferred to #544 PR2; this gate caps
-                    # the single batch against the chat-spend baseline only. The
-                    # baseline also EXCLUDES this call's own in-flight chat spend
-                    # (_call_total_cost), which is written to the ledger later at
-                    # the success-path run record (~5524) — so the headroom read
-                    # here is the cap minus prior-calls spend, not minus this
-                    # call's chat spend. Direction is conservative-toward-permissive
-                    # and this call's chat cap was already enforced at call entry,
-                    # so it is not a guardrail escape, only a documented imprecision.
+                    # code path that bills an LLM escapes its cost gate).
+                    # (#544 PR2a) sum_cost_for_period now includes prior embed spend
+                    # (via the dedicated embed_cost record emitted in the finally
+                    # block with cost_usd=actual_usd). The baseline EXCLUDES this
+                    # call's own in-flight chat spend (_call_total_cost), which is
+                    # written to the ledger later at the success-path run record.
+                    # Direction is conservative-toward-permissive and this call's
+                    # chat cap was already enforced at call entry, so it is not a
+                    # guardrail escape, only a documented imprecision.
                     if _embed_has_cap and _embed_reserved_usd > 0:
                         _embed_headroom = self._embed_remaining_headroom(
                             _today_r.total_usd,
@@ -5471,18 +5516,31 @@ class AtomicAgent:
 
                 try:
                     for c in all_captures:
-                        key = (c.type, c.name, hash(c.body))
+                        # (#544 PR2a) dedup key includes merge_into so two captures
+                        # with the same (type, name, fragment-hash) but different
+                        # merge targets are each written (not silently collapsed).
+                        key = (c.type, c.name, hash(c.body), c.merge_into)
                         if key in seen_capture_keys:
                             continue
                         seen_capture_keys.add(key)
                         try:
                             self.memory.write_note(c, policy)
                             written_captures.append(c)
-                            # True-up actual embed cost per written note. Same
-                            # _estimate_embed_tokens basis as the reservation loop
-                            # so the true-up never disagrees with the worst case.
+                            # True-up actual embed cost per written note.
+                            # (#544 PR2a) merge writes: use the pre-read merged body
+                            # from _merge_body_cache (populated in the reservation
+                            # loop) so the true-up reflects the same merged-body
+                            # estimate as the reservation. Fallback to fragment body
+                            # when the cache miss (read failed or merge_into unset).
+                            # The fallback is conservative-toward-permissive and
+                            # must never be zero — we always charge the fragment.
                             if _embed_gate_active:
-                                _tok = _estimate_embed_tokens(c.body)
+                                _trueup_body = (
+                                    _merge_body_cache.get(c.name)
+                                    if c.merge_into
+                                    else None
+                                ) or c.body
+                                _tok = _estimate_embed_tokens(_trueup_body)
                                 _note_cost, _ = _costs.calc_embedding_cost(
                                     _embed_model_id, _tok
                                 )
@@ -5511,6 +5569,25 @@ class AtomicAgent:
                             written_count=len(written_captures),
                             cost_estimated=_embed_cost_estimated,
                         )
+                        # (#544 PR2a) Cross-call embed accounting: emit a dedicated
+                        # embed_cost record with cost_usd=actual_usd so
+                        # sum_cost_for_period folds embed spend into the running
+                        # total on subsequent calls (Principle #4 — prior embed
+                        # spend now counts against the cap baseline).
+                        # Conditioned on actual_usd > 0: no zero-cost noise records
+                        # when all write_note() calls failed (the release record's
+                        # written_count=0 already signals that; no cost to report).
+                        # Ordering: release → cost (release is the reconciliation
+                        # anchor; cost is the accounting event).
+                        # ONLY the embed_cost record carries cost_usd; the release
+                        # record intentionally omits it to prevent double-count.
+                        if _embed_actual_usd > 0:
+                            self._emit_embed_cost_record(
+                                model_id=_embed_model_id,
+                                actual_usd=_embed_actual_usd,
+                                batch_size=_embed_batch_size,
+                                cost_estimated=_embed_cost_estimated,
+                            )
 
             # Build response
             response = Response(
@@ -6859,12 +6936,12 @@ class AtomicAgent:
         token count rather than confirmed from provider-reported usage
         (EmbeddingBackend returns no token usage).
 
-        KNOWN LIMITATION (#544 PR1, documented in spec/46 fail-closed section):
-        actual_usd is estimated from the INCOMING capture body (c.body). On a merge
-        write (capture.merge_into set) PgvectorMemoryBackend embeds the full merged
-        body, which can exceed the fragment — so actual_usd understates merge-write
-        embed cost. The gate caps against the fragment estimate; estimating from the
-        post-write stored body is deferred.
+        RESOLVED in #544 PR2a: merge writes now pre-read the stored body in the
+        reservation and true-up loops via read_note(merge_into) BEFORE the write
+        loop. actual_usd for a merge write reflects the merged body estimate
+        (target_body + fragment_body), not the fragment alone. The pre-read result
+        is cached in _merge_body_cache so reserve and actual_usd share the same
+        estimate and cannot desync.
         """
         self._log(
             {
@@ -6884,6 +6961,51 @@ class AtomicAgent:
                 "summary": (
                     f"embed batch: actual ${actual_usd:.6f} vs "
                     f"reserved ${reserved_usd:.6f} ({written_count}/{batch_size} written)"
+                ),
+            }
+        )
+
+    def _emit_embed_cost_record(
+        self,
+        model_id: str,
+        actual_usd: float,
+        batch_size: int,
+        cost_estimated: bool,
+    ) -> None:
+        """Log a dedicated embed_cost JSONL record (#544 PR2a — cross-call accounting).
+
+        This is the ONLY embed record that carries ``cost_usd``. ``sum_cost_for_period``
+        aggregates ``cost_usd`` exclusively, so prior embed spend is now visible to
+        the gate on subsequent calls (Principle #4 — embed cost counts against the
+        cap baseline across calls).
+
+        Emitted AFTER ``_emit_embed_batch_release`` in the same ``finally`` block,
+        conditioned on ``actual_usd > 0`` (no zero-cost noise records when all
+        writes failed).
+
+        Distinct from ``embed_batch_release`` (the reservation-reconciliation anchor):
+        the release record carries ``reserved_usd`` + ``actual_usd`` for accounting
+        metadata; this record carries ``cost_usd`` for cost aggregation. The split
+        prevents double-count — only the dedicated record is summed.
+
+        ``parent_agent`` enables audit-join back to the agent.call() run (Principle
+        #5). ``cost_source='actor'`` ensures the record is included in
+        ``sum_cost_for_period(source='actor')`` reads that feed _embed_remaining_headroom.
+        """
+        self._log(
+            {
+                "trigger": "embed_cost",
+                "parent_run_id": self.run_id,
+                "parent_agent": self.name,
+                "model": model_id,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cost_usd": actual_usd,
+                "cost_source": "actor",
+                "cost_estimated": cost_estimated,
+                "status": "ok",
+                "summary": (
+                    f"embed cost: actual ${actual_usd:.6f} ({batch_size} notes)"
                 ),
             }
         )
