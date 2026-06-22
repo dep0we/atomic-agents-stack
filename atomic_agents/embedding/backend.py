@@ -15,7 +15,7 @@ provider logic. The standalone use case -- constructing any vector-capable
 backend -- is the primary justification identified when ``EmbeddingBackend``
 was reconsidered at issue #200 after spec/34 scope analysis.
 
-See ``docs/spec/46-embedding-backend.md`` (DRAFT; locks at PR 3) for
+See ``docs/spec/46-embedding-backend.md`` (LOCKED at #544 PR2) for
 the normative contract.
 
 Mocking note: ``MagicMock(spec=EmbeddingBackend)`` DOES pass
@@ -76,7 +76,7 @@ class EmbeddingCapabilities:
         ``.venv/lib/python3.12/site-packages/openai/resources/embeddings.py``).
         ``OpenAIEmbeddingBackend`` therefore advertises ``supports_input_type=False``
         and accepts the kwarg but does not forward it to the API.
-        See spec/46 §"supports_input_type flag vs. parameter deferral".
+        See spec/46 §"supports_input_type flag".
     """
 
     max_batch_size: int
@@ -187,7 +187,7 @@ class EmbeddingBackend(Protocol):
         raising and ignore it (``supports_input_type=False`` remains honest
         because the *Protocol surface* now carries the parameter but the
         *implementation* cannot honour it).  See spec/46
-        §"supports_input_type flag vs. parameter deferral".
+        §"supports_input_type flag".
 
         This is a ``Protocol`` -- it provides no method body, so there is no
         inherited ``embed_batch()`` default. Every implementation MUST define

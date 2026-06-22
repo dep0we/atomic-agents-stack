@@ -151,6 +151,13 @@ EMBEDDING_PRICING: dict[str, float] = {
     "text-embedding-ada-002": 0.100,  # $0.100/1M tokens (legacy, still supported)
 }
 
+# Bytes-per-token constant for the UTF-8-based embed token estimate.
+# BPE tokens are bounded by UTF-8 byte length; bytes/3 is conservative for
+# natural-language text (covers CJK/emoji where code-point count under-counts
+# ~3x). Single source of truth shared by agent.py and cli.py — eliminates
+# drift if the constant is tuned in future.
+EMBED_BYTES_PER_TOKEN: int = 3
+
 # Per-process dedup set for unknown embedding model warnings.
 _unknown_embedding_model_warned: set[str] = set()
 
@@ -187,18 +194,19 @@ def calc_embedding_cost(model_id: str, input_tokens: int) -> tuple[float, bool]:
 
     Returns ``(cost_usd, cost_estimated)`` matching the shape of ``calc_cost()``:
     - ``cost_usd``: USD cost rounded UP to 6 decimal places. Rounding up (not
-      ``round()``) is deliberate: this is the PR3 gate's worst-case RESERVATION
-      primitive, and ``round()`` floors any sub-$0.000001 call to 0.0 (e.g. a
-      3-small call under ~25 tokens), so a high-volume per-text reservation loop
-      would systematically under-reserve to 0. Ceiling keeps every non-empty
-      reservation strictly positive (Principle #4 -- no path under-reserves its
-      cost guardrail). The over-count is at most $0.000001 per call.
+      ``round()``) is deliberate: this is the worst-case RESERVATION primitive
+      used by both live gate sites, and ``round()`` floors any sub-$0.000001
+      call to 0.0 (e.g. a 3-small call under ~25 tokens), so a high-volume
+      per-text reservation loop would systematically under-reserve to 0.
+      Ceiling keeps every non-empty reservation strictly positive (Principle #4
+      -- no path under-reserves its cost guardrail). The over-count is at most
+      $0.000001 per call.
     - ``cost_estimated``: True when ``model_id`` was not in ``EMBEDDING_PRICING``
       and the cost used the fallback (max known embedding rate). False when the
       model was priced exactly.
 
-    The caller distinction between 'estimated' and 'degraded' matters for the
-    PR3 ingestion gate (spec/46 MANDATE):
+    The caller distinction between 'estimated' and 'degraded' matters for both
+    wired gate sites (spec/46 MANDATE):
     - ``cost_estimated=True`` means "unpriced model, used max known rate" --
       the cost is pessimistic but usable. Fail-close only when a cap exists.
     - A CostReadResult(degraded=True) (from sum_cost_for_period) means "I/O
@@ -206,15 +214,13 @@ def calc_embedding_cost(model_id: str, input_tokens: int) -> tuple[float, bool]:
     Do NOT conflate these; see MEMORY.md lesson "Fail-closed only where there's
     something to protect" and the spec/46 MANDATE wording.
 
-    PR2 note: this function ships the pricing helper only. Live wiring to BOTH
-    the ingestion site (embed_batch_reservation / embed_batch_release) AND the
-    query-embedding site (embed_reservation / embed_release JSONL audit records)
-    ships at PR3 — gating only embed_batch() would leave query-time embed()
-    calls as an ungated billable path (Principle #4). See spec/46 §"Cost gate
-    mandate (DRAFT scope)".
+    This function is the worst-case reservation primitive wired into BOTH live
+    gate sites: the agent.call() capture-commit batch gate (#544 PR1,
+    embed_batch_reservation / embed_batch_release) and the CLI corpus-query gate
+    (#544 PR2, embed_reservation / embed_release JSONL audit records).
 
-    Negative ``input_tokens`` are clamped to 0: this helper is the PR3 gate's
-    worst-case RESERVATION primitive, and a negative reservation would REDUCE
+    Negative ``input_tokens`` are clamped to 0: this helper is the worst-case
+    RESERVATION primitive, and a negative reservation would REDUCE
     the reserved amount (a guardrail-escape shape per Principle #4 -- no path
     escapes its cost guardrail). A bad token count must never lower the
     reservation below zero.
@@ -412,6 +418,13 @@ def sum_cost_for_period(
     mandate_id: optional filter on mandate authorization (spec/29). When set,
         only records with cost.mandate_id == mandate_id contribute. When None,
         mandate_id is not consulted.
+
+    agent_name: optional filter on the originating agent. When set, only records
+        with a matching agent_name contribute.
+        NOTE: agent_name filters the shared-backend (SQLite/Postgres) path; on
+        the filesystem path isolation is provided by the per-agent log_dir, so
+        agent_name is not applied there. Passing agent_name without a non-
+        filesystem backend is a no-op (the log_dir already scopes to one agent).
 
     backend: optional ``LogBackend`` (#61 PR 2). When set, the period sum
         is computed via ``backend.query(LogQuery(...))`` — honoring the

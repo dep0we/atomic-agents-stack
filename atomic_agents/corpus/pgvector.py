@@ -385,13 +385,22 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
             supports_full_text_search=False,
             supports_versioning=True,
             supports_streaming_iteration=False,
+            # spec/34 LOCKED CorpusCapabilities invariant: embedding_provider
+            # MUST be None when supports_semantic_search is False. Gate on the
+            # SAME condition (has_semantic), not on embedding-backend presence
+            # alone — an FTS-fallback config (pgvector_url=None) has a backend
+            # injected but no semantic search, so it must report None.
             embedding_provider=(
-                self._embedding_backend.provider_id
-                if self._embedding_backend is not None
-                else None
+                self._embedding_backend.provider_id if has_semantic else None
             ),
             supports_canonical_export=True,
-            embedding_backend_resolved=self._embedding_backend,
+            # spec/34 addendum: embedding_backend_resolved MUST be None when
+            # supports_semantic_search is False (mirrors the embedding_provider
+            # gate above — an FTS-fallback config has a backend injected but
+            # no semantic search, so both sibling fields must report None).
+            embedding_backend_resolved=(
+                self._embedding_backend if has_semantic else None
+            ),
         )
 
     # ── write_page() override ───────────────────────────────────────────────
@@ -434,14 +443,18 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
 
         Note: on a content-identical idempotent write (parent Case 2, no file
         rewrite) ``index_page`` still re-embeds the unchanged body, making a
-        redundant billable embed.  Accepted as index-self-heal insurance until
-        the orchestration-layer cost gate (#544) dedupes unchanged-body embeds.
+        redundant billable embed.  Accepted as index-self-heal insurance.
 
-        Cost gate: NOT WIRED.  ``index_page`` calls ``embed()`` (a billable LLM
-        call) with no reservation, release, or JSONL audit record — same
-        deferred-to-orchestrator posture as ``PgvectorMemoryBackend`` (#544).  See the
-        module docstring's cost note; not dogfooded against a live pgvector
-        instance.
+        Cost gate: ungated at the backend layer (by design), AND there is no
+        framework-controlled gate site for the corpus *write* path — unlike
+        ``agent.call()``'s capture-commit batch gate (#544 PR1), which gates
+        ``memory.write_note`` only, ``corpus.write_page``/``index_page`` is not
+        invoked from ``agent.call()`` at all.  The only gated embed site that
+        touches a corpus is the *read* path (``atomic-agents corpus query``,
+        #544 PR2).  Callers that write corpus pages bear their own embed-cost
+        reservation — same deferred-to-orchestrator posture as
+        ``PgvectorMemoryBackend`` direct writes; see spec/46 §"Direct-caller
+        gate boundary".  Not dogfooded against a live pgvector instance.
         """
         ref = super().write_page(
             name,
@@ -485,7 +498,8 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
         schema-init) so the legitimate construct-then-reprovision flow — a
         migration, or a test that drops and recreates the table at its own
         dimension — is never blocked.  Validated once per instance and cached.
-        The holistic validate-before-bill lands with the cost gate in #544.
+        Both framework gate sites are now wired (#544 PR1 + PR2); standalone
+        callers of index_page()/query() remain ungated by design.
         """
         if self._embedding_dim_validated or self._embedding_backend is None:
             return
@@ -509,8 +523,8 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
                 f"(silent wasted spend).  To fix: drop the side table "
                 f"(`DROP TABLE corpus_page_embeddings;`) so it is re-created at "
                 f"{expected} dims on next start, or pin the embedding model whose "
-                f"dimension matches the existing column.  (Automatic re-index on "
-                f"a dimension change is tracked in #544.)"
+                f"dimension matches the existing column.  (Automatic re-index "
+                f"after a model swap is tracked at #588.)"
             )
         self._embedding_dim_validated = True
 

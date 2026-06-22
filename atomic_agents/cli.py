@@ -348,6 +348,14 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="override ATOMIC_AGENTS_AGENT_ROOT (default: $ATOMIC_AGENTS_AGENT_ROOT or cwd)",
     )
+    corpus_query.add_argument(
+        "--critical",
+        action="store_true",
+        help=(
+            "bypass the embed cost gate (headroom check AND fail-closed-on-degraded "
+            "refusal) for this query; still emits reservation/release/cost audit records"
+        ),
+    )
 
     # corpus version NAME --corpus wiki [--agent-root PATH]
     corpus_version = corpus_sub.add_parser(
@@ -1260,7 +1268,14 @@ def _cmd_corpus(args) -> int:
         elif corpus_cmd == "show":
             return _corpus_show(backend, args.name, args.corpus)
         elif corpus_cmd == "query":
-            return _corpus_query(backend, args.text, args.corpus, args.top_k)
+            return _corpus_query(
+                backend,
+                args.text,
+                args.corpus,
+                args.top_k,
+                agent_root,
+                critical=getattr(args, "critical", False),
+            )
         elif corpus_cmd == "version":
             return _corpus_version(backend, args.name, args.corpus)
         elif corpus_cmd == "restore":
@@ -1323,9 +1338,259 @@ def _corpus_show(backend, name: str, corpus: str) -> int:
     return 0
 
 
-def _corpus_query(backend, text: str, corpus: str, top_k: int) -> int:
-    """Run a query against the corpus and print matching pages."""
-    refs = backend.query(text, corpus, top_k=top_k)
+def _corpus_query(
+    backend,
+    text: str,
+    corpus: str,
+    top_k: int,
+    agent_root: Path,
+    *,
+    critical: bool = False,
+) -> int:
+    """Run a query against the corpus and print matching pages.
+
+    When the corpus backend supports semantic search (``supports_semantic_search=True``)
+    the ``query()`` call internally invokes ``embed()`` — a billable provider
+    call. This function applies a cost gate mirroring ``dream._check_cap``:
+
+    1. Resolve the embedding model_id from backend capabilities.
+    2. Estimate tokens via ``ceil(utf8_bytes / EMBED_BYTES_PER_TOKEN)`` (same
+       basis as the batch gate for non-empty text; an empty query clamps to 1
+       token, which is conservative).
+    3. Read cost history and apply headroom check (unless ``critical=True``).
+    4. Emit ``embed_reservation`` JSONL record before the query.
+    5. Call ``backend.query()`` inside try/finally.
+    6. Emit ``embed_release`` in the finally block.
+    7. Emit ``embed_cost`` record conditioned on ``actual_usd > 0``.
+
+    Spec/22 primitive: ``"embed"`` (PRIMITIVE_EMBED) — the records emitted here
+    carry ``primitive="embed"``; ``cli_corpus_query`` is the informal name of
+    this gate SITE, not a spec/22 taxonomy value.
+    Gate site: the only framework-controlled query-embed gate site (spec/46
+    §'Gate-site normative MUSTs'). Direct callers of ``corpus.query()`` on a
+    pgvector backend outside this CLI path are ungated by design — see spec/46.
+
+    ``--critical`` skips headroom enforcement but still emits all audit records.
+
+    Crash-window parity: ``actual_usd`` is charged only on a non-exception
+    ``query()`` return. If the backend's internal ``embed()`` commits real spend
+    and the downstream vector search then raises, this site records ``$0`` for a
+    call that did bill the provider — the CLI analog of the agent.call()
+    crash-window already tracked at #568. Sub-cent (single embed, never a batch);
+    the ``status="error"`` ``embed_release`` record keeps the failed call visible
+    in the audit trail. This site is in scope for the #568 follow-up rather than
+    carrying a second divergent posture here.
+    """
+    import math
+    from datetime import datetime, timezone
+    from uuid import uuid4
+
+    from . import _costs, _model
+    from .logs import get_default_log_backend
+    from .logs.types import PRIMITIVE_EMBED, RunRecord
+
+    # ── Resolve embedding gate parameters ──────────────────────────────────────
+    caps = backend.capabilities
+    if not caps.supports_semantic_search or caps.embedding_backend_resolved is None:
+        # No embedding backend wired — plain FTS/substring query, no gate needed.
+        refs = backend.query(text, corpus, top_k=top_k)
+        if not refs:
+            print(f"No matches for {text!r}")
+            return 0
+        for ref in refs:
+            print(f"{ref.name}  ({ref.byte_size} bytes)")
+        return 0
+
+    embed_backend = caps.embedding_backend_resolved
+    model_id = embed_backend.model_id
+
+    # Estimate tokens: ceil(utf8_bytes / EMBED_BYTES_PER_TOKEN) — same
+    # conservative basis as the batch gate in agent.call() (spec/46
+    # §'Token estimate basis'). Constant lives in _costs to avoid drift.
+    utf8_bytes = len(text.encode("utf-8"))
+    tokens_est = (
+        math.ceil(utf8_bytes / _costs.EMBED_BYTES_PER_TOKEN) if utf8_bytes > 0 else 1
+    )
+    per_call_cost, cost_estimated = _costs.calc_embedding_cost(model_id, tokens_est)
+
+    # ── Mint a standalone run_id (top-level CLI call, no parent) ───────────────
+    run_id = f"cli-embed-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S-%f')}-{uuid4().hex[:8]}"
+    agent_name = agent_root.name
+
+    # ── Cost gate (mirrors dream._check_cap) ───────────────────────────────────
+    log_backend = get_default_log_backend(agent_root)
+    log_dir = agent_root / "log"
+    if not critical:
+        _model_md_path = agent_root / "model.md"
+        if _model_md_path.exists():
+            # Pre-check existence ONCE to eliminate the TOCTOU race in a
+            # post-exception re-check (file deleted between raise and check).
+            try:
+                model_data = _model.parse_model_md(_model_md_path)
+            except Exception:
+                # PRESENT-but-unreadable: fail-closed (a blind read on an existing
+                # file is a degraded signal — silently proceeding would grant
+                # unbounded embed spend, the opposite of the gate's posture).
+                print(
+                    "Error: cost data unreadable — embed query gate fail-closed. "
+                    "Use --critical to bypass.",
+                    file=sys.stderr,
+                )
+                return 1
+        else:
+            # ABSENT: legitimately no caps configured → proceed.
+            model_data = {}
+        if model_data.get("cost_guardrails_enabled"):
+            # Hoist the cap existence check so uncapped agents skip both log
+            # reads (mirrors dream._check_cap's early-exit on no effective cap).
+            daily_cap = model_data.get("daily_cap_usd", 0.0)
+            monthly_cap = model_data.get("monthly_cap_usd", 0.0)
+            has_cap = daily_cap > 0 or monthly_cap > 0
+            if has_cap:
+                today_r = _costs.sum_cost_for_period(
+                    log_dir,
+                    "today",
+                    source="actor",
+                    backend=log_backend,
+                    agent_name=agent_name,
+                )
+                month_r = _costs.sum_cost_for_period(
+                    log_dir,
+                    "this_month",
+                    source="actor",
+                    backend=log_backend,
+                    agent_name=agent_name,
+                )
+                if today_r.degraded or month_r.degraded:
+                    print(
+                        "Error: cost data unreadable — embed query gate fail-closed. "
+                        "Use --critical to bypass.",
+                        file=sys.stderr,
+                    )
+                    return 1
+                today_cost = today_r.total_usd
+                month_cost = month_r.total_usd
+                daily_rem = (daily_cap - today_cost) if daily_cap > 0 else float("inf")
+                monthly_rem = (
+                    (monthly_cap - month_cost) if monthly_cap > 0 else float("inf")
+                )
+                headroom = min(daily_rem, monthly_rem)
+                if per_call_cost > headroom:
+                    print(
+                        f"Error: embed query reservation ${per_call_cost:.6f} exceeds "
+                        f"remaining headroom ${headroom:.6f}. Use --critical to bypass.",
+                        file=sys.stderr,
+                    )
+                    return 1
+
+    # ── Emit embed_reservation ─────────────────────────────────────────────────
+    def _emit(record: dict) -> None:
+        record.setdefault("ts", datetime.now().astimezone().isoformat())
+        record.setdefault("run_id", run_id)
+        # Stamp the originating agent (mirrors agent.py._log's
+        # record.setdefault("agent_name", self.name)). Without this the records
+        # persist with agent_name=None, and on a shared SQLite/Postgres log
+        # backend the cost-read filter `(agent_name = ? OR agent_name IS NULL)`
+        # folds them into EVERY agent's cap baseline — a cross-agent spend leak.
+        record.setdefault("agent_name", agent_name)
+        rr = RunRecord.from_dict(record)
+        try:
+            log_backend.append(rr)
+        except Exception as _emit_exc:
+            # Audit trail is best-effort in the CLI path; never crash on log failure.
+            # Print a non-fatal warning so a dropped embed billing record isn't silent.
+            print(
+                f"warning: failed to write embed audit record ({record.get('trigger')}): {_emit_exc}",
+                file=sys.stderr,
+            )
+
+    _emit(
+        {
+            "trigger": "embed_reservation",
+            "run_id": run_id,
+            "parent_run_id": None,
+            "parent_agent": agent_name,
+            "model": model_id,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "reserved_usd": per_call_cost,
+            "batch_size": 1,
+            "cost_estimated": cost_estimated,
+            "cost_source": "actor",
+            "critical": critical,
+            "status": "ok",
+            "summary": (
+                f"cli corpus query: reserved ${per_call_cost:.6f} for single embed "
+                f"(model={model_id}, corpus={corpus})"
+            ),
+            "primitive": PRIMITIVE_EMBED,
+        }
+    )
+
+    # ── Query with try/finally to always emit release ──────────────────────────
+    actual_usd = 0.0
+    refs = []
+    exc_to_reraise = None
+    try:
+        refs = backend.query(text, corpus, top_k=top_k)
+        # Charged on any non-exception query() success even when query() silently
+        # fell back to FTS (pg down / embed()->None) with zero billable embed —
+        # over-charges, never under-charges; embed-outcome signal deferred to #589.
+        actual_usd = per_call_cost  # per-call estimate (no provider token usage signal)
+    except Exception as _exc:
+        exc_to_reraise = _exc
+    finally:
+        _emit(
+            {
+                "trigger": "embed_release",
+                "run_id": run_id,
+                "parent_run_id": None,
+                "parent_agent": agent_name,
+                "model": model_id,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "reserved_usd": per_call_cost,
+                "actual_usd": actual_usd,
+                "batch_size": 1,
+                "cost_estimated": cost_estimated,
+                "cost_source": "actor",
+                "critical": critical,
+                "status": "ok" if exc_to_reraise is None else "error",
+                "summary": (
+                    f"cli corpus query: actual ${actual_usd:.6f} vs "
+                    f"reserved ${per_call_cost:.6f} (model={model_id})"
+                ),
+                "primitive": PRIMITIVE_EMBED,
+            }
+        )
+        # Cross-call embed accounting: dedicated embed_cost record so
+        # sum_cost_for_period folds this query's spend into the cap baseline
+        # on subsequent calls (mirrors _emit_embed_cost_record in agent.py).
+        if actual_usd > 0:
+            _emit(
+                {
+                    "trigger": "embed_cost",
+                    "run_id": run_id,
+                    "parent_run_id": None,
+                    "parent_agent": agent_name,
+                    "model": model_id,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cost_usd": actual_usd,
+                    "cost_source": "actor",
+                    "cost_estimated": cost_estimated,
+                    "critical": critical,
+                    "status": "ok",
+                    "summary": (
+                        f"cli corpus query embed cost: ${actual_usd:.6f} (model={model_id})"
+                    ),
+                    "primitive": PRIMITIVE_EMBED,
+                }
+            )
+
+    if exc_to_reraise is not None:
+        raise exc_to_reraise
+
     if not refs:
         print(f"No matches for {text!r}")
         return 0

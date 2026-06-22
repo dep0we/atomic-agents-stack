@@ -49,6 +49,22 @@ CHANGELOG entry.
 
 ## [Unreleased]
 
+### Added
+
+- **EmbeddingBackend LOCKED (spec/46, #544 PR2).** DRAFT→LOCKED ceremony for the nineteenth backend protocol. Ships the **CLI corpus-query embed gate** (`atomic-agents corpus query` now reserves worst-case single-embed cost before the query and records actual spend): `_corpus_query` emits `embed_reservation` + `embed_release` + `embed_cost` JSONL records in a try/finally block, applies a cost-headroom check mirroring `dream._check_cap`, and accepts a `--critical` flag that skips headroom enforcement while still emitting all audit records. Token estimate is `ceil(utf8_bytes / 3)` (single call, no fan-out), priced from the model_id resolved off `EmbeddingCapabilities.embedding_backend_resolved` (not a provider label).
+- **Gate-site normative MUSTs** added to spec/46 — four caller-side MUSTs (pre-call reservation, release-in-finally, embed_cost-for-cross-call-accounting, fail-closed-predicate) governing callers of `embed()`/`embed_batch()`. Categorically distinct from the 9-MUST backend Implementer Contract, which stays at 9.
+- **Direct-caller gate boundary** documented in spec/46 — `memory.search()` / `corpus.query()` on pgvector backends are ungated direct callers by design (the `llm_backend.chat()` analogy); a future gated helper is tracked at #586.
+- **pgvector conformance fold** — `PgvectorMemoryBackend` and `PgvectorCorpusBackend` folded into the shared `@_parametrize_backends` / `corpus_backend` conformance suites against a deterministic `StubEmbeddingBackend` (no live OpenAI), gated `@requires_postgres` (CI pgvector lane is the real gate; these skip locally). The memory side is a true vector fold (the stub's `embed()` is called on `write_note` against a live HNSW index); the corpus side runs in FTS-fallback mode (`pgvector_url=None`), so it verifies the non-ANN Protocol SHAPE invariants only — the corpus ANN path is covered separately in `test_pgvector_corpus_backend.py`.
+
+### Fixed
+
+- **CLI corpus-query embed records now carry the originating `agent_name`** (#544 PR2 review). `_corpus_query._emit` stamps `agent_name = agent_root.name` on every `embed_reservation`/`embed_release`/`embed_cost` record, fixing a cross-agent cost-attribution leak on shared SQLite/Postgres log backends where the cost-read filter `(agent_name = ? OR agent_name IS NULL)` previously folded any agent's CLI embed spend into every other agent's cap baseline. The filesystem default was unaffected (per-agent `log_dir` already provides isolation). Covered by a shared-backend (SQLite) regression test with a strip negative control.
+
+### Changed
+
+- **spec/46 DRAFT→LOCKED.** Status flipped; residual LOCK-ceremony markers resolved; MUST 3 `input_type` language reconciled with the shipped post-PR3 kwarg; cost-gate mandate and fail-closed posture promoted from DRAFT/non-normative guidance to normative.
+- spec/22 + spec/34 + spec/46 normative wording updated to describe the shipped CLI query-embed gate (the `embed_reservation`/`embed_release` triggers are now emitted by a live code path); spec/34 gains a versioned normative addendum for the corpus embedding model-swap-requires-DROP limitation (re-index tooling tracked at #588). The embed-None over-charge on the no-key path is honestly documented (over-charges, never under-charges) and deferred to #589.
+
 ## [2.0.0] - 2026-06-21
 
 ### Fixed

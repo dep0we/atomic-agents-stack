@@ -1,4 +1,4 @@
-"""Conformance test suite for the EmbeddingBackend Protocol (spec/46, DRAFT).
+"""Conformance test suite for the EmbeddingBackend Protocol (spec/46, LOCKED).
 
 Parametrized over concrete backend implementations:
 - ``StubEmbeddingBackend`` (test double, no external deps)
@@ -274,7 +274,7 @@ def test_capabilities_supports_input_type_is_false(backend):
     does NOT include input_type as a native parameter. The kwarg is accepted on
     the Protocol surface (PR3 addition) and on both impls, but ignored on the
     provider side (capability honesty: advertise what you can actually honour).
-    See spec/46 §"supports_input_type flag vs. parameter deferral".
+    See spec/46 §"supports_input_type flag".
     """
     caps = backend.capabilities()
     assert caps.supports_input_type is False, (

@@ -932,6 +932,61 @@ if _POSTGRES_AVAILABLE:
     BACKEND_FACTORIES["postgres"] = _make_postgres_backend
 
 
+def _make_pgvector_memory_backend(tmp_path: Path) -> tuple:
+    """Factory for PgvectorMemoryBackend in the shared conformance suite.
+
+    Uses StubEmbeddingBackend (no live OpenAI key required) so Protocol
+    shape invariants are verified without billing any provider.
+
+    Cleans the embeddings table first, mirroring the pgv_backend fixture in
+    test_pgvector_memory_backend.py to isolate tests from prior runs.
+    DROP CASCADE also removes the FK + HNSW index; the backend re-creates
+    them at next schema-init call.  This is the same isolation strategy as
+    test_pgvector_memory_backend.py:pgv_backend (lines 380-413).
+
+    IMPORTANT: the embedding column is created at the stub's dimensions=4.
+    If another test has already initialised the shared Postgres instance
+    with a different dimension, the DROP + re-create resolves the ordering
+    dependency.
+
+    Skips automatically without ATOMIC_AGENTS_TEST_POSTGRES_URL (CI only).
+    """
+    from atomic_agents.memory.pgvector import (
+        _ADD_EMBEDDINGS_FK,
+        _CREATE_EMBEDDINGS_HNSW_INDEX,
+        _CREATE_EMBEDDINGS_TABLE,
+        PgvectorMemoryBackend,
+    )
+    from tests.stub_embedding import StubEmbeddingBackend
+
+    stub = StubEmbeddingBackend(dimensions=4)
+    agent_root = tmp_path / "pgvector-memory-agent"
+    agent_root.mkdir(parents=True, exist_ok=True)
+    backend = PgvectorMemoryBackend(
+        agent_root, url=_POSTGRES_URL, embedding_backend=stub
+    )
+
+    # Reset shared table to avoid cross-test embedding-column-dimension conflicts.
+    # Use backend._get_conn() (mirrors _make_postgres_backend) so schema-init
+    # runs through the same connection that the backend will use, and avoids
+    # opening a redundant second bare connection.
+    conn = backend._get_conn()
+    conn.execute("DROP TABLE IF EXISTS memory_note_embeddings CASCADE")
+    conn.execute(_CREATE_EMBEDDINGS_TABLE.format(dimensions=4))
+    conn.execute(_ADD_EMBEDDINGS_FK)
+    conn.execute(_CREATE_EMBEDDINGS_HNSW_INDEX)
+    conn.execute("DELETE FROM memory_note_versions")
+    conn.execute("DELETE FROM memory_notes")
+    conn.commit()
+
+    policy = WritePolicy(write_paths=[tmp_path])
+    return backend, policy
+
+
+if _POSTGRES_AVAILABLE:
+    BACKEND_FACTORIES["pgvector-memory"] = _make_pgvector_memory_backend
+
+
 def _parametrize_backends(*ids):
     """Return pytest.mark.parametrize for the given backend ids."""
     factories = [
@@ -944,7 +999,7 @@ def _parametrize_backends(*ids):
     )
 
 
-@_parametrize_backends("filesystem", "postgres")
+@_parametrize_backends("filesystem", "postgres", "pgvector-memory")
 def test_pg_conformance_01_read_note_roundtrip(
     tmp_path, backend_factory_id, backend_factory
 ):
@@ -977,7 +1032,7 @@ def test_pg_conformance_01_read_note_roundtrip(
             backend.close()
 
 
-@_parametrize_backends("filesystem", "postgres")
+@_parametrize_backends("filesystem", "postgres", "pgvector-memory")
 def test_pg_conformance_02_read_note_returns_none_for_missing(
     tmp_path, backend_factory_id, backend_factory
 ):
@@ -991,7 +1046,7 @@ def test_pg_conformance_02_read_note_returns_none_for_missing(
             backend.close()
 
 
-@_parametrize_backends("filesystem", "postgres")
+@_parametrize_backends("filesystem", "postgres", "pgvector-memory")
 def test_pg_conformance_03_write_note_rejects_outside_write_paths(
     tmp_path, backend_factory_id, backend_factory
 ):
@@ -1006,7 +1061,7 @@ def test_pg_conformance_03_write_note_rejects_outside_write_paths(
             backend.close()
 
 
-@_parametrize_backends("filesystem", "postgres")
+@_parametrize_backends("filesystem", "postgres", "pgvector-memory")
 def test_pg_conformance_04_write_note_case4_collision(
     tmp_path, backend_factory_id, backend_factory
 ):
@@ -1025,7 +1080,7 @@ def test_pg_conformance_04_write_note_case4_collision(
             backend.close()
 
 
-@_parametrize_backends("filesystem", "postgres")
+@_parametrize_backends("filesystem", "postgres", "pgvector-memory")
 def test_pg_conformance_05_list_notes_reflects_writes(
     tmp_path, backend_factory_id, backend_factory
 ):
@@ -1042,7 +1097,7 @@ def test_pg_conformance_05_list_notes_reflects_writes(
             backend.close()
 
 
-@_parametrize_backends("filesystem", "postgres")
+@_parametrize_backends("filesystem", "postgres", "pgvector-memory")
 def test_pg_conformance_06_list_orphans_empty(
     tmp_path, backend_factory_id, backend_factory
 ):
@@ -1060,7 +1115,7 @@ def test_pg_conformance_06_list_orphans_empty(
             backend.close()
 
 
-@_parametrize_backends("filesystem", "postgres")
+@_parametrize_backends("filesystem", "postgres", "pgvector-memory")
 def test_pg_conformance_07_stats_total_notes(
     tmp_path, backend_factory_id, backend_factory
 ):
@@ -1078,6 +1133,13 @@ def test_pg_conformance_07_stats_total_notes(
             backend.close()
 
 
+# NOTE: pgvector-memory is intentionally EXCLUDED from this param. Its premise
+# is "non-embedding backends"; the pgvector-memory conformance factory injects a
+# StubEmbeddingBackend, and PgvectorMemoryBackend gates supports_semantic_search
+# on `embedding_backend is not None` alone (memory/pgvector.py), so it correctly
+# reports True. The embedding-present semantic path is covered by
+# test_pgvector_memory_backend.py. See test_pg_conformance_08b below for the
+# positive assertion on pgvector-memory.
 @_parametrize_backends("filesystem", "postgres")
 def test_pg_conformance_08_supports_semantic_false(
     tmp_path, backend_factory_id, backend_factory
@@ -1091,7 +1153,26 @@ def test_pg_conformance_08_supports_semantic_false(
             backend.close()
 
 
-@_parametrize_backends("filesystem", "postgres")
+@_parametrize_backends("pgvector-memory")
+def test_pg_conformance_08b_pgvector_memory_supports_semantic_true(
+    tmp_path, backend_factory_id, backend_factory
+):
+    """[BACKEND_FACTORIES] PgvectorMemoryBackend reports supports_semantic_search True.
+
+    The pgvector-memory conformance factory injects a StubEmbeddingBackend, and
+    PgvectorMemoryBackend gates supports_semantic_search on
+    ``embedding_backend is not None``. With an embedding backend present it MUST
+    report True — the positive counterpart to test 08's no-embedding case.
+    """
+    backend, _ = backend_factory(tmp_path)
+    try:
+        assert backend.supports_semantic_search is True
+    finally:
+        if hasattr(backend, "close"):
+            backend.close()
+
+
+@_parametrize_backends("filesystem", "postgres", "pgvector-memory")
 def test_pg_conformance_09_supports_canonical_export_true(
     tmp_path, backend_factory_id, backend_factory
 ):
@@ -1105,7 +1186,7 @@ def test_pg_conformance_09_supports_canonical_export_true(
             backend.close()
 
 
-@_parametrize_backends("filesystem", "postgres")
+@_parametrize_backends("filesystem", "postgres", "pgvector-memory")
 def test_pg_conformance_10_export_round_trip_field_lossless(
     tmp_path, backend_factory_id, backend_factory
 ):
@@ -1157,7 +1238,7 @@ def _staged_write_policy(backend, staging, base_policy):
     return base_policy
 
 
-@_parametrize_backends("filesystem", "postgres")
+@_parametrize_backends("filesystem", "postgres", "pgvector-memory")
 def test_pg_conformance_11_read_only_path_blocks_write(
     tmp_path, backend_factory_id, backend_factory
 ):
@@ -1184,7 +1265,7 @@ def test_pg_conformance_11_read_only_path_blocks_write(
             backend.close()
 
 
-@_parametrize_backends("filesystem", "postgres")
+@_parametrize_backends("filesystem", "postgres", "pgvector-memory")
 def test_pg_conformance_12_merge_refreshes_metadata(
     tmp_path, backend_factory_id, backend_factory
 ):
@@ -1220,7 +1301,7 @@ def test_pg_conformance_12_merge_refreshes_metadata(
             backend.close()
 
 
-@_parametrize_backends("filesystem", "postgres")
+@_parametrize_backends("filesystem", "postgres", "pgvector-memory")
 def test_pg_conformance_13_staging_apply_reflects_in_live(
     tmp_path, backend_factory_id, backend_factory
 ):
@@ -1241,7 +1322,7 @@ def test_pg_conformance_13_staging_apply_reflects_in_live(
             backend.close()
 
 
-@_parametrize_backends("filesystem", "postgres")
+@_parametrize_backends("filesystem", "postgres", "pgvector-memory")
 def test_pg_conformance_14_discard_staging_preserves_live(
     tmp_path, backend_factory_id, backend_factory
 ):

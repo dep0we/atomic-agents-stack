@@ -3,7 +3,7 @@
 This module is PR 1 of the 4-PR Postgres adapter arc for issue #258.
 PR1 ships: non-semantic FTS (tsvector) recall, Tier-B field-lossless export,
 spec/20 Postgres addendum, and conformance factory entry.
-EmbeddingBackend Protocol (#200) shipped as atomic_agents/embedding/ (DRAFT spec/46, PR2 of #200).
+EmbeddingBackend Protocol (#200) shipped as atomic_agents/embedding/ (LOCKED spec/46, PR2 of #200).
 pgvector wiring into this module is explicitly deferred to PR2/PR3 of #258.
 
 Install:
