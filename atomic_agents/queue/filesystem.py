@@ -425,6 +425,18 @@ class FilesystemQueueBackend:
         """Atomically claim the next item from queue/queued/<role>/.
 
         See module docstring for the full atomicity contract.
+
+        No-replace claim semantics (spec/44 MUST 4/9 strengthening, #478):
+        The claimed/<lease_token>/ directory is created with exist_ok=False.
+        If a directory already exists for this lease_token (a reused or stale
+        token from a prior claim session), mkdir raises FileExistsError and
+        claim_next returns None. Callers MUST generate a fresh lease_token per
+        claim session. A collision returns None; the caller must retry with a
+        new token.
+
+        Similarly, the work-file rename uses an O_EXCL existence probe to
+        detect a destination collision under token reuse, returning None rather
+        than clobbering an in-flight file at the same claimed/<token>/<name>.
         """
         try:
             _validate_bare_component(role, "role")
@@ -438,7 +450,14 @@ class FilesystemQueueBackend:
         if not queued_dir.is_dir():
             return None
 
-        claimed_dir.mkdir(parents=True, exist_ok=True)
+        # NO-REPLACE MKDIR: exist_ok=False so a reused lease_token whose
+        # claimed/ directory still exists returns None immediately. Callers must
+        # generate a fresh lease_token per claim session (spec/44 MUST 4/9).
+        try:
+            claimed_dir.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            # lease_token already in use — caller must retry with a fresh token.
+            return None
 
         # Sort to give deterministic FIFO-by-name behavior.
         # `p.is_file()` follows symlinks — a symlink to a regular file passes.
@@ -459,10 +478,38 @@ class FilesystemQueueBackend:
             except PathTraversalError:
                 continue
             dst = claimed_dir / src.name
+            # NO-REPLACE RENAME: use O_EXCL as a destination-existence probe
+            # before the rename so a destination collision under token reuse
+            # (same filename in claimed/<token>/) returns None instead of
+            # clobbering an in-flight file. On the normal concurrent-worker
+            # race, the SOURCE disappears (FileNotFoundError from rename) —
+            # that case continues to the next candidate. A DESTINATION
+            # collision (FileExistsError from O_EXCL open) means another
+            # session already placed a file at this path; skip this candidate
+            # too (the rename would silently overwrite it on POSIX).
+            import os as _os
+
+            try:
+                # O_EXCL: fail if dst already exists. This is a TOCTOU-narrow
+                # probe (a separate process could create dst between O_EXCL and
+                # rename), but it closes the common reuse-token clobber without
+                # requiring renameat2/RENAME_NOREPLACE (Linux-only) on macOS.
+                # The primary inter-worker race is still handled by rename's
+                # source-side FileNotFoundError (MUST 9 guarantee).
+                fd = _os.open(str(dst), _os.O_CREAT | _os.O_EXCL | _os.O_WRONLY, 0o600)
+                _os.close(fd)
+            except FileExistsError:
+                # Destination already occupied under this token — skip.
+                continue
             try:
                 src.rename(dst)
             except FileNotFoundError:
-                # Another worker raced us to this file. Try the next.
+                # Another worker raced us to this source file. Try the next.
+                # Clean up the empty placeholder we created via O_EXCL.
+                try:
+                    dst.unlink(missing_ok=True)
+                except OSError:
+                    pass
                 continue
             _write_sidecar(
                 dst, lease_token=lease_token, lease_seconds=lease_seconds, role=role

@@ -1353,3 +1353,57 @@ def test_move_to_dead_letter_shim_fails_soft_on_symlinked_queue(tmp_path):
     # Must NOT raise — parity with FilesystemQueueBackend.move_to_dead_letter().
     move_to_dead_letter(item, project_root, reason="terminal")
     assert list(outside.rglob("*")) == [], "no bytes may land outside project_root"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# #478 — no-replace claim semantics: lease_token collision returns None
+
+
+def test_claim_next_reused_token_returns_none(tmp_path):
+    """claim_next() with a reused lease_token returns None (no-replace mkdir).
+
+    When claimed/<lease_token>/ already exists (stale or active claim from a
+    prior session), claim_next with the SAME lease_token must return None.
+    Callers must generate a fresh lease_token per claim session (MUST 4/9).
+    """
+    project_root, _ = _make_project_with_queue_item(tmp_path)
+    backend = FilesystemQueueBackend(project_root)
+
+    # First claim succeeds.
+    item = backend.claim_next("writer", "tok-reuse")
+    assert item is not None, "first claim must succeed"
+    assert item.path.exists()
+
+    # Queue another item so there IS something to claim.
+    qd = project_root / "queue" / "queued" / "writer"
+    (qd / "002_task.md").write_text("second task")
+
+    # Second claim with the SAME lease_token must return None (no-replace).
+    result = backend.claim_next("writer", "tok-reuse")
+    assert result is None, (
+        "claim_next with a reused lease_token must return None — "
+        "caller must generate a fresh token per claim session (MUST 4/9)"
+    )
+
+
+def test_claim_next_reused_token_strip_control(tmp_path):
+    """Strip-RED control for test_claim_next_reused_token_returns_none.
+
+    Uses a DIFFERENT lease_token for the second claim — this MUST succeed
+    (second item is claimable). Proves the first test's None result is caused
+    by token reuse, not by an empty queue or some other condition.
+    """
+    project_root, _ = _make_project_with_queue_item(tmp_path)
+    backend = FilesystemQueueBackend(project_root)
+
+    item1 = backend.claim_next("writer", "tok-a")
+    assert item1 is not None
+
+    qd = project_root / "queue" / "queued" / "writer"
+    (qd / "002_task.md").write_text("second task")
+
+    # Different token — must succeed (proves queue is not empty).
+    item2 = backend.claim_next("writer", "tok-b")
+    assert item2 is not None, (
+        "claim_next with a DIFFERENT token must succeed when the queue has items"
+    )
+    assert item2.original_name == "002_task.md"

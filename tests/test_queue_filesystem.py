@@ -283,12 +283,14 @@ def test_list_claimed_skips_file_vanishing_mid_enumeration(tmp_path):
     _queued(project_root, name="vanishes.md")
     _queued(project_root, name="survives.md")
     backend = FilesystemQueueBackend(project_root)
-    item_a = backend.claim_next("writer", "lease-v", lease_seconds=60)
-    item_b = backend.claim_next("writer", "lease-v", lease_seconds=60)
+    # Use distinct lease tokens: #478 no-replace mkdir requires a fresh token
+    # per claim session; reusing the same token would return None on the second
+    # call because claimed/lease-v/ already exists.
+    item_a = backend.claim_next("writer", "lease-v1", lease_seconds=60)
+    item_b = backend.claim_next("writer", "lease-v2", lease_seconds=60)
     assert item_a is not None and item_b is not None
 
-    # Identify which claimed path holds vanishes.md / survives.md (lease-token
-    # namespacing means both land under claimed/lease-v/).
+    # Identify which claimed path holds vanishes.md / survives.md.
     vanish_path = next(p for p in (item_a.path, item_b.path) if p.name == "vanishes.md")
     survive_path = next(
         p for p in (item_a.path, item_b.path) if p.name == "survives.md"
@@ -2237,6 +2239,4 @@ def test_export_sorted_output_order_preserved(tmp_path):
     backend = FilesystemQueueBackend(project_root)
     result = backend.export()
     paths = [rel for rel, _ in result.items_with_bytes]
-    assert paths == sorted(paths), (
-        f"export() output must be sorted: {paths}"
-    )
+    assert paths == sorted(paths), f"export() output must be sorted: {paths}"
