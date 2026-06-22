@@ -2149,9 +2149,17 @@ def test_export_symlinked_subdir_inside_queued_is_skipped(tmp_path):
     refused at the subdir-descent stage of _walk_dir_no_follow; files inside
     the symlinked tree are NOT emitted in the export.
 
-    Strip-RED negative control: the real file in queued/writer/ IS exported
-    (proving the walk reaches real subdirs), while the symlinked subdir's
-    contents are NOT.
+    INVARIANT GUARD (not a strip-RED differentiator on CI interpreters): this
+    asserts the negative invariant "symlinked-subdir contents are never
+    exported" and the positive invariant "real subdir files ARE exported".
+    Both invariants hold under BOTH _walk_dir_no_follow AND default
+    sorted(rglob('*')), because default rglob does NOT follow directory
+    symlinks on any interpreter the framework supports (3.11-3.13:
+    recurse_symlinks defaults to False; the 3.13 change only ADDED the opt-in
+    parameter). The _walk_dir_no_follow hardening (#477) is therefore
+    defense-in-depth / version-independent, verified by inspection rather than
+    by a behavioral difference here. A 3.13+ CI lane exercising the live
+    recurse_symlinks vector is tracked in #595.
     """
     import os
 
@@ -2188,9 +2196,17 @@ def test_export_symlinked_subdir_within_queue_root_is_skipped(tmp_path):
     """export() must NOT follow a symlinked subdir even if it resolves within queue_root.
 
     A within-queue symlink (done/link-dir -> queued/writer/) would cause
-    double-enumeration and cross-boundary aliasing. It must be skipped at the
-    subdir descent gate (is_symlink() check BEFORE the containment check)
-    not just at the containment check.
+    double-enumeration and cross-boundary aliasing if symlink recursion were
+    ever enabled. It is skipped at the subdir descent gate (is_symlink() check
+    BEFORE the containment check), not just at the containment check.
+
+    INVARIANT GUARD (not a strip-RED differentiator on CI interpreters): the
+    no-double-count invariant holds under BOTH _walk_dir_no_follow AND default
+    sorted(rglob('*')), because default rglob does NOT follow directory
+    symlinks on 3.11-3.13 (recurse_symlinks defaults to False). The
+    _walk_dir_no_follow hardening (#477) makes this version-independent and
+    robust to a future recurse_symlinks default; it is verified by inspection
+    here. The live-vector 3.13+ test is tracked in #595.
     """
     import os
 
@@ -2333,7 +2349,15 @@ def test_dead_letter_reason_txt_refuses_symlinked_destination(tmp_path):
 def test_renew_lease_refuses_symlinked_sidecar_destination(tmp_path):
     """renew_lease must NOT write through a symlink at the sidecar path.
 
-    Strip-RED: the external target must be unchanged after renew_lease().
+    The symlink target is IN-TREE (under queue_root) so the upstream
+    containment guard (sidecar.resolve().is_relative_to(queue_root)) PASSES
+    and does NOT short-circuit before the write. That leaves the O_NOFOLLOW
+    write-side guard (#479, _write_no_follow) as the SOLE remaining defense —
+    so this is a genuine strip-RED control for the renew-path O_NOFOLLOW
+    write. (An out-of-tree target would be refused by the containment guard
+    before _write_no_follow ran, making the control false-green — verified.)
+
+    Strip-RED: the in-tree victim file must be unchanged after renew_lease().
     """
     import os
 
@@ -2343,20 +2367,23 @@ def test_renew_lease_refuses_symlinked_sidecar_destination(tmp_path):
     item = backend.claim_next("writer", "lease-1", lease_seconds=60)
     assert item is not None
 
-    # Replace the real sidecar with a symlink to an external file.
-    sidecar = item.path.parent / (item.original_name + ".lease.json")
-    external = tmp_path / "external.json"
-    external.write_text('{"hijacked": true}')
-    sidecar.unlink()
-    os.symlink(external, sidecar)
+    # Plant an in-tree victim file (under queue_root, in the same claimed dir).
+    victim = item.path.parent / "victim.txt"
+    victim.write_text("UNTOUCHED")
 
-    # renew_lease must NOT write through the symlink.
+    # Replace the real sidecar with a symlink pointing at the in-tree victim.
+    # This survives the resolve()/is_relative_to(queue_root) containment check,
+    # so only O_NOFOLLOW can stop the write from following the symlink.
+    sidecar = item.path.parent / (item.original_name + ".lease.json")
+    sidecar.unlink()
+    os.symlink(victim, sidecar)
+
+    # renew_lease must NOT write through the symlink (O_NOFOLLOW refuses it;
+    # the best-effort write is silently skipped).
     backend.renew_lease(item.lease_token, item.original_name, additional_seconds=3600)
 
-    # External file must be unchanged.
-    import json as _json
-
-    data = _json.loads(external.read_text())
-    assert data.get("hijacked") is True, (
-        "renew_lease must not write through a symlink at the sidecar path"
+    # In-tree victim file must be unchanged — O_NOFOLLOW refused the follow.
+    assert victim.read_text() == "UNTOUCHED", (
+        "renew_lease must not write through a symlink at the sidecar path "
+        "(O_NOFOLLOW must refuse the in-tree symlink redirect)"
     )

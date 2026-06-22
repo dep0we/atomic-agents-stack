@@ -789,6 +789,121 @@ def test_claim_race_rename_loser_returns_none(tmp_path, monkeypatch):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# TEST 31a — claim-race: a NON-FileNotFoundError rename failure (EXDEV/EACCES/
+# EIO/ENOSPC) must NOT leave the O_EXCL placeholder orphaned (Principle #8).
+
+
+def test_claim_next_non_fnf_rename_error_cleans_up_o_excl_placeholder(
+    tmp_path, monkeypatch
+):
+    """Principle #8: a non-FNF rename failure must not leave a phantom work item.
+
+    The #478 no-replace claim creates an empty O_EXCL placeholder file at
+    claimed/<token>/<name> BEFORE the rename. The committed FileNotFoundError
+    arm cleans up that placeholder only on the concurrent-worker race. On ANY
+    OTHER rename OSError (EXDEV cross-device, EACCES, EIO, ENOSPC disk-full)
+    the placeholder must ALSO be cleaned up — otherwise recover_stale_claims()
+    mtime-promotes the orphaned zero-byte file into queued/_recovered/<token>/
+    as a re-claimable PHANTOM work item.
+
+    This asserts: (a) the original OSError propagates (the caller is told the
+    claim failed, not silently handed None); (b) NO zero-byte file is left in
+    claimed/<token>/; (c) the empty claimed_dir is also cleaned up.
+    """
+    project_root = tmp_path / "project"
+    qd = project_root / "queue" / "queued" / "writer"
+    qd.mkdir(parents=True)
+    (qd / "only.md").write_text("only")
+
+    original_rename = Path.rename
+
+    def patched_rename(self, target):
+        # The work-file rename (queued → claimed/<token>/) raises a non-FNF
+        # OSError, exactly like a cross-device or permission failure.
+        if self.name == "only.md":
+            raise PermissionError("EACCES: simulated non-FNF rename failure")
+        return original_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", patched_rename)
+
+    backend = FilesystemQueueBackend(project_root)
+
+    # The original OSError propagates — the claim failed loudly, not silently.
+    with pytest.raises(OSError):
+        backend.claim_next("writer", "lease-eacces", lease_seconds=60)
+
+    # No orphaned zero-byte placeholder left behind in claimed/<token>/.
+    claimed_dir = project_root / "queue" / "claimed" / "lease-eacces"
+    leftover = [p for p in claimed_dir.iterdir()] if claimed_dir.exists() else []
+    assert leftover == [], (
+        f"non-FNF rename failure left orphaned file(s) in claimed/: {leftover} "
+        "— recover_stale_claims() would mtime-promote them as phantom work"
+    )
+
+    # recover_stale_claims() must NOT promote any phantom from this failed claim.
+    recover_stale_claims(backend, lease_seconds=0)
+    recovered_root = project_root / "queue" / "queued" / "_recovered"
+    phantom = list(recovered_root.rglob("*")) if recovered_root.exists() else []
+    phantom_files = [p for p in phantom if p.is_file()]
+    assert phantom_files == [], (
+        f"a failed claim produced a phantom re-claimable work item: {phantom_files}"
+    )
+
+
+# TEST 31b — strip-RED negative control: the queued SOURCE survives a non-FNF
+# rename failure and stays claimable with a fresh token (no half-move).
+
+
+def test_claim_next_non_fnf_rename_error_leaves_source_claimable(tmp_path, monkeypatch):
+    """Invariant guard: after a non-FNF rename failure, the SOURCE is intact.
+
+    The rename never moved the queued item (the failure was on the rename
+    itself), so the source must remain in queued/writer/ and be claimable on a
+    retry with a FRESH lease_token. This pins that a failed claim does NOT
+    consume or half-move the source.
+
+    NOTE — this is an invariant guard, NOT a strip-RED negative control for the
+    OSError cleanup arm. Stripping that arm leaves this test GREEN: the
+    fresh-token retry uses a DIFFERENT claimed/<token>/ dir, so the orphaned
+    placeholder left in claimed/lease-exdev/ never blocks the lease-fresh
+    reclaim. The authoritative strip-RED control for the OSError arm is the
+    sibling test_claim_next_non_fnf_rename_error_cleans_up_o_excl_placeholder
+    (which goes RED when the arm is removed). Per the project's
+    "negative control must diagnose the load-bearing guard" rule, this test is
+    labeled honestly as the source-survival invariant it actually pins.
+    """
+    project_root = tmp_path / "project"
+    qd = project_root / "queue" / "queued" / "writer"
+    qd.mkdir(parents=True)
+    (qd / "only.md").write_text("only")
+
+    original_rename = Path.rename
+    fail = {"on": True}
+
+    def patched_rename(self, target):
+        if self.name == "only.md" and fail["on"]:
+            raise OSError("EXDEV: simulated cross-device rename failure")
+        return original_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", patched_rename)
+
+    backend = FilesystemQueueBackend(project_root)
+    with pytest.raises(OSError):
+        backend.claim_next("writer", "lease-exdev", lease_seconds=60)
+
+    # The queued SOURCE is untouched — still sitting in queued/writer/.
+    assert (qd / "only.md").read_text() == "only", (
+        "the queued source must survive a failed claim (rename never moved it)"
+    )
+
+    # Stop failing; a retry with a FRESH token claims the original item.
+    fail["on"] = False
+    item = backend.claim_next("writer", "lease-fresh", lease_seconds=60)
+    assert item is not None, "the source must be claimable with a fresh token"
+    assert item.original_name == "only.md"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # TEST 32–35 — _redact_for_error_message
 
 
@@ -1353,6 +1468,7 @@ def test_move_to_dead_letter_shim_fails_soft_on_symlinked_queue(tmp_path):
     # Must NOT raise — parity with FilesystemQueueBackend.move_to_dead_letter().
     move_to_dead_letter(item, project_root, reason="terminal")
     assert list(outside.rglob("*")) == [], "no bytes may land outside project_root"
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # #478 — no-replace claim semantics: lease_token collision returns None

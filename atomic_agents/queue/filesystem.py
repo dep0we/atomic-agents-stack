@@ -477,6 +477,13 @@ class FilesystemQueueBackend:
         Similarly, the work-file rename uses an O_EXCL existence probe to
         detect a destination collision under token reuse, returning None rather
         than clobbering an in-flight file at the same claimed/<token>/<name>.
+
+        On a non-FileNotFoundError rename failure (EXDEV/EACCES/EIO/ENOSPC),
+        the O_EXCL placeholder and the now-empty claimed/<token>/ directory are
+        cleaned up before the OSError is re-raised — a failed claim leaves no
+        zero-byte phantom that recover_stale_claims() could mtime-promote into
+        queued/_recovered/ as re-claimable work (Principle #8). The queued
+        SOURCE is untouched (the rename never moved it).
         """
         try:
             _validate_bare_component(role, "role")
@@ -549,6 +556,29 @@ class FilesystemQueueBackend:
                 except OSError:
                     pass
                 continue
+            except OSError:
+                # Non-FNF rename failure (EXDEV cross-device, EACCES, EIO,
+                # ENOSPC). The O_EXCL probe above already created an empty
+                # placeholder at dst; if we re-raise without cleanup, the
+                # zero-byte file is orphaned in claimed/<token>/ and
+                # recover_stale_claims() will mtime-promote it into
+                # queued/_recovered/<token>/ as a re-claimable PHANTOM work
+                # item (Principle #8: a failed claim must not leave a
+                # corruption that recovery re-dispatches). Unlink the
+                # placeholder, then also drop the now-empty claimed_dir we
+                # created via mkdir(exist_ok=False), then propagate the error.
+                # The queued SOURCE is untouched (the rename did not move it),
+                # so it stays claimable with a fresh token.
+                try:
+                    dst.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                try:
+                    if claimed_dir.exists() and not any(claimed_dir.iterdir()):
+                        claimed_dir.rmdir()
+                except OSError:
+                    pass
+                raise
             _write_sidecar(
                 dst, lease_token=lease_token, lease_seconds=lease_seconds, role=role
             )
@@ -771,8 +801,9 @@ class FilesystemQueueBackend:
         with the sidecar path computed next to the actual work file — that is
         what the _cascade.py shim does to match pre-carve behavior at any depth.
 
-        NOTE: Uses raw Path.write_text() — behavior-neutral carve preserving
-        the _cascade.py implementation. See _write_sidecar docstring.
+        NOTE: The sidecar write routes through _write_no_follow (O_NOFOLLOW,
+        #479) — a symlink planted at the sidecar path is refused (ELOOP) and
+        the best-effort write is silently skipped. See _write_sidecar docstring.
         """
         try:
             queue_root = self._queue_root()
@@ -817,8 +848,9 @@ class FilesystemQueueBackend:
         skips the validation — consistent with its pre-carve any-depth semantics.
         The Protocol renew_lease() always supplies original_name.
 
-        NOTE: Uses raw Path.write_text() — behavior-neutral carve. See
-        _write_sidecar docstring.
+        NOTE: The sidecar write routes through _write_no_follow (O_NOFOLLOW,
+        #479) — a symlink planted at the sidecar path is refused (ELOOP) and
+        the best-effort write is silently skipped. See _write_sidecar docstring.
 
         Raises:
             PathTraversalError: when original_name is provided and is not a bare
@@ -1028,10 +1060,15 @@ class FilesystemQueueBackend:
         def _walk_dir_no_follow(root_dir: Path) -> list[Path]:
             """Iterdir-based recursive walk that refuses to follow symlinked subdirs.
 
-            Replaces rglob('*') to prevent the Python 3.13 vector where rglob
-            follows directory symlinks by default, enabling unbounded traversal
-            through a symlinked subdir pointing to a large or cyclic tree
-            (the #477 DoS vector).
+            Replaces rglob('*') as version-independent defense-in-depth (#477).
+            Default rglob('*') does NOT follow directory symlinks on any
+            interpreter the framework supports (3.11-3.13: recurse_symlinks
+            defaults to False; the 3.13 change only ADDED the opt-in
+            recurse_symlinks=True parameter). This explicit walk does not depend
+            on that stdlib default and stays correct if a caller (or a future
+            stdlib default) ever enables symlink recursion through a symlinked
+            subdir pointing at a large or cyclic tree. It also adds a per-subdir
+            containment re-assertion that rglob performs nowhere.
 
             At each subdirectory descent, re-asserts resolve() +
             is_relative_to(queue_root_resolved) before recursing. Skips any
@@ -1051,8 +1088,9 @@ class FilesystemQueueBackend:
                 return collected
             for entry in entries:
                 if entry.is_symlink():
-                    # Symlinked subdirs: skip without descending (DoS prevention).
-                    # Symlinked files: let the per-leaf guard below handle them.
+                    # Symlinked subdirs: skip without descending (containment +
+                    # cyclic/large-tree traversal guard). Symlinked files: let
+                    # the per-leaf guard below handle them.
                     if entry.is_dir():
                         continue
                     # Symlinked file — fall through to collection; per-leaf guard
