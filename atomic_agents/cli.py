@@ -167,6 +167,19 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="print the bundle path without (re)generating",
     )
+    bundle_cmd.add_argument(
+        "--validate",
+        action="store_true",
+        help=(
+            "verify the bundle faithfully contains every cascade body the "
+            "runtime assembles into the system prompt (content parity, not byte "
+            "equality). Renders a FRESH bundle in-memory, builds the runtime "
+            "system prompt via AtomicAgent.load(), and reports drift. Exit 0 on "
+            "parity (modulo known divergences: the runtime '# Available skills' "
+            "section is omitted per issue #593; model.md is bundle-only); exit 1 "
+            "and lists missing content on unexpected drift. spec/26."
+        ),
+    )
 
     doctor_cmd = sub.add_parser(
         "doctor",
@@ -1039,6 +1052,9 @@ def _cmd_bundle(args, agents_root: Path) -> int:
 
     extra_files = [Path(p) for p in args.extra_file]
 
+    if getattr(args, "validate", False):
+        return _run_bundle_validation(args, agents_root, agent_root, extra_files)
+
     try:
         result = bundle_mod.render_bundle(
             agent_root,
@@ -1064,6 +1080,80 @@ def _cmd_bundle(args, agents_root: Path) -> int:
         file=sys.stderr,
     )
     return 0
+
+
+def _run_bundle_validation(
+    args, agents_root: Path, agent_root: Path, extra_files
+) -> int:
+    """Validate that the bundle faithfully contains what the runtime assembles.
+
+    Content parity (spec/26 ``--validate``, issue #593): renders a FRESH bundle
+    in-memory (so the check is against current sources, never a stale on-disk
+    copy), builds the runtime system prompt via ``AtomicAgent.load()`` +
+    ``assemble_system_prompt()``, and compares. The agent construction lives
+    here in the CLI layer so ``bundle.py`` never imports ``AtomicAgent``; the
+    pure text comparison lives in ``bundle.validate_bundle_parity``.
+
+    Exit 0 + PASS summary when content parity holds (modulo known divergences:
+    the runtime ``# Available skills`` section omitted per #593; ``model.md``
+    bundle-only). Exit 1 + the missing-content list on unexpected drift.
+    """
+    from . import bundle as bundle_mod
+    from .agent import AtomicAgent
+
+    # Render a fresh bundle to a throwaway cache dir so validation never serves
+    # (or clobbers) a stale on-disk bundle, and never honors --if-stale here.
+    import tempfile
+
+    # The agent "name" is the path component(s) from agents_root to agent_root
+    # (the full relative path for cascaded layouts).
+    try:
+        rel_name = str(agent_root.relative_to(agents_root))
+    except ValueError:
+        rel_name = agent_root.name
+
+    try:
+        agent = AtomicAgent(name=rel_name, agents_root=agents_root)
+        agent.load()
+        system_prompt = agent.assemble_system_prompt()
+    except Exception as e:  # noqa: BLE001 — surface any load failure as exit 1
+        print(
+            f"Error: could not build runtime system prompt for validation: "
+            f"{type(e).__name__}: {e}",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Guard the validator's one cardinal sin: an empty runtime prompt would make
+    # validate_bundle_parity() return a VACUOUS pass (zero sections checked).
+    # load() above is what populates the cascade fields; if the assembled prompt
+    # is still empty, something is wrong with the agent — fail closed rather than
+    # report a meaningless PASS.
+    if not system_prompt.strip():
+        print(
+            "Error: runtime system prompt is empty — cannot validate parity. "
+            "The agent assembled no cascade content; check the agent config.",
+            file=sys.stderr,
+        )
+        return 1
+
+    with tempfile.TemporaryDirectory(prefix="atomic-bundle-validate-") as tmp:
+        try:
+            result = bundle_mod.render_bundle(
+                agent_root,
+                agents_root=agents_root,
+                cache_dir=Path(tmp),
+                extra_files=extra_files,
+                if_stale=False,
+            )
+            bundle_text = result.path.read_text(encoding="utf-8")
+        except FileNotFoundError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+
+    report = bundle_mod.validate_bundle_parity(system_prompt, bundle_text)
+    print(bundle_mod.format_validation_report(report))
+    return 0 if report.ok else 1
 
 
 def _cmd_doctor(args) -> int:
