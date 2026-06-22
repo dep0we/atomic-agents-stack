@@ -647,7 +647,9 @@ class FilesystemQueueBackend:
         # mkdir, rename, sidecar cleanup — is inside ONE try/except PathTraversalError
         # so ANY PathTraversalError (destination OR source, including unresolvable
         # work_path) fails soft for ALL callers (Protocol methods + _cascade shims).
-        # FileNotFoundError/other OSError from rename propagate normally (not swallowed).
+        # FileNotFoundError from rename fails soft (the item was already
+        # moved/dead-lettered — spec/44 MUST 10 dead-work-stays-dead no-op, handled
+        # by the inner except below); other OSError from rename propagates normally.
         try:
             _validate_original_name(original_name)
             _validate_bare_component(lease_token, "lease_token")
