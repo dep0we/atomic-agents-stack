@@ -525,26 +525,25 @@ class FilesystemQueueBackend:
             except PathTraversalError:
                 continue
             dst = claimed_dir / src.name
-            # NO-REPLACE RENAME: use O_EXCL as a destination-existence probe
-            # before the rename so a destination collision under token reuse
-            # (same filename in claimed/<token>/) returns None instead of
-            # clobbering an in-flight file. On the normal concurrent-worker
-            # race, the SOURCE disappears (FileNotFoundError from rename) —
-            # that case continues to the next candidate. A DESTINATION
-            # collision (FileExistsError from O_EXCL open) means another
-            # session already placed a file at this path; skip this candidate
-            # too (the rename would silently overwrite it on POSIX).
+            # DEFENSE-IN-DEPTH (redundant; removal tracked in #597). The
+            # in-scope lease_token-reuse clobber is ALREADY closed by the
+            # mkdir(exist_ok=False) above: a reused token whose claimed/ dir
+            # exists returns None before we get here, so claimed_dir is always
+            # freshly-created and empty at this point and we return on the first
+            # successful claim. This O_EXCL probe therefore only fires if an
+            # EXTERNAL within-queue/ process plants a file at dst in the
+            # TOCTOU window between that mkdir and here — a writer already inside
+            # the trust zone, which spec/44 §Security declares OUT OF SCOPE. So
+            # this destination-collision branch is unreachable by any in-scope
+            # path and is not strip-RED tested. The real guards are
+            # mkdir(exist_ok=False) (token-reuse clobber, strip-RED tested) +
+            # rename's source-side FileNotFoundError (concurrent-worker race,
+            # MUST 9). renameat2/RENAME_NOREPLACE is Linux-only, hence O_EXCL.
             try:
-                # O_EXCL: fail if dst already exists. This is a TOCTOU-narrow
-                # probe (a separate process could create dst between O_EXCL and
-                # rename), but it closes the common reuse-token clobber without
-                # requiring renameat2/RENAME_NOREPLACE (Linux-only) on macOS.
-                # The primary inter-worker race is still handled by rename's
-                # source-side FileNotFoundError (MUST 9 guarantee).
                 fd = os.open(str(dst), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
                 os.close(fd)
             except FileExistsError:
-                # Destination already occupied under this token — skip.
+                # Destination occupied by an out-of-scope racing writer — skip.
                 continue
             try:
                 src.rename(dst)
