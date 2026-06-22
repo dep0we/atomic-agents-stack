@@ -318,11 +318,17 @@ These MUSTs govern **callers** of `EmbeddingBackend` that invoke `embed()` or
 the Implementer Contract (which governs backends). The backend MUST count stays
 at 9.
 
-**GATE-MUST 1 — Pre-call reservation.** Any production call site that invokes
-`embed()` or `embed_batch()` MUST emit an `embed_reservation` (single-call) or
-`embed_batch_reservation` (batch) JSONL record BEFORE the call. The reservation
-MUST carry the worst-case cost estimate (including the per-item degradation
-fan-out for `embed_batch()`).
+**GATE-MUST 1 — Pre-call reservation.** Any **framework-controlled** production
+call site that invokes `embed()` or `embed_batch()` — namely the `agent.call()`
+capture-commit ingestion gate and the CLI corpus-query gate (`_corpus_query`) —
+MUST emit an `embed_reservation` (single-call) or `embed_batch_reservation`
+(batch) JSONL record BEFORE the call. The reservation MUST carry the worst-case
+cost estimate (including the per-item degradation fan-out for `embed_batch()`).
+Direct backend methods that invoke `embed()` (e.g. `memory.search()`,
+`corpus.query()`, `corpus.write_page()`/`index_page()`) are NOT
+framework-controlled gate sites: a direct caller owns its own gate, per the
+Direct-caller gate boundary section below (the same boundary that governs a raw
+`llm_backend.chat()` caller).
 
 **GATE-MUST 2 — Release in finally.** The matching `embed_release` or
 `embed_batch_release` record MUST be emitted in a `finally` block so it fires
