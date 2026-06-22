@@ -1385,7 +1385,7 @@ def _corpus_query(
 
     from . import _costs, _model
     from .logs import get_default_log_backend
-    from .logs.types import RunRecord
+    from .logs.types import PRIMITIVE_EMBED, RunRecord
 
     # ── Resolve embedding gate parameters ──────────────────────────────────────
     caps = backend.capabilities
@@ -1418,9 +1418,21 @@ def _corpus_query(
     log_backend = get_default_log_backend(agent_root)
     log_dir = agent_root / "log"
     if not critical:
+        _model_md_path = agent_root / "model.md"
         try:
-            model_data = _model.parse_model_md(agent_root / "model.md")
+            model_data = _model.parse_model_md(_model_md_path)
         except Exception:
+            if _model_md_path.exists():
+                # PRESENT-but-unreadable: fail-closed (a blind read on an existing
+                # file is a degraded signal — silently proceeding would grant
+                # unbounded embed spend, the opposite of the gate's posture).
+                print(
+                    "Error: cost data unreadable — embed query gate fail-closed. "
+                    "Use --critical to bypass.",
+                    file=sys.stderr,
+                )
+                return 1
+            # ABSENT: legitimately no caps configured → proceed.
             model_data = {}
         if model_data.get("cost_guardrails_enabled"):
             today_r = _costs.sum_cost_for_period(
@@ -1498,7 +1510,7 @@ def _corpus_query(
                 f"cli corpus query: reserved ${per_call_cost:.6f} for single embed "
                 f"(model={model_id}, corpus={corpus})"
             ),
-            "primitive": "embed",
+            "primitive": PRIMITIVE_EMBED,
         }
     )
 
@@ -1535,7 +1547,7 @@ def _corpus_query(
                     f"cli corpus query: actual ${actual_usd:.6f} vs "
                     f"reserved ${per_call_cost:.6f} (model={model_id})"
                 ),
-                "primitive": "embed",
+                "primitive": PRIMITIVE_EMBED,
             }
         )
         # Cross-call embed accounting: dedicated embed_cost record so
@@ -1559,7 +1571,7 @@ def _corpus_query(
                     "summary": (
                         f"cli corpus query embed cost: ${actual_usd:.6f} (model={model_id})"
                     ),
-                    "primitive": "embed",
+                    "primitive": PRIMITIVE_EMBED,
                 }
             )
 

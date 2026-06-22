@@ -154,13 +154,30 @@ def corpus_backend(request, tmp_path: Path):
         stub = StubEmbeddingBackend(dimensions=4)
         agent_root = tmp_path / f"pgvec-agent-{request.node.name[:24]}"
         agent_root.mkdir(exist_ok=True)
+        # Force FTS-fallback deterministically: clear the env var so that
+        # PgvectorCorpusBackend(pgvector_url=None) cannot silently pick up a
+        # live URL from the environment and flip supports_semantic_search=True,
+        # which would make test_capabilities_embedding_provider_honesty a
+        # vacuous no-op (the `if not caps.supports_semantic_search:` guard would
+        # never fire). monkeypatch ensures the FTS branch is always exercised.
+        monkeypatch = request.getfixturevalue("monkeypatch")
+        monkeypatch.delenv("ATOMIC_AGENTS_PGVECTOR_URL", raising=False)
         # pgvector_url=None → FTS-only mode; no Postgres ANN index used.
         # This is intentional: Protocol-shape conformance (list/read/write/
         # version/query-fallback) does not require ANN.
         backend = PgvectorCorpusBackend(
             agent_root, embedding_backend=stub, pgvector_url=None
         )
+        # Verify FTS-fallback is deterministic (a live pgvector_url env var
+        # would set _pgvector_url and flip supports_semantic_search=True).
+        assert backend._pgvector_url is None, (
+            "pgvector-corpus conformance fixture must run in FTS-fallback mode "
+            "(pgvector_url=None). If this assertion fails, PgvectorCorpusBackend "
+            "picked up ATOMIC_AGENTS_PGVECTOR_URL from the environment despite "
+            "pgvector_url=None being passed explicitly."
+        )
         yield backend
+        backend.close()
     else:
         raise NotImplementedError(f"unknown backend param: {request.param!r}")
 
@@ -208,10 +225,29 @@ def test_capabilities_embedding_provider_honesty(corpus_backend) -> None:
     param — the pgvector-corpus fixture runs in FTS-fallback mode (an embedding
     backend is injected but pgvector_url=None), which is exactly the config that
     used to leak a provider label past a False semantic flag.
+
+    Guard against silent no-ops: the ``if not caps.supports_semantic_search:``
+    branch MUST have fired for the pgvector-corpus param (fixture is pinned to
+    FTS-fallback mode). Without this check, an env-var surprise that flips
+    supports_semantic_search=True would silently turn this test into a vacuous
+    pass (the assertion body would never run, leaving the invariant unverified).
     """
     caps = corpus_backend.capabilities
     if not caps.supports_semantic_search:
         assert caps.embedding_provider is None
+    # For PgvectorCorpusBackend specifically, the fixture is pinned to
+    # FTS-fallback mode (pgvector_url=None, ATOMIC_AGENTS_PGVECTOR_URL cleared).
+    # Assert the asserting branch actually fired — if supports_semantic_search
+    # were True, the ``if not`` guard above would be a silent no-op.
+    # Detect by class name so we don't need request.param (which is not
+    # available to the test function — only available in the fixture itself).
+    if type(corpus_backend).__name__ == "PgvectorCorpusBackend":
+        assert not caps.supports_semantic_search, (
+            "pgvector-corpus conformance fixture is pinned to FTS-fallback mode; "
+            "supports_semantic_search must be False. If True, the fixture has "
+            "picked up a live pgvector URL and the embedding_provider invariant "
+            "check ran vacuously (the 'if not' body never executed)."
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────

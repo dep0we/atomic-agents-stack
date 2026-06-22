@@ -187,18 +187,19 @@ def calc_embedding_cost(model_id: str, input_tokens: int) -> tuple[float, bool]:
 
     Returns ``(cost_usd, cost_estimated)`` matching the shape of ``calc_cost()``:
     - ``cost_usd``: USD cost rounded UP to 6 decimal places. Rounding up (not
-      ``round()``) is deliberate: this is the PR3 gate's worst-case RESERVATION
-      primitive, and ``round()`` floors any sub-$0.000001 call to 0.0 (e.g. a
-      3-small call under ~25 tokens), so a high-volume per-text reservation loop
-      would systematically under-reserve to 0. Ceiling keeps every non-empty
-      reservation strictly positive (Principle #4 -- no path under-reserves its
-      cost guardrail). The over-count is at most $0.000001 per call.
+      ``round()``) is deliberate: this is the worst-case RESERVATION primitive
+      used by both live gate sites, and ``round()`` floors any sub-$0.000001
+      call to 0.0 (e.g. a 3-small call under ~25 tokens), so a high-volume
+      per-text reservation loop would systematically under-reserve to 0.
+      Ceiling keeps every non-empty reservation strictly positive (Principle #4
+      -- no path under-reserves its cost guardrail). The over-count is at most
+      $0.000001 per call.
     - ``cost_estimated``: True when ``model_id`` was not in ``EMBEDDING_PRICING``
       and the cost used the fallback (max known embedding rate). False when the
       model was priced exactly.
 
-    The caller distinction between 'estimated' and 'degraded' matters for the
-    PR3 ingestion gate (spec/46 MANDATE):
+    The caller distinction between 'estimated' and 'degraded' matters for both
+    wired gate sites (spec/46 MANDATE):
     - ``cost_estimated=True`` means "unpriced model, used max known rate" --
       the cost is pessimistic but usable. Fail-close only when a cap exists.
     - A CostReadResult(degraded=True) (from sum_cost_for_period) means "I/O
@@ -206,15 +207,13 @@ def calc_embedding_cost(model_id: str, input_tokens: int) -> tuple[float, bool]:
     Do NOT conflate these; see MEMORY.md lesson "Fail-closed only where there's
     something to protect" and the spec/46 MANDATE wording.
 
-    PR2 note: this function ships the pricing helper only. Live wiring to BOTH
-    the ingestion site (embed_batch_reservation / embed_batch_release) AND the
-    query-embedding site (embed_reservation / embed_release JSONL audit records)
-    ships at PR3 — gating only embed_batch() would leave query-time embed()
-    calls as an ungated billable path (Principle #4). See spec/46 §"Cost gate
-    mandate (normative)".
+    This function is the worst-case reservation primitive wired into BOTH live
+    gate sites: the agent.call() capture-commit batch gate (#544 PR1,
+    embed_batch_reservation / embed_batch_release) and the CLI corpus-query gate
+    (#544 PR2, embed_reservation / embed_release JSONL audit records).
 
-    Negative ``input_tokens`` are clamped to 0: this helper is the PR3 gate's
-    worst-case RESERVATION primitive, and a negative reservation would REDUCE
+    Negative ``input_tokens`` are clamped to 0: this helper is the worst-case
+    RESERVATION primitive, and a negative reservation would REDUCE
     the reserved amount (a guardrail-escape shape per Principle #4 -- no path
     escapes its cost guardrail). A bad token count must never lower the
     reservation below zero.

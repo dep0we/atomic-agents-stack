@@ -794,3 +794,155 @@ def test_no_results_prints_no_matches(tmp_path: Path, capsys) -> None:
     triggers = {r.get("trigger") for r in records}
     assert "embed_reservation" in triggers
     assert "embed_release" in triggers
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Category 9 — model.md read-failure posture (FIX 1: fail-closed on
+#               PRESENT-but-unreadable; ABSENT legitimately means no caps)
+
+
+def _run_query_gate_with_unreadable_model_md(
+    tmp_path: Path,
+    *,
+    critical: bool = False,
+    monkeypatch=None,
+) -> tuple[int, list]:
+    """Helper: run _corpus_query with parse_model_md raising while model.md exists.
+
+    Uses monkeypatch to make parse_model_md raise (simulating a permissions or
+    transient I/O error) while keeping model.md physically present on disk.
+    Returns (exit_code, log_records).
+    """
+    from unittest.mock import patch
+
+    from atomic_agents.cli import _corpus_query
+
+    agent_root = tmp_path / "test-agent-unreadable"
+    agent_root.mkdir(parents=True, exist_ok=True)
+    (agent_root / "log").mkdir()
+    # Write model.md so .exists() returns True — simulating a permission-denied
+    # or transient I/O failure where the file is present but unreadable.
+    (agent_root / "model.md").write_text("## model\nclaude-haiku-4-5-20251001\n")
+
+    backend = _FakeCorpusBackend(
+        supports_semantic_search=True,
+        embed_backend=_FakeEmbedBackend(),
+        query_result=[_FakeCorpusRef("page-a")],
+    )
+    fake_log = _FakeLogBackend()
+
+    with (
+        patch("atomic_agents.logs.get_default_log_backend", return_value=fake_log),
+        patch(
+            "atomic_agents._model.parse_model_md",
+            side_effect=OSError("Permission denied"),
+        ),
+    ):
+        exit_code = _corpus_query(
+            backend,
+            "test query",
+            "wiki",
+            10,
+            agent_root,
+            critical=critical,
+        )
+
+    return exit_code, fake_log.records
+
+
+def test_present_unreadable_model_md_fails_closed(tmp_path: Path, capsys) -> None:
+    """PRESENT-but-unreadable model.md → fail-closed (exit 1) without --critical.
+
+    A blind read on an existing file is a degraded signal: silently granting
+    unbounded embed spend (the old open-dict fallback) is the opposite of the
+    gate's fail-closed posture. The gate must refuse and print the same
+    cost-data-unreadable error used by the degraded-cost-read branch.
+    """
+    exit_code, _ = _run_query_gate_with_unreadable_model_md(tmp_path, critical=False)
+    assert exit_code == 1, (
+        "An existing-but-unreadable model.md MUST cause the gate to fail-closed "
+        "(return 1). Returning 0 would silently grant unbounded embed spend."
+    )
+    out = capsys.readouterr()
+    assert "fail-closed" in out.err or "unreadable" in out.err, (
+        "The fail-closed error message must mention 'fail-closed' or 'unreadable' "
+        f"so the operator knows why the gate refused. Got: {out.err!r}"
+    )
+
+
+def test_present_unreadable_model_md_critical_bypasses(tmp_path: Path) -> None:
+    """PRESENT-but-unreadable model.md + --critical → gate proceeds (exit 0).
+
+    --critical is the documented operator escape hatch for degraded cost-data
+    situations. Mirroring the degraded-cost-read bypass, an unreadable model.md
+    must NOT block when --critical is set.
+    """
+    exit_code, _ = _run_query_gate_with_unreadable_model_md(tmp_path, critical=True)
+    assert exit_code == 0, (
+        "With --critical, an unreadable model.md must NOT block the gate. "
+        "--critical is the documented bypass for degraded cost-data situations."
+    )
+
+
+def test_absent_model_md_proceeds_without_error(tmp_path: Path) -> None:
+    """ABSENT model.md → no caps configured, gate proceeds (exit 0).
+
+    A missing model.md legitimately means the operator has not configured cost
+    guardrails. The gate must not fail-closed on absence — only on a
+    PRESENT-but-unreadable file (a degraded read).
+    """
+    from atomic_agents.cli import _corpus_query
+    from atomic_agents._costs import CostReadResult
+
+    agent_root = tmp_path / "test-agent-no-model-md"
+    agent_root.mkdir(parents=True, exist_ok=True)
+    (agent_root / "log").mkdir()
+    # Deliberately do NOT write model.md — absent means no caps configured.
+    assert not (agent_root / "model.md").exists()
+
+    backend = _FakeCorpusBackend(
+        supports_semantic_search=True,
+        embed_backend=_FakeEmbedBackend(),
+        query_result=[_FakeCorpusRef("page-a")],
+    )
+    fake_log = _FakeLogBackend()
+
+    with (
+        patch("atomic_agents.logs.get_default_log_backend", return_value=fake_log),
+        patch(
+            "atomic_agents._costs.sum_cost_for_period",
+            return_value=CostReadResult(0.0, False, 0),
+        ),
+    ):
+        exit_code = _corpus_query(backend, "test query", "wiki", 10, agent_root)
+
+    assert exit_code == 0, (
+        "An ABSENT model.md must NOT fail-closed — absence means no caps "
+        "configured, so the gate must proceed normally."
+    )
+
+
+# NEGATIVE CONTROL: verify the fail-closed fix is load-bearing.
+def test_negative_control_unreadable_model_md_fail_closed_is_load_bearing(
+    tmp_path: Path,
+) -> None:
+    """Negative control: the PRESENT-unreadable → fail-closed path must be stripped-RED.
+
+    This test is the negative control for the FIX 1 guard:
+    ``if _model_md_path.exists(): print(...); return 1``.
+
+    If the fix is stripped (reverted to bare ``except Exception: model_data = {}``),
+    the gate silently proceeds with an empty dict — cost_guardrails_enabled is
+    never set, and the function returns 0. This test MUST go RED in that case.
+
+    Strip-verification confirmed during implementation: with the old bare
+    ``except Exception: model_data = {}`` fallback, exit_code was 0 (fail-open);
+    with the fix applied, exit_code is 1 (fail-closed).
+    """
+    exit_code, _ = _run_query_gate_with_unreadable_model_md(tmp_path, critical=False)
+    assert exit_code == 1, (
+        "NEGATIVE CONTROL FAILED: The PRESENT-unreadable model.md fail-closed "
+        "guard appears to be stripped. The gate returned 0 (fail-open) instead "
+        "of 1 (fail-closed). Restore the 'if _model_md_path.exists(): return 1' "
+        "branch in _corpus_query's except handler."
+    )
