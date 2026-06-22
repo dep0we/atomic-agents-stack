@@ -1,6 +1,6 @@
 # spec/44: QueueBackend Protocol
 
-> **Status:** LOCKED (issue #428, LOCK PR). 136 tests collected across `test_queue_backend_conformance.py` (62) and `test_queue_filesystem.py` (74). All 12 Implementer Contract MUSTs are individually test-covered. Registered in the shared #379 export conformance harness (`test_export_protocol_conformance.py`) and the capability-advertisement harness (`test_export_capability_advertisement.py`). This is a SCAFFOLDING-ONLY reference impl — zero internal runtime callers wired; the `_cascade.py` free-function API is preserved via a thin non-deprecated shim. Runtime adoption deferred to #469. Closes TENSIONS T4.
+> **Status:** LOCKED (issue #428, LOCK PR). 137 tests collected across `test_queue_backend_conformance.py` (62) and `test_queue_filesystem.py` (74). All 12 Implementer Contract MUSTs are individually test-covered. Registered in the shared #379 export conformance harness (`test_export_protocol_conformance.py`) and the capability-advertisement harness (`test_export_capability_advertisement.py`). This is a SCAFFOLDING-ONLY reference impl — zero internal runtime callers wired; the `_cascade.py` free-function API is preserved via a thin non-deprecated shim. Runtime adoption deferred to #469. Closes TENSIONS T4.
 
 ---
 

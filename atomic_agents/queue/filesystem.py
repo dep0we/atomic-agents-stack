@@ -215,7 +215,24 @@ def _write_no_follow(path: Path, content: str) -> None:
         0o666,
     )
     try:
-        os.write(fd, encoded)
+        # Drain the buffer: a raw os.write may write FEWER bytes than requested
+        # (POSIX permits a short write). Path.write_text's IO layer looped; raw
+        # os.write does not. Without this loop a short write returns success
+        # while leaving a TRUNCATED sidecar — and on the renew_lease
+        # read-modify-write path (O_TRUNC already cleared the old bytes) that
+        # silently erases a live lease, letting recover_stale_claims() promote
+        # an actively-held item as stale and re-dispatch in-flight work
+        # (Principle #8; cross-model adversarial finding on the #479 helper).
+        view = memoryview(encoded)
+        written = 0
+        while written < len(encoded):
+            n = os.write(fd, view[written:])
+            if n <= 0:
+                raise OSError(
+                    f"_write_no_follow: os.write made no progress "
+                    f"({len(encoded) - written} bytes remaining) for {path}"
+                )
+            written += n
     finally:
         os.close(fd)
 

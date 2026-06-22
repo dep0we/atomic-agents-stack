@@ -23,10 +23,12 @@ from pathlib import Path
 
 import pytest
 
+from atomic_agents.queue import filesystem as _fsmod
 from atomic_agents.queue.filesystem import (
     FilesystemQueueBackend,
     FilesystemQueueItem,
     _sidecar_path,
+    _write_no_follow,
     _write_sidecar,
 )
 from atomic_agents.queue.backend import recover_stale_claims
@@ -2386,4 +2388,39 @@ def test_renew_lease_refuses_symlinked_sidecar_destination(tmp_path):
     assert victim.read_text() == "UNTOUCHED", (
         "renew_lease must not write through a symlink at the sidecar path "
         "(O_NOFOLLOW must refuse the in-tree symlink redirect)"
+    )
+
+
+def test_write_no_follow_drains_short_writes(tmp_path, monkeypatch):
+    """_write_no_follow MUST loop os.write until ALL bytes land — a raw os.write
+    may short-write (POSIX permits it; Path.write_text's IO layer looped, raw
+    os.write does not). A silent short write would truncate the sidecar while
+    returning success; on renew_lease's read-modify-write path (O_TRUNC already
+    cleared the old bytes) that erases a live lease and lets recovery
+    re-dispatch active work (#479 cross-model adversarial finding, Principle #8).
+
+    STRIP-RED negative control: revert the drain loop to a single
+    `os.write(fd, encoded)` and this test fails (file truncated to 4 bytes).
+    """
+    import os
+
+    real_write = os.write
+
+    def short_write(fd, data):
+        # Force every write to make only 4 bytes of progress, exercising the
+        # drain loop. Without the loop, only the first 4 bytes are written.
+        return real_write(fd, bytes(data)[:4])
+
+    monkeypatch.setattr(_fsmod.os, "write", short_write)
+
+    target = tmp_path / "sidecar.lease.json"
+    payload = '{"lease_token":"abc","lease_expires_at":1234567890,"role":"writer"}'
+    assert len(payload) > 4  # ensure the single-write path would truncate
+
+    _write_no_follow(target, payload)
+
+    monkeypatch.undo()  # restore real os.write before reading back
+    assert target.read_text() == payload, (
+        "drain loop must write the FULL payload under short writes; a single "
+        "os.write would truncate it"
     )
