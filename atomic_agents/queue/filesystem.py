@@ -556,7 +556,16 @@ class FilesystemQueueBackend:
                 ],
             )
             done_dir.mkdir(parents=True, exist_ok=True)
-            work_path.rename(done_dir / original_name)
+            try:
+                work_path.rename(done_dir / original_name)
+            except FileNotFoundError:
+                # The work file is no longer at the claimed/ source — it was
+                # already moved (dead-lettered, recovered, or race-lost). The
+                # dead-work-stays-dead contract (spec/44 MUST 10) requires that
+                # release() does NOT affect a dead-lettered item. Since the
+                # item is already gone from claimed/, there is nothing to move
+                # to done/; silently no-op to satisfy the fail-soft contract.
+                return
             # Remove the sidecar from the (now-moved) original location.
             sc = _sidecar_path(work_path)
             if sc.exists():

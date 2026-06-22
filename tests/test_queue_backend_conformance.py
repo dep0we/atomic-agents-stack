@@ -16,6 +16,7 @@ test-case indices, NOT spec/44 MUST numbers (spec/44 has exactly 12 MUSTs).
   TEST 7  — move_to_dead_letter() moves item to dead-letter/ (spec/44 MUST 10)
   TEST 8  — move_to_dead_letter() writes .reason.txt sidecar (spec/44 MUST 10)
   TEST 9  — dead-work-stays-dead: release after dead-letter has no effect (spec/44 MUST 10)
+  TEST 9a — dead-work-stays-dead strip-RED control (spec/44 MUST 10)
   TEST 10 — renew_lease() updates lease_expires_at (spec/44 MUST 2)
   TEST 11 — list_claimed() returns claimed items (spec/44 MUST 11)
   TEST 12 — list_claimed() returns empty list when claimed/ absent (spec/44 MUST 11)
@@ -51,11 +52,18 @@ test-case indices, NOT spec/44 MUST numbers (spec/44 has exactly 12 MUSTs).
   TEST 42 — doctor.check_queue_backend PASS for cascade agent (spec/44)
   TEST 43 — doctor.check_queue_backend FAIL for bad env var (spec/44)
   TEST 44 — doctor.check_queue_backend WARN for single_host_only + MULTI_HOST (spec/44 MUST 12)
-  TEST 45 — compatibility: old and new import paths are behaviorally equivalent
-  TEST 46 — QueueExport importable from atomic_agents.export (spec/40)
-  TEST 47 — QueueItem has no path field (abstract Protocol-level type)
-  TEST 48 — FilesystemQueueItem has path field (filesystem-specific subtype)
-  TEST 49 — WritePolicy NOT in QueueBackend Protocol surface (spec/44 writepolicy-presence)
+  TEST 45 — doctor FAIL: _queue_root() raises PathTraversalError (symlink escape) (spec/44 §Doctor)
+  TEST 46 — doctor FAIL: list_claimed() raises (spec/44 §Doctor dual-probe)
+  TEST 47 — compatibility: old and new import paths are behaviorally equivalent
+  TEST 48 — cascade re-exports are same object and emit no DeprecationWarning
+  TEST 49 — QueueExport importable from atomic_agents.export (spec/40)
+  TEST 50 — QueueItem has no path field (abstract Protocol-level type)
+  TEST 51 — FilesystemQueueItem has path field (filesystem-specific subtype)
+  TEST 52 — WritePolicy NOT in QueueBackend Protocol surface (spec/44 writepolicy-presence)
+  TEST 53 — item.path stays in the caller's (unresolved/symlinked) representation
+  TEST 54 — renew_lease shim works with a symlinked project_root
+  TEST 55 — release_claim shim fails SOFT on a symlinked-escaping queue/
+  TEST 56 — move_to_dead_letter shim fails SOFT on a symlinked-escaping queue/
 
 PARAMETRIZATION: protocol-behavior tests use the ``backend`` fixture parametrized
 over BACKEND_FACTORIES (currently just 'filesystem'). Adding a second backend to
@@ -239,20 +247,57 @@ def test_move_to_dead_letter_writes_reason(tmp_path):
 
 
 def test_dead_work_stays_dead(tmp_path):
-    """After move_to_dead_letter, the item is NOT recoverable or re-claimable."""
+    """After move_to_dead_letter, the item is NOT recoverable or re-claimable.
+
+    Asserts the load-bearing MUST 10 contract:
+      1. release() after dead-lettering must not raise (fail-soft).
+      2. The dead-lettered file MUST remain in dead-letter/ after release().
+      3. No done/ entry is created.
+    """
     project_root, _ = _make_project_with_queue_item(tmp_path)
     backend = FilesystemQueueBackend(project_root)
     item = backend.claim_next("writer", "lease-1")
     assert item is not None
     backend.move_to_dead_letter(item.lease_token, item.original_name, reason="terminal")
-    # release() on an already-moved item should not raise (item.path is gone)
-    # and should not create a done/ entry
-    try:
-        backend.release(item.lease_token, item.original_name)
-    except FileNotFoundError:
-        pass  # expected: item already moved
+    dl_file = project_root / "queue" / "dead-letter" / "lease-1" / "001_task.md"
+    assert dl_file.exists(), "precondition: item must be in dead-letter/ after move"
+    # release() on a dead-lettered item must fail SOFT — no exception to caller.
+    backend.release(item.lease_token, item.original_name)
+    # Dead-letter item MUST remain in dead-letter/ (the load-bearing assertion).
+    assert dl_file.exists(), (
+        "dead-lettered file must remain in dead-letter/ after release() attempt"
+    )
     done_file = project_root / "queue" / "done" / "lease-1" / "001_task.md"
     assert not done_file.exists(), "dead-letter item must not appear in done/"
+
+
+# TEST 9a — dead-work-stays-dead strip-RED negative control (spec/44 MUST 10)
+
+
+def test_dead_work_stays_dead_strip_control(tmp_path):
+    """Strip-RED negative control for test_dead_work_stays_dead.
+
+    Skips the move_to_dead_letter step; calls release() directly.
+    The item goes to done/ instead of dead-letter/ — if the main test's
+    dl_file.exists() assertion were removed, it would still pass, but this
+    control proves the dl_file.exists() assertion is load-bearing (the test
+    setup correctly creates the dead-letter file and the assertion catches it).
+    """
+    project_root, _ = _make_project_with_queue_item(tmp_path)
+    backend = FilesystemQueueBackend(project_root)
+    item = backend.claim_next("writer", "lease-1")
+    assert item is not None
+    # Deliberately do NOT call move_to_dead_letter — release normally.
+    backend.release(item.lease_token, item.original_name)
+    done_file = project_root / "queue" / "done" / "lease-1" / "001_task.md"
+    dl_file = project_root / "queue" / "dead-letter" / "lease-1" / "001_task.md"
+    # Done file exists (release worked); dead-letter file does NOT exist.
+    assert done_file.exists(), (
+        "control: release() without dead-letter puts item in done/"
+    )
+    assert not dl_file.exists(), (
+        "control: no dead-letter file should exist when move_to_dead_letter was skipped"
+    )
 
 
 def test_dead_letter_not_resurrected_by_recover_stale(tmp_path):
@@ -687,6 +732,12 @@ def test_claim_race_only_one_winner_barrier(tmp_path):
     t2.start()
     t1.join(timeout=10.0)
     t2.join(timeout=10.0)
+    assert not t1.is_alive(), (
+        "worker-A thread did not complete within 10 s — barrier may have hung"
+    )
+    assert not t2.is_alive(), (
+        "worker-B thread did not complete within 10 s — barrier may have hung"
+    )
 
     assert not errors, f"Unexpected errors in workers: {errors}"
     non_none = [r for r in results if r is not None]
@@ -1047,6 +1098,10 @@ def test_compatibility_old_and_new_import_paths_equivalent(tmp_path):
     assert item_new.claimed_at > 0
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# TEST 48 — cascade re-exports are same object and emit no DeprecationWarning
+
+
 def test_cascade_reexports_are_same_object_and_quiet():
     """The _cascade.py NON-deprecated re-export shim must:
 
@@ -1088,7 +1143,7 @@ def test_cascade_reexports_are_same_object_and_quiet():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# TEST 46 — QueueExport importable from atomic_agents.export
+# TEST 49 — QueueExport importable from atomic_agents.export
 
 
 def test_queue_export_importable_from_export_package():
@@ -1100,7 +1155,7 @@ def test_queue_export_importable_from_export_package():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# TEST 47 — QueueItem has no path field (abstract Protocol-level type)
+# TEST 50 — QueueItem has no path field (abstract Protocol-level type)
 
 
 def test_queue_item_has_no_path_field():
@@ -1115,7 +1170,7 @@ def test_queue_item_has_no_path_field():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# TEST 48 — FilesystemQueueItem has path field
+# TEST 51 — FilesystemQueueItem has path field
 
 
 def test_filesystem_queue_item_has_path_field():
@@ -1127,7 +1182,7 @@ def test_filesystem_queue_item_has_path_field():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# TEST 49 — WritePolicy NOT in QueueBackend Protocol surface
+# TEST 52 — WritePolicy NOT in QueueBackend Protocol surface
 
 
 def test_writepolicy_not_in_queue_backend():
@@ -1163,7 +1218,7 @@ def test_writepolicy_not_in_queue_backend():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# TEST 48 — item.path stays in the CALLER's (unresolved/symlinked) representation
+# TEST 53 — item.path stays in the CALLER's (unresolved/symlinked) representation
 #
 # Closes the tmp_path blind spot: pytest's tmp_path is already resolved on macOS,
 # so the standard claim_next tests cannot detect a backend that returns the
@@ -1211,6 +1266,10 @@ def test_claim_next_path_uses_caller_unresolved_root(tmp_path):
     assert item.path.parents[3] == symlinked_root
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# TEST 54 — renew_lease shim works with a symlinked project_root
+
+
 def test_renew_lease_shim_symlinked_root(tmp_path):
     """The renew_lease shim (parents[3]) works with a symlinked project_root.
 
@@ -1239,7 +1298,7 @@ def test_renew_lease_shim_symlinked_root(tmp_path):
     assert new != orig, "renew_lease must have updated the sidecar via parents[3]"
 
 
-# TEST 49 — release_claim shim fails SOFT when queue/ is a symlink escaping
+# TEST 55 — release_claim shim fails SOFT when queue/ is a symlink escaping
 # project_root. Regression for the Round-4 P1: the shim called backend._queue_root()
 # OUTSIDE a try/except, so a symlinked-escaping queue/ made it RAISE
 # PathTraversalError to the caller — whereas the Protocol method release() catches
@@ -1271,8 +1330,8 @@ def test_release_claim_shim_fails_soft_on_symlinked_queue(tmp_path):
     assert list(outside.rglob("*")) == [], "no bytes may land outside project_root"
 
 
-# TEST 50 — move_to_dead_letter shim fails SOFT on a symlinked-escaping queue/.
-# Same Round-4 P1 root cause as TEST 49; same fail-soft parity assertion.
+# TEST 56 — move_to_dead_letter shim fails SOFT on a symlinked-escaping queue/.
+# Same Round-4 P1 root cause as TEST 55; same fail-soft parity assertion.
 def test_move_to_dead_letter_shim_fails_soft_on_symlinked_queue(tmp_path):
     """move_to_dead_letter() free-function no-ops (no raise) on a symlinked queue/."""
     from atomic_agents._cascade import move_to_dead_letter
