@@ -1042,3 +1042,298 @@ def test_source_paths_v11_deferral_returns_direct_wiki_path(tmp_path):
         "If _source_paths was refactored to route through CorpusBackend, "
         "the v1.1 follow-up issue (#65 PR 4) must land first."
     )
+
+
+# ──────────────────────────────────────────────────────────────────
+# Bundle validation (spec/26 `--validate`, issue #593)
+#
+# `--validate` checks the bundle faithfully CONTAINS every cascade body the
+# runtime assembles into the system prompt (content parity, not byte equality).
+# Known divergences (reported, never failures): the runtime `# Available skills`
+# section is omitted from the bundle (#593); model.md is bundle-only.
+
+
+def _runtime_system_prompt(agents_root: Path, agent_root: Path) -> str:
+    """Build the runtime system prompt the way the CLI --validate path does."""
+    from atomic_agents.agent import AtomicAgent
+
+    rel_name = str(agent_root.relative_to(agents_root))
+    agent = AtomicAgent(name=rel_name, agents_root=agents_root)
+    agent.load()
+    return agent.assemble_system_prompt()
+
+
+def test_validate_passes_on_faithful_cascade(tmp_path):
+    """A freshly rendered bundle contains every runtime cascade body."""
+    from atomic_agents import bundle as bundle_mod
+
+    agents_root, agent_root = _build_cascaded(tmp_path)
+    cache_dir = tmp_path / "cache"
+
+    result = bundle_mod.render_bundle(
+        agent_root, agents_root=agents_root, cache_dir=cache_dir
+    )
+    bundle_text = result.path.read_text(encoding="utf-8")
+    system_prompt = _runtime_system_prompt(agents_root, agent_root)
+
+    report = bundle_mod.validate_bundle_parity(system_prompt, bundle_text)
+
+    assert report.ok is True
+    assert report.missing == []
+    # The cascade bodies the runtime injects are all present.
+    headers = {s.header for s in report.present}
+    assert "# role PROMPT.md" in headers
+    assert "# project canon.md" in headers
+    # No skills here, so no skills divergence.
+    known_headers = {s.header for s in report.known}
+    assert "# Available skills" not in known_headers
+    # The runtime synthesizes an empty placeholder memory index even with no
+    # notes; the bundle omits it. That is a benign known divergence, not drift.
+    assert "# memory/INDEX.md" in known_headers
+
+    rendered = bundle_mod.format_validation_report(report)
+    assert "Bundle validation: PASS" in rendered
+
+
+def test_validate_passes_on_faithful_flat(tmp_path):
+    """Flat (spec/04) layout: bundle contains every runtime body."""
+    from atomic_agents import bundle as bundle_mod
+
+    agents_root, agent_root = _build_flat(tmp_path)
+    cache_dir = tmp_path / "cache"
+
+    result = bundle_mod.render_bundle(
+        agent_root, agents_root=agents_root, cache_dir=cache_dir
+    )
+    bundle_text = result.path.read_text(encoding="utf-8")
+    system_prompt = _runtime_system_prompt(agents_root, agent_root)
+
+    report = bundle_mod.validate_bundle_parity(system_prompt, bundle_text)
+
+    assert report.ok is True
+    assert report.missing == []
+    headers = {s.header for s in report.present}
+    # Flat-layout runtime sections: persona (one section), goal.md, tools.md.
+    assert "# goal.md" in headers
+    assert "# tools.md" in headers
+
+
+def test_validate_detects_drift(tmp_path):
+    """Negative control: stale bundle missing a runtime body MUST fail.
+
+    Render the bundle, THEN append new content to a source file. The runtime
+    system prompt (built fresh) now contains content the stale bundle lacks —
+    validation must report it as missing and report.ok must be False.
+    """
+    from atomic_agents import bundle as bundle_mod
+
+    agents_root, agent_root = _build_cascaded(tmp_path)
+    cache_dir = tmp_path / "cache"
+
+    result = bundle_mod.render_bundle(
+        agent_root, agents_root=agents_root, cache_dir=cache_dir
+    )
+    stale_bundle_text = result.path.read_text(encoding="utf-8")
+
+    # Mutate a source AFTER the bundle was rendered: the project canon now has
+    # a sentence the stale bundle does not contain.
+    cascade = bundle._cascade.detect_cascade(agent_root)
+    canon = cascade.project_root / "canon.md"
+    sentinel = "DRIFT-SENTINEL-a memory of a forgotten orb that never made the bundle."
+    canon.write_text(canon.read_text() + "\n\n" + sentinel)
+
+    # Runtime system prompt reflects the new content; stale bundle does not.
+    system_prompt = _runtime_system_prompt(agents_root, agent_root)
+    assert sentinel in system_prompt  # sanity: the runtime did pick it up
+
+    report = bundle_mod.validate_bundle_parity(system_prompt, stale_bundle_text)
+
+    assert report.ok is False, (
+        "validation must FAIL when the runtime assembles content the bundle "
+        "lacks — otherwise the negative control is worthless"
+    )
+    missing_headers = {s.header for s in report.missing}
+    assert "# project canon.md" in missing_headers
+
+    rendered = bundle_mod.format_validation_report(report)
+    assert "Bundle validation: FAIL" in rendered
+    assert "# project canon.md" in rendered
+
+
+def test_validate_populated_memory_index_is_not_excused(tmp_path):
+    """Guard: the empty-index carve-out is NARROW.
+
+    The carve-out excuses ONLY the empty synthesized placeholder. A POPULATED
+    memory INDEX that the runtime assembles but the bundle lacks must still
+    register as real drift (status missing), not be swallowed as 'known'."""
+    from atomic_agents import bundle as bundle_mod
+
+    agents_root, agent_root = _build_cascaded(tmp_path)
+    memory_dir = agent_root / "memory"
+    memory_dir.mkdir(parents=True)
+    (memory_dir / "INDEX.md").write_text(
+        "# Memory Index\n\n- orb-continuity: the orb remembers across chapters."
+    )
+
+    cache_dir = tmp_path / "cache"
+    result = bundle_mod.render_bundle(
+        agent_root, agents_root=agents_root, cache_dir=cache_dir
+    )
+    bundle_text = result.path.read_text(encoding="utf-8")
+    system_prompt = _runtime_system_prompt(agents_root, agent_root)
+
+    # Faithful: populated index is in both → present, parity holds.
+    report = bundle_mod.validate_bundle_parity(system_prompt, bundle_text)
+    assert report.ok is True
+    present_headers = {s.header for s in report.present}
+    assert "# memory/INDEX.md" in present_headers
+    known_headers = {s.header for s in report.known}
+    assert "# memory/INDEX.md" not in known_headers
+
+    # Now strip the populated index body from the bundle → it must FAIL, proving
+    # the carve-out does not swallow a real populated-index divergence.
+    stripped = bundle_text.replace(
+        "- orb-continuity: the orb remembers across chapters.", ""
+    )
+    report2 = bundle_mod.validate_bundle_parity(system_prompt, stripped)
+    assert report2.ok is False
+    assert "# memory/INDEX.md" in {s.header for s in report2.missing}
+
+
+def test_validate_skills_known_divergence(tmp_path):
+    """A SKILL.md makes the runtime inject `# Available skills`; the bundle
+    omits it. That divergence is reported (referencing #593) and PASSES."""
+    from atomic_agents import bundle as bundle_mod
+
+    agents_root, agent_root = _build_cascaded(tmp_path)
+    # Skills are discovered under <instance>/skills/<name>/SKILL.md (agent_root
+    # is the instance dir for a cascade).
+    skill_dir = agent_root / "skills" / "orb-lore"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: orb-lore\n"
+        "description: Lore lookups for the memory orb continuity.\n"
+        "---\n\n"
+        "# Orb Lore\n\nDetailed instructions for orb continuity.\n"
+    )
+
+    cache_dir = tmp_path / "cache"
+    result = bundle_mod.render_bundle(
+        agent_root, agents_root=agents_root, cache_dir=cache_dir
+    )
+    bundle_text = result.path.read_text(encoding="utf-8")
+    system_prompt = _runtime_system_prompt(agents_root, agent_root)
+
+    # Sanity: the runtime DID inject the skills section, and the bundle did NOT.
+    assert "# Available skills" in system_prompt
+    assert "orb-lore" in system_prompt
+    assert "# Available skills" not in bundle_text
+
+    report = bundle_mod.validate_bundle_parity(system_prompt, bundle_text)
+
+    # Known divergence reported, validation still PASSES (no unexpected drift).
+    assert report.ok is True
+    known_headers = {s.header for s in report.known}
+    assert "# Available skills" in known_headers
+    skills_note = next(s.note for s in report.known if s.header == "# Available skills")
+    assert "#593" in skills_note
+
+    rendered = bundle_mod.format_validation_report(report)
+    assert "Bundle validation: PASS" in rendered
+    assert "known divergence" in rendered.lower()
+    assert "#593" in rendered
+
+
+# ──────────────────────────────────────────────────────────────────
+# CLI --validate path
+
+
+def test_cli_bundle_validate_passes(tmp_path, monkeypatch, capsys):
+    from atomic_agents.cli import main as cli_main
+
+    agents_root, agent_root, name = _setup_cli_env(tmp_path, monkeypatch)
+    cache_dir = tmp_path / "cache"
+
+    rc = cli_main(["bundle", name, "--cache-dir", str(cache_dir), "--validate"])
+    out = capsys.readouterr()
+
+    assert rc == 0
+    assert "Bundle validation: PASS" in out.out
+
+
+def test_cli_bundle_validate_detects_drift(tmp_path, monkeypatch, capsys):
+    """CLI --validate MUST exit 1 + list missing content on real drift.
+
+    The CLI renders a FRESH bundle, so to force drift at the CLI boundary we
+    make the runtime assemble a section the bundle renderer never produces:
+    monkeypatch assemble_system_prompt to append a sentinel cascade section.
+    This exercises the full CLI path (agent construct + load + assemble +
+    fresh render + compare + exit code) — a negative control: it MUST fail."""
+    from atomic_agents.cli import main as cli_main
+    from atomic_agents.agent import AtomicAgent
+
+    agents_root, agent_root, name = _setup_cli_env(tmp_path, monkeypatch)
+    cache_dir = tmp_path / "cache"
+
+    sep = "\n\n═══════════════════════════\n\n"
+    sentinel = (
+        "# project canon.md\n\n"
+        "DRIFT-SENTINEL: content the runtime assembles but the bundle lacks."
+    )
+    real_assemble = AtomicAgent.assemble_system_prompt
+
+    def _drifted(self):
+        return real_assemble(self) + sep + sentinel
+
+    monkeypatch.setattr(AtomicAgent, "assemble_system_prompt", _drifted)
+
+    rc = cli_main(["bundle", name, "--cache-dir", str(cache_dir), "--validate"])
+    out = capsys.readouterr()
+
+    assert rc == 1, "CLI --validate must exit 1 when runtime content is missing"
+    assert "Bundle validation: FAIL" in out.out
+    assert "# project canon.md" in out.out
+
+
+def test_cli_bundle_validate_empty_prompt_fails_closed(tmp_path, monkeypatch, capsys):
+    """An empty runtime prompt MUST be an error, never a vacuous PASS.
+
+    validate_bundle_parity('', bundle) parses zero sections and would report
+    ok=True. The CLI guards this: if assemble_system_prompt() yields an empty
+    string (a misconfigured agent, or a future load path that silently returns
+    nothing), --validate fails closed (exit 1) instead of claiming parity.
+    Negative control for the empty-prompt guard."""
+    from atomic_agents.cli import main as cli_main
+    from atomic_agents.agent import AtomicAgent
+
+    agents_root, agent_root, name = _setup_cli_env(tmp_path, monkeypatch)
+    cache_dir = tmp_path / "cache"
+
+    monkeypatch.setattr(AtomicAgent, "assemble_system_prompt", lambda self: "")
+
+    rc = cli_main(["bundle", name, "--cache-dir", str(cache_dir), "--validate"])
+    out = capsys.readouterr()
+
+    assert rc == 1, "empty runtime prompt must fail closed, not pass vacuously"
+    assert "empty" in out.err.lower()
+    assert "Bundle validation: PASS" not in out.out
+
+
+def test_cli_bundle_validate_skills_known_divergence(tmp_path, monkeypatch, capsys):
+    from atomic_agents.cli import main as cli_main
+
+    agents_root, agent_root, name = _setup_cli_env(tmp_path, monkeypatch)
+    skill_dir = agent_root / "skills" / "orb-lore"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: orb-lore\ndescription: Lore lookups.\n---\n\n# Orb Lore\n\nBody.\n"
+    )
+    cache_dir = tmp_path / "cache"
+
+    rc = cli_main(["bundle", name, "--cache-dir", str(cache_dir), "--validate"])
+    out = capsys.readouterr()
+
+    assert rc == 0
+    assert "Bundle validation: PASS" in out.out
+    assert "#593" in out.out
