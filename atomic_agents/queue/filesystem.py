@@ -90,6 +90,7 @@ Import boundary (circular-import safety):
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -185,6 +186,57 @@ def _validate_original_name(original_name: str) -> None:
     _validate_bare_component(original_name, "original_name")
 
 
+def _write_no_follow(path: Path, content: str) -> None:
+    """Write *content* to *path* without following a symlink at the leaf.
+
+    Uses os.open(O_NOFOLLOW|O_CREAT|O_TRUNC|O_WRONLY) to refuse to follow a
+    symlink planted at the write destination (sidecar/reason-txt symlink-leaf
+    perimeter escape, #479). If the path is a symlink, os.open raises OSError
+    with errno ELOOP (POSIX) or similar; the exception is NOT caught here —
+    callers handle it in their existing fail-soft try/except.
+
+    Sidecar writes are best-effort (see _write_sidecar docstring); a refused
+    write (symlink at destination) is silently tolerated by callers that wrap
+    in try/except.
+
+    Args:
+        path: destination path (sidecar .lease.json or .reason.txt).
+        content: UTF-8 text to write.
+
+    Raises:
+        OSError: when os.open refuses the path (e.g. ELOOP because path is a
+            symlink, or EACCES/ENOENT from the parent directory). Callers
+            must wrap in try/except when best-effort semantics are required.
+    """
+    encoded = content.encode("utf-8")
+    fd = os.open(
+        str(path),
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+        0o666,
+    )
+    try:
+        # Drain the buffer: a raw os.write may write FEWER bytes than requested
+        # (POSIX permits a short write). Path.write_text's IO layer looped; raw
+        # os.write does not. Without this loop a short write returns success
+        # while leaving a TRUNCATED sidecar — and on the renew_lease
+        # read-modify-write path (O_TRUNC already cleared the old bytes) that
+        # silently erases a live lease, letting recover_stale_claims() promote
+        # an actively-held item as stale and re-dispatch in-flight work
+        # (Principle #8; cross-model adversarial finding on the #479 helper).
+        view = memoryview(encoded)
+        written = 0
+        while written < len(encoded):
+            n = os.write(fd, view[written:])
+            if n <= 0:
+                raise OSError(
+                    f"_write_no_follow: os.write made no progress "
+                    f"({len(encoded) - written} bytes remaining) for {path}"
+                )
+            written += n
+    finally:
+        os.close(fd)
+
+
 def _write_sidecar(
     work_file: Path,
     lease_token: str,
@@ -193,13 +245,12 @@ def _write_sidecar(
 ) -> None:
     """Write a lease sidecar alongside *work_file*.
 
-    NOTE: This uses raw Path.write_text() — NOT atomic_write(). This preserves
-    _cascade.py's write mechanism (best-effort sidecar; the claim atomicity
-    guarantee is on the rename, not the sidecar). A torn sidecar is recoverable
-    via the mtime fallback path in recover_stale_claims(). The mtime fallback
-    reads the work file's mtime (not the sidecar's mtime), so atomic_write
-    for sidecars would be safe — but raw write_text matches the carved-from
-    behavior.
+    Uses _write_no_follow (O_NOFOLLOW) to refuse to follow a symlink planted
+    at the sidecar path (#479 sidecar-leaf perimeter escape). If the sidecar
+    path is a symlink, the write is silently skipped (sidecar writes are
+    best-effort; the claim atomicity guarantee is on the rename, not the
+    sidecar). A torn/absent sidecar is recoverable via the mtime fallback in
+    recover_stale_claims().
 
     The sidecar gains an additive ``role`` key (absent in the pre-carve
     _cascade.py sidecar) so list_claimed(role=...) filtering works on the
@@ -226,7 +277,13 @@ def _write_sidecar(
         "lease_seconds": lease_seconds,
         "role": role,
     }
-    _sidecar_path(work_file).write_text(json.dumps(sidecar), encoding="utf-8")
+    try:
+        _write_no_follow(_sidecar_path(work_file), json.dumps(sidecar))
+    except OSError:
+        # Sidecar write is best-effort. A symlink at the destination (ELOOP)
+        # or any other OS error is silently tolerated — the mtime fallback
+        # in recover_stale_claims() handles the absent-sidecar case.
+        pass
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -425,6 +482,25 @@ class FilesystemQueueBackend:
         """Atomically claim the next item from queue/queued/<role>/.
 
         See module docstring for the full atomicity contract.
+
+        No-replace claim semantics (spec/44 MUST 4/9 strengthening, #478):
+        The claimed/<lease_token>/ directory is created with exist_ok=False.
+        If a directory already exists for this lease_token (a reused or stale
+        token from a prior claim session), mkdir raises FileExistsError and
+        claim_next returns None. Callers MUST generate a fresh lease_token per
+        claim session. A collision returns None; the caller must retry with a
+        new token.
+
+        Similarly, the work-file rename uses an O_EXCL existence probe to
+        detect a destination collision under token reuse, returning None rather
+        than clobbering an in-flight file at the same claimed/<token>/<name>.
+
+        On a non-FileNotFoundError rename failure (EXDEV/EACCES/EIO/ENOSPC),
+        the O_EXCL placeholder and the now-empty claimed/<token>/ directory are
+        cleaned up before the OSError is re-raised — a failed claim leaves no
+        zero-byte phantom that recover_stale_claims() could mtime-promote into
+        queued/_recovered/ as re-claimable work (Principle #8). The queued
+        SOURCE is untouched (the rename never moved it).
         """
         try:
             _validate_bare_component(role, "role")
@@ -438,7 +514,14 @@ class FilesystemQueueBackend:
         if not queued_dir.is_dir():
             return None
 
-        claimed_dir.mkdir(parents=True, exist_ok=True)
+        # NO-REPLACE MKDIR: exist_ok=False so a reused lease_token whose
+        # claimed/ directory still exists returns None immediately. Callers must
+        # generate a fresh lease_token per claim session (spec/44 MUST 4/9).
+        try:
+            claimed_dir.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            # lease_token already in use — caller must retry with a fresh token.
+            return None
 
         # Sort to give deterministic FIFO-by-name behavior.
         # `p.is_file()` follows symlinks — a symlink to a regular file passes.
@@ -459,11 +542,59 @@ class FilesystemQueueBackend:
             except PathTraversalError:
                 continue
             dst = claimed_dir / src.name
+            # DEFENSE-IN-DEPTH (redundant; removal tracked in #597). The
+            # in-scope lease_token-reuse clobber is ALREADY closed by the
+            # mkdir(exist_ok=False) above: a reused token whose claimed/ dir
+            # exists returns None before we get here, so claimed_dir is always
+            # freshly-created and empty at this point and we return on the first
+            # successful claim. This O_EXCL probe therefore only fires if an
+            # EXTERNAL within-queue/ process plants a file at dst in the
+            # TOCTOU window between that mkdir and here — a writer already inside
+            # the trust zone, which spec/44 §Security declares OUT OF SCOPE. So
+            # this destination-collision branch is unreachable by any in-scope
+            # path and is not strip-RED tested. The real guards are
+            # mkdir(exist_ok=False) (token-reuse clobber, strip-RED tested) +
+            # rename's source-side FileNotFoundError (concurrent-worker race,
+            # MUST 9). renameat2/RENAME_NOREPLACE is Linux-only, hence O_EXCL.
+            try:
+                fd = os.open(str(dst), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                os.close(fd)
+            except FileExistsError:
+                # Destination occupied by an out-of-scope racing writer — skip.
+                continue
             try:
                 src.rename(dst)
             except FileNotFoundError:
-                # Another worker raced us to this file. Try the next.
+                # Another worker raced us to this source file. Try the next.
+                # Clean up the empty placeholder we created via O_EXCL.
+                try:
+                    dst.unlink(missing_ok=True)
+                except OSError:
+                    pass
                 continue
+            except OSError:
+                # Non-FNF rename failure (EXDEV cross-device, EACCES, EIO,
+                # ENOSPC). The O_EXCL probe above already created an empty
+                # placeholder at dst; if we re-raise without cleanup, the
+                # zero-byte file is orphaned in claimed/<token>/ and
+                # recover_stale_claims() will mtime-promote it into
+                # queued/_recovered/<token>/ as a re-claimable PHANTOM work
+                # item (Principle #8: a failed claim must not leave a
+                # corruption that recovery re-dispatches). Unlink the
+                # placeholder, then also drop the now-empty claimed_dir we
+                # created via mkdir(exist_ok=False), then propagate the error.
+                # The queued SOURCE is untouched (the rename did not move it),
+                # so it stays claimable with a fresh token.
+                try:
+                    dst.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                try:
+                    if claimed_dir.exists() and not any(claimed_dir.iterdir()):
+                        claimed_dir.rmdir()
+                except OSError:
+                    pass
+                raise
             _write_sidecar(
                 dst, lease_token=lease_token, lease_seconds=lease_seconds, role=role
             )
@@ -532,7 +663,9 @@ class FilesystemQueueBackend:
         # mkdir, rename, sidecar cleanup — is inside ONE try/except PathTraversalError
         # so ANY PathTraversalError (destination OR source, including unresolvable
         # work_path) fails soft for ALL callers (Protocol methods + _cascade shims).
-        # FileNotFoundError/other OSError from rename propagate normally (not swallowed).
+        # FileNotFoundError from rename fails soft (the item was already
+        # moved/dead-lettered — spec/44 MUST 10 dead-work-stays-dead no-op, handled
+        # by the inner except below); other OSError from rename propagates normally.
         try:
             _validate_original_name(original_name)
             _validate_bare_component(lease_token, "lease_token")
@@ -556,7 +689,16 @@ class FilesystemQueueBackend:
                 ],
             )
             done_dir.mkdir(parents=True, exist_ok=True)
-            work_path.rename(done_dir / original_name)
+            try:
+                work_path.rename(done_dir / original_name)
+            except FileNotFoundError:
+                # The work file is no longer at the claimed/ source — it was
+                # already moved (dead-lettered, recovered, or race-lost). The
+                # dead-work-stays-dead contract (spec/44 MUST 10) requires that
+                # release() does NOT affect a dead-lettered item. Since the
+                # item is already gone from claimed/, there is nothing to move
+                # to done/; silently no-op to satisfy the fail-soft contract.
+                return
             # Remove the sidecar from the (now-moved) original location.
             sc = _sidecar_path(work_path)
             if sc.exists():
@@ -647,9 +789,14 @@ class FilesystemQueueBackend:
             target = dl_dir / original_name
             work_path.rename(target)
             if reason:
-                (dl_dir / (original_name + ".reason.txt")).write_text(
-                    reason, encoding="utf-8"
-                )
+                try:
+                    _write_no_follow(dl_dir / (original_name + ".reason.txt"), reason)
+                except OSError:
+                    # reason.txt write is best-effort (the work file is already
+                    # renamed to dead-letter/; the terminal state is established).
+                    # A symlink planted at the reason.txt path (ELOOP) or any
+                    # other OS error must not propagate — mirrors _write_sidecar.
+                    pass
             # Remove the sidecar from the (now-moved) original location.
             sc = _sidecar_path(work_path)
             if sc.exists():
@@ -672,8 +819,9 @@ class FilesystemQueueBackend:
         with the sidecar path computed next to the actual work file — that is
         what the _cascade.py shim does to match pre-carve behavior at any depth.
 
-        NOTE: Uses raw Path.write_text() — behavior-neutral carve preserving
-        the _cascade.py implementation. See _write_sidecar docstring.
+        NOTE: The sidecar write routes through _write_no_follow (O_NOFOLLOW,
+        #479) — a symlink planted at the sidecar path is refused (ELOOP) and
+        the best-effort write is silently skipped. See _write_sidecar docstring.
         """
         try:
             queue_root = self._queue_root()
@@ -718,8 +866,9 @@ class FilesystemQueueBackend:
         skips the validation — consistent with its pre-carve any-depth semantics.
         The Protocol renew_lease() always supplies original_name.
 
-        NOTE: Uses raw Path.write_text() — behavior-neutral carve. See
-        _write_sidecar docstring.
+        NOTE: The sidecar write routes through _write_no_follow (O_NOFOLLOW,
+        #479) — a symlink planted at the sidecar path is refused (ELOOP) and
+        the best-effort write is silently skipped. See _write_sidecar docstring.
 
         Raises:
             PathTraversalError: when original_name is provided and is not a bare
@@ -768,7 +917,16 @@ class FilesystemQueueBackend:
         data.setdefault("claimed_at", now.isoformat())
         data["lease_seconds"] = lease_secs
 
-        sidecar.write_text(json.dumps(data), encoding="utf-8")
+        try:
+            _write_no_follow(sidecar, json.dumps(data))
+        except OSError:
+            # Sidecar write is best-effort. A symlink at the sidecar path (ELOOP
+            # from O_NOFOLLOW — the #479 sidecar-leaf perimeter escape) or any
+            # other OS error must not propagate to the caller. The existing
+            # is_file()+not is_symlink() read-guard already blocks reading a
+            # symlinked sidecar; _write_no_follow closes the corresponding
+            # write-side gap.
+            pass
 
     def list_claimed(self, role: str | None = None) -> list[FilesystemQueueItem]:
         """Return all currently-held (claimed) work items.
@@ -910,14 +1068,63 @@ class FilesystemQueueBackend:
         # file_path values come from the UNRESOLVED queue_root (see _queue_root /
         # _safe_under_queue), so relativize against the UNRESOLVED project root.
         # The two share the same representation, so relative_to() never raises
-        # for the symlinked-project_root case. The per-leaf symlink guard below
-        # uses a separately-resolved queue_root to catch a symlinked WORK FILE
-        # escaping queue/ — that containment check needs the resolved anchor even
-        # though the emitted relative path uses the unresolved base.
+        # for the symlinked-project_root case. The per-subdir and per-leaf
+        # containment guards below use a separately-resolved queue_root anchor.
         try:
             queue_root_resolved = queue_root.resolve()
         except (OSError, RuntimeError):
             queue_root_resolved = queue_root
+
+        def _walk_dir_no_follow(root_dir: Path) -> list[Path]:
+            """Iterdir-based recursive walk that refuses to follow symlinked subdirs.
+
+            Replaces rglob('*') as version-independent defense-in-depth (#477).
+            Default rglob('*') does NOT follow directory symlinks on any
+            interpreter the framework supports (3.11-3.13: recurse_symlinks
+            defaults to False; the 3.13 change only ADDED the opt-in
+            recurse_symlinks=True parameter). This explicit walk does not depend
+            on that stdlib default and stays correct if a caller (or a future
+            stdlib default) ever enables symlink recursion through a symlinked
+            subdir pointing at a large or cyclic tree. It also adds a per-subdir
+            containment re-assertion that rglob performs nowhere.
+
+            At each subdirectory descent, re-asserts resolve() +
+            is_relative_to(queue_root_resolved) before recursing. Skips any
+            subdir that is a symlink (not just those that escape queue_root) —
+            same per-subdirectory containment pattern as
+            FilesystemConversationBackend.export()'s per-principal iterdir walk.
+
+            Returns a sorted list of all file paths (files only, no dirs).
+            NOT os.walk(followlinks=False): os.walk returns (dirpath, dirs,
+            files) tuples without per-entry resolve checks and doesn't give
+            per-subdir containment before descent.
+            """
+            collected: list[Path] = []
+            try:
+                entries = list(root_dir.iterdir())
+            except (OSError, PermissionError):
+                return collected
+            for entry in entries:
+                if entry.is_symlink():
+                    # Symlinked subdirs: skip without descending (containment +
+                    # cyclic/large-tree traversal guard). Symlinked files: let
+                    # the per-leaf guard below handle them.
+                    if entry.is_dir():
+                        continue
+                    # Symlinked file — fall through to collection; per-leaf guard
+                    # will reject containment-escaping symlinks.
+                if entry.is_dir():
+                    # Re-assert containment before descending into this subdir.
+                    try:
+                        subdir_resolved = entry.resolve()
+                    except (OSError, RuntimeError):
+                        continue
+                    if not subdir_resolved.is_relative_to(queue_root_resolved):
+                        continue
+                    collected.extend(_walk_dir_no_follow(entry))
+                else:
+                    collected.append(entry)
+            return collected
 
         for dir_name in durable_dirs:
             try:
@@ -927,7 +1134,7 @@ class FilesystemQueueBackend:
                 continue
             if not dir_path.is_dir():
                 continue
-            for file_path in sorted(dir_path.rglob("*")):
+            for file_path in sorted(_walk_dir_no_follow(dir_path)):
                 if not file_path.is_file():
                     continue
                 # Exclude .lease.json files (belt-and-suspenders: they only

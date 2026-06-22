@@ -23,10 +23,12 @@ from pathlib import Path
 
 import pytest
 
+from atomic_agents.queue import filesystem as _fsmod
 from atomic_agents.queue.filesystem import (
     FilesystemQueueBackend,
     FilesystemQueueItem,
     _sidecar_path,
+    _write_no_follow,
     _write_sidecar,
 )
 from atomic_agents.queue.backend import recover_stale_claims
@@ -283,12 +285,14 @@ def test_list_claimed_skips_file_vanishing_mid_enumeration(tmp_path):
     _queued(project_root, name="vanishes.md")
     _queued(project_root, name="survives.md")
     backend = FilesystemQueueBackend(project_root)
-    item_a = backend.claim_next("writer", "lease-v", lease_seconds=60)
-    item_b = backend.claim_next("writer", "lease-v", lease_seconds=60)
+    # Use distinct lease tokens: #478 no-replace mkdir requires a fresh token
+    # per claim session; reusing the same token would return None on the second
+    # call because claimed/lease-v/ already exists.
+    item_a = backend.claim_next("writer", "lease-v1", lease_seconds=60)
+    item_b = backend.claim_next("writer", "lease-v2", lease_seconds=60)
     assert item_a is not None and item_b is not None
 
-    # Identify which claimed path holds vanishes.md / survives.md (lease-token
-    # namespacing means both land under claimed/lease-v/).
+    # Identify which claimed path holds vanishes.md / survives.md.
     vanish_path = next(p for p in (item_a.path, item_b.path) if p.name == "vanishes.md")
     survive_path = next(
         p for p in (item_a.path, item_b.path) if p.name == "survives.md"
@@ -2133,3 +2137,290 @@ def test_list_claimed_and_recover_skip_symlinked_sidecar(tmp_path):
     # recover must not raise and must not read the external sidecar either.
     recover_stale_claims(backend, lease_seconds=999999)
     assert external.read_text().startswith("{"), "external file must be untouched"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# #477 export() symlinked-subdir DoS — iterdir() walk re-asserts containment
+# at each subdir descent; refuses to follow symlinked subdirs.
+
+
+def test_export_symlinked_subdir_inside_queued_is_skipped(tmp_path):
+    """export() must NOT descend into a symlinked subdirectory inside queued/.
+
+    A symlinked subdir inside queued/ (e.g. queued/evil/ -> /outside/) is
+    refused at the subdir-descent stage of _walk_dir_no_follow; files inside
+    the symlinked tree are NOT emitted in the export.
+
+    INVARIANT GUARD (not a strip-RED differentiator on CI interpreters): this
+    asserts the negative invariant "symlinked-subdir contents are never
+    exported" and the positive invariant "real subdir files ARE exported".
+    Both invariants hold under BOTH _walk_dir_no_follow AND default
+    sorted(rglob('*')), because default rglob does NOT follow directory
+    symlinks on any interpreter the framework supports (3.11-3.13:
+    recurse_symlinks defaults to False; the 3.13 change only ADDED the opt-in
+    parameter). The _walk_dir_no_follow hardening (#477) is therefore
+    defense-in-depth / version-independent, verified by inspection rather than
+    by a behavioral difference here. A 3.13+ CI lane exercising the live
+    recurse_symlinks vector is tracked in #595.
+    """
+    import os
+
+    project_root = tmp_path / "project"
+    # Plant a real file in queued/writer/
+    qd = project_root / "queue" / "queued" / "writer"
+    qd.mkdir(parents=True)
+    (qd / "real_task.md").write_text("real content")
+
+    # Plant a directory outside queue_root with a file in it.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "evil.md").write_text("should never appear in export")
+
+    # Create a symlinked subdir inside queued/ pointing outside.
+    evil_link = project_root / "queue" / "queued" / "evil"
+    os.symlink(outside, evil_link)
+
+    backend = FilesystemQueueBackend(project_root)
+    result = backend.export()
+    paths = [rel for rel, _ in result.items_with_bytes]
+
+    # The real file IS exported (walk reaches non-symlinked subdirs).
+    assert any("real_task.md" in p for p in paths), (
+        f"Real file must be exported: {paths}"
+    )
+    # The symlinked-subdir file is NOT exported.
+    assert not any("evil.md" in p for p in paths), (
+        f"File inside symlinked subdir must NOT be exported: {paths}"
+    )
+
+
+def test_export_symlinked_subdir_within_queue_root_is_skipped(tmp_path):
+    """export() must NOT follow a symlinked subdir even if it resolves within queue_root.
+
+    A within-queue symlink (done/link-dir -> queued/writer/) would cause
+    double-enumeration and cross-boundary aliasing if symlink recursion were
+    ever enabled. It is skipped at the subdir descent gate (is_symlink() check
+    BEFORE the containment check), not just at the containment check.
+
+    INVARIANT GUARD (not a strip-RED differentiator on CI interpreters): the
+    no-double-count invariant holds under BOTH _walk_dir_no_follow AND default
+    sorted(rglob('*')), because default rglob does NOT follow directory
+    symlinks on 3.11-3.13 (recurse_symlinks defaults to False). The
+    _walk_dir_no_follow hardening (#477) makes this version-independent and
+    robust to a future recurse_symlinks default; it is verified by inspection
+    here. The live-vector 3.13+ test is tracked in #595.
+    """
+    import os
+
+    project_root = tmp_path / "project"
+    # Plant a real file in queued/writer/
+    qd = project_root / "queue" / "queued" / "writer"
+    qd.mkdir(parents=True)
+    (qd / "original.md").write_text("original content")
+    done_dir = project_root / "queue" / "done"
+    done_dir.mkdir(parents=True)
+
+    # Create a within-queue symlink done/link-dir -> queued/writer/
+    link_dir = done_dir / "link-dir"
+    os.symlink(qd, link_dir)
+
+    backend = FilesystemQueueBackend(project_root)
+    result = backend.export()
+    paths = [rel for rel, _ in result.items_with_bytes]
+
+    # The original file IS exported once (from queued/).
+    queued_refs = [p for p in paths if "queued" in p and "original.md" in p]
+    assert len(queued_refs) == 1, (
+        f"original.md must appear exactly once from queued/: {paths}"
+    )
+    # The within-queue symlinked subdir must NOT be followed (no double-count).
+    done_refs = [p for p in paths if "done" in p]
+    assert not done_refs, (
+        f"Symlinked subdir inside done/ must NOT be followed: {done_refs}"
+    )
+
+
+def test_export_sorted_output_order_preserved(tmp_path):
+    """export() output must be sorted consistently after the iterdir() walk replacement.
+
+    Regression guard for the #477 iterdir() refactor: the walk collects all
+    files then sorts, matching the previous sorted(dir_path.rglob('*')) order.
+    """
+    project_root = tmp_path / "project"
+    # Multiple roles with multiple files to stress sort order.
+    for role in ["alpha", "beta", "zeta"]:
+        qd = project_root / "queue" / "queued" / role
+        qd.mkdir(parents=True)
+        for i in range(3):
+            (qd / f"00{i}_task.md").write_text(f"content {role}/{i}")
+
+    backend = FilesystemQueueBackend(project_root)
+    result = backend.export()
+    paths = [rel for rel, _ in result.items_with_bytes]
+    assert paths == sorted(paths), f"export() output must be sorted: {paths}"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# #479 sidecar/reason.txt symlink-leaf perimeter escape — O_NOFOLLOW writes
+
+
+def test_write_sidecar_refuses_symlinked_destination(tmp_path):
+    """_write_sidecar must NOT write through a symlink at the sidecar path.
+
+    Strip-RED negative control: the symlink target must NOT be written.
+    """
+    import os
+
+    project_root = tmp_path / "project"
+    claimed = project_root / "queue" / "claimed" / "lease-1"
+    claimed.mkdir(parents=True)
+    work_file = claimed / "task.md"
+    work_file.write_text("work")
+
+    # Plant a symlink at the sidecar path pointing to an external file.
+    external = tmp_path / "external_sidecar.json"
+    external.write_text('{"original": true}')
+    sidecar = claimed / "task.md.lease.json"
+    os.symlink(external, sidecar)
+
+    # _write_sidecar must NOT write through the symlink.
+    _write_sidecar(work_file, lease_token="lease-1", lease_seconds=60)
+
+    # The external file must be unchanged.
+    assert external.read_text() == '{"original": true}', (
+        "_write_sidecar must not follow a symlink at the sidecar path"
+    )
+    # The symlink itself must still be there (not replaced with a real file).
+    assert sidecar.is_symlink(), "symlink at sidecar path must be unchanged"
+
+
+def test_write_sidecar_writes_normally_when_no_symlink(tmp_path):
+    """Strip-RED control: _write_sidecar writes successfully to a real path."""
+    project_root = tmp_path / "project"
+    claimed = project_root / "queue" / "claimed" / "lease-1"
+    claimed.mkdir(parents=True)
+    work_file = claimed / "task.md"
+    work_file.write_text("work")
+
+    _write_sidecar(work_file, lease_token="lease-1", lease_seconds=60)
+
+    sidecar = claimed / "task.md.lease.json"
+    assert sidecar.exists() and not sidecar.is_symlink(), (
+        "_write_sidecar must write the real sidecar when no symlink is present"
+    )
+    import json as _json
+
+    data = _json.loads(sidecar.read_text())
+    assert data["lease_token"] == "lease-1"
+
+
+def test_dead_letter_reason_txt_refuses_symlinked_destination(tmp_path):
+    """move_to_dead_letter must NOT write .reason.txt through a symlink.
+
+    Strip-RED: the external target must be unchanged after the operation.
+    """
+    import os
+
+    project_root = tmp_path / "project"
+    _queued(project_root, name="001_task.md")
+    backend = FilesystemQueueBackend(project_root)
+    item = backend.claim_next("writer", "lease-1")
+    assert item is not None
+
+    # The item is in claimed/. Plant a symlink at the future .reason.txt path
+    # in dead-letter/ — create the dead-letter dir first.
+    dl_dir = project_root / "queue" / "dead-letter" / "lease-1"
+    dl_dir.mkdir(parents=True, exist_ok=True)
+    external = tmp_path / "external_reason.txt"
+    external.write_text("original content")
+    reason_link = dl_dir / "001_task.md.reason.txt"
+    os.symlink(external, reason_link)
+
+    # move_to_dead_letter must NOT write through the symlink.
+    backend.move_to_dead_letter(item.lease_token, item.original_name, reason="FAILED")
+
+    # External file must be unchanged.
+    assert external.read_text() == "original content", (
+        "move_to_dead_letter must not write .reason.txt through a symlink"
+    )
+    # The work file IS moved to dead-letter/ (rename still succeeds).
+    dl_file = dl_dir / "001_task.md"
+    assert dl_file.exists(), "work file must be in dead-letter/ after the rename"
+
+
+def test_renew_lease_refuses_symlinked_sidecar_destination(tmp_path):
+    """renew_lease must NOT write through a symlink at the sidecar path.
+
+    The symlink target is IN-TREE (under queue_root) so the upstream
+    containment guard (sidecar.resolve().is_relative_to(queue_root)) PASSES
+    and does NOT short-circuit before the write. That leaves the O_NOFOLLOW
+    write-side guard (#479, _write_no_follow) as the SOLE remaining defense —
+    so this is a genuine strip-RED control for the renew-path O_NOFOLLOW
+    write. (An out-of-tree target would be refused by the containment guard
+    before _write_no_follow ran, making the control false-green — verified.)
+
+    Strip-RED: the in-tree victim file must be unchanged after renew_lease().
+    """
+    import os
+
+    project_root = tmp_path / "project"
+    _queued(project_root, name="001_task.md")
+    backend = FilesystemQueueBackend(project_root)
+    item = backend.claim_next("writer", "lease-1", lease_seconds=60)
+    assert item is not None
+
+    # Plant an in-tree victim file (under queue_root, in the same claimed dir).
+    victim = item.path.parent / "victim.txt"
+    victim.write_text("UNTOUCHED")
+
+    # Replace the real sidecar with a symlink pointing at the in-tree victim.
+    # This survives the resolve()/is_relative_to(queue_root) containment check,
+    # so only O_NOFOLLOW can stop the write from following the symlink.
+    sidecar = item.path.parent / (item.original_name + ".lease.json")
+    sidecar.unlink()
+    os.symlink(victim, sidecar)
+
+    # renew_lease must NOT write through the symlink (O_NOFOLLOW refuses it;
+    # the best-effort write is silently skipped).
+    backend.renew_lease(item.lease_token, item.original_name, additional_seconds=3600)
+
+    # In-tree victim file must be unchanged — O_NOFOLLOW refused the follow.
+    assert victim.read_text() == "UNTOUCHED", (
+        "renew_lease must not write through a symlink at the sidecar path "
+        "(O_NOFOLLOW must refuse the in-tree symlink redirect)"
+    )
+
+
+def test_write_no_follow_drains_short_writes(tmp_path, monkeypatch):
+    """_write_no_follow MUST loop os.write until ALL bytes land — a raw os.write
+    may short-write (POSIX permits it; Path.write_text's IO layer looped, raw
+    os.write does not). A silent short write would truncate the sidecar while
+    returning success; on renew_lease's read-modify-write path (O_TRUNC already
+    cleared the old bytes) that erases a live lease and lets recovery
+    re-dispatch active work (#479 cross-model adversarial finding, Principle #8).
+
+    STRIP-RED negative control: revert the drain loop to a single
+    `os.write(fd, encoded)` and this test fails (file truncated to 4 bytes).
+    """
+    import os
+
+    real_write = os.write
+
+    def short_write(fd, data):
+        # Force every write to make only 4 bytes of progress, exercising the
+        # drain loop. Without the loop, only the first 4 bytes are written.
+        return real_write(fd, bytes(data)[:4])
+
+    monkeypatch.setattr(_fsmod.os, "write", short_write)
+
+    target = tmp_path / "sidecar.lease.json"
+    payload = '{"lease_token":"abc","lease_expires_at":1234567890,"role":"writer"}'
+    assert len(payload) > 4  # ensure the single-write path would truncate
+
+    _write_no_follow(target, payload)
+
+    monkeypatch.undo()  # restore real os.write before reading back
+    assert target.read_text() == payload, (
+        "drain loop must write the FULL payload under short writes; a single "
+        "os.write would truncate it"
+    )
