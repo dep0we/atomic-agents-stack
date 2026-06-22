@@ -434,14 +434,14 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
 
         Note: on a content-identical idempotent write (parent Case 2, no file
         rewrite) ``index_page`` still re-embeds the unchanged body, making a
-        redundant billable embed.  Accepted as index-self-heal insurance until
-        the orchestration-layer cost gate (#544) dedupes unchanged-body embeds.
+        redundant billable embed.  Accepted as index-self-heal insurance; the
+        agent.call() batch-ingestion gate (#544 PR1) covers the write path when
+        this is driven by a capture-commit.
 
-        Cost gate: NOT WIRED.  ``index_page`` calls ``embed()`` (a billable LLM
-        call) with no reservation, release, or JSONL audit record — same
-        deferred-to-orchestrator posture as ``PgvectorMemoryBackend`` (#544).  See the
-        module docstring's cost note; not dogfooded against a live pgvector
-        instance.
+        Cost gate: ungated at the backend layer (by design).  Same
+        deferred-to-orchestrator posture as ``PgvectorMemoryBackend`` — see
+        spec/46 §"Direct-caller gate boundary".  Not dogfooded against a live
+        pgvector instance.
         """
         ref = super().write_page(
             name,
@@ -485,7 +485,8 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
         schema-init) so the legitimate construct-then-reprovision flow — a
         migration, or a test that drops and recreates the table at its own
         dimension — is never blocked.  Validated once per instance and cached.
-        The holistic validate-before-bill lands with the cost gate in #544.
+        Both framework gate sites are now wired (#544 PR1 + PR2); standalone
+        callers of index_page()/query() remain ungated by design.
         """
         if self._embedding_dim_validated or self._embedding_backend is None:
             return
@@ -510,7 +511,7 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
                 f"(`DROP TABLE corpus_page_embeddings;`) so it is re-created at "
                 f"{expected} dims on next start, or pin the embedding model whose "
                 f"dimension matches the existing column.  (Automatic re-index on "
-                f"a dimension change is tracked in #544.)"
+                f"a bulk re-index tool is a follow-up item from #544 PR2.)"
             )
         self._embedding_dim_validated = True
 

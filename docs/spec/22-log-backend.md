@@ -997,8 +997,8 @@ Four triggers map to `PRIMITIVE_EMBED = 'embed'` in `_PRIMITIVE_BY_TRIGGER`:
 |---------|-------------|
 | `embed_batch_reservation` | Before the write_note() batch loop — worst-case cost reserved |
 | `embed_batch_release` | In finally after the loop — actual cost recorded |
-| `embed_reservation` | Before a single embed() call (query-embed gate at the CLI corpus-query site (#564), NOT inside agent.call() — wired in #544 PR2) |
-| `embed_release` | In finally after a single embed() call (query-embed gate at the CLI corpus-query site (#564), NOT inside agent.call() — wired in #544 PR2) |
+| `embed_reservation` | Before a single embed() call (query-embed gate at the CLI corpus-query site (#564), NOT inside agent.call(), shipped #544 PR2 in `_corpus_query`) |
+| `embed_release` | In finally after a single embed() call (query-embed gate at the CLI corpus-query site (#564), NOT inside agent.call(), shipped #544 PR2 in `_corpus_query`) |
 
 **Canonical shape for embed records (all four triggers):**
 
@@ -1022,9 +1022,9 @@ cost_usd: ABSENT         (embed spend is audit-only this PR; NOT folded into the
 
 `cost_estimated=True` NEVER gates — it only affects the reserved amount. The fail-closed gate is `if CostReadResult.degraded AND effective_cap is not None`, not a function of cost_estimated.
 
-`actual_usd` on a release record is a per-written-note ESTIMATE (the same UTF-8-byte token estimate as the reservation basis), summed over the notes successfully written. It is NOT conditioned on whether the underlying `embed()` returned `None`: `write_note()` returns a `NoteRef` and does not surface whether its internal `embed()` degraded to `None` (e.g. no API key — the note is still written via FTS and `write_note()` succeeds), so the orchestrator has no embed-None signal and charges the full per-note estimate. A true embed-None→`$0.0` accounting would require `write_note()` to report whether it embedded; that is deferred to a follow-up, not PR1.
+`actual_usd` on a release record is a per-written-note ESTIMATE (the same UTF-8-byte token estimate as the reservation basis), summed over the notes successfully written. It is NOT conditioned on whether the underlying `embed()` returned `None`: `write_note()` returns a `NoteRef` and does not surface whether its internal `embed()` degraded to `None` (e.g. no API key — the note is still written via FTS and `write_note()` succeeds), so the orchestrator has no embed-None signal and charges the full per-note estimate. A true embed-None→`$0.0` accounting would require `write_note()` to report whether it embedded (an optional, capability-advertised return signal); that refinement is deferred to a focused follow-up (#589), not #544 PR2. The gate over-charges, never under-charges, on the no-key path, so the deferral is fail-safe.
 
-The `embed_reservation` and `embed_release` triggers are defined here for completeness but not yet emitted by a shipped code path. There is no query-embed call site inside `agent.call()` to gate (neither `memory.search()` nor `corpus.query()` is invoked by the orchestrator — confirmed by grep over `agent.py`); the real ungated query-embed path is the CLI corpus-query command (#564). These two triggers will be emitted when that gate ships in #544 PR2.
+The `embed_reservation` and `embed_release` triggers are emitted by the CLI corpus-query embed gate shipped in #544 PR2 (`_corpus_query` in `cli.py`). There is still no query-embed call site inside `agent.call()` (neither `memory.search()` nor `corpus.query()` is invoked by the orchestrator — confirmed by grep over `agent.py`); the gated path is the CLI corpus-query command (#564).
 
 Added OUTSIDE the 8-MUST count, following the versioned-addendum precedent of spec/45 PR2 (#520) and spec/22 §Read-failure contract (#497).
 

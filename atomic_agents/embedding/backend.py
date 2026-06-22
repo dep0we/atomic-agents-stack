@@ -15,7 +15,7 @@ provider logic. The standalone use case -- constructing any vector-capable
 backend -- is the primary justification identified when ``EmbeddingBackend``
 was reconsidered at issue #200 after spec/34 scope analysis.
 
-See ``docs/spec/46-embedding-backend.md`` (DRAFT; locks at PR 3) for
+See ``docs/spec/46-embedding-backend.md`` (LOCKED at #544 PR2) for
 the normative contract.
 
 Mocking note: ``MagicMock(spec=EmbeddingBackend)`` DOES pass

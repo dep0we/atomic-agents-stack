@@ -17,6 +17,7 @@ Per spec/34 §"Test coverage" + design doc.
 from __future__ import annotations
 
 import hashlib
+import os
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -38,6 +39,28 @@ from atomic_agents.exceptions import (
     CorpusPageNotFound,
     CorpusPreconditionFailed,
     CorpusVersionNotFound,
+)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Postgres availability gate (for PgvectorCorpusBackend conformance)
+
+_POSTGRES_URL = os.environ.get("ATOMIC_AGENTS_TEST_POSTGRES_URL")
+_POSTGRES_AVAILABLE = False
+
+if _POSTGRES_URL:
+    try:
+        import psycopg as _psycopg_check  # noqa: F401
+
+        _POSTGRES_AVAILABLE = True
+    except ImportError:
+        pass
+
+requires_postgres = pytest.mark.skipif(
+    not _POSTGRES_AVAILABLE,
+    reason=(
+        "Requires ATOMIC_AGENTS_TEST_POSTGRES_URL env var and psycopg installed. "
+        "Set ATOMIC_AGENTS_TEST_POSTGRES_URL=postgresql://... to run Postgres tests."
+    ),
 )
 
 
@@ -85,13 +108,27 @@ def _make_content(
 # Fixtures
 
 
-@pytest.fixture(params=["filesystem", "sqlite"])
+_CORPUS_BACKEND_PARAMS = ["filesystem", "sqlite"]
+if _POSTGRES_AVAILABLE:
+    _CORPUS_BACKEND_PARAMS.append("pgvector-corpus")
+
+
+@pytest.fixture(params=_CORPUS_BACKEND_PARAMS)
 def corpus_backend(request, tmp_path: Path):
     """Parametrized over registered CorpusBackend implementations.
 
-    Both filesystem and sqlite backends are exercised against every test in
-    this module. Uses a subdirectory per-backend-id to keep filesystem state
-    isolated when multiple backends are tested in the same session.
+    Backends exercised:
+    - filesystem: always runs
+    - sqlite: always runs
+    - pgvector-corpus: skips without ATOMIC_AGENTS_TEST_POSTGRES_URL (CI only)
+
+    Uses a subdirectory per-backend-id to keep filesystem state isolated when
+    multiple backends are tested in the same session.
+
+    pgvector-corpus uses StubEmbeddingBackend (no live OpenAI key required) and
+    pgvector_url=None, which disables ANN and falls back to FTS — sufficient to
+    verify all non-ANN Protocol shape invariants.  ANN-specific behaviour is
+    covered by test_pgvector_corpus_backend.py with @requires_postgres.
     """
     if request.param == "filesystem":
         agent_root = tmp_path / f"agent-{request.node.name[:32]}"
@@ -106,6 +143,24 @@ def corpus_backend(request, tmp_path: Path):
         )
         yield backend
         backend.close()
+    elif request.param == "pgvector-corpus":
+        # Guarded by _POSTGRES_AVAILABLE so this branch only runs when a live
+        # Postgres URL is configured (CI lane).  Uses StubEmbeddingBackend
+        # (no live OpenAI) and pgvector_url=None (FTS-fallback mode) so the
+        # full Protocol shape is verified without billable provider calls.
+        from atomic_agents.corpus.pgvector import PgvectorCorpusBackend
+        from tests.stub_embedding import StubEmbeddingBackend
+
+        stub = StubEmbeddingBackend(dimensions=4)
+        agent_root = tmp_path / f"pgvec-agent-{request.node.name[:24]}"
+        agent_root.mkdir(exist_ok=True)
+        # pgvector_url=None → FTS-only mode; no Postgres ANN index used.
+        # This is intentional: Protocol-shape conformance (list/read/write/
+        # version/query-fallback) does not require ANN.
+        backend = PgvectorCorpusBackend(
+            agent_root, embedding_backend=stub, pgvector_url=None
+        )
+        yield backend
     else:
         raise NotImplementedError(f"unknown backend param: {request.param!r}")
 

@@ -1,15 +1,14 @@
 # spec/46 — EmbeddingBackend Protocol
 
-**Status:** DRAFT (locks at #544 PR2 — see the PR-slicing note below)
+**Status:** LOCKED (#544 PR2)
 **Issue:** [#200](https://github.com/dep0we/atomic-agents-stack/issues/200)
-**Implementer Contract MUSTs:** 9 <!-- conformance tests: TBD at lock -->
+**Implementer Contract MUSTs:** 9 <!-- conformance tests: 60 as of #544 PR2 (tests/test_embedding_protocol_conformance.py) -->
 **Arc:** PR 2 shipped Protocol + reference impl + spec + cost helpers (DRAFT).
 PR 3 shipped the pgvector backends + registry + `input_type` kwarg + opt-in guard.
 [#544](https://github.com/dep0we/atomic-agents-stack/issues/544) PR1 shipped the
 live batch embed cost-gate at the orchestrator layer, `PRIMITIVE_EMBED`, the doctor
-check, and the spec/20 + spec/34 addenda. The DRAFT→LOCKED ceremony lands at
-[#544](https://github.com/dep0we/atomic-agents-stack/issues/544) PR2 when the
-query-embed gate ships and both gate sites exist.
+check, and the spec/20 + spec/34 addenda. DRAFT→LOCKED ceremony shipped at
+[#544](https://github.com/dep0we/atomic-agents-stack/issues/544) PR2.
 
 > **PR-slicing update (#200 PR3, shipped 2026-06-18).** PR3 shipped:
 > `PgvectorMemoryBackend` + `PgvectorCorpusBackend` (the latter subclasses
@@ -59,8 +58,23 @@ query-embed gate ships and both gate sites exist.
 > [#564](https://github.com/dep0we/atomic-agents-stack/issues/564); that is the
 > PR2 gate site.
 >
-> spec/46 STAYS DRAFT until the query-embed (CLI corpus-query) gate ships (the
-> LOCK precondition below). The opt-in default (`ATOMIC_AGENTS_EMBEDDING_BACKEND`
+> **PR-slicing update (#544 PR2, shipped 2026-06-22).** PR2 shipped: the CLI
+> corpus-query embed gate (`_corpus_query` in `cli.py` — `embed_reservation` +
+> `embed_release` + `embed_cost` in try/finally; `--critical` bypass flag; cost
+> headroom check mirroring `dream._check_cap`; `cli_corpus_query` primitive
+> taxonomy context in spec/22 addendum); the gate-site normative MUSTs section
+> (caller-side, separate from the 9-MUST backend contract); the fail-closed
+> posture promoted from non-normative guidance to a normative gate-site MUST;
+> `PgvectorMemoryBackend` + `PgvectorCorpusBackend` folded into the shared
+> `@_parametrize_backends` conformance suites (gated `@requires_postgres`,
+> `StubEmbeddingBackend`, no live OpenAI); spec/34 normative addendum for the
+> corpus embedding model-swap-requires-DROP limitation; spec/46 DRAFT→LOCKED
+> ceremony complete. MUST 3 updated to reflect the shipped `input_type` kwarg
+> state (PR3 shipped; OpenAI stays `supports_input_type=False` because the SDK
+> does not expose the parameter). Unknown-model limitation resolved at path (a).
+> Direct-caller gate boundary documented. DRAFT→LOCKED.
+>
+> spec/46 is now LOCKED. The opt-in default (`ATOMIC_AGENTS_EMBEDDING_BACKEND`
 > unset → FTS only) ensures no ungated billable path runs without explicit
 > operator opt-in (Principle #4).
 
@@ -78,9 +92,9 @@ is the primary justification identified when `EmbeddingBackend` was reconsidered
 at issue #200 after spec/34 scope analysis. spec/34's "Out of scope" table
 (LOCKED) recorded "no standalone use case identified" at its lock time; that
 rationale is superseded for this use case. The superseding note is recorded
-here (DRAFT, in-scope) rather than amended into the LOCKED spec/34 — the
-normative reconciliation of spec/34 + spec/20 lands at #544 (the LOCK PR) when
-the live cost-gate wiring ships and those specs naturally take their addenda.
+here rather than amended into the LOCKED spec/34 — the normative reconciliation
+of spec/34 + spec/20 landed at #544 PR1/PR2 via versioned normative addenda to
+both specs.
 
 ### Module layout
 
@@ -141,28 +155,25 @@ class EmbeddingCapabilities:
     supports_input_type: bool     # see §"supports_input_type flag" below
 ```
 
-#### supports_input_type flag vs. parameter deferral
+#### supports_input_type flag
 
 `supports_input_type=True` advertises that the backend CAN distinguish
-query-embedding from document-embedding mode (e.g., OpenAI's `input_type`
-parameter, Cohere's `input_type`).
+query-embedding from document-embedding mode (e.g., Cohere's `input_type`).
 
-**PR 2 advertises this flag only.** The actual `input_type` parameter on
-`embed()`/`embed_batch()` is deliberately absent in PR 2, pending the
-`@runtime_checkable` limitation analysis (the decorator verifies member
-presence, not that a backend honors an optional kwarg, so the testable flag
-must precede the testable parameter). PR 3 adds the kwarg to the Protocol
-surface and the conformance suite when the flag semantics are confirmed.
+**The `input_type` kwarg shipped in PR 3** on both `embed()` and
+`embed_batch()`. Backends whose provider supports `input_type` SHOULD forward
+it and SHOULD advertise `supports_input_type=True`. Backends whose provider
+does NOT support `input_type` MUST accept the kwarg without raising (for
+interface compatibility with query-aware callers such as `PgvectorCorpusBackend`
+which passes `input_type="search_query"`) and MUST advertise
+`supports_input_type=False`.
 
-**PR 2 conformance requirement:** all implementations MUST advertise
-`supports_input_type=False`. The OpenAI API does support `input_type` but the
-Protocol surface in PR 2 does not expose the parameter — advertising `True`
-while the kwarg is absent violates capability honesty (MUST 3).
-
-```
-<!-- TODO: PR3 --> Flip OpenAIEmbeddingBackend.capabilities() to
-supports_input_type=True and add input_type kwarg to embed()/embed_batch().
-```
+**`OpenAIEmbeddingBackend` advertises `supports_input_type=False`** because the
+installed OpenAI SDK (`openai 2.35.1`) does not expose `input_type` on
+`embeddings.create()` — the kwarg is accepted and silently ignored for interface
+compatibility, but advertising `True` would violate capability honesty (MUST 3)
+by implying the backend honors a parameter it cannot forward. Future SDK
+versions that expose `input_type` should flip this flag to `True`.
 
 ---
 
@@ -206,19 +217,29 @@ failure, while preserving the `len(out)==len(in)` invariant.
 
 ---
 
-## Cost gate mandate (DRAFT scope)
+## Cost gate mandate (normative)
 
 **MANDATE (normative):** any code path that invokes `embed()` OR `embed_batch()`
 at a production ingestion site OR a query-embedding site MUST reserve worst-case
 embedding cost before dispatch and record actual spend via a distinct embedding
 audit record. Both methods are separately reachable billable provider calls:
 `embed_batch()` is the bulk-ingestion path (e.g. indexing a corpus), and the
-standalone `embed()` is the query-embedding path (e.g. `PgvectorMemoryBackend`
-recall or `PgvectorCorpusBackend.query()` embedding the search string in PR 3).
-Gating only `embed_batch()` would leave every query-time `embed()` call as an
-ungated billable LLM code path — the exact Principle #4 escape ("every code
-path that calls an LLM has a cost gate"). The single-call `embed()` worst-case
-is ONE billed call (no per-item fan-out, unlike `embed_batch()`).
+standalone `embed()` is the query-embedding path (e.g.
+`PgvectorCorpusBackend.query()` embedding the search string). Gating only
+`embed_batch()` would leave every query-time `embed()` call as an ungated
+billable LLM code path — the exact Principle #4 escape ("every code path that
+calls an LLM has a cost gate"). The single-call `embed()` worst-case is ONE
+billed call (no per-item fan-out, unlike `embed_batch()`).
+
+**Both framework-controlled gate sites are now wired (#544 PR1 + PR2):**
+
+1. **Batch-ingestion gate** — post-loop capture-commit site in `agent.call()`,
+   emitting `embed_batch_reservation` + `embed_batch_release` + `embed_cost`
+   (shipped in #544 PR1 + PR2a).
+
+2. **CLI corpus-query gate** — `_corpus_query` in `cli.py`, emitting
+   `embed_reservation` + `embed_release` + `embed_cost` in a try/finally block
+   (shipped in #544 PR2). `primitive="embed"` in spec/22 taxonomy.
 
 > **`embed_batch()` worst-case includes the per-item degradation fan-out.** A
 > backend whose `embed_batch()` falls back to per-item `embed()` on a
@@ -232,67 +253,47 @@ is ONE billed call (no per-item fan-out, unlike `embed_batch()`).
 > docstring on `OpenAIEmbeddingBackend.embed_batch()` for the matching code-side
 > note.
 
-> **Merge-write reservations are now target-body-sized (RESOLVED in #544 PR2a).**
+> **Merge-write reservations are target-body-sized (RESOLVED in #544 PR2a).**
 > A merge write PRESERVES the target body verbatim — the backend re-embeds the
 > stored TARGET body alone; the incoming fragment updates sources/last_seen
 > metadata, NOT the body (backend.py:316-317; filesystem `_merge_into_existing`
-> leaves the content untouched; pgvector.py:761-768 embeds `stored.body`). PR1
-> sized both the reservation and the true-up from the small incoming fragment,
-> under-reserving and under-charging a merge whose stored target body is large.
-> The reservation loop now calls `self.memory.read_note(merge_into)` BEFORE the
-> write loop and sizes the estimate from the PRESERVED TARGET body. An over-cap
-> merge is now refused before billing (Principle #4 — enforce-before-pay). On read
-> failure the gate falls back to fragment-only with a WARNING (conservative-toward-
-> permissive — an analogous failure posture to pgvector.py:778-785 in that both
-> refuse to act on a target body they couldn't read; the mechanics differ — the
-> gate still charges the fragment, whereas pgvector skips the upsert). The pre-read
-> result is cached in `_merge_body_cache` (keyed by the
-> same dedup 4-tuple) and reused in the true-up loop so `reserve` and `actual_usd`
-> share the same estimate. The 2x fan-out buffer still applies on top of the
-> target-body estimate.
+> leaves the content untouched; pgvector.py:761-768 embeds `stored.body`). The
+> reservation loop calls `self.memory.read_note(merge_into)` BEFORE the write
+> loop and sizes the estimate from the PRESERVED TARGET body. An over-cap merge
+> is refused before billing (Principle #4 — enforce-before-pay). On read failure
+> the gate falls back to fragment-only with a WARNING. The pre-read result is
+> cached in `_merge_body_cache` so reserve and actual_usd share the same estimate.
 
 > **Token estimate basis: `ceil(utf8_bytes / 3)` is conservative, not a strict
-> upper bound.** The capture-commit gate estimates tokens from the UTF-8 byte
-> length divided by 3. This is conservative for natural-language text (a Unicode
-> code-point count under-counts ~3x for CJK/emoji, where each multibyte char is
-> ≥1 token; the byte basis covers that). It is NOT a strict upper bound for
-> incompressible or adversarial byte sequences, which can tokenize closer to
-> ~1 token/byte and so under-reserve by up to ~3x before the 2x fan-out buffer.
-> The residual is bounded and small in practice: the provider rejects any single
-> text exceeding the model's per-text token cap, and embedding pricing is sub-cent
-> per token. A tokenizer-exact estimate is deferred (it would add a tokenizer
-> dependency); the documented basis matches the shipped code.
+> upper bound.** Both gates estimate tokens from the UTF-8 byte length divided by
+> 3. This is conservative for natural-language text (a Unicode code-point count
+> under-counts ~3x for CJK/emoji, where each multibyte char is ≥1 token; the
+> byte basis covers that). It is NOT a strict upper bound for incompressible or
+> adversarial byte sequences, which can tokenize closer to ~1 token/byte and so
+> under-reserve by up to ~3x before the 2x fan-out buffer. The residual is
+> bounded and small in practice: the provider rejects any single text exceeding
+> the model's per-text token cap, and embedding pricing is sub-cent per token. A
+> tokenizer-exact estimate is deferred (it would add a tokenizer dependency); the
+> documented basis matches the shipped code.
 
 ```
-trigger="embed_reservation"          output_tokens=0    cost_source="actor"  # single embed()
+trigger="embed_reservation"          output_tokens=0    cost_source="actor"  # single embed() at CLI site
 trigger="embed_release"              output_tokens=0    cost_source="actor"
-trigger="embed_batch_reservation"    output_tokens=0    cost_source="actor"  # embed_batch()
+trigger="embed_batch_reservation"    output_tokens=0    cost_source="actor"  # embed_batch() at agent.call() site
 trigger="embed_batch_release"        output_tokens=0    cost_source="actor"
-trigger="embed_cost"                 output_tokens=0    cost_source="actor"  # cross-call accounting (#544 PR2a)
+trigger="embed_cost"                 output_tokens=0    cost_source="actor"  # cross-call accounting (both gates)
                                      cost_usd=actual_usd  parent_agent=<name>  # ONLY embed trigger with cost_usd
 ```
 
-**PR 2 shipped the pricing helper (`EMBEDDING_PRICING` + `calc_embedding_cost()`)
-and this normative mandate only.** **#544 PR1 shipped the `embed_batch()`
-ingestion gate** (post-loop capture-commit site in `agent.call()`) + `PRIMITIVE_EMBED`
-+ `check_embedding_backend()` doctor check. The DRAFT status of spec/46 reflects
-the remaining gap — the single-call `embed()` query-embedding reservation is not yet
-wired. That gap is NOT inside `agent.call()` (no `memory.search()`/`corpus.query()`
-call site exists in the orchestrator); the ungated query-embed path is the CLI
-corpus-query command (#564). The LOCK ceremony on this spec (#544 PR2) MUST verify
-that BOTH wiring sites exist — the `embed_batch()` ingestion reservation AND the
-single-call `embed()` query-embedding reservation at the CLI corpus-query site —
-before removing the DRAFT marker, not just the batch one.
+### Fail-closed posture (normative)
 
-### Fail-closed posture (non-normative guidance — now partially shipped)
-
-Per MEMORY.md lesson "Fail-closed only where there's something to protect":
+The fail-closed predicate applies identically at both gate sites:
 
 ```
-if cost_read_degraded AND cap is not None:
-    fail-closed (refuse the embed_batch call)
+if cost_read_degraded AND effective_cap is not None:
+    fail-closed (refuse the embed call)
 else:
-    proceed (an unconstrained agent is not blocked by a blind read)
+    proceed (an unconstrained agent is NOT blocked by a blind read)
 ```
 
 `calc_embedding_cost()` returns `(cost_usd, cost_estimated: bool)`:
@@ -305,6 +306,65 @@ else:
 
 Fleet deployments SHOULD apply a per-agent cap AND a project-level cap via
 MandateBackend; the per-agent reservation alone does not bound fleet-wide spend.
+
+---
+
+## Gate-site normative MUSTs
+
+These MUSTs govern **callers** of `EmbeddingBackend` that invoke `embed()` or
+`embed_batch()` at a production call site. They are categorically distinct from
+the Implementer Contract (which governs backends). The backend MUST count stays
+at 9.
+
+**GATE-MUST 1 — Pre-call reservation.** Any production call site that invokes
+`embed()` or `embed_batch()` MUST emit an `embed_reservation` (single-call) or
+`embed_batch_reservation` (batch) JSONL record BEFORE the call. The reservation
+MUST carry the worst-case cost estimate (including the per-item degradation
+fan-out for `embed_batch()`).
+
+**GATE-MUST 2 — Release in finally.** The matching `embed_release` or
+`embed_batch_release` record MUST be emitted in a `finally` block so it fires
+even when `embed()` or `embed_batch()` raises or when a downstream processing
+step raises. An orphaned reservation record (release never emitted) inflates
+`sum_cost_for_period` and can produce spurious over-budget blocks on subsequent
+calls.
+
+**GATE-MUST 3 — embed_cost for cross-call accounting.** A dedicated `embed_cost`
+record (the ONLY embed trigger carrying `cost_usd`) MUST be emitted in the same
+`finally` block IMMEDIATELY AFTER the release record, conditioned on
+`actual_usd > 0`. This is what makes prior embed spend visible to the cap
+baseline on subsequent calls (Principle #4). Only the `embed_cost` record
+carries `cost_usd`; the release record intentionally omits it to prevent
+double-count.
+
+**GATE-MUST 4 — Fail-closed predicate.** The gate MUST apply the fail-closed
+predicate `if cost_read_degraded AND effective_cap is not None: fail-closed`
+ONLY when a cap exists. An unconstrained call site (no daily_cap_usd,
+monthly_cap_usd, or MandateBackend cap) MUST NOT be blocked by a degraded cost
+read — a blind read changes nothing when there is no budget to protect.
+
+**Shipped gate sites (normative examples):**
+
+| Site | Trigger group | Module |
+|------|--------------|--------|
+| `agent.call()` capture-commit | `embed_batch_reservation` + `embed_batch_release` + `embed_cost` | `atomic_agents/agent.py` |
+| `atomic-agents corpus query` | `embed_reservation` + `embed_release` + `embed_cost` | `atomic_agents/cli.py:_corpus_query` |
+
+### Direct-caller gate boundary
+
+`memory.search()` and `corpus.query()` on pgvector backends are direct callers
+of `embed()` that do NOT pass through either gate site above. The analogy is
+`llm_backend.chat()`: the LLMBackend Protocol does not gate cost inside
+`chat()` itself; the gate is at the `agent.call()` orchestrator layer. Direct
+callers bear responsibility for their own cost reservation.
+
+This is intentional for the current framework: there is no `memory.search()` or
+`corpus.query()` call site inside `agent.call()` (confirmed by grep over
+`agent.py`), so there is no orchestrator-controlled query-embed path beyond the
+CLI site. Operators who call `memory.search()` or `corpus.query()` directly
+(outside of `_corpus_query`) are ungated by design. A future gated helper
+(analogous to how `agent.call()` gates LLM cost for every LLM call) is tracked
+as a follow-up issue.
 
 ---
 
@@ -400,12 +460,19 @@ but issues no API calls.
 ### MUST 3 — Capability honesty
 
 `capabilities()` MUST return the same `EmbeddingCapabilities` value across
-calls for the lifetime of the backend instance. Backends that advertise
-`supports_input_type=True` but whose `embed()`/`embed_batch()` signatures do
-not accept an `input_type` parameter produce silent failures in any caller that
-relies on the flag. In PR 2, all conforming implementations MUST advertise
-`supports_input_type=False` (the Protocol surface does not include the parameter
-yet).
+calls for the lifetime of the backend instance.
+
+**`supports_input_type` — shipped state (as of PR 3).** The `input_type` kwarg
+IS on the Protocol surface (PR 3 shipped it on both `embed()` and
+`embed_batch()`). Backends whose provider supports `input_type` MUST accept and
+forward it and MUST advertise `supports_input_type=True`. Backends whose provider
+does NOT support `input_type` MUST accept the kwarg without raising (for
+interface compatibility — `PgvectorCorpusBackend` passes `input_type=
+"search_query"` to whichever backend is injected) and MUST advertise
+`supports_input_type=False`. Advertising `True` for a parameter the provider
+ignores violates capability honesty. `OpenAIEmbeddingBackend` correctly stays at
+`supports_input_type=False` because the OpenAI embeddings API does not expose
+`input_type` on `embeddings.create()`.
 
 **Advertised `dimensions` MUST equal produced length.** The `dimensions`
 property MUST equal `len(embed(text))` for any successfully-embedded text. A
@@ -427,23 +494,20 @@ return `None` (never a wrong-length vector) on a mismatch. The PR3 pgvector
 wiring sizes its vector column from this property, so a mismatch becomes insert
 failures or silent truncation.
 
-**Unknown-model limitation (DRAFT).** A backend cannot resolve the native size
-of a model it has never heard of without a network round-trip at construction
-(which MUST 1 / side-effect-free construction forbids). For an unknown model
-with the dimension omitted, the reference `OpenAIEmbeddingBackend` falls back to
-its global default (1536) and DOCUMENTS that the caller MUST pass an explicit
-`dimensions` if the true native size differs. This is the one place the
-"native, not a global constant" rule is best-effort rather than guaranteed at
-CONSTRUCTION; it is bounded to unknown (unlisted) models only. The silent
-mis-size it could cause is now caught at the PRODUCED vector: the PR2 reference
-impl verifies `len(returned) == dimensions` on every embed and returns `None`
-on a mismatch (see the produced-length backstop above), so an unknown model
-whose native size differs degrades to None rather than emitting a wrong-length
-vector. Full closure at LOCK still tightens construction by either (a) keeping
-the produced-length check as the guarantee, or (b) refusing construction of an
-unknown model without an explicit `dimensions`. The construction-guard error
-message for an unknown model MUST NOT assert a native size the backend does not
-actually know.
+**Unknown-model limitation — resolved at path (a).** A backend cannot resolve
+the native size of a model it has never heard of without a network round-trip at
+construction (which MUST 2 / side-effect-free construction forbids). For an
+unknown model with the dimension omitted, the reference `OpenAIEmbeddingBackend`
+falls back to its global default (1536) and DOCUMENTS that the caller MUST pass
+an explicit `dimensions` if the true native size differs. This is the one place
+the "native, not a global constant" rule is best-effort rather than guaranteed at
+construction; it is bounded to unknown (unlisted) models only. The LOCK ceremony
+resolved this at path (a): the produced-length backstop (`embed()`/`embed_batch()`
+verifying `len(returned) == dimensions` and returning `None` on mismatch) is the
+normative guarantee for unknown models. Construction-time refusal of unknown
+models without explicit `dimensions` is NOT required by conformance. The
+construction-guard error message for an unknown model MUST NOT assert a native
+size the backend does not actually know.
 
 ### MUST 4 — embed 4-case / MUST-NOT-RAISE
 
@@ -543,7 +607,7 @@ backend (e.g., `PgvectorCorpusBackend` receives an `EmbeddingBackend` at
 
 ## PR scope boundary
 
-| Scope | PR 2 (shipped) | PR 3 / #200 (shipped) | #544 PR1 (shipped) | #544 PR2a (shipped) | #544 PR2 |
+| Scope | PR 2 (shipped) | PR 3 / #200 (shipped) | #544 PR1 (shipped) | #544 PR2a (shipped) | #544 PR2 (shipped) |
 |-------|------|------------|------|------|------|
 | Protocol + dataclasses | ✅ Shipped | — | — | — | — |
 | `OpenAIEmbeddingBackend` ref impl | ✅ Shipped | — | — | — | — |
@@ -558,8 +622,10 @@ backend (e.g., `PgvectorCorpusBackend` receives an `EmbeddingBackend` at
 | Normative addenda: spec/20 MemoryCapabilities, spec/22 primitive taxonomy, spec/34 CorpusCapabilities | — | — | ✅ Shipped | — | — |
 | Cross-call embed accounting: dedicated `embed_cost` record with `cost_usd=actual_usd` — now visible to `sum_cost_for_period` across calls; `'embed_cost': PRIMITIVE_EMBED` in `_PRIMITIVE_BY_TRIGGER` | — | — | — | ✅ Shipped | — |
 | Merge-write pre-read reservation: `read_note(merge_into)` before gate; reservation and true-up sized from the PRESERVED TARGET body (merge preserves body verbatim — fragment lands in sources, not the body); Principle #4 enforce-before-pay on the target size | — | — | — | ✅ Shipped | — |
-| Query-embed gate (per-call `embed_reservation` + `embed_release` at the CLI corpus-query site (#564) — NOT inside `agent.call()`, which has no orchestrator query-embed path) | — | — | — | — | ✅ Ships |
-| Spec/46 DRAFT→LOCKED | — | — | — | — | ✅ Locks |
+| Query-embed gate (per-call `embed_reservation` + `embed_release` at the CLI corpus-query site — NOT inside `agent.call()`, which has no orchestrator query-embed path) | — | — | — | — | ✅ Shipped |
+| `PgvectorMemoryBackend` + `PgvectorCorpusBackend` folded into shared conformance suites (`@_parametrize_backends`, `@requires_postgres`) | — | — | — | — | ✅ Shipped |
+| Gate-site normative MUSTs section + Direct-caller gate boundary | — | — | — | — | ✅ Shipped |
+| Spec/46 DRAFT→LOCKED | — | — | — | — | ✅ Shipped |
 | Local embedding backend (sentence-transformers/Ollama) | — | — | — | — | Separate arc ([#534](https://github.com/dep0we/atomic-agents-stack/issues/534)) |
 
 ---

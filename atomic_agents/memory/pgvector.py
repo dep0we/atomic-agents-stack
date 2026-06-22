@@ -48,13 +48,14 @@ Decision rulings applied
       + ``get_default_embedding_backend()`` factory.
 * Q3  cost-gate: NOT YET WIRED.  The embed() calls in write_note()/search()
       are currently UNGATED billable LLM calls (no reservation, no release, no
-      JSONL audit record).  The Q3 ruling is that the gate belongs at the
-      agent.call() orchestration layer (NOT inside EmbeddingBackend — MUST 4
-      MUST-NOT-RAISE makes a backend-internal refusing gate incoherent), so the
-      backend stays cost-unaware.  Wiring the reservation/release at agent.call()
-      (calc_embedding_cost() exists in _costs.py; the 4 JSONL triggers
-      embed_reservation/embed_release/embed_batch_reservation/embed_batch_release
-      do not yet emit anywhere) is tracked in #544.  ASSURANCE LABEL:
+      JSONL audit record) when called directly (not via an orchestration layer).
+      The Q3 ruling is that the gate belongs at the orchestration layer (NOT
+      inside EmbeddingBackend — MUST 4 MUST-NOT-RAISE makes a backend-internal
+      refusing gate incoherent), so the backend stays cost-unaware.  The two
+      framework-controlled gate sites (agent.call() batch-ingestion gate in #544
+      PR1; CLI corpus-query gate in #544 PR2) are both wired.  Callers that
+      invoke write_note() / search() outside of those paths are ungated by
+      design — see spec/46 §"Direct-caller gate boundary".  ASSURANCE LABEL:
       this embed path has not been dogfooded against a live pgvector instance.
 * C2  missing extension: FAIL-HARD with a clear error.  The backend NEVER runs
       ``CREATE EXTENSION``.
@@ -91,7 +92,7 @@ under a since-replaced model is reachable via the FTS-only code paths
 (``recall_notes`` / parent ``search()`` invoked directly) but NOT via this
 backend's semantic ``search()`` until it is re-embedded under the active model.
 Re-embedding happens on the note's next ``write_note``; a bulk re-embed pass
-after a model swap is tracked as operator tooling (see #544 / follow-up).
+after a model swap is tracked as operator tooling (follow-up issue filed at #544 PR2).
 """
 
 from __future__ import annotations
@@ -734,13 +735,12 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
 
         Cost gate
         ---------
-        NOT YET WIRED.  The embed() call here is an UNGATED billable LLM call:
-        no cost reservation, no release, and no JSONL audit record are emitted.
-        Per the Q3 ruling the gate belongs at the agent.call() orchestration
-        layer (the backend stays cost-unaware so MUST-4 MUST-NOT-RAISE holds);
-        that wiring is tracked in #544, not part of this backend.  Standalone
-        use of PgvectorMemoryBackend therefore makes uncapped, unaudited
-        embedding spend on every write — see the module docstring's Q3 note.
+        Ungated at the backend layer (by design).  Per the Q3 ruling the gate
+        belongs at the orchestration layer (the backend stays cost-unaware so
+        MUST-4 MUST-NOT-RAISE holds).  The agent.call() batch-ingestion gate
+        (#544 PR1) covers this path when write_note() is driven by a capture-
+        commit.  Standalone use of PgvectorMemoryBackend (outside agent.call())
+        is ungated by design — see spec/46 §"Direct-caller gate boundary".
         """
         # Step 1: canonical write (parent handles CAS, merge, four cases).
         ref = super().write_note(
@@ -803,8 +803,8 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
         guard fires only when an embed is actually about to be billed.
 
         Validated once per instance and cached (the column width is fixed for
-        the instance's lifetime).  The holistic validate-before-bill lands with
-        the cost gate in #544.
+        the instance's lifetime).  Both orchestration gate sites (#544 PR1 +
+        PR2) are now wired; standalone callers remain ungated by design.
         """
         if self._embedding_dim_validated or self._embedding_backend is None:
             return
@@ -826,7 +826,7 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
                 f"(`DROP TABLE memory_note_embeddings;`) so it is re-created at "
                 f"{expected} dims on next start, or pin the embedding model whose "
                 f"dimension matches the existing column.  (Automatic re-index on "
-                f"a dimension change is tracked in #544.)"
+                f"a bulk re-index tool is a follow-up item from #544 PR2.)"
             )
         self._embedding_dim_validated = True
 
@@ -954,11 +954,11 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
 
         Cost gate note
         --------------
-        NOT YET WIRED.  The embed() call here (the query-embedding site) is an
-        UNGATED billable LLM call — no reservation, no release, no JSONL audit
-        record.  The Q3 ruling places the gate at the agent.call() orchestration
-        layer (backend stays cost-unaware); that wiring is tracked in #544.
-        See the module docstring's Q3 note.
+        Ungated at the backend layer (by design).  Per the Q3 ruling the gate
+        belongs at the orchestration layer (backend stays cost-unaware).  The
+        CLI corpus-query gate (#544 PR2) covers the framework-controlled query-
+        embed path.  Standalone callers of search() are ungated by design — see
+        spec/46 §"Direct-caller gate boundary".
         """
         if self._embedding_backend is None:
             return super().search(query, limit=limit)

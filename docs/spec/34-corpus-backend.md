@@ -884,3 +884,15 @@ For the full normative export contract, see `docs/spec/40-canonical-export.md`.
 **Forward-compat note:** `CorpusCapabilities.embedding_backend_resolved` is populated only by `PgvectorCorpusBackend`. `FilesystemCorpusBackend` and `SQLiteCorpusBackend` return it as `None` (the dataclass default). Callers that inspect this field MUST treat a missing / `None` value as "no live embedding backend." Uniform convergence of the `capabilities()` surface across all backends is deferred to issue #431.
 
 Added OUTSIDE the 9-MUST count, following the versioned-addendum precedent of spec/45 PR2 (#520) and spec/22 §Read-failure contract (#497), and mirroring the sibling spec/20 PR-3 addendum shipped in this same PR.
+
+---
+
+## Versioned normative addendum — corpus embedding model-swap-requires-DROP limitation (#200 PR3 / #544 PR2)
+
+`PgvectorCorpusBackend` stores page embeddings in `corpus_page_embeddings.embedding`, a `vector(N)` column whose width `N` is fixed at table-creation time to the active embedding model's output dimension. Swapping to an embedding model of a different dimension is therefore NOT an in-place migration: the operator MUST `DROP TABLE corpus_page_embeddings` (the table is re-created at the new width on the next embed) and re-embed the corpus.
+
+The `_assert_embedding_dim_matches` guard (`corpus/pgvector.py`) enforces this LOUD: every embed and query call against a dimension-mismatched column raises a `RuntimeError` with explicit DROP-and-re-embed recovery instructions BEFORE any billable embed occurs. There is no silent stale-vector path.
+
+The corpus embedding index is a DERIVED CACHE of the authoritative markdown pages (Principle 1); a model swap discards and rebuilds the cache rather than migrating row state, so no `schema_version` ladder applies. Automatic bulk re-index after a model swap is tracked at #588.
+
+Added OUTSIDE the 9-MUST count, following the versioned-addendum precedent.
