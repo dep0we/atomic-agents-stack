@@ -30,7 +30,8 @@ See ``docs/spec/26-cascade-bundle.md`` for the full contract.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -54,6 +55,297 @@ SECTION_SEPARATOR = "\n\n══════════════════�
 PINNED_MAX = 5
 RECENT_NOTES_DEFAULT = 5
 RECENT_JOURNAL_DEFAULT = 1
+
+
+# ──────────────────────────────────────────────────────────────────
+# Bundle validation (spec/26 `--validate`, issue #593)
+#
+# The runtime system prompt (AtomicAgent.assemble_system_prompt) and the
+# rendered bundle are two independent code paths. `--validate` confirms the
+# bundle faithfully CONTAINS every cascade body the runtime injects, catching
+# drift between them. This is *content parity*, NOT byte equality: the bundle
+# wraps content in scaffolding (HTML comments, BREAKPOINT headers, source-path
+# lines, `═══` separators) and legitimately differs in two known ways:
+#
+#   1. The runtime's `# Available skills` section is absent from the bundle
+#      (a known gap tracked as issue #593). Reported, never a failure.
+#   2. model.md content is present in the bundle but not in the runtime prompt.
+#      (Informational; the bundle is a superset on this axis, so no runtime
+#      body goes missing — nothing to validate against the bundle here.)
+#
+# The agent construction (AtomicAgent + .load() + .assemble_system_prompt())
+# stays in the CLI layer so bundle.py never imports the heavy `agent` module.
+# This helper is pure text: given the runtime system prompt + the bundle text,
+# it classifies each runtime section.
+
+# Header text of the runtime "skills" section emitted by
+# AtomicAgent.assemble_system_prompt(). Matched as a section header to classify
+# it as a KNOWN divergence rather than unexpected drift.
+SKILLS_SECTION_HEADER = "# Available skills"
+SKILLS_KNOWN_DIVERGENCE_ISSUE = "#593"
+
+# The runtime synthesizes a placeholder INDEX body even when the agent has no
+# memory/wiki notes (MemoryBackend.render_index_summary() returns
+# "# Memory Index\n\n" with no entries). The bundle reads INDEX.md from disk
+# and omits the section entirely when no file exists. So an EMPTY synthesized
+# index is a benign divergence (no real content is lost) — classified as known.
+# Whitespace-normalized placeholder bodies (no internal whitespace runs, so the
+# literals are already in normalized form — see _normalize_ws).
+_EMPTY_INDEX_PLACEHOLDERS = frozenset({"# Memory Index", "# Wiki Index"})
+# Runtime section headers whose body, when it is the empty placeholder above,
+# is a known divergence rather than drift.
+_INDEX_SECTION_HEADERS = frozenset({"# memory/INDEX.md", "# wiki/INDEX.md"})
+
+
+@dataclass(frozen=True)
+class SectionParity:
+    """Classification of one runtime system-prompt section against the bundle.
+
+    Attributes:
+        header: The section's first line (e.g. ``# project canon.md``).
+        status: One of ``"present"`` (body found in the bundle),
+            ``"missing"`` (unexpected drift — body NOT found), or
+            ``"known"`` (a documented divergence; reported, not a failure).
+        note: Human-readable explanation for ``"known"`` / ``"missing"``.
+    """
+
+    header: str
+    status: str  # "present" | "missing" | "known"
+    note: str = ""
+
+
+@dataclass(frozen=True)
+class ValidationReport:
+    """Result of comparing the runtime system prompt against a bundle.
+
+    Attributes:
+        sections: Per-section parity classifications, in runtime order.
+        ok: True iff there is no unexpected drift (no ``"missing"`` section).
+            Known divergences do NOT flip this to False.
+    """
+
+    sections: list[SectionParity] = field(default_factory=list)
+
+    @property
+    def missing(self) -> list[SectionParity]:
+        return [s for s in self.sections if s.status == "missing"]
+
+    @property
+    def known(self) -> list[SectionParity]:
+        return [s for s in self.sections if s.status == "known"]
+
+    @property
+    def present(self) -> list[SectionParity]:
+        return [s for s in self.sections if s.status == "present"]
+
+    @property
+    def ok(self) -> bool:
+        return not self.missing
+
+
+_WS_RE = re.compile(r"\s+")
+
+
+def _normalize_ws(text: str) -> str:
+    """Collapse all runs of whitespace to single spaces and strip ends.
+
+    The bundle reflows cascade bodies through scaffolding (extra blank lines,
+    indentation under section headers), so a substring check must compare on
+    whitespace-insensitive text. This normalizes BOTH operands the same way.
+    """
+    return _WS_RE.sub(" ", text).strip()
+
+
+def split_runtime_sections(system_prompt: str) -> list[tuple[str, str]]:
+    """Split an assembled system prompt into ``(header, body)`` sections.
+
+    ``AtomicAgent.assemble_system_prompt()`` joins sections with
+    :data:`SECTION_SEPARATOR`. Each section's first line is its header (an
+    ``# ``-headed line, e.g. ``# project canon.md``); the remainder is the
+    body. Empty sections are dropped. Robust to a missing trailing body.
+    """
+    sections: list[tuple[str, str]] = []
+    for chunk in system_prompt.split(SECTION_SEPARATOR):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        header, _, body = chunk.partition("\n")
+        sections.append((header.strip(), body.strip()))
+    return sections
+
+
+def validate_bundle_parity(
+    system_prompt: str,
+    bundle_text: str,
+) -> ValidationReport:
+    """Check every runtime cascade body is present in *bundle_text*.
+
+    Content parity (substring after whitespace normalization), NOT byte
+    equality — see the module-level note. The ``# Available skills`` section
+    is classified as a KNOWN divergence (issue #593), never as drift.
+
+    Args:
+        system_prompt: Output of ``AtomicAgent.assemble_system_prompt()``.
+        bundle_text: The rendered bundle's full text.
+
+    Returns:
+        A :class:`ValidationReport`. ``report.ok`` is False iff some runtime
+        section body is absent from the bundle (unexpected drift).
+    """
+    bundle_norm = _normalize_ws(bundle_text)
+    sections: list[SectionParity] = []
+
+    for header, body in split_runtime_sections(system_prompt):
+        # Known divergence: the runtime injects a skills metadata section the
+        # bundle deliberately omits (issue #593). Report it, do not fail.
+        if header == SKILLS_SECTION_HEADER:
+            sections.append(
+                SectionParity(
+                    header=header,
+                    status="known",
+                    note=(
+                        f"runtime '{SKILLS_SECTION_HEADER}' section is omitted "
+                        f"from the bundle (known gap, issue "
+                        f"{SKILLS_KNOWN_DIVERGENCE_ISSUE})"
+                    ),
+                )
+            )
+            continue
+
+        body_norm = _normalize_ws(body)
+        if not body_norm:
+            # Header-only section (no body to find) — treat as present; there
+            # is nothing whose absence would constitute drift.
+            sections.append(SectionParity(header=header, status="present"))
+            continue
+
+        # Known divergence: the runtime synthesizes a placeholder INDEX body
+        # ("# Memory Index") even with no notes; the bundle omits the section
+        # when no INDEX.md file exists. Only the EMPTY placeholder is benign —
+        # a populated index that's missing from the bundle is still real drift.
+        if header in _INDEX_SECTION_HEADERS and body_norm in _EMPTY_INDEX_PLACEHOLDERS:
+            sections.append(
+                SectionParity(
+                    header=header,
+                    status="known",
+                    note=(
+                        "runtime synthesizes an empty placeholder index "
+                        "(no notes); bundle omits the section when no INDEX.md "
+                        "file exists — no content is lost"
+                    ),
+                )
+            )
+            continue
+
+        if _body_present(body, body_norm, bundle_norm):
+            sections.append(SectionParity(header=header, status="present"))
+        else:
+            sections.append(
+                SectionParity(
+                    header=header,
+                    status="missing",
+                    note="runtime body not found in bundle",
+                )
+            )
+
+    return ValidationReport(sections=sections)
+
+
+def _body_present(body: str, body_norm: str, bundle_norm: str) -> bool:
+    """Return True if *body* is contained in the (normalized) bundle.
+
+    First tries the whole normalized body as a substring. If that misses, the
+    runtime section may be a CONCATENATION of multiple files under per-file
+    wrapper headers (the persona section joins
+    ``# IDENTITY.md\\n\\n<body>`` + ``# SOUL.md\\n\\n<body>`` + ...). The bundle
+    renders each file as its own section WITHOUT the runtime's ``# FILENAME.md``
+    wrapper line, so the concatenation is never a contiguous substring. Fall
+    back to checking each ``# ``-headed sub-block's content (after its own
+    header line) individually — every constituent body must be present.
+    """
+    if body_norm in bundle_norm:
+        return True
+
+    sub_blocks = _split_leaf_blocks(body)
+    if len(sub_blocks) <= 1:
+        # Not a multi-block body — the whole-body miss is real.
+        return False
+
+    for block in sub_blocks:
+        # Drop the block's own wrapper header line (e.g. "# SOUL.md"); the
+        # bundle carries the file CONTENT, not the runtime wrapper.
+        _hdr, _, block_body = block.partition("\n")
+        block_norm = _normalize_ws(block_body)
+        if not block_norm:
+            continue
+        if block_norm not in bundle_norm:
+            return False
+    return True
+
+
+def _split_leaf_blocks(body: str) -> list[str]:
+    """Split a section body into ``# ``-headed sub-blocks.
+
+    Splits at line boundaries that begin a new top-level (``# ``) heading, so a
+    concatenated persona body becomes one block per file. Lines that are not
+    ``# ``-headings stay attached to the preceding block.
+    """
+    blocks: list[str] = []
+    current: list[str] = []
+    for line in body.splitlines():
+        if line.startswith("# ") and current:
+            blocks.append("\n".join(current))
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        blocks.append("\n".join(current))
+    return blocks
+
+
+def format_validation_report(report: ValidationReport) -> str:
+    """Render a :class:`ValidationReport` as a human-readable report.
+
+    PASS form (no unexpected drift)::
+
+        Bundle validation: PASS — content parity holds.
+          N runtime sections checked, M present in bundle.
+          K known divergence(s) (reported, not failures):
+            - # Available skills: ... (issue #593)
+
+    FAILURE form (drift detected)::
+
+        Bundle validation: FAIL — N runtime section(s) missing from bundle.
+          Missing content (runtime assembles it; bundle lacks it):
+            - # project canon.md: runtime body not found in bundle
+    """
+    lines: list[str] = []
+    checked = len(report.sections)
+    if report.ok:
+        lines.append("Bundle validation: PASS — content parity holds.")
+        lines.append(
+            f"  {checked} runtime section(s) checked, "
+            f"{len(report.present)} present in bundle."
+        )
+        if report.known:
+            lines.append(
+                f"  {len(report.known)} known divergence(s) (reported, not failures):"
+            )
+            for s in report.known:
+                lines.append(f"    - {s.header}: {s.note}")
+    else:
+        lines.append(
+            f"Bundle validation: FAIL — "
+            f"{len(report.missing)} runtime section(s) missing from bundle."
+        )
+        lines.append("  Missing content (runtime assembles it; bundle lacks it):")
+        for s in report.missing:
+            lines.append(f"    - {s.header}: {s.note}")
+        if report.known:
+            lines.append("  Known divergence(s) (reported, not the cause of failure):")
+            for s in report.known:
+                lines.append(f"    - {s.header}: {s.note}")
+    return "\n".join(lines)
 
 
 @dataclass(frozen=True)
