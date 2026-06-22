@@ -1,6 +1,6 @@
 # spec/44: QueueBackend Protocol
 
-> **Status:** DRAFT at PR 1 (issue #428). Conformance suite covers all 12 Implementer Contract MUSTs for `FilesystemQueueBackend` (`test_queue_backend_conformance.py`) plus filesystem-specific tests (`test_queue_filesystem.py`). QueueBackend is also registered in the shared #379 export conformance harness (`test_export_protocol_conformance.py`) and the capability-advertisement harness (`test_export_capability_advertisement.py`). This is a SCAFFOLDING-ONLY carve — zero internal runtime callers wired; the `_cascade.py` free-function API is preserved via a thin non-deprecated shim. Closes TENSIONS T4.
+> **Status:** LOCKED (issue #428, LOCK PR). 134 tests collected across `test_queue_backend_conformance.py` (58) and `test_queue_filesystem.py` (76). All 12 Implementer Contract MUSTs are individually test-covered. Registered in the shared #379 export conformance harness (`test_export_protocol_conformance.py`) and the capability-advertisement harness (`test_export_capability_advertisement.py`). This is a SCAFFOLDING-ONLY reference impl — zero internal runtime callers wired; the `_cascade.py` free-function API is preserved via a thin non-deprecated shim. Runtime adoption deferred to #469. Closes TENSIONS T4.
 
 ---
 
@@ -11,7 +11,7 @@
 Prior to spec/44, queue-claim atomicity was locked to POSIX `Path.rename()` (T4 in `docs/TENSIONS.md`). The logic was embedded in free functions in `_cascade.py`:
 `_sidecar_path`, `_write_sidecar`, `claim_next_queued`, `release_claim`, `move_to_dead_letter`, `recover_stale_claims`, `renew_lease`.
 
-Filed as [#428](https://github.com/dep0we/atomic-agents-stack/issues/428) as the seventeenth backend protocol, shipping in v2.0.0.
+Filed as [#428](https://github.com/dep0we/atomic-agents-stack/issues/428) as the seventeenth backend protocol, shipping in v2.0.0. LOCKED in the follow-up hardening PR.
 
 **Cross-links:**
 
@@ -20,19 +20,12 @@ Filed as [#428](https://github.com/dep0we/atomic-agents-stack/issues/428) as the
 - spec/40. Canonical Export. `QueueExport` is a first-class `ExportableResult`; `FilesystemQueueBackend` implements `Exportable`.
 - spec/44 completes the v2.0.0 backend arc (alongside GoalBackend spec/41, OutcomeBackend spec/42, JournalBackend spec/43).
 
----
-
-## Shipping plan (1 PR for scaffolding)
-
-**PR 1 (this PR, SCAFFOLDING-ONLY).** Protocol scaffold + dataclasses + capability advertisement + `FilesystemQueueBackend` reference impl + factory/env/doctor + thin non-deprecated `_cascade.py` shim + full conformance suite + filesystem-specific tests + spec/44 DRAFT.
-
-The free-function cron/project-runner API (`claim_next_queued` etc.) is preserved in `_cascade.py` via wrapper functions that construct `FilesystemQueueBackend(project_root)` internally and delegate. NO internal runtime callers are wired — matching the #425 GoalBackend / #426 OutcomeBackend scaffolding shape.
-
-Follow-up work is tracked in these filed issues:
-- **#468** — Queue inspection CLI (`queue inspect` / `queue list-dead-letter` / `queue recover`), after spec/44 locks.
-- **#469** — Runtime adoption (cascade-runner wiring through QueueBackend Protocol), after spec/44 locks.
-- **#470** — Harmonizing `ATOMIC_AGENTS_MULTI_HOST` with LockBackend's single_host_only pattern.
-- **#472** — Extending `doctor.check_queue_backend`'s containment probe to per-subdirectory symlinks.
+**Deferred follow-up (tracked issues):**
+- **#468** — Queue inspection CLI (`queue inspect` / `queue list-dead-letter` / `queue recover`)
+- **#469** — Runtime adoption (cascade-runner wiring through QueueBackend Protocol)
+- **#470** — Harmonizing `ATOMIC_AGENTS_MULTI_HOST` with LockBackend's single_host_only pattern
+- **#472** — Extending `doctor.check_queue_backend`'s containment probe to per-subdirectory symlinks
+- **#480** — Framework-wide TOCTOU hardening (openat/O_NOFOLLOW dir-fd traversal; queue-only fix explicitly out of scope — shared `_io.safe_resolve_under` primitive used by 20+ backends)
 
 ---
 
@@ -185,7 +178,9 @@ The structural exclusion (whitelist: enumerate only `queued/`, `done/`, `dead-le
 
 ### Per-subdirectory symlink containment (security)
 
-`_queue_root()` proves only that `queue/` itself is contained under `project_root`. The per-operation subdirectories — `queued/`, `claimed/`, `done/`, `dead-letter/`, and their `<role>` / `<lease_token>` namespaces — are themselves attacker-influenceable and MAY be symlinks. A symlinked `claimed/` (or any durable subdir) pointing outside `queue/` would let a `claim_next()`/`release()`/`move_to_dead_letter()` rename land OUTSIDE `project_root`, leaking work-item bytes (the `#426 _runs_root()` ancestor-escalation pattern). Every write AND read site (`claim_next`, `release`, `move_to_dead_letter`, `renew_lease`, `list_claimed`, `recover`, `export`) MUST resolve its target subdirectory and re-assert `is_relative_to(queue_root_resolved)` before use. In `FilesystemQueueBackend` the containment guard raises `PathTraversalError` internally and every operation catches it and fails SOFT: writes (`claim_next`, `release`, `move_to_dead_letter`, `renew_lease`) return `None` / no-op, and reads (`list_claimed`, `recover`, `export`) skip / return `[]`. This preserves the pre-carve `_cascade.py` contract, which had no containment check and so never propagated an exception to a caller. (A backend MAY instead fail-loud on writes; that is an implementation choice, not a Protocol requirement.) The containment check uses the RESOLVED anchor, but the path RETURNED for file operations is the UNRESOLVED `queue_root.joinpath(...)` — mirroring `FilesystemJournalBackend._journal_dir()` — so caller-visible `item.path` stays in the operator's own path representation (byte-identical to the pre-carve `_cascade.py` cron API; a project reached through a symlink does not get `item.path` silently rewritten to the real on-disk location). Because returned paths AND the `export()` relativization base (`self._project_root`) share that same unresolved representation, `relative_to()` never raises for the symlinked-`project_root` case, so the export is never silently emptied. `export()` ADDITIONALLY re-asserts per-leaf containment: each durable work FILE is resolved and checked `is_relative_to(queue_root_resolved)` before its bytes are read, so a symlinked work file pointing outside `queue/` cannot exfiltrate host bytes into the portable export.
+`_queue_root()` proves only that `queue/` itself is contained under `project_root`. The per-operation subdirectories — `queued/`, `claimed/`, `done/`, `dead-letter/`, and their `<role>` / `<lease_token>` namespaces — are themselves attacker-influenceable and MAY be symlinks. A symlinked `claimed/` (or any durable subdir) pointing outside `queue/` would let a `claim_next()`/`release()`/`move_to_dead_letter()` rename land OUTSIDE `project_root`, leaking work-item bytes (the `#426 _runs_root()` ancestor-escalation pattern). Every write AND read site (`claim_next`, `release`, `move_to_dead_letter`, `renew_lease`, `list_claimed`, `recover`, `export`) MUST resolve its target subdirectory and re-assert `is_relative_to(queue_root_resolved)` before use. In `FilesystemQueueBackend` the containment guard raises `PathTraversalError` internally and every operation catches it and fails SOFT: writes (`claim_next`, `release`, `move_to_dead_letter`, `renew_lease`) return `None` / no-op, and reads (`list_claimed`, `recover`, `export`) skip / return `[]`. This preserves the pre-carve `_cascade.py` contract, which had no containment check and so never propagated an exception to a caller. (A backend MAY instead fail-loud on writes; that is an implementation choice, not a Protocol requirement.) The containment check uses the RESOLVED anchor, but the path RETURNED for file operations is the UNRESOLVED `queue_root.joinpath(...)` — mirroring `FilesystemJournalBackend._journal_dir()` — so caller-visible `item.path` stays in the operator's own path representation (byte-identical to the pre-carve `_cascade.py` cron API; a project reached through a symlink does not get `item.path` silently rewritten to the real on-disk location). Because returned paths AND the `export()` relativization base (`self._project_root`) share that same unresolved representation, `relative_to()` never raises for the symlinked-`project_root` case, so the export is never silently emptied. `export()` ADDITIONALLY re-asserts per-leaf containment AND per-subdirectory containment: the export walk uses an explicit `iterdir()`-based recursive walk (not `rglob('*')`) that re-asserts `resolve() + is_relative_to(queue_root_resolved)` at each subdirectory descent and refuses to follow symlinked subdirs before descending — closing the Python 3.13 rglob-follows-directory-symlinks DoS vector (#477). Each durable work FILE is also resolved and checked `is_relative_to(queue_root_resolved)` before its bytes are read, so a symlinked work file pointing outside `queue/` cannot exfiltrate host bytes.
+
+**Sidecar/reason-txt write containment.** Sidecar writes (`.lease.json`, `.reason.txt`) use `os.open(O_NOFOLLOW|O_CREAT|O_TRUNC|O_WRONLY)` instead of `Path.write_text()` so that a symlink planted at the sidecar write destination is refused at the OS level (ELOOP on POSIX). This closes the sidecar-leaf perimeter escape (#479): an actor who plants a symlink at `claimed/<token>/<name>.lease.json` or `dead-letter/<token>/<name>.reason.txt` pointing outside `queue_root` cannot cause a sidecar write to land outside the project. Sidecar writes remain best-effort (the claim atomicity guarantee is on the rename, not the sidecar); a refused write is silently tolerated and the mtime fallback handles the absent-sidecar case.
 
 ---
 
@@ -211,7 +206,7 @@ The structural exclusion (whitelist: enumerate only `queued/`, `done/`, `dead-le
 
 **Queue-unique axes (4 additional MUSTs):**
 
-9. **Atomic claim via rename / no-double-claim under race.** A concurrent two-claimer race where both workers attempt to claim the same work item MUST result in exactly one successful claim (one worker gets the item, the other gets None or claims a different item). The filesystem backend achieves this via `src.rename(dst)` — the POSIX rename is the exclusion primitive. Non-filesystem backends MUST provide an equivalent exclusive-take primitive (Redis `BRPOPLPUSH`, SQS visibility timeout, DB row-level lock).
+9. **Atomic claim via rename / no-double-claim under race.** A concurrent two-claimer race where both workers attempt to claim the same work item MUST result in exactly one successful claim (one worker gets the item, the other gets None or claims a different item). The filesystem backend achieves this via `src.rename(dst)` — the POSIX rename is the exclusion primitive. Non-filesystem backends MUST provide an equivalent exclusive-take primitive (Redis `BRPOPLPUSH`, SQS visibility timeout, DB row-level lock). _Lease-token collision (no-clobber strengthening):_ the filesystem backend uses `mkdir(exist_ok=False)` for `claimed/<lease_token>/` so that reusing a `lease_token` whose directory already exists returns `None` instead of silently inheriting the prior session's namespace. Callers MUST generate a fresh `lease_token` per claim session; a collision returns `None` and the caller must retry with a new token. This is a destination-collision guard, not a source-side race fix — the source-side race under concurrent workers is already handled by the POSIX rename `FileNotFoundError` path (the MUST 4/9 exclusive-take guarantee). The two guards compose: the mkdir guard closes token-reuse clobber; the rename guard closes concurrent-worker races.
 
 10. **Dead-letter terminal transition / dead-work-stays-dead.** `move_to_dead_letter()` MUST atomically transition the work item to a terminal state (`dead-letter/`). Once a file is in `dead-letter/`, no `claim_next()`, `recover_stale_claims()`, or `release()` operation MUST affect it. The state transition MUST be the file-move (POSIX rename or equivalent); `.reason.txt` and sidecar cleanup are best-effort. An orphaned `.lease.json` in `dead-letter/` MUST NOT constitute a live claim.
 
