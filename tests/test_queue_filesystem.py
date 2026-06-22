@@ -2133,3 +2133,110 @@ def test_list_claimed_and_recover_skip_symlinked_sidecar(tmp_path):
     # recover must not raise and must not read the external sidecar either.
     recover_stale_claims(backend, lease_seconds=999999)
     assert external.read_text().startswith("{"), "external file must be untouched"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# #477 export() symlinked-subdir DoS — iterdir() walk re-asserts containment
+# at each subdir descent; refuses to follow symlinked subdirs.
+
+
+def test_export_symlinked_subdir_inside_queued_is_skipped(tmp_path):
+    """export() must NOT descend into a symlinked subdirectory inside queued/.
+
+    A symlinked subdir inside queued/ (e.g. queued/evil/ -> /outside/) is
+    refused at the subdir-descent stage of _walk_dir_no_follow; files inside
+    the symlinked tree are NOT emitted in the export.
+
+    Strip-RED negative control: the real file in queued/writer/ IS exported
+    (proving the walk reaches real subdirs), while the symlinked subdir's
+    contents are NOT.
+    """
+    import os
+
+    project_root = tmp_path / "project"
+    # Plant a real file in queued/writer/
+    qd = project_root / "queue" / "queued" / "writer"
+    qd.mkdir(parents=True)
+    (qd / "real_task.md").write_text("real content")
+
+    # Plant a directory outside queue_root with a file in it.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "evil.md").write_text("should never appear in export")
+
+    # Create a symlinked subdir inside queued/ pointing outside.
+    evil_link = project_root / "queue" / "queued" / "evil"
+    os.symlink(outside, evil_link)
+
+    backend = FilesystemQueueBackend(project_root)
+    result = backend.export()
+    paths = [rel for rel, _ in result.items_with_bytes]
+
+    # The real file IS exported (walk reaches non-symlinked subdirs).
+    assert any("real_task.md" in p for p in paths), (
+        f"Real file must be exported: {paths}"
+    )
+    # The symlinked-subdir file is NOT exported.
+    assert not any("evil.md" in p for p in paths), (
+        f"File inside symlinked subdir must NOT be exported: {paths}"
+    )
+
+
+def test_export_symlinked_subdir_within_queue_root_is_skipped(tmp_path):
+    """export() must NOT follow a symlinked subdir even if it resolves within queue_root.
+
+    A within-queue symlink (done/link-dir -> queued/writer/) would cause
+    double-enumeration and cross-boundary aliasing. It must be skipped at the
+    subdir descent gate (is_symlink() check BEFORE the containment check)
+    not just at the containment check.
+    """
+    import os
+
+    project_root = tmp_path / "project"
+    # Plant a real file in queued/writer/
+    qd = project_root / "queue" / "queued" / "writer"
+    qd.mkdir(parents=True)
+    (qd / "original.md").write_text("original content")
+    done_dir = project_root / "queue" / "done"
+    done_dir.mkdir(parents=True)
+
+    # Create a within-queue symlink done/link-dir -> queued/writer/
+    link_dir = done_dir / "link-dir"
+    os.symlink(qd, link_dir)
+
+    backend = FilesystemQueueBackend(project_root)
+    result = backend.export()
+    paths = [rel for rel, _ in result.items_with_bytes]
+
+    # The original file IS exported once (from queued/).
+    queued_refs = [p for p in paths if "queued" in p and "original.md" in p]
+    assert len(queued_refs) == 1, (
+        f"original.md must appear exactly once from queued/: {paths}"
+    )
+    # The within-queue symlinked subdir must NOT be followed (no double-count).
+    done_refs = [p for p in paths if "done" in p]
+    assert not done_refs, (
+        f"Symlinked subdir inside done/ must NOT be followed: {done_refs}"
+    )
+
+
+def test_export_sorted_output_order_preserved(tmp_path):
+    """export() output must be sorted consistently after the iterdir() walk replacement.
+
+    Regression guard for the #477 iterdir() refactor: the walk collects all
+    files then sorts, matching the previous sorted(dir_path.rglob('*')) order.
+    """
+    project_root = tmp_path / "project"
+    # Multiple roles with multiple files to stress sort order.
+    for role in ["alpha", "beta", "zeta"]:
+        qd = project_root / "queue" / "queued" / role
+        qd.mkdir(parents=True)
+        for i in range(3):
+            (qd / f"00{i}_task.md").write_text(f"content {role}/{i}")
+
+    backend = FilesystemQueueBackend(project_root)
+    result = backend.export()
+    paths = [rel for rel, _ in result.items_with_bytes]
+    assert paths == sorted(paths), (
+        f"export() output must be sorted: {paths}"
+    )

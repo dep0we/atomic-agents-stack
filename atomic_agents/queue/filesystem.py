@@ -919,14 +919,57 @@ class FilesystemQueueBackend:
         # file_path values come from the UNRESOLVED queue_root (see _queue_root /
         # _safe_under_queue), so relativize against the UNRESOLVED project root.
         # The two share the same representation, so relative_to() never raises
-        # for the symlinked-project_root case. The per-leaf symlink guard below
-        # uses a separately-resolved queue_root to catch a symlinked WORK FILE
-        # escaping queue/ — that containment check needs the resolved anchor even
-        # though the emitted relative path uses the unresolved base.
+        # for the symlinked-project_root case. The per-subdir and per-leaf
+        # containment guards below use a separately-resolved queue_root anchor.
         try:
             queue_root_resolved = queue_root.resolve()
         except (OSError, RuntimeError):
             queue_root_resolved = queue_root
+
+        def _walk_dir_no_follow(root_dir: Path) -> list[Path]:
+            """Iterdir-based recursive walk that refuses to follow symlinked subdirs.
+
+            Replaces rglob('*') to prevent the Python 3.13 vector where rglob
+            follows directory symlinks by default, enabling unbounded traversal
+            through a symlinked subdir pointing to a large or cyclic tree
+            (the #477 DoS vector).
+
+            At each subdirectory descent, re-asserts resolve() +
+            is_relative_to(queue_root_resolved) before recursing. Skips any
+            subdir that is a symlink (not just those that escape queue_root) —
+            same per-subdirectory containment pattern as
+            FilesystemConversationBackend.export()'s per-principal iterdir walk.
+
+            Returns a sorted list of all file paths (files only, no dirs).
+            NOT os.walk(followlinks=False): os.walk returns (dirpath, dirs,
+            files) tuples without per-entry resolve checks and doesn't give
+            per-subdir containment before descent.
+            """
+            collected: list[Path] = []
+            try:
+                entries = list(root_dir.iterdir())
+            except (OSError, PermissionError):
+                return collected
+            for entry in entries:
+                if entry.is_symlink():
+                    # Symlinked subdirs: skip without descending (DoS prevention).
+                    # Symlinked files: let the per-leaf guard below handle them.
+                    if entry.is_dir():
+                        continue
+                    # Symlinked file — fall through to collection; per-leaf guard
+                    # will reject containment-escaping symlinks.
+                if entry.is_dir():
+                    # Re-assert containment before descending into this subdir.
+                    try:
+                        subdir_resolved = entry.resolve()
+                    except (OSError, RuntimeError):
+                        continue
+                    if not subdir_resolved.is_relative_to(queue_root_resolved):
+                        continue
+                    collected.extend(_walk_dir_no_follow(entry))
+                else:
+                    collected.append(entry)
+            return collected
 
         for dir_name in durable_dirs:
             try:
@@ -936,7 +979,7 @@ class FilesystemQueueBackend:
                 continue
             if not dir_path.is_dir():
                 continue
-            for file_path in sorted(dir_path.rglob("*")):
+            for file_path in sorted(_walk_dir_no_follow(dir_path)):
                 if not file_path.is_file():
                     continue
                 # Exclude .lease.json files (belt-and-suspenders: they only
