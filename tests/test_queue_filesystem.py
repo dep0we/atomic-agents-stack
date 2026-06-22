@@ -2240,3 +2240,123 @@ def test_export_sorted_output_order_preserved(tmp_path):
     result = backend.export()
     paths = [rel for rel, _ in result.items_with_bytes]
     assert paths == sorted(paths), f"export() output must be sorted: {paths}"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# #479 sidecar/reason.txt symlink-leaf perimeter escape — O_NOFOLLOW writes
+
+
+def test_write_sidecar_refuses_symlinked_destination(tmp_path):
+    """_write_sidecar must NOT write through a symlink at the sidecar path.
+
+    Strip-RED negative control: the symlink target must NOT be written.
+    """
+    import os
+
+    project_root = tmp_path / "project"
+    claimed = project_root / "queue" / "claimed" / "lease-1"
+    claimed.mkdir(parents=True)
+    work_file = claimed / "task.md"
+    work_file.write_text("work")
+
+    # Plant a symlink at the sidecar path pointing to an external file.
+    external = tmp_path / "external_sidecar.json"
+    external.write_text('{"original": true}')
+    sidecar = claimed / "task.md.lease.json"
+    os.symlink(external, sidecar)
+
+    # _write_sidecar must NOT write through the symlink.
+    _write_sidecar(work_file, lease_token="lease-1", lease_seconds=60)
+
+    # The external file must be unchanged.
+    assert external.read_text() == '{"original": true}', (
+        "_write_sidecar must not follow a symlink at the sidecar path"
+    )
+    # The symlink itself must still be there (not replaced with a real file).
+    assert sidecar.is_symlink(), "symlink at sidecar path must be unchanged"
+
+
+def test_write_sidecar_writes_normally_when_no_symlink(tmp_path):
+    """Strip-RED control: _write_sidecar writes successfully to a real path."""
+    project_root = tmp_path / "project"
+    claimed = project_root / "queue" / "claimed" / "lease-1"
+    claimed.mkdir(parents=True)
+    work_file = claimed / "task.md"
+    work_file.write_text("work")
+
+    _write_sidecar(work_file, lease_token="lease-1", lease_seconds=60)
+
+    sidecar = claimed / "task.md.lease.json"
+    assert sidecar.exists() and not sidecar.is_symlink(), (
+        "_write_sidecar must write the real sidecar when no symlink is present"
+    )
+    import json as _json
+
+    data = _json.loads(sidecar.read_text())
+    assert data["lease_token"] == "lease-1"
+
+
+def test_dead_letter_reason_txt_refuses_symlinked_destination(tmp_path):
+    """move_to_dead_letter must NOT write .reason.txt through a symlink.
+
+    Strip-RED: the external target must be unchanged after the operation.
+    """
+    import os
+
+    project_root = tmp_path / "project"
+    _queued(project_root, name="001_task.md")
+    backend = FilesystemQueueBackend(project_root)
+    item = backend.claim_next("writer", "lease-1")
+    assert item is not None
+
+    # The item is in claimed/. Plant a symlink at the future .reason.txt path
+    # in dead-letter/ — create the dead-letter dir first.
+    dl_dir = project_root / "queue" / "dead-letter" / "lease-1"
+    dl_dir.mkdir(parents=True, exist_ok=True)
+    external = tmp_path / "external_reason.txt"
+    external.write_text("original content")
+    reason_link = dl_dir / "001_task.md.reason.txt"
+    os.symlink(external, reason_link)
+
+    # move_to_dead_letter must NOT write through the symlink.
+    backend.move_to_dead_letter(item.lease_token, item.original_name, reason="FAILED")
+
+    # External file must be unchanged.
+    assert external.read_text() == "original content", (
+        "move_to_dead_letter must not write .reason.txt through a symlink"
+    )
+    # The work file IS moved to dead-letter/ (rename still succeeds).
+    dl_file = dl_dir / "001_task.md"
+    assert dl_file.exists(), "work file must be in dead-letter/ after the rename"
+
+
+def test_renew_lease_refuses_symlinked_sidecar_destination(tmp_path):
+    """renew_lease must NOT write through a symlink at the sidecar path.
+
+    Strip-RED: the external target must be unchanged after renew_lease().
+    """
+    import os
+
+    project_root = tmp_path / "project"
+    _queued(project_root, name="001_task.md")
+    backend = FilesystemQueueBackend(project_root)
+    item = backend.claim_next("writer", "lease-1", lease_seconds=60)
+    assert item is not None
+
+    # Replace the real sidecar with a symlink to an external file.
+    sidecar = item.path.parent / (item.original_name + ".lease.json")
+    external = tmp_path / "external.json"
+    external.write_text('{"hijacked": true}')
+    sidecar.unlink()
+    os.symlink(external, sidecar)
+
+    # renew_lease must NOT write through the symlink.
+    backend.renew_lease(item.lease_token, item.original_name, additional_seconds=3600)
+
+    # External file must be unchanged.
+    import json as _json
+
+    data = _json.loads(external.read_text())
+    assert data.get("hijacked") is True, (
+        "renew_lease must not write through a symlink at the sidecar path"
+    )

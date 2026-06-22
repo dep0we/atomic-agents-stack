@@ -90,6 +90,7 @@ Import boundary (circular-import safety):
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -185,6 +186,40 @@ def _validate_original_name(original_name: str) -> None:
     _validate_bare_component(original_name, "original_name")
 
 
+def _write_no_follow(path: Path, content: str) -> None:
+    """Write *content* to *path* without following a symlink at the leaf.
+
+    Uses os.open(O_NOFOLLOW|O_CREAT|O_TRUNC|O_WRONLY) to refuse to follow a
+    symlink planted at the write destination (sidecar/reason-txt symlink-leaf
+    perimeter escape, #479). If the path is a symlink, os.open raises OSError
+    with errno ELOOP (POSIX) or similar; the exception is NOT caught here —
+    callers handle it in their existing fail-soft try/except.
+
+    Sidecar writes are best-effort (see _write_sidecar docstring); a refused
+    write (symlink at destination) is silently tolerated by callers that wrap
+    in try/except.
+
+    Args:
+        path: destination path (sidecar .lease.json or .reason.txt).
+        content: UTF-8 text to write.
+
+    Raises:
+        OSError: when os.open refuses the path (e.g. ELOOP because path is a
+            symlink, or EACCES/ENOENT from the parent directory). Callers
+            must wrap in try/except when best-effort semantics are required.
+    """
+    encoded = content.encode("utf-8")
+    fd = os.open(
+        str(path),
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+        0o666,
+    )
+    try:
+        os.write(fd, encoded)
+    finally:
+        os.close(fd)
+
+
 def _write_sidecar(
     work_file: Path,
     lease_token: str,
@@ -193,13 +228,12 @@ def _write_sidecar(
 ) -> None:
     """Write a lease sidecar alongside *work_file*.
 
-    NOTE: This uses raw Path.write_text() — NOT atomic_write(). This preserves
-    _cascade.py's write mechanism (best-effort sidecar; the claim atomicity
-    guarantee is on the rename, not the sidecar). A torn sidecar is recoverable
-    via the mtime fallback path in recover_stale_claims(). The mtime fallback
-    reads the work file's mtime (not the sidecar's mtime), so atomic_write
-    for sidecars would be safe — but raw write_text matches the carved-from
-    behavior.
+    Uses _write_no_follow (O_NOFOLLOW) to refuse to follow a symlink planted
+    at the sidecar path (#479 sidecar-leaf perimeter escape). If the sidecar
+    path is a symlink, the write is silently skipped (sidecar writes are
+    best-effort; the claim atomicity guarantee is on the rename, not the
+    sidecar). A torn/absent sidecar is recoverable via the mtime fallback in
+    recover_stale_claims().
 
     The sidecar gains an additive ``role`` key (absent in the pre-carve
     _cascade.py sidecar) so list_claimed(role=...) filtering works on the
@@ -226,7 +260,13 @@ def _write_sidecar(
         "lease_seconds": lease_seconds,
         "role": role,
     }
-    _sidecar_path(work_file).write_text(json.dumps(sidecar), encoding="utf-8")
+    try:
+        _write_no_follow(_sidecar_path(work_file), json.dumps(sidecar))
+    except OSError:
+        # Sidecar write is best-effort. A symlink at the destination (ELOOP)
+        # or any other OS error is silently tolerated — the mtime fallback
+        # in recover_stale_claims() handles the absent-sidecar case.
+        pass
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -487,8 +527,6 @@ class FilesystemQueueBackend:
             # collision (FileExistsError from O_EXCL open) means another
             # session already placed a file at this path; skip this candidate
             # too (the rename would silently overwrite it on POSIX).
-            import os as _os
-
             try:
                 # O_EXCL: fail if dst already exists. This is a TOCTOU-narrow
                 # probe (a separate process could create dst between O_EXCL and
@@ -496,8 +534,8 @@ class FilesystemQueueBackend:
                 # requiring renameat2/RENAME_NOREPLACE (Linux-only) on macOS.
                 # The primary inter-worker race is still handled by rename's
                 # source-side FileNotFoundError (MUST 9 guarantee).
-                fd = _os.open(str(dst), _os.O_CREAT | _os.O_EXCL | _os.O_WRONLY, 0o600)
-                _os.close(fd)
+                fd = os.open(str(dst), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                os.close(fd)
             except FileExistsError:
                 # Destination already occupied under this token — skip.
                 continue
@@ -703,9 +741,14 @@ class FilesystemQueueBackend:
             target = dl_dir / original_name
             work_path.rename(target)
             if reason:
-                (dl_dir / (original_name + ".reason.txt")).write_text(
-                    reason, encoding="utf-8"
-                )
+                try:
+                    _write_no_follow(dl_dir / (original_name + ".reason.txt"), reason)
+                except OSError:
+                    # reason.txt write is best-effort (the work file is already
+                    # renamed to dead-letter/; the terminal state is established).
+                    # A symlink planted at the reason.txt path (ELOOP) or any
+                    # other OS error must not propagate — mirrors _write_sidecar.
+                    pass
             # Remove the sidecar from the (now-moved) original location.
             sc = _sidecar_path(work_path)
             if sc.exists():
@@ -824,7 +867,16 @@ class FilesystemQueueBackend:
         data.setdefault("claimed_at", now.isoformat())
         data["lease_seconds"] = lease_secs
 
-        sidecar.write_text(json.dumps(data), encoding="utf-8")
+        try:
+            _write_no_follow(sidecar, json.dumps(data))
+        except OSError:
+            # Sidecar write is best-effort. A symlink at the sidecar path (ELOOP
+            # from O_NOFOLLOW — the #479 sidecar-leaf perimeter escape) or any
+            # other OS error must not propagate to the caller. The existing
+            # is_file()+not is_symlink() read-guard already blocks reading a
+            # symlinked sidecar; _write_no_follow closes the corresponding
+            # write-side gap.
+            pass
 
     def list_claimed(self, role: str | None = None) -> list[FilesystemQueueItem]:
         """Return all currently-held (claimed) work items.
