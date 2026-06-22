@@ -151,6 +151,13 @@ EMBEDDING_PRICING: dict[str, float] = {
     "text-embedding-ada-002": 0.100,  # $0.100/1M tokens (legacy, still supported)
 }
 
+# Bytes-per-token constant for the UTF-8-based embed token estimate.
+# BPE tokens are bounded by UTF-8 byte length; bytes/3 is conservative for
+# natural-language text (covers CJK/emoji where code-point count under-counts
+# ~3x). Single source of truth shared by agent.py and cli.py — eliminates
+# drift if the constant is tuned in future.
+EMBED_BYTES_PER_TOKEN: int = 3
+
 # Per-process dedup set for unknown embedding model warnings.
 _unknown_embedding_model_warned: set[str] = set()
 

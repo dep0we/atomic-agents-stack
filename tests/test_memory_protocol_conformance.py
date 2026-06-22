@@ -951,8 +951,6 @@ def _make_pgvector_memory_backend(tmp_path: Path) -> tuple:
 
     Skips automatically without ATOMIC_AGENTS_TEST_POSTGRES_URL (CI only).
     """
-    import psycopg
-
     from atomic_agents.memory.pgvector import (
         _ADD_EMBEDDINGS_FK,
         _CREATE_EMBEDDINGS_HNSW_INDEX,
@@ -969,14 +967,17 @@ def _make_pgvector_memory_backend(tmp_path: Path) -> tuple:
     )
 
     # Reset shared table to avoid cross-test embedding-column-dimension conflicts.
-    with psycopg.connect(_POSTGRES_URL) as conn:
-        conn.execute("DROP TABLE IF EXISTS memory_note_embeddings CASCADE")
-        conn.execute(_CREATE_EMBEDDINGS_TABLE.format(dimensions=4))
-        conn.execute(_ADD_EMBEDDINGS_FK)
-        conn.execute(_CREATE_EMBEDDINGS_HNSW_INDEX)
-        conn.execute("DELETE FROM memory_note_versions")
-        conn.execute("DELETE FROM memory_notes")
-        conn.commit()
+    # Use backend._get_conn() (mirrors _make_postgres_backend) so schema-init
+    # runs through the same connection that the backend will use, and avoids
+    # opening a redundant second bare connection.
+    conn = backend._get_conn()
+    conn.execute("DROP TABLE IF EXISTS memory_note_embeddings CASCADE")
+    conn.execute(_CREATE_EMBEDDINGS_TABLE.format(dimensions=4))
+    conn.execute(_ADD_EMBEDDINGS_FK)
+    conn.execute(_CREATE_EMBEDDINGS_HNSW_INDEX)
+    conn.execute("DELETE FROM memory_note_versions")
+    conn.execute("DELETE FROM memory_notes")
+    conn.commit()
 
     policy = WritePolicy(write_paths=[tmp_path])
     return backend, policy

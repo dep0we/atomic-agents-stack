@@ -194,18 +194,18 @@ RECENT_JOURNAL_DEFAULT = 1
 
 # Embed cost-gate worst-case constants (#544 PR1). Shared by the reservation
 # loop and the true-up loop so the two estimates can never drift.
-#   _EMBED_BYTES_PER_TOKEN: BPE tokens are bounded by UTF-8 BYTE length. For
-#     natural-language text bytes/3 is conservative (covers CJK/emoji, where a
-#     code-point count under-counts ~3x). It is NOT a strict upper bound for
-#     incompressible/adversarial byte sequences (which can approach ~1 token/
-#     byte), but the provider rejects any single text over the model token cap
-#     and embedding is sub-cent per token, so the residual under-reservation is
-#     bounded and small. See spec/46 fail-closed section.
+#   _costs.EMBED_BYTES_PER_TOKEN: BPE tokens are bounded by UTF-8 BYTE length.
+#     For natural-language text bytes/3 is conservative (covers CJK/emoji,
+#     where a code-point count under-counts ~3x). It is NOT a strict upper
+#     bound for incompressible/adversarial byte sequences (which can approach
+#     ~1 token/byte), but the provider rejects any single text over the model
+#     token cap and embedding is sub-cent per token, so the residual
+#     under-reservation is bounded and small. See spec/46 fail-closed section.
+#     Canonical home: atomic_agents/_costs.py EMBED_BYTES_PER_TOKEN.
 #   _EMBED_BATCH_FANOUT_BUFFER: the MemoryBackend protocol does not advertise
 #     whether write_note() calls embed() (per-item) or embed_batch(); the 2x
 #     buffer is headroom against an embed_batch() path that degrades per-item
 #     (batch call + N retries).
-_EMBED_BYTES_PER_TOKEN = 3
 _EMBED_BATCH_FANOUT_BUFFER = 2.0
 
 
@@ -214,8 +214,9 @@ def _estimate_embed_tokens(body: str | None) -> int:
 
     Single source of truth for the reservation loop and the true-up loop so a
     future tweak cannot desync the reserved amount from the charged actual.
+    Uses _costs.EMBED_BYTES_PER_TOKEN — canonical constant shared with cli.py.
     """
-    return math.ceil(len((body or "").encode("utf-8")) / _EMBED_BYTES_PER_TOKEN)
+    return math.ceil(len((body or "").encode("utf-8")) / _costs.EMBED_BYTES_PER_TOKEN)
 
 
 _PRIMITIVE_BY_TRIGGER: dict[str, str] = {

@@ -1354,7 +1354,9 @@ def _corpus_query(
     call. This function applies a cost gate mirroring ``dream._check_cap``:
 
     1. Resolve the embedding model_id from backend capabilities.
-    2. Estimate tokens via ``ceil(utf8_bytes / 3)`` (same basis as the batch gate).
+    2. Estimate tokens via ``ceil(utf8_bytes / EMBED_BYTES_PER_TOKEN)`` (same
+       basis as the batch gate for non-empty text; an empty query clamps to 1
+       token, which is conservative).
     3. Read cost history and apply headroom check (unless ``critical=True``).
     4. Emit ``embed_reservation`` JSONL record before the query.
     5. Call ``backend.query()`` inside try/finally.
@@ -1402,10 +1404,13 @@ def _corpus_query(
     embed_backend = caps.embedding_backend_resolved
     model_id = embed_backend.model_id
 
-    # Estimate tokens: ceil(utf8_bytes / 3) — same conservative basis as the
-    # batch gate in agent.call() (spec/46 §'Token estimate basis').
+    # Estimate tokens: ceil(utf8_bytes / EMBED_BYTES_PER_TOKEN) — same
+    # conservative basis as the batch gate in agent.call() (spec/46
+    # §'Token estimate basis'). Constant lives in _costs to avoid drift.
     utf8_bytes = len(text.encode("utf-8"))
-    tokens_est = math.ceil(utf8_bytes / 3) if utf8_bytes > 0 else 1
+    tokens_est = (
+        math.ceil(utf8_bytes / _costs.EMBED_BYTES_PER_TOKEN) if utf8_bytes > 0 else 1
+    )
     per_call_cost, cost_estimated = _costs.calc_embedding_cost(model_id, tokens_est)
 
     # ── Mint a standalone run_id (top-level CLI call, no parent) ───────────────
@@ -1419,10 +1424,12 @@ def _corpus_query(
     log_dir = agent_root / "log"
     if not critical:
         _model_md_path = agent_root / "model.md"
-        try:
-            model_data = _model.parse_model_md(_model_md_path)
-        except Exception:
-            if _model_md_path.exists():
+        if _model_md_path.exists():
+            # Pre-check existence ONCE to eliminate the TOCTOU race in a
+            # post-exception re-check (file deleted between raise and check).
+            try:
+                model_data = _model.parse_model_md(_model_md_path)
+            except Exception:
                 # PRESENT-but-unreadable: fail-closed (a blind read on an existing
                 # file is a degraded signal — silently proceeding would grant
                 # unbounded embed spend, the opposite of the gate's posture).
@@ -1432,34 +1439,37 @@ def _corpus_query(
                     file=sys.stderr,
                 )
                 return 1
+        else:
             # ABSENT: legitimately no caps configured → proceed.
             model_data = {}
         if model_data.get("cost_guardrails_enabled"):
-            today_r = _costs.sum_cost_for_period(
-                log_dir,
-                "today",
-                source="actor",
-                backend=log_backend,
-                agent_name=agent_name,
-            )
-            month_r = _costs.sum_cost_for_period(
-                log_dir,
-                "this_month",
-                source="actor",
-                backend=log_backend,
-                agent_name=agent_name,
-            )
+            # Hoist the cap existence check so uncapped agents skip both log
+            # reads (mirrors dream._check_cap's early-exit on no effective cap).
             daily_cap = model_data.get("daily_cap_usd", 0.0)
             monthly_cap = model_data.get("monthly_cap_usd", 0.0)
             has_cap = daily_cap > 0 or monthly_cap > 0
-            if has_cap and (today_r.degraded or month_r.degraded):
-                print(
-                    "Error: cost data unreadable — embed query gate fail-closed. "
-                    "Use --critical to bypass.",
-                    file=sys.stderr,
-                )
-                return 1
             if has_cap:
+                today_r = _costs.sum_cost_for_period(
+                    log_dir,
+                    "today",
+                    source="actor",
+                    backend=log_backend,
+                    agent_name=agent_name,
+                )
+                month_r = _costs.sum_cost_for_period(
+                    log_dir,
+                    "this_month",
+                    source="actor",
+                    backend=log_backend,
+                    agent_name=agent_name,
+                )
+                if today_r.degraded or month_r.degraded:
+                    print(
+                        "Error: cost data unreadable — embed query gate fail-closed. "
+                        "Use --critical to bypass.",
+                        file=sys.stderr,
+                    )
+                    return 1
                 today_cost = today_r.total_usd
                 month_cost = month_r.total_usd
                 daily_rem = (daily_cap - today_cost) if daily_cap > 0 else float("inf")

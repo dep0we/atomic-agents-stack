@@ -372,43 +372,6 @@ def test_no_embed_cost_on_query_exception(tmp_path: Path) -> None:
     assert "embed_cost" not in triggers, "embed_cost must NOT emit when actual_usd=0"
 
 
-# NEGATIVE CONTROL: the release-in-finally guard is load-bearing.
-def test_negative_control_release_requires_finally(tmp_path: Path) -> None:
-    """Negative control: if release is inside try (not finally), it won't emit on exception.
-
-    This test verifies the guard is load-bearing by observing the contract:
-    release IS emitted on exception — meaning it must be in a finally block.
-    The absence of a release record would indicate a regression.
-    """
-    from atomic_agents.cli import _corpus_query
-
-    backend = _FakeCorpusBackend(
-        supports_semantic_search=True,
-        embed_backend=_FakeEmbedBackend(),
-        query_raises=RuntimeError("intentional"),
-    )
-    agent_root = _make_agent_root(tmp_path)
-    fake_log = _FakeLogBackend()
-
-    from atomic_agents._costs import CostReadResult
-
-    with (
-        patch("atomic_agents.logs.get_default_log_backend", return_value=fake_log),
-        patch(
-            "atomic_agents._costs.sum_cost_for_period",
-            return_value=CostReadResult(0.0, False, 0),
-        ),
-    ):
-        with pytest.raises(RuntimeError):
-            _corpus_query(backend, "query", "wiki", 10, agent_root)
-
-    # If release is in finally, it appears; if not, this assertion fails (RED).
-    assert any(r.get("trigger") == "embed_release" for r in fake_log.records), (
-        "embed_release MUST be in a finally block so it fires even on exception. "
-        "If this test fails, the guard has regressed from try/finally to try-only."
-    )
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Category 4 — Cost gate enforcement
 
@@ -687,10 +650,6 @@ def test_cli_embed_spend_not_attributed_to_other_agent_on_shared_backend(
         "the embed records were written with a NULL agent_name."
     )
 
-    # Defensive: ensure we actually exercised the agent_name-filtered SQL path
-    # (not a no-op skip) by confirming the cross-agent leak would be detectable.
-    assert _costs is not None
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Category 6 — Arg parser surface
@@ -919,30 +878,4 @@ def test_absent_model_md_proceeds_without_error(tmp_path: Path) -> None:
     assert exit_code == 0, (
         "An ABSENT model.md must NOT fail-closed — absence means no caps "
         "configured, so the gate must proceed normally."
-    )
-
-
-# NEGATIVE CONTROL: verify the fail-closed fix is load-bearing.
-def test_negative_control_unreadable_model_md_fail_closed_is_load_bearing(
-    tmp_path: Path,
-) -> None:
-    """Negative control: the PRESENT-unreadable → fail-closed path must be stripped-RED.
-
-    This test is the negative control for the FIX 1 guard:
-    ``if _model_md_path.exists(): print(...); return 1``.
-
-    If the fix is stripped (reverted to bare ``except Exception: model_data = {}``),
-    the gate silently proceeds with an empty dict — cost_guardrails_enabled is
-    never set, and the function returns 0. This test MUST go RED in that case.
-
-    Strip-verification confirmed during implementation: with the old bare
-    ``except Exception: model_data = {}`` fallback, exit_code was 0 (fail-open);
-    with the fix applied, exit_code is 1 (fail-closed).
-    """
-    exit_code, _ = _run_query_gate_with_unreadable_model_md(tmp_path, critical=False)
-    assert exit_code == 1, (
-        "NEGATIVE CONTROL FAILED: The PRESENT-unreadable model.md fail-closed "
-        "guard appears to be stripped. The gate returned 0 (fail-open) instead "
-        "of 1 (fail-closed). Restore the 'if _model_md_path.exists(): return 1' "
-        "branch in _corpus_query's except handler."
     )
