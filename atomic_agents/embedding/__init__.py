@@ -1,4 +1,4 @@
-"""EmbeddingBackend Protocol and OpenAI reference implementation (spec/46, DRAFT).
+"""EmbeddingBackend Protocol and OpenAI reference implementation (spec/46, LOCKED).
 
 This package is the nineteenth open Protocol in the protocol-pattern series.
 It abstracts the embedding provider so both ``PgvectorMemoryBackend`` (#200 PR3)

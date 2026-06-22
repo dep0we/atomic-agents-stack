@@ -434,14 +434,18 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
 
         Note: on a content-identical idempotent write (parent Case 2, no file
         rewrite) ``index_page`` still re-embeds the unchanged body, making a
-        redundant billable embed.  Accepted as index-self-heal insurance; the
-        agent.call() batch-ingestion gate (#544 PR1) covers the write path when
-        this is driven by a capture-commit.
+        redundant billable embed.  Accepted as index-self-heal insurance.
 
-        Cost gate: ungated at the backend layer (by design).  Same
-        deferred-to-orchestrator posture as ``PgvectorMemoryBackend`` — see
-        spec/46 §"Direct-caller gate boundary".  Not dogfooded against a live
-        pgvector instance.
+        Cost gate: ungated at the backend layer (by design), AND there is no
+        framework-controlled gate site for the corpus *write* path — unlike
+        ``agent.call()``'s capture-commit batch gate (#544 PR1), which gates
+        ``memory.write_note`` only, ``corpus.write_page``/``index_page`` is not
+        invoked from ``agent.call()`` at all.  The only gated embed site that
+        touches a corpus is the *read* path (``atomic-agents corpus query``,
+        #544 PR2).  Callers that write corpus pages bear their own embed-cost
+        reservation — same deferred-to-orchestrator posture as
+        ``PgvectorMemoryBackend`` direct writes; see spec/46 §"Direct-caller
+        gate boundary".  Not dogfooded against a live pgvector instance.
         """
         ref = super().write_page(
             name,

@@ -352,8 +352,8 @@ def main(argv: list[str] | None = None) -> int:
         "--critical",
         action="store_true",
         help=(
-            "bypass cost guardrails for this query — still emits reservation/release "
-            "audit records; skips headroom enforcement only"
+            "bypass the embed cost gate (headroom check AND fail-closed-on-degraded "
+            "refusal) for this query; still emits reservation/release/cost audit records"
         ),
     )
 
@@ -1361,7 +1361,9 @@ def _corpus_query(
     6. Emit ``embed_release`` in the finally block.
     7. Emit ``embed_cost`` record conditioned on ``actual_usd > 0``.
 
-    Spec/22 primitive taxonomy context: ``cli_corpus_query``.
+    Spec/22 primitive: ``"embed"`` (PRIMITIVE_EMBED) — the records emitted here
+    carry ``primitive="embed"``; ``cli_corpus_query`` is the informal name of
+    this gate SITE, not a spec/22 taxonomy value.
     Gate site: the only framework-controlled query-embed gate site (spec/46
     §'Gate-site normative MUSTs'). Direct callers of ``corpus.query()`` on a
     pgvector backend outside this CLI path are ungated by design — see spec/46.
@@ -1456,6 +1458,12 @@ def _corpus_query(
     def _emit(record: dict) -> None:
         record.setdefault("ts", datetime.now().astimezone().isoformat())
         record.setdefault("run_id", run_id)
+        # Stamp the originating agent (mirrors agent.py._log's
+        # record.setdefault("agent_name", self.name)). Without this the records
+        # persist with agent_name=None, and on a shared SQLite/Postgres log
+        # backend the cost-read filter `(agent_name = ? OR agent_name IS NULL)`
+        # folds them into EVERY agent's cap baseline — a cross-agent spend leak.
+        record.setdefault("agent_name", agent_name)
         rr = RunRecord.from_dict(record)
         try:
             log_backend.append(rr)

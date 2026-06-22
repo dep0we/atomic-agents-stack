@@ -300,8 +300,7 @@ class OpenAIEmbeddingBackend:
         The kwarg is accepted on ``embed()``/``embed_batch()`` per the Protocol
         surface added in PR 3, but is NOT forwarded to the API.
         ``supports_input_type=False`` is therefore capability-honest (MUST 3).
-        See class docstring and spec/46 §"supports_input_type flag vs. parameter
-        deferral".
+        See class docstring and spec/46 §"supports_input_type flag".
         """
         return EmbeddingCapabilities(
             max_batch_size=_OPENAI_MAX_BATCH_SIZE,

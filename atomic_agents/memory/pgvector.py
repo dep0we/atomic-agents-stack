@@ -955,9 +955,12 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
         Cost gate note
         --------------
         Ungated at the backend layer (by design).  Per the Q3 ruling the gate
-        belongs at the orchestration layer (backend stays cost-unaware).  The
-        CLI corpus-query gate (#544 PR2) covers the framework-controlled query-
-        embed path.  Standalone callers of search() are ungated by design — see
+        belongs at the orchestration layer (backend stays cost-unaware).  There
+        is NO framework gate site for ``memory.search()`` query-embed: unlike
+        ``corpus.query()`` (which the CLI ``atomic-agents corpus query`` gate
+        wraps, #544 PR2), ``search()`` is not invoked by ``agent.call()`` and is
+        not wrapped by any CLI gate.  Standalone callers of ``search()`` are
+        ungated by design; a future gated helper is tracked at #586.  See
         spec/46 §"Direct-caller gate boundary".
         """
         if self._embedding_backend is None:

@@ -29,7 +29,8 @@ check, and the spec/20 + spec/34 addenda. DRAFT→LOCKED ceremony shipped at
 > the DRAFT→LOCKED ceremony are deferred to PR2.
 >
 > **PR-slicing update (#544 PR2a, shipped 2026-06-20).** PR2a shipped two
-> accounting correctness fixes (spec/46 STAYS DRAFT): (1) dedicated `embed_cost`
+> accounting correctness fixes (spec/46 was still DRAFT at PR2a time; it LOCKED
+> at #544 PR2 — see the Status line above): (1) dedicated `embed_cost`
 > JSONL record (`trigger='embed_cost'`, `cost_usd=actual_usd`, `cost_source='actor'`,
 > `model`, `cost_estimated`, `parent_run_id`, `parent_agent`) emitted after
 > `embed_batch_release` in the same `finally` block conditioned on `actual_usd > 0`
@@ -61,8 +62,9 @@ check, and the spec/20 + spec/34 addenda. DRAFT→LOCKED ceremony shipped at
 > **PR-slicing update (#544 PR2, shipped 2026-06-22).** PR2 shipped: the CLI
 > corpus-query embed gate (`_corpus_query` in `cli.py` — `embed_reservation` +
 > `embed_release` + `embed_cost` in try/finally; `--critical` bypass flag; cost
-> headroom check mirroring `dream._check_cap`; `cli_corpus_query` primitive
-> taxonomy context in spec/22 addendum); the gate-site normative MUSTs section
+> headroom check mirroring `dream._check_cap`; the records carry the existing
+> `embed` primitive — `cli_corpus_query` is the informal name of the gate SITE,
+> not a new spec/22 taxonomy entry); the gate-site normative MUSTs section
 > (caller-side, separate from the 9-MUST backend contract); the fail-closed
 > posture promoted from non-normative guidance to a normative gate-site MUST;
 > `PgvectorMemoryBackend` + `PgvectorCorpusBackend` folded into the shared
@@ -339,9 +341,20 @@ double-count.
 
 **GATE-MUST 4 — Fail-closed predicate.** The gate MUST apply the fail-closed
 predicate `if cost_read_degraded AND effective_cap is not None: fail-closed`
-ONLY when a cap exists. An unconstrained call site (no daily_cap_usd,
-monthly_cap_usd, or MandateBackend cap) MUST NOT be blocked by a degraded cost
-read — a blind read changes nothing when there is no budget to protect.
+ONLY when a cap exists. An unconstrained call site (no cap resolvable AT THAT
+SITE) MUST NOT be blocked by a degraded cost read — a blind read changes
+nothing when there is no budget to protect.
+
+The set of cap sources a site considers is scoped to what the site can resolve.
+The `agent.call()` capture-commit site holds an active session, so it resolves
+the EFFECTIVE cap (`daily_cap_usd` / `monthly_cap_usd` from `model.md` composed
+with any Policy- or Mandate-derived cap via `_has_effective_embed_cap()`). The
+`atomic-agents corpus query` CLI site is a one-shot command with no active
+mandate session, so it resolves the per-agent `model.md` caps only
+(`cost_guardrails_enabled` + `daily_cap_usd` + `monthly_cap_usd`); session-scoped
+MandateBackend/Policy caps are not in scope at the CLI site. Extending the CLI
+site to consult a fleet-wide MandateBackend cap is a possible future refinement,
+not a LOCK requirement.
 
 **Shipped gate sites (normative examples):**
 
@@ -364,7 +377,7 @@ This is intentional for the current framework: there is no `memory.search()` or
 CLI site. Operators who call `memory.search()` or `corpus.query()` directly
 (outside of `_corpus_query`) are ungated by design. A future gated helper
 (analogous to how `agent.call()` gates LLM cost for every LLM call) is tracked
-as a follow-up issue.
+as follow-up issue [#586](https://github.com/dep0we/atomic-agents-stack/issues/586).
 
 ---
 
@@ -439,7 +452,8 @@ for backwards compatibility.
 
 ## Implementer Contract — 9 normative MUSTs
 
-<!-- MUST count: 9. Verify at LOCK ceremony. -->
+<!-- MUST count: 9 — verified at the #544 PR2 LOCK ceremony (backend Implementer
+Contract only; the 4 GATE-MUSTs above govern callers and are counted separately). -->
 
 ### MUST 1 — Input validation
 
@@ -636,10 +650,10 @@ The LOCKED spec/34 "Out of scope" table records, for `EmbeddingBackend`:
 > "No standalone use case identified."
 
 That was accurate at spec/34 lock time. Issue #200 subsequently identified the
-standalone use case: constructing `PgvectorCorpusBackend` (and future
+standalone use case: constructing `PgvectorCorpusBackend` (and
 `PgvectorMemoryBackend`) requires an injected embedding backend that both
 consumers share — a Protocol-typed abstraction, not a capability flag.
-`EmbeddingBackend` ships as `atomic_agents/embedding/` (spec/46, DRAFT).
+`EmbeddingBackend` ships as `atomic_agents/embedding/` (spec/46, LOCKED).
 
 **spec/34 was NOT edited by PR 2.** This supersession was recorded here only.
 The LOCKED spec/34 and spec/20 took their normative addenda at #544 PR1 (shipped

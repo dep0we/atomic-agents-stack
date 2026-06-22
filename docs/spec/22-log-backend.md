@@ -1026,6 +1026,8 @@ cost_usd: ABSENT         (embed spend is audit-only this PR; NOT folded into the
 
 The `embed_reservation` and `embed_release` triggers are emitted by the CLI corpus-query embed gate shipped in #544 PR2 (`_corpus_query` in `cli.py`). There is still no query-embed call site inside `agent.call()` (neither `memory.search()` nor `corpus.query()` is invoked by the orchestrator — confirmed by grep over `agent.py`); the gated path is the CLI corpus-query command (#564).
 
+Like the batch path, the CLI query gate's `actual_usd`/`embed_cost` is the single-embed ESTIMATE charged on ANY non-exception `query()` success — including the cases where `query()` silently falls back to FTS with zero billable provider calls (`PgvectorCorpusBackend.query()` returns FTS results when its `pg` connection is unavailable or its `embed()` returns `None`). `query()` returns the result rows and does not surface whether it embedded, so the gate has no embed-None signal and bills the full per-call estimate. This over-charges, never under-charges, matching the batch-gate posture, and is deferred to the same embed-outcome-signal follow-up (#589).
+
 Added OUTSIDE the 8-MUST count, following the versioned-addendum precedent of spec/45 PR2 (#520) and spec/22 §Read-failure contract (#497).
 
 ### Versioned normative addendum — `embed_cost` cross-call accounting record (spec/46, issue #544 PR2a)
