@@ -419,6 +419,13 @@ def sum_cost_for_period(
         only records with cost.mandate_id == mandate_id contribute. When None,
         mandate_id is not consulted.
 
+    agent_name: optional filter on the originating agent. When set, only records
+        with a matching agent_name contribute.
+        NOTE: agent_name filters the shared-backend (SQLite/Postgres) path; on
+        the filesystem path isolation is provided by the per-agent log_dir, so
+        agent_name is not applied there. Passing agent_name without a non-
+        filesystem backend is a no-op (the log_dir already scopes to one agent).
+
     backend: optional ``LogBackend`` (#61 PR 2). When set, the period sum
         is computed via ``backend.query(LogQuery(...))`` — honoring the
         operator's pinned backend (filesystem default; ``SQLiteLogBackend``

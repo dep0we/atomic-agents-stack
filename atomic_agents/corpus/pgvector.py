@@ -394,7 +394,13 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
                 self._embedding_backend.provider_id if has_semantic else None
             ),
             supports_canonical_export=True,
-            embedding_backend_resolved=self._embedding_backend,
+            # spec/34 addendum: embedding_backend_resolved MUST be None when
+            # supports_semantic_search is False (mirrors the embedding_provider
+            # gate above — an FTS-fallback config has a backend injected but
+            # no semantic search, so both sibling fields must report None).
+            embedding_backend_resolved=(
+                self._embedding_backend if has_semantic else None
+            ),
         )
 
     # ── write_page() override ───────────────────────────────────────────────

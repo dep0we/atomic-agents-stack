@@ -235,6 +235,9 @@ def test_capabilities_embedding_provider_honesty(corpus_backend) -> None:
     caps = corpus_backend.capabilities
     if not caps.supports_semantic_search:
         assert caps.embedding_provider is None
+        # spec/34 addendum: embedding_backend_resolved is the sibling field
+        # — it MUST also be None when supports_semantic_search is False.
+        assert caps.embedding_backend_resolved is None
     # For PgvectorCorpusBackend specifically, the fixture is pinned to
     # FTS-fallback mode (pgvector_url=None, ATOMIC_AGENTS_PGVECTOR_URL cleared).
     # Assert the asserting branch actually fired — if supports_semantic_search

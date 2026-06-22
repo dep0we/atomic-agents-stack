@@ -58,7 +58,7 @@ CHANGELOG entry.
 
 ### Fixed
 
-- **CLI corpus-query embed records now carry the originating `agent_name`** (#544 PR2 review). `_corpus_query._emit` stamps `agent_name = agent_root.name` on every `embed_reservation`/`embed_release`/`embed_cost` record, mirroring `agent.py._log`'s `record.setdefault("agent_name", self.name)`. Previously these records persisted with `agent_name=None`; on a shared SQLite/Postgres log backend the cost-read filter `(agent_name = ? OR agent_name IS NULL)` then folded one agent's CLI query spend into every other agent's cap baseline (a cross-agent cost-attribution leak in the org shape). The default filesystem backend was unaffected. Covered by a shared-backend (SQLite) regression test with a strip negative control.
+- **CLI corpus-query embed records now carry the originating `agent_name`** (#544 PR2 review). `_corpus_query._emit` stamps `agent_name = agent_root.name` on every `embed_reservation`/`embed_release`/`embed_cost` record, fixing a cross-agent cost-attribution leak on shared SQLite/Postgres log backends where the cost-read filter `(agent_name = ? OR agent_name IS NULL)` previously folded any agent's CLI embed spend into every other agent's cap baseline. The filesystem default was unaffected (per-agent `log_dir` already provides isolation). Covered by a shared-backend (SQLite) regression test with a strip negative control.
 
 ### Changed
 

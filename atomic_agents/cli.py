@@ -1382,7 +1382,7 @@ def _corpus_query(
     carrying a second divergent posture here.
     """
     import math
-    from datetime import datetime
+    from datetime import datetime, timezone
     from uuid import uuid4
 
     from . import _costs, _model
@@ -1414,9 +1414,7 @@ def _corpus_query(
     per_call_cost, cost_estimated = _costs.calc_embedding_cost(model_id, tokens_est)
 
     # ── Mint a standalone run_id (top-level CLI call, no parent) ───────────────
-    run_id = (
-        f"cli-embed-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}-{uuid4().hex[:8]}"
-    )
+    run_id = f"cli-embed-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S-%f')}-{uuid4().hex[:8]}"
     agent_name = agent_root.name
 
     # ── Cost gate (mirrors dream._check_cap) ───────────────────────────────────
@@ -1498,8 +1496,13 @@ def _corpus_query(
         rr = RunRecord.from_dict(record)
         try:
             log_backend.append(rr)
-        except Exception:
-            pass  # audit trail is best-effort in the CLI path; never crash on log failure
+        except Exception as _emit_exc:
+            # Audit trail is best-effort in the CLI path; never crash on log failure.
+            # Print a non-fatal warning so a dropped embed billing record isn't silent.
+            print(
+                f"warning: failed to write embed audit record ({record.get('trigger')}): {_emit_exc}",
+                file=sys.stderr,
+            )
 
     _emit(
         {

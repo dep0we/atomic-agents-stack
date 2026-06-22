@@ -650,6 +650,24 @@ def test_cli_embed_spend_not_attributed_to_other_agent_on_shared_backend(
         "the embed records were written with a NULL agent_name."
     )
 
+    # spec/22 double-count invariant: ONLY embed_cost carries a non-zero cost_usd.
+    # embed_reservation and embed_release are gate-bookkeeping records (reserved_usd
+    # vs cost_usd) — they must NOT carry a cost_usd value that sum_cost_for_period
+    # would fold in alongside the embed_cost record, which would double-count spend.
+    from atomic_agents.logs.types import LogQuery
+
+    all_records = [r.to_dict() for r in shared_backend.query(LogQuery())]
+    assert all(
+        (r.get("cost_usd") or 0.0) == 0.0
+        for r in all_records
+        if r.get("trigger") in ("embed_reservation", "embed_release")
+    ), (
+        "embed_reservation and embed_release records must NOT carry a non-zero "
+        "cost_usd — only embed_cost is the billing record (spec/22 double-count "
+        "invariant). A non-zero cost_usd on reservation/release would cause "
+        "sum_cost_for_period to double-count the spend alongside embed_cost."
+    )
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Category 6 — Arg parser surface
