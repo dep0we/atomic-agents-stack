@@ -200,6 +200,20 @@ def test_capabilities_flags_are_bools(corpus_backend) -> None:
     assert isinstance(caps.supports_streaming_iteration, bool)
 
 
+def test_capabilities_embedding_provider_honesty(corpus_backend) -> None:
+    """spec/34 LOCKED invariant: embedding_provider is None when no semantic search.
+
+    CorpusCapabilities (corpus/types.py) documents: ``embedding_provider`` MUST
+    be None when ``supports_semantic_search=False``. Enforced for EVERY backend
+    param — the pgvector-corpus fixture runs in FTS-fallback mode (an embedding
+    backend is injected but pgvector_url=None), which is exactly the config that
+    used to leak a provider label past a False semantic flag.
+    """
+    caps = corpus_backend.capabilities
+    if not caps.supports_semantic_search:
+        assert caps.embedding_provider is None
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Category 2 — list_pages (4 tests)
 

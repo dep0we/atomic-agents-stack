@@ -1132,7 +1132,14 @@ def test_pg_conformance_07_stats_total_notes(
             backend.close()
 
 
-@_parametrize_backends("filesystem", "postgres", "pgvector-memory")
+# NOTE: pgvector-memory is intentionally EXCLUDED from this param. Its premise
+# is "non-embedding backends"; the pgvector-memory conformance factory injects a
+# StubEmbeddingBackend, and PgvectorMemoryBackend gates supports_semantic_search
+# on `embedding_backend is not None` alone (memory/pgvector.py), so it correctly
+# reports True. The embedding-present semantic path is covered by
+# test_pgvector_memory_backend.py. See test_pg_conformance_08b below for the
+# positive assertion on pgvector-memory.
+@_parametrize_backends("filesystem", "postgres")
 def test_pg_conformance_08_supports_semantic_false(
     tmp_path, backend_factory_id, backend_factory
 ):
@@ -1140,6 +1147,25 @@ def test_pg_conformance_08_supports_semantic_false(
     backend, _ = backend_factory(tmp_path)
     try:
         assert backend.supports_semantic_search is False
+    finally:
+        if hasattr(backend, "close"):
+            backend.close()
+
+
+@_parametrize_backends("pgvector-memory")
+def test_pg_conformance_08b_pgvector_memory_supports_semantic_true(
+    tmp_path, backend_factory_id, backend_factory
+):
+    """[BACKEND_FACTORIES] PgvectorMemoryBackend reports supports_semantic_search True.
+
+    The pgvector-memory conformance factory injects a StubEmbeddingBackend, and
+    PgvectorMemoryBackend gates supports_semantic_search on
+    ``embedding_backend is not None``. With an embedding backend present it MUST
+    report True — the positive counterpart to test 08's no-embedding case.
+    """
+    backend, _ = backend_factory(tmp_path)
+    try:
+        assert backend.supports_semantic_search is True
     finally:
         if hasattr(backend, "close"):
             backend.close()

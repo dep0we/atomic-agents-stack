@@ -1369,6 +1369,15 @@ def _corpus_query(
     pgvector backend outside this CLI path are ungated by design — see spec/46.
 
     ``--critical`` skips headroom enforcement but still emits all audit records.
+
+    Crash-window parity: ``actual_usd`` is charged only on a non-exception
+    ``query()`` return. If the backend's internal ``embed()`` commits real spend
+    and the downstream vector search then raises, this site records ``$0`` for a
+    call that did bill the provider — the CLI analog of the agent.call()
+    crash-window already tracked at #568. Sub-cent (single embed, never a batch);
+    the ``status="error"`` ``embed_release`` record keeps the failed call visible
+    in the audit trail. This site is in scope for the #568 follow-up rather than
+    carrying a second divergent posture here.
     """
     import math
     from datetime import datetime
@@ -1499,6 +1508,9 @@ def _corpus_query(
     exc_to_reraise = None
     try:
         refs = backend.query(text, corpus, top_k=top_k)
+        # Charged on any non-exception query() success even when query() silently
+        # fell back to FTS (pg down / embed()->None) with zero billable embed —
+        # over-charges, never under-charges; embed-outcome signal deferred to #589.
         actual_usd = per_call_cost  # per-call estimate (no provider token usage signal)
     except Exception as _exc:
         exc_to_reraise = _exc

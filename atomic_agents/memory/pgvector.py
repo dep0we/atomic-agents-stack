@@ -46,9 +46,10 @@ Decision rulings applied
 * Q1  own-backend: distinct backend_id ``'pgvector-memory'``.
 * Q2  embedding-backend injection: constructor kwarg ``embedding_backend=None``
       + ``get_default_embedding_backend()`` factory.
-* Q3  cost-gate: NOT YET WIRED.  The embed() calls in write_note()/search()
-      are currently UNGATED billable LLM calls (no reservation, no release, no
-      JSONL audit record) when called directly (not via an orchestration layer).
+* Q3  cost-gate: WIRED AT THE ORCHESTRATION LAYER (direct callers ungated by
+      design).  The embed() calls in write_note()/search() are UNGATED billable
+      LLM calls (no reservation, no release, no JSONL audit record) only when
+      called directly (not via an orchestration layer).
       The Q3 ruling is that the gate belongs at the orchestration layer (NOT
       inside EmbeddingBackend — MUST 4 MUST-NOT-RAISE makes a backend-internal
       refusing gate incoherent), so the backend stays cost-unaware.  The two
@@ -683,8 +684,11 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
     def supports_semantic_search(self) -> bool:
         """True when an embedding backend is configured; False for FTS fallback.
 
-        Backward-compatible property alias for ``capabilities().embedding_provider
-        is not None``.
+        Returns ``embedding_backend is not None`` — equal to
+        ``capabilities().embedding_provider is not None`` for this backend, which
+        (unlike the corpus pgvector backend) has no FTS-fallback url-gating, so
+        the two conditions coincide. If memory ever adopts that url-gating, this
+        alias must be re-derived from ``capabilities()`` directly.
         """
         return self._embedding_backend is not None
 
@@ -825,8 +829,8 @@ class PgvectorMemoryBackend(PostgresMemoryBackend):
                 f"previously-pinned model).  To fix: drop the side table "
                 f"(`DROP TABLE memory_note_embeddings;`) so it is re-created at "
                 f"{expected} dims on next start, or pin the embedding model whose "
-                f"dimension matches the existing column.  (Automatic re-index on "
-                f"a bulk re-index tool is a follow-up item from #544 PR2.)"
+                f"dimension matches the existing column.  (Automatic re-index "
+                f"after a model swap is tracked at #588.)"
             )
         self._embedding_dim_validated = True
 

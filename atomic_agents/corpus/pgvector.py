@@ -385,10 +385,13 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
             supports_full_text_search=False,
             supports_versioning=True,
             supports_streaming_iteration=False,
+            # spec/34 LOCKED CorpusCapabilities invariant: embedding_provider
+            # MUST be None when supports_semantic_search is False. Gate on the
+            # SAME condition (has_semantic), not on embedding-backend presence
+            # alone — an FTS-fallback config (pgvector_url=None) has a backend
+            # injected but no semantic search, so it must report None.
             embedding_provider=(
-                self._embedding_backend.provider_id
-                if self._embedding_backend is not None
-                else None
+                self._embedding_backend.provider_id if has_semantic else None
             ),
             supports_canonical_export=True,
             embedding_backend_resolved=self._embedding_backend,
@@ -514,8 +517,8 @@ class PgvectorCorpusBackend(FilesystemCorpusBackend):
                 f"(silent wasted spend).  To fix: drop the side table "
                 f"(`DROP TABLE corpus_page_embeddings;`) so it is re-created at "
                 f"{expected} dims on next start, or pin the embedding model whose "
-                f"dimension matches the existing column.  (Automatic re-index on "
-                f"a bulk re-index tool is a follow-up item from #544 PR2.)"
+                f"dimension matches the existing column.  (Automatic re-index "
+                f"after a model swap is tracked at #588.)"
             )
         self._embedding_dim_validated = True
 

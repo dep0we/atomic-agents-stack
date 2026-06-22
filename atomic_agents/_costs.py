@@ -211,7 +211,7 @@ def calc_embedding_cost(model_id: str, input_tokens: int) -> tuple[float, bool]:
     query-embedding site (embed_reservation / embed_release JSONL audit records)
     ships at PR3 — gating only embed_batch() would leave query-time embed()
     calls as an ungated billable path (Principle #4). See spec/46 §"Cost gate
-    mandate (DRAFT scope)".
+    mandate (normative)".
 
     Negative ``input_tokens`` are clamped to 0: this helper is the PR3 gate's
     worst-case RESERVATION primitive, and a negative reservation would REDUCE
