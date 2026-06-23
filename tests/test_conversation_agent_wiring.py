@@ -1206,3 +1206,280 @@ def test_security_abort_record_absent_without_conversation_id(tmp_path):
         f"conversation_id MUST be absent when not supplied; sink={sink!r}"
     )
     mock_pool_instance.discover_tools.assert_not_called()
+
+
+# ──────────────────────────────────────────────────────────────────
+# spec/47 LOCK — model-aware token budget derivation (P0 fix)
+
+
+def test_model_aware_budget_uses_llm_capabilities(tmp_path):
+    """The conversation budget is derived from LLMCapabilities.max_input_tokens,
+    not the static 8000. A model with max_input_tokens=100_000 and a short system
+    prompt produces a budget well above 8000.
+
+    Strip-RED control: if model-aware derivation is absent (fallback 8000), the
+    asserted budget range fails because 8000 < 50_000.
+    """
+    from unittest.mock import patch, MagicMock
+    from atomic_agents.conversation import (
+        FilesystemConversationBackend,
+        LOCAL_PRINCIPAL,
+    )
+
+    backend = FilesystemConversationBackend(tmp_path / "convbot-budget")
+    agent = _make_agent(tmp_path, conversation_backend=backend, name="convbot-budget")
+
+    # Track the budget_tokens kwarg passed to load_turns
+    captured_budgets: list[int] = []
+    original_load_turns = FilesystemConversationBackend.load_turns
+
+    def spy_load_turns(self, principal, conversation_id, budget_tokens=8000):
+        captured_budgets.append(budget_tokens)
+        return original_load_turns(
+            self, principal, conversation_id, budget_tokens=budget_tokens
+        )
+
+    # Build a mock LLMCapabilities with a large context window
+    mock_caps = MagicMock()
+    mock_caps.max_input_tokens = 100_000
+    mock_caps.max_output_tokens = 4096
+
+    mock_backend_obj = MagicMock()
+    mock_backend_obj.capabilities.return_value = mock_caps
+
+    with (
+        patch.object(FilesystemConversationBackend, "load_turns", spy_load_turns),
+        # Patch at the source module since agent.py does a local import:
+        # `from .llm import find_backend_for_model as _fbfm_conv`
+        patch(
+            "atomic_agents.llm.find_backend_for_model", return_value=mock_backend_obj
+        ),
+        patch("atomic_agents._llm.call_llm", return_value=_fake_llm_response()),
+        patch.object(agent, "_log"),
+        patch.object(agent, "load"),
+        patch.object(
+            agent, "assemble_system_prompt", return_value="You are ConvBot." * 10
+        ),
+        patch.object(
+            agent,
+            "_check_cost_guardrails",
+            return_value=MagicMock(
+                allow=True, action="ok", reason="cap", cost_data_degraded=False
+            ),
+        ),
+    ):
+        agent.call(work_item="hello", conversation_id="budget-test")
+
+    assert len(captured_budgets) == 1, "load_turns should be called once"
+    budget = captured_budgets[0]
+    # With 100K context, even after subtracting system_prompt + max_output + safety_margin,
+    # the budget must be much larger than the static 8000 fallback.
+    assert budget > 8000, (
+        f"STRIP-RED: budget={budget} must exceed 8000; model-aware derivation produced "
+        "the static fallback — check that find_backend_for_model is being called in agent.py"
+    )
+    assert budget < 100_000, f"budget={budget} must be below max_input_tokens=100000"
+
+
+def test_model_aware_budget_falls_back_on_capability_error(tmp_path):
+    """When find_backend_for_model raises (e.g. UnknownModelError for a custom model id),
+    agent.call() must NOT crash — it falls back to 8000.
+
+    Strip-RED control: stripping the try/except in the derivation block would let the
+    exception propagate and crash call(), which this test would catch as an unexpected raise.
+    """
+    from unittest.mock import patch, MagicMock
+    from atomic_agents.exceptions import UnknownModelError
+    from atomic_agents.conversation import FilesystemConversationBackend
+
+    backend = FilesystemConversationBackend(tmp_path / "convbot-fallback")
+    agent = _make_agent(tmp_path, conversation_backend=backend, name="convbot-fallback")
+
+    captured_budgets: list[int] = []
+    original_load_turns = FilesystemConversationBackend.load_turns
+
+    def spy_load_turns(self, principal, conversation_id, budget_tokens=8000):
+        captured_budgets.append(budget_tokens)
+        return original_load_turns(
+            self, principal, conversation_id, budget_tokens=budget_tokens
+        )
+
+    with (
+        patch.object(FilesystemConversationBackend, "load_turns", spy_load_turns),
+        # Patch at the source module — agent.py does a local `from .llm import` import
+        patch(
+            "atomic_agents.llm.find_backend_for_model",
+            side_effect=UnknownModelError("unknown-model"),
+        ),
+        patch("atomic_agents._llm.call_llm", return_value=_fake_llm_response()),
+        patch.object(agent, "_log"),
+        patch.object(agent, "load"),
+        patch.object(agent, "assemble_system_prompt", return_value="short prompt"),
+        patch.object(
+            agent,
+            "_check_cost_guardrails",
+            return_value=MagicMock(
+                allow=True, action="ok", reason="cap", cost_data_degraded=False
+            ),
+        ),
+    ):
+        # Must not raise — fallback to 8000 on UnknownModelError
+        resp = agent.call(work_item="hello", conversation_id="fallback-test")
+
+    assert len(captured_budgets) == 1
+    assert captured_budgets[0] == 8000, (
+        f"STRIP-RED: expected fallback budget 8000, got {captured_budgets[0]}. "
+        "The try/except around find_backend_for_model in agent.py must catch the error."
+    )
+
+
+def test_model_aware_budget_max_tokens_none_does_not_crash(tmp_path):
+    """When max_tokens kwarg is None (the common case), the budget derivation
+    must use self.config.max_output_tokens as fallback — not crash with TypeError."""
+    from unittest.mock import patch, MagicMock
+    from atomic_agents.conversation import FilesystemConversationBackend
+
+    backend = FilesystemConversationBackend(tmp_path / "convbot-maxnone")
+    agent = _make_agent(tmp_path, conversation_backend=backend, name="convbot-maxnone")
+
+    mock_caps = MagicMock()
+    mock_caps.max_input_tokens = 50_000
+    mock_caps.max_output_tokens = 2048
+    mock_backend_obj = MagicMock()
+    mock_backend_obj.capabilities.return_value = mock_caps
+
+    with (
+        # Patch at the source module — agent.py does a local `from .llm import` import
+        patch(
+            "atomic_agents.llm.find_backend_for_model", return_value=mock_backend_obj
+        ),
+        patch("atomic_agents._llm.call_llm", return_value=_fake_llm_response()),
+        patch.object(agent, "_log"),
+        patch.object(agent, "load"),
+        patch.object(agent, "assemble_system_prompt", return_value="short prompt"),
+        patch.object(
+            agent,
+            "_check_cost_guardrails",
+            return_value=MagicMock(
+                allow=True, action="ok", reason="cap", cost_data_degraded=False
+            ),
+        ),
+    ):
+        # max_tokens=None is the default — must not raise TypeError
+        resp = agent.call(work_item="hello", conversation_id="maxnone-test")
+
+    assert resp is not None
+
+
+# ──────────────────────────────────────────────────────────────────
+# spec/47 LOCK — #553 write-back reorder fix
+
+
+def test_deferred_response_does_not_write_turns(tmp_path):
+    """A deferred/escalated response (response.deferred=True) must NOT write turns.
+
+    spec/47 LOCK (#553 fix): the write-back is now gated on `not _response_deferred`.
+    Without the gate, deferred runs accumulate orphaned turn pairs that corrupt the
+    conversation window on retry.
+
+    We inject deferred=True by patching accumulated_escalation_queue_ids into the
+    Response constructor call — the real code derives deferred from that list.
+    We do this by patching the agent.py-local `Response` class so that any call
+    to Response(...) produces a Response with deferred=True.
+
+    This is the SHIPPED-CODE assertion.
+    """
+    from unittest.mock import patch, MagicMock
+    from atomic_agents.conversation import FilesystemConversationBackend
+    from atomic_agents.types import Response
+
+    backend = FilesystemConversationBackend(tmp_path / "convbot-deferred")
+    agent = _make_agent(tmp_path, conversation_backend=backend, name="convbot-deferred")
+
+    write_turn_calls: list = []
+    original_write_turn = FilesystemConversationBackend.write_turn
+
+    def spy_write_turn(self, principal, conversation_id, turn):
+        write_turn_calls.append(turn)
+        return original_write_turn(self, principal, conversation_id, turn)
+
+    # Patch Response inside agent.py to always return deferred=True.
+    # This is the correct interception point: agent.py builds `response = Response(...)`
+    # and deferred is derived from accumulated_escalation_queue_ids internally.
+    _real_Response = Response
+
+    def _deferred_Response(*args, **kwargs):
+        kwargs["deferred"] = True
+        kwargs["escalation_queue_ids"] = ["fake-queue-id"]
+        return _real_Response(*args, **kwargs)
+
+    with (
+        patch.object(FilesystemConversationBackend, "write_turn", spy_write_turn),
+        patch("atomic_agents._llm.call_llm", return_value=_fake_llm_response()),
+        patch("atomic_agents.agent.Response", side_effect=_deferred_Response),
+        patch.object(agent, "_log"),
+        patch.object(agent, "load"),
+        patch.object(agent, "assemble_system_prompt", return_value="You are ConvBot."),
+        patch.object(
+            agent,
+            "_check_cost_guardrails",
+            return_value=MagicMock(
+                allow=True, action="ok", reason="cap", cost_data_degraded=False
+            ),
+        ),
+    ):
+        resp = agent.call(work_item="escalate me", conversation_id="defer-conv")
+
+    assert resp.deferred is True, "test precondition: response must be deferred"
+    assert len(write_turn_calls) == 0, (
+        f"FAIL: {len(write_turn_calls)} write_turn() call(s) on a deferred run — "
+        f"the `not _response_deferred` gate is missing or not working. "
+        f"Turns written: {write_turn_calls!r}"
+    )
+
+
+def test_deferred_write_back_gate_strip_red(tmp_path):
+    """Strip-RED negative control for the #553 write-back reorder fix.
+
+    Proves `and not _response_deferred` IS load-bearing: when deferred=False,
+    write_turn() IS called (user + assistant = 2 calls). This confirms the gate
+    only blocks on deferred=True, and that removing it would cause
+    test_deferred_response_does_not_write_turns to go RED (0 → 2 calls).
+    """
+    from unittest.mock import patch, MagicMock
+    from atomic_agents.conversation import FilesystemConversationBackend
+
+    backend = FilesystemConversationBackend(tmp_path / "convbot-strip")
+    agent = _make_agent(tmp_path, conversation_backend=backend, name="convbot-strip")
+
+    # A non-deferred response — write_turn SHOULD be called (2 turns: user + assistant)
+    write_turn_calls: list = []
+    original_write_turn = FilesystemConversationBackend.write_turn
+
+    def spy_write_turn(self, principal, conversation_id, turn):
+        write_turn_calls.append(turn)
+        return original_write_turn(self, principal, conversation_id, turn)
+
+    with (
+        patch.object(FilesystemConversationBackend, "write_turn", spy_write_turn),
+        patch("atomic_agents._llm.call_llm", return_value=_fake_llm_response()),
+        patch.object(agent, "_log"),
+        patch.object(agent, "load"),
+        patch.object(agent, "assemble_system_prompt", return_value="You are ConvBot."),
+        patch.object(
+            agent,
+            "_check_cost_guardrails",
+            return_value=MagicMock(
+                allow=True, action="ok", reason="cap", cost_data_degraded=False
+            ),
+        ),
+    ):
+        resp = agent.call(work_item="normal call", conversation_id="strip-conv")
+
+    # When deferred=False, write_turn MUST be called (user + assistant = 2 calls)
+    assert len(write_turn_calls) == 2, (
+        f"STRIP-RED: expected 2 write_turn() calls on a non-deferred run; "
+        f"got {len(write_turn_calls)}. "
+        "This proves the `not _response_deferred` gate is correct — "
+        "it only blocks on deferred=True."
+    )
