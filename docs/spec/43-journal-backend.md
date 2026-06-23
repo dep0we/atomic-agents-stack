@@ -1,6 +1,6 @@
 # spec/43: JournalBackend Protocol
 
-> **Status:** DRAFT at PR 1 (issue #427). Conformance suite covers all 10 Implementer Contract MUSTs for `FilesystemJournalBackend` (`test_journal_backend_conformance.py`) plus filesystem-specific tests (`test_journal_filesystem.py`). JournalBackend is also registered in the shared #379 export conformance harness (`test_export_protocol_conformance.py`) and the capability-advertisement harness (`test_export_capability_advertisement.py`). The three pre-existing journal consumers (bundle.py `_render_journal_breakpoint`/`_source_paths`, agent.py `_load_recent_journal`, dream.py `_run_pipeline`) are rewired through `JournalBackend` in this PR (ADOPT-NOW ruling). Byte-identity golden tests freeze the divergent render formats (bundle WITH backtick path line, agent WITHOUT — LOAD-BEARING divergence). Migration behavior (journal/ ownership transferred from MemoryBackend) is tested via spec/02 addendum.
+> **Status:** LOCKED (issue #427, LOCK PR). 80 tests collected across `test_journal_backend_conformance.py` (60) and `test_journal_filesystem.py` (20). All 10 Implementer Contract MUSTs are individually test-covered. Registered in the shared #379 export conformance harness (`test_export_protocol_conformance.py`) and the capability-advertisement harness (`test_export_capability_advertisement.py`). All three pre-existing journal consumers (bundle.py `_render_journal_breakpoint`/`_source_paths`, agent.py `_load_recent_journal`, dream.py `_run_pipeline`) were rewired through `JournalBackend` at PR 1 (ADOPT-NOW ruling). Byte-identity golden tests freeze the divergent render formats (bundle WITH backtick path line, agent WITHOUT — LOAD-BEARING divergence). The journal/ ownership reassignment (carved out of MemoryBackend's prior claim) is captured in the spec/02 ownership-reconciliation prose and exercised end-to-end by the call-site-adoption tests that drive the real bundle/agent/dream read paths through the backend.
 
 ---
 
@@ -14,19 +14,17 @@ Filed as [#427](https://github.com/dep0we/atomic-agents-stack/issues/427) as the
 
 **Cross-links:**
 
-- spec/02. Atomic Memory. journal/ ownership carved out from MemoryBackend's prior claim — updated in PR 1.
-- spec/24. AgentProfileBackend. journal/ ownership claim corrected (was MemoryBackend) — updated in PR 1.
+- spec/02. Atomic Memory. journal/ ownership carved out from MemoryBackend's prior claim.
+- spec/24. AgentProfileBackend. journal/ ownership claim corrected (was MemoryBackend).
 - spec/27. Doctor. `check_journal_backend()` uses the dual-probe pattern (list_entries + read_bytes).
 - spec/40. Canonical Export. `JournalExport` is a first-class `ExportableResult`; `FilesystemJournalBackend` implements `Exportable`.
 - spec/43 completes the v2.0.0 backend arc (alongside GoalBackend spec/41 and OutcomeBackend spec/42).
 
 ---
 
-## Shipping plan (1 PR)
+## ADOPT-NOW ruling
 
-**PR 1 (this PR, ADOPT-NOW).** Protocol scaffold + dataclasses + capability advertisement + `FilesystemJournalBackend` reference impl + factory/env/doctor + full ADOPT-NOW read-site wiring (bundle.py, agent.py, dream.py) + byte-identity golden tests + full conformance suite + filesystem-specific tests + spec/43 DRAFT.
-
-The three read sites are wired in the same PR as the Protocol definition (unlike GoalBackend/OutcomeBackend which were SCAFFOLDING-ONLY). The ADOPT-NOW ruling is motivated by the journal's distributed site structure: the three rglob sites are hand-synced duplicates with no single flat module to carve. Leaving them unwired after PR 1 would re-create the maintenance burden spec/43 exists to eliminate.
+The three read sites (bundle.py, agent.py, dream.py) were wired through `JournalBackend` in the same PR as the Protocol definition (unlike GoalBackend/OutcomeBackend which were SCAFFOLDING-ONLY). The ADOPT-NOW ruling is motivated by the journal's distributed site structure: the three rglob sites are hand-synced duplicates with no single flat module to carve. Leaving them unwired after PR 1 would re-create the maintenance burden spec/43 exists to eliminate.
 
 ---
 
@@ -347,7 +345,7 @@ Prior to spec/43, spec/02 stated:
 
 > "MemoryBackend (spec/20) retains exclusive ownership of memory/ and journal/"
 
-This claim was **incorrect** as of the legacy codebase (journal/ was populated by bundle/agent/dream independently of MemoryBackend) and is corrected in PR 1:
+This claim was **incorrect** as of the legacy codebase (journal/ was populated by bundle/agent/dream independently of MemoryBackend) and was corrected at PR 1 of issue #427:
 
 > "MemoryBackend retains exclusive ownership of memory/ only. As of spec/43, journal/ is carved out to JournalBackend (spec/43)."
 
