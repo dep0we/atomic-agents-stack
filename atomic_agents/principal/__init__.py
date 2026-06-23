@@ -19,8 +19,6 @@ Public surface:
         list_principal_backends, unregister_principal_backend,
         # Operator-config factory
         get_default_principal_backend,
-        # Storage-key derivation helper
-        derive_storage_key,
     )
 
 Env var: ATOMIC_AGENTS_PRINCIPAL_BACKEND (value is a registered backend_id;
@@ -51,10 +49,7 @@ from ..exceptions import (
 )
 from .backend import PrincipalBackend
 from .local_impl import LocalPrincipalBackend
-from .static_claims import (
-    StaticClaimsPrincipalBackend,
-    _derive_storage_key as derive_storage_key,
-)
+from .static_claims import StaticClaimsPrincipalBackend
 from .types import LOCAL_PRINCIPAL, Principal, PrincipalCapabilities
 
 _logger = logging.getLogger(__name__)
@@ -79,8 +74,6 @@ __all__ = [
     "list_principal_backends",
     # Operator-config factory
     "get_default_principal_backend",
-    # Storage-key derivation helper (for implementers + tests)
-    "derive_storage_key",
 ]
 
 # ──────────────────────────────────────────────────────────────────
@@ -187,9 +180,14 @@ def get_default_principal_backend() -> PrincipalBackend:
         return _registry[raw]()
 
     # Unknown backend_id — fail LOUDLY.
+    # Redact the raw value before embedding it in the exception message so
+    # a DSN-shaped env var value does not leak into error logs or doctor output.
+    from atomic_agents.conversation import _redact_for_error_message  # noqa: PLC0415
+
+    safe_raw = _redact_for_error_message(raw)
     known_ids = sorted(_registry.keys())
     raise BackendNotRegistered(
-        f"ATOMIC_AGENTS_PRINCIPAL_BACKEND={raw!r} is not a known "
+        f"ATOMIC_AGENTS_PRINCIPAL_BACKEND={safe_raw!r} is not a known "
         f"backend. Available: {known_ids}. Unset the env var "
         f"to use the local (home-user) default, or set it to a "
         f"registered backend id."

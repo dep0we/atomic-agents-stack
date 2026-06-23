@@ -6,7 +6,7 @@ that the caller has ALREADY verified the claims at the perimeter (IAP, OIDC
 middleware, mTLS termination).
 
 Storage-key derivation (spec/48 MUST 7 — NORMATIVE):
-    Principal.identifier = sha256(f'{provider.strip()}\\x00{sub.strip()}'.encode('utf-8')).hexdigest()
+    Principal.identifier = sha256(f'{provider.strip(_ASCII_WS)}\\x00{sub.strip(_ASCII_WS)}'.encode('utf-8')).hexdigest()
 
     Where:
     - provider: the 'provider' key from verified_claims (e.g. 'google', 'iap')
@@ -72,13 +72,13 @@ def _derive_storage_key(provider: str, sub: str) -> str:
     """Derive the stable storage-key identifier from (provider, sub).
 
     NORMATIVE encoding (spec/48 MUST 7):
-        sha256(f'{provider.strip()}\\x00{sub.strip()}'.encode('utf-8')).hexdigest()
+        sha256(f'{provider.strip(_ASCII_WS)}\\x00{sub.strip(_ASCII_WS)}'.encode('utf-8')).hexdigest()
 
-    Inputs are stripped of surrounding ASCII whitespace HERE (so the exported
-    ``derive_storage_key`` helper and ``derive_principal`` produce byte-identical
-    identifiers for the same logical claims — an accidental trailing space cannot
-    split a principal's namespace, spec/48 MUST 11). ``derive_principal`` also
-    strips before calling; the double-strip is idempotent and harmless.
+    Inputs are stripped of surrounding ASCII whitespace HERE (so ``_derive_storage_key``
+    and ``derive_principal`` produce byte-identical identifiers for the same logical
+    claims — an accidental trailing space cannot split a principal's namespace,
+    spec/48 MUST 11). ``derive_principal`` also strips before calling; the
+    double-strip is idempotent and harmless.
 
     The NUL byte (\\x00) is the domain separator. It cannot appear in a valid
     provider string or OIDC sub claim (both are printable ASCII/UTF-8 strings),
@@ -101,7 +101,7 @@ def _derive_storage_key(provider: str, sub: str) -> str:
 
     Returns:
         Full 64-character lowercase hexdigest of
-        sha256(b'{provider.strip()}\\x00{sub.strip()}').
+        sha256(b'{provider.strip(_ASCII_WS)}\\x00{sub.strip(_ASCII_WS)}').
     """
     hash_input = f"{provider.strip(_ASCII_WS)}\x00{sub.strip(_ASCII_WS)}".encode(
         "utf-8"
@@ -138,9 +138,13 @@ class StaticClaimsPrincipalBackend:
         returns _UNVERIFIED_PRINCIPAL (is_verified=False).
 
         Storage-key derivation (spec/48 MUST 7 + MUST 11):
-            provider/sub are stripped of surrounding whitespace first (so a
-            trailing space cannot split a namespace), then:
-            identifier = sha256(f'{provider}\\x00{sub}'.encode('utf-8')).hexdigest()
+            provider/sub are stripped of surrounding ASCII whitespace ONLY
+            (`_ASCII_WS`, NOT str.strip()'s Unicode set — so a leading Unicode
+            space cannot collapse two distinct subjects onto one identifier,
+            MUST 11; and a trailing ASCII space cannot split a namespace), then:
+            identifier = sha256(
+                f'{provider.strip(_ASCII_WS)}\\x00{sub.strip(_ASCII_WS)}'.encode('utf-8')
+            ).hexdigest()
             (64-char lowercase hexdigest, NUL-byte domain separator). Stable +
             non-reassignable (MUST 11): the same (provider, sub) always yields the
             same identifier; distinct pairs never collide.

@@ -3995,6 +3995,7 @@ class AtomicAgent:
         # refuse.
         if conversation_id is not None and not principal.is_verified:
             _principal_refused_record: dict = {
+                "run_id": self.run_id,  # redundant with _log()'s setdefault; kept for local readability
                 "trigger": self.trigger,
                 "model": self.config.default_model,
                 "input_tokens": 0,

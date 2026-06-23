@@ -546,6 +546,30 @@ def test_run_doctor_principal_backend_fails_on_unknown_env(monkeypatch, tmp_path
     assert principal_results[0].status == FAIL
 
 
+def test_principal_backend_redacts_credential_url(monkeypatch):
+    """When ATOMIC_AGENTS_PRINCIPAL_BACKEND is accidentally set to a DSN-shaped
+    value, check_principal_backend() FAIL message and detail MUST NOT reproduce
+    the raw credential. Mirrors test_conversation_backend_redacts_credential_url —
+    the principal check uses the same _redact_for_error_message convention as
+    every other doctor check (spec/48 LOCK ceremony, feedback_doctor_check_redacts_env_value_not_exception_string).
+    """
+    from atomic_agents.doctor import check_principal_backend, FAIL  # noqa: PLC0415
+
+    monkeypatch.setenv(
+        "ATOMIC_AGENTS_PRINCIPAL_BACKEND", "postgres://user:hunter2@host/db"
+    )
+    result = check_principal_backend()
+
+    assert result.status == FAIL
+    assert "hunter2" not in result.message
+    assert "hunter2" not in str(result.detail)
+    # Two-sided guard: the redacted-but-informative form is still shown (scheme
+    # prefix kept, credentials stripped) — not an empty/dropped field that would
+    # also pass the secret-absence checks above.
+    assert "postgres://..." in result.message
+    assert "postgres://..." in str(result.detail)
+
+
 # ──────────────────────────────────────────────────────────────────
 # Output rendering
 
