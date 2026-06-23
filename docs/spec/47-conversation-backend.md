@@ -1,8 +1,10 @@
-# spec/47 — ConversationBackend Protocol (DRAFT)
+# spec/47 — ConversationBackend Protocol
 
-**Status:** DRAFT — implementation complete for PR1; LOCK ceremony pending PR2 hardening
-(model-aware token-budget derivation, doctor check, PostgresConversationBackend). The
-per-principal serve wiring — deriving a verified `Principal` at the serve perimeter and
+**Status:** LOCKED — implementation complete. LOCK PR (#535 PR2) added model-aware
+token-budget derivation (per-model context window via `LLMCapabilities.max_input_tokens`),
+`check_conversation_backend` doctor check (wired into `run_doctor()`), and the #553
+write-back reorder fix (deferred runs no longer persist orphaned turn pairs).
+The per-principal serve wiring — deriving a verified `Principal` at the serve perimeter and
 threading it through `agent.call()` to gate conversation access — SHIPPED with PrincipalBackend
 (#556, spec/48): the serve layer's fail-closed opt-in HYBRID flow now produces the `Principal`
 that `load_turns()` / `write_turn()` here consume.
@@ -100,10 +102,8 @@ non-UTC timestamps with a WARNING, but callers MUST supply UTC.
 ## Three-channel seam (backend selection)
 
 Priority: constructor kwarg wins → `ATOMIC_AGENTS_CONVERSATION_BACKEND` env →
-model.md `## Conversation Backend` section (PROVISIONAL field). All channels resolve to
+model.md `## Conversation Backend` section (LOCKED field). All channels resolve to
 `None` when unset — `None == single-shot` is MANDATORY (rule #14).
-
-The model.md field is PROVISIONAL — its shape may change before the LOCK ceremony.
 
 The result is cached on `self._conversation_backend_resolved` for the agent's lifetime.
 If `model.md` is reloaded via `agent.load()`, the cached backend is NOT updated.
@@ -117,9 +117,17 @@ behavior as `JournalBackend` and `IdempotencyBackend`).
 `load_turns()` loads the most-recent turns that fit within `budget_tokens` (character
 count / 4 approximation). Oldest-first eviction when the window overflows.
 
-For PR1 DRAFT: `agent.call()` uses a conservative static budget of 8000 tokens with a
-`TODO` comment. Model-aware derivation (model_context_limit - system_prompt_tokens
-- max_output_tokens - safety_margin) ships in the LOCK PR.
+`agent.call()` derives `budget_tokens` per-call as:
+
+```
+max(1000, model_context_limit - system_prompt_tokens_est - max_output_tokens - safety_margin)
+```
+
+where `model_context_limit` is `LLMCapabilities.max_input_tokens` for the resolved
+model, `system_prompt_tokens_est = len(system_prompt) // 4` (same character-to-token
+approximation as `load_turns()`), and `safety_margin = 2000` tokens. Fails soft to
+`8000` on any error (e.g. `UnknownModelError` for a custom model id) so a
+misconfigured model never crashes `call()`.
 
 **One-turn floor:** when the single newest turn alone exceeds `budget_tokens`, `load_turns()`
 returns `[]`. Callers MUST supply a budget large enough for at least one turn, or accept
@@ -269,14 +277,13 @@ prepend them directly.
 **Injection normalization:** before injecting, `agent.call()` MUST normalize the
 prior-turn sequence so the provider API does not reject the request:
 (a) drop empty-content turns (a tool-only assistant turn persists `content=''`);
-(b) collapse consecutive same-role entries (keep the latest). **Context-loss caveat
-(PR1):** this is not pure dedupe — when (a) removes an empty-content turn BETWEEN two
-same-role turns (e.g. `[user_a, assistant_'', user_b]` → after (a) `[user_a, user_b]`),
-(b) keeps only `user_b` and silently discards `user_a` (a real prior message).
-`continuity_persisted` stays `True` and the caller cannot detect the loss. This only
-fires on an empty-content adjacency (rare in PR1) and keeps output alternation valid. The
-LOCK PR's model-aware budget work SHOULD revisit whether to concatenate same-role content
-instead of discarding the older turn;
+(b) collapse consecutive same-role entries (keep the latest). **Context-loss caveat:** this is not pure dedupe — when (a) removes an empty-content
+turn BETWEEN two same-role turns (e.g. `[user_a, assistant_'', user_b]` → after (a)
+`[user_a, user_b]`), (b) keeps only `user_b` and silently discards `user_a` (a real
+prior message). `continuity_persisted` stays `True` and the caller cannot detect the
+loss. This only fires on an empty-content adjacency (rare) and keeps output alternation
+valid. Concatenating same-role content instead of discarding the older turn is tracked
+as a follow-up issue (#NNN — file on first occurrence);
 (c) drop a trailing user turn (it would sit immediately before the new `work_item` user
 turn — consecutive same-role — and is the orphan left by a failed assistant write-back);
 (d) drop any LEADING assistant turn(s) — budget eviction is newest-first, so when it cuts
@@ -437,7 +444,10 @@ lane if any assertion hardcodes `schema_version == 2`.
 
 ## Deferred to later PRs
 
-- `PostgresConversationBackend` (pgvector for semantic conversation search).
+- `PostgresConversationBackend` — Phase 3 scale-out PR. The filesystem reference
+  implementation is production-suitable for single-host deployments. Postgres (with
+  pgvector for semantic conversation search) is the org-shape backend, deferred to
+  align with the Phase 3 state-backend scale-out arc (#344).
 - ~~spec/37 serve `conversation_id` wiring (HTTP path).~~ **SHIPPED with PrincipalBackend
   (#556):** `serve/_app.py` now extracts + validates `conversation_id` from the request body
   (bare component, no separators/control chars, max 512 chars; 422 on violation) and threads
@@ -446,7 +456,13 @@ lane if any assertion hardcodes `schema_version == 2`.
 - Summarization (PR3, budget-bounded same contract).
 - Doctor check for orphaned `.tmp` turn files.
 - `write_turns(list[Turn])` — atomic two-turn write path (eliminates PR1 crash boundary).
-- Model-aware token budget derivation (per-model context-limit table).
+- **`continuity_persisted` flag-flip for deferred/short-circuit paths.** When
+  `response.deferred is True` (ESCALATE path), the conversation write-back is now
+  gated out (the #553 fix), so no turns are written — but `continuity_persisted`
+  retains its `True` default (same as refusal short-circuits). Callers MUST NOT
+  rely on `continuity_persisted` being meaningful when `response.deferred is True`.
+  A future PR MAY flip the flag to `False` on deferred paths so callers can
+  distinguish "stored this run" from "paused, not yet stored".
 - **Idempotency × conversation interaction.** A deduped / in-flight `call()`
   short-circuit does NOT write conversation turns (idempotency must not double-write),
   so the conversation history reflects only first-delivery runs — a deduped call's
@@ -462,29 +478,17 @@ lane if any assertion hardcodes `schema_version == 2`.
   `temperature` and OMITS prior conversation turns, so auto-deduping a conversation call
   would replay a stale / cross-conversation result. Explicit caller-supplied
   idempotency keys are unaffected (the caller owns the key's semantics).
-- LOCK ceremony (pending PR2 hardening).
 
 ---
 
 ## Serve HYBRID flow — principal threading (spec/48 clarifying note)
 
-> **NOTE (non-normative, added spec/48 PR 1):** When the serve layer threads a
-> non-local `Principal` to `agent.call()`, the `principal` arg replaces the
-> hardcoded `LOCAL_PRINCIPAL` that was previously passed to `conversation_backend.load_turns()`
-> and `conversation_backend.write_turn()`. This is the mechanism by which conversation
-> isolation (this spec) becomes multi-principal in a served deployment.
->
-> No normative rule in this spec changes. The `Principal` parameter type in `load_turns`
-> and `write_turn` was already present in spec/47 to support exactly this extension.
-> The thread: `serve/_app.py` extracts `verified_claims` (using the FULL untruncated
-> identity header as `sub`) from the perimeter-verified identity header, `serve/_runner.py`
-> calls `agent.principal_backend.derive_principal(verified_claims)` — but ONLY on the trusted
-> path; the serve flow is fail-closed opt-in, so an untrusted-perimeter, header-absent-under-
-> perimeter, or `is_local_only`-backend-under-perimeter case instead yields an unverified
-> `Principal` directly (see spec/48 "Serve layer HYBRID flow"). The resulting `Principal` is
-> passed to `agent.call(principal=...)`. The HARD-REFUSE gate (spec/48) fires before lock
-> acquisition when `conversation_id is not None and not principal.is_verified`, returning HTTP
-> 401 before any storage or LLM spend.
+> **NOTE (non-normative):** The `Principal` parameter in `load_turns()` and `write_turn()`
+> was defined here specifically to support serve-layer multi-principal threading.
+> The serve layer's HYBRID flow (spec/48) derives a verified `Principal` from the
+> perimeter identity header and passes it as the `principal` argument to `agent.call()`,
+> which threads it to these methods. No normative rule in this spec changes; the
+> extension point was always present.
 
 ---
 

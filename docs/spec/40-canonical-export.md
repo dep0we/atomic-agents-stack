@@ -253,6 +253,7 @@ The following spec docs carry spec/40 addenda:
 | spec/29 | MandateBackend | True (MandateCapabilities field) |
 | spec/34 | CorpusBackend | True (CorpusCapabilities field) |
 | spec/38 | SecretBackend | True (SecretCapabilities field, MUST 9 absolute) |
+| spec/47 | ConversationBackend | True (ConversationCapabilities field, MUST 10) |
 
 The non-state backends (LLM, Judge, Policy, AgentProfile, ToolRegistry, Persona,
 GCPSecretManagerBackend) advertise `False` and are not export surfaces. With ONE
@@ -263,3 +264,26 @@ exception is `MCPServerRegistryCapabilities`, which carries the field defaulting
 `False` (its filesystem/HTTP export is deferred). PR1 adds the field only to the six
 state-backend surfaces that advertise `True` (Log/Lock/Mandate/Corpus/Secret
 dataclasses + Memory's `@property`) plus `MCPServerRegistryCapabilities`.
+
+### Versioned normative addendum — ConversationBackend export contract (spec/47 MUST 10)
+
+`ConversationBackend.export()` MUST return a `ConversationExport` containing all
+durable turn files as `(relative_path, raw_bytes)` tuples. Stale `.tmp` files MUST
+be excluded.
+
+**Principal-scoped export (first principal-scoped backend):** unlike the flat-`rglob()`
+pattern used by dedup/journal backends, `FilesystemConversationBackend.export()` iterates
+principal directories explicitly and runs the per-principal IDENTITY guard (MUST 2:
+resolved-basename + inode-identity two-part check) before enumerating each subtree. A
+redirecting symlink `conversations/bob -> conversations/alice` is skipped rather than
+aliasing alice's turns into bob's exported namespace. This is required because Python
+3.13+ `rglob()` follows directory symlinks, which would double-count on a flat walk.
+
+**Stale `.tmp` exclusion:** the `*.json` glob already excludes stale `.tmp` files from
+`load_turns()`. The same glob applies in `export()`.
+
+**`supports_canonical_export`:** `ConversationCapabilities.supports_canonical_export`
+MUST be `True` for the filesystem reference implementation.
+
+Added OUTSIDE the spec/40 MUST 1–10 count, following the existing cross-spec addenda
+precedent.
