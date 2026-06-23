@@ -1371,6 +1371,69 @@ def test_model_aware_budget_max_tokens_none_does_not_crash(tmp_path):
     assert resp is not None
 
 
+def test_model_aware_budget_clamps_to_floor_on_small_window(tmp_path):
+    """A model whose context window is too small for any prior-turn budget must
+    clamp to the 1000-token floor, not go negative.
+
+    spec/47 LOCK: the derivation is max(1000, max_input - sys - max_out - margin).
+    With a 2000-token input window, max_output=4096 alone drives the inner
+    expression deeply negative, so the max(1000, ...) operand must be selected.
+
+    This covers the clamp-floor branch that the large-window budget tests
+    (100K/50K) never exercise (ship coverage-audit gap, conversation-lock-535).
+    Strip-RED control: drop the `1000,` operand from max(...) and this test goes
+    RED — the budget becomes negative instead of 1000.
+    """
+    from unittest.mock import patch, MagicMock
+    from atomic_agents.conversation import FilesystemConversationBackend
+
+    backend = FilesystemConversationBackend(tmp_path / "convbot-floor")
+    agent = _make_agent(tmp_path, conversation_backend=backend, name="convbot-floor")
+
+    captured_budgets: list[int] = []
+    original_load_turns = FilesystemConversationBackend.load_turns
+
+    def spy_load_turns(self, principal, conversation_id, budget_tokens=8000):
+        captured_budgets.append(budget_tokens)
+        return original_load_turns(
+            self, principal, conversation_id, budget_tokens=budget_tokens
+        )
+
+    # A tiny input window: 2000 - sys_est - 4096 - 2000 is far below zero,
+    # so max(1000, ...) must clamp the derived budget to exactly 1000.
+    mock_caps = MagicMock()
+    mock_caps.max_input_tokens = 2000
+    mock_caps.max_output_tokens = 4096
+    mock_backend_obj = MagicMock()
+    mock_backend_obj.capabilities.return_value = mock_caps
+
+    with (
+        patch.object(FilesystemConversationBackend, "load_turns", spy_load_turns),
+        patch(
+            "atomic_agents.llm.find_backend_for_model", return_value=mock_backend_obj
+        ),
+        patch("atomic_agents._llm.call_llm", return_value=_fake_llm_response()),
+        patch.object(agent, "_log"),
+        patch.object(agent, "load"),
+        patch.object(agent, "assemble_system_prompt", return_value="short prompt"),
+        patch.object(
+            agent,
+            "_check_cost_guardrails",
+            return_value=MagicMock(
+                allow=True, action="ok", reason="cap", cost_data_degraded=False
+            ),
+        ),
+    ):
+        agent.call(work_item="hello", conversation_id="floor-test")
+
+    assert len(captured_budgets) == 1, "load_turns should be called once"
+    assert captured_budgets[0] == 1000, (
+        f"STRIP-RED: expected the 1000-token floor, got {captured_budgets[0]}. "
+        "A 2000-token window must clamp to max(1000, ...); without the floor "
+        "operand the budget goes negative."
+    )
+
+
 # ──────────────────────────────────────────────────────────────────
 # spec/47 LOCK — #553 write-back reorder fix
 

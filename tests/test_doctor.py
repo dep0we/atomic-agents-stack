@@ -1054,3 +1054,92 @@ def test_conversation_backend_capabilities_crash_returns_pass(tmp_path, monkeypa
     assert "capabilities_error" in (result.detail or {}), (
         "Expected 'capabilities_error' key in detail when capabilities() crashes."
     )
+
+
+def test_conversation_backend_fail_on_load_turns_raise(tmp_path, monkeypatch):
+    """The liveness probe FAILs when load_turns() raises a non-traversal error.
+
+    A backend whose load_turns() raises (e.g. PermissionError on a bad
+    conversations/ dir) is broken in the field; doctor must surface it as a FAIL
+    naming the exception type, not crash. Covers the liveness-probe except-branch
+    (ship coverage-audit gap, conversation-lock-535).
+    """
+    from atomic_agents.doctor import check_conversation_backend, FAIL
+    from atomic_agents.conversation import (
+        FilesystemConversationBackend,
+        register_conversation_backend,
+    )
+
+    class _RaisingLoadBackend(FilesystemConversationBackend):
+        def load_turns(self, principal, conversation_id, budget_tokens=8000):
+            raise PermissionError("conversations/ is not readable")
+
+    register_conversation_backend("raising-loadturns", _RaisingLoadBackend)
+    monkeypatch.setenv("ATOMIC_AGENTS_CONVERSATION_BACKEND", "raising-loadturns")
+    try:
+        result = check_conversation_backend(tmp_path)
+    finally:
+        from atomic_agents.conversation import _registry as _conv_registry
+
+        _conv_registry.pop("raising-loadturns", None)
+
+    assert result.status == FAIL
+    assert "PermissionError" in result.message
+    assert "load_turns" in result.message
+
+
+def test_conversation_backend_fail_on_load_turns_nonempty(tmp_path, monkeypatch):
+    """The liveness probe FAILs when load_turns() returns turns for a fresh probe id.
+
+    A uuid-keyed probe conversation cannot legitimately contain turns; a backend
+    that returns any is misbehaving and doctor must FAIL with an 'expected []'
+    message. Covers the `if turns:` FAIL branch (ship coverage-audit gap,
+    conversation-lock-535).
+    """
+    from unittest.mock import MagicMock
+    from atomic_agents.doctor import check_conversation_backend, FAIL
+    from atomic_agents.conversation import (
+        FilesystemConversationBackend,
+        register_conversation_backend,
+    )
+
+    class _NonEmptyLoadBackend(FilesystemConversationBackend):
+        def load_turns(self, principal, conversation_id, budget_tokens=8000):
+            # A backend that returns turns for an unseen probe id is broken;
+            # the doctor branch only inspects truthiness + len, so a sentinel
+            # one-element list faithfully models the misbehavior.
+            return [MagicMock()]
+
+    register_conversation_backend("nonempty-loadturns", _NonEmptyLoadBackend)
+    monkeypatch.setenv("ATOMIC_AGENTS_CONVERSATION_BACKEND", "nonempty-loadturns")
+    try:
+        result = check_conversation_backend(tmp_path)
+    finally:
+        from atomic_agents.conversation import _registry as _conv_registry
+
+        _conv_registry.pop("nonempty-loadturns", None)
+
+    assert result.status == FAIL
+    assert "expected []" in result.message
+
+
+def test_conversation_backend_redacts_credential_url(tmp_path, monkeypatch):
+    """When ATOMIC_AGENTS_CONVERSATION_BACKEND is accidentally set to a
+    credential-bearing URL/DSN, the FAIL message + detail MUST NOT reproduce the
+    raw credential. Mirrors test_check_persona_backend_redacts_credential_url —
+    the conversation check uses the same per-backend _redact_for_error_message
+    convention as every other doctor check (ship security-review finding,
+    conversation-lock-535).
+    """
+    from atomic_agents.doctor import check_conversation_backend, FAIL
+
+    monkeypatch.setenv(
+        "ATOMIC_AGENTS_CONVERSATION_BACKEND", "postgres://user:hunter2@host/db"
+    )
+    result = check_conversation_backend(tmp_path)
+
+    assert result.status == FAIL
+    assert "hunter2" not in result.message
+    assert "postgres://..." in result.message
+    # detail must not leak the credential either
+    assert "hunter2" not in str(result.detail)
