@@ -42,10 +42,10 @@ backend_id; defaults to None when unset). Connection-string forms are NOT
 consumed in PR1 — a future Postgres backend defines its own connection handling.
 When set, 'filesystem' instantiates FilesystemConversationBackend(agent_root).
 
-Model.md field: '## Conversation Backend' section (PROVISIONAL — shape may
-change before spec/47 LOCK; see spec/47 §"Three-channel seam"). Parsed from
-AgentConfig.conversation_backend_id. All three channels resolve to None when
-unset — 'no backend == single-shot' is MANDATORY (rule #14).
+Model.md field: '## Conversation Backend' section (LOCKED at spec/47;
+section name and parser are stable). Parsed from AgentConfig.conversation_backend_id.
+All three channels resolve to None when unset — 'no backend == single-shot'
+is MANDATORY (rule #14).
 
 The registry is a process-local dict keyed by backend_id (e.g. 'filesystem').
 Like all v1.5 backend registries it stores backend *classes*, not instances —

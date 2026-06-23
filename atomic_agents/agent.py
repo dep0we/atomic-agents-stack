@@ -281,6 +281,11 @@ _BODY_HASH_AUTO_DERIVE_TRIGGERS: frozenset[str] = frozenset({"http", "queue", "c
 # call() invocation can detect "not yet resolved" vs "resolved to no backend".
 _CONV_BACKEND_UNRESOLVED = object()
 
+# spec/47 LOCK: safety margin subtracted from model context window when
+# deriving the per-call conversation budget. Leaves headroom for tool
+# definitions, metadata, and mid-loop additions to messages[].
+_CONV_SAFETY_MARGIN = 2000
+
 
 def _derive_primitive_from_trigger(trigger: str | None) -> str:
     """Map the legacy ``trigger`` string to spec/22 ``primitive`` taxonomy.
@@ -3215,7 +3220,7 @@ class AtomicAgent:
             # snapshots that pre-date this field (no 'dedup_body_hash_enabled'
             # in their model_config dict).
             dedup_body_hash_enabled=model_data.get("dedup_body_hash_enabled", False),
-            # spec/47 PR1 (PROVISIONAL): channel-3 conversation backend selection
+            # spec/47 (LOCKED): channel-3 conversation backend selection
             # parsed from model.md's '## Conversation Backend' section. .get() with
             # None default for backward compat with AgentProfile snapshots that
             # pre-date this field. Without threading it here _resolve_conversation_backend()
@@ -3515,8 +3520,9 @@ class AtomicAgent:
               use it directly. (No lazy resolution needed.)
           (2) ATOMIC_AGENTS_CONVERSATION_BACKEND env var — instantiate the
               named backend_id via the registry.
-          (3) model.md field — AgentConfig.conversation_backend_id (PROVISIONAL).
-              (4) None when all three are absent — single-shot default (rule #14).
+          (3) model.md field — AgentConfig.conversation_backend_id (LOCKED at
+              spec/47; section name '## Conversation Backend' and parser are stable).
+          (4) None when all three are absent — single-shot default (rule #14).
 
         The result is cached on self._conversation_backend_resolved to avoid
         repeated env-var reads and to share the instance across the multi-turn
@@ -3524,8 +3530,7 @@ class AtomicAgent:
         resolved" from None (no backend).
 
         Called from call() after lazy load() so self.config is available for
-        channel (3). The model.md field is marked PROVISIONAL in DRAFT spec/47
-        — its section name and syntax may change before LOCK.
+        channel (3). The model.md field is LOCKED at spec/47 and stable.
 
         Returns:
             ConversationBackend instance or None (single-shot).
@@ -3572,13 +3577,11 @@ class AtomicAgent:
             self._conversation_backend_resolved = resolved
             return resolved
 
-        # Channel (3): model.md field (PROVISIONAL — shape may change before LOCK).
+        # Channel (3): model.md field — LOCKED at spec/47.
+        # Section name '## Conversation Backend' and parser are stable.
         # self.config is available here (called after load()).
         backend_id = getattr(self.config, "conversation_backend_id", None)
         if backend_id:
-            # TODO(#535 LOCK PR): firm up exact section name and parser semantics.
-            # The model.md field is PROVISIONAL per spec/47 DRAFT; do not depend
-            # on this for stable deployments until spec/47 is LOCKED.
             from .conversation import (  # noqa: PLC0415
                 BackendNotRegistered as _BackendNotRegistered,
                 get_conversation_backend,
@@ -4580,12 +4583,31 @@ class AtomicAgent:
                     ConversationBackendError as _ConvBackendError,
                 )
 
-                # TODO(spec/47 LOCK): derive budget from model_context_limit
-                # per-model table. For PR1 DRAFT use a conservative static budget
-                # (8000 tokens) — well below any model's context limit, large
-                # enough for ~30 turns of typical conversation. This avoids
-                # silent token-overflow before the per-model table ships.
-                _conv_budget_tokens = 8000
+                # spec/47 LOCK: model-aware token budget derivation.
+                # Formula: max_input_tokens - system_prompt_tokens_est
+                #   - max_output_tokens - _CONV_SAFETY_MARGIN
+                # where system_prompt_tokens_est = len(system_prompt) // 4
+                # (same character-to-token approximation as load_turns()).
+                # Fails soft to 8000 on any error (UnknownModelError,
+                # AmbiguousBackendError, or other capability lookup failure)
+                # so a misconfigured or custom model id never crashes call().
+                try:
+                    from .llm import find_backend_for_model as _fbfm_conv  # noqa: PLC0415
+
+                    _llm_caps_conv = _fbfm_conv(
+                        model, preferred_provider=self.config.provider
+                    ).capabilities(model)
+                    _sys_tokens_est = len(system_prompt) // 4
+                    _max_out = max_tokens or self.config.max_output_tokens
+                    _conv_budget_tokens = max(
+                        1000,
+                        _llm_caps_conv.max_input_tokens
+                        - _sys_tokens_est
+                        - _max_out
+                        - _CONV_SAFETY_MARGIN,
+                    )
+                except Exception:  # noqa: BLE001 — fail soft, never crash a call
+                    _conv_budget_tokens = 8000
                 try:
                     _prior_turns = _conv_backend.load_turns(
                         principal,  # spec/48: use caller-supplied principal (not hardcoded LOCAL_PRINCIPAL)
@@ -4627,10 +4649,9 @@ class AtomicAgent:
             #       only user_b and discards user_a's message. The drop is silent:
             #       continuity_persisted stays True and the caller cannot detect
             #       the lost turn. This only fires on an empty-content adjacency
-            #       (tool-only assistant turn between two user turns), is rare in
-            #       PR1, and keeps output alternation valid (no provider 400). The
-            #       LOCK PR's model-aware budget work should revisit whether to
-            #       concatenate same-role content instead of discarding the older;
+            #       (tool-only assistant turn between two user turns), is rare, and
+            #       keeps output alternation valid (no provider 400). Concatenating
+            #       same-role content instead of discarding is tracked as a follow-up;
             #   (c) drop a trailing user turn — it would sit immediately before
             #       the new work_item user turn (consecutive same-role, rejected),
             #       and the orphan trailing-user case (failed assistant write-back)
@@ -5743,6 +5764,14 @@ class AtomicAgent:
             # violates Principle 5 (audit trail is structural). Write order is load-
             # bearing; changing it is a P0.
             self._log(log_record)
+            # spec/47 LOCK: compute _response_deferred BEFORE the write-back so
+            # the gate below can suppress turn persistence for deferred/escalated
+            # runs. A deferred run has not completed — committing turns while the
+            # idempotency lease is unreleased causes orphaned turn pairs that
+            # accumulate on each retry. Fix for #553 (folded into the LOCK PR).
+            # continuity_persisted flag-flip for deferred paths is deferred as a
+            # tracked follow-up (see spec/47 §"Deferred to later PRs").
+            _response_deferred = bool(getattr(response, "deferred", False))
             # spec/47 PR1: write turn pair back AFTER _log() (JSONL-first principle).
             # Write user turn first, then assistant turn. On failure in either:
             # - set response.continuity_persisted = False
@@ -5751,14 +5780,12 @@ class AtomicAgent:
             # NOTE: a crash between user-turn write and assistant-turn write leaves an
             # orphaned user turn. The orphan is identified by run_id in the filename.
             # Manual recovery: delete the dangling file. A two-turn atomic path ships
-            # in a future PR (spec/47 §"PR1 crash boundary"). See prep finding P0-6.
-            # NOTE (#553): this write-back also runs on deferred/escalated runs,
-            # so a deferred run persists its turn pair + reports
-            # continuity_persisted=True while the idempotency layer treats the run
-            # as not-completed. Self-heals on retry (read-path normalization
-            # collapses the duplicate user turn + drops the empty assistant turn),
-            # so it is not a wrong-LLM-input bug; tracked for the gate fix.
-            if conversation_id is not None and _conv_backend is not None:
+            # in a future PR (spec/47 §"PR1 crash boundary").
+            if (
+                conversation_id is not None
+                and _conv_backend is not None
+                and not _response_deferred
+            ):
                 from .conversation import (  # noqa: PLC0415 — lazy import (circular-safety)
                     ConversationBackendError as _ConvBackendError2,
                     Turn as _Turn,
@@ -5840,7 +5867,7 @@ class AtomicAgent:
             # re-surfaces the escalation. _idempotency_lease_held stays True here
             # (we do NOT set it False), so the finally below releases the lease —
             # the same at-least-once direction as the failure path.
-            _response_deferred = bool(getattr(response, "deferred", False))
+            # _response_deferred is already computed above (before write-back).
             if (
                 idempotency_key is not None
                 and _idempotency_lease_held
