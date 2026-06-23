@@ -212,6 +212,7 @@ def run_doctor(
             "idempotency-backend",
             "embedding-backend",
             "principal-backend",
+            "conversation-backend",
             "memory-backend-config",
             "memory-backend",
             "write-paths",
@@ -294,6 +295,13 @@ def run_doctor(
     # (feedback_doctor_dual_probe_pattern) — so it MUST be appended here, not just
     # defined.
     results.append(check_principal_backend())
+    # spec/47 LOCK: conversation-backend check. Takes agent_root (reads
+    # ATOMIC_AGENTS_CONVERSATION_BACKEND + the registry). SKIP when env var is
+    # unset (opt-in default: single-shot is the default per MUST 9).
+    # A defined-but-unwired check is the same false-PASS-by-omission class as
+    # the list-vs-load_all gap (feedback_doctor_dual_probe_pattern) — so it
+    # MUST be appended here, not just defined.
+    results.append(check_conversation_backend(agent_root))
     # memory-backend-config (coherence) runs before memory-backend (liveness),
     # mirroring the check_lock_backend → check_locks ordering (#60 PR 3).
     results.append(check_memory_backend_config(agent_root))
@@ -5255,6 +5263,158 @@ def check_embedding_backend() -> CheckResult:
             "supports_input_type": caps.supports_input_type,
             "api_key_probe": api_key_probe,
         },
+    )
+
+
+def check_conversation_backend(agent_root: Path) -> CheckResult:
+    """ConversationBackend resolves and the configured backend operates correctly.
+
+    spec/47 LOCK: folded into the LOCK PR (doctor-check-fold-or-defer ruling).
+
+    SKIP when ATOMIC_AGENTS_CONVERSATION_BACKEND is unset — conversation history
+    is opt-in (single-shot is the default per rule #14 / MUST 9). This mirrors
+    check_embedding_backend's SKIP-when-unset pattern.
+
+    Doctor dual-probe pattern (MEMORY.md feedback_doctor_dual_probe_pattern):
+    Probes BOTH:
+    1. Construction probe via get_default_conversation_backend(agent_root) —
+       FAIL if the env var names an unregistered backend.
+    2. Directory-escape probe: when the backend exposes a _conversations_dir()
+       helper, call it and FAIL on PathTraversalError (a symlinked conversations/
+       pointing outside agent_root is the real misconfiguration class).
+    3. Liveness probe via backend.load_turns(LOCAL_PRINCIPAL, probe_id,
+       budget_tokens=1) — must return [] without raising for a clean vault
+       (MUST 9: absent conversations/ is valid and must not raise).
+
+    PASS / FAIL ladder (no WARN path):
+    SKIP when ATOMIC_AGENTS_CONVERSATION_BACKEND is unset.
+    FAIL when:
+    * get_default_conversation_backend() raises (bad env var or unregistered id).
+    * _conversations_dir() raises PathTraversalError (symlinked escape).
+    * load_turns() raises for a probe that should cleanly return [].
+    PASS otherwise.
+    """
+    import uuid  # noqa: PLC0415
+
+    from .conversation import (  # noqa: PLC0415
+        get_default_conversation_backend,
+        list_conversation_backends,
+        LOCAL_PRINCIPAL,
+    )
+    from .exceptions import PathTraversalError  # noqa: PLC0415
+
+    raw_backend_id = (
+        os.environ.get("ATOMIC_AGENTS_CONVERSATION_BACKEND", "").strip().lower()
+    )
+
+    if not raw_backend_id:
+        return CheckResult(
+            name="conversation-backend",
+            status=SKIP,
+            message=(
+                "ATOMIC_AGENTS_CONVERSATION_BACKEND is not set — conversation "
+                "history is disabled (single-shot default). Set this env var to "
+                "opt in to multi-turn conversation persistence."
+            ),
+        )
+
+    try:
+        backend = get_default_conversation_backend(agent_root)
+    except Exception as e:
+        known = list_conversation_backends()
+        return CheckResult(
+            name="conversation-backend",
+            status=FAIL,
+            message=(
+                f"failed to instantiate conversation backend "
+                f"(ATOMIC_AGENTS_CONVERSATION_BACKEND={raw_backend_id!r}): {e}"
+            ),
+            fix_hint=(
+                "Unset ATOMIC_AGENTS_CONVERSATION_BACKEND to use single-shot mode, "
+                f"or set it to a registered backend id (known: {known}). "
+            ),
+            detail={"backend_id": raw_backend_id, "error": str(e)},
+        )
+
+    # Directory-escape probe: a symlinked conversations/ DIRECTORY pointing outside
+    # agent_root is the real escape vector (spec/47 §"Layer 1 containment").
+    conv_dir_probe = getattr(backend, "_conversations_dir", None)
+    if callable(conv_dir_probe):
+        try:
+            conv_dir_probe()
+        except PathTraversalError as e:
+            return CheckResult(
+                name="conversation-backend",
+                status=FAIL,
+                message=(
+                    f"conversations/ directory escapes agent_root "
+                    f"(PathTraversalError): {e}"
+                ),
+                fix_hint=(
+                    "The conversations/ symlink under agent_root points outside the "
+                    "vault. Remove or redirect it: "
+                    f"rm '{agent_root}/conversations' and let the backend recreate it."
+                ),
+                detail={"backend_id": raw_backend_id, "error": str(e)},
+            )
+        except FileNotFoundError:
+            # Absent conversations/ is valid (no conversations yet — MUST 9).
+            pass
+        except Exception:
+            # Non-traversal errors (e.g. PermissionError) fall through to
+            # the liveness probe which will surface a more actionable message.
+            pass
+
+    # Liveness probe: load_turns on a uuid-keyed probe conversation must return
+    # [] without raising (MUST 9 — absent conversations/ is not an error).
+    probe_conv_id = f"_doctor_probe_{uuid.uuid4().hex[:8]}"
+    try:
+        turns = backend.load_turns(LOCAL_PRINCIPAL, probe_conv_id, budget_tokens=1)
+        if turns:
+            return CheckResult(
+                name="conversation-backend",
+                status=FAIL,
+                message=(
+                    f"load_turns() returned {len(turns)} turn(s) for a fresh probe "
+                    f"conversation_id {probe_conv_id!r} — expected []"
+                ),
+                fix_hint="Unexpected turns returned for a probe id; inspect the backend.",
+                detail={"backend_id": raw_backend_id, "probe_id": probe_conv_id},
+            )
+    except Exception as e:
+        return CheckResult(
+            name="conversation-backend",
+            status=FAIL,
+            message=(
+                f"conversation backend '{raw_backend_id}' raised "
+                f"{type(e).__name__} on load_turns() probe: {e}"
+            ),
+            fix_hint=(
+                "load_turns() must return [] for an absent conversation without raising. "
+                "Check the backend configuration and conversations/ directory permissions."
+            ),
+            detail={"backend_id": raw_backend_id, "error": str(e)},
+        )
+
+    # Wrap capabilities() separately — a broken custom backend's capabilities()
+    # must return a FAIL CheckResult, not crash doctor. (Codex adversarial finding,
+    # LOCK PR round 1.)
+    try:
+        caps = backend.capabilities()
+        detail = {
+            "backend_id": raw_backend_id,
+            "agent_root": str(agent_root),
+            "supports_principal_isolation": caps.supports_principal_isolation,
+            "supports_canonical_export": caps.supports_canonical_export,
+        }
+    except Exception as e:
+        detail = {"backend_id": raw_backend_id, "capabilities_error": str(e)}
+
+    return CheckResult(
+        name="conversation-backend",
+        status=PASS,
+        message=f"conversation backend '{backend.backend_id}' ready",
+        detail=detail,
     )
 
 
