@@ -5285,6 +5285,13 @@ def check_conversation_backend(agent_root: Path) -> CheckResult:
     3. Liveness probe via backend.load_turns(LOCAL_PRINCIPAL, probe_id,
        budget_tokens=1) — must return [] without raising for a clean vault
        (MUST 9: absent conversations/ is valid and must not raise).
+    4. Capabilities probe: backend.capabilities() is called separately and
+       wrapped so a broken custom backend's capabilities() yields a degraded
+       PASS detail rather than crashing doctor (Codex adversarial finding,
+       LOCK PR round 1). This probe does not FAIL the check — a backend that
+       constructs, contains, and reads cleanly is reported ready even if its
+       capabilities() advertisement is broken; the breakage surfaces in the
+       PASS detail.
 
     PASS / FAIL ladder (no WARN path):
     SKIP when ATOMIC_AGENTS_CONVERSATION_BACKEND is unset.
@@ -5292,7 +5299,7 @@ def check_conversation_backend(agent_root: Path) -> CheckResult:
     * get_default_conversation_backend() raises (bad env var or unregistered id).
     * _conversations_dir() raises PathTraversalError (symlinked escape).
     * load_turns() raises for a probe that should cleanly return [].
-    PASS otherwise.
+    PASS otherwise (including when capabilities() raises — surfaced in detail).
     """
     import uuid  # noqa: PLC0415
 
@@ -5300,12 +5307,19 @@ def check_conversation_backend(agent_root: Path) -> CheckResult:
         get_default_conversation_backend,
         list_conversation_backends,
         LOCAL_PRINCIPAL,
+        _redact_for_error_message,
     )
     from .exceptions import PathTraversalError  # noqa: PLC0415
 
     raw_backend_id = (
         os.environ.get("ATOMIC_AGENTS_CONVERSATION_BACKEND", "").strip().lower()
     )
+
+    # Credential safety: ATOMIC_AGENTS_CONVERSATION_BACKEND may carry a URL- or
+    # DSN-shaped value. Redact before it reaches the rendered CheckResult message
+    # or detail. Same per-backend _redact_for_error_message convention as
+    # logs/profile/corpus/mcp_registry/secret_backend/goal/outcome/persona.
+    safe_backend_id = _redact_for_error_message(raw_backend_id)
 
     if not raw_backend_id:
         return CheckResult(
@@ -5327,13 +5341,13 @@ def check_conversation_backend(agent_root: Path) -> CheckResult:
             status=FAIL,
             message=(
                 f"failed to instantiate conversation backend "
-                f"(ATOMIC_AGENTS_CONVERSATION_BACKEND={raw_backend_id!r}): {e}"
+                f"(ATOMIC_AGENTS_CONVERSATION_BACKEND={safe_backend_id!r}): {e}"
             ),
             fix_hint=(
                 "Unset ATOMIC_AGENTS_CONVERSATION_BACKEND to use single-shot mode, "
                 f"or set it to a registered backend id (known: {known}). "
             ),
-            detail={"backend_id": raw_backend_id, "error": str(e)},
+            detail={"backend_id": safe_backend_id, "error": str(e)},
         )
 
     # Directory-escape probe: a symlinked conversations/ DIRECTORY pointing outside
@@ -5355,14 +5369,15 @@ def check_conversation_backend(agent_root: Path) -> CheckResult:
                     "vault. Remove or redirect it: "
                     f"rm '{agent_root}/conversations' and let the backend recreate it."
                 ),
-                detail={"backend_id": raw_backend_id, "error": str(e)},
+                detail={"backend_id": safe_backend_id, "error": str(e)},
             )
-        except FileNotFoundError:
-            # Absent conversations/ is valid (no conversations yet — MUST 9).
-            pass
         except Exception:
-            # Non-traversal errors (e.g. PermissionError) fall through to
-            # the liveness probe which will surface a more actionable message.
+            # Non-traversal errors (e.g. PermissionError) fall through to the
+            # liveness probe, which surfaces a more actionable message. (The
+            # reference FilesystemConversationBackend._conversations_dir() only
+            # ever raises PathTraversalError — Path.resolve(strict=False) does
+            # not raise for an absent dir — so this guard is defense for a
+            # custom backend, not the reference impl.)
             pass
 
     # Liveness probe: load_turns on a uuid-keyed probe conversation must return
@@ -5379,21 +5394,21 @@ def check_conversation_backend(agent_root: Path) -> CheckResult:
                     f"conversation_id {probe_conv_id!r} — expected []"
                 ),
                 fix_hint="Unexpected turns returned for a probe id; inspect the backend.",
-                detail={"backend_id": raw_backend_id, "probe_id": probe_conv_id},
+                detail={"backend_id": safe_backend_id, "probe_id": probe_conv_id},
             )
     except Exception as e:
         return CheckResult(
             name="conversation-backend",
             status=FAIL,
             message=(
-                f"conversation backend '{raw_backend_id}' raised "
+                f"conversation backend '{safe_backend_id}' raised "
                 f"{type(e).__name__} on load_turns() probe: {e}"
             ),
             fix_hint=(
                 "load_turns() must return [] for an absent conversation without raising. "
                 "Check the backend configuration and conversations/ directory permissions."
             ),
-            detail={"backend_id": raw_backend_id, "error": str(e)},
+            detail={"backend_id": safe_backend_id, "error": str(e)},
         )
 
     # Wrap capabilities() separately — a broken custom backend's capabilities()
@@ -5402,18 +5417,24 @@ def check_conversation_backend(agent_root: Path) -> CheckResult:
     try:
         caps = backend.capabilities()
         detail = {
-            "backend_id": raw_backend_id,
+            "backend_id": safe_backend_id,
             "agent_root": str(agent_root),
             "supports_principal_isolation": caps.supports_principal_isolation,
             "supports_canonical_export": caps.supports_canonical_export,
         }
     except Exception as e:
-        detail = {"backend_id": raw_backend_id, "capabilities_error": str(e)}
+        detail = {"backend_id": safe_backend_id, "capabilities_error": str(e)}
 
     return CheckResult(
         name="conversation-backend",
         status=PASS,
-        message=f"conversation backend '{backend.backend_id}' ready",
+        # Redact backend.backend_id too: a custom backend MAY self-report a
+        # DSN-shaped id. _redact_for_error_message passes a normal id
+        # (e.g. "filesystem") through unchanged and only strips a credential.
+        message=(
+            f"conversation backend "
+            f"'{_redact_for_error_message(backend.backend_id)}' ready"
+        ),
         detail=detail,
     )
 

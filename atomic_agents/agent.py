@@ -4569,12 +4569,16 @@ class AtomicAgent:
             else:
                 _conv_backend = None
 
-            # spec/47 PR1: inject prior turns as real role-tagged message entries
-            # BEFORE the current work_item turn. This preserves the T14 cacheable
-            # prefix (assemble_system_prompt() is NOT touched — see TENSIONS T16,
-            # approved). The token budget is conservative for PR1 (8000 tokens);
-            # model-aware derivation (model_context_limit - system_prompt_tokens
-            # - max_output_tokens) is deferred to the spec/47 LOCK PR.
+            # spec/47 (LOCKED): inject prior turns as real role-tagged message
+            # entries BEFORE the current work_item turn. This preserves the T14
+            # cacheable prefix (assemble_system_prompt() is NOT touched — see
+            # TENSIONS T16, approved). The token budget is derived per-call from
+            # the resolved model's LLMCapabilities.max_input_tokens (see the
+            # derivation block below: max_input_tokens - system_prompt_tokens_est
+            # - max_output_tokens - _CONV_SAFETY_MARGIN), with a fail-soft
+            # fallback to 8000 on any capability-lookup failure. (The derived
+            # value itself has a max(1000, ...) lower bound; 8000 is the
+            # except-branch fallback, not a floor on the derived budget.)
             # Fail-open on load failure: prior turns are non-critical context;
             # if the backend is degraded the call still runs with single-shot behavior.
             _prior_turns_as_messages: list[dict] = []
