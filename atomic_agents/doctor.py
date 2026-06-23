@@ -4939,15 +4939,27 @@ def check_principal_backend() -> CheckResult:
        verified principal simply refuses every conversation caller; that is a
        legitimate (if niche) configuration, so it is advisory, not a hard fault.
 
+    Credential safety: ATOMIC_AGENTS_PRINCIPAL_BACKEND may carry a DSN-shaped
+    value. ``_redact_for_error_message`` is applied to the raw env value once and
+    substituted at every echo site (message + detail). Exception strings ({e},
+    str(e)) are left RAW — per MEMORY.md feedback_doctor_check_redacts_env_value_not_exception_string.
+
     Does NOT call agent.call() or touch the filesystem.
     """
-    from .exceptions import BackendNotRegistered, PrincipalBackendError
-    from .principal import get_default_principal_backend
-    from .conversation.types import Principal
+    from .conversation import _redact_for_error_message  # noqa: PLC0415
+    from .exceptions import BackendNotRegistered, PrincipalBackendError  # noqa: PLC0415
+    from .principal import get_default_principal_backend  # noqa: PLC0415
+    from .conversation.types import Principal  # noqa: PLC0415
 
     raw_backend_id = (
         os.environ.get("ATOMIC_AGENTS_PRINCIPAL_BACKEND", "").strip().lower() or "local"
     )
+    # Redact the raw env value once; substitute safe_backend_id at every echo site.
+    # backend.backend_id after construction is always a safe slug ('local',
+    # 'static_claims'), but raw_backend_id may carry a DSN-shaped value before
+    # construction succeeds — so all pre-construction and post-construction echo
+    # sites use safe_backend_id consistently.
+    safe_backend_id = _redact_for_error_message(raw_backend_id)
 
     try:
         backend = get_default_principal_backend()
@@ -4956,29 +4968,29 @@ def check_principal_backend() -> CheckResult:
             name="principal-backend",
             status=FAIL,
             message=(
-                f"ATOMIC_AGENTS_PRINCIPAL_BACKEND={raw_backend_id!r} is not a "
+                f"ATOMIC_AGENTS_PRINCIPAL_BACKEND={safe_backend_id!r} is not a "
                 f"registered backend: {e}"
             ),
             fix_hint=(
                 "Unset ATOMIC_AGENTS_PRINCIPAL_BACKEND to use the local default, "
                 "or set it to a registered backend id (known: 'local', 'static_claims')."
             ),
-            detail={"backend_id": raw_backend_id, "error": str(e)},
+            detail={"backend_id": safe_backend_id, "error": str(e)},
         )
     except PrincipalBackendError as e:
         return CheckResult(
             name="principal-backend",
             status=FAIL,
-            message=f"principal backend '{raw_backend_id}' raised PrincipalBackendError: {e}",
+            message=f"principal backend {safe_backend_id!r} raised PrincipalBackendError: {e}",
             fix_hint="Check the backend's configuration and dependencies.",
-            detail={"backend_id": raw_backend_id, "error": str(e)},
+            detail={"backend_id": safe_backend_id, "error": str(e)},
         )
     except Exception as e:
         return CheckResult(
             name="principal-backend",
             status=FAIL,
             message=f"principal backend raised unexpected error: {type(e).__name__}: {e}",
-            detail={"backend_id": raw_backend_id, "error_type": type(e).__name__},
+            detail={"backend_id": safe_backend_id, "error_type": type(e).__name__},
         )
 
     caps = backend.capabilities()
@@ -4991,11 +5003,11 @@ def check_principal_backend() -> CheckResult:
             name="principal-backend",
             status=FAIL,
             message=(
-                f"principal backend '{backend.backend_id}' raised {type(e).__name__} "
+                f"principal backend {safe_backend_id!r} raised {type(e).__name__} "
                 f"on derive_principal(positive probe): {e}"
             ),
             fix_hint="derive_principal() must never raise for any input.",
-            detail={"backend_id": backend.backend_id, "error_type": type(e).__name__},
+            detail={"backend_id": safe_backend_id, "error_type": type(e).__name__},
         )
 
     if not isinstance(positive_result, Principal):
@@ -5003,11 +5015,11 @@ def check_principal_backend() -> CheckResult:
             name="principal-backend",
             status=FAIL,
             message=(
-                f"principal backend '{backend.backend_id}' returned "
+                f"principal backend {safe_backend_id!r} returned "
                 f"{type(positive_result).__name__} from derive_principal() — "
                 f"expected Principal"
             ),
-            detail={"backend_id": backend.backend_id},
+            detail={"backend_id": safe_backend_id},
         )
 
     # Negative probe: derive_principal with empty claims must return is_verified=False.
@@ -5021,7 +5033,7 @@ def check_principal_backend() -> CheckResult:
                 name="principal-backend",
                 status=FAIL,
                 message=(
-                    f"principal backend '{backend.backend_id}' raised {type(e).__name__} "
+                    f"principal backend {safe_backend_id!r} raised {type(e).__name__} "
                     f"on derive_principal(empty claims — negative probe): {e}"
                 ),
                 fix_hint=(
@@ -5029,7 +5041,7 @@ def check_principal_backend() -> CheckResult:
                     "(spec/48 MUST 1). Return Principal(is_verified=False) instead."
                 ),
                 detail={
-                    "backend_id": backend.backend_id,
+                    "backend_id": safe_backend_id,
                     "error_type": type(e).__name__,
                 },
             )
@@ -5039,11 +5051,11 @@ def check_principal_backend() -> CheckResult:
                 name="principal-backend",
                 status=FAIL,
                 message=(
-                    f"principal backend '{backend.backend_id}' returned "
+                    f"principal backend {safe_backend_id!r} returned "
                     f"{type(negative_result).__name__} from derive_principal(empty) — "
                     f"expected Principal"
                 ),
-                detail={"backend_id": backend.backend_id},
+                detail={"backend_id": safe_backend_id},
             )
 
         if negative_result.is_verified:
@@ -5051,7 +5063,7 @@ def check_principal_backend() -> CheckResult:
                 name="principal-backend",
                 status=FAIL,
                 message=(
-                    f"principal backend '{backend.backend_id}' returned is_verified=True "
+                    f"principal backend {safe_backend_id!r} returned is_verified=True "
                     f"for empty claims — fail-closed invariant violated (spec/48 MUST 1 + MUST 3)"
                 ),
                 fix_hint=(
@@ -5059,7 +5071,7 @@ def check_principal_backend() -> CheckResult:
                     "If this backend is always-local (home-user singleton), set "
                     "capabilities().is_local_only=True to skip the negative probe."
                 ),
-                detail={"backend_id": backend.backend_id},
+                detail={"backend_id": safe_backend_id},
             )
 
     # Capability honesty check: backend claims produces_verified_principals=True.
@@ -5068,7 +5080,7 @@ def check_principal_backend() -> CheckResult:
             name="principal-backend",
             status=WARN,
             message=(
-                f"principal backend '{backend.backend_id}' reports "
+                f"principal backend {safe_backend_id!r} reports "
                 f"produces_verified_principals=False — no principal will pass the "
                 f"HARD-REFUSE gate with conversation_id"
             ),
@@ -5076,15 +5088,15 @@ def check_principal_backend() -> CheckResult:
                 "If this backend is expected to produce verified principals, set "
                 "capabilities().produces_verified_principals=True."
             ),
-            detail={"backend_id": backend.backend_id},
+            detail={"backend_id": safe_backend_id},
         )
 
     return CheckResult(
         name="principal-backend",
         status=PASS,
-        message=f"principal backend '{backend.backend_id}' ready",
+        message=f"principal backend {safe_backend_id!r} ready",
         detail={
-            "backend_id": backend.backend_id,
+            "backend_id": safe_backend_id,
             "is_local_only": caps.is_local_only,
             "supports_token_verification": caps.supports_token_verification,
             "produces_verified_principals": caps.produces_verified_principals,

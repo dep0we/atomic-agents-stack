@@ -30,9 +30,11 @@ Identity model:
 
 Storage-key derivation (spec/48 MUST 7):
     For a verified caller, Principal.identifier = the full 64-character lowercase
-    hexadecimal SHA-256 digest of (provider/sub stripped of surrounding
-    whitespace first, so a trailing space cannot split a namespace):
-        sha256(f'{provider.strip()}\\x00{sub.strip()}'.encode('utf-8')).hexdigest()
+    hexadecimal SHA-256 digest of (provider/sub stripped of surrounding ASCII
+    whitespace ONLY — `_ASCII_WS = " \\t\\n\\r\\f\\v"`, NOT str.strip()'s Unicode
+    set — so a trailing space cannot split a namespace yet two distinct subjects
+    differing only by a leading Unicode space do not collide, spec/48 MUST 11):
+        sha256(f'{provider.strip(_ASCII_WS)}\\x00{sub.strip(_ASCII_WS)}'.encode('utf-8')).hexdigest()
     The NUL byte (\\x00) is the domain separator — it cannot appear in a valid
     provider string or OIDC sub claim, making the separator unambiguous and
     preventing prefix-collision attacks.
@@ -108,9 +110,12 @@ class PrincipalBackend(Protocol):
         Storage-key derivation (spec/48 MUST 7 + MUST 11):
             For verified claims with non-empty 'provider' AND non-empty 'sub',
             Principal.identifier MUST be (provider/sub stripped of surrounding
-            whitespace first, so a trailing space cannot split a namespace):
+            ASCII whitespace ONLY — `_ASCII_WS = " \\t\\n\\r\\f\\v"`, NOT
+            str.strip()'s Unicode set — so a trailing space cannot split a
+            namespace yet two distinct subjects differing only by a leading
+            Unicode space do not collide):
                 hashlib.sha256(
-                    f'{provider.strip()}\\x00{sub.strip()}'.encode('utf-8')
+                    f'{provider.strip(_ASCII_WS)}\\x00{sub.strip(_ASCII_WS)}'.encode('utf-8')
                 ).hexdigest()
             (full 64-char lowercase hexdigest, NUL-byte domain separator).
             The mapping MUST be STABLE (same pair → same identifier across
