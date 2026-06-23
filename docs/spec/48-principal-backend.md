@@ -1,6 +1,6 @@
 # spec/48 — PrincipalBackend Protocol
 
-**Status: DRAFT** | Introduced: v2.0.0 | Issue: #556
+**Status: LOCKED** | Introduced: v2.0.0 | Issue: #556
 
 ---
 
