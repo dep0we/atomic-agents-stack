@@ -51,10 +51,9 @@ class AgentConfig:
     # precedence.
     dedup_body_hash_enabled: bool = False
 
-    # spec/47 PR1 (PROVISIONAL — field name and section syntax may change before LOCK):
-    # Backend id for the conversation backend, parsed from model.md
-    # '## Conversation Backend' section. None when the section is absent (single-shot
-    # default). The three-channel resolution order in agent.call() is:
+    # spec/47 (LOCKED): backend id for the conversation backend, parsed from
+    # model.md '## Conversation Backend' section. None when the section is absent
+    # (single-shot default). The three-channel resolution order in agent.call() is:
     # (1) constructor kwarg, (2) ATOMIC_AGENTS_CONVERSATION_BACKEND env var,
     # (3) this field. All three resolve to None when unset (backward-compatible).
     # DO NOT default to 'filesystem' — 'no backend == single-shot' is mandatory (rule #14).

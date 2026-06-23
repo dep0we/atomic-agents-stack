@@ -1061,3 +1061,31 @@ cost_estimated: bool     (True when the per-note cost was byte-token estimated)
 `sum_cost_for_period(source='actor')` now includes prior embed spend on subsequent calls via the `embed_cost` records, so the embed cost gate's headroom baseline is accurate across calls (Principle 4).
 
 Added OUTSIDE the 8-MUST count, same versioned-addendum precedent as the PR1 addendum above.
+
+### Versioned normative addendum — `LogQuery.conversation_id` AND-predicate (spec/47, issue #535 PR2)
+
+`conversation_id` is tagged on ALL terminal JSONL records when `agent.call()` is
+invoked with `conversation_id` set — all seven sites: ok, dedup, lock_busy,
+pre-loop cost-skip, in_flight, mid-loop cost-skip, and security-abort.
+
+`LogQuery.conversation_id` (added to `logs/types.py`) is a versioned normative
+addendum to this spec: conforming `LogBackend` implementations MUST support it as
+an AND-predicate returning ONLY records whose `conversation_id` matches — `None`
+means no filter (all records). SQLite and Postgres MUST resolve it via the
+`idx_conversation_id` partial index (equality `= ?` / `= %s` lookup matching the
+partial predicate, so it is an index seek).
+
+**Schema version:** SQLite and Postgres `LogBackend` implementations bumped from
+`v2` to `v3` (schema_version=3) in spec/47 PR1:
+- SQLite: `v2→v3` migration adds `conversation_id TEXT` column + `idx_conversation_id`
+  partial index (`PRAGMA table_info` guard for crash-resumability).
+- Postgres: `v2→v3` migration adds `conversation_id TEXT` column +
+  `idx_conversation_id` partial index (`ADD COLUMN IF NOT EXISTS`, idempotent).
+
+**Conformance test:** a parametrized round-trip test (`test_query_filters_by_conversation_id`)
+exists in `tests/test_log_protocol_conformance.py` with a strip negative control.
+Shipping the column + index WITHOUT the predicate is non-conforming: the parametrized
+round-trip conformance test fails such a backend rather than passing it.
+
+Added OUTSIDE the 8-MUST count, following the versioned-addendum precedent of
+spec/45 PR2 (#520) and the existing addenda in this spec.
