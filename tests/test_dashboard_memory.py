@@ -17,8 +17,13 @@ from atomic_agents.dashboard.memory import (
 )
 
 
-def _write_note(memory_dir: Path, filename: str, note_type: str, last_seen: str | None = None,
-                pinned: bool = False) -> Path:
+def _write_note(
+    memory_dir: Path,
+    filename: str,
+    note_type: str,
+    last_seen: str | None = None,
+    pinned: bool = False,
+) -> Path:
     memory_dir.mkdir(parents=True, exist_ok=True)
     content = f"---\ntype: {note_type}\n"
     if last_seen:
@@ -33,6 +38,7 @@ def _write_note(memory_dir: Path, filename: str, note_type: str, last_seen: str 
 
 def test_note_counts_by_type(tmp_path):
     (tmp_path / "alice" / "log").mkdir(parents=True)
+    (tmp_path / "alice" / "model.md").write_text("# model\n")
     mem_dir = tmp_path / "alice" / "memory"
     _write_note(mem_dir, "user_pref.md", "user")
     _write_note(mem_dir, "feedback_1.md", "feedback")
@@ -57,6 +63,7 @@ def test_note_counts_by_type(tmp_path):
 
 def test_staleness_candidates(tmp_path):
     (tmp_path / "alice" / "log").mkdir(parents=True)
+    (tmp_path / "alice" / "model.md").write_text("# model\n")
     mem_dir = tmp_path / "alice" / "memory"
     today = date.today()
     old_date = (today - timedelta(days=100)).isoformat()
@@ -75,6 +82,7 @@ def test_staleness_candidates(tmp_path):
 
 def test_staleness_threshold_respected(tmp_path):
     (tmp_path / "alice" / "log").mkdir(parents=True)
+    (tmp_path / "alice" / "model.md").write_text("# model\n")
     mem_dir = tmp_path / "alice" / "memory"
     today = date.today()
     # Note is 50 days old
@@ -92,6 +100,7 @@ def test_staleness_threshold_respected(tmp_path):
 
 def test_orphan_check(tmp_path):
     (tmp_path / "alice" / "log").mkdir(parents=True)
+    (tmp_path / "alice" / "model.md").write_text("# model\n")
     mem_dir = tmp_path / "alice" / "memory"
     mem_dir.mkdir(parents=True)
     # Two notes; INDEX.md only references one
@@ -107,6 +116,7 @@ def test_orphan_check(tmp_path):
 
 def test_no_orphans_when_all_indexed(tmp_path):
     (tmp_path / "alice" / "log").mkdir(parents=True)
+    (tmp_path / "alice" / "model.md").write_text("# model\n")
     mem_dir = tmp_path / "alice" / "memory"
     mem_dir.mkdir(parents=True)
     _write_note(mem_dir, "note_a.md", "user")
@@ -118,6 +128,7 @@ def test_no_orphans_when_all_indexed(tmp_path):
 
 def test_version_churn_ranking(tmp_path):
     (tmp_path / "alice" / "log").mkdir(parents=True)
+    (tmp_path / "alice" / "model.md").write_text("# model\n")
     mem_dir = tmp_path / "alice" / "memory"
     mem_dir.mkdir(parents=True)
 
@@ -126,7 +137,7 @@ def test_version_churn_ranking(tmp_path):
         ver_dir = mem_dir / ".versions" / stem
         ver_dir.mkdir(parents=True)
         for i in range(count):
-            ts = f"2026050{i+1}T120000Z"
+            ts = f"2026050{i + 1}T120000Z"
             (ver_dir / f"{ts}_abc{i:02d}abc.md").write_text(f"version {i}")
 
     data = aggregate_memory(tmp_path)
@@ -141,9 +152,12 @@ def test_version_churn_ranking(tmp_path):
 def test_dream_history_scanned(tmp_path):
     # alice needs log/ AND memory/ to be discovered and have memory data
     (tmp_path / "alice" / "log").mkdir(parents=True)
+    (tmp_path / "alice" / "model.md").write_text("# model\n")
     (tmp_path / "alice" / "memory").mkdir(parents=True)
     # Write a memory note so note_counts > 0 (agent discovered)
-    (tmp_path / "alice" / "memory" / "note.md").write_text("---\ntype: user\n---\nBody.")
+    (tmp_path / "alice" / "memory" / "note.md").write_text(
+        "---\ntype: user\n---\nBody."
+    )
     dream_dir = tmp_path / "alice" / "dreams" / "dream-001"
     dream_dir.mkdir(parents=True)
     manifest = {
@@ -168,6 +182,7 @@ def test_dream_history_scanned(tmp_path):
 
 def test_memory_size_calculation(tmp_path):
     (tmp_path / "alice" / "log").mkdir(parents=True)
+    (tmp_path / "alice" / "model.md").write_text("# model\n")
     mem_dir = tmp_path / "alice" / "memory"
     mem_dir.mkdir(parents=True)
     # Write a note of known size

@@ -1131,6 +1131,19 @@ def _compute_merged_content(
         # Render fresh content from template.
         fresh_text = _render_file_to_string(template_name, rel_parts, fresh_vars)
 
+        # governance.md is operator-curated content. Preserve it verbatim on
+        # add-to-it when it already exists — the operator may have filled in
+        # permission_tier, owner, and other structured fields. Re-rendering the
+        # stub would silently destroy that curation. Only backfill governance.md
+        # when it is absent (operator has never edited it).
+        if relpath == "governance.md" and target.exists():
+            try:
+                existing_governance = target.read_text(encoding="utf-8-sig")
+                merged[relpath] = existing_governance
+            except OSError:
+                merged[relpath] = fresh_text
+            continue
+
         if not target.exists():
             # Missing file: backfill entirely from template.
             merged[relpath] = fresh_text
@@ -1760,6 +1773,8 @@ def _write_scaffold(
         "Files written:\n"
         "  persona/IDENTITY.md, persona/SOUL.md, persona/USER.md\n"
         "  tools.md, model.md, memory/INDEX.md, wiki/INDEX.md\n"
+        "  governance.md (fill in permission_tier and owner; lifecycle_status "
+        "defaults to 'active')\n"
         "  plus the empty write-path directories declared in tools.md "
         "(e.g. journal/, log/, output/)\n"
     )

@@ -7,7 +7,7 @@ Pure Python. No LLM calls. Generic — works for any agents-root layout.
 """
 
 from __future__ import annotations
-import json
+import logging
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from datetime import date, datetime, timedelta
@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any
 
 from .._costs import calc_cost, PRICING
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -141,16 +143,93 @@ class AgentDashboardData:
 def discover_agents(agents_root: Path) -> list[str]:
     """Find agent folders under agents_root.
 
-    An "agent folder" has a `log/` subdirectory. Folders prefixed with `_`
-    or `.` are excluded (e.g., `_dashboard/`, `.git/`).
+    Routes through AgentRegistryBackend.list_agents() so the predicate is the
+    canonical spec/37:314 definition: model.md is present AND readable without
+    IOError. This correctly includes newly-deployed agents (model.md present,
+    no log/ yet) and excludes non-framework directories (log/ present, no model.md).
+
+    Thin adapter: discover_agents() keeps returning list[str] for backward
+    compatibility with every call site — the five cross-module callers
+    (memory.py, goals.py, activity.py, quality.py, render.py) plus the in-module
+    aggregate_global() call site in this file. The registry routing is internal.
+
+    Folders prefixed with '_' or '.' are excluded by the registry's list_agents()
+    predicate (same as the previous log/-presence guard).
+
+    Progressive disclosure (Principle #6): this caller needs only the id list, so
+    it requests list_agents(include_governance=False) — the registry skips the
+    per-agent governance.md read+parse that the dashboard discovery path never
+    uses. discover_agents() is called ~10x per dashboard render; parsing every
+    agent's governance.md on each call would be wasted work for an org fleet.
+
+    Resilience: the dashboard discovery path is read-only and must degrade
+    rather than crash an entire render, so the try/except spans BOTH backend
+    construction AND the list_agents() enumeration. It covers a typo'd
+    ATOMIC_AGENTS_AGENT_REGISTRY_BACKEND (BackendNotRegistered), a registered
+    backend that raises from its own constructor (e.g. a future DB-backed
+    registry that opens a connection in __init__), AND a registered backend
+    whose list_agents() raises. Any of those falls back to the filesystem
+    default here — the resilience promise is cross-backend, not filesystem-only.
+    The fallback enumeration is ITSELF guarded: when the env var is unset (the
+    home-user default), the failing backend WAS the filesystem default, so a
+    naive fallback would re-run the same code and re-raise; a second except
+    degrades to [] (the original absent-root behavior, which every downstream
+    caller tolerates) rather than crashing the render.
+    The breadcrumb logs only the exception TYPE (a DB-backed backend may embed a
+    DSN in its error text). The fail-loud signal still surfaces via
+    check_agent_registry_backend() (the doctor check is where fail-loud belongs).
     """
-    if not agents_root.exists():
-        return []
-    return sorted(
-        d.name
-        for d in agents_root.iterdir()
-        if d.is_dir() and not d.name.startswith(("_", ".")) and (d / "log").is_dir()
+    from ..agent_registry import (
+        FilesystemAgentRegistryBackend,
+        get_default_agent_registry_backend,
     )
+
+    try:
+        backend = get_default_agent_registry_backend(agents_root)
+        return sorted(ref.id for ref in backend.list_agents(include_governance=False))
+    except Exception as exc:
+        # Degrade rather than crash every dashboard tab. The except spans BOTH
+        # construction and enumeration: it covers BackendNotRegistered (typo'd
+        # env var), any error from a registered backend's own __init__ (e.g. a
+        # future DB-backed registry that opens a connection), AND any error its
+        # list_agents() raises. A filesystem-only guard would still crash on a
+        # non-filesystem backend whose list_agents() raises; the resilience
+        # promise is cross-backend. The doctor check is where fail-loud belongs.
+        #
+        # Log only the exception TYPE, not its message: a DB-backed backend can
+        # embed a DSN in the error text, and this breadcrumb must not leak
+        # credentials into dashboard logs (Principle #5; the redaction-tested
+        # fail-loud surface is `atomic-agents doctor`).
+        logger.warning(
+            "agent registry discovery failed (%s); falling back to the "
+            "filesystem registry for dashboard discovery. Run "
+            "`atomic-agents doctor` to see the failure.",
+            type(exc).__name__,
+        )
+        # The fallback is ITSELF guarded. When the env var is unset (the
+        # home-user default), the failing backend WAS the filesystem default,
+        # so a naive `fs.list_agents()` re-runs the exact same code and
+        # re-raises the same exception — crashing every dashboard tab, the
+        # precise failure this block claims to prevent. FilesystemAgent-
+        # RegistryBackend.list_agents() CAN raise mid-loop (an ELOOP/permission
+        # OSError on candidate.is_dir()/candidate.resolve()). Degrade to [] —
+        # the original behavior when agents_root was absent, which every
+        # downstream caller already tolerates.
+        try:
+            fs = FilesystemAgentRegistryBackend(agents_root)
+            return sorted(ref.id for ref in fs.list_agents(include_governance=False))
+        except Exception as fallback_exc:
+            # Log the FALLBACK failure's own type (not the primary `exc`): in the
+            # home-user case they are identical, but a registered primary backend
+            # could fail differently from the filesystem fallback, and the
+            # accurate breadcrumb is the one that actually aborted discovery.
+            logger.warning(
+                "filesystem fallback registry discovery also failed (%s); "
+                "returning an empty agent list. Run `atomic-agents doctor` "
+                "to see the failure.",
+                type(fallback_exc).__name__,
+            )
+            return []
 
 
 def _load_runs_with_degraded(

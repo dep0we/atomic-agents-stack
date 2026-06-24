@@ -15,9 +15,14 @@ from atomic_agents.dashboard.goals import (
 )
 
 
-def _write_goal(agent_root: Path, intent: str, sub_goals: list[dict],
-                priority: str = "high", created: str | None = None,
-                deadline: str | None = None) -> Path:
+def _write_goal(
+    agent_root: Path,
+    intent: str,
+    sub_goals: list[dict],
+    priority: str = "high",
+    created: str | None = None,
+    deadline: str | None = None,
+) -> Path:
     agent_root.mkdir(parents=True, exist_ok=True)
     today = date.today()
     fm: dict = {
@@ -61,15 +66,21 @@ def _write_goal(agent_root: Path, intent: str, sub_goals: list[dict],
 
 
 def _make_agent(agents_root: Path, agent: str) -> Path:
-    """Create minimum agent structure (needs log/ to be discoverable)."""
+    """Create minimum agent structure discoverable by AgentRegistryBackend (spec/37:314 predicate).
+
+    model.md must be present; log/ is created for run-history tests.
+    """
     agent_root = agents_root / agent
     (agent_root / "log").mkdir(parents=True, exist_ok=True)
+    (agent_root / "model.md").write_text("# model\n")
     return agent_root
 
 
 def test_has_any_goal_true(tmp_path):
     agent_root = _make_agent(tmp_path, "alice")
-    _write_goal(agent_root, "Ship v2", [{"id": "sg1", "label": "Build", "status": "pending"}])
+    _write_goal(
+        agent_root, "Ship v2", [{"id": "sg1", "label": "Build", "status": "pending"}]
+    )
     assert has_any_goal(tmp_path) is True
 
 
@@ -80,11 +91,15 @@ def test_has_any_goal_false(tmp_path):
 
 def test_active_goal_extraction(tmp_path):
     agent_root = _make_agent(tmp_path, "alice")
-    _write_goal(agent_root, "Ship v2", [
-        {"id": "sg1", "label": "Design", "status": "complete"},
-        {"id": "sg2", "label": "Build", "status": "in_progress"},
-        {"id": "sg3", "label": "Test", "status": "pending"},
-    ])
+    _write_goal(
+        agent_root,
+        "Ship v2",
+        [
+            {"id": "sg1", "label": "Design", "status": "complete"},
+            {"id": "sg2", "label": "Build", "status": "in_progress"},
+            {"id": "sg3", "label": "Test", "status": "pending"},
+        ],
+    )
 
     data = aggregate_goals(tmp_path)
     assert len(data.active_goals) == 1
@@ -99,10 +114,14 @@ def test_active_goal_extraction(tmp_path):
 
 def test_blocked_sub_goal_queue(tmp_path):
     agent_root = _make_agent(tmp_path, "alice")
-    _write_goal(agent_root, "Research", [
-        {"id": "sg1", "label": "Gather data", "status": "complete"},
-        {"id": "sg2", "label": "Analyze", "status": "blocked", "blocked_by": "sg1"},
-    ])
+    _write_goal(
+        agent_root,
+        "Research",
+        [
+            {"id": "sg1", "label": "Gather data", "status": "complete"},
+            {"id": "sg2", "label": "Analyze", "status": "blocked", "blocked_by": "sg1"},
+        ],
+    )
 
     data = aggregate_goals(tmp_path)
     assert len(data.blocked_sub_goals) == 1
@@ -113,10 +132,14 @@ def test_blocked_sub_goal_queue(tmp_path):
 
 def test_no_blocked_when_all_clear(tmp_path):
     agent_root = _make_agent(tmp_path, "alice")
-    _write_goal(agent_root, "Write docs", [
-        {"id": "sg1", "label": "Outline", "status": "complete"},
-        {"id": "sg2", "label": "Draft", "status": "in_progress"},
-    ])
+    _write_goal(
+        agent_root,
+        "Write docs",
+        [
+            {"id": "sg1", "label": "Outline", "status": "complete"},
+            {"id": "sg2", "label": "Draft", "status": "in_progress"},
+        ],
+    )
 
     data = aggregate_goals(tmp_path)
     assert data.blocked_sub_goals == []
@@ -161,15 +184,19 @@ def test_outcome_histogram_excludes_old_runs(tmp_path):
     old_date = (date.today() - timedelta(days=100)).isoformat()
     run_dir = outcomes_dir / "run-old"
     run_dir.mkdir()
-    (run_dir / "result.json").write_text(json.dumps({
-        "run_id": "run-old",
-        "description": "old",
-        "status": "satisfied",
-        "started_at": old_date,
-        "iterations": [{"iteration": 1}],
-        "max_iterations": 3,
-        "total_cost_usd": 0.05,
-    }))
+    (run_dir / "result.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run-old",
+                "description": "old",
+                "status": "satisfied",
+                "started_at": old_date,
+                "iterations": [{"iteration": 1}],
+                "max_iterations": 3,
+                "total_cost_usd": 0.05,
+            }
+        )
+    )
 
     data = aggregate_goals(tmp_path, outcome_histogram_days=90)
     assert data.iteration_histogram == {}  # old run excluded
@@ -186,8 +213,12 @@ def test_no_goals_returns_empty(tmp_path):
 def test_days_since_start_calculated(tmp_path):
     agent_root = _make_agent(tmp_path, "alice")
     created = (date.today() - timedelta(days=10)).isoformat()
-    _write_goal(agent_root, "Goal", [{"id": "sg1", "label": "L", "status": "pending"}],
-                created=created)
+    _write_goal(
+        agent_root,
+        "Goal",
+        [{"id": "sg1", "label": "L", "status": "pending"}],
+        created=created,
+    )
 
     data = aggregate_goals(tmp_path)
     g = data.active_goals[0]
@@ -197,8 +228,12 @@ def test_days_since_start_calculated(tmp_path):
 def test_overdue_deadline_detected(tmp_path):
     agent_root = _make_agent(tmp_path, "alice")
     yesterday = (date.today() - timedelta(days=1)).isoformat()
-    _write_goal(agent_root, "Goal", [{"id": "sg1", "label": "L", "status": "pending"}],
-                deadline=yesterday)
+    _write_goal(
+        agent_root,
+        "Goal",
+        [{"id": "sg1", "label": "L", "status": "pending"}],
+        deadline=yesterday,
+    )
 
     data = aggregate_goals(tmp_path)
     g = data.active_goals[0]
@@ -208,8 +243,12 @@ def test_overdue_deadline_detected(tmp_path):
 def test_future_deadline_not_overdue(tmp_path):
     agent_root = _make_agent(tmp_path, "alice")
     next_month = (date.today() + timedelta(days=30)).isoformat()
-    _write_goal(agent_root, "Goal", [{"id": "sg1", "label": "L", "status": "pending"}],
-                deadline=next_month)
+    _write_goal(
+        agent_root,
+        "Goal",
+        [{"id": "sg1", "label": "L", "status": "pending"}],
+        deadline=next_month,
+    )
 
     data = aggregate_goals(tmp_path)
     g = data.active_goals[0]
@@ -222,8 +261,16 @@ def test_load_blocked_at_from_history(tmp_path):
     agent_root = tmp_path / "alice"
     agent_root.mkdir(parents=True)
     events = [
-        {"event": "sub_goal_blocked", "sub_goal_id": "sg2", "ts": "2026-05-01T10:00:00Z"},
-        {"event": "sub_goal_outcome_dispatched", "sub_goal_id": "sg1", "ts": "2026-05-02T10:00:00Z"},
+        {
+            "event": "sub_goal_blocked",
+            "sub_goal_id": "sg2",
+            "ts": "2026-05-01T10:00:00Z",
+        },
+        {
+            "event": "sub_goal_outcome_dispatched",
+            "sub_goal_id": "sg1",
+            "ts": "2026-05-02T10:00:00Z",
+        },
     ]
     history_path = agent_root / "goal_history.jsonl"
     history_path.write_text("\n".join(json.dumps(e) for e in events) + "\n")

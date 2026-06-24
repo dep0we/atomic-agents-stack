@@ -27,9 +27,18 @@ def _write_log(agents_root: Path, agent: str, when: date, records: list[dict]) -
     ``agent._log()`` produces in production (``datetime.now().astimezone()
     .isoformat()``). Naive ts breaks ``FilesystemLogBackend.query`` lex
     comparison against tz-aware since/until bounds.
+
+    Per spec/51 ADOPT-NOW: also creates model.md so that discover_agents()
+    (now routed through AgentRegistryBackend.list_agents()) recognizes this
+    folder as a framework agent. The spec/37:314 predicate is model.md
+    presence+readability, NOT log/ presence.
     """
     log_dir = agents_root / agent / "log" / when.strftime("%Y-%m")
     log_dir.mkdir(parents=True, exist_ok=True)
+    # Create minimal model.md so discover_agents() finds this agent.
+    model_md = agents_root / agent / "model.md"
+    if not model_md.exists():
+        model_md.write_text("# model\n")
     path = log_dir / f"{when.isoformat()}.jsonl"
     lines = []
     for rec in records:
@@ -50,19 +59,72 @@ def _write_log(agents_root: Path, agent: str, when: date, records: list[dict]) -
 
 
 def test_discover_agents(tmp_path):
-    (tmp_path / "alice" / "log").mkdir(parents=True)
-    (tmp_path / "bob" / "log").mkdir(parents=True)
-    (tmp_path / "no-log-dir").mkdir()  # not an agent
+    # spec/51 ADOPT-NOW: predicate is model.md presence (spec/37:314),
+    # NOT log/ presence. Newly-deployed agents (model.md only, no log yet)
+    # MUST appear; non-framework directories (log/ only, no model.md) MUST NOT.
+    (tmp_path / "alice").mkdir()
+    (tmp_path / "alice" / "model.md").write_text("# model\n")
+    (tmp_path / "alice" / "log").mkdir()  # log/ present too (normal running agent)
+    (tmp_path / "bob").mkdir()
+    (tmp_path / "bob" / "model.md").write_text("# model\n")
+    # 'bob' has model.md but NO log/ — newly-deployed agent, MUST be discovered
+    (tmp_path / "no-model-but-has-log" / "log").mkdir(parents=True)  # no model.md → not an agent
+    (tmp_path / "empty-dir").mkdir()  # no model.md → not an agent
     (tmp_path / "_dashboard").mkdir()  # excluded prefix
     (tmp_path / ".hidden").mkdir()
 
     agents = discover_agents(tmp_path)
     assert agents == ["alice", "bob"]
+    # Negative controls:
+    assert "no-model-but-has-log" not in agents  # log/ alone is not enough
+    assert "empty-dir" not in agents
 
 
 def test_discover_agents_empty_root(tmp_path):
     assert discover_agents(tmp_path) == []
     assert discover_agents(tmp_path / "nonexistent") == []
+
+
+def test_discover_agents_model_md_only_no_log(tmp_path):
+    """A just-deployed agent (model.md present, no log/) MUST appear in discover_agents.
+
+    This is the primary regression guard for the spec/51 predicate change —
+    the old log/-presence predicate excluded newly-deployed agents from the
+    dashboard until they had their first run. spec/37:314 + spec/51 ADOPT-NOW
+    requires the model.md predicate instead.
+    """
+    # Agent with model.md but NO log/ — just deployed, never run yet.
+    (tmp_path / "new-agent").mkdir()
+    (tmp_path / "new-agent" / "model.md").write_text("# model\n")
+    # Agent with log/ but NO model.md — not a framework agent by spec/37:314.
+    (tmp_path / "legacy-data-dir" / "log").mkdir(parents=True)
+
+    agents = discover_agents(tmp_path)
+    assert "new-agent" in agents, "just-deployed agent (model.md, no log/) must be discovered"
+    assert "legacy-data-dir" not in agents, "log/ alone is not the framework-agent predicate"
+
+
+def test_discover_agents_no_log_aggregate_agent_zero_runs(tmp_path):
+    """aggregate_agent on a just-deployed agent (no log/) returns zeros, not an error.
+
+    Acceptance Criterion for the ADOPT-NOW rewire: spec/22 boundary contract
+    (empty/absent → [], not an error) handles the no-log case gracefully.
+    """
+    today = date.today()
+    # Create agent with model.md but no log directory.
+    (tmp_path / "new-agent").mkdir()
+    (tmp_path / "new-agent" / "model.md").write_text("# model\n")
+
+    # discover_agents should find it.
+    agents = discover_agents(tmp_path)
+    assert "new-agent" in agents
+
+    # aggregate_agent must return zero-run data, not raise.
+    data = aggregate_agent(tmp_path, "new-agent", today=today)
+    assert data.name == "new-agent"
+    assert data.summary_this_month.runs == 0
+    assert data.summary_this_month.cost_usd == 0.0
+    assert data.cost_data_degraded is False
 
 
 def test_load_runs_basic(tmp_path):
