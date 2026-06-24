@@ -16,6 +16,11 @@ from atomic_agents.dashboard.activity import (
 
 
 def _write_log(agents_root: Path, agent: str, when: date, records: list[dict]) -> Path:
+    # Create model.md so discover_agents() picks up this agent (spec/37:314 predicate).
+    model_md = agents_root / agent / "model.md"
+    model_md.parent.mkdir(parents=True, exist_ok=True)
+    if not model_md.exists():
+        model_md.write_text("# model\n")
     log_dir = agents_root / agent / "log" / when.strftime("%Y-%m")
     log_dir.mkdir(parents=True, exist_ok=True)
     path = log_dir / f"{when.isoformat()}.jsonl"
@@ -38,15 +43,28 @@ def test_headline_counts_runs_24h(tmp_path):
     now = datetime.now(tz=timezone.utc)
     today = now.date()
     # 3 runs "now" (within 24h), 1 run 8 days ago (outside 7d window)
-    _write_log(tmp_path, "alice", today, [
-        {"ts": now.isoformat(), "status": "ok"},
-        {"ts": now.isoformat(), "status": "ok"},
-        {"ts": now.isoformat(), "status": "error"},
-    ])
+    _write_log(
+        tmp_path,
+        "alice",
+        today,
+        [
+            {"ts": now.isoformat(), "status": "ok"},
+            {"ts": now.isoformat(), "status": "ok"},
+            {"ts": now.isoformat(), "status": "error"},
+        ],
+    )
     eight_days_ago = today - timedelta(days=8)
-    _write_log(tmp_path, "alice", eight_days_ago, [
-        {"ts": datetime.combine(eight_days_ago, datetime.min.time()).isoformat(), "status": "ok"},
-    ])
+    _write_log(
+        tmp_path,
+        "alice",
+        eight_days_ago,
+        [
+            {
+                "ts": datetime.combine(eight_days_ago, datetime.min.time()).isoformat(),
+                "status": "ok",
+            },
+        ],
+    )
 
     data = aggregate_activity(tmp_path, now=now)
     assert data.headline.runs_24h == 3
@@ -59,10 +77,15 @@ def test_recent_runs_sorted_newest_first(tmp_path):
     now = datetime.now(tz=timezone.utc)
     today = now.date()
     earlier = now - timedelta(hours=2)
-    _write_log(tmp_path, "alice", today, [
-        {"ts": now.isoformat(), "summary": "newest"},
-        {"ts": earlier.isoformat(), "summary": "older"},
-    ])
+    _write_log(
+        tmp_path,
+        "alice",
+        today,
+        [
+            {"ts": now.isoformat(), "summary": "newest"},
+            {"ts": earlier.isoformat(), "summary": "older"},
+        ],
+    )
 
     data = aggregate_activity(tmp_path, now=now)
     assert data.recent_runs[0].summary == "newest"
@@ -72,9 +95,7 @@ def test_recent_runs_sorted_newest_first(tmp_path):
 def test_recent_runs_capped_at_max(tmp_path):
     now = datetime.now(tz=timezone.utc)
     today = now.date()
-    _write_log(tmp_path, "alice", today, [
-        {"ts": now.isoformat()} for _ in range(60)
-    ])
+    _write_log(tmp_path, "alice", today, [{"ts": now.isoformat()} for _ in range(60)])
 
     data = aggregate_activity(tmp_path, now=now, max_recent=50)
     assert len(data.recent_runs) == 50
@@ -83,11 +104,21 @@ def test_recent_runs_capped_at_max(tmp_path):
 def test_failure_detection(tmp_path):
     now = datetime.now(tz=timezone.utc)
     today = now.date()
-    _write_log(tmp_path, "alice", today, [
-        {"ts": now.isoformat(), "status": "error", "summary": "failed run"},
-        {"ts": now.isoformat(), "status": "ok", "summary": "good run"},
-        {"ts": now.isoformat(), "trigger": "cron_error", "status": "ok", "summary": "trigger error"},
-    ])
+    _write_log(
+        tmp_path,
+        "alice",
+        today,
+        [
+            {"ts": now.isoformat(), "status": "error", "summary": "failed run"},
+            {"ts": now.isoformat(), "status": "ok", "summary": "good run"},
+            {
+                "ts": now.isoformat(),
+                "trigger": "cron_error",
+                "status": "ok",
+                "summary": "trigger error",
+            },
+        ],
+    )
 
     data = aggregate_activity(tmp_path, now=now)
     assert len(data.recent_failures) == 2  # error status + _error trigger
@@ -98,11 +129,16 @@ def test_failure_detection(tmp_path):
 def test_tool_call_and_delegation_filter(tmp_path):
     now = datetime.now(tz=timezone.utc)
     today = now.date()
-    _write_log(tmp_path, "alice", today, [
-        {"ts": now.isoformat(), "trigger": "tool_call", "summary": "tool"},
-        {"ts": now.isoformat(), "trigger": "delegate", "summary": "delegated"},
-        {"ts": now.isoformat(), "trigger": "cron", "summary": "normal"},
-    ])
+    _write_log(
+        tmp_path,
+        "alice",
+        today,
+        [
+            {"ts": now.isoformat(), "trigger": "tool_call", "summary": "tool"},
+            {"ts": now.isoformat(), "trigger": "delegate", "summary": "delegated"},
+            {"ts": now.isoformat(), "trigger": "cron", "summary": "normal"},
+        ],
+    )
 
     data = aggregate_activity(tmp_path, now=now)
     assert len(data.recent_tool_calls) == 1
@@ -113,11 +149,13 @@ def test_tool_call_and_delegation_filter(tmp_path):
 
 def test_stale_lock_detection(tmp_path):
     (tmp_path / "alice" / "log").mkdir(parents=True)
+    (tmp_path / "alice" / "model.md").write_text("# model\n")
     lock_path = tmp_path / "alice" / ".lock"
     lock_path.write_text("locked")
     # Make lock appear > 5 minutes old by manipulating mtime
     old_time = time.time() - 400  # 400 seconds = 6.7 minutes
     import os
+
     os.utime(lock_path, (old_time, old_time))
 
     now = datetime.now(tz=timezone.utc)
@@ -129,6 +167,7 @@ def test_stale_lock_detection(tmp_path):
 
 def test_no_stale_lock_for_fresh_lock(tmp_path):
     (tmp_path / "alice" / "log").mkdir(parents=True)
+    (tmp_path / "alice" / "model.md").write_text("# model\n")
     lock_path = tmp_path / "alice" / ".lock"
     lock_path.write_text("locked")
     # Lock is brand new — not stale
@@ -140,6 +179,7 @@ def test_no_stale_lock_for_fresh_lock(tmp_path):
 
 def test_dream_scan(tmp_path):
     (tmp_path / "alice" / "log").mkdir(parents=True)
+    (tmp_path / "alice" / "model.md").write_text("# model\n")
     dream_dir = tmp_path / "alice" / "dreams" / "dream-001"
     dream_dir.mkdir(parents=True)
     manifest = {
@@ -163,9 +203,11 @@ def test_dream_scan(tmp_path):
 
 def test_recent_captures_sorted_by_mtime(tmp_path):
     (tmp_path / "alice" / "log").mkdir(parents=True)
+    (tmp_path / "alice" / "model.md").write_text("# model\n")
     mem_dir = tmp_path / "alice" / "memory"
     mem_dir.mkdir(parents=True)
     import os
+
     # Create two memory notes with different mtimes
     note1 = mem_dir / "note_old.md"
     note2 = mem_dir / "note_new.md"

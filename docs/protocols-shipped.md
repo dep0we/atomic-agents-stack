@@ -581,9 +581,37 @@ Filed as [#556](https://github.com/dep0we/atomic-agents-stack/issues/556). Shipp
 
 ---
 
-## Why twenty-one protocols, summarized
+## AgentRegistryBackend (#607, DRAFT spec/51, the twenty-second)
 
-A person at home runs filesystem-everything with one agent. An organization runs the same agents over Postgres, behind an HTTP service, with a fleet of orchestrated roles, each caller's conversation namespace isolated by verified identity. **Same agent definitions, same `call()` flow, same audit trail. Different backends.**
+Filed as [#607](https://github.com/dep0we/atomic-agents-stack/issues/607) (PR 1 of the AgentRegistry arc, epic [#606](https://github.com/dep0we/atomic-agents-stack/issues/606)). Shipped in PR 1; spec/51 is DRAFT (LOCK ceremony follows the arc).
+
+**Reference implementation:** `FilesystemAgentRegistryBackend` (discovery-only / read-only, `backend_id="filesystem"`) in `atomic_agents/agent_registry/`. Discovers agents by walking `agents_root` and applying the spec/37:314 predicate — `model.md` present AND readable without `IOError` (replaces the old `log/` predicate, so a just-deployed agent with no run history is discovered immediately).
+
+**Protocol surface (spec/51 10-MUST Implementer Contract):** `backend_id` @property; `list_agents(include_governance: bool = True) → list[AgentRef]`; `get_agent(agent_id) → AgentRef | None`; `capabilities` @property → `AgentRegistryCapabilities`; `register_agent()` / `unregister_agent()` (raise `RegistrationNotSupported` on read-only backends, MUST 10). `list_agents()` is sorted lexicographically by id (MUST 6), fail-soft per agent (a corrupt `governance.md` for one agent does not abort the fleet loop, MUST 5), and returns `[]` (not raise) on absent/empty root (MUST 2). `get_agent()` returns `None` on miss/TOCTOU (MUST 7) and raises `PathTraversalError` for an `agent_id` that is empty, `.`/`..`, or contains a separator (MUST 8).
+
+**governance.md schema (operator-curated):** one embedded fenced YAML block with root key `governance:` plus free-prose markdown sections. Five parse states: ABSENT `(False, None)`, PRESENT_VALID `(True, record)`, PRESENT_INVALID `(True, record-with-parse_errors)`, PRESENT_NO_BLOCK `(True, None)` — readable file with no `governance:` block, and PRESENT_UNREADABLE `(False, None)` + WARNING log. An unknown enum value raises `GovernanceParseError` fail-fast in `GovernanceRecord.from_dict()`; the filesystem caller catches it into a partial `GovernanceRecord.parse_errors` (PRESENT_INVALID). A malformed non-governance illustrative YAML block placed before the real block does NOT shadow it — the parser defers the YAML error and keeps scanning, flagging it only when no `governance:` block is found.
+
+**Progressive disclosure (Principle #6):** `list_agents(include_governance=False)` SKIPS the per-agent `governance.md` read+parse, returning ids only. The dashboard `discover_agents()` rewire uses this path (called ~10x per render and never reads governance). On that path `has_governance` reflects "not read", not "absent on disk".
+
+**ADOPT-NOW (this PR, not deferred):** (1) `atomic_agents/dashboard/costs.py::discover_agents()` rewired as a thin adapter over `FilesystemAgentRegistryBackend.list_agents()` (`list[str]` return + sort order preserved; every call site fixed for free — the five cross-module callers plus the in-module `aggregate_global()` call site; catches ANY registry construction or enumeration failure — a typo'd env value (`BackendNotRegistered`) OR a registered backend whose `__init__`/`list_agents()` raises — and degrades to the filesystem registry, whose own fallback enumeration is then guarded to `[]` rather than crashing every tab). (2) `atomic-agents init --from-template <advisor|researcher|writer>` writes a `governance.md` stub; add-to-it preserves an existing `governance.md` unchanged. (3) `check_agent_registry_backend()` wired into `run_doctor()`.
+
+**Operator override:** `ATOMIC_AGENTS_AGENT_REGISTRY_BACKEND` env var. Absent/empty → `FilesystemAgentRegistryBackend`. Unknown id → raises `BackendNotRegistered` LOUDLY with a credential-redacted message (`_redact_for_error_message()` strips `://`-scheme URLs and DSN patterns).
+
+**Doctor:** `check_agent_registry_backend()` in `atomic_agents/doctor.py`, WIRED into `run_doctor()` — construction probe + capabilities-property probe + liveness `list_agents()` probe + BIDIRECTIONAL reconcile sub-probe against `AgentProfileBackend` ids: WARN on registry-has/profile-missing AND on profile-has/registry-missing (the latter catches an agent whose `model.md` was deleted while its persona sentinel remains, so it silently vanished from discovery). Best-effort: `detail["reconcile_skipped"]` records the exception type if the profile probe itself errors. SKIP when called without `--agent` (fleet-scoped roster); FAIL with credential-redacted message on an unknown env value.
+
+**Exception hierarchy:** `AgentRegistryError(AtomicAgentsError)` base + `RegistrationNotSupported` (read-only backend write attempt, spec/51 MUST 10) + `GovernanceParseError` (invalid governance.md enum value, caught fail-soft per spec/51 MUST 5). All in `atomic_agents/exceptions.py`.
+
+**Test layout:** `tests/test_agent_registry_conformance.py` (37 collected) + `tests/test_agent_registry_filesystem.py` (39 collected) + 2 predicate-change regression guards in `tests/test_dashboard_costs.py` + 1 governance.md placeholder-render regression in `tests/test_init_templates.py`. 79 new tests. The filesystem suite carries two MUST-5 per-entry fail-soft negative controls (a single entry whose `is_dir()` / containment `resolve()` raises `OSError`/`RuntimeError` is skipped, the enumeration survives) — strip-RED verified against the `except (OSError, RuntimeError)` guard — plus a `get_agent()` `_`/`.`-prefix-exclusion guard (returns None, agreeing with the MUST 3 universe `list_agents()` enumerates, strip-RED verified). The init-template guard renders each template's `governance.md` and asserts the agent name substitutes with no literal placeholder surviving (caught the bare `$AGENT_NAME` token, since fixed to `${agent_name}`).
+
+**Closes:** the fleet-discovery cliff — agent discovery moves from a hard-coded `log/`-predicate filesystem walk in the dashboard to a swappable Protocol, so an org fleet can register agents in Postgres (or any backend) without the dashboard re-implementing discovery, and governance metadata gets a typed, fail-soft home.
+
+**Spec status:** DRAFT spec/51 (this is PR 1 of the arc). The protocols-shipped.md section follows the PrincipalBackend precedent of documenting a DRAFT-but-merged Protocol; the LOCK ceremony will reconcile any spec-vs-impl drift before removing the DRAFT marker.
+
+---
+
+## Why twenty-two protocols, summarized
+
+A person at home runs filesystem-everything with one agent. An organization runs the same agents over Postgres, behind an HTTP service, with a fleet of orchestrated roles, each caller's conversation namespace isolated by verified identity, the whole fleet discovered through a swappable registry. **Same agent definitions, same `call()` flow, same audit trail. Different backends.**
 
 That property is the moat. Each Protocol is one Implementer Contract away from a new substrate, and every reference impl follows the same shape established by `docs/spec/20-memory-backend.md` + PR #57.
 

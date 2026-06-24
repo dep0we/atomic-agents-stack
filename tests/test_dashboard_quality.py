@@ -112,6 +112,7 @@ def test_hard_fail_detection(tmp_path):
     two_weeks_ago = today - timedelta(days=14)
     # alice must have log/ dir to be discovered
     (tmp_path / "alice" / "log").mkdir(parents=True)
+    (tmp_path / "alice" / "model.md").write_text("# model\n")
     _write_eval_run(
         tmp_path,
         "alice",
@@ -146,6 +147,7 @@ def test_tuning_proposal_listing(tmp_path):
     (tuning_dir / "report_2026-04-15.md").write_text("# older proposal")
     # Ensure alice is discoverable
     (tmp_path / "alice" / "log").mkdir(parents=True)
+    (tmp_path / "alice" / "model.md").write_text("# model\n")
 
     today = date.today()
     data = aggregate_quality(tmp_path, today=today)

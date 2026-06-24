@@ -30,6 +30,11 @@ from atomic_agents.dashboard._shared import nav_bar
 
 
 def _write_log(agents_root: Path, agent: str, when: date, records: list[dict]) -> None:
+    # Create model.md so discover_agents() picks up this agent (spec/37:314 predicate).
+    model_md = agents_root / agent / "model.md"
+    model_md.parent.mkdir(parents=True, exist_ok=True)
+    if not model_md.exists():
+        model_md.write_text("# model\n")
     log_dir = agents_root / agent / "log" / when.strftime("%Y-%m")
     log_dir.mkdir(parents=True, exist_ok=True)
     path = log_dir / f"{when.isoformat()}.jsonl"

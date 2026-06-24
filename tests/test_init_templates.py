@@ -458,12 +458,61 @@ def test_template_preset_defaults_all_three_present() -> None:
 
 
 def test_template_section_schema_all_three_populated() -> None:
-    """TEMPLATE_SECTION_SCHEMA must have advisor, researcher, and writer, each with 7 files."""
+    """TEMPLATE_SECTION_SCHEMA must have advisor, researcher, and writer, each with 8 files.
+
+    Count is 8 after spec/51 added governance.md to every template (was 7).
+    """
     for template_name in ("advisor", "researcher", "writer"):
         assert template_name in C.TEMPLATE_SECTION_SCHEMA, (
             f"TEMPLATE_SECTION_SCHEMA missing key: {template_name}"
         )
         file_count = len(C.TEMPLATE_SECTION_SCHEMA[template_name])
-        assert file_count == 7, (
-            f"TEMPLATE_SECTION_SCHEMA['{template_name}'] has {file_count} files, expected 7"
+        assert file_count == 8, (
+            f"TEMPLATE_SECTION_SCHEMA['{template_name}'] has {file_count} files, expected 8"
+        )
+
+
+def test_governance_md_renders_with_no_leftover_placeholder() -> None:
+    """The scaffolded governance.md MUST substitute the agent name, leaving no
+    literal placeholder token in the rendered output.
+
+    Regression guard for the spec/51 governance.md templates, which were
+    authored with the bare ``$AGENT_NAME`` token instead of the locked
+    ``${agent_name}`` brace convention (the only placeholder form
+    safe_substitute resolves against the ``agent_name`` variable). The bare
+    form survives substitution untouched, so every ``init --from-template``
+    agent shipped a governance.md titled ``$AGENT_NAME`` instead of its name.
+
+    Strip-RED negative control: revert any template's first line to
+    ``# Governance : $AGENT_NAME`` and this test fails on the ``$`` assertion
+    (the literal token survives and the name is absent from the title line).
+
+    The brace-syntax helper ``_extract_template_vars`` only matches ``${var}``
+    and would NOT catch a bare ``$AGENT_NAME``; this test asserts on the
+    RENDERED output instead, so it catches BOTH placeholder syntaxes.
+    """
+    from atomic_agents.init.wizard import (
+        _default_template_vars,
+        _render_file_to_string,
+    )
+
+    agent_name = "caldwell"
+    for template_name in ("advisor", "researcher", "writer"):
+        template_vars = _default_template_vars(agent_name, template_name)
+        rendered = _render_file_to_string(
+            template_name, ["governance.md"], template_vars
+        )
+        first_line = rendered.splitlines()[0]
+        assert agent_name in first_line, (
+            f"{template_name}/governance.md title did not substitute the agent "
+            f"name: {first_line!r}"
+        )
+        # No unresolved placeholder of EITHER syntax may survive: no bare
+        # ``$NAME`` token and no ``${var}`` brace token. (A literal ``$`` that
+        # is part of prose, e.g. a price, is not a placeholder; the templates
+        # contain none, so a blanket ``$`` scan is safe and maximally strict.)
+        assert "$" not in rendered, (
+            f"{template_name}/governance.md has an unresolved placeholder "
+            f"(literal '$' survived rendering): "
+            f"{[ln for ln in rendered.splitlines() if '$' in ln]}"
         )
