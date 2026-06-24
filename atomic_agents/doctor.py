@@ -42,6 +42,14 @@ Checks (one CheckResult per check unless noted):
                        (construct + API-key resolution). SKIP when
                        ATOMIC_AGENTS_EMBEDDING_BACKEND is unset (semantic search
                        off by default).
+    agent-registry-backend  FilesystemAgentRegistryBackend resolves and
+                            list_agents() enumerates agents by the spec/37:314
+                            predicate (model.md present+readable). Bidirectional
+                            reconcile sub-probe WARNs when the registry and the
+                            profile backend disagree in either direction — most
+                            importantly an agent the profile backend knows but the
+                            registry no longer discovers (model.md deleted).
+                            Fleet-scoped (agents_root, NOT agent_root).
     write-paths     Each tools.md write_paths entry exists and is writable.
 
 Exit code mapping (set by the CLI, not this module):
@@ -213,6 +221,7 @@ def run_doctor(
             "embedding-backend",
             "principal-backend",
             "conversation-backend",
+            "agent-registry-backend",
             "memory-backend-config",
             "memory-backend",
             "write-paths",
@@ -302,6 +311,19 @@ def run_doctor(
     # the list-vs-load_all gap (feedback_doctor_dual_probe_pattern) — so it
     # MUST be appended here, not just defined.
     results.append(check_conversation_backend(agent_root))
+    # spec/51: agent-registry-backend check. Fleet-scoped — takes resolved_root
+    # (agents_root), NOT agent_root, like check_agent_profile_backend (the other
+    # fleet-scoped check).
+    # Always-on backend (filesystem default, no env var required to enable) —
+    # unlike embedding/conversation it is never opt-in, so the check itself never
+    # returns SKIP. With --agent it returns PASS/WARN/FAIL (PASS with 0 agents
+    # when agents_root is absent: Path.resolve() still yields a Path and
+    # list_agents() returns [] per the filesystem MUST 2). The only SKIP for
+    # agent-registry-backend comes from the no-agent roster above when no --agent
+    # is supplied. The bidirectional reconcile sub-probe (registry-has /
+    # profile-missing AND profile-has / registry-missing) runs inside
+    # check_agent_registry_backend.
+    results.append(check_agent_registry_backend(resolved_root))
     # memory-backend-config (coherence) runs before memory-backend (liveness),
     # mirroring the check_lock_backend → check_locks ordering (#60 PR 3).
     results.append(check_memory_backend_config(agent_root))
@@ -5446,6 +5468,203 @@ def check_conversation_backend(agent_root: Path) -> CheckResult:
         message=(
             f"conversation backend "
             f"'{_redact_for_error_message(backend.backend_id)}' ready"
+        ),
+        detail=detail,
+    )
+
+
+def check_agent_registry_backend(agents_root: Path) -> CheckResult:
+    """AgentRegistryBackend resolves and the fleet-root enumeration works (spec/51).
+
+    Fleet-scoped (takes agents_root, NOT agent_root) — mirrors
+    check_agent_profile_backend(). Placed after check_conversation_backend in the
+    execution sequence and in the no-agent SKIP list.
+
+    The agent-registry backend is always-on (filesystem default, no env var
+    required to enable). Unlike embedding/conversation, it is never opt-in.
+
+    Doctor dual-probe pattern (MEMORY.md feedback_doctor_dual_probe_pattern):
+    1. Construction probe via get_default_agent_registry_backend(agents_root) —
+       FAIL if env var names an unregistered backend.
+    2. Capabilities probe: backend.capabilities (property) — recorded in detail.
+    3. Liveness probe: backend.list_agents() — must not raise. Result count
+       and reconcile findings included in detail (bidirectional set-difference
+       reconcile against the profile backend's id list — see below).
+
+    Reconcile sub-probe (bidirectional, spec/51 §"Doctor check"):
+    Compare the registry's discovered id set against the profile backend's
+    id set via set difference, and WARN on a mismatch in EITHER direction:
+    (A) registry-has / profile-missing — an agent with model.md but no profile
+        sentinel (persona/IDENTITY.md or persona.link.md), so it is visible to
+        the registry's model.md predicate but not to the profile backend; and
+    (B) profile-has / registry-missing — an agent the profile backend knows but
+        the registry did NOT discover (model.md absent/unreadable), e.g. model.md
+        was deleted while persona/IDENTITY.md remains, so the agent silently
+        vanished from discovery. Direction B is the one most worth surfacing.
+    Either direction is a WARN, not a FAIL — the two stores use different
+    predicates by design. The sub-probe is best-effort: if the profile probe
+    itself errors, detail["reconcile_skipped"] records the exception type.
+
+    PASS / FAIL / WARN ladder:
+    FAIL when:
+    - get_default_agent_registry_backend() raises (bad env var / unregistered id).
+    - backend.list_agents() raises unexpectedly.
+    WARN when reconcile finds a mismatch in either direction — agents in the
+    registry but not the profile backend (A), or in the profile backend but not
+    the registry (B). Neither is an error; both are worth noting.
+    PASS otherwise.
+    """
+    from .agent_registry import (  # noqa: PLC0415
+        get_default_agent_registry_backend,
+        list_agent_registry_backends,
+        _redact_for_error_message,
+    )
+
+    raw_backend_id = (
+        os.environ.get("ATOMIC_AGENTS_AGENT_REGISTRY_BACKEND", "").strip().lower()
+    )
+    # Credential safety: redact before echoing in any CheckResult field.
+    safe_backend_id = (
+        _redact_for_error_message(raw_backend_id) if raw_backend_id else "filesystem"
+    )
+
+    # Construction probe.
+    try:
+        backend = get_default_agent_registry_backend(agents_root)
+    except Exception as e:
+        known = list_agent_registry_backends()
+        return CheckResult(
+            name="agent-registry-backend",
+            status=FAIL,
+            message=(
+                f"failed to instantiate agent registry backend "
+                f"(ATOMIC_AGENTS_AGENT_REGISTRY_BACKEND={safe_backend_id!r}): {e}"
+            ),
+            fix_hint=(
+                "Unset ATOMIC_AGENTS_AGENT_REGISTRY_BACKEND to use the filesystem "
+                f"default, or set it to a registered backend id (known: {known})."
+            ),
+            detail={"backend_id": safe_backend_id, "error": str(e)},
+        )
+
+    # Capabilities probe (property, not method — per spec/51 Protocol NOTE).
+    try:
+        caps = backend.capabilities
+        caps_detail = {
+            "supports_registration": caps.supports_registration,
+            "supports_canonical_export": caps.supports_canonical_export,
+            "single_host_only": caps.single_host_only,
+        }
+    except Exception as e:
+        caps_detail = {"capabilities_error": str(e)}
+
+    # Liveness probe: list_agents() must not raise.
+    # include_governance=False — this check consumes only ref.id (agent_count
+    # below + the reconcile id-set), never .governance, so skip the per-agent
+    # governance.md read+parse (progressive disclosure, Principle #6; mirrors
+    # the discover_agents() id-only adapter). Results are identical either way.
+    try:
+        agents = backend.list_agents(include_governance=False)
+        agent_count = len(agents)
+    except Exception as e:
+        return CheckResult(
+            name="agent-registry-backend",
+            status=FAIL,
+            message=(f"agent registry backend list_agents() raised unexpectedly: {e}"),
+            fix_hint=(
+                "Check that agents_root is accessible and that no agent subfolder "
+                "has a corrupted state that aborts the discovery loop."
+            ),
+            detail={
+                "backend_id": safe_backend_id,
+                "agents_root": str(agents_root),
+                "error": str(e),
+                **caps_detail,
+            },
+        )
+
+    # Reconcile sub-probe: compare registry list with profile backend list.
+    # This surfaces agents visible to the model.md-predicate registry but
+    # absent from the persona-predicate profile backend (profile needs
+    # persona/IDENTITY.md; newly-scaffolded agents have both, but the
+    # predicate mismatch is worth surfacing).
+    registry_ids = {ref.id for ref in agents}
+    warn_msgs: list[str] = []
+    reconcile_skipped: str | None = None
+    try:
+        from .profile import get_default_profile_backend  # noqa: PLC0415
+
+        profile_backend = get_default_profile_backend(agents_root)
+        # The profile backend skips only '.'-prefixed dirs; the registry skips
+        # BOTH '_' and '.'-prefixed dirs. Filter the profile id set to the same
+        # candidate universe before the set difference, or a '_'-prefixed full
+        # agent dir (model.md + persona/IDENTITY.md present, but excluded by the
+        # '_'-prefix convention) would fire a spurious direction-B WARN claiming
+        # "model.md missing" when it is actually present and intentionally
+        # excluded. Reconcile only compares dirs both stores would consider.
+        profile_ids = {
+            p for p in profile_backend.list_agents() if not p.startswith(("_", "."))
+        }
+
+        # Bidirectional reconcile (spec/51 §"Doctor check"): WARN if the registry has
+        # agents the profile store doesn't, OR VICE VERSA. Both directions are
+        # operator-relevant — the profile-only direction (an agent the profile
+        # backend knows but the registry's model.md predicate didn't discover,
+        # e.g. model.md was deleted while persona/IDENTITY.md remains) is the
+        # one most worth flagging, since a registered agent silently vanished
+        # from discovery.
+        not_in_profile = sorted(registry_ids - profile_ids)
+        if not_in_profile:
+            warn_msgs.append(
+                f"{len(not_in_profile)} agent(s) have model.md but lack the "
+                f"profile sentinel (persona/IDENTITY.md or persona.link.md) — "
+                f"not visible to the profile backend: "
+                f"{not_in_profile[:5]}" + (" …" if len(not_in_profile) > 5 else "")
+            )
+
+        not_in_registry = sorted(profile_ids - registry_ids)
+        if not_in_registry:
+            warn_msgs.append(
+                f"{len(not_in_registry)} agent(s) known to the profile backend "
+                f"but NOT discovered by the registry (model.md missing or "
+                f"unreadable?): "
+                f"{not_in_registry[:5]}" + (" …" if len(not_in_registry) > 5 else "")
+            )
+    except Exception as exc:
+        # Reconcile is best-effort; don't fail the check if the profile probe
+        # errors. Record that the reconcile did not run so the operator doesn't
+        # read a clean (warning-free) result as "reconcile passed" — the
+        # underlying profile-backend error surfaces in check_agent_profile_backend.
+        reconcile_skipped = type(exc).__name__
+
+    detail = {
+        "backend_id": safe_backend_id,
+        "agents_root": str(agents_root),
+        "agent_count": agent_count,
+        **caps_detail,
+    }
+    if warn_msgs:
+        detail["reconcile_warnings"] = warn_msgs
+    if reconcile_skipped is not None:
+        detail["reconcile_skipped"] = reconcile_skipped
+
+    if warn_msgs:
+        return CheckResult(
+            name="agent-registry-backend",
+            status=WARN,
+            message=(
+                f"agent registry backend ok ({agent_count} agent"
+                f"{'' if agent_count == 1 else 's'} discovered) — reconcile warnings"
+            ),
+            detail=detail,
+        )
+
+    return CheckResult(
+        name="agent-registry-backend",
+        status=PASS,
+        message=(
+            f"agent registry backend ok ({agent_count} agent"
+            f"{'' if agent_count == 1 else 's'} discovered)"
         ),
         detail=detail,
     )

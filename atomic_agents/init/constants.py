@@ -156,6 +156,11 @@ TEMPLATE_SECTION_SCHEMA: Final[dict[str, dict[str, list[str]]]] = {
             "Reference material",
             "How wiki pages cite sources",
         ],
+        "governance.md": [
+            "Forbidden actions",
+            "Failure modes",
+            "Pause / retire criteria",
+        ],
     },
     "researcher": {
         "persona/IDENTITY.md": [
@@ -213,6 +218,11 @@ TEMPLATE_SECTION_SCHEMA: Final[dict[str, dict[str, list[str]]]] = {
             "Reference material",
             "How wiki pages cite sources",
         ],
+        "governance.md": [
+            "Forbidden actions",
+            "Failure modes",
+            "Pause / retire criteria",
+        ],
     },
     "writer": {
         "persona/IDENTITY.md": [
@@ -267,6 +277,11 @@ TEMPLATE_SECTION_SCHEMA: Final[dict[str, dict[str, list[str]]]] = {
             "Background and context",
             "Reference material",
             "How wiki pages cite sources",
+        ],
+        "governance.md": [
+            "Forbidden actions",
+            "Failure modes",
+            "Pause / retire criteria",
         ],
     },
 }
