@@ -1018,3 +1018,58 @@ class UnverifiedPrincipalConversationAccess(AtomicAgentsError):
         self.conversation_id = conversation_id
         self.principal_id = principal_id
         super().__init__(message)
+
+
+# ──────────────────────────────────────────────────────────────────
+# AgentRegistryBackend exceptions (spec/51 — issue #607)
+#
+# AgentRegistryError and its subclasses live here (not in agent_registry/
+# backend.py) per the convention for backend error hierarchies that need
+# to be catchable via `except AtomicAgentsError` across the framework.
+# Callers that want to catch the entire agent-registry failure surface can
+# use `except AgentRegistryError`.
+
+
+class AgentRegistryError(AtomicAgentsError):
+    """Base class for AgentRegistryBackend subsystem errors (spec/51).
+
+    All AgentRegistryBackend reference implementations raise subclasses of
+    this exception. Operators may ``except AgentRegistryError`` to catch the
+    entire agent-registry failure surface without enumerating subtypes.
+    """
+
+
+class RegistrationNotSupported(AgentRegistryError):
+    """register_agent() / unregister_agent() called on a backend that does
+    not support write operations.
+
+    Raised by backends declaring ``supports_registration=False`` (including
+    FilesystemAgentRegistryBackend, which is read-only / discovery-only).
+    Distinct from ``NotImplementedError`` — callers can distinguish
+    "this backend is intentionally read-only" from a genuine implementation
+    bug (missing method body). spec/51 MUST 10.
+
+    The typed exception keeps ``except AtomicAgentsError`` from conflating
+    intentional-read-only with coding error.
+    """
+
+
+class GovernanceParseError(AgentRegistryError):
+    """A governance.md file is present but its structured content is invalid.
+
+    Sole raise site: an embedded YAML block contains an unknown/invalid enum
+    value for a Literal-typed field (e.g. permission_tier: 'superpower') —
+    GovernanceRecord.from_dict() -> _validate_enum() raises fail-fast.
+
+    NOT raised for absent governance.md (that case sets has_governance=False
+    with no exception). NOT raised for unreadable governance.md (IOError/
+    PermissionError — those set has_governance=False at the caller site).
+    NOT raised for a malformed YAML block (yaml.YAMLError): the reference
+    parser defers that error into GovernanceRecord.parse_errors rather than
+    raising, so an illustrative bad block never shadows a later valid one.
+
+    Per spec/51 MUST 5: list_agents() and get_agent() MUST catch this
+    exception and return the entry with has_governance=True and a partial
+    GovernanceRecord flagging the bad field — they MUST NOT propagate
+    GovernanceParseError to the caller.
+    """
