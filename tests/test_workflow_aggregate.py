@@ -19,7 +19,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -518,6 +518,65 @@ def test_aggregate_workflow_cost_data_degraded_on_read_error(tmp_path, monkeypat
     )
 
 
+def test_aggregate_workflow_degraded_on_non_read_error_exceptions(
+    tmp_path, monkeypatch
+):
+    """The broadened ``except Exception`` degrades on backend-construction AND
+    non-LogBackendReadError query failures, not only on LogBackendReadError.
+
+    aggregate_workflow()'s per-agent guard was widened from ``except
+    LogBackendReadError`` to ``except Exception`` precisely because, on shared
+    SQLite/Postgres deployments, ``get_default_log_backend()`` construction or a
+    ``.query()`` call can raise types other than LogBackendReadError (the
+    docstring promises this is caught). This pins that widened branch: a
+    construction-time error AND a generic query error each degrade gracefully
+    (no propagation), set cost_data_degraded, and leave the clean agent's
+    records intact. Without the broad catch, either failure would escape and
+    crash the whole rollup.
+    """
+    agent_ok = tmp_path / "agent-ok"
+    agent_construct = tmp_path / "agent-construct-boom"
+    agent_query = tmp_path / "agent-query-boom"
+
+    _write_agent_log(
+        agent_ok,
+        [_make_jsonl(run_id="ok-r", cost_usd=0.010, workflow_id="wf-9")],
+    )
+    for bad in (agent_construct, agent_query):
+        bad.mkdir(parents=True, exist_ok=True)
+        (bad / "model.md").write_text("## Model\nclaude-haiku-4-5\n")
+
+    import atomic_agents.logs as logs_mod
+
+    original_get = logs_mod.get_default_log_backend
+
+    def _patched_get(root: Path):
+        if root.name == "agent-construct-boom":
+            # Generic error at backend CONSTRUCTION (inside the try, before query).
+            raise RuntimeError("injected construction failure")
+        if root.name == "agent-query-boom":
+            # Non-LogBackendReadError raised by query() — e.g. a programming/
+            # driver error a shared backend can surface.
+            mock = MagicMock()
+            mock.query.side_effect = ValueError("injected non-read-error query failure")
+            return mock
+        return original_get(root)
+
+    monkeypatch.setattr(logs_mod, "get_default_log_backend", _patched_get)
+
+    # Must NOT raise — the broad catch absorbs both failures.
+    ws = aggregate_workflow(tmp_path, "wf-9")
+    assert ws.cost_data_degraded is True, (
+        "cost_data_degraded MUST be True when an agent backend fails at "
+        "construction OR raises a non-LogBackendReadError from query() — the "
+        "broadened except Exception covers more than the typed read error."
+    )
+    assert ws.total == pytest.approx(0.010, abs=1e-9), (
+        "The clean agent's records MUST survive both a construction-time and a "
+        "generic query-time failure in sibling agents (fail-soft)."
+    )
+
+
 # ──────────────────────────────────────────────────────────────────
 # RunRecord workflow_id field — unit tests
 
@@ -799,6 +858,75 @@ def test_real_call_no_workflow_id_is_not_stamped(tmp_path):
     assert all("workflow_id" not in r for r in ok), (
         "ok-path record MUST NOT carry workflow_id when call() is invoked without "
         f"one (None-omit, backward-compat). Records: {ok}"
+    )
+
+
+def test_real_principal_refused_record_carries_workflow_id(tmp_path):
+    """A real agent.call(conversation_id=X, workflow_id=Y, principal=<unverified>)
+    is HARD-REFUSED at the identity gate, but the principal_not_verified terminal
+    record MUST still carry workflow_id — so a workflow run blocked at the security
+    gate stays visible to LogQuery(workflow_id=...) (Principle #5, audit completeness).
+
+    This is the 1-of-9 stamp site (principal-refused). conversation_id and workflow_id
+    are both keyword-only and freely combinable, so this reachable combination MUST
+    stamp both on the refusal record. The refusal raises
+    UnverifiedPrincipalConversationAccess; the audit record is written before the raise.
+    """
+    from atomic_agents.conversation.types import Principal
+    from atomic_agents.exceptions import UnverifiedPrincipalConversationAccess
+
+    agent = _make_call_agent(tmp_path)
+    sink: list[dict] = []
+
+    unverified = Principal(identifier="attacker", is_verified=False)
+    with patch.object(agent, "_log", side_effect=lambda rec: sink.append(dict(rec))):
+        with pytest.raises(UnverifiedPrincipalConversationAccess):
+            agent.call(
+                work_item="ping",
+                conversation_id="conv-1",
+                workflow_id="wf-refused",
+                principal=unverified,
+            )
+
+    refused = [r for r in sink if r.get("status") == "principal_not_verified"]
+    assert refused, (
+        f"no principal_not_verified record emitted; got "
+        f"statuses={[r.get('status') for r in sink]}"
+    )
+    assert all(r.get("workflow_id") == "wf-refused" for r in refused), (
+        "principal-refused terminal record MUST carry workflow_id so a workflow "
+        "run blocked at the identity gate surfaces under LogQuery(workflow_id=...) "
+        f"(Principle #5). Records: {refused}"
+    )
+    # conversation_id is still stamped too (the gate's pre-existing behavior).
+    assert all(r.get("conversation_id") == "conv-1" for r in refused)
+
+
+def test_real_principal_refused_no_workflow_id_is_not_stamped(tmp_path):
+    """Strip-RED negative control for the principal-refused stamp: a refusal WITHOUT
+    workflow_id must NOT carry the field. Pairs with the test above to prove the
+    stamp is driven by the workflow_id kwarg, not unconditional (per-invocation
+    negative control)."""
+    from atomic_agents.conversation.types import Principal
+    from atomic_agents.exceptions import UnverifiedPrincipalConversationAccess
+
+    agent = _make_call_agent(tmp_path)
+    sink: list[dict] = []
+
+    unverified = Principal(identifier="attacker", is_verified=False)
+    with patch.object(agent, "_log", side_effect=lambda rec: sink.append(dict(rec))):
+        with pytest.raises(UnverifiedPrincipalConversationAccess):
+            agent.call(
+                work_item="ping",
+                conversation_id="conv-1",
+                principal=unverified,
+            )
+
+    refused = [r for r in sink if r.get("status") == "principal_not_verified"]
+    assert refused, "no principal_not_verified record emitted"
+    assert all("workflow_id" not in r for r in refused), (
+        "principal-refused record MUST NOT carry workflow_id when call() is invoked "
+        f"without one (None-omit, backward-compat). Records: {refused}"
     )
 
 

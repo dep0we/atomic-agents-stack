@@ -3625,6 +3625,7 @@ class AtomicAgent:
         *,
         idempotency_key: str | None = None,
         conversation_id: str | None = None,
+        workflow_id: str | None = None,
         principal: Principal = LOCAL_PRINCIPAL,
     ) -> Response:
         """Make the LLM call. Returns a Response with captures populated.
@@ -3670,6 +3671,26 @@ class AtomicAgent:
         committed on docs/tensions-t16-conversation-flex, merges with this PR).
         Do NOT inject into assemble_system_prompt() — the T14 cache prefix must
         remain stable across turns.
+
+        ``workflow_id``: optional workflow correlation key (spec/22 versioned
+        normative addendum, issue #622 PR1). When set, workflow_id is stamped on
+        the terminal JSONL records for this call (the same 9 sites as
+        conversation_id: principal-refused, dedup, lock_busy, pre-loop cost-skip,
+        in_flight, mid-loop cost-skip, ok, security-abort, embed-block) PLUS
+        helper records and embed_cost records. It also threads through
+        delegate()/delegate_parallel() into the
+        child's call(), so the delegated child's own terminal record carries it.
+        NOT stamped on the coordinator's trigger='delegate' MIRROR record
+        (delegation echo) — that absence is the count-once mechanism:
+        aggregate_workflow() excludes the mirror (identified by its
+        delegate_run_id/delegated_agent marker), keeping the child's real spend
+        counted exactly once. NOTE: the delegated child's OWN terminal record is
+        also trigger='delegate' but DOES carry workflow_id (no mirror marker) and
+        IS counted — it is not the mirror. Use aggregate_workflow(agents_root,
+        workflow_id) to get a count-once cross-agent cost rollup for a workflow.
+        ``None`` (the default) = no workflow correlation — zero behavioral change for
+        existing callers (backward-compatible, rule #14). NOT stored on self; purely
+        a local variable threaded explicitly through all dispatch sites.
 
         ``model_override``: per-call model selection that supersedes ``model.md``'s
         default. Policy's ``get_effective_model`` (when set) takes precedence over
@@ -4004,6 +4025,16 @@ class AtomicAgent:
                 "conversation_id": conversation_id,
                 "principal_id": principal.identifier,
             }
+            # spec/22 versioned normative addendum (issue #622 PR1): tag
+            # workflow_id on ALL terminal JSONL records. The principal-refused
+            # security-gate record is site 1 of 9 — a workflow run blocked at
+            # the identity gate MUST still surface under LogQuery(workflow_id=...)
+            # (Principle #5, audit completeness). This site is reached only when
+            # conversation_id is not None, but workflow_id is keyword-only and
+            # freely combinable, so call(conversation_id=X, workflow_id=Y,
+            # principal=<unverified>) MUST carry both on the refusal record.
+            if workflow_id is not None:
+                _principal_refused_record["workflow_id"] = workflow_id
             if caller_identity is not None:
                 _principal_refused_record["http_caller"] = caller_identity
             if idempotency_key is not None:
@@ -4071,6 +4102,12 @@ class AtomicAgent:
                 # JSONL records, including dedup short-circuit paths.
                 if conversation_id is not None:
                     _dedup_record["conversation_id"] = conversation_id
+                # spec/22 versioned normative addendum (issue #622 PR1): tag
+                # workflow_id on ALL terminal JSONL records. Dedup is one of the 9
+                # terminal sites (site 2 of 9). workflow_id is NOT stored on self — it is a local
+                # variable in call() threaded explicitly to each site.
+                if workflow_id is not None:
+                    _dedup_record["workflow_id"] = workflow_id
                 self._log(_dedup_record)
                 _resp = Response.deduped_response(
                     prior_run_id=_decision.prior_run_id,
@@ -4143,6 +4180,10 @@ class AtomicAgent:
             # JSONL records (lock_busy, cost-skip, dedup, in_flight, ok).
             if conversation_id is not None:
                 _lock_busy_record["conversation_id"] = conversation_id
+            # spec/22 versioned normative addendum (issue #622 PR1): tag
+            # workflow_id on ALL terminal JSONL records. lock_busy is site 3 of 9.
+            if workflow_id is not None:
+                _lock_busy_record["workflow_id"] = workflow_id
             self._log(_lock_busy_record)
             # spec/39 MUST 3: end span on lock_busy path. This path raises BEFORE
             # the body try/finally is entered, so it finalizes its own span here.
@@ -4260,6 +4301,11 @@ class AtomicAgent:
                 # terminal JSONL records, including cost-skip refused paths.
                 if conversation_id is not None:
                     _skip_record["conversation_id"] = conversation_id
+                # spec/22 versioned normative addendum (issue #622 PR1): tag
+                # workflow_id on ALL terminal JSONL records. pre-loop cost-skip
+                # is site 4 of 9.
+                if workflow_id is not None:
+                    _skip_record["workflow_id"] = workflow_id
                 self._log(_skip_record)
                 # spec/39 MUST 9: cost-skip carries OUTCOME_SKIPPED + ERROR
                 # status. _call_total_cost stays 0.0 (no LLM call was made), so
@@ -4328,6 +4374,10 @@ class AtomicAgent:
                     # JSONL records, including in_flight dedup paths.
                     if conversation_id is not None:
                         _in_flight_record["conversation_id"] = conversation_id
+                    # spec/22 versioned normative addendum (issue #622 PR1): tag
+                    # workflow_id on ALL terminal JSONL records. in_flight is site 5 of 9.
+                    if workflow_id is not None:
+                        _in_flight_record["workflow_id"] = workflow_id
                     self._log(_in_flight_record)
                     # Finalize span as IN_FLIGHT (a refusal, not an error — mirrors
                     # lock_busy span semantics per spec/39).
@@ -4819,6 +4869,11 @@ class AtomicAgent:
                         # idempotency_key/http_caller tagging just above.
                         if conversation_id is not None:
                             _mid_loop_skip["conversation_id"] = conversation_id
+                        # spec/22 versioned normative addendum (issue #622 PR1): tag
+                        # workflow_id on ALL terminal JSONL records. mid-loop
+                        # cost-skip is site 6 of 9.
+                        if workflow_id is not None:
+                            _mid_loop_skip["workflow_id"] = workflow_id
                         self._log(_mid_loop_skip)
                         # spec/39 MUST 1 / MUST 9: mid-loop cost-cap. Sync the
                         # span accumulators from the local loop accumulators so
@@ -5635,11 +5690,17 @@ class AtomicAgent:
                         # ONLY the embed_cost record carries cost_usd; the release
                         # record intentionally omits it to prevent double-count.
                         if _embed_actual_usd > 0:
+                            # spec/22 versioned normative addendum (issue #622 PR1):
+                            # thread workflow_id from call()'s local scope into the
+                            # embed_cost emitter so the embed_cost record carries it.
+                            # embed_cost is a child-cost record that aggregate_workflow()
+                            # must include in the count-once sum.
                             self._emit_embed_cost_record(
                                 model_id=_embed_model_id,
                                 actual_usd=_embed_actual_usd,
                                 batch_size=_embed_batch_size,
                                 cost_estimated=_embed_cost_estimated,
+                                workflow_id=workflow_id,
                             )
 
             # Build response
@@ -5755,6 +5816,10 @@ class AtomicAgent:
             # that sets conversation_id so LogQuery.conversation_id filtering works).
             if conversation_id is not None:
                 log_record["conversation_id"] = conversation_id
+            # spec/22 versioned normative addendum (issue #622 PR1): tag workflow_id
+            # on ALL terminal JSONL records. ok-path is site 7 of 9.
+            if workflow_id is not None:
+                log_record["workflow_id"] = workflow_id
             # spec/48 PR1: tag principal_id on ok-path records when a non-local
             # principal is used, so audit answers "which principal ran this turn?"
             # Omit for LOCAL_PRINCIPAL to preserve backward compatibility with
@@ -5942,6 +6007,13 @@ class AtomicAgent:
                 # LogQuery(conversation_id=...) — audit completeness (Principle #5).
                 if conversation_id is not None:
                     _security_abort_record["conversation_id"] = conversation_id
+                # spec/22 versioned normative addendum (issue #622 PR1): tag
+                # workflow_id on ALL terminal JSONL records. security-abort is
+                # site 8 of 9. Audit completeness — a workflow run blocked at the
+                # MCP spawn gate must still surface under
+                # LogQuery(workflow_id=...) (Principle #5).
+                if workflow_id is not None:
+                    _security_abort_record["workflow_id"] = workflow_id
                 # Best-effort: an audit-write failure must not mask the original
                 # security refusal (the refusal is the load-bearing signal).
                 try:
@@ -6006,6 +6078,15 @@ class AtomicAgent:
                     _embed_block_record["http_caller"] = caller_identity
                 if conversation_id is not None:
                     _embed_block_record["conversation_id"] = conversation_id
+                # spec/22 versioned normative addendum (issue #622 PR1): tag
+                # workflow_id on the embed-block terminal record. conversation_id is
+                # already stamped here (line above), so this is site 9 of 9 of
+                # the shared terminal sites — workflow_id mirrors conversation_id's
+                # coverage exactly (all 9 sites), it is not beyond it. A workflow
+                # blocked at the embed gate must still surface under
+                # LogQuery(workflow_id=...) (Principle #5, audit completeness).
+                if workflow_id is not None:
+                    _embed_block_record["workflow_id"] = workflow_id
                 # Best-effort: an audit-write failure must not mask the original
                 # cost refusal (the refusal is the load-bearing signal).
                 try:
@@ -6125,6 +6206,7 @@ class AtomicAgent:
         temperature: float = 0.3,
         summary: str = "",
         sources: list[str] | None = None,
+        workflow_id: str | None = None,
     ) -> HelperResult:
         """One sequential helper call. Bound by parent's cost guardrails.
 
@@ -6177,6 +6259,14 @@ class AtomicAgent:
         if sources_list:
             log_record["sources"] = sources_list
             log_record["provenance_preserved"] = provenance_preserved
+        # spec/22 versioned normative addendum (issue #622 PR1): stamp workflow_id
+        # on helper records. These are child-cost records that aggregate_workflow()
+        # must include in the count-once cost sum. workflow_id is NOT stored on self
+        # — it must be threaded explicitly from the call() frame via the parameter.
+        # No stale-propagation risk: each helper_call() invocation receives its own
+        # workflow_id from the enclosing call() scope or is None.
+        if workflow_id is not None:
+            log_record["workflow_id"] = workflow_id
         self._log(log_record)
 
         # Append to the in-memory rollup for spec/13 Layer 3 (research log).
@@ -6213,6 +6303,7 @@ class AtomicAgent:
         summary_template: str = "helper call {idx} of {total}",
         sources_per_prompt: list[list[str]] | None = None,
         sources: list[str] | None = None,
+        workflow_id: str | None = None,
     ) -> list[HelperResult]:
         """Parallel helper calls. Pre-checks guardrails ONCE; if cap hit, refuses the batch.
 
@@ -6273,6 +6364,11 @@ class AtomicAgent:
             return sources
 
         def call_one(idx: int, prompt: str):
+            # spec/22 versioned normative addendum (issue #622 PR1): forward
+            # workflow_id from the enclosing helper_call_parallel() scope into
+            # each helper_call() so parallel child records carry it. workflow_id
+            # is captured from the outer scope (not self) — no stale-propagation
+            # risk. None if the caller did not supply a workflow_id.
             return idx, self.helper_call(
                 prompt=prompt,
                 model=model,
@@ -6280,6 +6376,7 @@ class AtomicAgent:
                 temperature=temperature,
                 summary=summary_template.format(idx=idx + 1, total=total),
                 sources=sources_for(idx),
+                workflow_id=workflow_id,
             )
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent) as pool:
@@ -6364,6 +6461,7 @@ class AtomicAgent:
         temperature: float | None = None,
         critical: bool = False,
         summary: str = "",
+        workflow_id: str | None = None,
     ) -> Response:
         """Synchronously dispatch a work item to another agent in the roster.
 
@@ -6581,6 +6679,13 @@ class AtomicAgent:
             temperature=temperature if temperature is not None else None,
             critical=critical,
             parent_remaining_headroom_usd=remaining_headroom,
+            # spec/22 versioned normative addendum (issue #622 PR1): thread
+            # workflow_id to the child agent's call() so the child's ok-path
+            # terminal record carries it. This ensures aggregate_workflow() can
+            # collect the child's real spend via LogQuery(workflow_id=...) on
+            # the child's log dir. workflow_id is NOT stored on self (never on
+            # target_agent either) — it flows as a local kwarg only.
+            workflow_id=workflow_id,
         )
         latency_ms = int((time.time() - start) * 1000)
 
@@ -6628,6 +6733,7 @@ class AtomicAgent:
         max_tokens: int | None = None,
         temperature: float | None = None,
         summary_template: str = "delegate {idx} of {total}: {target}",
+        workflow_id: str | None = None,
     ) -> list[Response]:
         """Parallel fan-out to multiple agents.
 
@@ -6710,12 +6816,18 @@ class AtomicAgent:
 
         def call_one(idx: int, target: str, work_item: str):
             summ = summary_template.format(idx=idx + 1, total=total, target=target)
+            # spec/22 versioned normative addendum (issue #622 PR1): forward
+            # workflow_id from the enclosing delegate_parallel() scope into each
+            # delegate() so the child's ok-path terminal records carry it. The
+            # closure captures workflow_id from the outer scope (not self) — no
+            # stale-propagation risk. None if the caller did not supply one.
             return idx, self.delegate(
                 target_agent_name=target,
                 work_item=work_item,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 summary=summ,
+                workflow_id=workflow_id,
             )
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent) as pool:
@@ -7046,6 +7158,7 @@ class AtomicAgent:
         actual_usd: float,
         batch_size: int,
         cost_estimated: bool,
+        workflow_id: str | None = None,
     ) -> None:
         """Log a dedicated embed_cost JSONL record (#544 PR2a — cross-call accounting).
 
@@ -7066,24 +7179,30 @@ class AtomicAgent:
         ``parent_agent`` enables audit-join back to the agent.call() run (Principle
         #5). ``cost_source='actor'`` ensures the record is included in
         ``sum_cost_for_period(source='actor')`` reads that feed _embed_remaining_headroom.
+
+        ``workflow_id``: optional workflow correlation key (spec/22 versioned normative
+        addendum, issue #622 PR1). When set, stamped on the embed_cost record so
+        aggregate_workflow() can include embed spend in the count-once cost rollup.
+        Threaded explicitly from call()'s local scope — NOT stored on self.
         """
-        self._log(
-            {
-                "trigger": "embed_cost",
-                "parent_run_id": self.run_id,
-                "parent_agent": self.name,
-                "model": model_id,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "cost_usd": actual_usd,
-                "cost_source": "actor",
-                "cost_estimated": cost_estimated,
-                "status": "ok",
-                "summary": (
-                    f"embed cost: actual ${actual_usd:.6f} (batch of {batch_size})"
-                ),
-            }
-        )
+        _embed_cost_record: dict = {
+            "trigger": "embed_cost",
+            "parent_run_id": self.run_id,
+            "parent_agent": self.name,
+            "model": model_id,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cost_usd": actual_usd,
+            "cost_source": "actor",
+            "cost_estimated": cost_estimated,
+            "status": "ok",
+            "summary": (
+                f"embed cost: actual ${actual_usd:.6f} (batch of {batch_size})"
+            ),
+        }
+        if workflow_id is not None:
+            _embed_cost_record["workflow_id"] = workflow_id
+        self._log(_embed_cost_record)
 
     def _build_helper_system_prompt(self, sources: list[str]) -> str:
         """Build the helper's system prompt. Empty when no sources are passed."""
