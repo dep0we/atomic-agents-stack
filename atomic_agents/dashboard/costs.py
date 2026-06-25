@@ -40,6 +40,13 @@ class RunRecord:
     parent_agent: str | None = None  # set for helper trigger
     parent_run_id: str | None = None
     run_id: str | None = None
+    # extra: pass-through dict for non-canonical JSONL fields used by the
+    # Reliability axis (spec/52 MUST 8). Specifically: embed_batch_blocked
+    # (written by the embed cost gate in agent.call() — it lands in the
+    # RunRecord.extra field of the logs-layer dataclass, not in a top-level
+    # field). This matches how logs/types.py RunRecord handles unknown keys
+    # (extra accumulation at line 365 of logs/types.py).
+    extra: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -333,6 +340,33 @@ def _record_from_dict(rec: dict, agent: str) -> RunRecord | None:
         ts = datetime.fromisoformat(ts_str)
     except (ValueError, TypeError):
         return None
+    # Collect the pass-through extra dict: any key not otherwise consumed
+    # by the canonical fields above. The Reliability axis (spec/52 MUST 8)
+    # reads embed_batch_blocked from extra. Mirrors logs/types.py RunRecord's
+    # own extra accumulation pattern (line 365 of logs/types.py).
+    _CANONICAL_KEYS = frozenset(
+        {
+            "ts",
+            "trigger",
+            "model",
+            "input_tokens",
+            "output_tokens",
+            "cost_usd",
+            "cache_hit_tokens",
+            "cache_miss_tokens",
+            "latency_ms",
+            "status",
+            "summary",
+            "fallback",
+            "critical",
+            "parent_agent",
+            "parent_run_id",
+            "run_id",
+            "agent",
+        }
+    )
+    extra = {k: v for k, v in rec.items() if k not in _CANONICAL_KEYS}
+
     return RunRecord(
         ts=ts,
         agent=agent,
@@ -351,6 +385,7 @@ def _record_from_dict(rec: dict, agent: str) -> RunRecord | None:
         parent_agent=rec.get("parent_agent"),
         parent_run_id=rec.get("parent_run_id"),
         run_id=rec.get("run_id"),
+        extra=extra,
     )
 
 

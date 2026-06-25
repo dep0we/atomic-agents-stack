@@ -46,7 +46,9 @@ def test_render_global_creates_html(tmp_path):
     summary = aggregate_global(tmp_path, today=today)
     out_path = render_global(tmp_path, summary)
 
-    assert out_path == tmp_path / "_dashboard" / "index.html"
+    # BEHAVIOR CHANGE (spec/52 PR1): render_global now writes cost.html, not index.html.
+    # index.html is now the Fleet Console home (written by render_console).
+    assert out_path == tmp_path / "_dashboard" / "cost.html"
     assert out_path.exists()
 
     html = out_path.read_text()
@@ -79,7 +81,9 @@ def test_render_all_creates_global_and_per_agent(tmp_path):
     _write_log(tmp_path, "bob", today, [{"cost_usd": 0.05}])
     written = render_all(tmp_path, today=today)
 
-    assert written["global"] == str(tmp_path / "_dashboard" / "index.html")
+    # BEHAVIOR CHANGE (spec/52 PR1): render_global writes cost.html (not index.html).
+    # index.html is now the Fleet Console home.
+    assert written["global"] == str(tmp_path / "_dashboard" / "cost.html")
     assert len(written["per_agent"]) == 2
     assert (tmp_path / "alice" / "dashboard.html").exists()
     assert (tmp_path / "bob" / "dashboard.html").exists()

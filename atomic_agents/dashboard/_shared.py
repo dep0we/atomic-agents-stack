@@ -133,14 +133,36 @@ def sparkline(values: list[float]) -> str:
     return "".join(chars)
 
 
+_KNOWN_TAB_KEYS = frozenset(
+    {"console", "cost", "activity", "quality", "memory", "goals"}
+)
+
+
 def nav_bar(current: str, has_goals: bool = True) -> str:
     """Render the top navigation bar for a dashboard page.
 
-    current: one of "cost", "activity", "quality", "memory", "goals"
+    current: one of "console", "cost", "activity", "quality", "memory", "goals"
     has_goals: if False, the Goals tab is omitted from the nav.
+
+    BEHAVIOR CHANGE (spec/52 PR1): 'console' is now the FIRST tab (home position)
+    and links to index.html. The Cost tab now links to cost.html (not index.html).
+    All existing callers that pass current='cost' etc. continue to work unchanged —
+    they gain a Console tab link in the nav without any call-site change needed.
     """
+    if current not in _KNOWN_TAB_KEYS:
+        import logging as _logging
+
+        _logging.getLogger(__name__).warning(
+            "nav_bar() received unknown current=%r; expected one of %s",
+            current,
+            sorted(_KNOWN_TAB_KEYS),
+        )
+
+    # Console is the FIRST tab (front door per spec/52). Cost tab now points to
+    # cost.html (was index.html — backward-compat callout in spec/52 + CHANGELOG).
     tabs = [
-        ("cost", "index.html", "Cost"),
+        ("console", "index.html", "Console"),
+        ("cost", "cost.html", "Cost"),
         ("activity", "activity.html", "Activity"),
         ("quality", "quality.html", "Quality"),
         ("memory", "memory.html", "Memory"),
