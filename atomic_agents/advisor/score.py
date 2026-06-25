@@ -97,6 +97,11 @@ class AgentHealth:
     composite: float | None = None
     band: str = "unknown"  # "green" | "amber" | "red" | "unknown"
 
+    # Canonical display integer — int(round(composite)) AFTER the critical-cap
+    # override. Bands are assigned from this int, not from the raw float (#623 fix,
+    # spec/53 §3.3 + MUST 11). None when composite is None.
+    composite_display: int | None = None
+
     # Per-axis degraded flags (axis-granularity, spec/53 MUST 8)
     cost_degraded: bool = False
     quality_degraded: bool = False
@@ -114,6 +119,10 @@ class AgentHealth:
     # If the composite was capped by a critical sub-score, name the axis
     capped_by_axis: str | None = None
 
+    # Primary model (most common model in recent 30d primary runs; None = no runs).
+    # Populated by compute_fleet_health for the recommendations engine (#616).
+    primary_model: str | None = None
+
 
 @dataclass
 class FleetHealth:
@@ -127,6 +136,12 @@ class FleetHealth:
     # a few bad agents from being hidden behind a healthy mean.
     fleet_composite: float | None = None
     fleet_band: str = "unknown"
+
+    # Canonical display integers — int(round(v)) AFTER the critical-cap override
+    # (#623 fix, spec/53 §3.3 + MUST 11). None when the corresponding composite is None.
+    # Bands are assigned from these ints; render.py uses them directly (no {:.0f}).
+    fleet_composite_display: int | None = None
+    worst_agent_composite_display: int | None = None
 
     # Worst agent (lowest per-agent composite)
     worst_agent: str | None = None
@@ -265,12 +280,18 @@ def _compute_composite(
             capped_by_axis = "metric"
         composite = min(composite, float(CRITICAL_COMPOSITE_CAP))
 
-    # Band the ROUNDED value so the displayed number and its color always agree:
-    # the headline shows round(composite, 1) (and render shows it at .0f), so a raw
-    # 79.95 that rounds to 80.0 must wear the band of 80.0, not of 79.95 (spec/53 §3.3).
-    rounded = round(composite, 1)
-    computed_band = "red" if capped_by_axis else _band(rounded)
-    return rounded, computed_band, capped_by_axis
+    # Band the DISPLAY INTEGER so the shown number and its color always agree.
+    # int(round(composite)) is the canonical display integer (#623 fix, spec/53 §3.3).
+    # NOTE: Python's round() uses round-half-to-even (banker's rounding), so .5
+    # does NOT always round up — int(round(78.5))==78 but int(round(79.5))==80.
+    # At the band thresholds (60, 80) the even neighbor happens to be the
+    # hundred-side, so raw 79.5 → 80 → green and raw 59.5 → 60 → amber; raw 79.49
+    # → 79 → amber and raw 59.49 → 59 → red. Bands are derived from the int, never
+    # from a {:.0f} format of the raw float.
+    # Keep composite as the float value for math/history; band is derived from the int.
+    display_int = int(round(composite))
+    computed_band = "red" if capped_by_axis else _band(display_int)
+    return composite, computed_band, capped_by_axis
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -661,11 +682,12 @@ def _score_cost_axis(
     """
     cost_targets = targets.axes.get("cost", {})
 
-    # All billable primary runs
+    # Billable primary runs in the 30d window — the only primary-filtered list the
+    # cost axis consumes (cheaper_model_share + tokens_per_output below). WoW and
+    # spend_vs_trend read the raw runs_7d / runs_prior_7d / runs_prior_30d params
+    # directly (helpers + delegates are billed to the fleet too), so no
+    # primary-filtered prior/7d lists are needed here.
     primary_30d = [r for r in runs_30d if _is_primary_run(r)]
-    primary_prior_30d = [r for r in runs_prior_30d if _is_primary_run(r)]
-    primary_7d = [r for r in runs_7d if _is_primary_run(r)]
-    primary_prior_7d = [r for r in runs_prior_7d if _is_primary_run(r)]
 
     if not primary_30d:
         return None, [
@@ -851,66 +873,56 @@ def _score_cost_axis(
 
 
 # ──────────────────────────────────────────────────────────────────
-# Per-agent computation
+# Pure scoring core (zero I/O — for counterfactual re-scoring in recommend.py)
 
 
-def _compute_agent_health(
-    agents_root: Path,
+def _score_agent_from_data(
     agent: str,
+    runs_30d: list[RunRecord],
+    runs_prior_30d: list[RunRecord],
+    eval_records: list["_EvalRecord"],
     targets: FleetTargets,
     today: date,
-    thirty_days_ago: date,
-    prior_30_end: date,
-    prior_30_start: date,
-    seven_days_ago: date,
+    six_days_ago: date,
     prior_7_start: date,
     prior_7_end: date,
+    recent_degraded: bool = False,
+    prior_degraded: bool = False,
 ) -> AgentHealth:
-    """Compute AgentHealth for one agent. Fail-soft per axis."""
+    """Pure scoring core — zero disk I/O; operates on pre-loaded data.
+
+    Extracted from _compute_agent_health so the recommendations engine
+    (recommend.py) can call it twice: once with real data (baseline) and once
+    with a counterfactual run list (model substituted via dataclasses.replace)
+    to compute projected_points_delta without extra disk reads.
+
+    All window-slicing is done inside this function from pre-loaded 30d data.
+    Caller is responsible for ensuring runs_30d + eval_records cover the full
+    30d window [thirty_days_ago, today] — no enforcement here (pure/trust-caller).
+
+    Parameters
+    ----------
+    agent:            Agent identifier (used for logging + AgentHealth.agent).
+    runs_30d:         All runs in the recent 30d window (inclusive both ends).
+    runs_prior_30d:   All runs in the prior 30d window (inclusive both ends).
+    eval_records:     All eval records in the recent 30d window.
+    targets:          Parsed fleet targets.
+    today:            Reference date for all window boundaries.
+    six_days_ago:     today - 6 days; current 7d window = [six_days_ago, today].
+    prior_7_start:    Start of prior 7d window.
+    prior_7_end:      End of prior 7d window.
+    recent_degraded:  True if recent run load was degraded.
+    prior_degraded:   True if prior run load was degraded.
+    """
     health = AgentHealth(agent=agent)
 
-    # ── Load runs (30d + prior 30d + 7d + prior 7d) ──────────────
-    runs_30d: list[RunRecord] = []
-    runs_prior_30d: list[RunRecord] = []
-    runs_7d: list[RunRecord] = []
-    runs_prior_7d: list[RunRecord] = []
-    run_load_degraded = False
-
-    # Track degradation PER WINDOW. Conflating the two windows over-degrades:
-    # reliability + cheaper_model_share + tokens_per_output read ONLY the recent
-    # window, so a PRIOR-30d read failure must NOT exclude them. Only spend_vs_trend
-    # needs the prior window. (spec/53 §5.1, MUST 8.)
-    recent_degraded = False
-    prior_degraded = False
-
-    try:
-        runs_30d, deg1 = _load_runs_with_degraded(
-            agents_root, agent, thirty_days_ago, today
-        )
-        runs_prior_30d, deg2 = _load_runs_with_degraded(
-            agents_root, agent, prior_30_start, prior_30_end
-        )
-        recent_degraded = deg1
-        prior_degraded = deg2
-        run_load_degraded = deg1 or deg2
-        # A RECENT-window failure poisons every recent metric → degrade reliability
-        # AND the cost axis. A PRIOR-only failure degrades only spend_vs_trend
-        # (handled below via spend_vs_trend_degraded), not the whole cost axis.
-        if recent_degraded:
-            health.cost_degraded = True
-            health.reliability_degraded = True
-    except Exception as exc:
-        logger.warning(
-            "advisor: run load failed for %s (%s)", agent, type(exc).__name__
-        )
-        run_load_degraded = True
-        recent_degraded = True
-        prior_degraded = True
+    if recent_degraded:
         health.cost_degraded = True
         health.reliability_degraded = True
 
-    # Slice 7d windows from the already-loaded 30d lists (avoids extra I/O)
-    runs_7d = [r for r in runs_30d if r.ts.date() >= seven_days_ago]
+    # Slice 7d windows from the already-loaded 30d lists (avoids extra I/O).
+    # Current 7d: [six_days_ago, today] = 7 inclusive days (#623 WoW fix, spec/53 §6).
+    runs_7d = [r for r in runs_30d if six_days_ago <= r.ts.date() <= today]
     runs_prior_7d = [r for r in runs_30d if prior_7_start <= r.ts.date() <= prior_7_end]
 
     # ── Reliability axis ─────────────────────────────────────────
@@ -984,13 +996,8 @@ def _compute_agent_health(
         )
 
     # ── Quality axis ─────────────────────────────────────────────
-    eval_since = thirty_days_ago
-    eval_7d_since = seven_days_ago
-    eval_prior_7d_since = prior_7_start
-
     try:
-        eval_records = _load_eval_records(agents_root, agent, eval_since, today)
-        eval_7d = [r for r in eval_records if r.ts_date >= seven_days_ago]
+        eval_7d = [r for r in eval_records if r.ts_date >= six_days_ago]
         eval_prior_7d = [
             r for r in eval_records if prior_7_start <= r.ts_date <= prior_7_end
         ]
@@ -1045,13 +1052,94 @@ def _compute_agent_health(
     health.composite = composite
     health.band = band
     health.capped_by_axis = capped_by
+    # Canonical display integer — assigned AFTER the critical-cap override (the
+    # cap is applied inside _compute_composite before returning). Bands are derived
+    # from this int in render.py (#623 fix, spec/53 §3.3 + MUST 11).
+    health.composite_display = int(round(composite)) if composite is not None else None
 
     health.degraded = (
         health.cost_degraded or health.quality_degraded or health.reliability_degraded
     )
     health.axes_with_data = sum(1 for s in sub_scores.values() if s is not None)
 
+    # ── Primary model ─────────────────────────────────────────────
+    # Most common model in recent 30d primary runs; used by recommend.py (#616).
+    primary_runs = [r for r in runs_30d if _is_primary_run(r)]
+    if primary_runs:
+        from collections import Counter
+
+        model_counts = Counter(r.model for r in primary_runs)
+        health.primary_model = model_counts.most_common(1)[0][0]
+
     return health
+
+
+# ──────────────────────────────────────────────────────────────────
+# Per-agent computation (thin loader wrapper around _score_agent_from_data)
+
+
+def _compute_agent_health(
+    agents_root: Path,
+    agent: str,
+    targets: FleetTargets,
+    today: date,
+    thirty_days_ago: date,
+    prior_30_end: date,
+    prior_30_start: date,
+    six_days_ago: date,
+    prior_7_start: date,
+    prior_7_end: date,
+) -> AgentHealth:
+    """Load run/eval data from disk then delegate to _score_agent_from_data.
+
+    This is the thin loader. The pure scoring logic lives in _score_agent_from_data
+    so that recommend.py can call it with in-memory counterfactual data without
+    extra disk I/O.
+    """
+    runs_30d: list[RunRecord] = []
+    runs_prior_30d: list[RunRecord] = []
+    recent_degraded = False
+    prior_degraded = False
+
+    try:
+        runs_30d, deg1 = _load_runs_with_degraded(
+            agents_root, agent, thirty_days_ago, today
+        )
+        runs_prior_30d, deg2 = _load_runs_with_degraded(
+            agents_root, agent, prior_30_start, prior_30_end
+        )
+        recent_degraded = deg1
+        prior_degraded = deg2
+    except Exception as exc:
+        logger.warning(
+            "advisor: run load failed for %s (%s)", agent, type(exc).__name__
+        )
+        recent_degraded = True
+        prior_degraded = True
+
+    eval_records: list[_EvalRecord] = []
+    try:
+        eval_records = _load_eval_records(agents_root, agent, thirty_days_ago, today)
+    except Exception as exc:
+        logger.warning(
+            "advisor: eval load failed for %s (%s)", agent, type(exc).__name__
+        )
+        # eval load failure is handled inside _score_agent_from_data's quality axis
+        # try/except; pass the empty list — the quality scorer returns no-data.
+
+    return _score_agent_from_data(
+        agent=agent,
+        runs_30d=runs_30d,
+        runs_prior_30d=runs_prior_30d,
+        eval_records=eval_records,
+        targets=targets,
+        today=today,
+        six_days_ago=six_days_ago,
+        prior_7_start=prior_7_start,
+        prior_7_end=prior_7_end,
+        recent_degraded=recent_degraded,
+        prior_degraded=prior_degraded,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -1091,10 +1179,13 @@ def compute_fleet_health(
     # recent window preserves the boundary-day-counts-recent invariant.
     prior_30_end = thirty_days_ago - timedelta(days=1)
     prior_30_start = today - timedelta(days=61)
-    seven_days_ago = today - timedelta(days=7)
-    # Prior 7d window: [today-14d, today-8d] (strictly before current 7d)
-    prior_7_start = today - timedelta(days=14)
-    prior_7_end = today - timedelta(days=8)
+    # 7d WoW windows: BOTH must be equal-length (7 inclusive days each) so a
+    # flat-spend fleet reports wow_spend = 'flat', not +14.3% (#623 fix, spec/53 §6).
+    # Current 7d: [today-6, today] = 7 inclusive days.
+    # Prior 7d:   [today-13, today-7] = 7 inclusive days, no overlap, no gap.
+    six_days_ago = today - timedelta(days=6)
+    prior_7_start = today - timedelta(days=13)
+    prior_7_end = today - timedelta(days=7)
 
     fleet = FleetHealth()
 
@@ -1142,7 +1233,7 @@ def compute_fleet_health(
                 thirty_days_ago=thirty_days_ago,
                 prior_30_end=prior_30_end,
                 prior_30_start=prior_30_start,
-                seven_days_ago=seven_days_ago,
+                six_days_ago=six_days_ago,
                 prior_7_start=prior_7_start,
                 prior_7_end=prior_7_end,
             )
@@ -1185,11 +1276,6 @@ def compute_fleet_health(
         fleet_c = min(mean_c, worst_c)
         fleet_c = max(0.0, min(100.0, fleet_c))
 
-        # Band the ROUNDED headline so the number shown and its color agree
-        # (same rounded-band invariant as _compute_composite; spec/53 §3.3).
-        fleet_c = round(fleet_c, 1)
-        fleet.fleet_composite = fleet_c
-        fleet.fleet_band = _band(fleet_c)
         # Fleet critical cap: if ANY included agent is itself critical, force the
         # fleet red (and floor the headline at the ceiling). Keying on the agent's
         # own `capped_by_axis` flag — NOT on `worst_c < THRESHOLD` — is load-bearing:
@@ -1202,14 +1288,29 @@ def compute_fleet_health(
             ah.composite is not None and ah.capped_by_axis is not None
             for ah in agent_healths
         )
+        # Apply the critical cap to the RAW capped float — keep a single raw value
+        # so the display integer rounds ONCE off the raw composite, never off the
+        # 1-decimal-rounded float (the #623 fleet-headline double-round: a raw
+        # 79.45 → round(79.45,1)=79.5 → int(round(79.5))=80/GREEN, vs. the
+        # canonical single round int(round(79.45))=79/AMBER). Mirror the
+        # worst-agent path (below) which already rounds the raw value once.
         if any_critical_agent:
-            fleet.fleet_composite = min(
-                fleet.fleet_composite, float(CRITICAL_COMPOSITE_CAP)
-            )
-            fleet.fleet_band = "red"
+            fleet_c = min(fleet_c, float(CRITICAL_COMPOSITE_CAP))
+
+        # Float for math/history/downstream consumers (1-decimal, display-agnostic).
+        fleet.fleet_composite = round(fleet_c, 1)
+
+        # Canonical display integer — int(round(raw)) AFTER the critical-cap
+        # override (#623 fix, spec/53 §3.3 + MUST 11). Bands are derived from this int so the
+        # shown number and its CSS color class always agree.
+        fleet.fleet_composite_display = int(round(fleet_c))
+        fleet.fleet_band = (
+            "red" if any_critical_agent else _band(fleet.fleet_composite_display)
+        )
 
         fleet.worst_agent = worst_agent
         fleet.worst_agent_composite = round(worst_c, 1)
+        fleet.worst_agent_composite_display = int(round(worst_c))
 
     # Degraded flag: OR-composition
     fleet.degraded = any(ah.degraded for ah in agent_healths)

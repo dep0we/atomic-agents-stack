@@ -194,6 +194,14 @@ def render_console(agents_root: Path, console_data) -> Path:
         for agent in discover_agents(agents_root)
     )
 
+    # Single reference date threaded into BOTH advisor calls below so the health
+    # band (compute_fleet_health) and the recommendation windows + point-impact
+    # counterfactual (recommend_fleet) score against the SAME today — the
+    # same-today coherence recommend_fleet documents as a MUST, held by
+    # construction here rather than by two independent date.today() reads
+    # happening to land on the same calendar day (a #623-class boundary).
+    advisor_today = date.today()
+
     # ── spec/53 PR2: Fleet Health Score ──────────────────────────────
     # Compute fleet health score before rendering. Fail-soft: the PR1 console
     # renders fully even when the advisor is unavailable.
@@ -201,13 +209,36 @@ def render_console(agents_root: Path, console_data) -> Path:
         try:
             from ..advisor.score import compute_fleet_health
 
-            console_data.fleet_health = compute_fleet_health(agents_root)
+            console_data.fleet_health = compute_fleet_health(
+                agents_root, today=advisor_today
+            )
         except Exception as exc:
             logger.warning(
                 "advisor.compute_fleet_health failed (%s); rendering without health band",
                 type(exc).__name__,
             )
             console_data.fleet_health = None
+
+    # ── spec/54 PR3: Recommendations ─────────────────────────────────
+    # Compute recommendations. Fail-soft: absent = no recommendations panel.
+    if console_data.recommendations is None:
+        try:
+            from ..advisor.recommend import recommend_fleet
+
+            # Reuse the fleet_health just computed for the band so the loader does
+            # not re-run the fleet-wide scoring pass a second time (Principle #6).
+            # advisor_today is threaded into both calls so the pre-computed
+            # fleet_health and the recommendation windows share the same reference
+            # date by construction; pass None through if scoring failed above.
+            console_data.recommendations = recommend_fleet(
+                agents_root, today=advisor_today, fleet_health=console_data.fleet_health
+            )
+        except Exception as exc:
+            logger.warning(
+                "advisor.recommend_fleet failed (%s); rendering without recommendations",
+                type(exc).__name__,
+            )
+            console_data.recommendations = None
 
     html_content = _render_console_template(console_data, has_goals=has_goals)
     out_path = out_dir / _CONSOLE_HOME
@@ -1012,6 +1043,23 @@ _CONSOLE_CSS_EXTRA = """
 .wow-good { color: var(--good); }
 .wow-bad { color: var(--error); }
 .wow-flat { color: var(--muted); }
+
+/* Recommendations panel (spec/54) */
+.rec-panel { margin: 24px 0; }
+.rec-row { border: 1px solid var(--border); border-radius: 6px; padding: 12px 16px; margin-bottom: 10px; }
+.rec-header { display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px; }
+.rec-kind-pill { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; white-space: nowrap; }
+.rec-kind-savings_cost { background: #e6f4ea; color: #137333; }
+.rec-kind-quality_report { background: #fef9e7; color: #9a6700; }
+.rec-kind-governance { background: #e8f0fe; color: #1967d2; }
+.rec-agent { font-weight: 600; }
+.rec-models { font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+.rec-models .rec-arrow { margin: 0 4px; color: var(--muted); }
+.rec-rationale { font-size: 13px; color: var(--text); }
+.rec-deltas { font-size: 12px; color: var(--muted); margin-top: 4px; }
+.rec-delta-badge { display: inline-block; padding: 1px 6px; border-radius: 4px; margin-right: 6px; }
+.rec-delta-savings { background: #e6f4ea; color: #137333; }
+.rec-delta-points { background: #e8f0fe; color: #1967d2; }
 """
 
 
@@ -1057,14 +1105,27 @@ def _render_health_band(fleet_health) -> str:
     fh_degraded = getattr(fleet_health, "degraded", False)
     used_defaults = getattr(fleet_health, "used_targets_defaults", False)
 
-    if composite is not None:
-        score_html = f'<span class="health-score-composite">{composite:.0f}</span>'
+    # Prefer the canonical display integer fields (fleet_composite_display,
+    # worst_agent_composite_display) which are set by compute_fleet_health after
+    # the critical-cap override (#623 fix, spec/53 §3.3 + MUST 11). Fall back to int(round())
+    # for older FleetHealth objects that may not have the field populated.
+    composite_display = getattr(fleet_health, "fleet_composite_display", None)
+    if composite_display is None and composite is not None:
+        composite_display = int(round(composite))
+    worst_composite_display = getattr(
+        fleet_health, "worst_agent_composite_display", None
+    )
+    if worst_composite_display is None and worst_composite is not None:
+        worst_composite_display = int(round(worst_composite))
+
+    if composite is not None and composite_display is not None:
+        score_html = f'<span class="health-score-composite">{composite_display}</span>'
         coverage_html = (
-            f'<span class="health-coverage">Health {composite:.0f}'
+            f'<span class="health-coverage">Health {composite_display}'
             f" | Coverage {coverage_n}/{coverage_m}"
             + (
-                f" | Worst: {html.escape(worst_agent)} ({worst_composite:.0f})"
-                if worst_agent
+                f" | Worst: {html.escape(worst_agent)} ({worst_composite_display})"
+                if worst_agent and worst_composite_display is not None
                 else ""
             )
             + "</span>"
@@ -1102,11 +1163,19 @@ def _render_health_band(fleet_health) -> str:
                 f"</div>"
             )
         mean_v = sum(vals) / len(vals)
-        chip_band = "green" if mean_v >= 80 else ("amber" if mean_v >= 60 else "red")
+        # Use int(round()) for display/band consistency (#623 fix): chip value 79.5
+        # rounds to 80 and gets a green chip, not an amber chip labeled '80'.
+        chip_di = int(round(mean_v))
+        # Band the displayed integer via the scoring core's _band (single source
+        # of truth for BAND_GREEN_MIN/BAND_AMBER_MIN) so the chip thresholds can
+        # never drift from the headline/composite bands (#623 root-cause class).
+        from ..advisor.score import _band
+
+        chip_band = _band(chip_di)
         return (
             f'<div class="health-chip health-chip-{chip_band}">'
             f'<div class="health-chip-label">{html.escape(label)}</div>'
-            f'<div class="health-chip-value">{mean_v:.0f}</div>'
+            f'<div class="health-chip-value">{chip_di}</div>'
             f"</div>"
         )
 
@@ -1255,6 +1324,85 @@ def _render_health_band(fleet_health) -> str:
         f"{defaults_note}"
         f"</div>"
     )
+
+
+def _render_recommendations(recommendations) -> str:
+    """Render the Recommendations panel (spec/54 PR3). Fail-soft: returns '' on None."""
+    if recommendations is None:
+        return ""
+    recs = list(recommendations)
+    if not recs:
+        return (
+            "<h2>Recommendations</h2>"
+            '<div class="queue-empty">No recommendations at this time — fleet looks optimized.</div>'
+        )
+
+    _kind_label = {
+        "savings_cost": "Cost Savings",
+        "quality_report": "Quality Report",
+        "governance": "Governance",
+    }
+    # Known rec kinds get their own kind-pill color (CSS .rec-kind-{kind}).
+    _known_kinds = {"savings_cost", "quality_report", "governance"}
+
+    rows_html = ""
+    for rec in recs:
+        agent_safe = html.escape(getattr(rec, "agent", ""))
+        kind = getattr(rec, "kind", "")
+        kind_label = html.escape(_kind_label.get(kind, kind))
+        # Use the kind-specific pill class for known kinds; fall back to the
+        # generic info pill for any unknown kind (defensive — kind is validated
+        # at construction, so this only guards against a future kind not in CSS).
+        if kind in _known_kinds:
+            pill_html = (
+                f'<span class="rec-kind-pill rec-kind-{kind}">{kind_label}</span>'
+            )
+        else:
+            pill_html = f'<span class="pill info">{kind_label}</span>'
+        rationale_safe = html.escape(getattr(rec, "rationale", "") or "")
+        current_model = getattr(rec, "current_model", None)
+        candidate_model = getattr(rec, "candidate_model", None)
+        usd_delta = getattr(rec, "projected_usd_delta", None)
+        pts_delta = getattr(rec, "projected_points_delta", None)
+
+        model_str = ""
+        if current_model and candidate_model:
+            model_str = (
+                f'<div class="rec-models">'
+                f"{html.escape(current_model)}"
+                f'<span class="rec-arrow">→</span>'
+                f"{html.escape(candidate_model)}"
+                f"</div>"
+            )
+
+        delta_parts = []
+        if usd_delta is not None:
+            # Savings recs only ever carry a negative usd_delta (the rec fires
+            # only when projected_usd_delta < 0). Render the magnitude as a
+            # positive "saved" figure rather than a raw "$-42.50/mo" (#616 review).
+            delta_parts.append(
+                f'<span class="rec-delta-badge rec-delta-savings">'
+                f"${abs(usd_delta):.2f}/mo saved</span>"
+            )
+        if pts_delta is not None:
+            delta_parts.append(
+                f'<span class="rec-delta-badge rec-delta-points">{pts_delta:+.1f} pts</span>'
+            )
+        delta_html = "".join(delta_parts)
+
+        rows_html += (
+            f'<div class="rec-row">'
+            f'<div class="rec-header">'
+            f"{pill_html}"
+            f'<span class="rec-agent">{agent_safe}</span>'
+            f"</div>"
+            f"{model_str}"
+            f'<div class="rec-rationale">{rationale_safe}</div>'
+            + (f'<div class="rec-deltas">{delta_html}</div>' if delta_html else "")
+            + "</div>"
+        )
+
+    return f'<h2>Recommendations</h2><div class="rec-panel">{rows_html}</div>'
 
 
 def _render_console_template(console_data, has_goals: bool = True) -> str:
@@ -1496,6 +1644,11 @@ def _render_console_template(console_data, has_goals: bool = True) -> str:
         else ""
     )
 
+    # ── Recommendations panel (spec/54 PR3) ──────────────────────────
+    recommendations_section = _render_recommendations(
+        getattr(console_data, "recommendations", None)
+    )
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1531,12 +1684,14 @@ def _render_console_template(console_data, has_goals: bool = True) -> str:
 {reliability_panel}
 </div>
 
+{recommendations_section}
+
 <h2>Agent Fleet</h2>
 {agent_grid_html}
 
 <footer>
   <div>Generated {date.today().isoformat()} by atomic_agents.dashboard</div>
-  <div>Fleet Console · spec/52 + spec/53</div>
+  <div>Fleet Console · spec/52 + spec/53 + spec/54</div>
 </footer>
 
 {snooze_modal}

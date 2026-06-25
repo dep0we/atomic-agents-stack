@@ -227,11 +227,23 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
-def _extract_scoring_yaml(text: str) -> dict | None:
-    """Extract the first fenced YAML block that contains a top-level 'scoring:' key.
+def _extract_block(text: str, key: str) -> dict | None:
+    """Extract the first fenced YAML block whose parsed dict contains ``key``.
 
-    Never merges multiple blocks. Returns None if none found.
+    Never merges multiple blocks. Returns None if no block contains ``key``.
     Uses yaml.safe_load (spec/25 PR1 / mandates_md.py:330 — never yaml.load).
+
+    Parameterized by the required top-level key so that the scoring parser and the
+    recommendations parser each find THEIR OWN block independently. This matters
+    when an operator writes two separate fenced YAML blocks (e.g. a
+    'recommendations:' block before a 'scoring:' block): a shared extractor that
+    matched EITHER key would return the first-matching block, so parse_targets
+    could land on a recommendations-only block, see no 'scoring' key, and silently
+    drop the operator's real scoring config to all defaults (spec/53 MUST 6 says
+    fail-soft per-KEY, not per-FILE — silently discarding a valid block is the
+    opposite of that). Keying each parser on its own block restores the spec/53
+    behavior while still finding a COMBINED block (one block carrying both keys —
+    the normative spec/54 §4 layout) for each parser.
     """
     blocks = re.findall(r"```yaml\s*\n(.*?)```", text, re.DOTALL)
     for block in blocks:
@@ -241,9 +253,18 @@ def _extract_scoring_yaml(text: str) -> dict | None:
             continue
         if not isinstance(parsed, dict):
             continue
-        if "scoring" in parsed:
+        if key in parsed:
             return parsed
     return None
+
+
+def _extract_scoring_yaml(text: str) -> dict | None:
+    """Extract the first fenced YAML block containing 'scoring:' (spec/53).
+
+    Thin wrapper over _extract_block keyed on 'scoring'. Never merges multiple
+    blocks. Returns None if no block contains a 'scoring:' key.
+    """
+    return _extract_block(text, "scoring")
 
 
 def _parse_metric(
@@ -478,3 +499,208 @@ def parse_targets(agents_root: Path) -> FleetTargets:
     axes = _parse_axes(raw_axes, used_defaults)
 
     return FleetTargets(weights=weights, axes=axes, used_defaults=used_defaults)
+
+
+# ──────────────────────────────────────────────────────────────────
+# Recommendation config (spec/54) — new top-level 'recommendations:' block
+# in targets.md, parallel to 'scoring:' (Option A: same fenced YAML block).
+
+# Baked-in defaults for recommendation config (normative non-negotiable floors;
+# individual values are operator-configurable knobs, not normative).
+# weighted-score margin above the rubric threshold required to clear guard P1.
+# UNITS: this is on the 1-5 weighted-score scale (eval.py _SCORE_MIN=1.0,
+# _SCORE_MAX=5.0). weighted_score_margin = mean_weighted - rubric_threshold, so
+# with the default rubric_threshold=4.0 the MAXIMUM achievable margin is
+# 5.0 - 4.0 = 1.0. The floor MUST be reachable on that scale or the guard can
+# never pass and no savings_cost rec ever fires. 0.5 = "half a rubric point of
+# proven headroom above threshold" (spec/54 §5 + §10). See test
+# test_default_config_score_margin_floor_is_reachable which pins this.
+_DEFAULT_REC_SCORE_MARGIN_FLOOR = (
+    0.5  # weighted-score margin above threshold (points, 1-5 scale)
+)
+_DEFAULT_REC_PASS_RATE_MARGIN_FLOOR = (
+    0.10  # pass-rate margin above threshold (fraction)
+)
+_DEFAULT_REC_MIN_EVAL_N = 10  # minimum scorable eval records to consider a downgrade
+_DEFAULT_REC_MIN_SAVINGS_USD = 5.0  # minimum projected monthly savings to surface rec
+
+# Default same-family downgrade map (conservative: one step down within family).
+# Keys are ALL known model aliases in PRICING; values are the next cheaper sibling.
+# Prefer dated aliases as candidates (pinned version, not floating).
+_DEFAULT_SAME_FAMILY_DOWNGRADE: dict[str, str] = {
+    # Anthropic: opus → sonnet → haiku
+    "claude-opus-4-8": "claude-sonnet-4-6-20260101",
+    "claude-opus-4-7-20260101": "claude-sonnet-4-6-20260101",
+    "claude-opus-4-7": "claude-sonnet-4-6-20260101",
+    "claude-sonnet-4-6-20260101": "claude-haiku-4-5-20251001",
+    "claude-sonnet-4-6": "claude-haiku-4-5-20251001",
+    # haiku is the cheapest Anthropic tier — no downgrade
+    # OpenAI: gpt-5 → gpt-5-mini → gpt-5-nano
+    "gpt-5": "gpt-5-mini",
+    "gpt-5-mini": "gpt-5-nano",
+    # gpt-5-nano is cheapest — no downgrade
+    # Moonshot: all same price tier — no downgrade
+    # Vertex: gemini-2.5-pro → gemini-2.5-flash → gemini-2.0-flash → gemini-2.0-flash-lite
+    "vertex/gemini-2.5-pro": "vertex/gemini-2.5-flash",
+    "vertex/gemini-2.5-flash": "vertex/gemini-2.0-flash",
+    "vertex/gemini-2.0-flash": "vertex/gemini-2.0-flash-lite",
+    # vertex/gemini-2.0-flash-lite is cheapest — no downgrade
+}
+
+
+@dataclass
+class RecommendationConfig:
+    """Parsed recommendation config from the 'recommendations:' block in targets.md.
+
+    All fields have baked-in defaults and fail-soft per key (spec/54 MUST 6).
+    Floors are non-normative operator knobs; the composite-gate logic is normative.
+    """
+
+    # No-quality-cost-guard floors (spec/54 Option C gate, #616 ruling)
+    score_margin_floor: float = _DEFAULT_REC_SCORE_MARGIN_FLOOR
+    pass_rate_margin_floor: float = _DEFAULT_REC_PASS_RATE_MARGIN_FLOOR
+    min_eval_n: int = _DEFAULT_REC_MIN_EVAL_N
+
+    # Minimum projected monthly savings (USD) to surface a cost rec
+    min_savings_usd: float = _DEFAULT_REC_MIN_SAVINGS_USD
+
+    # Operator-configured work_type → allowed candidate models map.
+    # None means use the baked-in _DEFAULT_SAME_FAMILY_DOWNGRADE map.
+    work_type_allowed_models: dict[str, list[str]] | None = None
+
+    # NOTE: recommend_fleet() ranks recs purely by abs(projected_points_delta)
+    # (spec/54 §7 Option 1 — fleet-health point impact). There are intentionally
+    # NO ranking_*_weight fields: a weighted ranking scheme would be dead config
+    # (nothing reads it) and would contradict §7. "Pick the option that adds fewer
+    # concepts" — the point-impact delta IS the ranking signal.
+
+    # Keys that fell back to defaults (diagnostic only)
+    used_defaults: list[str] = field(default_factory=list)
+
+
+def _parse_rec_float(
+    raw: object, key: str, default: float, used_defaults: list[str]
+) -> float:
+    """Parse a single float recommendation config key with per-key fail-soft."""
+    if raw is None or not _is_real_number(raw) or raw < 0:
+        used_defaults.append(f"recommendations.{key}")
+        return default
+    return float(raw)
+
+
+def _parse_rec_int(
+    raw: object, key: str, default: int, used_defaults: list[str]
+) -> int:
+    """Parse a single int recommendation config key with per-key fail-soft."""
+    if raw is None or isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        used_defaults.append(f"recommendations.{key}")
+        return default
+    v = int(raw)
+    if v < 1:
+        used_defaults.append(f"recommendations.{key}(below_minimum)")
+        return default
+    return v
+
+
+def parse_recommendations(agents_root: Path) -> RecommendationConfig:
+    """Parse 'recommendations:' config block from <agents_root>/targets.md.
+
+    Fail-soft posture (spec/54 MUST 6):
+    - File absent → all defaults.
+    - Block absent → all defaults.
+    - Individual key missing/malformed → default for THAT key only.
+
+    The normative spec/54 §4 layout places 'recommendations:' as a parallel sibling
+    of 'scoring:' in ONE fenced YAML block. This parser is keyed independently on
+    'recommendations:' (via _extract_block), so an operator who instead writes a
+    SEPARATE fenced block — in either order relative to the scoring block — still
+    gets their recommendation config parsed, and the scoring parser independently
+    finds the scoring block. Neither parser can clobber the other's config.
+    """
+    used_defaults: list[str] = []
+    raw_rec: dict = {}
+
+    base_path = agents_root / "targets.md"
+    if base_path.exists():
+        try:
+            text = base_path.read_text(encoding="utf-8")
+            parsed = _extract_block(text, "recommendations")
+            if parsed is not None:
+                raw_rec = parsed.get("recommendations", {}) or {}
+                if not isinstance(raw_rec, dict):
+                    logger.warning(
+                        "targets.md: 'recommendations' block is not a dict; using defaults"
+                    )
+                    used_defaults.append("recommendations(not_a_dict)")
+                    raw_rec = {}
+        except (OSError, yaml.YAMLError) as exc:
+            logger.warning(
+                "targets.md: recommendations parse error (%s); using all defaults",
+                type(exc).__name__,
+            )
+            used_defaults.append("recommendations(parse_error)")
+    else:
+        used_defaults.append("recommendations(targets.md absent)")
+
+    score_margin_floor = _parse_rec_float(
+        raw_rec.get("score_margin_floor"),
+        "score_margin_floor",
+        _DEFAULT_REC_SCORE_MARGIN_FLOOR,
+        used_defaults,
+    )
+    pass_rate_margin_floor = _parse_rec_float(
+        raw_rec.get("pass_rate_margin_floor"),
+        "pass_rate_margin_floor",
+        _DEFAULT_REC_PASS_RATE_MARGIN_FLOOR,
+        used_defaults,
+    )
+    min_eval_n = _parse_rec_int(
+        raw_rec.get("min_eval_n"),
+        "min_eval_n",
+        _DEFAULT_REC_MIN_EVAL_N,
+        used_defaults,
+    )
+    min_savings_usd = _parse_rec_float(
+        raw_rec.get("min_savings_usd"),
+        "min_savings_usd",
+        _DEFAULT_REC_MIN_SAVINGS_USD,
+        used_defaults,
+    )
+
+    # work_type_allowed_models: dict[str, list[str]] | None (operator-configured)
+    work_type_allowed_models: dict[str, list[str]] | None = None
+    raw_wam = raw_rec.get("work_type_allowed_models")
+    if raw_wam is not None:
+        if isinstance(raw_wam, dict):
+            valid_wam: dict[str, list[str]] = {}
+            for wt, models in raw_wam.items():
+                if isinstance(models, list) and all(isinstance(m, str) for m in models):
+                    valid_wam[str(wt)] = [str(m) for m in models]
+                else:
+                    logger.warning(
+                        "targets.md: recommendations.work_type_allowed_models.%s "
+                        "is not a list of strings; skipping",
+                        wt,
+                    )
+                    used_defaults.append(
+                        f"recommendations.work_type_allowed_models.{wt}"
+                    )
+            if valid_wam:
+                work_type_allowed_models = valid_wam
+        else:
+            logger.warning(
+                "targets.md: recommendations.work_type_allowed_models is not a dict; "
+                "using default same-family downgrade map"
+            )
+            used_defaults.append("recommendations.work_type_allowed_models(not_a_dict)")
+
+    # No ranking_*_weight parsing: ranking is purely by point-impact (spec/54 §7).
+
+    return RecommendationConfig(
+        score_margin_floor=score_margin_floor,
+        pass_rate_margin_floor=pass_rate_margin_floor,
+        min_eval_n=min_eval_n,
+        min_savings_usd=min_savings_usd,
+        work_type_allowed_models=work_type_allowed_models,
+        used_defaults=used_defaults,
+    )

@@ -156,6 +156,11 @@ class ConsoleData:
     # The template renders the header band when this is not None; absent = no band,
     # not a crash (fail-soft, spec/53 §8).
     fleet_health: object | None = None  # FleetHealth | None (avoid circular import)
+    # Recommendations (spec/54 PR3) — None until recommend_fleet() runs.
+    # Populated by render_console() BEFORE _render_console_template().
+    # The template renders a recommendations panel when this is not None; absent = no
+    # panel (fail-soft, spec/54 §11 — ConsoleData + render integration).
+    recommendations: list | None = None  # list[Recommendation] | None (avoid circular)
 
 
 # ──────────────────────────────────────────────────────────────────
