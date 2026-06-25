@@ -50,6 +50,20 @@ from typing import NamedTuple
 
 from .costs import RunRecord, discover_agents, _load_runs_with_degraded
 from .alert_state import read_alert_state
+from ._reliability import (
+    ReliabilityMetrics,
+    _compute_reliability,
+    _is_primary_run,
+    _NON_PRIMARY_TRIGGERS,
+    _RELIABILITY_ERROR_STATUSES,
+    _RELIABILITY_BLOCKED_STATUSES,
+    _RELIABILITY_INFLIGHT_STATUSES,
+    _RELIABILITY_PRINCIPAL_STATUSES,
+    _RELIABILITY_SKIPPED_STATUSES,
+    _RELIABILITY_ERROR_RATE_WARN,
+    _RELIABILITY_BLOCKED_RATE_WARN,
+    _RELIABILITY_SKIPPED_RATE_WARN,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,85 +79,12 @@ _SEVERITY_RANK = {
     "info": 4,
 }
 
-# Hardcoded thresholds (PR1 — tunability arrives with PR2 targets.md, #615)
+# Hardcoded thresholds (PR1 — alert thresholds are NOT controlled by
+# targets.md; targets.md controls SCORING targets (spec/53 PR2). Alert
+# threshold tunability is a separate follow-up.)
 _COST_SPIKE_THRESHOLD_MULT = 3.0  # alert when daily cost > N × baseline
 _COST_SPIKE_MIN_BASELINE_DAYS = 7  # need at least N days of history
 _QUALITY_REGRESSION_THRESHOLD = -0.10  # alert when delta_30d <= -10%
-_RELIABILITY_ERROR_RATE_WARN = 0.20  # 20% error rate
-_RELIABILITY_BLOCKED_RATE_WARN = 0.10  # 10% blocked rate
-# Cost-guardrail-blocked (skipped) rate. The primary/mid-loop cost gate in
-# agent.call() logs status="skipped" (summary "Skipped: <reason>"); the dashboard
-# RunRecord lands these in skipped_rate. This is the framework's MOST COMMON
-# refusal, so a high skipped rate is the operator's clearest "an agent keeps
-# hitting its cost cap" signal — surface it as an attention item, not just an
-# axis number (spec/52 §Reliability axis, the cost-block visibility gap).
-_RELIABILITY_SKIPPED_RATE_WARN = 0.10  # 10% cost-guardrail-blocked rate
-
-# Reliability status strings from RunRecord structural markers (spec/52 MUST 8)
-# Verified against agent.py self._log({... 'status': ...}) call sites.
-_RELIABILITY_ERROR_STATUSES = frozenset({"error"})
-_RELIABILITY_BLOCKED_STATUSES = frozenset({"lock_busy"})
-_RELIABILITY_INFLIGHT_STATUSES = frozenset({"in_flight"})
-_RELIABILITY_PRINCIPAL_STATUSES = frozenset({"principal_not_verified"})
-_RELIABILITY_SKIPPED_STATUSES = frozenset({"skipped", "deduped"})
-
-# Child / bookkeeping triggers that share the agent's JSONL but are NOT primary
-# unattended runs. The Reliability axis (spec/52 MUST 8) is a rate over PRIMARY
-# runs; counting these in the denominator dilutes error/blocked/skipped rates and
-# makes a failing fleet render healthier than it is (Principle #5 — the rate IS
-# the audit signal, so a polluted denominator is dishonest). It also fixes a
-# cross-attribution bug: a coordinator's `delegate` child row carries
-# status="skipped" when the DELEGATED agent hits its own cost cap; that cost-block
-# is already attributed in the child's own reliability, so counting it in the
-# coordinator's skipped_rate double-attributes one event to two agents.
-#
-# Mirrors the child/bookkeeping half of agent.py's `_PRIMITIVE_BY_TRIGGER`. Every
-# row whose trigger is in this set ALSO carries a `parent_run_id` (tool_call,
-# delegate, embed_*, judgment, helper) OR is a self-logged bookkeeping row that
-# is not a run (`cost_warning`, `escalation_*`). We use this allowlist-by-exclusion
-# rather than a primary allowlist so a new primary trigger is counted by default
-# (the conservative direction for a health signal) rather than silently dropped.
-_NON_PRIMARY_TRIGGERS = frozenset(
-    {
-        "helper",
-        "helper_batch_reservation",
-        "helper_batch_release",
-        "delegate",
-        "delegate_batch_reservation",
-        "delegate_batch_release",
-        "tool_call",
-        "tool_call_deferred",
-        "judgment",
-        "cost_warning",
-        "capture_write_error",
-        "escalation_deferred_execution",
-        "escalation_operator_revise_executed",
-        "escalation_operator_revise_invalid_amendment",
-        "escalation_resolved",
-        "embed_reservation",
-        "embed_release",
-        "embed_batch_reservation",
-        "embed_batch_release",
-        "embed_cost",
-    }
-)
-
-
-def _is_primary_run(r: RunRecord) -> bool:
-    """True if a RunRecord is a primary (unattended/top-level) agent run.
-
-    spec/52 MUST 8: the Reliability rate is computed over primary runs only.
-    A primary run has NO ``parent_run_id`` and a ``trigger`` that is not in the
-    known child/bookkeeping set. Either condition is sufficient to exclude a row:
-    the ``parent_run_id`` check catches a future child trigger we haven't
-    enumerated; the trigger-set check catches a self-logged bookkeeping row that
-    legitimately carries no parent (``cost_warning``, ``escalation_*``).
-    """
-    if getattr(r, "parent_run_id", None):
-        return False
-    if r.trigger in _NON_PRIMARY_TRIGGERS:
-        return False
-    return True
 
 
 # Alert key version prefix — increment when normalization logic changes
@@ -175,20 +116,6 @@ class AlertItem:
 
     def __post_init__(self):
         self.severity_rank = _SEVERITY_RANK.get(self.severity, 99)
-
-
-@dataclass
-class ReliabilityMetrics:
-    """Three-axis Reliability breakdown for one agent over a window."""
-
-    agent: str
-    total_runs: int
-    error_rate: float  # fraction of runs with status=error
-    blocked_rate: float  # fraction with status=lock_busy or embed_batch_blocked
-    inflight_rate: float  # fraction with status=in_flight (stuck / not completed)
-    principal_rate: float  # fraction with status=principal_not_verified
-    skipped_rate: float  # fraction with status=skipped (cost-guardrail-blocked)
-    embed_blocked_count: int  # absolute count of embed_batch_blocked events
 
 
 @dataclass
@@ -224,6 +151,11 @@ class ConsoleData:
     rendered_alert_keys: frozenset[str]  # all keys rendered this cycle
     agent_count: int
     degraded: bool  # True if any backend read degraded
+    # Fleet Health Score (spec/53 PR2) — None until compute_fleet_health() runs.
+    # Populated by render_console() / render_all() BEFORE _render_console_template().
+    # The template renders the header band when this is not None; absent = no band,
+    # not a crash (fail-soft, spec/53 §8).
+    fleet_health: object | None = None  # FleetHealth | None (avoid circular import)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -359,71 +291,9 @@ def _governance_alerts(
 
 # ──────────────────────────────────────────────────────────────────
 # Reliability axis
-
-
-def _compute_reliability(
-    runs: list[RunRecord],
-    agent: str,
-) -> ReliabilityMetrics:
-    """Derive reliability metrics from explicit RunRecord structural markers.
-
-    spec/52 MUST 8: ONLY explicit status markers + extra.embed_batch_blocked.
-    No heuristic inference.
-
-    The denominator is PRIMARY runs only — child/bookkeeping rows (tool_call,
-    delegate, embed_*, judgment, helper, cost_warning, escalation_*) share the
-    agent's JSONL but are not unattended runs. Counting them dilutes every rate
-    and double-attributes a delegated agent's cost-skip to the coordinator
-    (see ``_is_primary_run`` / ``_NON_PRIMARY_TRIGGERS``).
-    """
-    runs = [r for r in runs if _is_primary_run(r)]
-    total = len(runs)
-    if total == 0:
-        return ReliabilityMetrics(
-            agent=agent,
-            total_runs=0,
-            error_rate=0.0,
-            blocked_rate=0.0,
-            inflight_rate=0.0,
-            principal_rate=0.0,
-            skipped_rate=0.0,
-            embed_blocked_count=0,
-        )
-
-    error_count = sum(1 for r in runs if r.status in _RELIABILITY_ERROR_STATUSES)
-    lock_blocked_count = sum(
-        1 for r in runs if r.status in _RELIABILITY_BLOCKED_STATUSES
-    )
-    inflight_count = sum(1 for r in runs if r.status in _RELIABILITY_INFLIGHT_STATUSES)
-    principal_count = sum(
-        1 for r in runs if r.status in _RELIABILITY_PRINCIPAL_STATUSES
-    )
-    skipped_count = sum(1 for r in runs if r.status in _RELIABILITY_SKIPPED_STATUSES)
-    # embed_batch_blocked lives in extra dict (extended RunRecord field)
-    embed_blocked_count = sum(
-        1 for r in runs if getattr(r, "extra", {}).get("embed_batch_blocked", False)
-    )
-    # Total blocked is a SINGLE predicate over records — a run that is BOTH
-    # lock_busy AND carries embed_batch_blocked=True must count ONCE, not twice.
-    # Summing the two counts separately (lock_blocked_count + embed_blocked_count)
-    # double-counts the overlap, which can push blocked_rate above 1.0 (#614 P2).
-    total_blocked = sum(
-        1
-        for r in runs
-        if r.status in _RELIABILITY_BLOCKED_STATUSES
-        or getattr(r, "extra", {}).get("embed_batch_blocked", False) is True
-    )
-
-    return ReliabilityMetrics(
-        agent=agent,
-        total_runs=total,
-        error_rate=round(error_count / total, 4),
-        blocked_rate=round(total_blocked / total, 4),
-        inflight_rate=round(inflight_count / total, 4),
-        principal_rate=round(principal_count / total, 4),
-        skipped_rate=round(skipped_count / total, 4),
-        embed_blocked_count=embed_blocked_count,
-    )
+# _compute_reliability, _is_primary_run, ReliabilityMetrics, and the
+# _RELIABILITY_* constants are imported from ._reliability (shared with
+# advisor/score.py so both surfaces use the exact same computation).
 
 
 def _reliability_alerts(

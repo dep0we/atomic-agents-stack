@@ -178,6 +178,11 @@ def render_console(agents_root: Path, console_data) -> Path:
     This is the new landing page (spec/52 PR1). Writes the rendered alert_keys
     sidecar at _console/rendered_alert_keys.json for POST /alerts/ack validation.
     Returns the written path.
+
+    spec/53 PR2: compute_fleet_health() is called here (NOT inside
+    _render_console_template) so the template stays a pure HTML formatter.
+    If the advisor fails for any reason, console_data.fleet_health stays None
+    and the header band is absent — the PR1 axis panels render normally.
     """
     from .._io import atomic_write
 
@@ -188,6 +193,21 @@ def render_console(agents_root: Path, console_data) -> Path:
         (agents_root / agent / "goal.md").exists()
         for agent in discover_agents(agents_root)
     )
+
+    # ── spec/53 PR2: Fleet Health Score ──────────────────────────────
+    # Compute fleet health score before rendering. Fail-soft: the PR1 console
+    # renders fully even when the advisor is unavailable.
+    if console_data.fleet_health is None:
+        try:
+            from ..advisor.score import compute_fleet_health
+
+            console_data.fleet_health = compute_fleet_health(agents_root)
+        except Exception as exc:
+            logger.warning(
+                "advisor.compute_fleet_health failed (%s); rendering without health band",
+                type(exc).__name__,
+            )
+            console_data.fleet_health = None
 
     html_content = _render_console_template(console_data, has_goals=has_goals)
     out_path = out_dir / _CONSOLE_HOME
@@ -947,6 +967,51 @@ _CONSOLE_CSS_EXTRA = """
   background: transparent; border: none; color: var(--muted);
   cursor: pointer; font-size: 13px; padding: 0;
 }
+
+/* Fleet Health header band (spec/53 PR2) */
+.health-band {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 10px; padding: 20px 24px; margin-bottom: 24px;
+}
+.health-band-header {
+  display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.health-score-composite {
+  font-size: 36px; font-weight: 700; line-height: 1;
+}
+.health-band-green .health-score-composite { color: var(--good); }
+.health-band-amber .health-score-composite { color: var(--warn); }
+.health-band-red .health-score-composite { color: var(--error); }
+.health-band-unknown .health-score-composite { color: var(--muted); }
+.health-coverage { color: var(--muted); font-size: 13px; }
+.health-sub-chips { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+.health-chip {
+  display: flex; flex-direction: column; align-items: center;
+  background: rgba(255,255,255,0.04); border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px 16px; min-width: 100px;
+}
+.health-chip-label { font-size: 10px; color: var(--muted); text-transform: uppercase;
+  letter-spacing: 0.05em; margin-bottom: 4px; }
+.health-chip-value { font-size: 20px; font-weight: 600; }
+.health-chip-green .health-chip-value { color: var(--good); }
+.health-chip-amber .health-chip-value { color: var(--warn); }
+.health-chip-red .health-chip-value { color: var(--error); }
+.health-chip-unknown .health-chip-value { color: var(--muted); }
+.health-scorecard { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+.health-scorecard th {
+  text-align: left; color: var(--muted); font-weight: 500; font-size: 10px;
+  text-transform: uppercase; letter-spacing: 0.05em;
+  padding: 6px 10px; border-bottom: 1px solid var(--border);
+}
+.health-scorecard td { padding: 6px 10px; border-bottom: 1px solid rgba(42,50,61,0.4); }
+.health-scorecard tr:last-child td { border-bottom: none; }
+.health-no-data { color: var(--muted); font-style: italic; }
+.health-degraded { color: var(--warn); font-style: italic; }
+.health-defaults-note { font-size: 11px; color: var(--muted); margin-top: 8px; }
+.wow-good { color: var(--good); }
+.wow-bad { color: var(--error); }
+.wow-flat { color: var(--muted); }
 """
 
 
@@ -967,6 +1032,229 @@ def _queue_status_html(status: str) -> str:
         "known": "status-known",
     }.get(status, "status-known")
     return f'<span class="{cls}">{html.escape(status)}</span>'
+
+
+def _render_health_band(fleet_health) -> str:
+    """Render the Fleet Health header band for spec/53 PR2.
+
+    Always called from _render_console_template(); returns an empty string when
+    fleet_health is None (fail-soft absent, not a crash).
+    All HTML generation lives here — the advisor module exports only dataclasses.
+    """
+    if fleet_health is None:
+        return ""
+
+    # Band CSS class
+    band = getattr(fleet_health, "fleet_band", "unknown")
+    band_cls = f"health-band health-band-{band}"
+
+    # Composite score display
+    composite = getattr(fleet_health, "fleet_composite", None)
+    coverage_n = getattr(fleet_health, "coverage_n", 0)
+    coverage_m = getattr(fleet_health, "coverage_m", 0)
+    worst_agent = getattr(fleet_health, "worst_agent", None)
+    worst_composite = getattr(fleet_health, "worst_agent_composite", None)
+    fh_degraded = getattr(fleet_health, "degraded", False)
+    used_defaults = getattr(fleet_health, "used_targets_defaults", False)
+
+    if composite is not None:
+        score_html = f'<span class="health-score-composite">{composite:.0f}</span>'
+        coverage_html = (
+            f'<span class="health-coverage">Health {composite:.0f}'
+            f" | Coverage {coverage_n}/{coverage_m}"
+            + (
+                f" | Worst: {html.escape(worst_agent)} ({worst_composite:.0f})"
+                if worst_agent
+                else ""
+            )
+            + "</span>"
+        )
+    else:
+        score_html = (
+            '<span class="health-score-composite" style="color:var(--muted)">—</span>'
+        )
+        coverage_html = (
+            f'<span class="health-coverage">insufficient data'
+            f" | Coverage {coverage_n}/{coverage_m}</span>"
+        )
+
+    # Sub-score chips (cost / quality / reliability)
+    agents = getattr(fleet_health, "agents", [])
+    axis_scores: dict[str, list[float]] = {"cost": [], "quality": [], "reliability": []}
+    for ah in agents:
+        cs = getattr(ah, "cost_score", None)
+        qs = getattr(ah, "quality_score", None)
+        rs = getattr(ah, "reliability_score", None)
+        if cs is not None:
+            axis_scores["cost"].append(cs)
+        if qs is not None:
+            axis_scores["quality"].append(qs)
+        if rs is not None:
+            axis_scores["reliability"].append(rs)
+
+    def _chip(label: str, axis: str) -> str:
+        vals = axis_scores.get(axis, [])
+        if not vals:
+            return (
+                f'<div class="health-chip health-chip-unknown">'
+                f'<div class="health-chip-label">{html.escape(label)}</div>'
+                f'<div class="health-chip-value" style="color:var(--muted);font-size:14px;">no data</div>'
+                f"</div>"
+            )
+        mean_v = sum(vals) / len(vals)
+        chip_band = "green" if mean_v >= 80 else ("amber" if mean_v >= 60 else "red")
+        return (
+            f'<div class="health-chip health-chip-{chip_band}">'
+            f'<div class="health-chip-label">{html.escape(label)}</div>'
+            f'<div class="health-chip-value">{mean_v:.0f}</div>'
+            f"</div>"
+        )
+
+    chips_html = (
+        '<div class="health-sub-chips">'
+        + _chip("Cost", "cost")
+        + _chip("Quality", "quality")
+        + _chip("Reliability", "reliability")
+        + "</div>"
+    )
+
+    # Scorecard table — aggregate all per-agent scorecard rows by metric
+    # Show fleet-mean value, target, mean score, and WoW summary
+    from collections import defaultdict
+
+    metric_values: dict[str, list] = defaultdict(list)
+    metric_targets: dict[str, float | None] = {}
+    metric_scores: dict[str, list[float]] = defaultdict(list)
+    metric_wows: dict[str, list[str]] = defaultdict(list)
+    metric_axis: dict[str, str] = {}
+
+    for ah in agents:
+        for row in getattr(ah, "scorecard", []):
+            key = row.metric
+            metric_axis[key] = row.axis
+            if row.target is not None:
+                metric_targets[key] = row.target
+            if row.value is not None:
+                metric_values[key].append(row.value)
+            if row.score is not None:
+                metric_scores[key].append(row.score)
+            if row.wow is not None:
+                metric_wows[key].append(row.wow)
+
+    def _wow_symbol(wows: list[str], direction: str) -> str:
+        """Render the aggregated WoW arrow, colored by GOODNESS not raw direction.
+
+        The glyph reflects raw movement (↑ = the metric value rose, ↓ = it fell).
+        The color reflects whether that movement is good or bad for THIS metric:
+        for a 'lower'-is-better metric (error_rate, spend_vs_trend, ...) a rising
+        value is BAD (red), a falling value is GOOD (green) — the inverse of a
+        'higher'-is-better metric (pass_rate, cheaper_model_share). Coloring on raw
+        direction alone would paint a rising error rate green (spec/53 §6).
+        """
+        if not wows:
+            return '<span class="wow-flat">—</span>'
+        ups = wows.count("up")
+        downs = wows.count("down")
+        if ups == downs:
+            return '<span class="wow-flat">→</span>'
+        rose = ups > downs
+        glyph = "↑" if rose else "↓"
+        # good = the movement improves the metric.
+        if direction == "lower":
+            good = not rose  # falling is good for lower-is-better
+        else:
+            good = rose  # rising is good for higher-is-better
+        cls = "wow-good" if good else "wow-bad"
+        return f'<span class="{cls}">{glyph}</span>'
+
+    scorecard_rows_html = ""
+    # Ordered display: reliability first, then quality, then cost.
+    # Each entry carries the metric's optimization direction ('higher'|'lower') so
+    # the WoW arrow is colored by goodness, not by raw value direction (spec/53 §6).
+    # Six of eight metrics are lower-is-better; only pass_rate and
+    # cheaper_model_share are higher-is-better.
+    #
+    # SCOPE NOTE (spec/53 §6, PR2): these directions are the DEFAULT directions. An
+    # operator who overrides a metric's `direction` in targets.md changes how the
+    # SCORE column is computed (targets.py _parse_metric), but the WoW arrow COLOR
+    # here still uses the default direction below — the two can diverge for an
+    # overridden metric. Honoring a targets.md direction override in the WoW color
+    # (threading MetricTarget.direction through ScorecardRow into the render) is
+    # deferred to the recommendations PR (#616); PR2 colors WoW on defaults only.
+    display_order = [
+        ("reliability", "error_rate", "lower"),
+        ("reliability", "blocked_rate", "lower"),
+        ("reliability", "skipped_rate", "lower"),
+        ("quality", "pass_rate", "higher"),
+        ("quality", "hard_fail_rate", "lower"),
+        ("cost", "cheaper_model_share", "higher"),
+        ("cost", "tokens_per_output", "lower"),
+        ("cost", "spend_vs_trend", "lower"),
+    ]
+    for axis_name, metric_name, direction in display_order:
+        vals = metric_values.get(metric_name, [])
+        scores = metric_scores.get(metric_name, [])
+        tgt = metric_targets.get(metric_name)
+        wows = metric_wows.get(metric_name, [])
+
+        val_str = (
+            f"{sum(vals) / len(vals):.3f}"
+            if vals
+            else '<span class="health-no-data">no data</span>'
+        )
+        tgt_str = f"{tgt:.3f}" if tgt is not None else "—"
+        score_str = (
+            f"{sum(scores) / len(scores):.0f}"
+            if scores
+            else '<span class="health-no-data">—</span>'
+        )
+        wow_str = _wow_symbol(wows, direction)
+
+        scorecard_rows_html += (
+            f"<tr>"
+            f"<td>{html.escape(axis_name)}</td>"
+            f"<td>{html.escape(metric_name)}</td>"
+            f"<td>{val_str}</td>"
+            f"<td>{tgt_str}</td>"
+            f"<td>{score_str}</td>"
+            f"<td>{wow_str}</td>"
+            f"</tr>"
+        )
+
+    scorecard_html = (
+        '<table class="health-scorecard">'
+        "<thead><tr>"
+        "<th>Axis</th><th>Metric</th><th>Value (fleet mean)</th>"
+        "<th>Target</th><th>Score</th><th>WoW</th>"
+        "</tr></thead>"
+        f"<tbody>{scorecard_rows_html}</tbody>"
+        "</table>"
+    )
+
+    degraded_note = (
+        '<div class="degraded-banner" style="margin-top:8px;">'
+        '<span class="pill warn">⚠ scoring data may be incomplete</span>'
+        " One or more axis reads degraded — affected sub-scores excluded from composite."
+        "</div>"
+        if fh_degraded
+        else ""
+    )
+
+    defaults_note = (
+        '<div class="health-defaults-note">Some scoring targets using defaults (targets.md absent or partially missing).</div>'
+        if used_defaults
+        else ""
+    )
+
+    return (
+        f'<div class="{band_cls}">'
+        f'<div class="health-band-header">{score_html}{coverage_html}</div>'
+        f"{chips_html}"
+        f"{scorecard_html}"
+        f"{degraded_note}"
+        f"{defaults_note}"
+        f"</div>"
+    )
 
 
 def _render_console_template(console_data, has_goals: bool = True) -> str:
@@ -1198,6 +1486,16 @@ def _render_console_template(console_data, has_goals: bool = True) -> str:
     active_count = len(active_items)
     fleet_size = console_data.agent_count
 
+    # ── Fleet Health header band (spec/53 PR2) ────────────────────────
+    # Rendered ABOVE the three axis panels. Absent (empty string) when
+    # fleet_health is None — the PR1 panels render normally either way.
+    health_band_html = _render_health_band(getattr(console_data, "fleet_health", None))
+    health_band_section = (
+        f"\n<h2>Fleet Health Score</h2>\n{health_band_html}\n"
+        if health_band_html
+        else ""
+    )
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1220,7 +1518,7 @@ def _render_console_template(console_data, has_goals: bool = True) -> str:
 
 {_nav}
 {_degraded_banner}
-
+{health_band_section}
 <h2>Operator Attention Queue
   {'<span class="pill error" style="margin-left:8px;">' + str(active_count) + " open</span>" if active_count else '<span class="pill ok" style="margin-left:8px;">0 open</span>'}
 </h2>
@@ -1238,7 +1536,7 @@ def _render_console_template(console_data, has_goals: bool = True) -> str:
 
 <footer>
   <div>Generated {date.today().isoformat()} by atomic_agents.dashboard</div>
-  <div>Fleet Console · spec/52 PR1</div>
+  <div>Fleet Console · spec/52 + spec/53</div>
 </footer>
 
 {snooze_modal}
