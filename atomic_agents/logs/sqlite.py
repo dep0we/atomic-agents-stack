@@ -95,8 +95,11 @@ from .types import (
 # replayed_run_id columns + idx_idempotency_key index, per the
 # spec/22 versioned normative addendum); spec/47 PR1 bumps to ``v3``
 # (adds conversation_id column + idx_conversation_id partial index,
-# per the spec/22 versioned normative addendum for ConversationBackend).
-_SCHEMA_VERSION = 3
+# per the spec/22 versioned normative addendum for ConversationBackend);
+# issue #622 PR1 bumps to ``v4`` (adds workflow_id column +
+# idx_workflow_id partial index, per the spec/22 versioned normative
+# addendum for workflow correlation).
+_SCHEMA_VERSION = 4
 
 
 # SQL for schema creation. Idempotent — ``CREATE TABLE IF NOT EXISTS``
@@ -131,6 +134,8 @@ CREATE TABLE IF NOT EXISTS run_records (
     replayed_run_id TEXT,
     -- spec/47 PR1 / spec/22 versioned normative addendum: conversation audit field.
     conversation_id TEXT,
+    -- spec/22 versioned normative addendum (issue #622 PR1): workflow correlation field.
+    workflow_id TEXT,
     extra TEXT NOT NULL DEFAULT '{}'
 )
 """
@@ -168,6 +173,15 @@ _CREATE_INDEXES = [
     # overwhelming majority of run records (only conversation-keyed runs set it).
     "CREATE INDEX IF NOT EXISTS idx_conversation_id ON run_records(conversation_id) "
     "WHERE conversation_id IS NOT NULL",
+    # spec/22 versioned normative addendum (issue #622 PR1): MUST add this index
+    # to enable LogQuery.workflow_id AND-predicate as an index seek. PARTIAL
+    # index (WHERE workflow_id IS NOT NULL): workflow_id is NULL for the
+    # overwhelming majority of run records (only workflow-tagged runs set it),
+    # so a partial index keeps the index small and the append hot-path cheap
+    # while still serving the `= ?` lookup as an index seek (the AND-predicate
+    # matches the partial predicate). SQLite 3.8.0+ supports partial indexes.
+    "CREATE INDEX IF NOT EXISTS idx_workflow_id ON run_records(workflow_id) "
+    "WHERE workflow_id IS NOT NULL",
 ]
 
 
@@ -197,6 +211,7 @@ _INSERT_COLUMNS = (
     "idempotency_key",
     "replayed_run_id",
     "conversation_id",
+    "workflow_id",
     "extra",
 )
 
@@ -433,6 +448,25 @@ class SQLiteLogBackend:
                 conn.execute("ALTER TABLE run_records ADD COLUMN conversation_id TEXT")
             conn.execute("UPDATE meta SET value='3' WHERE key='schema_version'")
             existing = 3
+        if existing == 3:
+            # v3 → v4 (issue #622 PR1): add workflow_id column +
+            # idx_workflow_id partial index (spec/22 versioned normative addendum
+            # for workflow correlation). Guarded by PRAGMA table_info() existence
+            # check for crash-resumability (SQLite has no ADD COLUMN IF NOT EXISTS).
+            # CRASH/RETRY SAFETY: if the process dies AFTER the ALTER TABLE commits
+            # but BEFORE the meta UPDATE, schema_version stays 3 with the column
+            # already present. On reopen this block re-runs; without the guard a
+            # bare ALTER would raise "duplicate column name" and permanently wedge
+            # the backend. The PRAGMA table_info() check makes the migration
+            # idempotent — exactly mirrors the v2→v3 pattern above.
+            _cols_v4 = {
+                str(r[1])
+                for r in conn.execute("PRAGMA table_info(run_records)").fetchall()
+            }
+            if "workflow_id" not in _cols_v4:
+                conn.execute("ALTER TABLE run_records ADD COLUMN workflow_id TEXT")
+            conn.execute("UPDATE meta SET value='4' WHERE key='schema_version'")
+            existing = 4
         # Create/update indexes AFTER migrations so all columns they reference exist.
         for stmt in _CREATE_INDEXES:
             conn.execute(stmt)
@@ -483,6 +517,7 @@ class SQLiteLogBackend:
             record.idempotency_key,
             record.replayed_run_id,
             record.conversation_id,
+            record.workflow_id,
             json.dumps(record.extra) if record.extra else "{}",
         )
         conn.execute(_INSERT_SQL, values)
@@ -830,6 +865,15 @@ class SQLiteLogBackend:
         if filter.conversation_id is not None:
             clauses.append("conversation_id = ?")
             params.append(filter.conversation_id)
+        # spec/22 versioned normative addendum (issue #622 PR1): workflow_id
+        # AND-predicate. Uses the idx_workflow_id partial index for an index seek.
+        # Without this, LogQuery(workflow_id=...) would silently return ALL records
+        # — making aggregate_workflow() return fleet-total cost instead of per-
+        # workflow cost. The `= ?` lookup matches the partial predicate
+        # (WHERE workflow_id IS NOT NULL), so it resolves as an index seek.
+        if filter.workflow_id is not None:
+            clauses.append("workflow_id = ?")
+            params.append(filter.workflow_id)
 
         where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
@@ -890,6 +934,14 @@ class SQLiteLogBackend:
             idempotency_key=row["idempotency_key"],
             replayed_run_id=row["replayed_run_id"],
             conversation_id=row["conversation_id"],
+            # spec/22 versioned normative addendum (issue #622 PR1): workflow_id.
+            # _ensure_schema() runs on every connection acquisition (read paths
+            # included: query()/tail()/aggregate() all route through _get_conn ->
+            # _ensure_schema before any row is read) and always applies pending
+            # migrations first, so after the v3→v4 migration this column ALWAYS
+            # exists (NULL on old rows, never absent). The direct subscript is
+            # therefore guaranteed safe and symmetric with conversation_id above.
+            workflow_id=row["workflow_id"],
             extra=extra,
         )
 

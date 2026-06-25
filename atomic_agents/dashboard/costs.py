@@ -742,6 +742,248 @@ def _build_monthly_trend(
     return list(reversed(out)), any_degraded
 
 
+# ──────────────────────────────────────────────────────────────────
+# Workflow cost rollup (spec/22 versioned normative addendum, issue #622 PR1)
+
+
+@dataclass
+class WorkflowSummary:
+    """Cross-run, cross-agent cost rollup for one workflow_id.
+
+    Fields:
+        total: actor-cost USD summed across all agents for this workflow,
+            using count-once semantics (the coordinator's delegate MIRROR
+            record is excluded to prevent double-count — see spec/22
+            addendum). Scoped to actor-cost records by correct-by-stamping,
+            NOT by a runtime cost_source predicate: judge/audit spend
+            (cost_source != 'actor') is NOT workflow-stamped, so it never
+            enters this total without an explicit filter in the loop (#639
+            tracks adding a defensive cost_source=='actor' filter). An
+            operator comparing this against the per-agent
+            dashboard total (which folds in judge/audit) will see this come
+            up short when LLM judging fired — that gap is by design in PR1.
+            total is the authoritative figure and reconciles with the
+            breakdown to the microcent: each per-agent value is rounded to 6
+            places FIRST and total accumulates those rounded values, so
+            round(sum(cost_by_agent.values()), 6) == total. This is agreement
+            to 6 decimal places, NOT bit-exact float equality — a raw float sum
+            of the rounded per-agent values can differ from total by a
+            binary-float epsilon (Principle #4, cost is first-class).
+        cost_by_agent: per-agent cost breakdown (agent name → USD), each value
+            rounded to 6 places. Only agents with at least one matching
+            cost-bearing record appear. round(sum(cost_by_agent.values()), 6)
+            == total (reconciles to the microcent, not bit-exact).
+        run_count: count of all records returned by LogQuery(workflow_id=...)
+            that do not carry the coordinator's delegate-mirror marker
+            (delegate_run_id / delegated_agent). In normal operation the mirror
+            is never workflow_id-stamped, so it is already excluded by the query
+            filter and never enters the queried set; the marker check is the
+            in-loop belt-and-suspenders guard (it only fires on a marker-bearing
+            record that somehow slipped past the filter). This count includes
+            zero-cost terminal records — refusals (principal-refused, dedup,
+            lock_busy, pre-/mid-loop cost-skip, in_flight, security-abort,
+            embed-block) that are workflow-stamped but carry no cost_usd. It is
+            NOT a "billable runs" count.
+        errors: count of RunRecord entries in the count-once-filtered set
+            where status == 'error'. Query errors from a specific agent's
+            backend are surfaced via cost_data_degraded, not this count.
+        cost_data_degraded: True if ANY per-agent backend query failed
+            (LogBackendReadError, or a backend construction / query error a
+            shared SQLite/Postgres backend can raise). Mirrors
+            GlobalSummary.cost_data_degraded so callers can surface a "data may
+            be incomplete" banner (spec/22 addendum + spec/09 §"Cost-read error
+            posture").
+
+    Count-once semantics: a delegation produces TWO records that both carry
+    the child's full cost_usd:
+      1. the coordinator's delegate MIRROR record (trigger='delegate',
+         carries delegated_agent + delegate_run_id, NOT stamped with
+         workflow_id), and
+      2. the delegated CHILD's own terminal record — which is ALSO
+         trigger='delegate' (the child agent is constructed with
+         trigger='delegate'), but DOES carry workflow_id and has NO
+         delegated_agent/delegate_run_id marker.
+    Summing both would double-count every delegation. aggregate_workflow()
+    excludes ONLY the mirror — identified by the mirror-only marker keys
+    delegate_run_id/delegated_agent, NOT by bare trigger — and KEEPS the
+    child's real spend. (The mirror is also excluded by the
+    LogQuery(workflow_id=...) filter, since it is never workflow-stamped;
+    the marker check is the in-loop belt-and-suspenders guard.) Included
+    set: agent_call, helper, embed_cost, and the delegated child's own
+    trigger='delegate' record — every actor-cost record EXCEPT the mirror.
+    (tool_call records are not stamped with workflow_id and carry no
+    cost_usd — tool spend is folded into the parent agent_call record — so
+    they never enter this rollup.)
+
+    Spike finding: summarize_agent() is correct only because it operates on
+    a single agent's records — the coordinator's delegate mirror and the
+    delegated child's record live in SEPARATE log dirs, so a per-dir load
+    never sees both. aggregate_workflow() fans out ACROSS agent dirs and
+    merges records from all of them, making the mirror exclusion mandatory.
+    summarize_agent() logic MUST NOT be reused for cross-agent aggregation.
+
+    NOTE: delegate_batch_reservation and delegate_batch_release records are
+    NOT stamped with workflow_id (they carry reserved_usd / actual_usd, not
+    cost_usd, and are bookkeeping-only). They are naturally excluded from
+    LogQuery(workflow_id=...) results and from this rollup.
+    """
+
+    total: float
+    cost_by_agent: dict[str, float]
+    run_count: int
+    errors: int
+    cost_data_degraded: bool = False
+
+
+def aggregate_workflow(agents_root: Path, workflow_id: str) -> WorkflowSummary:
+    """Cross-agent, count-once cost rollup for one workflow_id.
+
+    Fans out across every agent dir under agents_root, queries each agent's
+    LogBackend with LogQuery(workflow_id=workflow_id), merges all records,
+    then applies count-once dedup by excluding ONLY the coordinator's
+    delegate MIRROR record (identified by the mirror-only marker keys
+    delegate_run_id/delegated_agent), NOT every trigger='delegate' record.
+
+    Per the spec/22 versioned normative addendum (issue #622 PR1):
+    - Stamp sites: terminal records (ok/dedup/lock_busy/pre-loop-skip/
+      in_flight/mid-loop-skip/security-abort/embed-block) + helper +
+      embed_cost. The delegated child's own terminal record is stamped too
+      (it goes through the same ok-path stamping in the child's call()).
+    - Excluded from cost sum: the coordinator's delegate MIRROR record only.
+      The discriminator is the mirror-only marker (delegate_run_id /
+      delegated_agent in extra), NOT bare trigger — because the delegated
+      child's own record is ALSO trigger='delegate' and carries the real
+      spend that must be counted.
+    - Fan-out: one LogBackend query per agent dir ensures correctness on
+      filesystem (per-agent JSONL) deployments. On shared-backend
+      (SQLite/Postgres) deployments, the agent_name filter isolates each
+      agent's slice — but agents that ran under this workflow_id WITHOUT a
+      local directory under agents_root (ephemeral/remote compute) are not
+      enumerated by discover_agents() and their records are not picked up.
+      A shared-backend single-query path (no agent_name partitioning) plus
+      the ephemeral/remote-agent completeness gap are tracked in #638. The
+      N-query amplification on shared backends is the same follow-up.
+
+      SHARED-BACKEND OVERCOUNT CAVEAT (#638): the SQL agent_name filter is
+      lenient — `agent_name = ? OR agent_name IS NULL` (legacy-compat). The
+      framework's own _log() ALWAYS stamps agent_name, so every
+      framework-produced record is partitioned to exactly one agent and the
+      total is correct. But a record appended OUTSIDE _log() with a
+      workflow_id + cost_usd and NO agent_name matches EVERY per-agent query
+      on a shared backend, so the fan-out counts it once per discovered agent
+      (one dollar → N dollars). The default filesystem deployment is immune
+      (each record lives in exactly one agent dir, queried once). This is a
+      shared-backend-only correctness limitation for non-_log()-produced
+      records; the count-once-across-fan-out fix rides with the #638
+      single-query path. Do not rely on this total on a shared backend that
+      ingests externally-appended records until #638 lands.
+
+    Raises no exceptions. Any per-agent failure — LogBackendReadError, or the
+    backend-construction / query errors that shared SQLite/Postgres backends
+    can raise — is captured in cost_data_degraded and that agent's records are
+    omitted from the total (fail-soft for read-only reporting, matching the
+    GlobalSummary / discover_agents() broad-catch degraded-read posture).
+
+    Args:
+        agents_root: path to the agents root directory (the directory that
+            contains individual agent subdirectories).
+        workflow_id: the workflow correlation key to query for. Must be
+            non-empty.
+
+    Returns:
+        WorkflowSummary with total, cost_by_agent, run_count, errors, and
+        cost_data_degraded populated from the count-once-filtered record set.
+    """
+    from ..logs import LogQuery, get_default_log_backend
+    from ..logs.types import PRIMITIVE_DELEGATE
+
+    agent_names = discover_agents(agents_root)
+
+    total = 0.0
+    cost_by_agent: dict[str, float] = {}
+    run_count = 0
+    errors = 0
+    any_degraded = False
+
+    for agent in agent_names:
+        # Build a per-agent backend. For filesystem deployments, each agent
+        # has its own log dir. For shared-backend deployments (single SQLite/
+        # Postgres file), using agent_name in the LogQuery isolates records to
+        # this agent's slice — avoids cross-agent bleed without requiring a
+        # backend capability flag (fan-out is the correctness baseline).
+        try:
+            backend = get_default_log_backend(agents_root / agent)
+            records = backend.query(
+                LogQuery(
+                    workflow_id=workflow_id,
+                    agent_name=agent,
+                )
+            )
+        except Exception:
+            # Any per-agent read failure — LogBackendReadError, or the backend
+            # construction / query errors that shared SQLite/Postgres backends
+            # can raise — degrades gracefully rather than aborting the whole
+            # rollup. This mirrors discover_agents()'s broad-catch resilience
+            # model that the spec/22 addendum cites as the precedent. The total
+            # undercounts this agent's contribution; the banner signals the
+            # incompleteness (spec/22 addendum + spec/09 posture).
+            any_degraded = True
+            continue
+
+        agent_cost = 0.0
+        for rec in records:
+            # Count-once: exclude ONLY the coordinator's delegate MIRROR record,
+            # not every trigger='delegate' record. This is the load-bearing
+            # subtlety: a delegated child is constructed with trigger='delegate'
+            # (agent.py delegate() kwargs), so the CHILD's own terminal ok-record
+            # is ALSO trigger='delegate', carries the child's real cost_usd, and
+            # IS stamped with workflow_id (threaded into the child's call()). That
+            # child record is the real spend and MUST be counted.
+            #
+            # The coordinator's mirror record (agent.py delegate() logging) is the
+            # one to drop — it echoes the child's full cost a second time. It is
+            # uniquely identified by mirror-only keys the child record never has:
+            # delegate_run_id / delegated_agent (both land in rec.extra). Keying on
+            # those, not on bare trigger, keeps the child's spend in the sum while
+            # still excluding the mirror.
+            #
+            # (Note: the mirror is ALSO excluded by the LogQuery(workflow_id=...)
+            # filter, because the mirror is intentionally NOT stamped with
+            # workflow_id. This marker check is the in-loop belt-and-suspenders
+            # guard for the same record — it does NOT, and must not, drop the
+            # child's delegate-trigger record.)
+            if rec.trigger == PRIMITIVE_DELEGATE and (
+                "delegate_run_id" in rec.extra or "delegated_agent" in rec.extra
+            ):
+                continue
+
+            # Sum cost_usd (None-safe, same as summarize_agent pattern).
+            rec_cost = rec.cost_usd or 0.0
+            agent_cost += rec_cost
+            run_count += 1
+            if rec.status == "error":
+                errors += 1
+
+        # Round per-agent FIRST, then accumulate total from the rounded value so
+        # the breakdown reconciles with the headline to the microcent:
+        # round(sum(cost_by_agent.values()), 6) == total. Agreement to 6 decimal
+        # places, NOT bit-exact — a raw float sum of the rounded values can
+        # differ from total by a binary-float epsilon (Principle #4, cost is
+        # first-class).
+        agent_cost_rounded = round(agent_cost, 6)
+        if agent_cost > 0.0:
+            cost_by_agent[agent] = agent_cost_rounded
+        total += agent_cost_rounded
+
+    return WorkflowSummary(
+        total=round(total, 6),
+        cost_by_agent=cost_by_agent,
+        run_count=run_count,
+        errors=errors,
+        cost_data_degraded=any_degraded,
+    )
+
+
 # Allow JSON-serializing the dataclasses for pre-aggregated JSON
 def to_json_dict(obj: Any) -> Any:
     """Convert dataclass / nested structure to JSON-friendly dict."""
