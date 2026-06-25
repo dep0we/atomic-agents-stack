@@ -160,6 +160,29 @@ This mirrors the issue's execution-model note exactly: the **kit-side** conducto
 
 ---
 
+## Relationship to the management CLI (spec/54) — compose above, don't duplicate
+
+> **Addendum, 2026-06-25.** spec/54 (Fleet Management CLI) did not exist when this DRAFT and its five rulings were written (2026-06-22). This section records where the conductor sits relative to it. It changes none of the ruled forks (OD1a–OD4); it names the composition seam and fixes the build order. An outside-voice review (cross-family, 2026-06-25) confirmed the layering and sharpened the seam — its points are folded in below.
+
+The Agent Fleet Platform (epic #606) grows as **observe → manage → orchestrate → interact**. The console (#614/#615/#616) is *observe*; the management CLI (spec/54) is *manage*; **the conductor is *orchestrate*** — the durable, sequenced top of the manage layer; the chat UI is *interact*.
+
+**The conductor composes *above* the management CLI; it does not overlap it.** They are different layers:
+
+- The management CLI is the set of **verbs** — a single, synchronous, operator-present, validated+audited edit to one agent's config (`govern`, `set-model`, `apply-rec`). Its confirm (spec/54 S2 step 3) is in-the-moment; there is no suspend/resume.
+- The conductor is the **sequencer** — a conductor stage MAY *be* "run a management verb" (an automated stage), the way an `agent.call()` stage invokes a tool. The conductor sits above the management CLI as `agent.call()` sits above tools.
+
+So "run a playbook" is **not** a management verb (a single validated config edit). It is the orchestration layer that *invokes* management verbs and `agent.call()`s as stages. Neither layer subsumes the other.
+
+**The reusable seam is the effect-execution contract, not the word "decision."** What a config-mutating conductor stage must reuse from the management CLI is its *safety envelope* around a config write — validate/authorize, preview, snapshot + rollback, atomic write, and the principal-stamped audit record (spec/54 S2 + M1–M10). A conductor stage MUST consume that envelope, never reimplement it. Concretely: a management verb's `--json` result (planned effect, validation outcome, snapshot ref, audit ref, applied result) is the structured stage-result the conductor consumes. This is the first-class reason to build the verbs first — they are the *transactional stage primitives* the conductor sequences.
+
+**The human-decision seam — unify vocabulary, not storage semantics.** Both layers record "a human was asked X, chose Y — who, when, why." Keep that *audit vocabulary* consistent (principal-stamped, rationale-bearing) so a reader sees one decision language across both. But do **not** collapse them into one object. The management CLI's synchronous confirm is an inline consent event, not a durable, replay-aware `GateDecision`; forcing every `set-model` confirm through the goal ledger and a suspend/resume cycle would over-complicate the verbs for no gain (Principle #3). The conductor's `GateDecision` is the *durable, async* member of the family; the verb confirm is its *synchronous, in-process sibling* — shared vocabulary, different storage.
+
+**Watch for rot — cursor vs. evidence.** This spec's headline ("the resume cursor and the audit record are the same artifact") holds **only** because the goal ledger is append-only and CAS-guarded (spec/41): the resume cursor is a **projection replayed over the append-only `GateDecision`/transition events**, never a mutable pointer overwritten in place. An operational cursor (mutable state) and immutable audit evidence have different lifecycles; the single-artifact design is safe *precisely because* the implementation derives the cursor from the immutable event stream rather than mutating a stored cursor. The build MUST hold that discipline — the moment a future change wants a mutable cursor field is the moment to split cursor from audit.
+
+**Build order — verbs first.** The management foundation (#624) + `govern` (#609), then `set-model`, are the conductor's *predecessor*: they are the transactional stage primitives it sequences, and building them first lets the gate/effect machinery be designed once (the verb's effect-execution contract generalized into a conductor stage) rather than twice. The conductor is the *orchestrate* rung, sequenced **after** the primitive manage verbs exist — not before, and not folded into a single verb.
+
+---
+
 ## One-level delegation (#9) — the conductor is not a delegation level
 
 A conductor runs stages; a stage may be an `agent.call()` that itself delegates to a specialist (spec/15). Does "a conductor running stages that delegate" stack onto the one-level delegation bound?
@@ -264,6 +287,7 @@ The five Tier-A forks were ruled by the maintainer. The DRAFT above reflects the
 - spec/44 (QueueBackend) — optional role-team fan-out (org shape).
 - spec/45 (IdempotencyBackend) — resume safety; the TTL-sweep dependency for exactly-once.
 - spec/48 (PrincipalBackend) — `answered_by` on a gate decision (who ruled).
+- spec/54 (Fleet Management CLI) — the *manage* layer the conductor composes above; its verbs are the conductor's transactional stage primitives (see §"Relationship to the management CLI"). Build the verbs first.
 - TENSIONS T15 / Position B — the backend-swap authority model the throughline scaling leans on.
 - ROADMAP §"What we're NOT building" — graph workflows stay out of scope.
 - Issue #575 — the design conversation and maintainer framing this spec implements.
