@@ -413,6 +413,44 @@ class TestTargetsParsing:
         targets = parse_targets(tmp_path)
         assert "cost" in targets.axes  # rest of config still parsed
 
+    def test_separate_rec_block_first_does_not_drop_scoring(self, tmp_path):
+        """A recommendations-only block BEFORE a valid scoring block must NOT drop
+        the operator's scoring weights to defaults (spec/53 MUST 6 — per-key
+        fail-soft, not per-file).
+
+        strip-RED: when the extractor matched EITHER 'scoring' OR 'recommendations',
+        parse_targets landed on the first (recommendations-only) block, saw no
+        'scoring' key, and silently used all default weights — discarding the
+        operator's real config. Keying each parser on its own block fixes this.
+        """
+        from atomic_agents.advisor.targets import parse_recommendations
+
+        (tmp_path / "targets.md").write_text(
+            "## Recommendations\n\n"
+            "```yaml\n"
+            "recommendations:\n"
+            "  min_savings_usd: 7.50\n"
+            "```\n\n"
+            "## Scoring\n\n"
+            "```yaml\n"
+            "scoring:\n"
+            "  weights:\n"
+            "    cost: 0.50\n"
+            "    quality: 0.25\n"
+            "    reliability: 0.25\n"
+            "```\n"
+        )
+        targets = parse_targets(tmp_path)
+        # The operator's NON-default cost weight must survive (not 1/3).
+        assert abs(targets.weights["cost"] - 0.50) < 0.001, (
+            f"operator scoring weights must not be dropped by a preceding "
+            f"recommendations-only block; got {targets.weights!r}"
+        )
+        assert abs(targets.weights["quality"] - 0.25) < 0.001
+        # And the recommendations parser independently finds its own block.
+        rec_cfg = parse_recommendations(tmp_path)
+        assert rec_cfg.min_savings_usd == 7.50
+
 
 class TestDeepMerge:
     """targets.override.md deep-merge correctness."""
@@ -1261,37 +1299,91 @@ class TestSpendWindowNonOverlap:
 
 
 class TestRoundedBandConsistency:
-    """The displayed (rounded) composite and its band color always agree."""
+    """The display integer and its band color always agree (#623 fix, spec/53 §10).
+
+    _compute_composite returns the raw float composite (for math/history) and
+    derives the band from int(round(composite)) — not from round(composite, 1).
+    AgentHealth.composite_display = int(round(composite)) is the canonical display
+    integer written by _compute_agent_health / _score_agent_from_data.
+    render.py consumes composite_display directly — no {:.0f} on raw floats.
+    """
 
     def test_composite_rounding_does_not_cross_band_boundary(self):
-        """79.95 rounds to 80.0 (displayed); band must be the band OF 80.0 (green),
-        not of the raw 79.95 (amber) — number and color must not disagree.
+        """79.95 display-int = 80 → green band (not amber from round(79.95,1)=79.95).
 
-        strip-RED: banding the unrounded composite returns 'amber' while the
-        displayed round(79.95,1)=80.0 reads as green.
+        strip-RED: banding round(79.95,1) returns 'amber'; int(round(79.95))=80 → green.
         """
         from atomic_agents.advisor.score import _compute_composite
 
-        # cost=quality=79.95, reliability absent → mean = 79.95, rounds to 80.0.
+        # cost=quality=79.95, reliability absent → mean = 79.95
         composite, band, capped = _compute_composite(
             {"cost": 79.95, "quality": 79.95, "reliability": None},
             {"cost": 1 / 3, "quality": 1 / 3, "reliability": 1 / 3},
         )
         assert capped is None
-        assert composite == 80.0  # displayed number
-        assert band == "green"  # color agrees with the displayed 80
+        # Raw float preserved for math/history — NOT rounded to 80.0 (new contract)
+        assert abs(composite - 79.95) < 0.01
+        # Band derived from int(round(79.95)) = 80 → green (#623 fix)
+        assert band == "green", (
+            f"band should be green (display int 80), got {band!r} for composite {composite}"
+        )
 
     def test_composite_below_boundary_stays_amber(self):
-        """79.94 rounds to 79.9 (< 80) → still amber. Guards the fix from
-        over-rounding everything up."""
+        """79.49 display-int = 79 → amber band (not green from naive int rounding).
+
+        Guards the fix from over-rounding: 79.49 must NOT become 80.
+        """
         from atomic_agents.advisor.score import _compute_composite
 
         composite, band, capped = _compute_composite(
-            {"cost": 79.94, "quality": 79.94, "reliability": None},
+            {"cost": 79.49, "quality": 79.49, "reliability": None},
             {"cost": 1 / 3, "quality": 1 / 3, "reliability": 1 / 3},
         )
-        assert composite == 79.9
-        assert band == "amber"
+        # int(round(79.49)) = 79 → amber
+        assert band == "amber", f"band should be amber (display int 79), got {band!r}"
+
+    def test_composite_at_79_5_is_green(self):
+        """79.5 display-int = 80 → green (#623 boundary fix).
+
+        Python uses round-half-to-even (banker's rounding); at 79.5 the even
+        neighbor is 80 (the green-side), so int(round(79.5)) = 80. Do NOT
+        generalize this to "<.5 rounds up" — int(round(78.5)) = 78.
+        strip-RED: round(79.5, 1) = 79.5 → _band(79.5) = amber, but
+        int(round(79.5)) = 80 → _band(80) = green.
+        """
+        from atomic_agents.advisor.score import _compute_composite
+
+        composite, band, capped = _compute_composite(
+            {"cost": 79.5, "quality": 79.5, "reliability": None},
+            {"cost": 1 / 3, "quality": 1 / 3, "reliability": 1 / 3},
+        )
+        assert band == "green", f"79.5 display-int=80 must be green, got {band!r}"
+
+    def test_composite_at_59_49_is_red(self):
+        """59.49 display-int = 59 → red (not amber from {59.49:.0f}='59')."""
+        from atomic_agents.advisor.score import _compute_composite
+
+        composite, band, capped = _compute_composite(
+            {"cost": 59.49, "quality": 59.49, "reliability": None},
+            {"cost": 1 / 3, "quality": 1 / 3, "reliability": 1 / 3},
+        )
+        assert band == "red", f"59.49 display-int=59 must be red, got {band!r}"
+
+    def test_composite_at_59_5_is_amber(self):
+        """59.5 display-int = 60 → amber (#623 boundary fix).
+
+        Banker's rounding: at 59.5 the even neighbor is 60 (the amber-side), so
+        int(round(59.5)) = 60. Not a general ".5 rounds up" rule.
+        strip-RED: round(59.5, 1) = 59.5 → _band(59.5) = red, but
+        int(round(59.5)) = 60 → _band(60) = amber.
+        """
+        from atomic_agents.advisor.score import _compute_composite
+
+        composite, band, capped = _compute_composite(
+            {"cost": 59.5, "quality": 59.5, "reliability": None},
+            {"cost": 1 / 3, "quality": 1 / 3, "reliability": 1 / 3},
+        )
+        assert band == "amber", f"59.5 display-int=60 must be amber, got {band!r}"
 
 
 class TestDirectionEnumFailSoft:
@@ -1776,3 +1868,328 @@ class TestPerWindowDegradation:
         # cheaper_model_share + tokens_per_output (recent-only) still scored.
         cms = next(r for r in ah.scorecard if r.metric == "cheaper_model_share")
         assert cms.status != "degraded"
+
+
+# ──────────────────────────────────────────────────────────────────
+# #623 fixes: WoW 7d equal-window + fleet display integer boundaries
+
+
+class TestWoW7dEqualWindows:
+    """Both 7d WoW windows must be 7 inclusive days each (#623 fix, spec/53 §6).
+
+    strip-RED: with the old timedelta(days=7) current window the current slice was
+    [today-7, today] = 8 inclusive days while prior was [today-14, today-8] = 7 days.
+    A flat-spend fleet reported wow_spend 'up' (+14.3%). The fix uses timedelta(days=6)
+    for the current window: [today-6, today] = 7 inclusive days, prior [today-13, today-7].
+    """
+
+    def test_flat_wow_7d_spend_yields_flat(self, tmp_path):
+        """Flat $1.00/day fleet → the spend_vs_trend row's wow arrow == 'flat'.
+
+        This is the strip-RED conformance proof for the #623(b) equal-window fix
+        (spec/53 MUST 12). The wow arrow only attaches to the spend_vs_trend
+        scorecard row when prior-30d spend > 0 (the `elif mt_svt and spend_ratio is
+        not None` branch in _score_cost_axis), so the fixture seeds runs across the
+        FULL [today-61, today] span — both the recent 30d window AND the prior 30d
+        window — at a flat $1.00/day. That makes spend_ratio computable so the row
+        carries a wow arrow, and the 7d WoW arrow itself is computed from
+        current_7d / prior_7d spend.
+
+        strip-RED mechanism (verified by reverting score.py:1185 to
+        `timedelta(days=7)`): an 8-day current window vs a 7-day prior window makes
+        a flat fleet report current_7d=$8 vs prior_7d=$7 → ratio-1 = 1/7 ≈ 0.143 >
+        threshold(0.05) → wow='up'. With the fix both windows are 7 inclusive days
+        → ratio=1.0 → delta=0 → wow='flat'. The assertion below FAILS ('up' !=
+        'flat') under the reverted (buggy) window, so it actually locks the fix.
+        """
+        today = date(2026, 6, 25)
+        recs = []
+        # One $1.00/day run across the full [today-61, today] span so BOTH the
+        # prior-30d window ([today-61, today-31]) and the recent-30d window
+        # ([today-30, today]) are populated — prior_spend > 0 is what makes the
+        # spend_vs_trend row carry a (non-None) wow arrow at all.
+        for d in range(0, 62):
+            day = today - timedelta(days=d)
+            recs.append(
+                {
+                    "run_id": f"r{d}",
+                    "ts": datetime(
+                        day.year, day.month, day.day, 12, tzinfo=timezone.utc
+                    ).isoformat(),
+                    "agent": "a1",
+                    "trigger": "manual",
+                    "status": "completed",
+                    "model": "claude-haiku-4-5",
+                    "output_tokens": 100,
+                    "cost_usd": 1.0,
+                }
+            )
+        _write_agent_model_md(tmp_path, "a1")
+        _write_run_jsonl(tmp_path, "a1", recs)
+
+        fh = compute_fleet_health(tmp_path, today=today)
+        a1 = next(ah for ah in fh.agents if ah.agent == "a1")
+
+        # The load-bearing assertion: the spend_vs_trend row's 7d WoW arrow must be
+        # 'flat' for a perfectly flat fleet. This is the field the #623(b) fix
+        # corrects; under the buggy 8-vs-7-day window it would read 'up'.
+        svt = next((r for r in a1.scorecard if r.metric == "spend_vs_trend"), None)
+        assert svt is not None
+        assert svt.wow is not None, (
+            "spend_vs_trend row must carry a wow arrow (needs prior-30d spend > 0); "
+            "if this is None the test no longer exercises the equal-window fix"
+        )
+        assert svt.wow == "flat", (
+            f"flat $1/day fleet must report spend_vs_trend wow='flat' with equal 7d "
+            f"windows; got {svt.wow!r} (an 'up' here means the current 7d window is "
+            f"longer than the prior — the #623(b) regression)"
+        )
+
+    def test_fleet_composite_display_int_type(self, tmp_path):
+        """fleet_composite_display must be int (not float), set after critical-cap."""
+        today = date(2026, 6, 25)
+        recs = [
+            {
+                "run_id": "r0",
+                "ts": datetime(2026, 6, 24, 12, tzinfo=timezone.utc).isoformat(),
+                "agent": "a1",
+                "trigger": "manual",
+                "status": "completed",
+                "model": "claude-haiku-4-5",
+                "output_tokens": 100,
+                "cost_usd": 0.01,
+            }
+        ]
+        _write_agent_model_md(tmp_path, "a1")
+        _write_run_jsonl(tmp_path, "a1", recs)
+        fh = compute_fleet_health(tmp_path, today=today)
+        if fh.fleet_composite_display is not None:
+            assert isinstance(fh.fleet_composite_display, int)
+        if fh.worst_agent_composite_display is not None:
+            assert isinstance(fh.worst_agent_composite_display, int)
+        for ah in fh.agents:
+            if ah.composite_display is not None:
+                assert isinstance(ah.composite_display, int)
+
+
+class TestFleetDisplayIntegerBoundaries:
+    """Fleet headline and worst-agent display integers use int(round()) after cap (#623).
+
+    Each boundary test verifies display integer AND band agree.
+    """
+
+    def _make_composite_from_scores(self, cost, quality, reliability=None):
+        """Helper: call _compute_composite and return (composite, display_int, band)."""
+        from atomic_agents.advisor.score import _compute_composite
+
+        sub = {"cost": cost, "quality": quality, "reliability": reliability}
+        w = {"cost": 1 / 3, "quality": 1 / 3, "reliability": 1 / 3}
+        composite, band, _ = _compute_composite(sub, w)
+        display_int = int(round(composite)) if composite is not None else None
+        return composite, display_int, band
+
+    def test_79_49_is_amber_display_79(self):
+        """79.49 → display int 79 → amber band (not green from {:.0f}='79')."""
+        _, di, band = self._make_composite_from_scores(79.49, 79.49)
+        assert di == 79
+        assert band == "amber"
+
+    def test_79_5_is_green_display_80(self):
+        """79.5 → display int 80 → green band (#623 strip-RED boundary)."""
+        _, di, band = self._make_composite_from_scores(79.5, 79.5)
+        assert di == 80
+        assert band == "green"
+
+    def test_59_49_is_red_display_59(self):
+        """59.49 → display int 59 → red band."""
+        _, di, band = self._make_composite_from_scores(59.49, 59.49)
+        assert di == 59
+        assert band == "red"
+
+    def test_59_5_is_amber_display_60(self):
+        """59.5 → display int 60 → amber band (#623 strip-RED boundary)."""
+        _, di, band = self._make_composite_from_scores(59.5, 59.5)
+        assert di == 60
+        assert band == "amber"
+
+    def _drive_fleet_with_composite(self, tmp_path, monkeypatch, raw_composite):
+        """Drive the REAL compute_fleet_health fleet-reduction path with a controlled
+        per-agent composite.
+
+        Single agent → fleet headline = min(mean, worst) = raw_composite, so the
+        fleet display integer + band are computed off this exact raw value. This
+        exercises score.py's fleet-headline int(round(...)) path (the #623 fleet
+        double-round), NOT the per-agent _compute_composite path the other tests in
+        this class cover.
+        """
+        from atomic_agents.advisor import score as score_mod
+
+        _write_agent_model_md(tmp_path, "fleet-agent")
+
+        def _fake_agent_health(*, agent, **_kwargs):
+            return AgentHealth(
+                agent=agent,
+                cost_score=raw_composite,
+                quality_score=raw_composite,
+                reliability_score=raw_composite,
+                composite=raw_composite,
+                band=_band(int(round(raw_composite))),
+                composite_display=int(round(raw_composite)),
+                axes_with_data=3,
+                capped_by_axis=None,
+            )
+
+        monkeypatch.setattr(score_mod, "_compute_agent_health", _fake_agent_health)
+        return compute_fleet_health(tmp_path, today=date(2026, 6, 25))
+
+    def test_fleet_79_45_is_amber_display_79(self, tmp_path, monkeypatch):
+        """Fleet raw 79.45 → display int 79 → amber band.
+
+        Strip-RED against the #623 fleet double-round: round(79.45,1)=79.5 →
+        int(round(79.5))=80 → GREEN would be wrong. Canonical single round
+        int(round(79.45))=79 → amber.
+        """
+        fh = self._drive_fleet_with_composite(tmp_path, monkeypatch, 79.45)
+        assert fh.fleet_composite_display == 79
+        assert fh.fleet_band == "amber"
+
+    def test_fleet_59_45_is_red_display_59(self, tmp_path, monkeypatch):
+        """Fleet raw 59.45 → display int 59 → red band.
+
+        Strip-RED against the double-round at the amber/red edge: round(59.45,1)=
+        59.5 → int(round(59.5))=60 → AMBER would be wrong; canonical int(round(
+        59.45))=59 → red.
+        """
+        fh = self._drive_fleet_with_composite(tmp_path, monkeypatch, 59.45)
+        assert fh.fleet_composite_display == 59
+        assert fh.fleet_band == "red"
+
+
+class TestScoreAgentFromDataPureCore:
+    """_score_agent_from_data is a pure function — zero disk I/O, verifiable in-memory."""
+
+    def test_pure_core_returns_agent_health(self):
+        """Pure core returns AgentHealth without touching disk."""
+        from atomic_agents.advisor.score import _score_agent_from_data
+        from atomic_agents.advisor.targets import (
+            _DEFAULT_WEIGHTS,
+            _DEFAULT_AXES,
+        )
+
+        today = date(2026, 6, 25)
+        six_days_ago = today - timedelta(days=6)
+        prior_7_start = today - timedelta(days=13)
+        prior_7_end = today - timedelta(days=7)
+
+        axes = {
+            axis_name: {
+                metric: MetricTarget(
+                    target=float(cfg["target"]),
+                    direction=str(cfg["direction"]),
+                    band=float(cfg["band"]),
+                    floor=float(cfg["floor"]),
+                )
+                for metric, cfg in axis_cfg["metrics"].items()
+            }
+            for axis_name, axis_cfg in _DEFAULT_AXES.items()
+        }
+        targets = FleetTargets(weights=dict(_DEFAULT_WEIGHTS), axes=axes)
+
+        run = RunRecord(
+            ts=datetime(2026, 6, 24, 12, tzinfo=timezone.utc),
+            agent="pure-agent",
+            trigger="cron",
+            model="claude-haiku-4-5",
+            input_tokens=100,
+            output_tokens=200,
+            cost_usd=0.01,
+            cache_hit_tokens=0,
+            cache_miss_tokens=100,
+            latency_ms=100,
+            status="completed",
+            summary="ok",
+            parent_run_id=None,
+            extra={},
+        )
+
+        ah = _score_agent_from_data(
+            agent="pure-agent",
+            runs_30d=[run],
+            runs_prior_30d=[],
+            eval_records=[],
+            targets=targets,
+            today=today,
+            six_days_ago=six_days_ago,
+            prior_7_start=prior_7_start,
+            prior_7_end=prior_7_end,
+        )
+        assert ah.agent == "pure-agent"
+        # At least reliability + cost axes should have data
+        assert ah.composite is not None
+        assert ah.composite_display is not None
+        assert isinstance(ah.composite_display, int)
+
+    def test_counterfactual_does_not_mutate_originals(self):
+        """dataclasses.replace produces new objects; originals unchanged (#623 MUST 9)."""
+        import dataclasses
+        from atomic_agents.advisor.score import _score_agent_from_data
+        from atomic_agents.advisor.targets import (
+            _DEFAULT_WEIGHTS,
+            _DEFAULT_AXES,
+        )
+
+        today = date(2026, 6, 25)
+        six_days_ago = today - timedelta(days=6)
+        prior_7_start = today - timedelta(days=13)
+        prior_7_end = today - timedelta(days=7)
+
+        axes = {
+            axis_name: {
+                metric: MetricTarget(
+                    target=float(cfg["target"]),
+                    direction=str(cfg["direction"]),
+                    band=float(cfg["band"]),
+                    floor=float(cfg["floor"]),
+                )
+                for metric, cfg in axis_cfg["metrics"].items()
+            }
+            for axis_name, axis_cfg in _DEFAULT_AXES.items()
+        }
+        targets = FleetTargets(weights=dict(_DEFAULT_WEIGHTS), axes=axes)
+
+        run = RunRecord(
+            ts=datetime(2026, 6, 24, 12, tzinfo=timezone.utc),
+            agent="pure-agent",
+            trigger="cron",
+            model="claude-opus-4-8",
+            input_tokens=100,
+            output_tokens=200,
+            cost_usd=0.05,
+            cache_hit_tokens=0,
+            cache_miss_tokens=100,
+            latency_ms=100,
+            status="completed",
+            summary="ok",
+            parent_run_id=None,
+            extra={},
+        )
+        original_model = run.model
+
+        # Create counterfactual — replace does not mutate original
+        cf_run = dataclasses.replace(run, model="claude-haiku-4-5", cost_usd=0.01)
+        assert run.model == original_model, "Original run must not be mutated"
+        assert cf_run.model == "claude-haiku-4-5"
+
+        _score_agent_from_data(
+            agent="pure-agent",
+            runs_30d=[cf_run],
+            runs_prior_30d=[],
+            eval_records=[],
+            targets=targets,
+            today=today,
+            six_days_ago=six_days_ago,
+            prior_7_start=prior_7_start,
+            prior_7_end=prior_7_end,
+        )
+        # Original still intact after counterfactual scoring
+        assert run.model == original_model
