@@ -235,14 +235,27 @@ class TestEvalHeadroom:
         assert h.weighted_score_margin < cfg.score_margin_floor
 
     def test_strip_red_p2_pass_rate_margin_fails(self):
-        """MUST 3 strip-RED: pass-rate margin below floor → passed = False."""
-        # 3/5 pass = 0.6; threshold=4.0/5=0.8; margin=0.6-0.8=-0.2 < floor(0.05)
-        evals = [_make_eval(verdict="pass", weighted_score=4.8)] * 3 + [
-            _make_eval(verdict="fail", weighted_score=2.0)
-        ] * 2
+        """MUST 3 strip-RED: pass-rate margin below floor → passed = False.
+
+        ISOLATES p2: the fixture clears p1/p3/p4 so p2 is the ONLY failing
+        predicate. Failing scores are pinned at 5.0 (independent of verdict) so
+        the mean weighted score stays at 5.0 — p1 margin = 5.0-4.0 = 1.0 >= floor
+        — while pass-rate = 4/7 = 0.571, margin = 0.571-0.8 = -0.229 < floor.
+        Deleting the p2 check makes this go GREEN, so it locks MUST 3 (the prior
+        3-pass@4.8 + 2-fail@2.0 fixture also failed p1 (mean 3.68), so it stayed
+        red with p2 removed and did NOT lock the pass-rate guard).
+        """
+        evals = [_make_eval(verdict="pass", weighted_score=5.0)] * 4 + [
+            _make_eval(verdict="fail", weighted_score=5.0)
+        ] * 3
         cfg = self._passing_config()
         h = _eval_headroom(evals, rubric_threshold=4.0, rec_config=cfg)
         assert h.passed is False
+        # p2 is the uniquely-failing predicate: p1/p3/p4 all hold.
+        assert h.pass_rate_margin < cfg.pass_rate_margin_floor  # p2 fails
+        assert h.weighted_score_margin >= cfg.score_margin_floor  # p1 holds
+        assert h.hard_fails == 0  # p3 holds
+        assert h.sample_n >= cfg.min_eval_n  # p4 holds
 
     def test_strip_red_p3_hard_fails_present(self):
         """MUST 4 strip-RED: any hard-fail → passed = False."""
@@ -814,8 +827,8 @@ class TestSavingsCostRec:
             rubric_threshold=4.0,
         )
         cost_recs = [r for r in recs if r.kind == "savings_cost"]
-        if cost_recs:
-            assert cost_recs[0].safety.passed is True
+        assert cost_recs, "savings rec must fire for a passing-guard fixture"
+        assert cost_recs[0].safety.passed is True
 
     def test_repricing_with_cache_hits_uses_discount(self):
         """Repricing respects cache_hit_tokens (uses CACHE_HIT_DISCOUNT)."""

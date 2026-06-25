@@ -46,6 +46,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
@@ -612,7 +613,7 @@ def _compute_point_impact(
     run_records: list[RunRecord],
     eval_records: list[_EvalRecord],
     candidate_model: str,
-    repriced_cost_per_run: object,
+    repriced_cost_per_run: Callable[[RunRecord], float],
     targets: FleetTargets | None,
     today: date | None,
 ) -> float | None:

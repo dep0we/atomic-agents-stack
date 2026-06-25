@@ -1166,7 +1166,12 @@ def _render_health_band(fleet_health) -> str:
         # Use int(round()) for display/band consistency (#623 fix): chip value 79.5
         # rounds to 80 and gets a green chip, not an amber chip labeled '80'.
         chip_di = int(round(mean_v))
-        chip_band = "green" if chip_di >= 80 else ("amber" if chip_di >= 60 else "red")
+        # Band the displayed integer via the scoring core's _band (single source
+        # of truth for BAND_GREEN_MIN/BAND_AMBER_MIN) so the chip thresholds can
+        # never drift from the headline/composite bands (#623 root-cause class).
+        from ..advisor.score import _band
+
+        chip_band = _band(chip_di)
         return (
             f'<div class="health-chip health-chip-{chip_band}">'
             f'<div class="health-chip-label">{html.escape(label)}</div>'
