@@ -1,4 +1,4 @@
-"""HTML rendering for the cost dashboard.
+"""HTML rendering for the Fleet Console and cost dashboard.
 
 Pure-Python templates (no Jinja2) for portability and to keep deps minimal.
 The HTML is deliberately matched to samples/caldwell/dashboard.html — that's
@@ -7,11 +7,18 @@ the visual contract.
 Self-contained output: inline CSS, no external assets, no JavaScript
 dependencies. Opens in any browser. Refresh button only does anything
 when the optional Flask server (serve.py) is running.
+
+BEHAVIOR CHANGE (spec/52 PR1): The dashboard home page (GET /) now serves the
+Fleet Console Attention Queue. The cost view has moved to GET /cost (cost.html).
+Direct links to /_dashboard/index.html now land on the console home.
+This is a named backward-compat callout — see spec/52 §'Migration notes' and
+CHANGELOG [Unreleased] §'BEHAVIOR CHANGE'.
 """
 
 from __future__ import annotations
 import html
 import json
+import logging
 import shutil
 import urllib.parse
 from datetime import date
@@ -29,6 +36,13 @@ from .costs import (
 )
 from ._shared import nav_bar as _nav_bar, CSS as _SHARED_CSS, _CSP as _SHARED_CSP
 
+logger = logging.getLogger(__name__)
+
+# The console home is always index.html (the new front door).
+# The cost view moves to cost.html.
+_CONSOLE_HOME = "index.html"
+_COST_VIEW = "cost.html"
+
 
 # ──────────────────────────────────────────────────────────────────
 # Public entry points
@@ -39,11 +53,15 @@ def render_all(
     today: date | None = None,
     tab: str = "all",
 ) -> dict:
-    """Render the global dashboard + per-agent dashboards + new tabs.
+    """Render the fleet console + cost dashboard + per-agent dashboards + tabs.
 
     tab: "all" (default) renders everything; or one of
-         "cost" | "activity" | "quality" | "memory" | "goals"
+         "console" | "cost" | "activity" | "quality" | "memory" | "goals"
          to render only that tab (useful for fast iteration).
+
+    tab='console' renders index.html (console home) only — skips the cost
+    aggregation to keep it fast. tab='cost' renders cost.html only (NOT
+    index.html — the console home is only updated on 'all' or 'console' runs).
 
     Returns a dict with paths of files written, for caller logging.
     """
@@ -52,16 +70,22 @@ def render_all(
     from .quality import aggregate_quality, render_quality
     from .memory import aggregate_memory, render_memory
     from .goals import aggregate_goals, render_goals, has_any_goal
+    from .attention import aggregate_console, QualitySignal
 
     today = today or date.today()
     now = datetime.now(tz=timezone.utc)
     written: dict = {"global": None, "per_agent": []}
 
+    render_console_tab = tab in ("all", "console")
     render_cost = tab in ("all", "cost")
     render_activity_tab = tab in ("all", "activity")
     render_quality_tab = tab in ("all", "quality")
     render_memory_tab = tab in ("all", "memory")
     render_goals_tab = tab in ("all", "goals")
+
+    # Render the cost view first so quality signals can be shared with the
+    # console aggregation on full renders (avoids a second evals/ read).
+    quality_signals = None
 
     if render_cost:
         global_summary = aggregate_global(agents_root, today=today)
@@ -82,6 +106,21 @@ def render_all(
         quality_data = aggregate_quality(agents_root, today=today, now=now)
         quality_path = render_quality(agents_root, quality_data)
         written["quality"] = str(quality_path)
+        # Extract quality signals for the console so we don't re-read evals/
+        # on a full render (progressive disclosure Principle #6). The aggregate's
+        # per-agent trends live on `quality_data.eval_trends` (a list of
+        # AgentEvalTrend) — NOT a `.agents` attribute. No broad except here: if
+        # `aggregate_quality()` returned, `eval_trends` is a guaranteed dataclass
+        # field, so a binding error means a real rename and MUST fail loud rather
+        # than silently disabling the share and falling back to a second read.
+        quality_signals = [
+            QualitySignal(
+                agent=t.agent,
+                latest_score=t.latest_score,
+                delta_30d=t.delta_30d,
+            )
+            for t in quality_data.eval_trends
+        ]
 
     if render_memory_tab:
         memory_data = aggregate_memory(agents_root, today=today, now=now)
@@ -94,11 +133,23 @@ def render_all(
         if goals_path:
             written["goals"] = str(goals_path)
 
+    if render_console_tab:
+        console_data = aggregate_console(
+            agents_root, today=today, quality_signals=quality_signals
+        )
+        console_path = render_console(agents_root, console_data)
+        written["console"] = str(console_path)
+
     return written
 
 
 def render_global(agents_root: Path, summary: GlobalSummary) -> Path:
-    """Render <agents_root>/_dashboard/index.html. Returns the written path."""
+    """Render <agents_root>/_dashboard/cost.html. Returns the written path.
+
+    BEHAVIOR CHANGE (spec/52 PR1): previously wrote index.html; now writes
+    cost.html so the console home can occupy index.html. The serve.py routing
+    and nav_bar() href are updated to match.
+    """
     out_dir = agents_root / "_dashboard"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -106,9 +157,9 @@ def render_global(agents_root: Path, summary: GlobalSummary) -> Path:
         (agents_root / agent / "goal.md").exists()
         for agent in discover_agents(agents_root)
     )
-    html = _render_global_template(summary, has_goals=has_goals)
-    out_path = out_dir / "index.html"
-    atomic_write(out_path, html)
+    html_content = _render_global_template(summary, has_goals=has_goals)
+    out_path = out_dir / _COST_VIEW
+    atomic_write(out_path, html_content)
 
     # Pre-aggregated JSON for fast page-load by future versions
     data_dir = out_dir / "data"
@@ -121,11 +172,55 @@ def render_global(agents_root: Path, summary: GlobalSummary) -> Path:
     return out_path
 
 
+def render_console(agents_root: Path, console_data) -> Path:
+    """Render <agents_root>/_dashboard/index.html (the Fleet Console home).
+
+    This is the new landing page (spec/52 PR1). Writes the rendered alert_keys
+    sidecar at _console/rendered_alert_keys.json for POST /alerts/ack validation.
+    Returns the written path.
+    """
+    from .._io import atomic_write
+
+    out_dir = agents_root / "_dashboard"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    has_goals = any(
+        (agents_root / agent / "goal.md").exists()
+        for agent in discover_agents(agents_root)
+    )
+
+    html_content = _render_console_template(console_data, has_goals=has_goals)
+    out_path = out_dir / _CONSOLE_HOME
+    atomic_write(out_path, html_content)
+
+    # Persist rendered alert_keys for closed-allowlist validation in POST handlers.
+    # Written atomically after a successful render so the sidecar is absent only
+    # before the first render (not after a failed one). POST /alerts/ack reads this
+    # file; if absent it returns 503 (spec/52 MUST 4 closed-allowlist).
+    _write_rendered_alert_keys(agents_root, console_data.rendered_alert_keys)
+
+    return out_path
+
+
+def _write_rendered_alert_keys(agents_root: Path, keys: frozenset) -> None:
+    """Write the currently-rendered alert_keys to the _console/ sidecar JSON.
+
+    Called by render_console() after every successful render. The POST ack/snooze
+    handlers read this sidecar to validate the submitted alert_key against the
+    closed allowlist (spec/52 MUST 4). Written atomically; absent before the first
+    render — POST returns 503 in that case rather than accepting all keys.
+    """
+    console_dir = agents_root / "_console"
+    console_dir.mkdir(parents=True, exist_ok=True)
+    sidecar_path = console_dir / "rendered_alert_keys.json"
+    atomic_write(sidecar_path, json.dumps(sorted(keys), indent=2))
+
+
 def render_agent(agents_root: Path, data: AgentDashboardData) -> Path:
     """Render <agents_root>/<agent>/dashboard.html. Returns the written path."""
-    html = _render_agent_template(data)
+    html_content = _render_agent_template(data)
     out_path = agents_root / data.name / "dashboard.html"
-    atomic_write(out_path, html)
+    atomic_write(out_path, html_content)
     return out_path
 
 
@@ -684,7 +779,7 @@ def _render_agent_template(d: AgentDashboardData) -> str:
 
 <header>
   <div>
-    <div class="breadcrumb"><a href="../_dashboard/index.html">&#8592; All agents</a></div>
+    <div class="breadcrumb"><a href="../_dashboard/index.html">&#8592; Fleet Console</a></div>
     <h1>{_agent_name_safe}</h1>
     <div class="period">{html.escape(d.period_label)} · as of {date.today().isoformat()}</div>
   </div>
@@ -764,3 +859,429 @@ def _truncate(text: str, n: int) -> str:
     if len(text) <= n:
         return text
     return text[: n - 1].rstrip() + "…"
+
+
+# ──────────────────────────────────────────────────────────────────
+# Fleet Console template
+
+
+_CONSOLE_CSS_EXTRA = """
+/* Fleet Console — attention queue + three-axis trend panels */
+.attention-queue { margin-bottom: 24px; }
+.queue-empty {
+  padding: 32px; text-align: center; color: var(--good);
+  font-size: 15px; background: var(--card); border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.alert-row { display: grid; grid-template-columns: 80px 1fr 120px 200px 100px; gap: 12px;
+  align-items: start; padding: 12px 16px; border-bottom: 1px solid var(--border);
+  font-size: 13px; }
+.alert-row:last-child { border-bottom: none; }
+.alert-row:hover { background: rgba(78, 201, 176, 0.03); }
+.alert-header { display: grid; grid-template-columns: 80px 1fr 120px 200px 100px; gap: 12px;
+  padding: 8px 16px; font-size: 11px; font-weight: 500; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.05em;
+  border-bottom: 1px solid var(--border); }
+.sev-critical { color: var(--error); font-weight: 700; }
+.sev-high { color: var(--warn); font-weight: 600; }
+.sev-medium { color: var(--accent); }
+.sev-low { color: var(--muted); }
+.sev-info { color: var(--muted); font-style: italic; }
+.status-new { color: var(--error); font-size: 10px; font-weight: 700; text-transform: uppercase; }
+.status-recurring { color: var(--warn); font-size: 10px; font-weight: 600; text-transform: uppercase; }
+.status-known { color: var(--muted); font-size: 10px; text-transform: uppercase; }
+.alert-actions { display: flex; gap: 6px; }
+.alert-btn {
+  background: var(--card); color: var(--muted); border: 1px solid var(--border);
+  padding: 3px 10px; border-radius: 4px; cursor: pointer; font-size: 11px;
+}
+.alert-btn:hover { border-color: var(--accent); color: var(--accent); }
+.alert-btn.acked { color: var(--good); border-color: var(--good); }
+
+/* Three-axis panels */
+.axis-panels { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin-bottom: 24px; }
+.axis-panel { background: var(--card); border: 1px solid var(--border);
+  border-radius: 10px; padding: 20px; }
+.axis-title { font-size: 12px; font-weight: 600; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 12px; }
+.axis-row { display: flex; justify-content: space-between; align-items: center;
+  padding: 6px 0; border-bottom: 1px solid rgba(42, 50, 61, 0.5); font-size: 13px; }
+.axis-row:last-child { border-bottom: none; }
+.axis-val { font-variant-numeric: tabular-nums; font-weight: 500; }
+.axis-spike { color: var(--error); }
+.axis-ok { color: var(--good); }
+.axis-warn { color: var(--warn); }
+.axis-muted { color: var(--muted); }
+
+/* Agent card grid */
+.agent-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
+.agent-card {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 8px; padding: 16px; font-size: 13px;
+}
+.agent-card a { color: var(--accent); text-decoration: none; font-weight: 500; }
+.agent-card a:hover { text-decoration: underline; }
+.agent-card .meta { color: var(--muted); font-size: 12px; margin-top: 6px; }
+.agent-card .alerts-badge {
+  display: inline-block; background: var(--error); color: #fff;
+  border-radius: 10px; padding: 1px 7px; font-size: 10px;
+  font-weight: 700; margin-left: 6px;
+}
+.snooze-modal {
+  display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+  align-items: center; justify-content: center; z-index: 100;
+}
+.snooze-modal.open { display: flex; }
+.snooze-box {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 10px; padding: 24px; min-width: 320px;
+}
+.snooze-box h3 { margin-bottom: 12px; font-size: 15px; }
+.snooze-options { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
+.snooze-btn {
+  background: transparent; border: 1px solid var(--border); color: var(--text);
+  padding: 8px 12px; border-radius: 6px; cursor: pointer; text-align: left; font-size: 13px;
+}
+.snooze-btn:hover { border-color: var(--accent); }
+.snooze-cancel {
+  background: transparent; border: none; color: var(--muted);
+  cursor: pointer; font-size: 13px; padding: 0;
+}
+"""
+
+
+def _severity_class(severity: str) -> str:
+    return {
+        "critical": "sev-critical",
+        "high": "sev-high",
+        "medium": "sev-medium",
+        "low": "sev-low",
+        "info": "sev-info",
+    }.get(severity, "sev-info")
+
+
+def _queue_status_html(status: str) -> str:
+    cls = {
+        "new": "status-new",
+        "recurring": "status-recurring",
+        "known": "status-known",
+    }.get(status, "status-known")
+    return f'<span class="{cls}">{html.escape(status)}</span>'
+
+
+def _render_console_template(console_data, has_goals: bool = True) -> str:
+    """Fleet Console home page HTML — the new index.html landing page (spec/52 PR1)."""
+    from datetime import datetime, timezone
+
+    _nav = _nav_bar("console", has_goals=has_goals)
+    now_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    _degraded_banner = (
+        '<div class="degraded-banner">'
+        '<span class="pill warn">⚠ data may be incomplete</span>'
+        " &nbsp;One or more backend reads failed. Metrics below may be partial."
+        "</div>"
+        if console_data.degraded
+        else ""
+    )
+
+    # ── Attention Queue ─────────────────────────────────────────────
+    queue = console_data.attention_queue
+    # Show only open + recurring items at the top; acked/snoozed shown muted
+    active_items = [a for a in queue if a.ack_snooze_status == "open"]
+    known_items = [a for a in queue if a.ack_snooze_status in ("acked", "snoozed")]
+
+    if not queue:
+        queue_html = (
+            '<div class="queue-empty">'
+            "✓ All agents healthy — no items need attention."
+            "</div>"
+        )
+    else:
+        rows = []
+        for item in active_items + known_items:
+            muted_style = (
+                ' style="opacity: 0.5;"' if item.ack_snooze_status != "open" else ""
+            )
+            sev_cls = _severity_class(item.severity)
+            agent_safe = html.escape(item.agent)
+            reason_safe = html.escape(item.reason)
+            next_step_safe = html.escape(item.next_step)
+            owner_safe = html.escape(item.owner or "—")
+            key_safe = html.escape(item.alert_key)
+            ack_label = "Acked" if item.ack_snooze_status == "acked" else "Ack"
+            ack_btn_cls = (
+                "alert-btn acked" if item.ack_snooze_status == "acked" else "alert-btn"
+            )
+            rows.append(
+                f'<div class="alert-row"{muted_style}>'
+                f'<div class="{sev_cls}">{html.escape(item.severity.upper())}'
+                f"<br>{_queue_status_html(item.status)}</div>"
+                f"<div><strong>{agent_safe}</strong>"
+                f'<div class="muted">{reason_safe}</div>'
+                f'<div class="muted" style="margin-top:4px;font-size:11px;">'
+                f"Next: {next_step_safe}</div></div>"
+                f"<div>{owner_safe}</div>"
+                f'<div class="muted">{html.escape(item.alert_class)}'
+                f"/{html.escape(item.alert_subclass)}</div>"
+                f'<div class="alert-actions">'
+                f'<button class="{ack_btn_cls}" onclick="ackAlert(\'{key_safe}\')">{ack_label}</button>'
+                f'<button class="alert-btn" onclick="openSnooze(\'{key_safe}\')">Snooze</button>'
+                f"</div>"
+                f"</div>"
+            )
+        queue_html = (
+            '<div class="attention-queue">'
+            '<div class="alert-header">'
+            "<div>Severity</div><div>Agent / Reason</div>"
+            "<div>Owner</div><div>Class</div><div>Actions</div>"
+            "</div>" + "".join(rows) + "</div>"
+        )
+
+    # ── Three-axis trend panels ─────────────────────────────────────
+    # Cost trend
+    if console_data.cost_trends:
+        cost_rows = []
+        for ct in console_data.cost_trends[:8]:
+            spike_html = (
+                ' <span class="axis-spike">▲spike</span>' if ct.spike_detected else ""
+            )
+            agent_safe = html.escape(ct.agent)
+            cost_rows.append(
+                f'<div class="axis-row">'
+                f"<div>{agent_safe}</div>"
+                f'<div class="axis-val">${ct.total_usd_30d:.3f}/30d{spike_html}</div>'
+                f"</div>"
+            )
+        cost_panel = (
+            '<div class="axis-panel">'
+            '<div class="axis-title">Cost · 30-day total</div>'
+            + "".join(cost_rows)
+            + "</div>"
+        )
+    else:
+        cost_panel = (
+            '<div class="axis-panel">'
+            '<div class="axis-title">Cost · 30-day total</div>'
+            '<p class="empty-note">No cost data.</p>'
+            "</div>"
+        )
+
+    # Quality trend
+    if console_data.quality_signals:
+        qual_rows = []
+        for qs in sorted(
+            console_data.quality_signals,
+            key=lambda q: q.latest_score or 0,
+        )[:8]:
+            if qs.latest_score is None:
+                score_html = '<span class="axis-muted">no evals</span>'
+            else:
+                delta_str = ""
+                if qs.delta_30d is not None:
+                    sign = "+" if qs.delta_30d >= 0 else ""
+                    delta_cls = "axis-ok" if qs.delta_30d >= 0 else "axis-spike"
+                    delta_str = (
+                        f' <span class="{delta_cls}">{sign}{qs.delta_30d:.2f}</span>'
+                    )
+                score_html = (
+                    f'<span class="axis-val">{qs.latest_score:.2f}{delta_str}</span>'
+                )
+            qual_rows.append(
+                f'<div class="axis-row">'
+                f"<div>{html.escape(qs.agent)}</div>"
+                f"<div>{score_html}</div>"
+                f"</div>"
+            )
+        quality_panel = (
+            '<div class="axis-panel">'
+            '<div class="axis-title">Quality · eval score (30d delta)</div>'
+            + "".join(qual_rows)
+            + "</div>"
+        )
+    else:
+        quality_panel = (
+            '<div class="axis-panel">'
+            '<div class="axis-title">Quality · eval score (30d delta)</div>'
+            '<p class="empty-note">No eval data yet.</p>'
+            "</div>"
+        )
+
+    # Reliability trend
+    if console_data.reliability_metrics:
+        rel_rows = []
+        for rm in sorted(
+            console_data.reliability_metrics,
+            key=lambda r: -r.error_rate,
+        )[:8]:
+            if rm.total_runs == 0:
+                val_html = '<span class="axis-muted">no runs</span>'
+            else:
+                err_pct = int(rm.error_rate * 100)
+                blk_pct = int(rm.blocked_rate * 100)
+                err_cls = "axis-spike" if rm.error_rate >= 0.2 else "axis-ok"
+                val_html = (
+                    f'<span class="axis-val">'
+                    f'<span class="{err_cls}">{err_pct}% err</span>'
+                    f" · {blk_pct}% blk"
+                    f"</span>"
+                )
+            rel_rows.append(
+                f'<div class="axis-row">'
+                f"<div>{html.escape(rm.agent)}</div>"
+                f"<div>{val_html}</div>"
+                f"</div>"
+            )
+        reliability_panel = (
+            '<div class="axis-panel">'
+            '<div class="axis-title">Reliability · error / blocked rate (30d)</div>'
+            + "".join(rel_rows)
+            + "</div>"
+        )
+    else:
+        reliability_panel = (
+            '<div class="axis-panel">'
+            '<div class="axis-title">Reliability · error / blocked rate (30d)</div>'
+            '<p class="empty-note">No run data yet.</p>'
+            "</div>"
+        )
+
+    # ── Agent Card Grid ─────────────────────────────────────────────
+    alerts_by_agent: dict[str, int] = {}
+    for item in active_items:
+        alerts_by_agent[item.agent] = alerts_by_agent.get(item.agent, 0) + 1
+
+    agent_names = sorted(
+        set(
+            [ct.agent for ct in console_data.cost_trends]
+            + [rm.agent for rm in console_data.reliability_metrics]
+        )
+    )
+
+    if agent_names:
+        cards = []
+        for agent in agent_names:
+            agent_safe = html.escape(agent)
+            agent_href = urllib.parse.quote(agent, safe="")
+            n_alerts = alerts_by_agent.get(agent, 0)
+            badge = (
+                f'<span class="alerts-badge">{n_alerts}</span>' if n_alerts > 0 else ""
+            )
+            ct = next((c for c in console_data.cost_trends if c.agent == agent), None)
+            cost_str = f"${ct.total_usd_30d:.3f}/30d" if ct else "no cost data"
+            cards.append(
+                f'<div class="agent-card">'
+                f'<a href="../{agent_href}/dashboard.html">{agent_safe}</a>{badge}'
+                f'<div class="meta">{html.escape(cost_str)}</div>'
+                f"</div>"
+            )
+        agent_grid_html = f'<div class="agent-grid">{"".join(cards)}</div>'
+    else:
+        agent_grid_html = '<p class="empty-note">No agents discovered.</p>'
+
+    # ── Snooze Modal ────────────────────────────────────────────────
+    snooze_modal = """
+<div class="snooze-modal" id="snoozeModal">
+  <div class="snooze-box">
+    <h3>Snooze alert</h3>
+    <div class="snooze-options">
+      <button class="snooze-btn" onclick="snoozeFor(4)">Snooze 4 hours</button>
+      <button class="snooze-btn" onclick="snoozeFor(24)">Snooze 24 hours</button>
+      <button class="snooze-btn" onclick="snoozeFor(72)">Snooze 3 days</button>
+      <button class="snooze-btn" onclick="snoozeFor(168)">Snooze 1 week</button>
+    </div>
+    <button class="snooze-cancel" onclick="closeSnooze()">Cancel</button>
+  </div>
+</div>
+"""
+
+    active_count = len(active_items)
+    fleet_size = console_data.agent_count
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="{_SHARED_CSP}">
+<title>Atomic Agents — Fleet Console</title>
+<style>{CSS}{_CONSOLE_CSS_EXTRA}</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Fleet Console</h1>
+    <div class="period">{fleet_size} agent{"s" if fleet_size != 1 else ""} · {now_str}</div>
+  </div>
+  <div>
+    <button class="refresh-btn" onclick="refresh()">&#8635; Refresh</button>
+  </div>
+</header>
+
+{_nav}
+{_degraded_banner}
+
+<h2>Operator Attention Queue
+  {'<span class="pill error" style="margin-left:8px;">' + str(active_count) + " open</span>" if active_count else '<span class="pill ok" style="margin-left:8px;">0 open</span>'}
+</h2>
+{queue_html}
+
+<h2>Fleet Trends</h2>
+<div class="axis-panels">
+{cost_panel}
+{quality_panel}
+{reliability_panel}
+</div>
+
+<h2>Agent Fleet</h2>
+{agent_grid_html}
+
+<footer>
+  <div>Generated {date.today().isoformat()} by atomic_agents.dashboard</div>
+  <div>Fleet Console · spec/52 PR1</div>
+</footer>
+
+{snooze_modal}
+
+<script>
+var _snoozeKey = null;
+
+function refresh() {{
+  fetch('/regenerate', {{method: 'POST'}})
+    .then(r => {{ if (r.ok) location.reload(); else fallback(); }})
+    .catch(fallback);
+}}
+function fallback() {{ location.reload(); }}
+
+function ackAlert(key) {{
+  fetch('/alerts/ack', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{alert_key: key}})
+  }}).then(r => {{ if (r.ok) location.reload(); }});
+}}
+
+function openSnooze(key) {{
+  _snoozeKey = key;
+  document.getElementById('snoozeModal').classList.add('open');
+}}
+
+function closeSnooze() {{
+  _snoozeKey = null;
+  document.getElementById('snoozeModal').classList.remove('open');
+}}
+
+function snoozeFor(hours) {{
+  if (!_snoozeKey) return;
+  var until = new Date(Date.now() + hours * 3600 * 1000).toISOString();
+  fetch('/alerts/snooze', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{alert_key: _snoozeKey, snooze_until: until}})
+  }}).then(r => {{ closeSnooze(); if (r.ok) location.reload(); }});
+}}
+</script>
+
+</body>
+</html>
+"""
