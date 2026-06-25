@@ -1377,8 +1377,12 @@ def _render_recommendations(recommendations) -> str:
 
         delta_parts = []
         if usd_delta is not None:
+            # Savings recs only ever carry a negative usd_delta (the rec fires
+            # only when projected_usd_delta < 0). Render the magnitude as a
+            # positive "saved" figure rather than a raw "$-42.50/mo" (#616 review).
             delta_parts.append(
-                f'<span class="rec-delta-badge rec-delta-savings">${usd_delta:+.2f}/mo</span>'
+                f'<span class="rec-delta-badge rec-delta-savings">'
+                f"${abs(usd_delta):.2f}/mo saved</span>"
             )
         if pts_delta is not None:
             delta_parts.append(

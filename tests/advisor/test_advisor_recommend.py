@@ -284,6 +284,48 @@ class TestEvalHeadroom:
         assert h.passed is False
         assert h.sample_n == 0
 
+    def test_failsafe_non_finite_weighted_score(self):
+        """Fail-safe (Codex #616): a non-finite weighted_score → passed = False.
+
+        Every other predicate is satisfied (5 passing evals, sample_n=5, zero
+        hard-fails, pass-rate 1.0). Without the finiteness guard, the inf score
+        makes mean_weighted = inf, weighted_score_margin = inf >= floor (p1 True),
+        so the whole conjunction passes and a downgrade fires on garbage data —
+        the strip-RED for the finiteness fail-safe.
+        """
+        evals = _passing_evals(n=4, score=4.8) + [
+            _make_eval(verdict="pass", weighted_score=float("inf"))
+        ]
+        cfg = self._passing_config()
+        h = _eval_headroom(evals, rubric_threshold=4.0, rec_config=cfg)
+        assert h.passed is False
+        # Distinguishes the finiteness fail-safe from the sample_n fail-safe:
+        # there ARE enough scorable evals, the suppression is the inf guard.
+        assert h.sample_n == 5
+
+    def test_hard_fail_on_judge_error_blocks_downgrade(self):
+        """Fail-safe (Codex #616): a hard-fail on a judge_error eval blocks p3.
+
+        The 5 passing scorable evals clear p1/p2/p4; the extra judge_error eval is
+        excluded from `scorable` but carries a hard-fail. Counting hard_fails over
+        the FULL window (not just scorable) makes p3 fail → passed=False. Strip-RED:
+        with the old scorable-only count, hard_fails=0, p3 holds, passed=True.
+        """
+        evals = _passing_evals(n=5, score=4.8) + [
+            _make_eval(
+                verdict="judge_error",
+                weighted_score=0.0,
+                hard_fails=["critical_format_error"],
+            )
+        ]
+        cfg = self._passing_config()
+        h = _eval_headroom(evals, rubric_threshold=4.0, rec_config=cfg)
+        assert h.passed is False
+        # p3 is the failing predicate: the hard-fail came from the judge_error
+        # record, and sample_n still counts only the 5 scorable evals.
+        assert h.hard_fails == 1
+        assert h.sample_n == 5
+
     def test_judge_error_excluded_from_scorable(self):
         """judge_error records must not count as scorable (not pass/fail)."""
         evals = (
@@ -1534,7 +1576,7 @@ class TestRenderRecommendations:
         assert "rec-arrow" in html_out
         # delta badges with sign + units
         assert "rec-delta-savings" in html_out
-        assert "$-42.50/mo" in html_out
+        assert "$42.50/mo saved" in html_out
         assert "rec-delta-points" in html_out
         assert "+3.2 pts" in html_out
 
@@ -1588,4 +1630,4 @@ class TestRenderRecommendations:
         page = _render_console_template(cd, has_goals=False)
         assert "Recommendations" in page
         assert "rec-kind-savings_cost" in page
-        assert "$-42.50/mo" in page
+        assert "$42.50/mo saved" in page

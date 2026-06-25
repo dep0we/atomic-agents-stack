@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -192,15 +193,33 @@ def _eval_headroom(
     """
     scorable = [r for r in eval_records if r.verdict in ("pass", "fail")]
     sample_n = len(scorable)
-    hard_fails = sum(1 for r in scorable if r.hard_fails)
+    # hard_fails counted over the FULL window, not just scorable (pass/fail)
+    # records — matches the field's documented "in window" semantics and the
+    # fail-safe posture: a hard-fail on a judge_error / unscored eval is still a
+    # catastrophic-output signal that MUST block a downgrade. (Codex cross-family
+    # review #616: scorable-only counting let a judge_error+hard_fail slip past.)
+    hard_fails = sum(1 for r in eval_records if r.hard_fails)
 
     if sample_n == 0:
-        # Fail-safe (MUST 6): no eval data → NO downgrade
+        # Fail-safe (MUST 6): no scorable eval data → NO downgrade
         return EvalHeadroom(
             weighted_score_margin=0.0,
             pass_rate_margin=0.0,
-            hard_fails=0,
+            hard_fails=hard_fails,
             sample_n=0,
+            rubric_threshold=rubric_threshold,
+            passed=False,
+        )
+
+    # Fail-safe: a non-finite weighted_score (NaN/inf from a corrupt or
+    # adversarial eval JSONL) is NOT finite proof of headroom — an inf margin
+    # would otherwise clear P1. Suppress the downgrade. (Codex cross-family #616.)
+    if not all(math.isfinite(r.weighted_score) for r in scorable):
+        return EvalHeadroom(
+            weighted_score_margin=0.0,
+            pass_rate_margin=0.0,
+            hard_fails=hard_fails,
+            sample_n=sample_n,
             rubric_threshold=rubric_threshold,
             passed=False,
         )
