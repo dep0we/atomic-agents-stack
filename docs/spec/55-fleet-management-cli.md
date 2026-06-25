@@ -1,12 +1,12 @@
 ---
-spec: 54
+spec: 55
 title: Fleet Management CLI — the "manage" layer
 status: DRAFT
 created: 2026-06-25
 issue: 624
 ---
 
-# spec/54 — Fleet Management CLI: the "manage" layer
+# spec/55 — Fleet Management CLI: the "manage" layer
 
 **Status:** DRAFT — foundation + first verb (`govern`, #609) ship with issue #624 (epic #606); locked after the foundation conformance tests pass and the first verb is wired.
 
@@ -89,7 +89,7 @@ Write verbs live under a single `manage` group: `atomic-agents manage <verb> <ag
 ```
  discover   →   create   →   deploy   →   manage   →   observe        →   retire
  (registry)     init         deploy       (this spec)  doctor + console     deploy down
- #607           shipped      spec/49      spec/54      shipped              spec/49
+ #607           shipped      spec/49      spec/55      shipped              spec/49
 ```
 
 The management CLI does not rebuild any neighbor. `deploy` (spec/49) already owns standing an agent up and tearing it down; `manage` owns changing its config while it exists. Both sit on the same spine (S1–S4) so the experience is consistent across the lifecycle. A later console/`manage` surface MAY display `deploy status` inline; this spec does not require it.
@@ -170,7 +170,7 @@ Every name/format here is a public operator surface (a compatibility contract) a
 - (b) untargeted keys inside the block — including their inline comments and authored key order — survive **byte-for-byte**;
 - (c) only the targeted key's scalar **value** is rewritten in place.
 
-The implementation MUST be a line-aware in-block value editor. PyYAML is the **reader/validator only** (enum/format validation per M4) and MUST NEVER be the writer — a parse→`safe_dump` round-trip is forbidden because it strips comments, reorders keys, and is non-idempotent against a hand-authored file. No comment-preserving YAML dependency (e.g. ruamel) is added; the codebase's existing line-aware config-edit idiom (`_model.py`, `_roster.py`) is the model. If a `--set` ever targets a **list** field (`sources.*`, `actions.*`), full re-emission of that one list is the single documented exception (spec/54 names it so it is never a silent surprise) — PR1 does not implement list mutation (see CLI grammar).
+The implementation MUST be a line-aware in-block value editor. PyYAML is the **reader/validator only** (enum/format validation per M4) and MUST NEVER be the writer — a parse→`safe_dump` round-trip is forbidden because it strips comments, reorders keys, and is non-idempotent against a hand-authored file. No comment-preserving YAML dependency (e.g. ruamel) is added; the codebase's existing line-aware config-edit idiom (`_model.py`, `_roster.py`) is the model. If a `--set` ever targets a **list** field (`sources.*`, `actions.*`), full re-emission of that one list is the single documented exception (spec/55 names it so it is never a silent surprise) — PR1 does not implement list mutation (see CLI grammar).
 
 **M3 — Atomic write + restorable snapshot (decided — arc #624 fork `snapshot-mechanism`).** Every write MUST go through `_io.atomic_write` (a crash mid-write MUST NOT leave a half-written config, principle #8) and MUST first snapshot the prior **file** content to a **dedicated config-snapshot location** so the change is rollback-able to byte-faithful prior content. The snapshot MUST NOT reuse memory's `.versions/` machinery (that surface is memory-scoped per spec/02/spec/20; governance is config, not a memory note), and the JSONL audit line MUST NOT be treated as the rollback source (an audit record is not restorable file content, and recoverability MUST NOT depend on the observability stream being readable — cf. #497/#498 degraded-read posture). The snapshot is taken BEFORE overwrite; the audit (M8) is appended AFTER, so rollback never depends on the audit having been written.
 
