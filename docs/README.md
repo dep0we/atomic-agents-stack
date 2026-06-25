@@ -56,6 +56,7 @@ Two layers per agent: human-curated persona on top, agent-curated memory below. 
 | Look at a complete worked example (single-agent) | [samples/caldwell](samples/caldwell/README.md) |
 | Understand a specific design choice | [spec/01-anatomy](spec/01-anatomy.md) through [spec/09-cost-observability](spec/09-cost-observability.md) |
 | Build multi-agent with shared role templates (Muse-style) | [spec/06-multi-agent-projects](spec/06-multi-agent-projects.md) — the three-layer cascade section |
+| **Reuse one worker across many projects (build the playbook once)** | [patterns/factory-pattern](patterns/factory-pattern.md), the Factory Pattern |
 | **Track cost + token usage across all agents** | [spec/09-cost-observability](spec/09-cost-observability.md) + [implementation/cost-dashboard](implementation/cost-dashboard.md) |
 | **Use cheaper LLMs for sub-tasks (parallel helpers)** | [spec/10-helpers](spec/10-helpers.md) |
 | **Score agent quality with rubrics + LLM-as-judge** | [spec/08-evaluation](spec/08-evaluation.md) + [implementation/eval-runner](implementation/eval-runner.md) |
