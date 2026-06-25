@@ -1089,3 +1089,174 @@ round-trip conformance test fails such a backend rather than passing it.
 
 Added OUTSIDE the 8-MUST count, following the versioned-addendum precedent of
 spec/45 PR2 (#520) and the existing addenda in this spec.
+
+### Versioned normative addendum — `workflow_id` cross-run correlation field (issue #622 PR1)
+
+`workflow_id` is an optional string field on `RunRecord` and `LogQuery` that lets
+callers group multiple independent `agent.call()` invocations under a single
+workflow identity for cost rollup and audit.
+
+**Stamp sites.** When `agent.call()` is invoked with `workflow_id` set, it is
+stamped on the nine terminal JSONL record sites: principal-refused
+(`principal_not_verified`), dedup, lock_busy, pre-loop cost-skip, in_flight,
+mid-loop cost-skip, ok, security-abort, and embed-block. These are exactly the nine
+sites `conversation_id` is stamped on — including the `principal_not_verified`
+security-refusal record, which is reached only when `conversation_id` is set but,
+since `workflow_id` is keyword-only and freely combinable, MUST carry both when a
+caller supplies `call(conversation_id=X, workflow_id=Y, principal=<unverified>)`: a
+workflow run blocked at the identity gate MUST still surface under
+`LogQuery(workflow_id=...)` (Principle #5). `workflow_id` is also stamped on helper
+records (via `helper_call()` / `helper_call_parallel()`) and on the dedicated
+`embed_cost` record (via `_emit_embed_cost_record()`). It threads through
+`delegate()` / `delegate_parallel()` into the child's `call()`, so the delegated
+child's own terminal record carries it too. The field is threaded as an explicit
+local variable from `call()`'s parameter scope — it is NEVER stored on `self`,
+preventing stale-propagation when an agent instance is reused across calls.
+
+(Grep note: not every `if conversation_id is not None:` branch in `agent.py` is a
+stamp site. The conversation-backend resolution branch
+(`if conversation_id is not None: _conv_backend = ...`), the write-back/load
+branches, and the door-gate guard all reference `conversation_id` WITHOUT writing a
+JSONL stamp. So a raw `grep -c 'conversation_id is not None' agent.py` returns more
+than nine; the `workflow_id`/`conversation_id` parity is "9 record-stamp sites,"
+not "every `conversation_id` reference." The nine stamp sites are the ones listed
+above.)
+
+**Excluded site.** A delegation produces TWO records that each carry the child's
+full `cost_usd`:
+
+1. the coordinator's delegate MIRROR record (`trigger='delegate'`, carries the
+   mirror-only keys `delegated_agent` + `delegate_run_id`), and
+2. the delegated CHILD's own terminal record — which is ALSO `trigger='delegate'`,
+   because the child agent is constructed with `trigger='delegate'` (the child's
+   ok-path record uses `trigger=self.trigger`), but which carries `workflow_id` and
+   has NO `delegated_agent`/`delegate_run_id` marker.
+
+Only the MIRROR is excluded. The coordinator's MIRROR record MUST NOT carry
+`workflow_id` — that is the count-once enforcement mechanism: `aggregate_workflow()`
+queries with `LogQuery(workflow_id=...)` and the mirror is naturally excluded (it
+carries `workflow_id=None`). The coordinator's own `agent_call` record and the
+delegated child's `trigger='delegate'` terminal record EACH carry `workflow_id`
+once and are both counted; the mirror never appears in the rollup. `trigger` alone
+CANNOT discriminate the mirror from the child's record (both are `'delegate'`) — the
+discriminator is the mirror-only marker (`delegate_run_id`/`delegated_agent`).
+
+**`LogQuery.workflow_id` AND-predicate.** Conforming `LogBackend` implementations
+MUST support `LogQuery.workflow_id` as an AND-predicate returning ONLY records whose
+`workflow_id` matches. `None` means no filter (all records). A `None`-`workflow_id`
+record MUST NOT match a non-`None` filter — strict equality, not lenient. SQLite and
+Postgres MUST resolve it via the `idx_workflow_id` partial index (equality seek, same
+pattern as `idx_conversation_id`).
+
+**`WorkflowSummary` and `aggregate_workflow()`.** A `WorkflowSummary` dataclass
+and `aggregate_workflow(agents_root, workflow_id)` free function are added to
+`atomic_agents/dashboard/costs.py` and re-exported from `atomic_agents/dashboard/__init__.py`
+(in `__all__`), matching how the sibling cost-rollup symbols `GlobalSummary` /
+`aggregate_global` are exposed. `aggregate_workflow()`:
+- fans out via `discover_agents()` and queries each agent's `LogBackend` with
+  `LogQuery(workflow_id=workflow_id, agent_name=agent)` (the per-agent fan-out is
+  the filesystem-deployment correctness baseline; the shared-backend single-query
+  path and the ephemeral/remote-agent completeness gap are tracked in #638).
+  **Shared-backend overcount caveat (#638):** the SQL `agent_name` filter is
+  lenient (`agent_name = ? OR agent_name IS NULL`, legacy-compat). `_log()` always
+  stamps `agent_name`, so every framework-produced record partitions to exactly one
+  agent and the total is correct; but a record appended OUTSIDE `_log()` with a
+  `workflow_id` + `cost_usd` and NO `agent_name` matches every per-agent query on a
+  shared backend and is counted once per discovered agent (one dollar → N). The
+  default filesystem deployment is immune (each record lives in one agent dir,
+  queried once). The count-once-across-fan-out fix rides with the #638 single-query
+  path; until then a shared-backend total is not authoritative for
+  non-`_log()`-produced records;
+- excludes ONLY the coordinator's delegate MIRROR record — identified by the
+  mirror-only marker keys `delegate_run_id`/`delegated_agent` in `extra`, NOT by
+  bare `trigger` (the delegated child's own record is also `trigger='delegate'`
+  and carries the real spend that must be counted). This in-loop marker check is
+  the belt-and-suspenders guard for the same mirror record the `LogQuery` filter
+  already excludes;
+- sums `cost_usd` across the included set (agent_call, helper, embed_cost, and the
+  delegated child's own `trigger='delegate'` record — every actor-cost record
+  EXCEPT the mirror). `tool_call` records are not stamped with `workflow_id` and
+  carry no `cost_usd` (tool spend is folded into the parent `agent_call` record),
+  so they never enter the rollup;
+- the sum is correct-by-stamping, NOT by a runtime `cost_source` predicate: only
+  actor-cost records are workflow-stamped (the judge record at the LLM-judge gate
+  carries `cost_source='judge'` and is never in `workflow_id` scope), so
+  judge/audit spend is excluded from the workflow total in PR1 without an explicit
+  `cost_source == 'actor'` filter in the loop. (An operator comparing against the
+  per-agent dashboard total, which folds in judge/audit, will see this come up
+  short when LLM judging fired.) If a future PR ever workflow-stamps a record with
+  `cost_source != 'actor'`, this scoping property would no longer hold by
+  stamping alone and an explicit `cost_source == 'actor'` filter would be
+  required — tracked as a defensive follow-up in #639;
+- OR-accumulates `cost_data_degraded` from any per-agent query failure —
+  `LogBackendReadError`, or the backend-construction / query errors a shared
+  SQLite/Postgres backend can raise — caught with a broad `except Exception`
+  per agent (fail-soft, mirroring the broad-catch resilience model of
+  `discover_agents()` / `GlobalSummary`, not a narrow typed catch);
+- NEVER reads through the legacy `_record_from_dict` reader in `costs.py` (which
+  lacks `workflow_id`); always queries via the `LogBackend` protocol.
+
+**`_CANONICAL_FIELDS`.** `'workflow_id'` is added to `_CANONICAL_FIELDS` in
+`logs/types.py`. Without this, `from_dict()` routes the field into `extra{}` rather
+than the top-level `RunRecord` field, breaking the `LogQuery.workflow_id` filter
+on filesystem backends (which match against `record.workflow_id`, not `extra`).
+
+**Schema version.** SQLite and Postgres `LogBackend` implementations bump from v3
+to v4 (schema_version=4):
+- SQLite: `v3→v4` migration adds `workflow_id TEXT` column + `idx_workflow_id`
+  partial index (`PRAGMA table_info` guard for crash-resumability, same pattern
+  as all prior SQLite migration steps).
+- Postgres: `v3→v4` migration adds `workflow_id TEXT` column + `idx_workflow_id`
+  partial index (`ADD COLUMN IF NOT EXISTS`, idempotent).
+
+**Count-once semantics.** A delegation emits two records carrying the child's full
+`cost_usd`: the coordinator's delegate MIRROR record (`trigger='delegate'`, carries
+`delegated_agent`/`delegate_run_id`, NOT `workflow_id`-stamped) and the delegated
+CHILD's own terminal record (ALSO `trigger='delegate'` — the child agent runs with
+`self.trigger='delegate'` — but `workflow_id`-stamped, no mirror marker). Summing
+both would double-count every delegation. `aggregate_workflow()` excludes ONLY the
+mirror, identified by the mirror-only marker (`delegate_run_id`/`delegated_agent`),
+and KEEPS the child's real spend. The discriminator is the mirror marker, NOT bare
+`trigger`: a `trigger='delegate'` test on its own would drop the child's real
+record (and since the mirror is never `workflow_id`-stamped, it would never have
+entered the rollup anyway — so a bare-trigger guard is a pure undercount, not a
+dedup). The included set is: `agent_call`, `helper`, `embed_cost`, the delegated
+child's own `trigger='delegate'` record, and any other `cost_source='actor'` record
+that is not the mirror. `summarize_agent()` is correct-by-scoping (per-agent dir
+isolation means the coordinator's mirror and the child's record never coexist in a
+single-agent query), but its logic MUST NOT be reused for cross-agent aggregation.
+
+**Conformance tests.** `tests/test_log_protocol_conformance.py` adds:
+- `test_query_filters_by_workflow_id` — three records (w-1 / w-2 / None), asserts
+  filter returns exactly one. Negative control: a `None`-workflow_id record MUST NOT
+  match. No-filter arm asserts the predicate is not over-broad (returns all three).
+- `test_query_workflow_id_round_trips` — present-when-set, `None`-on-read when absent.
+
+`tests/test_workflow_aggregate.py` adds count-once behavioral tests:
+- delegate count-once: the coordinator's MIRROR record (carrying
+  `delegate_run_id`/`delegated_agent`) is excluded, while the delegated child's
+  own `trigger='delegate'` record (no mirror marker, `workflow_id`-stamped) IS
+  counted exactly once — the fixtures use the real runtime trigger value
+  (`'delegate'`), not a fabricated `'agent_call'`
+- helper undercount guard
+- embed_cost inclusion guard
+- propagation-leakage negative control
+- degraded-read banner on `LogBackendReadError`
+
+`tests/test_workflow_aggregate.py` also adds producer integration tests that drive a
+real `agent.call(workflow_id=...)` (stub LLM) and assert: (a) the emitted ok-path
+record carries `workflow_id`, with a strip-RED negative control proving the stamp is
+driven by the kwarg (a `workflow_id=None` call leaves the ok-path record unstamped);
+(b) a real `delegate(workflow_id=...)` threads `workflow_id` into the child's `call()`
+(the child's `call()` is spied to assert the kwarg reaches it) while the coordinator's
+mirror record is emitted with the mirror marker (`delegated_agent`/`delegate_run_id`)
+and is NOT `workflow_id`-stamped. The end-to-end count-once assertion — that
+`aggregate_workflow()` counts the delegated child's spend exactly once and excludes the
+mirror — is covered by the synthetic-fixture `test_aggregate_workflow_delegate_count_once`
+above (the spied delegate integration test verifies propagation, not the on-disk rollup).
+
+SQLite v3→v4 migration isolation tests are in `tests/test_log_sqlite_backend.py`.
+Postgres v3→v4 migration isolation tests are in `tests/test_log_postgres_backend.py`.
+
+Added OUTSIDE the 8-MUST count, following the versioned-addendum precedent of all
+prior addenda in this spec.
