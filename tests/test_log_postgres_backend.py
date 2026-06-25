@@ -1088,15 +1088,24 @@ def test_postgres_schema_has_idempotency_columns_and_index():
     assert "conversation_id" in _CREATE_RUN_RECORDS, (
         "Postgres run_records MUST have a conversation_id column (spec/47 PR1)"
     )
+    assert "workflow_id" in _CREATE_RUN_RECORDS, (
+        "Postgres run_records MUST have a workflow_id column (spec/22 addendum, #622 PR1)"
+    )
     assert "conversation_id" in _INSERT_COLUMNS
+    assert "workflow_id" in _INSERT_COLUMNS, (
+        "workflow_id MUST be in _INSERT_COLUMNS (spec/22 addendum, #622 PR1)"
+    )
     assert any("idx_idempotency_key" in stmt for stmt in _CREATE_INDEXES), (
         "Postgres MUST create idx_idempotency_key (spec/22 addendum)"
     )
     assert any("idx_conversation_id" in stmt for stmt in _CREATE_INDEXES), (
         "Postgres MUST create idx_conversation_id (spec/47 PR1 / spec/22 addendum)"
     )
-    # Schema bumped to v3 with the v2→v3 migration (conversation_id, spec/47 PR1).
-    assert _SCHEMA_VERSION == 3
+    assert any("idx_workflow_id" in stmt for stmt in _CREATE_INDEXES), (
+        "Postgres MUST create idx_workflow_id (spec/22 addendum, #622 PR1)"
+    )
+    # Schema bumped to v4 with the v3→v4 migration (workflow_id, spec/22 addendum #622 PR1).
+    assert _SCHEMA_VERSION == 4
 
 
 def test_postgres_build_query_sql_includes_idempotency_key_predicate():
@@ -1149,20 +1158,21 @@ def test_postgres_build_query_sql_no_idempotency_predicate_when_absent():
     )
 
 
-def test_postgres_ensure_schema_v1_to_v3_migration_ladder_order():
-    """BEHAVIORAL coverage of the FULL Postgres v1→v2→v3 migration ladder (not
+def test_postgres_ensure_schema_v1_to_v4_migration_ladder_order():
+    """BEHAVIORAL coverage of the FULL Postgres v1→v2→v3→v4 migration ladder (not
     string-presence on the constants): drive _ensure_schema() with a mock conn
-    pre-seeded to schema_version='1'. Because `existing` is reassigned 1→2→3 in
-    the ladder, a v1-seeded run walks both steps, so this asserts:
+    pre-seeded to schema_version='1'. Because `existing` is reassigned 1→2→3→4 in
+    the ladder, a v1-seeded run walks all steps, so this asserts:
       * v1→v2: BOTH idempotency ADD-COLUMN ALTERs + UPDATE meta '2'
       * v2→v3 (spec/47 PR1): conversation_id ADD-COLUMN ALTER + UPDATE meta '3'
+      * v3→v4 (spec/22 addendum, #622 PR1): workflow_id ADD-COLUMN ALTER + UPDATE meta '4'
     and the ordering invariant that each ADD COLUMN precedes the CREATE INDEX
-    that references it (idx_idempotency_key / idx_conversation_id).
+    that references it (idx_idempotency_key / idx_conversation_id / idx_workflow_id).
 
     The ordering is load-bearing: an index references its column, so the index
     MUST be created AFTER the ALTER that adds it. No live Postgres required —
-    mirrors the SQLite on-disk v1→v3 migration test for cross-backend parity
-    (the CHANGELOG/CLAUDE.md 'Postgres v1→v2 / v2→v3 migration' claims are
+    mirrors the SQLite on-disk v1→v4 migration test for cross-backend parity
+    (the CHANGELOG/CLAUDE.md 'Postgres v1→v2 / v2→v3 / v3→v4 migration' claims are
     otherwise unverified; static column-name string checks do not exercise the
     ALTER/UPDATE ladder)."""
     from atomic_agents.logs.postgres import PostgresLogBackend
@@ -1248,6 +1258,29 @@ def test_postgres_ensure_schema_v1_to_v3_migration_ladder_order():
         "idx_conversation_id (the partial index references the column)"
     )
 
+    # --- v3→v4 step (spec/22 addendum, #622 PR1): the SAME v1-seeded run continues
+    # the ladder because `existing` is reassigned to 3 then 4. Assert it ALSO ADDs
+    # the workflow_id column and bumps meta to '4'. Without these asserts a regression
+    # that deleted the Postgres v3→v4 block would pass every test.
+    assert any(
+        "ADD COLUMN IF NOT EXISTS" in s and "workflow_id" in s for s in executed
+    ), "v3→v4 migration MUST ALTER ... ADD COLUMN IF NOT EXISTS workflow_id"
+    assert any("UPDATE meta SET value = '4'" in s for s in executed), (
+        "v3→v4 migration MUST bump meta.schema_version to 4"
+    )
+    # Ordering invariant: the workflow_id ALTER MUST precede the idx_workflow_id
+    # CREATE INDEX (the partial index references the column).
+    wf_alter_idx = next(
+        i
+        for i, s in enumerate(executed)
+        if "ADD COLUMN IF NOT EXISTS" in s and "workflow_id" in s
+    )
+    wf_index_idx = next(i for i, s in enumerate(executed) if "idx_workflow_id" in s)
+    assert wf_alter_idx < wf_index_idx, (
+        "ADD COLUMN workflow_id MUST run BEFORE CREATE INDEX "
+        "idx_workflow_id (the partial index references the column)"
+    )
+
 
 def test_postgres_ensure_schema_v2_to_v3_migration_ladder_order():
     """BEHAVIORAL coverage of the Postgres v2→v3 migration step in ISOLATION
@@ -1318,13 +1351,85 @@ def test_postgres_ensure_schema_v2_to_v3_migration_ladder_order():
     )
 
 
+def test_postgres_ensure_schema_v3_to_v4_migration_ladder_order():
+    """BEHAVIORAL coverage of the Postgres v3→v4 migration step in ISOLATION
+    (spec/22 versioned normative addendum, issue #622 PR1): drive _ensure_schema()
+    with a mock conn pre-seeded to schema_version='3' (idempotency + conversation
+    columns already present) and assert it:
+      (a) ADDs the workflow_id column via ADD COLUMN IF NOT EXISTS,
+      (b) bumps meta.schema_version to '4',
+      (c) runs the workflow_id ALTER BEFORE idx_workflow_id CREATE INDEX,
+      (d) does NOT re-issue the v1→v2 or v2→v3 ALTERs (gate isolation).
+
+    A v1-seeded ladder test walks ALL steps, so a regression that mis-gated the
+    v3→v4 block (e.g. `if existing == 2` instead of `== 3`) could still pass
+    there. This isolates the v3→v4 entry point: it only fires when starting at
+    exactly v3. Mirrors the SQLite cross-backend parity coverage; no live
+    Postgres required."""
+    from atomic_agents.logs.postgres import PostgresLogBackend
+
+    backend = PostgresLogBackend.__new__(PostgresLogBackend)
+
+    executed: list[str] = []
+
+    def _execute(sql, params=None):
+        executed.append(sql)
+        cur = MagicMock()
+        if "SELECT value FROM meta" in sql:
+            cur.fetchone.return_value = {"value": "3"}
+        else:
+            cur.fetchone.return_value = None
+        return cur
+
+    conn = MagicMock()
+    conn.execute.side_effect = _execute
+
+    backend._ensure_schema(conn)
+
+    # (a) workflow_id column added.
+    assert any(
+        "ADD COLUMN IF NOT EXISTS" in s and "workflow_id" in s for s in executed
+    ), "v3→v4 migration MUST ALTER ... ADD COLUMN IF NOT EXISTS workflow_id"
+    # (b) meta bumped to '4'.
+    assert any("UPDATE meta SET value = '4'" in s for s in executed), (
+        "v3→v4 migration MUST bump meta.schema_version to 4"
+    )
+    # (c) ALTER precedes the partial index that references the column.
+    wf_alter_idx = next(
+        i
+        for i, s in enumerate(executed)
+        if "ADD COLUMN IF NOT EXISTS" in s and "workflow_id" in s
+    )
+    wf_index_idx = next(i for i, s in enumerate(executed) if "idx_workflow_id" in s)
+    assert wf_alter_idx < wf_index_idx, (
+        "ADD COLUMN workflow_id MUST run BEFORE CREATE INDEX "
+        "idx_workflow_id (the partial index references the column)"
+    )
+    # (d) gate isolation: starting at v3, the v1→v2 and v2→v3 ALTERs MUST NOT re-fire.
+    assert not any(
+        "ADD COLUMN IF NOT EXISTS" in s and "idempotency_key" in s for s in executed
+    ), "a v3-seeded run MUST NOT re-run the v1→v2 idempotency_key ALTER"
+    assert not any(
+        "ADD COLUMN IF NOT EXISTS" in s and "replayed_run_id" in s for s in executed
+    ), "a v3-seeded run MUST NOT re-run the v1→v2 replayed_run_id ALTER"
+    assert not any(
+        "ADD COLUMN IF NOT EXISTS" in s and "conversation_id" in s for s in executed
+    ), "a v3-seeded run MUST NOT re-run the v2→v3 conversation_id ALTER"
+    assert not any("UPDATE meta SET value = '2'" in s for s in executed), (
+        "a v3-seeded run MUST NOT bump meta back through '2'"
+    )
+    assert not any("UPDATE meta SET value = '3'" in s for s in executed), (
+        "a v3-seeded run MUST NOT bump meta back through '3'"
+    )
+
+
 def test_postgres_ensure_schema_current_version_skips_migration_ladder():
     """NEGATIVE control: when the meta row already reports the CURRENT
     _SCHEMA_VERSION, _ensure_schema MUST NOT issue any ADD COLUMN ALTER (the
-    ladder steps are gated on existing==1 / existing==2). Without this gate a
-    warm DB would re-run the migration on every connect. (Mock returns
-    str(_SCHEMA_VERSION), so this exercises the already-current path regardless
-    of which version is current — v3 today after the spec/47 PR1 bump.)"""
+    ladder steps are gated on existing==1/2/3). Without this gate a warm DB
+    would re-run the migration on every connect. (Mock returns str(_SCHEMA_VERSION),
+    so this exercises the already-current path regardless of which version is
+    current — v4 today after the spec/22 addendum #622 PR1 bump.)"""
     from atomic_agents.logs.postgres import PostgresLogBackend, _SCHEMA_VERSION
 
     backend = PostgresLogBackend.__new__(PostgresLogBackend)
@@ -1350,6 +1455,7 @@ def test_postgres_ensure_schema_current_version_skips_migration_ladder():
     # Index creation still runs (idempotent CREATE INDEX IF NOT EXISTS).
     assert any("idx_idempotency_key" in s for s in executed)
     assert any("idx_conversation_id" in s for s in executed)
+    assert any("idx_workflow_id" in s for s in executed)
 
 
 def test_aggregate_injection_guard_raises_on_bad_identifier():
@@ -1580,6 +1686,8 @@ def test_row_to_record_handles_jsonb_dict():
         "replayed_run_id": None,
         # spec/47 PR1: post-v2→v3 migration this column ALWAYS exists.
         "conversation_id": None,
+        # spec/22 addendum (#622 PR1): post-v3→v4 migration this column ALWAYS exists.
+        "workflow_id": None,
         # JSONB returns a Python dict directly — must NOT json.loads this.
         "extra": {"iteration": 3, "nested": [1, 2]},
     }
@@ -1629,6 +1737,8 @@ def test_row_to_record_fallback_none_preserved():
         "replayed_run_id": None,
         # spec/47 PR1: post-v2→v3 migration this column ALWAYS exists.
         "conversation_id": None,
+        # spec/22 addendum (#622 PR1): post-v3→v4 migration this column ALWAYS exists.
+        "workflow_id": None,
         "extra": {},
     }
 
@@ -1676,6 +1786,8 @@ def test_row_to_record_boolean_true_false():
         "replayed_run_id": None,
         # spec/47 PR1: post-v2→v3 migration this column ALWAYS exists.
         "conversation_id": None,
+        # spec/22 addendum (#622 PR1): post-v3→v4 migration this column ALWAYS exists.
+        "workflow_id": None,
         "extra": {},
     }
 

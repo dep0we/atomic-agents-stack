@@ -249,6 +249,7 @@ def _make_record(
     idempotency_key: str | None = None,
     replayed_run_id: str | None = None,
     conversation_id: str | None = None,
+    workflow_id: str | None = None,
     parent_run_id: str | None = None,
     parent_agent: str | None = None,
     trigger: str | None = None,
@@ -277,6 +278,7 @@ def _make_record(
         idempotency_key=idempotency_key,
         replayed_run_id=replayed_run_id,
         conversation_id=conversation_id,
+        workflow_id=workflow_id,
         parent_run_id=parent_run_id,
         parent_agent=parent_agent,
         trigger=trigger,
@@ -611,6 +613,69 @@ def test_query_conversation_id_round_trips(backend):
     out = backend.query(LogQuery(conversation_id="thread-7"))
     assert len(out) == 1
     assert out[0].conversation_id == "thread-7"
+
+
+def test_query_filters_by_workflow_id(backend):
+    """spec/22 versioned normative addendum (issue #622 PR1): every conforming
+    backend MUST support the ``workflow_id`` AND-predicate, returning ONLY records
+    whose workflow_id matches. Mirrors test_query_filters_by_conversation_id so
+    a backend that ships the column + index but FORGETS the WHERE clause fails
+    this canonical gate instead of silently returning all records.
+
+    Negative-control shape: the third record has workflow_id=None. A backend
+    that skipped the predicate would return all three for LogQuery(workflow_id=
+    'w-1'); this asserts exactly one. The no-filter arm asserts the predicate
+    is not over-broad (returns all three).
+    """
+    backend.append(
+        _make_record(run_id="w1", workflow_id="w-1", ts=_ts_at(2026, 5, 15, 10))
+    )
+    backend.append(
+        _make_record(run_id="w2", workflow_id="w-2", ts=_ts_at(2026, 5, 15, 11))
+    )
+    backend.append(
+        _make_record(run_id="wn", workflow_id=None, ts=_ts_at(2026, 5, 15, 12))
+    )
+    out = backend.query(LogQuery(workflow_id="w-1"))
+    assert len(out) == 1, (
+        "workflow_id predicate MUST scope results to the matching record; "
+        "returning more means the WHERE/skip clause is missing (the SHORTCUT "
+        "this test guards against). A None-workflow_id record MUST NOT match."
+    )
+    assert out[0].run_id == "w1"
+    assert out[0].workflow_id == "w-1"
+    # Distinct second key returns only its own record (not a w-1 echo).
+    out_w2 = backend.query(LogQuery(workflow_id="w-2"))
+    assert len(out_w2) == 1 and out_w2[0].run_id == "w2"
+    # No predicate → all three records (predicate is not over-broad).
+    assert len(backend.query(LogQuery())) == 3
+
+
+def test_query_workflow_id_round_trips(backend):
+    """workflow_id is a canonical RunRecord field (spec/22 addendum, issue #622
+    PR1) and MUST survive the append → query round trip — present when set,
+    absent (None) when not. A backend that adds the column but fails to read
+    it back in _row_to_record produces workflow_id=None on every record —
+    this test catches that silent failure.
+    """
+    backend.append(
+        _make_record(
+            run_id="wf-rt",
+            workflow_id="wf-round-trip",
+            ts=_ts_at(2026, 5, 15, 14),
+        )
+    )
+    out = backend.query(LogQuery(workflow_id="wf-round-trip"))
+    assert len(out) == 1
+    assert out[0].workflow_id == "wf-round-trip"
+    # A record with no workflow_id must round-trip to None, not empty string.
+    backend.append(
+        _make_record(run_id="wf-none", workflow_id=None, ts=_ts_at(2026, 5, 15, 15))
+    )
+    all_recs = backend.query(LogQuery())
+    wf_none_recs = [r for r in all_recs if r.run_id == "wf-none"]
+    assert len(wf_none_recs) == 1
+    assert wf_none_recs[0].workflow_id is None
 
 
 def test_query_filters_by_parent_run_id(backend):

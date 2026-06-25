@@ -708,6 +708,14 @@ def _matches(
         and record.conversation_id != filter.conversation_id
     ):
         return False
+    # spec/22 versioned normative addendum (issue #622 PR1): workflow_id
+    # AND-predicate. Strict equality (same as conversation_id, NOT the lenient
+    # agent_name pattern) — records without workflow_id must NOT match a
+    # workflow_id filter. Without this, LogQuery(workflow_id=...) would silently
+    # match every record on the filesystem backend, making aggregate_workflow()
+    # return fleet-total cost instead of per-workflow cost.
+    if filter.workflow_id is not None and record.workflow_id != filter.workflow_id:
+        return False
     return True
 
 

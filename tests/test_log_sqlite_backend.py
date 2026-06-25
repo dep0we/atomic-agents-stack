@@ -131,10 +131,11 @@ def test_indexes_created(tmp_path):
 
 
 def test_schema_version_recorded(tmp_path):
-    """A fresh DB carries schema_version=3 in meta — pins the bump-on-change contract.
+    """A fresh DB carries schema_version=4 in meta — pins the bump-on-change contract.
 
     v2 adds idempotency_key + replayed_run_id columns (spec/45 PR2).
     v3 adds conversation_id column (spec/47 PR1).
+    v4 adds workflow_id column (spec/22 versioned normative addendum, issue #622 PR1).
     """
     db = tmp_path / "logs.db"
     backend = SQLiteLogBackend(db)
@@ -454,6 +455,232 @@ def test_sqlite_v2_to_v3_migration_gate_isolation(tmp_path):
         assert legacy == ("idem-key-preexisting", None), (
             "v2-seeded migration MUST preserve the pre-existing idempotency_key "
             "value and leave conversation_id NULL for the legacy row"
+        )
+    finally:
+        conn.close()
+
+
+def _build_v3_db(db: Path, *, with_legacy_row: bool = True) -> None:
+    """Create a schema_version=3 SQLite DB on disk (post-conversation_id, pre-workflow_id).
+
+    Mirrors the on-disk state a real backend leaves after the v2→v3 migration:
+    run_records has idempotency_key + replayed_run_id + conversation_id columns,
+    idx_conversation_id exists, and meta.schema_version == '3'. workflow_id does
+    NOT yet exist.
+    """
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(_V1_CREATE_RUN_RECORDS)
+        conn.execute("ALTER TABLE run_records ADD COLUMN idempotency_key TEXT")
+        conn.execute("ALTER TABLE run_records ADD COLUMN replayed_run_id TEXT")
+        conn.execute("ALTER TABLE run_records ADD COLUMN conversation_id TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_idempotency_key "
+            "ON run_records (idempotency_key)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_conversation_id "
+            "ON run_records (conversation_id) WHERE conversation_id IS NOT NULL"
+        )
+        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute("INSERT INTO meta (key, value) VALUES ('schema_version', '3')")
+        if with_legacy_row:
+            conn.execute(
+                "INSERT INTO run_records "
+                "(ts, run_id, primitive, status, summary, model, "
+                " input_tokens, output_tokens, conversation_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    _ts(2026, 6, 1),
+                    "v3-legacy-run",
+                    "agent_call",
+                    "ok",
+                    "pre-v4 row with conversation_id set",
+                    "gpt-x",
+                    10,
+                    20,
+                    "conv-preexisting",
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_sqlite_v3_to_v4_migration_gate_isolation(tmp_path):
+    """BEHAVIORAL coverage of the SQLite v3→v4 migration step in ISOLATION
+    (spec/22 versioned normative addendum, issue #622 PR1), seeded at EXACTLY
+    schema_version=3 — the cross-backend parity companion to
+    test_postgres_ensure_schema_v3_to_v4_migration_ladder_order.
+
+    A v1-seeded ladder test walks ALL steps, so a regression that mis-gated the
+    v3→v4 block (e.g. `if existing == 2` instead of `== 3` in sqlite.py) could
+    still pass there (a v1 DB runs all steps regardless of a later gate's literal).
+    This isolates the v3→v4 entry point on the backend where it runs LOCALLY:
+    open a real v3 DB and assert it:
+      (a) ADDs the workflow_id column + idx_workflow_id partial index,
+      (b) bumps meta.schema_version to 4,
+      (c) does NOT re-fire the v1→v2 or v2→v3 ALTERs — the pre-existing
+          conversation_id VALUE on the legacy row survives untouched.
+
+    NEGATIVE CONTROL: if sqlite.py's v3→v4 gate is mis-changed to
+    `if existing == 2`, opening this v3-seeded DB leaves schema_version at 3
+    and never adds workflow_id, so assertions (a)/(b) FAIL. (v1 or v2-seeded
+    tests would NOT catch that regression — that is the gap this test closes.)
+    """
+    db = tmp_path / "logs.db"
+    _build_v3_db(db, with_legacy_row=True)
+    # v3 precondition: idempotency + conversation columns present, workflow_id absent.
+    cols0 = _table_columns(db)
+    assert "idempotency_key" in cols0 and "conversation_id" in cols0
+    assert "workflow_id" not in cols0, (
+        "precondition: workflow_id MUST NOT exist in a v3 DB (the column the migration adds)"
+    )
+
+    # Open the backend — triggers _ensure_schema() starting from existing==3.
+    backend = SQLiteLogBackend(db)
+    backend.append(_make_record())  # forces _get_conn()/_ensure_schema()
+
+    cols = _table_columns(db)
+    # (a) workflow_id column + index added.
+    assert "workflow_id" in cols, (
+        "v3→v4 migration MUST add workflow_id (proves the == 3 gate fired)"
+    )
+    conn = sqlite3.connect(db)
+    try:
+        version = int(
+            conn.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+        )
+        # (b) bumped to current (4).
+        assert version == _SCHEMA_VERSION, (
+            "v3→v4 migration MUST bump schema_version to 4 (current _SCHEMA_VERSION); "
+            "would stay 3 if the gate were mis-changed to == 2"
+        )
+        indexes = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
+        assert "idx_workflow_id" in indexes, (
+            "v3→v4 migration MUST create idx_workflow_id partial index"
+        )
+        # (c) gate isolation: the v1→v2 and v2→v3 blocks did NOT re-fire — the
+        # pre-existing conversation_id VALUE on the legacy row is untouched.
+        legacy = conn.execute(
+            "SELECT conversation_id, workflow_id FROM run_records "
+            "WHERE run_id = 'v3-legacy-run'"
+        ).fetchone()
+        assert legacy == ("conv-preexisting", None), (
+            "v3-seeded migration MUST preserve the pre-existing conversation_id "
+            "value and leave workflow_id NULL for the legacy row"
+        )
+    finally:
+        conn.close()
+
+
+def test_sqlite_v3_to_v4_migration_resumes_after_partial_crash(tmp_path):
+    """CRASH/RETRY SAFETY: if a prior migration died AFTER the workflow_id ADD
+    COLUMN committed but BEFORE the meta UPDATE (schema_version still 3, column
+    already present), reopening MUST complete the migration WITHOUT raising
+    'duplicate column name'. Pins the PRAGMA-guarded ALTER fix.
+
+    NEGATIVE CONTROL: with a bare (unguarded) ALTER the second open raises
+    sqlite3.OperationalError('duplicate column name workflow_id') — verified
+    by manually adding the column below, which simulates the exact partial-migration
+    state.
+
+    After completion, schema_version is 4 (current _SCHEMA_VERSION).
+    """
+    db = tmp_path / "logs.db"
+    _build_v3_db(db, with_legacy_row=True)
+
+    # Simulate a partial v3→v4 migration: ALTER committed, meta still v3.
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("ALTER TABLE run_records ADD COLUMN workflow_id TEXT")
+        conn.commit()
+    finally:
+        conn.close()
+    cols = _table_columns(db)
+    assert "workflow_id" in cols, (
+        "precondition: workflow_id column was added (partial migration state)"
+    )
+
+    # Reopen — the PRAGMA-guarded migration MUST skip the already-present column,
+    # bump meta to 4, and NOT raise duplicate-column.
+    backend = SQLiteLogBackend(db)
+    backend.append(_make_record())  # must NOT raise
+
+    conn = sqlite3.connect(db)
+    try:
+        version = int(
+            conn.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+        )
+        assert version == _SCHEMA_VERSION, (
+            "Crash-resume MUST complete the migration and bump schema_version to 4"
+        )
+    finally:
+        conn.close()
+
+
+def test_sqlite_v1_to_v4_migration_end_to_end(tmp_path):
+    """Opening a real v1 DB MUST migrate it to v4 (v1→v2→v3→v4): add all
+    columns, create all indexes, bump meta.schema_version to 4.
+    The legacy row MUST survive with NULL for all new columns (no data loss).
+
+    This end-to-end ladder test complements the gate-isolation tests: while the
+    isolation tests verify each individual step fires at the right entry point,
+    this verifies the full chain runs in sequence when starting from v1.
+    """
+    db = tmp_path / "logs.db"
+    _build_v1_db(db, with_legacy_row=True)
+    # v1 precondition: none of the added columns exist yet.
+    cols0 = _table_columns(db)
+    assert "idempotency_key" not in cols0
+    assert "conversation_id" not in cols0
+    assert "workflow_id" not in cols0
+
+    # Open the backend — this triggers the full v1→v2→v3→v4 ladder.
+    backend = SQLiteLogBackend(db)
+    backend.append(_make_record())  # forces _get_conn()/_ensure_schema()
+
+    cols = _table_columns(db)
+    assert "idempotency_key" in cols, "v1→v4 MUST add idempotency_key"
+    assert "replayed_run_id" in cols, "v1→v4 MUST add replayed_run_id"
+    assert "conversation_id" in cols, "v1→v4 MUST add conversation_id"
+    assert "workflow_id" in cols, "v1→v4 MUST add workflow_id"
+
+    conn = sqlite3.connect(db)
+    try:
+        version = int(
+            conn.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+        )
+        assert version == _SCHEMA_VERSION, (
+            "Full ladder MUST bump schema_version to 4 (current _SCHEMA_VERSION)"
+        )
+        indexes = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            ).fetchall()
+        }
+        assert "idx_idempotency_key" in indexes
+        assert "idx_conversation_id" in indexes
+        assert "idx_workflow_id" in indexes
+        # Legacy row survives with NULL for all new columns.
+        legacy = conn.execute(
+            "SELECT idempotency_key, replayed_run_id, conversation_id, workflow_id "
+            "FROM run_records WHERE run_id = 'legacy-run'"
+        ).fetchone()
+        assert legacy == (None, None, None, None), (
+            "legacy row MUST survive full v1→v4 migration with NULL new fields"
         )
     finally:
         conn.close()

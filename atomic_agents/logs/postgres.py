@@ -189,7 +189,10 @@ def _psycopg_error() -> type[BaseException]:
 # spec/47 PR1 bumps to v3 (adds conversation_id column + idx_conversation_id
 # partial index, per the spec/22 versioned normative addendum for
 # ConversationBackend). Both SQLite and Postgres move to v3 in this PR.
-_SCHEMA_VERSION = 3
+# issue #622 PR1 bumps to v4 (adds workflow_id column + idx_workflow_id
+# partial index, per the spec/22 versioned normative addendum for workflow
+# correlation). Both SQLite and Postgres move to v4.
+_SCHEMA_VERSION = 4
 
 # Advisory lock key — stable int64 derived from a fixed constant string.
 # All processes using this backend target the same key, so the cold-start
@@ -234,6 +237,8 @@ CREATE TABLE IF NOT EXISTS run_records (
     replayed_run_id TEXT,
     -- spec/47 PR1 / spec/22 versioned normative addendum: conversation audit field.
     conversation_id TEXT,
+    -- spec/22 versioned normative addendum (issue #622 PR1): workflow correlation field.
+    workflow_id TEXT,
     extra JSONB NOT NULL DEFAULT '{}'::jsonb
 )
 """
@@ -270,6 +275,12 @@ _CREATE_INDEXES = [
     # nearly every run (only conversation-keyed runs set it).
     "CREATE INDEX IF NOT EXISTS idx_conversation_id ON run_records(conversation_id) "
     "WHERE conversation_id IS NOT NULL",
+    # spec/22 versioned normative addendum (issue #622 PR1): MUST index for the
+    # LogQuery.workflow_id AND-predicate (index seek, not table scan).
+    # PARTIAL index (WHERE workflow_id IS NOT NULL): the column is NULL for the
+    # overwhelming majority of run records (only workflow-tagged runs set it).
+    "CREATE INDEX IF NOT EXISTS idx_workflow_id ON run_records(workflow_id) "
+    "WHERE workflow_id IS NOT NULL",
 ]
 
 # Column names in INSERT order (matches CREATE TABLE column order minus id).
@@ -297,6 +308,7 @@ _INSERT_COLUMNS = (
     "idempotency_key",
     "replayed_run_id",
     "conversation_id",
+    "workflow_id",
     "extra",
 )
 
@@ -787,6 +799,19 @@ class PostgresLogBackend:
                 )
                 conn.execute("UPDATE meta SET value = '3' WHERE key = 'schema_version'")
                 existing = 3
+            if existing == 3:
+                # v3 → v4 (issue #622 PR1): add workflow_id column +
+                # idx_workflow_id partial index (spec/22 versioned normative addendum
+                # for workflow correlation). ADD COLUMN IF NOT EXISTS is idempotent +
+                # safe (existing rows get NULL). On a fresh DB the CREATE TABLE
+                # already includes workflow_id so the ALTER is a no-op; the meta row
+                # is inserted at the CURRENT _SCHEMA_VERSION (4 today), so this
+                # migration block is skipped entirely (existing != 3).
+                conn.execute(
+                    "ALTER TABLE run_records ADD COLUMN IF NOT EXISTS workflow_id TEXT"
+                )
+                conn.execute("UPDATE meta SET value = '4' WHERE key = 'schema_version'")
+                existing = 4
             # Create indexes AFTER migrations so all indexed columns exist.
             for stmt in _CREATE_INDEXES:
                 conn.execute(stmt)
@@ -977,6 +1002,7 @@ class PostgresLogBackend:
             record.idempotency_key,
             record.replayed_run_id,
             record.conversation_id,
+            record.workflow_id,
             _pj.Jsonb(record.extra if record.extra is not None else {}),
         )
 
@@ -1468,6 +1494,14 @@ class PostgresLogBackend:
         if filter.conversation_id is not None:
             clauses.append("conversation_id = %s")
             params.append(filter.conversation_id)
+        # spec/22 versioned normative addendum (issue #622 PR1): workflow_id
+        # AND-predicate. Uses the idx_workflow_id partial index for an index seek.
+        # Without this, LogQuery(workflow_id=...) would silently return ALL records
+        # — making aggregate_workflow() return fleet-total cost instead of per-
+        # workflow cost.
+        if filter.workflow_id is not None:
+            clauses.append("workflow_id = %s")
+            params.append(filter.workflow_id)
 
         where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
@@ -1544,6 +1578,11 @@ class PostgresLogBackend:
             # absent), so direct subscript is correct and symmetric with SQLite's
             # _row_to_record.
             conversation_id=row["conversation_id"],
+            # spec/22 versioned normative addendum (issue #622 PR1): workflow_id.
+            # After the v3→v4 migration this column ALWAYS exists (NULL on old
+            # rows, never absent), so direct subscript is correct and symmetric
+            # with conversation_id above and with SQLite's _row_to_record.
+            workflow_id=row["workflow_id"],
             extra=extra,
         )
 

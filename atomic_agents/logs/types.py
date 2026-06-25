@@ -105,6 +105,13 @@ _CANONICAL_FIELDS = frozenset(
         # conversation_id is tagged on every terminal JSONL record when agent.call()
         # is invoked with a conversation_id kwarg.
         "conversation_id",
+        # workflow correlation field (spec/22 versioned normative addendum, issue #622
+        # PR1 — promoted to canonical so SQLite/Postgres backends can index on it and
+        # LogQuery can filter). workflow_id is tagged on call-terminal records and
+        # child-cost records (helper, embed_cost) when agent.call() is invoked with a
+        # workflow_id kwarg. NOT tagged on trigger='delegate' mirror records (those are
+        # excluded from aggregate_workflow() cost sums to prevent double-count).
+        "workflow_id",
     }
 )
 
@@ -222,6 +229,20 @@ class RunRecord:
     # lock_busy, pre-loop cost-skip, in_flight, mid-loop cost-skip, and
     # security-abort. LogQuery.conversation_id filters on this field.
     conversation_id: str | None = None
+    # spec/22 versioned normative addendum (issue #622 PR1): workflow correlation field.
+    # Absent on calls that do not supply a workflow_id. Present on EVERY terminal JSONL
+    # record when workflow_id is set — the same 9 terminal sites as conversation_id
+    # (principal-refused, dedup, lock_busy, pre-loop cost-skip, in_flight, mid-loop
+    # cost-skip, ok, security-abort, embed-block) PLUS helper records and embed_cost
+    # records (the child-cost records aggregate_workflow() must include). (Not every
+    # `conversation_id is not None` reference in agent.py is a stamp site — the
+    # conversation-backend resolution branch, write-back/load branches, and door gate
+    # reference it WITHOUT writing a JSONL stamp — so a raw grep returns more than 9; the
+    # parity is "9 record-stamp sites," not "every conversation_id reference." See the
+    # spec/22 grep note.) NOT stamped on trigger='delegate' mirror records
+    # (coordinator's delegation mirror) — those are excluded from aggregate_workflow() cost
+    # sums to prevent double-count. LogQuery.workflow_id filters on this field.
+    workflow_id: str | None = None
 
     # Primitive-specific catch-all
     extra: dict[str, Any] = field(default_factory=dict)
@@ -289,6 +310,12 @@ class RunRecord:
         # as idempotency fields). LogQuery-queryable via canonical field index.
         if self.conversation_id is not None:
             out["conversation_id"] = self.conversation_id
+        # spec/22 versioned normative addendum (issue #622 PR1): workflow_id — omit
+        # when None (same None-omit pattern as conversation_id). LogQuery-queryable
+        # via canonical field index. NOT emitted on trigger='delegate' mirror records
+        # (those records never have workflow_id set; see agent.py propagation rules).
+        if self.workflow_id is not None:
+            out["workflow_id"] = self.workflow_id
         # Flatten extra last so caller's primitive-specific keys appear
         # after canonical fields in the JSONL line.
         for k, v in self.extra.items():
@@ -360,6 +387,11 @@ class RunRecord:
         # spec/47 PR1 — conversation continuity field (spec/22 versioned normative
         # addendum). In _CANONICAL_FIELDS so excluded from extra on read-back.
         conversation_id = _coerce_optional_str(d.get("conversation_id"))
+        # spec/22 versioned normative addendum (issue #622 PR1): workflow correlation
+        # field. In _CANONICAL_FIELDS so excluded from extra on read-back. See the
+        # addendum for which records carry this field (terminal sites + helper +
+        # embed_cost; NOT trigger='delegate' mirror records).
+        workflow_id = _coerce_optional_str(d.get("workflow_id"))
 
         # Everything not in the canonical set lands in extra.
         extra = {k: v for k, v in d.items() if k not in _CANONICAL_FIELDS}
@@ -388,6 +420,7 @@ class RunRecord:
             idempotency_key=idempotency_key,
             replayed_run_id=replayed_run_id,
             conversation_id=conversation_id,
+            workflow_id=workflow_id,
             extra=extra,
         )
 
@@ -461,6 +494,12 @@ class LogQuery:
     # whose conversation_id matches. SQLite backends MUST index on this column
     # (idx_conversation_id). None = no filter (all records).
     conversation_id: str | None = None
+    # spec/22 versioned normative addendum (issue #622 PR1): LogQuery.workflow_id
+    # conforming backends MUST support as an AND-predicate returning only records
+    # whose workflow_id matches. SQLite and Postgres backends MUST index on this
+    # column (idx_workflow_id partial index, WHERE workflow_id IS NOT NULL).
+    # None = no filter (all records).
+    workflow_id: str | None = None
 
 
 # Canonical aggregation metrics. Backends advertising
