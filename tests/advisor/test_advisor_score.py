@@ -1633,7 +1633,11 @@ class TestWeightDomainValidation:
             "    quality: 0.0\n    reliability: 0.0\n```\n"
         )
         ft = parse_targets(tmp_path)
-        assert abs(sum(ft.weights.values()) - 1.0) < 0.01
+        # strip-RED: the bug coerced cost:true → 1.0, giving {cost:1.0, quality:0,
+        # reliability:0} — which ALSO sums to 1.0, so a sum-only assertion is a
+        # false-green. Assert the bool is rejected and EQUAL weights are used.
+        for axis in ("cost", "quality", "reliability"):
+            assert abs(ft.weights[axis] - 1 / 3) < 1e-6, ft.weights
 
 
 class TestSpanDegeneracyValidation:

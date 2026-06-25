@@ -336,7 +336,11 @@ def _parse_weights(raw_weights: object, used_defaults: list[str]) -> dict[str, f
     result: dict[str, float] = {}
     for axis in ("cost", "quality", "reliability"):
         v = raw_weights.get(axis)
-        if v is None or not isinstance(v, (int, float)):
+        # Reject bool/NaN/inf/None HERE: bool subclasses int, so the bare
+        # isinstance(v, (int, float)) gate accepted `cost: true` and coerced it
+        # to 1.0 before the [0,1] domain guard below ever ran. _is_real_number
+        # rejects bool/NaN/inf (and None) up front.
+        if not _is_real_number(v):
             used_defaults.append(f"weights.{axis}")
             result[axis] = _DEFAULT_WEIGHTS[axis]
         else:
