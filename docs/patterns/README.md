@@ -7,5 +7,6 @@ A **pattern** is a structural choice (how you arrange agents and their files). F
 | Pattern | What it's for |
 |---|---|
 | [The Factory Pattern](factory-pattern.md) | Build a reusable AI worker's playbook once, then run a separate, isolated copy of it for each project. |
+| [The Five Disciplines](five-disciplines.md) | A five-part checklist for whether an agent is safe to put to work, and the framework primitive that enforces each part. |
 
 > These docs explain *ways to use* the framework. For the framework's own design and specification, start at [docs/README.md](../README.md).
