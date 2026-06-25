@@ -1,9 +1,10 @@
 # spec/53 — Fleet Console: Health Scoring Engine (DRAFT)
 
 **Status:** DRAFT
-**PR:** Console PR2 (#615)
+**PR:** Console PR2 (#615), Console PR3 (#616 — scoring-core extraction)
 **Depends on:** spec/52 (Fleet Console PR1), spec/09 (LogBackend), spec/46 (EmbeddingBackend)
 **Module:** `atomic_agents/advisor/` (pure-compute; ZERO LLM spend)
+**Recommendations contract:** see spec/54
 
 ---
 
@@ -60,9 +61,16 @@ Each metric maps to a 0-100 score via a **piecewise plateau-at-target curve**:
 
 Constants `BAND_GREEN_MIN = 80`, `BAND_AMBER_MIN = 60` are normative.
 
-The band is derived from the **rounded** composite (the value displayed), so the
-displayed number and its band color always agree: a raw `79.95` that rounds to `80.0`
-bands green, not amber. Applies to both the per-agent composite and the fleet headline.
+The band is derived from the **canonical display integer** `int(round(raw_composite))`
+— rounded ONCE off the raw capped float, AFTER the critical-cap override (see §3.5),
+never off a `round(composite, 1)` intermediate (the #623 double-round). This is the
+same integer render.py displays, so the displayed number and its band color always
+agree across the rounding boundary. Worked examples (round-half-to-even at the .5
+boundary): raw `79.6` → `int(round(79.6))=80` → green (a `round(79.6, 1)=79.6`
+float-band would have read amber); raw `79.49` → `79` → amber; raw `79.5` → `80` →
+green; raw `59.49` → `59` → red; raw `59.5` → `60` → amber. Applies to BOTH the
+per-agent composite (`composite_display`) and the fleet headline
+(`fleet_composite_display` / `worst_agent_composite_display`). See MUST 11.
 
 ### 3.4 Composite roll-up (MUST 2, MUST 3)
 
@@ -81,7 +89,7 @@ Applied **POST-computation** (after weighted mean). Two triggers, either of whic
 - **Metric-level:** any individual metric score < `CRITICAL_SUBSCORE_THRESHOLD` (30), even when its axis MEAN dilutes it above threshold. Each axis sub-score is the unweighted mean of its metrics, so a single catastrophic metric (e.g. `error_rate=0.90` → metric score 0, with healthy siblings averaging the reliability axis to ~66) would otherwise read green. ANY single critical signal must force the cap; averaging cannot hide it. (`_compute_composite` takes the flat list of every present metric score; when that list is omitted — direct unit tests of the composite math — only the axis-level check runs.)
 - The cap fires even when the pre-cap composite would be amber/green. Per-axis chips still show their own uncapped values — decomposition stays visible (MUST 5).
 
-The composite is **banded on its rounded value** (the displayed number), so the headline number and its color always agree across the rounding boundary.
+The composite is **banded on its canonical display integer** `int(round(raw_composite))` — derived from the raw capped float AFTER this critical-cap override (§3.3, MUST 11), never off a `round(composite, 1)` intermediate — so the headline number and its color always agree across the rounding boundary.
 
 ---
 
@@ -134,10 +142,10 @@ Reuses `_compute_reliability()` from `dashboard/_reliability.py` (the shared neu
 
 ## 6. WoW (Week-over-Week) windows
 
-- **Current 7d**: `[today - 7d, today]` (8 calendar days, inclusive both ends)
-- **Prior 7d**: `[today - 14d, today - 8d]` (7 calendar days; strictly before current window — no boundary overlap)
+- **Current 7d**: `[today − 6d, today]` (7 calendar days, inclusive both ends; `timedelta(days=6)`)
+- **Prior 7d**: `[today − 13d, today − 7d]` (7 calendar days, inclusive both ends; strictly before current window — no boundary overlap, no gap)
 - **WoW arrow**: `up | down | flat | None`. `None` when either window has no data. `flat` when delta within 1% threshold (metric-dependent). The displayed arrow is colored by **goodness**, not raw direction: for a `lower`-is-better metric a rising value renders red (bad) and a falling value green (good); for a `higher`-is-better metric the reverse (render.py `_wow_symbol`).
-- Sliced from already-loaded 30d lists — no extra I/O. Both windows are inclusive-boundary date ranges; the rate metrics are means (length-asymmetry-insensitive). The 30d spend-vs-trend windows are made strictly non-overlapping (prior-30d ends `today - 31d`) AND equal length (31 inclusive days each, prior-30d starts `today - 61d`) so a busy boundary day is neither double-counted nor one-day-biased in the spend ratio.
+- Sliced from already-loaded 30d lists — no extra I/O. Both windows are inclusive-boundary date ranges of **equal length (7 inclusive days each)** by design (#623b): an earlier draft used `[today − 7d, today]` (8 inclusive days) for the current window against a 7-day prior, so a flat-spend fleet reported `spend_vs_trend = +14.3%` instead of `0.0`. Equalizing the windows removes that length bias. The 30d spend-vs-trend windows are likewise strictly non-overlapping (prior-30d ends `today − 31d`) AND equal length (31 inclusive days each, prior-30d starts `today − 61d`) so a busy boundary day is neither double-counted nor one-day-biased in the spend ratio. See MUST 12.
 - **WoW color uses DEFAULT directions only (PR2 scope).** The arrow color above derives from each metric's default optimization direction, hard-coded in `render.py _render_health_band`. An operator who overrides a metric's `direction` in `targets.md` changes how the SCORE column is computed, but the WoW arrow COLOR still uses the default direction — the two can diverge for an overridden metric. Honoring a `targets.md` direction override in the WoW color is deferred to the recommendations PR (#616).
 
 ---
@@ -223,9 +231,9 @@ from atomic_agents.advisor import compute_fleet_health, FleetHealth, AgentHealth
 fleet_health: FleetHealth = compute_fleet_health(agents_root, today=date.today())
 ```
 
-`FleetHealth` fields: `agents`, `fleet_composite`, `fleet_band`, `worst_agent`, `worst_agent_composite`, `coverage_n`, `coverage_m`, `degraded`, `used_targets_defaults`.
+`FleetHealth` fields: `agents`, `fleet_composite`, `fleet_composite_display`, `fleet_band`, `worst_agent`, `worst_agent_composite`, `worst_agent_composite_display`, `coverage_n`, `coverage_m`, `degraded`, `used_targets_defaults`. (`fleet_composite_display` / `worst_agent_composite_display` are the `int | None` canonical display integers — `int(round(raw_capped_float))`, MUST 11.)
 
-`AgentHealth` fields: `agent`, `cost_score`, `quality_score`, `reliability_score`, `composite`, `band`, `cost_degraded`, `quality_degraded`, `reliability_degraded`, `degraded`, `axes_with_data`, `scorecard`, `capped_by_axis`.
+`AgentHealth` fields: `agent`, `cost_score`, `quality_score`, `reliability_score`, `composite`, `composite_display`, `primary_model`, `band`, `cost_degraded`, `quality_degraded`, `reliability_degraded`, `degraded`, `axes_with_data`, `scorecard`, `capped_by_axis`. (`composite_display` is the `int | None` canonical display integer, MUST 11; `primary_model` is the agent's majority primary-run model — `str | None` — consumed by spec/54 recommendations.)
 
 `ScorecardRow` fields: `metric`, `axis`, `value`, `target`, `status`, `score`, `wow`.
 
@@ -255,6 +263,9 @@ The band renders as: composite score, band color, sub-score chips (cost/quality/
 | 8 | Degraded LogBackend read: affected sub-score = None (excluded from composite, not scored as 0) | `TestDegradedReadPosture` |
 | 9 | Cheap-model classification: strict less-than threshold; ties and unknown models = NOT cheap | `TestCheapModelClassification` |
 | 10 | No LLMBackend is constructed and no LLM call is made on any advisor path (zero LLM spend); advisor's own code performs no direct `agent`/`eval`/`tuning`/`dream` import; the conftest construction guard enforces the spend guarantee at test time (NOT `sys.modules` isolation — see §2 NOTE) | `TestNoLLMEnforcement` |
+| 11 | Display integer (`composite_display` / `fleet_composite_display`) is `int(round(raw_composite))` rounded ONCE off the raw capped float AFTER critical-cap override (never off the 1-decimal `round(v, 1)` float — the #623 fleet double-round); band is assigned from the display integer, not the raw float; render.py consumes the display integer directly (no `{:.0f}` on raw floats) (#623). Covered for BOTH the per-agent composite (`_compute_composite`) and the fleet-headline path (`compute_fleet_health`). | `TestRoundedBandConsistency`, `TestFleetDisplayIntegerBoundaries` (per-agent boundaries + `test_fleet_79_45_is_amber_display_79` / `test_fleet_59_45_is_red_display_59` drive `compute_fleet_health`) |
+| 12 | Both 7d WoW windows are exactly 7 inclusive days each: current = [today−6, today], prior = [today−13, today−7] (#623) | `TestWoW7dEqualWindows` |
+| 13 | `_score_agent_from_data` is a zero-disk-I/O pure function; takes pre-loaded run + eval records; counterfactual use with `dataclasses.replace` must not mutate originals | `TestScoreAgentFromDataPureCore` |
 
 ---
 
@@ -273,6 +284,7 @@ atomic_agents/
 
 docs/spec/
   53-fleet-console-scoring.md    — this file
+  54-fleet-console-recommendations.md — recommendations engine built on scoring core
 
 tests/
   advisor/
