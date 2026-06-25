@@ -184,13 +184,24 @@ def test_nav_bar_no_goals_link_when_no_goal(tmp_path):
 
 
 def test_index_html_content_unchanged(tmp_path):
+    """index.html is now the Fleet Console home (spec/52 PR1 BEHAVIOR CHANGE).
+
+    The cost view (previously index.html) has moved to cost.html.
+    This test is updated to assert the new landing-page content (Fleet Console)
+    and a companion assertion verifies cost.html has the old cost-view content.
+    """
     _build_synthetic_vault(tmp_path, with_goals=False)
     render_all(tmp_path)
 
-    html = (tmp_path / "_dashboard" / "index.html").read_text()
-    assert "Atomic Agents" in html
-    assert "Spend this month" in html
-    assert "Per-agent breakdown" in html
+    # index.html is now the Fleet Console home
+    index_html = (tmp_path / "_dashboard" / "index.html").read_text()
+    assert "Atomic Agents" in index_html or "Fleet Console" in index_html
+    assert "Fleet Console" in index_html
+
+    # cost.html carries the old cost-view content
+    cost_html = (tmp_path / "_dashboard" / "cost.html").read_text()
+    assert "Spend this month" in cost_html
+    assert "Per-agent breakdown" in cost_html
 
 
 def test_activity_html_content(tmp_path):
@@ -274,9 +285,16 @@ def test_all_pages_are_valid_html(tmp_path):
 
 
 def test_nav_bar_helper_functions():
-    """Unit test the nav_bar() helper directly."""
+    """Unit test the nav_bar() helper directly.
+
+    BEHAVIOR CHANGE (spec/52 PR1): the Cost tab now links to cost.html (was
+    index.html). index.html is now the Console tab's href (the new front door).
+    """
     html_with_goals = nav_bar("cost", has_goals=True)
+    # Console tab links to index.html (new front door)
     assert 'href="index.html"' in html_with_goals
+    # Cost tab links to cost.html (not index.html any more)
+    assert 'href="cost.html"' in html_with_goals
     assert 'href="activity.html"' in html_with_goals
     assert 'href="goals.html"' in html_with_goals
     assert 'class="active"' in html_with_goals
@@ -288,8 +306,9 @@ def test_nav_bar_helper_functions():
     # Each page marks itself as active
     for tab_name in ("cost", "activity", "quality", "memory"):
         nav = nav_bar(tab_name, has_goals=True)
-        # The active page's href should have class="active"
-        expected_href = "index.html" if tab_name == "cost" else f"{tab_name}.html"
+        # The active page's href: cost → cost.html; others → <name>.html
+        # (spec/52 PR1: cost tab no longer uses index.html)
+        expected_href = f"{tab_name}.html"
         assert f'href="{expected_href}" class="active"' in nav
 
 
