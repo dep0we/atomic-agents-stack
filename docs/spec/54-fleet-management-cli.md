@@ -54,7 +54,9 @@ The north star is a single CLI for the whole lifecycle of a fleet. The risk of "
 
 ### S1 — The registry is the single agent selector
 
-Every management verb targets its agent through `AgentRegistryBackend` (#607). The same backend the console reads is the backend the management CLI writes through. This keeps discovery uniform across observe and manage, and means a verb works against the filesystem default today and a Postgres registry (#608) later without per-verb changes. A verb MUST NOT walk the filesystem directly to find or load an agent's config when the registry exposes that surface.
+Every management verb **resolves and loads** its target agent through `AgentRegistryBackend` (#607) — the same backend the console reads. This keeps discovery uniform across observe and manage, and means a verb works against the filesystem default today and a Postgres registry (#608) later without per-verb changes. A verb MUST NOT walk the filesystem directly to find or load an agent's config when the registry exposes that surface.
+
+**The registry is a selector, not the config writer (decided — arc #624 fork `registry-write-seam`).** The registry resolves *which* agent and returns its location; the verb then writes the canonical config file (`governance.md`, etc.) via `_io.atomic_write` to that resolved location. The write does NOT flow through a registry-backend method, and the `AgentRegistryBackend` protocol is NOT extended with a governance-write method. Rationale: governance is **config**, not state (T15) — it is operator-authored, read-mostly, version-controlled, and has *no runtime consumer* (verified: nothing in `agent.call()`, the cost engine, the policy layer, or the mandate layer reads governance; only the registry/dashboard/`doctor` read it, all for display/aggregation). Per T15, config stays file-canonical in every deployment; routing config *writes* through the discovery backend (the surface that becomes Postgres at scale) is the "human-authored config shoved into Postgres" error T15 explicitly warns against. A future Postgres registry MAY *index/cache* governance for fast fleet reads, but the file remains the thing an operator edits, and reconstruction across stores is the spec/40 export contract's job — not a write seam on the discovery protocol.
 
 ### S2 — One five-step safety routine for every verb
 
@@ -132,8 +134,8 @@ atomic-agents manage govern <agent> --show
 1. **Resolve + validate.** Load the target through `AgentRegistryBackend`. Validate every `--set` field name against the `GovernanceRecord` schema and every value against its enum/format (`permission-tier`, `customer-data`/`writes-sor` tri-states, date fields). Refuse unknown fields and invalid enums with a clear, named error before writing.
 2. **Preview.** Show the before→after of `governance.md`'s frontmatter block (the prose body is preserved verbatim).
 3. **Confirm.** Interactive y/n on a TTY, or `--yes`.
-4. **Snapshot + atomic write.** Snapshot the existing `governance.md`, then write the updated frontmatter through `_io.atomic_write`, preserving the markdown body. Creating `governance.md` where absent is allowed (a fleet operator authoring governance for the first time); the write still goes through validation + audit.
-5. **Audit.** Append a `manage_govern` management event (principal_id, ts, agent, changed fields, before→after) through `LogBackend`.
+4. **Snapshot + atomic write.** Snapshot the existing `governance.md` to the dedicated config-snapshot location (M3), then write the updated block through `_io.atomic_write` per the M2 surgical preservation contract. **Creating `governance.md` where absent** (a fleet operator authoring governance for the first time) is allowed and MUST render the **init governance.md template** (via a shared renderer that `init` and `govern` both call — one canonical governance.md shape in the wild, decided — arc #624 fork `create-absent-governance`), then apply the `--set` values on top. The write still goes through validation + audit, and MUST NOT clobber an existing file (consistent with init's preserve-on-re-run contract, spec/51).
+5. **Audit.** Append a `PRIMITIVE_MANAGE_GOVERN` `RunRecord` event (principal_id, ts, agent, changed_fields, before→after) through `LogBackend` to BOTH the per-agent and fleet scopes (M8).
 
 ### Why governance first
 
@@ -141,13 +143,36 @@ atomic-agents manage govern <agent> --show
 
 ---
 
+## CLI surface grammar (normative — decided, arc #624 fork `cli-surface-flags-naming`)
+
+Every name/format here is a public operator surface (a compatibility contract) and a copilot-prompt surface, so the **full grammar is pinned now** even though PR1 implements only the flat-scalar slice. Deferring implementation of low-traffic fields is fine; deferring the *contract* is the trap.
+
+- **Group + verb:** `atomic-agents manage govern <agent> ...` (S4).
+- **Scalar fields:** `--set <field>=<value>`, repeatable. CLI field names are hyphenated; they map to the underscore `GovernanceRecord` schema keys (`permission-tier` → `permission_tier`). Split on the first `=` (values may contain `=`).
+- **Nested fields:** addressed with **dotted paths** (`--set review.reviewer=...`), NOT hyphen-joined — the dot disambiguates a nested path from a hyphenated scalar name.
+- **List fields** (`sources.*`, `actions.*`): mutated with `--add <path>=<item>` / `--remove <path>=<item>` for element-level changes and `--set-json <path>=<json-array>` for full-list replacement. Comma-separated values are explicitly NOT used (they break on items containing commas).
+- **Fleet-scoped flag:** `--agents-root` (matching the existing `init`/registry convention; the registry is agents_root/fleet-scoped — NOT the per-agent `--agent-root`).
+- **Read/safety flags:** `--show` (print current resolved record), `--dry-run` (preview only, S2 step 2), `--yes` (apply without TTY confirm, S2 step 3), `--json` (structured output, S3).
+- **`--json` output** exposes canonical **underscore** schema keys (not CLI hyphen spellings), so a copilot reads the schema, not the typing convention.
+- **PR1 scope:** flat scalar `--set` only. `--add`/`--remove`/`--set-json` and dotted nested paths are reserved-and-documented; an unimplemented path returns a clean `"not yet settable via CLI; edit governance.md directly"` refusal — never a parser error whose meaning shifts in a later PR.
+
+## Implementation notes (Tier B — agent decides at build, with justification)
+
+- **Code location:** a new `atomic_agents/manage/` package holding the reusable S2 safety-routine helper + per-verb modules, with thin dispatch in `cli.py` — matching the `secrets`/`mcp_registry` packaging idiom. The five-step routine MUST be a genuine shared helper, not copy-paste per verb.
+- **Error taxonomy:** a typed exception ladder (unknown-field / invalid-enum / composition-refused / audit-dropped) each with a distinct message + structured `--json` reason, so the negative-control tests have a distinct, strip-testable failure per guard (audit-drop is a warn → still exit 0 on an applied write; validation/composition failures → non-zero, no write).
+
 ## Implementer Contract (MUSTs)
 
 **M1 — No new config format or state store.** A management verb MUST write only to existing agent markdown files in their existing formats, and MUST record management events only through `LogBackend`. It MUST NOT introduce a management-state sidecar file.
 
-**M2 — Markdown body preservation.** A frontmatter-field write MUST preserve the file's prose body and any fields not targeted by the write. Only the targeted fields change.
+**M2 — Preservation contract (decided — arc #624 fork `governance-yaml-block-format`).** governance.md is a fenced ` ```yaml ` block (root key `governance:`) surrounded by operator-authored prose sections, and the block carries instructional inline comments operators rely on. A `--set` write MUST be **surgical**, satisfying this normative contract:
+- (a) the prose body outside the yaml block survives **byte-for-byte**;
+- (b) untargeted keys inside the block — including their inline comments and authored key order — survive **byte-for-byte**;
+- (c) only the targeted key's scalar **value** is rewritten in place.
 
-**M3 — Atomic write + snapshot.** Every write MUST go through `_io.atomic_write` and MUST snapshot the prior file content before overwriting, so the change is rollback-able. A crash mid-write MUST NOT leave a half-written config (principle #8).
+The implementation MUST be a line-aware in-block value editor. PyYAML is the **reader/validator only** (enum/format validation per M4) and MUST NEVER be the writer — a parse→`safe_dump` round-trip is forbidden because it strips comments, reorders keys, and is non-idempotent against a hand-authored file. No comment-preserving YAML dependency (e.g. ruamel) is added; the codebase's existing line-aware config-edit idiom (`_model.py`, `_roster.py`) is the model. If a `--set` ever targets a **list** field (`sources.*`, `actions.*`), full re-emission of that one list is the single documented exception (spec/54 names it so it is never a silent surprise) — PR1 does not implement list mutation (see CLI grammar).
+
+**M3 — Atomic write + restorable snapshot (decided — arc #624 fork `snapshot-mechanism`).** Every write MUST go through `_io.atomic_write` (a crash mid-write MUST NOT leave a half-written config, principle #8) and MUST first snapshot the prior **file** content to a **dedicated config-snapshot location** so the change is rollback-able to byte-faithful prior content. The snapshot MUST NOT reuse memory's `.versions/` machinery (that surface is memory-scoped per spec/02/spec/20; governance is config, not a memory note), and the JSONL audit line MUST NOT be treated as the rollback source (an audit record is not restorable file content, and recoverability MUST NOT depend on the observability stream being readable — cf. #497/#498 degraded-read posture). The snapshot is taken BEFORE overwrite; the audit (M8) is appended AFTER, so rollback never depends on the audit having been written.
 
 **M4 — Validate before write.** A verb MUST validate field names AND values (schema + enums + formats) AND applicable composition gates BEFORE step 2 (preview). Invalid input MUST be refused with a clear, named error and a non-zero exit, and MUST NOT write or partially write.
 
@@ -155,11 +180,11 @@ atomic-agents manage govern <agent> --show
 
 **M6 — Copilot properties.** Every verb MUST support `--json` (structured output incl. the structured refusal reason) and MUST be fully drivable with flags (no required interactive prompt). The only interactive element permitted is the TTY confirm of M5, which `--yes` always satisfies.
 
-**M7 — Registry-resolved target.** A verb MUST resolve and load its target agent through `AgentRegistryBackend`, not by direct filesystem walking, so it works against any registered registry backend.
+**M7 — Registry-resolved target; verb-side write.** A verb MUST resolve and load its target agent through `AgentRegistryBackend`, not by direct filesystem walking, so it works against any registered registry backend. The **write** then goes to the registry-resolved location via `_io.atomic_write` (M3); the `AgentRegistryBackend` protocol stays read-only discovery and is NOT extended with a governance-write method (see S1; arc #624 fork `registry-write-seam`).
 
-**M8 — Audited with identity.** Every applied write MUST append a management event through `LogBackend` carrying the principal_id (from the resolved Principal — `LOCAL_PRINCIPAL` for the home user), timestamp, agent name, changed fields, and before→after values. A dropped audit write MUST surface a non-fatal warning, never fail silently.
+**M8 — Audited with identity, on the existing audit shape (decided — arc #624 fork `audit-record-shape`).** Every applied write MUST append a management event through `LogBackend` as a `RunRecord` — NOT a new event dataclass (which would require widening the LOCKED `LogBackend.append()` signature) — following the established non-LLM-event precedent (`policy_decision`, `mandate_reservation`). The record uses a dedicated primitive `PRIMITIVE_MANAGE_GOVERN = "manage_govern"`, `model="n/a"`, `input_tokens=0`/`output_tokens=0`, a named `status` value, and carries `principal_id` (from the resolved Principal — `LOCAL_PRINCIPAL` for the home user), `changed_fields`, `before`, and `after` in `extra{}`. These `extra{}` key names + the primitive id + the status vocabulary are pinned NORMATIVELY here so every later verb (set-model, set-goal, apply-rec) emits the same shape. The event is written to BOTH scopes (decided — arc #624 fork `logbackend-scope`): the target agent's per-agent `LogBackend` AND a fleet-level management `LogBackend` at `agents_root` (two append-only copies of one immutable event — the home user sees it in the agent's own log with zero extra machinery; the fleet stream survives the agent's deletion). A dropped audit write MUST surface a non-fatal warning, never fail silently, and (per M3) MUST NOT compromise rollback. Before/after values are operator-authored config (not new secrets), kept inline; the verb MUST redact known-secret-shaped fields at the echo site (the project's redact-at-echo rule) and cap string length the way `summary` is capped.
 
-**M9 — Compose, never bypass.** A verb that sets a value the agent runtime would reject MUST refuse at write time (e.g. a model not in `_costs.PRICING`/caps, or disallowed by `policy.md`). A management write MUST NOT produce a config the agent cannot honor.
+**M9 — Compose, never bypass (per-field scoped; decided — arc #624 fork `composition-gates-for-govern`).** A verb that sets a value the agent runtime would reject MUST refuse at write time (e.g. a model not in `_costs.PRICING`/caps, or disallowed by `policy.md`). A management write MUST NOT produce a config the agent cannot honor. **For `govern` specifically, the composition set is EMPTY by design:** every governance field is descriptive metadata with no runtime-rejection counterpart (verified — no runtime gate reads governance), so S2 step 1's composition check resolves to enum/format validation (M4) with zero additional gates. This is a documented intentional empty set, NOT an unimplemented step. The composition set becomes non-empty for runtime-effective verbs (set-model composes with PRICING/caps/policy); if a future GovernanceRecord field ever becomes runtime-enforced, its non-empty composition set is recorded in this per-field scoping.
 
 **M10 — No authority escalation.** A verb MUST NOT perform any action the operator could not already perform with direct write access to the agent folder. The CLI is a validated path to those edits, not a privilege grant.
 
