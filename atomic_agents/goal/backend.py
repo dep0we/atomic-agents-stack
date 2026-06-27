@@ -28,8 +28,22 @@ Protocol method surface — HYBRID design (per arc ruling):
                             Filesystem impl uses fcntl.flock; a Postgres impl
                             uses a SQL transaction (which does add rollback).
 
+  Multi-goal addressing (spec/41 #642 addendum):
+    create_goal()         — atomically create a new addressed run-goal at
+                            goals/<goal_id>/ with O_EXCL collision semantics
+    list_goals()          — enumerate all goal_ids: '_standing' (if goal.md
+                            exists) + addressed run-goals under goals/
+
   Capability advertisement:
     capabilities()        — return GoalCapabilities
+
+Separate AddressableGoalBackend Protocol (spec/41 #642):
+    for_goal(goal_id)     — thin scope-handle factory; returns a view satisfying
+                            the GoalBackend contract scoped to the addressed goal.
+                            Mirrors LockBackend.scope() precedent. The twelve
+                            pre-#642 GoalBackend signatures stay BYTE-IDENTICAL.
+                            Operators MUST check isinstance(backend,
+                            AddressableGoalBackend) before calling for_goal().
 
 Pure computation stays ABOVE the Protocol in GoalManager:
   legal-transition rules, cycle detection (_would_cycle), evaluate_completion,
@@ -323,6 +337,100 @@ class GoalBackend(Protocol):
         """
         ...
 
+    def create_goal(
+        self,
+        agent_id: str,
+        goal_id: str,
+        goal: Goal,
+        when: date | None = None,
+    ) -> Goal:
+        """Atomically create a new addressed run-goal at goals/<goal_id>/.
+
+        Implements O_EXCL collision semantics via lock-guarded existence check:
+        under the per-goal lock, check goal.md absence, raise GoalAlreadyExists
+        if present, then probe serializability and write atomically. The lock
+        serializes the check+write so no TOCTOU race exists.
+
+        Write ordering (mirrors MUST 6 exactly):
+          1. Validate goal_id (charset + reserved-name) — before any disk I/O.
+          2. Stamp goal.created from `when` (or date.today() when None).
+          3. Build goal_created event dict (ts-first per JSONL key ordering).
+          4. Acquire per-goal lock.
+          5. Check goal.md absence → raise GoalAlreadyExists if present.
+          6. json.dumps(goal_created_event) pre-probe (serializability gate,
+             BEFORE any goal.md/JSONL write — fails closed; no goal state is
+             committed if it raises. An empty goals/<goal_id>/ directory may
+             remain — see partial-create debris in MUST 11 / the module docstring).
+          7. atomic_write goal.md (goals/<goal_id>/goal.md).
+          8. atomic_append_jsonl goal_created event to goals/<goal_id>/goal_history.jsonl.
+
+        The goal_created JSONL event schema:
+          {ts, event:'goal_created', goal_id, intent, created, schema_version,
+           conductor_run_id?}
+          ts is FIRST (JSONL key ordering MUST). conductor_run_id is OMITTED
+          (not set to None) for home-user goals — the key is absent.
+
+        Note: create_goal() MUST stamp goal.created from `when` (overriding any
+        value the caller placed on the Goal object). This is the single exception
+        to MUST 4's write-verbatim rule, which applies to save_goal() only.
+        See spec/41 #642 addendum for the distinct MUST.
+
+        Args:
+            agent_id: the agent directory name (unused in filesystem impl).
+            goal_id: the addressed goal identifier. Must match [a-z0-9_-]{1,64}
+                and MUST NOT equal STANDING_GOAL_ID ('_standing').
+            goal: a fully-constructed, validated Goal object. The backend stamps
+                goal.created from `when` before persisting.
+            when: the date to stamp as goal.created and the goal_created event's
+                `created` field. Defaults to date.today() when None.
+
+        Returns:
+            The persisted Goal (with goal.created stamped from `when`).
+
+        Raises:
+            ValueError: when goal_id fails charset validation or is the reserved
+                STANDING_GOAL_ID ('_standing') — the reserved-name check raises
+                ValueError, NOT GoalAlreadyExists (it is a rejection, not a
+                collision).
+            GoalAlreadyExists: when a goal with that goal_id already exists.
+            SchemaValidationError: when the goal fails validate_goal().
+            PathTraversalError: when goals/<goal_id> or a write leaf (goal.md /
+                goal_history.jsonl) resolves outside the agent vault perimeter
+                (a symlinked goal dir or leaf is refused before any byte is
+                written — spec/41 #642).
+        """
+        ...
+
+    def list_goals(self, agent_id: str) -> list[str]:
+        """Enumerate all goal_ids for this agent.
+
+        Returns a sorted list containing:
+        - STANDING_GOAL_ID ('_standing') when agent_root/goal.md is present.
+        - One entry per addressed run-goal whose goals/<id>/goal.md exists
+          and whose id passes the [a-z0-9_-]{1,64} charset allow-list.
+
+        Empty goals/ directories (partial create_goal()) are SKIPPED —
+        list_goals() requires goals/<id>/goal.md to be present, not just the
+        directory. This makes list_goals() / for_goal() / load_goal() consistent
+        (no list entry that load_goal() would then fail on).
+
+        Return ordering: sorted() — '_standing' sorts before alphabetic (a-z)
+        run-goal names ('_' (95) < 'a' (97) in ASCII), but it is NOT
+        unconditionally first: a goal_id beginning with '-' (45) or a digit (48)
+        sorts before '_standing'. No code depends on the position.
+        Conformance tests assert assert result == sorted(result).
+
+        Returns:
+            Sorted list of goal_id strings. [] when no goals exist.
+
+        Raises:
+            Never raises FileNotFoundError (absent goals/ → empty list). May
+            raise PathTraversalError from the standing goal.md containment check
+            (the only _require_within_root call in list_goals) if agent_root/
+            goal.md resolves outside the vault.
+        """
+        ...
+
     def export(self, query: Any = None) -> GoalExport:
         """Export goal state as a canonical GoalExport (spec/40 Exportable).
 
@@ -339,6 +447,12 @@ class GoalBackend(Protocol):
         UTF-8, LF, no-BOM throughout (spec/40 MUST 5). The filesystem impl
         normalizes CRLF → LF in all exported bytes.
 
+        FAIL-LOUD GUARD (spec/41 #642): when the agent has any addressed goals
+        (goals/<id>/goal.md present), export() MUST raise before reading any
+        bytes. The guard fires as the FIRST operation. See issue #643 for the
+        multi-goal export extension. The guard predicate requires at least one
+        valid goals/*/goal.md — an empty goals/ directory does NOT trigger it.
+
         Args:
             query: unused (reserved for future bounded-export filtering).
 
@@ -346,6 +460,10 @@ class GoalBackend(Protocol):
             GoalExport with goal_md_bytes, history_records_with_bytes, and
             archived_goals_with_bytes. Each component is empty (b"" / [] / [])
             when the corresponding file/directory is absent.
+
+        Raises:
+            AtomicAgentsError: when the agent has addressed run-goals (guard
+                fires before any bytes are read; points at #643).
         """
         ...
 
@@ -358,5 +476,56 @@ class GoalBackend(Protocol):
 
         Conformance tests assert claim-vs-behavior parity. Honest capabilities
         let callers fail fast against incompatible backends.
+        """
+        ...
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# AddressableGoalBackend Protocol (spec/41 #642)
+# SEPARATE from GoalBackend — mirrors LockBackend.scope() precedent.
+# The twelve pre-#642 GoalBackend signatures are BYTE-IDENTICAL.
+
+
+@runtime_checkable
+class AddressableGoalBackend(Protocol):
+    """Thin scope-handle factory for multi-goal agents (spec/41 #642).
+
+    SEPARATE Protocol from GoalBackend — mirrors LockBackend.scope() precedent.
+    The twelve pre-#642 GoalBackend signatures stay BYTE-IDENTICAL. This Protocol
+    adds only for_goal(goal_id), which returns a scoped view satisfying the
+    full GoalBackend contract for the addressed goal.
+
+    Callers MUST check isinstance(backend, AddressableGoalBackend) before
+    calling for_goal() — this is the runtime gate. Do NOT call for_goal() on
+    a bare GoalBackend that doesn't implement this Protocol.
+
+    Routing contract:
+    - for_goal(STANDING_GOAL_ID) or for_goal(None): returns a GoalBackend
+      scoped to agent_root/ (i.e., agent_root/goal.md, goal_history.jsonl,
+      etc. — UNCHANGED from the standing-goal layout). Backward-compat alias.
+    - for_goal(other_id): returns a GoalBackend scoped to
+      agent_root/goals/<other_id>/ (own goal.md, goal_history.jsonl,
+      goal_archive/, .goal.lock). Per-goal lock granularity: concurrent
+      run-goals never block each other.
+
+    FilesystemGoalBackend implements both GoalBackend AND AddressableGoalBackend.
+    """
+
+    def for_goal(self, goal_id: str | None) -> GoalBackend:
+        """Return a GoalBackend view scoped to the addressed goal.
+
+        Args:
+            goal_id: the goal identifier. STANDING_GOAL_ID ('_standing') or
+                None routes to the standing goal (agent_root/goal.md).
+                Any other valid goal_id routes to goals/<goal_id>/.
+
+        Returns:
+            A GoalBackend instance whose paths are all scoped to the addressed
+            goal's directory. The returned backend satisfies the full GoalBackend
+            contract (all 13 methods + the backend_id property — 14 protocol
+            attributes as of #642).
+
+        Raises:
+            ValueError: when goal_id is not None and fails charset validation.
         """
         ...

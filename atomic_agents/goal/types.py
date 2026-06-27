@@ -18,6 +18,7 @@ backward-compatible additive extension.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -36,6 +37,75 @@ CURRENT_GOAL_SCHEMA_VERSION = 1
 VALID_SUB_GOAL_STATUSES = {"pending", "in_progress", "complete", "blocked", "abandoned"}
 VALID_PRIORITIES = {"high", "medium", "low"}
 VALID_AGENT_MODES = {"reactive", "goal-driven", "hybrid"}
+
+# ──────────────────────────────────────────────────────────────────
+# Multi-goal addressing constants (spec/41 #642)
+
+# The canonical address for the standing goal (agent_root/goal.md).
+# goal_id=None is a backward-compat alias; for_goal(None) == for_goal('_standing').
+# '_standing' passes the charset allow-list ([a-z0-9_-]) so it must be
+# explicitly reserved and rejected by create_goal() before charset validation.
+STANDING_GOAL_ID = "_standing"
+
+# Maximum length for a goal_id.
+# 64 chars — a conservative limit well under the 255-byte NAME_MAX per-component
+# filesystem limit, chosen for shell usability and readable directory names.
+_GOAL_ID_MAX_LEN = 64
+
+# Compiled allow-list regex: lowercase letters, digits, hyphen, underscore.
+# Does NOT include uppercase, slash, dot, whitespace, or NUL.
+# Anchored with \A...\Z (NOT ^...$): in Python, $ also matches just before a
+# single trailing newline, so "abc\n" would slip the allow-list and become a
+# real directory name. \Z matches ONLY the true end of string — no trailing-
+# newline allowance. (charset-bypass class — MEMORY identity_backend_security_lenses.)
+_GOAL_ID_RE = re.compile(r"\A[a-z0-9_-]{1,%d}\Z" % _GOAL_ID_MAX_LEN)
+
+
+def validate_goal_id(goal_id: str) -> None:
+    """Validate a goal_id for use in create_goal() and for_goal().
+
+    Two independent layers (spec/41 #642, goal-id-validation-containment ruling):
+    1. Strict allow-list charset: lowercase [a-z0-9_-], 1–64 chars.
+       REJECTS loudly: empty, leading-dot, '..', path separators, NUL,
+       ASCII/Unicode whitespace, uppercase letters, any char not in [a-z0-9_-].
+       Does NOT normalize or slugify — reject means reject.
+    2. Reserved-name check: STANDING_GOAL_ID ('_standing') is unconditionally
+       rejected even though it passes the charset test (underscore is allowed).
+
+    Callers: create_goal() and GoalManager.for_goal().
+    FilesystemGoalBackend.for_goal() applies the charset regex (_GOAL_ID_RE)
+    directly rather than this function, because it must accept the reserved
+    '_standing'/None alias that validate_goal_id() rejects.
+    The path-traversal resolve-then-verify-under-root guard is a separate,
+    independent layer applied at the filesystem level.
+
+    Raises:
+        ValueError: with a descriptive message identifying which rule was violated.
+    """
+    if not isinstance(goal_id, str) or not goal_id:
+        raise ValueError(f"goal_id must be a non-empty string; got {goal_id!r}")
+    # Reserved-name check FIRST (before charset) — _standing passes the charset
+    # allow-list and would not be caught by the regex.
+    if goal_id == STANDING_GOAL_ID:
+        raise ValueError(
+            f"goal_id {goal_id!r} is reserved for the standing goal "
+            f"(agent_root/goal.md). Use for_goal('_standing') or "
+            f"for_goal(None) to address the standing goal; call "
+            f"create_goal() only for run-goals with a unique goal_id."
+        )
+    # Charset allow-list: [a-z0-9_-], 1–64 chars.
+    if not _GOAL_ID_RE.match(goal_id):
+        if len(goal_id) > _GOAL_ID_MAX_LEN:
+            raise ValueError(
+                f"goal_id {goal_id!r} exceeds the {_GOAL_ID_MAX_LEN}-character "
+                f"maximum (got {len(goal_id)} chars). Use a shorter identifier."
+            )
+        raise ValueError(
+            f"goal_id {goal_id!r} contains invalid characters. "
+            f"Only lowercase letters (a-z), digits (0-9), hyphens (-), and "
+            f"underscores (_) are allowed. Got: {goal_id!r}"
+        )
+
 
 # The SubGoal fields the apply_transition() `fields` channel is permitted to set.
 # Explicit ALLOW-set (fails closed): `id`/`label` are immutable identity and
@@ -150,6 +220,10 @@ class GoalCapabilities:
             append_history_event(); history records are enumerable only via
             export() — there is no dedicated history-query method on the
             Protocol. FilesystemGoalBackend=True.
+        supports_multi_goal: True when the backend implements create_goal(),
+            list_goals(), and (via AddressableGoalBackend) for_goal().
+            FilesystemGoalBackend=True. Default False so a backend that has not
+            adopted #642 multi-goal addressing constructs without this kwarg.
 
     Field ordering: backend_id (required, no default) first so positional
     construction GoalCapabilities("filesystem") is meaningful; capability
@@ -161,6 +235,15 @@ class GoalCapabilities:
     supports_canonical_export: bool = False
     supports_archive: bool = False
     supports_history_query: bool = False
+    supports_multi_goal: bool = False
+    """True when the backend also implements AddressableGoalBackend.
+
+    An operator calling for_goal(goal_id) MUST check
+    isinstance(backend, AddressableGoalBackend) (the runtime gate) rather than
+    checking this flag alone — this flag is the honest capability advertisement
+    for use in health checks and operator tooling. FilesystemGoalBackend=True.
+    Spec/41 #642 addendum.
+    """
 
 
 # ──────────────────────────────────────────────────────────────────
