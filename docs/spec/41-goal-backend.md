@@ -1,6 +1,6 @@
 # spec/41: GoalBackend Protocol
 
-> **Status:** LOCKED — Protocol scaffold: #425 PR1 (2026-06-11); write-path adoption: #448 PR1 (2026-06-13); audit + CAS conformance: #448 PR2 (2026-06-13); coordinator + fail-closed cost gate + spec/41 LOCK: #448 PR3 (2026-06-13); clock-injection addendum + GoalManager shim + agent_root resolution: #483 PR1 (2026-06-13); backend-universe alignment (coordinator threads log/policy/profile backends into OutcomeRunner): #496 PR1 (2026-06-14). Conformance suite covers all 10 Implementer Contract MUSTs for `FilesystemGoalBackend` (`test_goal_backend_conformance.py`, 60 tests) plus filesystem-specific tests (`test_goal_filesystem.py`) and coordinator integration tests (`test_goal_coordinator.py`, 21 tests). Goal is also registered in the shared #379 export conformance harness (`test_export_protocol_conformance.py`) and the capability-advertisement harness (`test_export_capability_advertisement.py`: 2 goal-specific tests — `test_goal_backend_advertises_canonical_export`, `test_goal_backend_is_exportable` — plus the shared `test_all_capability_flags_are_bool` parametrization extended to cover goal). The four pre-existing goal tests (`test_goal.py`, `test_agent_goal_loading.py`, `test_dashboard_goals.py`, `test_goal_outcome_composition.py`) remain the zero-behavior-change regression guard (assertions unchanged); archive golden assertions updated in #448 PR1 for the A3 data-loss fix (the one sanctioned exception to the freeze), and the `test_goal_outcome_composition.py` `agent_with_goal` fixture gained a minimal `persona/IDENTITY.md` in #448 PR3 so the shim can construct the real `AtomicAgent` the now-live cost gate requires (fixture-only; every assertion is byte-identical).
+> **Status:** LOCKED — Protocol scaffold: #425 PR1 (2026-06-11); write-path adoption: #448 PR1 (2026-06-13); audit + CAS conformance: #448 PR2 (2026-06-13); coordinator + fail-closed cost gate + spec/41 LOCK: #448 PR3 (2026-06-13); clock-injection addendum + GoalManager shim + agent_root resolution: #483 PR1 (2026-06-13); backend-universe alignment (coordinator threads log/policy/profile backends into OutcomeRunner): #496 PR1 (2026-06-14); **multi-goal addressing + create_goal RE-LOCK: #642 PR1 (2026-06-26)**. Conformance suite covers all 13 Implementer Contract MUSTs for `FilesystemGoalBackend` (`test_goal_backend_conformance.py`, 60 tests + `test_goal_multigoal_642.py`, TEST 60–129, 74 collected) plus filesystem-specific tests (`test_goal_filesystem.py`) and coordinator integration tests (`test_goal_coordinator.py`, 21 tests). Goal is also registered in the shared #379 export conformance harness (`test_export_protocol_conformance.py`) and the capability-advertisement harness (`test_export_capability_advertisement.py`: 2 goal-specific tests — `test_goal_backend_advertises_canonical_export`, `test_goal_backend_is_exportable` — plus the shared `test_all_capability_flags_are_bool` parametrization extended to cover goal). The four pre-existing goal tests (`test_goal.py`, `test_agent_goal_loading.py`, `test_dashboard_goals.py`, `test_goal_outcome_composition.py`) remain the zero-behavior-change regression guard (assertions unchanged); archive golden assertions updated in #448 PR1 for the A3 data-loss fix (the one sanctioned exception to the freeze), and the `test_goal_outcome_composition.py` `agent_with_goal` fixture gained a minimal `persona/IDENTITY.md` in #448 PR3 so the shim can construct the real `AtomicAgent` the now-live cost gate requires (fixture-only; every assertion is byte-identical).
 
 ---
 
@@ -96,6 +96,8 @@ Two distinct concerns are easy to conflate here; the backend enforces exactly on
 
 ## Protocol surface
 
+The GoalBackend Protocol exposes **14 protocol attributes** as of #642 (13 methods + the `backend_id` property); the pre-#642 LOCK surface was 12 attributes (11 methods + the property). The twelve pre-#642 signatures are byte-identical; `create_goal()` and `list_goals()` are new first-class Protocol methods; `export()` gains a normative fail-loud guard. `for_goal()` is NOT on `GoalBackend` — it lives on the separate `AddressableGoalBackend` Protocol.
+
 ```python
 @runtime_checkable
 class GoalBackend(Protocol):
@@ -133,13 +135,39 @@ class GoalBackend(Protocol):
     def export(self, query: Any = None) -> GoalExport: ...
     def export_all(self) -> GoalExport: ...
     def capabilities(self) -> GoalCapabilities: ...
+
+    # New in #642 — MUST 11 and MUST 12
+    def create_goal(
+        self,
+        agent_id: str,
+        goal_id: str,
+        goal: Goal,
+        when: date | None = None,
+    ) -> Goal: ...
+    def list_goals(self, agent_id: str) -> list[str]: ...
 ```
+
+`AddressableGoalBackend` is a **separate** `@runtime_checkable` Protocol that carries only the scope-handle factory. It MUST NOT inherit from `GoalBackend`.
+
+```python
+@runtime_checkable
+class AddressableGoalBackend(Protocol):
+    """Thin scope-handle factory for multi-goal agents (MUST 13).
+
+    Callers MUST check isinstance(backend, AddressableGoalBackend) before
+    calling for_goal(). FilesystemGoalBackend implements both GoalBackend
+    and AddressableGoalBackend.
+    """
+    def for_goal(self, goal_id: str | None) -> GoalBackend: ...
+```
+
+**Breaking change for third-party GoalBackend authors.** Adding `create_goal()` and `list_goals()` to `GoalBackend.__protocol_attrs__` means any existing class that satisfies `isinstance(obj, GoalBackend)` via the runtime_checkable check must now also provide these two methods or the check will fail. A stub that raises `NotImplementedError` preserves Protocol membership but MUST advertise `supports_multi_goal=False` (capability honesty, MUST 2).
 
 ---
 
 ## Capability advertisement
 
-`GoalCapabilities` is a frozen dataclass with four fields:
+`GoalCapabilities` is a frozen dataclass with **five** fields (one added in #642):
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
@@ -147,8 +175,9 @@ class GoalBackend(Protocol):
 | `supports_canonical_export` | `bool` | `False` | Implements `export()` per spec/40 |
 | `supports_archive` | `bool` | `False` | Implements `archive_goal()` and `list_archived()` |
 | `supports_history_query` | `bool` | `False` | Implements `append_history_event()`; history is enumerable only via `export()` — there is no dedicated history-query method on the Protocol |
+| `supports_multi_goal` | `bool` | `False` | Implements `create_goal()`, `list_goals()`, and (via AddressableGoalBackend) `for_goal()` |
 
-`FilesystemGoalBackend` advertises all three capability flags as `True`.
+The new field is appended last to preserve positional backward-compatibility (`GoalCapabilities(backend_id='x')` still constructs with all defaults False). `FilesystemGoalBackend` advertises all five flags as `True`.
 
 ---
 
@@ -158,9 +187,9 @@ class GoalBackend(Protocol):
 
 ---
 
-## Implementer Contract (10 MUSTs)
+## Implementer Contract (13 MUSTs)
 
-These MUSTs bind every conforming GoalBackend implementation. The conformance test suite in `tests/test_goal_backend_conformance.py` covers all ten (60 tests total, including 2 CAS tests at TEST 54–55 and 4 clock-injection / key-ordering tests at TEST 56–59).
+These MUSTs bind every conforming GoalBackend implementation (MUST 1–12 are GoalBackend; MUST 13 binds the separate AddressableGoalBackend Protocol). The conformance test suite in `tests/test_goal_backend_conformance.py` covers the original 10 MUSTs (60 tests total, including 2 CAS tests at TEST 54–55 and 4 clock-injection / key-ordering tests at TEST 56–59). MUST 11 and MUST 12 are covered by `tests/test_goal_multigoal_642.py` (TEST 60–129, 74 collected). MUST 13 (AddressableGoalBackend) is covered by TEST 72–74 and TEST 93–98.
 
 ### MUST 1 — Side-effect-free construction
 
@@ -372,3 +401,150 @@ The `GoalManager.archive()` / `abandon()` runtime boundary (above the Protocol) 
 - The `GoalManager.archive(reason)` public signature: unchanged (`returns Path`; thin shim behavior-compatible).
 - `AtomicAgent.goal_backend` public attribute: unchanged.
 - All pre-existing conformance tests (TEST 1–55): no behavioral change, all passing.
+
+---
+
+## Addendum — #642 (2026-06-26): multi-goal addressing + create_goal RE-LOCK
+
+This addendum records the Protocol surface additions and behavioral contracts introduced in #642 PR1. Because the new methods (`create_goal`, `list_goals`) exceed the addendum pattern (they are first-class `__protocol_attrs__` entries, not keyword-only extensions to existing methods), a **full re-LOCK ceremony** was required. The spec status was updated from LOCKED (10 MUSTs) to LOCKED (13 MUSTs) — three new MUSTs were added (MUST 11 `create_goal`, MUST 12 `list_goals` on GoalBackend; MUST 13 `for_goal` on the separate AddressableGoalBackend Protocol).
+
+### New protocol methods
+
+Two methods added to `GoalBackend`, one method added via `AddressableGoalBackend`:
+
+| Method | Contract | MUST |
+|--------|----------|------|
+| `create_goal(agent_id, goal_id, goal, when=None) -> Goal` | refuse-on-COMPLETE / complete-on-PARTIAL collision semantics; MUST 11 | MUST 11 |
+| `list_goals(agent_id) -> list[str]` | sorted; includes `'_standing'`; MUST 12 | MUST 12 |
+| `for_goal(goal_id) -> GoalBackend` | on AddressableGoalBackend only | MUST 13 |
+
+### MUST 11 — `create_goal()` atomicity and collision semantics
+
+`create_goal(agent_id, goal_id, goal, when=None)` MUST atomically create a new addressed run-goal at `goals/<goal_id>/`. All of the following are REQUIRED:
+
+1. **charset validation before I/O.** `goal_id` MUST match `[a-z0-9_-]{1,64}`. STANDING_GOAL_ID (`'_standing'`) is reserved and MUST be rejected before the charset check (because it passes the charset regex). Rejection is loud (`ValueError`); no normalize-or-slugify behavior.
+2. **MUST stamp `goal.created` from `when`.** The backend resolves `today = (when or date.today()).isoformat()` and writes `goal.created = today`, overriding any caller-supplied value. This is the single normative exception to MUST 4's write-verbatim rule (`create_goal` has different stamping semantics).
+3. **Collision semantics — refuse-on-COMPLETE, heal-only-the-genuine-PARTIAL, fail-closed on ambiguity (recoverability refinement).** Evaluated UNDER the per-goal lock against `goals/<goal_id>/`. The complete decision table:
+   - `goal.md` ABSENT → create normally (write `goal.md`, then append the `goal_created` event).
+   - `goal.md` PRESENT, `goal_history.jsonl` ABSENT or EMPTY / whitespace-only → a **genuine PARTIAL** / half-created state (goal.md landed but the audit line never did — the rare post-goal.md I/O-failure outcome). The backend MUST **complete it**: append the missing `goal_created` event and return the goal, making `create_goal()` idempotent / self-healing over a partial create. On this path the **persisted `goal.md` is AUTHORITATIVE** — the supplied `goal` argument's body MUST NOT be re-written; the appended event is built **ENTIRELY from the persisted goal** (`intent`/`created`/`schema_version` AND `conductor_run_id` all read off the reloaded goal — "persisted wins" for every field, no field is sourced from the supplied `goal` arg).
+   - `goal.md` PRESENT, `goal_history.jsonl` contains a `goal_created` event → the goal is **COMPLETE** → the backend MUST raise `GoalAlreadyExists` (subclass of `AtomicAgentsError`) **with no write to goal.md and no JSONL append**. No overwrite, no upsert.
+   - `goal.md` PRESENT, `goal_history.jsonl` contains events but **no** `goal_created` event → **FAIL CLOSED**: the backend MUST raise (the reference impl raises `GoalAlreadyExists` with a clear message naming the scoped `goals/<id>/goal.md` and history path). A goal with transition events but no creation marker was authored via `save_goal()` / `apply_transition()` (which do NOT emit `goal_created`); it is corrupt/ambiguous, NOT a clean partial. Healing it would mint a spurious, mis-ordered `goal_created` over a legitimately-authored goal. The classifier MUST distinguish absent/empty history (heal) from has-events-but-no-creation (fail closed).
+   - `goal.md` PRESENT but `goal_history.jsonl` cannot be read or a line cannot be parsed (completeness is undeterminable) → **FAIL CLOSED**: the backend MUST raise (the reference impl raises `GoalAlreadyExists` with a clear message) rather than silently complete or overwrite an ambiguous state.
+
+   Also under the lock: if `goals/<goal_id>` exists as a regular **file** (not a directory), the backend MUST raise `GoalAlreadyExists` with an actionable message (the `goals/` tree is framework-reserved) rather than leaking the raw `FileExistsError` the lock's lazy `mkdir` would otherwise surface. This MUST hold even when the file is **raced** into place between the pre-lock stray-file check and the lock's `mkdir` (TOCTOU): the reference impl catches the `FileExistsError` from the lock-acquire/`mkdir` path and re-raises it as `GoalAlreadyExists` so the raw `OSError` never escapes the documented Raises contract.
+4. **MUST 6 ordering mirror.** Inside the lock, on the fresh-create path:  `json.dumps(goal_created_event)` pre-probe FIRST (raises before any `goal.md`/`goal_history.jsonl` write if non-serializable — no goal state is committed, though an empty `goals/<goal_id>/` directory may already exist from the lock's lazy `mkdir`; see partial-create debris below), then `atomic_write(goal.md)`, then `atomic_append_jsonl(goal_history.jsonl)`. The reverse (JSONL before goal.md) is a conformance violation. On the complete-on-partial path the goal.md already exists, so only the `json.dumps` pre-probe + `atomic_append_jsonl(goal_history.jsonl)` run.
+5. **goal_created JSONL schema.** The appended JSONL line MUST contain `{ts, event: "goal_created", goal_id, intent, created, schema_version}`. `ts` MUST be the first key. `conductor_run_id` MUST be **absent** (not `None`) for home-user goals (it is present only when the conductor threads it — Conductor is out of scope for this PR).
+6. **per-goal lock granularity.** The lock file MUST be `goals/<goal_id>/.goal.lock`. Concurrent `create_goal()` calls for **different** goal_ids MUST NOT contend on the same lock. The completeness check and the complete-or-refuse decision MUST happen under the SAME lock as the write (TOCTOU-safe).
+
+Two-layer containment: charset allow-list validation (`validate_goal_id`) is the first layer; the canonical resolve-and-verify guard is the second independent layer, applied at **every** I/O boundary — NOT to the parent `goals/` alone. The guard MUST (a) resolve-and-verify the ACTUAL create target directory `goals/<goal_id>` (checking the parent does not contain a symlinked `goals/<goal_id>` that escapes the vault — the escape is at the child node) AND (b) re-resolve-and-verify each write leaf it opens — both `goals/<goal_id>/goal.md` AND `goals/<goal_id>/goal_history.jsonl` — before opening it. (b) is load-bearing because `goal_history.jsonl` is opened in append mode, which FOLLOWS a symlink: a pre-planted symlinked history leaf inside an otherwise-contained goal dir would otherwise write the `goal_created` audit line OUTSIDE the vault (Principle #5). The reference impl satisfies both by routing `create_goal`'s writes through the `for_goal(goal_id)`-scoped backend's `_goal_lock()`/`_write_goal()`/`_append_jsonl()`, each of which calls `_require_within_root` on its leaf; it additionally **verifies BOTH write leaves up front** (before the goal.md write) so a planted symlinked history leaf is an all-or-nothing REFUSE — no goal.md is committed when the sibling leaf escapes. Both layers (charset + per-boundary containment) MUST be present.
+
+Partial-create debris acknowledgment: a failed `create_goal()` (directory created, goal.md not written) may leave an empty `goals/<goal_id>/` directory. `list_goals()` MUST skip these (see MUST 12). Cleanup is tracked in #643.
+
+Single-writer assumption (#642 follow-up, Codex #1): `create_goal()`'s atomicity holds against other LOCK-TAKING writers on the same `goal_id` — `apply_transition()`, `archive_goal()`, and `create_goal()` all share the per-goal lock and therefore serialize. It does NOT hold against a concurrent LOCK-FREE `save_goal()` on the SAME `goal_id` during the create window: `save_goal()` bypasses the per-goal lock, so a racing `save_goal()` violates the framework's single-writer-per-goal model and may interleave with the create. Serializing multiple writers on one `goal_id` (conflict keys / queue-behind-decision) is the conductor's concern, tracked in #655. This is a documented assumption, not a behavior change.
+
+### MUST 12 — `list_goals()` enumeration
+
+`list_goals(agent_id) -> list[str]` MUST return a sorted list of all goal_ids for this agent:
+
+- Include `STANDING_GOAL_ID` (`'_standing'`) when `<agent_root>/goal.md` is a regular file.
+- Include any `goals/<id>` where `id` matches `[a-z0-9_-]{1,64}`, `id != STANDING_GOAL_ID`, and `goals/<id>/goal.md` is a regular file (presence predicate — directories without goal.md are skipped).
+- Return `sorted(result)` — `'_standing'` naturally appears before alpha names because `'_' < 'a'` in ASCII.
+- MUST NOT raise when `goals/` is absent, when it is empty, or when it contains non-conforming entries.
+- MUST return `[]` for a reactive agent with no goal.md and no goals/ directory.
+
+**Containment consistency (#642 follow-up, Codex #3).** Each enumerated candidate MUST also pass the SAME resolve-and-verify-under-root containment guard `for_goal()` applies (`_require_within_root` in the reference impl), and the `goals/` directory itself MUST be contained. An escaping symlinked `goals/<id>` directory whose `goals/<id>/goal.md` resolves OUTSIDE the vault root MUST be SKIPPED (not listed), and if `agent_root/goals` itself resolves outside the vault it MUST be treated as no addressed goals. This makes a listed id one that `for_goal(<id>)` can actually open — closing the prior list/`for_goal` asymmetry where an escaping entry was listed here yet refused with `PathTraversalError` by `for_goal()`, which let discovery/doctor/resume hand out a goal_id the backend could not open (a durability-consistency footgun). The containment check only ADDS to the charset + presence predicates; it does not relax them.
+
+### MUST 13 — `AddressableGoalBackend.for_goal()` routing
+
+`AddressableGoalBackend` is a **separate** `@runtime_checkable` Protocol (not a subclass of `GoalBackend`). Its single method is `for_goal(goal_id: str | None) -> GoalBackend`.
+
+Routing contract:
+
+- `goal_id is None` or `goal_id == STANDING_GOAL_ID`: return a backend scoped to `agent_root/`. The returned backend's `_goal_path` MUST be `agent_root/goal.md` (byte-identical to the pre-#642 standing-goal layout).
+- Any other valid `goal_id`: return a backend scoped to `agent_root/goals/<goal_id>/`. The returned backend's `_goal_path` MUST be `agent_root/goals/<goal_id>/goal.md`.
+- An invalid `goal_id` (fails charset) MUST raise `ValueError` before any I/O.
+- A `goals/<goal_id>` that resolves OUTSIDE the vault (a symlinked goal dir escaping the perimeter) MUST be refused with `PathTraversalError` **before the scoped backend is constructed** — parity with `create_goal`'s leaf containment. Without this, the scoped backend's construction-time `resolve()` would re-anchor its containment root on the escaped target, and a subsequent scoped write could land outside the vault. (Within-vault symlinks remain in the T15 trust zone.) The same parity applies to `GoalManager.for_goal()` in the reference impl.
+
+The returned backend implements the full `GoalBackend` contract scoped to the target directory. Per-goal lock granularity is preserved: `for_goal('run-a').apply_transition(…)` and `for_goal('run-b').apply_transition(…)` MUST NOT share a lock.
+
+Callers MUST check `isinstance(backend, AddressableGoalBackend)` before calling `for_goal()`. `GoalBackend` does NOT declare `for_goal()`.
+
+### `goals/` reserved directory
+
+`goals/` is a RESERVED directory name within `<agent_root>`. Operators and agent scripts MUST NOT create a `goals/` directory manually. `list_goals()`, `export()`, and the export guard interpret its contents as framework-managed run-goal state.
+
+**Backward-compat note (newly reserved name).** The reservation is new in #642. An existing agent that happened to carry a stray `goals/<x>/goal.md` of its own (unrelated to framework run-goals) now trips the `export()` fail-loud guard where pre-#642 it did not — the guard fires on any `goals/*/goal.md`, regardless of content. This is the fail-safe direction (refuse rather than silently drop possible run-goal state) and is bounded: an agent with no `goals/` directory is byte-for-byte unaffected. An upgrading operator who has repurposed a `goals/` path must move it aside (or, per #643, wait for the content-aware predicate). Tightening the guard to require parseable goal frontmatter is a #643-adjacent follow-up.
+
+### `export()` multi-goal fail-loud guard
+
+`export()` MUST raise `AtomicAgentsError` as its FIRST operation (before reading any bytes) if the agent has at least one addressed run-goal (`goals/*/goal.md` is a regular file). The error message MUST reference issue #643.
+
+The predicate is `goals_dir.is_dir() AND any(p.is_file() for p in goals_dir.glob("*/goal.md"))`, with each matching `goal.md` additionally required to be CONTAINED within the vault root (#642 follow-up, Codex #3): the guard runs `_require_within_root` on `goals/` and on each candidate `goals/<id>/goal.md`, and an escaping symlinked entry whose `goal.md` resolves OUTSIDE the vault is NOT counted as addressed run-goal state within this vault (it is skipped, mirroring `list_goals()`/`for_goal()`). The guard stays fail-loud for genuinely-contained addressed goals. An empty `goals/` directory (partial-create debris) MUST NOT trigger the guard.
+
+Note: this guard predicate (`glob("*/goal.md")`, no charset filter) is intentionally broader than `list_goals()` (which admits a directory only when its name passes the charset allow-list). A non-conforming directory such as `goals/My-Goal/goal.md` is therefore invisible to `list_goals()` yet still trips the guard. This is the fail-safe direction (refuse rather than silently drop run-goal state) and is deliberate; reconciling the two predicates is a #643-adjacent follow-up, not a behavior change required for this LOCK. The containment requirement is the one alignment the guard and `list_goals()` now share: an escaping symlinked entry is excluded from BOTH.
+
+While addressed run-goals exist, **both whole-agent `export()` AND standing-goal export are blocked**: calling `export()` on a standing-scoped backend (`for_goal(None)` / `for_goal('_standing')`) re-runs this identical guard against the same `goals/*/goal.md` and raises again. The only export path that works while #643 is open is **per-run-goal**: `for_goal(<run_goal_id>).export()` (that backend is scoped to `agent_root/goals/<run_goal_id>/`, which has no nested `goals/`, so the guard does not fire). Whole-agent export and standing-goal-while-addressed-goals-exist are deferred to #643.
+
+**Dashboard / discovery blind spot (#654).** The same gap exists on the read-observability side: the dashboard Goals & Outcomes tab, `discover_agents()`, and `list_archived()` currently surface only the STANDING goal (`agent_root/goal.md`) — addressed run-goals under `goals/<id>/goal.md` are NOT shown. This mirrors how the `export()` guard points at #643: the export gap is fail-loud (refuses), the dashboard gap is silently-incomplete (renders only the standing goal). Surfacing addressed run-goals in the dashboard is tracked in **#654**; it is read-only observability work and is intentionally out of scope for the #642 create/address LOCK. No dashboard behavior changes in #642.
+
+### Module layout update (addendum to §"Module layout")
+
+```
+atomic_agents/goal/
+├── types.py           # + STANDING_GOAL_ID, _GOAL_ID_MAX_LEN, _GOAL_ID_RE,
+│                      #   validate_goal_id(), GoalCapabilities.supports_multi_goal
+├── backend.py         # + create_goal(), list_goals() on GoalBackend Protocol;
+│                      #   AddressableGoalBackend Protocol (separate)
+└── filesystem.py      # + create_goal(), list_goals(), for_goal() implementations;
+                       #   export() fail-loud guard
+
+atomic_agents/exceptions.py   # + GoalAlreadyExists (direct AtomicAgentsError subclass,
+                               #   sibling NOT subclass of GoalConcurrentModification)
+atomic_agents/_goal_impl.py   # + GoalManager.for_goal(goal_id) scope-binding handle
+```
+
+### Backward compatibility
+
+Zero behavior change for existing reactive/hybrid agents:
+
+- `goal_id=None` is a `for_goal()` backward-compat alias for `STANDING_GOAL_ID`.
+- `<agent_root>/goal.md` layout is byte-identical; `for_goal(None).load_goal()` reads it.
+- `list_goals()` returns `[]` for agents with no goal.md and no goals/ directory.
+- `GoalCapabilities(backend_id='x')` construction with positional `backend_id` continues to work; `supports_multi_goal` defaults to `False`.
+- All 60 pre-existing conformance tests (TEST 1–59) pass without modification.
+
+### Doctor probe extension
+
+`check_goal_backend()` now runs a new `list_goals()` probe inserted between the `list_archived()` probe and the `load_goal()` probe (making three probes in sequence — `list_archived()`, then `list_goals()`, then the heavy `load_goal()`):
+
+- Calls `list_goals(agent_id)` and asserts the return value is a `list`.
+- If `goal.md` exists, asserts `STANDING_GOAL_ID` appears in the returned list.
+- A `list_goals()` that returns `None` or raises produces a FAIL result.
+
+The `detail` dict now includes `goal_ids: list[str]` and `supports_multi_goal: bool` alongside the existing fields.
+
+### Export round-trip gap (normative)
+
+Multi-goal export (a round-trip that includes all addressed run-goals in a single `GoalExport`) is **out of scope for this PR**. The current `export()` guard (MUST: raise before reading any bytes when addressed goals are present) is the normative gap marker for this gap. See issue #643 for the tracking issue.
+
+Agents with addressed run-goals MUST NOT be passed to the #379 export conformance harness until #643 ships — the harness would trigger the fail-loud guard and report a false failure.
+
+### New conformance tests (TEST 60–129, `test_goal_multigoal_642.py`)
+
+TEST 60–129 in `tests/test_goal_multigoal_642.py` (74 collected functions — TEST 113 is parametrized across five trailing-whitespace chars, so 70 TEST-number labels = 74 collected functions) cover:
+
+- TEST 60–68: `validate_goal_id()` — all valid chars, reserved-name-first rejection, 64/65-char boundary, uppercase/separator/whitespace rejection, charset-passes-standing proof.
+- TEST 69–71: `GoalCapabilities.supports_multi_goal` — default False, FilesystemGoalBackend True, bool type.
+- TEST 72–74: `AddressableGoalBackend` Protocol — separate from GoalBackend, FilesystemGoalBackend isinstance, GoalBackend has no for_goal().
+- TEST 75–86: `create_goal()` — happy path, `when` stamping, date.today() fallback, ts-first JSONL, conductor_run_id absent, required fields, GoalAlreadyExists collision, original-unchanged after collision, STANDING_GOAL_ID reject before I/O, invalid-charset reject before I/O, pre-probe raises before goal.md, write ordering (goal.md first).
+- TEST 87–92: `list_goals()` — empty agent, standing-only, standing+run-goals sorted, partial debris skipped, non-conforming dirs skipped, '_standing' first.
+- TEST 93–98: `for_goal()` — None routes to agent_root, '_standing' routes to agent_root, valid_id scopes goal_path, invalid charset raises, apply_transition writes to correct location, load_goal reads correct location.
+- TEST 99–102: `export()` guard — raises when addressed goals present, no raise on empty goals/, succeeds with no goals/ dir, error message mentions '#643'.
+- TEST 103–108: `GoalManager.for_goal()` — returns scoped manager, raises when goal absent, None raises, '_standing' raises, invalid charset raises, goal_path inside goals/<id>/.
+- TEST 109–112: doctor `check_goal_backend()` — includes goal_ids + supports_multi_goal, includes '_standing' when goal.md present, PASS for empty list, FAIL when list_goals returns non-list.
+- TEST 113–116: anchor / containment / fail-closed-dispatch negative controls — `validate_goal_id()` rejects trailing newline/CR/tab/VT/FF (the `\Z`-anchor fix; parametrized ×5), `for_goal()` charset gate rejects a trailing-newline id (shared-regex parity), `create_goal()` refuses a symlinked `goals/<id>` dir escaping the vault (dir-node containment), and a `GoalManager.for_goal()`-scoped `dispatch_as_outcome()` raises `NotImplementedError` (#580) instead of running an ungated LLM cost path.
+- TEST 117: `create_goal()` leaf-node containment negative control — with `goals/<id>/` a legitimate directory but `goal_history.jsonl` pre-planted as a symlink to an out-of-vault target, `create_goal()` raises `PathTraversalError` and the `goal_created` audit line does NOT land outside the vault (closes the append-mode-follows-symlink escape the dir-node check alone does not — the P1 fix that routes the write through the contained `_append_jsonl`).
+- TEST 118: `list_goals()` ordering negative control — a hyphen/digit-prefixed run-goal sorts BEFORE `'_standing'` (`'-'`/digit < `'_'` in ASCII), locking the corrected "sorts before alphabetic names, not unconditionally first" claim.
+- TEST 119–124: `create_goal()` complete-on-partial recoverability (the #642 fix set) — fresh goal_id writes goal.md + one goal_created event (119); goal.md present WITH a goal_created event raises `GoalAlreadyExists` (COMPLETE, 120); goal.md present with EMPTY (`""`) goal_history.jsonl self-heals (appends the missing event, returns the PERSISTED goal — body-authoritative — and stays idempotent / no duplicate event on re-run, 121); a symlinked `goal_history.jsonl` leaf REFUSES with `PathTraversalError` and leaves NO goal.md committed (the two-leaf pre-verification / all-or-nothing control, distinct from TEST 117's no-escape control, 122); a stray regular FILE at `goals/<id>` raises `GoalAlreadyExists` (not a raw `FileExistsError`, 123); and a goal.md present alongside an unparseable `goal_history.jsonl` FAILS CLOSED (raises, leaving goal.md + the corrupt history untouched — no silent complete/overwrite, 124).
+- TEST 125–128: the review-driven tightening of the complete-on-partial predicate (the #642 fix set continued) — a NUL-byte goal_id (`'a\x00b'`) is rejected by both `validate_goal_id()` and `for_goal()` with a valid-id positive control (125); `for_goal('a')` and `for_goal('b')` resolve to DIFFERENT `.goal.lock` paths, both nested under `goals/<id>/` (per-goal lock isolation, 126); `create_goal()` self-heals when `goal_history.jsonl` is ABSENT (unlinked, goal.md kept) — the other genuine partial shape distinct from TEST 121's empty-file case — appending exactly one goal_created and staying idempotent (127); and the load-bearing fail-closed branch: goal.md present with a `goal_history.jsonl` holding a transition event but NO goal_created marker RAISES `GoalAlreadyExists` (fail closed) and mints NO spurious goal_created, leaving history untouched (128 — the exact case the pre-fix predicate mis-healed; its `_count_goal_created == 0` assertion is the negative control).
+- TEST 129: `list_goals()`/`for_goal()` containment agreement — `list_goals()` SKIPS an escaping symlinked goal dir whose `goal.md` resolves outside the vault, and `list_goals()` and `for_goal()` AGREE the id is unusable (the list/`for_goal` containment-consistency control detailed under "Containment consistency (#642 follow-up, Codex #3)" above; strip-RED negative control).

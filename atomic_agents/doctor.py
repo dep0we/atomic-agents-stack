@@ -3870,7 +3870,8 @@ def check_goal_backend(agent_root: Path) -> CheckResult:
             detail={"backend_id": safe_backend_id, "error": str(e)},
         )
 
-    # Dual-probe step 1: lightweight list
+    # Three-probe sequence (#642 added the list_goals() probe).
+    # Probe 1: lightweight list_archived
     try:
         archived = backend.list_archived(agent_root.name)
     except Exception as e:
@@ -3885,7 +3886,39 @@ def check_goal_backend(agent_root: Path) -> CheckResult:
             },
         )
 
-    # Dual-probe step 2: heavy load (only when goal.md is present)
+    # Probe 2: list_goals() — new first-class Protocol method (#642).
+    # Verifies the enumeration method is functional and returns a list.
+    # A broken list_goals() (returns None, raises AttributeError) would pass
+    # list_archived() but fail here, so BOTH probes are required.
+    try:
+        goal_ids = backend.list_goals(agent_root.name)
+        if not isinstance(goal_ids, list):
+            raise TypeError(
+                f"list_goals() must return list, got {type(goal_ids).__name__}"
+            )
+        # Verify '_standing' appears when goal.md exists.
+        standing_goal_path = agent_root / "goal.md"
+        if standing_goal_path.is_file():
+            from .goal.types import STANDING_GOAL_ID  # noqa: PLC0415
+
+            if STANDING_GOAL_ID not in goal_ids:
+                raise ValueError(
+                    f"list_goals() did not include '{STANDING_GOAL_ID}' even "
+                    f"though goal.md exists — enumeration is broken."
+                )
+    except Exception as e:
+        return CheckResult(
+            name="goal-backend",
+            status=FAIL,
+            message=f"goal backend list_goals() raised: {type(e).__name__}: {e}",
+            detail={
+                "backend_id": backend.backend_id,
+                "error": str(e),
+                "error_type": type(e).__name__,
+            },
+        )
+
+    # Probe 3: heavy load (only when goal.md is present)
     goal_md_present = (agent_root / "goal.md").is_file()
     if goal_md_present:
         try:
@@ -3944,9 +3977,11 @@ def check_goal_backend(agent_root: Path) -> CheckResult:
             "backend_id": backend.backend_id,
             "goal_md_present": goal_md_present,
             "archived_count": len(archived),
+            "goal_ids": goal_ids,
             "supports_canonical_export": caps.supports_canonical_export,
             "supports_archive": caps.supports_archive,
             "supports_history_query": caps.supports_history_query,
+            "supports_multi_goal": caps.supports_multi_goal,
         },
     )
 

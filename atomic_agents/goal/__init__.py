@@ -50,10 +50,11 @@ import re
 from pathlib import Path
 
 from ..exceptions import BackendNotRegistered
-from .backend import GoalBackend
+from .backend import AddressableGoalBackend, GoalBackend
 from .coordinator import dispatch_sub_goal_as_outcome
 from .filesystem import FilesystemGoalBackend
 from .types import (
+    STANDING_GOAL_ID,
     SUB_GOAL_TRANSITION_FIELDS,
     CompletionEvaluation,
     Goal,
@@ -62,6 +63,7 @@ from .types import (
     SubGoal,
     build_goal_frontmatter,
     serialize_sub_goal,
+    validate_goal_id,
 )
 
 # ── Re-export GoalManager + helpers (backward compat) ──
@@ -130,8 +132,9 @@ def __getattr__(name: str):
 _logger = logging.getLogger(__name__)
 
 __all__ = [
-    # Protocol
+    # Protocols
     "GoalBackend",
+    "AddressableGoalBackend",
     # Canonical types
     "Goal",
     "SubGoal",
@@ -139,6 +142,9 @@ __all__ = [
     "GoalCapabilities",
     "GoalExport",
     "SUB_GOAL_TRANSITION_FIELDS",
+    # Multi-goal addressing constants + validation (spec/41 #642)
+    "STANDING_GOAL_ID",
+    "validate_goal_id",
     # Serialization helpers
     "build_goal_frontmatter",
     "serialize_sub_goal",

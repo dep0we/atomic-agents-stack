@@ -97,6 +97,23 @@ class GoalConcurrentModification(AtomicAgentsError):
     """
 
 
+class GoalAlreadyExists(AtomicAgentsError):
+    """Raised by create_goal() when a goal with the given goal_id already
+    exists at the target path.
+
+    Sibling (NOT subclass) of GoalConcurrentModification — both extend
+    AtomicAgentsError directly. Callers catching GoalConcurrentModification
+    for in-flight race detection MUST NOT accidentally swallow GoalAlreadyExists
+    (a refuse-on-exists collision, not a concurrent-write race).
+
+    A reserved goal_id (STANDING_GOAL_ID, '_standing') is NOT a collision and
+    does NOT raise this exception — create_goal() rejects it earlier with
+    ValueError via validate_goal_id() (reserved-name check before charset).
+
+    spec/41 #642.
+    """
+
+
 class OutcomeCorrupted(AtomicAgentsError):
     """result.json is present but cannot be parsed as a valid OutcomeResult."""
 

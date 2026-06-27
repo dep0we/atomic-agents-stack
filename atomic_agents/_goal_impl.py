@@ -158,6 +158,15 @@ class GoalManager:
         self.agent_name = agent_name
         self.today = today or date.today()
 
+        # Addressed-goal scope marker (spec/41 #642). False for the standing
+        # manager; set True ONLY by for_goal() on the scoped child. A scoped
+        # manager's agent_root is agent_root/goals/<goal_id>/, which has goal.md
+        # but NO model.md — so its cost universe is undefined. The LLM-dispatch
+        # path (dispatch_as_outcome) is REFUSED on a scoped manager
+        # until the conductor (#580) wires the real cost universe, rather than
+        # silently running ungated against absent caps (fail-OPEN). Principle #4.
+        self._addressed_goal_scope = False
+
         # #486 (one canonical-path invariant): resolve agents_root AND agent_root
         # at construction so all derived paths (goal_path, archive_dir) are
         # absolute and canonical regardless of process cwd — and therefore agree
@@ -286,6 +295,132 @@ class GoalManager:
         # backend writes the injectable self.today clock value, not a stale date.
         self._goal.last_progress_check = self.today.isoformat()
         self.goal_backend.save_goal(self.agent_name, self._goal)
+
+    # ────────────────────────────────────────────────────────────
+    # Multi-goal addressing (spec/41 #642)
+
+    def for_goal(self, goal_id: str) -> "GoalManager":
+        """Return a GoalManager scoped to the addressed run-goal.
+
+        Scope-binding handle — NOT a creation operation. The goal must already
+        exist (created via create_goal()) before for_goal() is callable.
+
+        Routing:
+        - goal_id == '_standing' or goal_id is None (alias): NOT supported here;
+          use the GoalManager directly (self is already scoped to the standing
+          goal path). Raises ValueError to keep the distinction explicit.
+        - Any other valid goal_id: Returns a GoalManager whose agent_root is
+          agent_root/goals/<goal_id>/. The scoped manager's goal_path is
+          agent_root/goals/<goal_id>/goal.md.
+
+        The one-manager-one-goal invariant is preserved: the returned manager
+        resolves its goal_backend via the default factory (FilesystemGoalBackend
+        unless ATOMIC_AGENTS_GOAL_BACKEND is set), scoped to the goal directory.
+        KNOWN LIMITATION: a goal_backend explicitly injected into the PARENT
+        manager is NOT propagated to the scoped child (the child re-resolves a
+        default backend). Multi-goal is filesystem-only today, so the substitution
+        is store-equivalent; threading the parent backend is tracked for the
+        conductor integration (#580; explicit tracking issue #656).
+
+        Cost-gate safety: the returned manager is marked _addressed_goal_scope.
+        Its directory has goal.md but no model.md, so its cost universe is
+        undefined. dispatch_as_outcome() is REFUSED on the scoped manager
+        (NotImplementedError pointing at #580) rather than running an ungated LLM
+        call against absent caps. State inspection (load/save/transitions) works.
+
+        Caller contract: call create_goal() on the parent backend BEFORE calling
+        for_goal(). Raises AtomicAgentsError when goals/<goal_id>/goal.md is
+        absent (the goal does not exist yet).
+
+        Args:
+            goal_id: the addressed run-goal identifier. Must match [a-z0-9_-]{1,64}.
+                MUST NOT be None or STANDING_GOAL_ID.
+
+        Returns:
+            A GoalManager scoped to agent_root/goals/<goal_id>/.
+
+        Raises:
+            ValueError: when goal_id fails charset validation or is STANDING_GOAL_ID.
+            AtomicAgentsError: when goals/<goal_id>/goal.md does not exist (call
+                create_goal() on the backend first).
+        """
+        from .goal.types import STANDING_GOAL_ID, validate_goal_id  # noqa: PLC0415
+
+        if goal_id is None or goal_id == STANDING_GOAL_ID:
+            raise ValueError(
+                f"GoalManager.for_goal() does not accept None or "
+                f"'{STANDING_GOAL_ID}' — the current GoalManager IS the standing "
+                f"goal scope. Use for_goal() only for addressed run-goals with a "
+                f"distinct goal_id."
+            )
+        validate_goal_id(goal_id)
+
+        goal_dir = self.agent_root / "goals" / goal_id
+
+        # Containment parity with FilesystemGoalBackend.for_goal (MEMORY
+        # feedback_containment_reframe_not_whackamole): resolve goals/<goal_id>
+        # against the parent root and refuse a symlinked goal dir escaping the
+        # vault BEFORE the goal.md presence check (which FOLLOWS the symlink) and
+        # BEFORE constructing the scoped GoalManager (whose __init__ resolve()
+        # would otherwise re-anchor its root — and the default backend's
+        # containment — on the escaped target, so a subsequent scoped write could
+        # land outside the vault). This is the create-path's strict-containment
+        # choice extended to the scope-binding path; it does NOT change the
+        # standing agent_root posture documented in __init__ (T15).
+        try:
+            resolved_goal_dir = goal_dir.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise PathTraversalError(
+                f"goals/{goal_id} could not be resolved (symlink loop or "
+                f"inaccessible ancestor)"
+            ) from exc
+        if not resolved_goal_dir.is_relative_to(self.agent_root):
+            raise PathTraversalError(
+                f"goals/{goal_id} resolves outside the agent vault "
+                f"(symlinked goal dir refused)"
+            )
+
+        if not (goal_dir / "goal.md").is_file():
+            raise AtomicAgentsError(
+                f"No goal found at {goal_dir / 'goal.md'}. "
+                f"Call create_goal(goal_id={goal_id!r}, ...) on the backend "
+                f"before using for_goal() to get a scoped manager."
+            )
+
+        # Construct a scoped GoalManager: agents_root = agent_root/goals/,
+        # agent_name = goal_id. The manager's agent_root becomes
+        # agent_root/goals/<goal_id>/ and goal_path becomes
+        # agent_root/goals/<goal_id>/goal.md — the one-manager-one-goal invariant.
+        scoped = GoalManager(
+            agents_root=self.agent_root / "goals",
+            agent_name=goal_id,
+            today=self.today,
+        )
+        # Mark the scoped manager so dispatch_as_outcome() refuses the
+        # ungated LLM path (the scoped dir has no model.md → no cost cap). #580.
+        scoped._addressed_goal_scope = True
+        return scoped
+
+    def _is_addressed_goal_scope_by_layout(self) -> bool:
+        """Structural fallback for the addressed-goal-scope dispatch refusal (#642 fix).
+
+        ``_addressed_goal_scope`` is set True ONLY by for_goal(). A GoalManager
+        constructed DIRECTLY against a goals/<goal_id>/ root (bypassing for_goal())
+        would keep the flag False and reach the ungated LLM-dispatch path — a
+        fail-OPEN LLM spend against absent model.md caps. ``goals/`` is a
+        framework-reserved directory name within an agent root (spec/41 #642), so a
+        manager whose agent_root sits immediately under a directory named
+        ``goals`` IS an addressed run-goal scope by layout, regardless of how it
+        was constructed. Keying the refusal on this structural signal (not the flag
+        alone) makes the fail-closed posture hold for both construction paths.
+
+        agent_root is resolved at __init__, so ``.parent.name`` is the canonical
+        parent component. Over-refusing the pathological case of an agents_root
+        literally named ``goals`` is the SAFE direction: it only blocks the LLM
+        dispatch path (NotImplementedError → conductor #580), never state
+        inspection (load/save/transitions still work).
+        """
+        return self.agent_root.parent.name == "goals"
 
     # ────────────────────────────────────────────────────────────
     # Sub-goal lifecycle
@@ -725,7 +860,31 @@ class GoalManager:
                 the coordinator_dispatch_rejected event was appended first.
             GoalConcurrentModification: terminal apply_transition detected a
                 concurrent modification (sub-goal moved off in_progress during run).
+            NotImplementedError: this manager is an addressed-goal scope from
+                for_goal() — see below (spec/41 #642, conductor #580).
         """
+        # FAIL-CLOSED on an addressed-goal scope (spec/41 #642). A manager
+        # returned by for_goal() is rooted at agent_root/goals/<goal_id>/, which
+        # has goal.md but NO model.md. Constructing the gate AtomicAgent there
+        # would default cost_guardrails_enabled=False (_model.py), so the
+        # pre-dispatch fail-closed cost gate AND the OutcomeRunner's internal
+        # agent.call() would run ungated — a fail-OPEN LLM spend path against no
+        # cap. Refuse the dispatch until the conductor (#580) wires the real
+        # cost universe. State inspection on the scoped manager still works;
+        # only the LLM-dispatch path is closed. (Principle #4: every code path
+        # that calls an LLM has a cost gate; "refusal is a feature".)
+        if self._addressed_goal_scope or self._is_addressed_goal_scope_by_layout():
+            raise NotImplementedError(
+                "dispatch_as_outcome() is not available on an addressed-goal "
+                "scope (a manager rooted at goals/<goal_id>/): that directory has "
+                "no model.md, so there is no cost cap to gate the LLM spend "
+                "against (running here would be fail-OPEN). The refusal fires both "
+                "for managers returned by for_goal() AND for ones constructed "
+                "directly against a goals/<goal_id>/ root. Dispatch the standing "
+                "goal directly, or wait for the conductor (#580) which wires the "
+                "real cost universe for addressed run-goals."
+            )
+
         from .agent import AtomicAgent  # noqa: PLC0415
         from .goal.coordinator import dispatch_sub_goal_as_outcome  # noqa: PLC0415
 

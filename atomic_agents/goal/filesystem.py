@@ -2,9 +2,27 @@
 
 This is the default backend for single-host deployments. It wraps the same
 on-disk shape GoalManager has used since the framework's first goal support:
+
+Standing goal (backward-compat, unchanged):
     <agent_root>/goal.md            — active goal (frontmatter + markdown body)
     <agent_root>/goal_history.jsonl — structured history events (append-only)
     <agent_root>/goal_archive/      — archived goals (one .md per archived goal)
+    <agent_root>/.goal.lock         — exclusive advisory lock sidecar
+
+Addressed run-goals (spec/41 #642 multi-goal addendum):
+    <agent_root>/goals/<goal_id>/goal.md
+    <agent_root>/goals/<goal_id>/goal_history.jsonl
+    <agent_root>/goals/<goal_id>/goal_archive/
+    <agent_root>/goals/<goal_id>/.goal.lock
+
+goals/ is a RESERVED directory name within agent_root (spec/41 #642 addendum,
+§"goals/ reserved directory"). Do not create goals/ manually — list_goals() and
+the export() guard interpret its contents as framework-managed run-goal state.
+
+A failed create_goal() (directory created, goal.md not written due to a
+pre-probe failure or lock contention) may leave an empty goals/<goal_id>/
+directory. This is inert (list_goals() skips directories without goal.md)
+but accumulates over time. Cleanup is out of scope for this PR; see #643.
 
 Zero behavior change for existing reactive/hybrid agents: construction is
 side-effect-free (no filesystem I/O in __init__), goal_text() returns ''
@@ -15,17 +33,19 @@ a corpus).
 
 Ordering contract for apply_transition():
     The method acquires an exclusive advisory lock (fcntl.flock on
-    <agent_root>/.goal.lock) before the read-modify-write sequence. Both
-    the goal.md atomic_write AND the goal_history.jsonl append happen under
-    this lock, serialized and ordered: goal.md is written FIRST, the JSONL
-    audit line second. The lock guarantees serialization + ordering, NOT
-    crash-rollback — a crash between the two writes is permissible and leaves
-    goal.md updated with no audit line (recoverable, retry-safe). The
-    conformance requirement (spec/41 MUST 6) is only that the reverse never
-    occur: a JSONL audit line MUST NOT exist for a goal.md state that was not
-    written. A Postgres backend wraps the same sequence in a SQL transaction,
-    which additionally rolls back on failure. The lock is released in a finally
-    block.
+    <agent_root>/.goal.lock for the standing goal, or
+    <agent_root>/goals/<goal_id>/.goal.lock for an addressed goal) before the
+    read-modify-write sequence. Both the goal.md atomic_write AND the
+    goal_history.jsonl append happen under this lock, serialized and ordered:
+    goal.md is written FIRST, the JSONL audit line second. Per-goal lock
+    granularity: concurrent run-goals on different goal_ids never block.
+    The lock guarantees serialization + ordering, NOT crash-rollback — a crash
+    between the two writes is permissible and leaves goal.md updated with no
+    audit line (recoverable, retry-safe). The conformance requirement (spec/41
+    MUST 6) is only that the reverse never occur: a JSONL audit line MUST NOT
+    exist for a goal.md state that was not written. A Postgres backend wraps
+    the same sequence in a SQL transaction, which additionally rolls back on
+    failure. The lock is released in a finally block.
 
 archive_goal() also acquires the goal lock so the collision-suffix loop is
 race-free (no TOCTOU window between .exists() check and atomic_write).
@@ -33,7 +53,11 @@ race-free (no TOCTOU window between .exists() check and atomic_write).
 spec/40 addendum: GoalBackend composes the Exportable Protocol at definition
 time (not retrofitted). FilesystemGoalBackend.capabilities() returns
 GoalCapabilities(backend_id='filesystem', supports_canonical_export=True,
-supports_archive=True, supports_history_query=True).
+supports_archive=True, supports_history_query=True, supports_multi_goal=True).
+
+spec/41 #642: FilesystemGoalBackend also implements AddressableGoalBackend
+(for_goal() factory method). Callers MUST check isinstance(backend,
+AddressableGoalBackend) before calling for_goal().
 
 Import boundary (circular-import safety):
     - Imports only from ..exceptions, .._io, .types — no imports from
@@ -43,6 +67,7 @@ Import boundary (circular-import safety):
 
 from __future__ import annotations
 
+import dataclasses
 import fcntl
 import json
 import os
@@ -57,20 +82,24 @@ import frontmatter
 from .._io import atomic_write, atomic_append_jsonl
 from ..exceptions import (
     AtomicAgentsError,
+    GoalAlreadyExists,
     GoalConcurrentModification,
     GoalCorrupted,
     PathTraversalError,
     SchemaValidationError,
 )
 from .types import (
+    STANDING_GOAL_ID,
     SUB_GOAL_TRANSITION_FIELDS,
     VALID_SUB_GOAL_STATUSES,
+    _GOAL_ID_RE,
     Goal,
     GoalCapabilities,
     GoalExport,
     SubGoal,
     build_goal_frontmatter,
     validate_goal,
+    validate_goal_id,
 )
 
 # Schema version + valid-status sets are the single-source constants in
@@ -266,6 +295,114 @@ class FilesystemGoalBackend:
         )
         line = json.dumps(event)
         atomic_append_jsonl(history_path, line)
+
+    def _build_goal_created_event(
+        self,
+        ts: str,
+        goal_id: str,
+        *,
+        intent: str,
+        created: str,
+        schema_version: int,
+        conductor_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Build the canonical ``goal_created`` history event.
+
+        Shared by both create_goal() write paths (the fresh-create path and the
+        complete-on-partial recoverability path) so the JSONL schema can never
+        diverge between them. ``conductor_run_id`` is OMITTED (not set to None)
+        when None — key absence is the home-user contract the conformance suite
+        asserts (TEST 79); it appears only when the conductor threads it.
+        """
+        fields: dict[str, Any] = {
+            "goal_id": goal_id,
+            "intent": intent,
+            "created": created,
+            "schema_version": schema_version,
+        }
+        if conductor_run_id is not None:
+            fields["conductor_run_id"] = conductor_run_id
+        return self._make_history_event(ts, "goal_created", **fields)
+
+    def _classify_create_history(
+        self, history_path: Path, goal_id: str, *, goal_path: Path
+    ) -> str:
+        """Classify goals/<id>/goal_history.jsonl for create_goal (caller holds lock).
+
+        create_goal() reaches this only when the scoped goals/<id>/goal.md is
+        PRESENT. The history file decides whether that goal.md is COMPLETE, a
+        healable PARTIAL, or a corrupt/ambiguous state that must fail closed.
+        Returns one of three string verdicts:
+
+          'complete' — at least one ``goal_created`` event is present. The goal
+            was fully created; the caller refuses with GoalAlreadyExists (no
+            overwrite, no upsert).
+          'empty' — the history file is ABSENT, or present but EMPTY /
+            whitespace-only. This is the genuine post-goal.md-write crash shape
+            (goal.md landed, the goal_created audit line never did). The caller
+            SELF-HEALS: it appends the missing goal_created event and returns the
+            persisted goal.
+          'corrupt' — the history holds one or more parseable events but NONE is
+            ``goal_created``. A goal.md carrying transition events (written by
+            save_goal() / apply_transition(), which do NOT emit goal_created) with
+            no creation marker is NOT a clean partial — it is an ambiguous,
+            already-authored goal. The caller FAILS CLOSED (raises) rather than
+            minting a spurious, mis-ordered goal_created over it. This is the
+            distinction the old has-events-but-no-creation → heal predicate got
+            wrong (it self-healed a legitimately-authored goal).
+
+        FAIL CLOSED on unreadability (Principle #4 / #5): if the history file
+        exists but cannot be read, or any line cannot be parsed as JSON, raise
+        GoalAlreadyExists rather than guess. The operator inspects the file and
+        decides. The error messages reference the SCOPED ``goal_path`` /
+        ``history_path`` the operator should actually inspect — NOT the standing
+        ``self._goal_path`` (create_goal() runs on the parent backend).
+
+        Returns:
+            'complete', 'empty', or 'corrupt'.
+
+        Raises:
+            GoalAlreadyExists: when the history is present but unreadable or has
+                an unparseable line (completeness cannot be determined).
+        """
+        if not history_path.is_file():
+            # goal.md present, no history file at all → genuine partial → heal.
+            return "empty"
+        try:
+            raw = history_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise GoalAlreadyExists(
+                f"goal_id={goal_id!r}: goal.md is present at {goal_path} but "
+                f"its goal_history.jsonl ({history_path}) could not be read to "
+                f"determine whether the goal is complete ({exc}). Refusing to "
+                f"complete or overwrite (fail-closed). Inspect {history_path} "
+                f"manually."
+            ) from exc
+        saw_event = False
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError as exc:
+                # json.JSONDecodeError is a ValueError subclass.
+                raise GoalAlreadyExists(
+                    f"goal_id={goal_id!r}: goal.md is present at {goal_path} but "
+                    f"its goal_history.jsonl ({history_path}) has an unparseable "
+                    f"line, so completeness cannot be determined ({exc}). Refusing "
+                    f"to complete or overwrite (fail-closed). Inspect "
+                    f"{history_path} manually."
+                ) from exc
+            saw_event = True
+            if isinstance(event, dict) and event.get("event") == "goal_created":
+                return "complete"
+        if saw_event:
+            # Parseable events present, but NONE is goal_created → corrupt /
+            # ambiguous (a goal authored via save_goal()/apply_transition()),
+            # NOT a clean partial. Fail closed — do NOT heal.
+            return "corrupt"
+        # No non-blank lines (empty / whitespace-only file) → genuine partial.
+        return "empty"
 
     # ──────────────────────────────────────────────────────────────
     # Protocol: load / save
@@ -682,6 +819,17 @@ class FilesystemGoalBackend:
     def export(self, query: Any = None) -> GoalExport:  # noqa: ARG002
         """Export goal state as a canonical GoalExport.
 
+        FAIL-LOUD GUARD (spec/41 #642, first operation): if the agent has any
+        addressed run-goals (goals/<id>/goal.md present), export() MUST raise
+        before reading any bytes. The guard never silently returns a partial
+        snapshot that drops run-goal state.
+
+        The predicate requires at least one valid goals/*/goal.md — an empty
+        goals/ directory (cleanup debris) does NOT trigger the guard (conformance
+        test: export() on an agent with empty goals/ must NOT raise).
+
+        See issue #643 for the multi-goal export extension.
+
         Read ordering: goal.md first (authoritative state), then
         goal_history.jsonl, then archives. CRLF → LF normalized (MUST 5).
 
@@ -696,6 +844,51 @@ class FilesystemGoalBackend:
         See GoalExport docstring for the snapshot-consistency acknowledgment
         (spec/40 MUST 7).
         """
+        # FAIL-LOUD GUARD — FIRST operation, before any bytes are read.
+        # Predicate: goals/ dir exists AND has at least one CONTAINED
+        # goals/*/goal.md. An empty goals/ directory (partial create_goal()
+        # debris) is NOT grounds for the guard (home-user safety: a stray empty
+        # goals/ dir never blocks export). Only a genuine addressed goal with a
+        # committed goal.md triggers.
+        #
+        # Containment consistency (Codex #3): the guard fires only on addressed
+        # goals that actually live within this vault. An escaping symlinked
+        # goals/ directory (or an individual goals/<id> whose goal.md resolves
+        # outside the vault root) is NOT "addressed run-goal state within this
+        # vault" — for_goal()/list_goals() would refuse/skip it, so it must not
+        # block export here either. The guard stays fail-loud for genuinely-
+        # contained addressed goals.
+        goals_dir = self._agent_root / "goals"
+        try:
+            self._require_within_root(goals_dir, "goals/")
+            goals_dir_is_dir = goals_dir.is_dir()
+        except PathTraversalError:
+            goals_dir_is_dir = False
+        addressed_goal_present = False
+        if goals_dir_is_dir:
+            for candidate in goals_dir.glob("*/goal.md"):
+                if not candidate.is_file():
+                    continue
+                try:
+                    self._require_within_root(candidate, "goals/<id>/goal.md")
+                except PathTraversalError:
+                    # Escaping symlinked goals/<id> — not within this vault; skip.
+                    continue
+                addressed_goal_present = True
+                break
+        if addressed_goal_present:
+            raise AtomicAgentsError(
+                f"export() refused: agent at {self._agent_root} has addressed "
+                f"run-goals under goals/. Exporting a multi-goal agent without "
+                f"including all run-goal state would silently drop data. "
+                f"Both whole-agent export AND standing-goal export are blocked "
+                f"while addressed run-goals exist (calling export() on a "
+                f"standing-scoped backend re-runs this same guard). "
+                f"Multi-goal export is tracked in issue #643. "
+                f"To export a single addressed run-goal in the meantime, use "
+                f"for_goal(<run_goal_id>).export()."
+            )
+
         # Containment: refuse symlinked goal.md / goal_history.jsonl / goal_archive
         # that escape the vault before reading their bytes into the export.
         goal_path = self._require_within_root(self._goal_path, "goal.md")
@@ -755,7 +948,428 @@ class FilesystemGoalBackend:
             supports_canonical_export=True,
             supports_archive=True,
             supports_history_query=True,
+            supports_multi_goal=True,
         )
+
+    # ──────────────────────────────────────────────────────────────────
+    # Protocol: multi-goal addressing (spec/41 #642)
+
+    def create_goal(
+        self,
+        agent_id: str,  # noqa: ARG002 (filesystem ignores agent_id — scoped at construction time)
+        goal_id: str,
+        goal: Goal,
+        when: date | None = None,
+    ) -> Goal:
+        """Atomically create a new addressed run-goal at goals/<goal_id>/.
+
+        Collision semantics — refuse-on-COMPLETE, heal-only-the-genuine-PARTIAL,
+        fail-closed on everything ambiguous (the recoverability refinement,
+        spec/41 MUST 11). The complete decision table, all UNDER the per-goal lock:
+          - goal.md ABSENT → create normally (write goal.md, then append the
+            goal_created event).
+          - goal.md PRESENT, goal_history.jsonl ABSENT or EMPTY / whitespace-only
+            → a genuine half-created state (goal.md landed, the audit line never
+            did — the rare post-goal.md I/O-failure outcome). create_goal()
+            SELF-HEALS it: it appends the missing goal_created event and returns
+            the goal, making the operation idempotent over a partial create.
+            **The persisted goal.md is AUTHORITATIVE on this path** — the supplied
+            `goal` arg's body is NOT re-written; the goal_created event is built
+            ENTIRELY from the persisted goal (intent/created/schema_version AND
+            conductor_run_id all come from the persisted goal — persisted wins for
+            every field).
+          - goal.md PRESENT, goal_history.jsonl contains a goal_created event →
+            the goal is COMPLETE → raise GoalAlreadyExists (no overwrite, no
+            upsert).
+          - goal.md PRESENT, goal_history.jsonl contains events but NO
+            goal_created event → FAIL CLOSED: raise GoalAlreadyExists. A goal with
+            transition events but no creation marker was authored via
+            save_goal()/apply_transition() (which do NOT emit goal_created); it is
+            corrupt/ambiguous, NOT a clean partial. Healing it would mint a
+            spurious, mis-ordered goal_created over a legitimately-authored goal.
+          - goal.md PRESENT but goal_history.jsonl unreadable/unparseable →
+            FAIL CLOSED: raise GoalAlreadyExists (never silently complete or
+            overwrite an ambiguous state). See _classify_create_history().
+
+        Mirrors apply_transition()'s MUST 6 ordering: json.dumps pre-probe BEFORE
+        any goal.md/JSONL write. The completeness check and the
+        complete-or-refuse decision happen UNDER THE SAME per-goal lock as the
+        write (TOCTOU-safe).
+
+        Write sequence (steps 5+ hold the per-goal lock; steps 1–4 are pre-lock):
+          1. validate_goal_id(goal_id) — charset + reserved-name (pre-lock).
+          2. Stamp goal.created from `when` (or date.today()) on a COPY (pre-lock).
+          3. Build the scoped backend via for_goal(goal_id) — applies the
+             canonical containment guard to goals/<goal_id> (pre-lock).
+          4. Build the goal_created event for the fresh-create path (pre-lock).
+          5. Stray-file guard: refuse if goals/<goal_id> exists as a regular FILE
+             (not a directory) — a clear GoalAlreadyExists instead of the raw
+             FileExistsError the lock's lazy mkdir would otherwise leak (pre-lock).
+          6. Acquire the scoped backend's per-goal lock (lazily mkdirs
+             goals/<goal_id>/).
+          7. Two-leaf pre-verification: _require_within_root on BOTH the goal.md
+             leaf AND the goal_history.jsonl leaf BEFORE the goal.md write, so a
+             planted symlinked history leaf is an all-or-nothing REFUSE (no
+             goal.md committed).
+          8. Branch on goal.md presence (complete-on-partial logic above).
+          9. Fresh-create path: json.dumps pre-probe → _write_goal() (goal.md
+             FIRST) → _append_jsonl() (goal_history.jsonl SECOND).
+
+        Containment (MEMORY feedback_containment_reframe_not_whackamole — ONE
+        canonical invariant applied at EVERY I/O boundary, not per-path point
+        checks): the writes are routed through the for_goal(goal_id)-scoped
+        backend's _goal_lock()/_write_goal()/_append_jsonl(), each of which calls
+        _require_within_root on its leaf (goal.md AND goal_history.jsonl) before
+        opening it; step 7 additionally verifies both leaves UP FRONT so the
+        goal.md write never lands when a sibling history leaf escapes. This closes
+        the perimeter escape a pre-planted symlinked
+        goals/<goal_id>/goal_history.jsonl (append mode FOLLOWS symlinks) would
+        otherwise open — the goal_created audit line can never be written outside
+        the vault (Principle #5). for_goal() additionally resolves-and-verifies
+        the goals/<goal_id> directory node itself, so a symlinked goal dir is
+        refused before the scoped backend is even constructed.
+
+        Single-writer assumption (Codex #1): create_goal()'s atomicity holds
+        against other LOCK-TAKING writers on the same goal_id — apply_transition(),
+        archive_goal(), and create_goal() all share the per-goal lock, so they
+        serialize. It does NOT hold against a concurrent LOCK-FREE save_goal() on
+        the SAME goal_id during the create window; save_goal() bypasses the per-goal
+        lock, so a racing save_goal() violates the framework's single-writer-per-goal
+        model and can interleave with the create. Serializing multiple writers on
+        one goal_id (conflict keys / queue-behind-decision) is the conductor's
+        concern, tracked in #655.
+
+        Raises:
+            ValueError: invalid charset or reserved goal_id (pre-lock, no I/O).
+            GoalAlreadyExists: goal.md present and COMPLETE; goal.md present with
+                history events but no goal_created marker (corrupt/ambiguous,
+                fail-closed); goals/<goal_id> is a stray regular file (or a file
+                raced into place between the pre-lock check and lock mkdir); or
+                goal_history.jsonl is unreadable/unparseable so completeness
+                cannot be determined (fail-closed).
+            SchemaValidationError: the fresh-create validate path — _write_goal()
+                runs validate_goal() before the durable write and rejects an
+                invalid Goal.
+            GoalCorrupted: the self-heal path reloads the persisted goal.md via
+                load_goal(), which raises GoalCorrupted if it is unparseable.
+            PathTraversalError: a symlinked goal dir or history/goal.md leaf
+                escapes the vault perimeter.
+        """
+        # Step 1: validate goal_id BEFORE any I/O (pre-lock).
+        # validate_goal_id raises ValueError for bad charset or reserved '_standing'.
+        validate_goal_id(goal_id)
+
+        # Step 2: stamp goal.created from `when` on a COPY — do NOT mutate the
+        # caller's Goal object (sibling save_goal() promises write-verbatim / no
+        # caller-object mutation; create_goal() honors the same no-surprise
+        # contract). This stamping is the single exception to MUST 4's
+        # write-verbatim rule (spec/41 #642 addendum), but it lands on the copy
+        # we persist + return, never on the caller's input. (Principle #8.)
+        today = (when or date.today()).isoformat()
+        goal = dataclasses.replace(goal, created=today)
+
+        # Step 3: build the scoped backend. for_goal() applies the canonical
+        # _require_within_root containment guard to goals/<goal_id> against the
+        # parent root (refuses a symlinked goal dir escaping the vault) and
+        # returns a backend whose _goal_lock()/_write_goal()/_append_jsonl()
+        # re-verify EVERY write leaf — NOT a per-path point check. validate_goal_id
+        # above already rejected STANDING_GOAL_ID, so for_goal() never routes to
+        # the standing layout here.
+        scoped = self.for_goal(goal_id)
+
+        # Step 4: build the goal_created event for the fresh-create path via the
+        # shared ts-first helper so this event inherits any future key-ordering/
+        # normalization centralized in _make_history_event (every other writer to
+        # goal_history.jsonl uses it). conductor_run_id is OMITTED (not set to
+        # None) for home-user goals; key absence is what the conformance test
+        # asserts. A Goal carries no conductor_run_id field today, so the getattr
+        # resolves to None (omitted) — the hook is forward-compatible only.
+        ts = datetime.now().astimezone().isoformat()
+        conductor_run_id = getattr(goal, "conductor_run_id", None)
+        goal_created_event = self._build_goal_created_event(
+            ts,
+            goal_id,
+            intent=goal.intent,
+            created=today,
+            schema_version=goal.schema_version,
+            conductor_run_id=conductor_run_id,
+        )
+
+        # Step 5: stray-file guard (pre-lock). If goals/<goal_id> exists as a
+        # regular FILE (not a directory), the lock's lazy mkdir below would leak a
+        # raw FileExistsError. Detect it and raise GoalAlreadyExists with an
+        # actionable message — the goals/ tree is framework-reserved. (A symlinked
+        # goal dir escaping the vault was already refused in for_goal() above.)
+        goal_dir = self._agent_root / "goals" / goal_id
+        if goal_dir.exists() and not goal_dir.is_dir():
+            raise GoalAlreadyExists(
+                f"goal_id={goal_id!r}: a non-directory already occupies "
+                f"{goal_dir}. The goals/ tree is framework-reserved for addressed "
+                f"run-goals; move the stray path aside (or pick a different "
+                f"goal_id) before calling create_goal()."
+            )
+
+        # Steps 6+: under the scoped backend's contained per-goal lock.
+        # TOCTOU-hardened stray-file guard: the pre-lock check (step 5) can be
+        # raced — a regular file planted at goals/<goal_id> BETWEEN that check and
+        # the lock's lazy mkdir(parents=True, exist_ok=True) makes mkdir raise a
+        # raw FileExistsError (exist_ok=True only suppresses when the existing path
+        # is a directory). That OSError is outside the documented Raises contract,
+        # so catch it at the lock-acquire boundary and re-raise it as the same
+        # GoalAlreadyExists reserved-dir refusal the pre-lock check emits. The
+        # create body itself never raises FileExistsError (atomic_write uses
+        # rename; os.open uses O_CREAT without O_EXCL), so wrapping the whole
+        # block cannot mask an unrelated error. GoalAlreadyExists / PathTraversal
+        # raised inside the body are NOT FileExistsError and pass through.
+        try:
+            with scoped._goal_lock():
+                # Step 7: TWO-LEAF pre-verification — resolve-and-verify BOTH write
+                # leaves through the canonical containment guard BEFORE the goal.md
+                # write. _write_goal()/_append_jsonl() each re-verify their own
+                # leaf, but doing both UP FRONT makes a planted symlinked
+                # goal_history.jsonl leaf an all-or-nothing REFUSE: no goal.md is
+                # committed when the sibling history leaf escapes the vault. The
+                # existence check below reuses the verified goal.md path
+                # (TOCTOU-safe — inside the lock).
+                goal_path = scoped._require_within_root(scoped._goal_path, "goal.md")
+                history_path = scoped._require_within_root(
+                    scoped._history_path, "goal_history.jsonl"
+                )
+
+                # Step 8: branch on goal.md presence (the complete-on-partial
+                # logic). Two concurrent create_goal() calls for the same goal_id
+                # serialize on this lock; the winner proceeds, the loser sees
+                # goal.md present. _classify_create_history() FAILS CLOSED (raises)
+                # if the history cannot be read/parsed to decide, and reports
+                # 'corrupt' (NOT 'empty'/heal) when the history holds non-creation
+                # events — a legitimately-authored goal must never be mis-healed.
+                if goal_path.is_file():
+                    verdict = self._classify_create_history(
+                        history_path, goal_id, goal_path=goal_path
+                    )
+                    if verdict == "complete":
+                        # COMPLETE — refuse (no overwrite, no upsert).
+                        raise GoalAlreadyExists(
+                            f"goal_id={goal_id!r} already exists at {goal_path}. "
+                            f"Use a unique goal_id or call list_goals() to "
+                            f"enumerate existing goals."
+                        )
+                    if verdict == "corrupt":
+                        # FAIL CLOSED — history holds events but no goal_created
+                        # marker. A goal authored via save_goal()/apply_transition()
+                        # is NOT a clean partial; healing it would mint a spurious,
+                        # mis-ordered goal_created over a legitimate goal.
+                        raise GoalAlreadyExists(
+                            f"goal_id={goal_id!r}: goal.md is present at "
+                            f"{goal_path} and its goal_history.jsonl "
+                            f"({history_path}) is non-empty but holds NO "
+                            f"goal_created marker — a goal with transitions and no "
+                            f"creation record is corrupt/ambiguous, not a clean "
+                            f"partial. Refusing to complete or overwrite "
+                            f"(fail-closed). Inspect {history_path} manually."
+                        )
+                    # verdict == 'empty' → genuine PARTIAL — complete-on-partial
+                    # recoverability (self-healing / idempotent over a partial
+                    # create). The PERSISTED goal.md is AUTHORITATIVE; we only
+                    # append the missing goal_created event (built ENTIRELY from
+                    # the persisted goal — intent/created/schema_version AND
+                    # conductor_run_id all read off the reloaded goal so "persisted
+                    # wins" holds for every field) and return the persisted goal.
+                    persisted = scoped.load_goal(agent_id)
+                    completion_event = self._build_goal_created_event(
+                        datetime.now().astimezone().isoformat(),
+                        goal_id,
+                        intent=persisted.intent,
+                        created=persisted.created,
+                        schema_version=persisted.schema_version,
+                        conductor_run_id=getattr(persisted, "conductor_run_id", None),
+                    )
+                    # json.dumps pre-probe BEFORE the append (mirror MUST 6 order).
+                    json.dumps(completion_event)
+                    scoped._append_jsonl(completion_event)
+                    return persisted
+
+                # goal.md ABSENT — fresh create.
+                # Step 9a: json.dumps serializability pre-probe BEFORE any goal.md/
+                # JSONL write. A non-serializable value raises here (inside the
+                # lock, before goal.md is touched) — no goal state is committed (an
+                # empty goals/<goal_id>/ directory may remain from the lock's lazy
+                # mkdir; see the partial-create debris note in the module
+                # docstring). The real append still happens AFTER goal.md (MUST 6
+                # ordering).
+                json.dumps(goal_created_event)
+
+                # Step 9b: write goal.md FIRST (MUST 6 ordering) — _write_goal()
+                # calls _require_within_root on the goal.md leaf before
+                # atomic_write.
+                scoped._write_goal(goal)
+
+                # Step 9c: append goal_created JSONL line AFTER goal.md —
+                # _append_jsonl() calls _require_within_root on the
+                # goal_history.jsonl leaf before atomic_append_jsonl (closes the
+                # symlinked-leaf escape).
+                scoped._append_jsonl(goal_created_event)
+        except FileExistsError as exc:
+            # A regular file raced into goals/<goal_id> between the pre-lock check
+            # (step 5) and the lock's mkdir. Map the raw OSError onto the same
+            # reserved-dir refusal so the Raises contract holds (no FileExistsError
+            # escapes).
+            raise GoalAlreadyExists(
+                f"goal_id={goal_id!r}: a non-directory already occupies "
+                f"{goal_dir}. The goals/ tree is framework-reserved for addressed "
+                f"run-goals; move the stray path aside (or pick a different "
+                f"goal_id) before calling create_goal()."
+            ) from exc
+
+        return goal
+
+    def list_goals(self, agent_id: str) -> list[str]:  # noqa: ARG002
+        """Enumerate all goal_ids for this agent. Returns sorted list.
+
+        Includes STANDING_GOAL_ID ('_standing') when agent_root/goal.md exists.
+        Includes addressed run-goals from goals/<id>/goal.md (requires goal.md
+        presence — partial create_goal() directories with no goal.md are skipped).
+
+        Filters goals/ subdirectories by:
+        - is_dir() (not files like stray notes.md)
+        - name matches [a-z0-9_-]{1,64} charset allow-list
+        - name != STANDING_GOAL_ID (reserved sentinel, not a run-goal dir)
+        - contains goals/<id>/goal.md (presence predicate — not just directory)
+
+        Consistency guarantee (Codex #3): the goal.md presence predicate keeps
+        partial-create debris (an empty goals/<id>/ directory with no goal.md)
+        out of the list, AND each candidate is run through the SAME
+        resolve-then-verify-under-root containment guard for_goal()/the write
+        leaves use (_require_within_root). A listed id is therefore one
+        for_goal(<id>) can actually open: an escaping symlinked goals/<id>
+        directory whose goal.md resolves outside the vault root is SKIPPED here
+        (not listed), exactly as for_goal() would refuse it with
+        PathTraversalError. The goals/ directory itself is contained too — if
+        agent_root/goals resolves outside the vault, it is treated as no
+        addressed goals. This removes the prior list/for_goal asymmetry so
+        discovery/doctor/resume never hand out a goal_id for_goal() cannot open
+        (durability-consistency, Principle #13). Under the T15 trust model the
+        perimeter is the vault root; the containment guard lives at the I/O
+        boundary, and the enumeration now mirrors it.
+
+        Return ordering: sorted() — '_standing' sorts before alphabetic (a-z)
+        run-goal names (ASCII '_' (95) < 'a' (97)). It is NOT unconditionally
+        first: a goal_id beginning with '-' (45) or a digit (48) sorts before
+        '_standing'. No code depends on the position; only sorted() order is
+        contractual.
+        """
+        result: list[str] = []
+
+        # Standing goal: present when agent_root/goal.md is a regular file.
+        standing_goal_path = self._require_within_root(self._goal_path, "goal.md")
+        if standing_goal_path.is_file():
+            result.append(STANDING_GOAL_ID)
+
+        # Addressed run-goals: scan goals/ directory.
+        # Contain the goals/ directory itself first (Codex #3): if
+        # agent_root/goals resolves outside the vault (escaping symlink), there
+        # are no addressed goals within this vault to enumerate.
+        goals_dir = self._agent_root / "goals"
+        try:
+            self._require_within_root(goals_dir, "goals/")
+            goals_dir_is_dir = goals_dir.is_dir()
+        except PathTraversalError:
+            goals_dir_is_dir = False
+        if goals_dir_is_dir:
+            for entry in goals_dir.iterdir():
+                if not entry.is_dir():
+                    # Skip non-directory entries (stray files in goals/).
+                    continue
+                name = entry.name
+                # Skip the reserved sentinel.
+                if name == STANDING_GOAL_ID:
+                    continue
+                # Charset allow-list: skip non-conforming names silently
+                # (e.g. pre-existing dirs from other tools, macOS .DS_Store).
+                if not _GOAL_ID_RE.match(name):
+                    continue
+                # Presence predicate: require goal.md, not just the directory.
+                # Skips partial create_goal() debris (empty dirs).
+                if not (entry / "goal.md").is_file():
+                    continue
+                # Containment consistency (Codex #3): apply the SAME
+                # resolve-then-verify-under-root guard for_goal() uses, so a
+                # listed id is one for_goal() can actually open. An escaping
+                # symlinked goals/<id> whose goal.md resolves outside the vault
+                # is SKIPPED here rather than listed-then-refused.
+                try:
+                    self._require_within_root(
+                        entry / "goal.md", f"goals/{name}/goal.md"
+                    )
+                except PathTraversalError:
+                    continue
+                result.append(name)
+
+        return sorted(result)
+
+    def for_goal(self, goal_id: str | None) -> "FilesystemGoalBackend":
+        """Return a FilesystemGoalBackend scoped to the addressed goal.
+
+        Routing (backward-compat invariant — spec/41 #642):
+        - goal_id is None or goal_id == STANDING_GOAL_ID ('_standing'):
+          Returns a backend scoped to agent_root/ (the standing-goal layout
+          UNCHANGED). agent_root/goal.md is the target — NOT goals/_standing/.
+          This is the critical backward-compat branch: any agent that already
+          has agent_root/goal.md continues to read/write it correctly.
+        - Any other valid goal_id: Returns a backend scoped to
+          agent_root/goals/<goal_id>/. That backend's _goal_path is
+          goals/<goal_id>/goal.md, _history_path is goals/<goal_id>/
+          goal_history.jsonl, _archive_dir is goals/<goal_id>/goal_archive/,
+          _lock_path is goals/<goal_id>/.goal.lock — per-goal lock granularity.
+
+        The returned backend satisfies the full GoalBackend + AddressableGoalBackend
+        contract. Callers MUST check isinstance(backend, AddressableGoalBackend)
+        before calling this method.
+
+        Args:
+            goal_id: the goal identifier or None (alias for '_standing').
+
+        Raises:
+            ValueError: when goal_id is not None/STANDING_GOAL_ID and fails
+                charset validation.
+            PathTraversalError: when goals/<goal_id> resolves outside the vault
+                (a symlinked goal dir escaping the perimeter is refused before
+                the scoped backend is constructed — parity with create_goal).
+        """
+        if goal_id is None or goal_id == STANDING_GOAL_ID:
+            # Return a backend scoped to the original agent_root layout.
+            # _goal_path = agent_root/goal.md (unchanged).
+            # _history_path = agent_root/goal_history.jsonl (unchanged).
+            # _lock_path = agent_root/.goal.lock (unchanged).
+            return FilesystemGoalBackend(self._agent_root)
+        # Charset validation for non-standing goal_ids.
+        if not _GOAL_ID_RE.match(goal_id):
+            raise ValueError(
+                f"goal_id {goal_id!r} contains invalid characters or exceeds "
+                f"the maximum length. Use only [a-z0-9_-] up to 64 chars."
+            )
+        # Containment guard — the same canonical invariant create_goal relies on
+        # (MEMORY feedback_containment_reframe_not_whackamole). Resolve
+        # goals/<goal_id> against the PARENT root and refuse a symlinked goal dir
+        # that escapes the vault BEFORE constructing the scoped backend. Without
+        # this, FilesystemGoalBackend.__init__ would resolve() the symlink and
+        # re-anchor the scoped backend's containment root on the escaped target —
+        # so a subsequent write via the scoped backend's leaves (each of which
+        # checks against the re-anchored root) could land outside the vault. The
+        # leaf may not yet exist (create_goal calls this before any mkdir);
+        # _require_within_root resolves the non-existent tail against its existing
+        # ancestors and still detects an escaping symlink ancestor.
+        self._require_within_root(
+            self._agent_root / "goals" / goal_id, f"goals/{goal_id}/"
+        )
+        # Return a backend scoped to goals/<goal_id>/.
+        # FilesystemGoalBackend.__init__ sets:
+        #   _goal_path     = goals/<goal_id>/goal.md
+        #   _history_path  = goals/<goal_id>/goal_history.jsonl
+        #   _archive_dir   = goals/<goal_id>/goal_archive/
+        #   _lock_path     = goals/<goal_id>/.goal.lock
+        # Per-goal lock granularity: concurrent run-goals never block.
+        return FilesystemGoalBackend(self._agent_root / "goals" / goal_id)
 
 
 # ──────────────────────────────────────────────────────────────────
