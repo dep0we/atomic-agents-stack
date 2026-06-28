@@ -95,7 +95,7 @@ success_criteria:
 sub_goals:
   - id: ch_1_to_4
     label: "Chapters 1-4 drafted and edited"
-    status: complete                 # pending | in_progress | complete | blocked | abandoned
+    status: complete                 # pending | in_progress | complete | blocked | abandoned | awaiting_decision | skipped
     assigned: writer
     deadline: 2026-04-30
     completed: 2026-04-28
@@ -193,7 +193,7 @@ Each entry in `sub_goals`:
 ```yaml
 - id: <unique within this goal>
   label: <human-readable>
-  status: pending | in_progress | complete | blocked | abandoned
+  status: pending | in_progress | complete | blocked | abandoned | awaiting_decision | skipped
   assigned: <role_name | "self" | null>
   deadline: <date | null>
   blocked_by: <other sub_goal id | null>      # if status == blocked, what's blocking
@@ -544,3 +544,31 @@ These are reasonable v2 additions when the first goal-driven agent has been runn
 ---
 
 *See [06-multi-agent-projects](06-multi-agent-projects.md) for project-level goals (Muse Director case) and [../implementation/cron-agent](../implementation/cron-agent.md) for the cron loop that drives goal-driven agents.*
+
+---
+
+## Versioned normative addendum — #581 PR2 (2026-06-27): conductor gate statuses
+
+Two sub-goal status values were added to `VALID_SUB_GOAL_STATUSES` by the conductor (spec/50 PR2, issue [#581](https://github.com/dep0we/atomic-agents-stack/issues/581)). These statuses are **set only by the conductor** — they are not reachable via `GoalManager.mark_complete()`, operator CLI, or any goal-manager method. The `VALID_SUB_GOAL_STATUSES` set now has **7 members** (was 5 before conductor PR2).
+
+### `awaiting_decision`
+
+**Who sets it:** the conductor (`conductor.run()`) when an `is_gate=True` stage is first reached and the run cap has not been exhausted.
+
+**What it means:** the sub-goal/stage is durably suspended, awaiting a human gate decision. The run is NOT continuing; it will only advance when `conductor.resume()` is called with a valid `decision_id`. This is NOT a terminal status — the sub-goal may transition from `awaiting_decision` to `complete`, `skipped`, or `abandoned` when the gate is answered.
+
+**Transition in/out:**
+- Into: `pending`/`in_progress` → `awaiting_decision` (conductor sets `gate_decision_id` on the sub-goal in the same transition).
+- Out (via `conductor.resume()`): `awaiting_decision` → `complete` (disposition='continue'), `skipped` (disposition='skip'), `abandoned` (disposition='halt').
+
+**CAS semantics:** `apply_transition(expected_from_status='awaiting_decision')` is used by `conductor.resume()` to atomically verify the run is still suspended and the `decision_id` matches before writing the answer. A stale or duplicate answer raises `GoalConcurrentModification` without writing.
+
+### `skipped`
+
+**Who sets it:** the conductor (`conductor.resume()`) when a gate is answered with `disposition='skip'`.
+
+**What it means:** the stage was deliberately skipped by a human gate ruling. This is a **terminal-done** status — the conductor treats it like `complete` for resume-cursor purposes (the stage is not re-dispatched). Unlike `complete`, a `skipped` stage has no `outcome_run_id` or `output` pointer — the human ruling IS the "result." Every skipped stage records a `GateDecision` with the rationale; a silent skip is structurally impossible (spec/50 C4).
+
+**`gate_decision_id` transition field:** when the conductor suspends a gate stage, it stores `gate_decision_id` on the `SubGoal` via the `apply_transition(fields={'gate_decision_id': decision_id})` channel. This field is cleared (`None`) when the gate is answered (transition out of `awaiting_decision`). It is a member of `SUB_GOAL_TRANSITION_FIELDS` as of PR2 and is covered by `MUST 6`'s allow-set enforcement.
+
+These additions are backward-compatible: existing goals never contain these statuses; `VALID_SUB_GOAL_STATUSES` is an additive set; `GoalCapabilities`, `CompletionEvaluation`, and all existing backends handle the new values without schema migration. `CompletionEvaluation` gained `sub_goals_awaiting_decision` and `sub_goals_skipped` count fields (both default 0) in the same PR; a goal with `sub_goals_awaiting_decision > 0` reports `all_criteria_met=False`.
