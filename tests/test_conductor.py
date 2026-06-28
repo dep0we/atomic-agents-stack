@@ -60,6 +60,27 @@ Coverage (acceptance criteria from arc-ruling #580 PR1, #581 PR2, #582 PR3):
   TEST 42 — end-to-end self-release: deferred B self-releases once A's gate is answered + still-blocked negative control (C1, PR3 #582)
   TEST 43 — _is_decision_still_pending FAILS CLOSED (stays deferred) on a goal read error (C4a/A1, PR3 #582)
   TEST 44 — _scan_active_conflicts FAILS CLOSED (raises ConductorConflictScanError) on an unreadable scan / malformed blocker (C4b/A2/B3, PR3 #582)
+  TEST 45 — C7 launder-guard: run() raises ConductorLaunderRefused when agent.trigger == 'delegate' (PR4 #583)
+  TEST 45-strip-RED — C7 launder-guard: run() does NOT raise on non-delegate trigger (PR4 #583)
+  TEST 46 — C7 launder-guard: resume() raises ConductorLaunderRefused when agent.trigger == 'delegate' BEFORE any ledger mutation (PR4 #583)
+  TEST 46-strip-RED — C7 launder-guard: resume() does NOT raise on non-delegate trigger (PR4 #583)
+  TEST 47–50 — check_conductor heavy probe: PASS on healthy run; FAIL on corrupted goal.md;
+              most-recent-by-ts selection; WARN on missing per-gate conductor_gate_pending (PR4 #583)
+  TEST 51 — check_conductor heavy probe: gated run completed via resume(continue) → PASS (P1 negative control) (PR4 #583)
+  TEST 52 — check_conductor heavy probe: parseable-but-SCHEMA-INVALID goal.md → FAIL (PR4 #583)
+  TEST 53 — check_conductor heavy probe: goal.md intact but goal_history.jsonl unreadable → honest WARN (PR4 #583)
+  TEST 54 — check_conductor heavy probe: awaiting_decision sub-goal with NO gate_decision_id → FAIL (PR4 #583)
+  TEST 54b — check_conductor heavy probe: COMPOUND fault (corrupt goal.md cursor + degraded history) → FAIL (PR4 #583)
+  TEST 55 — check_conductor heavy probe: 'skipped' sub-goal with NO recorded skip ruling → FAIL (PR4 #583)
+  TEST 56 (C8) — gate suspension holds NO live lock; an independent non-conflicting run proceeds normally (PR4 #583)
+  TEST 57 — parse-guard: committed reference PLAYBOOK.md at docs/samples/dev-lifecycle/ validates via
+            validate_playbook_manifest (18 stages, 8 gates, merge-gate conflict_keys=('merge:main',),
+            run_cap_usd=50.00, zero warnings) (#584)
+  TEST 58 — e2e integration: full dev-lifecycle run against a feature-issue subject; suspends at each
+            of 8 gates; resumes (6x continue + 2x skip); all 8 rulings in one queryable goal ledger
+            with rationale; cumulative_spend_usd > 0 (#584)
+  TEST 59 — merge-gate conflict serialization: A suspends holding 'merge:main', B defers, A
+            resumes(continue), B self-releases into its own gate; real FilesystemLockBackend (#584)
 
 Note on dispatch patching: dispatch_sub_goal_as_outcome is imported via
 a local `from ..goal.coordinator import ...` inside _dispatch_stage(). Patch
@@ -7075,4 +7096,452 @@ def test_c8_gate_suspension_holds_no_lock_independent_run_proceeds(
     )
     assert holders.get("repo-z") == 1, (
         f"B must independently hold 'repo-z' in awaiting_decision; holders={holders!r}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 57 — parse-guard: the committed reference PLAYBOOK.md at
+# docs/samples/dev-lifecycle/skills/dev-lifecycle-playbook/ validates
+# through validate_playbook_manifest with zero warnings and the
+# correct structural properties (#584).
+#
+# Anchored to the repo root via __file__, not a hard-coded absolute
+# path, so it works on any checkout. Fails loud if the file is absent
+# (is_dir() assertion) so a stale/removed sample is caught immediately.
+
+
+def test_reference_playbook_parses_correctly() -> None:
+    """TEST 57 — parse-guard: reference PLAYBOOK.md validates and has the expected shape.
+
+    Confirms:
+    - validate_playbook_manifest succeeds with zero warnings
+    - 18 conductor stages total (10 automated + 8 gates)
+    - The merge-gate stage carries conflict_keys == ('merge:main',)
+    - run_cap_usd is 50.00
+    - All gate stages have at least two options
+    - design-direction-gate and rollback-gate have a 'skip' option
+    """
+    playbook_dir = (
+        Path(__file__).resolve().parent.parent
+        / "docs"
+        / "samples"
+        / "dev-lifecycle"
+        / "skills"
+        / "dev-lifecycle-playbook"
+    )
+    assert playbook_dir.is_dir(), (
+        f"Reference playbook directory not found at {playbook_dir}; "
+        "was docs/samples/dev-lifecycle/ created as part of #584?"
+    )
+
+    manifest, warnings = validate_playbook_manifest(playbook_dir)
+
+    assert manifest is not None, (
+        f"validate_playbook_manifest returned None; warnings={warnings}"
+    )
+    assert warnings == [], (
+        f"Reference PLAYBOOK.md must validate with zero warnings; got: {warnings}"
+    )
+    assert manifest.run_cap_usd == 50.00, (
+        f"run_cap_usd must be 50.00; got {manifest.run_cap_usd}"
+    )
+    assert len(manifest.stages) == 18, (
+        f"Expected 18 conductor stages (10 automated + 8 gates); got {len(manifest.stages)}"
+    )
+
+    gate_stages = [s for s in manifest.stages if s.is_gate]
+    automated_stages = [s for s in manifest.stages if not s.is_gate]
+    assert len(gate_stages) == 8, (
+        f"Expected 8 gate stages; got {len(gate_stages)}: {[s.stage_id for s in gate_stages]}"
+    )
+    assert len(automated_stages) == 10, (
+        f"Expected 10 automated stages; got {len(automated_stages)}"
+    )
+
+    # merge-gate must carry conflict_keys=("merge:main",)
+    merge_gate = next((s for s in manifest.stages if s.stage_id == "merge-gate"), None)
+    assert merge_gate is not None, "merge-gate stage must be present"
+    assert merge_gate.conflict_keys == ("merge:main",), (
+        f"merge-gate must declare conflict_keys=('merge:main',); "
+        f"got {merge_gate.conflict_keys!r}"
+    )
+
+    # Every gate stage must offer at least two options (a gate with one option
+    # is not a decision point). Loop all 8 so the docstring claim is exercised,
+    # not just the two skip gates checked below.
+    for stage in gate_stages:
+        assert stage.options is not None and len(stage.options) >= 2, (
+            f"gate stage {stage.stage_id} must have at least two options; "
+            f"got {stage.options!r}"
+        )
+
+    # design-direction-gate and rollback-gate must carry a skip option
+    for stage_id in ("design-direction-gate", "rollback-gate"):
+        stage = next((s for s in manifest.stages if s.stage_id == stage_id), None)
+        assert stage is not None, f"{stage_id} must be present"
+        skip_options = [o for o in stage.options if "skip" in o.lower()]
+        assert skip_options, (
+            f"{stage_id} must have a 'skip' option; options={stage.options!r}"
+        )
+
+    # Stage order: gate first, then automated stages in document order
+    stage_ids = [s.stage_id for s in manifest.stages]
+    assert stage_ids[0] == "go-no-go-gate", (
+        f"First stage must be go-no-go-gate; got {stage_ids[0]!r}"
+    )
+    assert stage_ids[-1] == "document-run", (
+        f"Last stage must be document-run; got {stage_ids[-1]!r}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 58 — e2e integration: full dev-lifecycle run.
+#
+# Loads the committed reference PLAYBOOK.md, runs the full 18-stage
+# lifecycle against a "feature-issue" subject, suspending at each of
+# 8 gates and resuming with a mix of continue/skip dispositions.
+# All 8 gate rulings land in ONE goal ledger queryable as
+# conductor_gate_answered events. cumulative_spend_usd > 0 after 10
+# automated stages each costing 0.10 (#584).
+#
+# Dispatch patching: uses _make_ledger_updating_dispatch so the goal
+# ledger is updated on each automated stage dispatch (C2 resume cursor
+# correctness). Gate-answered transitions are written by resume().
+#
+# Design-direction-gate and rollback-gate are answered with skip
+# (no UI component; no deployed surface) — exercises the skip path on
+# a real run resuming from a real ledger.
+
+
+def test_e2e_dev_lifecycle_full_run(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """TEST 58 — e2e integration: full 18-stage dev-lifecycle run, 8 gates, 10 dispatches.
+
+    Gate dispositions:
+      go-no-go-gate         → continue
+      spec-scope-gate       → continue
+      autoplan-concerns-gate → continue
+      design-direction-gate → skip  (backend change, no UI)
+      tier-a-rulings-gate   → continue
+      security-findings-gate → continue
+      merge-gate            → continue
+      rollback-gate         → skip  (no deployed surface yet)
+    """
+    from atomic_agents.locks.filesystem import FilesystemLockBackend  # noqa: PLC0415
+
+    # Use a real lock backend so the per-run lease and conflict-scan lease
+    # actually take/release on each run()/resume() call.
+    mock_agent.lock_backend = FilesystemLockBackend(agent_root)
+
+    playbook_dir = (
+        Path(__file__).resolve().parent.parent
+        / "docs"
+        / "samples"
+        / "dev-lifecycle"
+        / "skills"
+        / "dev-lifecycle-playbook"
+    )
+    assert playbook_dir.is_dir(), f"Reference playbook dir not found at {playbook_dir}"
+    manifest, warnings = validate_playbook_manifest(playbook_dir)
+    assert manifest is not None and warnings == [], (
+        f"Reference PLAYBOOK.md must parse cleanly; warnings={warnings}"
+    )
+
+    _ledger_dispatch = _make_ledger_updating_dispatch(total_cost_usd=0.10)
+    idem = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+    subject = "Implement feature X from issue #584"
+
+    with (
+        patch(
+            "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
+            side_effect=_ledger_dispatch,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=idem,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        # 1. run() → suspends at go-no-go-gate (first stage, is_gate=True)
+        state = run(playbook=manifest, subject=subject, agent=mock_agent)
+        assert state.status == "awaiting_decision", (
+            f"run() must suspend at go-no-go-gate; got {state.status!r}"
+        )
+        assert state.pending_decision is not None
+        assert state.pending_decision.stage_id == "go-no-go-gate"
+        run_id = state.conductor_run_id
+
+        def _resume(answer: str, disposition: str, rationale: str) -> "ConductorState":  # noqa: F821
+            nonlocal state
+            state = resume(
+                playbook=manifest,
+                subject=subject,
+                agent=mock_agent,
+                conductor_run_id=run_id,
+                decision_id=state.pending_decision.decision_id,
+                answer=answer,
+                disposition=disposition,
+                rationale=rationale,
+            )
+            return state
+
+        # Gate 1: go-no-go → continue → processes spec-run → spec-scope-gate
+        _resume(
+            answer="Proceed — well-defined problem, right shape.",
+            disposition="continue",
+            rationale="Idea is solid; bounded scope.",
+        )
+        assert state.status == "awaiting_decision", (
+            f"After go-no-go continue, must suspend at spec-scope-gate; got {state.status!r}"
+        )
+        assert state.pending_decision.stage_id == "spec-scope-gate"
+
+        # Gate 2: spec-scope → continue → autoplan-run → autoplan-concerns-gate
+        _resume(
+            answer="Spec is crisp; scope boundaries approved.",
+            disposition="continue",
+            rationale="All in-scope items clear; out-of-scope explicit.",
+        )
+        assert state.status == "awaiting_decision"
+        assert state.pending_decision.stage_id == "autoplan-concerns-gate"
+
+        # Gate 3: autoplan-concerns → continue → design-run → design-direction-gate
+        _resume(
+            answer="Concerns noted and addressed; proceed to build.",
+            disposition="continue",
+            rationale="Engineering concerns resolved; architecture sound.",
+        )
+        assert state.status == "awaiting_decision"
+        assert state.pending_decision.stage_id == "design-direction-gate"
+
+        # Gate 4: design-direction → skip (backend change, no UI)
+        # → discovery-run → tier-a-rulings-gate
+        _resume(
+            answer="No UI component; design gate not applicable.",
+            disposition="skip",
+            rationale="Backend-only change; no visual direction needed.",
+        )
+        assert state.status == "awaiting_decision"
+        assert state.pending_decision.stage_id == "tier-a-rulings-gate"
+
+        # Gate 5: tier-a-rulings → continue
+        # → build-run, verify-run, security-run → security-findings-gate
+        _resume(
+            answer="All Tier-A forks ruled; proceed to build.",
+            disposition="continue",
+            rationale="Three forks: chose option A on each with rationale.",
+        )
+        assert state.status == "awaiting_decision"
+        assert state.pending_decision.stage_id == "security-findings-gate"
+
+        # Gate 6: security-findings → continue
+        # → ship-run → merge-gate (has conflict_keys=["merge:main"])
+        _resume(
+            answer="Security gate clears; no findings.",
+            disposition="continue",
+            rationale="No auth/secrets/money surfaces touched.",
+        )
+        assert state.status == "awaiting_decision"
+        assert state.pending_decision.stage_id == "merge-gate"
+        # merge-gate must surface its conflict_keys in the GateDecision
+        assert "merge:main" in (state.pending_decision.held_conflict_keys or ()), (
+            f"merge-gate GateDecision must carry 'merge:main' in held_conflict_keys; "
+            f"got {state.pending_decision.held_conflict_keys!r}"
+        )
+
+        # Gate 7: merge-gate → continue → deploy-run → rollback-gate
+        _resume(
+            answer="PR reviewed and approved; proceed to merge.",
+            disposition="continue",
+            rationale="Diff matches spec; commits bisectable; CHANGELOG accurate.",
+        )
+        assert state.status == "awaiting_decision"
+        assert state.pending_decision.stage_id == "rollback-gate"
+
+        # Gate 8: rollback-gate → skip (no deployed surface yet) → document-run → complete
+        _resume(
+            answer="No deployed surface yet; rollback gate not applicable.",
+            disposition="skip",
+            rationale="Pre-production codebase; no live traffic to protect.",
+        )
+        assert state.status == "complete", (
+            f"After all 8 gates, run must complete; got {state.status!r}: "
+            f"completed_stages={state.completed_stage_ids}"
+        )
+
+    # All 8 gate rulings must be in ONE queryable ledger
+    history_path = agent_root / "goals" / run_id / "goal_history.jsonl"
+    answer_events = []
+    for raw in history_path.read_text(encoding="utf-8").splitlines():
+        if not raw.strip():
+            continue
+        rec = json.loads(raw)
+        if rec.get("event") == "conductor_gate_answered":
+            answer_events.append(rec)
+
+    assert len(answer_events) == 8, (
+        f"Expected 8 conductor_gate_answered events (one per gate); "
+        f"got {len(answer_events)}"
+    )
+    # All rulings must carry a rationale AND a ruler (answered_by) — the decision
+    # record requirement is "rationale + ruler", so the e2e test asserts both.
+    for evt in answer_events:
+        assert evt.get("rationale"), (
+            f"Every gate ruling must have a non-empty rationale; "
+            f"stage_id={evt.get('stage_id')!r} has none"
+        )
+        assert evt.get("answered_by"), (
+            f"Every gate ruling must record its ruler (answered_by); "
+            f"stage_id={evt.get('stage_id')!r} has none"
+        )
+
+    dispositions = [e.get("disposition") for e in answer_events]
+    assert dispositions.count("skip") == 2, (
+        f"Expected 2 skip dispositions; got {dispositions}"
+    )
+    assert dispositions.count("continue") == 6, (
+        f"Expected 6 continue dispositions; got {dispositions}"
+    )
+
+    # 10 automated stages × 0.10 each = 1.00. The exact-value assertion proves
+    # the durable ledger accumulates spend ACROSS the 8 resume() boundaries — a
+    # weak `> 0` would still pass if only the final invocation's single dispatch
+    # were counted (cross-resume accumulation broken).
+    assert state.cumulative_spend_usd == pytest.approx(1.00), (
+        f"cumulative_spend_usd must be 1.00 (10 dispatched stages × 0.10, "
+        f"accumulated across all resume boundaries); got {state.cumulative_spend_usd}"
+    )
+    # All 18 stages must appear as completed or skipped in the final state
+    assert len(state.completed_stage_ids) == 18, (
+        f"Expected 18 completed (incl. skipped) stage IDs; "
+        f"got {len(state.completed_stage_ids)}: {state.completed_stage_ids}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 59 — merge-gate conflict serialization: A suspends holding
+# 'merge:main', B defers, A resumes(continue), B self-releases into
+# its own gate. Real FilesystemLockBackend for the scan/suspend
+# critical section. Interleaved-sequential (not threaded — fcntl.flock
+# from the same process would be a false green on macOS/Linux). (#584)
+
+
+def test_merge_key_conflict_serialization(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """TEST 59 — merge:main conflict key: A holds it, B defers, A releases, B proceeds.
+
+    The 'merge:main' key is the irreversible merge-to-main gate guard.
+    Only one run should hold it at a time; a second run reaching its
+    merge gate must defer until the first completes.
+
+    Interleaved-sequential: A suspends (holds 'merge:main'), B defers
+    behind A's decision, A resumes (continue) → A completes, key freed,
+    B self-releases on next run() call → B proceeds into its own gate.
+
+    This is the correct layer to test: conductor merge serialization is
+    decision-ledger-based (OD1b — B queues behind A's pending DECISION),
+    NOT a flock held across suspension (C8 — gate suspension holds no live
+    lock). True cross-process lock contention is exercised by the
+    FilesystemLockBackend's own conformance suite, not here; a single-process
+    threaded test would be a false green anyway (fcntl.flock is keyed to the
+    open file description, so two threads in one process do not contend).
+    """
+    from atomic_agents.locks.filesystem import FilesystemLockBackend  # noqa: PLC0415
+
+    mock_agent.lock_backend = FilesystemLockBackend(agent_root)
+
+    # Two independent playbooks, each with a single merge:main gate.
+    pb_a = _make_conflict_gate_playbook(agent_root, "merge-a", "merge:main")
+    pb_b = _make_conflict_gate_playbook(agent_root, "merge-b", "merge:main")
+
+    idem = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+
+    with (
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=idem,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        # 1. A suspends at its gate, holding 'merge:main'.
+        state_a = run(playbook=pb_a, subject="merge-A", agent=mock_agent)
+        assert state_a.status == "awaiting_decision", (
+            f"Run A must suspend at merge:main gate; got {state_a.status!r}"
+        )
+        a_decision_id = state_a.pending_decision.decision_id
+        a_run_id = state_a.conductor_run_id
+        # The held key must be durable in the sub-goal
+        goal_a = mock_agent.goal_backend.for_goal(a_run_id).load_goal(mock_agent.name)
+        held = [
+            sg.held_conflict_keys or ()
+            for sg in goal_a.sub_goals
+            if sg.status == "awaiting_decision"
+        ]
+        assert any("merge:main" in k for k in held), (
+            f"A must hold 'merge:main' in its awaiting_decision sub-goal; held={held!r}"
+        )
+
+        # 2. B defers behind A.
+        state_b1 = run(playbook=pb_b, subject="merge-B", agent=mock_agent)
+        assert state_b1.status == "deferred", (
+            f"Run B must defer behind A's merge:main gate; got {state_b1.status!r}"
+        )
+        b_run_id = state_b1.conductor_run_id
+        assert state_b1.queued_behind_decision_id == a_decision_id
+
+        # 3. A resumes (continue) → A completes, 'merge:main' freed.
+        state_a2 = resume(
+            playbook=pb_a,
+            subject="merge-A",
+            agent=mock_agent,
+            conductor_run_id=a_run_id,
+            decision_id=a_decision_id,
+            answer="PR reviewed and approved.",
+            disposition="continue",
+            rationale="Diff matches spec.",
+        )
+        assert state_a2.status == "complete", (
+            f"A must complete after continue; got {state_a2.status!r}"
+        )
+
+        # 4. Re-invoke run(B) → B self-releases into its OWN merge:main gate.
+        state_b2 = run(
+            playbook=pb_b,
+            subject="merge-B",
+            agent=mock_agent,
+            conductor_run_id=b_run_id,
+        )
+
+    b_history = agent_root / "goals" / b_run_id / "goal_history.jsonl"
+    assert _has_event(b_history, "conductor_queue_released"), (
+        "B must append conductor_queue_released once A's gate is answered"
+    )
+    assert state_b2.status == "awaiting_decision", (
+        f"B must proceed into its own merge:main gate; got {state_b2.status!r}"
+    )
+    assert state_b2.pending_decision is not None
+    assert state_b2.pending_decision.decision_id != a_decision_id, (
+        "B must have its OWN gate decision, not A's"
+    )
+    # 'merge:main' is now held by B
+    goal_b = mock_agent.goal_backend.for_goal(b_run_id).load_goal(mock_agent.name)
+    held_b = [
+        sg.held_conflict_keys or ()
+        for sg in goal_b.sub_goals
+        if sg.status == "awaiting_decision"
+    ]
+    assert any("merge:main" in k for k in held_b), (
+        f"B must now hold 'merge:main' in its awaiting_decision sub-goal; held={held_b!r}"
     )

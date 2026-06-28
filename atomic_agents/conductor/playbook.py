@@ -43,9 +43,9 @@ Stage field rules:
     for the stage.
   - prompt_ref: optional path relative to playbook dir for longer prompts.
   - rubric / rubric_ref: optional judge rubric; defaults to the prompt text.
-  - model: optional per-stage model dial. PARSED but NOT APPLIED in PR1 (the
+  - model: optional per-stage model dial. PARSED but NOT YET APPLIED (the
     stage runs on the agent's configured model.md model); a non-None value emits
-    a one-time warning at run(). Actor-model wiring is deferred.
+    a warning on each run()/resume() process. Actor-model wiring is tracked in #668.
   - is_gate: false (default). True stages SUSPEND the run (PR2 #581): run()
     transitions the gate sub-goal to 'awaiting_decision' and returns a
     ConductorState carrying the pending GateDecision; resume() answers it.
