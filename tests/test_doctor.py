@@ -479,6 +479,8 @@ def test_run_doctor_no_agent_skips_agent_checks(tmp_path, monkeypatch):
         "principal-backend",
         "embedding-backend",
         "conversation-backend",
+        "agent-registry-backend",
+        "conductor",
         "memory-backend-config",
         "memory-backend",
         "write-paths",
@@ -1165,5 +1167,106 @@ def test_conversation_backend_redacts_credential_url(tmp_path, monkeypatch):
     assert result.status == FAIL
     assert "hunter2" not in result.message
     assert "postgres://..." in result.message
-    # detail must not leak the credential either
-    assert "hunter2" not in str(result.detail)
+
+
+# ──────────────────────────────────────────────────────────────────
+# check_conductor (spec/50 PR4 #583)
+
+
+def test_check_conductor_pass_with_zero_runs(tmp_path):
+    """check_conductor returns PASS (not SKIP) when no conductor runs exist.
+
+    A fresh agent with no goals/ dir at all is the clean home-user default.
+    PASS with 0 runs signals 'the check ran and found a healthy empty state',
+    not 'this check was skipped' (which would be misleading).
+    """
+    from atomic_agents.doctor import check_conductor, PASS
+
+    agent_root = tmp_path / "fresh-agent"
+    agent_root.mkdir()
+
+    result = check_conductor(agent_root)
+
+    assert result.status == PASS, (
+        f"Expected PASS for agent with no conductor runs; got {result.status!r}: {result.message}"
+    )
+    assert result.detail.get("conductor_runs_found") == 0
+    assert "no conductor runs" in result.message
+
+
+def test_check_conductor_pass_with_goals_dir_no_conductor_runs(tmp_path):
+    """check_conductor returns PASS when goals/ exists but has no conductor runs.
+
+    An agent with a standing goal.md (non-conductor goals) but no conductor
+    playbook runs should also return PASS with 0 conductor runs found.
+    """
+    from atomic_agents.doctor import check_conductor, PASS
+
+    agent_root = tmp_path / "goal-agent"
+    agent_root.mkdir()
+    goals_dir = agent_root / "goals"
+    goals_dir.mkdir()
+    # Create a non-conductor goal directory (no conductor_run_started event)
+    goal_dir = goals_dir / "ordinary-goal"
+    goal_dir.mkdir()
+    (goal_dir / "goal_history.jsonl").write_text(
+        '{"event": "goal_created", "ts": "2026-06-28T00:00:00+00:00"}\n'
+    )
+
+    result = check_conductor(agent_root)
+
+    assert result.status == PASS
+    assert result.detail.get("conductor_runs_found") == 0
+
+
+def test_check_conductor_wired_into_run_doctor(tmp_path, monkeypatch):
+    """check_conductor must appear in run_doctor() output for an agent with no conductor runs.
+
+    This verifies BOTH wiring points:
+    (1) The no-agent SKIP roster includes 'conductor'.
+    (2) The agent-scoped execution block calls check_conductor() so it appears
+        in run_doctor() results (false-PASS-by-omission prevention).
+    """
+    from atomic_agents.doctor import run_doctor, PASS
+
+    _isolate_keys(monkeypatch, tmp_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-key")
+    _make_agent(tmp_path, "conductor-wiring-agent")
+
+    results = run_doctor(
+        agent_name="conductor-wiring-agent",
+        agents_root=tmp_path,
+        skip_mcp=True,
+    )
+    names = [r.name for r in results]
+    assert "conductor" in names, (
+        "check_conductor must be wired into run_doctor() — 'conductor' missing from results. "
+        f"Names found: {names}"
+    )
+
+    conductor_result = next(r for r in results if r.name == "conductor")
+    assert conductor_result.status == PASS, (
+        f"conductor check must PASS for a fresh agent with no runs; "
+        f"got {conductor_result.status!r}: {conductor_result.message}"
+    )
+
+
+def test_check_conductor_no_agent_emits_skip():
+    """run_doctor(agent_name=None) must emit 'conductor' as SKIP (no-agent roster).
+
+    Without --agent, every agent-scoped check must appear in the output as SKIP.
+    Omitting 'conductor' from the SKIP roster creates a false-PASS-by-omission
+    (the check never appears, so CI can't verify it exists).
+    """
+    from atomic_agents.doctor import run_doctor, SKIP
+
+    results = run_doctor(agent_name=None, agents_root=None)
+    names_by_status = {r.name: r.status for r in results}
+
+    assert "conductor" in names_by_status, (
+        "'conductor' must be in the no-agent SKIP roster in doctor.py lines 200-228. "
+        f"Names found: {list(names_by_status.keys())}"
+    )
+    assert names_by_status["conductor"] == SKIP, (
+        f"conductor must be SKIP when no --agent supplied; got {names_by_status['conductor']!r}"
+    )

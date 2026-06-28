@@ -30,6 +30,7 @@ from .exceptions import (
     WritePathViolation,
     NotInRoster,
     SelfDelegationError,
+    ConductorLaunderRefused,
     DreamInProgress,
     DreamNotFound,
     ToolNotRegistered,

@@ -222,6 +222,7 @@ def run_doctor(
             "principal-backend",
             "conversation-backend",
             "agent-registry-backend",
+            "conductor",
             "memory-backend-config",
             "memory-backend",
             "write-paths",
@@ -324,6 +325,12 @@ def run_doctor(
     # profile-missing AND profile-has / registry-missing) runs inside
     # check_agent_registry_backend.
     results.append(check_agent_registry_backend(resolved_root))
+    # spec/50 PR4: orchestration-layer check (NOT a backend protocol check).
+    # PASS-with-0-runs is the clean home-user default (no SKIP for the agent path).
+    # Positioned after check_agent_registry_backend and before memory-backend-config
+    # so backend checks form a contiguous block and conductor follows naturally after
+    # the last backend.
+    results.append(check_conductor(agent_root))
     # memory-backend-config (coherence) runs before memory-backend (liveness),
     # mirroring the check_lock_backend → check_locks ordering (#60 PR 3).
     results.append(check_memory_backend_config(agent_root))
@@ -5702,6 +5709,220 @@ def check_agent_registry_backend(agents_root: Path) -> CheckResult:
             f"{'' if agent_count == 1 else 's'} discovered)"
         ),
         detail=detail,
+    )
+
+
+def check_conductor(agent_root: Path) -> CheckResult:
+    """Conductor orchestration layer check — dual-probe (light + heavy cursor read).
+
+    This is an ORCHESTRATION-LAYER check, not a backend protocol check. The
+    conductor holds no authoritative state (spec/50 C1) — it composes Goal /
+    Outcome / Idempotency / Queue. Doctor checks that those composed stores are
+    readable and the last run's resume cursor is reconstructable (read-only).
+
+    Dual-probe (spec/50 PR4 addendum):
+    1. Light probe: scan goals/<id>/goal_history.jsonl files for
+       'conductor_run_started' events to identify conductor runs. If zero
+       conductor runs exist, return PASS (clean state — not SKIP; the check
+       ran and found a healthy empty set). Select the MOST RECENT run.
+    2. Heavy probe: load the selected run's goal via
+       agent.goal_backend.for_goal(id).load_goal() and read the history file
+       for cursor-walk validation — STRICTLY READ-ONLY (no write operations,
+       no healing). FAIL on confirmed GoalCorrupted (ledger corruption
+       detected during the read). WARN on other read exceptions (transient
+       race or missing run). WARN when a gate sub-goal has awaiting_decision
+       status but the history has no 'conductor_gate_pending' event (missing
+       audit — healable on next run(), but worth flagging). WARN when a
+       complete sub-goal has no output pointer (pointer missing — also
+       healable on resume, but worth surfacing).
+
+    Returns PASS with detail when all reads succeed.
+    Returns WARN for transient read failures or healable anomalies.
+    Returns FAIL for confirmed GoalCorrupted (structural ledger corruption).
+
+    SKIP is only emitted by the no-agent SKIP roster (no agent_root supplied).
+    """
+    from .exceptions import GoalCorrupted  # noqa: PLC0415
+    from .conductor.run import _has_event, _iter_history_events  # noqa: PLC0415
+
+    goals_dir = agent_root / "goals"
+
+    # ── Light probe: find conductor runs by scanning goal_history.jsonl ──
+    conductor_runs: list[tuple[str, Path]] = []  # (run_id, history_path)
+
+    if goals_dir.is_dir():
+        for run_dir in sorted(goals_dir.iterdir()):
+            if not run_dir.is_dir():
+                continue
+            history_path = run_dir / "goal_history.jsonl"
+            if not history_path.is_file():
+                continue
+            try:
+                if _has_event(history_path, "conductor_run_started"):
+                    conductor_runs.append((run_dir.name, history_path))
+            except Exception:
+                # A single unreadable history file doesn't block the overall scan
+                pass
+
+    if not conductor_runs:
+        return CheckResult(
+            name="conductor",
+            status=PASS,
+            message="no conductor runs found (agent has not run a playbook yet)",
+            detail={"conductor_runs_found": 0},
+        )
+
+    # ── Heavy probe: reconstruct the resume cursor for the most recent run ──
+    # "Most recent" = lexicographically last (crun-<uuid> format sorts by creation order)
+    most_recent_run_id, most_recent_history = sorted(
+        conductor_runs, key=lambda t: t[0]
+    )[-1]
+
+    # Load the goal — read-only. No write operations permitted here.
+    # Use get_default_goal_backend() to resolve the operator-configured backend
+    # (same pattern as check_goal_backend), then for_goal() to scope it to the run.
+    try:
+        from .goal import get_default_goal_backend  # noqa: PLC0415
+        from .goal.backend import AddressableGoalBackend  # noqa: PLC0415
+
+        goal_backend = get_default_goal_backend(agent_root)
+        if not isinstance(goal_backend, AddressableGoalBackend):
+            return CheckResult(
+                name="conductor",
+                status=WARN,
+                message=(
+                    f"goal backend ({type(goal_backend).__name__!r}) does not "
+                    f"implement AddressableGoalBackend — conductor cursor probe skipped"
+                ),
+                detail={
+                    "conductor_runs_found": len(conductor_runs),
+                    "most_recent_run_id": most_recent_run_id,
+                },
+            )
+        conductor_backend = goal_backend.for_goal(most_recent_run_id)
+        goal = conductor_backend.load_goal(agent_root.name)
+    except GoalCorrupted as exc:
+        return CheckResult(
+            name="conductor",
+            status=FAIL,
+            message=f"most-recent conductor run {most_recent_run_id!r} has a corrupted goal ledger: {exc}",
+            fix_hint=(
+                "Inspect the goal at goals/"
+                + most_recent_run_id
+                + "/goal.md and goal_history.jsonl. "
+                "If the run completed or was halted, archive it via the goal backend."
+            ),
+            detail={
+                "conductor_runs_found": len(conductor_runs),
+                "most_recent_run_id": most_recent_run_id,
+                "corruption": str(exc),
+            },
+        )
+    except Exception as exc:
+        # Transient race (run deleted between scan and load), or read error.
+        # WARN not FAIL — this is not confirmed corruption.
+        return CheckResult(
+            name="conductor",
+            status=WARN,
+            message=(
+                f"could not read most-recent conductor run {most_recent_run_id!r} "
+                f"for cursor probe: {exc}"
+            ),
+            detail={
+                "conductor_runs_found": len(conductor_runs),
+                "most_recent_run_id": most_recent_run_id,
+            },
+        )
+
+    # ── Cursor walk — read-only checks for anomalies ──
+    warnings_found: list[str] = []
+
+    try:
+        # _iter_history_events yields (rec, ok) tuples; collect only valid records
+        event_names = {
+            rec.get("event", "")
+            for rec, ok in _iter_history_events(most_recent_history)
+            if ok and isinstance(rec, dict)
+        }
+    except Exception as exc:
+        return CheckResult(
+            name="conductor",
+            status=WARN,
+            message=(
+                f"conductor run {most_recent_run_id!r} goal loaded but history unreadable: {exc}"
+            ),
+            detail={
+                "conductor_runs_found": len(conductor_runs),
+                "most_recent_run_id": most_recent_run_id,
+                "sub_goals_count": len(goal.sub_goals),
+            },
+        )
+
+    for sg in goal.sub_goals:
+        if sg.status == "awaiting_decision":
+            # Check that the audit event exists (it should be written atomically with
+            # the apply_transition, but a crash in the narrow window can leave it absent)
+            if "conductor_gate_pending" not in event_names:
+                warnings_found.append(
+                    f"sub-goal {sg.id!r} is 'awaiting_decision' but "
+                    f"no 'conductor_gate_pending' event found in history "
+                    f"(healable: next run() will re-emit it)"
+                )
+        elif sg.status == "complete":
+            # For automated stages, output pointer should be set.
+            # Gate stages marked complete (continue disposition) have no outcome_run_id —
+            # that is normal. We check only when gate_decision_id is absent (automated).
+            if not getattr(sg, "gate_decision_id", None) and not sg.output:
+                warnings_found.append(
+                    f"sub-goal {sg.id!r} is 'complete' but has no output pointer "
+                    f"(healable: resume() will re-store the outcome pointer)"
+                )
+
+    if warnings_found:
+        return CheckResult(
+            name="conductor",
+            status=WARN,
+            message=(
+                f"conductor run {most_recent_run_id!r} has "
+                f"{len(warnings_found)} cursor anomaly"
+                f"{'s' if len(warnings_found) != 1 else ''} (healable on next run/resume)"
+            ),
+            fix_hint="Run the conductor again with the same conductor_run_id to heal.",
+            detail={
+                "conductor_runs_found": len(conductor_runs),
+                "most_recent_run_id": most_recent_run_id,
+                "sub_goals_count": len(goal.sub_goals),
+                "warnings": warnings_found,
+            },
+        )
+
+    # Determine run status from events for detail reporting
+    run_status = "unknown"
+    for evt_name in (
+        "conductor_run_completed",
+        "conductor_run_halted",
+        "conductor_gate_pending",
+    ):
+        if evt_name in event_names:
+            run_status = evt_name.replace("conductor_run_", "").replace(
+                "conductor_", ""
+            )
+            break
+
+    return CheckResult(
+        name="conductor",
+        status=PASS,
+        message=(
+            f"conductor ok ({len(conductor_runs)} run"
+            f"{'s' if len(conductor_runs) != 1 else ''} found; "
+            f"most recent {most_recent_run_id!r} cursor readable)"
+        ),
+        detail={
+            "conductor_runs_found": len(conductor_runs),
+            "most_recent_run_id": most_recent_run_id,
+            "most_recent_run_status": run_status,
+            "sub_goals_count": len(goal.sub_goals),
+        },
     )
 
 

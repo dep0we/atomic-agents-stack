@@ -139,6 +139,25 @@ class NestedDelegationRefused(AtomicAgentsError):
     """
 
 
+class ConductorLaunderRefused(NestedDelegationRefused):
+    """A delegated specialist tried to start or resume a conductor run — forbidden.
+
+    The conductor is an orchestration top (spec/50 C7 + OD3). Invoking
+    conductor.run() or conductor.resume() from within a delegated agent frame
+    (trigger='delegate') would launder two-level delegation through the
+    conductor, circumventing spec/15 #9.
+
+    This is a one-level-delegation violation (spec/15), not a transient
+    orchestration error — it must NOT be caught by any ``except ConductorError``
+    retry handler. Subclasses NestedDelegationRefused so existing delegation-
+    violation handlers catch it correctly.
+
+    PR4 #583 upgraded the guard from warnings.warn() to this hard raise on
+    both run() and resume() for the observable ``trigger=='delegate'`` case.
+    Structural call-depth enforcement is deferred (spec/50 C7 caveat).
+    """
+
+
 class DreamInProgress(AtomicAgentsError):
     """A dream run is already in progress for this agent — lock held."""
 

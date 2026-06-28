@@ -102,6 +102,7 @@ from atomic_agents._goal_impl import GoalManager
 from atomic_agents.exceptions import (
     AtomicAgentsError,
     ConductorConflictScanError,
+    ConductorLaunderRefused,
     GoalConcurrentModification,
     GoalCorrupted,
     UnverifiedPrincipalConversationAccess,
@@ -5837,4 +5838,284 @@ def test_scan_active_conflicts_fails_closed_on_read_error(
             agent=agent_c,
             stage_conflict_keys=("repo-x",),
             own_conductor_run_id="crun-self",
+        )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 45 — C7 launder-guard (PR4 #583): run() raises ConductorLaunderRefused
+#           when agent.trigger == 'delegate' (hard raise, not warn)
+
+
+def test_c7_run_raises_on_delegate_trigger(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """C7: run() MUST raise ConductorLaunderRefused when agent.trigger == 'delegate'.
+
+    PR4 #583 upgraded the warn-only guard in run() to a hard raise. The guard must
+    fire BEFORE _resolve_or_create_run() — no goals/<id>/ directory must be created
+    for an invalid delegate call (Principle #5: no orphaned ledger state).
+    """
+    pb_dir = agent_root / "skills" / "c7-run-pb"
+    pb_dir.mkdir()
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(_make_playbook_md(name="c7-run-pb"))
+    playbook = next(m for m in discover_playbooks(agent_root) if m.name == "c7-run-pb")
+
+    mock_agent.trigger = "delegate"
+
+    goals_before = (
+        set((agent_root / "goals").iterdir())
+        if (agent_root / "goals").is_dir()
+        else set()
+    )
+
+    with pytest.raises(ConductorLaunderRefused):
+        run(playbook=playbook, subject="launder attempt", agent=mock_agent)
+
+    # Guard must fire BEFORE any goal directory is created
+    goals_after = (
+        set((agent_root / "goals").iterdir())
+        if (agent_root / "goals").is_dir()
+        else set()
+    )
+    new_dirs = goals_after - goals_before
+    assert not new_dirs, (
+        f"C7 guard must fire BEFORE _resolve_or_create_run() — "
+        f"no goal directory must be created; got new dirs: {new_dirs}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 45-strip-RED — C7 launder-guard: run() does NOT raise when trigger
+#                     is NOT 'delegate'
+
+
+def test_c7_run_does_not_raise_on_non_delegate_trigger(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """C7 strip-RED: run() must NOT raise ConductorLaunderRefused for non-delegate triggers.
+
+    The guard is keyed on trigger == 'delegate' only. cron / serve / None / 'operator'
+    must all proceed normally (the guard does not fire for these).
+    """
+    pb_dir = agent_root / "skills" / "c7-strip-pb"
+    pb_dir.mkdir()
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(_make_playbook_md(name="c7-strip-pb"))
+    playbook = next(
+        m for m in discover_playbooks(agent_root) if m.name == "c7-strip-pb"
+    )
+
+    _ledger_dispatch = _make_ledger_updating_dispatch(total_cost_usd=0.01)
+    idem_backend = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+
+    for trigger_val in (None, "cron", "serve", "operator"):
+        mock_agent.trigger = trigger_val
+        # Reset goal state so each iteration runs fresh
+        mock_agent.agent_root = agent_root
+        with (
+            patch(
+                "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
+                side_effect=_ledger_dispatch,
+            ),
+            patch(
+                "atomic_agents.conductor.run._get_idempotency_backend",
+                return_value=idem_backend,
+            ),
+            patch(
+                "atomic_agents.conductor.run._get_outcome_backend",
+                return_value=outcome_backend,
+            ),
+        ):
+            # Must NOT raise ConductorLaunderRefused — any other exception is unexpected
+            # but not what this strip-RED is testing
+            try:
+                run(playbook=playbook, subject="valid trigger", agent=mock_agent)
+            except ConductorLaunderRefused:
+                pytest.fail(
+                    f"C7 strip-RED: run() must NOT raise ConductorLaunderRefused "
+                    f"for trigger={trigger_val!r}; it must only raise for 'delegate'."
+                )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 46 — C7 launder-guard (PR4 #583): resume() raises ConductorLaunderRefused
+#           when agent.trigger == 'delegate' BEFORE any ledger mutation
+
+
+def test_c7_resume_raises_on_delegate_trigger(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """C7: resume() MUST raise ConductorLaunderRefused when agent.trigger == 'delegate'.
+
+    The guard must fire BEFORE _record_gate_answer() — the gate sub-goal must remain
+    in 'awaiting_decision' after the raise (no ledger mutation on a launder call).
+    """
+    from atomic_agents.goal.filesystem import FilesystemGoalBackend  # noqa: PLC0415
+
+    # Phase 1: establish a suspended gate via a non-delegate run()
+    pb_dir = agent_root / "skills" / "c7-resume-pb"
+    pb_dir.mkdir()
+    stages_yaml = textwrap.dedent(
+        """\
+        stages:
+          - stage_id: gate-stage
+            label: Human gate
+            prompt: Approve to continue.
+            is_gate: true
+        """
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="c7-resume-pb", stages=stages_yaml, run_cap_usd=5.0)
+    )
+    playbook = next(
+        m for m in discover_playbooks(agent_root) if m.name == "c7-resume-pb"
+    )
+
+    idem_backend = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+
+    # Non-delegate trigger for run() — must succeed and suspend at the gate
+    mock_agent.trigger = "cron"
+    with (
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=idem_backend,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state = run(playbook=playbook, subject="c7 resume test", agent=mock_agent)
+
+    assert state.status == "awaiting_decision", (
+        f"Expected suspension at gate; got {state.status!r}"
+    )
+    conductor_run_id = state.conductor_run_id
+    decision_id = state.pending_decision.decision_id
+
+    # Read the history JSONL before the resume() attempt to compare after
+    history_path = agent_root / "goals" / conductor_run_id / "goal_history.jsonl"
+    events_before = history_path.read_bytes()
+
+    # Phase 2: attempt resume() with trigger == 'delegate' — must raise BEFORE any write
+    mock_agent.trigger = "delegate"
+
+    with pytest.raises(ConductorLaunderRefused):
+        resume(
+            playbook=playbook,
+            subject="c7 resume test",
+            agent=mock_agent,
+            conductor_run_id=conductor_run_id,
+            decision_id=decision_id,
+            answer="Approved.",
+            disposition="continue",
+            rationale="Testing the C7 guard.",
+        )
+
+    # The guard must have fired BEFORE _record_gate_answer — no new events appended
+    events_after = history_path.read_bytes()
+    assert events_before == events_after, (
+        "C7 resume() guard must fire BEFORE _record_gate_answer(); "
+        "goal_history.jsonl must NOT have new events after the raise. "
+        f"Before size={len(events_before)}, after size={len(events_after)}."
+    )
+
+    # The gate sub-goal must still be 'awaiting_decision'
+    goal_backend = FilesystemGoalBackend(agent_root)
+    conductor_backend = goal_backend.for_goal(conductor_run_id)
+    goal = conductor_backend.load_goal(agent_root.name)
+    gate_sg = next((sg for sg in goal.sub_goals if sg.id == "gate-stage"), None)
+    assert gate_sg is not None, "gate-stage sub-goal must still exist"
+    assert gate_sg.status == "awaiting_decision", (
+        f"Gate sub-goal must remain 'awaiting_decision' after C7 resume() raise; "
+        f"got {gate_sg.status!r}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 46-strip-RED — C7 launder-guard: resume() does NOT raise when trigger
+#                     is NOT 'delegate'
+
+
+def test_c7_resume_does_not_raise_on_non_delegate_trigger(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """C7 strip-RED: resume() must NOT raise ConductorLaunderRefused for non-delegate triggers.
+
+    Only trigger == 'delegate' trips the guard. Other triggers (cron, None, serve) must
+    proceed normally through the resume path.
+    """
+    pb_dir = agent_root / "skills" / "c7-resume-strip-pb"
+    pb_dir.mkdir()
+    stages_yaml = textwrap.dedent(
+        """\
+        stages:
+          - stage_id: gate-stage
+            label: Gate
+            prompt: Approve.
+            is_gate: true
+        """
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(
+            name="c7-resume-strip-pb", stages=stages_yaml, run_cap_usd=5.0
+        )
+    )
+    playbook = next(
+        m for m in discover_playbooks(agent_root) if m.name == "c7-resume-strip-pb"
+    )
+
+    idem_backend = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+
+    # Establish a suspended gate
+    mock_agent.trigger = "cron"
+    with (
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=idem_backend,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state = run(playbook=playbook, subject="strip test", agent=mock_agent)
+
+    assert state.status == "awaiting_decision"
+    conductor_run_id = state.conductor_run_id
+    decision_id = state.pending_decision.decision_id
+
+    # resume() with a non-delegate trigger must NOT raise ConductorLaunderRefused
+    mock_agent.trigger = "cron"
+    try:
+        with (
+            patch(
+                "atomic_agents.conductor.run._get_idempotency_backend",
+                return_value=_make_idempotency_backend_mock(),
+            ),
+            patch(
+                "atomic_agents.conductor.run._get_outcome_backend",
+                return_value=outcome_backend,
+            ),
+        ):
+            resume(
+                playbook=playbook,
+                subject="strip test",
+                agent=mock_agent,
+                conductor_run_id=conductor_run_id,
+                decision_id=decision_id,
+                answer="Fine.",
+                disposition="halt",
+                rationale="Strip-RED control: non-delegate trigger must not raise C7.",
+            )
+    except ConductorLaunderRefused:
+        pytest.fail(
+            "C7 strip-RED: resume() must NOT raise ConductorLaunderRefused "
+            "for trigger='cron' — only trigger='delegate' trips the guard."
         )
