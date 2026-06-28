@@ -34,11 +34,21 @@ from .._export_base import ExportableResult
 # about what a valid goal.md is. Both sites import from here.
 
 CURRENT_GOAL_SCHEMA_VERSION = 1
-VALID_SUB_GOAL_STATUSES = {"pending", "in_progress", "complete", "blocked", "abandoned"}
-# TODO(PR2 #581): add "awaiting_decision" to VALID_SUB_GOAL_STATUSES when implementing
-# conductor gate-stage suspension. Adding it here in PR1 would break 25+ conformance
-# tests that enumerate the valid-status set. Gate stages MUST NOT be wired until
-# this status is accepted by validate_goal() and apply_transition().
+VALID_SUB_GOAL_STATUSES = {
+    "pending",
+    "in_progress",
+    "complete",
+    "blocked",
+    "abandoned",
+    # PR2 (#581): conductor gate-stage suspension statuses.
+    # 'awaiting_decision' is set ONLY by the conductor when a gate stage is reached;
+    # it is NOT a terminal status — the run may resume via conductor.resume().
+    # 'skipped' is set ONLY by the gate resume path when disposition='skip';
+    # it is a terminal-done status (recorded GateDecision, never dispatched).
+    # Neither is user-reachable via GoalManager.mark_complete() or operator CLI.
+    "awaiting_decision",
+    "skipped",
+}
 VALID_PRIORITIES = {"high", "medium", "low"}
 VALID_AGENT_MODES = {"reactive", "goal-driven", "hybrid"}
 
@@ -126,6 +136,10 @@ SUB_GOAL_TRANSITION_FIELDS = frozenset(
         "output",
         "body",
         "acceptance_criteria",
+        # PR2 (#581): gate_decision_id is the conductor-assigned decision ID for an
+        # 'awaiting_decision' sub-goal. Stored on SubGoal to enable the atomic
+        # decision_id CAS check inside apply_transition (c5-stale-duplicate-rejection).
+        "gate_decision_id",
     }
 )
 
@@ -157,6 +171,11 @@ class SubGoal:
     acceptance_criteria: list[str] = field(
         default_factory=list
     )  # optional per-sub-goal criteria
+    # PR2 (#581): gate_decision_id holds the conductor-assigned decision ID when
+    # this sub-goal is in 'awaiting_decision' status. This enables the atomic
+    # CAS check in resume() — the decision_id is verified UNDER the goal lock
+    # (spec/50 c5-stale-duplicate-rejection ruling). None for all other statuses.
+    gate_decision_id: str | None = None
 
 
 @dataclass
@@ -205,6 +224,11 @@ class CompletionEvaluation:
     sub_goals_pending: int
     days_until_deadline: int | None
     overdue: bool
+    # PR2 (#581): conductor gate-suspension count. Default 0 (additive, backward-compat).
+    # A goal with sub_goals_awaiting_decision > 0 MUST report all_criteria_met=False
+    # (a suspended conductor gate is not done; see evaluate_completion()).
+    sub_goals_awaiting_decision: int = 0
+    sub_goals_skipped: int = 0
 
 
 @dataclass(frozen=True)
@@ -330,6 +354,8 @@ def serialize_sub_goal(sg: SubGoal) -> dict[str, Any]:
         d["body"] = sg.body
     if sg.acceptance_criteria:
         d["acceptance_criteria"] = sg.acceptance_criteria
+    if sg.gate_decision_id is not None:
+        d["gate_decision_id"] = sg.gate_decision_id
     return d
 
 

@@ -1,4 +1,4 @@
-"""Conductor run engine — free function run() + helpers (spec/50 PR1).
+"""Conductor run engine — free functions run() + resume() + helpers (spec/50 PR1+PR2).
 
 This module is the orchestration core: it sequences automated PLAYBOOK.md stages,
 writes the durable goal ledger, and resumes from it on crash-restart.
@@ -8,9 +8,10 @@ lives in Goal / Outcome / Idempotency. run() reconstructs the run's place
 entirely from those stores on every invocation.
 
 C2 — The goal ledger is the authoritative resume cursor. A stage whose sub-goal
-is 'complete' (with a resolvable stored result) is skipped; 'in_progress'/'pending'
-is (re-)run; 'blocked' is normalized and re-run; 'abandoned' is TERMINAL on resume
-(the run halts — never auto-revived, maintainer ruling A).
+is 'complete' or 'skipped' (PR2) is terminal-done and skipped on resume;
+'in_progress'/'pending' is (re-)run; 'blocked' is normalized and re-run;
+'awaiting_decision' (PR2) is re-surfaced (return the pending GateDecision);
+'abandoned' is TERMINAL on resume (the run halts — never auto-revived, ruling A).
 
 C3 — A replayed stage's result comes from the durable store (OutcomeBackend),
 never from a deduped Response (spec/45 W2/W7 — deduped Responses carry no output).
@@ -46,8 +47,10 @@ operator who sets run_cap_usd while disabling the daily/monthly caps, and only
 across repeated hard crashes mid-call (#580 follow-up: cross-check the parent
 agent daily-log delta against the ledger on stage close/resume).
 
-PR1 scope — automated stages only. Gate stages (is_gate=True) cause run() to halt
-with halt_reason='gate_not_implemented_pr2'. PR2 (#581) adds suspend/resume().
+PR2 (#581) — Gate stages + resume(). Gate stages (is_gate=True) suspend the run
+via 'awaiting_decision' sub-goal status. resume() injects a typed disposition
+(continue/skip/halt) and continues. Gate answer semantics: disposition is a TYPED
+field — NOT magic-word-sniffed from the free-text answer string.
 
 Module-name-collision note: this is atomic_agents/conductor/run.py (the public
 orchestration package). The deploy helper atomic_agents/deploy/_planner.py
@@ -66,6 +69,7 @@ Running a conductor session creates goals/<conductor_run_id>/goal.md; any
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -79,7 +83,13 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from ..outcome.types import OutcomeResult
 
-from ..exceptions import AtomicAgentsError, CostGuardrailBlocked, GoalCorrupted
+from ..exceptions import (
+    AtomicAgentsError,
+    CostGuardrailBlocked,
+    GoalConcurrentModification,
+    GoalCorrupted,
+    UnverifiedPrincipalConversationAccess,
+)
 from ..goal.backend import AddressableGoalBackend
 from ..goal.types import (
     CURRENT_GOAL_SCHEMA_VERSION,
@@ -88,7 +98,7 @@ from ..goal.types import (
     validate_goal_id,
 )
 from ..idempotency.types import COMPLETED
-from .types import ConductorState, PlaybookManifest, StageSpec
+from .types import ConductorState, GateDecision, PlaybookManifest, StageSpec
 
 _logger = logging.getLogger(__name__)
 
@@ -160,12 +170,10 @@ def run(
     behavior the spec acknowledges for single-host crashes. It is NOT silently
     short-circuited.
 
-    Gate stages (is_gate=True): PR1 halts immediately with
-    halt_reason='gate_not_implemented_pr2'. PR2 (#581) adds suspend/resume().
-
-    PR2 note — VALID_SUB_GOAL_STATUSES does NOT yet include 'awaiting_decision'.
-    PR2 (#581) must add it to types.py + update validate_goal() before implementing
-    gate suspension. Adding it in PR1 would break 25+ conformance tests.
+    Gate stages (is_gate=True): PR2 (#581) — run() suspends on a gate by
+    transitioning the stage sub-goal to 'awaiting_decision' and returning
+    ConductorState(status='awaiting_decision', pending_decision=GateDecision(...)).
+    Call conductor.resume() with the decision_id to answer and continue.
 
     C7 — the conductor is NOT a delegation level. Do not invoke run() from inside
     a depth-1 delegated specialist call (spec/15 one-level bound). That would
@@ -318,6 +326,9 @@ def run(
                 "playbook_name": playbook.name,
                 "subject": subject,
                 "run_cap_usd": playbook.run_cap_usd,
+                # P0-2 — pin the structure here too (the crash-window re-emit);
+                # the event was absent, so the live playbook is the run-start one.
+                "playbook_fingerprint": _compute_playbook_fingerprint(playbook),
                 "stage_ids": [s.stage_id for s in playbook.stages],
             },
         )
@@ -330,6 +341,21 @@ def run(
     # value regardless of the current PLAYBOOK.md.
     run_cap_usd = _read_pinned_run_cap(history_path, default=playbook.run_cap_usd)
 
+    # P0-2 — pin the playbook STRUCTURE across suspend/resume, not just run_cap_usd.
+    # The fingerprint of the ordered control-flow tuples (stage_id, is_gate, prompt/
+    # prompt_ref, options, rubric_ref) is recorded in conductor_run_started at
+    # creation; on every run()/resume of an EXISTING run we recompute it from the
+    # LIVE playbook and REFUSE on mismatch. A multi-day gate-suspended (or merely
+    # in-flight) run MUST execute the playbook it started with — an operator editing
+    # PLAYBOOK.md (prompts, gate flags, added/removed/reordered stages) mid-run
+    # cannot silently change the resumed run's control flow. This also makes the
+    # awaiting_decision re-surface (below) consistent: the gate stage spec the
+    # resume reconstructs from is verified-identical to the one that suspended.
+    # A fresh run just pinned the live fingerprint, so it never mismatches; a run
+    # started before this pin existed has pinned_fingerprint=None → check skipped
+    # (backward-compat — we cannot refuse a structure that was never pinned).
+    _refuse_if_playbook_changed(playbook, history_path, conductor_run_id)
+
     # Step 4: get idempotency and outcome backends (from parent agent's root)
     idempotency_backend = _get_idempotency_backend(agent.agent_root)
     outcome_backend = _get_outcome_backend(agent.agent_root)
@@ -338,33 +364,14 @@ def run(
     completed_stage_ids: list[str] = []
 
     for stage in playbook.stages:
-        # Gate stages: PR1 halts immediately (PR2 #581 implements resume)
-        if stage.is_gate:
-            _logger.info(
-                "conductor: halting run %s at gate stage %r (PR2 #581 not yet implemented)",
-                conductor_run_id,
-                stage.stage_id,
-            )
-            conductor_backend.append_history_event(
-                agent.name,
-                {
-                    "ts": _now_ts(),
-                    "event": "conductor_run_halted",
-                    "conductor_run_id": conductor_run_id,
-                    "stage_id": stage.stage_id,
-                    "reason": "gate_not_implemented_pr2",
-                },
-            )
-            return _build_state(
-                conductor_run_id=conductor_run_id,
-                playbook=playbook,
-                subject=subject,
-                status="halted",
-                halt_reason="gate_not_implemented_pr2",
-                history_path=history_path,
-                completed_stage_ids=completed_stage_ids,
-                run_cap_usd=run_cap_usd,
-            )
+        # PR2: ALWAYS load the goal FIRST so all status branches read fresh disk state.
+        # The PR1 gate-halt block (is_gate check before goal load) is REMOVED — it
+        # would win over the new status-based branching and never let the cursor logic
+        # run (a dead-code trap, prep finding P0 at run.py:340-367).
+        # The safe structural order is:
+        #   load goal → find sub-goal → check awaiting_decision (re-surface) →
+        #   check complete/skipped (skip) → check abandoned (halt) →
+        #   check is_gate+pending (first suspension) → check blocked (normalize) → dispatch.
 
         # Reload the goal from the scoped backend to get fresh sub-goal status
         conductor_goal = conductor_backend.load_goal(agent.name)
@@ -378,6 +385,102 @@ def run(
                 f"conductor_run_id={conductor_run_id!r}"
             )
 
+        # PR2 — C2/D2 gate suspension re-surface (P0-1): a stage already suspended
+        # (awaiting_decision) is RE-SURFACED from the DURABLE status, not from the
+        # audit event. The authoritative resume cursor is sg.status +
+        # sg.gate_decision_id (goal.md). The conductor_gate_pending event is pure
+        # append-only AUDIT and is written AFTER goal.md (apply_transition MUST-6
+        # ordering), so a crash in that window leaves status='awaiting_decision' +
+        # gate_decision_id with NO event — an UNRESUMABLE run if we hard-required
+        # the event. Instead we reconstruct the pending GateDecision from goal.md +
+        # the (fingerprint-pinned, so verified-identical) playbook gate stage spec,
+        # re-derive context_ref from the ledger, and HEAL the audit (re-append the
+        # event) when it is absent — never raise GoalCorrupted for a merely-missing
+        # audit event. (This handles crash-then-run(), the cron-re-trigger-while-
+        # suspended path, AND the MUST-6 audit-write crash window.)
+        if sg.status == "awaiting_decision":
+            decision_id = sg.gate_decision_id
+            if not decision_id:
+                # awaiting_decision with NO gate_decision_id is GENUINE durable
+                # corruption — the resume cursor itself (goal.md) is unreadable,
+                # not a merely-absent audit event.
+                raise GoalCorrupted(
+                    f"stage {stage.stage_id!r} is 'awaiting_decision' but carries "
+                    f"no gate_decision_id on the sub-goal — the durable resume "
+                    f"cursor is unreadable. conductor_run_id={conductor_run_id!r}"
+                )
+            pending_event = _find_gate_pending_event(
+                history_path, stage.stage_id, decision_id
+            )
+            if pending_event is not None:
+                context_ref = pending_event.get("context_ref", "")
+                held_conflict_keys = list(pending_event.get("held_conflict_keys") or [])
+            else:
+                # MUST-6 crash window: status landed durably, the audit event did
+                # not. Re-derive context_ref from the ledger and HEAL the audit by
+                # re-appending the conductor_gate_pending event (it is pure audit,
+                # consistent with D2). Do NOT raise GoalCorrupted.
+                context_ref = _derive_context_ref(
+                    completed_stage_ids=completed_stage_ids,
+                    conductor_backend=conductor_backend,
+                    agent_name=agent.name,
+                    history_path=history_path,
+                    conductor_run_id=conductor_run_id,
+                )
+                held_conflict_keys = []
+                conductor_backend.append_history_event(
+                    agent.name,
+                    {
+                        "ts": _now_ts(),
+                        "event": "conductor_gate_pending",
+                        "conductor_run_id": conductor_run_id,
+                        "stage_id": stage.stage_id,
+                        "decision_id": decision_id,
+                        "prompt": stage.prompt,
+                        "options": list(stage.options),
+                        "context_ref": context_ref,
+                        "held_conflict_keys": held_conflict_keys,
+                        # Marker so an operator/audit can see this event was healed
+                        # (re-appended on resume) rather than written at suspension.
+                        "healed_missing_audit": True,
+                    },
+                )
+                _logger.warning(
+                    "conductor: healed a missing conductor_gate_pending audit event "
+                    "for stage %r (decision_id=%s) in run %s — status was durably "
+                    "'awaiting_decision' but the audit event was absent (MUST-6 "
+                    "crash window). Reconstructed from goal.md + playbook.",
+                    stage.stage_id,
+                    decision_id,
+                    conductor_run_id,
+                )
+            existing_gd = GateDecision(
+                decision_id=decision_id,
+                stage_id=stage.stage_id,
+                prompt=stage.prompt,
+                options=list(stage.options),
+                context_ref=context_ref,
+                held_conflict_keys=held_conflict_keys,
+            )
+            _logger.info(
+                "conductor: run %s suspended at gate stage %r "
+                "(decision_id=%s), re-surfacing",
+                conductor_run_id,
+                stage.stage_id,
+                existing_gd.decision_id,
+            )
+            return _build_state(
+                conductor_run_id=conductor_run_id,
+                playbook=playbook,
+                subject=subject,
+                status="awaiting_decision",
+                halt_reason=None,
+                history_path=history_path,
+                completed_stage_ids=completed_stage_ids,
+                run_cap_usd=run_cap_usd,
+                pending_decision=existing_gd,
+            )
+
         # C2 — the goal ledger is the authoritative resume cursor, with the FULL
         # Contract C2 predicate enforced: a `complete` stage is skipped ONLY when
         # its stored result is resolvable from the durable store. A complete stage
@@ -387,7 +490,46 @@ def run(
         # whose output a later stage may consume (spec/50 C2 + the
         # stage-result-source ruling). The result is read from the store, never
         # re-computed (C3).
+        # PR2: 'skipped' is terminal-done (a gate was answered with disposition='skip').
+        # No result to resolve — the stage was deliberately not dispatched.
+        if sg.status == "skipped":
+            # C3 symmetry — a 'skipped' stage MUST carry a recorded
+            # conductor_gate_answered (disposition='skip') ruling. This is the
+            # symmetric partner of the complete-without-result corruption check
+            # below: a 'skipped' status with no skip ruling in the audit trail is
+            # ledger corruption (spec/50 C4 "a skipped stage is a recorded ruling,
+            # never an absent stage"), so fail closed rather than silently treat an
+            # unexplained 'skipped' as terminal-done.
+            if not _has_gate_answered_skip(history_path, stage.stage_id):
+                raise GoalCorrupted(
+                    f"stage {stage.stage_id!r} is 'skipped' but no "
+                    f"conductor_gate_answered (disposition='skip') ruling is "
+                    f"recorded in the ledger. A skipped stage MUST be a recorded "
+                    f"gate ruling (spec/50 C4); failing closed rather than treating "
+                    f"an unexplained 'skipped' as terminal-done. "
+                    f"conductor_run_id={conductor_run_id!r}"
+                )
+            _logger.debug(
+                "conductor: stage %r is skipped (gate ruling), treating as terminal-done",
+                stage.stage_id,
+            )
+            completed_stage_ids.append(stage.stage_id)
+            continue
+
         if sg.status == "complete":
+            # PR2: gate stages answered with disposition='continue' are marked 'complete'
+            # but they have NO outcome_run_id / sub_goal.output — the human's answer
+            # is the "output", not a dispatched outcome. Skip the H1 result-pointer
+            # resolution for gate stages (it would always fail: no pointer to resolve).
+            if stage.is_gate:
+                _logger.debug(
+                    "conductor: gate stage %r is complete (human 'continue' ruling), "
+                    "skipping H1 result-pointer resolution (no outcome_run_id)",
+                    stage.stage_id,
+                )
+                completed_stage_ids.append(stage.stage_id)
+                continue
+
             # H1 — resolve (and if needed REPAIR) the stored result before skipping.
             # A complete stage normally carries a resolvable sub_goal.output; if that
             # pointer is missing/unresolvable we consult idempotency (which may hold
@@ -449,6 +591,140 @@ def run(
                 history_path=history_path,
                 completed_stage_ids=completed_stage_ids,
                 run_cap_usd=run_cap_usd,
+            )
+
+        # PR2 — Gate stage first-suspension path (sg.status is 'pending' or 'in_progress').
+        # Cost gate fires BEFORE the suspension write (C6 compliance — a gate suspension
+        # must not be committed when run_remaining <= 0).
+        if stage.is_gate:
+            # Re-sum cumulative spend (C6, no process-memory carry — same as automated path)
+            cumulative_spend, spend_degraded = _sum_cumulative_spend(history_path)
+            if spend_degraded:
+                _logger.warning(
+                    "conductor: cumulative-spend read degraded at gate stage %r — "
+                    "halting run %s fail-closed",
+                    stage.stage_id,
+                    conductor_run_id,
+                )
+                conductor_backend.append_history_event(
+                    agent.name,
+                    {
+                        "ts": _now_ts(),
+                        "event": "conductor_run_halted",
+                        "conductor_run_id": conductor_run_id,
+                        "stage_id": stage.stage_id,
+                        "reason": "cost_data_degraded",
+                        "cost_data_degraded": True,
+                        "cumulative_spend_usd": cumulative_spend,
+                        "run_cap_usd": run_cap_usd,
+                    },
+                )
+                return _build_state(
+                    conductor_run_id=conductor_run_id,
+                    playbook=playbook,
+                    subject=subject,
+                    status="halted",
+                    halt_reason="cost_data_degraded",
+                    history_path=history_path,
+                    completed_stage_ids=completed_stage_ids,
+                    run_cap_usd=run_cap_usd,
+                    cost_data_degraded=True,
+                )
+            run_remaining = run_cap_usd - cumulative_spend
+            if run_remaining <= 0:
+                _logger.info(
+                    "conductor: run cap exhausted (spent=%.4f, cap=%.4f) at gate stage %r",
+                    cumulative_spend,
+                    run_cap_usd,
+                    stage.stage_id,
+                )
+                conductor_backend.append_history_event(
+                    agent.name,
+                    {
+                        "ts": _now_ts(),
+                        "event": "conductor_run_halted",
+                        "conductor_run_id": conductor_run_id,
+                        "stage_id": stage.stage_id,
+                        "reason": "run_cap_exhausted",
+                        "cumulative_spend_usd": cumulative_spend,
+                        "run_cap_usd": run_cap_usd,
+                    },
+                )
+                return _build_state(
+                    conductor_run_id=conductor_run_id,
+                    playbook=playbook,
+                    subject=subject,
+                    status="halted",
+                    halt_reason="run_cap_exhausted",
+                    history_path=history_path,
+                    completed_stage_ids=completed_stage_ids,
+                    run_cap_usd=run_cap_usd,
+                )
+
+            # Suspend the gate: mint a decision_id, transition to awaiting_decision,
+            # write the conductor_gate_pending audit event.
+            decision_id = f"gate-{uuid.uuid4().hex[:16]}"
+            # Derive context_ref: use the last completed stage's outcome_run_id pointer,
+            # or fall back to the goal history path if no prior stage completed.
+            context_ref = _derive_context_ref(
+                completed_stage_ids=completed_stage_ids,
+                conductor_backend=conductor_backend,
+                agent_name=agent.name,
+                history_path=history_path,
+                conductor_run_id=conductor_run_id,
+            )
+
+            # Transition to awaiting_decision (CAS guard: expected_from_status catches
+            # a concurrent write between the load and the transition).
+            conductor_backend.apply_transition(
+                agent_id=agent.name,
+                sub_goal_id=stage.stage_id,
+                to_status="awaiting_decision",
+                fields={"gate_decision_id": decision_id},
+                history_prose=(
+                    f"sub_goal `{stage.stage_id}` suspended awaiting gate decision "
+                    f"(decision_id={decision_id})"
+                ),
+                history_event={
+                    "ts": _now_ts(),
+                    "event": "conductor_gate_pending",
+                    "conductor_run_id": conductor_run_id,
+                    "stage_id": stage.stage_id,
+                    "decision_id": decision_id,
+                    "prompt": stage.prompt,
+                    "options": list(stage.options),
+                    "context_ref": context_ref,
+                    "held_conflict_keys": [],  # PR3 (#582) drives release
+                },
+                expected_from_status=sg.status,
+                when=date.today(),
+            )
+
+            gate_decision = GateDecision(
+                decision_id=decision_id,
+                stage_id=stage.stage_id,
+                prompt=stage.prompt,
+                options=list(stage.options),
+                context_ref=context_ref,
+                held_conflict_keys=[],
+            )
+            _logger.info(
+                "conductor: run %s suspended at gate stage %r "
+                "(decision_id=%s); call conductor.resume() to continue",
+                conductor_run_id,
+                stage.stage_id,
+                decision_id,
+            )
+            return _build_state(
+                conductor_run_id=conductor_run_id,
+                playbook=playbook,
+                subject=subject,
+                status="awaiting_decision",
+                halt_reason=None,
+                history_path=history_path,
+                completed_stage_ids=completed_stage_ids,
+                run_cap_usd=run_cap_usd,
+                pending_decision=gate_decision,
             )
 
         # Re-sum cumulative spend from durable ledger (C6, no process-memory carry)
@@ -819,6 +1095,348 @@ def run(
 
 
 # ──────────────────────────────────────────────────────────────────
+# Public resume entry point (PR2 #581)
+
+
+def resume(
+    playbook: PlaybookManifest,
+    subject: str,
+    agent: Any,
+    conductor_run_id: str,
+    decision_id: str,
+    answer: str,
+    *,
+    disposition: str,
+    rationale: str,
+    principal: Any | None = None,
+    max_stage_iterations: int = 3,
+    judge_model: str | None = None,
+) -> ConductorState:
+    """Answer a suspended gate and continue the playbook from the next stage.
+
+    Resume semantics (spec/50 C2 + c5-stale-duplicate-rejection ruling):
+
+    1. Re-read the ledger + CAS-confirm the run is still suspended on
+       ``decision_id`` (atomic under the goal lock — uses apply_transition's
+       expected_from_status='awaiting_decision' + gate_decision_id field check).
+    2. Append ``conductor_gate_answered`` under the same transition (transition-
+       first per spec/41 MUST 6 — the answer event is embedded in apply_transition
+       so the status change and the audit record are one atomic unit).
+    3. Transition the gate sub-goal to its final status based on ``disposition``:
+       - 'continue' → 'complete' (run proceeds to the next stage)
+       - 'skip' → 'skipped' (gate is terminal-done-without-result; run continues)
+       - 'halt' → 'abandoned' (run halts; operator must decide next action)
+    4. Delegate to run(..., conductor_run_id=conductor_run_id) to continue.
+
+    A stale or duplicate answer (wrong decision_id, or gate already answered)
+    raises GoalConcurrentModification (no write) — the gate is NOT re-opened.
+
+    H3 — 'skip' vs 'continue' are RUNTIME-IDENTICAL in PR2: both proceed to the
+    next stage. The ONLY difference is the gate's OWN recorded audit status —
+    'skipped' vs 'complete'. Neither skips a downstream guarded stage; the richer
+    "skip the guarded work" semantic is deferred to the reference playbook (#584).
+    The control flow is honestly the same; only the audit label differs.
+
+    C2 — an unverified principal is HARD-REFUSED (UnverifiedPrincipalConversation-
+    Access) before any ledger write. The gate-ruling author MUST be a verified
+    identity (LOCAL_PRINCIPAL for the home shape, a serve-derived verified
+    Principal for org). Keyed on is_verified ONLY (mirrors agent.call()).
+
+    Args:
+        playbook: parsed PlaybookManifest (same object as the original run() call).
+        subject: work subject (same as original run()).
+        agent: AtomicAgent instance (parent agent, same as original run()).
+        conductor_run_id: the ConductorState.conductor_run_id from the suspended run.
+        decision_id: GateDecision.decision_id from the pending ConductorState.
+        answer: the human's free-text answer (recorded in audit; NOT threaded into
+            later stage prompts — D3=A, deferred to #584).
+        disposition: the typed gate ruling — 'continue', 'skip', or 'halt'.
+            DISTINCT typed field, NEVER magic-word-sniffed from answer string
+            (gate-answer-semantics ruling).
+        rationale: required keyword — the human's stated reason for the ruling.
+            Recorded in the conductor_gate_answered audit event.
+        principal: a spec/48 Principal object (defaults to LOCAL_PRINCIPAL).
+            answered_by is set from principal.identifier (the stable identity).
+            MUST be is_verified=True (C2 HARD-REFUSE) — the gate-ruling author may
+            not be an unverified identity.
+        max_stage_iterations: forwarded to run().
+        judge_model: forwarded to run().
+
+    Returns:
+        ConductorState — the state after continuing. May be 'complete', 'halted',
+        or 'awaiting_decision' (another gate further in the playbook).
+
+    Raises:
+        ValueError: if disposition is not 'continue'/'skip'/'halt', or if
+            rationale/answer is empty/whitespace-only.
+        UnverifiedPrincipalConversationAccess: if principal.is_verified is False
+            (C2 — the gate-ruling author must be a verified identity).
+        GoalConcurrentModification: if decision_id does not match the current
+            pending gate decision (stale/duplicate answer rejected).
+        AtomicAgentsError: if the goal backend doesn't implement AddressableGoalBackend.
+    """
+    from ..principal.types import LOCAL_PRINCIPAL  # noqa: PLC0415
+
+    if disposition not in ("continue", "skip", "halt"):
+        raise ValueError(
+            f"disposition must be 'continue', 'skip', or 'halt'; got {disposition!r}"
+        )
+
+    # rationale is the load-bearing audit 'why' (spec/50 C4; acceptance: every gate
+    # ruling is queryable with rationale). Reject whitespace-only/empty so a hollow
+    # ruling cannot be silently recorded (Principle #5). answer carries the human's
+    # decision content and is likewise required to be non-empty.
+    if not rationale or not rationale.strip():
+        raise ValueError(
+            "rationale must be a non-empty, non-whitespace string "
+            "(spec/50 C4: every gate ruling records a rationale)."
+        )
+    if not answer or not answer.strip():
+        raise ValueError(
+            "answer must be a non-empty, non-whitespace string "
+            "(the human's gate decision is recorded in the audit trail)."
+        )
+
+    if principal is None:
+        principal = LOCAL_PRINCIPAL
+    # C2 — HARD-REFUSE an unverified principal BEFORE deriving answered_by. The
+    # 'who approved this human gate' record is the load-bearing audit field
+    # (spec/50 C4); it MUST NOT be attributable to an unverified identity. Mirrors
+    # agent.call()'s HARD-REFUSE gate (spec/48 MUST 10): key on is_verified ONLY —
+    # never on object identity with LOCAL_PRINCIPAL (a fabricated LOCAL_PRINCIPAL-
+    # shaped object with is_verified=False must be caught). LOCAL_PRINCIPAL is
+    # is_verified=True by construction (the home operator IS the caller), so the
+    # zero-config home path passes; a serve-layer-derived verified org principal
+    # passes; an unverified/raw caller claim is refused before any ledger write.
+    if not principal.is_verified:
+        raise UnverifiedPrincipalConversationAccess(
+            "Gate answer refused: principal.is_verified is False. The "
+            "conductor_gate_answered audit record attributes the human approval to "
+            "principal.identifier — an unverified identity MUST NOT be recorded as "
+            "the gate-ruling author (spec/50 C4, spec/48 MUST 10). Pass a verified "
+            "Principal (serve layer) or the home-user LOCAL_PRINCIPAL.",
+            principal_id=getattr(principal, "identifier", None),
+        )
+    # Read identifier directly (no getattr-'local' fallback): a wrong-typed object
+    # (PrincipalBackend, raw string, etc.) must fail loud, not silently misattribute
+    # a human ruling to the local operator in the conductor_gate_answered audit line.
+    answered_by = principal.identifier
+
+    if not isinstance(agent.goal_backend, AddressableGoalBackend):
+        raise AtomicAgentsError(
+            f"Conductor requires a GoalBackend that implements AddressableGoalBackend. "
+            f"The agent's goal_backend ({type(agent.goal_backend).__name__!r}) does not."
+        )
+
+    validate_goal_id(conductor_run_id)
+    conductor_goal_path = agent.agent_root / "goals" / conductor_run_id / "goal.md"
+    if not conductor_goal_path.is_file():
+        raise ValueError(
+            f"conductor_run_id={conductor_run_id!r} supplied for resume, but "
+            f"no goal found at {conductor_goal_path}."
+        )
+
+    conductor_backend = agent.goal_backend.for_goal(conductor_run_id)
+
+    # P0-2 — refuse a gate answer against an EDITED playbook BEFORE recording the
+    # ruling (no mutation on a structure-changed resume). Mirrors the run() check;
+    # placed before _record_gate_answer so the gate is not transitioned under a
+    # changed structure.
+    history_path_for_pin = (
+        agent.agent_root / "goals" / conductor_run_id / "goal_history.jsonl"
+    )
+    _refuse_if_playbook_changed(playbook, history_path_for_pin, conductor_run_id)
+
+    # Determine the final sub-goal status and gate sub-goal from disposition.
+    if disposition == "continue":
+        final_status = "complete"
+    elif disposition == "skip":
+        final_status = "skipped"
+    else:  # halt
+        final_status = "abandoned"
+
+    answered_at = _now_ts()
+
+    # _record_gate_answer performs the atomic CAS + audit write.
+    _record_gate_answer(
+        conductor_backend=conductor_backend,
+        agent_name=agent.name,
+        decision_id=decision_id,
+        answer=answer,
+        answered_by=answered_by,
+        answered_at=answered_at,
+        rationale=rationale,
+        disposition=disposition,
+        final_status=final_status,
+        conductor_run_id=conductor_run_id,
+    )
+
+    if disposition == "halt":
+        # Gate answered with halt disposition — record the halt and return.
+        history_path = (
+            agent.agent_root / "goals" / conductor_run_id / "goal_history.jsonl"
+        )
+        history_path_obj = history_path
+        run_cap_usd = _read_pinned_run_cap(
+            history_path_obj, default=playbook.run_cap_usd
+        )
+        conductor_backend.append_history_event(
+            agent.name,
+            {
+                "ts": _now_ts(),
+                "event": "conductor_run_halted",
+                "conductor_run_id": conductor_run_id,
+                "reason": "gate_halt_disposition",
+                "decision_id": decision_id,
+            },
+        )
+        # Re-derive completed_stage_ids from the authoritative ledger — do NOT
+        # hardcode [] (P1: a run that completed automated stages before the gate
+        # must report them; the just-abandoned gate is correctly excluded since
+        # its status is 'abandoned', not in the terminal-done set). The sub-goal
+        # id IS the stage_id (run() matches via find_sub_goal(stage.stage_id)).
+        goal = conductor_backend.load_goal(agent.name)
+        status_by_id = {sg.id: sg.status for sg in goal.sub_goals}
+        completed_stage_ids = [
+            s.stage_id
+            for s in playbook.stages
+            if status_by_id.get(s.stage_id) in ("complete", "skipped")
+        ]
+        return _build_state(
+            conductor_run_id=conductor_run_id,
+            playbook=playbook,
+            subject=subject,
+            status="halted",
+            halt_reason="gate_halt_disposition",
+            history_path=history_path_obj,
+            completed_stage_ids=completed_stage_ids,
+            run_cap_usd=run_cap_usd,
+        )
+
+    # For continue/skip: delegate to run() with the same conductor_run_id to proceed.
+    return run(
+        playbook=playbook,
+        subject=subject,
+        agent=agent,
+        conductor_run_id=conductor_run_id,
+        max_stage_iterations=max_stage_iterations,
+        judge_model=judge_model,
+    )
+
+
+def _record_gate_answer(
+    conductor_backend: Any,
+    agent_name: str,
+    decision_id: str,
+    answer: str,
+    answered_by: str,
+    answered_at: str,
+    rationale: str,
+    disposition: str,
+    final_status: str,
+    conductor_run_id: str,
+) -> None:
+    """Atomically record a gate answer and transition the sub-goal.
+
+    Private seam for resume(). Implements the c5-stale-duplicate-rejection ruling.
+
+    H1 — HONEST concurrency posture (do NOT overclaim atomicity): the decision_id
+    is resolved on the OUTER, UNLOCKED ``load_goal()`` here (finding the sub-goal
+    whose ``gate_decision_id`` matches). The inner ``apply_transition`` CAS verifies
+    ONLY the sub-goal STATUS (``expected_from_status='awaiting_decision'``), NOT the
+    decision_id — there is no ``expected_decision_id`` parameter on
+    ``apply_transition`` in PR2. So the decision_id check is NOT atomic with the
+    write in the strict sense.
+
+    It is nonetheless SAFE in PR2 by a HARD-PRECONDITION lockstep invariant: a
+    sub-goal's ``gate_decision_id`` and its ``status`` move together (set together
+    on suspension, cleared together on answer) and a sub-goal NEVER re-enters
+    ``awaiting_decision`` after leaving it. Under that invariant the unlocked
+    decision_id resolution cannot bind to a different gate than the under-lock
+    status CAS guards. PR2 has no concurrent writer (run() is single-writer per
+    conductor_run_id, MUST be serialized by the caller), so the TOCTOU only bites
+    once PR3 (#582) adds concurrency. The proper fix — an ``expected_decision_id``
+    parameter on ``apply_transition`` verified UNDER the lock — is filed for PR3
+    (#582 concurrency hardening) and deliberately NOT added here (it is another
+    spec/41 surface change).
+
+    Transition-first (spec/41 MUST 6): the conductor_gate_answered event is passed
+    as the history_event to apply_transition, so the goal.md status change and the
+    JSONL audit record are ONE atomic unit under the lock. No separate
+    append_history_event call is made for the answer event — that would allow a
+    crash between writes to produce an orphan audit line for a status never written.
+
+    Raises:
+        GoalConcurrentModification: if the sub-goal is not 'awaiting_decision' OR
+            if the stored gate_decision_id does not match decision_id. No write occurs.
+    """
+    # Load the goal to find the gate stage — needed to locate the sub-goal id.
+    # The CAS guard (expected_from_status='awaiting_decision') inside apply_transition
+    # will re-verify the status under the lock.
+    goal = conductor_backend.load_goal(agent_name)
+    gate_sg = next(
+        (s for s in goal.sub_goals if s.gate_decision_id == decision_id), None
+    )
+    if gate_sg is None:
+        # No sub-goal with this decision_id — either stale or wrong run.
+        raise GoalConcurrentModification(
+            f"No sub-goal with gate_decision_id={decision_id!r} found in run "
+            f"{conductor_run_id!r}. The decision may have already been answered "
+            f"or the decision_id is incorrect."
+        )
+    if gate_sg.status != "awaiting_decision":
+        raise GoalConcurrentModification(
+            f"sub_goal '{gate_sg.id}' with gate_decision_id={decision_id!r} "
+            f"is no longer 'awaiting_decision' (current status: {gate_sg.status!r}). "
+            f"Stale or duplicate answer rejected."
+        )
+
+    sub_goal_id = gate_sg.id
+
+    # Build the conductor_gate_answered audit event — embedded in apply_transition
+    # so the status change and the event are atomic (spec/41 MUST 6 / prep finding P1).
+    conductor_gate_answered_event = {
+        "ts": answered_at,
+        "event": "conductor_gate_answered",
+        "conductor_run_id": conductor_run_id,
+        "stage_id": sub_goal_id,
+        "decision_id": decision_id,
+        "answer": answer,
+        "answered_by": answered_by,
+        "answered_at": answered_at,
+        "rationale": rationale,
+        "disposition": disposition,
+    }
+
+    # Fields to write to the sub-goal alongside the status change.
+    transition_fields: dict[str, Any] = {"gate_decision_id": None}
+    if final_status == "complete":
+        from datetime import date as _date  # noqa: PLC0415
+
+        transition_fields["completed"] = _date.today().isoformat()
+
+    # apply_transition: CAS (expected_from_status='awaiting_decision') + enum gate +
+    # MUST 6 ordering — all under the goal lock. The embedded history_event makes the
+    # answer audit atomic with the status change. H1: the CAS verifies STATUS only,
+    # NOT decision_id — the decision_id match (outer unlocked load above) is safe in
+    # PR2 only by the gate_decision_id↔status lockstep invariant; an atomic
+    # expected_decision_id CAS is deferred to PR3 (#582). See the docstring.
+    conductor_backend.apply_transition(
+        agent_id=agent_name,
+        sub_goal_id=sub_goal_id,
+        to_status=final_status,
+        fields=transition_fields,
+        history_prose=(
+            f"sub_goal `{sub_goal_id}` gate answered → {final_status} "
+            f"(disposition={disposition}, answered_by={answered_by})"
+        ),
+        history_event=conductor_gate_answered_event,
+        expected_from_status="awaiting_decision",
+        when=date.today(),
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
 # Internal helpers
 
 
@@ -889,6 +1507,10 @@ def _resolve_or_create_run(
             "playbook_name": playbook.name,
             "subject": subject,
             "run_cap_usd": playbook.run_cap_usd,
+            # P0-2 — pin the playbook STRUCTURE alongside the cost ceiling so a
+            # mid-suspension edit to PLAYBOOK.md cannot silently change a live
+            # run's control flow on resume (recomputed + refused on mismatch).
+            "playbook_fingerprint": _compute_playbook_fingerprint(playbook),
             "stage_ids": [s.stage_id for s in playbook.stages],
         },
     )
@@ -1408,6 +2030,160 @@ def _iter_history_events(history_path: Path) -> Iterator[tuple[dict | None, bool
             yield None, False
 
 
+def _find_gate_pending_event(
+    history_path: Path, stage_id: str, decision_id: str
+) -> dict | None:
+    """Return the most recent conductor_gate_pending audit event for a gate, or None.
+
+    Matches on BOTH ``stage_id`` AND ``decision_id`` (P0-1 / P0-2: the gate stage
+    spec is pinned by fingerprint, so the audit event for the live decision_id is
+    the one to reconstruct context from). Returns None when no matching event
+    exists — the MUST-6 crash window where status='awaiting_decision' landed but
+    the audit event did not. The caller HEALS that window rather than treating it
+    as corruption (the durable cursor is goal.md status + gate_decision_id, not the
+    audit event — D2). It is purely append-only AUDIT.
+    """
+    last_event: dict | None = None
+    for rec, ok in _iter_history_events(history_path):
+        if (
+            ok
+            and rec.get("event") == "conductor_gate_pending"
+            and rec.get("stage_id") == stage_id
+            and rec.get("decision_id") == decision_id
+        ):
+            last_event = rec  # keep scanning to find the LAST one
+    return last_event
+
+
+def _has_gate_answered_skip(history_path: Path, stage_id: str) -> bool:
+    """Return True iff a conductor_gate_answered (disposition='skip') event exists.
+
+    C3 symmetry: a 'skipped' sub-goal is a RECORDED gate ruling (spec/50 C4 — "a
+    skipped stage is a recorded ruling, never an absent stage"). The resume cursor
+    must verify the ruling is present, symmetric with the complete-without-result
+    corruption check — a 'skipped' status with no conductor_gate_answered (skip)
+    audit is ledger corruption, not a valid terminal-done skip.
+    """
+    for rec, ok in _iter_history_events(history_path):
+        if (
+            ok
+            and rec.get("event") == "conductor_gate_answered"
+            and rec.get("stage_id") == stage_id
+            and rec.get("disposition") == "skip"
+        ):
+            return True
+    return False
+
+
+def _compute_playbook_fingerprint(playbook: PlaybookManifest) -> str:
+    """Stable hash of the playbook's control-flow STRUCTURE (P0-2).
+
+    Hashes the ordered (stage_id, is_gate, effective prompt, prompt_ref, options,
+    rubric_ref) tuples so a resume can REFUSE a playbook edited mid-suspension.
+    run_cap pinning already protects cost across suspension; this extends the same
+    durability guarantee to control flow (prompts, gate flags, stage add/remove/
+    reorder, a changed referenced prompt-file body — the effective ``prompt`` text
+    is hashed, so a prompt_ref whose target file changed is caught too).
+
+    A NUL record separator after each stage makes the digest length-independent
+    (so e.g. concatenation collisions across stage boundaries are not possible).
+    """
+    h = hashlib.sha256()
+    for s in playbook.stages:
+        part = json.dumps(
+            {
+                "stage_id": s.stage_id,
+                "is_gate": bool(s.is_gate),
+                "prompt": s.prompt,
+                "prompt_ref": s.prompt_ref,
+                "options": list(s.options),
+                "rubric_ref": s.rubric_ref,
+            },
+            sort_keys=True,
+            ensure_ascii=True,
+        )
+        h.update(part.encode("utf-8"))
+        h.update(b"\x00")
+    return h.hexdigest()
+
+
+def _read_pinned_fingerprint(history_path: Path) -> str | None:
+    """Return the playbook_fingerprint pinned in conductor_run_started, or None.
+
+    None when the event is absent OR carries no fingerprint (a run started before
+    P0-2 shipped) — the caller skips the structure-change refusal in that case
+    (backward-compat: a structure that was never pinned cannot be refused).
+    """
+    for rec, ok in _iter_history_events(history_path):
+        if not ok:
+            continue
+        if rec.get("event") == "conductor_run_started":
+            fp = rec.get("playbook_fingerprint")
+            return fp if isinstance(fp, str) and fp else None
+    return None
+
+
+def _refuse_if_playbook_changed(
+    playbook: PlaybookManifest, history_path: Path, conductor_run_id: str
+) -> None:
+    """REFUSE (raise) when the live playbook structure differs from the pinned one.
+
+    P0-2 — a suspended or in-flight conductor run MUST execute the playbook it
+    started with. Called by BOTH run() (re-entrant resume) and resume() (gate
+    answer) BEFORE any state mutation, so an operator editing PLAYBOOK.md
+    mid-suspension cannot silently change the resumed run's control flow. A run
+    started before P0-2 shipped has no pinned fingerprint → check skipped
+    (backward-compat: a structure never pinned cannot be refused).
+    """
+    pinned_fingerprint = _read_pinned_fingerprint(history_path)
+    if pinned_fingerprint is None:
+        return
+    live_fingerprint = _compute_playbook_fingerprint(playbook)
+    if pinned_fingerprint != live_fingerprint:
+        raise AtomicAgentsError(
+            f"conductor run {conductor_run_id!r} was started with a different "
+            f"PLAYBOOK.md structure than the one now on disk (pinned fingerprint "
+            f"{pinned_fingerprint[:12]}…, live {live_fingerprint[:12]}…). A "
+            f"suspended or in-flight conductor run MUST execute the playbook it "
+            f"started with — editing prompts, gate flags, rubric refs, or adding/"
+            f"removing/reordering stages mid-run is refused (spec/50 §Cost/"
+            f"§Throughline, P0-2). Revert PLAYBOOK.md to its run-start structure to "
+            f"resume this run, or start a fresh run."
+        )
+
+
+def _derive_context_ref(
+    completed_stage_ids: list[str],
+    conductor_backend: Any,
+    agent_name: str,
+    history_path: Path,
+    conductor_run_id: str,
+) -> str:
+    """Derive the context_ref for a gate suspension.
+
+    context_ref is the opaque reference to the prior-stage output the human should
+    review. Derived at suspension time, NOT operator-authored in markdown
+    (gate-stage-markdown-schema ruling).
+
+    Strategy: if any prior stage completed, use the last completed stage's
+    sub_goal.output (the outcome_run_id pointer). Falls back to the
+    goal_history.jsonl path string when no prior stage completed (e.g. the gate
+    is first in the playbook).
+    """
+    if completed_stage_ids:
+        # Read the last completed stage's sub-goal to get its outcome_run_id pointer.
+        try:
+            goal = conductor_backend.load_goal(agent_name)
+            last_id = completed_stage_ids[-1]
+            last_sg = next((s for s in goal.sub_goals if s.id == last_id), None)
+            if last_sg is not None and last_sg.output:
+                return last_sg.output
+        except Exception:
+            pass  # Fall through to the path fallback
+    # No prior completed stage (gate is first) — use the history path.
+    return str(history_path)
+
+
 def _get_idempotency_backend(agent_root: Path) -> Any:
     """Get the default idempotency backend for the parent agent root."""
     from ..idempotency import get_default_idempotency_backend  # noqa: PLC0415
@@ -1432,6 +2208,7 @@ def _build_state(
     completed_stage_ids: list[str],
     run_cap_usd: float | None = None,
     cost_data_degraded: bool = False,
+    pending_decision: GateDecision | None = None,
 ) -> ConductorState:
     """Build a fresh ConductorState projection from the ledger.
 
@@ -1444,6 +2221,9 @@ def _build_state(
     ``cost_data_degraded`` lets a caller OR-compose a degraded observation made
     earlier in the run (e.g. the in-loop fail-closed halt) with this final
     cumulative-spend read, so the surfaced flag is never under-reported (#498).
+
+    ``pending_decision`` is set when status='awaiting_decision'. The __post_init__
+    invariant on ConductorState enforces this relationship (ValueError if violated).
     """
     cumulative_spend, degraded = _sum_cumulative_spend(history_path)
     return ConductorState(
@@ -1458,4 +2238,5 @@ def _build_state(
         run_cap_usd=playbook.run_cap_usd if run_cap_usd is None else run_cap_usd,
         completed_stage_ids=list(completed_stage_ids),
         cost_data_degraded=cost_data_degraded or degraded,
+        pending_decision=pending_decision,
     )

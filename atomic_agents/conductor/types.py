@@ -4,10 +4,16 @@ All types are frozen dataclasses (value objects). The conductor holds no
 authoritative state; every durable fact lives in Goal / Outcome / Idempotency.
 ConductorState is a fresh projection from the ledger each time run() is called.
 
-PR1 scope: automated stages only (is_gate=False). Gate stages are parsed
-(the schema accepts them) but cause run() to halt immediately with
-status='halted' and halt_reason='gate_not_implemented_pr2'.
-PR2 (#581) will add await_decision / resume() and the awaiting_decision status.
+PR2 (#581) scope: gate stages (is_gate=True) SUSPEND the run — run() transitions
+the gate sub-goal to 'awaiting_decision' and returns ConductorState(status=
+'awaiting_decision', pending_decision=GateDecision(...)). resume() injects the
+typed disposition to continue/skip/halt. (PR1 parsed gate stages but halted
+immediately with gate_not_implemented_pr2; that halt path is removed in PR2.)
+PR2 (#581): Gate suspension + resume. GateDecision is the one genuinely new
+artifact (spec/50 §"The one genuinely new artifact"). ConductorState.status
+gains 'awaiting_decision'. resume() is the public entry point for answering
+a gate; GateDecision carries the decision_id, prompt, options, context_ref,
+and disposition (typed: 'continue'/'skip'/'halt' — NOT magic-word-sniffed).
 """
 
 from __future__ import annotations
@@ -60,6 +66,15 @@ class StageSpec:
     rubric_ref: str | None = None
     model: str | None = None
     is_gate: bool = False
+    # PR2 (#581): gate-stage-markdown-schema ruling. Optional declared choices for a
+    # gate question. Empty tuple = free-text (the human may answer anything). Non-empty
+    # = the playbook author offers these specific choices (displayed by the CLI).
+    # SHAPE-validated at parse time for ANY stage that supplies a truthy `options`
+    # key (must be a list of non-empty strings — a malformed value is rejected even
+    # on a non-gate stage); the validated value is RETAINED only for is_gate=True
+    # stages and silently discarded (left as the empty tuple) for non-gate stages.
+    # Tuple because StageSpec is frozen=True; list would fail the frozen constraint.
+    options: tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -96,6 +111,78 @@ class PlaybookManifest:
 
 
 # ──────────────────────────────────────────────────────────────────
+# Gate-decision record (PR2 — the one genuinely new artifact, spec/50 §63)
+
+
+@dataclass(frozen=True)
+class GateDecision:
+    """The durable record of a pending-or-answered human gate decision.
+
+    This is the ONE genuinely new artifact the conductor introduces (spec/50
+    §"The one genuinely new artifact"). Everything else is reuse of shipped
+    primitives (Goal/Outcome/Idempotency/Queue). A GateDecision records:
+
+    - What is the question (prompt, options)?
+    - What is the context the human should review (context_ref)?
+    - What resources does the suspended run hold (held_conflict_keys)?
+    - Has the human answered yet, and if so: what, by whom, when, why (disposition)?
+
+    The resume cursor is the gate sub-goal's STATUS (apply_transition path), NOT
+    this event — this is pure append-only audit. Two distinct JSONL event types
+    carry the lifecycle: 'conductor_gate_pending' (on suspension) and
+    'conductor_gate_answered' (on resume), linked by decision_id.
+
+    Fields:
+        decision_id: stable id for this gate within the run (16-char UUID4 hex
+            slice with a 'gate-' prefix). Stored on the sub-goal as gate_decision_id for
+            atomic CAS verification in resume() (c5-stale-duplicate-rejection).
+        stage_id: the stage this gate guards.
+        prompt: the question text (from stage.prompt).
+        options: offered choices from the PLAYBOOK.md stage schema (empty list
+            when the gate allows free-text; non-empty for structured choices).
+        context_ref: opaque reference to the prior-stage result the human should
+            review. Derived at suspension time from completed_stage_ids (the last
+            completed stage's outcome_run_id), NOT operator-authored in markdown.
+            Falls back to the goal-history path when no prior stage completed.
+        held_conflict_keys: resources this suspended run holds (PR3 #582).
+            PR2: RECORDED in the conductor_gate_pending event but NOT acted on
+            for release. Conflict release (queued waiters) is PR3 (#582);
+            held_conflict_keys drives that release but the release logic is not
+            yet wired.
+        disposition: the typed gate ruling — 'continue' (run continues to next
+            stage), 'skip' (stage is skipped, sub-goal → 'skipped'), or 'halt'
+            (run halts). DISTINCT typed field — NOT magic-word-sniffed from the
+            free-text answer string (gate-answer-semantics ruling). None while the
+            gate is pending (disposition is None encodes "pending"; the durable
+            machine state is the gate sub-goal's STATUS in the goal ledger, not a
+            field on this record — D2). NOTE: 'skip' and 'continue' are runtime-
+            identical in PR2 (both proceed to the next stage); they differ only in
+            the gate's recorded audit status ('skipped' vs 'complete'). Stage-level
+            skip-the-guarded-work is deferred to #584 (H3).
+        answer: the human's free-text answer. Recorded in conductor_gate_answered
+            for audit. NOT threaded into later stage prompts (D3=A, deferred #584).
+        answered_by: principal.identifier of the human who answered (the stable
+            identity string, e.g. 'local' for LOCAL_PRINCIPAL). None until answered.
+        answered_at: ISO-8601 timestamp when the gate was answered. None until answered.
+        rationale: the human's stated reason for the ruling. None until answered.
+    """
+
+    decision_id: str
+    stage_id: str
+    prompt: str
+    options: list[str] = field(default_factory=list)
+    context_ref: str = ""
+    held_conflict_keys: list[str] = field(default_factory=list)
+    # Answered fields (all None while pending — disposition is None encodes
+    # "pending"; there is no `status` field on GateDecision, D2).
+    disposition: Literal["continue", "skip", "halt"] | None = None
+    answer: str | None = None
+    answered_by: str | None = None
+    answered_at: str | None = None
+    rationale: str | None = None
+
+
+# ──────────────────────────────────────────────────────────────────
 # Conductor run state (ledger projection — NOT authoritative)
 
 
@@ -115,17 +202,23 @@ class ConductorState:
             run() to resume from the durable ledger.
         playbook_name: the playbook's ``name`` field (from frontmatter).
         subject: the work subject passed to run() (e.g. "feature #1234").
-        status: 'complete' (all stages done) or 'halted' (stopped early — see
-            halt_reason). run() only ever returns one of these two terminal
-            projections; there is no 'running' value because ConductorState is a
-            fresh return-only projection, never a live mid-run handle (C1). A
-            streaming/live-handle API is a future addition, not a PR1 state.
+        status: 'complete' (all stages done), 'halted' (stopped early — see
+            halt_reason), or 'awaiting_decision' (suspended on a gate — see
+            pending_decision). PR2 (#581) adds 'awaiting_decision'. There is no
+            'running' value because ConductorState is a fresh return-only
+            projection, never a live mid-run handle (C1).
         halt_reason: present when status='halted'; describes why the run stopped.
             Examples: 'run_cap_exhausted', 'cost_gate_halted', 'cost_data_degraded',
             'stage_max_iterations_reached', 'stage_abandoned', 'dispatch_error',
-            'gate_not_implemented_pr2'.
+            'gate_halt_disposition' (resume answered a gate with disposition='halt').
+            PR1's 'gate_not_implemented_pr2' is removed in PR2 (replaced by the
+            real gate-suspension path). None when status='awaiting_decision'.
+        pending_decision: the GateDecision the run is suspended on. Non-None iff
+            status=='awaiting_decision' (__post_init__ invariant). Callers must
+            pass pending_decision.decision_id to conductor.resume() to answer.
         stages_total: total number of stages in the playbook.
-        stages_complete: number of stages whose sub-goal is status='complete'.
+        stages_complete: number of stages whose sub-goal is status='complete'
+            or 'skipped' (PR2 — skipped stages are terminal-done).
         cumulative_spend_usd: sum of every stage dispatch attempt that reached a
             terminal coordinator transition (complete or not — re-summed from the
             durable ledger, not carried in process memory; fail-closed accounting
@@ -144,13 +237,14 @@ class ConductorState:
             authoritative. The in-loop run-cap gate already fails closed (halts)
             on a degraded read before admitting more spend; this flag is the
             display-time marker on the returned projection.
-        completed_stage_ids: list of stage_ids that have completed successfully.
+        completed_stage_ids: list of stage_ids that have reached a terminal-done
+            state ('complete' or 'skipped').
     """
 
     conductor_run_id: str
     playbook_name: str
     subject: str
-    status: Literal["complete", "halted"]
+    status: Literal["complete", "halted", "awaiting_decision"]
     halt_reason: str | None
     stages_total: int
     stages_complete: int
@@ -158,3 +252,21 @@ class ConductorState:
     run_cap_usd: float
     completed_stage_ids: list[str] = field(default_factory=list)
     cost_data_degraded: bool = False
+    # PR2 (#581): gate suspension. Non-None iff status=='awaiting_decision'.
+    # The __post_init__ invariant enforces this relationship.
+    pending_decision: GateDecision | None = None
+
+    def __post_init__(self) -> None:
+        """Enforce the pending_decision <-> awaiting_decision invariant."""
+        if self.status == "awaiting_decision" and self.pending_decision is None:
+            raise ValueError(
+                "ConductorState with status='awaiting_decision' MUST have "
+                "pending_decision set (invariant violated: pending_decision is None)"
+            )
+        if self.status != "awaiting_decision" and self.pending_decision is not None:
+            raise ValueError(
+                f"ConductorState with status={self.status!r} MUST NOT have "
+                "pending_decision set (invariant violated: pending_decision is non-None "
+                f"for a non-suspended run; pending_decision.decision_id="
+                f"{self.pending_decision.decision_id!r})"
+            )
