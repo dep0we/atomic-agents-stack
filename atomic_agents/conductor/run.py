@@ -198,12 +198,12 @@ def run(
     Call conductor.resume() with the decision_id to answer and continue.
 
     C7 — the conductor is NOT a delegation level. Do not invoke run() from inside
-    a depth-1 delegated specialist call (spec/15 one-level bound). That would
+    a depth-1 delegated specialist call (spec/15 one-level bound); that would
     launder two-level delegation through the conductor and defeat spec/15 #9.
-    C7 — the conductor is NOT a delegation level. Raises ConductorLaunderRefused
-    (a NestedDelegationRefused subclass) if agent.trigger == 'delegate'. Structural
-    call-depth enforcement (refusing to start from within a delegate frame without
-    the trigger signal) is deferred to a follow-up issue.
+    Raises ConductorLaunderRefused (a NestedDelegationRefused subclass) if
+    agent.trigger == 'delegate'. Structural call-depth enforcement (refusing to
+    start from within a delegate frame without the trigger signal) is deferred to
+    follow-up issue #665.
 
     Args:
         playbook: parsed PlaybookManifest.

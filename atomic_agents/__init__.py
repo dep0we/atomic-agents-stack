@@ -180,6 +180,7 @@ __all__ = [
     "WritePathViolation",
     "NotInRoster",
     "SelfDelegationError",
+    "ConductorLaunderRefused",
     "DreamInProgress",
     "DreamNotFound",
     "ToolNotRegistered",
