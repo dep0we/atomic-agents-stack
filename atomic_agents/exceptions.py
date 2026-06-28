@@ -1090,3 +1090,28 @@ class GovernanceParseError(AgentRegistryError):
     GovernanceRecord flagging the bad field — they MUST NOT propagate
     GovernanceParseError to the caller.
     """
+
+
+# ──────────────────────────────────────────────────────────────────
+# Conductor (spec/50) — orchestration errors
+
+
+class ConductorError(AtomicAgentsError):
+    """Base class for conductor (spec/50) orchestration errors."""
+
+
+class ConductorConflictScanError(ConductorError):
+    """A conflict-keyed run could not verify it is safe to enter an exclusive stage.
+
+    Raised when a run declares ``conflict_keys`` on a gate stage and the
+    conflict scan over the goal ledger CANNOT reliably complete — the goal
+    backend's ``list_goals()`` raised, or a per-goal ``load_goal()`` raised
+    for a goal that might be holding an overlapping key. Rather than fail OPEN
+    (silently treating an unreadable holder as "no conflict" and executing the
+    exclusive stage concurrently with a holder it could not read), the scan
+    fails CLOSED: it refuses to execute the conflict-keyed stage and raises.
+
+    ``run()`` is re-entrant/idempotent, so the next scheduled trigger (cron
+    tick / serve request / CLI drain) retries the scan from the durable ledger.
+    A no-conflict-keys home run never triggers the scan and is never affected.
+    """

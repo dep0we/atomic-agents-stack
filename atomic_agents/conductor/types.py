@@ -14,6 +14,15 @@ artifact (spec/50 §"The one genuinely new artifact"). ConductorState.status
 gains 'awaiting_decision'. resume() is the public entry point for answering
 a gate; GateDecision carries the decision_id, prompt, options, context_ref,
 and disposition (typed: 'continue'/'skip'/'halt' — NOT magic-word-sniffed).
+PR3 (#582): Concurrency + conflict serialization. StageSpec gains
+conflict_keys (a tuple of key strings a gate stage holds while suspended).
+ConductorState.status gains 'deferred' (a second run is blocked behind an active
+gate that holds a conflicting key and must wait for that gate to be answered).
+The status value is 'deferred' NOT 'queued' to avoid colliding with the
+QueueBackend's own queue-dir vocabulary (deferred-run-status-value ruling).
+queued_behind_decision_id records which gate decision is blocking the deferred
+run; queued_behind_conductor_run_id records which conductor run holds it (the
+blocking gate lives in a DIFFERENT conductor run).
 """
 
 from __future__ import annotations
@@ -75,6 +84,14 @@ class StageSpec:
     # stages and silently discarded (left as the empty tuple) for non-gate stages.
     # Tuple because StageSpec is frozen=True; list would fail the frozen constraint.
     options: tuple[str, ...] = field(default_factory=tuple)
+    # PR3 (#582): optional conflict serialization keys. When a gate stage has
+    # non-empty conflict_keys, a second run() call that would also gate on ANY
+    # overlapping key is queued behind this gate rather than running concurrently.
+    # Empty tuple for all non-gate stages (validated at parse time: rejected for
+    # non-gate stages). The tuple is copied onto the gate sub-goal as
+    # SubGoal.held_conflict_keys at suspension time so a conflict scan reads it
+    # with one load_goal() per goal (O(n_goals) loads, no per-goal JSONL parse).
+    conflict_keys: tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -203,10 +220,13 @@ class ConductorState:
         playbook_name: the playbook's ``name`` field (from frontmatter).
         subject: the work subject passed to run() (e.g. "feature #1234").
         status: 'complete' (all stages done), 'halted' (stopped early — see
-            halt_reason), or 'awaiting_decision' (suspended on a gate — see
-            pending_decision). PR2 (#581) adds 'awaiting_decision'. There is no
-            'running' value because ConductorState is a fresh return-only
-            projection, never a live mid-run handle (C1).
+            halt_reason), 'awaiting_decision' (suspended on a gate — see
+            pending_decision), or 'deferred' (blocked behind another run's active
+            conflict-key gate — see queued_behind_decision_id /
+            queued_behind_conductor_run_id). PR2 (#581) adds 'awaiting_decision';
+            PR3 (#582) adds 'deferred'. There is no 'running' value because
+            ConductorState is a fresh return-only projection, never a live mid-run
+            handle (C1).
         halt_reason: present when status='halted'; describes why the run stopped.
             Examples: 'run_cap_exhausted', 'cost_gate_halted', 'cost_data_degraded',
             'stage_max_iterations_reached', 'stage_abandoned', 'dispatch_error',
@@ -244,7 +264,7 @@ class ConductorState:
     conductor_run_id: str
     playbook_name: str
     subject: str
-    status: Literal["complete", "halted", "awaiting_decision"]
+    status: Literal["complete", "halted", "awaiting_decision", "deferred"]
     halt_reason: str | None
     stages_total: int
     stages_complete: int
@@ -255,9 +275,18 @@ class ConductorState:
     # PR2 (#581): gate suspension. Non-None iff status=='awaiting_decision'.
     # The __post_init__ invariant enforces this relationship.
     pending_decision: GateDecision | None = None
+    # PR3 (#582): conflict-queue parking. Both fields are non-None iff
+    # status=='deferred' (the __post_init__ invariant enforces this relationship).
+    # Records which gate decision (queued_behind_decision_id) on which conductor
+    # run (queued_behind_conductor_run_id) is blocking this run; caller should poll
+    # run() again after the blocking gate is answered (self-release model: the
+    # deferred run re-checks the gate status on its next run() invocation — no
+    # push-release).
+    queued_behind_decision_id: str | None = None
+    queued_behind_conductor_run_id: str | None = None
 
     def __post_init__(self) -> None:
-        """Enforce the pending_decision <-> awaiting_decision invariant."""
+        """Enforce the pending_decision / deferred-run invariants."""
         if self.status == "awaiting_decision" and self.pending_decision is None:
             raise ValueError(
                 "ConductorState with status='awaiting_decision' MUST have "
@@ -269,4 +298,30 @@ class ConductorState:
                 "pending_decision set (invariant violated: pending_decision is non-None "
                 f"for a non-suspended run; pending_decision.decision_id="
                 f"{self.pending_decision.decision_id!r})"
+            )
+        # Both deferred-tracking fields are bound to status=='deferred': both
+        # non-None iff deferred, both None otherwise.
+        if self.status == "deferred" and (
+            self.queued_behind_decision_id is None
+            or self.queued_behind_conductor_run_id is None
+        ):
+            raise ValueError(
+                "ConductorState with status='deferred' MUST have BOTH "
+                "queued_behind_decision_id AND queued_behind_conductor_run_id set "
+                f"(invariant violated: queued_behind_decision_id="
+                f"{self.queued_behind_decision_id!r}, "
+                f"queued_behind_conductor_run_id="
+                f"{self.queued_behind_conductor_run_id!r})"
+            )
+        if self.status != "deferred" and (
+            self.queued_behind_decision_id is not None
+            or self.queued_behind_conductor_run_id is not None
+        ):
+            raise ValueError(
+                f"ConductorState with status={self.status!r} MUST NOT have "
+                "queued_behind_decision_id or queued_behind_conductor_run_id set "
+                f"(invariant violated for a non-deferred run; "
+                f"queued_behind_decision_id={self.queued_behind_decision_id!r}, "
+                f"queued_behind_conductor_run_id="
+                f"{self.queued_behind_conductor_run_id!r})"
             )
