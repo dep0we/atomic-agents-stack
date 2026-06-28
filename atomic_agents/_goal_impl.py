@@ -591,9 +591,13 @@ class GoalManager:
     def evaluate_completion(self) -> CompletionEvaluation:
         """Check whether the goal's success criteria are met.
 
-        v0.4 heuristic: 'all criteria met' iff every sub_goal is complete or
-        abandoned AND no sub_goals are pending/in_progress/blocked.
-        Operator confirms before mark-complete (this method just reports).
+        Heuristic: 'all criteria met' iff every sub_goal is in a terminal-done
+        status (``complete``, ``abandoned``, or ``skipped``) AND none is
+        ``pending``/``in_progress``/``blocked``/``awaiting_decision``. ``skipped``
+        (PR2 #581 conductor gate skip ruling) is terminal-done and does NOT block
+        completion; ``awaiting_decision`` (a suspended conductor gate) is NOT
+        terminal and DOES block completion. Operator confirms before mark-complete
+        (this method just reports).
         """
         if self._goal is None:
             self.load()
@@ -602,8 +606,23 @@ class GoalManager:
         in_progress = sum(1 for s in sg if s.status == "in_progress")
         blocked = sum(1 for s in sg if s.status == "blocked")
         pending = sum(1 for s in sg if s.status == "pending")
+        # PR2 (#581): 'awaiting_decision' is a conductor gate suspension — NOT terminal.
+        # A run suspended on a gate is NOT done; all_criteria_met must be False.
+        # 'skipped' IS terminal-done (alongside 'complete' and 'abandoned') — it counts
+        # toward completion, not against it. Default 0 so existing goals are unaffected.
+        awaiting = sum(1 for s in sg if s.status == "awaiting_decision")
+        skipped = sum(1 for s in sg if s.status == "skipped")
 
-        all_done = len(sg) > 0 and pending == 0 and in_progress == 0 and blocked == 0
+        # all_done: every sub-goal must be in a terminal-done status.
+        # Terminal-done statuses: complete, abandoned, skipped.
+        # NOT terminal-done: pending, in_progress, blocked, awaiting_decision.
+        all_done = (
+            len(sg) > 0
+            and pending == 0
+            and in_progress == 0
+            and blocked == 0
+            and awaiting == 0
+        )
 
         # Deadline analysis
         days_until_deadline: int | None = None
@@ -625,6 +644,8 @@ class GoalManager:
             sub_goals_pending=pending,
             days_until_deadline=days_until_deadline,
             overdue=overdue,
+            sub_goals_awaiting_decision=awaiting,
+            sub_goals_skipped=skipped,
         )
 
     def archive(self, reason: str = "completed") -> Path:
@@ -727,10 +748,18 @@ class GoalManager:
             lines.append(f"  - {c}")
 
         lines.append("")
+        # H2 — the "done" tally counts BOTH complete and skipped (skipped is
+        # terminal-done), so the count agrees with the all_done verdict: a
+        # fully-skipped goal reads "N/N done" + "All sub-goals complete", not the
+        # contradictory "0/N complete" + "All sub-goals complete". awaiting_decision
+        # and skipped are surfaced in the breakdown (and the symbol map) rather than
+        # being invisible / rendered as '?'.
+        done = ev.sub_goals_complete + ev.sub_goals_skipped
         lines.append(
-            f"Sub-goals: {ev.sub_goals_complete}/{ev.sub_goals_total} complete  "
+            f"Sub-goals: {done}/{ev.sub_goals_total} done  "
             f"({ev.sub_goals_in_progress} in progress, {ev.sub_goals_pending} pending, "
-            f"{ev.sub_goals_blocked} blocked)"
+            f"{ev.sub_goals_blocked} blocked, {ev.sub_goals_skipped} skipped, "
+            f"{ev.sub_goals_awaiting_decision} awaiting decision)"
         )
         for sg in self._goal.sub_goals:
             status_marker = {
@@ -739,6 +768,8 @@ class GoalManager:
                 "complete": "✓",
                 "blocked": "⛔",
                 "abandoned": "✗",
+                "awaiting_decision": "⏸",
+                "skipped": "⏭",
             }.get(sg.status, "?")
             assigned = f" [{sg.assigned}]" if sg.assigned else ""
             deadline = f"  (due {sg.deadline})" if sg.deadline else ""

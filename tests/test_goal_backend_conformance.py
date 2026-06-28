@@ -1,6 +1,6 @@
 """Conformance tests for GoalBackend Protocol (spec/41).
 
-60 test cases covering the GoalBackend Implementer Contract (the protocol-
+64 test cases covering the GoalBackend Implementer Contract (the protocol-
 behavior subset is parametrized over every registered backend via the
 ``backend`` / ``backend_with_goal`` fixtures; see PARAMETRIZATION below).
 
@@ -68,6 +68,10 @@ contributor reconciling code-to-spec lands on the right requirement.
   TEST 57 — archive_goal() 'goal archived' prose appears exactly once (backend owns prose, no double-write)
   TEST 58 — append_history_event() reorders ts-first when ts is NOT the first key in input dict (#485)
   TEST 59 — apply_transition(when=pinned) stamps the ## History prose date only; JSONL ts stays caller wall-clock (spec/41 MUST 6 clock injection, #483 PR1)
+  TEST 60 — apply_transition() accepts 'awaiting_decision' as a valid to_status (PR2 #581 — strip-RED: was rejected in PR1)
+  TEST 61 — apply_transition() accepts 'skipped' as a valid to_status (PR2 #581 — strip-RED: was rejected in PR1)
+  TEST 62 — apply_transition() still rejects 'frobnicate' with the 7-member set (PR2 #581 regression guard)
+  TEST 63 — gate_decision_id persists and reloads through apply_transition (PR2 #581 SUB_GOAL_TRANSITION_FIELDS addendum)
 
 PARAMETRIZATION: the protocol-behavior tests construct their backend through
 the ``backend`` / ``backend_with_goal`` fixtures, which are themselves
@@ -1755,3 +1759,179 @@ def test_apply_transition_when_parameter_stamps_prose_not_ts(
         "the JSONL ts must be the real wall-clock audit timestamp, never the "
         f"injected `when` date prefix; got {probe['ts']!r}"
     )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 60-63 — PR2 #581: conductor gate statuses in VALID_SUB_GOAL_STATUSES
+# (spec/41 MUST 6 enum-domain validation, versioned normative addendum)
+
+
+def test_apply_transition_accepts_awaiting_decision(
+    backend_with_goal, agent_root_with_goal: Path
+) -> None:
+    """TEST 60 — apply_transition() MUST accept 'awaiting_decision' as a valid to_status.
+
+    PR2 #581 adds 'awaiting_decision' to VALID_SUB_GOAL_STATUSES. Before PR2 this
+    status was rejected by the enum gate; now it must be accepted and persisted
+    (strip-RED control: was a SchemaValidationError in PR1).
+    """
+    from datetime import datetime
+
+    backend = backend_with_goal
+    ts = datetime.now().astimezone().isoformat()
+
+    # Must NOT raise (strip-RED: was SchemaValidationError in PR1)
+    goal = backend.apply_transition(
+        agent_id="agent",
+        sub_goal_id="sg1",
+        to_status="awaiting_decision",
+        fields={"gate_decision_id": "gate-abc123"},
+        history_prose="sg1 → awaiting_decision (gate suspended)",
+        history_event={
+            "ts": ts,
+            "event": "conductor_gate_pending",
+            "sub_goal_id": "sg1",
+            "decision_id": "gate-abc123",
+        },
+    )
+
+    sg1 = next(s for s in goal.sub_goals if s.id == "sg1")
+    assert sg1.status == "awaiting_decision", (
+        f"apply_transition(to_status='awaiting_decision') must persist; "
+        f"got {sg1.status!r}"
+    )
+
+    # Persists and reloads correctly
+    reloaded = backend.load_goal("agent")
+    reloaded_sg1 = next(s for s in reloaded.sub_goals if s.id == "sg1")
+    assert reloaded_sg1.status == "awaiting_decision", (
+        f"'awaiting_decision' must survive a round-trip through goal.md; "
+        f"got {reloaded_sg1.status!r}"
+    )
+
+
+def test_apply_transition_accepts_skipped(
+    backend_with_goal, agent_root_with_goal: Path
+) -> None:
+    """TEST 61 — apply_transition() MUST accept 'skipped' as a valid to_status.
+
+    PR2 #581 adds 'skipped' to VALID_SUB_GOAL_STATUSES (c4-skipped-stage-recorded-ruling:
+    dedicated terminal status for gate skip disposition). Must NOT raise (strip-RED).
+    """
+    from datetime import datetime
+
+    backend = backend_with_goal
+    ts = datetime.now().astimezone().isoformat()
+
+    goal = backend.apply_transition(
+        agent_id="agent",
+        sub_goal_id="sg1",
+        to_status="skipped",
+        fields={},
+        history_prose="sg1 → skipped (gate skip ruling)",
+        history_event={
+            "ts": ts,
+            "event": "conductor_gate_answered",
+            "sub_goal_id": "sg1",
+            "disposition": "skip",
+        },
+    )
+
+    sg1 = next(s for s in goal.sub_goals if s.id == "sg1")
+    assert sg1.status == "skipped", (
+        f"apply_transition(to_status='skipped') must persist; got {sg1.status!r}"
+    )
+
+    reloaded = backend.load_goal("agent")
+    reloaded_sg1 = next(s for s in reloaded.sub_goals if s.id == "sg1")
+    assert reloaded_sg1.status == "skipped", (
+        f"'skipped' must survive a round-trip through goal.md; "
+        f"got {reloaded_sg1.status!r}"
+    )
+
+
+def test_apply_transition_still_rejects_frobnicate_with_7_member_set(
+    backend_with_goal, agent_root_with_goal: Path
+) -> None:
+    """TEST 62 — apply_transition() MUST still reject 'frobnicate' with the 7-member set.
+
+    Regression guard: adding 'awaiting_decision' and 'skipped' to VALID_SUB_GOAL_STATUSES
+    must not accidentally widen the set to accept arbitrary strings. The enum gate
+    must still fire for an unknown status (spec/41 MUST 6).
+    """
+    from datetime import datetime
+
+    from atomic_agents.exceptions import SchemaValidationError
+
+    backend = backend_with_goal
+    ts = datetime.now().astimezone().isoformat()
+    goal_md = agent_root_with_goal / "goal.md"
+    before = goal_md.read_bytes()
+
+    with pytest.raises(SchemaValidationError):
+        backend.apply_transition(
+            agent_id="agent",
+            sub_goal_id="sg1",
+            to_status="frobnicate",
+            fields={},
+            history_prose="sg1 → frobnicate",
+            history_event={"ts": ts, "event": "bad_status"},
+        )
+
+    # goal.md must be unchanged
+    assert goal_md.read_bytes() == before, (
+        "goal.md must be untouched when to_status='frobnicate' is rejected"
+    )
+
+
+def test_gate_decision_id_persists_through_apply_transition(
+    backend_with_goal, agent_root_with_goal: Path
+) -> None:
+    """TEST 63 — gate_decision_id in fields persists and reloads via apply_transition.
+
+    PR2 #581 adds 'gate_decision_id' to SUB_GOAL_TRANSITION_FIELDS. The conductor
+    writes fields={'gate_decision_id': decision_id} on gate suspension so resume()
+    can CAS-verify the decision_id under the goal lock (c5-stale-duplicate-rejection).
+    This test verifies the field round-trips through goal.md.
+    """
+    from datetime import datetime
+
+    backend = backend_with_goal
+    ts = datetime.now().astimezone().isoformat()
+    expected_id = "gate-a1b2c3d4e5f6"
+
+    goal = backend.apply_transition(
+        agent_id="agent",
+        sub_goal_id="sg1",
+        to_status="awaiting_decision",
+        fields={"gate_decision_id": expected_id},
+        history_prose="sg1 → awaiting_decision (gate suspension, decision_id stored)",
+        history_event={
+            "ts": ts,
+            "event": "conductor_gate_pending",
+            "sub_goal_id": "sg1",
+            "decision_id": expected_id,
+        },
+    )
+
+    sg1 = next(s for s in goal.sub_goals if s.id == "sg1")
+    assert sg1.gate_decision_id == expected_id, (
+        f"gate_decision_id must be returned on the in-memory object; "
+        f"got {sg1.gate_decision_id!r}"
+    )
+
+    # Must persist to goal.md and survive reload
+    reloaded = backend.load_goal("agent")
+    reloaded_sg1 = next(s for s in reloaded.sub_goals if s.id == "sg1")
+    assert reloaded_sg1.gate_decision_id == expected_id, (
+        f"gate_decision_id must round-trip through goal.md; "
+        f"got {reloaded_sg1.gate_decision_id!r}"
+    )
+
+    # Strip-RED: a different sub-goal must NOT have its gate_decision_id contaminated
+    other_sg = next((s for s in reloaded.sub_goals if s.id != "sg1"), None)
+    if other_sg is not None:
+        assert other_sg.gate_decision_id is None, (
+            f"other sub-goal must NOT have gate_decision_id set; "
+            f"got {other_sg.gate_decision_id!r}"
+        )

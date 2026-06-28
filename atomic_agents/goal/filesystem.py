@@ -444,6 +444,8 @@ class FilesystemGoalBackend:
                 output=sg.get("output"),
                 body=sg.get("body"),
                 acceptance_criteria=list(sg.get("acceptance_criteria") or []),
+                # PR2 (#581): gate_decision_id for conductor gate suspension atomics.
+                gate_decision_id=sg.get("gate_decision_id"),
             )
             for sg in meta.get("sub_goals", [])
         ]
