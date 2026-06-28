@@ -80,6 +80,7 @@ def dispatch_sub_goal_as_outcome(
     max_iterations: int = 3,
     extra_context: str | None = None,
     judge_model: str | None = None,
+    parent_remaining_headroom_usd: float | None = None,
 ) -> "tuple[OutcomeResult, SubGoal]":
     """Dispatch a sub-goal as an outcome, with a fail-closed pre-dispatch cost gate.
 
@@ -106,6 +107,11 @@ def dispatch_sub_goal_as_outcome(
         max_iterations: maximum outcome iterations (default 3).
         extra_context: optional extra context passed to OutcomeRunner.run().
         judge_model: optional judge model override.
+        parent_remaining_headroom_usd: when set by a tree-capping caller (e.g. the
+            conductor's run-level cost root), this dispatch's effective per-call cap
+            is clamped to MIN(own model.md remaining, this headroom) at BOTH the
+            pre-dispatch gate AND the OutcomeRunner's per-iteration gates — the
+            spec/15 tree-cap clamp. None means "no parent cap" (model.md caps only).
 
     Returns:
         (OutcomeResult, SubGoal) — same shape as the legacy dispatch_as_outcome
@@ -130,6 +136,9 @@ def dispatch_sub_goal_as_outcome(
         Policy-layer caps (_policy_snapshot_this_call) are None outside of
         agent.call() and are NOT enforced at the coordinator level.
         The same bound applies to OutcomeRunner's per-iteration gate.
+        When parent_remaining_headroom_usd is set, BOTH gates additionally clamp
+        to that headroom (the tree-cap), so a tree-capping caller's ceiling is
+        enforced even though the policy layer is not.
     """
     # Lazy import — REQUIRED to avoid closing the goal-package bootstrap cycle.
     # goal/__init__.py uses __getattr__ to defer _goal_impl imports; a module-
@@ -194,7 +203,12 @@ def dispatch_sub_goal_as_outcome(
     # the policy stack — false assurance).
     #
     # NO TRY/EXCEPT anywhere below this comment until after the gate is resolved.
-    result_check = agent._check_cost_guardrails(critical=False)
+    # parent_remaining_headroom_usd threads a tree-cap (e.g. the conductor's
+    # run-level run_remaining) into the gate so the effective cap is clamped to
+    # MIN(model.md remaining, parent headroom) — spec/15 / Principle #4.
+    result_check = agent._check_cost_guardrails(
+        critical=False, parent_remaining_headroom_usd=parent_remaining_headroom_usd
+    )
 
     if not result_check.allow:
         # BLOCKED PATH (CLAUDE.md Principle #4 + spec/41 MUST 6 audit-ordering):
@@ -302,6 +316,13 @@ def dispatch_sub_goal_as_outcome(
         log_backend=agent.log_backend,
         policy_backend=agent.policy_backend,
         profile_backend=agent.profile_backend,
+        # Tree-cap: the runner's per-iteration cost gate clamps to MIN(own
+        # remaining, this headroom − the stage's spend so far). Without threading
+        # this, a single stage's OutcomeRunner would gate on model.md caps ONLY and
+        # could overshoot the caller's run-level ceiling within one stage; the
+        # runner decrements this snapshot by accumulated spend so the run cap binds
+        # at each iteration boundary (Principle #4 tree-cap).
+        parent_remaining_headroom_usd=parent_remaining_headroom_usd,
     )
     outcome_result = runner.run(
         description=description,

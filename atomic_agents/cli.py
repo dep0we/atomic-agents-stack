@@ -668,7 +668,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # ── deploy subcommand ─────────────────────────────────────────────────
-    # The deployment conductor (spec/48). Takes a POSITIONAL agent like
+    # The deployment planner (spec/49). Takes a POSITIONAL agent like
     # init/serve. `deploy <agent>` plans + installs a supervised loopback
     # deployment, verifies it, then GUIDES exposure (never performs it).
     # `deploy status <agent>` / `deploy down <agent>` are nested subcommands.
@@ -676,7 +676,7 @@ def main(argv: list[str] | None = None) -> int:
         "deploy",
         help="Plan, install, and verify a supervised loopback deployment (macOS)",
         description=(
-            "Conductor that sequences init/doctor/serve to get an agent "
+            "Planner that sequences init/doctor/serve to get an agent "
             "running, supervised (user-level launchd, no sudo), and verified "
             "on loopback, then prints tailored network-exposure guidance. It "
             "never performs the exposure step (the operator owns the "

@@ -121,8 +121,18 @@ class OutcomeRunner:
         corpus_backend: "CorpusBackend | None" = None,
         mcp_server_registry_backend: "MCPServerRegistryBackend | None" = None,
         outcome_backend: OutcomeBackend | None = None,
+        parent_remaining_headroom_usd: float | None = None,
     ):
         self.agents_root = Path(agents_root) if agents_root else get_agents_root()
+        # Tree-cap headroom threaded by a tree-capping caller (e.g. the goal-
+        # outcome coordinator under the conductor's run-level cost root). This is
+        # the run_remaining captured at stage ENTRY; the per-iteration cost gate
+        # clamps to MIN(own remaining, this headroom − stage spend so far) via
+        # _clamped_parent_headroom, so the run cap binds at each iteration boundary
+        # (within-stage overshoot bounded by one iteration's spend) — spec/15
+        # tree-cap / Principle #4. None means model.md caps only (backward-
+        # compatible: no caller passes it).
+        self._parent_remaining_headroom_usd = parent_remaining_headroom_usd
         self.agent_name = agent_name
         self.agent_root = self.agents_root / agent_name
         self._explicit_judge_model = judge_model
@@ -328,7 +338,14 @@ class OutcomeRunner:
             # status = max_iterations_reached (not a new revision — we evaluate then stop).
 
             # ── Step 1: Cost guardrail check ──────────────────────────────
-            check = agent._check_cost_guardrails(critical=False)
+            # Tree-cap binds PER ITERATION: the threaded run-level headroom is
+            # decremented by this stage's own accumulated spend so a single
+            # multi-iteration stage cannot drain the whole run cap before the
+            # next between-stage check (see _clamped_parent_headroom).
+            check = agent._check_cost_guardrails(
+                critical=False,
+                parent_remaining_headroom_usd=self._clamped_parent_headroom(result),
+            )
             if not check.allow:
                 result.status = "interrupted"
                 result.explanation = (
@@ -404,7 +421,15 @@ class OutcomeRunner:
             )
 
             # ── Step 6: Cost guardrail check before judge ─────────────────
-            judge_check = agent._check_cost_guardrails(critical=False)
+            # Include this iteration's agent-call spend (not yet appended to
+            # result.iterations) via extra_inflight so the pre-judge gate sees
+            # the up-to-the-moment run-level headroom.
+            judge_check = agent._check_cost_guardrails(
+                critical=False,
+                parent_remaining_headroom_usd=self._clamped_parent_headroom(
+                    result, extra_inflight=agent_response.cost_usd
+                ),
+            )
             if not judge_check.allow:
                 result.status = "interrupted"
                 result.explanation = f"cost guardrail hit before judge call at iteration {i}: {judge_check.reason}"
@@ -582,6 +607,43 @@ class OutcomeRunner:
         )  # no-catch discipline
 
         return result
+
+    # ────────────────────────────────────────────────────────────
+    # Tree-cap headroom
+
+    def _clamped_parent_headroom(
+        self, result: OutcomeResult, extra_inflight: float = 0.0
+    ) -> float | None:
+        """Run-level tree-cap headroom for the next gate, decremented by this
+        stage's own accumulated spend.
+
+        ``self._parent_remaining_headroom_usd`` is the run_remaining captured at
+        stage ENTRY (run_cap_usd − cumulative_spend across prior stages). It is a
+        separate budget dimension from the agent's daily/monthly model.md caps, so
+        it does NOT shrink as this stage's iterations write spend to the daily
+        ledger. If we threaded the fixed snapshot unchanged, the gate's
+        ``min(own_remaining, parent_headroom) <= 0`` condition could only ever be
+        tripped by own_remaining (the model.md cap) — the run cap would be inert
+        within a stage and a single multi-iteration stage could overshoot the run
+        ceiling by up to its model.md remaining before the next between-stage check.
+
+        Subtracting the stage's in-flight spend here makes the run cap bind at each
+        iteration boundary, exactly as own_remaining binds against the daily cap.
+        Within-stage overshoot is therefore bounded by ONE iteration's spend (the
+        gate fires before each call; a single in-flight call can still exceed the
+        headroom by its own cost — identical granularity to the delegate tree-cap),
+        not zero. Returns None when no parent cap was threaded (model.md caps only).
+
+        ``extra_inflight`` covers spend already incurred this iteration but not yet
+        appended to ``result.iterations`` (the agent call's cost, checked at the
+        pre-judge gate).
+        """
+        if self._parent_remaining_headroom_usd is None:
+            return None
+        spent = sum(
+            rec.agent_cost_usd + rec.judge_cost_usd for rec in result.iterations
+        )
+        return self._parent_remaining_headroom_usd - spent - extra_inflight
 
     # ────────────────────────────────────────────────────────────
     # Rubric resolution

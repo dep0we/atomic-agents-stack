@@ -1,4 +1,4 @@
-"""deploy/_types.py — dataclasses + enums for the deployment conductor.
+"""deploy/_types.py — dataclasses + enums for the deployment planner.
 
 spec/49 §"Execution model — planner → executor". These types are the shared
 vocabulary between the planner (builds an ordered list of `Step`s) and the
