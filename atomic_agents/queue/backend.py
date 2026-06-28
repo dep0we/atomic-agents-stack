@@ -9,7 +9,8 @@ Closes TENSIONS T4 (cascade queue is filesystem-only).
 
 Protocol method surface (Hybrid Option B, per arc ruling 428-pr1-args.json):
 
-  Four atomicity primitives ON the Protocol:
+  Five atomicity primitives ON the Protocol:
+    enqueue(role, item_name, payload)             — produce (atomic, POSIX write+rename)
     claim_next(role, lease_token, lease_seconds)  — atomic claim (POSIX rename or equiv)
     release(lease_token, original_name)           — move to done/ (atomic)
     move_to_dead_letter(lease_token, original_name, reason)  — terminal failure
@@ -88,6 +89,43 @@ class QueueBackend(Protocol):
         Used by the registry for lookup and by diagnostic tooling. Treat as
         a backwards-compatibility surface — operator deployments may pin
         against these strings.
+        """
+        ...
+
+    def enqueue(self, role: str, item_name: str, payload: bytes) -> None:
+        """Atomically enqueue a new work item into the queued/<role>/ bucket.
+
+        Producer primitive (spec/44 MUST 13, PR3 #582). Writes the payload
+        bytes atomically (temp+fsync+rename) into queue/queued/<role>/<item_name>.
+        The atomicity guarantee mirrors claim_next: the item either appears
+        completely in queued/<role>/ or not at all — no partial-write state is
+        possible.
+
+        Args:
+            role: the role queue to enqueue into (e.g. 'gate-abc123'). MUST be
+                a bare path component — no path separators, no null byte, not
+                '.'/'..', no leading dot (the dot-prefix namespace is reserved
+                for producer temp files), non-empty. The backend MUST validate
+                and raise PathTraversalError on violation, before any I/O
+                (containment guard).
+            item_name: the item filename (e.g. 'crun-xyz789'). Same validation
+                rules as role — including the no-leading-dot rule (the dot-prefix
+                namespace is reserved for producer temp files). When an item with
+                this name already exists in queued/<role>/, the backend MAY
+                overwrite it (idempotent enqueue) or raise — behavior is
+                backend-defined. The filesystem implementation silently
+                overwrites (last-writer-wins).
+            payload: the raw bytes to store. MUST be treated as opaque — the
+                backend does not parse or validate the content.
+
+        Raises:
+            PathTraversalError: when role or item_name contains a path separator
+                ('/' or the OS path separator) or a null byte, is empty, is
+                '.'/'..', or begins with a leading dot (the dot-prefix namespace
+                is reserved for producer temp files). (PathTraversalError is an
+                AtomicAgentsError subclass, NOT a ValueError — a conforming caller
+                catches AtomicAgentsError or PathTraversalError, not ValueError.)
+            AtomicAgentsError: on I/O failure or path-containment violation.
         """
         ...
 

@@ -38,11 +38,21 @@ Options (resume):
                      when omitted.
 
 Exits:
-    0 — run completed (all stages satisfied)
-    1 — run halted or suspended (gate, cap exhausted, or stage failure)
+    0 — run completed (all stages satisfied), OR deferred behind a conflicting
+        run's gate decision (a benign, self-healing state: it auto-releases and
+        continues on its next scheduled trigger, so no operator action is needed).
+        For the deferred case, exit 0 means THIS TICK is fine and needs no operator
+        action — it does NOT mean the run is complete. The run self-releases and
+        continues on its NEXT scheduled trigger, so a driver MUST keep re-triggering
+        it (do not treat this 0 as "done; stop re-triggering"). Only a 'complete'
+        status means the run is finished.
+    1 — run halted or suspended awaiting a human gate decision (gate, cap
+        exhausted, or stage failure) — needs attention; will not progress alone
     2 — usage / configuration error
 
-PR3 (#582) will add: concurrency and conflict serialization.
+PR3 (#582) added concurrency and conflict serialization: a run that needs a
+conflict key held by another run's suspended gate returns status='deferred'
+and self-releases on its next trigger once that gate is answered.
 PR4 (#583) will add: launder-guard and doctor check.
 """
 
@@ -183,6 +193,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
     """Execute or resume a conductor run. Returns exit code."""
     from atomic_agents import AtomicAgent  # noqa: PLC0415
     from atomic_agents.conductor import discover_playbooks, run  # noqa: PLC0415
+    from atomic_agents.exceptions import (  # noqa: PLC0415
+        ConductorConflictScanError,
+        LockBusy,
+    )
 
     agent_root = Path(args.agent_root).resolve()
     if not agent_root.is_dir():
@@ -230,14 +244,31 @@ def _cmd_run(args: argparse.Namespace) -> int:
         flush=True,
     )
 
-    state = run(
-        playbook=playbook,
-        subject=args.subject,
-        agent=agent,
-        conductor_run_id=args.resume,
-        max_stage_iterations=args.max_stage_iterations,
-        judge_model=args.judge_model,
-    )
+    try:
+        state = run(
+            playbook=playbook,
+            subject=args.subject,
+            agent=agent,
+            conductor_run_id=args.resume,
+            max_stage_iterations=args.max_stage_iterations,
+            judge_model=args.judge_model,
+        )
+    except (ConductorConflictScanError, LockBusy) as exc:
+        # Fail-closed conflict scan (a goal in the universe was unreadable) or a
+        # per-run-lock contention (another invocation holds this conductor_run_id's
+        # lease) — neither is a hard failure: this tick simply did not run. Surface a
+        # clean retryable message (didn't-complete-this-tick → exit 1, same as
+        # halted/awaiting; distinct from the benign 'deferred' STATUS which is exit 0).
+        print(
+            f"conductor: could not complete this tick ({exc}); refused to execute "
+            "(fail-closed). This is transient/retryable — it will retry on the next "
+            "scheduled trigger.",
+            file=sys.stderr,
+        )
+        return 1
+    except Exception as exc:
+        print(f"error: run failed: {exc}", file=sys.stderr)
+        return 1
 
     # Print a brief summary
     summary = {
@@ -250,6 +281,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
         "run_cap_usd": state.run_cap_usd,
         "cost_data_degraded": state.cost_data_degraded,
         "completed_stage_ids": state.completed_stage_ids,
+        # PR3 (#582): what a deferred run is blocked on (None for non-deferred states).
+        "queued_behind_decision_id": state.queued_behind_decision_id,
+        "queued_behind_conductor_run_id": state.queued_behind_conductor_run_id,
     }
     print(json.dumps(summary, indent=2))
 
@@ -259,6 +293,27 @@ def _cmd_run(args: argparse.Namespace) -> int:
             "degraded); cumulative_spend_usd may be under-counted.",
             file=sys.stderr,
         )
+
+    # PR3 (#582): a run blocked behind another run's conflict-key gate is DEFERRED,
+    # not halted. It self-releases automatically on its next trigger (no operator
+    # action required) — so this is a benign, expected outcome, NOT a failure: exit 0.
+    # The `resume` SUBCOMMAND is the wrong guidance here (a deferred run owns no gate
+    # to answer); the correct action is to re-run the SAME trigger with
+    # `run --resume <id>` to poll.
+    if state.status == "deferred":
+        print(
+            f"\nconductor: deferred — run {state.conductor_run_id} is queued behind "
+            f"decision {state.queued_behind_decision_id} held by run "
+            f"{state.queued_behind_conductor_run_id} "
+            f"({state.stages_complete}/{state.stages_total} stages done). "
+            f"It will self-release and continue when that gate is answered; "
+            f"re-run the same trigger to poll:\n"
+            f"  python -m atomic_agents.conductor run {args.playbook_name!r} "
+            f"{args.subject!r} {args.agent_root!r} "
+            f"--resume {state.conductor_run_id}",
+            file=sys.stderr,
+        )
+        return 0
 
     if state.status == "complete":
         print(
@@ -462,6 +517,9 @@ def _cmd_resume(args: argparse.Namespace) -> int:
         "run_cap_usd": state.run_cap_usd,
         "cost_data_degraded": state.cost_data_degraded,
         "completed_stage_ids": state.completed_stage_ids,
+        # PR3 (#582): what a deferred run is blocked on (None for non-deferred states).
+        "queued_behind_decision_id": state.queued_behind_decision_id,
+        "queued_behind_conductor_run_id": state.queued_behind_conductor_run_id,
     }
     print(json.dumps(summary, indent=2))
 
@@ -498,6 +556,28 @@ def _cmd_resume(args: argparse.Namespace) -> int:
             f"      --disposition {{continue,skip,halt}}"
         )
         return 1
+
+    # PR3 (#582): answering this gate (continue/skip) delegated to run(), which can
+    # land DEFERRED behind ANOTHER run's conflict-key gate. That is benign and
+    # self-releasing (no operator action) — exit 0, and point the operator at the
+    # poll trigger (NOT --resume, which answers a gate this run does not own).
+    if state.status == "deferred":
+        # Use the RESOLVED playbook + subject (not args.*, which are None when the
+        # operator relied on ledger auto-detect) so the poll hint is fully runnable.
+        _pb = repr(playbook.name)
+        _subj = repr(subject)
+        print(
+            f"\nconductor: deferred — run {state.conductor_run_id} is queued behind "
+            f"decision {state.queued_behind_decision_id} held by run "
+            f"{state.queued_behind_conductor_run_id} "
+            f"({state.stages_complete}/{state.stages_total} stages done). "
+            f"It will self-release and continue when that gate is answered; "
+            f"re-run the same trigger to poll:\n"
+            f"  python -m atomic_agents.conductor run {_pb} {_subj} "
+            f"{args.agent_root!r} --resume {state.conductor_run_id}",
+            file=sys.stderr,
+        )
+        return 0
 
     print(
         f"\nconductor: halted — {state.halt_reason} "

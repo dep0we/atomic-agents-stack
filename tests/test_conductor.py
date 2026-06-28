@@ -1,6 +1,6 @@
-"""Tests for atomic_agents/conductor/ — spec/50 PR1+PR2.
+"""Tests for atomic_agents/conductor/ — spec/50 PR1+PR2+PR3.
 
-Coverage (acceptance criteria from arc-ruling #580 PR1, #581 PR2):
+Coverage (acceptance criteria from arc-ruling #580 PR1, #581 PR2, #582 PR3):
   TEST 1  — playbook loader: valid PLAYBOOK.md parses to PlaybookManifest
   TEST 2  — playbook loader: missing 'kind: playbook' frontmatter is rejected
   TEST 3  — playbook loader: missing stage_id FAILS LOUD (no positional fallback)
@@ -40,6 +40,26 @@ Coverage (acceptance criteria from arc-ruling #580 PR1, #581 PR2):
   TEST 18 — conductor_run_id resume: supplying an absent run_id raises ValueError
   TEST 19 — non-AddressableGoalBackend raises AtomicAgentsError
   TEST 20 — VALID_SUB_GOAL_STATUSES: 7-member set with 'awaiting_decision' + 'skipped' (PR2)
+  TEST 25 — conflict_keys parses from PLAYBOOK.md stage YAML (PR3 #582)
+  TEST 26 — conflict_keys validates: non-gate stage with conflict_keys is rejected (PR3 #582)
+  TEST 27 — conflict_keys validates: oversized key (>128 chars) is rejected (PR3 #582)
+  TEST 28 — conflict_keys validates: path-separator in key is rejected (PR3 #582)
+  TEST 29 — ConductorState(status='deferred') requires both queued-behind fields (PR3 #582)
+  TEST 30 — ConductorState(status!='deferred') rejects queued-behind fields (PR3 #582)
+  TEST 31 — _find_queued_event: returns queued event when no release follows (PR3 #582)
+  TEST 32 — _find_queued_event: returns None when queued event is followed by release (PR3 #582)
+  TEST 33 — _scan_active_conflicts: returns None for empty conflict_keys (PR3 #582)
+  TEST 34 — _scan_active_conflicts: detects conflict with held_conflict_keys on awaiting sub-goal (PR3 #582)
+  TEST 35 — per-run lock: run() raises LockBusy when concurrent invocation holds the lock (PR3 #582)
+  TEST 36 — per-run lock strip-RED: run() succeeds when no concurrent invocation holds the lock (PR3 #582)
+  TEST 37 — SubGoal.held_conflict_keys: round-trips through save_goal/load_goal (PR3 #582)
+  TEST 38 — _sum_cumulative_spend: conductor_run_queued event is NOT counted as spend (PR3 #582)
+  TEST 39 — per-run lock RELEASED (real backend): a 2nd in-process run() on the same id succeeds (PR3 #582)
+  TEST 40 — conflict serialization: overlapping conflict_keys → one suspends, the other defers (PR3 #582)
+  TEST 41 — scan+suspend is gated on the shared conductor-conflict-scan lease (double-suspend TOCTOU guard) (PR3 #582)
+  TEST 42 — end-to-end self-release: deferred B self-releases once A's gate is answered + still-blocked negative control (C1, PR3 #582)
+  TEST 43 — _is_decision_still_pending FAILS CLOSED (stays deferred) on a goal read error (C4a/A1, PR3 #582)
+  TEST 44 — _scan_active_conflicts FAILS CLOSED (raises ConductorConflictScanError) on an unreadable scan / malformed blocker (C4b/A2/B3, PR3 #582)
 
 Note on dispatch patching: dispatch_sub_goal_as_outcome is imported via
 a local `from ..goal.coordinator import ...` inside _dispatch_stage(). Patch
@@ -69,11 +89,19 @@ from atomic_agents.conductor import (
     validate_playbook_manifest,
 )
 from atomic_agents.conductor.playbook import PLAYBOOK_ENTRY_POINT
-from atomic_agents.conductor.run import _read_pinned_run_cap, _sum_cumulative_spend
+from atomic_agents.conductor.run import (
+    _find_queued_event,
+    _has_event,
+    _is_decision_still_pending,
+    _read_pinned_run_cap,
+    _scan_active_conflicts,
+    _sum_cumulative_spend,
+)
 from atomic_agents.conductor.types import ConductorState, GateDecision
 from atomic_agents._goal_impl import GoalManager
 from atomic_agents.exceptions import (
     AtomicAgentsError,
+    ConductorConflictScanError,
     GoalConcurrentModification,
     GoalCorrupted,
     UnverifiedPrincipalConversationAccess,
@@ -4086,6 +4114,187 @@ def test_conductor_cli_constructs_agent_run_and_resume(tmp_path: Path) -> None:
     assert captured["resume_principal"].is_verified is True
 
 
+def test_conductor_cli_run_deferred_status_not_mislabeled_halted(
+    tmp_path: Path, capsys
+) -> None:
+    """_cmd_run must render a 'deferred' ConductorState as DEFERRED, not HALTED (PR3 #582).
+
+    Strip-RED for the CLI fall-through bug: before this fix both _cmd_run and
+    _cmd_resume only branched on 'complete'/'awaiting_decision', so a 'deferred'
+    run fell through to the halted branch and printed
+    `conductor: halted — None ... Resume with: --resume <id>` — wrong twice
+    (mislabels deferred as halted, and --resume is wrong guidance: a deferred run
+    self-releases by RE-INVOKING run() to poll, it does not own the blocking gate).
+
+    Asserts: exit 0 (deferred is a benign, self-releasing, expected outcome — NOT a
+    failure), the word 'deferred' surfaces, 'halted' does NOT, the queued_behind_*
+    identifiers are surfaced in the guidance, the poll hint uses `run ... --resume`
+    (not a bare `--resume`), and the JSON summary carries the queued_behind_* fields.
+    """
+    from atomic_agents.conductor import __main__ as cli  # noqa: PLC0415
+
+    root = _full_cli_agent_root(tmp_path)
+
+    def _run_stub(**kwargs):
+        return ConductorState(
+            conductor_run_id="crun-deferred-1",
+            playbook_name="cli-pb",
+            subject="s",
+            status="deferred",
+            halt_reason=None,
+            stages_total=2,
+            stages_complete=1,
+            cumulative_spend_usd=0.0,
+            run_cap_usd=5.0,
+            completed_stage_ids=["only-stage"],
+            queued_behind_decision_id="gate-blocking-77",
+            queued_behind_conductor_run_id="crun-holder-9",
+        )
+
+    parser = cli._build_parser()
+    run_args = parser.parse_args(["run", "cli-pb", "subj", str(root)])
+    with patch("atomic_agents.conductor.run", _run_stub):
+        rc = cli._cmd_run(run_args)
+
+    out = capsys.readouterr()
+    combined = out.out + out.err
+
+    # Exit code: deferred is benign/expected (self-releasing), NOT a failure → 0.
+    assert rc == 0, (
+        f"a deferred run is a benign, self-releasing outcome and must exit 0; got {rc}"
+    )
+    # Labelled deferred, NOT halted (the old fall-through printed 'halted — None').
+    # Assert the human-readable stderr guidance label (independently strip-RED — the
+    # JSON summary always emits "status":"deferred", so a bare `'deferred' in combined`
+    # would stay green even if the guidance branch were deleted).
+    assert "conductor: deferred" in out.err, (
+        "CLI must print the human-readable 'conductor: deferred' guidance label"
+    )
+    assert "halted" not in out.err, (
+        "a deferred run must NOT be mislabelled 'halted' in the guidance"
+    )
+    # Surfaces what it is blocked on.
+    assert "gate-blocking-77" in combined, (
+        "the blocking decision id must be surfaced in the deferred guidance"
+    )
+    assert "crun-holder-9" in combined, (
+        "the holding run id must be surfaced in the deferred guidance"
+    )
+    # Correct poll guidance: re-run with `run ... --resume <id>`, never a bare --resume.
+    assert "--resume crun-deferred-1" in out.err
+    assert "conductor run" in out.err, (
+        "the poll hint must re-invoke `run` (self-release poll), not answer a gate"
+    )
+    # JSON summary exposes the queued_behind_* fields for --json operators.
+    # (stdout also carries the leading 'conductor: starting ...' line, so slice the
+    # JSON object out of it before parsing.)
+    json_block = out.out[out.out.index("{") : out.out.rindex("}") + 1]
+    summary = json.loads(json_block)
+    assert summary["status"] == "deferred"
+    assert summary["queued_behind_decision_id"] == "gate-blocking-77"
+    assert summary["queued_behind_conductor_run_id"] == "crun-holder-9"
+
+
+def test_conductor_cli_resume_deferred_status_not_mislabeled_halted(
+    tmp_path: Path, capsys
+) -> None:
+    """_cmd_resume must render a 'deferred' ConductorState as DEFERRED, not HALTED (PR3 #582).
+
+    Strip-RED for the _cmd_resume deferred branch (previously a FALSE-GREEN — no test
+    drove it): answering a gate (continue/skip) delegates to run(), which can land
+    DEFERRED behind ANOTHER run's conflict-key gate. Before the branch, that fell
+    through to the halted path and printed `conductor: halted — None`, exit 1 — wrong
+    twice (mislabels deferred as halted, and offers no poll guidance).
+
+    Asserts: exit 0 (deferred is benign/self-releasing), the human-readable
+    'conductor: deferred' stderr label, 'halted' does NOT appear, both queued_behind_*
+    ids surface, and the poll hint uses `run ... --resume` (not a bare `--resume`) and
+    is fully populated (resolved playbook name + subject, no literal placeholders).
+    """
+    from atomic_agents.conductor import __main__ as cli  # noqa: PLC0415
+
+    root = _full_cli_agent_root(tmp_path)
+
+    def _resume_stub(**kwargs):
+        return ConductorState(
+            conductor_run_id="crun-resume-deferred-1",
+            playbook_name="cli-pb",
+            subject="subj",
+            status="deferred",
+            halt_reason=None,
+            stages_total=2,
+            stages_complete=1,
+            cumulative_spend_usd=0.0,
+            run_cap_usd=5.0,
+            completed_stage_ids=["only-stage"],
+            queued_behind_decision_id="gate-blocking-88",
+            queued_behind_conductor_run_id="crun-holder-12",
+        )
+
+    parser = cli._build_parser()
+    resume_args = parser.parse_args(
+        [
+            "resume",
+            str(root),
+            "crun-resume-deferred-1",
+            "--decision-id",
+            "gate-abc",
+            "--answer",
+            "ok",
+            "--rationale",
+            "because",
+            "--disposition",
+            "continue",
+            "--playbook-name",
+            "cli-pb",
+            "--subject",
+            "subj",
+        ]
+    )
+    with patch("atomic_agents.conductor.resume", _resume_stub):
+        rc = cli._cmd_resume(resume_args)
+
+    out = capsys.readouterr()
+    combined = out.out + out.err
+
+    # Exit code: deferred is benign/expected (self-releasing), NOT a failure → 0.
+    assert rc == 0, (
+        f"a deferred resume is a benign, self-releasing outcome and must exit 0; got {rc}"
+    )
+    # Human-readable stderr guidance label (independently strip-RED).
+    assert "conductor: deferred" in out.err, (
+        "CLI must print the human-readable 'conductor: deferred' guidance label"
+    )
+    assert "halted" not in out.err, (
+        "a deferred resume must NOT be mislabelled 'halted' in the guidance"
+    )
+    # Surfaces what it is blocked on.
+    assert "gate-blocking-88" in combined, (
+        "the blocking decision id must be surfaced in the deferred guidance"
+    )
+    assert "crun-holder-12" in combined, (
+        "the holding run id must be surfaced in the deferred guidance"
+    )
+    # Correct poll guidance: re-run with `run ... --resume <id>`, never a bare --resume.
+    assert "--resume crun-resume-deferred-1" in out.err
+    assert "conductor run" in out.err, (
+        "the poll hint must re-invoke `run` (self-release poll), not answer a gate"
+    )
+    # Fully-populated hint: resolved playbook name + subject, NO literal placeholders.
+    assert "cli-pb" in out.err and "subj" in out.err, (
+        "the poll hint must use the resolved playbook name and subject"
+    )
+    assert "<playbook_name>" not in out.err and "<subject>" not in out.err, (
+        "the poll hint must not leave literal placeholders"
+    )
+    # JSON summary exposes the queued_behind_* fields for --json operators.
+    json_block = out.out[out.out.index("{") : out.out.rindex("}") + 1]
+    summary = json.loads(json_block)
+    assert summary["status"] == "deferred"
+    assert summary["queued_behind_decision_id"] == "gate-blocking-88"
+    assert summary["queued_behind_conductor_run_id"] == "crun-holder-12"
+
+
 # ──────────────────────────────────────────────────────────────────
 # C2 — resume() HARD-REFUSES an unverified principal before any ledger write.
 
@@ -4510,3 +4719,1122 @@ def test_status_summary_counts_skipped_and_awaiting(agent_root: Path) -> None:
         "the all-done verdict must agree with the done tally (no 0/1 + all-complete "
         "contradiction)"
     )
+
+
+# ──────────────────────────────────────────────────────────────────
+# PR3 (#582): Concurrency + conflict serialization tests
+
+
+def test_conflict_keys_parse_from_playbook(tmp_path: Path) -> None:
+    """TEST 25 — conflict_keys parses from PLAYBOOK.md stage YAML (PR3 #582).
+
+    A gate stage with conflict_keys: [key-a, key-b] must round-trip through
+    playbook parsing and appear as a tuple on StageSpec.
+    """
+    from atomic_agents.conductor.playbook import PLAYBOOK_ENTRY_POINT
+    from atomic_agents.conductor.types import StageSpec
+
+    pb_dir = tmp_path / "skills" / "conflict-pb"
+    pb_dir.mkdir(parents=True)
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        "---\n"
+        "name: conflict-pb\n"
+        "description: Conflict test.\n"
+        "kind: playbook\n"
+        "---\n"
+        "\n"
+        "A conflict playbook.\n"
+        "\n"
+        "```yaml\n"
+        "run_cap_usd: 2.0\n"
+        "stages:\n"
+        "  - stage_id: gate-one\n"
+        "    label: The gate\n"
+        "    prompt: Approve?\n"
+        "    is_gate: true\n"
+        "    conflict_keys:\n"
+        "      - resource-x\n"
+        "      - resource-y\n"
+        "```\n"
+    )
+
+    manifest, warnings = validate_playbook_manifest(pb_dir)
+    assert manifest is not None, (
+        f"validate_playbook_manifest must succeed; warnings={warnings}"
+    )
+    assert len(manifest.stages) == 1
+    stage = manifest.stages[0]
+    assert isinstance(stage, StageSpec)
+    assert stage.is_gate is True
+    assert set(stage.conflict_keys) == {"resource-x", "resource-y"}, (
+        f"conflict_keys must round-trip; got {stage.conflict_keys!r}"
+    )
+
+
+def test_fingerprint_keyless_stage_is_pr2_backward_compatible(tmp_path: Path) -> None:
+    """TEST 25b — a keyless stage hashes byte-identically to its pre-PR3 (PR2) pin.
+
+    Backward-compat regression guard (Principle #14). On PR2 the per-stage
+    fingerprint dict had NO conflict_keys field at all. A run pinned under PR2 and
+    resumed under PR3 recomputes the fingerprint with PR3 code — if PR3 added
+    `"conflict_keys": []` unconditionally, the digest would change and resume()
+    would falsely raise "started with a different PLAYBOOK.md structure" even
+    though the operator changed nothing. PR3 fixes this by only hashing
+    conflict_keys when non-empty. This test pins that: a keyless stage's PR3
+    fingerprint must equal the exact PR2-shaped digest (no conflict_keys key).
+    """
+    import hashlib  # noqa: PLC0415
+    import json  # noqa: PLC0415
+
+    from atomic_agents.conductor.run import (  # noqa: PLC0415
+        _compute_playbook_fingerprint,
+    )
+    from atomic_agents.conductor.types import PlaybookManifest, StageSpec
+
+    # A manifest whose only stage carries NO conflict_keys (default empty tuple).
+    keyless_stage = StageSpec(
+        stage_id="stage-one",
+        label="Stage One",
+        prompt="Do the thing.",
+    )
+    manifest = PlaybookManifest(
+        name="pb",
+        description="d",
+        when_to_use=None,
+        run_cap_usd=1.0,
+        stages=[keyless_stage],
+        playbook_dir=tmp_path,
+        playbook_md_path=tmp_path / "PLAYBOOK.md",
+    )
+
+    # Replicate the EXACT pre-PR3 digest: the per-stage dict WITHOUT conflict_keys,
+    # NUL-separated, sha256. This is byte-for-byte what PR2 code produced.
+    h = hashlib.sha256()
+    part = json.dumps(
+        {
+            "stage_id": "stage-one",
+            "is_gate": False,
+            "prompt": "Do the thing.",
+            "prompt_ref": None,
+            "options": [],
+            "rubric_ref": None,
+        },
+        sort_keys=True,
+        ensure_ascii=True,
+    )
+    h.update(part.encode("utf-8"))
+    h.update(b"\x00")
+    pr2_digest = h.hexdigest()
+
+    assert _compute_playbook_fingerprint(manifest) == pr2_digest, (
+        "a keyless stage must hash identically to its PR2 pin (no conflict_keys "
+        "key in the hashed dict), so a PR2-pinned run resumes under PR3 unchanged"
+    )
+
+    # And a stage that DOES carry conflict_keys must change the digest (the new
+    # guarantee — editing conflict_keys mid-suspension is still caught).
+    keyed_stage = StageSpec(
+        stage_id="stage-one",
+        label="Stage One",
+        prompt="Do the thing.",
+        is_gate=True,
+        conflict_keys=("resource-x",),
+    )
+    keyed_manifest = PlaybookManifest(
+        name="pb",
+        description="d",
+        when_to_use=None,
+        run_cap_usd=1.0,
+        stages=[keyed_stage],
+        playbook_dir=tmp_path,
+        playbook_md_path=tmp_path / "PLAYBOOK.md",
+    )
+    assert _compute_playbook_fingerprint(keyed_manifest) != pr2_digest, (
+        "a stage carrying conflict_keys must change the fingerprint"
+    )
+
+
+def test_conflict_keys_rejected_on_non_gate_stage(tmp_path: Path) -> None:
+    """TEST 26 — conflict_keys on a non-gate stage is rejected (PR3 #582).
+
+    Only gate stages (is_gate: true) may carry conflict_keys. An automated
+    stage with conflict_keys is a configuration error that must fail loud.
+    """
+    from atomic_agents.conductor.playbook import PLAYBOOK_ENTRY_POINT
+
+    pb_dir = tmp_path / "skills" / "bad-conflict-pb"
+    pb_dir.mkdir(parents=True)
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        "---\n"
+        "name: bad-conflict-pb\n"
+        "description: Bad.\n"
+        "kind: playbook\n"
+        "---\n"
+        "\n"
+        "Bad.\n"
+        "\n"
+        "```yaml\n"
+        "run_cap_usd: 2.0\n"
+        "stages:\n"
+        "  - stage_id: auto-stage\n"
+        "    label: Automated\n"
+        "    prompt: Do something.\n"
+        "    conflict_keys:\n"
+        "      - resource-x\n"
+        "```\n"
+    )
+
+    # validate_playbook_manifest returns (None, warnings) on hard error.
+    manifest2, warnings2 = validate_playbook_manifest(pb_dir)
+    assert manifest2 is None, (
+        "conflict_keys on a non-gate stage must cause validate_playbook_manifest to "
+        "return (None, warnings); manifest was not None"
+    )
+    # At least one warning must mention conflict_keys or gate.
+    combined = " ".join(w.lower() for w in warnings2)
+    assert "conflict_keys" in combined or "gate" in combined or "is_gate" in combined, (
+        f"warnings must mention conflict_keys or gate; got: {warnings2!r}"
+    )
+
+
+def test_conflict_keys_rejected_when_key_too_long(tmp_path: Path) -> None:
+    """TEST 27 — conflict_keys rejects a key longer than 128 chars (PR3 #582).
+
+    Oversized keys create operational hazards (path components, log truncation).
+    The validator must refuse them.
+    """
+    from atomic_agents.conductor.playbook import PLAYBOOK_ENTRY_POINT
+
+    long_key = "x" * 129
+    pb_dir = tmp_path / "skills" / "longkey-pb"
+    pb_dir.mkdir(parents=True)
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        "---\n"
+        "name: longkey-pb\n"
+        "description: Long key.\n"
+        "kind: playbook\n"
+        "---\n"
+        "\n"
+        "Long key.\n"
+        "\n"
+        "```yaml\n"
+        "run_cap_usd: 2.0\n"
+        "stages:\n"
+        "  - stage_id: gate-long\n"
+        "    label: Gate\n"
+        "    prompt: Approve?\n"
+        "    is_gate: true\n"
+        f"    conflict_keys:\n"
+        f"      - {long_key}\n"
+        "```\n"
+    )
+
+    manifest, warnings = validate_playbook_manifest(pb_dir)
+    assert manifest is None, (
+        f"A conflict key >128 chars must cause validation failure; "
+        f"manifest was not None, warnings={warnings!r}"
+    )
+
+
+def test_conflict_keys_rejected_with_path_separator(tmp_path: Path) -> None:
+    """TEST 28 — conflict_keys rejects a key containing a path separator (PR3 #582).
+
+    A key with / would allow directory traversal in any path-keyed secondary
+    index. The validator must refuse it.
+    """
+    from atomic_agents.conductor.playbook import PLAYBOOK_ENTRY_POINT
+
+    pb_dir = tmp_path / "skills" / "pathsep-pb"
+    pb_dir.mkdir(parents=True)
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        "---\n"
+        "name: pathsep-pb\n"
+        "description: Path sep.\n"
+        "kind: playbook\n"
+        "---\n"
+        "\n"
+        "Path sep.\n"
+        "\n"
+        "```yaml\n"
+        "run_cap_usd: 2.0\n"
+        "stages:\n"
+        "  - stage_id: gate-sep\n"
+        "    label: Gate\n"
+        "    prompt: Approve?\n"
+        "    is_gate: true\n"
+        "    conflict_keys:\n"
+        "      - resource/subresource\n"
+        "```\n"
+    )
+
+    manifest, warnings = validate_playbook_manifest(pb_dir)
+    assert manifest is None, (
+        f"A conflict key with '/' must cause validation failure; "
+        f"manifest was not None, warnings={warnings!r}"
+    )
+
+
+def test_conductor_state_deferred_requires_queued_behind_fields() -> None:
+    """TEST 29 — ConductorState(status='deferred') must have BOTH queued-behind fields (PR3 #582).
+
+    The __post_init__ invariant: a 'deferred' status without BOTH
+    queued_behind_decision_id AND queued_behind_conductor_run_id raises
+    ValueError. This is the same invariant pattern as 'awaiting_decision'
+    requiring pending_decision.
+    """
+    # Missing both
+    with pytest.raises(ValueError, match="queued_behind_decision_id"):
+        ConductorState(
+            conductor_run_id="crun-test",
+            playbook_name="pb",
+            subject="s",
+            status="deferred",
+            halt_reason=None,
+            stages_total=2,
+            stages_complete=0,
+            cumulative_spend_usd=0.0,
+            run_cap_usd=5.0,
+            completed_stage_ids=[],
+            # both queued-behind fields intentionally omitted
+        )
+    # Only one of the two present is still a violation (BOTH required)
+    with pytest.raises(ValueError, match="queued_behind_conductor_run_id"):
+        ConductorState(
+            conductor_run_id="crun-test",
+            playbook_name="pb",
+            subject="s",
+            status="deferred",
+            halt_reason=None,
+            stages_total=2,
+            stages_complete=0,
+            cumulative_spend_usd=0.0,
+            run_cap_usd=5.0,
+            completed_stage_ids=[],
+            queued_behind_decision_id="gate-xyz",
+            # queued_behind_conductor_run_id intentionally omitted
+        )
+
+
+def test_conductor_state_non_deferred_rejects_queued_behind_fields() -> None:
+    """TEST 30 — ConductorState(status!='deferred') rejects queued-behind fields (PR3 #582).
+
+    Setting either queued-behind field on a non-deferred state must raise ValueError.
+    """
+    with pytest.raises(ValueError, match="queued_behind_decision_id"):
+        ConductorState(
+            conductor_run_id="crun-test",
+            playbook_name="pb",
+            subject="s",
+            status="complete",
+            halt_reason=None,
+            stages_total=2,
+            stages_complete=2,
+            cumulative_spend_usd=0.01,
+            run_cap_usd=5.0,
+            completed_stage_ids=["s1", "s2"],
+            queued_behind_decision_id="some-decision-id",
+            queued_behind_conductor_run_id="crun-other",
+        )
+
+
+def test_find_queued_event_returns_event_when_not_released(tmp_path: Path) -> None:
+    """TEST 31 — _find_queued_event returns the queued event when no release follows.
+
+    A history file with a conductor_run_queued event and NO subsequent
+    conductor_queue_released event must return the queued event dict.
+    """
+    history = tmp_path / "goal_history.jsonl"
+    events = [
+        '{"ts": "2026-06-27T00:00:00+00:00", "event": "conductor_run_started", '
+        '"conductor_run_id": "crun-abc"}',
+        '{"ts": "2026-06-27T00:01:00+00:00", "event": "conductor_run_queued", '
+        '"blocking_decision_id": "gate-xyz", "blocking_conductor_run_id": "crun-other"}',
+    ]
+    history.write_text("\n".join(events) + "\n", encoding="utf-8")
+
+    result = _find_queued_event(history)
+    assert result is not None, "_find_queued_event must return event when not released"
+    assert result.get("event") == "conductor_run_queued"
+    assert result.get("blocking_decision_id") == "gate-xyz"
+
+
+def test_find_queued_event_returns_none_when_released(tmp_path: Path) -> None:
+    """TEST 32 — _find_queued_event returns None when a release follows the queued event.
+
+    A conductor_run_queued event followed by conductor_queue_released means the
+    run self-released. _find_queued_event must return None.
+    """
+    history = tmp_path / "goal_history.jsonl"
+    events = [
+        '{"ts": "2026-06-27T00:00:00+00:00", "event": "conductor_run_started"}',
+        '{"ts": "2026-06-27T00:01:00+00:00", "event": "conductor_run_queued", '
+        '"blocking_decision_id": "gate-xyz"}',
+        '{"ts": "2026-06-27T00:02:00+00:00", "event": "conductor_queue_released"}',
+    ]
+    history.write_text("\n".join(events) + "\n", encoding="utf-8")
+
+    result = _find_queued_event(history)
+    assert result is None, "_find_queued_event must return None when a release follows"
+
+
+def test_scan_active_conflicts_returns_none_for_no_keys(
+    agent_root: Path, mock_agent: MagicMock
+) -> None:
+    """TEST 33 — _scan_active_conflicts returns None when conflict_keys is empty (PR3 #582).
+
+    An empty conflict_keys tuple means this stage has no conflict scope —
+    _scan_active_conflicts must return None immediately without scanning any goals.
+    This is the fast-path (most stages have no conflict_keys).
+    """
+    result = _scan_active_conflicts(
+        agent=mock_agent,
+        stage_conflict_keys=(),
+        own_conductor_run_id="crun-self",
+    )
+    assert result is None, (
+        "_scan_active_conflicts must return None for empty conflict_keys"
+    )
+
+
+def test_scan_active_conflicts_detects_held_keys(
+    agent_root: Path, goal_backend: FilesystemGoalBackend
+) -> None:
+    """TEST 34 — _scan_active_conflicts detects conflict with held_conflict_keys (PR3 #582).
+
+    Set up a goal with a sub-goal in 'awaiting_decision' status that has
+    held_conflict_keys=['resource-x']. A scan for stage_conflict_keys=('resource-x',)
+    must find this sub-goal and return (blocking_run_id, decision_id).
+    """
+    from atomic_agents.goal.types import CURRENT_GOAL_SCHEMA_VERSION, Goal, SubGoal
+
+    # Write a blocking goal: awaiting_decision with held_conflict_keys=['resource-x'].
+    blocking_run_id = "crun-blocking"
+    decision_id = "gate-abc123"
+    blocking_backend = goal_backend.for_goal(blocking_run_id)
+
+    blocking_goal = Goal(
+        schema_version=CURRENT_GOAL_SCHEMA_VERSION,
+        active=True,
+        intent="Blocking run",
+        priority="medium",
+        created="2026-06-27",
+        last_progress_check="2026-06-27",
+        success_criteria=["done"],
+        sub_goals=[
+            SubGoal(
+                id="gate-stage",
+                label="Gate",
+                status="awaiting_decision",
+                gate_decision_id=decision_id,
+                held_conflict_keys=["resource-x"],
+            )
+        ],
+    )
+    blocking_backend.save_goal(agent_root.name, blocking_goal)
+
+    # Build a mock agent that uses the real goal_backend.
+    agent = MagicMock()
+    agent.name = agent_root.name
+    agent.goal_backend = goal_backend
+
+    # Scan for resource-x from a DIFFERENT run (own_conductor_run_id != blocking_run_id).
+    result = _scan_active_conflicts(
+        agent=agent,
+        stage_conflict_keys=("resource-x",),
+        own_conductor_run_id="crun-self",
+    )
+    assert result is not None, (
+        "_scan_active_conflicts must detect a conflict when held_conflict_keys overlap"
+    )
+    found_run_id, found_decision_id = result
+    assert found_run_id == blocking_run_id, (
+        f"Must return the blocking run_id; got {found_run_id!r}"
+    )
+    assert found_decision_id == decision_id, (
+        f"Must return the blocking decision_id; got {found_decision_id!r}"
+    )
+
+    # Strip-RED: a scan for a NON-overlapping key must NOT detect the conflict.
+    no_result = _scan_active_conflicts(
+        agent=agent,
+        stage_conflict_keys=("resource-z",),  # no overlap with resource-x
+        own_conductor_run_id="crun-self",
+    )
+    assert no_result is None, (
+        "_scan_active_conflicts must NOT detect a conflict when keys do NOT overlap"
+    )
+
+
+def test_per_run_lock_raises_lockbusy(
+    agent_root: Path, mock_agent: MagicMock, playbook_dir: Path
+) -> None:
+    """TEST 35 — run() raises LockBusy when a concurrent invocation holds the per-run lock.
+
+    The first run() acquires the per-run LockBackend lease. A mocked second
+    invocation where lock_backend.scope().acquire() raises LockBusy must propagate
+    as LockBusy to the caller.
+
+    This is a unit test of the lock-acquisition gate, not a full end-to-end run.
+    We patch the lock backend's acquire() to raise LockBusy immediately, simulating
+    a concurrent run that already holds the lock.
+    """
+    from atomic_agents.exceptions import LockBusy
+
+    manifests = discover_playbooks(agent_root)
+    assert manifests, "playbook_dir fixture must create at least one manifest"
+    playbook = manifests[0]
+
+    # First: configure the mock_agent's lock_backend to raise LockBusy on acquire.
+    lock_scope_mock = MagicMock()
+    lock_scope_mock.acquire.side_effect = LockBusy("simulated concurrent lock")
+    mock_agent.lock_backend.scope.return_value = lock_scope_mock
+
+    with pytest.raises(LockBusy, match="already executing in a concurrent invocation"):
+        run(playbook=playbook, subject="lock-test", agent=mock_agent)
+
+
+def test_per_run_lock_succeeds_with_no_contention(
+    agent_root: Path, mock_agent: MagicMock, playbook_dir: Path
+) -> None:
+    """TEST 36 — run() succeeds when lock_backend.scope().acquire() does not raise (PR3 #582).
+
+    Strip-RED control for TEST 35. When the lock is available, run() must proceed
+    normally. We use a standard MagicMock lock that does not raise, then verify
+    that run() proceeds past the lock acquisition point (i.e. does not raise
+    LockBusy).
+    """
+    from atomic_agents.exceptions import LockBusy
+
+    manifests = discover_playbooks(agent_root)
+    assert manifests, "playbook_dir fixture must create at least one manifest"
+    playbook = manifests[0]
+
+    # Default MagicMock for lock_backend — acquire returns a MagicMock (no raise).
+    # run() must NOT raise LockBusy.
+    with patch(
+        "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
+        side_effect=_make_ledger_updating_dispatch("satisfied", 0.05),
+    ):
+        try:
+            state = run(
+                playbook=playbook, subject="lock-test-strip-red", agent=mock_agent
+            )
+            # If run() reaches this point, LockBusy was NOT raised — test passes.
+            assert state.status in ("complete", "halted", "awaiting_decision"), (
+                f"run() must return a valid status; got {state.status!r}"
+            )
+        except LockBusy:
+            pytest.fail("run() must NOT raise LockBusy when the lock is available")
+
+
+def test_held_conflict_keys_round_trip(agent_root: Path) -> None:
+    """TEST 37 — SubGoal.held_conflict_keys round-trips through save_goal/load_goal (PR3 #582).
+
+    PR3 adds held_conflict_keys: list[str] to SubGoal and persists it via
+    SUB_GOAL_TRANSITION_FIELDS. This test proves the field survives a
+    save_goal → load_goal cycle, so conflict scans can read it without
+    re-parsing the history JSONL.
+    """
+    backend = FilesystemGoalBackend(agent_root)
+
+    goal = Goal(
+        schema_version=CURRENT_GOAL_SCHEMA_VERSION,
+        active=True,
+        intent="Held keys round-trip test",
+        priority="medium",
+        created="2026-06-27",
+        last_progress_check="2026-06-27",
+        success_criteria=["done"],
+        sub_goals=[
+            SubGoal(
+                id="sg-gate",
+                label="Gate",
+                status="awaiting_decision",
+                gate_decision_id="gate-xyz",
+                held_conflict_keys=["resource-alpha", "resource-beta"],
+            )
+        ],
+    )
+    backend.save_goal(agent_root.name, goal)
+
+    reloaded = backend.load_goal(agent_root.name)
+    sg = next(s for s in reloaded.sub_goals if s.id == "sg-gate")
+    assert set(sg.held_conflict_keys) == {"resource-alpha", "resource-beta"}, (
+        f"held_conflict_keys must round-trip; got {sg.held_conflict_keys!r}"
+    )
+
+    # Strip-RED: a sub-goal WITHOUT held_conflict_keys must default to [].
+    goal2 = Goal(
+        schema_version=CURRENT_GOAL_SCHEMA_VERSION,
+        active=True,
+        intent="No held keys",
+        priority="low",
+        created="2026-06-27",
+        last_progress_check="2026-06-27",
+        success_criteria=["done"],
+        sub_goals=[SubGoal(id="sg-auto", label="Auto", status="pending")],
+    )
+    backend.save_goal(agent_root.name, goal2)
+    reloaded2 = backend.load_goal(agent_root.name)
+    sg2 = next(s for s in reloaded2.sub_goals if s.id == "sg-auto")
+    assert sg2.held_conflict_keys == [], (
+        f"held_conflict_keys must default to [] when not set; got {sg2.held_conflict_keys!r}"
+    )
+
+
+def test_sum_cumulative_spend_does_not_count_queued_events(tmp_path: Path) -> None:
+    """TEST 38 — _sum_cumulative_spend: conductor_run_queued event is NOT counted as spend.
+
+    conductor_run_queued is an advisory ledger event (no cost attached). Only
+    sub_goal_outcome_dispatched events carry cost. The queued event must not
+    affect the cumulative spend total (negative control for the cost isolation).
+    """
+    history = tmp_path / "goal_history.jsonl"
+    events = [
+        json.dumps(
+            {
+                "ts": "2026-06-27T00:00:00+00:00",
+                "event": "conductor_run_started",
+                "run_cap_usd": 5.0,
+            }
+        ),
+        json.dumps(
+            {
+                "ts": "2026-06-27T00:01:00+00:00",
+                "event": "sub_goal_outcome_dispatched",
+                "sub_goal_id": "stage-one",
+                "total_cost_usd": 0.10,
+            }
+        ),
+        json.dumps(
+            {
+                "ts": "2026-06-27T00:02:00+00:00",
+                "event": "conductor_run_queued",
+                "blocking_decision_id": "gate-abc",
+                "blocking_conductor_run_id": "crun-other",
+            }
+        ),
+        json.dumps(
+            {
+                "ts": "2026-06-27T00:03:00+00:00",
+                "event": "conductor_queue_released",
+            }
+        ),
+    ]
+    history.write_text("\n".join(events) + "\n", encoding="utf-8")
+
+    total, degraded = _sum_cumulative_spend(history)
+    assert not degraded, "history must not be degraded (all events are well-formed)"
+    assert abs(total - 0.10) < 1e-9, (
+        f"_sum_cumulative_spend must count only sub_goal_outcome_dispatched; "
+        f"got {total!r} (expected 0.10)"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 39 — per-run lock is RELEASED (real FilesystemLockBackend): a second
+# in-process run()/resume() on the same conductor_run_id does NOT dead-lock.
+
+
+def test_per_run_lock_released_real_backend_second_run_succeeds(
+    agent_root: Path,
+    mock_agent: MagicMock,
+    playbook_dir: Path,
+) -> None:
+    """TEST 39 — run() releases the per-run lease on every exit path (real backend).
+
+    Pins the P0/P1 fix: the per-run LockBackend lease is released EXPLICITLY in a
+    finally (not by GC — LockHandle has no __del__ and backend_state is a bare fd
+    int, so dropping the handle releases nothing). We drive run() against a REAL
+    FilesystemLockBackend (not the MagicMock the rest of the suite uses, which
+    never takes a real lock), then call run() AGAIN in the SAME process with the
+    SAME conductor_run_id. With the lock leaked this second acquire would raise
+    LockBusy (fcntl flock held until process exit); with the explicit release it
+    succeeds. This is the assertion that fails RED on the un-released-lock bug.
+    """
+    from atomic_agents.exceptions import LockBusy
+    from atomic_agents.locks.filesystem import FilesystemLockBackend
+
+    # Real lock backend — this is the load-bearing difference vs. TEST 35/36.
+    mock_agent.lock_backend = FilesystemLockBackend(agent_root)
+
+    manifests = discover_playbooks(agent_root)
+    playbook = next(m for m in manifests if m.name == "my-playbook")
+
+    idem = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+    with (
+        patch(
+            "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
+            side_effect=_make_ledger_updating_dispatch("satisfied", 0.05),
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend", return_value=idem
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state1 = run(playbook=playbook, subject="lock-release", agent=mock_agent)
+        assert state1.status == "complete", (
+            f"first run must complete; got {state1.status!r}"
+        )
+        run_id = state1.conductor_run_id
+
+        # Second in-process run() on the SAME id MUST NOT raise LockBusy — proves
+        # the first run() released its per-run lease. (RED without the fix.)
+        try:
+            state2 = run(
+                playbook=playbook,
+                subject="lock-release",
+                agent=mock_agent,
+                conductor_run_id=run_id,
+            )
+        except LockBusy:  # pragma: no cover - this is the failure the fix prevents
+            pytest.fail(
+                "run() leaked its per-run lock: a second in-process run() on the "
+                "same conductor_run_id raised LockBusy. The lease must be released "
+                "in finally (NOT via GC)."
+            )
+        assert state2.status == "complete", (
+            f"second run must re-complete from the durable cursor; got {state2.status!r}"
+        )
+
+    # The lock file must be unlocked now: a fresh manual acquire succeeds.
+    probe = FilesystemLockBackend(agent_root).scope("conductor-runs")
+    handle = probe.acquire(run_id, timeout=0.0)  # must NOT raise
+    probe.release(handle)
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 40 — conflict serialization (OD1b): when run A holds a gate with a
+# conflict key, a second run B whose gate shares that key QUEUES (does not
+# double-suspend). Driven against a REAL FilesystemLockBackend + goal backend.
+
+
+def _make_conflict_gate_playbook(agent_root: Path, name: str, key: str) -> Any:
+    pb_dir = agent_root / "skills" / name
+    pb_dir.mkdir()
+    stages_yaml = (
+        "stages:\n"
+        "  - stage_id: gate-stage\n"
+        "    label: Human gate\n"
+        "    prompt: Human review required.\n"
+        "    is_gate: true\n"
+        "    options:\n"
+        "      - Approve\n"
+        "      - Reject\n"
+        "    conflict_keys:\n"
+        f"      - {key}\n"
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name=name, stages=stages_yaml, run_cap_usd=5.0)
+    )
+    return next(m for m in discover_playbooks(agent_root) if m.name == name)
+
+
+def test_conflict_serialization_second_run_queues_not_double_suspends(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """TEST 40 — overlapping conflict_keys: exactly one run suspends, the other queues.
+
+    Pins the OD1b headline guarantee + the scan+suspend serialization fix. Run A
+    reaches a gate declaring conflict_keys=['repo-x'] and suspends
+    (awaiting_decision, held_conflict_keys=['repo-x'] persisted on its sub-goal).
+    Run B reaches a gate that shares 'repo-x'; _scan_active_conflicts (run UNDER
+    the shared conductor-conflict-scan lease) sees A's claim and B returns
+    status='deferred' with queued_behind_decision_id = A's decision_id — it does
+    NOT write a second awaiting_decision holding the same key. Driven against a REAL
+    FilesystemLockBackend so the scan+suspend critical section actually takes the
+    shared lease.
+    """
+    from atomic_agents.locks.filesystem import FilesystemLockBackend
+
+    mock_agent.lock_backend = FilesystemLockBackend(agent_root)
+
+    pb_a = _make_conflict_gate_playbook(agent_root, "conflict-a", "repo-x")
+    pb_b = _make_conflict_gate_playbook(agent_root, "conflict-b", "repo-x")
+
+    idem = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+    with (
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend", return_value=idem
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state_a = run(playbook=pb_a, subject="A", agent=mock_agent)
+        assert state_a.status == "awaiting_decision", (
+            f"run A must suspend at its gate; got {state_a.status!r}"
+        )
+        assert state_a.pending_decision is not None
+        blocking_id = state_a.pending_decision.decision_id
+
+        state_b = run(playbook=pb_b, subject="B", agent=mock_agent)
+
+    # Run B must DEFER behind A's gate — NOT suspend a second time on the same key.
+    assert state_b.status == "deferred", (
+        f"run B must defer behind A's conflicting gate (NOT double-suspend); "
+        f"got {state_b.status!r}"
+    )
+    assert state_b.queued_behind_decision_id == blocking_id, (
+        f"run B must be blocked behind A's decision {blocking_id!r}; "
+        f"got {state_b.queued_behind_decision_id!r}"
+    )
+    assert state_b.queued_behind_conductor_run_id == state_a.conductor_run_id, (
+        f"run B must record A's conductor_run_id as the holder; "
+        f"got {state_b.queued_behind_conductor_run_id!r}"
+    )
+    assert state_b.pending_decision is None, (
+        "a deferred run has no pending_decision of its own"
+    )
+
+    # Durable check: exactly ONE goal holds 'repo-x' in awaiting_decision.
+    holders = 0
+    for goal_id in mock_agent.goal_backend.list_goals(mock_agent.name):
+        goal = mock_agent.goal_backend.for_goal(goal_id).load_goal(mock_agent.name)
+        for sg in goal.sub_goals:
+            if sg.status == "awaiting_decision" and "repo-x" in (
+                sg.held_conflict_keys or []
+            ):
+                holders += 1
+    assert holders == 1, (
+        f"exactly one run may hold the 'repo-x' conflict key in awaiting_decision; "
+        f"found {holders}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 41 — the scan+suspend critical section is gated on the SHARED
+# conductor-conflict-scan lease (the cross-run TOCTOU guard).
+
+
+def test_conflict_scan_suspend_acquires_shared_scan_lease(
+    agent_root: Path,
+    mock_agent: MagicMock,
+    monkeypatch,
+) -> None:
+    """TEST 41 — run() acquires the shared 'conductor-conflict-scan' lease before
+    scanning+suspending a gate with conflict_keys.
+
+    This pins the double-suspend TOCTOU fix directly (TEST 40 only proves the
+    SEQUENTIAL queue behavior, which would pass even without the lock). Here we
+    pre-hold the shared scan lease from the test, then drive a conflict-gate run:
+    because scan+suspend must acquire that same lease, run() blocks and (with a
+    short timeout) raises LockBusy. Without the lock the run would suspend
+    normally — so a green assertion proves the serialization lease is real.
+    """
+    import importlib
+
+    from atomic_agents.exceptions import LockBusy
+    from atomic_agents.locks.filesystem import FilesystemLockBackend
+
+    # The conductor package re-exports run() as the attribute `conductor.run`,
+    # which shadows the submodule — import the real module via importlib.
+    _runmod = importlib.import_module("atomic_agents.conductor.run")
+
+    mock_agent.lock_backend = FilesystemLockBackend(agent_root)
+    # Short timeout so the blocked acquire fails fast instead of waiting 30s.
+    monkeypatch.setattr(_runmod, "_CONFLICT_SCAN_LOCK_TIMEOUT_S", 0.1)
+
+    pb = _make_conflict_gate_playbook(agent_root, "scan-lease", "repo-y")
+
+    # Hold the shared scan lease from the test (simulates another run mid-critical
+    # section). run()'s scan+suspend must contend for THIS lease.
+    held_scope = mock_agent.lock_backend.scope("conductor-conflict-scan")
+    held = held_scope.acquire("scan", timeout=0.0)
+
+    idem = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+    try:
+        with (
+            patch(
+                "atomic_agents.conductor.run._get_idempotency_backend",
+                return_value=idem,
+            ),
+            patch(
+                "atomic_agents.conductor.run._get_outcome_backend",
+                return_value=outcome_backend,
+            ),
+        ):
+            with pytest.raises(LockBusy):
+                run(playbook=pb, subject="scan-lease", agent=mock_agent)
+    finally:
+        held_scope.release(held)
+
+    # Strip-RED: once the shared lease is released, the same run suspends normally
+    # (the LockBusy above was caused by the held scan lease, not something else).
+    with (
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend", return_value=idem
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state = run(playbook=pb, subject="scan-lease-2", agent=mock_agent)
+    assert state.status == "awaiting_decision", (
+        f"with the scan lease free, the gate must suspend; got {state.status!r}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 42 (C1) — end-to-end self-release: a deferred run self-releases once the
+# blocking gate is answered, with a negative control while the gate stays open.
+
+
+def test_self_release_after_blocking_gate_answered(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """TEST 42 — end-to-end OD1b self-release loop + the still-blocked negative control.
+
+    Deterministic, sequential:
+      1. Run A → suspends at its conflict-keyed gate (holds 'repo-x').
+      2. Run B (shares 'repo-x') → status='deferred' behind A's decision.
+      3. NEGATIVE CONTROL — with A STILL awaiting_decision, re-invoke run(B):
+         B STAYS deferred, NO conductor_queue_released is appended, and B does
+         NOT execute the conflict-keyed stage (never becomes the 'repo-x' holder).
+      4. Answer A's gate (resume A, disposition='continue') → A completes, key freed.
+      5. Re-invoke run(B): a conductor_queue_released event is appended AND B
+         proceeds past the deferral into its OWN conflict-keyed gate
+         (status='awaiting_decision', now the holder, with its own decision_id).
+
+    Exercises _is_decision_still_pending (True path in step 3, False path in
+    step 5) and the self-release branch (previously untested end-to-end).
+    """
+    from atomic_agents.locks.filesystem import FilesystemLockBackend
+
+    mock_agent.lock_backend = FilesystemLockBackend(agent_root)
+    pb_a = _make_conflict_gate_playbook(agent_root, "conflict-a", "repo-x")
+    pb_b = _make_conflict_gate_playbook(agent_root, "conflict-b", "repo-x")
+
+    idem = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+
+    with (
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend", return_value=idem
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        # 1. A suspends at its gate.
+        state_a = run(playbook=pb_a, subject="A", agent=mock_agent)
+        assert state_a.status == "awaiting_decision", (
+            f"run A must suspend; got {state_a.status!r}"
+        )
+        a_decision = state_a.pending_decision.decision_id
+        a_run_id = state_a.conductor_run_id
+
+        # 2. B defers behind A.
+        state_b1 = run(playbook=pb_b, subject="B", agent=mock_agent)
+        assert state_b1.status == "deferred", (
+            f"run B must defer behind A; got {state_b1.status!r}"
+        )
+        b_run_id = state_b1.conductor_run_id
+        b_history = agent_root / "goals" / b_run_id / "goal_history.jsonl"
+
+        # 3. NEGATIVE CONTROL — A still pending → B stays deferred, no release.
+        state_b_neg = run(
+            playbook=pb_b,
+            subject="B",
+            agent=mock_agent,
+            conductor_run_id=b_run_id,
+        )
+        assert state_b_neg.status == "deferred", (
+            f"B must STAY deferred while A's gate is unanswered; "
+            f"got {state_b_neg.status!r}"
+        )
+        assert state_b_neg.queued_behind_decision_id == a_decision
+        assert not _has_event(b_history, "conductor_queue_released"), (
+            "B must NOT self-release while A's gate is still awaiting_decision"
+        )
+        b_goal_neg = mock_agent.goal_backend.for_goal(b_run_id).load_goal(
+            mock_agent.name
+        )
+        assert all(sg.status != "awaiting_decision" for sg in b_goal_neg.sub_goals), (
+            "a deferred B must NOT execute (hold) its conflict-keyed gate"
+        )
+
+        # 4. Answer A's gate → A completes, 'repo-x' released.
+        state_a2 = resume(
+            playbook=pb_a,
+            subject="A",
+            agent=mock_agent,
+            conductor_run_id=a_run_id,
+            decision_id=a_decision,
+            answer="Approve.",
+            disposition="continue",
+            rationale="Reviewed.",
+        )
+        assert state_a2.status == "complete", (
+            f"A must complete after continue; got {state_a2.status!r}"
+        )
+
+        # 5. Re-invoke B → self-release, then B proceeds into its own gate.
+        state_b2 = run(
+            playbook=pb_b,
+            subject="B",
+            agent=mock_agent,
+            conductor_run_id=b_run_id,
+        )
+
+    assert _has_event(b_history, "conductor_queue_released"), (
+        "B must append conductor_queue_released once A's gate is answered "
+        "(self-release path)"
+    )
+    assert state_b2.status == "awaiting_decision", (
+        f"B must proceed PAST the deferral into its own conflict-keyed gate; "
+        f"got {state_b2.status!r}"
+    )
+    assert state_b2.queued_behind_decision_id is None, (
+        "B is no longer deferred — the queued-behind field must be cleared"
+    )
+    assert state_b2.pending_decision is not None, (
+        "B now holds its own gate and must surface its own pending decision"
+    )
+    assert state_b2.pending_decision.decision_id != a_decision, (
+        "B's gate decision must be its OWN, not A's released decision"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 43 (C4a) — _is_decision_still_pending FAILS CLOSED (returns True) on a
+# goal-backend read error, so a deferred run is never self-released by a glitch.
+
+
+def test_is_decision_still_pending_fails_closed_on_read_error(
+    agent_root: Path,
+) -> None:
+    """TEST 43 — _is_decision_still_pending returns True (stay deferred) on read errors.
+
+    A1 fail-closed: a transient goal-backend read failure MUST NOT be read as
+    'gate answered → release B into the resource'. Two cases:
+      (a) both the direct load and the list_goals fallback raise → True.
+      (b) list_goals succeeds but the per-goal load_goal raises (incomplete scan)
+          → True.
+
+    Strip-RED: if A1 is reverted (return False on read error), both assertions
+    fail.
+    """
+    # (a) Every read path raises.
+    agent_a = MagicMock()
+    agent_a.name = agent_root.name
+    backend_a = MagicMock()
+    backend_a.for_goal.side_effect = OSError("backend down")
+    backend_a.list_goals.side_effect = OSError("backend down")
+    agent_a.goal_backend = backend_a
+    assert (
+        _is_decision_still_pending(
+            agent=agent_a, decision_id="gate-abc", blocking_run_id="crun-blocking"
+        )
+        is True
+    ), "both read paths failing must keep the run deferred (fail-closed)"
+
+    # (b) list_goals OK, but a per-goal load raises → the scan is incomplete and
+    # cannot prove the gate is answered → fail closed.
+    agent_b = MagicMock()
+    agent_b.name = agent_root.name
+    backend_b = MagicMock()
+    backend_b.for_goal.side_effect = OSError("goal file unreadable")
+    backend_b.list_goals.return_value = ["crun-other"]
+    agent_b.goal_backend = backend_b
+    assert (
+        _is_decision_still_pending(
+            agent=agent_b, decision_id="gate-abc", blocking_run_id="crun-blocking"
+        )
+        is True
+    ), "an incomplete fallback scan must keep the run deferred (fail-closed)"
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 44 (C4b) — _scan_active_conflicts FAILS CLOSED (raises) when it cannot
+# reliably complete, so a new run never enters an exclusive stage blind.
+
+
+def test_scan_active_conflicts_fails_closed_on_read_error(
+    agent_root: Path,
+    goal_backend: FilesystemGoalBackend,
+) -> None:
+    """TEST 44 — _scan_active_conflicts raises ConductorConflictScanError on a bad scan.
+
+    A2 + B3 fail-closed. Three cases:
+      (a) list_goals raises → cannot enumerate the goal universe → raise.
+      (b) list_goals OK but a per-goal load_goal raises (a goal that MIGHT hold
+          an overlapping key is unreadable) → raise.
+      (c) a real holder overlaps the key in 'awaiting_decision' but carries a
+          FALSY gate_decision_id (malformed blocker) → raise (B3), rather than
+          emit a blank blocking id that would defeat self-release.
+
+    Strip-RED: if A2/B3 are reverted (return None / emit ''), each case fails.
+    """
+    from atomic_agents.goal.types import CURRENT_GOAL_SCHEMA_VERSION, Goal, SubGoal
+
+    # (a) list_goals raises.
+    agent_a = MagicMock()
+    agent_a.name = agent_root.name
+    backend_a = MagicMock()
+    backend_a.list_goals.side_effect = OSError("backend down")
+    agent_a.goal_backend = backend_a
+    with pytest.raises(ConductorConflictScanError):
+        _scan_active_conflicts(
+            agent=agent_a,
+            stage_conflict_keys=("repo-x",),
+            own_conductor_run_id="crun-self",
+        )
+
+    # (b) list_goals OK, per-goal load raises.
+    agent_b = MagicMock()
+    agent_b.name = agent_root.name
+    backend_b = MagicMock()
+    backend_b.list_goals.return_value = ["crun-other"]
+    scoped_b = MagicMock()
+    scoped_b.load_goal.side_effect = OSError("goal file unreadable")
+    backend_b.for_goal.return_value = scoped_b
+    agent_b.goal_backend = backend_b
+    with pytest.raises(ConductorConflictScanError):
+        _scan_active_conflicts(
+            agent=agent_b,
+            stage_conflict_keys=("repo-x",),
+            own_conductor_run_id="crun-self",
+        )
+
+    # (c) B3 — a real overlapping holder with a falsy gate_decision_id.
+    blocking_backend = goal_backend.for_goal("crun-malformed")
+    blocking_goal = Goal(
+        schema_version=CURRENT_GOAL_SCHEMA_VERSION,
+        active=True,
+        intent="Malformed blocker",
+        priority="medium",
+        created="2026-06-28",
+        last_progress_check="2026-06-28",
+        success_criteria=["done"],
+        sub_goals=[
+            SubGoal(
+                id="gate-stage",
+                label="Gate",
+                status="awaiting_decision",
+                gate_decision_id="",  # malformed: no decision id
+                held_conflict_keys=["repo-x"],
+            )
+        ],
+    )
+    blocking_backend.save_goal(agent_root.name, blocking_goal)
+    agent_c = MagicMock()
+    agent_c.name = agent_root.name
+    agent_c.goal_backend = goal_backend
+    with pytest.raises(ConductorConflictScanError):
+        _scan_active_conflicts(
+            agent=agent_c,
+            stage_conflict_keys=("repo-x",),
+            own_conductor_run_id="crun-self",
+        )

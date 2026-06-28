@@ -140,6 +140,11 @@ SUB_GOAL_TRANSITION_FIELDS = frozenset(
         # 'awaiting_decision' sub-goal. Stored on SubGoal to enable the atomic
         # decision_id CAS check inside apply_transition (c5-stale-duplicate-rejection).
         "gate_decision_id",
+        # PR3 (#582): held_conflict_keys are the stage.conflict_keys copied onto the
+        # sub-goal at gate-suspension time so a conflict scan costs O(n_goals)
+        # load_goal() calls (one cheap read per goal) instead of O(n_goals × n_events)
+        # JSONL parses. Cleared on gate answer / stage completion.
+        "held_conflict_keys",
     }
 )
 
@@ -176,6 +181,12 @@ class SubGoal:
     # CAS check in resume() — the decision_id is verified UNDER the goal lock
     # (spec/50 c5-stale-duplicate-rejection ruling). None for all other statuses.
     gate_decision_id: str | None = None
+    # PR3 (#582): conflict keys copied from StageSpec.conflict_keys at gate-suspension
+    # time. Lets a conflict scan read the keys from one load_goal() per goal (no
+    # per-goal JSONL parse) — O(n_goals) loads, not O(n_goals × n_events).
+    # Empty list when no conflict keys are registered or the sub-goal is not in
+    # 'awaiting_decision' status. Cleared at gate-answer time.
+    held_conflict_keys: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -356,6 +367,10 @@ def serialize_sub_goal(sg: SubGoal) -> dict[str, Any]:
         d["acceptance_criteria"] = sg.acceptance_criteria
     if sg.gate_decision_id is not None:
         d["gate_decision_id"] = sg.gate_decision_id
+    if sg.held_conflict_keys:
+        # PR3 (#582): only serialize when non-empty (avoids polluting goal.md for
+        # the vast majority of sub-goals that have no conflict keys).
+        d["held_conflict_keys"] = list(sg.held_conflict_keys)
     return d
 
 

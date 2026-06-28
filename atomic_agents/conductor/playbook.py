@@ -335,6 +335,46 @@ def _parse_stage_block(
             # For non-gate stages, silently discard non-empty options (no error,
             # the stage is valid; the options are simply irrelevant).
 
+        # PR3 (#582): conflict_keys — resources a gate stage holds while suspended.
+        # Only valid on is_gate stages; rejected (hard error) for non-gate stages.
+        # Validated: must be a list of non-empty strings, each max 128 chars, no
+        # null bytes, no path separators ('/', '\\', os.sep), no '.' or '..'.
+        conflict_keys_raw = raw.get("conflict_keys", [])
+        conflict_keys: tuple[str, ...] = ()
+        if conflict_keys_raw:
+            if not isinstance(conflict_keys_raw, list):
+                errors.append(
+                    f"stages[{i}] (stage_id={stage_id!r}) 'conflict_keys' must be a "
+                    f"list of strings; got {type(conflict_keys_raw).__name__!r}"
+                )
+                continue
+            if not is_gate:
+                errors.append(
+                    f"stages[{i}] (stage_id={stage_id!r}) 'conflict_keys' is only "
+                    "valid on is_gate=true stages"
+                )
+                continue
+            bad_keys = []
+            for ck in conflict_keys_raw:
+                if (
+                    not isinstance(ck, str)
+                    or not ck.strip()
+                    or len(ck) > 128
+                    or "\x00" in ck
+                    or "/" in ck
+                    or "\\" in ck
+                    or ck.strip() in (".", "..")
+                ):
+                    bad_keys.append(ck)
+            if bad_keys:
+                errors.append(
+                    f"stages[{i}] (stage_id={stage_id!r}) 'conflict_keys' entries "
+                    f"must be non-empty strings, max 128 chars, no null bytes, no path "
+                    f"separators; invalid: {bad_keys!r}"
+                )
+                continue
+            conflict_keys = tuple(str(ck).strip() for ck in conflict_keys_raw)
+
         stages.append(
             StageSpec(
                 stage_id=stage_id,
@@ -346,6 +386,7 @@ def _parse_stage_block(
                 model=model,
                 is_gate=is_gate,
                 options=options,
+                conflict_keys=conflict_keys,
             )
         )
 
