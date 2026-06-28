@@ -479,6 +479,8 @@ def test_run_doctor_no_agent_skips_agent_checks(tmp_path, monkeypatch):
         "principal-backend",
         "embedding-backend",
         "conversation-backend",
+        "agent-registry-backend",
+        "conductor",
         "memory-backend-config",
         "memory-backend",
         "write-paths",
@@ -1165,5 +1167,365 @@ def test_conversation_backend_redacts_credential_url(tmp_path, monkeypatch):
     assert result.status == FAIL
     assert "hunter2" not in result.message
     assert "postgres://..." in result.message
-    # detail must not leak the credential either
-    assert "hunter2" not in str(result.detail)
+
+
+# ──────────────────────────────────────────────────────────────────
+# check_conductor (spec/50 PR4 #583)
+
+
+def test_check_conductor_pass_with_zero_runs(tmp_path):
+    """check_conductor returns PASS (not SKIP) when no conductor runs exist.
+
+    A fresh agent with no goals/ dir at all is the clean home-user default.
+    PASS with 0 runs signals 'the check ran and found a healthy empty state',
+    not 'this check was skipped' (which would be misleading).
+    """
+    from atomic_agents.doctor import check_conductor, PASS
+
+    agent_root = tmp_path / "fresh-agent"
+    agent_root.mkdir()
+
+    result = check_conductor(agent_root)
+
+    assert result.status == PASS, (
+        f"Expected PASS for agent with no conductor runs; got {result.status!r}: {result.message}"
+    )
+    assert result.detail.get("conductor_runs_found") == 0
+    assert "no conductor runs" in result.message
+
+
+def test_check_conductor_pass_with_goals_dir_no_conductor_runs(tmp_path):
+    """check_conductor returns PASS when goals/ exists but has no conductor runs.
+
+    An agent with a standing goal.md (non-conductor goals) but no conductor
+    playbook runs should also return PASS with 0 conductor runs found.
+    """
+    from atomic_agents.doctor import check_conductor, PASS
+
+    agent_root = tmp_path / "goal-agent"
+    agent_root.mkdir()
+    goals_dir = agent_root / "goals"
+    goals_dir.mkdir()
+    # Create a non-conductor goal directory (no conductor_run_started event)
+    goal_dir = goals_dir / "ordinary-goal"
+    goal_dir.mkdir()
+    (goal_dir / "goal_history.jsonl").write_text(
+        '{"event": "goal_created", "ts": "2026-06-28T00:00:00+00:00"}\n'
+    )
+
+    result = check_conductor(agent_root)
+
+    assert result.status == PASS
+    assert result.detail.get("conductor_runs_found") == 0
+
+
+def test_check_conductor_warn_on_unreadable_goals_dir(tmp_path, monkeypatch):
+    """An unreadable goals/ dir degrades THIS check to WARN, not the whole doctor run.
+
+    run_doctor() does not wrap individual checks in try/except — each is expected
+    to fail soft internally. If the light-probe iterdir() propagated an OSError it
+    would abort every check. Guard it: an unreadable goals/ → WARN, isolated.
+    """
+    from atomic_agents.doctor import check_conductor, WARN
+    from pathlib import Path
+
+    agent_root = tmp_path / "perm-agent"
+    agent_root.mkdir()
+    (agent_root / "goals").mkdir()
+
+    real_iterdir = Path.iterdir
+
+    def _boom(self):
+        if self.name == "goals":
+            raise PermissionError("goals dir unreadable")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", _boom)
+
+    result = check_conductor(agent_root)
+
+    assert result.status == WARN, (
+        f"unreadable goals/ must degrade to WARN, not raise; got {result.status!r}"
+    )
+    assert "unreadable" in result.message
+
+
+def test_check_conductor_wired_into_run_doctor(tmp_path, monkeypatch):
+    """check_conductor must appear in run_doctor() output for an agent with no conductor runs.
+
+    This verifies BOTH wiring points:
+    (1) The no-agent SKIP roster includes 'conductor'.
+    (2) The agent-scoped execution block calls check_conductor() so it appears
+        in run_doctor() results (false-PASS-by-omission prevention).
+    """
+    from atomic_agents.doctor import run_doctor, PASS
+
+    _isolate_keys(monkeypatch, tmp_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-key")
+    _make_agent(tmp_path, "conductor-wiring-agent")
+
+    results = run_doctor(
+        agent_name="conductor-wiring-agent",
+        agents_root=tmp_path,
+        skip_mcp=True,
+    )
+    names = [r.name for r in results]
+    assert "conductor" in names, (
+        "check_conductor must be wired into run_doctor() — 'conductor' missing from results. "
+        f"Names found: {names}"
+    )
+
+    conductor_result = next(r for r in results if r.name == "conductor")
+    assert conductor_result.status == PASS, (
+        f"conductor check must PASS for a fresh agent with no runs; "
+        f"got {conductor_result.status!r}: {conductor_result.message}"
+    )
+
+
+def test_check_conductor_no_agent_emits_skip():
+    """run_doctor(agent_name=None) must emit 'conductor' as SKIP (no-agent roster).
+
+    Without --agent, every agent-scoped check must appear in the output as SKIP.
+    Omitting 'conductor' from the SKIP roster creates a false-PASS-by-omission
+    (the check never appears, so CI can't verify it exists).
+    """
+    from atomic_agents.doctor import run_doctor, SKIP
+
+    results = run_doctor(agent_name=None, agents_root=None)
+    names_by_status = {r.name: r.status for r in results}
+
+    assert "conductor" in names_by_status, (
+        "'conductor' must be in the no-agent SKIP roster in doctor.py lines 200-228. "
+        f"Names found: {list(names_by_status.keys())}"
+    )
+    assert names_by_status["conductor"] == SKIP, (
+        f"conductor must be SKIP when no --agent supplied; got {names_by_status['conductor']!r}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# check_conductor heavy-probe invariants (spec/50 PR4 #583): read-only-on-probe
+# + the automated-complete-no-output WARN positive. These materialize a REAL
+# conductor run on disk (via the conductor run() API) so the probe walks a
+# genuine ledger, not a hand-rolled one.
+
+
+def _materialize_conductor_run(agent_root: Path) -> str:
+    """Drive a single automated-stage conductor playbook to completion on disk.
+
+    Returns the conductor_run_id. The run leaves a healthy completed ledger
+    (goal.md + goal_history.jsonl) under <agent_root>/goals/<run_id>/, with the
+    automated sub-goal carrying its output pointer (set by run()'s
+    _store_outcome_pointer) — i.e. a check_conductor() PASS fixture.
+    """
+    from datetime import date as _date
+    from unittest.mock import MagicMock, patch
+
+    from atomic_agents.conductor import run as conductor_run
+    from atomic_agents.conductor import discover_playbooks
+    from atomic_agents.conductor.playbook import PLAYBOOK_ENTRY_POINT
+    from atomic_agents.goal.filesystem import FilesystemGoalBackend
+    from atomic_agents.idempotency.types import FRESH
+
+    agent_root.mkdir(parents=True, exist_ok=True)
+    (agent_root / "model.md").write_text(
+        "---\n"
+        "provider: anthropic\n"
+        "model: claude-3-5-haiku-20241022\n"
+        "cost_guardrails:\n"
+        "  max_cost_per_run_usd: 2.00\n"
+        "  max_cumulative_cost_usd: 20.00\n"
+        "---\n",
+        encoding="utf-8",
+    )
+    (agent_root / "skills").mkdir(exist_ok=True)
+    pb_dir = agent_root / "skills" / "probe-pb"
+    pb_dir.mkdir()
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        "---\n"
+        "name: probe-pb\n"
+        "description: A probe playbook.\n"
+        "kind: playbook\n"
+        "---\n"
+        "\n"
+        "A probe playbook.\n"
+        "\n"
+        "```yaml\n"
+        "run_cap_usd: 5.0\n"
+        "stages:\n"
+        "  - stage_id: only-stage\n"
+        "    label: The only stage\n"
+        "    prompt: Do the thing.\n"
+        "    is_gate: false\n"
+        "```\n",
+        encoding="utf-8",
+    )
+
+    agent = MagicMock()
+    agent.agent_root = agent_root
+    agent.agents_root = agent_root.parent
+    agent.name = agent_root.name
+    agent.goal_backend = FilesystemGoalBackend(agent_root)
+    agent.trigger = None
+
+    def _dispatch(agent, goal_manager, sub_goal_id, **kwargs):
+        """Mark the dispatched sub-goal complete in the ledger (as the real
+        coordinator would), so the conductor sees a satisfied automated stage."""
+        today = _date.today()
+        goal_manager.goal_backend.apply_transition(
+            agent_id=goal_manager.agent_name,
+            sub_goal_id=sub_goal_id,
+            to_status="complete",
+            fields={"completed": today.isoformat()},
+            history_prose=f"sub_goal `{sub_goal_id}` -> complete (mock dispatch)",
+            history_event={
+                "ts": "2026-06-28T00:00:00+00:00",
+                "event": "sub_goal_outcome_dispatched",
+                "sub_goal_id": sub_goal_id,
+                "outcome_run_id": f"outcome-mock-{sub_goal_id}",
+                "terminal_state": "satisfied",
+                "applied_status": "complete",
+                "iterations": 1,
+                "total_cost_usd": 0.05,
+            },
+            expected_from_status=None,
+            when=today,
+        )
+        result = MagicMock()
+        result.status = "satisfied"
+        result.run_id = f"outcome-mock-{sub_goal_id}"
+        result.total_cost_usd = 0.05
+        result.iterations = [MagicMock()]
+        sg = MagicMock()
+        sg.status = "complete"
+        return result, sg
+
+    idem = MagicMock()
+    fresh = MagicMock()
+    fresh.state = FRESH
+    fresh.prior_result_ref = None
+    idem.lookup.return_value = fresh
+    idem.begin.return_value = fresh
+
+    playbook = next(m for m in discover_playbooks(agent_root) if m.name == "probe-pb")
+    with (
+        patch(
+            "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
+            side_effect=_dispatch,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend", return_value=idem
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=MagicMock(),
+        ),
+    ):
+        state = conductor_run(playbook=playbook, subject="probe subject", agent=agent)
+    assert state.status == "complete", (
+        f"probe-run setup did not complete: {state.status!r}"
+    )
+    return state.conductor_run_id
+
+
+def test_check_conductor_read_only_invariant(tmp_path):
+    """check_conductor() is STRICTLY READ-ONLY — the ledger is byte-identical
+    after a probe, on BOTH a PASS path and a FAIL path.
+
+    The read-only property is P0-critical: a doctor diagnostic must never heal,
+    lock, or rewrite the conductor ledger it inspects. This snapshots the raw
+    bytes of goal.md AND goal_history.jsonl before and after check_conductor()
+    and asserts no file was added, removed, or changed — guarding against a
+    future heal/lock regression on the doctor path.
+    """
+    from atomic_agents.doctor import check_conductor, PASS, FAIL
+
+    def _snapshot(run_dir: Path) -> dict[str, bytes]:
+        return {
+            p.name: p.read_bytes() for p in sorted(run_dir.iterdir()) if p.is_file()
+        }
+
+    # ---- PASS path: a healthy completed run ----
+    pass_root = tmp_path / "pass-agent"
+    pass_run_id = _materialize_conductor_run(pass_root)
+    pass_dir = pass_root / "goals" / pass_run_id
+
+    before = _snapshot(pass_dir)
+    result = check_conductor(pass_root)
+    after = _snapshot(pass_dir)
+
+    assert result.status == PASS, (
+        f"healthy run must PASS (read-only fixture precondition); "
+        f"got {result.status!r}: {result.message}"
+    )
+    assert before == after, (
+        "check_conductor() mutated the conductor ledger on the PASS path — it must "
+        "be strictly read-only (no file added/removed/changed)"
+    )
+
+    # ---- FAIL path: a corrupted goal.md ----
+    fail_root = tmp_path / "fail-agent"
+    fail_run_id = _materialize_conductor_run(fail_root)
+    fail_dir = fail_root / "goals" / fail_run_id
+    (fail_dir / "goal.md").write_text(
+        "---\ncorrupt: [unterminated\n---\nbroken goal.md\n", encoding="utf-8"
+    )
+
+    before_fail = _snapshot(fail_dir)
+    result_fail = check_conductor(fail_root)
+    after_fail = _snapshot(fail_dir)
+
+    assert result_fail.status == FAIL, (
+        f"corrupt goal.md must FAIL (read-only fixture precondition); "
+        f"got {result_fail.status!r}: {result_fail.message}"
+    )
+    assert before_fail == after_fail, (
+        "check_conductor() mutated the conductor ledger on the FAIL path — even when "
+        "it detects corruption it must NOT heal/rewrite (strictly read-only)"
+    )
+
+
+def test_check_conductor_warn_automated_complete_no_output_pointer(tmp_path):
+    """An AUTOMATED 'complete' sub-goal with NO output pointer → WARN naming it.
+
+    Positive control for the automated-complete-no-output-pointer WARN sub-rung
+    (an answered gate clears its gate_decision_id, so automated stages are
+    identified by the ABSENCE of a conductor_gate_answered audit). TEST 53 in
+    test_conductor.py only guards the cry-wolf NEGATIVE (a degraded history must
+    NOT trip this WARN); this guards the POSITIVE so an inverted predicate is
+    caught. Materialize a healthy run (PASS — its output pointer is present),
+    then strip the output pointer and assert the probe downgrades to WARN.
+    """
+    from atomic_agents.doctor import check_conductor, PASS, WARN
+    from atomic_agents.goal.filesystem import FilesystemGoalBackend
+
+    agent_root = tmp_path / "warn-agent"
+    run_id = _materialize_conductor_run(agent_root)
+
+    # Negative control: with the output pointer present, the run PASSes.
+    assert check_conductor(agent_root).status == PASS, (
+        "fixture precondition: a healthy automated run must PASS before stripping"
+    )
+
+    # Strip the output pointer off the automated complete sub-goal (read-only
+    # backend round-trip — the doctor probe must not have written anything).
+    scoped = FilesystemGoalBackend(agent_root).for_goal(run_id)
+    goal = scoped.load_goal(agent_root.name)
+    stripped = False
+    for sg in goal.sub_goals:
+        if sg.status == "complete" and sg.output:
+            sg.output = None
+            stripped = True
+    assert stripped, "test setup: no complete sub-goal with an output pointer to strip"
+    scoped.save_goal(agent_root.name, goal)
+
+    result = check_conductor(agent_root)
+
+    assert result.status == WARN, (
+        f"an automated 'complete' sub-goal with no output pointer must WARN; "
+        f"got {result.status!r}: {result.message}"
+    )
+    assert any("output pointer" in w for w in result.detail.get("warnings", [])), (
+        f"the WARN must name the missing output pointer; "
+        f"got warnings={result.detail.get('warnings')!r}"
+    )

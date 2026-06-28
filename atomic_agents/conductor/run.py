@@ -86,6 +86,7 @@ if TYPE_CHECKING:
 from ..exceptions import (
     AtomicAgentsError,
     ConductorConflictScanError,
+    ConductorLaunderRefused,
     CostGuardrailBlocked,
     GoalConcurrentModification,
     GoalCorrupted,
@@ -197,9 +198,12 @@ def run(
     Call conductor.resume() with the decision_id to answer and continue.
 
     C7 — the conductor is NOT a delegation level. Do not invoke run() from inside
-    a depth-1 delegated specialist call (spec/15 one-level bound). That would
+    a depth-1 delegated specialist call (spec/15 one-level bound); that would
     launder two-level delegation through the conductor and defeat spec/15 #9.
-    Best-effort guard: if agent.trigger == 'delegate', emits a warning.
+    Raises ConductorLaunderRefused (a NestedDelegationRefused subclass) if
+    agent.trigger == 'delegate'. Structural call-depth enforcement (refusing to
+    start from within a delegate frame without the trigger signal) is deferred to
+    follow-up issue #665.
 
     Args:
         playbook: parsed PlaybookManifest.
@@ -226,15 +230,18 @@ def run(
         GoalCorrupted: when a sub-goal referenced by the playbook is missing from
             the goal (ledger/playbook mismatch).
     """
-    # C7 best-effort launder-guard: warn if invoked from a delegate trigger.
+    # C7 hard launder-guard: raise ConductorLaunderRefused if invoked from a delegate trigger.
+    # Fires BEFORE _resolve_or_create_run() so no goal is ever created for an invalid call
+    # and no ledger event is emitted before the guard (Principle #5 + audit correctness).
     _trigger = getattr(agent, "trigger", None)
     if _trigger == "delegate":
-        _warnings.warn(
-            "conductor.run() is being called from within a delegated agent (trigger='delegate'). "
-            "This may launder two-level delegation through the conductor, circumventing spec/15 #9. "
-            "The conductor is an orchestration top — invoke it from an operator trigger, cron, "
-            "or a coordinator agent BEFORE it has delegated (spec/50 C7, OD3).",
-            stacklevel=2,
+        raise ConductorLaunderRefused(
+            "conductor.run() was called from within a delegated agent (trigger='delegate'). "
+            "This would launder two-level delegation through the conductor, circumventing "
+            "spec/15 #9. The conductor is an orchestration top — invoke it from an operator "
+            "trigger, cron, or a coordinator agent BEFORE it has delegated (spec/50 C7, OD3). "
+            "PR4 #583 upgraded this guard from warn to hard raise (ConductorLaunderRefused, "
+            "a NestedDelegationRefused subclass). Structural call-depth enforcement deferred."
         )
 
     # PR1 honesty: the per-stage `model` dial is parsed but NOT applied (no
@@ -1466,7 +1473,14 @@ def resume(
         (PR3 #582: a later gate is blocked behind another run's conflicting gate —
         the continue/skip dispositions delegate to run(), which can return 'deferred').
 
+    C7 — the conductor is NOT a delegation level. Raises ConductorLaunderRefused
+    (a NestedDelegationRefused subclass) if agent.trigger == 'delegate', BEFORE
+    any ledger read or write. This mirrors the guard in run() and closes the
+    launder path through the gate-answer path (PR4 #583, spec/50 C7).
+
     Raises:
+        ConductorLaunderRefused: if agent.trigger == 'delegate' (C7 launder guard,
+            fired BEFORE any ledger work — the gate sub-goal is not modified).
         ValueError: if disposition is not 'continue'/'skip'/'halt', or if
             rationale/answer is empty/whitespace-only.
         UnverifiedPrincipalConversationAccess: if principal.is_verified is False
@@ -1476,6 +1490,21 @@ def resume(
         AtomicAgentsError: if the goal backend doesn't implement AddressableGoalBackend.
     """
     from ..principal.types import LOCAL_PRINCIPAL  # noqa: PLC0415
+
+    # C7 hard launder-guard: raise BEFORE any ledger read or write, including
+    # _record_gate_answer(), so the gate sub-goal is never mutated on a launder call.
+    # Placed BEFORE the disposition/rationale/answer validation and BEFORE the
+    # principal check — no state is touched at all before this guard fires.
+    _trigger = getattr(agent, "trigger", None)
+    if _trigger == "delegate":
+        raise ConductorLaunderRefused(
+            "conductor.resume() was called from within a delegated agent (trigger='delegate'). "
+            "This would launder two-level delegation through the conductor gate-answer path, "
+            "circumventing spec/15 #9. The conductor is an orchestration top — invoke it from "
+            "an operator trigger, cron, or a coordinator agent BEFORE it has delegated "
+            "(spec/50 C7, OD3). PR4 #583 added this guard to resume() with no ledger side "
+            "effects on raise (the gate sub-goal remains in 'awaiting_decision')."
+        )
 
     if disposition not in ("continue", "skip", "halt"):
         raise ValueError(

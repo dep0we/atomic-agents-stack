@@ -102,6 +102,7 @@ from atomic_agents._goal_impl import GoalManager
 from atomic_agents.exceptions import (
     AtomicAgentsError,
     ConductorConflictScanError,
+    ConductorLaunderRefused,
     GoalConcurrentModification,
     GoalCorrupted,
     UnverifiedPrincipalConversationAccess,
@@ -5838,3 +5839,1240 @@ def test_scan_active_conflicts_fails_closed_on_read_error(
             stage_conflict_keys=("repo-x",),
             own_conductor_run_id="crun-self",
         )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 45 — C7 launder-guard (PR4 #583): run() raises ConductorLaunderRefused
+#           when agent.trigger == 'delegate' (hard raise, not warn)
+
+
+def test_c7_run_raises_on_delegate_trigger(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """C7: run() MUST raise ConductorLaunderRefused when agent.trigger == 'delegate'.
+
+    PR4 #583 upgraded the warn-only guard in run() to a hard raise. The guard must
+    fire BEFORE _resolve_or_create_run() — no goals/<id>/ directory must be created
+    for an invalid delegate call (Principle #5: no orphaned ledger state).
+    """
+    pb_dir = agent_root / "skills" / "c7-run-pb"
+    pb_dir.mkdir()
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(_make_playbook_md(name="c7-run-pb"))
+    playbook = next(m for m in discover_playbooks(agent_root) if m.name == "c7-run-pb")
+
+    mock_agent.trigger = "delegate"
+
+    goals_before = (
+        set((agent_root / "goals").iterdir())
+        if (agent_root / "goals").is_dir()
+        else set()
+    )
+
+    with pytest.raises(ConductorLaunderRefused):
+        run(playbook=playbook, subject="launder attempt", agent=mock_agent)
+
+    # Guard must fire BEFORE any goal directory is created
+    goals_after = (
+        set((agent_root / "goals").iterdir())
+        if (agent_root / "goals").is_dir()
+        else set()
+    )
+    new_dirs = goals_after - goals_before
+    assert not new_dirs, (
+        f"C7 guard must fire BEFORE _resolve_or_create_run() — "
+        f"no goal directory must be created; got new dirs: {new_dirs}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 45-strip-RED — C7 launder-guard: run() does NOT raise when trigger
+#                     is NOT 'delegate'
+
+
+def test_c7_run_does_not_raise_on_non_delegate_trigger(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """C7 strip-RED: run() must NOT raise ConductorLaunderRefused for non-delegate triggers.
+
+    The guard is keyed on trigger == 'delegate' only. cron / serve / None / 'operator'
+    must all proceed normally (the guard does not fire for these).
+    """
+    pb_dir = agent_root / "skills" / "c7-strip-pb"
+    pb_dir.mkdir()
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(_make_playbook_md(name="c7-strip-pb"))
+    playbook = next(
+        m for m in discover_playbooks(agent_root) if m.name == "c7-strip-pb"
+    )
+
+    _ledger_dispatch = _make_ledger_updating_dispatch(total_cost_usd=0.01)
+    idem_backend = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+
+    for trigger_val in (None, "cron", "serve", "operator"):
+        mock_agent.trigger = trigger_val
+        # Reset goal state so each iteration runs fresh
+        mock_agent.agent_root = agent_root
+        with (
+            patch(
+                "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
+                side_effect=_ledger_dispatch,
+            ),
+            patch(
+                "atomic_agents.conductor.run._get_idempotency_backend",
+                return_value=idem_backend,
+            ),
+            patch(
+                "atomic_agents.conductor.run._get_outcome_backend",
+                return_value=outcome_backend,
+            ),
+        ):
+            # Must NOT raise ConductorLaunderRefused — any other exception is unexpected
+            # but not what this strip-RED is testing
+            try:
+                run(playbook=playbook, subject="valid trigger", agent=mock_agent)
+            except ConductorLaunderRefused:
+                pytest.fail(
+                    f"C7 strip-RED: run() must NOT raise ConductorLaunderRefused "
+                    f"for trigger={trigger_val!r}; it must only raise for 'delegate'."
+                )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 46 — C7 launder-guard (PR4 #583): resume() raises ConductorLaunderRefused
+#           when agent.trigger == 'delegate' BEFORE any ledger mutation
+
+
+def test_c7_resume_raises_on_delegate_trigger(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """C7: resume() MUST raise ConductorLaunderRefused when agent.trigger == 'delegate'.
+
+    The guard must fire BEFORE _record_gate_answer() — the gate sub-goal must remain
+    in 'awaiting_decision' after the raise (no ledger mutation on a launder call).
+    """
+    from atomic_agents.goal.filesystem import FilesystemGoalBackend  # noqa: PLC0415
+
+    # Phase 1: establish a suspended gate via a non-delegate run()
+    pb_dir = agent_root / "skills" / "c7-resume-pb"
+    pb_dir.mkdir()
+    stages_yaml = textwrap.dedent(
+        """\
+        stages:
+          - stage_id: gate-stage
+            label: Human gate
+            prompt: Approve to continue.
+            is_gate: true
+        """
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="c7-resume-pb", stages=stages_yaml, run_cap_usd=5.0)
+    )
+    playbook = next(
+        m for m in discover_playbooks(agent_root) if m.name == "c7-resume-pb"
+    )
+
+    idem_backend = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+
+    # Non-delegate trigger for run() — must succeed and suspend at the gate
+    mock_agent.trigger = "cron"
+    with (
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=idem_backend,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state = run(playbook=playbook, subject="c7 resume test", agent=mock_agent)
+
+    assert state.status == "awaiting_decision", (
+        f"Expected suspension at gate; got {state.status!r}"
+    )
+    conductor_run_id = state.conductor_run_id
+    decision_id = state.pending_decision.decision_id
+
+    # Read the history JSONL before the resume() attempt to compare after
+    history_path = agent_root / "goals" / conductor_run_id / "goal_history.jsonl"
+    events_before = history_path.read_bytes()
+
+    # Phase 2: attempt resume() with trigger == 'delegate' — must raise BEFORE any write
+    mock_agent.trigger = "delegate"
+
+    with pytest.raises(ConductorLaunderRefused):
+        resume(
+            playbook=playbook,
+            subject="c7 resume test",
+            agent=mock_agent,
+            conductor_run_id=conductor_run_id,
+            decision_id=decision_id,
+            answer="Approved.",
+            disposition="continue",
+            rationale="Testing the C7 guard.",
+        )
+
+    # The guard must have fired BEFORE _record_gate_answer — no new events appended
+    events_after = history_path.read_bytes()
+    assert events_before == events_after, (
+        "C7 resume() guard must fire BEFORE _record_gate_answer(); "
+        "goal_history.jsonl must NOT have new events after the raise. "
+        f"Before size={len(events_before)}, after size={len(events_after)}."
+    )
+
+    # The gate sub-goal must still be 'awaiting_decision'
+    goal_backend = FilesystemGoalBackend(agent_root)
+    conductor_backend = goal_backend.for_goal(conductor_run_id)
+    goal = conductor_backend.load_goal(agent_root.name)
+    gate_sg = next((sg for sg in goal.sub_goals if sg.id == "gate-stage"), None)
+    assert gate_sg is not None, "gate-stage sub-goal must still exist"
+    assert gate_sg.status == "awaiting_decision", (
+        f"Gate sub-goal must remain 'awaiting_decision' after C7 resume() raise; "
+        f"got {gate_sg.status!r}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 46-strip-RED — C7 launder-guard: resume() does NOT raise when trigger
+#                     is NOT 'delegate'
+
+
+def test_c7_resume_does_not_raise_on_non_delegate_trigger(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """C7 strip-RED: resume() must NOT raise ConductorLaunderRefused for non-delegate triggers.
+
+    Only trigger == 'delegate' trips the guard. Other triggers (cron, None, serve) must
+    proceed normally through the resume path.
+    """
+    pb_dir = agent_root / "skills" / "c7-resume-strip-pb"
+    pb_dir.mkdir()
+    stages_yaml = textwrap.dedent(
+        """\
+        stages:
+          - stage_id: gate-stage
+            label: Gate
+            prompt: Approve.
+            is_gate: true
+        """
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(
+            name="c7-resume-strip-pb", stages=stages_yaml, run_cap_usd=5.0
+        )
+    )
+    playbook = next(
+        m for m in discover_playbooks(agent_root) if m.name == "c7-resume-strip-pb"
+    )
+
+    idem_backend = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+
+    # Establish a suspended gate
+    mock_agent.trigger = "cron"
+    with (
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=idem_backend,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state = run(playbook=playbook, subject="strip test", agent=mock_agent)
+
+    assert state.status == "awaiting_decision"
+    conductor_run_id = state.conductor_run_id
+    decision_id = state.pending_decision.decision_id
+
+    # resume() with a non-delegate trigger must NOT raise ConductorLaunderRefused
+    mock_agent.trigger = "cron"
+    try:
+        with (
+            patch(
+                "atomic_agents.conductor.run._get_idempotency_backend",
+                return_value=_make_idempotency_backend_mock(),
+            ),
+            patch(
+                "atomic_agents.conductor.run._get_outcome_backend",
+                return_value=outcome_backend,
+            ),
+        ):
+            resume(
+                playbook=playbook,
+                subject="strip test",
+                agent=mock_agent,
+                conductor_run_id=conductor_run_id,
+                decision_id=decision_id,
+                answer="Fine.",
+                disposition="halt",
+                rationale="Strip-RED control: non-delegate trigger must not raise C7.",
+            )
+    except ConductorLaunderRefused:
+        pytest.fail(
+            "C7 strip-RED: resume() must NOT raise ConductorLaunderRefused "
+            "for trigger='cron' — only trigger='delegate' trips the guard."
+        )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 47–50 — check_conductor heavy probe (spec/50 PR4 #583)
+#
+# The dual-probe diagnostic's whole purpose is to detect ledger corruption /
+# anomalies on the genuinely-MOST-RECENT conductor run. These tests materialize
+# REAL conductor runs on disk (via run()) and exercise the heavy-probe ladder
+# the light/zero-run tests in test_doctor.py do NOT: PASS on a healthy run,
+# FAIL on a corrupted goal.md, the most-recent-BY-TS selection (the regression
+# guard for the random-UUID4 run_id sort bug), and the per-gate missing-audit
+# WARN. Without these, the FAIL/WARN rungs ship at 0% coverage (false-green).
+
+
+def _run_simple_conductor(
+    agent_root: Path,
+    mock_agent: MagicMock,
+    *,
+    name: str = "probe-pb",
+    run_cap: float = 5.0,
+) -> str:
+    """Run a single-auto-stage conductor playbook to completion; return run_id."""
+    pb_dir = agent_root / "skills" / name
+    pb_dir.mkdir(parents=True, exist_ok=True)
+    stages_yaml = textwrap.dedent(
+        """\
+        stages:
+          - stage_id: only-stage
+            label: The only stage
+            prompt: Do the thing.
+            is_gate: false
+        """
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name=name, stages=stages_yaml, run_cap_usd=run_cap)
+    )
+    playbook = next(m for m in discover_playbooks(agent_root) if m.name == name)
+    _dispatch = _make_ledger_updating_dispatch(total_cost_usd=0.05)
+    with (
+        patch(
+            "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
+            side_effect=_dispatch,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=_make_idempotency_backend_mock(),
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=_make_outcome_backend_mock(),
+        ),
+    ):
+        state = run(playbook=playbook, subject=f"{name} subject", agent=mock_agent)
+    assert state.status == "complete", (
+        f"heavy-probe setup run did not complete: {state.status!r}"
+    )
+    return state.conductor_run_id
+
+
+def _set_run_started_ts(agent_root: Path, run_id: str, ts: str) -> None:
+    """Rewrite the conductor_run_started event's `ts` in a run's history file."""
+    history_path = agent_root / "goals" / run_id / "goal_history.jsonl"
+    out: list[str] = []
+    for line in history_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        rec = json.loads(line)
+        if rec.get("event") == "conductor_run_started":
+            rec["ts"] = ts
+        out.append(json.dumps(rec))
+    history_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+def _corrupt_goal_md(agent_root: Path, run_id: str) -> None:
+    """Break a run's goal.md so load_goal() raises GoalCorrupted.
+
+    An unterminated YAML flow sequence in the frontmatter makes frontmatter.load
+    raise, which load_goal() maps to GoalCorrupted (the goal.md STATE SNAPSHOT,
+    not the goal_history.jsonl audit ledger).
+    """
+    (agent_root / "goals" / run_id / "goal.md").write_text(
+        "---\ncorrupt: [unterminated\n---\nbroken goal.md\n", encoding="utf-8"
+    )
+
+
+def test_check_conductor_pass_healthy_run(
+    agent_root: Path, mock_agent: MagicMock
+) -> None:
+    """TEST 47 — a healthy completed run → PASS with the run's id surfaced."""
+    from atomic_agents.doctor import check_conductor, PASS  # noqa: PLC0415
+
+    run_id = _run_simple_conductor(agent_root, mock_agent)
+    result = check_conductor(agent_root)
+
+    assert result.status == PASS, (
+        f"healthy run must PASS; got {result.status!r}: {result.message}"
+    )
+    assert result.detail["conductor_runs_found"] == 1
+    assert result.detail["most_recent_run_id"] == run_id
+
+
+def test_check_conductor_fail_on_corrupted_goal(
+    agent_root: Path, mock_agent: MagicMock
+) -> None:
+    """TEST 48 — the most-recent run's goal.md is corrupt → FAIL (negative control).
+
+    This is the rung the heavy probe exists for. PASS here would be a false
+    negative masking real corruption.
+    """
+    from atomic_agents.doctor import check_conductor, FAIL, PASS  # noqa: PLC0415
+
+    run_id = _run_simple_conductor(agent_root, mock_agent)
+    _corrupt_goal_md(agent_root, run_id)
+    result = check_conductor(agent_root)
+
+    assert result.status == FAIL, (
+        f"corrupt goal.md must FAIL; got {result.status!r}: {result.message}"
+    )
+    assert result.status != PASS  # explicit false-negative guard
+    assert result.detail["most_recent_run_id"] == run_id
+    assert "corruption" in result.detail
+
+
+def test_check_conductor_selects_most_recent_by_ts(
+    agent_root: Path, mock_agent: MagicMock
+) -> None:
+    """TEST 49 — most-recent selection is BY TS, not by lexicographic run_id (nor mtime).
+
+    Regression guard for the random-UUID4 run_id sort bug. Run IDs are
+    'crun-<uuid4().hex[:16]>' (no temporal order). The three candidate signals
+    are deliberately set to DISAGREE so only a ts-based selection lands on the
+    run we corrupt:
+      - conductor_run_started ts: NEWER on the lexicographically-SMALLER run_id.
+      - history-file mtime (the documented FALLBACK): forced NEWER on the OTHER
+        (lexicographically-larger, older-ts) run via os.utime.
+    We corrupt ONLY the newest-BY-TS run. A correct ts-based selection probes the
+    corrupt run → FAIL. A lexicographic run_id sort OR an mtime sort would each
+    instead probe the older healthy run → false PASS. Deterministic: the answer
+    does not depend on the random run_ids or on filesystem write timing.
+    """
+    import os  # noqa: PLC0415
+    import time  # noqa: PLC0415
+
+    from atomic_agents.doctor import check_conductor, FAIL  # noqa: PLC0415
+
+    run_a = _run_simple_conductor(agent_root, mock_agent, name="probe-a")
+    run_b = _run_simple_conductor(agent_root, mock_agent, name="probe-b")
+
+    lex_smaller, lex_larger = sorted([run_a, run_b])
+    # Newer ts → lexicographically SMALLER id; older ts → larger id.
+    _set_run_started_ts(agent_root, lex_smaller, "2026-06-28T12:00:00+00:00")
+    _set_run_started_ts(agent_root, lex_larger, "2026-06-27T12:00:00+00:00")
+    # Force the mtime fallback to point the OTHER way: the older-ts (lex_larger)
+    # run gets the NEWER history mtime, so an mtime-based pick would (wrongly)
+    # choose it. Only ts-based selection survives this.
+    now = time.time()
+    os.utime(
+        agent_root / "goals" / lex_smaller / "goal_history.jsonl",
+        (now - 1000, now - 1000),
+    )
+    os.utime(agent_root / "goals" / lex_larger / "goal_history.jsonl", (now, now))
+    # Corrupt the genuinely-most-recent (by ts) run.
+    _corrupt_goal_md(agent_root, lex_smaller)
+
+    result = check_conductor(agent_root)
+
+    assert result.status == FAIL, (
+        f"Expected FAIL — the most-recent-by-ts run {lex_smaller!r} has a corrupt "
+        f"goal.md. A lexicographic run_id sort would instead probe the older "
+        f"healthy run {lex_larger!r} and return a false PASS. "
+        f"got {result.status!r}: {result.message}"
+    )
+    assert result.detail["most_recent_run_id"] == lex_smaller, (
+        f"heavy probe must select the most-recent-BY-TS run {lex_smaller!r}, not "
+        f"{result.detail.get('most_recent_run_id')!r} (lexicographic-largest id)"
+    )
+    assert result.detail["conductor_runs_found"] == 2
+
+
+def test_check_conductor_warn_missing_gate_pending(
+    agent_root: Path, mock_agent: MagicMock
+) -> None:
+    """TEST 50 — awaiting_decision sub-goal with no matching gate-pending audit → WARN.
+
+    Suspend a run at a gate (PASS while the audit event is present — the
+    negative control), then strip the conductor_gate_pending event from history.
+    The heavy probe must downgrade to WARN, flagging the specific gate whose
+    per-stage+decision audit is missing (healable on next run()).
+    """
+    from atomic_agents.doctor import check_conductor, PASS, WARN  # noqa: PLC0415
+
+    pb_dir = agent_root / "skills" / "warn-gate-pb"
+    pb_dir.mkdir(parents=True)
+    stages_yaml = textwrap.dedent(
+        """\
+        stages:
+          - stage_id: auto-stage
+            label: Automated stage
+            prompt: Do the first thing.
+            is_gate: false
+          - stage_id: gate-stage
+            label: Human gate
+            prompt: Human review required.
+            is_gate: true
+            options:
+              - Approve
+              - Reject
+        """
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="warn-gate-pb", stages=stages_yaml, run_cap_usd=5.0)
+    )
+    playbook = next(
+        m for m in discover_playbooks(agent_root) if m.name == "warn-gate-pb"
+    )
+    _dispatch = _make_ledger_updating_dispatch(total_cost_usd=0.05)
+    with (
+        patch(
+            "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
+            side_effect=_dispatch,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=_make_idempotency_backend_mock(),
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=_make_outcome_backend_mock(),
+        ),
+    ):
+        state = run(playbook=playbook, subject="warn gate", agent=mock_agent)
+    assert state.status == "awaiting_decision"
+    run_id = state.conductor_run_id
+
+    # Negative control: with the gate-pending audit present, the suspended run is PASS.
+    pre = check_conductor(agent_root)
+    assert pre.status == PASS, (
+        f"suspended run with its gate-pending audit present must PASS; "
+        f"got {pre.status!r}: {pre.message}"
+    )
+
+    # Strip the conductor_gate_pending event(s) from history.
+    history_path = agent_root / "goals" / run_id / "goal_history.jsonl"
+    kept = [
+        line
+        for line in history_path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and json.loads(line).get("event") != "conductor_gate_pending"
+    ]
+    history_path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+
+    result = check_conductor(agent_root)
+    assert result.status == WARN, (
+        f"missing per-gate conductor_gate_pending must WARN; "
+        f"got {result.status!r}: {result.message}"
+    )
+    assert any("awaiting_decision" in w for w in result.detail.get("warnings", [])), (
+        f"WARN detail must name the awaiting_decision anomaly; got {result.detail}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 51 — a gated run completed via resume(continue) → PASS (P1 negative control)
+#
+# An answered gate (disposition='continue') is marked 'complete' with its
+# gate_decision_id CLEARED to None and NO output pointer (gates produce no
+# outcome_run_id). The earlier complete-branch heuristic keyed off gate_decision_id
+# presence and so cried wolf on this — the COMMON happy path for human-gated
+# playbooks. This drives a gate to 'complete' (the rung TEST 50 never reaches,
+# since it only SUSPENDS the gate) and asserts the probe distinguishes the answered
+# gate from a genuinely-output-less automated stage by the durable
+# conductor_gate_answered audit, returning PASS.
+
+
+def test_check_conductor_pass_completed_gate_continue(
+    agent_root: Path, mock_agent: MagicMock
+) -> None:
+    """TEST 51 — resume(continue) completes a gate → check_conductor PASS."""
+    from atomic_agents.doctor import check_conductor, PASS, WARN  # noqa: PLC0415
+
+    pb_dir = agent_root / "skills" / "pass-gate-pb"
+    pb_dir.mkdir()
+    stages_yaml = textwrap.dedent(
+        """\
+        stages:
+          - stage_id: gate-stage
+            label: Human gate
+            prompt: Approve to continue.
+            is_gate: true
+            options:
+              - Approve
+          - stage_id: post-gate
+            label: Post-gate work
+            prompt: Do the work after approval.
+            is_gate: false
+        """
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="pass-gate-pb", stages=stages_yaml, run_cap_usd=5.0)
+    )
+    playbook = next(
+        m for m in discover_playbooks(agent_root) if m.name == "pass-gate-pb"
+    )
+    _ledger_dispatch = _make_ledger_updating_dispatch(total_cost_usd=0.02)
+    outcome_backend = _make_outcome_backend_mock()
+
+    # Phase 1: run() hits the gate stage and suspends.
+    with (
+        patch(
+            "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
+            side_effect=_ledger_dispatch,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=_make_idempotency_backend_mock(),
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state1 = run(playbook=playbook, subject="pass gate", agent=mock_agent)
+    assert state1.status == "awaiting_decision"
+    gd = state1.pending_decision
+    assert gd is not None
+
+    # Phase 2: resume(continue) → gate marked 'complete', post-gate runs, run completes.
+    with (
+        patch(
+            "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
+            side_effect=_ledger_dispatch,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=_make_idempotency_backend_mock(),
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state2 = resume(
+            playbook=playbook,
+            subject="pass gate",
+            agent=mock_agent,
+            conductor_run_id=state1.conductor_run_id,
+            decision_id=gd.decision_id,
+            answer="Approve",
+            disposition="continue",
+            rationale="All checks passed.",
+        )
+    assert state2.status == "complete", (
+        f"resume(continue) must complete the run; got {state2.status!r}"
+    )
+
+    # The completed gate (gate_decision_id cleared, no output) must NOT trip a WARN.
+    result = check_conductor(agent_root)
+    assert result.status == PASS, (
+        f"a healthy gated run answered with disposition='continue' must PASS; "
+        f"got {result.status!r}: {result.message}. "
+        f"detail={result.detail}"
+    )
+    assert result.status != WARN  # explicit false-WARN guard (P1 cry-wolf)
+    assert result.detail["most_recent_run_id"] == state1.conductor_run_id
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 52 — a parseable-but-SCHEMA-INVALID goal.md → FAIL (PR4 #583 R3)
+#
+# load_goal() raises SchemaValidationError (NOT a GoalCorrupted subclass) on the
+# most common goal.md state-snapshot corruption class: parseable frontmatter that
+# fails validate_goal() — duplicate sub_goal id, missing required field, bad
+# schema_version, broken blocked_by graph. The heavy probe must catch BOTH
+# GoalCorrupted (unparseable, TEST 48) AND SchemaValidationError here, or a
+# structurally-corrupt ledger that hard-crashes every run()/resume() would fall
+# to the generic-Exception WARN and doctor would exit 0 on confirmed corruption.
+
+
+def _schema_invalidate_goal_md(agent_root: Path, run_id: str) -> None:
+    """Make a run's goal.md parseable-but-schema-INVALID (SchemaValidationError).
+
+    Duplicates the first sub_goal id (validate_goal raises 'duplicate sub_goal
+    id'); falls back to a bad schema_version if the run has no sub_goals. The
+    frontmatter stays valid YAML, so frontmatter.load() succeeds and load_goal()
+    surfaces a SchemaValidationError, NOT a GoalCorrupted — the exact distinction
+    this test guards.
+    """
+    import frontmatter  # noqa: PLC0415
+
+    goal_path = agent_root / "goals" / run_id / "goal.md"
+    post = frontmatter.load(goal_path)
+    subs = list(post.metadata.get("sub_goals") or [])
+    if subs:
+        subs.append(dict(subs[0]))  # duplicate id → SchemaValidationError
+        post.metadata["sub_goals"] = subs
+    else:
+        post.metadata["schema_version"] = CURRENT_GOAL_SCHEMA_VERSION + 9000
+    goal_path.write_text(frontmatter.dumps(post) + "\n", encoding="utf-8")
+
+
+def test_check_conductor_fail_on_schema_invalid_goal(
+    agent_root: Path, mock_agent: MagicMock
+) -> None:
+    """TEST 52 — parseable-but-schema-invalid goal.md → FAIL (not WARN).
+
+    Mirrors TEST 48 (unparseable → GoalCorrupted → FAIL) for the
+    SchemaValidationError path, which is a DIFFERENT exception class and would
+    otherwise be downgraded to a transient WARN (doctor false-passes corruption).
+    """
+    from atomic_agents.exceptions import (  # noqa: PLC0415
+        GoalCorrupted,
+        SchemaValidationError,
+    )
+    from atomic_agents.doctor import check_conductor, FAIL, PASS  # noqa: PLC0415
+
+    # Guard the load-bearing class fact: SchemaValidationError must NOT be a
+    # GoalCorrupted subclass, else the original `except GoalCorrupted` would have
+    # already covered it and this regression would be vacuous.
+    assert not issubclass(SchemaValidationError, GoalCorrupted)
+
+    run_id = _run_simple_conductor(agent_root, mock_agent)
+    _schema_invalidate_goal_md(agent_root, run_id)
+    result = check_conductor(agent_root)
+
+    assert result.status == FAIL, (
+        f"schema-invalid goal.md must FAIL (confirmed corruption), not WARN; "
+        f"got {result.status!r}: {result.message}"
+    )
+    assert result.status != PASS  # explicit false-negative guard
+    assert result.detail["most_recent_run_id"] == run_id
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 53 — goal.md intact but goal_history.jsonl unreadable → honest WARN
+#           (NOT a cry-wolf about a missing output pointer) (PR4 #583 R3)
+#
+# _iter_history_events swallows OSError/JSONDecodeError into (None, False) and
+# never raises, so the heavy-probe collection loop sees an EMPTY event set when
+# the audit log is corrupt. The earlier code then ran the cursor walk against
+# that empty set and cried wolf — a completed-continue gate (TEST 51 happy path)
+# tripped 'automated sub-goal complete but no output pointer' because its
+# conductor_gate_answered audit was no longer visible. The probe must instead
+# honor the ok=False degraded signal and WARN about the unreadable history.
+
+
+def test_check_conductor_warn_on_unreadable_history(
+    agent_root: Path, mock_agent: MagicMock
+) -> None:
+    """TEST 53 — completed-continue run with corrupted history → WARN names the history."""
+    from atomic_agents.doctor import check_conductor, PASS, WARN  # noqa: PLC0415
+
+    pb_dir = agent_root / "skills" / "deg-gate-pb"
+    pb_dir.mkdir()
+    stages_yaml = textwrap.dedent(
+        """\
+        stages:
+          - stage_id: gate-stage
+            label: Human gate
+            prompt: Approve to continue.
+            is_gate: true
+            options:
+              - Approve
+          - stage_id: post-gate
+            label: Post-gate work
+            prompt: Do the work after approval.
+            is_gate: false
+        """
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="deg-gate-pb", stages=stages_yaml, run_cap_usd=5.0)
+    )
+    playbook = next(
+        m for m in discover_playbooks(agent_root) if m.name == "deg-gate-pb"
+    )
+    _ledger_dispatch = _make_ledger_updating_dispatch(total_cost_usd=0.02)
+    outcome_backend = _make_outcome_backend_mock()
+
+    with (
+        patch(
+            "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
+            side_effect=_ledger_dispatch,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=_make_idempotency_backend_mock(),
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state1 = run(playbook=playbook, subject="deg gate", agent=mock_agent)
+        gd = state1.pending_decision
+        assert gd is not None
+        state2 = resume(
+            playbook=playbook,
+            subject="deg gate",
+            agent=mock_agent,
+            conductor_run_id=state1.conductor_run_id,
+            decision_id=gd.decision_id,
+            answer="Approve",
+            disposition="continue",
+            rationale="ok",
+        )
+    assert state2.status == "complete"
+    run_id = state1.conductor_run_id
+
+    # Negative control: with an intact history the completed-continue run PASSes.
+    assert check_conductor(agent_root).status == PASS
+
+    # Corrupt the audit log (goal.md stays intact) by garbling ONLY the
+    # conductor_gate_answered line: the light probe still classifies the run
+    # (conductor_run_started line untouched), but the heavy re-read loses the
+    # answered-gate signal AND sees an ok=False degraded line. Without the
+    # history-degraded guard the cursor walk would cry wolf about a completed
+    # gate with 'no output pointer'; the probe must instead surface the honest
+    # history-degraded WARN.
+    history_path = agent_root / "goals" / run_id / "goal_history.jsonl"
+    out: list[str] = []
+    for line in history_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        if json.loads(line).get("event") == "conductor_gate_answered":
+            out.append("}{ corrupt audit line not json")
+        else:
+            out.append(line)
+    history_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+    result = check_conductor(agent_root)
+    assert result.status == WARN, (
+        f"unreadable goal_history.jsonl (goal.md intact) must WARN; "
+        f"got {result.status!r}: {result.message}"
+    )
+    assert result.detail.get("history_degraded") is True, (
+        f"WARN must flag history_degraded, not a cursor anomaly; got {result.detail}"
+    )
+    # Cry-wolf guard: must NOT blame a missing output pointer / missing audit.
+    assert "output pointer" not in result.message
+    assert "warnings" not in result.detail
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 54 — awaiting_decision sub-goal with NO gate_decision_id → FAIL
+#           (durable resume cursor unreadable; run.py raises GoalCorrupted) (PR4 #583 R3)
+#
+# validate_goal does NOT couple awaiting_decision to gate_decision_id, so a
+# hand-edited/corrupted goal.md in that state loads cleanly and reaches the
+# cursor walk. run.py:533 raises GoalCorrupted for exactly this state — the next
+# run()/resume() hard-fails, it does NOT heal. The probe must FAIL here, not
+# under-report it as a 'healable: next run() will re-emit it' WARN.
+
+
+def test_check_conductor_fail_awaiting_decision_no_gate_id(
+    agent_root: Path, mock_agent: MagicMock
+) -> None:
+    """TEST 54 — awaiting_decision sub-goal missing gate_decision_id → FAIL (not healable WARN)."""
+    import frontmatter  # noqa: PLC0415
+
+    from atomic_agents.doctor import check_conductor, FAIL, WARN  # noqa: PLC0415
+
+    pb_dir = agent_root / "skills" / "nocursor-gate-pb"
+    pb_dir.mkdir()
+    stages_yaml = textwrap.dedent(
+        """\
+        stages:
+          - stage_id: gate-stage
+            label: Human gate
+            prompt: Approve to continue.
+            is_gate: true
+            options:
+              - Approve
+        """
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="nocursor-gate-pb", stages=stages_yaml, run_cap_usd=5.0)
+    )
+    playbook = next(
+        m for m in discover_playbooks(agent_root) if m.name == "nocursor-gate-pb"
+    )
+    with (
+        patch(
+            "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
+            side_effect=_make_ledger_updating_dispatch(total_cost_usd=0.02),
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=_make_idempotency_backend_mock(),
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=_make_outcome_backend_mock(),
+        ),
+    ):
+        state = run(playbook=playbook, subject="nocursor gate", agent=mock_agent)
+    assert state.status == "awaiting_decision"
+    run_id = state.conductor_run_id
+
+    # Negative control: with the gate_decision_id present the suspended run PASSes
+    # (its gate-pending audit is intact). Corruption is ONLY the cleared cursor.
+    assert check_conductor(agent_root).status != FAIL
+
+    # Strip gate_decision_id from the awaiting_decision sub-goal (goal.md stays
+    # valid YAML and passes validate_goal — the cursor field is not schema-coupled).
+    goal_path = agent_root / "goals" / run_id / "goal.md"
+    post = frontmatter.load(goal_path)
+    subs = list(post.metadata.get("sub_goals") or [])
+    changed = False
+    for sg in subs:
+        if sg.get("status") == "awaiting_decision":
+            sg.pop("gate_decision_id", None)
+            sg["gate_decision_id"] = None
+            changed = True
+    assert changed, "test setup: no awaiting_decision sub-goal found to corrupt"
+    post.metadata["sub_goals"] = subs
+    goal_path.write_text(frontmatter.dumps(post) + "\n", encoding="utf-8")
+
+    result = check_conductor(agent_root)
+    assert result.status == FAIL, (
+        f"awaiting_decision with no gate_decision_id is durable corruption "
+        f"(next run()/resume() raises GoalCorrupted); must FAIL, not a healable "
+        f"WARN. got {result.status!r}: {result.message}"
+    )
+    assert result.status != WARN  # explicit under-report guard
+    assert result.detail.get("corrupt_sub_goal_id")
+
+
+# TEST 54b — COMPOUND fault: corrupt goal.md cursor (awaiting_decision with NO
+#            gate_decision_id) PLUS a degraded goal_history.jsonl → FAIL (PR4 #583 R5)
+#
+# The awaiting_decision-no-gate_decision_id FAIL reads ONLY goal.md (sg.status +
+# sg.gate_decision_id) — it has no audit-log dependency — so it MUST run BEFORE
+# the history_degraded early-return. Otherwise a single garbled audit line would
+# demote a confirmed durable-corruption FAIL (run.py:536 raises GoalCorrupted
+# regardless of audit readability) to a healable history-degraded WARN. This is
+# the compound case TEST 54 (intact history) does not exercise.
+
+
+def test_check_conductor_fail_awaiting_no_gate_id_even_when_history_degraded(
+    agent_root: Path, mock_agent: MagicMock
+) -> None:
+    """TEST 54b — corrupt goal.md cursor + degraded history → FAIL, not history-degraded WARN."""
+    import frontmatter  # noqa: PLC0415
+
+    from atomic_agents.doctor import check_conductor, FAIL, WARN  # noqa: PLC0415
+
+    pb_dir = agent_root / "skills" / "compound-gate-pb"
+    pb_dir.mkdir()
+    stages_yaml = textwrap.dedent(
+        """\
+        stages:
+          - stage_id: gate-stage
+            label: Human gate
+            prompt: Approve to continue.
+            is_gate: true
+            options:
+              - Approve
+        """
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="compound-gate-pb", stages=stages_yaml, run_cap_usd=5.0)
+    )
+    playbook = next(
+        m for m in discover_playbooks(agent_root) if m.name == "compound-gate-pb"
+    )
+    with (
+        patch(
+            "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
+            side_effect=_make_ledger_updating_dispatch(total_cost_usd=0.02),
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=_make_idempotency_backend_mock(),
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=_make_outcome_backend_mock(),
+        ),
+    ):
+        state = run(playbook=playbook, subject="compound gate", agent=mock_agent)
+    assert state.status == "awaiting_decision"
+    run_id = state.conductor_run_id
+
+    # Fault 1 — strip gate_decision_id from goal.md (the durable cursor).
+    goal_path = agent_root / "goals" / run_id / "goal.md"
+    post = frontmatter.load(goal_path)
+    subs = list(post.metadata.get("sub_goals") or [])
+    for sg in subs:
+        if sg.get("status") == "awaiting_decision":
+            sg["gate_decision_id"] = None
+    post.metadata["sub_goals"] = subs
+    goal_path.write_text(frontmatter.dumps(post) + "\n", encoding="utf-8")
+
+    # Fault 2 — garble one goal_history.jsonl line so the audit reader reports
+    # ok=False (history_degraded). The conductor_run_started line stays intact so
+    # the light probe still classifies the run.
+    history_path = agent_root / "goals" / run_id / "goal_history.jsonl"
+    out: list[str] = []
+    for line in history_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        if json.loads(line).get("event") == "conductor_gate_pending":
+            out.append("}{ corrupt audit line not json")
+        else:
+            out.append(line)
+    history_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+    # The goal.md-only FAIL must win over the history-degraded WARN: a confirmed
+    # durable-cursor corruption is NOT healable just because the audit log is also
+    # unreadable. (Strip-RED: if the FAIL pre-pass sat AFTER the history gate,
+    # this would return a history-degraded WARN.)
+    result = check_conductor(agent_root)
+    assert result.status == FAIL, (
+        f"corrupt goal.md cursor must FAIL even when goal_history.jsonl is also "
+        f"degraded (run.py:536 raises GoalCorrupted regardless of audit "
+        f"readability); got {result.status!r}: {result.message}"
+    )
+    assert result.status != WARN  # explicit compound-fault under-report guard
+    assert result.detail.get("corrupt_sub_goal_id")
+    # The FAIL must name the cursor corruption, not the degraded audit log.
+    assert result.detail.get("history_degraded") is not True
+
+
+# TEST 55 — 'skipped' sub-goal with NO recorded skip ruling → FAIL
+#           (durable corruption; run.py raises GoalCorrupted) (PR4 #583 R4)
+#
+# A 'skipped' status is schema-valid, so load_goal() succeeds and the cursor walk
+# is reached. run.py:660 raises GoalCorrupted for exactly this state via
+# _has_gate_answered_skip() — its own comment calls it "the symmetric partner of
+# the complete-without-result corruption check" (spec/50 C4: "a skipped stage is a
+# recorded ruling, never an absent stage"). A skipped stage sits behind the resume
+# frontier, so the next run()/resume() iterates to it FIRST and hard-crashes; it is
+# NOT healable. The probe must FAIL here, symmetric with the awaiting_decision-no-
+# gate_decision_id FAIL (TEST 54) — the fourth hard-crash class.
+
+
+def test_check_conductor_fail_skipped_no_skip_ruling(
+    agent_root: Path, mock_agent: MagicMock
+) -> None:
+    """TEST 55 — 'skipped' sub-goal missing its conductor_gate_answered(skip) ruling → FAIL."""
+    from atomic_agents.doctor import check_conductor, FAIL, PASS, WARN  # noqa: PLC0415
+
+    pb_dir = agent_root / "skills" / "skip-ruling-pb"
+    pb_dir.mkdir()
+    stages_yaml = textwrap.dedent(
+        """\
+        stages:
+          - stage_id: gate-stage
+            label: Optional gate
+            prompt: Should we run the extra analysis?
+            is_gate: true
+          - stage_id: after-gate
+            label: After gate
+            prompt: Always run this.
+        """
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="skip-ruling-pb", stages=stages_yaml, run_cap_usd=5.0)
+    )
+    playbook = next(
+        m for m in discover_playbooks(agent_root) if m.name == "skip-ruling-pb"
+    )
+    _ledger_dispatch = _make_ledger_updating_dispatch(total_cost_usd=0.02)
+    outcome_backend = _make_outcome_backend_mock()
+
+    # Phase 1: suspend at the gate.
+    with (
+        patch(
+            "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
+            side_effect=_ledger_dispatch,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=_make_idempotency_backend_mock(),
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state1 = run(playbook=playbook, subject="skip ruling", agent=mock_agent)
+    assert state1.status == "awaiting_decision"
+    gd = state1.pending_decision
+    assert gd is not None
+    run_id = state1.conductor_run_id
+
+    # Phase 2: resume(skip) → gate-stage marked 'skipped' WITH a recorded
+    # conductor_gate_answered(disposition='skip') ruling, run completes.
+    with (
+        patch(
+            "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
+            side_effect=_ledger_dispatch,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=_make_idempotency_backend_mock(),
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state2 = resume(
+            playbook=playbook,
+            subject="skip ruling",
+            agent=mock_agent,
+            conductor_run_id=run_id,
+            decision_id=gd.decision_id,
+            answer="Skip it — not needed this time.",
+            disposition="skip",
+            rationale="Low-risk change; extra analysis not warranted.",
+        )
+    assert state2.status == "complete"
+    assert "gate-stage" in state2.completed_stage_ids
+
+    # Negative control: the skip ruling IS recorded → the skipped stage is a valid
+    # terminal-done ruling, so the probe PASSes (it must NOT FAIL on the happy path).
+    pre = check_conductor(agent_root)
+    assert pre.status == PASS, (
+        f"a skipped stage WITH its recorded skip ruling is the happy path and must "
+        f"PASS, not cry corruption; got {pre.status!r}: {pre.message}"
+    )
+
+    # Strip the conductor_gate_answered(disposition='skip') event from the audit
+    # ledger (rewrite without that one line — all remaining lines stay valid JSON,
+    # so history is NOT degraded; only the skip ruling is gone). goal.md still
+    # carries status='skipped'. This is the exact state run.py GoalCorrupts on.
+    history_path = agent_root / "goals" / run_id / "goal_history.jsonl"
+    kept: list[str] = []
+    stripped = False
+    for line in history_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        rec = json.loads(line)
+        if (
+            rec.get("event") == "conductor_gate_answered"
+            and rec.get("stage_id") == "gate-stage"
+            and rec.get("disposition") == "skip"
+        ):
+            stripped = True
+            continue
+        kept.append(line)
+    assert stripped, "test setup: no conductor_gate_answered(skip) event found to strip"
+    history_path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+
+    result = check_conductor(agent_root)
+    assert result.status == FAIL, (
+        f"a 'skipped' sub-goal with no recorded conductor_gate_answered(skip) ruling "
+        f"is durable corruption (next run()/resume() raises GoalCorrupted; spec/50 "
+        f"C4); must FAIL, not a healable WARN. got {result.status!r}: {result.message}"
+    )
+    assert result.status != WARN  # explicit under-report guard (not history-degraded)
+    assert result.detail.get("corrupt_sub_goal_id") == "gate-stage"
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 56 (C8) — a gate-suspended run holds NO live lock across the wait: an
+# independent, non-conflicting run for the SAME agent proceeds normally.
+#
+# spec/50 C8 is LOCKed as an UNCONDITIONAL MUST ("a gate-suspended run holds NO
+# live resource / lock across the wait; an independent non-conflicting run for
+# the same agent proceeds normally"). The sibling conflict tests cover only the
+# negative direction (TEST 40/42: a CONFLICTING-key run B QUEUES behind A). None
+# of them proves the positive C8 guarantee — that a NON-conflicting B is NOT
+# blocked by A's suspension. This is that positive conformance test. Driven
+# against a REAL FilesystemLockBackend so the per-run "conductor-runs" lease (run
+# A acquires it for the whole body and releases it in finally on the suspend
+# exit, run.py:311-329 + 1395-1399) and the conflict-scan lease are actually
+# taken/released — a MagicMock backend would prove nothing about real locks.
+
+
+def test_c8_gate_suspension_holds_no_lock_independent_run_proceeds(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """TEST 56 (C8) — gate suspension holds no live lock; an independent run proceeds.
+
+    Run A reaches a gate declaring conflict_keys=['repo-x'] and SUSPENDS
+    (awaiting_decision, holding 'repo-x'). Then a FRESH INDEPENDENT run B for the
+    SAME agent — DIFFERENT conductor_run_id (distinct subject), NON-conflicting
+    key 'repo-z' that A does NOT hold — must proceed NORMALLY to its OWN gate
+    (status='awaiting_decision', its own decision_id), NOT 'deferred'. If A's
+    suspension held any live lock that blocked an independent run, B would either
+    raise LockBusy or defer. Two extra proofs that A holds nothing live:
+      - A's per-run "conductor-runs" lease is FREE (a manual acquire on A's
+        conductor_run_id does NOT raise — released on the suspend exit path).
+      - B becomes the legitimate holder of its OWN distinct key with its own
+        pending GateDecision, so it executed its full pre-suspend path unblocked.
+    """
+    from atomic_agents.locks.filesystem import FilesystemLockBackend
+
+    mock_agent.lock_backend = FilesystemLockBackend(agent_root)
+
+    pb_a = _make_conflict_gate_playbook(agent_root, "c8-a", "repo-x")
+    # B declares a DIFFERENT key that A does not hold — genuinely non-conflicting.
+    pb_b = _make_conflict_gate_playbook(agent_root, "c8-b", "repo-z")
+
+    idem = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+    with (
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend", return_value=idem
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state_a = run(playbook=pb_a, subject="A", agent=mock_agent)
+        assert state_a.status == "awaiting_decision", (
+            f"run A must suspend at its gate; got {state_a.status!r}"
+        )
+        a_run_id = state_a.conductor_run_id
+        a_decision_id = state_a.pending_decision.decision_id
+
+        # The INDEPENDENT, non-conflicting run B.
+        state_b = run(playbook=pb_b, subject="B", agent=mock_agent)
+
+    # C8 positive: B proceeds NORMALLY to its own gate — NOT blocked by A.
+    assert state_b.status == "awaiting_decision", (
+        f"an independent non-conflicting run B must proceed to its OWN gate while A "
+        f"is suspended (NOT be blocked by A's suspension); got {state_b.status!r}"
+    )
+    assert state_b.status != "deferred", (
+        "B shares NO conflict key with A, so it must NOT defer behind A"
+    )
+    assert state_b.queued_behind_decision_id is None, (
+        f"B is non-conflicting and must not be queued behind any decision; "
+        f"got {state_b.queued_behind_decision_id!r}"
+    )
+    assert state_b.conductor_run_id != a_run_id, (
+        "B must be a genuinely independent run (distinct conductor_run_id)"
+    )
+    assert state_b.pending_decision is not None
+    assert state_b.pending_decision.decision_id != a_decision_id, (
+        "B must mint its OWN decision_id, distinct from A's"
+    )
+
+    # A's per-run lease is FREE — the suspension released it (no live lock held
+    # across the wait). A manual acquire on A's conductor_run_id must NOT raise.
+    probe = FilesystemLockBackend(agent_root).scope("conductor-runs")
+    handle = probe.acquire(a_run_id, timeout=0.0)  # must NOT raise LockBusy
+    probe.release(handle)
+
+    # Durable check: A holds 'repo-x' and B holds 'repo-z' — two independent
+    # awaiting_decision claims, neither blocking the other.
+    holders: dict[str, int] = {}
+    for goal_id in mock_agent.goal_backend.list_goals(mock_agent.name):
+        goal = mock_agent.goal_backend.for_goal(goal_id).load_goal(mock_agent.name)
+        for sg in goal.sub_goals:
+            if sg.status == "awaiting_decision":
+                for key in sg.held_conflict_keys or []:
+                    holders[key] = holders.get(key, 0) + 1
+    assert holders.get("repo-x") == 1, (
+        f"A must hold 'repo-x' in awaiting_decision; holders={holders!r}"
+    )
+    assert holders.get("repo-z") == 1, (
+        f"B must independently hold 'repo-z' in awaiting_decision; holders={holders!r}"
+    )
