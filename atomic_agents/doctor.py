@@ -5724,45 +5724,160 @@ def check_conductor(agent_root: Path) -> CheckResult:
     1. Light probe: scan goals/<id>/goal_history.jsonl files for
        'conductor_run_started' events to identify conductor runs. If zero
        conductor runs exist, return PASS (clean state — not SKIP; the check
-       ran and found a healthy empty set). Select the MOST RECENT run.
+       ran and found a healthy empty set). Select the MOST RECENT run by the
+       conductor_run_started event's `ts` (fallback: the history file's mtime).
+       Recency is NOT derived from the run_id — _mint_conductor_run_id() emits
+       a random UUID4 ('crun-<uuid4().hex[:16]>'), which has no temporal order,
+       so lexicographic sorting of the run_id would probe an arbitrary run and
+       could mask corruption in the genuinely-latest run.
     2. Heavy probe: load the selected run's goal via
-       agent.goal_backend.for_goal(id).load_goal() and read the history file
-       for cursor-walk validation — STRICTLY READ-ONLY (no write operations,
-       no healing). FAIL on confirmed GoalCorrupted (ledger corruption
-       detected during the read). WARN on other read exceptions (transient
-       race or missing run). WARN when a gate sub-goal has awaiting_decision
-       status but the history has no 'conductor_gate_pending' event (missing
-       audit — healable on next run(), but worth flagging). WARN when a
-       complete sub-goal has no output pointer (pointer missing — also
-       healable on resume, but worth surfacing).
+       get_default_goal_backend(agent_root).for_goal(id).load_goal() and read
+       the history file for cursor-walk validation — STRICTLY READ-ONLY (no
+       write operations, no healing). FAIL on confirmed goal.md state-snapshot
+       corruption surfaced by load_goal() — both GoalCorrupted (unparseable
+       goal.md) AND SchemaValidationError (parseable-but-schema-invalid
+       frontmatter: duplicate sub_goal id, missing required field, bad
+       schema_version, broken blocked_by graph). Both are confirmed durable
+       corruption that hard-crashes every subsequent run()/resume(), so neither
+       may be downgraded to a transient WARN. FAIL also on an awaiting_decision
+       sub-goal carrying NO gate_decision_id — run.py raises GoalCorrupted for
+       exactly that state (the durable resume cursor itself is unreadable), so
+       it is NOT a healable WARN. FAIL also on a 'skipped' sub-goal carrying NO
+       recorded conductor_gate_answered(disposition='skip') ruling — run.py
+       raises GoalCorrupted for exactly that state too (a skipped stage sits
+       behind the resume frontier, so the next run()/resume() iterates to it
+       first and hard-crashes; spec/50 C4 "a skipped stage is a recorded ruling,
+       never an absent stage"), so it is durable corruption, not a healable WARN.
+       (This FAIL reads the audit log, so it is guarded behind the history-
+       degraded WARN: a truncated audit log cannot confirm the ruling and WARNs
+       rather than false-FAILing.) WARN on other read exceptions (transient race
+       or missing run). WARN — honestly — when the most-recent run's
+       goal_history.jsonl is unreadable/corrupt (the append-only AUDIT log,
+       distinct from the goal.md state snapshot): the degraded-read signal from
+       _iter_history_events (ok=False) is surfaced and the cursor anomaly checks
+       are skipped, rather than running them against an empty event set (which
+       would cry wolf about missing audit/output pointers). WARN when a gate
+       sub-goal that DOES carry a gate_decision_id has no matching
+       'conductor_gate_pending' event for that stage_id + decision_id (missing
+       audit — healable on next run()). WARN when an AUTOMATED complete sub-goal
+       has no output pointer — automated stages are identified by the ABSENCE of
+       a durable conductor_gate_answered audit (an answered gate clears its
+       gate_decision_id, so the field is not a reliable discriminator); resume()
+       repairs the pointer from a COMPLETED idempotency record IF one resolves,
+       otherwise it fails closed as GoalCorrupted per the C2 predicate (spec/50
+       §120), so this WARN flags a pointer the probe cannot cheaply confirm is
+       recoverable.
 
     Returns PASS with detail when all reads succeed.
-    Returns WARN for transient read failures or healable anomalies.
-    Returns FAIL for confirmed GoalCorrupted (structural ledger corruption).
+    Returns WARN for transient read failures or healable anomalies (including
+    history-JSONL unreadability — the audit log, distinct from the goal.md
+    state snapshot).
+    Returns FAIL for confirmed goal.md state-snapshot corruption: GoalCorrupted,
+    SchemaValidationError, an awaiting_decision sub-goal with no gate_decision_id,
+    or a 'skipped' sub-goal with no recorded conductor_gate_answered(skip) ruling
+    (all four hard-crash the next run()/resume()). The awaiting_decision-with-no-
+    gate_decision_id FAIL reads ONLY goal.md (sg.status + sg.gate_decision_id), so
+    it runs BEFORE the history-degraded gate — a compound fault (a corrupt goal.md
+    cursor PLUS an unreadable audit line) still FAILs, never demoted to the
+    history-degraded WARN. Only the last (the 'skipped'-with-no-skip-ruling FAIL)
+    is audit-dependent, so it alone is guarded behind the history-degraded WARN.
+
+    Scope (explicit out-of-scope false-PASS): the heavy probe validates output-
+    pointer PRESENCE on automated 'complete' stages, NOT store-resolvability. A
+    present-but-dangling output pointer (a result_ref that no longer resolves via
+    OutcomeBackend.read_result) hard-crashes resume() as GoalCorrupted, but
+    confirming resolvability needs OutcomeBackend store I/O — the expensive path
+    this read-only cursor probe deliberately avoids — so it returns PASS here. The
+    runtime backstop is run.py's C2 fail-closed predicate; doctor does not pre-empt
+    it for the dangling-pointer case.
 
     SKIP is only emitted by the no-agent SKIP roster (no agent_root supplied).
     """
-    from .exceptions import GoalCorrupted  # noqa: PLC0415
-    from .conductor.run import _has_event, _iter_history_events  # noqa: PLC0415
+    from datetime import datetime  # noqa: PLC0415
+    from .exceptions import GoalCorrupted, SchemaValidationError  # noqa: PLC0415
+    from .conductor.run import (  # noqa: PLC0415
+        _find_gate_pending_event,
+        _has_gate_answered_skip,
+        _iter_history_events,
+    )
 
     goals_dir = agent_root / "goals"
 
+    def _run_recency(started_ts: Any, history_path: Path) -> tuple[int, float]:
+        """Recency key for a conductor run: ``(has_ts, value)``, newer = larger.
+
+        Run IDs are random UUID4 ('crun-<uuid4().hex[:16]>'), so they carry NO
+        creation order. Order by the conductor_run_started event's `ts` (tz-aware
+        ISO from run.py:_now_ts), parsed to an absolute epoch so cross-offset/DST
+        timestamps sort correctly.
+
+        The key is a ``(has_ts, value)`` tuple so a run carrying a PARSEABLE `ts`
+        ALWAYS outranks a run that lacks one. An absolute event epoch and a file
+        mtime are non-comparable clocks — mtime is wall-clock-now (or copy-time
+        after a vault restore), not a true recency signal — so they must never be
+        compared in the same ordering. mtime is a last-resort TIEBREAKER among
+        ts-less runs only; it can never beat a genuine (even older) `ts`. (Under
+        the reference FilesystemGoalBackend every conductor_run_started carries a
+        `ts` — run.py always writes ts=_now_ts() — so the mtime path is reached
+        only for an alternate backend that omits it, or a copied/restored vault.)
+        """
+        if isinstance(started_ts, str) and started_ts:
+            try:
+                return (1, datetime.fromisoformat(started_ts).timestamp())
+            except (ValueError, TypeError):
+                pass
+        try:
+            return (0, history_path.stat().st_mtime)
+        except OSError:
+            return (0, 0.0)
+
     # ── Light probe: find conductor runs by scanning goal_history.jsonl ──
-    conductor_runs: list[tuple[str, Path]] = []  # (run_id, history_path)
+    # (run_id, history_path, recency_key) where recency_key = (has_ts, value);
+    # ts-bearing runs strictly dominate ts-less runs (mtime never beats a ts).
+    conductor_runs: list[tuple[str, Path, tuple[int, float]]] = []
 
     if goals_dir.is_dir():
-        for run_dir in sorted(goals_dir.iterdir()):
+        try:
+            run_dirs = sorted(goals_dir.iterdir())
+        except OSError as exc:
+            # goals/ exists but is unreadable (permissions, FS error). run_doctor
+            # does NOT wrap individual checks in try/except — each check fails soft
+            # internally — so letting iterdir() propagate would abort the WHOLE
+            # doctor run, the opposite of every other check's posture. Degrade this
+            # one check to WARN instead.
+            return CheckResult(
+                name="conductor",
+                status=WARN,
+                message=f"goals directory unreadable — conductor check skipped: {exc}",
+                fix_hint=f"Check read permissions on {goals_dir}.",
+                detail={"goals_dir": str(goals_dir)},
+            )
+        for run_dir in run_dirs:
             if not run_dir.is_dir():
                 continue
             history_path = run_dir / "goal_history.jsonl"
             if not history_path.is_file():
                 continue
             try:
-                if _has_event(history_path, "conductor_run_started"):
-                    conductor_runs.append((run_dir.name, history_path))
+                started_ts: Any = None
+                is_conductor_run = False
+                for rec, ok in _iter_history_events(history_path):
+                    if (
+                        ok
+                        and isinstance(rec, dict)
+                        and rec.get("event") == "conductor_run_started"
+                    ):
+                        is_conductor_run = True
+                        started_ts = rec.get("ts")
+                        break
+                if not is_conductor_run:
+                    continue
             except Exception:
                 # A single unreadable history file doesn't block the overall scan
-                pass
+                continue
+            conductor_runs.append(
+                (run_dir.name, history_path, _run_recency(started_ts, history_path))
+            )
 
     if not conductor_runs:
         return CheckResult(
@@ -5773,10 +5888,11 @@ def check_conductor(agent_root: Path) -> CheckResult:
         )
 
     # ── Heavy probe: reconstruct the resume cursor for the most recent run ──
-    # "Most recent" = lexicographically last (crun-<uuid> format sorts by creation order)
-    most_recent_run_id, most_recent_history = sorted(
-        conductor_runs, key=lambda t: t[0]
-    )[-1]
+    # "Most recent" = max conductor_run_started ts (fallback: history mtime).
+    # NOT the lexicographically-last run_id — run_ids are random UUID4 and carry
+    # no creation order, so a lexicographic pick would probe an arbitrary run and
+    # could hide corruption in the genuinely-latest run (false-PASS).
+    most_recent_run_id, most_recent_history, _ = max(conductor_runs, key=lambda t: t[2])
 
     # Load the goal — read-only. No write operations permitted here.
     # Use get_default_goal_backend() to resolve the operator-configured backend
@@ -5801,7 +5917,14 @@ def check_conductor(agent_root: Path) -> CheckResult:
             )
         conductor_backend = goal_backend.for_goal(most_recent_run_id)
         goal = conductor_backend.load_goal(agent_root.name)
-    except GoalCorrupted as exc:
+    except (GoalCorrupted, SchemaValidationError) as exc:
+        # BOTH are confirmed goal.md state-snapshot corruption surfaced by
+        # load_goal(): GoalCorrupted = unparseable goal.md; SchemaValidationError
+        # = parseable-but-schema-invalid frontmatter (duplicate sub_goal id,
+        # missing required field, bad schema_version, broken blocked_by graph) —
+        # NOT a GoalCorrupted subclass, so it must be caught explicitly or it
+        # falls to the generic-Exception WARN below and a corrupt ledger
+        # false-passes doctor. Both hard-crash every run()/resume().
         return CheckResult(
             name="conductor",
             status=FAIL,
@@ -5838,12 +5961,35 @@ def check_conductor(agent_root: Path) -> CheckResult:
     warnings_found: list[str] = []
 
     try:
-        # _iter_history_events yields (rec, ok) tuples; collect only valid records
-        event_names = {
-            rec.get("event", "")
-            for rec, ok in _iter_history_events(most_recent_history)
-            if ok and isinstance(rec, dict)
-        }
+        # _iter_history_events yields (rec, ok) tuples; collect only valid records.
+        # Also collect the stage_ids that carry a conductor_gate_answered audit:
+        # an answered gate (disposition='continue') is marked 'complete' with its
+        # gate_decision_id CLEARED to None and no output pointer (gates produce no
+        # outcome_run_id), so it is indistinguishable from an automated stage by
+        # the gate_decision_id field. The durable audit event is the honest signal.
+        event_names: set[str] = set()
+        gate_answered_stage_ids: set[str] = set()
+        history_degraded = False
+        for rec, ok in _iter_history_events(most_recent_history):
+            if not ok:
+                # _iter_history_events swallows OSError/JSONDecodeError into
+                # (None, False) units and NEVER raises, so the generic-Exception
+                # branch below cannot catch an unreadable/corrupt audit log. Honor
+                # the ok=False degraded signal explicitly: a wedged/garbled history
+                # leaves event_names + gate_answered_stage_ids partial/empty, which
+                # would make the cursor walk cry wolf about a "missing output
+                # pointer" / "missing gate_pending audit" when the real problem is
+                # the unreadable audit log. Surface that honestly (WARN) and skip
+                # the cursor walk.
+                history_degraded = True
+                continue
+            if not isinstance(rec, dict):
+                continue
+            event_names.add(rec.get("event", ""))
+            if rec.get("event") == "conductor_gate_answered":
+                _sid = rec.get("stage_id")
+                if isinstance(_sid, str):
+                    gate_answered_stage_ids.add(_sid)
     except Exception as exc:
         return CheckResult(
             name="conductor",
@@ -5858,24 +6004,157 @@ def check_conductor(agent_root: Path) -> CheckResult:
             },
         )
 
+    # ── goal.md-only structural cursor FAIL (audit-log-independent) ──
+    # An awaiting_decision sub-goal carrying NO gate_decision_id is GENUINE
+    # durable goal.md corruption, not a healable missing-audit anomaly: the
+    # durable resume cursor itself (goal.md) is unreadable. run.py raises
+    # GoalCorrupted for exactly this state (run.py:536) regardless of whether
+    # goal_history.jsonl is readable. This check reads ONLY goal.md
+    # (sg.status + sg.gate_decision_id) — no audit-log dependency — so it runs
+    # BEFORE the history_degraded gate below: a compound fault (corrupt goal.md
+    # cursor PLUS one unreadable audit line) must still FAIL, never be demoted to
+    # the history-degraded WARN. The audit-DEPENDENT structural FAIL (a 'skipped'
+    # sub-goal with no recorded skip ruling) stays behind the gate, because it
+    # needs _has_gate_answered_skip to confirm and a truncated log cannot.
+    for sg in goal.sub_goals:
+        if sg.status == "awaiting_decision" and not (
+            getattr(sg, "gate_decision_id", None) or ""
+        ):
+            # run.py raises GoalCorrupted for exactly this state (run.py:536), so
+            # the next run()/resume() hard-fails — it does not heal. FAIL here to
+            # mirror run.py rather than under-report it as a "healable" WARN.
+            return CheckResult(
+                name="conductor",
+                status=FAIL,
+                message=(
+                    f"most-recent conductor run {most_recent_run_id!r}: "
+                    f"sub-goal {sg.id!r} is 'awaiting_decision' but carries no "
+                    f"gate_decision_id — the durable resume cursor is unreadable "
+                    f"(next run()/resume() raises GoalCorrupted; not healable)"
+                ),
+                fix_hint=(
+                    "Inspect goals/"
+                    + most_recent_run_id
+                    + "/goal.md; the awaiting_decision sub-goal must carry a "
+                    "gate_decision_id. Repair or archive the run."
+                ),
+                detail={
+                    "conductor_runs_found": len(conductor_runs),
+                    "most_recent_run_id": most_recent_run_id,
+                    "sub_goals_count": len(goal.sub_goals),
+                    "corrupt_sub_goal_id": sg.id,
+                },
+            )
+
+    if history_degraded:
+        # goal.md (state snapshot) is readable, but goal_history.jsonl (the
+        # append-only AUDIT log) is unreadable/corrupt. The cursor anomaly checks
+        # below depend on the event set; running them against partial events
+        # would mis-blame a missing audit/output pointer. Skip them and report
+        # the actual fault — matching the spec/50 dual-probe ladder WARN for an
+        # "unreadable goal_history.jsonl".
+        return CheckResult(
+            name="conductor",
+            status=WARN,
+            message=(
+                f"conductor run {most_recent_run_id!r}: goal.md readable but "
+                f"goal_history.jsonl audit ledger is unreadable/corrupt — cursor "
+                f"anomaly checks skipped"
+            ),
+            fix_hint=(
+                "Inspect goals/"
+                + most_recent_run_id
+                + "/goal_history.jsonl for unreadable or malformed lines."
+            ),
+            detail={
+                "conductor_runs_found": len(conductor_runs),
+                "most_recent_run_id": most_recent_run_id,
+                "sub_goals_count": len(goal.sub_goals),
+                "history_degraded": True,
+            },
+        )
+
     for sg in goal.sub_goals:
         if sg.status == "awaiting_decision":
-            # Check that the audit event exists (it should be written atomically with
-            # the apply_transition, but a crash in the narrow window can leave it absent)
-            if "conductor_gate_pending" not in event_names:
+            # The goal.md-only FAIL pre-pass above already returned for any
+            # awaiting_decision sub-goal missing its gate_decision_id, so every
+            # such sub-goal reaching here carries a non-empty id. The remaining
+            # check is audit-DEPENDENT (per-gate conductor_gate_pending event),
+            # so it correctly sits after the history_degraded gate.
+            gate_decision_id = getattr(sg, "gate_decision_id", None) or ""
+            # Check that the audit event exists for THIS gate (it should be written
+            # atomically with the apply_transition, but a crash in the narrow window
+            # can leave it absent). Match per-gate on BOTH stage_id (== sub_goal id)
+            # AND decision_id — a coarse 'any conductor_gate_pending in history'
+            # check would let one gate's event mask a genuinely-missing event for a
+            # different gate in a multi-gate playbook (the runtime resume cursor
+            # uses this same stage+decision-keyed matcher; run.py:546). This branch
+            # is genuinely healable: the gate_decision_id IS present, so next run()
+            # re-emits the missing audit event (run.py:549-595).
+            if (
+                _find_gate_pending_event(
+                    most_recent_history,
+                    sg.id,
+                    gate_decision_id,
+                )
+                is None
+            ):
                 warnings_found.append(
                     f"sub-goal {sg.id!r} is 'awaiting_decision' but "
-                    f"no 'conductor_gate_pending' event found in history "
+                    f"no matching 'conductor_gate_pending' event found in history "
                     f"(healable: next run() will re-emit it)"
                 )
         elif sg.status == "complete":
-            # For automated stages, output pointer should be set.
-            # Gate stages marked complete (continue disposition) have no outcome_run_id —
-            # that is normal. We check only when gate_decision_id is absent (automated).
-            if not getattr(sg, "gate_decision_id", None) and not sg.output:
+            # An answered gate (disposition='continue') is marked 'complete' with
+            # gate_decision_id CLEARED and no output pointer — that is the COMMON
+            # happy path for human-gated playbooks, NOT an anomaly. Identify it by
+            # its durable conductor_gate_answered audit, NOT by the (now-cleared)
+            # gate_decision_id field. Only an AUTOMATED complete stage with no
+            # output pointer is worth surfacing.
+            if sg.id not in gate_answered_stage_ids and not sg.output:
                 warnings_found.append(
-                    f"sub-goal {sg.id!r} is 'complete' but has no output pointer "
-                    f"(healable: resume() will re-store the outcome pointer)"
+                    f"automated sub-goal {sg.id!r} is 'complete' but has no output "
+                    f"pointer (resume() repairs it from a COMPLETED idempotency "
+                    f"record if one resolves; otherwise it fails closed as "
+                    f"GoalCorrupted per the C2 predicate — spec/50 §120)"
+                )
+        elif sg.status == "skipped":
+            # C3/C4 symmetry — a 'skipped' sub-goal MUST carry a recorded
+            # conductor_gate_answered(disposition='skip') ruling. run.py treats a
+            # 'skipped' status with NO skip ruling as durable ledger corruption and
+            # raises GoalCorrupted (run.py:660, via _has_gate_answered_skip) — its
+            # own comment calls this "the symmetric partner of the complete-without-
+            # result corruption check" (spec/50 C4: "a skipped stage is a recorded
+            # ruling, never an absent stage"). A skipped stage sits behind the resume
+            # frontier, so the next run()/resume() iterates to it FIRST and hard-
+            # crashes — it is NOT healable. FAIL here to mirror run.py, symmetric with
+            # the awaiting_decision-no-gate_decision_id FAIL above. This branch reads
+            # the audit log (_has_gate_answered_skip), so it sits INSIDE the
+            # history_degraded early-return: a truncated audit log cannot find the
+            # ruling and would false-FAIL, so a degraded history WARNs (above) instead.
+            if not _has_gate_answered_skip(most_recent_history, sg.id):
+                return CheckResult(
+                    name="conductor",
+                    status=FAIL,
+                    message=(
+                        f"most-recent conductor run {most_recent_run_id!r}: "
+                        f"sub-goal {sg.id!r} is 'skipped' but no "
+                        f"conductor_gate_answered(disposition='skip') ruling is "
+                        f"recorded — the next run()/resume() raises GoalCorrupted "
+                        f"(spec/50 C4; not healable)"
+                    ),
+                    fix_hint=(
+                        "Inspect goals/"
+                        + most_recent_run_id
+                        + "/goal.md and goal_history.jsonl; a skipped stage MUST "
+                        "carry a recorded skip ruling. Repair or archive the run."
+                    ),
+                    detail={
+                        "conductor_runs_found": len(conductor_runs),
+                        "most_recent_run_id": most_recent_run_id,
+                        "sub_goals_count": len(goal.sub_goals),
+                        "corrupt_sub_goal_id": sg.id,
+                    },
                 )
 
     if warnings_found:
@@ -5896,18 +6175,28 @@ def check_conductor(agent_root: Path) -> CheckResult:
             },
         )
 
-    # Determine run status from events for detail reporting
+    # Determine run status from events for detail reporting (coarse terminal-state
+    # hint only — no operator decision rides on this field). 'deferred' is reported
+    # only for a run that is queued AND not yet self-released: a run that queued,
+    # self-released (conductor_queue_released), and is now running an automated stage
+    # carries BOTH events and is no longer deferred, so it falls back to 'unknown'
+    # (running, non-terminal) rather than being mislabeled 'deferred'. Falls back to
+    # 'unknown' for any other non-terminal run.
     run_status = "unknown"
-    for evt_name in (
-        "conductor_run_completed",
-        "conductor_run_halted",
-        "conductor_gate_pending",
+    for evt_name, label in (
+        ("conductor_run_completed", "completed"),
+        ("conductor_run_halted", "halted"),
+        ("conductor_gate_pending", "gate_pending"),
     ):
         if evt_name in event_names:
-            run_status = evt_name.replace("conductor_run_", "").replace(
-                "conductor_", ""
-            )
+            run_status = label
             break
+    else:
+        if (
+            "conductor_run_queued" in event_names
+            and "conductor_queue_released" not in event_names
+        ):
+            run_status = "deferred"
 
     return CheckResult(
         name="conductor",
