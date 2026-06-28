@@ -91,12 +91,14 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .._io import _fsync_dir
 from ..exceptions import PathTraversalError
 from .types import QueueCapabilities, QueueItem, QueueExport
 
@@ -148,12 +150,26 @@ def _validate_bare_component(value: str, label: str) -> None:
     """Reject a caller-supplied path component that is not a bare filename.
 
     A valid bare component must be a single path component with no separators,
-    not empty, and not the reserved names '.' or '..'.  Any of those conditions
-    would allow a traversing value (e.g. 'a/b' or '../../evil') to compose into
-    a path that escapes its containing directory when concatenated with a base dir.
+    no null byte, not empty, not the reserved names '.' or '..', and must NOT
+    begin with a leading dot.  Any of the first conditions would allow a
+    traversing value (e.g. 'a/b' or '../../evil') to compose into a path that
+    escapes its containing directory when concatenated with a base dir, or (the
+    null byte) to truncate a path at the OS layer.
 
-    Used for original_name, role, and lease_token — all caller-supplied values
-    that are appended to directory paths at the sink layer.
+    The leading-dot rejection reserves the dot-prefix namespace bucket-wide for
+    internal producer temp files. ``enqueue()`` stages its payload at
+    ``.{item_name}.<rand>.tmp`` and ``claim_next()`` skips any candidate matching
+    ``name.startswith(".") and name.endswith(".tmp")``. Rejecting leading-dot
+    item_names here is what makes that skip provably unable to exclude a
+    legitimately-named item: a valid item can never begin with '.'. This is safe
+    for all four uses — role, original_name, item_name, and lease_token never
+    legitimately begin with a dot (lease tokens are uuids/literals, roles and
+    item names are work-item slugs). The internal ``_recovered`` literal is
+    underscore-prefixed, not dot-prefixed, and is passed as a hardcoded path
+    segment, not through this validator.
+
+    Used for original_name, role, item_name, and lease_token — all caller-supplied
+    values that are appended to directory paths at the sink layer.
 
     Args:
         value: the caller-supplied string to validate.
@@ -161,13 +177,19 @@ def _validate_bare_component(value: str, label: str) -> None:
             "original_name", "role", "lease_token").
 
     Raises:
-        PathTraversalError: when value contains path separators, is empty,
-            or is '.' or '..'.
+        PathTraversalError: when value contains path separators or a null byte,
+            is empty, is '.' or '..', or begins with a leading dot.
     """
-    if not value or value in (".", "..") or value != Path(value).name:
+    if (
+        not value
+        or "\x00" in value
+        or value in (".", "..")
+        or value.startswith(".")
+        or value != Path(value).name
+    ):
         raise PathTraversalError(
-            f"{label} must be a bare filename (no path separators, not empty, "
-            f"not '.' or '..')",
+            f"{label} must be a bare filename (no path separators, no null byte, "
+            f"not empty, not '.' or '..', no leading dot)",
             child=value,
             root=f"<{label} validation>",
         )
@@ -473,6 +495,53 @@ class FilesystemQueueBackend:
     # ──────────────────────────────────────────────────────────────
     # Protocol methods
 
+    def enqueue(self, role: str, item_name: str, payload: bytes) -> None:
+        """Atomically enqueue payload bytes into queue/queued/<role>/<item_name>.
+
+        Producer primitive (spec/44 MUST 13, PR3 #582). Hand-rolls the binary
+        temp+fsync+rename+parent-dir-fsync idiom (mkstemp → write → fsync(file)
+        → rename → fsync(queued_dir)) so the item either appears completely in
+        queued/<role>/ or not at all, and the renamed directory entry survives a
+        power loss. (atomic_write() is text-only, so it is not reused here.) An
+        existing item with the same item_name is silently overwritten
+        (last-writer-wins, idempotent enqueue).
+
+        Containment guard: _queue_root() and _safe_under_queue() ensure
+        the destination stays within queue/ regardless of symlinks.
+        role and item_name are validated by _validate_bare_component()
+        (rejects path separators, null bytes, empty strings, '.' and '..',
+        raising PathTraversalError before any I/O).
+        """
+        _validate_bare_component(role, "role")
+        _validate_bare_component(item_name, "item_name")
+        queue_root = self._queue_root()
+        queued_dir = self._safe_under_queue(queue_root, "queued", role)
+        queued_dir.mkdir(parents=True, exist_ok=True)
+        dest = queued_dir / item_name
+        # atomic_write is text-only; use the temp+fsync+rename idiom directly
+        # for binary payloads (spec/44 MUST 13 mandates atomic semantics).
+        tmp_fd, tmp_path_str = tempfile.mkstemp(
+            dir=queued_dir, prefix=f".{item_name}.", suffix=".tmp"
+        )
+        tmp_path = Path(tmp_path_str)
+        try:
+            with os.fdopen(tmp_fd, "wb") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            tmp_path.rename(dest)
+            # Parent-dir fsync so the renamed entry is durable across power loss
+            # (Principle #8: the canonical idiom is temp+fsync+rename+parent-dir
+            # fsync; atomic_write does this via _fsync_dir, the hand-rolled binary
+            # path must too).
+            _fsync_dir(queued_dir)
+        except BaseException:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+
     def claim_next(
         self,
         role: str,
@@ -527,7 +596,22 @@ class FilesystemQueueBackend:
         # `p.is_file()` follows symlinks — a symlink to a regular file passes.
         # The canonical-source invariant below is the explicit guard (regular-file
         # invariant + containment + symlinked-parent rejection).
-        candidates = sorted(p for p in queued_dir.iterdir() if p.is_file())
+        #
+        # Skip the producer's in-flight temp files. enqueue() stages its payload
+        # at `.{item_name}.<rand>.tmp` INSIDE this same queued/<role>/ bucket
+        # before the atomic rename to the final name. A claim racing a concurrent
+        # enqueue (or a crash-leaked orphan temp from a process that died between
+        # mkstemp and rename) must NOT promote that transient/partial file into
+        # work — both would corrupt the producer's atomic round-trip (Principle #8).
+        # _validate_bare_component ENFORCES that a real item_name cannot begin
+        # with '.' (it rejects leading-dot values, reserving the dot-prefix
+        # namespace for these temp files), so this skip can never exclude a
+        # legitimately-named item.
+        candidates = sorted(
+            p
+            for p in queued_dir.iterdir()
+            if p.is_file() and not (p.name.startswith(".") and p.name.endswith(".tmp"))
+        )
         for src in candidates:
             # CANONICAL SOURCE INVARIANT: src must resolve to EXACTLY
             # queue/queued/<role>/<src.name>. This subsumes: queue_root containment,

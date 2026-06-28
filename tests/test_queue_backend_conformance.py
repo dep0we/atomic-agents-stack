@@ -1,11 +1,11 @@
 """Conformance tests for QueueBackend Protocol (spec/44).
 
-Tests covering the QueueBackend Implementer Contract (12 MUSTs). The
+Tests covering the QueueBackend Implementer Contract (13 MUSTs). The
 protocol-behavior tests are parametrized over every registered backend
 via the ``backend`` fixture; see PARAMETRIZATION below.
 
 NOTE ON NUMBERING: the "TEST N" labels below are this file's own granular
-test-case indices, NOT spec/44 MUST numbers (spec/44 has exactly 12 MUSTs).
+test-case indices, NOT spec/44 MUST numbers (spec/44 has exactly 13 MUSTs).
 
   TEST 1  — side-effect-free construction (spec/44 MUST 1)
   TEST 2  — claim_next() returns None when queue absent (spec/44 MUST 1)
@@ -64,6 +64,12 @@ test-case indices, NOT spec/44 MUST numbers (spec/44 has exactly 12 MUSTs).
   TEST 54 — renew_lease shim works with a symlinked project_root
   TEST 55 — release_claim shim fails SOFT on a symlinked-escaping queue/
   TEST 56 — move_to_dead_letter shim fails SOFT on a symlinked-escaping queue/
+  TEST 57 — enqueue() places an item in queued/<role>/ and claim_next() can claim it (spec/44 MUST 13)
+  TEST 58 — enqueue() is atomic: a crash-simulated partial write leaves no corrupt state (spec/44 MUST 13)
+  TEST 59 — enqueue() strip-RED: item_name with path separator raises (spec/44 MUST 13 validation)
+  TEST 60 — enqueue() rejects a null byte (PathTraversalError, not ValueError) before any I/O (spec/44 MUST 13)
+  TEST 61 — claim_next() skips an orphan producer temp file (spec/44 MUST 13 temp-file isolation)
+  TEST 62 — enqueue() rejects a leading-dot item_name (PathTraversalError); enforces the claim_next skip invariant (spec/44 MUST 13)
 
 PARAMETRIZATION: protocol-behavior tests use the ``backend`` fixture parametrized
 over BACKEND_FACTORIES (currently just 'filesystem'). Adding a second backend to
@@ -1523,3 +1529,261 @@ def test_claim_next_reused_token_strip_control(tmp_path):
         "claim_next with a DIFFERENT token must succeed when the queue has items"
     )
     assert item2.original_name == "002_task.md"
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 57-59: enqueue() producer primitive (PR3 #582, spec/44 MUST 13)
+
+
+def test_enqueue_places_item_and_claim_next_retrieves_it(tmp_path):
+    """TEST 57 — enqueue() places an item in queued/<role>/ and claim_next() claims it.
+
+    PR3 (#582) adds enqueue() as a producer primitive (spec/44 MUST 13). This is
+    the happy-path round-trip: enqueue bytes → claim_next retrieves the item with
+    the correct payload. Validates:
+    - Item appears under queued/<role>/<item_name> after enqueue.
+    - claim_next() returns a FilesystemQueueItem with matching original_name.
+    - The claimed item's path contains the expected payload bytes.
+    """
+    project_root = tmp_path / "agent_root"
+    project_root.mkdir()
+    backend = FilesystemQueueBackend(project_root)
+
+    payload = b"hello conductor conflict queue"
+    role = "conductor"
+    item_name = "stage-approval.md"
+
+    backend.enqueue(role, item_name, payload)
+
+    # The item must appear in the queued dir immediately.
+    queued_path = project_root / "queue" / "queued" / role / item_name
+    assert queued_path.exists(), f"enqueue must place item at {queued_path}"
+    assert queued_path.read_bytes() == payload, (
+        f"enqueue must write the exact payload bytes; got {queued_path.read_bytes()!r}"
+    )
+
+    # claim_next must return the item.
+    item = backend.claim_next(role, "lease-tok-57")
+    assert item is not None, "claim_next must find the enqueued item"
+    assert item.original_name == item_name, (
+        f"claimed item.original_name must be '{item_name}'; got {item.original_name!r}"
+    )
+    assert item.path.read_bytes() == payload, (
+        "claimed item payload must match enqueued payload"
+    )
+
+
+def test_enqueue_atomic_no_corrupt_on_partial_write(tmp_path, monkeypatch):
+    """TEST 58 — enqueue() atomicity: a simulated partial write leaves no corrupt state.
+
+    The implementation uses mkstemp + write + fsync + rename. We simulate a crash
+    after the write but before the rename by monkeypatching Path.rename to raise.
+    The queued/<role>/<item_name> destination must NOT exist afterward
+    (the temp file is cleaned up, and the rename never executed).
+
+    This proves the temp-then-rename atomicity: a reader that arrived between the
+    write and the simulated crash would NOT see a partially-written item at the
+    destination path (spec/44 MUST 13 atomicity, Principle #8).
+    """
+    import tempfile as _tempfile
+
+    project_root = tmp_path / "agent_root"
+    project_root.mkdir()
+    backend = FilesystemQueueBackend(project_root)
+
+    role = "conductor"
+    item_name = "conflict-advisory.md"
+    payload = b"advisory payload"
+    dest_path = project_root / "queue" / "queued" / role / item_name
+
+    # Track temp paths created so we can verify cleanup.
+    created_tmp_paths: list[Path] = []
+    original_mkstemp = _tempfile.mkstemp
+
+    def patched_mkstemp(dir, prefix, suffix):
+        result = original_mkstemp(dir=dir, prefix=prefix, suffix=suffix)
+        created_tmp_paths.append(Path(result[1]))
+        return result
+
+    monkeypatch.setattr(_tempfile, "mkstemp", patched_mkstemp)
+
+    # Patch Path.rename only for the destination (the temp-to-dest rename).
+    import pathlib
+
+    original_rename = pathlib.Path.rename
+
+    def patched_rename(self, target):
+        # Allow the temp file creation but fail the final rename to dest.
+        if Path(target) == dest_path:
+            raise OSError("simulated crash during rename")
+        return original_rename(self, target)
+
+    monkeypatch.setattr(pathlib.Path, "rename", patched_rename)
+
+    with pytest.raises(OSError, match="simulated crash during rename"):
+        backend.enqueue(role, item_name, payload)
+
+    # Destination must NOT exist.
+    assert not dest_path.exists(), (
+        f"enqueue must NOT leave a partial item at {dest_path} after a failed rename"
+    )
+    # Temp files must be cleaned up.
+    for tmp_p in created_tmp_paths:
+        assert not tmp_p.exists(), (
+            f"enqueue must clean up the temp file {tmp_p} on failure"
+        )
+
+
+def test_enqueue_rejects_item_name_with_path_separator(tmp_path):
+    """TEST 59 — enqueue() strip-RED: item_name with path separator raises.
+
+    spec/44 MUST 13 + _validate_bare_component: item_name must not contain
+    path separators (/ or os.sep). An item_name like 'foo/bar' would allow
+    a caller to plant a file in an arbitrary subdirectory under queued/<role>/,
+    violating containment.
+
+    Type honesty: MUST 13 names PathTraversalError (an AtomicAgentsError subclass,
+    NOT a ValueError) as the raised type. A broad `pytest.raises(Exception)` would
+    stay green on an unrelated failure (e.g. a mkdir/permission error); this asserts
+    the specific contract type, matching TEST 60's null-byte assertion.
+
+    Strip-RED control: a valid item_name must NOT raise (proven by TEST 57).
+    """
+    from atomic_agents.exceptions import PathTraversalError
+
+    project_root = tmp_path / "agent_root"
+    project_root.mkdir()
+    backend = FilesystemQueueBackend(project_root)
+
+    # item_name with a path separator must raise PathTraversalError specifically.
+    bad_names = ["foo/bar.md", "sub/dir/item.md"]
+    for bad in bad_names:
+        with pytest.raises(PathTraversalError):
+            backend.enqueue("conductor", bad, b"payload")
+        # The queued directory must not have been created with a subdirectory.
+        role_dir = project_root / "queue" / "queued" / "conductor"
+        if role_dir.exists():
+            # No subdirectory named 'foo' or 'sub' must exist.
+            for entry in role_dir.iterdir():
+                assert entry.is_file(), (
+                    f"enqueue must not create subdirs; found {entry}"
+                )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 60 — enqueue() rejects a null byte in role/item_name (PR3 #582, MUST 13)
+
+
+def test_enqueue_rejects_null_byte_before_any_io(tmp_path):
+    """TEST 60 — enqueue() rejects a null byte in role/item_name, before any I/O.
+
+    spec/44 MUST 13 + the enqueue() Protocol docstring claim role/item_name are
+    rejected for null bytes BEFORE any I/O, and that the raised type is
+    PathTraversalError (an AtomicAgentsError subclass, NOT a ValueError). A null
+    byte can truncate a path at the OS layer, so the guard is a containment
+    requirement, not a cosmetic one. This pins both the behavior and the type.
+    """
+    from atomic_agents.exceptions import AtomicAgentsError, PathTraversalError
+
+    project_root = tmp_path / "agent_root"
+    project_root.mkdir()
+    backend = FilesystemQueueBackend(project_root)
+
+    # A null byte in item_name must raise PathTraversalError (subclass of
+    # AtomicAgentsError, NOT ValueError) before any directory is created.
+    with pytest.raises(PathTraversalError):
+        backend.enqueue("conductor", "item\x00name", b"payload")
+    # And a null byte in role likewise.
+    with pytest.raises(PathTraversalError):
+        backend.enqueue("ro\x00le", "item", b"payload")
+
+    # Type honesty: PathTraversalError IS an AtomicAgentsError and is NOT a
+    # ValueError — a caller catching ValueError (the old, wrong docstring) would
+    # have missed it.
+    assert issubclass(PathTraversalError, AtomicAgentsError)
+    assert not issubclass(PathTraversalError, ValueError)
+
+    # Before any I/O: the role bucket must not have been created by the rejected call.
+    assert not (project_root / "queue" / "queued" / "conductor").exists(), (
+        "enqueue must validate and raise before creating the queued/<role>/ dir"
+    )
+
+
+def test_claim_next_skips_orphan_producer_temp_file(tmp_path):
+    """TEST 61 — claim_next() must NOT promote an enqueue() temp file into work.
+
+    enqueue() stages its payload at `.{item_name}.<rand>.tmp` INSIDE
+    queued/<role>/ before the atomic rename. A claim racing a concurrent enqueue,
+    or a crash that leaves an orphan temp behind, must never hand that
+    transient/partial file to a consumer (Principle #8: crashes leave recoverable
+    artifacts, not corruption). The orphan sorts BEFORE a real item ('.' < letters),
+    so a naive first-alphabetical scan would claim it FIRST — this pins the skip.
+    """
+    project_root = tmp_path / "agent_root"
+    project_root.mkdir()
+    backend = FilesystemQueueBackend(project_root)
+    role = "conductor"
+
+    # A legitimately-enqueued real item.
+    backend.enqueue(role, "real-item.md", b"real work")
+
+    # Simulate a crash-leaked producer temp orphan in the SAME bucket. It matches
+    # the mkstemp pattern (`.{item_name}.<rand>.tmp`) and sorts before the real one.
+    queued_dir = project_root / "queue" / "queued" / role
+    orphan = queued_dir / ".real-item.md.abc123.tmp"
+    orphan.write_bytes(b"partial, never renamed")
+    assert orphan.exists()
+
+    item = backend.claim_next(role, "lease-tok-61")
+    assert item is not None, "claim_next must still find the real item"
+    assert item.original_name == "real-item.md", (
+        f"claim_next must claim the real item, not the orphan temp; "
+        f"got {item.original_name!r}"
+    )
+    assert item.path.read_bytes() == b"real work"
+    # The orphan temp is untouched (left for a future producer-side cleanup), but
+    # it was NOT promoted into claimed/.
+    assert orphan.exists(), "the orphan temp must be skipped, not consumed"
+
+
+def test_enqueue_rejects_leading_dot_item_name(tmp_path):
+    """TEST 62 — enqueue() rejects a leading-dot item_name (PathTraversalError).
+
+    spec/44 MUST 13 + the "Producer/consumer temp-file isolation" addendum: the
+    claim_next() skip filter (`name.startswith(".") and name.endswith(".tmp")`)
+    must never be able to exclude a legitimately-named item. That safety invariant
+    is true ONLY if _validate_bare_component ENFORCES the leading-dot rejection —
+    not merely the bare '.'/'..' names. Without enforcement, an item_name like
+    '.config.tmp' would round-trip into queued/<role>/ via enqueue() yet be
+    permanently un-claimable (claim_next skips it as an orphan temp), a silent
+    round-trip violation (Principles #10/#13).
+
+    This pins the enforcement that makes the asserted invariant true: a leading-dot
+    item_name (including the un-claimable '.config.tmp' shape) is rejected at
+    enqueue() with PathTraversalError before any I/O, and no file lands on disk.
+    """
+    from atomic_agents.exceptions import AtomicAgentsError, PathTraversalError
+
+    project_root = tmp_path / "agent_root"
+    project_root.mkdir()
+    backend = FilesystemQueueBackend(project_root)
+
+    # The reproduced un-claimable shape plus a plain leading-dot name. Both must
+    # raise PathTraversalError (NOT a ValueError) before any directory is created.
+    for bad in [".config.tmp", ".hidden", ".real-item.md"]:
+        with pytest.raises(PathTraversalError):
+            backend.enqueue("conductor", bad, b"real work")
+
+    # Type honesty (matches TEST 60): PathTraversalError IS an AtomicAgentsError and
+    # is NOT a ValueError.
+    assert issubclass(PathTraversalError, AtomicAgentsError)
+    assert not issubclass(PathTraversalError, ValueError)
+
+    # Before any I/O: the role bucket must not have been created by a rejected call.
+    assert not (project_root / "queue" / "queued" / "conductor").exists(), (
+        "enqueue must validate and raise before creating the queued/<role>/ dir"
+    )
+
+    # A leading dot in `role` is likewise rejected (the invariant is bucket-wide).
+    with pytest.raises(PathTraversalError):
+        backend.enqueue(".sneaky-role", "real-item.md", b"real work")
