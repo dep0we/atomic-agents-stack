@@ -266,10 +266,12 @@ class GoalManager:
         COARSE-ROUTE adoption (#448 PR1): routes through self.goal_backend.save_goal().
         Caller-side stamping (A2 ruling): self._goal.last_progress_check is set
         FIRST with self.today (injectable clock), then save_goal() writes verbatim.
-        self.goal_backend.save_goal() is intentionally lock-free — single-session
-        saves are safe without the lock. The backend's apply_transition() (PR3's
-        coordinator primitive) holds the lock for its atomic sequence; this coarse
-        save path does not (accepted COARSE-ROUTE ordering contract, spec/41).
+        self.goal_backend.save_goal() now acquires the per-goal lock (#655 closed
+        in #582 PR3): both apply_transition() and this coarse save path serialize
+        under the same _goal_lock(), so a save here can no longer interleave with a
+        concurrent transition on the same goal_id. (Deadlock caveat, mirrored from
+        filesystem.py + spec/41's addendum: a caller already holding _goal_lock()
+        must not call save_goal() while holding it; GoalManager.save() does not.)
         (Note: archive() is a thin shim over backend.archive_goal() — see #483 PR1.)
 
         BEHAVIOR DELTA vs. pre-#448 save() (conscious, spec/41 MUST 5-aligned,
@@ -957,16 +959,22 @@ class GoalManager:
         # the terminal status written by apply_transition) with the updated date.
         # The CLI's trailing gm.save() after this call is a harmless no-op.
         #
-        # DELIBERATE lock-free re-stamp: this trailing save() stamps
-        # last_progress_check with the injectable self.today clock. The
-        # apply_transition `when=goal_manager.today` param (#483 PR1) already makes
-        # the prose date injectable; this save() additionally makes last_progress_check
-        # injectable, consistent with save()'s A2 ruling (caller-side stamp before
-        # save_goal). The CAS-guarded terminal apply_transition already persisted the
-        # authoritative status under the lock; this re-stamp is accepted under the
-        # single-session COARSE-ROUTE contract (the CLI is single-session).
+        # DELIBERATE trailing re-stamp: this save() stamps last_progress_check with
+        # the injectable self.today clock. The apply_transition `when=goal_manager.today`
+        # param (#483 PR1) already makes the prose date injectable; this save()
+        # additionally makes last_progress_check injectable, consistent with save()'s
+        # A2 ruling (caller-side stamp before save_goal). As of #655 (closed in #582
+        # PR3) save_goal() ITSELF serializes under the per-goal `_goal_lock()` — so
+        # this re-stamp is NO LONGER lock-free; it is a separate serialized write that
+        # runs AFTER the coordinator's CAS-guarded terminal apply_transition has both
+        # persisted the authoritative status AND released the lock. It is safe (no
+        # deadlock) precisely because apply_transition released `_goal_lock()` before
+        # returning, so this save() re-acquires it cleanly rather than re-entering a
+        # lock the caller still holds (the deadlock caveat in save()/filesystem.py/
+        # spec/41's addendum). Accepted under the single-session COARSE-ROUTE contract
+        # (the CLI is single-session).
         self._goal = self.goal_backend.load_goal(self.agent_name)
-        self.save()  # stamps last_progress_check = self.today (lock-free, see above)
+        self.save()  # stamps last_progress_check = self.today (serialized under _goal_lock, see above)
 
         return outcome_result, updated_sg
 

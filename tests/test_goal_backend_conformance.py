@@ -72,6 +72,9 @@ contributor reconciling code-to-spec lands on the right requirement.
   TEST 61 — apply_transition() accepts 'skipped' as a valid to_status (PR2 #581 — strip-RED: was rejected in PR1)
   TEST 62 — apply_transition() still rejects 'frobnicate' with the 7-member set (PR2 #581 regression guard)
   TEST 63 — gate_decision_id persists and reloads through apply_transition (PR2 #581 SUB_GOAL_TRANSITION_FIELDS addendum)
+  TEST 64 — apply_transition() raises GoalConcurrentModification on expected_decision_id mismatch; passes on match (PR3 #582 spec/41 MUST 14)
+  TEST 65 — save_goal() serializes under the per-goal lock (held-lease style; #655 regression guard) (PR3 #582)
+  TEST 66 — two CONCURRENT gate answers race the same decision: exactly one wins, the other raises GoalConcurrentModification (#660) (PR3 #582)
 
 PARAMETRIZATION: the protocol-behavior tests construct their backend through
 the ``backend`` / ``backend_with_goal`` fixtures, which are themselves
@@ -93,7 +96,10 @@ through the fixture so a future backend inherits the conformance assertions.
 
 from __future__ import annotations
 
+import fcntl
 import json
+import os
+import threading
 from pathlib import Path
 
 import frontmatter
@@ -1935,3 +1941,273 @@ def test_gate_decision_id_persists_through_apply_transition(
             f"other sub-goal must NOT have gate_decision_id set; "
             f"got {other_sg.gate_decision_id!r}"
         )
+
+
+def test_apply_transition_expected_decision_id_cas(
+    backend_with_goal, agent_root_with_goal: Path
+) -> None:
+    """TEST 64 — expected_decision_id CAS: mismatch raises GoalConcurrentModification;
+    match proceeds. (PR3 #582 — spec/41 MUST 14)
+
+    The expected_decision_id parameter adds an inner-lock CAS that catches a stale
+    or duplicate gate answer that races past the outer expected_from_status check.
+    Two cases are tested:
+      (a) POSITIVE: correct expected_decision_id proceeds without raising.
+      (b) NEGATIVE strip-RED: wrong expected_decision_id raises GoalConcurrentModification.
+    """
+    from datetime import datetime
+
+    from atomic_agents.exceptions import GoalConcurrentModification
+
+    backend = backend_with_goal
+    ts = datetime.now().astimezone().isoformat()
+    decision_id = "gate-expected-cas-test"
+    wrong_id = "gate-WRONG-id"
+
+    # Set sub-goal to awaiting_decision with a known gate_decision_id.
+    backend.apply_transition(
+        agent_id="agent",
+        sub_goal_id="sg1",
+        to_status="awaiting_decision",
+        fields={"gate_decision_id": decision_id},
+        history_prose="sg1 → awaiting_decision (gate suspension)",
+        history_event={
+            "ts": ts,
+            "event": "conductor_gate_pending",
+            "sub_goal_id": "sg1",
+            "decision_id": decision_id,
+        },
+    )
+
+    # (b) NEGATIVE strip-RED: wrong decision_id must raise GoalConcurrentModification.
+    with pytest.raises(GoalConcurrentModification, match="expected gate_decision_id"):
+        backend.apply_transition(
+            agent_id="agent",
+            sub_goal_id="sg1",
+            to_status="complete",
+            fields={"gate_decision_id": None},
+            history_prose="sg1 → complete (stale answer, WRONG decision_id)",
+            history_event={
+                "ts": ts,
+                "event": "conductor_gate_answered",
+                "decision_id": wrong_id,
+            },
+            expected_from_status="awaiting_decision",
+            expected_decision_id=wrong_id,
+        )
+
+    # Status must remain awaiting_decision (write was refused).
+    reloaded = backend.load_goal("agent")
+    sg1 = next(s for s in reloaded.sub_goals if s.id == "sg1")
+    assert sg1.status == "awaiting_decision", (
+        f"Status must remain 'awaiting_decision' after a refused expected_decision_id "
+        f"CAS; got {sg1.status!r}"
+    )
+    assert sg1.gate_decision_id == decision_id, (
+        f"gate_decision_id must remain '{decision_id}' after a refused CAS; "
+        f"got {sg1.gate_decision_id!r}"
+    )
+
+    # (a) POSITIVE: correct expected_decision_id proceeds without raising.
+    goal = backend.apply_transition(
+        agent_id="agent",
+        sub_goal_id="sg1",
+        to_status="complete",
+        fields={"gate_decision_id": None, "held_conflict_keys": []},
+        history_prose="sg1 → complete (gate answered, correct decision_id)",
+        history_event={
+            "ts": ts,
+            "event": "conductor_gate_answered",
+            "decision_id": decision_id,
+        },
+        expected_from_status="awaiting_decision",
+        expected_decision_id=decision_id,
+    )
+
+    sg1_after = next(s for s in goal.sub_goals if s.id == "sg1")
+    assert sg1_after.status == "complete", (
+        f"Status must be 'complete' after a successful expected_decision_id CAS; "
+        f"got {sg1_after.status!r}"
+    )
+    assert sg1_after.gate_decision_id is None, (
+        f"gate_decision_id must be None after gate answer cleared it; "
+        f"got {sg1_after.gate_decision_id!r}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TEST 65 (#655) — save_goal() serializes against create_goal()/apply_transition
+# via the per-goal lock. Filesystem-specific (held-lease style on .goal.lock).
+
+
+def test_save_goal_serializes_under_per_goal_lock(agent_root_with_goal: Path) -> None:
+    """TEST 65 — save_goal() acquires the per-goal lock, serializing concurrent writers.
+
+    #655: before PR3, save_goal() wrote goal.md WITHOUT the per-goal lock, so a
+    direct save_goal() (e.g. GoalManager.save()) could interleave a full-file
+    rewrite with a concurrent apply_transition()/create_goal() read-modify-write on
+    the same goal_id, losing one write. PR3 makes save_goal() acquire
+    self._goal_lock() (filesystem.py ~491).
+
+    Held-lease proof: hold the backend's `.goal.lock` externally (fcntl LOCK_EX),
+    then run save_goal() in a worker thread. While the external lease is held,
+    save_goal() MUST block (cannot acquire the same exclusive lock) — so it does
+    NOT complete. Releasing the lease lets it finish. If the _goal_lock()
+    acquisition were removed from save_goal(), the worker would complete WHILE the
+    lease is held and the `completed` event would be set within the timeout →
+    this test FAILS RED.
+    """
+    backend = FilesystemGoalBackend(agent_root_with_goal)
+    existing = backend.load_goal("agent")
+
+    # Mutate a sub-goal so the worker's save_goal() does real work.
+    mutated_sub_goals = [
+        SubGoal(id=sg.id, label=sg.label, status="in_progress")
+        if sg.id == "sg1"
+        else sg
+        for sg in existing.sub_goals
+    ]
+    to_save = Goal(
+        schema_version=existing.schema_version,
+        active=existing.active,
+        intent=existing.intent,
+        priority=existing.priority,
+        created=existing.created,
+        last_progress_check=existing.last_progress_check,
+        success_criteria=existing.success_criteria,
+        sub_goals=mutated_sub_goals,
+    )
+
+    completed = threading.Event()
+
+    def _worker() -> None:
+        backend.save_goal("agent", to_save)
+        completed.set()
+
+    # Acquire the SAME per-goal lock the backend uses, externally. (The .goal.lock
+    # file is created on first use; ensure it exists by creating the agent_root.)
+    agent_root_with_goal.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(str(backend._lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    worker = threading.Thread(target=_worker, daemon=True)
+    try:
+        worker.start()
+        # While the lease is held, save_goal() must NOT complete (it blocks on the
+        # exclusive lock). flock across two open file descriptions blocks even in
+        # the same process, so a correctly-locked save_goal() cannot finish here.
+        assert not completed.wait(timeout=0.75), (
+            "save_goal() completed while the per-goal lock was held externally — it "
+            "did NOT acquire self._goal_lock() (#655 regression at filesystem.py ~491)"
+        )
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+    # Once the external lease is released, save_goal() must finish promptly.
+    assert completed.wait(timeout=5.0), (
+        "save_goal() did not complete after the external per-goal lock was released"
+    )
+    worker.join(timeout=5.0)
+    reloaded = backend.load_goal("agent")
+    sg1 = next(s for s in reloaded.sub_goals if s.id == "sg1")
+    assert sg1.status == "in_progress", (
+        f"save_goal() must have persisted the mutation after acquiring the lock; "
+        f"got sg1.status={sg1.status!r}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TEST 66 (#660) — two CONCURRENT gate answers race the same decision: exactly one
+# wins; the other raises GoalConcurrentModification (genuine contention via barrier).
+
+
+def test_apply_transition_concurrent_gate_answer_race(
+    backend_with_goal,
+) -> None:
+    """TEST 66 — concurrent expected_decision_id CAS: exactly one of two racing answers wins.
+
+    #660 / spec/41 MUST 14: TEST 64 answers the gate SEQUENTIALLY (wrong id then
+    right id). This test drives a GENUINE concurrent race — two threads each call
+    apply_transition() to answer the SAME gate with the CORRECT expected_decision_id,
+    synchronized on a barrier so both reach the locked critical section contended.
+    The per-goal lock + the inner CAS (expected_from_status + expected_decision_id)
+    must admit EXACTLY ONE writer; the loser must raise GoalConcurrentModification
+    (the gate is no longer awaiting_decision / its decision_id was cleared by the
+    winner). Anything else (two winners, or the loser raising something other than
+    GoalConcurrentModification) is a serialization failure.
+    """
+    from datetime import datetime
+
+    from atomic_agents.exceptions import GoalConcurrentModification
+
+    backend = backend_with_goal
+    ts = datetime.now().astimezone().isoformat()
+    decision_id = "gate-concurrent-race"
+
+    # Suspend sg1 at a gate with a known decision_id.
+    backend.apply_transition(
+        agent_id="agent",
+        sub_goal_id="sg1",
+        to_status="awaiting_decision",
+        fields={"gate_decision_id": decision_id},
+        history_prose="sg1 → awaiting_decision (gate suspension)",
+        history_event={
+            "ts": ts,
+            "event": "conductor_gate_pending",
+            "sub_goal_id": "sg1",
+            "decision_id": decision_id,
+        },
+    )
+
+    barrier = threading.Barrier(2)
+    results: list[str] = []
+    results_lock = threading.Lock()
+
+    def _answer() -> None:
+        # Contend: both threads block here until both are ready, then race the lock.
+        barrier.wait(timeout=5.0)
+        try:
+            backend.apply_transition(
+                agent_id="agent",
+                sub_goal_id="sg1",
+                to_status="complete",
+                fields={"gate_decision_id": None, "held_conflict_keys": []},
+                history_prose="sg1 → complete (gate answered)",
+                history_event={
+                    "ts": ts,
+                    "event": "conductor_gate_answered",
+                    "decision_id": decision_id,
+                },
+                expected_from_status="awaiting_decision",
+                expected_decision_id=decision_id,
+            )
+            with results_lock:
+                results.append("won")
+        except GoalConcurrentModification:
+            with results_lock:
+                results.append("lost")
+
+    threads = [threading.Thread(target=_answer) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10.0)
+
+    assert results.count("won") == 1, (
+        f"EXACTLY ONE concurrent gate answer must win; got {results!r}"
+    )
+    assert results.count("lost") == 1, (
+        f"the losing concurrent answer must raise GoalConcurrentModification; "
+        f"got {results!r}"
+    )
+
+    # Durable end state: gate answered exactly once.
+    reloaded = backend.load_goal("agent")
+    sg1 = next(s for s in reloaded.sub_goals if s.id == "sg1")
+    assert sg1.status == "complete", (
+        f"the winner's transition must be durable; got {sg1.status!r}"
+    )
+    assert sg1.gate_decision_id is None, (
+        f"gate_decision_id must be cleared by the winning answer; "
+        f"got {sg1.gate_decision_id!r}"
+    )

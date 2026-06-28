@@ -1,6 +1,6 @@
 # spec/41: GoalBackend Protocol
 
-> **Status:** LOCKED — Protocol scaffold: #425 PR1 (2026-06-11); write-path adoption: #448 PR1 (2026-06-13); audit + CAS conformance: #448 PR2 (2026-06-13); coordinator + fail-closed cost gate + spec/41 LOCK: #448 PR3 (2026-06-13); clock-injection addendum + GoalManager shim + agent_root resolution: #483 PR1 (2026-06-13); backend-universe alignment (coordinator threads log/policy/profile backends into OutcomeRunner): #496 PR1 (2026-06-14); multi-goal addressing + create_goal RE-LOCK: #642 PR1 (2026-06-26); **conductor gate statuses (awaiting_decision + skipped) + gate_decision_id transition field RE-LOCK: #581 PR2 (2026-06-27)**. Conformance suite covers all 13 Implementer Contract MUSTs for `FilesystemGoalBackend` (`test_goal_backend_conformance.py`, 64 tests + `test_goal_multigoal_642.py`, TEST 60–129, 74 collected) plus filesystem-specific tests (`test_goal_filesystem.py`) and coordinator integration tests (`test_goal_coordinator.py`, 21 tests). Goal is also registered in the shared #379 export conformance harness (`test_export_protocol_conformance.py`) and the capability-advertisement harness (`test_export_capability_advertisement.py`: 2 goal-specific tests — `test_goal_backend_advertises_canonical_export`, `test_goal_backend_is_exportable` — plus the shared `test_all_capability_flags_are_bool` parametrization extended to cover goal). The four pre-existing goal tests (`test_goal.py`, `test_agent_goal_loading.py`, `test_dashboard_goals.py`, `test_goal_outcome_composition.py`) remain the zero-behavior-change regression guard (assertions unchanged); archive golden assertions updated in #448 PR1 for the A3 data-loss fix (the one sanctioned exception to the freeze), and the `test_goal_outcome_composition.py` `agent_with_goal` fixture gained a minimal `persona/IDENTITY.md` in #448 PR3 so the shim can construct the real `AtomicAgent` the now-live cost gate requires (fixture-only; every assertion is byte-identical).
+> **Status:** LOCKED — Protocol scaffold: #425 PR1 (2026-06-11); write-path adoption: #448 PR1 (2026-06-13); audit + CAS conformance: #448 PR2 (2026-06-13); coordinator + fail-closed cost gate + spec/41 LOCK: #448 PR3 (2026-06-13); clock-injection addendum + GoalManager shim + agent_root resolution: #483 PR1 (2026-06-13); backend-universe alignment (coordinator threads log/policy/profile backends into OutcomeRunner): #496 PR1 (2026-06-14); multi-goal addressing + create_goal RE-LOCK: #642 PR1 (2026-06-26); conductor gate statuses (awaiting_decision + skipped) + gate_decision_id transition field RE-LOCK: #581 PR2 (2026-06-27); **conductor concurrency + conflict serialization RE-LOCK: #582 PR3 (2026-06-27) — MUST 14 (expected_decision_id CAS under goal lock), save_goal per-goal lock (#655 closed), held_conflict_keys on SubGoal + SUB_GOAL_TRANSITION_FIELDS, serialize_sub_goal emits held_conflict_keys when non-empty; 14 MUSTs total, 3 new conformance tests (TEST 64–66: expected_decision_id CAS, save_goal held-lease serialization closing #655, concurrent two-thread gate-answer race closing #660)**. Conformance suite covers all 14 Implementer Contract MUSTs for `FilesystemGoalBackend` (`test_goal_backend_conformance.py`, 67 tests + `test_goal_multigoal_642.py`, TEST 60–129, 74 collected) plus filesystem-specific tests (`test_goal_filesystem.py`) and coordinator integration tests (`test_goal_coordinator.py`, 21 tests). Goal is also registered in the shared #379 export conformance harness (`test_export_protocol_conformance.py`) and the capability-advertisement harness (`test_export_capability_advertisement.py`: 2 goal-specific tests — `test_goal_backend_advertises_canonical_export`, `test_goal_backend_is_exportable` — plus the shared `test_all_capability_flags_are_bool` parametrization extended to cover goal). The four pre-existing goal tests (`test_goal.py`, `test_agent_goal_loading.py`, `test_dashboard_goals.py`, `test_goal_outcome_composition.py`) remain the zero-behavior-change regression guard (assertions unchanged); archive golden assertions updated in #448 PR1 for the A3 data-loss fix (the one sanctioned exception to the freeze), and the `test_goal_outcome_composition.py` `agent_with_goal` fixture gained a minimal `persona/IDENTITY.md` in #448 PR3 so the shim can construct the real `AtomicAgent` the now-live cost gate requires (fixture-only; every assertion is byte-identical).
 
 ---
 
@@ -187,9 +187,9 @@ The new field is appended last to preserve positional backward-compatibility (`G
 
 ---
 
-## Implementer Contract (13 MUSTs)
+## Implementer Contract (14 MUSTs)
 
-These MUSTs bind every conforming GoalBackend implementation (MUST 1–12 are GoalBackend; MUST 13 binds the separate AddressableGoalBackend Protocol). The conformance test suite in `tests/test_goal_backend_conformance.py` covers the original 10 MUSTs (64 tests total, including 2 CAS tests at TEST 54–55, 4 clock-injection / key-ordering tests at TEST 56–59, and the #581 PR2 conductor gate-status tests at TEST 60–63: 'awaiting_decision' + 'skipped' enum acceptance, the 7-member-set rejection regression guard, and gate_decision_id round-trip through apply_transition). MUST 11 and MUST 12 are covered by `tests/test_goal_multigoal_642.py` (TEST 60–129, 74 collected). MUST 13 (AddressableGoalBackend) is covered by TEST 72–74 and TEST 93–98.
+These MUSTs bind every conforming GoalBackend implementation (MUST 1–12 are GoalBackend; MUST 13 binds the separate AddressableGoalBackend Protocol; MUST 14 extends `apply_transition()` with an inner-lock decision CAS). The conformance test suite in `tests/test_goal_backend_conformance.py` covers spec/41 MUSTs 1–10 and MUST 14 (67 tests total, including 2 CAS tests at TEST 54–55, 4 clock-injection / key-ordering tests at TEST 56–59, the #581 PR2 conductor gate-status tests at TEST 60–63: 'awaiting_decision' + 'skipped' enum acceptance, the 7-member-set rejection regression guard, and gate_decision_id round-trip through apply_transition; TEST 64: expected_decision_id CAS match/mismatch; TEST 65: `save_goal()` held-lease serialization under the per-goal lock (#655); and TEST 66: a genuinely concurrent two-thread gate-answer race where exactly one wins and the other raises `GoalConcurrentModification` (#660) — all #582 PR3). MUST 11 and MUST 12 are covered by `tests/test_goal_multigoal_642.py` (TEST 60–129, 74 collected). MUST 13 (AddressableGoalBackend) is covered by TEST 72–74 and TEST 93–98.
 
 ### MUST 1 — Side-effect-free construction
 
@@ -440,7 +440,7 @@ Two-layer containment: charset allow-list validation (`validate_goal_id`) is the
 
 Partial-create debris acknowledgment: a failed `create_goal()` (directory created, goal.md not written) may leave an empty `goals/<goal_id>/` directory. `list_goals()` MUST skip these (see MUST 12). Cleanup is tracked in #643.
 
-Single-writer assumption (#642 follow-up, Codex #1): `create_goal()`'s atomicity holds against other LOCK-TAKING writers on the same `goal_id` — `apply_transition()`, `archive_goal()`, and `create_goal()` all share the per-goal lock and therefore serialize. It does NOT hold against a concurrent LOCK-FREE `save_goal()` on the SAME `goal_id` during the create window: `save_goal()` bypasses the per-goal lock, so a racing `save_goal()` violates the framework's single-writer-per-goal model and may interleave with the create. Serializing multiple writers on one `goal_id` (conflict keys / queue-behind-decision) is the conductor's concern, tracked in #655. This is a documented assumption, not a behavior change.
+Single-writer assumption (#642 follow-up, Codex #1; #655 closed in #582 PR3): `create_goal()`'s atomicity holds against ALL other writers on the same `goal_id` — `apply_transition()`, `archive_goal()`, `create_goal()`, AND `save_goal()` all share the per-goal lock and therefore serialize. As of #582 PR3, `save_goal()` acquires `self._goal_lock()` before writing (closing #655, the prior single-writer gap), so a concurrent `save_goal()` can no longer interleave with the create. The whole-fleet serialization of multiple conductor runs on one `goal_id` (conflict keys / queue-behind-decision) is handled by the conductor's conflict-scan lease (spec/50 §"Concurrency and conflict serialization"). Note for custom backends: a caller already holding `_goal_lock()` must not call `save_goal()` while holding it (deadlock risk); the reference impl does not.
 
 ### MUST 12 — `list_goals()` enumeration
 
@@ -598,3 +598,46 @@ The two events are linked by `decision_id`. The resume cursor is the sub-goal ST
 - `sub_goals_skipped: int` — count of sub-goals in `skipped` status.
 
 `all_done` is now negated by any `awaiting` count in addition to `pending` / `in_progress` / `blocked`. `skipped` sub-goals are terminal-done and do NOT block `all_done` — a fully-skipped playbook can complete.
+
+---
+
+## Versioned normative addendum — #582 PR3 (2026-06-27): conductor concurrency + conflict serialization
+
+This addendum records the Protocol surface additions and behavioral contracts introduced in #582 PR3. The additions close the per-goal lock gap (#655) and add an inner-lock decision CAS (MUST 14) to guard against stale resume() races that the outer expected_from_status check cannot catch alone.
+
+### MUST 14 — `apply_transition()` inner-lock decision CAS (`expected_decision_id`)
+
+`apply_transition()` gains an optional `expected_decision_id: str | None = None` keyword parameter. When non-None, the backend MUST verify — **under the goal lock, after the `expected_from_status` check** — that the current sub-goal's `gate_decision_id` matches the supplied value. If it does not match, the backend MUST raise `GoalConcurrentModification` and perform NO writes (goal.md and JSONL must remain unchanged).
+
+This closes a race that `expected_from_status` alone cannot catch: two concurrent `resume()` callers, both finding `status='awaiting_decision'`, both pass the `expected_from_status` CAS. The one that acquires the lock first transitions the status to `complete`; the second's `expected_from_status` check would then *correctly* catch the status change. But there is a TOCTOU window: if the second caller reads the status *before* the first writes, both could proceed past the outer check. The `expected_decision_id` check runs under the lock, after the status check, closing that window.
+
+**Behavior contract:**
+- `expected_decision_id=None` (the default): no decision-id check is performed — backward-compatible with all callers that do not supply it.
+- `expected_decision_id=<id>` and `sub_goal.gate_decision_id == <id>`: the CAS passes, writes proceed normally.
+- `expected_decision_id=<id>` and `sub_goal.gate_decision_id != <id>`: raise `GoalConcurrentModification` with a message that mentions "expected gate_decision_id". No writes are performed.
+
+**Conformance:** TEST 64 in `test_goal_backend_conformance.py`.
+
+### `save_goal()` per-goal lock (#655 closed)
+
+`save_goal()` previously bypassed the per-goal lock, creating a write-gap where a concurrent `apply_transition()` could interleave with a `save_goal()` on the same goal_id. In PR3, `save_goal()` now acquires `self._goal_lock()` before calling `self._write_goal(goal)`, matching the lock discipline of `apply_transition()` and `archive_goal()`. This closes #655 (single-writer assumption).
+
+**Impact on callers:** `save_goal()` is now serialized per-goal. Callers holding an outer lock that already includes `_goal_lock()` must not call `save_goal()` while holding that lock (deadlock risk). The reference impl does not do this; custom backends should be aware.
+
+### `held_conflict_keys` added to `SubGoal` and `SUB_GOAL_TRANSITION_FIELDS`
+
+`SubGoal` gains `held_conflict_keys: list[str]` (default `[]`, backward-compatible). This field stores the `StageSpec.conflict_keys` copied onto the sub-goal at gate suspension time. It exists so `_scan_active_conflicts()` in the conductor can detect conflicts in O(n_goals) goal loads instead of O(n_goals × n_events) JSONL parses.
+
+`SUB_GOAL_TRANSITION_FIELDS` gains `"held_conflict_keys"` so it can be written via `apply_transition(fields={'held_conflict_keys': [...]})` (written at suspension time) and cleared via `apply_transition(fields={'held_conflict_keys': []})` (written at gate answer time, alongside `gate_decision_id: None`).
+
+`serialize_sub_goal()` now emits `held_conflict_keys` in the serialized dict when the list is non-empty. This keeps goal.md clean for the common case (automated stages, no conflict scope) while ensuring the field round-trips correctly through save_goal/load_goal for gate sub-goals that have it set.
+
+**Conflict scan protocol:** the conductor's `_scan_active_conflicts(agent, stage_conflict_keys, own_conductor_run_id)` iterates `list_goals()`, loads each goal via `for_goal(id).load_goal()`, and checks for sub-goals with `status='awaiting_decision'` and `held_conflict_keys` that intersect `stage_conflict_keys`. It skips the caller's own `conductor_run_id`. Returns `(blocking_run_id, blocking_decision_id)` on the first hit, or `None` if no conflict found. Errors on individual goal loads are swallowed (fail-open: a load error cannot prove a conflict).
+
+### Backward compatibility
+
+All changes are additive and backward-compatible:
+- `expected_decision_id=None` is the default, so all existing `apply_transition()` callers are unaffected.
+- `held_conflict_keys: list[str] = field(default_factory=list)` is a default-empty field; existing SubGoal constructions are unaffected.
+- `serialize_sub_goal()` only emits `held_conflict_keys` when non-empty; existing goal.md files round-trip unchanged.
+- `save_goal()` acquiring the lock is a behavioral correctness fix, not a protocol change.

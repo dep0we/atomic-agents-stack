@@ -446,6 +446,9 @@ class FilesystemGoalBackend:
                 acceptance_criteria=list(sg.get("acceptance_criteria") or []),
                 # PR2 (#581): gate_decision_id for conductor gate suspension atomics.
                 gate_decision_id=sg.get("gate_decision_id"),
+                # PR3 (#582): held_conflict_keys so a conflict scan reads them via
+                # one load_goal() per goal (O(n_goals) loads, no per-goal JSONL parse).
+                held_conflict_keys=list(sg.get("held_conflict_keys") or []),
             )
             for sg in meta.get("sub_goals", [])
         ]
@@ -473,12 +476,21 @@ class FilesystemGoalBackend:
         Write-what-I-give-you: does NOT mutate goal.last_progress_check.
         Uses atomic_write (temp+fsync+rename).
 
-        This method does NOT acquire the goal lock — callers that need
-        atomicity (apply_transition, archive_goal) acquire the lock themselves.
-        Direct callers (GoalManager.save()) call this without a lock because
-        single-session saves are safe without it.
+        PR3 (#582, closes #655): save_goal() NOW acquires the per-goal fcntl.flock
+        before writing. Before PR3 the lock was omitted on the assumption that
+        single-session writes were always safe. That assumption is the #655
+        single-writer gap: any direct save_goal() caller (e.g. GoalManager.save())
+        that runs while a concurrent apply_transition()/archive_goal() holds the
+        lock on the same goal_id could interleave a full-file rewrite with the
+        transition's read-modify-write, losing one of the two writes. Acquiring the
+        lock here serializes save_goal() against apply_transition() and
+        archive_goal() (which already hold the same lock), eliminating that window.
+        The conductor's conflict scan does NOT call save_goal() — it only reads
+        (load_goal); held_conflict_keys are cleared via apply_transition(), which
+        already holds the lock.
         """
-        self._write_goal(goal)
+        with self._goal_lock():
+            self._write_goal(goal)
 
     # ──────────────────────────────────────────────────────────────
     # Protocol: atomic transition
@@ -492,6 +504,7 @@ class FilesystemGoalBackend:
         history_prose: str,
         history_event: dict[str, Any],
         expected_from_status: str | None = None,
+        expected_decision_id: str | None = None,
         when: date | None = None,
     ) -> Goal:
         """Serialized + ordered: flip sub-goal status, write goal.md, append JSONL.
@@ -571,6 +584,22 @@ class FilesystemGoalBackend:
                     f"sub_goal '{sub_goal_id}' expected status "
                     f"'{expected_from_status}' but found '{sg.status}' on disk "
                     f"— concurrent modification detected (spec/41 MUST 10)"
+                )
+
+            # Gate-decision CAS guard (spec/41 MUST 14, PR3 #582): UNDER THE LOCK,
+            # AFTER the expected_from_status check, verify gate_decision_id matches
+            # the caller's expected value. Protects against a stale duplicate-resume
+            # that arrives after the canonical resume has already answered and cleared
+            # the decision_id. Placed AFTER the status check so a status mismatch is
+            # surfaced first (clearer diagnostic when the gate is already complete).
+            if expected_decision_id is not None and (
+                sg.gate_decision_id != expected_decision_id
+            ):
+                raise GoalConcurrentModification(
+                    f"sub_goal '{sub_goal_id}' expected gate_decision_id "
+                    f"'{expected_decision_id}' but found "
+                    f"{sg.gate_decision_id!r} on disk — stale or duplicate "
+                    f"gate answer detected (spec/41 MUST 14)"
                 )
 
             sg.status = to_status
@@ -1031,15 +1060,15 @@ class FilesystemGoalBackend:
         the goals/<goal_id> directory node itself, so a symlinked goal dir is
         refused before the scoped backend is even constructed.
 
-        Single-writer assumption (Codex #1): create_goal()'s atomicity holds
-        against other LOCK-TAKING writers on the same goal_id — apply_transition(),
-        archive_goal(), and create_goal() all share the per-goal lock, so they
-        serialize. It does NOT hold against a concurrent LOCK-FREE save_goal() on
-        the SAME goal_id during the create window; save_goal() bypasses the per-goal
-        lock, so a racing save_goal() violates the framework's single-writer-per-goal
-        model and can interleave with the create. Serializing multiple writers on
+        Single-writer assumption (Codex #1; #655 closed in #582 PR3):
+        create_goal()'s atomicity holds against ALL other writers on the same
+        goal_id — apply_transition(), archive_goal(), create_goal(), AND
+        save_goal() all share the per-goal lock, so they serialize. As of #582
+        PR3, save_goal() acquires self._goal_lock() before writing (closing #655,
+        the prior single-writer gap), so a concurrent save_goal() can no longer
+        interleave with the create window. Serializing multiple conductor runs on
         one goal_id (conflict keys / queue-behind-decision) is the conductor's
-        concern, tracked in #655.
+        concern (spec/50 conflict-scan lease).
 
         Raises:
             ValueError: invalid charset or reserved goal_id (pre-lock, no I/O).

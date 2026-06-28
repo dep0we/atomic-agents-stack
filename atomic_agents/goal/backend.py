@@ -144,6 +144,7 @@ class GoalBackend(Protocol):
         history_prose: str,
         history_event: dict[str, Any],
         expected_from_status: str | None = None,
+        expected_decision_id: str | None = None,
         when: date | None = None,
     ) -> Goal:
         """Atomic transition: flip sub-goal status + write history as one durable unit.
@@ -196,6 +197,15 @@ class GoalBackend(Protocol):
                 authors: the check MUST be under the lock/transaction so a
                 concurrent write cannot slip between the check and the write
                 (TOCTOU guard).
+            expected_decision_id: optional gate-decision CAS guard (spec/41 MUST 14,
+                PR3 #582). When not None, the backend MUST, UNDER THE LOCK
+                (after load_goal(), AFTER the expected_from_status check, before
+                the write), compare the sub-goal's gate_decision_id field against
+                this value. If they differ (or gate_decision_id is None), MUST
+                raise GoalConcurrentModification (no write, no JSONL line).
+                Protects against a stale duplicate-resume replaying a gate answer
+                for a decision_id that has already been answered and cleared.
+                Default None = no check (backward-compatible).
             when: the date used for the ## History prose bullet date prefix
                 (e.g. "- 2026-05-08 — sub_goal ..."). Defaults to date.today()
                 when None. Injected for clock-determinism in tests. Does NOT
@@ -225,6 +235,9 @@ class GoalBackend(Protocol):
                 expected_from_status — another writer moved the goal between
                 the caller's lock release and re-acquisition (spec/41 MUST 10).
                 No write is performed; no JSONL line is appended.
+                Also raised when expected_decision_id is not None and the
+                sub-goal's gate_decision_id differs — detects a stale gate
+                answer for an already-cleared decision (spec/41 MUST 14).
             AtomicAgentsError: when goal.md is absent.
             AtomicAgentsError: when sub_goal_id is not found in the goal.
         """
