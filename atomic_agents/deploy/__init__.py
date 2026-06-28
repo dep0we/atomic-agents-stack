@@ -1,4 +1,4 @@
-"""atomic_agents.deploy — the deployment conductor (spec/49).
+"""atomic_agents.deploy — the deployment planner (spec/49).
 
 `atomic-agents deploy <agent>` takes an operator from "I have an agent folder"
 to "the agent is running, supervised, and verified on this machine," then
@@ -24,12 +24,12 @@ The lower-level modules (kept internal):
     _ports     — port precedence resolution + pre-bootstrap socket-bind probe
     _verify    — non-mutating, unbilled, predicate-based loopback verification
     _exposure  — exposure guidance (guide, NEVER perform)
-    _conductor — the planner + executor that ties the modules together
+    _planner   — the deployment planner + executor that ties the modules together
 """
 
 from __future__ import annotations
 
-from ._conductor import (
+from ._planner import (
     DeployError,
     deploy,
     deploy_down,

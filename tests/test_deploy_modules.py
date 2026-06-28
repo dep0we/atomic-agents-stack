@@ -2,7 +2,7 @@
 
 Complements test_deploy_conformance.py (the 12-MUST table). These cover the
 finer-grained behaviour of _types / _launchd / _ports / _verify / _exposure /
-_conductor and the cli.py `deploy` subcommand parsing/dispatch. All system
+_planner and the cli.py `deploy` subcommand parsing/dispatch. All system
 interactions are mocked.
 """
 
@@ -278,7 +278,7 @@ def test_detect_tailscale_false_on_nonzero(monkeypatch):
     assert _exposure.detect_tailscale(runner=runner) is False
 
 
-# ── _conductor: missing agent fails with init hint ───────────────────────
+# ── _planner: missing agent fails with init hint ───────────────────────
 
 
 def test_deploy_missing_agent_fails_with_init_hint(tmp_path, monkeypatch):
@@ -499,7 +499,7 @@ def test_deploy_verify_raising_http_get_still_rolls_back(tmp_path, monkeypatch):
     MUST still bootout the agent + remove the plist + exit non-zero (MUST 8).
 
     Negative control: remove the try/except wrapping verify_deployment in the
-    conductor and the exception propagates uncaught — the plist is left behind
+    planner and the exception propagates uncaught — the plist is left behind
     and this assertion (empty LA dir) fails.
     """
     import urllib.error
@@ -611,7 +611,7 @@ def test_check_doctor_all_malformed_items_fails():
     assert "no well-formed" in msg
 
 
-# Fix #3 — env-var-only key injection (MUST 5), THROUGH the conductor.
+# Fix #3 — env-var-only key injection (MUST 5), THROUGH the planner.
 def test_deploy_env_only_key_injected_into_plist(tmp_path, monkeypatch):
     """When the provider key's sole source is an env var, deploy injects it into
     the plist (KEY=VALUE) and prints the cleartext caveat.
@@ -1077,7 +1077,7 @@ def test_label_for_rejects_deploy_reserved_names(reserved):
         _launchd.label_for(reserved)
 
 
-# Shared http_get fakes for the conductor-level tests above.
+# Shared http_get fakes for the planner-level tests above.
 def _healthz_ok_doctor_ok_modtest(url):
     if url.endswith("/healthz"):
         return 200, '{"status": "ok"}'

@@ -1,12 +1,12 @@
 ---
 spec: 49
-title: atomic-agents deploy — the deployment conductor
+title: atomic-agents deploy — the deployment planner
 status: DRAFT
 created: 2026-06-19
 issue: 558
 ---
 
-# spec/49 — `atomic-agents deploy`: the deployment conductor
+# spec/49 — `atomic-agents deploy`: the deployment planner
 
 **Status:** DRAFT — ships with issue #558; locked after conformance tests pass.
 Revised after a cross-family (Codex) review and a plan-eng-review architecture finding
@@ -16,7 +16,8 @@ Revised after a cross-family (Codex) review and a plan-eng-review architecture f
 
 ## Purpose
 
-`atomic-agents deploy` is a conductor that takes an operator from "I have an agent
+`atomic-agents deploy` is an orchestrator (the deployment planner) that takes an
+operator from "I have an agent
 folder" to "the agent is running, supervised, and verified on this machine," by
 orchestrating the surfaces that already exist (`init`, `doctor`, `serve`). It owns no
 new runtime: it sequences existing commands, installs a supervised process, verifies it,

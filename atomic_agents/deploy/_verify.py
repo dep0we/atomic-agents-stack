@@ -55,7 +55,7 @@ class VerifyResult:
                   reach the server at all (the transport sentinel, not a 503 or a
                   bad JSON body). This distinguishes "server unreachable — a
                   foreign holder of the port is plausible" from "our serve bound
-                  the port but failed healthz/doctor" — the conductor uses it to
+                  the port but failed healthz/doctor" — the planner uses it to
                   decide whether an address-in-use diagnostic is warranted on
                   rollback (spec/49 MUST 10).
     """
@@ -245,7 +245,7 @@ def verify_deployment(
         # Track whether the FINAL probe was a transport failure (server
         # unreachable) vs a real HTTP response (503 / bad body). Only the former
         # is consistent with "a foreign process holds the port, our serve never
-        # bound" — the conductor's address-in-use diagnostic keys off this.
+        # bound" — the planner's address-in-use diagnostic keys off this.
         h_transport_fail = status == TRANSPORT_FAILURE_STATUS
         h_ok, h_msg = _check_healthz(status, body)
         if h_ok:

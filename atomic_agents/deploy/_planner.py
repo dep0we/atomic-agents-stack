@@ -1,4 +1,4 @@
-"""deploy/_conductor.py — the planner + executor (spec/49).
+"""deploy/_planner.py — the planner + executor (spec/49).
 
 This module ties the deploy sub-modules together. It builds an ordered, tagged
 :class:`Plan` (the *planner*), then runs each step (the *executor*), then
@@ -633,7 +633,7 @@ def deploy(
 ) -> int:
     """Plan + execute a loopback deployment, verify, then guide exposure.
 
-    spec/49 — the conductor. Returns a process exit code (0 = success).
+    spec/49 — the deployment planner. Returns a process exit code (0 = success).
 
     With ``plan_only`` (the ``--plan`` flag) this prints the tagged plan and
     returns 0 with ZERO side effects: no filesystem write, no launchctl call,

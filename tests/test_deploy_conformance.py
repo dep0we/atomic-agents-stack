@@ -1,4 +1,4 @@
-"""Conformance tests for atomic_agents.deploy — the deployment conductor.
+"""Conformance tests for atomic_agents.deploy — the deployment planner.
 
 spec/49 §"Conformance test outline". One test (at least) per MUST row in the
 table. Every system interaction is mocked: launchctl, tailscale, the socket
@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from atomic_agents import deploy as deploy_mod
-from atomic_agents.deploy import _conductor, _exposure, _launchd, _ports, _verify
+from atomic_agents.deploy import _planner, _exposure, _launchd, _ports, _verify
 from atomic_agents.deploy._types import DeployState, StepTag
 
 
@@ -152,7 +152,7 @@ def _run_deploy(agent_root, launch_dir, **overrides):
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# MUST 1 — Conductor, not a reimplementation
+# MUST 1 — Planner, not a reimplementation
 # ──────────────────────────────────────────────────────────────────────────
 
 
@@ -185,9 +185,9 @@ def test_must1_invokes_doctor_via_entry_point(agent_root, launch_dir, monkeypatc
 def test_must1_no_migrate_invoked(agent_root, launch_dir, monkeypatch):
     """deploy must not run migrations."""
     _patch_doctor_pass(monkeypatch)
-    import atomic_agents.deploy._conductor as cond
+    import atomic_agents.deploy._planner as cond
 
-    # There is no migrate import in the conductor surface.
+    # There is no migrate import in the planner surface.
     src = Path(cond.__file__).read_text(encoding="utf-8")
     assert "migrate" not in src.lower()
 
@@ -263,9 +263,9 @@ def test_must4_program_arguments_absolute_and_serve():
     assert "--port" in prog and "8000" in prog
 
 
-def test_must4_no_uvicorn_imported_in_conductor():
-    """The conductor never imports uvicorn / starlette (no in-process serve)."""
-    src = Path(_conductor.__file__).read_text(encoding="utf-8")
+def test_must4_no_uvicorn_imported_in_planner():
+    """The planner never imports uvicorn / starlette (no in-process serve)."""
+    src = Path(_planner.__file__).read_text(encoding="utf-8")
     assert "uvicorn" not in src
     assert "starlette" not in src
     assert "run_serve" not in src
