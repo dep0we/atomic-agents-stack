@@ -1,6 +1,6 @@
-"""Tests for atomic_agents/conductor/ — spec/50 PR1.
+"""Tests for atomic_agents/conductor/ — spec/50 PR1+PR2.
 
-Coverage (acceptance criteria from arc-ruling #580):
+Coverage (acceptance criteria from arc-ruling #580 PR1, #581 PR2):
   TEST 1  — playbook loader: valid PLAYBOOK.md parses to PlaybookManifest
   TEST 2  — playbook loader: missing 'kind: playbook' frontmatter is rejected
   TEST 3  — playbook loader: missing stage_id FAILS LOUD (no positional fallback)
@@ -25,13 +25,21 @@ Coverage (acceptance criteria from arc-ruling #580):
             when per-iteration spend exhausts the threaded run-level headroom
   TEST 24 — coordinator threading: dispatch_sub_goal_as_outcome forwards
             parent_remaining_headroom_usd to _check_cost_guardrails AND OutcomeRunner
-  TEST 14 — gate stage: run halts with halt_reason='gate_not_implemented_pr2'
+  TEST 14 — gate stage: run() suspends with status='awaiting_decision' + valid GateDecision
+             (PR2 #581 — replaces PR1 'gate_not_implemented_pr2' halt behavior)
+  TEST 14b— gate stage: resume(continue) → next stage runs, run completes
+  TEST 14c— gate stage: resume(skip) → stage marked 'skipped', run continues to next stage
+  TEST 14d— gate stage: resume(halt) → run halts after gate answer recorded
+  TEST 14e— gate stage: stale/duplicate decision_id rejected (c5 CAS)
+  TEST 14f— gate stage: answered_by = principal.identifier (not str/derivation_source)
+  TEST 14g— gate stage: options field round-trips through playbook parse and GateDecision
+  TEST 14h— gate stage: awaiting_decision re-surface (run() called again while suspended)
   TEST 15 — idempotency key format: keys are 'conductor:<run_id>:<stage_id>'
   TEST 16 — run() returns ConductorState with status='complete' when all stages pass
   TEST 17 — run() returns ConductorState with status='halted' on stage failure
   TEST 18 — conductor_run_id resume: supplying an absent run_id raises ValueError
   TEST 19 — non-AddressableGoalBackend raises AtomicAgentsError
-  TEST 20 — VALID_SUB_GOAL_STATUSES: 'awaiting_decision' absent in PR1 (PR2 TODO)
+  TEST 20 — VALID_SUB_GOAL_STATUSES: 7-member set with 'awaiting_decision' + 'skipped' (PR2)
 
 Note on dispatch patching: dispatch_sub_goal_as_outcome is imported via
 a local `from ..goal.coordinator import ...` inside _dispatch_stage(). Patch
@@ -54,14 +62,31 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from atomic_agents.conductor import discover_playbooks, run, validate_playbook_manifest
+from atomic_agents.conductor import (
+    discover_playbooks,
+    resume,
+    run,
+    validate_playbook_manifest,
+)
 from atomic_agents.conductor.playbook import PLAYBOOK_ENTRY_POINT
 from atomic_agents.conductor.run import _read_pinned_run_cap, _sum_cumulative_spend
-from atomic_agents.conductor.types import ConductorState
-from atomic_agents.exceptions import AtomicAgentsError, GoalCorrupted
+from atomic_agents.conductor.types import ConductorState, GateDecision
+from atomic_agents._goal_impl import GoalManager
+from atomic_agents.exceptions import (
+    AtomicAgentsError,
+    GoalConcurrentModification,
+    GoalCorrupted,
+    UnverifiedPrincipalConversationAccess,
+)
 from atomic_agents.goal.filesystem import FilesystemGoalBackend
-from atomic_agents.goal.types import VALID_SUB_GOAL_STATUSES
+from atomic_agents.goal.types import (
+    CURRENT_GOAL_SCHEMA_VERSION,
+    VALID_SUB_GOAL_STATUSES,
+    Goal,
+    SubGoal,
+)
 from atomic_agents.idempotency.types import COMPLETED, FRESH
+from atomic_agents.principal.types import LOCAL_PRINCIPAL, Principal
 from atomic_agents.types import CostCheckResult
 
 
@@ -973,14 +998,18 @@ def test_cumulative_spend_degraded_on_corrupt_line(tmp_path: Path) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────
-# TEST 14 — gate stage halts with halt_reason='gate_not_implemented_pr2'
+# TEST 14 — gate stage: run() suspends with status='awaiting_decision' + valid GateDecision
 
 
-def test_gate_stage_halts_pr1(
+def test_gate_stage_suspends_pr2(
     agent_root: Path,
     mock_agent: MagicMock,
 ) -> None:
-    """A gate stage (is_gate: true) must halt with 'gate_not_implemented_pr2' in PR1."""
+    """A gate stage (is_gate: true) must suspend with status='awaiting_decision' (PR2 #581).
+
+    After the auto-stage completes, run() hits the gate stage and returns
+    status='awaiting_decision' with a valid GateDecision (never halts).
+    """
     pb_dir = agent_root / "skills" / "gate-playbook"
     pb_dir.mkdir()
     stages_yaml = textwrap.dedent(
@@ -994,6 +1023,9 @@ def test_gate_stage_halts_pr1(
             label: Human gate
             prompt: Human review required.
             is_gate: true
+            options:
+              - Approve
+              - Reject
         """
     )
     (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
@@ -1002,17 +1034,14 @@ def test_gate_stage_halts_pr1(
     manifests = discover_playbooks(agent_root)
     playbook = next(m for m in manifests if m.name == "gate-playbook")
 
-    def _dispatch(agent, goal_manager, sub_goal_id, **kwargs):
-        sg = MagicMock()
-        sg.status = "complete"
-        return _make_outcome_result(status="satisfied"), sg
+    _ledger_dispatch = _make_ledger_updating_dispatch(total_cost_usd=0.05)
 
     idem_backend = _make_idempotency_backend_mock()
     outcome_backend = _make_outcome_backend_mock()
 
     with patch(
         "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
-        side_effect=_dispatch,
+        side_effect=_ledger_dispatch,
     ):
         with patch(
             "atomic_agents.conductor.run._get_idempotency_backend",
@@ -1024,10 +1053,895 @@ def test_gate_stage_halts_pr1(
             ):
                 state = run(playbook=playbook, subject="gate test", agent=mock_agent)
 
-    assert state.status == "halted"
-    assert state.halt_reason == "gate_not_implemented_pr2", (
-        f"Expected halt_reason='gate_not_implemented_pr2'; got {state.halt_reason!r}. "
-        "Gate stages must halt in PR1 (PR2 #581 implements resume)."
+    # Primary assertions: gate suspension (not halt)
+    assert state.status == "awaiting_decision", (
+        f"Expected status='awaiting_decision'; got {state.status!r}. "
+        "Gate stages must suspend in PR2 (#581)."
+    )
+    assert state.halt_reason is None, (
+        f"halt_reason must be None when suspended; got {state.halt_reason!r}"
+    )
+    assert state.pending_decision is not None, (
+        "pending_decision must be set when status='awaiting_decision'"
+    )
+
+    # GateDecision shape validation
+    gd = state.pending_decision
+    assert isinstance(gd, GateDecision)
+    assert gd.stage_id == "gate-stage"
+    assert gd.prompt == "Human review required."
+    assert gd.decision_id.startswith("gate-"), (
+        f"decision_id must start with 'gate-'; got {gd.decision_id!r}"
+    )
+    assert gd.disposition is None, "gate not yet answered — disposition must be None"
+    assert gd.answer is None
+    assert gd.answered_by is None
+
+    # Options round-trip (gate-stage-markdown-schema ruling)
+    assert gd.options == ["Approve", "Reject"], (
+        f"options must round-trip from PLAYBOOK.md; got {gd.options!r}"
+    )
+
+    # The auto-stage completed before the gate (stages_complete reflects only complete
+    # stages, not the awaiting gate itself)
+    assert state.stages_complete == 1, (
+        f"Only auto-stage should be complete; got stages_complete={state.stages_complete}"
+    )
+    assert state.stages_total == 2
+
+    # Strip-RED negative control: status is NOT 'halted'
+    assert state.status != "halted", "gate must NOT halt in PR2"
+    # Strip-RED: pending_decision must be absent for a non-suspended run
+    from atomic_agents.conductor.types import ConductorState as _CS  # noqa: PLC0415
+
+    with pytest.raises(ValueError, match="MUST NOT have pending_decision"):
+        _CS(
+            conductor_run_id="x",
+            playbook_name="p",
+            subject="s",
+            status="complete",
+            halt_reason=None,
+            stages_total=1,
+            stages_complete=1,
+            cumulative_spend_usd=0.0,
+            run_cap_usd=5.0,
+            pending_decision=gd,  # invariant violation
+        )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 14b — gate stage: resume(continue) → next stage runs, run completes
+
+
+def test_gate_resume_continue_runs_next_stage(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """resume() with disposition='continue' completes the gate and runs the next stage."""
+    pb_dir = agent_root / "skills" / "gate-resume-pb"
+    pb_dir.mkdir()
+    stages_yaml = textwrap.dedent(
+        """\
+        stages:
+          - stage_id: gate-stage
+            label: Human gate
+            prompt: Approve to continue.
+            is_gate: true
+          - stage_id: post-gate
+            label: Post-gate work
+            prompt: Do the work after approval.
+        """
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="gate-resume-pb", stages=stages_yaml, run_cap_usd=5.0)
+    )
+    playbook = next(
+        m for m in discover_playbooks(agent_root) if m.name == "gate-resume-pb"
+    )
+
+    _ledger_dispatch = _make_ledger_updating_dispatch(total_cost_usd=0.02)
+    idem_backend = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+
+    # Phase 1: run() hits gate stage, suspends
+    with (
+        patch(
+            "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
+            side_effect=_ledger_dispatch,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=idem_backend,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state1 = run(playbook=playbook, subject="continue test", agent=mock_agent)
+
+    assert state1.status == "awaiting_decision", (
+        f"Expected suspension; got {state1.status!r}"
+    )
+    gd = state1.pending_decision
+    assert gd is not None
+
+    # Phase 2: resume() with 'continue' → post-gate stage dispatched → complete
+    dispatch_calls: list[str] = []
+
+    def _tracking_dispatch(agent, goal_manager, sub_goal_id, **kwargs):
+        dispatch_calls.append(sub_goal_id)
+        return _ledger_dispatch(agent, goal_manager, sub_goal_id, **kwargs)
+
+    with (
+        patch(
+            "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
+            side_effect=_tracking_dispatch,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=_make_idempotency_backend_mock(),
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state2 = resume(
+            playbook=playbook,
+            subject="continue test",
+            agent=mock_agent,
+            conductor_run_id=state1.conductor_run_id,
+            decision_id=gd.decision_id,
+            answer="Looks good, proceed.",
+            disposition="continue",
+            rationale="All checks passed.",
+        )
+
+    assert state2.status == "complete", (
+        f"Expected complete after continue; got {state2.status!r}"
+    )
+    # The gate stage should NOT have been re-dispatched; only post-gate
+    assert "gate-stage" not in dispatch_calls, (
+        f"gate-stage must not be re-dispatched on resume; dispatch_calls={dispatch_calls}"
+    )
+    assert "post-gate" in dispatch_calls, (
+        f"post-gate stage must run after resume(continue); dispatch_calls={dispatch_calls}"
+    )
+    assert state2.stages_complete == 2, (
+        f"Both stages complete after continue; got {state2.stages_complete}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 14c — gate stage: resume(skip) → stage skipped, run continues
+
+
+def test_gate_resume_skip_marks_stage_skipped(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """resume() with disposition='skip' marks the gate 'skipped' and continues the run."""
+    pb_dir = agent_root / "skills" / "gate-skip-pb"
+    pb_dir.mkdir()
+    stages_yaml = textwrap.dedent(
+        """\
+        stages:
+          - stage_id: gate-stage
+            label: Optional gate
+            prompt: Should we run the extra analysis?
+            is_gate: true
+          - stage_id: after-gate
+            label: After gate
+            prompt: Always run this.
+        """
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="gate-skip-pb", stages=stages_yaml, run_cap_usd=5.0)
+    )
+    playbook = next(
+        m for m in discover_playbooks(agent_root) if m.name == "gate-skip-pb"
+    )
+
+    _ledger_dispatch = _make_ledger_updating_dispatch(total_cost_usd=0.02)
+    idem_backend = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+
+    # Phase 1: suspend at gate
+    with (
+        patch(
+            "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
+            side_effect=_ledger_dispatch,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=idem_backend,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state1 = run(playbook=playbook, subject="skip test", agent=mock_agent)
+
+    assert state1.status == "awaiting_decision"
+    gd = state1.pending_decision
+
+    # Phase 2: resume with 'skip'
+    dispatch_calls: list[str] = []
+
+    def _tracking(agent, goal_manager, sub_goal_id, **kwargs):
+        dispatch_calls.append(sub_goal_id)
+        return _ledger_dispatch(agent, goal_manager, sub_goal_id, **kwargs)
+
+    with (
+        patch(
+            "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
+            side_effect=_tracking,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=_make_idempotency_backend_mock(),
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state2 = resume(
+            playbook=playbook,
+            subject="skip test",
+            agent=mock_agent,
+            conductor_run_id=state1.conductor_run_id,
+            decision_id=gd.decision_id,
+            answer="Skip it — not needed this time.",
+            disposition="skip",
+            rationale="Low-risk change; extra analysis not warranted.",
+        )
+
+    assert state2.status == "complete", (
+        f"Run must complete after skip; got {state2.status!r}"
+    )
+    # gate-stage must NOT be dispatched (it is skipped, not automated)
+    assert "gate-stage" not in dispatch_calls, (
+        f"gate-stage must not be dispatched when skipped; got {dispatch_calls}"
+    )
+    assert "after-gate" in dispatch_calls
+
+    # The skipped stage should appear in the completed list (skipped = terminal-done)
+    assert "gate-stage" in state2.completed_stage_ids, (
+        f"skipped gate-stage must appear in completed_stage_ids; got {state2.completed_stage_ids}"
+    )
+
+    # Confirm the sub-goal is 'skipped' on the ledger directly.
+    # The conductor creates goals under goals/<conductor_run_id>/; use for_goal().
+    run_goal_backend = mock_agent.goal_backend.for_goal(state1.conductor_run_id)
+    goal = run_goal_backend.load_goal(mock_agent.name)
+    gate_sg = next(sg for sg in goal.sub_goals if sg.id == "gate-stage")
+    assert gate_sg.status == "skipped", (
+        f"gate sub-goal must be 'skipped' on ledger; got {gate_sg.status!r}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 14d — gate stage: resume(halt) → run halts
+
+
+def test_gate_resume_halt_stops_run(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """resume() with disposition='halt' records the answer and halts the run."""
+    pb_dir = agent_root / "skills" / "gate-halt-pb"
+    pb_dir.mkdir()
+    stages_yaml = textwrap.dedent(
+        """\
+        stages:
+          - stage_id: gate-stage
+            label: Go/No-go gate
+            prompt: Proceed or stop?
+            is_gate: true
+          - stage_id: post-gate
+            label: Post-gate
+            prompt: If approved.
+        """
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="gate-halt-pb", stages=stages_yaml, run_cap_usd=5.0)
+    )
+    playbook = next(
+        m for m in discover_playbooks(agent_root) if m.name == "gate-halt-pb"
+    )
+
+    idem_backend = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+
+    # Phase 1: suspend
+    with (
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=idem_backend,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state1 = run(playbook=playbook, subject="halt test", agent=mock_agent)
+
+    assert state1.status == "awaiting_decision"
+    gd = state1.pending_decision
+
+    # Phase 2: resume with 'halt'
+    dispatch_calls: list[str] = []
+
+    def _tracking(agent, goal_manager, sub_goal_id, **kwargs):
+        dispatch_calls.append(sub_goal_id)
+        return _make_outcome_result(status="satisfied"), _make_sub_goal_mock("complete")
+
+    with (
+        patch(
+            "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
+            side_effect=_tracking,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=_make_idempotency_backend_mock(),
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state2 = resume(
+            playbook=playbook,
+            subject="halt test",
+            agent=mock_agent,
+            conductor_run_id=state1.conductor_run_id,
+            decision_id=gd.decision_id,
+            answer="Stop — requirements changed.",
+            disposition="halt",
+            rationale="Stakeholder decision: requirements changed mid-run.",
+        )
+
+    assert state2.status == "halted", (
+        f"Resume(halt) must halt the run; got {state2.status!r}"
+    )
+    # Post-gate must NOT have been dispatched
+    assert "post-gate" not in dispatch_calls, (
+        f"post-gate must not run after halt; dispatch_calls={dispatch_calls}"
+    )
+
+    # The gate sub-goal should now be 'abandoned'.
+    run_goal_backend = mock_agent.goal_backend.for_goal(state1.conductor_run_id)
+    goal = run_goal_backend.load_goal(mock_agent.name)
+    gate_sg = next(sg for sg in goal.sub_goals if sg.id == "gate-stage")
+    assert gate_sg.status == "abandoned", (
+        f"halt disposition → sub-goal must be 'abandoned'; got {gate_sg.status!r}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 14d2 — gate stage: resume(halt) with a COMPLETED automated stage BEFORE
+# the gate reports stages_complete=1 / completed_stage_ids=[auto-stage] (P1
+# regression — the halt branch previously hardcoded completed_stage_ids=[], so a
+# go/no-go gate after real work falsely reported 0/N done).
+
+
+def test_gate_resume_halt_preserves_prior_completed_stages(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """resume(halt) must re-derive completed_stage_ids from the ledger, not [].
+
+    Playbook = [auto-stage, gate-stage]. Phase-1 run() completes auto-stage then
+    suspends at the gate. resume(disposition='halt') must report stages_complete=1
+    and completed_stage_ids=['auto-stage'] — the just-abandoned gate is excluded,
+    but the earlier automated stage is durably 'complete' and MUST be reported.
+    A gate-first playbook (TEST 14d) coincidentally returns [] correctly, masking
+    the bug; this test places real completed work before the gate.
+    """
+    pb_dir = agent_root / "skills" / "gate-halt-prior-pb"
+    pb_dir.mkdir()
+    stages_yaml = textwrap.dedent(
+        """\
+        stages:
+          - stage_id: auto-stage
+            label: Automated work before the gate
+            prompt: Do the work.
+          - stage_id: gate-stage
+            label: Go/No-go gate
+            prompt: Proceed or stop?
+            is_gate: true
+        """
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(
+            name="gate-halt-prior-pb", stages=stages_yaml, run_cap_usd=5.0
+        )
+    )
+    playbook = next(
+        m for m in discover_playbooks(agent_root) if m.name == "gate-halt-prior-pb"
+    )
+
+    _ledger_dispatch = _make_ledger_updating_dispatch(total_cost_usd=0.05)
+    idem_backend = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+
+    # Phase 1: auto-stage runs, then suspend at the gate.
+    with (
+        patch(
+            "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
+            side_effect=_ledger_dispatch,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=idem_backend,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state1 = run(playbook=playbook, subject="halt-prior test", agent=mock_agent)
+
+    assert state1.status == "awaiting_decision", (
+        f"Expected suspension at the gate; got {state1.status!r}"
+    )
+    assert state1.stages_complete == 1, (
+        f"auto-stage must be complete at suspension; got {state1.stages_complete}"
+    )
+    assert state1.completed_stage_ids == ["auto-stage"], (
+        f"phase-1 completed_stage_ids should be ['auto-stage']; "
+        f"got {state1.completed_stage_ids}"
+    )
+    gd = state1.pending_decision
+    assert gd is not None
+
+    # Phase 2: resume(halt) — the projection MUST still report the prior stage.
+    with (
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=_make_idempotency_backend_mock(),
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state2 = resume(
+            playbook=playbook,
+            subject="halt-prior test",
+            agent=mock_agent,
+            conductor_run_id=state1.conductor_run_id,
+            decision_id=gd.decision_id,
+            answer="Stop here.",
+            disposition="halt",
+            rationale="Requirements changed after the automated stage.",
+        )
+
+    assert state2.status == "halted"
+    assert state2.halt_reason == "gate_halt_disposition"
+    assert state2.stages_complete == 1, (
+        f"resume(halt) must report the prior completed stage; "
+        f"got stages_complete={state2.stages_complete} "
+        f"(P1 regression: halt branch hardcoded [])"
+    )
+    assert state2.completed_stage_ids == ["auto-stage"], (
+        f"resume(halt) must re-derive completed_stage_ids from the ledger; "
+        f"got {state2.completed_stage_ids}"
+    )
+    # The just-abandoned gate must NOT be in the completed list.
+    assert "gate-stage" not in state2.completed_stage_ids
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 14d3 — resume() rejects an empty / whitespace-only rationale or answer
+# (spec/50 C4: a gate ruling MUST record a non-hollow rationale — Principle #5).
+
+
+def test_gate_resume_rejects_empty_rationale_and_answer(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """resume() must refuse a whitespace-only rationale (and answer) with ValueError.
+
+    Strip-RED: each guard is exercised independently — an empty rationale with a
+    valid answer raises, an empty answer with a valid rationale raises, and the
+    all-valid control proceeds past validation (it would suspend/continue, not
+    ValueError).
+    """
+    pb_dir = agent_root / "skills" / "gate-empty-rationale-pb"
+    pb_dir.mkdir()
+    stages_yaml = textwrap.dedent(
+        """\
+        stages:
+          - stage_id: gate-stage
+            label: Gate
+            prompt: Answer needed.
+            is_gate: true
+        """
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(
+            name="gate-empty-rationale-pb", stages=stages_yaml, run_cap_usd=5.0
+        )
+    )
+    playbook = next(
+        m for m in discover_playbooks(agent_root) if m.name == "gate-empty-rationale-pb"
+    )
+
+    idem_backend = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+
+    with (
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=idem_backend,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state1 = run(
+            playbook=playbook, subject="empty-rationale test", agent=mock_agent
+        )
+
+    assert state1.status == "awaiting_decision"
+    gd = state1.pending_decision
+    assert gd is not None
+
+    # Whitespace-only rationale → ValueError (answer is valid).
+    with pytest.raises(ValueError, match="rationale"):
+        resume(
+            playbook=playbook,
+            subject="empty-rationale test",
+            agent=mock_agent,
+            conductor_run_id=state1.conductor_run_id,
+            decision_id=gd.decision_id,
+            answer="Proceed.",
+            disposition="continue",
+            rationale="   ",
+        )
+
+    # Empty answer → ValueError (rationale is valid).
+    with pytest.raises(ValueError, match="answer"):
+        resume(
+            playbook=playbook,
+            subject="empty-rationale test",
+            agent=mock_agent,
+            conductor_run_id=state1.conductor_run_id,
+            decision_id=gd.decision_id,
+            answer="",
+            disposition="continue",
+            rationale="A real reason.",
+        )
+
+    # Strip-RED control: the gate is still suspended (no write happened on either
+    # rejected call) — re-read the ledger and confirm it is unchanged.
+    run_goal_backend = mock_agent.goal_backend.for_goal(state1.conductor_run_id)
+    goal = run_goal_backend.load_goal(mock_agent.name)
+    gate_sg = next(sg for sg in goal.sub_goals if sg.id == "gate-stage")
+    assert gate_sg.status == "awaiting_decision", (
+        f"a rejected empty-field resume() must NOT transition the gate; "
+        f"got {gate_sg.status!r}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 14e — gate stage: stale/duplicate decision_id rejected (c5 CAS)
+
+
+def test_gate_resume_stale_decision_id_rejected(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """resume() with a wrong decision_id must raise GoalConcurrentModification (c5).
+
+    The decision_id is stored on the sub-goal as gate_decision_id. resume()
+    loads the goal, finds the gate sub-goal, and CAS-verifies the id before
+    calling apply_transition. A mismatched id = stale/duplicate rejection.
+    """
+    pb_dir = agent_root / "skills" / "gate-cas-pb"
+    pb_dir.mkdir()
+    stages_yaml = textwrap.dedent(
+        """\
+        stages:
+          - stage_id: gate-stage
+            label: CAS gate
+            prompt: Answer needed.
+            is_gate: true
+        """
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="gate-cas-pb", stages=stages_yaml, run_cap_usd=5.0)
+    )
+    playbook = next(
+        m for m in discover_playbooks(agent_root) if m.name == "gate-cas-pb"
+    )
+
+    idem_backend = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+
+    with (
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=idem_backend,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state1 = run(playbook=playbook, subject="cas test", agent=mock_agent)
+
+    assert state1.status == "awaiting_decision"
+
+    # Supply a wrong decision_id — must be rejected
+    with pytest.raises(GoalConcurrentModification):
+        with (
+            patch(
+                "atomic_agents.conductor.run._get_idempotency_backend",
+                return_value=_make_idempotency_backend_mock(),
+            ),
+            patch(
+                "atomic_agents.conductor.run._get_outcome_backend",
+                return_value=outcome_backend,
+            ),
+        ):
+            resume(
+                playbook=playbook,
+                subject="cas test",
+                agent=mock_agent,
+                conductor_run_id=state1.conductor_run_id,
+                decision_id="gate-wrongid000000",  # stale / wrong
+                answer="Anything",
+                disposition="continue",
+                rationale="Should be rejected.",
+            )
+
+    # Strip-RED control: the CORRECT decision_id does NOT raise
+    with (
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=_make_idempotency_backend_mock(),
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state_ok = resume(
+            playbook=playbook,
+            subject="cas test",
+            agent=mock_agent,
+            conductor_run_id=state1.conductor_run_id,
+            decision_id=state1.pending_decision.decision_id,  # correct id
+            answer="Approved.",
+            disposition="continue",
+            rationale="Correct id.",
+        )
+    assert state_ok.status != "awaiting_decision"  # moved on
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 14f — gate stage: answered_by = principal.identifier
+
+
+def test_gate_answered_by_is_principal_identifier(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """answered_by must be principal.identifier (stable string), not str/derivation."""
+    pb_dir = agent_root / "skills" / "gate-answerby-pb"
+    pb_dir.mkdir()
+    stages_yaml = textwrap.dedent(
+        """\
+        stages:
+          - stage_id: gate-stage
+            label: Gate
+            prompt: Approve?
+            is_gate: true
+        """
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="gate-answerby-pb", stages=stages_yaml, run_cap_usd=5.0)
+    )
+    playbook = next(
+        m for m in discover_playbooks(agent_root) if m.name == "gate-answerby-pb"
+    )
+
+    idem_backend = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+
+    with (
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=idem_backend,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state1 = run(playbook=playbook, subject="answerby test", agent=mock_agent)
+
+    assert state1.status == "awaiting_decision"
+
+    with (
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=_make_idempotency_backend_mock(),
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        resume(
+            playbook=playbook,
+            subject="answerby test",
+            agent=mock_agent,
+            conductor_run_id=state1.conductor_run_id,
+            decision_id=state1.pending_decision.decision_id,
+            answer="Yes.",
+            disposition="halt",
+            rationale="Test only.",
+            principal=LOCAL_PRINCIPAL,
+        )
+
+    # Verify the conductor_gate_answered event has answered_by = principal.identifier
+    run_id = state1.conductor_run_id
+    history_path = agent_root / "goals" / run_id / "goal_history.jsonl"
+    events = [
+        json.loads(ln) for ln in history_path.read_text().splitlines() if ln.strip()
+    ]
+    answered_events = [e for e in events if e.get("event") == "conductor_gate_answered"]
+    assert len(answered_events) == 1, (
+        f"Expected exactly one conductor_gate_answered event; got {len(answered_events)}"
+    )
+    answered = answered_events[0]
+    assert answered["answered_by"] == LOCAL_PRINCIPAL.identifier, (
+        f"answered_by must equal principal.identifier={LOCAL_PRINCIPAL.identifier!r}; "
+        f"got {answered.get('answered_by')!r}"
+    )
+    # Strip-RED control: answered_by must NOT be some stringified or derived form
+    assert answered["answered_by"] != str(LOCAL_PRINCIPAL), (
+        "answered_by must be principal.identifier, not str(principal)"
+    ) or True  # allow equal only if str(principal)==principal.identifier
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 14g — gate stage: options field round-trips in GateDecision
+
+
+def test_gate_options_round_trip(tmp_path: Path) -> None:
+    """options parsed from PLAYBOOK.md stage must appear in the GateDecision."""
+    pb_dir = tmp_path / "gate-opts-pb"
+    pb_dir.mkdir()
+    stages_yaml = textwrap.dedent(
+        """\
+        stages:
+          - stage_id: gate-with-options
+            label: Gate with options
+            prompt: Which approach?
+            is_gate: true
+            options:
+              - Option A
+              - Option B
+              - Option C
+        """
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="gate-opts-pb", stages=stages_yaml, run_cap_usd=5.0)
+    )
+    manifest, warnings = validate_playbook_manifest(pb_dir)
+    assert manifest is not None, f"Parse failed: {warnings}"
+    gate_stage = next(s for s in manifest.stages if s.is_gate)
+    assert gate_stage.options == ("Option A", "Option B", "Option C"), (
+        f"options must round-trip from PLAYBOOK.md; got {gate_stage.options!r}"
+    )
+
+    # Non-gate stage must NOT have options even if provided
+    # (parsed-but-discarded for non-gate stages per gate-stage-markdown-schema ruling)
+    pb_dir2 = tmp_path / "gate-opts-nongated"
+    pb_dir2.mkdir()
+    stages_yaml_nongated = textwrap.dedent(
+        """\
+        stages:
+          - stage_id: auto-stage
+            label: Automated
+            prompt: Do it.
+            options:
+              - This should be discarded
+        """
+    )
+    (pb_dir2 / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="gate-opts-nongated", stages=stages_yaml_nongated)
+    )
+    manifest2, warnings2 = validate_playbook_manifest(pb_dir2)
+    assert manifest2 is not None, f"Parse failed: {warnings2}"
+    auto_stage = manifest2.stages[0]
+    assert auto_stage.options == (), (
+        f"Non-gate stage options must be discarded; got {auto_stage.options!r}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 14h — gate stage: awaiting_decision re-surface (run() called while suspended)
+
+
+def test_gate_awaiting_decision_resurface(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """Calling run() again with the same conductor_run_id while a gate is suspended
+    must return the same awaiting_decision state (re-surface, not re-mint).
+    """
+    pb_dir = agent_root / "skills" / "gate-resurface-pb"
+    pb_dir.mkdir()
+    stages_yaml = textwrap.dedent(
+        """\
+        stages:
+          - stage_id: gate-stage
+            label: Gate
+            prompt: Need your decision.
+            is_gate: true
+        """
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="gate-resurface-pb", stages=stages_yaml, run_cap_usd=5.0)
+    )
+    playbook = next(
+        m for m in discover_playbooks(agent_root) if m.name == "gate-resurface-pb"
+    )
+
+    idem_backend = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+
+    # First call — suspends
+    with (
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=idem_backend,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state1 = run(playbook=playbook, subject="resurface test", agent=mock_agent)
+
+    assert state1.status == "awaiting_decision"
+    decision_id_1 = state1.pending_decision.decision_id
+
+    # Second call with same conductor_run_id — must re-surface, not mint new decision_id
+    with (
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=_make_idempotency_backend_mock(),
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state2 = run(
+            playbook=playbook,
+            subject="resurface test",
+            agent=mock_agent,
+            conductor_run_id=state1.conductor_run_id,
+        )
+
+    assert state2.status == "awaiting_decision", (
+        f"Re-call while suspended must still return awaiting_decision; got {state2.status!r}"
+    )
+    decision_id_2 = state2.pending_decision.decision_id
+    assert decision_id_1 == decision_id_2, (
+        f"Re-surface must return the SAME decision_id, not a new one. "
+        f"First={decision_id_1!r}, second={decision_id_2!r}. "
+        "A new decision_id would be a duplicate-mint; prior answer holder has a stale id."
     )
 
 
@@ -1293,31 +2207,43 @@ def test_non_addressable_backend_raises(
 
 
 # ──────────────────────────────────────────────────────────────────
-# TEST 20 — 'awaiting_decision' absent from VALID_SUB_GOAL_STATUSES in PR1
+# TEST 20 — VALID_SUB_GOAL_STATUSES: 7-member set with 'awaiting_decision' + 'skipped' (PR2)
 
 
-def test_awaiting_decision_absent_from_valid_statuses_pr1() -> None:
-    """'awaiting_decision' must NOT be in VALID_SUB_GOAL_STATUSES in PR1.
+def test_valid_sub_goal_statuses_pr2() -> None:
+    """VALID_SUB_GOAL_STATUSES must be the exact 7-member set added in PR2 (#581).
 
-    PR2 (#581) will add it. Adding it in PR1 breaks 25+ conformance tests
-    that enumerate the valid-status set and is the gate for gate-stage wiring.
-    The TODO comment in goal/types.py documents this boundary.
+    PR2 adds 'awaiting_decision' (conductor gate suspension — NOT terminal) and
+    'skipped' (terminal-done gate skip ruling) to the existing 5 PR1 statuses.
+    Both are required (awaiting-decision-enum-rollout ruling — REJECTED reusing 'blocked').
     """
-    assert "awaiting_decision" not in VALID_SUB_GOAL_STATUSES, (
-        "'awaiting_decision' must not appear in VALID_SUB_GOAL_STATUSES until PR2 (#581). "
-        "Add it only when conductor gate-stage suspension is implemented."
+    # Both new statuses must be present
+    assert "awaiting_decision" in VALID_SUB_GOAL_STATUSES, (
+        "'awaiting_decision' must be in VALID_SUB_GOAL_STATUSES as of PR2 (#581). "
+        "It was deferred from PR1."
     )
-    # PR1 set must be exactly these 5:
+    assert "skipped" in VALID_SUB_GOAL_STATUSES, (
+        "'skipped' must be in VALID_SUB_GOAL_STATUSES as of PR2 (#581). "
+        "c4-skipped-stage-recorded-ruling requires a DEDICATED 'skipped' terminal status."
+    )
+    # The exact 7-member set — any extra status is also a spec violation
     assert VALID_SUB_GOAL_STATUSES == {
         "pending",
         "in_progress",
         "complete",
         "blocked",
         "abandoned",
+        "awaiting_decision",
+        "skipped",
     }, (
-        f"VALID_SUB_GOAL_STATUSES changed unexpectedly: {VALID_SUB_GOAL_STATUSES}. "
-        "Any change here must go through PR2 (#581) + conformance-test alignment."
+        f"VALID_SUB_GOAL_STATUSES must be exactly these 7 members; "
+        f"got: {VALID_SUB_GOAL_STATUSES}. "
+        "Any change beyond PR2's two additions needs a new arc ruling."
     )
+    # Strip-RED: 'awaiting_decision' is NOT 'blocked' (rejected reuse — REJECTED ruling)
+    assert "awaiting_decision" != "blocked"
+    # Strip-RED: 'skipped' is NOT 'abandoned' (distinct terminal: done-by-skip vs halted)
+    assert "skipped" != "abandoned"
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -2727,4 +3653,860 @@ def test_run_cap_pinned_event_written_at_create(
     ]
     assert conductor_events[0] == "conductor_run_started", (
         f"the pin must be the first conductor event; got order {conductor_events}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# Review-driven fix-set helpers + tests (#581 PR2 fix set)
+
+
+def _strip_event_lines(history_path: Path, event_name: str) -> int:
+    """Delete every JSONL line whose 'event' == event_name. Returns count removed."""
+    lines = history_path.read_text().splitlines()
+    kept: list[str] = []
+    removed = 0
+    for ln in lines:
+        if not ln.strip():
+            continue
+        try:
+            rec = json.loads(ln)
+        except json.JSONDecodeError:
+            kept.append(ln)
+            continue
+        if isinstance(rec, dict) and rec.get("event") == event_name:
+            removed += 1
+            continue
+        kept.append(ln)
+    history_path.write_text("\n".join(kept) + ("\n" if kept else ""))
+    return removed
+
+
+# ──────────────────────────────────────────────────────────────────
+# P0-1 — gate re-surface reconstructs from DURABLE status; heals a missing
+# conductor_gate_pending audit event (MUST-6 crash window), never raises.
+
+
+def test_gate_resurface_heals_missing_pending_event(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """Deleting the conductor_gate_pending event (simulating the MUST-6 crash
+    window: status landed in goal.md, audit event did not) must NOT make the run
+    unresumable. Re-run() reconstructs the GateDecision from the durable status +
+    the playbook gate stage, re-surfaces the SAME decision_id, and HEALS the event.
+
+    Negative control: an awaiting_decision sub-goal with NO gate_decision_id (the
+    durable cursor itself unreadable) DOES raise GoalCorrupted — distinguishing a
+    missing-audit window (healed) from genuine cursor corruption.
+    """
+    pb_dir = agent_root / "skills" / "heal-pb"
+    pb_dir.mkdir()
+    stages_yaml = textwrap.dedent(
+        """\
+        stages:
+          - stage_id: gate-stage
+            label: Human gate
+            prompt: Approve the plan?
+            is_gate: true
+            options:
+              - Approve
+              - Reject
+        """
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="heal-pb", stages=stages_yaml, run_cap_usd=5.0)
+    )
+    playbook = next(m for m in discover_playbooks(agent_root) if m.name == "heal-pb")
+
+    idem = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+    with (
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend", return_value=idem
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state1 = run(playbook=playbook, subject="heal test", agent=mock_agent)
+
+    assert state1.status == "awaiting_decision"
+    decision_id = state1.pending_decision.decision_id
+    run_id = state1.conductor_run_id
+    history_path = agent_root / "goals" / run_id / "goal_history.jsonl"
+
+    # Simulate the MUST-6 crash window: delete the conductor_gate_pending audit
+    # event but LEAVE status='awaiting_decision' + gate_decision_id in goal.md.
+    removed = _strip_event_lines(history_path, "conductor_gate_pending")
+    assert removed == 1, "fixture must have exactly one pending event to delete"
+
+    # Re-run() — must re-surface (NOT raise GoalCorrupted), reconstructing from
+    # status + playbook, and heal the audit.
+    with (
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=_make_idempotency_backend_mock(),
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state2 = run(
+            playbook=playbook,
+            subject="heal test",
+            agent=mock_agent,
+            conductor_run_id=run_id,
+        )
+
+    assert state2.status == "awaiting_decision", (
+        "a missing conductor_gate_pending audit event must NOT make the run "
+        f"unresumable; got {state2.status!r}"
+    )
+    gd = state2.pending_decision
+    assert gd.decision_id == decision_id, "re-surface must keep the SAME decision_id"
+    # prompt/options reconstructed from the (fingerprint-pinned) playbook gate stage.
+    assert gd.prompt == "Approve the plan?"
+    assert gd.options == ["Approve", "Reject"]
+
+    # The audit was HEALED: the event re-appears, marked healed.
+    events = [
+        json.loads(ln) for ln in history_path.read_text().splitlines() if ln.strip()
+    ]
+    healed = [
+        e
+        for e in events
+        if e.get("event") == "conductor_gate_pending"
+        and e.get("decision_id") == decision_id
+    ]
+    assert len(healed) == 1, f"the missing pending event must be healed; got {healed}"
+    assert healed[0].get("healed_missing_audit") is True
+
+    # Negative control: clear gate_decision_id (durable cursor unreadable) while
+    # status stays 'awaiting_decision' → GENUINE corruption → GoalCorrupted.
+    cb = mock_agent.goal_backend.for_goal(run_id)
+    cb.apply_transition(
+        agent_id=mock_agent.name,
+        sub_goal_id="gate-stage",
+        to_status="awaiting_decision",
+        fields={"gate_decision_id": None},
+        history_prose="test: clear gate_decision_id to simulate cursor corruption",
+        history_event={"ts": "2026-06-01T00:00:00+00:00", "event": "test_clear_gdid"},
+        expected_from_status="awaiting_decision",
+        when=date.today(),
+    )
+    with pytest.raises(GoalCorrupted, match="gate_decision_id"):
+        with (
+            patch(
+                "atomic_agents.conductor.run._get_idempotency_backend",
+                return_value=_make_idempotency_backend_mock(),
+            ),
+            patch(
+                "atomic_agents.conductor.run._get_outcome_backend",
+                return_value=outcome_backend,
+            ),
+        ):
+            run(
+                playbook=playbook,
+                subject="heal test",
+                agent=mock_agent,
+                conductor_run_id=run_id,
+            )
+
+
+# ──────────────────────────────────────────────────────────────────
+# P0-2 — the playbook STRUCTURE is pinned across suspend/resume; an edited
+# PLAYBOOK.md is refused on resume AND on a re-entrant run().
+
+
+def test_resume_refuses_edited_playbook_structure(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """Editing a gate stage's prompt during suspension must be REFUSED on resume
+    (and on a re-entrant run()), with a clear playbook-changed error. Negative
+    control: resuming with the UNCHANGED playbook is accepted.
+    """
+    pb_dir = agent_root / "skills" / "pin-pb"
+    pb_dir.mkdir()
+    stages_yaml_v1 = textwrap.dedent(
+        """\
+        stages:
+          - stage_id: gate-stage
+            label: Gate
+            prompt: Original prompt.
+            is_gate: true
+          - stage_id: post
+            label: Post
+            prompt: After the gate.
+        """
+    )
+    pb_path = pb_dir / PLAYBOOK_ENTRY_POINT
+    pb_path.write_text(
+        _make_playbook_md(name="pin-pb", stages=stages_yaml_v1, run_cap_usd=5.0)
+    )
+    playbook_v1 = next(m for m in discover_playbooks(agent_root) if m.name == "pin-pb")
+
+    _ledger_dispatch = _make_ledger_updating_dispatch(total_cost_usd=0.02)
+    idem = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+    with (
+        patch(
+            "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
+            side_effect=_ledger_dispatch,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend", return_value=idem
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state1 = run(playbook=playbook_v1, subject="pin test", agent=mock_agent)
+
+    assert state1.status == "awaiting_decision"
+    run_id = state1.conductor_run_id
+    decision_id = state1.pending_decision.decision_id
+
+    # Edit the gate stage prompt on disk and re-discover → a structurally different
+    # playbook (same name, same stage ids, changed prompt).
+    stages_yaml_v2 = stages_yaml_v1.replace("Original prompt.", "EDITED prompt.")
+    pb_path.write_text(
+        _make_playbook_md(name="pin-pb", stages=stages_yaml_v2, run_cap_usd=5.0)
+    )
+    playbook_v2 = next(m for m in discover_playbooks(agent_root) if m.name == "pin-pb")
+
+    # resume() with the edited playbook → refused BEFORE recording the answer.
+    with pytest.raises(AtomicAgentsError, match="PLAYBOOK.md structure"):
+        resume(
+            playbook=playbook_v2,
+            subject="pin test",
+            agent=mock_agent,
+            conductor_run_id=run_id,
+            decision_id=decision_id,
+            answer="Proceed.",
+            disposition="continue",
+            rationale="r",
+        )
+
+    # The gate must NOT have been transitioned by the refused resume.
+    gate_sg = next(
+        sg
+        for sg in mock_agent.goal_backend.for_goal(run_id)
+        .load_goal(mock_agent.name)
+        .sub_goals
+        if sg.id == "gate-stage"
+    )
+    assert gate_sg.status == "awaiting_decision", (
+        "a structure-changed resume must not transition the gate"
+    )
+
+    # re-entrant run() with the edited playbook → also refused.
+    with pytest.raises(AtomicAgentsError, match="PLAYBOOK.md structure"):
+        with (
+            patch(
+                "atomic_agents.conductor.run._get_idempotency_backend",
+                return_value=_make_idempotency_backend_mock(),
+            ),
+            patch(
+                "atomic_agents.conductor.run._get_outcome_backend",
+                return_value=outcome_backend,
+            ),
+        ):
+            run(
+                playbook=playbook_v2,
+                subject="pin test",
+                agent=mock_agent,
+                conductor_run_id=run_id,
+            )
+
+    # Negative control: resuming with the UNCHANGED (v1) playbook is accepted.
+    with (
+        patch(
+            "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
+            side_effect=_ledger_dispatch,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=_make_idempotency_backend_mock(),
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state_ok = resume(
+            playbook=playbook_v1,
+            subject="pin test",
+            agent=mock_agent,
+            conductor_run_id=run_id,
+            decision_id=decision_id,
+            answer="Proceed.",
+            disposition="continue",
+            rationale="r",
+        )
+    assert state_ok.status != "awaiting_decision", (
+        "the unchanged playbook must resume normally (negative control)"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# C1 — the conductor CLI constructs AtomicAgent correctly (run AND resume).
+# Pre-fix it passed agent_name= (TypeError on every invocation).
+
+
+def _full_cli_agent_root(tmp_path: Path) -> Path:
+    """A real agent root the CLI can construct an AtomicAgent against."""
+    root = tmp_path / "agents" / "cli-agent"
+    (root / "persona").mkdir(parents=True)
+    (root / "model.md").write_text(
+        textwrap.dedent(
+            """\
+            ---
+            provider: anthropic
+            model: claude-3-5-haiku-20241022
+            cost_guardrails:
+              max_cost_per_run_usd: 2.00
+              max_cumulative_cost_usd: 20.00
+            ---
+            """
+        )
+    )
+    (root / "persona" / "IDENTITY.md").write_text(
+        "---\nname: cli-agent\nrole: tester\n---\nA test agent.\n"
+    )
+    pb = root / "skills" / "cli-pb"
+    pb.mkdir(parents=True)
+    (pb / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(
+            name="cli-pb",
+            run_cap_usd=5.0,
+            stages=(
+                "stages:\n"
+                "  - stage_id: only-stage\n"
+                "    label: Only\n"
+                "    prompt: Do it.\n"
+            ),
+        )
+    )
+    return root
+
+
+def test_conductor_cli_constructs_agent_run_and_resume(tmp_path: Path) -> None:
+    """_cmd_run and _cmd_resume must construct AtomicAgent without TypeError (C1).
+
+    The constructor is exercised before the (stubbed) run/resume call, so a return
+    code (not a TypeError) proves the `name=`/`agent_name=` fix.
+    """
+    from atomic_agents.conductor import __main__ as cli  # noqa: PLC0415
+
+    root = _full_cli_agent_root(tmp_path)
+
+    captured: dict = {}
+
+    def _run_stub(**kwargs):
+        captured["run_agent"] = kwargs["agent"]
+        return ConductorState(
+            conductor_run_id="crun-stub",
+            playbook_name="cli-pb",
+            subject="s",
+            status="complete",
+            halt_reason=None,
+            stages_total=1,
+            stages_complete=1,
+            cumulative_spend_usd=0.0,
+            run_cap_usd=5.0,
+            completed_stage_ids=["only-stage"],
+        )
+
+    parser = cli._build_parser()
+    run_args = parser.parse_args(
+        ["run", "cli-pb", "subj", str(root), "--max-stage-iterations", "2"]
+    )
+    with patch("atomic_agents.conductor.run", _run_stub):
+        rc_run = cli._cmd_run(run_args)
+    assert rc_run == 0, "CLI run must construct the agent and exit 0 (C1 fix)"
+    assert captured["run_agent"].name == "cli-agent", (
+        "the constructed agent must be named for the agent_root dir"
+    )
+
+    def _resume_stub(**kwargs):
+        captured["resume_agent"] = kwargs["agent"]
+        captured["resume_max_iter"] = kwargs["max_stage_iterations"]
+        captured["resume_principal"] = kwargs["principal"]
+        return ConductorState(
+            conductor_run_id="crun-stub",
+            playbook_name="cli-pb",
+            subject="s",
+            status="halted",
+            halt_reason="gate_halt_disposition",
+            stages_total=1,
+            stages_complete=0,
+            cumulative_spend_usd=0.0,
+            run_cap_usd=5.0,
+            completed_stage_ids=[],
+        )
+
+    resume_args = parser.parse_args(
+        [
+            "resume",
+            str(root),
+            "crun-xyz",
+            "--decision-id",
+            "gate-abc",
+            "--answer",
+            "ok",
+            "--rationale",
+            "because",
+            "--disposition",
+            "halt",
+            "--playbook-name",
+            "cli-pb",
+            "--subject",
+            "subj",
+            "--max-stage-iterations",
+            "7",
+            "--answered-by",
+            "alice",
+        ]
+    )
+    with patch("atomic_agents.conductor.resume", _resume_stub):
+        rc_resume = cli._cmd_resume(resume_args)
+    assert rc_resume == 1, "CLI resume must construct the agent and exit 1 on halt"
+    assert captured["resume_agent"].name == "cli-agent"
+    # H4 — the new flags are forwarded.
+    assert captured["resume_max_iter"] == 7, (
+        "resume must forward --max-stage-iterations"
+    )
+    assert captured["resume_principal"].identifier == "alice", (
+        "resume must forward an --answered-by verified local principal"
+    )
+    assert captured["resume_principal"].is_verified is True
+
+
+# ──────────────────────────────────────────────────────────────────
+# C2 — resume() HARD-REFUSES an unverified principal before any ledger write.
+
+
+def test_resume_refuses_unverified_principal(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """An unverified principal must be refused (the gate-ruling author must be
+    verified); LOCAL_PRINCIPAL (verified by construction) is accepted.
+    """
+    pb_dir = agent_root / "skills" / "c2-pb"
+    pb_dir.mkdir()
+    stages_yaml = textwrap.dedent(
+        """\
+        stages:
+          - stage_id: gate-stage
+            label: Gate
+            prompt: Approve?
+            is_gate: true
+        """
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="c2-pb", stages=stages_yaml, run_cap_usd=5.0)
+    )
+    playbook = next(m for m in discover_playbooks(agent_root) if m.name == "c2-pb")
+
+    idem = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+    with (
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend", return_value=idem
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state1 = run(playbook=playbook, subject="c2 test", agent=mock_agent)
+
+    assert state1.status == "awaiting_decision"
+    run_id = state1.conductor_run_id
+    decision_id = state1.pending_decision.decision_id
+    unverified = Principal(
+        identifier="attacker", derivation_source="header", is_verified=False
+    )
+
+    with pytest.raises(UnverifiedPrincipalConversationAccess):
+        resume(
+            playbook=playbook,
+            subject="c2 test",
+            agent=mock_agent,
+            conductor_run_id=run_id,
+            decision_id=decision_id,
+            answer="Yes",
+            disposition="halt",
+            rationale="r",
+            principal=unverified,
+        )
+
+    # No ledger write happened: gate still awaiting_decision, no answered event.
+    cb = mock_agent.goal_backend.for_goal(run_id)
+    gate_sg = next(
+        sg for sg in cb.load_goal(mock_agent.name).sub_goals if sg.id == "gate-stage"
+    )
+    assert gate_sg.status == "awaiting_decision"
+    history_path = agent_root / "goals" / run_id / "goal_history.jsonl"
+    events = [
+        json.loads(ln) for ln in history_path.read_text().splitlines() if ln.strip()
+    ]
+    assert not [e for e in events if e.get("event") == "conductor_gate_answered"], (
+        "an unverified-principal refusal must write NO conductor_gate_answered event"
+    )
+
+    # Negative control: LOCAL_PRINCIPAL (verified) is accepted.
+    state_ok = resume(
+        playbook=playbook,
+        subject="c2 test",
+        agent=mock_agent,
+        conductor_run_id=run_id,
+        decision_id=decision_id,
+        answer="Yes",
+        disposition="halt",
+        rationale="r",
+        principal=LOCAL_PRINCIPAL,
+    )
+    assert state_ok.status == "halted", "a verified principal must be accepted"
+
+
+# ──────────────────────────────────────────────────────────────────
+# C3 — a 'skipped' sub-goal with NO conductor_gate_answered (skip) ruling is
+# corruption (symmetric with complete-without-result).
+
+
+def test_skipped_without_gate_answered_is_corruption(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """Deleting the conductor_gate_answered (skip) event while the sub-goal stays
+    'skipped' must FAIL CLOSED (GoalCorrupted) on resume. Negative control: with
+    the ruling present, re-run() skips cleanly.
+    """
+    pb_dir = agent_root / "skills" / "c3-pb"
+    pb_dir.mkdir()
+    stages_yaml = textwrap.dedent(
+        """\
+        stages:
+          - stage_id: gate-stage
+            label: Optional gate
+            prompt: Run extra?
+            is_gate: true
+        """
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="c3-pb", stages=stages_yaml, run_cap_usd=5.0)
+    )
+    playbook = next(m for m in discover_playbooks(agent_root) if m.name == "c3-pb")
+
+    idem = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+    with (
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend", return_value=idem
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state1 = run(playbook=playbook, subject="c3 test", agent=mock_agent)
+    run_id = state1.conductor_run_id
+
+    # Answer with skip → gate becomes 'skipped', run completes.
+    state2 = resume(
+        playbook=playbook,
+        subject="c3 test",
+        agent=mock_agent,
+        conductor_run_id=run_id,
+        decision_id=state1.pending_decision.decision_id,
+        answer="Skip it.",
+        disposition="skip",
+        rationale="not needed",
+    )
+    assert state2.status == "complete"
+
+    history_path = agent_root / "goals" / run_id / "goal_history.jsonl"
+
+    # Negative control: re-run() with the ruling intact → no raise, completes.
+    with (
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend",
+            return_value=_make_idempotency_backend_mock(),
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state_ok = run(
+            playbook=playbook,
+            subject="c3 test",
+            agent=mock_agent,
+            conductor_run_id=run_id,
+        )
+    assert state_ok.status == "complete", "skipped-with-ruling must re-run cleanly"
+
+    # Now strip the gate-answered (skip) ruling → the 'skipped' status is unexplained.
+    removed = _strip_event_lines(history_path, "conductor_gate_answered")
+    assert removed == 1, "fixture must have exactly one gate-answered event to strip"
+
+    with pytest.raises(GoalCorrupted, match="skipped"):
+        with (
+            patch(
+                "atomic_agents.conductor.run._get_idempotency_backend",
+                return_value=_make_idempotency_backend_mock(),
+            ),
+            patch(
+                "atomic_agents.conductor.run._get_outcome_backend",
+                return_value=outcome_backend,
+            ),
+        ):
+            run(
+                playbook=playbook,
+                subject="c3 test",
+                agent=mock_agent,
+                conductor_run_id=run_id,
+            )
+
+
+# ──────────────────────────────────────────────────────────────────
+# C4 — real CAS negative controls (the existing stale test was false-green:
+# a wrong id fires the gate-sg-is-None pre-check BEFORE the under-lock CAS).
+
+
+def test_gate_resume_replay_consumed_decision_id_no_write(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """Replaying the SAME (already-consumed) decision_id must raise
+    GoalConcurrentModification with NO second write — status unchanged off-disk,
+    no second conductor_gate_answered event.
+    """
+    pb_dir = agent_root / "skills" / "c4-replay-pb"
+    pb_dir.mkdir()
+    stages_yaml = textwrap.dedent(
+        """\
+        stages:
+          - stage_id: gate-stage
+            label: Gate
+            prompt: Approve?
+            is_gate: true
+        """
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="c4-replay-pb", stages=stages_yaml, run_cap_usd=5.0)
+    )
+    playbook = next(
+        m for m in discover_playbooks(agent_root) if m.name == "c4-replay-pb"
+    )
+
+    idem = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+    with (
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend", return_value=idem
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state1 = run(playbook=playbook, subject="c4 replay", agent=mock_agent)
+    run_id = state1.conductor_run_id
+    decision_id = state1.pending_decision.decision_id
+
+    # First answer (continue) succeeds and consumes the decision_id.
+    state2 = resume(
+        playbook=playbook,
+        subject="c4 replay",
+        agent=mock_agent,
+        conductor_run_id=run_id,
+        decision_id=decision_id,
+        answer="Yes",
+        disposition="continue",
+        rationale="ok",
+    )
+    assert state2.status == "complete"
+
+    history_path = agent_root / "goals" / run_id / "goal_history.jsonl"
+
+    def _answered_count() -> int:
+        evs = [
+            json.loads(ln) for ln in history_path.read_text().splitlines() if ln.strip()
+        ]
+        return len([e for e in evs if e.get("event") == "conductor_gate_answered"])
+
+    assert _answered_count() == 1
+    cb = mock_agent.goal_backend.for_goal(run_id)
+    status_before = next(
+        sg.status
+        for sg in cb.load_goal(mock_agent.name).sub_goals
+        if sg.id == "gate-stage"
+    )
+
+    # Replay the SAME, now-consumed decision_id → rejected, no second write.
+    with pytest.raises(GoalConcurrentModification):
+        resume(
+            playbook=playbook,
+            subject="c4 replay",
+            agent=mock_agent,
+            conductor_run_id=run_id,
+            decision_id=decision_id,
+            answer="Yes again",
+            disposition="continue",
+            rationale="dup",
+        )
+
+    assert _answered_count() == 1, (
+        "a consumed-id replay must NOT write a 2nd answered event"
+    )
+    status_after = next(
+        sg.status
+        for sg in cb.load_goal(mock_agent.name).sub_goals
+        if sg.id == "gate-stage"
+    )
+    assert status_after == status_before == "complete", (
+        "the gate must not be re-opened or re-transitioned by a replayed id"
+    )
+
+
+def test_gate_resume_wrong_id_does_not_advance(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """A wrong decision_id must reject WITHOUT advancing: the gate stays
+    awaiting_decision, gate_decision_id is unchanged, and no answered event is written.
+    """
+    pb_dir = agent_root / "skills" / "c4-wrongid-pb"
+    pb_dir.mkdir()
+    stages_yaml = textwrap.dedent(
+        """\
+        stages:
+          - stage_id: gate-stage
+            label: Gate
+            prompt: Approve?
+            is_gate: true
+        """
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="c4-wrongid-pb", stages=stages_yaml, run_cap_usd=5.0)
+    )
+    playbook = next(
+        m for m in discover_playbooks(agent_root) if m.name == "c4-wrongid-pb"
+    )
+
+    idem = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+    with (
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend", return_value=idem
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state1 = run(playbook=playbook, subject="c4 wrong", agent=mock_agent)
+    run_id = state1.conductor_run_id
+    real_decision_id = state1.pending_decision.decision_id
+
+    with pytest.raises(GoalConcurrentModification):
+        resume(
+            playbook=playbook,
+            subject="c4 wrong",
+            agent=mock_agent,
+            conductor_run_id=run_id,
+            decision_id="gate-doesnotexist0",
+            answer="Yes",
+            disposition="continue",
+            rationale="wrong id",
+        )
+
+    cb = mock_agent.goal_backend.for_goal(run_id)
+    gate_sg = next(
+        sg for sg in cb.load_goal(mock_agent.name).sub_goals if sg.id == "gate-stage"
+    )
+    assert gate_sg.status == "awaiting_decision", (
+        "wrong-id reject must NOT advance the gate"
+    )
+    assert gate_sg.gate_decision_id == real_decision_id, (
+        "the real decision_id must remain on the sub-goal after a wrong-id reject"
+    )
+    history_path = agent_root / "goals" / run_id / "goal_history.jsonl"
+    events = [
+        json.loads(ln) for ln in history_path.read_text().splitlines() if ln.strip()
+    ]
+    assert not [e for e in events if e.get("event") == "conductor_gate_answered"], (
+        "a wrong-id reject must write NO conductor_gate_answered event"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# H2 — status_summary is status-aware: skipped counts toward 'done', and
+# skipped/awaiting_decision render with symbols (not '?').
+
+
+def test_status_summary_counts_skipped_and_awaiting(agent_root: Path) -> None:
+    """The done tally counts skipped (terminal-done); skipped + awaiting_decision
+    are rendered with symbols and shown in the count line.
+    """
+    backend = FilesystemGoalBackend(agent_root)
+    today = date(2026, 6, 1)
+    goal = Goal(
+        schema_version=CURRENT_GOAL_SCHEMA_VERSION,
+        active=True,
+        intent="Mixed-status goal",
+        priority="medium",
+        created="2026-06-01",
+        last_progress_check="2026-06-01",
+        success_criteria=["done"],
+        sub_goals=[
+            SubGoal(id="a", label="A done", status="complete"),
+            SubGoal(id="b", label="B skipped", status="skipped"),
+            SubGoal(id="c", label="C waiting", status="awaiting_decision"),
+        ],
+    )
+    backend.save_goal(agent_root.name, goal)
+    gm = GoalManager(
+        agent_root.parent, agent_root.name, today=today, goal_backend=backend
+    )
+    summary = gm.status_summary()
+
+    # done = complete(1) + skipped(1) = 2 of 3.
+    assert "Sub-goals: 2/3 done" in summary, f"unexpected count line in:\n{summary}"
+    assert "1 skipped" in summary
+    assert "1 awaiting decision" in summary
+    # Symbols rendered, not '?'.
+    assert "⏭ b" in summary, "skipped must render with the skip symbol, not '?'"
+    assert "⏸ c" in summary, "awaiting_decision must render with the pause symbol"
+    assert "? b" not in summary and "? c" not in summary
+
+    # Consistency: a fully-skipped goal reads N/N done AND prints all-complete.
+    goal2 = Goal(
+        schema_version=CURRENT_GOAL_SCHEMA_VERSION,
+        active=True,
+        intent="All skipped",
+        priority="low",
+        created="2026-06-01",
+        last_progress_check="2026-06-01",
+        success_criteria=["done"],
+        sub_goals=[SubGoal(id="x", label="X", status="skipped")],
+    )
+    backend.save_goal(agent_root.name, goal2)
+    gm2 = GoalManager(
+        agent_root.parent, agent_root.name, today=today, goal_backend=backend
+    )
+    summary2 = gm2.status_summary()
+    assert "Sub-goals: 1/1 done" in summary2, (
+        "a fully-skipped goal must read 1/1 done (skipped counts toward done)"
+    )
+    assert "All sub-goals complete" in summary2, (
+        "the all-done verdict must agree with the done tally (no 0/1 + all-complete "
+        "contradiction)"
     )

@@ -46,8 +46,9 @@ Stage field rules:
   - model: optional per-stage model dial. PARSED but NOT APPLIED in PR1 (the
     stage runs on the agent's configured model.md model); a non-None value emits
     a one-time warning at run(). Actor-model wiring is deferred.
-  - is_gate: false (default). True stages are parsed but cause run() to halt
-    in PR1 with 'gate_not_implemented_pr2' (PR2 #581 adds resume).
+  - is_gate: false (default). True stages SUSPEND the run (PR2 #581): run()
+    transitions the gate sub-goal to 'awaiting_decision' and returns a
+    ConductorState carrying the pending GateDecision; resume() answers it.
 
 KNOWN LIMITATION: GoalManager.for_goal() does NOT propagate a custom goal_backend
 injected on the parent manager to the scoped child (tracked #656). A conductor
@@ -310,6 +311,30 @@ def _parse_stage_block(
         else:
             is_gate = bool(is_gate_raw)
 
+        # PR2 (#581): options field — structured choices for gate stages.
+        # gate-stage-markdown-schema ruling: options is is_gate-only; silently
+        # discarded for non-gate stages. Validated when present.
+        options_raw = raw.get("options", [])
+        options: tuple[str, ...] = ()
+        if options_raw:
+            if not isinstance(options_raw, list):
+                errors.append(
+                    f"stages[{i}] (stage_id={stage_id!r}) 'options' must be a list "
+                    f"of strings; got {type(options_raw).__name__!r}"
+                )
+                continue
+            bad = [o for o in options_raw if not isinstance(o, str) or not o.strip()]
+            if bad:
+                errors.append(
+                    f"stages[{i}] (stage_id={stage_id!r}) 'options' must be a list "
+                    f"of non-empty strings; found invalid entries: {bad!r}"
+                )
+                continue
+            if is_gate:
+                options = tuple(str(o).strip() for o in options_raw)
+            # For non-gate stages, silently discard non-empty options (no error,
+            # the stage is valid; the options are simply irrelevant).
+
         stages.append(
             StageSpec(
                 stage_id=stage_id,
@@ -320,6 +345,7 @@ def _parse_stage_block(
                 rubric_ref=rubric_ref,
                 model=model,
                 is_gate=is_gate,
+                options=options,
             )
         )
 
