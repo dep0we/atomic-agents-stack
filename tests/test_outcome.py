@@ -625,7 +625,7 @@ def test_outcome_judge_call_respects_cost_cap(agent_vault, rubric_text):
     agent_resp = _make_agent_response()
     call_count = {"guardrail": 0, "judge": 0}
 
-    def guardrail_side_effect(critical=False):
+    def guardrail_side_effect(critical=False, **kwargs):
         call_count["guardrail"] += 1
         # First check (pre-agent): allow. Second check (pre-judge): deny.
         if call_count["guardrail"] <= 1:

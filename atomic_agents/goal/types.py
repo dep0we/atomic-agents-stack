@@ -35,6 +35,10 @@ from .._export_base import ExportableResult
 
 CURRENT_GOAL_SCHEMA_VERSION = 1
 VALID_SUB_GOAL_STATUSES = {"pending", "in_progress", "complete", "blocked", "abandoned"}
+# TODO(PR2 #581): add "awaiting_decision" to VALID_SUB_GOAL_STATUSES when implementing
+# conductor gate-stage suspension. Adding it here in PR1 would break 25+ conformance
+# tests that enumerate the valid-status set. Gate stages MUST NOT be wired until
+# this status is accepted by validate_goal() and apply_transition().
 VALID_PRIORITIES = {"high", "medium", "low"}
 VALID_AGENT_MODES = {"reactive", "goal-driven", "hybrid"}
 
@@ -145,7 +149,10 @@ class SubGoal:
     deadline: str | None = None  # YYYY-MM-DD
     blocked_by: str | None = None  # id of another sub_goal
     completed: str | None = None  # YYYY-MM-DD when status=complete
-    output: str | None = None  # path to artifact this sub_goal produced
+    output: str | None = None  # path to artifact this sub_goal produced,
+    # or an outcome_run_id pointer when the sub_goal was dispatched by the
+    # conductor (set via a status-preserving complete→complete apply_transition
+    # after dispatch_sub_goal_as_outcome() returns — spec/50 PR1).
     body: str | None = None  # optional longer description / narrative
     acceptance_criteria: list[str] = field(
         default_factory=list

@@ -113,8 +113,11 @@ def _is_valid_name(name: str) -> tuple[bool, str]:
     return True, ""
 
 
-def validate_skill_manifest(skill_dir: Path) -> tuple[SkillManifest | None, list[str]]:
-    """Parse and validate SKILL.md in ``skill_dir``.
+def validate_skill_manifest(
+    skill_dir: Path,
+    entry_point: str = SKILL_ENTRY_POINT,
+) -> tuple[SkillManifest | None, list[str]]:
+    """Parse and validate the entry-point manifest in ``skill_dir``.
 
     Returns ``(manifest, warnings)``. Manifest is ``None`` on hard error (missing
     required fields, invalid name). Warnings include soft issues (body > 500 lines,
@@ -122,12 +125,19 @@ def validate_skill_manifest(skill_dir: Path) -> tuple[SkillManifest | None, list
 
     This function is called by :func:`discover_skills` and can also be called
     directly for operator-side linting.
+
+    Args:
+        skill_dir: absolute path to the skill/playbook directory.
+        entry_point: filename of the manifest file (default: ``SKILL_ENTRY_POINT``
+            = ``'SKILL.md'``). Pass ``'PLAYBOOK.md'`` to validate a playbook
+            manifest using the same hardened loader — the ``discover_playbooks``
+            wrapper uses this parameter.
     """
     warnings: list[str] = []
-    skill_md = skill_dir / SKILL_ENTRY_POINT
+    skill_md = skill_dir / entry_point
 
     if not skill_md.is_file():
-        return None, [f"no SKILL.md in {skill_dir}"]
+        return None, [f"no {entry_point} in {skill_dir}"]
 
     try:
         parsed = _frontmatter.load(skill_md)
@@ -195,7 +205,9 @@ def validate_skill_manifest(skill_dir: Path) -> tuple[SkillManifest | None, list
     ), warnings
 
 
-def _check_deep_references(body: str, skill_name: str, skill_dir: Path, warnings: list[str]) -> None:
+def _check_deep_references(
+    body: str, skill_name: str, skill_dir: Path, warnings: list[str]
+) -> None:
     """Scan body for Markdown links/includes that reference nested paths.
 
     A reference is considered "deeply nested" if it contains a path separator
@@ -203,7 +215,7 @@ def _check_deep_references(body: str, skill_name: str, skill_dir: Path, warnings
     One level deep is fine: ``reference.md``, ``examples.md``.
     """
     # Match Markdown links: [text](path) and bare paths in code spans/text
-    link_re = re.compile(r'\[(?:[^\]]*)\]\(([^)]+)\)')
+    link_re = re.compile(r"\[(?:[^\]]*)\]\(([^)]+)\)")
     for match in link_re.finditer(body):
         ref_path = match.group(1).strip()
         # Skip URLs
@@ -224,37 +236,76 @@ def _check_deep_references(body: str, skill_name: str, skill_dir: Path, warnings
 # Discovery
 
 
-def discover_skills(agent_root: Path) -> list[SkillManifest]:
-    """Scan ``<agent_root>/skills/*/SKILL.md`` and return parsed manifests.
+def _discover_entry_dirs(skills_dir: Path, entry_point: str) -> list[Path]:
+    """Shared hardened discovery scan: subdirs of ``skills_dir`` holding ``entry_point``.
 
-    Skips directories without a SKILL.md. Logs warnings on validation issues
-    but does not raise — operators can fix gradually.
+    This is the SINGLE scan loop consumed by BOTH :func:`discover_skills`
+    (``entry_point='SKILL.md'``) and ``conductor.playbook.discover_playbooks``
+    (``entry_point='PLAYBOOK.md'``). Neither caller re-implements the iterdir
+    walk; each layers its own per-directory validation on top of this one scan
+    (the playbook-vs-skill OD4 ruling: reuse the single hardened loader, don't
+    fork a duplicate scan). Returns candidate directories in sorted order; the
+    caller validates each (containment/charset hardening lives in
+    ``validate_skill_manifest`` / ``load_skill_referenced_file``).
 
-    Returns an empty list if ``<agent_root>/skills/`` does not exist.
+    T15 trust note: this scan follows directory symlinks under ``skills_dir`` (an
+    out-of-vault symlinked skill/playbook dir IS discovered). This is the framework's
+    pre-existing operator-trust model — the agent folder is the trust boundary and
+    what the operator symlinks under it is theirs to vouch for (TENSIONS T15). Left
+    intentionally unchanged; the conductor refactor preserves it rather than altering
+    skills-wide discovery behavior.
+
+    Returns ``[]`` when ``skills_dir`` does not exist.
     """
-    skills_dir = agent_root / "skills"
     if not skills_dir.is_dir():
         return []
-
-    manifests: list[SkillManifest] = []
+    dirs: list[Path] = []
     for skill_subdir in sorted(skills_dir.iterdir()):
         if not skill_subdir.is_dir():
             continue
-        skill_md = skill_subdir / SKILL_ENTRY_POINT
-        if not skill_md.is_file():
-            _logger.debug("skills: skipping %s — no SKILL.md", skill_subdir.name)
+        if not (skill_subdir / entry_point).is_file():
+            _logger.debug("skills: skipping %s — no %s", skill_subdir.name, entry_point)
             continue
-        manifest, warnings = validate_skill_manifest(skill_subdir)
+        dirs.append(skill_subdir)
+    return dirs
+
+
+def discover_skills(agent_root: Path) -> list[SkillManifest]:
+    """Scan ``<agent_root>/skills/*/SKILL.md`` and return parsed manifests.
+
+    Skips directories without the SKILL.md file. Logs warnings on validation
+    issues but does not raise — operators can fix gradually.
+
+    Returns an empty list if ``<agent_root>/skills/`` does not exist.
+
+    The discovery scan is shared with ``conductor.playbook.discover_playbooks``
+    via :func:`_discover_entry_dirs` (the parameterized ``entry_point`` lives
+    there); ``discover_skills`` consumes that scan hardcoded to ``SKILL.md`` and
+    layers SKILL.md manifest validation on top. (The previously-exposed
+    ``entry_point`` parameter on this function was dead — no caller passed it, and
+    ``discover_playbooks`` calls ``_discover_entry_dirs`` directly — so it was
+    removed.)
+    """
+    skills_dir = agent_root / "skills"
+
+    manifests: list[SkillManifest] = []
+    for skill_subdir in _discover_entry_dirs(skills_dir, SKILL_ENTRY_POINT):
+        manifest, warnings = validate_skill_manifest(
+            skill_subdir, entry_point=SKILL_ENTRY_POINT
+        )
         for w in warnings:
             _logger.warning("skills: %s", w)
         if manifest is None:
             _logger.warning(
                 "skills: skipping %s due to validation error: %s",
-                skill_subdir.name, warnings[0] if warnings else "unknown"
+                skill_subdir.name,
+                warnings[0] if warnings else "unknown",
             )
             continue
         manifests.append(manifest)
-        _logger.debug("skills: loaded %r (%d body lines)", manifest.name, manifest.body_lines)
+        _logger.debug(
+            "skills: loaded %r (%d body lines)", manifest.name, manifest.body_lines
+        )
 
     return manifests
 
@@ -279,7 +330,9 @@ def load_skill_body(skill_manifest: SkillManifest) -> str:
         return ""
 
 
-def load_skill_referenced_file(skill_manifest: SkillManifest, relative_path: str) -> str:
+def load_skill_referenced_file(
+    skill_manifest: SkillManifest, relative_path: str
+) -> str:
     """Load a file referenced from SKILL.md (one level deep).
 
     Security guarantees:
