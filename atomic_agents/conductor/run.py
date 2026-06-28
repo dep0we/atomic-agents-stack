@@ -246,15 +246,15 @@ def run(
 
     # PR1 honesty: the per-stage `model` dial is parsed but NOT applied (no
     # actor-model override is plumbed through the coordinator/OutcomeRunner yet —
-    # only judge_model is). Warn once so an operator who set `model:` to control
+    # only judge_model is). Warn on each run()/resume() process so an operator who set `model:` to control
     # cost/quality is not silently given the default model (Principle #13).
     _model_stages = [s.stage_id for s in playbook.stages if s.model]
     if _model_stages:
         _warnings.warn(
-            "conductor: per-stage `model:` dial is PARSED but NOT APPLIED in PR1 — "
+            "conductor: per-stage `model:` dial is PARSED but NOT YET APPLIED — "
             f"stages {_model_stages} declare a model override that will be IGNORED; "
-            "the stage runs on the agent's configured model.md model. Actor-model "
-            "wiring is deferred. Remove the `model:` field or accept the default.",
+            "stages run on model.md's model. Per-stage actor-model wiring is tracked "
+            "in #668. Remove the `model:` field or accept the default.",
             stacklevel=2,
         )
 
@@ -1439,7 +1439,7 @@ def resume(
     H3 — 'skip' vs 'continue' are RUNTIME-IDENTICAL in PR2: both proceed to the
     next stage. The ONLY difference is the gate's OWN recorded audit status —
     'skipped' vs 'complete'. Neither skips a downstream guarded stage; the richer
-    "skip the guarded work" semantic is deferred to the reference playbook (#584).
+    "skip the guarded work" semantic is deferred (tracked in #671).
     The control flow is honestly the same; only the audit label differs.
 
     C2 — an unverified principal is HARD-REFUSED (UnverifiedPrincipalConversation-
@@ -1454,7 +1454,7 @@ def resume(
         conductor_run_id: the ConductorState.conductor_run_id from the suspended run.
         decision_id: GateDecision.decision_id from the pending ConductorState.
         answer: the human's free-text answer (recorded in audit; NOT threaded into
-            later stage prompts — D3=A, deferred to #584).
+            later stage prompts — D3=A, tracked in #672).
         disposition: the typed gate ruling — 'continue', 'skip', or 'halt'.
             DISTINCT typed field, NEVER magic-word-sniffed from answer string
             (gate-answer-semantics ruling).

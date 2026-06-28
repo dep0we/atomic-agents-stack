@@ -57,12 +57,12 @@ class StageSpec:
             faithful to the prompt?").
         rubric_ref: optional path to a rubric file (relative to playbook dir).
             Resolved by the loader into ``rubric``.
-        model: optional per-stage model dial. PARSED but NOT APPLIED in PR1 —
+        model: optional per-stage model dial. PARSED but NOT YET APPLIED —
             the stage always runs on the agent's configured model.md model. The
             actor-model override is not yet plumbed through the goal-outcome
             coordinator / OutcomeRunner (only judge_model is). A non-None value is
-            stored and a one-time warning is emitted at run() so the no-op is never
-            silent; wiring is deferred (tracked: per-stage actor-model override).
+            stored and a warning is emitted on each run()/resume() process so the
+            no-op is never silent; actor-model wiring is tracked in #668.
         is_gate: True when this stage requires a human decision before the run
             may continue. PR1 halts on gate stages (PR2 #581 implements resume).
     """
@@ -175,9 +175,9 @@ class GateDecision:
             field on this record — D2). NOTE: 'skip' and 'continue' are runtime-
             identical in PR2 (both proceed to the next stage); they differ only in
             the gate's recorded audit status ('skipped' vs 'complete'). Stage-level
-            skip-the-guarded-work is deferred to #584 (H3).
+            skip-the-guarded-work is deferred (tracked in #671) (H3).
         answer: the human's free-text answer. Recorded in conductor_gate_answered
-            for audit. NOT threaded into later stage prompts (D3=A, deferred #584).
+            for audit. NOT threaded into later stage prompts (D3=A, tracked in #672).
         answered_by: principal.identifier of the human who answered (the stable
             identity string, e.g. 'local' for LOCAL_PRINCIPAL). None until answered.
         answered_at: ISO-8601 timestamp when the gate was answered. None until answered.
