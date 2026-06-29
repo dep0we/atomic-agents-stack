@@ -1064,6 +1064,10 @@ def _score_agent_from_data(
 
     # ── Primary model ─────────────────────────────────────────────
     # Most common model in recent 30d primary runs; used by recommend.py (#616).
+    # NOTE: the most-recent-primary-run TIMESTAMP (for status_for_agent() STALE
+    # detection) is computed ONCE by aggregate_console() into
+    # ConsoleData.last_primary_runs — NOT duplicated here — so the home summary and
+    # the Fleet Monitor (#653) share a single source of that fact (MUST 18).
     primary_runs = [r for r in runs_30d if _is_primary_run(r)]
     if primary_runs:
         from collections import Counter

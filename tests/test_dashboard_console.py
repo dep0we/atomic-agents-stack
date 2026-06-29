@@ -22,6 +22,7 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from http.server import HTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -1633,3 +1634,346 @@ def test_is_loopback_rejects_localhost_string(tmp_path):
     assert _is_loopback("127.5.5.5") is True
     assert _is_loopback("localhost") is False
     assert _is_loopback("10.0.0.5") is False
+
+
+# ══════════════════════════════════════════════════════════════════
+# Cockpit rebuild #635 — home layout MUSTs 14, 15, 17 (endpoint), 18
+# ══════════════════════════════════════════════════════════════════
+
+
+# ── MUST 14 — Runtime-Health renders cost/quality/reliability only ──
+
+
+def test_runtime_health_excludes_governance_modelfit_workmix(tmp_path):
+    """MUST 14: the rendered Runtime-Health scorecard MUST NOT contain a governance,
+    model_fit, or work_mix row. Asserts on the produced HTML (the load-bearing
+    enforcement is render._render_health_band filtering display_order through
+    _RUNTIME_AXES), not on a constant.
+    """
+    from atomic_agents.dashboard.render import _render_health_band
+    from atomic_agents.advisor.score import compute_fleet_health
+
+    today = date(2026, 6, 28)
+    _write_log(tmp_path, "alice", today, [{"cost_usd": 0.05, "status": "ok"}])
+    fh = compute_fleet_health(tmp_path, today=today)
+    html = _render_health_band(fh)
+
+    assert "governance" not in html.lower(), (
+        "MUST 14: no governance row in Runtime-Health"
+    )
+    assert "model_fit" not in html, "MUST 14: no model_fit row in Runtime-Health"
+    assert "work_mix" not in html, "MUST 14: no work_mix row in Runtime-Health"
+    # The three real axes ARE present (positive control).
+    assert "reliability" in html and "quality" in html and "cost" in html
+
+
+def test_runtime_health_excludes_governance_strip_red(tmp_path):
+    """MUST 14 strip-RED: the _RUNTIME_AXES filter is what excludes a governance row —
+    not an incidental absence.
+
+    Setup: add a ('governance', 'owner_present', ...) candidate to the scorecard
+    display order AND inject a matching governance scorecard row. With the production
+    _RUNTIME_AXES (3 runtime axes), the row is FILTERED OUT — does not render. Then
+    strip the filter (patch _RUNTIME_AXES to also include 'governance') and re-render:
+    the SAME row now renders. The only thing that changed is the filter set, so the
+    exclusion is load-bearing on the filter, not on row-absence.
+    """
+    from atomic_agents.dashboard import render as rmod
+    from atomic_agents.dashboard.panels import _health as health_mod
+    from atomic_agents.advisor.score import compute_fleet_health
+
+    today = date(2026, 6, 28)
+    _write_log(tmp_path, "alice", today, [{"cost_usd": 0.05, "status": "ok"}])
+    fh = compute_fleet_health(tmp_path, today=today)
+
+    # Inject a governance scorecard row (metric 'owner_present') onto each agent.
+    injected = False
+    for ah in fh.agents:
+        if not ah.scorecard:
+            continue
+        ah.scorecard.append(
+            _make_scorecard_row(ah, axis="governance", metric="owner_present")
+        )
+        injected = True
+    assert injected, "precondition: an agent must have a scorecard to inject into"
+
+    # Add a governance candidate row to the display order so the metric is eligible.
+    patched_order = list(rmod._SCORECARD_DISPLAY_ORDER) + [
+        ("governance", "owner_present", "higher")
+    ]
+
+    # 1) Production filter (3 runtime axes) → governance row is FILTERED OUT.
+    with patch.object(rmod, "_SCORECARD_DISPLAY_ORDER", patched_order):
+        html_filtered = rmod._render_health_band(fh)
+    assert "owner_present" not in html_filtered, (
+        "MUST 14: with the runtime-axes filter, a governance row does NOT render"
+    )
+
+    # 2) Strip the filter (admit 'governance') → the SAME row now renders.
+    relaxed_axes = frozenset(health_mod._RUNTIME_AXES | {"governance"})
+    with (
+        patch.object(rmod, "_SCORECARD_DISPLAY_ORDER", patched_order),
+        patch.object(health_mod, "_RUNTIME_AXES", relaxed_axes),
+    ):
+        html_unfiltered = rmod._render_health_band(fh)
+    assert "owner_present" in html_unfiltered, (
+        "strip-RED: removing the runtime-axes filter renders the governance row — "
+        "so the filter is the load-bearing MUST 14 enforcement"
+    )
+
+
+def _make_scorecard_row(ah, axis: str, metric: str):
+    """Build a ScorecardRow matching the project's real type, with the given axis/metric."""
+    proto = ah.scorecard[0]
+    cls = type(proto)
+    import dataclasses
+
+    kwargs = {}
+    for f in dataclasses.fields(cls):
+        if f.name == "axis":
+            kwargs[f.name] = axis
+        elif f.name == "metric":
+            kwargs[f.name] = metric
+        elif f.name == "value":
+            kwargs[f.name] = 1.0
+        elif f.name == "score":
+            kwargs[f.name] = 50.0
+        elif f.name == "target":
+            kwargs[f.name] = 0.5
+        elif f.name == "wow":
+            kwargs[f.name] = None
+        elif f.name == "direction":
+            kwargs[f.name] = "higher"
+        else:
+            # default any other field to the prototype's value
+            kwargs[f.name] = getattr(proto, f.name)
+    return cls(**kwargs)
+
+
+# ── MUST 15 — home renders fleet-status summary, NOT the agent card grid ──
+
+
+def test_home_has_no_card_grid(tmp_path):
+    """MUST 15: the home page MUST NOT render the per-agent card grid."""
+    today = date.today()
+    _write_log(tmp_path, "alice", today, [{"cost_usd": 0.05}])
+    _write_log(tmp_path, "bob", today, [{"cost_usd": 0.06}])
+    render_all(tmp_path, today=today)
+    html = (tmp_path / "_dashboard" / "index.html").read_text()
+    assert 'class="agent-grid"' not in html, (
+        "MUST 15: home must not render the card grid"
+    )
+    assert 'class="agent-card"' not in html, "MUST 15: no per-agent cards on the home"
+
+
+def test_home_fleet_status_summary_links_monitor(tmp_path):
+    """MUST 15: the home renders the compact fleet-status summary (OK/WARN/ERROR/STALE
+    count grid) and links to the Fleet Monitor (#653)."""
+    today = date.today()
+    _write_log(tmp_path, "alice", today, [{"cost_usd": 0.05}])
+    render_all(tmp_path, today=today)
+    html = (tmp_path / "_dashboard" / "index.html").read_text()
+    # Distinctive fleet-status markup (the HTML usage class="fo-grid", NOT the bare
+    # string which also appears in the CSS, and NOT the always-present zone-label).
+    assert 'class="fo-grid"' in html, "MUST 15: fleet-status count grid must be present"
+    assert "Fleet Status" in html
+    for label in ("OK", "WARN", "ERROR", "STALE"):
+        assert f'fc-k">{label}<' in html, (
+            f"MUST 15: status count cell '{label}' must render"
+        )
+    assert "monitor.html" in html, "MUST 15: must link to the Fleet Monitor (#653)"
+
+
+def test_home_fleet_status_summary_strip_red(tmp_path):
+    """MUST 15 strip-RED: 'fo-grid' is the fleet-status panel's distinctive marker —
+    an empty-string check on the always-present zone-label would false-green. Confirm
+    'fo-grid' is genuinely produced by the panel (absent before render)."""
+    today = date.today()
+    _write_log(tmp_path, "alice", today, [{"cost_usd": 0.05}])
+    # Before render: no index.html exists at all.
+    assert not (tmp_path / "_dashboard" / "index.html").exists()
+    render_all(tmp_path, today=today)
+    html = (tmp_path / "_dashboard" / "index.html").read_text()
+    assert 'class="fo-grid"' in html
+
+
+# ── MUST 17 — engine-only sidecar: empty aggregation 422s a legit ack ──
+
+
+def test_alert_keys_aggregated_sidecar_empty_422s_ack(tmp_path):
+    """MUST 17 strip-RED (the spec §12 control): if the engine aggregation is empty
+    (no panel contributes alert_keys), the sidecar is empty and a POST of a key that
+    WAS in the pre-computed ConsoleData.rendered_alert_keys seed is rejected 422 — i.e.
+    the seed does NOT silently keep the allowlist populated. This proves the engine
+    union (not the seed) is the load-bearing source for MUST 4.
+    """
+    import atomic_agents.dashboard.panels._registry as _reg_mod
+    from atomic_agents.dashboard.render import render_console
+    from atomic_agents.dashboard.attention import aggregate_console
+    from atomic_agents.dashboard.panels._registry import PanelRegistry
+
+    today = date.today()
+    # An agent with no governance.md → aggregate_console emits a governance alert,
+    # so console_data.rendered_alert_keys (the seed) is NON-empty.
+    _write_log(tmp_path, "alice", today, [{"cost_usd": 0.05}])
+    cd = aggregate_console(tmp_path, today=today)
+    seed_keys = sorted(cd.rendered_alert_keys)
+    assert seed_keys, "precondition: the aggregation seed must contain at least one key"
+
+    # Render with an EMPTY registry so NO panel contributes alert_keys.
+    empty_reg = PanelRegistry()
+    original = _reg_mod._REGISTRY
+    _reg_mod._REGISTRY = empty_reg
+    try:
+        render_console(tmp_path, cd, today=today)
+    finally:
+        _reg_mod._REGISTRY = original
+
+    # Sidecar must be empty — the seed was NOT OR'd in.
+    sidecar = tmp_path / "_console" / "rendered_alert_keys.json"
+    assert json.loads(sidecar.read_text()) == [], (
+        "MUST 17: empty engine union → empty sidecar (no seed backfill)"
+    )
+
+    # A POST of a previously-valid (seed) key is now 422'd (closed allowlist empty).
+    srv = _make_server(tmp_path)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        status, _ = _raw_request(
+            srv, "POST", "/alerts/ack", {"alert_key": seed_keys[0]}
+        )
+        assert status == 422, (
+            f"MUST 17: with an empty engine-aggregated sidecar a legit-looking ack "
+            f"must 422 (got {status}) — proving the aggregation is load-bearing"
+        )
+    finally:
+        srv.shutdown()
+
+
+def test_alert_keys_aggregated_sidecar_loadbearing_positive(tmp_path):
+    """MUST 17 positive: with the PRODUCTION registry the attention panel contributes
+    its keys, so a real rendered alert_key acks 200 (the engine union populated the
+    allowlist)."""
+    today = date.today()
+    _write_log(tmp_path, "alice", today, [{"cost_usd": 0.05}])
+    render_all(tmp_path, today=today)
+    sidecar = tmp_path / "_console" / "rendered_alert_keys.json"
+    keys = json.loads(sidecar.read_text())
+    assert keys, "production render must populate the sidecar via the engine union"
+
+    srv = _make_server(tmp_path)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    try:
+        status, _ = _raw_request(srv, "POST", "/alerts/ack", {"alert_key": keys[0]})
+        assert status == 200, f"a real rendered key must ack 200, got {status}"
+    finally:
+        srv.shutdown()
+
+
+# ── MUST 18 — home summary status uses the canonical status_for_agent mapping ──
+
+
+def test_home_summary_status_matches_monitor_mapping(tmp_path):
+    """MUST 18: the home fleet-status counts derive from status_for_agent() — the SAME
+    canonical function the Fleet Monitor (#653) will reuse. We compute the expected
+    counts directly from status_for_agent() over the console data and assert the home
+    panel produced the same OK count cell, so home and Monitor cannot diverge.
+    """
+    from datetime import timezone as _tz
+    from atomic_agents.dashboard.attention import aggregate_console
+    from atomic_agents.dashboard.panels._fleet_status import _FleetStatusPanel
+    from atomic_agents.dashboard.panels._registry import (
+        ConsoleCapabilities,
+        PanelContext,
+    )
+    from atomic_agents.dashboard._status import status_for_agent
+    from atomic_agents.advisor.score import compute_fleet_health
+
+    today = date(2026, 6, 28)
+    now = datetime(2026, 6, 28, 12, 0, tzinfo=_tz.utc)
+    _write_log(tmp_path, "alice", today, [{"cost_usd": 0.05, "status": "ok"}])
+
+    cd = aggregate_console(tmp_path, today=today)
+    cd.fleet_health = compute_fleet_health(tmp_path, today=today)
+
+    # Reference (Monitor-side) computation using the canonical function directly.
+    ah_by_name = {ah.agent: ah for ah in cd.fleet_health.agents}
+    open_by_agent: dict[str, list] = {}
+    for item in cd.attention_queue:
+        if item.ack_snooze_status == "open":
+            open_by_agent.setdefault(item.agent, []).append(item)
+    spike_agents = {ct.agent for ct in cd.cost_trends if ct.spike_detected}
+    expected: dict[str, int] = {"OK": 0, "WARN": 0, "ERROR": 0, "STALE": 0}
+    for agent in cd.last_primary_runs:
+        st = status_for_agent(
+            agent_health=ah_by_name.get(agent),
+            attention_items=open_by_agent.get(agent, []),
+            last_primary_run_at=cd.last_primary_runs.get(agent),
+            now=now,
+            cost_spike=agent in spike_agents,
+        )
+        expected[st] += 1
+
+    # Home-side: render the fleet-status panel and read its count cells.
+    ctx = PanelContext(
+        console_data=cd,
+        capabilities=ConsoleCapabilities(),
+        today=today,
+        now=now,
+    )
+    html = _FleetStatusPanel().render(ctx).html
+
+    # The panel renders each count as <div class="fc-v fc-...">{n}</div>. Parse them.
+    import re
+
+    rendered = {}
+    for m in re.finditer(
+        r'fc-v fc-\w+">(\d+)</div>\s*<div class="fc-k">(\w+)</div>', html
+    ):
+        rendered[m.group(2)] = int(m.group(1))
+
+    assert rendered.get("OK") == expected["OK"], (
+        f"MUST 18: home OK count {rendered.get('OK')} must match the canonical "
+        f"status_for_agent() count {expected['OK']}"
+    )
+    # Total agents accounted for identically on both sides.
+    assert sum(rendered.values()) == sum(expected.values()) == len(cd.last_primary_runs)
+
+
+def test_home_summary_status_strip_red(tmp_path):
+    """MUST 18 strip-RED: a STALE agent (no primary run) is counted STALE, not OK —
+    confirming the home reads the real status, not a hardcoded all-OK."""
+    from datetime import timezone as _tz
+    from atomic_agents.dashboard.attention import aggregate_console
+    from atomic_agents.dashboard.panels._fleet_status import _FleetStatusPanel
+    from atomic_agents.dashboard.panels._registry import (
+        ConsoleCapabilities,
+        PanelContext,
+    )
+
+    today = date(2026, 6, 28)
+    # 'now' far in the future so the run is well past the 24h staleness window.
+    now = datetime(2026, 8, 1, 12, 0, tzinfo=_tz.utc)
+    _write_log(tmp_path, "alice", today, [{"cost_usd": 0.05, "status": "ok"}])
+    cd = aggregate_console(tmp_path, today=today)
+
+    ctx = PanelContext(
+        console_data=cd,
+        capabilities=ConsoleCapabilities(),
+        today=today,
+        now=now,
+    )
+    html = _FleetStatusPanel().render(ctx).html
+    import re
+
+    rendered = {}
+    for m in re.finditer(
+        r'fc-v fc-\w+">(\d+)</div>\s*<div class="fc-k">(\w+)</div>', html
+    ):
+        rendered[m.group(2)] = int(m.group(1))
+    assert rendered.get("STALE", 0) >= 1, (
+        "an agent with a long-past run must count STALE"
+    )
+    assert rendered.get("OK", 0) == 0, "the stale agent must NOT be counted OK"

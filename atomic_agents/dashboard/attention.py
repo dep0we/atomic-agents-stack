@@ -129,6 +129,11 @@ class CostTrendPoint:
     baseline_avg_daily: (
         float | None
     )  # prior 30-day baseline, None if insufficient history
+    # ISO-day + USD pairs for the last 30 calendar days (sparse — missing days omitted).
+    # Sorted ascending by ISO day string. Source: daily_30d dict in aggregate_console.
+    # Empty list is the absent sentinel (no data or first-run). Used by sparklines.
+    # The 7d slice is daily_series[-7:] (applied at render time, not aggregation time).
+    daily_series: list[tuple[str, float]] = field(default_factory=list)
 
 
 @dataclass
@@ -148,7 +153,15 @@ class ConsoleData:
     cost_trends: list[CostTrendPoint]
     quality_signals: list[QualitySignal]
     reliability_metrics: list[ReliabilityMetrics]
-    rendered_alert_keys: frozenset[str]  # all keys rendered this cycle
+    # Alert keys from the attention-queue aggregation. Historically this fed the
+    # sidecar directly; under panelization (spec/52 §16.3 MUST 17) it is NO LONGER
+    # the sidecar source. The sidecar (for MUST 4 validation) is the ENGINE-union of
+    # every PanelResult.alert_keys — the attention-queue PANEL recomputes its keys
+    # from the same queue and contributes them to that union, so this field is now an
+    # informational byproduct of aggregation, not the authoritative allowlist. It is
+    # intentionally NOT OR'd into the sidecar (doing so would defeat MUST 17's
+    # strip-RED — see render_console()).
+    rendered_alert_keys: frozenset[str]
     agent_count: int
     degraded: bool  # True if any backend read degraded
     # Fleet Health Score (spec/53 PR2) — None until compute_fleet_health() runs.
@@ -161,6 +174,12 @@ class ConsoleData:
     # The template renders a recommendations panel when this is not None; absent = no
     # panel (fail-soft, spec/54 §11 — ConsoleData + render integration).
     recommendations: list | None = None  # list[Recommendation] | None (avoid circular)
+    # Per-agent most-recent primary-run timestamp (agent_id -> datetime | None).
+    # Populated by aggregate_console() from the already-loaded runs_30d.
+    # The fleet-status panel reads this for status_for_agent() (MUST 13 — no render-time
+    # backend I/O from panels). Default empty dict is backward-compatible with all
+    # existing construction sites.
+    last_primary_runs: dict[str, datetime | None] = field(default_factory=dict)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -637,6 +656,7 @@ def aggregate_console(
     all_alerts: list[AlertItem] = list(gov_alerts)
     cost_trends: list[CostTrendPoint] = []
     reliability_metrics: list[ReliabilityMetrics] = []
+    last_primary_runs: dict[str, datetime | None] = {}
 
     quality_by_agent = {s.agent: s for s in (quality_signals or [])}
 
@@ -670,6 +690,14 @@ def aggregate_console(
         reliability_metrics.append(metrics)
         all_alerts.extend(_reliability_alerts(agent, metrics, alert_state))
 
+        # Last primary run timestamp — for status_for_agent() STALE detection.
+        # Computed from the already-loaded runs_30d so panels need not re-read disk
+        # (spec/52 §17.1 MUST 13 + MUST 18). None = no primary runs in window.
+        last_primary_runs[agent] = max(
+            (r.ts for r in runs_30d if _is_primary_run(r)),
+            default=None,
+        )
+
         # Cost trend
         total_30d = sum(r.cost_usd for r in runs_30d)
         daily_30d: dict[str, float] = {}
@@ -701,6 +729,10 @@ def aggregate_console(
                 baseline_avg_daily=round(baseline_avg, 4)
                 if baseline_avg is not None
                 else None,
+                # Populate daily_series from the daily_30d dict (ISO-day → USD, sparse,
+                # ascending). The 7d sparkline slices daily_series[-7:] at render time.
+                # Option B ruling: missing days omitted (sparse), 30d window.
+                daily_series=sorted(daily_30d.items()),
             )
         )
 
@@ -732,4 +764,5 @@ def aggregate_console(
         rendered_alert_keys=rendered_keys,
         agent_count=len(agent_names),
         degraded=degraded,
+        last_primary_runs=last_primary_runs,
     )

@@ -137,7 +137,10 @@ def render_all(
         console_data = aggregate_console(
             agents_root, today=today, quality_signals=quality_signals
         )
-        console_path = render_console(agents_root, console_data)
+        # Thread `today` through so the health-band scoring, recommendation
+        # windows, and status_for_agent() STALE checks use the SAME pinned date
+        # as the cost/reliability aggregation — no #623-class midnight divergence.
+        console_path = render_console(agents_root, console_data, today=today)
         written["console"] = str(console_path)
 
     return written
@@ -172,39 +175,49 @@ def render_global(agents_root: Path, summary: GlobalSummary) -> Path:
     return out_path
 
 
-def render_console(agents_root: Path, console_data) -> Path:
+def render_console(agents_root: Path, console_data, today: date | None = None) -> Path:
     """Render <agents_root>/_dashboard/index.html (the Fleet Console home).
 
     This is the new landing page (spec/52 PR1). Writes the rendered alert_keys
     sidecar at _console/rendered_alert_keys.json for POST /alerts/ack validation.
     Returns the written path.
 
-    spec/53 PR2: compute_fleet_health() is called here (NOT inside
-    _render_console_template) so the template stays a pure HTML formatter.
-    If the advisor fails for any reason, console_data.fleet_health stays None
-    and the header band is absent — the PR1 axis panels render normally.
+    spec/53 PR2: compute_fleet_health() is called here (NOT inside panels)
+    so panels receive pre-computed data via PanelContext (MUST 13 — no
+    render-time backend I/O from panels).
+
+    spec/52 §16 (Cockpit PR-A): the layout engine composes registered panels by
+    slot+order; the sidecar is written from the engine-aggregated alert_keys union
+    ONLY (MUST 17) — NOT from the pre-computed ConsoleData.rendered_alert_keys
+    field. The attention-queue panel contributes the keys for every queue item it
+    renders; if that panel raises, its keys legitimately drop from the allowlist
+    (those items are not on the page, so they cannot be acked) — that is the
+    intended MUST 11 fail-soft, not a reason to fall back to the seed.
     """
+    from datetime import datetime, timezone
+
     from .._io import atomic_write
 
     out_dir = agents_root / "_dashboard"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    has_goals = any(
-        (agents_root / agent / "goal.md").exists()
-        for agent in discover_agents(agents_root)
-    )
+    # ── Single reference date/time pinned once ──────────────────────────────
+    # Both advisor calls and PanelContext use the SAME today/now values so
+    # health-band scoring, recommendation windows, and status_for_agent()
+    # STALE checks are coherent — no midnight-boundary races (#623-class).
+    advisor_today = today or date.today()
+    now = datetime.now(tz=timezone.utc)
 
-    # Single reference date threaded into BOTH advisor calls below so the health
-    # band (compute_fleet_health) and the recommendation windows + point-impact
-    # counterfactual (recommend_fleet) score against the SAME today — the
-    # same-today coherence recommend_fleet documents as a MUST, held by
-    # construction here rather than by two independent date.today() reads
-    # happening to land on the same calendar day (a #623-class boundary).
-    advisor_today = date.today()
+    # ── has_goals (single discover_agents pass) ────────────────────────────
+    # has_goals (for the nav bar + the only capability a panel gates on today)
+    # is computed here in a single pass over the agent list (MUST 13 — all loader
+    # I/O before the engine loop).
+    agent_list = list(discover_agents(agents_root))
+    has_goals = any((agents_root / a / "goal.md").exists() for a in agent_list)
 
-    # ── spec/53 PR2: Fleet Health Score ──────────────────────────────
-    # Compute fleet health score before rendering. Fail-soft: the PR1 console
-    # renders fully even when the advisor is unavailable.
+    # ── spec/53 PR2: Fleet Health Score ──────────────────────────────────
+    # Compute fleet health score BEFORE building PanelContext so panels receive
+    # the computed FleetHealth via ctx.console_data.fleet_health (MUST 13).
     if console_data.fleet_health is None:
         try:
             from ..advisor.score import compute_fleet_health
@@ -219,17 +232,13 @@ def render_console(agents_root: Path, console_data) -> Path:
             )
             console_data.fleet_health = None
 
-    # ── spec/54 PR3: Recommendations ─────────────────────────────────
-    # Compute recommendations. Fail-soft: absent = no recommendations panel.
+    # ── spec/54 PR3: Recommendations ─────────────────────────────────────
+    # Compute recommendations BEFORE PanelContext so the recommendations panel
+    # reads from ctx.console_data (MUST 13 — no render-time I/O from panels).
     if console_data.recommendations is None:
         try:
             from ..advisor.recommend import recommend_fleet
 
-            # Reuse the fleet_health just computed for the band so the loader does
-            # not re-run the fleet-wide scoring pass a second time (Principle #6).
-            # advisor_today is threaded into both calls so the pre-computed
-            # fleet_health and the recommendation windows share the same reference
-            # date by construction; pass None through if scoring failed above.
             console_data.recommendations = recommend_fleet(
                 agents_root, today=advisor_today, fleet_health=console_data.fleet_health
             )
@@ -240,15 +249,36 @@ def render_console(agents_root: Path, console_data) -> Path:
             )
             console_data.recommendations = None
 
-    html_content = _render_console_template(console_data, has_goals=has_goals)
+    # ── Build PanelContext (all I/O complete by here) ─────────────────────
+    # Importing the panels package also triggers panel registration as an import
+    # side effect (spec/52 §16.5) before _render_console_template composes them.
+    from .panels import ConsoleCapabilities, PanelContext
+
+    capabilities = ConsoleCapabilities(
+        has_goals=has_goals,
+    )
+    ctx = PanelContext(
+        console_data=console_data,
+        capabilities=capabilities,
+        today=advisor_today,
+        now=now,
+    )
+
+    # ── Compose layout via panel registry (MUST 10, MUST 11, MUST 17) ────
+    html_content = _render_console_template(console_data, has_goals=has_goals, ctx=ctx)
     out_path = out_dir / _CONSOLE_HOME
     atomic_write(out_path, html_content)
 
-    # Persist rendered alert_keys for closed-allowlist validation in POST handlers.
-    # Written atomically after a successful render so the sidecar is absent only
-    # before the first render (not after a failed one). POST /alerts/ack reads this
-    # file; if absent it returns 503 (spec/52 MUST 4 closed-allowlist).
-    _write_rendered_alert_keys(agents_root, console_data.rendered_alert_keys)
+    # MUST 17: write the sidecar from the engine-aggregated alert_keys union ONLY.
+    # _render_console_template() stashes the union on console_data._engine_alert_keys
+    # (the layout engine has no agents_root, so the write happens here). The fallback
+    # is an EMPTY frozenset, never console_data.rendered_alert_keys — if the engine
+    # produced no keys (e.g. the attention panel raised), the allowlist is empty by
+    # construction, which is the correct MUST 11 fail-soft (an item not on the page
+    # cannot be acked). Falling back to the pre-computed seed would make the engine
+    # aggregation non-load-bearing and defeat MUST 17's strip-RED.
+    engine_keys = getattr(console_data, "_engine_alert_keys", frozenset())
+    _write_rendered_alert_keys(agents_root, engine_keys)
 
     return out_path
 
@@ -964,20 +994,10 @@ _CONSOLE_CSS_EXTRA = """
 .axis-warn { color: var(--warn); }
 .axis-muted { color: var(--muted); }
 
-/* Agent card grid */
-.agent-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
-.agent-card {
-  background: var(--card); border: 1px solid var(--border);
-  border-radius: 8px; padding: 16px; font-size: 13px;
-}
-.agent-card a { color: var(--accent); text-decoration: none; font-weight: 500; }
-.agent-card a:hover { text-decoration: underline; }
-.agent-card .meta { color: var(--muted); font-size: 12px; margin-top: 6px; }
-.agent-card .alerts-badge {
-  display: inline-block; background: var(--error); color: #fff;
-  border-radius: 10px; padding: 1px 7px; font-size: 10px;
-  font-weight: 700; margin-left: 6px;
-}
+/* NOTE: the per-agent card-grid CSS (.agent-grid / .agent-card / .alerts-badge)
+   was REMOVED here as part of MUST 15 (D10 roster relocation) + the D4 CSS
+   consolidation — the home no longer renders that grid. Those rules move to the
+   Fleet Monitor (#653) when its page ships; keeping them here would be dead CSS. */
 .snooze-modal {
   display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6);
   align-items: center; justify-content: center; z-index: 100;
@@ -1062,6 +1082,128 @@ _CONSOLE_CSS_EXTRA = """
 .rec-delta-points { background: #e8f0fe; color: #1967d2; }
 """
 
+# B6 Cockpit CSS — D4 rule: B6 zone/KPI styles go ONLY here, never in the shared CSS block.
+# Scoped to .cockpit-* and .zone-label.cockpit-zone-label so all other tabs are unaffected.
+_COCKPIT_CSS = """
+/* ── B6 Cockpit zone dividers ─────────────────────────────────────── */
+.cockpit-zone-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+  padding: 20px 0 6px;
+  margin: 0 0 12px;
+}
+
+/* ── KPI hero tile strip ──────────────────────────────────────────── */
+.cockpit-kpis {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+.cockpit-kpi {
+  flex: 1 1 140px;
+  min-width: 120px;
+  max-width: 200px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px 12px;
+}
+.cockpit-kpi .k {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 4px;
+}
+.cockpit-kpi .v {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--text);
+  line-height: 1.1;
+}
+.cockpit-kpi .sub2 {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 4px;
+}
+/* Inline 7-day cost sparkline inside the 7-day-spend KPI tile. */
+.cockpit-kpi .kpi-spark {
+  display: block;
+  margin: 6px 0 2px;
+  opacity: 0.85;
+}
+.cockpit-kpi.kpi-alert { border-color: var(--warn); }
+.cockpit-kpi.kpi-save { border-color: var(--good); }
+.cockpit-kpi.kpi-health-green { border-color: var(--good); }
+.cockpit-kpi.kpi-health-amber { border-color: var(--warn); }
+.cockpit-kpi.kpi-health-red { border-color: var(--error); }
+
+/* ── Fleet Overview count grid (explore zone) ────────────────────── */
+.fo-grid {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.fo-cell {
+  text-align: center;
+  min-width: 60px;
+}
+.fc-v {
+  font-size: 28px;
+  font-weight: 700;
+  line-height: 1;
+}
+.fc-k {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-top: 4px;
+}
+.fc-spike { color: var(--error); }
+.fc-warn  { color: var(--warn); }
+.fc-ok    { color: var(--good); }
+.fc-muted { color: var(--muted); }
+
+/* ── B6 typography helpers (matches variant-B6-zones.html) ────────── */
+/* .mono: tabular monospace for KPI numerals + timestamps. The cockpit KPI tiles
+   render every value as <div class="v mono">; without this rule the digits fall
+   back to the proportional body font (design-gate fidelity). */
+.mono {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+}
+/* .foot-note: the Fleet-Status → Monitor link footnote (explore zone). */
+.foot-note {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 14px;
+}
+
+/* ── Display-only "apply →" affordance (ACT zone) ────────────────────
+   A static, non-interactive CTA on savings / priority-action rows. It does NOT
+   POST or wire to any write endpoint — the management/write layer ships later.
+   Matches the mockup's apply-cta (title="Management action — coming with the
+   write layer"). Cursor stays default so it does not read as clickable. */
+.apply-cta {
+  display: inline-block;
+  margin-left: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 8px;
+  cursor: default;
+  white-space: nowrap;
+}
+"""
+
 
 def _severity_class(severity: str) -> str:
     return {
@@ -1080,6 +1222,23 @@ def _queue_status_html(status: str) -> str:
         "known": "status-known",
     }.get(status, "status-known")
     return f'<span class="{cls}">{html.escape(status)}</span>'
+
+
+# Candidate (axis, metric, default_direction) rows for the Runtime-Health scorecard,
+# in display order: reliability, then quality, then cost. This list is FILTERED through
+# panels._health._RUNTIME_AXES in _render_health_band before any row is emitted, so a
+# row whose axis is not a runtime axis (governance / model_fit / work_mix) never renders
+# (MUST 14). Module-level so the MUST 14 strip-RED conformance test can patch it.
+_SCORECARD_DISPLAY_ORDER = [
+    ("reliability", "error_rate", "lower"),
+    ("reliability", "blocked_rate", "lower"),
+    ("reliability", "skipped_rate", "lower"),
+    ("quality", "pass_rate", "higher"),
+    ("quality", "hard_fail_rate", "lower"),
+    ("cost", "cheaper_model_share", "higher"),
+    ("cost", "tokens_per_output", "lower"),
+    ("cost", "spend_vs_trend", "lower"),
+]
 
 
 def _render_health_band(fleet_health) -> str:
@@ -1250,16 +1409,17 @@ def _render_health_band(fleet_health) -> str:
     # overridden metric. Honoring a targets.md direction override in the WoW color
     # (threading MetricTarget.direction through ScorecardRow into the render) is
     # deferred to the recommendations PR (#616); PR2 colors WoW on defaults only.
-    display_order = [
-        ("reliability", "error_rate", "lower"),
-        ("reliability", "blocked_rate", "lower"),
-        ("reliability", "skipped_rate", "lower"),
-        ("quality", "pass_rate", "higher"),
-        ("quality", "hard_fail_rate", "lower"),
-        ("cost", "cheaper_model_share", "higher"),
-        ("cost", "tokens_per_output", "lower"),
-        ("cost", "spend_vs_trend", "lower"),
-    ]
+    # MUST 14 (Runtime-Health framing): the Runtime-Health scorecard renders ONLY
+    # the three real equal-weight axes (cost/quality/reliability). The candidate row
+    # order lives in the module-level _SCORECARD_DISPLAY_ORDER; it is filtered HERE
+    # through _RUNTIME_AXES (the panel-owned set) before any row is emitted. This is
+    # the load-bearing enforcement: adding a ("governance", ...) row to the candidate
+    # list changes nothing in the output unless "governance" is ALSO added to
+    # _RUNTIME_AXES. (Conformance: test_runtime_health_excludes_governance_strip_red
+    # patches _RUNTIME_AXES to include governance and proves the row then renders.)
+    from .panels._health import _RUNTIME_AXES
+
+    display_order = [row for row in _SCORECARD_DISPLAY_ORDER if row[0] in _RUNTIME_AXES]
     for axis_name, metric_name, direction in display_order:
         vals = metric_values.get(metric_name, [])
         scores = metric_scores.get(metric_name, [])
@@ -1390,11 +1550,23 @@ def _render_recommendations(recommendations) -> str:
             )
         delta_html = "".join(delta_parts)
 
+        # Display-only "apply →" affordance (ACT zone, B6 mockup). Static span — no
+        # POST, no write wiring; the management/write layer ships later. Rendered on
+        # savings_cost rows (the actionable model-right-size recs) per the mockup's
+        # priority-action list.
+        apply_cta = (
+            '<span class="apply-cta" title="Management action — coming with the write layer">'
+            "apply &rarr;</span>"
+            if kind == "savings_cost"
+            else ""
+        )
+
         rows_html += (
             f'<div class="rec-row">'
             f'<div class="rec-header">'
             f"{pill_html}"
             f'<span class="rec-agent">{agent_safe}</span>'
+            f"{apply_cta}"
             f"</div>"
             f"{model_str}"
             f'<div class="rec-rationale">{rationale_safe}</div>'
@@ -1405,12 +1577,31 @@ def _render_recommendations(recommendations) -> str:
     return f'<h2>Recommendations</h2><div class="rec-panel">{rows_html}</div>'
 
 
-def _render_console_template(console_data, has_goals: bool = True) -> str:
-    """Fleet Console home page HTML — the new index.html landing page (spec/52 PR1)."""
+def _render_console_template(console_data, has_goals: bool = True, ctx=None) -> str:
+    """Fleet Console home page HTML — B6 cockpit layout (spec/52 §16, Cockpit PR-A).
+
+    Composes the page via the registry's layout engine (registry.compose()), which
+    iterates registered panels by slot (STATUS, ACT, EXPLORE) with per-panel fail-soft
+    (MUST 11) and unions every PanelResult.alert_keys (MUST 17). The engine union is the
+    SOLE source of the sidecar keys — this function stashes it on
+    console_data._engine_alert_keys for render_console() to write; it does NOT seed it
+    from console_data.rendered_alert_keys.
+
+    MUST 10: no surface hard-codes a panel inline outside the registry. The only
+    non-panel content here is page chrome (header, nav, zone-label dividers, footer,
+    snooze modal, JS) — chrome is emitted HERE, keyed on slot, so a panel fail-soft
+    degrades only the panel's content, never the zone divider (MUST 11 spirit).
+    MUST 15: the agent-grid is NOT rendered on the home page (moved to Fleet Monitor #653).
+    """
     from datetime import datetime, timezone
+
+    # Import the panels package to ensure all panels are registered (spec/52 §16.5).
+    # This is idempotent — Python's module cache prevents double-registration.
+    from .panels import get_registry
 
     _nav = _nav_bar("console", has_goals=has_goals)
     now_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    fleet_size = console_data.agent_count
 
     _degraded_banner = (
         '<div class="degraded-banner">'
@@ -1421,201 +1612,38 @@ def _render_console_template(console_data, has_goals: bool = True) -> str:
         else ""
     )
 
-    # ── Attention Queue ─────────────────────────────────────────────
-    queue = console_data.attention_queue
-    # Show only open + recurring items at the top; acked/snoozed shown muted
-    active_items = [a for a in queue if a.ack_snooze_status == "open"]
-    known_items = [a for a in queue if a.ack_snooze_status in ("acked", "snoozed")]
+    # ── Build PanelContext if not supplied (supports direct test calls) ───────
+    if ctx is None:
+        from datetime import date as _date
 
-    if not queue:
-        queue_html = (
-            '<div class="queue-empty">'
-            "✓ All agents healthy — no items need attention."
-            "</div>"
-        )
-    else:
-        rows = []
-        for item in active_items + known_items:
-            muted_style = (
-                ' style="opacity: 0.5;"' if item.ack_snooze_status != "open" else ""
-            )
-            sev_cls = _severity_class(item.severity)
-            agent_safe = html.escape(item.agent)
-            reason_safe = html.escape(item.reason)
-            next_step_safe = html.escape(item.next_step)
-            owner_safe = html.escape(item.owner or "—")
-            key_safe = html.escape(item.alert_key)
-            ack_label = "Acked" if item.ack_snooze_status == "acked" else "Ack"
-            ack_btn_cls = (
-                "alert-btn acked" if item.ack_snooze_status == "acked" else "alert-btn"
-            )
-            rows.append(
-                f'<div class="alert-row"{muted_style}>'
-                f'<div class="{sev_cls}">{html.escape(item.severity.upper())}'
-                f"<br>{_queue_status_html(item.status)}</div>"
-                f"<div><strong>{agent_safe}</strong>"
-                f'<div class="muted">{reason_safe}</div>'
-                f'<div class="muted" style="margin-top:4px;font-size:11px;">'
-                f"Next: {next_step_safe}</div></div>"
-                f"<div>{owner_safe}</div>"
-                f'<div class="muted">{html.escape(item.alert_class)}'
-                f"/{html.escape(item.alert_subclass)}</div>"
-                f'<div class="alert-actions">'
-                f'<button class="{ack_btn_cls}" onclick="ackAlert(\'{key_safe}\')">{ack_label}</button>'
-                f'<button class="alert-btn" onclick="openSnooze(\'{key_safe}\')">Snooze</button>'
-                f"</div>"
-                f"</div>"
-            )
-        queue_html = (
-            '<div class="attention-queue">'
-            '<div class="alert-header">'
-            "<div>Severity</div><div>Agent / Reason</div>"
-            "<div>Owner</div><div>Class</div><div>Actions</div>"
-            "</div>" + "".join(rows) + "</div>"
+        from .panels import ConsoleCapabilities, PanelContext
+
+        _now = datetime.now(tz=timezone.utc)
+        ctx = PanelContext(
+            console_data=console_data,
+            capabilities=ConsoleCapabilities(has_goals=has_goals),
+            today=_date.today(),
+            now=_now,
         )
 
-    # ── Three-axis trend panels ─────────────────────────────────────
-    # Cost trend
-    if console_data.cost_trends:
-        cost_rows = []
-        for ct in console_data.cost_trends[:8]:
-            spike_html = (
-                ' <span class="axis-spike">▲spike</span>' if ct.spike_detected else ""
-            )
-            agent_safe = html.escape(ct.agent)
-            cost_rows.append(
-                f'<div class="axis-row">'
-                f"<div>{agent_safe}</div>"
-                f'<div class="axis-val">${ct.total_usd_30d:.3f}/30d{spike_html}</div>'
-                f"</div>"
-            )
-        cost_panel = (
-            '<div class="axis-panel">'
-            '<div class="axis-title">Cost · 30-day total</div>'
-            + "".join(cost_rows)
-            + "</div>"
-        )
-    else:
-        cost_panel = (
-            '<div class="axis-panel">'
-            '<div class="axis-title">Cost · 30-day total</div>'
-            '<p class="empty-note">No cost data.</p>'
-            "</div>"
-        )
+    # ── Layout engine — compose registered panels by slot (MUST 10) ──────────
+    # registry.compose() is the SINGLE engine entry point; it owns the
+    # is_available gate (MUST 12), per-panel render fail-soft (MUST 11), and the
+    # alert-key union (MUST 17). Conformance tests call the same method, so the
+    # behaviors are exercised by production code, not re-implemented in tests.
+    registry = get_registry()
+    slot_html, engine_keys = registry.compose(ctx)
 
-    # Quality trend
-    if console_data.quality_signals:
-        qual_rows = []
-        for qs in sorted(
-            console_data.quality_signals,
-            key=lambda q: q.latest_score or 0,
-        )[:8]:
-            if qs.latest_score is None:
-                score_html = '<span class="axis-muted">no evals</span>'
-            else:
-                delta_str = ""
-                if qs.delta_30d is not None:
-                    sign = "+" if qs.delta_30d >= 0 else ""
-                    delta_cls = "axis-ok" if qs.delta_30d >= 0 else "axis-spike"
-                    delta_str = (
-                        f' <span class="{delta_cls}">{sign}{qs.delta_30d:.2f}</span>'
-                    )
-                score_html = (
-                    f'<span class="axis-val">{qs.latest_score:.2f}{delta_str}</span>'
-                )
-            qual_rows.append(
-                f'<div class="axis-row">'
-                f"<div>{html.escape(qs.agent)}</div>"
-                f"<div>{score_html}</div>"
-                f"</div>"
-            )
-        quality_panel = (
-            '<div class="axis-panel">'
-            '<div class="axis-title">Quality · eval score (30d delta)</div>'
-            + "".join(qual_rows)
-            + "</div>"
-        )
-    else:
-        quality_panel = (
-            '<div class="axis-panel">'
-            '<div class="axis-title">Quality · eval score (30d delta)</div>'
-            '<p class="empty-note">No eval data yet.</p>'
-            "</div>"
-        )
+    # ── MUST 17: stash the engine-aggregated union for render_console() ───────
+    # engine_keys is the SOLE source for the sidecar — render_console() writes it
+    # (the layout engine has no agents_root). We do NOT OR in
+    # console_data.rendered_alert_keys: the attention panel already contributes the
+    # keys for every queue item it renders, so the union is complete by
+    # construction. Seeding from the pre-computed field would make this aggregation
+    # non-load-bearing and defeat MUST 17's strip-RED.
+    console_data._engine_alert_keys = engine_keys  # type: ignore[attr-defined]
 
-    # Reliability trend
-    if console_data.reliability_metrics:
-        rel_rows = []
-        for rm in sorted(
-            console_data.reliability_metrics,
-            key=lambda r: -r.error_rate,
-        )[:8]:
-            if rm.total_runs == 0:
-                val_html = '<span class="axis-muted">no runs</span>'
-            else:
-                err_pct = int(rm.error_rate * 100)
-                blk_pct = int(rm.blocked_rate * 100)
-                err_cls = "axis-spike" if rm.error_rate >= 0.2 else "axis-ok"
-                val_html = (
-                    f'<span class="axis-val">'
-                    f'<span class="{err_cls}">{err_pct}% err</span>'
-                    f" · {blk_pct}% blk"
-                    f"</span>"
-                )
-            rel_rows.append(
-                f'<div class="axis-row">'
-                f"<div>{html.escape(rm.agent)}</div>"
-                f"<div>{val_html}</div>"
-                f"</div>"
-            )
-        reliability_panel = (
-            '<div class="axis-panel">'
-            '<div class="axis-title">Reliability · error / blocked rate (30d)</div>'
-            + "".join(rel_rows)
-            + "</div>"
-        )
-    else:
-        reliability_panel = (
-            '<div class="axis-panel">'
-            '<div class="axis-title">Reliability · error / blocked rate (30d)</div>'
-            '<p class="empty-note">No run data yet.</p>'
-            "</div>"
-        )
-
-    # ── Agent Card Grid ─────────────────────────────────────────────
-    alerts_by_agent: dict[str, int] = {}
-    for item in active_items:
-        alerts_by_agent[item.agent] = alerts_by_agent.get(item.agent, 0) + 1
-
-    agent_names = sorted(
-        set(
-            [ct.agent for ct in console_data.cost_trends]
-            + [rm.agent for rm in console_data.reliability_metrics]
-        )
-    )
-
-    if agent_names:
-        cards = []
-        for agent in agent_names:
-            agent_safe = html.escape(agent)
-            agent_href = urllib.parse.quote(agent, safe="")
-            n_alerts = alerts_by_agent.get(agent, 0)
-            badge = (
-                f'<span class="alerts-badge">{n_alerts}</span>' if n_alerts > 0 else ""
-            )
-            ct = next((c for c in console_data.cost_trends if c.agent == agent), None)
-            cost_str = f"${ct.total_usd_30d:.3f}/30d" if ct else "no cost data"
-            cards.append(
-                f'<div class="agent-card">'
-                f'<a href="../{agent_href}/dashboard.html">{agent_safe}</a>{badge}'
-                f'<div class="meta">{html.escape(cost_str)}</div>'
-                f"</div>"
-            )
-        agent_grid_html = f'<div class="agent-grid">{"".join(cards)}</div>'
-    else:
-        agent_grid_html = '<p class="empty-note">No agents discovered.</p>'
-
-    # ── Snooze Modal ────────────────────────────────────────────────
+    # ── Snooze Modal (page chrome — not a panel) ──────────────────────────────
     snooze_modal = """
 <div class="snooze-modal" id="snoozeModal">
   <div class="snooze-box">
@@ -1631,31 +1659,13 @@ def _render_console_template(console_data, has_goals: bool = True) -> str:
 </div>
 """
 
-    active_count = len(active_items)
-    fleet_size = console_data.agent_count
-
-    # ── Fleet Health header band (spec/53 PR2) ────────────────────────
-    # Rendered ABOVE the three axis panels. Absent (empty string) when
-    # fleet_health is None — the PR1 panels render normally either way.
-    health_band_html = _render_health_band(getattr(console_data, "fleet_health", None))
-    health_band_section = (
-        f"\n<h2>Fleet Health Score</h2>\n{health_band_html}\n"
-        if health_band_html
-        else ""
-    )
-
-    # ── Recommendations panel (spec/54 PR3) ──────────────────────────
-    recommendations_section = _render_recommendations(
-        getattr(console_data, "recommendations", None)
-    )
-
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="{_SHARED_CSP}">
 <title>Atomic Agents — Fleet Console</title>
-<style>{CSS}{_CONSOLE_CSS_EXTRA}</style>
+<style>{CSS}{_CONSOLE_CSS_EXTRA}{_COCKPIT_CSS}</style>
 </head>
 <body>
 
@@ -1671,23 +1681,15 @@ def _render_console_template(console_data, has_goals: bool = True) -> str:
 
 {_nav}
 {_degraded_banner}
-{health_band_section}
-<h2>Operator Attention Queue
-  {'<span class="pill error" style="margin-left:8px;">' + str(active_count) + " open</span>" if active_count else '<span class="pill ok" style="margin-left:8px;">0 open</span>'}
-</h2>
-{queue_html}
 
-<h2>Fleet Trends</h2>
-<div class="axis-panels">
-{cost_panel}
-{quality_panel}
-{reliability_panel}
-</div>
+<div class="zone-label cockpit-zone-label">Status</div>
+{slot_html["status"]}
 
-{recommendations_section}
+<div class="zone-label cockpit-zone-label">Act</div>
+{slot_html["act"]}
 
-<h2>Agent Fleet</h2>
-{agent_grid_html}
+<div class="zone-label cockpit-zone-label">Explore</div>
+{slot_html["explore"]}
 
 <footer>
   <div>Generated {date.today().isoformat()} by atomic_agents.dashboard</div>
