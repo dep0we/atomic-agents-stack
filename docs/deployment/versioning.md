@@ -28,6 +28,38 @@ flipping a default field's type, dropping a recognised note `type`,
 changing the wikilink rewriting rule. Always paired with a migration
 script (`atomic_agents.migrate`) and bumps `CURRENT_SCHEMA_VERSION`.
 
+### How a vault's schema version is determined
+
+A vault does **not** store its schema version in a manifest file. The effective
+version is **computed** as the *minimum* `schema_version` across all note files
+(`FilesystemMigrationBackend.read_schema_version()`); an empty vault reports the
+package's `CURRENT_SCHEMA_VERSION`. The files *are* the version — there is no
+second copy to drift out of sync.
+
+This is a deliberate choice (settled 2026-06-29). A written
+`kit-version.json`-style manifest with a `schema_version` field would be a
+second copy of authoritative state. It can lie: a stale field that looks
+authoritative while the files say otherwise is the worst failure mode, because
+humans and tools will trust the manifest. Keeping the version computed means
+Principle #1 (the vault is the source of truth) holds with nothing to
+reconcile.
+
+Two consequences follow:
+
+- **Detecting "needs migration" is `doctor`'s job, not a stored flag.** Today
+  `doctor` does not yet make this comparison directly; a mismatch surfaces
+  indirectly as per-file parse failures. The planned check (issue #675) compares
+  the computed vault version against the package `CURRENT_SCHEMA_VERSION` and
+  tells the operator to run `migrate` when they differ. The comparison is
+  read-only; it writes nothing to the vault.
+- **Provenance ("what framework version touched this vault, when") is a
+  separate concern from authoritative schema state.** If we want it for
+  debugging or fleet observability, the shape is an *append-only* provenance log
+  written only by `init` and `migrate` — never a mutable manifest (issue #676,
+  optional/not scheduled). An append-only log records what happened; it is never
+  consulted to decide schema validity or migration need, so it cannot become a
+  drifting source of truth.
+
 ### Framework API break
 
 Any change to the public Python surface (`AtomicAgent`, exception types,

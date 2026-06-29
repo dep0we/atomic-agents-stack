@@ -199,6 +199,14 @@ Exit 0 = ready to schedule. Exit 1 = one or more checks failed; the
 output prints the literal command needed to fix each one. Exit 2 = bug
 in doctor itself; file an issue.
 
+> **Planned (#675):** today `doctor` does not directly compare your vault's
+> schema version against the version the installed package expects — a
+> mismatch surfaces indirectly as per-file parse failures. Until the
+> dedicated check lands, run step 3's `migrate --status` after any upgrade
+> whose release notes mention schema, even if `doctor` exits 0. The vault's
+> version is computed from your files, never stored (see
+> [versioning.md §How a vault's schema version is determined](versioning.md)).
+
 **Pre-v0.10.0 — manual sanity check:** doctor isn't available yet, so
 run this loop instead. It catches the most common upgrade breakage
 (persona/config didn't load, no API key, wrong model id) but not the
