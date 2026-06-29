@@ -346,11 +346,11 @@ Each MUST ships with parametrized conformance coverage in `tests/test_dashboard_
 | MUST 11 | `test_panel_render_raise_degrades_only_that_panel` (strip-RED), `test_panel_is_available_raise_omits_panel` |
 | MUST 12 | `test_unavailable_capability_omits_panel`, `test_available_but_empty_renders_empty` (the two states distinguishable) |
 | MUST 13 | `test_panels_no_backend_io_at_render` |
-| MUST 14 | `test_runtime_health_excludes_governance_modelfit_workmix` |
-| MUST 15 | `test_home_has_no_card_grid`, `test_home_fleet_status_summary_links_monitor` |
-| MUST 16 | `test_duplicate_panel_id_registration_raises` |
-| MUST 17 | `test_alert_keys_aggregated_to_sidecar` (strip-RED: empty sidecar 422s a legit ack) |
-| MUST 18 | `test_home_summary_status_matches_monitor_mapping` |
+| MUST 14 | `test_runtime_health_excludes_governance_modelfit_workmix`, `test_runtime_health_excludes_governance_strip_red` (strip-RED: removing the `_RUNTIME_AXES` filter renders an injected governance row) |
+| MUST 15 | `test_home_has_no_card_grid`, `test_home_fleet_status_summary_links_monitor`, `test_home_fleet_status_summary_strip_red` |
+| MUST 16 | `test_duplicate_panel_id_registration_raises`, `test_duplicate_panel_id_registration_strip_red` |
+| MUST 17 | `test_alert_keys_aggregated_to_sidecar` (panel-contributed key reaches the sidecar; seed does NOT), `test_alert_keys_aggregated_sidecar_empty_422s_ack` (strip-RED: empty engine union → empty sidecar → a legit-looking ack 422s) |
+| MUST 18 | `test_home_summary_status_matches_monitor_mapping`, `test_status_*` precedence suite in `tests/test_dashboard_panels.py`, `test_home_summary_status_strip_red` |
 
 ---
 
