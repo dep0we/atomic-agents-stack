@@ -1069,17 +1069,17 @@ _CONSOLE_CSS_EXTRA = """
 .rec-row { border: 1px solid var(--border); border-radius: 6px; padding: 12px 16px; margin-bottom: 10px; }
 .rec-header { display: flex; align-items: baseline; gap: 10px; margin-bottom: 6px; }
 .rec-kind-pill { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; white-space: nowrap; }
-.rec-kind-savings_cost { background: #e6f4ea; color: #137333; }
-.rec-kind-quality_report { background: #fef9e7; color: #9a6700; }
-.rec-kind-governance { background: #e8f0fe; color: #1967d2; }
+.rec-kind-savings_cost { background: rgba(72,199,154,.14); color: var(--good); }
+.rec-kind-quality_report { background: rgba(240,163,94,.14); color: var(--warn); }
+.rec-kind-governance { background: rgba(240,163,94,.14); color: var(--warn); }
 .rec-agent { font-weight: 600; }
 .rec-models { font-size: 13px; color: var(--muted); margin-bottom: 4px; }
 .rec-models .rec-arrow { margin: 0 4px; color: var(--muted); }
 .rec-rationale { font-size: 13px; color: var(--text); }
 .rec-deltas { font-size: 12px; color: var(--muted); margin-top: 4px; }
 .rec-delta-badge { display: inline-block; padding: 1px 6px; border-radius: 4px; margin-right: 6px; }
-.rec-delta-savings { background: #e6f4ea; color: #137333; }
-.rec-delta-points { background: #e8f0fe; color: #1967d2; }
+.rec-delta-savings { background: rgba(72,199,154,.14); color: var(--good); }
+.rec-delta-points { background: rgba(97,175,239,.14); color: var(--sonnet); }
 """
 
 # B6 Cockpit CSS — D4 rule: B6 zone/KPI styles go ONLY here, never in the shared CSS block.

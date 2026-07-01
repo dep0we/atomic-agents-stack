@@ -209,9 +209,13 @@ class PanelRegistry:
                     result = panel.render(ctx)
                 except Exception as exc:
                     logger.warning(
-                        "panel '%s' render failed (%s); skipping (MUST 11 fail-soft)",
+                        "panel '%s' render failed (%s); degraded placeholder (MUST 11 fail-soft)",
                         panel.id,
                         type(exc).__name__,
+                    )
+                    fragments.append(
+                        f'<div class="panel-degraded" data-panel-id="{panel.id}">'
+                        f"Panel unavailable</div>"
                     )
                     continue
                 fragments.append(result.html)

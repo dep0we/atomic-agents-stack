@@ -299,10 +299,11 @@ class _RaisingAvailablePanel:
 
 
 def test_panel_render_raise_degrades_only_that_panel():
-    """MUST 11: a render() that raises degrades ONLY that panel; siblings render; page intact.
+    """MUST 11: a render() that raises emits a degraded placeholder for THAT panel; siblings render; page intact.
 
     Drives the REAL engine via registry.compose() (the production code path), not a
-    re-implemented loop. logger.warning must fire for the raising panel.
+    re-implemented loop. logger.warning must fire for the raising panel. The degraded
+    placeholder fragment must appear in the slot output (spec/52 §16.3).
     """
     import atomic_agents.dashboard.render as rmod
 
@@ -316,6 +317,13 @@ def test_panel_render_raise_degrades_only_that_panel():
 
     assert "good output" in slot_html["act"], "sibling panel must still render"
     assert "should not appear" not in slot_html["act"]
+    # Degraded placeholder must appear for the raising panel (spec/52 §16.3)
+    assert "panel-degraded" in slot_html["act"], (
+        "raising panel must emit a degraded placeholder fragment, not be silently skipped"
+    )
+    assert "raising_render_panel" in slot_html["act"], (
+        "degraded placeholder must carry the panel id for diagnostics"
+    )
     mock_warn.assert_called_once()
     assert "raising_render_panel" in str(mock_warn.call_args)
 
