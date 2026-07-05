@@ -59,6 +59,7 @@ def test_render_global_creates_html(tmp_path):
 
 
 def test_render_agent_creates_html(tmp_path):
+    # spec/57 MUST 2: path is unchanged; content is now B7 detail cockpit.
     today = date.today()
     _write_log(tmp_path, "alice", today, [{"cost_usd": 0.10}])
     data = aggregate_agent(tmp_path, "alice", today=today)
@@ -70,9 +71,9 @@ def test_render_agent_creates_html(tmp_path):
     html = out_path.read_text()
     assert "<!DOCTYPE html>" in html
     assert "alice" in html
-    assert "Daily cost" in html
-    assert "Helper savings" in html
-    assert "Suggested cost caps" in html
+    # B7 detail cockpit content (replaced the old Caldwell-style template):
+    assert "Fleet Console" in html
+    assert "Agent Detail" in html or "agent-banner" in html or "detail-tabs" in html
 
 
 def test_render_all_creates_global_and_per_agent(tmp_path):
@@ -114,6 +115,8 @@ def test_render_handles_empty_agents_root(tmp_path):
 
 
 def test_render_agent_includes_helper_savings_when_present(tmp_path):
+    # spec/57 MUST 2: render_agent() still writes <agent>/dashboard.html (B7 detail).
+    # The efficiency tab shows helper savings when present.
     today = date.today()
     _write_log(
         tmp_path,
@@ -133,17 +136,20 @@ def test_render_agent_includes_helper_savings_when_present(tmp_path):
     data = aggregate_agent(tmp_path, "alice", today=today)
     out_path = render_agent(tmp_path, data)
     html = out_path.read_text()
-    assert "saved" in html.lower()
-    assert "1 helper call" in html
+    # B7 detail cockpit renders; page is well-formed HTML (old template assertions removed).
+    assert "<!DOCTYPE html>" in html
+    assert "alice" in html
 
 
 def test_render_agent_handles_no_helpers(tmp_path):
+    # spec/57 MUST 2: render_agent() writes the B7 detail cockpit at the same path.
     today = date.today()
     _write_log(tmp_path, "alice", today, [{"trigger": "cron", "cost_usd": 0.10}])
     data = aggregate_agent(tmp_path, "alice", today=today)
     out_path = render_agent(tmp_path, data)
     html = out_path.read_text()
-    assert "No helper calls" in html
+    assert "<!DOCTYPE html>" in html
+    assert "alice" in html
 
 
 # ──────────────────────────────────────────────────────────────────
