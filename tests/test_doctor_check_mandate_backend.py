@@ -21,12 +21,15 @@ from atomic_agents.doctor import check_mandate_backend
 
 # Minimal valid mandates.md content — copied from
 # tests/test_mandate_protocol_conformance.py::_GOOD_MANDATE_FILE so the
-# parser conformance suite owns its evolution.
+# parser conformance suite owns its evolution. expires_at is a FIXED far-future
+# sentinel so this "active" fixture never lapses at a quarter/year boundary
+# (#678: the hardcoded 2026-06-30 expiry went stale on 2026-07-01). Keep this
+# byte-identical to the conformance-suite copy.
 _GOOD_MANDATE_FILE = """\
 ## procurement-q2-2026
 granted_by: operator
 granted_at: 2026-04-01T00:00:00Z
-expires_at: 2026-06-30T23:59:59Z
+expires_at: 2999-12-31T23:59:59Z
 revocable_by: operator
 scope: |
   Purchase SaaS subscriptions on the approved-vendor list.
