@@ -57,12 +57,14 @@ class StageSpec:
             faithful to the prompt?").
         rubric_ref: optional path to a rubric file (relative to playbook dir).
             Resolved by the loader into ``rubric``.
-        model: optional per-stage model dial. PARSED but NOT YET APPLIED —
-            the stage always runs on the agent's configured model.md model. The
-            actor-model override is not yet plumbed through the goal-outcome
-            coordinator / OutcomeRunner (only judge_model is). A non-None value is
-            stored and a warning is emitted on each run()/resume() process so the
-            no-op is never silent; actor-model wiring is tracked in #668.
+        model: optional per-stage model dial. On automated (is_gate=False) stages,
+            passed as model_override= to agent.call() — Policy enforce-mode
+            get_effective_model takes precedence per spec/32 ("fleet-config wins").
+            On gate stages (is_gate=True), model: is rejected at parse time (hard
+            validation error, symmetric with conflict_keys being gate-only: gate
+            stages make no actor LLM call and suspend for a human decision, so the
+            field is semantically incoherent there). None = use the agent's model.md
+            default. (#668 wired per-stage actor-model at dispatch time.)
         is_gate: True when this stage requires a human decision before the run
             may continue. PR1 halts on gate stages (PR2 #581 implements resume).
     """

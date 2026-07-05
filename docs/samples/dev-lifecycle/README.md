@@ -45,9 +45,13 @@ lifecycle has a bounded spend.
 - **Stages 0 (project bootstrap) and 12 (ongoing maintenance)** are documented as
   context prose above and below the YAML block. They are *not* conductor stages —
   they run once-per-project or on their own schedule, not per change.
-- **Per-stage `model:` dials** are authored as faithful content (gate stages →
-  Opus, automated stages → Sonnet) but are **parsed-not-applied** today; per-stage
-  actor-model wiring is tracked in [#668](https://github.com/dep0we/atomic-agents-stack/issues/668).
+- **Per-stage `model:` dials are applied** ([#668](https://github.com/dep0we/atomic-agents-stack/issues/668)).
+  The 10 automated stages each declare `model: claude-sonnet-4-6-20260101`, and the
+  conductor passes it as `model_override=` to `agent.call()` at dispatch (Policy
+  enforce-mode `get_effective_model` supersedes it when fleet config is active, per
+  spec/32 "fleet-config wins"). Gate stages carry **no** `model:` field — they make
+  no actor LLM call (they suspend for a human ruling), so `model:` on a gate stage is
+  rejected at parse time as a hard validation error.
 - **Automated-stage prompts are generic.** They approximate the intent of each kit
   step in plain language; they do not invoke the kit's slash-commands. This sample
   is content, not a coupling to the kit's tooling.

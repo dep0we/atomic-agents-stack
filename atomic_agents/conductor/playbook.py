@@ -43,9 +43,16 @@ Stage field rules:
     for the stage.
   - prompt_ref: optional path relative to playbook dir for longer prompts.
   - rubric / rubric_ref: optional judge rubric; defaults to the prompt text.
-  - model: optional per-stage model dial. PARSED but NOT YET APPLIED (the
-    stage runs on the agent's configured model.md model); a non-None value emits
-    a warning on each run()/resume() process. Actor-model wiring is tracked in #668.
+  - model: optional per-stage model dial. For automated stages (is_gate: false),
+    the declared model is passed as actor_model= to dispatch_sub_goal_as_outcome
+    and from there as model_override= to agent.call() (#668). Policy enforce-mode
+    get_effective_model supersedes the per-stage dial (spec/32 "fleet-config wins").
+    For gate stages (is_gate: true), model: is rejected at parse time (hard validation
+    error, symmetric with conflict_keys being gate-only): gate stages make no actor LLM
+    call and suspend for a human decision, so model: there is semantically incoherent.
+    At parse time a model absent from _costs.PRICING emits a non-blocking WARNING but
+    the playbook loads successfully (the dispatch/runtime LLMBackend layer is
+    authoritative for actual model resolution).
   - is_gate: false (default). True stages SUSPEND the run (PR2 #581): run()
     transitions the gate sub-goal to 'awaiting_decision' and returns a
     ConductorState carrying the pending GateDecision; resume() answers it.
@@ -133,15 +140,22 @@ def _resolve_ref(ref: str, playbook_dir: Path) -> Path:
 
 
 def _parse_stage_block(
-    body: str, playbook_dir: Path
+    body: str, playbook_dir: Path, soft_warnings: list[str] | None = None
 ) -> tuple[list[StageSpec] | None, float | None, list[str]]:
     """Extract and validate the embedded YAML block from a PLAYBOOK.md body.
 
     The block is the first ```yaml ... ``` fenced code block in the body.
 
     Returns (stages, run_cap_usd, errors). On any hard error, stages is None.
+
+    Non-blocking diagnostics (e.g. #668 unknown-model advisories) are appended to
+    the caller-supplied ``soft_warnings`` list so they flow through the same
+    structured (manifest, warnings) channel as every other parse diagnostic —
+    not a side-channel logger only.
     """
     errors: list[str] = []
+    if soft_warnings is None:
+        soft_warnings = []
 
     # Extract fenced YAML block
     block_match = re.search(r"```yaml\s*\n(.*?)```", body, re.DOTALL)
@@ -298,8 +312,22 @@ def _parse_stage_block(
             rubric_ref = None
 
         model_raw = raw.get("model")
-        model = (
-            str(model_raw).strip() if model_raw and isinstance(model_raw, str) else None
+        # Normalize empty/whitespace-only-after-strip to None at this single parse
+        # site so all three downstream sites (gate-rejection `is not None`,
+        # unknown-model `is not None`, fingerprint `is not None`, audit `is not None`)
+        # agree on the field state. A blank `model: "   "` is genuinely absent, not a
+        # zero-length model name that would trip a spurious PRICING warning and split
+        # the fingerprint/audit gates.
+        _model_stripped = str(model_raw).strip() if isinstance(model_raw, str) else ""
+        model = _model_stripped or None
+        # A model was "declared" if a non-blank string OR any non-string value was
+        # provided (a blank/whitespace-only string is genuinely absent). The gate
+        # rejection below keys on THIS, not on `model is not None`, so a non-string
+        # model: on a gate stage (e.g. `model: 123`, coerced to None above) is still
+        # rejected — otherwise it would slip past the `model is not None` gate and
+        # parse, despite C10 forbidding model: on gate stages (#668 Codex review).
+        _model_declared = model is not None or (
+            model_raw is not None and not isinstance(model_raw, str)
         )
 
         is_gate_raw = raw.get("is_gate", False)
@@ -310,6 +338,50 @@ def _parse_stage_block(
             is_gate = is_gate_raw.lower() in ("true", "yes", "1")
         else:
             is_gate = bool(is_gate_raw)
+
+        # #668 — gate-model rejection (symmetric with conflict_keys being gate-only).
+        # Gate stages make no actor LLM call (they suspend for a human decision), so
+        # model: on a gate stage is semantically incoherent — hard parse error.
+        # Placement: AFTER is_gate is resolved (uses the resolved bool, not is_gate_raw
+        # — a raw string "false" would be truthy in Python, silently rejecting automated
+        # stages carrying model:, which is exactly the feature we are building).
+        if is_gate and _model_declared:
+            errors.append(
+                f"stages[{i}] (stage_id={stage_id!r}) 'model:' is only valid on "
+                "automated (is_gate=false) stages — gate stages make no actor LLM call "
+                "and suspend for a human decision; the model: field has no effect here. "
+                "Strip it from this stage."
+            )
+            continue
+
+        # #668 P2 — a non-string model: on an AUTOMATED stage is coerced to None
+        # above. WARN (do not block) so the silent-drop path gives the same legible
+        # parse-time feedback as the unknown-model warning below (gate stages with a
+        # non-string model already hard-errored above, so this only reaches automated
+        # stages). The WARN-not-block ruling's intent is legible feedback.
+        if model_raw is not None and not isinstance(model_raw, str):
+            soft_warnings.append(
+                f"stages[{i}] (stage_id={stage_id!r}) 'model:' must be a string; "
+                f"ignoring non-string value {model_raw!r} (treated as absent)."
+            )
+
+        # #668 — WARN (not block) when a declared model is absent from _costs.PRICING.
+        # Parse-time legible feedback that flows through the structured
+        # (manifest, warnings) channel (soft_warnings), so a programmatic caller of
+        # validate_playbook_manifest sees it — not a logger-only side channel. The
+        # dispatch/runtime LLMBackend layer stays authoritative for actual model
+        # resolution. Lazy import inside the function (per project convention —
+        # coordinator.py, agent.py) to avoid bootstrap-cycle risk from a new
+        # cross-module dependency at module level.
+        if model is not None:
+            from .._costs import PRICING  # noqa: PLC0415
+
+            if model not in PRICING:
+                soft_warnings.append(
+                    f"stages[{i}] (stage_id={stage_id!r}) declares model={model!r} which "
+                    "is not in _costs.PRICING — the dispatch/runtime LLMBackend layer is "
+                    "authoritative; the stage will run if the backend resolves the model."
+                )
 
         # PR2 (#581): options field — structured choices for gate stages.
         # gate-stage-markdown-schema ruling: options is is_gate-only; silently
@@ -446,9 +518,14 @@ def validate_playbook_manifest(
             "by discover_playbooks()."
         ]
 
-    # Parse the embedded stage block
+    # Parse the embedded stage block. soft_warnings collects non-blocking
+    # diagnostics (#668 unknown-model advisories) so they surface in the same
+    # returned warnings list as skill-loader warnings — one structured channel.
     body = parsed.content or ""
-    stages, run_cap_usd, stage_errors = _parse_stage_block(body, playbook_dir)
+    soft_warnings: list[str] = []
+    stages, run_cap_usd, stage_errors = _parse_stage_block(
+        body, playbook_dir, soft_warnings=soft_warnings
+    )
     if stage_errors:
         return None, warnings + stage_errors
     if stages is None or run_cap_usd is None:
@@ -464,7 +541,7 @@ def validate_playbook_manifest(
         stages=stages,
         playbook_dir=playbook_dir,
         playbook_md_path=playbook_md,
-    ), warnings
+    ), warnings + soft_warnings
 
 
 # ──────────────────────────────────────────────────────────────────

@@ -111,6 +111,7 @@ class OutcomeRunner:
         agents_root: Path | str | None = None,
         agent_name: str = "",
         judge_model: str | None = None,
+        actor_model: str | None = None,
         *,
         log_backend: "LogBackend | None" = None,
         profile_backend: "AgentProfileBackend | None" = None,
@@ -136,6 +137,12 @@ class OutcomeRunner:
         self.agent_name = agent_name
         self.agent_root = self.agents_root / agent_name
         self._explicit_judge_model = judge_model
+        # #668 — Per-stage actor-model override (conductor C10). When set, passed as
+        # model_override= to every agent.call() iteration in run() so the stage
+        # executes on and is billed against the declared per-stage model. None = use
+        # model.md default (backward-compatible: existing callers never pass it).
+        # Policy enforce-mode get_effective_model supersedes this per spec/32.
+        self._actor_model = actor_model
         # #61 PR 2 — LogBackend forwarding. Operators pass a custom
         # backend via the kwarg; the internal ``AtomicAgent`` constructed
         # inside ``run()`` inherits it. Without this threading, the
@@ -371,6 +378,23 @@ class OutcomeRunner:
                     work_item=agent_prompt,
                     write_captures=False,
                     # trigger is already 'outcome' from __init__
+                    # #668 — C10 per-stage actor-model override. None = model.md
+                    # default (backward-compatible: existing callers store None).
+                    # agent.call already accepts model_override (agent.py ~3618).
+                    model_override=self._actor_model,
+                    # NOTE (#668, ruling cost-gate-prices-override-model = "NO
+                    # cost-gate change"): the run-level dollar tree-cap is enforced
+                    # by the OutcomeRunner per-iteration pre-call gate ABOVE
+                    # (_check_cost_guardrails with the decremented
+                    # _clamped_parent_headroom), which runs before EVERY iteration's
+                    # agent.call(). The run cap is therefore NOT threaded into
+                    # agent.call() here: within a single agent.call() the run-cap
+                    # dimension is a fixed entry value that does not tighten per LLM
+                    # turn (only the model.md daily/monthly caps tighten per turn), so
+                    # threading it would be a redundant entry gate, not a per-turn
+                    # bound. Within-stage overshoot of run_cap_usd is bounded by one
+                    # agent.call() (one OutcomeRunner iteration) and caught at the next
+                    # pre-call gate above — that is the Principle #4 guarantee here.
                 )
             except CostGuardrailBlocked as e:
                 result.status = "interrupted"
@@ -629,10 +653,19 @@ class OutcomeRunner:
 
         Subtracting the stage's in-flight spend here makes the run cap bind at each
         iteration boundary, exactly as own_remaining binds against the daily cap.
-        Within-stage overshoot is therefore bounded by ONE iteration's spend (the
-        gate fires before each call; a single in-flight call can still exceed the
-        headroom by its own cost — identical granularity to the delegate tree-cap),
-        not zero. Returns None when no parent cap was threaded (model.md caps only).
+        This value is consumed at the two per-iteration cost gates: the
+        pre-actor-call gate (``_check_cost_guardrails`` run before each iteration's
+        ``agent.call()``) and the pre-judge gate (run before each judge call, passing
+        ``extra_inflight`` for the just-incurred agent-call spend).
+        Within-stage overshoot of the run cap is therefore bounded by ONE iteration
+        (one ``agent.call()``) — identical granularity to the daily-cap bind: a
+        single in-flight call can still exceed the headroom by its own cost, then the
+        NEXT iteration's pre-call gate refuses. The run cap is NOT threaded into
+        ``agent.call()`` itself (#668, ruling cost-gate-prices-override-model = "NO
+        cost-gate change"): within a single ``agent.call()`` the run-cap dimension is
+        a fixed entry value that does not tighten per LLM turn, so threading it would
+        be a redundant entry gate, not the per-turn bound it would appear to be.
+        Returns None when no parent cap was threaded (model.md caps only).
 
         ``extra_inflight`` covers spend already incurred this iteration but not yet
         appended to ``result.iterations`` (the agent call's cost, checked at the

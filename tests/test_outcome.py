@@ -41,7 +41,11 @@ def agent_vault(tmp_path):
 
     # tools.md
     (agent_root / "tools.md").write_text(
-        "# TOOLS\n\n## Read paths\n- " + str(agent_root) + "\n\n## Write paths\n- " + str(agent_root) + "\n"
+        "# TOOLS\n\n## Read paths\n- "
+        + str(agent_root)
+        + "\n\n## Write paths\n- "
+        + str(agent_root)
+        + "\n"
     )
 
     # model.md
@@ -65,28 +69,36 @@ def rubric_text():
 
 @pytest.fixture
 def satisfied_verdict():
-    return json.dumps({
-        "satisfied": True,
-        "criterion_results": [
-            {"criterion": "completeness", "met": True},
-            {"criterion": "accuracy", "met": True},
-        ],
-        "explanation": "All criteria met.",
-        "rubric_contradicts_description": False,
-    })
+    return json.dumps(
+        {
+            "satisfied": True,
+            "criterion_results": [
+                {"criterion": "completeness", "met": True},
+                {"criterion": "accuracy", "met": True},
+            ],
+            "explanation": "All criteria met.",
+            "rubric_contradicts_description": False,
+        }
+    )
 
 
 @pytest.fixture
 def unsatisfied_verdict():
-    return json.dumps({
-        "satisfied": False,
-        "criterion_results": [
-            {"criterion": "completeness", "met": False, "gap": "Missing the summary section"},
-            {"criterion": "accuracy", "met": True},
-        ],
-        "explanation": "Summary section is missing.",
-        "rubric_contradicts_description": False,
-    })
+    return json.dumps(
+        {
+            "satisfied": False,
+            "criterion_results": [
+                {
+                    "criterion": "completeness",
+                    "met": False,
+                    "gap": "Missing the summary section",
+                },
+                {"criterion": "accuracy", "met": True},
+            ],
+            "explanation": "Summary section is missing.",
+            "rubric_contradicts_description": False,
+        }
+    )
 
 
 def _make_agent_response(
@@ -164,7 +176,9 @@ def test_outcome_satisfied_on_iteration_0(agent_vault, rubric_text, satisfied_ve
 # Test 2: revises then satisfies
 
 
-def test_outcome_revises_then_satisfies(agent_vault, rubric_text, unsatisfied_verdict, satisfied_verdict):
+def test_outcome_revises_then_satisfies(
+    agent_vault, rubric_text, unsatisfied_verdict, satisfied_verdict
+):
     """First iteration fails one criterion; second satisfies. status=satisfied, 2 iterations."""
     runner = _make_runner(agent_vault)
 
@@ -190,7 +204,9 @@ def test_outcome_revises_then_satisfies(agent_vault, rubric_text, unsatisfied_ve
         mock_instance._check_cost_guardrails.return_value = CostCheckResult(allow=True)
         MockAgent.return_value = mock_instance
 
-        with patch("atomic_agents.outcome._llm.call_llm", side_effect=judge_side_effect):
+        with patch(
+            "atomic_agents.outcome._llm.call_llm", side_effect=judge_side_effect
+        ):
             result = runner.run(
                 description="Write a test summary",
                 rubric=rubric_text,
@@ -248,12 +264,14 @@ def test_outcome_rubric_contradicts_description_fails(agent_vault, rubric_text):
     """Judge sets rubric_contradicts_description=true on iteration 0 → status=failed immediately."""
     runner = _make_runner(agent_vault)
 
-    contradicts_verdict = json.dumps({
-        "satisfied": False,
-        "criterion_results": [],
-        "explanation": "The description asks for one page but rubric requires 10 sections.",
-        "rubric_contradicts_description": True,
-    })
+    contradicts_verdict = json.dumps(
+        {
+            "satisfied": False,
+            "criterion_results": [],
+            "explanation": "The description asks for one page but rubric requires 10 sections.",
+            "rubric_contradicts_description": True,
+        }
+    )
 
     agent_resp = _make_agent_response()
     judge_resp = _make_judge_response(contradicts_verdict)
@@ -274,7 +292,10 @@ def test_outcome_rubric_contradicts_description_fails(agent_vault, rubric_text):
 
     assert result.status == "failed"
     assert len(result.iterations) == 1
-    assert "contradict" in result.explanation.lower() or "one page" in result.explanation.lower()
+    assert (
+        "contradict" in result.explanation.lower()
+        or "one page" in result.explanation.lower()
+    )
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -316,7 +337,9 @@ def test_outcome_malformed_judge_json_retries_then_fails(agent_vault, rubric_tex
 def test_outcome_clamps_max_iterations_to_valid_range(agent_vault):
     """0 raises ValueError, 21+ raises ValueError, 1-20 are OK (no LLM call needed)."""
     agents_root, agent_name = agent_vault
-    runner = OutcomeRunner(agents_root=agents_root, agent_name=agent_name, judge_model="gpt-5")
+    runner = OutcomeRunner(
+        agents_root=agents_root, agent_name=agent_name, judge_model="gpt-5"
+    )
 
     # 0 → ValueError
     with pytest.raises(ValueError, match="max_iterations"):
@@ -334,12 +357,18 @@ def test_outcome_clamps_max_iterations_to_valid_range(agent_vault):
         mock_instance.config.default_model = "claude-sonnet-4-6-20260101"
         mock_instance._check_cost_guardrails.return_value = CostCheckResult(allow=True)
         MockAgent.return_value = mock_instance
-        satisfied_v = json.dumps({
-            "satisfied": True, "criterion_results": [], "explanation": "OK",
-            "rubric_contradicts_description": False,
-        })
-        with patch("atomic_agents.outcome._llm.call_llm",
-                   return_value=_make_judge_response(satisfied_v)):
+        satisfied_v = json.dumps(
+            {
+                "satisfied": True,
+                "criterion_results": [],
+                "explanation": "OK",
+                "rubric_contradicts_description": False,
+            }
+        )
+        with patch(
+            "atomic_agents.outcome._llm.call_llm",
+            return_value=_make_judge_response(satisfied_v),
+        ):
             # max_iterations=1 — should not raise
             result = runner.run("desc", "rubric\n# criteria", max_iterations=1)
             assert result.status == "satisfied"
@@ -350,8 +379,10 @@ def test_outcome_clamps_max_iterations_to_valid_range(agent_vault):
         mock_instance.config.default_model = "claude-sonnet-4-6-20260101"
         mock_instance._check_cost_guardrails.return_value = CostCheckResult(allow=True)
         MockAgent.return_value = mock_instance
-        with patch("atomic_agents.outcome._llm.call_llm",
-                   return_value=_make_judge_response(satisfied_v)):
+        with patch(
+            "atomic_agents.outcome._llm.call_llm",
+            return_value=_make_judge_response(satisfied_v),
+        ):
             # max_iterations=20 — should not raise
             result = runner.run("desc", "rubric\n# criteria", max_iterations=20)
             assert result.status == "satisfied"
@@ -374,7 +405,9 @@ def test_outcome_clamps_max_iterations_to_valid_range(agent_vault):
 # they do NOT assert the constructor forwarding. This test closes that gap.
 
 
-def test_outcome_runner_forwards_backends_to_internal_agent(agent_vault, rubric_text, satisfied_verdict):
+def test_outcome_runner_forwards_backends_to_internal_agent(
+    agent_vault, rubric_text, satisfied_verdict
+):
     """run() must construct its internal AtomicAgent with the SAME
     log_backend / policy_backend / profile_backend objects passed to OutcomeRunner.
 
@@ -433,10 +466,14 @@ def test_outcome_runner_forwards_backends_to_internal_agent(agent_vault, rubric_
 # Test 7: iteration records written to agent log
 
 
-def test_outcome_writes_iteration_records_to_agent_log(agent_vault, rubric_text, satisfied_verdict, tmp_path):
+def test_outcome_writes_iteration_records_to_agent_log(
+    agent_vault, rubric_text, satisfied_verdict, tmp_path
+):
     """Per-iteration JSONL records land in <agent>/log/<YYYY-MM>/<date>.jsonl."""
     agents_root, agent_name = agent_vault
-    runner = OutcomeRunner(agents_root=agents_root, agent_name=agent_name, judge_model="gpt-5")
+    runner = OutcomeRunner(
+        agents_root=agents_root, agent_name=agent_name, judge_model="gpt-5"
+    )
 
     agent_resp = _make_agent_response()
     judge_resp = _make_judge_response(satisfied_verdict)
@@ -450,6 +487,7 @@ def test_outcome_writes_iteration_records_to_agent_log(agent_vault, rubric_text,
         # agent.log_backend.append(...). Wire a real FilesystemLogBackend
         # so the test continues to verify the on-disk landing point.
         from atomic_agents.logs import FilesystemLogBackend
+
         mock_instance.log_backend = FilesystemLogBackend(agents_root / agent_name)
         MockAgent.return_value = mock_instance
 
@@ -462,7 +500,9 @@ def test_outcome_writes_iteration_records_to_agent_log(agent_vault, rubric_text,
 
     today = date.today()
     log_path = (
-        agents_root / agent_name / "log"
+        agents_root
+        / agent_name
+        / "log"
         / today.strftime("%Y-%m")
         / f"{today.isoformat()}.jsonl"
     )
@@ -516,7 +556,9 @@ def test_outcome_writes_result_json(agent_vault, rubric_text, satisfied_verdict)
     # Find the result.json
     runs_dir = agents_root / agent_name / "outcomes" / "runs"
     result_files = list(runs_dir.glob("*/result.json"))
-    assert len(result_files) == 1, f"Expected exactly 1 result.json, found: {result_files}"
+    assert len(result_files) == 1, (
+        f"Expected exactly 1 result.json, found: {result_files}"
+    )
 
     data = json.loads(result_files[0].read_text())
     assert data["run_id"] == result.run_id
@@ -562,14 +604,119 @@ def test_outcome_respects_parent_cost_cap(agent_vault, rubric_text):
     assert len(result.iterations) == 0
 
 
+def test_outcome_per_iteration_treecap_clamps_under_model_override(
+    agent_vault, rubric_text, unsatisfied_verdict
+):
+    """#668 (C10) — the per-iteration MIN(child_remaining, parent_remaining) tree-cap
+    clamp still fires on a model-bearing stage, AND the per-stage model_override is
+    threaded into EVERY real agent.call() iteration.
+
+    This is the differing-model tree-cap guard named by the #668 rulings
+    (cost-gate-prices-override-model). Unlike the conductor-level
+    test_between_stage_halt_is_model_agnostic (which mocks dispatch and only exercises
+    the coarse between-stage `run_remaining <= 0` backstop), this test drives the REAL
+    OutcomeRunner.run() per-iteration gate: the un-mocked `_clamped_parent_headroom`
+    decrements the run-level headroom by this stage's accumulated spend each iteration,
+    so a model-bearing stage cannot overshoot the run cap by more than one iteration.
+
+    Setup: parent_remaining_headroom_usd=0.10, each agent iteration costs 0.08 (priced
+    post-hoc, independent of the declared model), judge unsatisfied so the stage keeps
+    revising. The mocked `_check_cost_guardrails` allows iff the clamped headroom it is
+    handed is > 0, so the REAL clamp arithmetic decides when the gate fires:
+      - iter 0 entry: clamp = 0.10 → allow → agent.call #1 (model_override threaded)
+      - iter 0 pre-judge: 0.10 - 0.08 = 0.02 → allow → records ~0.08 spend
+      - iter 1 entry: 0.10 - ~0.08 = ~0.02 → allow → agent.call #2 (model_override threaded)
+      - iter 1 pre-judge: 0.10 - ~0.08 - 0.08 = ~-0.06 → REFUSE → interrupted at iteration 1
+    """
+    ACTOR_MODEL = "claude-sonnet-4-6-20260101"
+    agents_root, agent_name = agent_vault
+    runner = OutcomeRunner(
+        agents_root=agents_root,
+        agent_name=agent_name,
+        judge_model="gpt-5",
+        actor_model=ACTOR_MODEL,
+        parent_remaining_headroom_usd=0.10,
+    )
+
+    agent_resp = _make_agent_response(cost_usd=0.08)
+    judge_resp = _make_judge_response(unsatisfied_verdict)
+
+    seen_headrooms: list[float | None] = []
+
+    def _gate(critical=False, parent_remaining_headroom_usd=None, **_kwargs):
+        # Drive the REAL clamp: allow iff the un-mocked _clamped_parent_headroom
+        # value handed to us is positive (or unset). This makes the per-iteration
+        # MIN clamp the thing under test, not a hard-coded refuse.
+        seen_headrooms.append(parent_remaining_headroom_usd)
+        if (
+            parent_remaining_headroom_usd is not None
+            and parent_remaining_headroom_usd <= 0
+        ):
+            return CostCheckResult(
+                allow=False,
+                action="skip",
+                reason="run tree-cap hit (per-iteration clamp)",
+            )
+        return CostCheckResult(allow=True)
+
+    with patch("atomic_agents.outcome.AtomicAgent") as MockAgent:
+        mock_instance = MagicMock()
+        mock_instance.call.return_value = agent_resp
+        mock_instance.config.default_model = "claude-3-5-haiku-20241022"
+        mock_instance._check_cost_guardrails.side_effect = _gate
+        MockAgent.return_value = mock_instance
+
+        with patch("atomic_agents.outcome._llm.call_llm", return_value=judge_resp):
+            result = runner.run(
+                description="Per-iteration tree-cap on a model-bearing stage",
+                rubric=rubric_text,
+                max_iterations=3,
+            )
+
+    # The per-iteration clamp must halt the stage (not run to max_iterations).
+    assert result.status == "interrupted", (
+        f"per-iteration tree-cap must interrupt the model-bearing stage; "
+        f"got status={result.status!r} explanation={result.explanation!r}"
+    )
+    assert "iteration 1" in result.explanation, (
+        f"interrupt must land at the per-iteration gate (iteration 1), not iteration 0 "
+        f"or a between-stage backstop; got {result.explanation!r}"
+    )
+
+    # The model_override MUST thread into EVERY real agent.call() iteration. The
+    # strip-control sense: were the dial NOT wired, these would be None.
+    call_models = [
+        c.kwargs.get("model_override") for c in mock_instance.call.call_args_list
+    ]
+    assert len(call_models) >= 2, (
+        f"expected >=2 agent.call iterations; got {len(call_models)}"
+    )
+    assert all(m == ACTOR_MODEL for m in call_models), (
+        f"every per-iteration agent.call must carry model_override={ACTOR_MODEL!r}; "
+        f"got {call_models!r}"
+    )
+
+    # The gate that fired must be the DECREMENTED clamp (proving _clamped_parent_headroom
+    # ran on the model path), not the fixed 0.10 snapshot — i.e. a negative headroom was
+    # handed to the refusing gate.
+    assert any(h is not None and h <= 0 for h in seen_headrooms), (
+        f"the refusing gate must receive a clamped (decremented) headroom <= 0, proving "
+        f"the per-iteration MIN clamp ran on the model_override path; got {seen_headrooms!r}"
+    )
+
+
 # ──────────────────────────────────────────────────────────────────
 # Test 10: artifact glob picks up new files
 
 
-def test_outcome_artifact_glob_picks_up_new_files(agent_vault, rubric_text, satisfied_verdict, tmp_path):
+def test_outcome_artifact_glob_picks_up_new_files(
+    agent_vault, rubric_text, satisfied_verdict, tmp_path
+):
     """Agent writes a file under run output dir; final result.output_files contains it."""
     agents_root, agent_name = agent_vault
-    runner = OutcomeRunner(agents_root=agents_root, agent_name=agent_name, judge_model="gpt-5")
+    runner = OutcomeRunner(
+        agents_root=agents_root, agent_name=agent_name, judge_model="gpt-5"
+    )
 
     # We'll capture the output_dir and write a file into it during the agent call
     captured_output_dir: dict = {}
@@ -586,7 +733,9 @@ def test_outcome_artifact_glob_picks_up_new_files(agent_vault, rubric_text, sati
                 artifact.write_text("The Q1 summary artifact content.")
                 captured_output_dir["path"] = str(artifact)
                 break
-        return _make_agent_response(text="I wrote the artifact to the output directory.")
+        return _make_agent_response(
+            text="I wrote the artifact to the output directory."
+        )
 
     judge_resp = _make_judge_response(satisfied_verdict)
 
@@ -630,7 +779,9 @@ def test_outcome_judge_call_respects_cost_cap(agent_vault, rubric_text):
         # First check (pre-agent): allow. Second check (pre-judge): deny.
         if call_count["guardrail"] <= 1:
             return CostCheckResult(allow=True)
-        return CostCheckResult(allow=False, action="skip", reason="daily cap hit ($0.10/$0.10)")
+        return CostCheckResult(
+            allow=False, action="skip", reason="daily cap hit ($0.10/$0.10)"
+        )
 
     def judge_side_effect(*args, **kwargs):
         call_count["judge"] += 1
@@ -643,7 +794,9 @@ def test_outcome_judge_call_respects_cost_cap(agent_vault, rubric_text):
         mock_instance._check_cost_guardrails.side_effect = guardrail_side_effect
         MockAgent.return_value = mock_instance
 
-        with patch("atomic_agents.outcome._llm.call_llm", side_effect=judge_side_effect) as mock_llm:
+        with patch(
+            "atomic_agents.outcome._llm.call_llm", side_effect=judge_side_effect
+        ) as mock_llm:
             result = runner.run(
                 description="Cost cap judge test",
                 rubric=rubric_text,
@@ -666,7 +819,9 @@ def test_outcome_judge_call_respects_cost_cap(agent_vault, rubric_text):
 def test_outcome_max_iterations_zero_raises(agent_vault):
     """max_iterations=0 raises ValueError (operator mistake should be loud)."""
     agents_root, agent_name = agent_vault
-    runner = OutcomeRunner(agents_root=agents_root, agent_name=agent_name, judge_model="gpt-5")
+    runner = OutcomeRunner(
+        agents_root=agents_root, agent_name=agent_name, judge_model="gpt-5"
+    )
 
     with pytest.raises(ValueError, match="max_iterations"):
         runner.run("desc", "rubric text\n# criteria", max_iterations=0)
@@ -675,7 +830,9 @@ def test_outcome_max_iterations_zero_raises(agent_vault):
 def test_outcome_max_iterations_twentyone_raises(agent_vault):
     """max_iterations=21 raises ValueError (above allowed cap)."""
     agents_root, agent_name = agent_vault
-    runner = OutcomeRunner(agents_root=agents_root, agent_name=agent_name, judge_model="gpt-5")
+    runner = OutcomeRunner(
+        agents_root=agents_root, agent_name=agent_name, judge_model="gpt-5"
+    )
 
     with pytest.raises(ValueError, match="max_iterations"):
         runner.run("desc", "rubric text\n# criteria", max_iterations=21)
