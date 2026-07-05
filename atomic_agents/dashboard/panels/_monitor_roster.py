@@ -179,7 +179,7 @@ class _MonitorRosterPanel:
                     if raw_composite is None:
                         raw_composite = getattr(ah, "fleet_composite", None)
                     if raw_composite is not None:
-                        health_score = int(round(float(raw_composite) * 100))
+                        health_score = int(round(float(raw_composite)))
                     health_band = getattr(ah, "band", "unknown")
 
                 # Model

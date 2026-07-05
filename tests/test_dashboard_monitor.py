@@ -1431,3 +1431,265 @@ def test_monitor_detail_link_encodes_special_chars(tmp_path):
     assert "onclick=\"window.location.href=\\'" not in _MONITOR_JS, (
         "Security fix #2: inline onclick string-building is forbidden"
     )
+
+
+# ──────────────────────────────────────────────────────────────────
+# FIX 1: health score ×100 bug (composite is 0-100, not 0-1)
+
+
+def test_monitor_health_score_not_multiplied_by_100(tmp_path):
+    """FIX 1: a composite of 55.57 must render as 56, not 5557.
+
+    _monitor_roster.py previously computed int(round(float(raw_composite) * 100)),
+    but AgentHealth.composite is already in [0, 100] (e.g. 55.57). The correct
+    formula is int(round(float(raw_composite))) — no ×100.
+
+    Strip-RED: removing the * 100 from the formula changes the value from 5557 to 56.
+    If the fix were reverted, the health score in the JSON would be 5557 and this
+    test would fail on the >100 guard.
+    """
+    composite_val = 55.57  # already 0-100 — must display as 56
+
+    ah = _StubAgentHealth(agent="scored_agent", composite=composite_val, band="amber")
+    fh = _StubFleetHealth(agents=[ah])
+    lpr = {"scored_agent": _RECENT}
+    cd = _StubConsoleData(
+        agent_count=1,
+        last_primary_runs=lpr,
+        fleet_health=fh,
+    )
+    html = _render_monitor_html(tmp_path, console_data=cd)
+    agent_list = _parse_agents_json(html)
+    assert agent_list, "AGENTS JSON must not be empty"
+    a = agent_list[0]
+    score = a["health"]["score"]
+    assert score is not None, "health.score must not be None for a scored agent"
+    # Score must be in [0, 100] — a ×100 bug would give 5557 here
+    assert 0 <= score <= 100, (
+        f"FIX 1: health score {score} is out of [0, 100] range. "
+        "composite is already in 0-100; do not multiply by 100."
+    )
+    # The specific value: round(55.57) == 56
+    assert score == 56, f"FIX 1: composite 55.57 must display as 56, got {score}"
+
+
+def test_monitor_health_score_range_boundary_values(tmp_path):
+    """FIX 1 boundary: scores at the edges of [0, 100] stay in range.
+
+    Composites of 0.0, 100.0, and typical mid-range values all render in [0, 100].
+    """
+    from atomic_agents.dashboard.panels._monitor_roster import _MonitorRosterPanel
+
+    for composite_val, expected in [(0.0, 0), (100.0, 100), (85.0, 85), (42.5, 42)]:
+        ah = _StubAgentHealth(agent="edge_agent", composite=composite_val, band="green")
+        fh = _StubFleetHealth(agents=[ah])
+        cd = _StubConsoleData(
+            agent_count=1,
+            last_primary_runs={"edge_agent": _RECENT},
+            fleet_health=fh,
+        )
+        ctx = _make_ctx(console_data=cd)
+        panel = _MonitorRosterPanel()
+        result = panel.render(ctx)
+        agent_list = _parse_agents_json(result.html)
+        assert agent_list, (
+            f"AGENTS JSON must not be empty for composite={composite_val}"
+        )
+        score = agent_list[0]["health"]["score"]
+        assert score is not None
+        assert 0 <= score <= 100, (
+            f"FIX 1 boundary: composite {composite_val} yielded score {score} outside [0, 100]"
+        )
+        assert score == expected, (
+            f"FIX 1 boundary: composite {composite_val} must display as {expected}, got {score}"
+        )
+
+
+# ──────────────────────────────────────────────────────────────────
+# FIX 2: Monitor tab in shared nav_bar on EVERY page
+
+
+def test_nav_bar_includes_monitor_tab():
+    """FIX 2: nav_bar() always includes a Monitor tab linking to monitor.html.
+
+    The Monitor is a primary surface (spec/56 #653) and must appear in the top
+    tab nav on every page — Console, Cost, Activity, Quality, Memory — not only
+    on the Monitor page itself.
+    """
+    from atomic_agents.dashboard._shared import nav_bar
+
+    for current in ("console", "cost", "activity", "quality", "memory"):
+        result = nav_bar(current)
+        assert 'href="monitor.html"' in result, (
+            f"FIX 2: nav_bar(current={current!r}) must include Monitor tab linking to monitor.html"
+        )
+        assert ">Monitor<" in result, (
+            f"FIX 2: nav_bar(current={current!r}) must include Monitor label"
+        )
+
+
+def test_nav_bar_monitor_active_on_monitor_page():
+    """FIX 2: when current='monitor', the Monitor tab is marked active."""
+    from atomic_agents.dashboard._shared import nav_bar
+
+    result = nav_bar("monitor")
+    # The active class must be on the Monitor anchor
+    assert (
+        'href="monitor.html" class="active"' in result
+        or 'href="monitor.html"' in result
+    ), "FIX 2: monitor.html link must be present when current='monitor'"
+    # Confirm the Monitor link is the active one
+    assert 'class="active"' in result
+    # Extract the active anchor and verify it links to monitor.html
+    import re as _re
+
+    active_match = _re.search(r'<a [^>]*class="active"[^>]*>(.*?)</a>', result)
+    assert active_match, "FIX 2: an active anchor must exist"
+    active_href_match = _re.search(r'<a href="([^"]+)" class="active"', result)
+    if active_href_match:
+        assert active_href_match.group(1) == "monitor.html", (
+            f"FIX 2: active tab on monitor page must link to monitor.html, "
+            f"got {active_href_match.group(1)!r}"
+        )
+
+
+def test_nav_bar_other_tabs_not_active_when_monitor(self_param=None):
+    """FIX 2: when current='monitor', only Monitor is active — other tabs are not."""
+    from atomic_agents.dashboard._shared import nav_bar
+    import re as _re
+
+    result = nav_bar("monitor")
+    # Count active tabs — must be exactly 1
+    active_count = result.count('class="active"')
+    assert active_count == 1, (
+        f"FIX 2: exactly one tab must be active when current='monitor', got {active_count}"
+    )
+
+
+def test_nav_bar_memory_tab_still_present():
+    """FIX 2 KEEP: Memory tab must not be removed (it is a real surface)."""
+    from atomic_agents.dashboard._shared import nav_bar
+
+    for current in ("console", "monitor", "cost", "activity", "quality", "memory"):
+        result = nav_bar(current)
+        assert 'href="memory.html"' in result, (
+            f"FIX 2: Memory tab must remain in nav_bar for current={current!r}"
+        )
+        assert ">Memory<" in result
+
+
+def test_rendered_pages_nav_contains_monitor_tab(tmp_path):
+    """FIX 2 integration: rendered HTML pages all contain a Monitor tab.
+
+    Verifies that pages rendered by render_all() — index.html, cost.html,
+    activity.html, quality.html, memory.html — each contain a Monitor tab link.
+    monitor.html has the Monitor tab active; other pages have it inactive.
+    """
+    import json as _j
+    from datetime import date as _date
+    from atomic_agents.dashboard.render import render_all
+
+    # Set up a minimal agent so all tabs have something to render
+    agent = "nav_test_agent"
+    agent_dir = tmp_path / agent
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    (agent_dir / "model.md").write_text("# model\n")
+    log_dir = agent_dir / "log" / "2026-07"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "ts": "2026-07-05T12:00:00+00:00",
+        "trigger": "cron",
+        "model": "claude-haiku-4-5-20260101",
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cost_usd": 0.001,
+        "status": "ok",
+        "summary": "test",
+    }
+    (log_dir / "2026-07-05.jsonl").write_text(_j.dumps(rec) + "\n")
+
+    render_all(tmp_path, today=_date(2026, 7, 5))
+
+    dash = tmp_path / "_dashboard"
+    pages_to_check = [
+        "index.html",
+        "cost.html",
+        "monitor.html",
+        "activity.html",
+        "quality.html",
+        "memory.html",
+    ]
+    for page in pages_to_check:
+        path = dash / page
+        if not path.exists():
+            # Some pages may not exist without enough data; skip them
+            continue
+        content = path.read_text()
+        assert 'href="monitor.html"' in content, (
+            f"FIX 2 integration: {page} must contain a Monitor tab linking to monitor.html"
+        )
+        assert ">Monitor<" in content, (
+            f"FIX 2 integration: {page} must contain Monitor label in nav"
+        )
+
+
+# ──────────────────────────────────────────────────────────────────
+# FIX 3: view toggle List button has server-side active class
+
+
+def test_monitor_list_button_has_active_class_server_side(tmp_path):
+    """FIX 3: the List button carries class='active' in the server-rendered HTML.
+
+    Before JS runs the toggle looks unselected because neither button had an
+    active class. The List button must have class='active' server-side (spec/56 §4:
+    list is the default view). JS overrides this from ?view= / localStorage on load.
+
+    Strip-RED: removing class='active' from the List button causes this test to fail.
+    """
+    cd = _StubConsoleData(agent_count=0, last_primary_runs={})
+    html = _render_monitor_html(tmp_path, console_data=cd)
+
+    # The List button must carry class="active" in the server HTML
+    assert 'data-view="list" class="active"' in html, (
+        'FIX 3: List button must have class="active" in server-rendered HTML '
+        "(spec/56 §4: list is the default view)"
+    )
+
+
+def test_monitor_cards_button_not_active_server_side(tmp_path):
+    """FIX 3: the Cards button must NOT carry active class in server HTML."""
+    cd = _StubConsoleData(agent_count=0, last_primary_runs={})
+    html = _render_monitor_html(tmp_path, console_data=cd)
+
+    # Cards button must not be marked active server-side
+    assert 'data-view="cards" class="active"' not in html, (
+        "FIX 3: Cards button must not be marked active in server HTML"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# FIX 4: arrival banner copy
+
+
+def test_monitor_arrival_banner_copy(tmp_path):
+    """FIX 4: arrival banner text reads 'arrived from home · filtered to' (B7 design).
+
+    The original text was 'arrived filtered to' (missing 'from home ·').
+    """
+    cd = _StubConsoleData(agent_count=0, last_primary_runs={})
+    html = _render_monitor_html(tmp_path, console_data=cd)
+
+    # The banner element exists (hidden by default)
+    assert 'id="arrival-banner"' in html, "arrival-banner must be present"
+
+    # The copy must include "from home" and the separator (middot or ·)
+    assert "arrived from home" in html, (
+        "FIX 4: arrival banner must say 'arrived from home' (not just 'arrived')"
+    )
+    assert "filtered to" in html, "FIX 4: arrival banner must say 'filtered to'"
+    # The old incorrect copy must not appear
+    # (The old text was 'arrived filtered to' — the new one is 'arrived from home · filtered to')
+    # Check that the separator (middot or its entity) is between them
+    assert "middot" in html or "·" in html, (
+        "FIX 4: arrival banner must include a middot (·) separator between 'from home' and 'filtered to'"
+    )

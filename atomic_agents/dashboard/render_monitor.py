@@ -736,10 +736,14 @@ def _render_monitor_template(
     )
 
     # Controls row (MUST 4 view toggle, MUST 6 filter/search/sort)
+    # Server-render the List button as active by default (spec/56 §4: list is the
+    # default view). JS overrides from ?view= / localStorage on load, so the
+    # server-side class is only visible before JS runs — it prevents the toggle
+    # looking unselected on first paint (FIX 3).
     controls = (
         '<div class="mon-controls">'
         '<div class="view-toggle" id="view-toggle">'
-        '<button data-view="list">List</button>'
+        '<button data-view="list" class="active">List</button>'
         '<button data-view="cards">Cards</button>'
         "</div>"
         '<input class="mon-search" id="mon-search" type="text"'
@@ -765,7 +769,7 @@ def _render_monitor_template(
     # Arrival filter banner (hidden by default; JS shows it when ?status=<s> matches)
     arrival_banner = (
         '<div class="arrival-banner" id="arrival-banner" style="display:none">'
-        '<span class="arrival-caption">arrived filtered to</span>'
+        '<span class="arrival-caption">arrived from home &middot; filtered to</span>'
         '<span class="active-filter-chip chip-error" id="arrival-chip"'
         ' onclick="clearArrivalFilter()">'
         '<span id="arrival-chip-label">ERROR</span>'
