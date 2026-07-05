@@ -105,12 +105,11 @@ class _FleetStatusPanel:
                 "</div>"
             )
 
-        # Monitor link placeholder (#653)
+        # Monitor link (#653 shipped)
         monitor_link = (
             '<div class="foot-note" style="margin-top:12px">'
-            "Full per-agent grid → "
-            '<a href="monitor.html" title="Fleet Monitor (#653 — coming soon)">Fleet Monitor</a>'
-            " (coming soon)"
+            "Full per-agent roster → "
+            '<a href="monitor.html" title="Fleet Monitor">Fleet Monitor</a>'
             "</div>"
         )
 

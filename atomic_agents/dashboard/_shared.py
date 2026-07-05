@@ -134,7 +134,7 @@ def sparkline(values: list[float]) -> str:
 
 
 _KNOWN_TAB_KEYS = frozenset(
-    {"console", "cost", "activity", "quality", "memory", "goals"}
+    {"console", "monitor", "cost", "activity", "quality", "memory", "goals"}
 )
 
 
@@ -158,10 +158,12 @@ def nav_bar(current: str, has_goals: bool = True) -> str:
             sorted(_KNOWN_TAB_KEYS),
         )
 
-    # Console is the FIRST tab (front door per spec/52). Cost tab now points to
-    # cost.html (was index.html — backward-compat callout in spec/52 + CHANGELOG).
+    # Console is the FIRST tab (front door per spec/52). Monitor is second (spec/56 #653):
+    # it is a primary surface and must be reachable from every page's top nav.
+    # Cost tab now points to cost.html (was index.html — backward-compat callout in spec/52).
     tabs = [
         ("console", "index.html", "Console"),
+        ("monitor", "monitor.html", "Monitor"),
         ("cost", "cost.html", "Cost"),
         ("activity", "activity.html", "Activity"),
         ("quality", "quality.html", "Quality"),

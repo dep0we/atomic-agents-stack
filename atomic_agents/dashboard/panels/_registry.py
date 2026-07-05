@@ -112,7 +112,7 @@ class Panel(Protocol):
     """Protocol that every registered panel must satisfy."""
 
     id: str
-    slot: str  # 'status' | 'act' | 'explore'
+    slot: str  # 'status' | 'act' | 'explore' | 'agent-tab' | 'monitor-summary' | 'monitor-roster'
     order: int  # ties broken by id (ascending alpha)
 
     def is_available(self, ctx: PanelContext) -> bool:
@@ -220,6 +220,60 @@ class PanelRegistry:
                     continue
                 fragments.append(result.html)
                 all_alert_keys |= result.alert_keys  # MUST 17: engine aggregation
+            slot_html[slot] = "\n".join(fragments)
+
+        return slot_html, frozenset(all_alert_keys)
+
+    def compose_monitor(
+        self, ctx: "PanelContext"
+    ) -> "tuple[dict[str, str], frozenset[str]]":
+        """Run the layout engine for the Fleet Monitor page (spec/56 §6).
+
+        Mirrors compose() but iterates the monitor-specific slots
+        ('monitor-summary', 'monitor-roster') instead of the home slots.
+        Per-panel fail-soft (MUST 11), is_available gate (MUST 12), and
+        alert-key union (MUST 17) apply identically to the home engine.
+
+        Returns
+        -------
+        (slot_html, alert_keys):
+            slot_html: dict slot -> joined HTML fragments for that slot.
+            alert_keys: frozenset (monitor panels carry no alert keys today).
+        """
+        from ..render import logger
+
+        slot_html: dict[str, str] = {"monitor-summary": "", "monitor-roster": ""}
+        all_alert_keys: set[str] = set()
+
+        for slot in ("monitor-summary", "monitor-roster"):
+            fragments: list[str] = []
+            for panel in self.panels_by_slot(slot):
+                try:
+                    available = panel.is_available(ctx)
+                except Exception as exc:
+                    logger.warning(
+                        "monitor panel '%s' is_available raised (%s); omitting",
+                        panel.id,
+                        type(exc).__name__,
+                    )
+                    continue
+                if not available:
+                    continue
+                try:
+                    result = panel.render(ctx)
+                except Exception as exc:
+                    logger.warning(
+                        "monitor panel '%s' render failed (%s); degraded placeholder",
+                        panel.id,
+                        type(exc).__name__,
+                    )
+                    fragments.append(
+                        f'<div class="panel-degraded" data-panel-id="{panel.id}">'
+                        f"Panel unavailable</div>"
+                    )
+                    continue
+                fragments.append(result.html)
+                all_alert_keys |= result.alert_keys
             slot_html[slot] = "\n".join(fragments)
 
         return slot_html, frozenset(all_alert_keys)
