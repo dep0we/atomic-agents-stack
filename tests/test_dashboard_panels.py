@@ -1228,23 +1228,49 @@ def test_fleet_status_counts_link_to_monitor():
 
 
 def test_fleet_status_counts_link_strip_red():
-    """B7 strip-RED: if count cells were plain <div>s (no <a> wrapper),
-    no monitor.html links would appear — confirms the <a> wrapping is load-bearing."""
+    """B7 strip-RED: each fleet-status count cell must be an <a> element that carries
+    BOTH class='fo-cell-nav' AND href='monitor.html?status=<status>'.
+    A plain <div class='fo-cell-nav'> (no <a> wrapper) or an <a> with the href removed
+    would leave the navigation broken — this test catches both regressions."""
+    import re
+
     from atomic_agents.dashboard.panels._fleet_status import _FleetStatusPanel
 
     cd = _StubConsoleData(
-        agent_count=1,
-        last_primary_runs={"a": None},
+        agent_count=2,
+        last_primary_runs={"a": None, "b": None},
         attention_queue=[],
         cost_trends=[],
     )
     ctx = _make_ctx(console_data=cd)
     result = _FleetStatusPanel().render(ctx)
-    # If the link is absent entirely, the test above would fail. Here we confirm
-    # the fo-cell-nav class is present (the affordance CSS hook).
-    assert "fo-cell-nav" in result.html, (
-        "strip-RED: count cell must carry .fo-cell-nav — absent means no affordance"
-    )
+    html = result.html
+
+    for status in ("ok", "warn", "error", "stale"):
+        href = f'href="monitor.html?status={status}"'
+        # Assert the <a> element exists with the right href.
+        assert href in html, (
+            f"strip-RED: fleet-status {status.upper()} cell must carry "
+            f"href='monitor.html?status={status}'"
+        )
+        # Assert the href lives inside an <a> tag (not a <div> or other element).
+        # Pattern: <a ... href="monitor.html?status={status}" ... > — the opening
+        # tag must start with '<a ' or '<a\n'.
+        pattern = rf'<a\b[^>]*\bhref="monitor\.html\?status={re.escape(status)}"'
+        assert re.search(pattern, html), (
+            f"strip-RED: fleet-status {status.upper()} href must be on an <a> element — "
+            "a plain <div> with the href attribute would not create a real link"
+        )
+        # Assert fo-cell-nav class co-occurs on the same <a> tag.
+        a_tag_pattern = (
+            rf'<a\b[^>]*\bclass="fo-cell-nav"[^>]*\bhref="monitor\.html\?status={re.escape(status)}"'
+            r"|"
+            rf'<a\b[^>]*\bhref="monitor\.html\?status={re.escape(status)}"[^>]*\bclass="fo-cell-nav"'
+        )
+        assert re.search(a_tag_pattern, html), (
+            f"strip-RED: fleet-status {status.upper()} <a> must carry class='fo-cell-nav' "
+            "on the same element as the href — class on a wrapper div leaves no keyboard affordance"
+        )
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -1338,9 +1364,11 @@ def test_governance_rec_renders_advisory_tag():
 
 
 def test_governance_rec_must_not_get_axis_tag_strip_red():
-    """B7 strip-RED: a governance rec must NOT get a teal axis 'Cost · +N pts' tag.
-    Stripping the kind check in _render_recommendations would cause governance recs
-    to incorrectly render rec-axis-tag — this test catches that regression."""
+    """B7 strip-RED: a governance rec must NOT get a teal axis 'Cost · +N pts' tag
+    AND must NOT get a rec-delta-points / '+N pts' points badge.
+    Stripping the kind == 'savings_cost' guard in _render_recommendations would
+    cause governance recs to incorrectly render both — this test catches that
+    regression on both surfaces."""
     from atomic_agents.dashboard.render import _render_recommendations
 
     rec = _StubRec(
@@ -1348,10 +1376,18 @@ def test_governance_rec_must_not_get_axis_tag_strip_red():
         current_model=None,
         candidate_model=None,
         projected_usd_delta=None,
-        projected_points_delta=5.0,  # would show pts if check is missing
+        projected_points_delta=5.0,  # would show pts if either check is missing
     )
     html = _render_recommendations([rec])
     assert "rec-axis-tag" not in html, (
         "strip-RED: governance rec must NOT get an axis tag — "
         "removing the kind check would make it appear"
+    )
+    assert "rec-delta-points" not in html, (
+        "strip-RED: governance rec must NOT get a rec-delta-points points badge — "
+        "removing the kind == 'savings_cost' guard on the pts badge would make it appear"
+    )
+    assert "+5.0 pts" not in html, (
+        "strip-RED: governance rec must NOT render '+N pts' text — "
+        "advisory recs carry no points badge regardless of projected_points_delta"
     )

@@ -1638,7 +1638,7 @@ def _render_recommendations(recommendations) -> str:
                 f'<span class="rec-delta-badge rec-delta-savings">'
                 f"${abs(usd_delta):.2f}/mo saved</span>"
             )
-        if pts_delta is not None:
+        if pts_delta is not None and kind == "savings_cost":
             delta_parts.append(
                 f'<span class="rec-delta-badge rec-delta-points">{pts_delta:+.1f} pts</span>'
             )
