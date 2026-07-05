@@ -338,6 +338,20 @@ Each MUST ships with parametrized conformance coverage in `tests/test_dashboard_
 | MUST 8 | `test_reliability_error_rate`, `test_reliability_embed_blocked_from_extra`, `test_reliability_embed_blocked_strip_red`, `test_reliability_lock_busy_counted`, `test_reliability_skipped_rate_counts_cost_blocks`, `test_reliability_alerts_fires_on_high_skipped_rate` |
 | MUST 9 | `test_governance_no_governance_alert`, `test_governance_invalid_alert`, `test_governance_incomplete_alert`, `test_governance_no_block_alert` (strip-RED on the PRESENT_NO_BLOCK branch), `test_governance_valid_emits_no_alert` |
 
+**Cockpit rebuild (#635) — MUSTs 10-18 conformance** (authored in the #635 build, in `tests/test_dashboard_panels.py` for the registry/engine + `tests/test_dashboard_console.py` for the home layout):
+
+| MUST | Key test functions (build deliverable) |
+|------|----------------------------------------|
+| MUST 10 | `test_console_renders_via_registry`, `test_no_inline_panel_outside_registry` |
+| MUST 11 | `test_panel_render_raise_degrades_only_that_panel` (strip-RED), `test_panel_is_available_raise_omits_panel` |
+| MUST 12 | `test_unavailable_capability_omits_panel`, `test_available_but_empty_renders_empty` (the two states distinguishable) |
+| MUST 13 | `test_panels_no_backend_io_at_render` |
+| MUST 14 | `test_runtime_health_excludes_governance_modelfit_workmix`, `test_runtime_health_excludes_governance_strip_red` (strip-RED: removing the `_RUNTIME_AXES` filter renders an injected governance row) |
+| MUST 15 | `test_home_has_no_card_grid`, `test_home_fleet_status_summary_links_monitor`, `test_home_fleet_status_summary_strip_red` |
+| MUST 16 | `test_duplicate_panel_id_registration_raises`, `test_duplicate_panel_id_registration_strip_red` |
+| MUST 17 | `test_alert_keys_aggregated_to_sidecar` (panel-contributed key reaches the sidecar; seed does NOT), `test_alert_keys_aggregated_sidecar_empty_422s_ack` (strip-RED: empty engine union → empty sidecar → a legit-looking ack 422s) |
+| MUST 18 | `test_home_summary_status_matches_monitor_mapping`, `test_status_*` precedence suite in `tests/test_dashboard_panels.py`, `test_home_summary_status_strip_red` |
+
 ---
 
 ## 13. Performance notes
@@ -345,6 +359,108 @@ Each MUST ships with parametrized conformance coverage in `tests/test_dashboard_
 - `list_agents(include_governance=True)` reads and parses every agent's `governance.md` on every console render. For a fleet of 50+ agents, this is 50+ file reads at render time. Acceptable for PR1 (visibility cut, not a performance release). A caching layer (invalidated on `governance.md` mtime change) is filed as a follow-up for PR2.
 - The quality signal reader does a lightweight direct read of `evals/runs/*.jsonl` per agent on standalone console renders. On full `render_all()` calls, the quality signals are shared from the quality tab's aggregation to avoid a second evals/ read (progressive disclosure, Principle #6).
 - `aggregate_console()` accepts pre-aggregated `quality_signals` as an optional parameter for this sharing pattern.
+
+---
+
+## 16. Panel Registry — console composition architecture (Cockpit rebuild #635, decision D8)
+
+**Status:** DRAFT (Cockpit rebuild #635). This section defines HOW the console composes its UI. It RE-EXPRESSES the existing surfaces (the attention queue §2, three-axis panels §6, and — once spec/53/54 shipped — the health band and recommendations) as **registered panels**, and is the foundation every later Cockpit surface plugs into (Fleet Monitor #653, fleet-overview #636, per-agent detail #637, future modules #645). The approved layout contract is `variant-B6-zones.html`; the design rationale is `2026-06-26-cockpit-design-rethink.md` §3.
+
+### 16.1 Motivation
+
+The pre-Cockpit render stacked sections inline in `_render_console_template`, so every new surface meant editing that template. The Cockpit composes from a **registry of self-contained panels** so "add a feature = register a panel" — no render-template rewrite.
+
+### 16.2 The Panel contract
+
+A panel is an object with this interface:
+
+- `id: str` — stable, unique panel id (duplicate ids are a registration error, MUST 16).
+- `slot: Literal["status", "act", "explore", "agent-tab"]` + `order: int` — placement; ascending `order` within a slot, ties broken by `id` (deterministic).
+- `is_available(ctx: PanelContext) -> bool` — capability gate (§16.5): False when the panel's required data/backend is absent (e.g. a Goals panel only when GoalBackend is configured; an "apply"-action panel only when Principal + Mandate are present).
+- `render(ctx: PanelContext) -> PanelResult` — the SINGLE render entry. Reads only pre-loaded inputs off `ctx` (MUST 13). The panel handles its OWN known states internally: it returns empty content when its data is present-but-zero-items, and degraded content when `ctx` reports its read degraded (spec/09). `render_empty()` / `render_degraded()` are RECOMMENDED panel-internal helpers the panel calls from `render` — they are NOT invoked by the engine.
+
+`PanelResult = (html: str, alert_keys: frozenset[str] = frozenset())`. `html` is the fragment; `alert_keys` lets a panel (the attention queue) contribute the keys the engine aggregates for the `_console/rendered_alert_keys.json` sidecar (§4 / MUST 4), so panelization preserves that contract (MUST 17).
+
+### 16.3 The layout engine
+
+For each registered panel, in `(slot, order)`:
+
+1. Call `is_available(ctx)`. If it returns False **or raises**, the panel is OMITTED (an `is_available` exception is treated as not-available, logged WARNING — fail-safe).
+2. Else call `render(ctx)` inside try/except. On any uncaught exception the engine substitutes a generic degraded placeholder fragment for THAT panel and logs WARNING; it MUST NOT abort the page or affect siblings (MUST 11). Known empty/degraded states are the panel's own `render` return value, NOT an exception.
+3. Aggregate every `PanelResult.alert_keys` into the sidecar write (MUST 17).
+
+The composition as a whole MUST NOT raise. `is_available == False` → omitted entirely (no empty box); "present-but-empty" is the panel's own returned empty content (distinct from capability-absent).
+
+### 16.5 Registration + data loading
+
+- **Registry:** a process-level `PanelRegistry` with `register(panel)`. Each panel module calls `register(...)` at import; the registry package (`atomic_agents/dashboard/panels/__init__.py`) imports every panel module, so registration is an import side effect, and `render_console` imports the registry package before composing. Registering a duplicate `id` MUST raise at registration time (fail-loud, MUST 16) — no silent overwrite (Principle #8, the ToolRegistry refuse-overwrite shape).
+- **Loader → `PanelContext`:** a single loader resolves ALL inputs once per render and builds one typed `PanelContext`. Its fields: `console_data: ConsoleData` (the existing dataclass — attention queue, trends, `fleet_health`, recommendations, and the spec/09 `*_degraded` flags it already carries), `capabilities: ConsoleCapabilities`, and `today: date`. EVERY panel's `render`/`is_available` receives the SAME `ctx`; panels read the fields they need. Data is NEVER passed as per-panel payloads or re-loaded per panel (MUST 13).
+- **Capabilities:** `ConsoleCapabilities` is a small dataclass of booleans advertising which optional backends/data are present (`has_goals`, `has_principal_and_mandate`, `has_governance`, …), resolved once by the loader; `is_available` reads `ctx.capabilities`.
+
+### 16.4 Slots
+
+| Slot | Contents (home unless noted) |
+|------|------------------------------|
+| `status` | above-the-fold vitals: KPI strip + the Runtime-Health tile |
+| `act` | attention queue + Advisor/score + savings (the do-now zone) |
+| `explore` | compact fleet-status summary (links to Monitor #653) + fleet-overview (#636) |
+| `agent-tab` | panels inside the per-agent detail view (#637) |
+
+### Implementer Contract — additional MUSTs (extends §11)
+
+**MUST 10 — Registered composition:** every console surface MUST render by composing registered panels by `(slot, order)`; no surface may hard-code a panel inline outside the registry.
+
+**MUST 11 — Per-panel fail-soft:** an uncaught exception from a panel's `is_available` or `render` MUST degrade ONLY that panel (omit it, or substitute a generic degraded fragment) and MUST NOT abort the page render or affect sibling panels. (Conformance: strip-RED — a panel that raises still yields a full page containing the other panels.)
+
+**MUST 12 — Capability-gated registration:** a panel whose declared data/backend dependency is absent (`is_available == False`) MUST be omitted entirely (no placeholder box); a panel that IS available but has zero items renders its own empty content. The two states MUST be distinguishable in a test.
+
+**MUST 13 — No render-time backend I/O:** panels render from the single pre-loaded `PanelContext` only; a panel MUST NOT open a new backend connection or re-read JSONL at render time (Principle #6 + the zero-extra-I/O posture). The loader resolves all inputs once, before composition.
+
+**MUST 16 — Fail-loud duplicate registration:** `PanelRegistry.register` MUST raise on a duplicate `id` (no silent overwrite, the ToolRegistry shape). (Conformance: registering two panels with the same id raises.)
+
+**MUST 17 — Alert-key aggregation preserved:** the layout engine MUST aggregate every `PanelResult.alert_keys` across rendered panels and write them to `_console/rendered_alert_keys.json` (§4); the attention-queue panel MUST contribute its keys, preserving MUST 4 under panelization. (Conformance: strip-RED — without the aggregation the sidecar is empty and a legitimate ack is wrongly 422'd.)
+
+---
+
+## 17. Cockpit Home Layout (decisions D9 + D1-layered)
+
+The home composes panels into three zones, in order: **STATUS → ACT → EXPLORE** (the §16.4 slots), per `variant-B6-zones.html`.
+
+- **Runtime Health (D1 = layered):** the health panel renders the shipped spec/53 0-100 composite as **"Runtime Health"** (cost / quality / reliability only). Governance is a SEPARATE grade panel (#630), registered in its own right, NOT folded into the health number. Model-fit and work-mix surface as advisory **recommendation** panels (spec/54), never as score inputs.
+- **Roster relocation (D10):** the per-agent card grid of §8 MOVES to the Fleet Monitor page (#653). The home's `explore` slot carries a compact **fleet-status summary** panel — counts of OK / WARN / ERROR / STALE — that links to the Monitor. §8's card-grid contract is hereby superseded ON THE HOME by this summary (the card grid itself lives on, in the Monitor spec).
+
+**MUST 14 — Runtime-Health framing:** the home health panel MUST present the spec/53 composite as runtime health only (cost/quality/reliability). Governance, model-fit, and work-mix MUST NOT be folded into that composite — they render as their own panel/recs. (Locks D1.)
+
+**MUST 15 — Roster relocation:** the home MUST NOT render the full per-agent card grid (§8); it renders the compact fleet-status summary panel linking to the Fleet Monitor (#653). (Locks D10 at the home boundary.)
+
+### 17.2 Navigable summary tiles (B7, #635)
+
+The **"Needs Attention" KPI tile** links to the attention-queue section on the same page (`href="#attention-queue"`). The attention-queue heading carries `id="attention-queue"`. Clicking the tile smooth-scrolls to the heading with a brief highlight pulse (JS in the console template). The tile uses `.cockpit-kpi-nav` for the affordance (cursor:pointer, hover lift + accent border, `→` glyph on hover) — no new color tokens.
+
+The **fleet-status count cells** (OK / WARN / ERROR / STALE) each link to `monitor.html?status=<status>` (Fleet Monitor #653). The Monitor page is not yet built; the links are wired per the design now and resolve when it ships. Each cell uses `.fo-cell-nav` for the affordance (tooltip caption on hover).
+
+### 17.3 Layered recommendation tie-back tags (B7, #635)
+
+Each recommendation card carries a tie-back tag matching its scored/advisory status in the 3-axis composite:
+
+- **`savings_cost` recs** → teal axis tag `→ Cost · +N pts` (where N is `projected_points_delta` rounded; if N is 0, shown as `→ Cost`). These recs move the Cost axis of the composite score.
+- **`quality_report` recs** → muted `advisory · not scored` tag. Eval coverage is advisory — it does not move the 3-axis composite directly.
+- **`governance` recs** → muted `advisory · not scored` tag. Governance is a separate grade (not part of the cost/quality/reliability composite).
+
+Tag placement: right side of the rec-header (`margin-left: auto`). Styling: `.rec-axis-tag` (teal, accent tokens) and `.rec-advisory-tag` (muted tokens). No new colors introduced.
+
+### 17.1 Canonical per-agent status (decision D12)
+
+Each agent has a status `OK | WARN | ERROR | STALE`, shared by the home fleet-status summary AND the Fleet Monitor (#653):
+
+- **STALE** — no primary run in the staleness window (default: no primary run in the last 24h). The agent went quiet (the agent-equivalent of an unreachable device).
+- **ERROR** — Runtime Health is critical-capped (spec/53 critical cap) OR the reliability error-rate is over its threshold in the window.
+- **WARN** — not ERROR, but has any open attention-queue item, OR amber Runtime Health, OR a cost-spike flag.
+- **OK** — none of the above.
+
+Precedence: **ERROR > STALE > WARN > OK**. Exact thresholds and the staleness window are operator-tunable and detailed in the Fleet Monitor scope (#653 / D12); the signal-to-status mapping above is canonical.
+
+**MUST 18 — Single status definition:** the home fleet-status summary counts MUST derive from this canonical per-agent status, and the Fleet Monitor (#653) MUST reuse the SAME mapping (one definition — the home summary and the Monitor never diverge).
 
 ---
 
@@ -361,7 +477,7 @@ Each MUST ships with parametrized conformance coverage in `tests/test_dashboard_
 
 ## 15. LOCK ceremony checklist (for future LOCK PR)
 
-- [ ] All 9 MUSTs have parametrized conformance tests with strip-RED negative controls
+- [ ] All 18 MUSTs have parametrized conformance tests with strip-RED negative controls (1-9 console PR1; 10-18 Cockpit rebuild #635)
 - [ ] No inline `TODO` markers in spec/52 body
 - [ ] `docs/protocols-shipped.md` updated with console entry
 - [ ] CLAUDE.md status block updated (dashboard tab count, spec/52 LOCKED notation)

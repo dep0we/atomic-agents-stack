@@ -204,6 +204,103 @@ def test_index_html_content_unchanged(tmp_path):
     assert "Per-agent breakdown" in cost_html
 
 
+# ──────────────────────────────────────────────────────────────────
+# Panelized console layout — structural invariants (spec/52 §16, Cockpit #635)
+#
+# These replace the old "inline section content" assertions: the home is now
+# composed by the panel registry, so the integration test guards the PANELIZED
+# structure (zones compose in order, panel markers present, no inline-only
+# structures, fail-soft keeps the page whole), not literal inline strings.
+
+
+def test_console_home_composes_zones_in_order(tmp_path):
+    """The home composes STATUS → ACT → EXPLORE in that order, with all three
+    zone-label dividers present (the panelized layout contract)."""
+    _build_synthetic_vault(tmp_path, with_goals=False)
+    render_all(tmp_path)
+    html = (tmp_path / "_dashboard" / "index.html").read_text()
+
+    # Zone dividers appear in STATUS → ACT → EXPLORE order.
+    i_status = html.find(">Status<")
+    i_act = html.find(">Act<")
+    i_explore = html.find(">Explore<")
+    assert -1 < i_status < i_act < i_explore, (
+        "zones must compose in STATUS → ACT → EXPLORE order"
+    )
+
+
+def test_console_home_panel_markers_present(tmp_path):
+    """The home carries the registered panels' distinctive markers — proving the
+    page is composed from the registry (KPI strip, attention queue, trends,
+    fleet-status), not an inline template."""
+    _build_synthetic_vault(tmp_path, with_goals=False)
+    render_all(tmp_path)
+    html = (tmp_path / "_dashboard" / "index.html").read_text()
+
+    assert 'class="kpis cockpit-kpis"' in html, "KPI-strip panel marker"
+    assert "Operator Attention Queue" in html, "attention-queue panel marker"
+    assert "Fleet Trends" in html, "three-axis trends panel marker"
+    assert 'class="fo-grid"' in html, "fleet-status summary panel marker"
+
+
+def test_console_home_no_inline_card_grid(tmp_path):
+    """MUST 15 at the integration boundary: the panelized home no longer renders the
+    per-agent card grid (it moved to the Fleet Monitor #653)."""
+    _build_synthetic_vault(tmp_path, with_goals=False)
+    render_all(tmp_path)
+    html = (tmp_path / "_dashboard" / "index.html").read_text()
+    assert 'class="agent-grid"' not in html
+    assert 'class="agent-card"' not in html
+
+
+def test_console_home_fail_soft_keeps_page_whole(tmp_path):
+    """MUST 11 at the integration boundary: if ONE registered panel raises, the page
+    still renders with its sibling panels and all zone chrome intact."""
+    import atomic_agents.dashboard.panels._registry as _reg_mod
+    from atomic_agents.dashboard.panels._registry import PanelRegistry
+
+    _build_synthetic_vault(tmp_path, with_goals=False)
+
+    # Wrap the live registry: make the attention-queue panel raise, leave the rest.
+    live = _reg_mod.get_registry()
+
+    class _Boom:
+        id = "attention_queue"  # shadow id (we swap into a fresh registry)
+        slot = "act"
+        order = 10
+
+        def is_available(self, ctx):
+            return True
+
+        def render(self, ctx):
+            raise RuntimeError("intentional panel failure")
+
+    patched = PanelRegistry()
+    for p in live.panels:
+        patched.register(_Boom() if p.id == "attention_queue" else p)
+
+    original = _reg_mod._REGISTRY
+    _reg_mod._REGISTRY = patched
+    try:
+        render_all(tmp_path)
+    finally:
+        _reg_mod._REGISTRY = original
+
+    html = (tmp_path / "_dashboard" / "index.html").read_text()
+    # The page is whole: sibling panels rendered, all zone dividers present.
+    assert "Fleet Console" in html
+    assert 'class="kpis cockpit-kpis"' in html, "sibling STATUS panel intact"
+    assert "Fleet Trends" in html, "sibling ACT panel intact"
+    assert html.count("cockpit-zone-label") >= 3, (
+        "all zone dividers survive a panel failure"
+    )
+    # The failed panel's content is absent (it degraded to empty).
+    # B7: "Operator Attention Queue" now also appears in the KPI tile title attr, so
+    # check for the panel's heading anchor (id="attention-queue") which is only
+    # emitted by the panel render itself — not by the KPI strip.
+    assert 'id="attention-queue"' not in html
+
+
 def test_activity_html_content(tmp_path):
     _build_synthetic_vault(tmp_path, with_goals=False)
     render_all(tmp_path)
