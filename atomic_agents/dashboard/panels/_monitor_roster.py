@@ -24,8 +24,11 @@ from datetime import timedelta, timezone
 
 from ._registry import PanelContext, PanelResult, register
 
-# Problems-first sort order for the client (matches spec/56 §4 + mockup JS).
-_STATUS_SORT = {"error": 0, "warn": 1, "stale": 2, "ok": 3}
+# Problems-first sort order: ERROR=0, STALE=1, WARN=2, OK=3 (spec/56 §4, MUST 3).
+# This order is used BOTH server-side (to emit rows in the correct default order
+# so the page is problems-first without JS) AND client-side (JS re-sorts on
+# interactive filter/sort changes). They MUST agree.
+_STATUS_SORT = {"error": 0, "stale": 1, "warn": 2, "ok": 3}
 
 # Sparkline color by status
 _SPARK_COLOR = {
@@ -155,79 +158,131 @@ class _MonitorRosterPanel:
             open_items = open_items_by_agent.get(agent, [])
             lpr = cd.last_primary_runs.get(agent)
 
-            # Per-entity fail-soft (MUST 10): any field read that fails degrades
-            # only that row's value. Since we're reading from pre-loaded dataclasses
-            # (MUST 13), the individual getattr calls below are the per-field guards.
+            # Per-entity fail-soft (MUST 10): wrap EACH agent's full metric/data
+            # build in its own try/except so one bad agent degrades only its own
+            # row — the rest of the roster renders normally.
+            try:
+                status = status_for_agent(
+                    agent_health=ah,
+                    attention_items=open_items,
+                    last_primary_run_at=lpr,
+                    now=now,
+                    cost_spike=agent in spike_agents,
+                )
+                status_lower = status.lower()
 
-            status = status_for_agent(
-                agent_health=ah,
-                attention_items=open_items,
-                last_primary_run_at=lpr,
-                now=now,
-                cost_spike=agent in spike_agents,
+                # Health score + band
+                health_score: int | None = None
+                health_band = "unknown"
+                if ah is not None:
+                    raw_composite = getattr(ah, "composite", None)
+                    if raw_composite is None:
+                        raw_composite = getattr(ah, "fleet_composite", None)
+                    if raw_composite is not None:
+                        health_score = int(round(float(raw_composite) * 100))
+                    health_band = getattr(ah, "band", "unknown")
+
+                # Model
+                model_id = ""
+                if ah is not None:
+                    model_id = getattr(ah, "primary_model", None) or ""
+
+                # Cost (7d from daily_series[-7:])
+                series_7d = daily_series_by_agent.get(agent, [])
+                cost_7d = sum(v for _, v in series_7d) if series_7d else 0.0
+                spark_values = [v for _, v in series_7d]
+
+                # Degraded check
+                row_cost_degraded = cost_degraded_by_agent.get(agent, False)
+                if row_cost_degraded:
+                    any_cost_degraded = True
+
+                # Errors (24h) and failures (7d)
+                errors_24h = errors_by_agent.get(agent, 0)
+                fail_7d = failures_by_agent.get(agent, 0)
+
+                # Last run — ISO timestamp for JS lastrun sort (MUST 6); relative str for display.
+                last_run_str = _relative_time(lpr, now) if lpr else "never"
+                last_run_stale = status_lower == "stale"
+                # ISO 8601 epoch string for proper JS date-based sort (empty string when no run).
+                last_run_iso = lpr.isoformat() if lpr is not None else ""
+
+                entity_list.append(
+                    {
+                        "id": agent,
+                        "name": agent,
+                        "model": _short_model_name(model_id) if model_id else "",
+                        "modelClass": _model_pill_class(model_id)
+                        if model_id
+                        else "local",
+                        "status": status_lower,
+                        "health": {
+                            "score": health_score,
+                            "band": health_band,
+                        },
+                        "errors24h": errors_24h,
+                        "fail7d": fail_7d,
+                        "cost7d": cost_7d,
+                        "lastRun": last_run_str,
+                        "lastRunISO": last_run_iso,
+                        "lastRunStale": last_run_stale,
+                        "spark": spark_values,
+                        "costDegraded": row_cost_degraded,
+                    }
+                )
+            except Exception:
+                import logging as _logging
+
+                _logging.getLogger(__name__).warning(
+                    "monitor_roster: failed to build row for agent '%s'; "
+                    "emitting degraded row (MUST 10 per-row fail-soft)",
+                    agent,
+                )
+                entity_list.append(
+                    {
+                        "id": agent,
+                        "name": agent,
+                        "model": "",
+                        "modelClass": "local",
+                        "status": "stale",
+                        "health": {"score": None, "band": "unknown"},
+                        "errors24h": 0,
+                        "fail7d": 0,
+                        "cost7d": 0.0,
+                        "lastRun": "degraded",
+                        "lastRunISO": "",
+                        "lastRunStale": True,
+                        "spark": [],
+                        "costDegraded": True,
+                        "degraded": True,
+                    }
+                )
+
+        # Server-side problems-first sort (MUST 3): emit rows in ERROR→STALE→WARN→OK
+        # order so the default page is problems-first WITHOUT requiring JS execution.
+        # Secondary sort: name (stable, alphabetical). JS re-sorts on interactive changes.
+        entity_list.sort(
+            key=lambda e: (
+                _STATUS_SORT.get(e.get("status", "ok"), 3),
+                e.get("name", ""),
             )
-            status_lower = status.lower()
-
-            # Health score + band
-            health_score: int | None = None
-            health_band = "unknown"
-            if ah is not None:
-                raw_composite = getattr(ah, "composite", None)
-                if raw_composite is None:
-                    raw_composite = getattr(ah, "fleet_composite", None)
-                if raw_composite is not None:
-                    health_score = int(round(float(raw_composite) * 100))
-                health_band = getattr(ah, "band", "unknown")
-
-            # Model
-            model_id = ""
-            if ah is not None:
-                model_id = getattr(ah, "primary_model", None) or ""
-
-            # Cost (7d from daily_series[-7:])
-            series_7d = daily_series_by_agent.get(agent, [])
-            cost_7d = sum(v for _, v in series_7d) if series_7d else 0.0
-            spark_values = [v for _, v in series_7d]
-
-            # Degraded check
-            row_cost_degraded = cost_degraded_by_agent.get(agent, False)
-            if row_cost_degraded:
-                any_cost_degraded = True
-
-            # Errors (24h) and failures (7d)
-            errors_24h = errors_by_agent.get(agent, 0)
-            fail_7d = failures_by_agent.get(agent, 0)
-
-            # Last run
-            last_run_str = _relative_time(lpr, now) if lpr else "never"
-            last_run_stale = (status_lower == "stale")
-
-            # Determine isStale for the JS sort key
-            is_stale_for_sort = last_run_stale
-
-            entity_list.append(
-                {
-                    "id": agent,
-                    "name": agent,
-                    "model": _short_model_name(model_id) if model_id else "",
-                    "modelClass": _model_pill_class(model_id) if model_id else "local",
-                    "status": status_lower,
-                    "health": {
-                        "score": health_score,
-                        "band": health_band,
-                    },
-                    "errors24h": errors_24h,
-                    "fail7d": fail_7d,
-                    "cost7d": cost_7d,
-                    "lastRun": last_run_str,
-                    "lastRunStale": is_stale_for_sort,
-                    "spark": spark_values,
-                    "costDegraded": row_cost_degraded,
-                }
-            )
+        )
 
         # Embed entity data as JSON for client JS (no SSE/fetch — MUST 13).
-        agents_json = _json.dumps(entity_list)
+        # XSS-safe embedding: emit a <script type="application/json"> element so the
+        # content is never parsed as JS, then read it from JS via JSON.parse(). We still
+        # escape <, >, &, and the U+2028/U+2029 line-terminator code points so a crafted
+        # agent id/name cannot break out of the element even if a browser mis-parses it.
+        # (json.dumps alone does NOT neutralize </script> in the raw output — it emits
+        # the literal characters, which causes a script-break in HTML context.)
+        _raw_json = _json.dumps(entity_list)
+        agents_json_safe = (
+            _raw_json.replace("&", "\\u0026")
+            .replace("<", "\\u003c")
+            .replace(">", "\\u003e")
+            .replace(" ", "\\u2028")
+            .replace(" ", "\\u2029")
+        )
 
         # Cost-degraded banner (spec/09 posture — MUST 10).
         cost_banner = (
@@ -241,8 +296,8 @@ class _MonitorRosterPanel:
         )
 
         html_out = (
-            # Embedded agent data for JS
-            f'<script>var AGENTS = {agents_json};</script>\n'
+            # XSS-safe JSON data element — JS reads it via JSON.parse(getElementById(...).textContent)
+            f'<script type="application/json" id="monitor-agents">{agents_json_safe}</script>\n'
             # Cost-degraded banner
             + cost_banner
             + "\n"

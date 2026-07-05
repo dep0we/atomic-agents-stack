@@ -77,7 +77,11 @@ def render_all(
     written: dict = {"global": None, "per_agent": []}
 
     render_console_tab = tab in ("all", "console")
-    render_monitor_tab = tab in ("all", "console", "monitor")  # monitor renders when console data is fresh
+    render_monitor_tab = tab in (
+        "all",
+        "console",
+        "monitor",
+    )  # monitor renders when console data is fresh
     render_cost = tab in ("all", "cost")
     render_activity_tab = tab in ("all", "activity")
     render_quality_tab = tab in ("all", "quality")
@@ -138,10 +142,12 @@ def render_all(
         console_data = aggregate_console(
             agents_root, today=today, quality_signals=quality_signals
         )
-        # Thread `today` through so the health-band scoring, recommendation
-        # windows, and status_for_agent() STALE checks use the SAME pinned date
-        # as the cost/reliability aggregation — no #623-class midnight divergence.
-        console_path = render_console(agents_root, console_data, today=today)
+        # Thread `today` AND `now` through so the health-band scoring, recommendation
+        # windows, and status_for_agent() STALE checks use the SAME pinned date/time
+        # as the cost/reliability aggregation and as render_monitor() (spec/56 MUST 12).
+        # No #623-class midnight divergence; no staleness-boundary disagreement between
+        # the home fleet-status counts and the monitor status counts.
+        console_path = render_console(agents_root, console_data, today=today, now=now)
         written["console"] = str(console_path)
 
         # Fleet Monitor (spec/56 #653): render alongside the console home from the
@@ -200,7 +206,12 @@ def render_global(agents_root: Path, summary: GlobalSummary) -> Path:
     return out_path
 
 
-def render_console(agents_root: Path, console_data, today: date | None = None) -> Path:
+def render_console(
+    agents_root: Path,
+    console_data,
+    today: date | None = None,
+    now=None,
+) -> Path:
     """Render <agents_root>/_dashboard/index.html (the Fleet Console home).
 
     This is the new landing page (spec/52 PR1). Writes the rendered alert_keys
@@ -218,6 +229,12 @@ def render_console(agents_root: Path, console_data, today: date | None = None) -
     renders; if that panel raises, its keys legitimately drop from the allowlist
     (those items are not on the page, so they cannot be acked) — that is the
     intended MUST 11 fail-soft, not a reason to fall back to the seed.
+
+    spec/56 MUST 12: accepts an optional `now` so render_all() can thread the
+    SAME datetime into both render_console() and render_monitor(), guaranteeing
+    they share one snapshot for status derivation (no staleness-boundary divergence).
+    When called standalone (e.g. from serve.py after an ack), now defaults to a
+    fresh datetime.now() — that is the correct behaviour for a single-surface render.
     """
     from datetime import datetime, timezone
 
@@ -230,8 +247,10 @@ def render_console(agents_root: Path, console_data, today: date | None = None) -
     # Both advisor calls and PanelContext use the SAME today/now values so
     # health-band scoring, recommendation windows, and status_for_agent()
     # STALE checks are coherent — no midnight-boundary races (#623-class).
+    # `now` is accepted as a parameter so render_all() can share one clock with
+    # render_monitor() (spec/56 MUST 12).
     advisor_today = today or date.today()
-    now = datetime.now(tz=timezone.utc)
+    now = now if now is not None else datetime.now(tz=timezone.utc)
 
     # ── has_goals (single discover_agents pass) ────────────────────────────
     # has_goals (for the nav bar + the only capability a panel gates on today)

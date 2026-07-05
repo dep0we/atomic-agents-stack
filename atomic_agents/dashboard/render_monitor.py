@@ -260,7 +260,14 @@ a:hover { text-decoration: underline; }
 
 _MONITOR_JS = r"""
 /* Fleet Monitor — client-side JS (MUST 13: no polling/SSE/fetch) */
-/* AGENTS is injected by the monitor_roster panel as a <script> block */
+/* AGENTS is loaded from the <script type="application/json" id="monitor-agents"> element */
+
+/* ── Bootstrap agent data from XSS-safe JSON element (MUST 11 no-LLM, MUST 13 no-fetch) ── */
+var AGENTS = (function() {
+  var el = document.getElementById('monitor-agents');
+  if (!el) return [];
+  try { return JSON.parse(el.textContent); } catch(e) { return []; }
+})();
 
 /* ── State ── */
 var monFilter = 'all';
@@ -269,7 +276,8 @@ var monSearch = '';
 var monModel = 'all';
 var monView = 'list';
 
-const STATUS_ORDER = { error: 0, warn: 1, stale: 2, ok: 3 };
+/* STATUS_ORDER must match _STATUS_SORT in _monitor_roster.py: ERROR=0, STALE=1, WARN=2, OK=3 */
+const STATUS_ORDER = { error: 0, stale: 1, warn: 2, ok: 3 };
 
 /* ── View persistence (MUST 4) ── */
 /* ?view= wins -> localStorage["fleet-monitor.view"] -> 'list' */
@@ -290,7 +298,13 @@ function sortKey(a) {
   }
   if (monSort === 'cost') return -(a.cost7d || 0);
   if (monSort === 'errors') return -(a.errors24h || 0);
-  if (monSort === 'lastrun') return a.lastRunStale ? 9999 : 0;
+  /* lastrun sort: missing run (empty ISO) sorts last; otherwise sort ascending so
+     oldest-run agents surface first (most stale). Use ISO string comparison which
+     is lexicographically correct for 8601 timestamps. Empty string > any date. */
+  if (monSort === 'lastrun') {
+    var iso = a.lastRunISO || '';
+    return iso === '' ? '￿' : iso;
+  }
   if (monSort === 'name') return (a.name || a.id).toLowerCase();
   if (monSort === 'health') {
     var s = a.health && a.health.score !== null ? a.health.score : -1;
@@ -304,7 +318,7 @@ function buildModelOptions() {
   const sel = document.getElementById('mon-model-sel');
   if (!sel) return;
   const models = new Set();
-  (typeof AGENTS !== 'undefined' ? AGENTS : []).forEach(a => { if (a.model) models.add(a.model); });
+  AGENTS.forEach(a => { if (a.model) models.add(a.model); });
   Array.from(models).sort().forEach(m => {
     const opt = document.createElement('option');
     opt.value = m; opt.textContent = m;
@@ -314,7 +328,7 @@ function buildModelOptions() {
 
 /* ── Filtering ── */
 function filteredAgents() {
-  const agents = (typeof AGENTS !== 'undefined') ? AGENTS : [];
+  const agents = AGENTS;
   return agents.filter(a => {
     if (monFilter !== 'all' && a.status !== monFilter) return false;
     if (monModel !== 'all' && a.model !== monModel) return false;
@@ -408,10 +422,13 @@ function renderList() {
     const healthScore = (a.health && a.health.score !== null) ? a.health.score : '—';
     const healthBand = (a.health && a.health.band) ? a.health.band : 'unknown';
     const healthClass = healthBand === 'green' ? 'green' : healthBand === 'amber' ? 'amber' : healthBand === 'red' ? 'red' : '';
-    const detailHref = 'agent-detail.html?agent=' + esc(a.id);
-    return '<tr onclick="window.location.href=\'' + detailHref + '\'">'
+    /* Use encodeURIComponent for the query value so ids with &, ', ? are safe.
+       Use data-detail-href + delegated click (below) instead of inline onclick
+       string-building, which is vulnerable to JS injection via &#39; decode order. */
+    const detailHref = 'agent-detail.html?agent=' + encodeURIComponent(a.id);
+    return '<tr data-detail-href="' + esc(detailHref) + '">'
       + '<td><span class="row-dot ' + a.status + '"></span></td>'
-      + '<td><a href="' + detailHref + '" class="row-agent-name' + (a.status === 'stale' ? ' stale' : '') + '" onclick="event.stopPropagation()" data-agent-detail-link="' + esc(a.id) + '">' + esc(a.name || a.id) + '</a></td>'
+      + '<td><a href="' + esc(detailHref) + '" class="row-agent-name' + (a.status === 'stale' ? ' stale' : '') + '" data-agent-detail-link="' + esc(encodeURIComponent(a.id)) + '">' + esc(a.name || a.id) + '</a></td>'
       + '<td><span class="pill ' + esc(a.modelClass || 'local') + '">' + esc(a.model || '—') + '</span></td>'
       + '<td class="r"><span class="health-val ' + healthClass + '">' + healthScore + '</span></td>'
       + '<td class="r"><span class="err-val ' + errClass + '">' + a.errors24h + '</span></td>'
@@ -441,8 +458,8 @@ function renderCards() {
     const costFmt = a.cost7d === 0 ? '$0.00' : '$' + a.cost7d.toFixed(2);
     const healthScore = (a.health && a.health.score !== null) ? a.health.score : '—';
     const healthBand = (a.health && a.health.band) ? a.health.band : 'unknown';
-    const detailHref = 'agent-detail.html?agent=' + esc(a.id);
-    return '<a href="' + detailHref + '" class="agent-card status-' + a.status + '" data-agent-detail-link="' + esc(a.id) + '">'
+    const detailHref = 'agent-detail.html?agent=' + encodeURIComponent(a.id);
+    return '<a href="' + esc(detailHref) + '" class="agent-card status-' + a.status + '" data-agent-detail-link="' + esc(encodeURIComponent(a.id)) + '">'
       + '<div class="card-head">'
       + '<span class="agent-name">' + esc(a.name || a.id) + '</span>'
       + '<span class="status-head"><span class="status-dot ' + a.status + '"></span><span class="health-badge ' + healthBand + '">' + healthScore + '</span></span>'
@@ -476,6 +493,19 @@ function render() {
     if (mc2) mc2.style.display = '';
     renderCards();
   }
+}
+
+/* ── Delegated row-click handler (detail navigation, security fix #2) ── */
+/* Rows carry data-detail-href instead of an inline onclick string so that
+   agent ids containing ', &, or ? cannot corrupt the JS string context. */
+var listBody = document.getElementById('mon-list-body');
+if (listBody) {
+  listBody.addEventListener('click', function(e) {
+    var row = e.target.closest('tr[data-detail-href]');
+    if (!row) return;
+    var href = row.getAttribute('data-detail-href');
+    if (href) window.location.href = href;
+  });
 }
 
 /* ── View toggle event (MUST 4) ── */
@@ -731,9 +761,7 @@ def _render_monitor_template(
 
     # Auto-reload meta tag (MUST 13: full-page reload, not background fetch).
     # CSP 'unsafe-inline' covers inline scripts; meta http-equiv is allowed.
-    auto_reload_meta = (
-        f'<meta http-equiv="refresh" content="{_AUTO_RELOAD_SECONDS}">'
-    )
+    auto_reload_meta = f'<meta http-equiv="refresh" content="{_AUTO_RELOAD_SECONDS}">'
 
     summary_html = slot_html.get("monitor-summary", "")
     roster_html = slot_html.get("monitor-roster", "")

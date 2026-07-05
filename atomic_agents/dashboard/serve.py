@@ -130,6 +130,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         # /console and /index.html route to the new console home (index.html)
         "/console": "index.html",
         "/console.html": "index.html",
+        # Fleet Monitor (spec/56 MUST 1): /monitor and /monitor.html → monitor.html
+        "/monitor": "monitor.html",
+        "/monitor.html": "monitor.html",
     }
 
     # POST route dispatch table (explicit; preserves 404 fallthrough for unknowns)
@@ -497,15 +500,16 @@ def serve(agents_root: Path | None = None, host: str = HOST, port: int = PORT) -
         sys.exit(1)
 
     # Ensure dashboard exists before starting (regenerate it once).
-    # Regenerate if EITHER the console home (index.html — new spec/52 PR1 landing
-    # page) OR the cost view (cost.html) is absent. The cost.html check closes an
-    # upgrade gap: a pre-spec/52 dashboard wrote the cost view to index.html, so a
-    # stale index.html could be present with no cost.html — leaving GET /cost a 404
-    # until the next manual /regenerate. render_all() writes both files.
+    # Regenerate if ANY required file is absent. Checks:
+    #   - index.html (console home, spec/52 PR1 landing page)
+    #   - cost.html (cost view; absence = upgrade gap from pre-spec/52 installs)
+    #   - monitor.html (Fleet Monitor, spec/56 MUST 1; absent on first install or
+    #     pre-spec/56 dashboards — GET /monitor would 404 without this check)
     dashboard_dir = agents_root / "_dashboard"
     if (
         not (dashboard_dir / "index.html").exists()
         or not (dashboard_dir / "cost.html").exists()
+        or not (dashboard_dir / "monitor.html").exists()
     ):
         print(f"No complete dashboard at {dashboard_dir} — generating now...")
         render_all(agents_root)

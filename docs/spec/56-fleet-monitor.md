@@ -128,21 +128,33 @@ The Monitor page composes through the **panel registry (spec/52 §16)** — the 
 
 Each MUST ships parametrized conformance coverage in `tests/test_dashboard_monitor.py`. Strip-RED negative controls are REQUIRED for the MUSTs marked ✱ (the ones where a silent regression would be invisible); the rest get positive-signal + boundary tests.
 
+**Coverage boundaries (as of the post-review hardening pass):**
+
+- **MUST 3** default order is **server-rendered** and tested by `test_monitor_default_order_is_problems_first`, which parses the `<script type="application/json" id="monitor-agents">` element and asserts the real ordering invariant (last error index < first stale index < first warn index < first ok index). Strip-RED verified: removing `entity_list.sort(...)` in `_monitor_roster.py` causes the test to fail.
+- **MUST 10** per-row fail-soft is tested by `test_monitor_per_row_fail_soft_isolates_bad_agent`, which patches `status_for_agent` to raise for one agent and asserts the other agent still renders normally. Strip-RED: removing the per-row try/except in `_monitor_roster.py` causes the good agent to disappear.
+- **MUST 11** no-LLM is tested by `test_monitor_no_llm_spend_on_render`, which monkeypatches `AnthropicLLMBackend.__init__` to raise and asserts `render_monitor()` does not raise. Strip-RED: `test_monitor_no_llm_spend_on_render_strip_red` proves the patch fires by directly calling the patched constructor.
+- **MUST 12** shared clock is tested by `test_monitor_render_all_status_counts_match_index`, which runs the real `render_all()` and extracts status counts from `monitor.html`, verifying they sum correctly. The unit-level `test_monitor_status_counts_equal_home_summary` tests both panels over the same PanelContext.
+- **MUSTs 4/5/6 interactive client-JS runtime** (view toggle persistence across reloads, `?status=` runtime filter application, interactive filter/sort/search, toggle click) are covered by JS-source-text invariants (verified load-bearing by strip-RED on the JS string content) and are **deferred to the #686 browser harness** for real runtime verification. Tests that only assert markup/string presence are marked accordingly; they are not dressed as behavior tests.
+
 | MUST | Test (indicative) | strip-RED |
 |------|-------------------|-----------|
-| 1 | `test_monitor_enumerates_all_fleet_agents` | boundary (empty fleet) |
+| 1 | `test_monitor_enumerates_all_fleet_agents`, `test_serve_monitor_route` | boundary (empty fleet); route missing → test fails |
 | 2 ✱ | `test_monitor_status_uses_shared_status_for_agent` | ✱ divergent local status impl fails |
-| 3 | `test_monitor_default_order_is_problems_first` | order-inversion boundary |
+| 3 ✱ | `test_monitor_default_order_is_problems_first` | ✱ server sort removed → ordering invariant fails |
 | 4 ✱ | `test_monitor_view_toggle_persistence` | ✱ `?view=` precedence over localStorage; invalid → list |
 | 5 ✱ | `test_monitor_status_query_preapplies_filter` + `test_monitor_invalid_status_ignored` | ✱ uppercase/garbage status → no filter + no banner |
-| 6 | `test_monitor_filter_sort_search` | empty-result boundary |
+| 6 | `test_monitor_filter_sort_search` | empty-result boundary; JS runtime deferred to #686 |
 | 7 ✱ | `test_monitor_entity_links_to_detail` | ✱ each entity href = `agent-detail.html?agent=<id>` |
 | 8 | `test_monitor_freshness_stamp_and_windows` | — |
 | 9 | `test_monitor_entity_columns_present` | — |
-| 10 ✱ | `test_monitor_one_agent_degraded_degrades_only_that_row` + `test_monitor_cost_degraded_banner` | ✱ + `test_monitor_unenumerable_agent_is_not_a_row` (spec/51 boundary) |
-| 11 ✱ | `test_monitor_no_llm_spend_on_render` | ✱ construction-time no-LLM assertion |
-| 12 ✱ | `test_monitor_status_counts_equal_home_summary` | ✱ divergent window/snapshot fails |
+| 10 ✱ | `test_monitor_per_row_fail_soft_isolates_bad_agent` + `test_monitor_one_agent_degraded_degrades_only_that_row` + `test_monitor_cost_degraded_banner` + `test_monitor_unenumerable_agent_is_not_a_row` | ✱ per-row guard removed → good agent disappears |
+| 11 ✱ | `test_monitor_no_llm_spend_on_render` | ✱ `AnthropicLLMBackend.__init__` patched to raise; render must not raise |
+| 12 ✱ | `test_monitor_status_counts_equal_home_summary` + `test_monitor_render_all_status_counts_match_index` | ✱ divergent window fails; integration test verifies real render path |
 | 13 ✱ | `test_monitor_render_has_no_polling` | ✱ no SSE/fetch/poll in the rendered page |
+
+**Security coverage:**
+- `test_monitor_xss_agent_name_does_not_break_script`: verifies `</script>` in agent id is escaped in the JSON element
+- `test_monitor_detail_link_encodes_special_chars`: verifies `encodeURIComponent` used for query values
 
 ## 11. Design contract
 
