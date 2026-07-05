@@ -712,6 +712,142 @@ def test_monitor_cost_degraded_banner(tmp_path):
     assert "data may be incomplete" in html
 
 
+def test_monitor_degraded_row_sets_banner_flag(tmp_path):
+    """FIX 3a: a per-row exception (MUST 10 fail-soft path) MUST set any_cost_degraded.
+
+    When status_for_agent() raises for an agent, the roster panel emits a degraded
+    row (degraded=True, costDegraded=True). That row MUST also flip the page-level
+    banner flag so the spec/09 'data may be incomplete' banner appears — the same
+    banner that fires when cost_data_degraded=True on a CostTrendPoint.
+
+    Strip-RED: before the fix, the exception path did NOT set any_cost_degraded=True,
+    so the banner stayed hidden even though an agent row was degraded. This test
+    catches that regression: if the banner is hidden, the assertion fails.
+    """
+    from unittest.mock import patch
+
+    # Wire status_for_agent to raise for the target agent so the per-row
+    # except-path fires and emits a degraded row.
+    lpr = {"fail_agent": _RECENT}
+    cd = _StubConsoleData(agent_count=1, last_primary_runs=lpr)
+
+    def _raise_for_agent(*args, **kwargs):
+        raise RuntimeError("synthetic per-row failure for banner test")
+
+    with patch("atomic_agents.dashboard._status.status_for_agent", _raise_for_agent):
+        html = _render_monitor_html(tmp_path, console_data=cd)
+
+    # Banner MUST be shown (not hidden) — the degraded row must flip the flag
+    assert 'id="cost-degraded-banner"' in html
+    assert (
+        'style="display:none"'
+        not in html.split('id="cost-degraded-banner"')[1].split(">")[0]
+    ), (
+        "FIX 3a: cost-degraded-banner must NOT be hidden when a row is degraded via exception"
+    )
+    assert "data may be incomplete" in html, (
+        "FIX 3a: degraded-banner text must appear when any row fails"
+    )
+
+    # The degraded row itself must carry degraded=True
+    agent_list = _parse_agents_json(html)
+    assert any(a.get("degraded") is True for a in agent_list), (
+        "FIX 3a: degraded row must carry degraded=True marker in the JSON"
+    )
+
+
+def test_monitor_degraded_row_renders_degraded_marker_not_zero(tmp_path):
+    """FIX 3b: a degraded row renders '—' (cost-degraded-cell) not '$0.00' for cost/spark.
+
+    When a.degraded is True (per-row exception path) or a.costDegraded is True
+    (cost read failed), the JS costCell()/sparkCell() helpers render an explicit
+    degraded marker rather than a misleading '$0.00' / empty sparkline.
+
+    The marker is produced by the JS helper functions in _MONITOR_JS; we test it
+    by verifying _MONITOR_JS contains the guard logic and that the CSS class is
+    present, since the JS executes client-side (not server-side in tests).
+    """
+    from atomic_agents.dashboard.render_monitor import _MONITOR_JS
+
+    # The JS must define costCell() that guards on a.degraded || a.costDegraded
+    assert "costCell" in _MONITOR_JS, (
+        "FIX 3b: costCell() helper must exist in _MONITOR_JS"
+    )
+    assert "a.degraded || a.costDegraded" in _MONITOR_JS, (
+        "FIX 3b: costCell() must check a.degraded || a.costDegraded"
+    )
+    # The degraded marker text must be the em-dash, not $0.00
+    assert "cost data unavailable" in _MONITOR_JS, (
+        "FIX 3b: degraded marker must carry descriptive title attribute"
+    )
+    # The sparkCell helpers must also guard on degraded
+    assert "sparkCell" in _MONITOR_JS, (
+        "FIX 3b: sparkCell() helper must exist in _MONITOR_JS"
+    )
+    assert "trend data unavailable" in _MONITOR_JS, (
+        "FIX 3b: spark degraded marker must carry descriptive title"
+    )
+
+    # Strip-RED: costCell() must NOT return '$0.00' for the degraded case.
+    # Verify the branch that returns '$0.00' is only the non-degraded path.
+    # The guard must come BEFORE the '$0.00' literal in the function body.
+    cost_cell_start = _MONITOR_JS.index("function costCell")
+    # Find the '$0.00' inside costCell — it must come after the degraded guard
+    degraded_guard_pos = _MONITOR_JS.index(
+        "a.degraded || a.costDegraded", cost_cell_start
+    )
+    zero_dollar_pos = _MONITOR_JS.index("$0.00", cost_cell_start)
+    assert degraded_guard_pos < zero_dollar_pos, (
+        "FIX 3b strip-RED: the degraded guard in costCell() must precede the '$0.00' branch"
+    )
+
+
+def test_monitor_degraded_row_banner_and_marker_integration(tmp_path):
+    """FIX 3 integration: a degraded row (costDegraded via CostTrendPoint) must show
+    both the page banner AND produce a cost-degraded-cell class in the rendered HTML.
+
+    The CSS class is emitted inline in the JS-rendered rows (client-side), so we
+    verify it appears in the _MONITOR_JS template string and the banner shows
+    server-side. This is the end-to-end check for both FIX 3a and FIX 3b together.
+    """
+    from atomic_agents.dashboard.render_monitor import _MONITOR_JS
+
+    @dataclass
+    class _DegradedCostTrendFix3:
+        agent: str = "fix3_agent"
+        total_usd_30d: float = 0.0
+        spike_detected: bool = False
+        daily_series: list = field(default_factory=list)
+        cost_data_degraded: bool = True
+
+    lpr = {"fix3_agent": _RECENT}
+    cd = _StubConsoleData(
+        agent_count=1,
+        last_primary_runs=lpr,
+        cost_trends=[_DegradedCostTrendFix3()],
+    )
+    html = _render_monitor_html(tmp_path, console_data=cd)
+
+    # Banner must be shown (FIX 3a: server-side flag set)
+    assert "data may be incomplete" in html, (
+        "FIX 3 integration: banner must appear for cost-degraded agent"
+    )
+    assert (
+        'style="display:none"'
+        not in html.split('id="cost-degraded-banner"')[1].split(">")[0]
+    )
+
+    # The costDegraded=True entity must be in the JSON so the JS can guard it
+    agent_list = _parse_agents_json(html)
+    deg_agents = [a for a in agent_list if a.get("costDegraded")]
+    assert deg_agents, "FIX 3 integration: costDegraded agent must appear in JSON"
+
+    # The JS template must contain cost-degraded-cell class (FIX 3b: marker class)
+    assert "cost-degraded-cell" in _MONITOR_JS, (
+        "FIX 3 integration: _MONITOR_JS must contain cost-degraded-cell class"
+    )
+
+
 def test_monitor_unenumerable_agent_is_not_a_row(tmp_path):
     """MUST 10 spec/51 boundary: agents not in last_primary_runs are not rows.
 
@@ -794,45 +930,69 @@ def test_monitor_per_row_fail_soft_isolates_bad_agent(tmp_path):
 def test_monitor_no_llm_spend_on_render(tmp_path):
     """MUST 11: render_monitor does NOT construct any LLM backend.
 
-    Load-bearing approach: monkeypatch the real AnthropicLLMBackend.__init__ to raise,
-    then call render_monitor() and assert it does NOT raise. If the render path
-    constructed an LLM backend, the patch would fire and render_monitor would raise.
+    Load-bearing approach: patch EVERY concrete LLMBackend.__init__ to raise, then
+    call render_monitor() and assert it does NOT raise. If the render path constructed
+    ANY LLM backend the patch would fire and render_monitor would raise.
 
-    Strip-RED: the test below (test_monitor_no_llm_spend_on_render_strip_red) verifies
-    that calling AnthropicLLMBackend() directly DOES raise with the patch active,
-    proving the patch is effective.
+    The repo has three concrete backends with their own __init__:
+      - AnthropicLLMBackend (atomic_agents.llm.anthropic)
+      - OpenAICompatibleLLMBackend (atomic_agents.llm.openai_compat)
+      - VertexGeminiLLMBackend (atomic_agents.llm.vertex_gemini)
+    MoonshotLLMBackend is a factory over OpenAICompatibleLLMBackend and is
+    covered transitively by the OpenAICompatibleLLMBackend patch.
+
+    Strip-RED: test_monitor_no_llm_spend_on_render_strip_red verifies that
+    constructing each backend directly DOES raise with the patch active, proving
+    each patch is individually load-bearing.
     """
     from atomic_agents.dashboard.render_monitor import render_monitor
     from atomic_agents.llm.anthropic import AnthropicLLMBackend
+    from atomic_agents.llm.openai_compat import OpenAICompatibleLLMBackend
+    from atomic_agents.llm.vertex_gemini import VertexGeminiLLMBackend
 
     cd = _StubConsoleData(agent_count=0, last_primary_runs={})
 
     def _raise_if_constructed(*a, **kw):
         raise AssertionError(
-            "MUST 11 violation: AnthropicLLMBackend was constructed on the render path"
+            "MUST 11 violation: an LLMBackend was constructed on the render path"
         )
 
-    with patch.object(AnthropicLLMBackend, "__init__", _raise_if_constructed):
-        # Must NOT raise — render_monitor must not construct an LLMBackend
+    with (
+        patch.object(AnthropicLLMBackend, "__init__", _raise_if_constructed),
+        patch.object(OpenAICompatibleLLMBackend, "__init__", _raise_if_constructed),
+        patch.object(VertexGeminiLLMBackend, "__init__", _raise_if_constructed),
+    ):
+        # Must NOT raise — render_monitor must not construct any LLMBackend
         render_monitor(agents_root=tmp_path, console_data=cd, now=_NOW, today=_TODAY)
 
 
 def test_monitor_no_llm_spend_on_render_strip_red(tmp_path):
-    """MUST 11 strip-RED: the patch fires if AnthropicLLMBackend is constructed.
+    """MUST 11 strip-RED: the patch fires if ANY concrete LLMBackend is constructed.
 
-    Proves the patching approach in test_monitor_no_llm_spend_on_render is load-bearing:
-    directly constructing AnthropicLLMBackend() under the patch raises AssertionError,
-    so if the render path ever called the constructor, the positive test would catch it.
+    Proves the multi-backend patching approach is individually load-bearing:
+    directly constructing each backend under its patch raises AssertionError,
+    so if the render path ever called any of these constructors, the positive
+    test would catch it.
     """
     from atomic_agents.llm.anthropic import AnthropicLLMBackend
+    from atomic_agents.llm.openai_compat import OpenAICompatibleLLMBackend
+    from atomic_agents.llm.vertex_gemini import VertexGeminiLLMBackend
 
     def _raise_if_constructed(*a, **kw):
         raise AssertionError("patch fired — LLM constructor was called")
 
+    # Each backend patch must fire independently
     with patch.object(AnthropicLLMBackend, "__init__", _raise_if_constructed):
-        # Directly constructing it MUST raise (proves the patch is active)
         with pytest.raises(AssertionError, match="patch fired"):
             AnthropicLLMBackend.__init__(object())
+
+    with patch.object(OpenAICompatibleLLMBackend, "__init__", _raise_if_constructed):
+        with pytest.raises(AssertionError, match="patch fired"):
+            OpenAICompatibleLLMBackend.__init__(object())
+
+    with patch.object(VertexGeminiLLMBackend, "__init__", _raise_if_constructed):
+        with pytest.raises(AssertionError, match="patch fired"):
+            VertexGeminiLLMBackend.__init__(object())
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -1079,38 +1239,64 @@ def test_compose_monitor_uses_monitor_slots():
 
 
 def test_monitor_render_all_status_counts_match_index(tmp_path):
-    """MUST 12 integration: render_all() produces index.html and monitor.html from
-    one shared clock; the status counts extracted from both pages agree.
+    """MUST 12 integration: render_all() status counts are EQUAL on both index.html
+    (home fleet-status panel) and monitor.html (monitor-summary bar).
 
-    This tests the actual render path (not just panel units) to verify the
-    spec/56 §3 shared-snapshot guarantee end-to-end. Both pages parse to the
-    same status totals because render_console() and render_monitor() receive
-    the same `now` from render_all().
+    Both pages receive the SAME console_data and SAME now from render_all(), so
+    every status_for_agent() call sees the same snapshot. The test runs render_all()
+    on a real fixture, extracts the per-status counts from BOTH rendered pages, and
+    asserts they are equal for every status.
 
-    Strip-RED: if render_console() created its own `now` independently of render_all(),
-    agents near the staleness boundary could flip between the two renders, producing
-    different counts. The fix (passing `now` as a parameter) is what makes them agree.
+    Home page extraction: _FleetStatusPanel renders counts inside
+      <a href="monitor.html?status=<s>" ...><div class="fc-v ...">N</div></a>
+    We extract N per status from that link-adjacent div.
+
+    Monitor page extraction: _MonitorSummaryPanel renders chips as
+      <span id="chip-count-<s>">N</span>
+    We extract N per chip id.
+
+    Strip-RED: if render_console() created its own independent `now` (instead of
+    receiving it from render_all()), agents on a staleness boundary could flip
+    between renders and produce different counts — the shared-clock design is the
+    only guarantee. To verify this test is load-bearing, calling status_for_agent()
+    with a 24h vs 48h window on a 30h-old agent yields different results
+    (proven in test_monitor_status_counts_equal_home_summary_strip_red).
     """
     import json as _j
-    from datetime import date as _date, datetime as _datetime
+    from datetime import date as _date
     from atomic_agents.dashboard.render import render_all
 
-    # Create two agents: one recent (OK), one stale
-    (tmp_path / "agent_ok").mkdir()
-    (tmp_path / "agent_ok" / "model.md").write_text("# model\n")
-    log_dir_ok = tmp_path / "agent_ok" / "log" / "2026-07"
-    log_dir_ok.mkdir(parents=True)
-    rec_ok = {
-        "ts": "2026-07-05T13:00:00+00:00",  # 1h before render time
-        "trigger": "cron",
-        "model": "claude-haiku-4-5-20260101",
-        "input_tokens": 100,
-        "output_tokens": 20,
-        "cost_usd": 0.001,
-        "status": "ok",
-        "summary": "ok run",
+    # Create three agents with distinct statuses:
+    # - agent_ok: recent run → OK
+    # - agent_stale: run 36h ago → STALE (beyond 24h staleness window)
+    # - agent_warn_att: recent run with an open attention item → WARN
+    # We control statuses by writing logs with known timestamps.
+    agents_setup = {
+        "agent_ok": "2026-07-05T13:00:00+00:00",  # 1h ago → OK
+        "agent_stale": "2026-07-03T14:00:00+00:00",  # ~47h ago → STALE
     }
-    (log_dir_ok / "2026-07-05.jsonl").write_text(_j.dumps(rec_ok) + "\n")
+    for agent_name, ts in agents_setup.items():
+        agent_dir = tmp_path / agent_name
+        agent_dir.mkdir()
+        (agent_dir / "model.md").write_text("# model\n")
+        log_dir = agent_dir / "log" / "2026-07"
+        log_dir.mkdir(parents=True)
+        rec = {
+            "ts": ts,
+            "trigger": "cron",
+            "model": "claude-haiku-4-5-20260101",
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cost_usd": 0.001,
+            "status": "ok",
+            "summary": "run",
+        }
+        # Write to correct date file based on ts date
+        ts_date = ts[:10]  # e.g. "2026-07-05"
+        ts_ym = ts_date[:7].replace("-", "-")  # "2026-07"
+        log_file_dir = agent_dir / "log" / ts_ym
+        log_file_dir.mkdir(parents=True, exist_ok=True)
+        (log_file_dir / f"{ts_date}.jsonl").write_text(_j.dumps(rec) + "\n")
 
     result = render_all(tmp_path, today=_date(2026, 7, 5), tab="console")
 
@@ -1120,29 +1306,55 @@ def test_monitor_render_all_status_counts_match_index(tmp_path):
     assert index_path.exists(), "render_all must produce index.html"
     assert monitor_path.exists(), "render_all must produce monitor.html"
 
+    index_html = index_path.read_text()
     monitor_html = monitor_path.read_text()
-    # Monitor page rendered without error and contains Fleet Monitor markup
-    assert "Fleet Monitor" in monitor_html
-    assert "<!DOCTYPE html>" in monitor_html
 
-    # Extract monitor status counts from the monitor-summary chip spans
-    def _extract_monitor_count(html: str, chip_cls: str) -> int:
-        # Chips render as: <span id="chip-count-X">N</span>
-        m = re.search(rf'id="chip-count-{chip_cls}">(\d+)', html)
-        return int(m.group(1)) if m else -1
+    # ── Extract counts from monitor.html (monitor-summary chips) ──────────
+    def _monitor_count(html: str, status: str) -> int:
+        """Extract chip count from monitor-summary: <span id="chip-count-X">N</span>."""
+        m = re.search(rf'id="chip-count-{re.escape(status)}">(\d+)', html)
+        assert m, f"MUST 12: chip-count-{status} not found in monitor.html"
+        return int(m.group(1))
 
-    error_count = _extract_monitor_count(monitor_html, "error")
-    ok_count = _extract_monitor_count(monitor_html, "ok")
-    total_count = _extract_monitor_count(monitor_html, "all")
+    # ── Extract counts from index.html (fleet-status fo-cell links) ───────
+    def _home_count(html: str, status: str) -> int:
+        """Extract status count from home fleet-status panel.
 
-    # We have exactly 1 agent that was recent → OK
-    assert ok_count >= 0, "monitor must have an 'ok' count chip"
-    assert total_count >= 0, "monitor must have a total 'all' count chip"
-    # The total must equal sum of individual counts (sanity)
-    stale_count = _extract_monitor_count(monitor_html, "stale")
-    warn_count = _extract_monitor_count(monitor_html, "warn")
-    assert total_count == error_count + warn_count + stale_count + ok_count, (
-        "MUST 12: monitor chip counts must sum to total"
+        _FleetStatusPanel emits:
+          <a ... href="monitor.html?status=<status>">
+          <div class="fc-v ...">N</div>
+
+        We locate the href anchor and grab the integer inside the nearest fc-v div.
+        """
+        # Find the anchor href for this status, then extract the number from fc-v
+        pattern = (
+            rf'href="monitor\.html\?status={re.escape(status)}"[^>]*>'
+            rf'\s*<div class="fc-v[^"]*">(\d+)</div>'
+        )
+        m = re.search(pattern, html)
+        if not m:
+            return -1
+        return int(m.group(1))
+
+    # Assert equality per status across both pages
+    for status in ("error", "warn", "stale", "ok"):
+        monitor_n = _monitor_count(monitor_html, status)
+        home_n = _home_count(index_html, status)
+        assert home_n >= 0, (
+            f"MUST 12: status '{status}' count not found in index.html fleet-status panel"
+        )
+        assert monitor_n == home_n, (
+            f"MUST 12: monitor {status} count ({monitor_n}) != "
+            f"home {status} count ({home_n}) — shared-snapshot violated"
+        )
+
+    # Sanity: monitor total chip == sum of individual chips
+    total_n = _monitor_count(monitor_html, "all")
+    parts = sum(
+        _monitor_count(monitor_html, s) for s in ("error", "warn", "stale", "ok")
+    )
+    assert total_n == parts, (
+        f"MUST 12: monitor total chip ({total_n}) != sum of per-status chips ({parts})"
     )
 
 

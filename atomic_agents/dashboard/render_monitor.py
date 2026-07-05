@@ -237,6 +237,12 @@ a:hover { text-decoration: underline; }
   padding: 26px; text-align: center; color: var(--muted); font-size: 13px; margin-top: 8px;
 }
 
+/* ── Degraded cell marker (spec/09 posture, MUST 10 per-row) ── */
+/* Shown in place of cost / sparkline when a.degraded || a.costDegraded is true. */
+.cost-degraded-cell {
+  color: var(--muted); font-style: italic; cursor: help;
+}
+
 /* ── Degraded banner ── */
 .degraded-banner {
   margin-bottom: 16px; padding: 10px 16px; border-radius: 8px;
@@ -402,6 +408,30 @@ function esc(s) {
   });
 }
 
+/* ── Degraded cell helpers ── */
+/* When a row is degraded (failed metric build) or its cost read failed, render an
+   explicit degraded marker instead of a misleading $0.00 / empty sparkline.
+   class="cost-degraded-cell" carries a title so the operator knows why the dash
+   appears (spec/09 "data may be incomplete" posture, MUST 10 per-row). */
+function costCell(a) {
+  if (a.degraded || a.costDegraded) {
+    return '<span class="cost-degraded-cell" title="cost data unavailable">—</span>';
+  }
+  return a.cost7d === 0 ? '$0.00' : '$' + a.cost7d.toFixed(2);
+}
+function sparkCell(a, color) {
+  if (a.degraded || a.costDegraded) {
+    return '<span class="cost-degraded-cell" title="trend data unavailable">—</span>';
+  }
+  return miniSparkline(a.spark, color);
+}
+function sparkCardCell(a, color) {
+  if (a.degraded || a.costDegraded) {
+    return '<span class="cost-degraded-cell" title="trend data unavailable">—</span>';
+  }
+  return fullSparkline(a.spark, color);
+}
+
 /* ── Render list view ── */
 function renderList() {
   const agents = filteredAgents();
@@ -418,7 +448,6 @@ function renderList() {
     const color = sparkColor(a.status);
     const errClass = a.errors24h >= 5 ? 'bad' : a.errors24h >= 1 ? 'warn' : '';
     const failClass = a.fail7d >= 5 ? 'bad' : '';
-    const costFmt = a.cost7d === 0 ? '$0.00' : '$' + a.cost7d.toFixed(2);
     const healthScore = (a.health && a.health.score !== null) ? a.health.score : '—';
     const healthBand = (a.health && a.health.band) ? a.health.band : 'unknown';
     const healthClass = healthBand === 'green' ? 'green' : healthBand === 'amber' ? 'amber' : healthBand === 'red' ? 'red' : '';
@@ -433,9 +462,9 @@ function renderList() {
       + '<td class="r"><span class="health-val ' + healthClass + '">' + healthScore + '</span></td>'
       + '<td class="r"><span class="err-val ' + errClass + '">' + a.errors24h + '</span></td>'
       + '<td class="r"><span class="fail-val ' + failClass + '">' + a.fail7d + '</span></td>'
-      + '<td class="r mono">' + costFmt + '</td>'
+      + '<td class="r mono">' + costCell(a) + '</td>'
       + '<td><span class="last-run' + (a.lastRunStale ? ' stale' : '') + '">' + esc(a.lastRun) + '</span></td>'
-      + '<td>' + miniSparkline(a.spark, color) + '</td>'
+      + '<td>' + sparkCell(a, color) + '</td>'
       + '</tr>';
   }).join('');
 }
@@ -455,7 +484,6 @@ function renderCards() {
   grid.innerHTML = agents.map(function(a) {
     const color = sparkColor(a.status);
     const errClass = a.errors24h >= 5 ? 'bad' : a.errors24h >= 1 ? 'warn' : 'ok';
-    const costFmt = a.cost7d === 0 ? '$0.00' : '$' + a.cost7d.toFixed(2);
     const healthScore = (a.health && a.health.score !== null) ? a.health.score : '—';
     const healthBand = (a.health && a.health.band) ? a.health.band : 'unknown';
     const detailHref = 'agent-detail.html?agent=' + encodeURIComponent(a.id);
@@ -465,11 +493,11 @@ function renderCards() {
       + '<span class="status-head"><span class="status-dot ' + a.status + '"></span><span class="health-badge ' + healthBand + '">' + healthScore + '</span></span>'
       + '</div>'
       + '<div class="card-meta"><span class="pill ' + esc(a.modelClass || 'local') + '">' + esc(a.model || '—') + '</span></div>'
-      + '<div class="card-spark">' + fullSparkline(a.spark, color) + '</div>'
+      + '<div class="card-spark">' + sparkCardCell(a, color) + '</div>'
       + '<div class="card-metrics">'
       + '<div class="metric"><div class="mk">Errors 24h</div><div class="mv ' + errClass + '">' + a.errors24h + '</div></div>'
       + '<div class="metric"><div class="mk">Failures 7d</div><div class="mv' + (a.fail7d >= 5 ? ' bad' : '') + '">' + a.fail7d + '</div></div>'
-      + '<div class="metric"><div class="mk">7d cost</div><div class="mv mono">' + costFmt + '</div></div>'
+      + '<div class="metric"><div class="mk">7d cost</div><div class="mv mono">' + costCell(a) + '</div></div>'
       + '<div class="metric"><div class="mk">Last run</div><div class="mv' + (a.lastRunStale ? ' muted' : '') + '">' + esc(a.lastRun) + '</div></div>'
       + '</div>'
       + '</a>';

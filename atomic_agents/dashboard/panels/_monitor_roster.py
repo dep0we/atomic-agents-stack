@@ -238,6 +238,9 @@ class _MonitorRosterPanel:
                     "emitting degraded row (MUST 10 per-row fail-soft)",
                     agent,
                 )
+                # Flip the page-level banner flag: a degraded row means cost data
+                # is incomplete for that agent (spec/09 "data may be incomplete").
+                any_cost_degraded = True
                 entity_list.append(
                     {
                         "id": agent,
