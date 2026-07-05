@@ -114,10 +114,12 @@ class _StubCostTrend:
 @dataclass
 class _StubReliabilityMetrics:
     agent: str = "agent1"
-    error_count: int = 0
-    blocked_count: int = 0
     total_runs: int = 10
     error_rate: float = 0.0
+    blocked_rate: float = 0.0
+    # Real display-window counts (spec/56 MUST 9 — populated by aggregate_console).
+    errors_24h: int = 0
+    failures_7d: int = 0
 
 
 @dataclass
@@ -639,6 +641,110 @@ def test_monitor_entity_columns_present(tmp_path):
     assert "cost7d" in a
     assert "lastRun" in a
     assert "spark" in a
+
+
+def test_monitor_errors_24h_column_uses_real_count(tmp_path):
+    """MUST 9 errors(24h): an agent with N error-status runs shows N, not 0.
+
+    Load-bearing test for the phantom-field bug: the panel previously read
+    getattr(rm, 'error_count', 0) which silently returned 0 for every agent
+    because ReliabilityMetrics has no error_count field. The fix reads
+    rm.errors_24h (a real field populated by aggregate_console).
+
+    Strip-RED: if the panel reverts to the getattr default (or any expression
+    that ignores rm.errors_24h), an ERROR-classified agent with errors_24h=5
+    would emit errors24h=0 in the JSON, and this test fails.
+
+    Also verifies: an agent with 0 errors renders 0 (not a phantom non-zero).
+    """
+    from atomic_agents.dashboard.panels._monitor_roster import _MonitorRosterPanel
+
+    # Agent with 3 errors in 24h window
+    rm_errors = _StubReliabilityMetrics(
+        agent="error_agent",
+        total_runs=5,
+        error_rate=0.6,
+        errors_24h=3,
+        failures_7d=0,
+    )
+    # Agent with 0 errors
+    rm_clean = _StubReliabilityMetrics(
+        agent="clean_agent",
+        total_runs=10,
+        error_rate=0.0,
+        errors_24h=0,
+        failures_7d=0,
+    )
+
+    # error_agent gets ERROR status via capped_by_axis="reliability"
+    ah_error = _StubAgentHealth(agent="error_agent", capped_by_axis="reliability")
+    fh = _StubFleetHealth(agents=[ah_error])
+    cd = _StubConsoleData(
+        agent_count=2,
+        last_primary_runs={"error_agent": _RECENT, "clean_agent": _RECENT},
+        reliability_metrics=[rm_errors, rm_clean],
+        fleet_health=fh,
+    )
+    ctx = _make_ctx(console_data=cd)
+    panel = _MonitorRosterPanel()
+    result = panel.render(ctx)
+    agent_list = _parse_agents_json(result.html)
+
+    by_id = {a["id"]: a for a in agent_list}
+
+    # ERROR-classified agent must show its real error count (not 0)
+    assert "error_agent" in by_id, "error_agent must be in the entity list"
+    error_row = by_id["error_agent"]
+    assert error_row["status"] == "error", (
+        "error_agent must have status=error (capped_by_axis=reliability)"
+    )
+    assert error_row["errors24h"] == 3, (
+        f"MUST 9: errors24h must be 3 (from rm.errors_24h=3), got {error_row['errors24h']}. "
+        "This is the phantom-field bug: getattr(rm, 'error_count', 0) always returns 0."
+    )
+
+    # Clean agent must show 0 (not a phantom non-zero)
+    assert "clean_agent" in by_id, "clean_agent must be in the entity list"
+    clean_row = by_id["clean_agent"]
+    assert clean_row["errors24h"] == 0, (
+        f"MUST 9: clean agent errors24h must be 0, got {clean_row['errors24h']}"
+    )
+
+
+def test_monitor_failures_7d_column_uses_real_count(tmp_path):
+    """MUST 9 failures(7d): an agent with N blocked runs shows N in fail7d, not 0.
+
+    Parallel test to test_monitor_errors_24h_column_uses_real_count — covers the
+    failures(7d) column which had the same phantom-field bug (blocked_count getattr).
+
+    Strip-RED: if the panel reads getattr(rm, 'blocked_count', 0) instead of
+    rm.failures_7d, an agent with failures_7d=2 would emit fail7d=0.
+    """
+    from atomic_agents.dashboard.panels._monitor_roster import _MonitorRosterPanel
+
+    rm_blocked = _StubReliabilityMetrics(
+        agent="blocked_agent",
+        total_runs=8,
+        blocked_rate=0.25,
+        errors_24h=0,
+        failures_7d=2,
+    )
+    cd = _StubConsoleData(
+        agent_count=1,
+        last_primary_runs={"blocked_agent": _RECENT},
+        reliability_metrics=[rm_blocked],
+    )
+    ctx = _make_ctx(console_data=cd)
+    panel = _MonitorRosterPanel()
+    result = panel.render(ctx)
+    agent_list = _parse_agents_json(result.html)
+
+    assert agent_list, "AGENTS JSON must not be empty"
+    row = agent_list[0]
+    assert row["fail7d"] == 2, (
+        f"MUST 9: fail7d must be 2 (from rm.failures_7d=2), got {row['fail7d']}. "
+        "This is the phantom-field bug: getattr(rm, 'blocked_count', 0) always returns 0."
+    )
 
 
 # ──────────────────────────────────────────────────────────────────

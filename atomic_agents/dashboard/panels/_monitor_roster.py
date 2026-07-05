@@ -135,8 +135,13 @@ class _MonitorRosterPanel:
             a = rm.agent if hasattr(rm, "agent") else getattr(rm, "agent_id", None)
             if a is None:
                 continue
-            errors_by_agent[a] = int(getattr(rm, "error_count", 0) or 0)
-            failures_by_agent[a] = int(getattr(rm, "blocked_count", 0) or 0)
+            # spec/56 MUST 9: errors_24h and failures_7d are real integer fields
+            # on ReliabilityMetrics (populated by aggregate_console from the
+            # already-loaded runs_30d filtered to the correct windows). Reading
+            # them directly — never via getattr with a 0 default — prevents the
+            # phantom-field silent-zero bug this fix addresses.
+            errors_by_agent[a] = int(rm.errors_24h)
+            failures_by_agent[a] = int(rm.failures_7d)
 
         # Build the entity list. Each agent in last_primary_runs is an enumerated entity.
         agents = sorted(cd.last_primary_runs.keys())

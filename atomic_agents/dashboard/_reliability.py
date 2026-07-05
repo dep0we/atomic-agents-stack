@@ -91,6 +91,14 @@ class ReliabilityMetrics:
     principal_rate: float  # fraction with status=principal_not_verified
     skipped_rate: float  # fraction with status=skipped (cost-guardrail-blocked)
     embed_blocked_count: int  # absolute count of embed_batch_blocked events
+    # Absolute counts for display columns (spec/56 MUST 9).
+    # errors_24h: primary runs with status=error in the last 24h (error window).
+    # failures_7d: primary runs that were blocked (lock_busy or embed_batch_blocked)
+    #              in the last 7d (failure window).
+    # These are 0 by default; aggregate_console populates them from the already-
+    # loaded runs_30d filtered to the correct windows — no extra disk I/O required.
+    errors_24h: int = 0
+    failures_7d: int = 0
 
 
 def _compute_reliability(

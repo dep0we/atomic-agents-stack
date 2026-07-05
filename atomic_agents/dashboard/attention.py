@@ -687,6 +687,39 @@ def aggregate_console(
 
         # Reliability axis
         metrics = _compute_reliability(runs_30d, agent)
+
+        # Populate the display-window counts for spec/56 MUST 9 columns.
+        # errors_24h: primary runs with status=error in the last 24h.
+        # failures_7d: primary runs that were blocked in the last 7d.
+        # Both filter the already-loaded runs_30d — no extra disk I/O (MUST 13).
+        #
+        # Tz normalisation: r.ts may be tz-naive (JSONL without offset) or
+        # tz-aware (JSONL with +00:00). Treat naive as UTC — same convention
+        # as _monitor_roster._relative_time().
+        cutoff_24h = now - timedelta(hours=24)
+        cutoff_7d = now - timedelta(days=7)
+
+        def _ts_aware(ts: datetime) -> datetime:
+            return ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
+
+        metrics.errors_24h = sum(
+            1
+            for r in runs_30d
+            if _is_primary_run(r)
+            and r.status in _RELIABILITY_ERROR_STATUSES
+            and _ts_aware(r.ts) >= cutoff_24h
+        )
+        metrics.failures_7d = sum(
+            1
+            for r in runs_30d
+            if _is_primary_run(r)
+            and (
+                r.status in _RELIABILITY_BLOCKED_STATUSES
+                or getattr(r, "extra", {}).get("embed_batch_blocked", False) is True
+            )
+            and _ts_aware(r.ts) >= cutoff_7d
+        )
+
         reliability_metrics.append(metrics)
         all_alerts.extend(_reliability_alerts(agent, metrics, alert_state))
 
