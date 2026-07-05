@@ -44,6 +44,10 @@ from . import _recommendations  # noqa: F401 — registration side effect (order
 from . import _fleet_status  # noqa: F401 — registration side effect (order=10: fleet-status, MUST 15)
 from . import _fleet_overview  # noqa: F401 — registration side effect (order=20: #636 placeholder)
 
+# MONITOR slots (spec/56 §6 — amends spec/52 §16 slot set)
+from . import _monitor_summary  # noqa: F401 — registration side effect (order=10: status-count bar)
+from . import _monitor_roster  # noqa: F401 — registration side effect (order=10: entity list/cards)
+
 __all__ = [
     "ConsoleCapabilities",
     "PanelContext",

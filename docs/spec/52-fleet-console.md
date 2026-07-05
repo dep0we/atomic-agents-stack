@@ -375,7 +375,7 @@ The pre-Cockpit render stacked sections inline in `_render_console_template`, so
 A panel is an object with this interface:
 
 - `id: str` — stable, unique panel id (duplicate ids are a registration error, MUST 16).
-- `slot: Literal["status", "act", "explore", "agent-tab"]` + `order: int` — placement; ascending `order` within a slot, ties broken by `id` (deterministic).
+- `slot: Literal["status", "act", "explore", "agent-tab", "monitor-summary", "monitor-roster"]` + `order: int` — placement; ascending `order` within a slot, ties broken by `id` (deterministic). The `monitor-summary` and `monitor-roster` slots are used by the Fleet Monitor page (spec/56 §6).
 - `is_available(ctx: PanelContext) -> bool` — capability gate (§16.5): False when the panel's required data/backend is absent (e.g. a Goals panel only when GoalBackend is configured; an "apply"-action panel only when Principal + Mandate are present).
 - `render(ctx: PanelContext) -> PanelResult` — the SINGLE render entry. Reads only pre-loaded inputs off `ctx` (MUST 13). The panel handles its OWN known states internally: it returns empty content when its data is present-but-zero-items, and degraded content when `ctx` reports its read degraded (spec/09). `render_empty()` / `render_degraded()` are RECOMMENDED panel-internal helpers the panel calls from `render` — they are NOT invoked by the engine.
 
@@ -405,6 +405,8 @@ The composition as a whole MUST NOT raise. `is_available == False` → omitted e
 | `act` | attention queue + Advisor/score + savings (the do-now zone) |
 | `explore` | compact fleet-status summary (links to Monitor #653) + fleet-overview (#636) |
 | `agent-tab` | panels inside the per-agent detail view (#637) |
+| `monitor-summary` | Fleet Monitor status-count bar (OK/WARN/ERROR/STALE filters) — spec/56 #653 |
+| `monitor-roster` | Fleet Monitor entity list/cards — spec/56 #653 |
 
 ### Implementer Contract — additional MUSTs (extends §11)
 

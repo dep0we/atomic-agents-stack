@@ -77,6 +77,7 @@ def render_all(
     written: dict = {"global": None, "per_agent": []}
 
     render_console_tab = tab in ("all", "console")
+    render_monitor_tab = tab in ("all", "console", "monitor")  # monitor renders when console data is fresh
     render_cost = tab in ("all", "cost")
     render_activity_tab = tab in ("all", "activity")
     render_quality_tab = tab in ("all", "quality")
@@ -142,6 +143,30 @@ def render_all(
         # as the cost/reliability aggregation — no #623-class midnight divergence.
         console_path = render_console(agents_root, console_data, today=today)
         written["console"] = str(console_path)
+
+        # Fleet Monitor (spec/56 #653): render alongside the console home from the
+        # SAME console_data so home summary counts and monitor counts agree (MUST 12).
+        if render_monitor_tab:
+            try:
+                from .render_monitor import render_monitor as _render_monitor
+
+                agent_list = list(discover_agents(agents_root))
+                _has_goals = any(
+                    (agents_root / a / "goal.md").exists() for a in agent_list
+                )
+                monitor_path = _render_monitor(
+                    agents_root,
+                    console_data,
+                    today=today,
+                    now=now,
+                    has_goals=_has_goals,
+                )
+                written["monitor"] = str(monitor_path)
+            except Exception as exc:
+                logger.warning(
+                    "render_monitor failed (%s); skipping monitor.html",
+                    type(exc).__name__,
+                )
 
     return written
 
