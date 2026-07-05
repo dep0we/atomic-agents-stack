@@ -433,6 +433,22 @@ The home composes panels into three zones, in order: **STATUS → ACT → EXPLOR
 
 **MUST 15 — Roster relocation:** the home MUST NOT render the full per-agent card grid (§8); it renders the compact fleet-status summary panel linking to the Fleet Monitor (#653). (Locks D10 at the home boundary.)
 
+### 17.2 Navigable summary tiles (B7, #635)
+
+The **"Needs Attention" KPI tile** links to the attention-queue section on the same page (`href="#attention-queue"`). The attention-queue heading carries `id="attention-queue"`. Clicking the tile smooth-scrolls to the heading with a brief highlight pulse (JS in the console template). The tile uses `.cockpit-kpi-nav` for the affordance (cursor:pointer, hover lift + accent border, `→` glyph on hover) — no new color tokens.
+
+The **fleet-status count cells** (OK / WARN / ERROR / STALE) each link to `monitor.html?status=<status>` (Fleet Monitor #653). The Monitor page is not yet built; the links are wired per the design now and resolve when it ships. Each cell uses `.fo-cell-nav` for the affordance (tooltip caption on hover).
+
+### 17.3 Layered recommendation tie-back tags (B7, #635)
+
+Each recommendation card carries a tie-back tag matching its scored/advisory status in the 3-axis composite:
+
+- **`savings_cost` recs** → teal axis tag `→ Cost · +N pts` (where N is `projected_points_delta` rounded; if N is 0, shown as `→ Cost`). These recs move the Cost axis of the composite score.
+- **`quality_report` recs** → muted `advisory · not scored` tag. Eval coverage is advisory — it does not move the 3-axis composite directly.
+- **`governance` recs** → muted `advisory · not scored` tag. Governance is a separate grade (not part of the cost/quality/reliability composite).
+
+Tag placement: right side of the rec-header (`margin-left: auto`). Styling: `.rec-axis-tag` (teal, accent tokens) and `.rec-advisory-tag` (muted tokens). No new colors introduced.
+
 ### 17.1 Canonical per-agent status (decision D12)
 
 Each agent has a status `OK | WARN | ERROR | STALE`, shared by the home fleet-status summary AND the Fleet Monitor (#653):

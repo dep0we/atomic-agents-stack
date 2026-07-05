@@ -104,14 +104,18 @@ class _KpiStripPanel:
             "</div>"
         )
 
-        # Needs attention
+        # Needs attention — B7: wrapped in <a> to nav to the attention-queue section.
+        # The entire card is the hit target (display:block on the <a> via .cockpit-kpi-nav).
+        # Hover lift + accent border + → glyph are applied via CSS .cockpit-kpi-nav.
         alert_cls = " kpi-alert" if alert_count > 0 else ""
         tiles.append(
-            f'<div class="kpi cockpit-kpi{alert_cls}">'
+            f'<a href="#attention-queue" class="kpi cockpit-kpi{alert_cls} cockpit-kpi-nav"'
+            f' title="Jump to attention queue">'
             '<div class="k">Needs attention</div>'
-            f'<div class="v mono">{alert_count}</div>'
+            f'<div class="v mono">{alert_count}'
+            ' <span class="kpi-nav-arrow">&#8594;</span></div>'
             f'<div class="sub2">open flag{"s" if alert_count != 1 else ""}</div>'
-            "</div>"
+            "</a>"
         )
 
         # Potential savings

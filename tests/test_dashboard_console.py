@@ -1930,7 +1930,7 @@ def test_home_summary_status_matches_monitor_mapping(tmp_path):
 
     rendered = {}
     for m in re.finditer(
-        r'fc-v fc-\w+">(\d+)</div>\s*<div class="fc-k">(\w+)</div>', html
+        r'fc-v fc-\w+">(\d+)</div>\s*</?\w*>\s*<div class="fc-k">(\w+)</div>', html
     ):
         rendered[m.group(2)] = int(m.group(1))
 
@@ -1970,7 +1970,7 @@ def test_home_summary_status_strip_red(tmp_path):
 
     rendered = {}
     for m in re.finditer(
-        r'fc-v fc-\w+">(\d+)</div>\s*<div class="fc-k">(\w+)</div>', html
+        r'fc-v fc-\w+">(\d+)</div>\s*</?\w*>\s*<div class="fc-k">(\w+)</div>', html
     ):
         rendered[m.group(2)] = int(m.group(1))
     assert rendered.get("STALE", 0) >= 1, (

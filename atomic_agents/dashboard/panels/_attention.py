@@ -87,7 +87,9 @@ class _AttentionQueuePanel:
             else '<span class="pill ok" style="margin-left:8px;">0 open</span>'
         )
 
-        html_out = f"<h2>Operator Attention Queue {count_badge}</h2>\n{queue_html}"
+        # B7: id="attention-queue" anchor so the "Needs Attention" KPI tile can
+        # smooth-scroll here when clicked (spec/52 §17 navigable summary tiles).
+        html_out = f'<h2 id="attention-queue">Operator Attention Queue {count_badge}</h2>\n{queue_html}'
 
         # All rendered alert keys — engine will union these into the sidecar (MUST 17).
         alert_keys = frozenset(item.alert_key for item in queue)

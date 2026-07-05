@@ -1132,3 +1132,226 @@ def _write_minimal_vault(agents_root: Path) -> None:
             today,
             [{"cost_usd": 0.10, "status": "ok", "summary": "run"}],
         )
+
+
+# ──────────────────────────────────────────────────────────────────
+# B7 ADD 1: Navigable summary tiles (spec/52 §17.2, #635)
+# Tests:
+#   - attention-queue anchor id is present in the attention panel output
+#   - Needs-Attention KPI tile links to #attention-queue
+#   - fleet-status count cells link to monitor.html?status=<s>
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_attention_queue_heading_has_anchor_id():
+    """B7: the attention-queue panel heading must carry id='attention-queue' so
+    the 'Needs Attention' KPI tile can smooth-scroll to it."""
+    from atomic_agents.dashboard.panels._attention import _AttentionQueuePanel
+    from atomic_agents.dashboard.render import _severity_class, _queue_status_html  # noqa: F401 (side-effect: confirm importable)
+
+    ctx = _make_ctx(console_data=_StubConsoleData(attention_queue=[]))
+    result = _AttentionQueuePanel().render(ctx)
+    assert 'id="attention-queue"' in result.html, (
+        "attention-queue heading must carry id='attention-queue' for KPI tile nav"
+    )
+
+
+def test_needs_attention_kpi_tile_links_to_anchor():
+    """B7: the 'Needs Attention' KPI tile must be an <a href='#attention-queue'>."""
+    from atomic_agents.dashboard.panels._kpi_strip import _KpiStripPanel
+
+    cd = _StubConsoleData(
+        attention_queue=[_StubAlertItem(agent="a", alert_key="v1:abc123def456")],
+        cost_trends=[_StubCostTrend()],
+        last_primary_runs={"a": None},
+    )
+    ctx = _make_ctx(console_data=cd)
+    result = _KpiStripPanel().render(ctx)
+    assert 'href="#attention-queue"' in result.html, (
+        "Needs Attention tile must link to #attention-queue"
+    )
+    assert "cockpit-kpi-nav" in result.html, (
+        "Needs Attention tile must have the .cockpit-kpi-nav affordance class"
+    )
+
+
+def test_needs_attention_kpi_tile_links_to_anchor_strip_red():
+    """B7 strip-RED: the Needs Attention tile must be an <a> element, not a <div>.
+    A plain <div> cannot carry href, so the '#attention-queue' link would be absent.
+    This test verifies the link appears as part of an <a …> opening tag, not a div."""
+    from atomic_agents.dashboard.panels._kpi_strip import _KpiStripPanel
+
+    cd = _StubConsoleData(
+        attention_queue=[_StubAlertItem(agent="a", alert_key="v1:abc123def456")],
+        cost_trends=[_StubCostTrend()],
+        last_primary_runs={"a": None},
+    )
+    ctx = _make_ctx(console_data=cd)
+    result = _KpiStripPanel().render(ctx)
+    html = result.html
+    # The opening tag must be <a … href="#attention-queue" …>, not <div …>.
+    # We confirm this by asserting the literal string '<a ' appears before
+    # '#attention-queue' in the HTML — if someone switched to <div>, the <a
+    # prefix would be absent and only href (inside a data attribute or similar)
+    # might survive, but would not be at an <a tag.
+    href_idx = html.find('href="#attention-queue"')
+    assert href_idx != -1, "href='#attention-queue' must be present"
+    # Find the last '<' before the href attribute — it must open an <a, not a <div.
+    tag_start = html.rfind("<", 0, href_idx)
+    assert tag_start != -1
+    tag_snippet = html[tag_start : tag_start + 3]
+    assert tag_snippet == "<a ", (
+        "strip-RED: the tag containing href='#attention-queue' must be <a>, not <div> — "
+        f"got {tag_snippet!r}"
+    )
+
+
+def test_fleet_status_counts_link_to_monitor():
+    """B7: each fleet-status count cell (OK/WARN/ERROR/STALE) must link to
+    monitor.html?status=<status> (Fleet Monitor #653)."""
+    from atomic_agents.dashboard.panels._fleet_status import _FleetStatusPanel
+
+    cd = _StubConsoleData(
+        agent_count=2,
+        last_primary_runs={"a": None, "b": None},
+        attention_queue=[],
+        cost_trends=[],
+    )
+    ctx = _make_ctx(console_data=cd)
+    result = _FleetStatusPanel().render(ctx)
+    html = result.html
+
+    for status in ("error", "stale", "warn", "ok"):
+        assert f"monitor.html?status={status}" in html, (
+            f"fleet-status {status.upper()} cell must link to monitor.html?status={status}"
+        )
+
+
+def test_fleet_status_counts_link_strip_red():
+    """B7 strip-RED: if count cells were plain <div>s (no <a> wrapper),
+    no monitor.html links would appear — confirms the <a> wrapping is load-bearing."""
+    from atomic_agents.dashboard.panels._fleet_status import _FleetStatusPanel
+
+    cd = _StubConsoleData(
+        agent_count=1,
+        last_primary_runs={"a": None},
+        attention_queue=[],
+        cost_trends=[],
+    )
+    ctx = _make_ctx(console_data=cd)
+    result = _FleetStatusPanel().render(ctx)
+    # If the link is absent entirely, the test above would fail. Here we confirm
+    # the fo-cell-nav class is present (the affordance CSS hook).
+    assert "fo-cell-nav" in result.html, (
+        "strip-RED: count cell must carry .fo-cell-nav — absent means no affordance"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# B7 ADD 2: Layered rec tie-back tags (spec/52 §17.3, #635)
+# Tests:
+#   - savings_cost → axis tag "→ Cost · +N pts"
+#   - quality_report → advisory tag "advisory · not scored"
+#   - governance → advisory tag "advisory · not scored"
+#   - strip-RED: governance rec must NOT get an axis "+pts" tag
+# ──────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class _StubRec:
+    """Minimal recommendation stub for render tests."""
+
+    agent: str = "test-agent"
+    kind: str = "savings_cost"
+    current_model: str | None = "claude-opus-4-8"
+    candidate_model: str | None = "claude-sonnet-4-6"
+    projected_usd_delta: float | None = -10.0
+    projected_points_delta: float | None = 7.0
+    rationale: str = "test rationale"
+
+
+def test_savings_cost_rec_renders_axis_tag():
+    """B7: savings_cost recs must show a teal '→ Cost · +N pts' axis tag."""
+    from atomic_agents.dashboard.render import _render_recommendations
+
+    rec = _StubRec(kind="savings_cost", projected_points_delta=7.0)
+    html = _render_recommendations([rec])
+    assert "rec-axis-tag" in html, "savings_cost rec must have rec-axis-tag"
+    assert "Cost" in html, "axis tag must reference 'Cost'"
+    assert "+7 pts" in html, "axis tag must show the rounded pts delta"
+
+
+def test_savings_cost_rec_zero_pts_shows_cost_only():
+    """B7: savings_cost rec with projected_points_delta=0 shows '→ Cost' without pts."""
+    from atomic_agents.dashboard.render import _render_recommendations
+
+    rec = _StubRec(kind="savings_cost", projected_points_delta=0.0)
+    html = _render_recommendations([rec])
+    assert "rec-axis-tag" in html
+    assert "Cost" in html
+    # Should NOT show "+0 pts" (the pts suffix is suppressed when delta rounds to 0)
+    assert "+0 pts" not in html
+
+
+def test_savings_cost_rec_none_pts_shows_cost_tag():
+    """B7: savings_cost rec with projected_points_delta=None still shows '→ Cost' tag."""
+    from atomic_agents.dashboard.render import _render_recommendations
+
+    rec = _StubRec(kind="savings_cost", projected_points_delta=None)
+    html = _render_recommendations([rec])
+    assert "rec-axis-tag" in html
+    assert "Cost" in html
+
+
+def test_quality_report_rec_renders_advisory_tag():
+    """B7: quality_report recs must show the muted 'advisory · not scored' tag."""
+    from atomic_agents.dashboard.render import _render_recommendations
+
+    rec = _StubRec(
+        kind="quality_report",
+        current_model=None,
+        candidate_model=None,
+        projected_usd_delta=None,
+        projected_points_delta=None,
+    )
+    html = _render_recommendations([rec])
+    assert "rec-advisory-tag" in html, "quality_report rec must have rec-advisory-tag"
+    assert "advisory" in html
+    assert "not scored" in html
+
+
+def test_governance_rec_renders_advisory_tag():
+    """B7: governance recs must show 'advisory · not scored', NOT an axis tag."""
+    from atomic_agents.dashboard.render import _render_recommendations
+
+    rec = _StubRec(
+        kind="governance",
+        current_model=None,
+        candidate_model=None,
+        projected_usd_delta=None,
+        projected_points_delta=None,
+    )
+    html = _render_recommendations([rec])
+    assert "rec-advisory-tag" in html, "governance rec must have rec-advisory-tag"
+    assert "advisory" in html
+    assert "not scored" in html
+
+
+def test_governance_rec_must_not_get_axis_tag_strip_red():
+    """B7 strip-RED: a governance rec must NOT get a teal axis 'Cost · +N pts' tag.
+    Stripping the kind check in _render_recommendations would cause governance recs
+    to incorrectly render rec-axis-tag — this test catches that regression."""
+    from atomic_agents.dashboard.render import _render_recommendations
+
+    rec = _StubRec(
+        kind="governance",
+        current_model=None,
+        candidate_model=None,
+        projected_usd_delta=None,
+        projected_points_delta=5.0,  # would show pts if check is missing
+    )
+    html = _render_recommendations([rec])
+    assert "rec-axis-tag" not in html, (
+        "strip-RED: governance rec must NOT get an axis tag — "
+        "removing the kind check would make it appear"
+    )

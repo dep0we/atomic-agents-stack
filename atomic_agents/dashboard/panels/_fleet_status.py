@@ -83,14 +83,24 @@ class _FleetStatusPanel:
             )
             counts[status] = counts.get(status, 0) + 1
 
-        # Build count cells
+        # Build count cells — B7: each count cell is wrapped in an <a> linking to
+        # monitor.html?status=<status> (Fleet Monitor #653, not built yet — link is
+        # wired per the design now and resolves once the Monitor page ships).
+        # .fo-cell-nav provides the cursor:pointer + hover affordance via CSS.
         count_cells = []
         for status in _STATUS_ORDER:
             n = counts.get(status, 0)
             css = _STATUS_CSS.get(status, "axis-muted")
+            status_lower = status.lower()
+            tip = f"&#8594; Fleet Monitor · {status}"
             count_cells.append(
                 f'<div class="fo-cell">'
+                f'<a class="fo-cell-nav" data-tip="{tip}"'
+                f' title="Opens Fleet Monitor filtered to {status}"'
+                f' href="monitor.html?status={status_lower}"'
+                f' style="text-decoration:none;color:inherit">'
                 f'<div class="fc-v {css.replace("axis-", "fc-")}">{n}</div>'
+                f"</a>"
                 f'<div class="fc-k">{status}</div>'
                 "</div>"
             )

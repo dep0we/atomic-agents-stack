@@ -1202,6 +1202,100 @@ _COCKPIT_CSS = """
   cursor: default;
   white-space: nowrap;
 }
+
+/* ── B7 CHANGE 1: Navigable KPI tiles ────────────────────────────────
+   .cockpit-kpi-nav: makes a KPI tile a clickable/focusable nav target.
+   Reuses --accent for hover border + subtle lift — no new color tokens.
+   text-decoration: none + display:block so the entire card is the hit area. */
+.cockpit-kpi-nav {
+  text-decoration: none;
+  color: inherit;
+  display: block;
+  transition: transform 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
+  cursor: pointer;
+}
+.cockpit-kpi-nav:hover {
+  transform: translateY(-2px);
+  border-color: var(--accent) !important;
+  box-shadow: 0 4px 16px rgba(78, 201, 176, 0.12);
+}
+.cockpit-kpi-nav:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* Nav arrow glyph inside navigable tiles — subtle, appears on hover */
+.kpi-nav-arrow {
+  display: inline-block;
+  font-size: 10px;
+  color: var(--accent);
+  opacity: 0;
+  margin-left: 4px;
+  transition: opacity 0.12s ease;
+  vertical-align: middle;
+}
+.cockpit-kpi-nav:hover .kpi-nav-arrow { opacity: 1; }
+
+/* ── B7: Fleet status count cells — clickable affordance ─────────────
+   .fo-cell-nav: wraps each OK/WARN/ERROR/STALE count so it reads as
+   interactive and carries a tooltip. href="monitor.html?status=X" is wired
+   per the design now; the Monitor page (#653) resolves when it ships.
+   Uses existing tokens — no new palette. */
+.fo-cell-nav {
+  position: relative;
+  display: inline-block;
+  cursor: pointer;
+}
+.fo-cell-nav:hover .fc-v {
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
+/* Tooltip caption on the fleet status count cells */
+.fo-cell-nav[data-tip]:hover::after {
+  content: attr(data-tip);
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--card);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+  padding: 4px 8px;
+  border-radius: 5px;
+  pointer-events: none;
+  z-index: 10;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+}
+
+/* ── B7 CHANGE 2: axis tie-back tag on rec cards ─────────────────────
+   .rec-axis-tag: scored recs showing which axis they move + how many pts.
+   .rec-advisory-tag: "advisory · not scored" for governance + quality_report recs.
+   Both use existing accent/muted tokens — no new palette introduced. */
+.rec-axis-tag {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 10px;
+  white-space: nowrap;
+  background: rgba(78, 201, 176, 0.12);
+  color: var(--accent);
+  border: 1px solid rgba(78, 201, 176, 0.3);
+  margin-left: auto;
+}
+.rec-advisory-tag {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: 10px;
+  white-space: nowrap;
+  background: rgba(138, 150, 163, 0.1);
+  color: var(--muted);
+  border: 1px solid rgba(138, 150, 163, 0.2);
+  margin-left: auto;
+}
 """
 
 
@@ -1561,12 +1655,30 @@ def _render_recommendations(recommendations) -> str:
             else ""
         )
 
+        # B7 CHANGE 2: axis tie-back tag (spec/52 §17 layered rec tie-back).
+        # savings_cost recs move the Cost axis — show "→ Cost · +N pts" (teal).
+        # quality_report + governance recs do NOT move the 3-axis composite — show
+        # "advisory · not scored" (muted). Unknown kinds get no tag.
+        tie_back_tag = ""
+        if kind == "savings_cost":
+            if pts_delta is not None:
+                pts_rounded = int(round(pts_delta))
+                pts_str = f" &middot; +{pts_rounded} pts" if pts_rounded != 0 else ""
+            else:
+                pts_str = ""
+            tie_back_tag = f'<span class="rec-axis-tag">&#8594; Cost{pts_str}</span>'
+        elif kind in ("quality_report", "governance"):
+            tie_back_tag = (
+                '<span class="rec-advisory-tag">advisory &middot; not scored</span>'
+            )
+
         rows_html += (
             f'<div class="rec-row">'
             f'<div class="rec-header">'
             f"{pill_html}"
             f'<span class="rec-agent">{agent_safe}</span>'
             f"{apply_cta}"
+            f"{tie_back_tag}"
             f"</div>"
             f"{model_str}"
             f'<div class="rec-rationale">{rationale_safe}</div>'
@@ -1735,6 +1847,21 @@ function snoozeFor(hours) {{
     body: JSON.stringify({{alert_key: _snoozeKey, snooze_until: until}})
   }}).then(r => {{ closeSnooze(); if (r.ok) location.reload(); }});
 }}
+
+// B7 CHANGE 1: smooth-scroll + brief highlight pulse for in-page anchor links
+// (e.g. the "Needs Attention" KPI tile → #attention-queue).
+document.querySelectorAll('a[href^="#"]').forEach(function(anchor) {{
+  anchor.addEventListener('click', function(e) {{
+    var target = document.querySelector(this.getAttribute('href'));
+    if (target) {{
+      e.preventDefault();
+      target.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+      target.style.transition = 'background 0.3s ease';
+      target.style.background = 'rgba(78, 201, 176, 0.06)';
+      setTimeout(function() {{ target.style.background = ''; }}, 1200);
+    }}
+  }});
+}});
 </script>
 
 </body>

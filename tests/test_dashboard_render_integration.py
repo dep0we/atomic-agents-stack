@@ -295,7 +295,10 @@ def test_console_home_fail_soft_keeps_page_whole(tmp_path):
         "all zone dividers survive a panel failure"
     )
     # The failed panel's content is absent (it degraded to empty).
-    assert "Operator Attention Queue" not in html
+    # B7: "Operator Attention Queue" now also appears in the KPI tile title attr, so
+    # check for the panel's heading anchor (id="attention-queue") which is only
+    # emitted by the panel render itself — not by the KPI strip.
+    assert 'id="attention-queue"' not in html
 
 
 def test_activity_html_content(tmp_path):
