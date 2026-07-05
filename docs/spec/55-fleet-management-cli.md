@@ -96,6 +96,26 @@ The management CLI does not rebuild any neighbor. `deploy` (spec/49) already own
 
 ---
 
+## Front-ends — one engine, terminal-primary
+
+The management verbs are one **engine**, driven by several **front-ends**. The engine is: the backend protocols (read), the management verbs (write, this spec), and `agent.call()` (interact). Every human-facing surface is a *thin presentation* over that engine — it renders protocol reads and invokes verbs; it holds **no business logic of its own**. This is what lets the framework grow multiple surfaces and still "feel like one thing" (the aesthetic): each new surface is a rendering, not a re-implementation, and each inherits the S2 safety routine + S3 copilot properties for free.
+
+**The surfaces, positioned (decided — operator ruling, 2026-07-05):**
+
+| Capability | Terminal habitat | Web habitat |
+|---|---|---|
+| Observe | TUI dashboard | Web console (spec/52–54) |
+| Manage | CLI verbs (this spec) + TUI actions | CLI verbs / copilot |
+| Interact | TUI chat pane | web chat (later) |
+
+- **The terminal (TUI + CLI) is the primary deployment and management driver.** This is the surface an operator uses to deploy (`deploy`, spec/49) and manage (this spec) a fleet — keyboard-driven, SSH-friendly, copilot-adjacent.
+- **The web console (spec/52–54) is the visual monitoring layer** — the shareable, remote, graphical *observe* surface. It reads the same protocols; it is not the primary act-on-the-fleet surface.
+- **The CLI and a copilot are complementary manage drivers, not competitors:** the CLI verbs are the scriptable, structured (`--json`), preview-then-`--yes` surface; a copilot drives those same verbs from natural-language intent (S3). The TUI is the interactive, live cockpit that folds observe + manage (+ later interact) into one keyboard-driven surface.
+
+**The TUI is a named future front-end, sequenced after the verbs.** It is *not* specified here and adds *no* engine concept: every TUI view is a protocol read, every TUI action is a verb run through the same preview→confirm→audit path (S2), and any chat pane is `agent.call()`. Because the verbs it drives must exist first, the TUI is built after the first management verbs land; it earns its own spec at that time. The design consequence for *this* spec is only that the verb layer must stay clean and fully flag-drivable with structured output (S3) so the TUI (like the copilot) can drive it without special-casing. The TUI ships as an optional extra (`atomic-agents-stack[tui]`), lazy-loaded so the base CLI stays lean (principle #6), mirroring the `[serve]` pattern. Tracked as a future front-end under epic #606.
+
+---
+
 ## Authorization posture
 
 The management CLI does NOT decide who is allowed to make a write. **Access is authority:**
