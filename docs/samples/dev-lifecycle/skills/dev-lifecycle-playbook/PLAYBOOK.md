@@ -59,7 +59,6 @@ stages:
   # automated stage — the human brings the idea; the gate records the ruling).
 
   - stage_id: go-no-go-gate
-    model: claude-opus-4-7-20260101
     label: "Stage 1 · Go / no-go gate"
     prompt: >
       Review the proposed change and rule on whether to proceed.
@@ -87,7 +86,6 @@ stages:
     is_gate: false
 
   - stage_id: spec-scope-gate
-    model: claude-opus-4-7-20260101
     label: "Stage 2b · Scope approval gate"
     prompt: >
       Review the specification produced in the previous stage and rule
@@ -119,7 +117,6 @@ stages:
     is_gate: false
 
   - stage_id: autoplan-concerns-gate
-    model: claude-opus-4-7-20260101
     label: "Stage 3b · Concerns ruling gate"
     prompt: >
       Review the plan assessment from the previous stage and rule on
@@ -147,7 +144,6 @@ stages:
     is_gate: false
 
   - stage_id: design-direction-gate
-    model: claude-opus-4-7-20260101
     label: "Stage 4b · Visual direction gate"
     prompt: >
       Review the design direction proposed in the previous stage and rule.
@@ -181,7 +177,6 @@ stages:
     is_gate: false
 
   - stage_id: tier-a-rulings-gate
-    model: claude-opus-4-7-20260101
     label: "Stage 5b · Tier-A rulings gate"
     # NOTE: ideally one gate per fork; batched into one per Grok ruling.
     # Per-item granularity tracked in #667.
@@ -257,7 +252,6 @@ stages:
     is_gate: false
 
   - stage_id: security-findings-gate
-    model: claude-opus-4-7-20260101
     label: "Stage 8b · Security findings gate"
     # NOTE: ideally one gate per finding; batched into one per Grok ruling.
     # Per-item granularity tracked in #667.
@@ -298,7 +292,6 @@ stages:
     is_gate: false
 
   - stage_id: merge-gate
-    model: claude-opus-4-7-20260101
     label: "Stage 9b · Merge gate (irreversible)"
     prompt: >
       Review the open pull request as if you were reading it cold for the
@@ -335,7 +328,6 @@ stages:
     is_gate: false
 
   - stage_id: rollback-gate
-    model: claude-opus-4-7-20260101
     label: "Stage 10b · Rollback decision gate"
     prompt: >
       Review the deploy outcome from the previous stage and rule on the
@@ -380,20 +372,33 @@ stages:
 
 ## Per-stage model dials
 
-Each stage in the YAML block above carries a `model:` dial. The conductor
-**parses** these fields but does **not yet apply** them at dispatch time — every
-stage currently runs on the agent's configured `model.md` model, and `run()`
-emits a warning on each run()/resume() process that a per-stage `model:` was set
-but not honored.
-Per-stage actor-model wiring is tracked in [#668](https://github.com/dep0we/atomic-agents-stack/issues/668); the dials
-are authored now so the intended pattern is recorded and applies the moment the
-wiring lands.
+The 10 automated stages in the YAML block above each carry a `model:` dial
+(`claude-sonnet-4-6-20260101`). As of [#668](https://github.com/dep0we/atomic-agents-stack/issues/668), the conductor **applies**
+these dials at dispatch time — each automated stage runs on its declared model,
+passed as `model_override=` to `agent.call()`. Policy enforce-mode
+`get_effective_model` supersedes the per-stage dial when fleet config is active
+(spec/32 "fleet-config wins").
+
+The run-level dollar tree-cap is enforced by the conductor's per-iteration
+pre-call gate, which checks the run-level headroom (decremented by this stage's
+actual accumulated spend) before every iteration's `agent.call()`. The cap is
+dollar-denominated and model-agnostic — a `model:` priced materially above the
+agent's `model.md` default is billed post-hoc and still clamps to the run cap,
+overshooting `run_cap_usd` by at most one iteration's (one `agent.call()`'s)
+actual spend before the next iteration's gate refuses. Size `run_cap_usd` with
+the per-stage dials in mind, not just `model.md`.
+
+Gate stages (`is_gate: true`) do **not** carry a `model:` field. Gate stages
+make no actor LLM call — they suspend the run and wait for a human ruling via
+`resume()`. The `model:` field is rejected at parse time for gate stages (hard
+validation error, symmetric with `conflict_keys` being gate-only). An optional
+future enhancement — rendering AI-summarized gate context for the human reviewer
+before they rule — is tracked in [#674](https://github.com/dep0we/atomic-agents-stack/issues/674).
 
 The dial pattern for this playbook:
-- Gate stages (`is_gate: true`): a higher-reasoning model (Opus) to surface
-  context clearly for the human reviewer.
-- Automated stages (`is_gate: false`): a capable but cheaper model (Sonnet)
-  for the bulk of the legwork.
+- Automated stages (`is_gate: false`): `claude-sonnet-4-6-20260101` — capable
+  but cost-efficient for the bulk of the legwork.
+- Gate stages (`is_gate: true`): no model dial (none needed — no actor LLM call).
 
 ## Querying the decision ledger
 

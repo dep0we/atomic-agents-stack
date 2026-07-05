@@ -4018,7 +4018,10 @@ class AtomicAgent:
             _principal_refused_record: dict = {
                 "run_id": self.run_id,  # redundant with _log()'s setdefault; kept for local readability
                 "trigger": self.trigger,
-                "model": self.config.default_model,
+                # #668: report the requested model_override (effective model
+                # unresolved on this pre-loop early-exit), consistent with the
+                # other pre-loop refusal records (dedup/lock_busy/cost-skip/in_flight).
+                "model": model_override or self.config.default_model,
                 "input_tokens": 0,
                 "output_tokens": 0,
                 "status": "principal_not_verified",
@@ -4085,7 +4088,11 @@ class AtomicAgent:
             def _serve_completed_dedup(_decision: "DedupDecision") -> Response:
                 _dedup_record: dict = {
                     "trigger": self.trigger,
-                    "model": self.config.default_model,
+                    # #668: report the model the caller actually requested (a per-stage
+                    # actor-model override on the conductor path), falling back to the
+                    # default. The effective model isn't resolved on this pre-loop
+                    # early-exit path; model_override is the most truthful available.
+                    "model": model_override or self.config.default_model,
                     "input_tokens": 0,
                     "output_tokens": 0,
                     "status": "deduped",
@@ -4113,7 +4120,12 @@ class AtomicAgent:
                     prior_run_id=_decision.prior_run_id,
                     replayed_run_id=_decision.prior_run_id,
                     result_ref=_decision.prior_result_ref,
-                    model=self.config.default_model,
+                    # #668: report the model the caller requested (a conductor
+                    # per-stage dial), consistent with the dedup audit record above
+                    # (which logs model_override or default). No spend occurs on a
+                    # replay, so this is a labeling fix, not a billing change
+                    # (#668 Codex review).
+                    model=model_override or self.config.default_model,
                 )
                 _finalize_call_span(outcome=_tracing.OUTCOME_DEDUPED)
                 return _resp
@@ -4166,7 +4178,9 @@ class AtomicAgent:
         except LockBusy as e:
             _lock_busy_record: dict = {
                 "trigger": self.trigger,
-                "model": self.config.default_model,
+                # #668: report the requested model_override on the conductor path
+                # (effective model unresolved on this pre-loop early-exit).
+                "model": model_override or self.config.default_model,
                 "input_tokens": 0,
                 "output_tokens": 0,
                 "status": "lock_busy",
@@ -4275,7 +4289,9 @@ class AtomicAgent:
             if not check.allow:
                 _skip_record: dict = {
                     "trigger": self.trigger,
-                    "model": self.config.default_model,
+                    # #668: report the requested model_override on the conductor path
+                    # (effective model unresolved on this pre-loop early-exit).
+                    "model": model_override or self.config.default_model,
                     "input_tokens": 0,
                     "output_tokens": 0,
                     "status": "skipped",
@@ -4356,7 +4372,9 @@ class AtomicAgent:
                     # spec/22 addendum, replayed_run_id ABSENT) THEN raise.
                     _in_flight_record: dict = {
                         "trigger": self.trigger,
-                        "model": self.config.default_model,
+                        # #668: report the requested model_override on the conductor
+                        # path (effective model unresolved on this early-exit).
+                        "model": model_override or self.config.default_model,
                         "input_tokens": 0,
                         "output_tokens": 0,
                         "status": "in_flight",
@@ -5991,7 +6009,12 @@ class AtomicAgent:
             if isinstance(_call_exc, MCPCommandNotAllowed):
                 _security_abort_record: dict = {
                     "trigger": self.trigger,
-                    "model": self.config.default_model,
+                    # #668: report the requested model_override (e.g. a conductor
+                    # per-stage actor-model dial), consistent with the five pre-loop
+                    # refusal records updated in #668. model_override is the function
+                    # parameter (always bound here); the resolved `model` local may be
+                    # unbound if the exception fired before model resolution.
+                    "model": model_override or self.config.default_model,
                     "input_tokens": 0,
                     "output_tokens": 0,
                     "status": "error",

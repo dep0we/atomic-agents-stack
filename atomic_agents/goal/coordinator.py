@@ -81,6 +81,7 @@ def dispatch_sub_goal_as_outcome(
     extra_context: str | None = None,
     judge_model: str | None = None,
     parent_remaining_headroom_usd: float | None = None,
+    actor_model: str | None = None,
 ) -> "tuple[OutcomeResult, SubGoal]":
     """Dispatch a sub-goal as an outcome, with a fail-closed pre-dispatch cost gate.
 
@@ -112,6 +113,11 @@ def dispatch_sub_goal_as_outcome(
             is clamped to MIN(own model.md remaining, this headroom) at BOTH the
             pre-dispatch gate AND the OutcomeRunner's per-iteration gates — the
             spec/15 tree-cap clamp. None means "no parent cap" (model.md caps only).
+        actor_model: optional per-stage actor model override (#668 — conductor C10).
+            When set, passed as actor_model= to OutcomeRunner and from there as
+            model_override= to every agent.call() iteration so the stage runs on and
+            is billed against the declared model. Policy enforce-mode get_effective_model
+            supersedes this per spec/32 ("fleet-config wins"). None = model.md default.
 
     Returns:
         (OutcomeResult, SubGoal) — same shape as the legacy dispatch_as_outcome
@@ -222,17 +228,25 @@ def dispatch_sub_goal_as_outcome(
         # The dashboard collision is avoided by NOT using 'blocked' in the event name
         # (goals.py:310 matches 'blocked' substring; 'coordinator_dispatch_rejected'
         # does not match that pattern).
+        _rejected_event = {
+            "ts": datetime.now().astimezone().isoformat(),
+            "event": "coordinator_dispatch_rejected",
+            "sub_goal_id": sub_goal_id,
+            "reason": result_check.reason,
+            # Include degraded flag so the audit trail distinguishes a real
+            # cap hit from a data-quality blind spot (spec/09 cost-read posture).
+            "cost_data_degraded": result_check.cost_data_degraded,
+        }
+        # #668 P2 — mirror the success-path (sub_goal_outcome_dispatched) audit:
+        # record the DECLARED per-stage dial on the cost-rejected terminal event too,
+        # so the goal ledger viewed in isolation keeps the dial context for a
+        # "why was this pricier-model stage refused" query (Principle #5 — audit
+        # symmetry across both terminal dispositions). 'declared, not effective'.
+        if actor_model is not None:
+            _rejected_event["actor_model"] = actor_model
         goal_manager.goal_backend.append_history_event(
             goal_manager.agent_name,
-            {
-                "ts": datetime.now().astimezone().isoformat(),
-                "event": "coordinator_dispatch_rejected",
-                "sub_goal_id": sub_goal_id,
-                "reason": result_check.reason,
-                # Include degraded flag so the audit trail distinguishes a real
-                # cap hit from a data-quality blind spot (spec/09 cost-read posture).
-                "cost_data_degraded": result_check.cost_data_degraded,
-            },
+            _rejected_event,
         )
         raise CostGuardrailBlocked(result_check.reason)
 
@@ -305,6 +319,7 @@ def dispatch_sub_goal_as_outcome(
         agents_root=goal_manager.agents_root,
         agent_name=goal_manager.agent_name,
         judge_model=judge_model,
+        actor_model=actor_model,
         # keyword args, not positional — mirrors the #425 fix discipline.
         # Threading the gate agent's RESOLVED policy_backend flips the runner's
         # internal-agent _policy_backend_was_explicit True, which SKIPS its
@@ -386,22 +401,33 @@ def dispatch_sub_goal_as_outcome(
             f"(outcome {outcome_result.run_id} interrupted)"
         )
 
+    _terminal_event: dict = {
+        "ts": datetime.now().astimezone().isoformat(),
+        "event": "sub_goal_outcome_dispatched",
+        "sub_goal_id": sub_goal_id,
+        "outcome_run_id": outcome_result.run_id,
+        "terminal_state": outcome_result.status,
+        "applied_status": applied_status,
+        "iterations": len(outcome_result.iterations),
+        "total_cost_usd": outcome_result.total_cost_usd,
+    }
+    if actor_model is not None:
+        # #668: record the DECLARED actor-model dial requested for this dispatch in
+        # the goal-ledger audit trail. The EFFECTIVE model that actually ran may
+        # differ under Policy enforce-mode (fleet-config supersedes the dial) OR the
+        # agent's own cost-cap fallback (a model.md-cap fallback supersedes the dial);
+        # the authoritative billed model lives in the agent's own RunRecord (linked via
+        # outcome_run_id), not this goal-ledger event. Goal history is append-only
+        # JSONL with permissive schema — no migration needed. Gated on non-None so
+        # the common (no override) case stays sparse.
+        _terminal_event["actor_model"] = actor_model
     updated_goal = goal_manager.goal_backend.apply_transition(
         agent_id=goal_manager.agent_name,
         sub_goal_id=sub_goal_id,
         to_status=applied_status,
         fields=terminal_fields,
         history_prose=history_prose,
-        history_event={
-            "ts": datetime.now().astimezone().isoformat(),
-            "event": "sub_goal_outcome_dispatched",
-            "sub_goal_id": sub_goal_id,
-            "outcome_run_id": outcome_result.run_id,
-            "terminal_state": outcome_result.status,
-            "applied_status": applied_status,
-            "iterations": len(outcome_result.iterations),
-            "total_cost_usd": outcome_result.total_cost_usd,
-        },
+        history_event=_terminal_event,
         expected_from_status="in_progress",
         when=goal_manager.today,  # prose date from injectable clock (#483 PR1)
     )

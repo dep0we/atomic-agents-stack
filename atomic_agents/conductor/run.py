@@ -244,20 +244,6 @@ def run(
             "a NestedDelegationRefused subclass). Structural call-depth enforcement deferred."
         )
 
-    # PR1 honesty: the per-stage `model` dial is parsed but NOT applied (no
-    # actor-model override is plumbed through the coordinator/OutcomeRunner yet —
-    # only judge_model is). Warn on each run()/resume() process so an operator who set `model:` to control
-    # cost/quality is not silently given the default model (Principle #13).
-    _model_stages = [s.stage_id for s in playbook.stages if s.model]
-    if _model_stages:
-        _warnings.warn(
-            "conductor: per-stage `model:` dial is PARSED but NOT YET APPLIED — "
-            f"stages {_model_stages} declare a model override that will be IGNORED; "
-            "stages run on model.md's model. Per-stage actor-model wiring is tracked "
-            "in #668. Remove the `model:` field or accept the default.",
-            stacklevel=2,
-        )
-
     # M1 — the within-stage tree-cap binds only when the agent's cost guardrails are
     # ENABLED. _check_cost_guardrails() short-circuits to allow=True BEFORE the
     # parent_remaining_headroom_usd clamp when config.cost_guardrails_enabled is
@@ -1134,22 +1120,27 @@ def run(
                         # Emit the per-stage completion event so the narrow-window
                         # close path has the same audit shape as the normal path
                         # (both routes leave a conductor_stage_completed line).
+                        _narrow_close_event = {
+                            "ts": _now_ts(),
+                            "event": "conductor_stage_completed",
+                            "conductor_run_id": conductor_run_id,
+                            "stage_id": stage.stage_id,
+                            "outcome_run_id": outcome_run_id,
+                            "total_cost_usd": getattr(
+                                _stage_result, "total_cost_usd", 0.0
+                            ),
+                            "iterations": len(getattr(_stage_result, "iterations", [])),
+                            "narrow_window_close": True,
+                        }
+                        # #668: mirror the normal completion path — record the DECLARED
+                        # per-stage dial so the resume/repair (narrow-window) audit shape
+                        # does not diverge from the normal path exactly on a
+                        # resume-sensitive route (#668 Codex review).
+                        if stage.model is not None:
+                            _narrow_close_event["actor_model"] = stage.model
                         conductor_backend.append_history_event(
                             agent.name,
-                            {
-                                "ts": _now_ts(),
-                                "event": "conductor_stage_completed",
-                                "conductor_run_id": conductor_run_id,
-                                "stage_id": stage.stage_id,
-                                "outcome_run_id": outcome_run_id,
-                                "total_cost_usd": getattr(
-                                    _stage_result, "total_cost_usd", 0.0
-                                ),
-                                "iterations": len(
-                                    getattr(_stage_result, "iterations", [])
-                                ),
-                                "narrow_window_close": True,
-                            },
+                            _narrow_close_event,
                         )
                         completed_stage_ids.append(stage.stage_id)
                         continue
@@ -1164,16 +1155,23 @@ def run(
                         # Fall through to normal dispatch (re-run the stage)
 
             # Emit stage-started event
-            conductor_backend.append_history_event(
-                agent.name,
-                {
-                    "ts": _now_ts(),
-                    "event": "conductor_stage_started",
-                    "conductor_run_id": conductor_run_id,
-                    "stage_id": stage.stage_id,
-                    "label": stage.label,
-                },
-            )
+            _stage_started_event: dict = {
+                "ts": _now_ts(),
+                "event": "conductor_stage_started",
+                "conductor_run_id": conductor_run_id,
+                "stage_id": stage.stage_id,
+                "label": stage.label,
+            }
+            if stage.model is not None:
+                # #668: record the DECLARED per-stage model dial (stage.model). The
+                # EFFECTIVE model that actually runs and bills may differ under Policy
+                # enforce-mode (fleet-config supersedes the dial) OR the agent's own
+                # cost-cap fallback (a model.md-cap fallback supersedes the dial) — see
+                # C10; the authoritative billed model lives in the agent's RunRecord
+                # linked via outcome_run_id, not this conductor event. None stages omit the field
+                # to keep events sparse for the common case.
+                _stage_started_event["actor_model"] = stage.model
+            conductor_backend.append_history_event(agent.name, _stage_started_event)
 
             # Resume normalization (BLOCKED ONLY): the coordinator
             # (dispatch_sub_goal_as_outcome) only accepts a 'pending' or 'in_progress'
@@ -1341,18 +1339,22 @@ def run(
             )
 
             # Emit stage-completed event
-            conductor_backend.append_history_event(
-                agent.name,
-                {
-                    "ts": _now_ts(),
-                    "event": "conductor_stage_completed",
-                    "conductor_run_id": conductor_run_id,
-                    "stage_id": stage.stage_id,
-                    "outcome_run_id": outcome_result.run_id,
-                    "total_cost_usd": outcome_result.total_cost_usd,
-                    "iterations": len(outcome_result.iterations),
-                },
-            )
+            _stage_completed_event: dict = {
+                "ts": _now_ts(),
+                "event": "conductor_stage_completed",
+                "conductor_run_id": conductor_run_id,
+                "stage_id": stage.stage_id,
+                "outcome_run_id": outcome_result.run_id,
+                "total_cost_usd": outcome_result.total_cost_usd,
+                "iterations": len(outcome_result.iterations),
+            }
+            if stage.model is not None:
+                # #668: symmetry with conductor_stage_started — record the DECLARED
+                # per-stage model dial (the effective billed model may differ under
+                # Policy enforce-mode OR the agent's cost-cap fallback; see the agent
+                # RunRecord at outcome_run_id).
+                _stage_completed_event["actor_model"] = stage.model
+            conductor_backend.append_history_event(agent.name, _stage_completed_event)
 
             completed_stage_ids.append(stage.stage_id)
             _logger.info(
@@ -1942,6 +1944,13 @@ def _dispatch_stage(
     The coarse pre-stage `run_remaining <= 0` halt in run() is the between-stage
     backstop; this clamp is the within-stage enforcement.
 
+    #668 — actor_model: stage.model is threaded as actor_model= through
+    dispatch_sub_goal_as_outcome → OutcomeRunner → agent.call(model_override=)
+    so every iteration of this stage runs on (and is billed against) the
+    declared per-stage model. None (most stages) = model.md default, zero
+    behavior change for existing callers. Policy enforce-mode get_effective_model
+    supersedes the per-stage dial per spec/32 ("fleet-config wins").
+
     Returns (OutcomeResult, SubGoal).
     """
     from ..goal.coordinator import dispatch_sub_goal_as_outcome  # noqa: PLC0415
@@ -1960,6 +1969,7 @@ def _dispatch_stage(
         extra_context=extra_context,
         judge_model=judge_model,
         parent_remaining_headroom_usd=run_remaining,
+        actor_model=stage.model,
     )
 
 
@@ -2407,16 +2417,23 @@ def _compute_playbook_fingerprint(playbook: PlaybookManifest) -> str:
     """Stable hash of the playbook's control-flow STRUCTURE (P0-2).
 
     Hashes the ordered (stage_id, is_gate, effective prompt, prompt_ref, options,
-    rubric_ref, conflict_keys) tuples so a resume can REFUSE a playbook edited
-    mid-suspension. run_cap pinning already protects cost across suspension; this
-    extends the same durability guarantee to control flow (prompts, gate flags,
+    rubric_ref, conflict_keys, model) tuples so a resume can REFUSE a playbook
+    edited mid-suspension. run_cap pinning already protects cost across suspension;
+    this extends the same durability guarantee to control flow (prompts, gate flags,
     stage add/remove/reorder, a changed referenced prompt-file body — the effective
     ``prompt`` text is hashed, so a prompt_ref whose target file changed is caught
-    too). PR3 (#582): conflict_keys added to the fingerprint so editing a gate's
-    conflict_keys mid-suspension is also caught.
+    too). PR3 (#582): conflict_keys added. #668: model added.
 
     A NUL record separator after each stage makes the digest length-independent
     (so e.g. concatenation collisions across stage boundaries are not possible).
+
+    KNOWN LIMITATION (#668 upgrade boundary): The conditional model inclusion means
+    any in-flight conductor run started BEFORE #668 on a playbook with model: on
+    automated stages will refuse to resume after the upgrade — the pre-#668 pinned
+    fingerprint excluded model; the post-#668 live fingerprint includes it. Start a
+    fresh run. (The reference PLAYBOOK.md has model: on all 10 automated stages, so
+    any run started with it between #584 and #668 is affected.) This is the same
+    class of contract as conflict_keys (PR3 docstring above).
     """
     h = hashlib.sha256()
     for s in playbook.stages:
@@ -2437,6 +2454,20 @@ def _compute_playbook_fingerprint(playbook: PlaybookManifest) -> str:
         # PR2→PR3 upgrade boundary.
         if s.conflict_keys:
             part_dict["conflict_keys"] = list(s.conflict_keys)
+        # #668: include model in the fingerprint ONLY when non-None, so stages
+        # without a model field hash byte-identically to their pre-#668 pin and
+        # existing mid-suspension runs (with no model dial) resume without a false
+        # mismatch. This is the exact same upgrade-compat rationale as conflict_keys.
+        # A model edit on an in-flight automated stage is now caught by _refuse_if_
+        # playbook_changed() on the next run()/resume() call.
+        # `is not None` (not truthiness) so this gate matches the audit-emission
+        # sites (run.py conductor_stage_started/_completed, coordinator.py
+        # sub_goal_outcome_dispatched) for every field state. The parse site
+        # already normalizes empty/whitespace-only model to None, so the two forms
+        # are equivalent on parsed manifests; aligning the operator removes any
+        # cross-site split for a directly-constructed StageSpec(model="").
+        if s.model is not None:
+            part_dict["model"] = s.model
         part = json.dumps(part_dict, sort_keys=True, ensure_ascii=True)
         h.update(part.encode("utf-8"))
         h.update(b"\x00")
