@@ -1143,6 +1143,86 @@ def test_coordinator_threads_gate_agent_backends_into_runner(agent_with_goal):
 
 
 # ──────────────────────────────────────────────────────────────────
+# #668 (C10) — the REAL production link of the four-link actor-model chain that
+# every other #668 test patches out: dispatch_sub_goal_as_outcome (the real
+# coordinator body) must forward its actor_model= kwarg into the OutcomeRunner
+# constructor. The conductor TEST 61 patches the coordinator out; TEST 62 /
+# test_outcome construct OutcomeRunner directly; the conductor e2e TEST 58 also
+# patches the coordinator out — so without THIS test, commenting out
+# `actor_model=actor_model` at coordinator.py breaks zero tests, and a silent
+# regression on the production dispatch path would ship green. spec/50 C10:
+# "A conforming implementation MUST propagate the dial through every link;
+# receiving model_override=None when a non-None model was declared is a wiring
+# failure." This is the conformance guard on the link the spec itself flags.
+
+
+def test_coordinator_threads_actor_model_into_runner(agent_with_goal):
+    """The coordinator must forward actor_model= into OutcomeRunner (#668 C10).
+
+    Mirrors test_coordinator_threads_gate_agent_backends_into_runner: asserts on
+    MockRunner.call_args.kwargs to inspect what the REAL coordinator body actually
+    passed to OutcomeRunner(...). Includes a None strip-control so the assertion is
+    not vacuously true (a coordinator that dropped actor_model would pass the None
+    case but fail the positive case).
+    """
+    agents_root, agent_name, agent_root = agent_with_goal
+    gm = _make_gm(agent_with_goal)
+    gm.load()
+
+    declared_model = "claude-sonnet-4-6-20260101"
+
+    agent = _make_agent_mock(allow=True)
+    outcome_result = _make_outcome_result("satisfied")
+
+    # (a) Positive case: a non-None actor_model is forwarded to the runner ctor.
+    with patch("atomic_agents.outcome.OutcomeRunner") as MockRunner:
+        mock_instance = MagicMock()
+        mock_instance.run.return_value = outcome_result
+        MockRunner.return_value = mock_instance
+
+        dispatch_sub_goal_as_outcome(
+            agent=agent,
+            goal_manager=gm,
+            sub_goal_id="sg_pending",
+            rubric="inline: acceptance criteria",
+            actor_model=declared_model,
+        )
+
+    ctor_kwargs = MockRunner.call_args.kwargs
+    assert ctor_kwargs.get("actor_model") == declared_model, (
+        "C10: the coordinator MUST forward actor_model= into OutcomeRunner(...); "
+        f"got actor_model={ctor_kwargs.get('actor_model')!r}, expected {declared_model!r}. "
+        "This is the production link _dispatch_stage → dispatch_sub_goal_as_outcome → "
+        "OutcomeRunner that every other #668 test patches out."
+    )
+
+    # (b) Strip-control: no actor_model arg → the runner receives None (the
+    # zero-behavior-change default for all pre-#668 callers). Uses sg_in_progress
+    # (a fresh dispatchable sub-goal) because the positive case above transitioned
+    # sg_pending to complete on disk.
+    gm2 = _make_gm(agent_with_goal)
+    gm2.load()
+    agent2 = _make_agent_mock(allow=True)
+    with patch("atomic_agents.outcome.OutcomeRunner") as MockRunner2:
+        mock_instance2 = MagicMock()
+        mock_instance2.run.return_value = _make_outcome_result("satisfied")
+        MockRunner2.return_value = mock_instance2
+
+        dispatch_sub_goal_as_outcome(
+            agent=agent2,
+            goal_manager=gm2,
+            sub_goal_id="sg_in_progress",
+            rubric="inline: acceptance criteria",
+        )
+
+    assert MockRunner2.call_args.kwargs.get("actor_model") is None, (
+        "strip-control: a coordinator call with no actor_model must pass "
+        f"actor_model=None to OutcomeRunner; got "
+        f"{MockRunner2.call_args.kwargs.get('actor_model')!r}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
 # T6 (custom-backend programmatic path): a custom log_backend injected into the
 # gate agent is the backend the OutcomeRunner receives — the case the #496 fix
 # exists for (the default-filesystem CLI path is byte-identical; only this

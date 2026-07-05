@@ -103,11 +103,18 @@ def backend(backend_factory, tmp_path) -> MandateBackend:
 # Helpers: well-formed mandate file fixtures
 
 
+# The "active" fixture's expires_at is a FIXED far-future sentinel so it never
+# lapses at a quarter/year boundary and re-detonates the conformance suite (#678:
+# a hardcoded 2026-06-30 expiry that went stale on 2026-07-01, failing
+# revocation-state tests that require this mandate ACTIVE). A FIXED date (not a
+# dynamic now()+N) keeps the fixture bytes deterministic and byte-identical to the
+# copy in test_doctor_check_mandate_backend.py. The other fixtures below
+# deliberately use fixed PAST dates to exercise expired/revoked.
 _GOOD_MANDATE_FILE = """\
 ## procurement-q2-2026
 granted_by: operator
 granted_at: 2026-04-01T00:00:00Z
-expires_at: 2026-06-30T23:59:59Z
+expires_at: 2999-12-31T23:59:59Z
 revocable_by: operator
 scope: |
   Purchase SaaS subscriptions on the approved-vendor list.
@@ -453,10 +460,10 @@ def test_load_mandate_missing_raises_mandate_not_found(
         "foo\\bar",
         "..",
         "",
-        "FOO",          # uppercase not in [a-z0-9][a-z0-9-]*
-        "foo!",         # disallowed character
-        "foo bar",      # space
-        "a" * 65,       # exceeds 64-char max per spec/29 parser rules
+        "FOO",  # uppercase not in [a-z0-9][a-z0-9-]*
+        "foo!",  # disallowed character
+        "foo bar",  # space
+        "a" * 65,  # exceeds 64-char max per spec/29 parser rules
         "-starts-with-hyphen",  # must start with alphanumeric
     ],
 )
@@ -761,9 +768,7 @@ def test_scope_isolation_project_mandates_dont_appear_in_agent_scope(
     """Mandate written to ``project:root`` MUST NOT appear in
     ``list_mandates("agent:test")`` — each scope is independent (spec/29
     MUST #2 — scope isolation)."""
-    make_mandate_in_backend(
-        backend, tmp_path, "project:root", is_project_root=True
-    )
+    make_mandate_in_backend(backend, tmp_path, "project:root", is_project_root=True)
     agent_refs = backend.list_mandates("agent:test")
     assert agent_refs == []
 
@@ -831,9 +836,7 @@ revocation_state: active
 revoked_at: null
 revocation_reason: null
 """
-    make_mandate_in_backend(
-        backend, tmp_path, "agent:test", content=valid_ids_content
-    )
+    make_mandate_in_backend(backend, tmp_path, "agent:test", content=valid_ids_content)
     refs = backend.list_mandates("agent:test")
     ids = {r.mandate_id for r in refs}
     assert ids == {"a", "abc123", "foo-bar-baz"}
@@ -891,9 +894,7 @@ def test_load_mandate_populates_source_path(
 # Mandate is frozen (MUST #1 from types.py design notes)
 
 
-def test_mandate_dataclass_is_frozen(
-    backend: MandateBackend, tmp_path: Path
-) -> None:
+def test_mandate_dataclass_is_frozen(backend: MandateBackend, tmp_path: Path) -> None:
     """``Mandate`` is ``@dataclass(frozen=True)`` — attempting to mutate a
     returned instance MUST raise ``FrozenInstanceError`` (or ``AttributeError``
     on older Python). Backends MUST NOT return mutable mandate dicts or

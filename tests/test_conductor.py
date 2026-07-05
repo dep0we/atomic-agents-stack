@@ -75,12 +75,30 @@ Coverage (acceptance criteria from arc-ruling #580 PR1, #581 PR2, #582 PR3):
   TEST 56 (C8) — gate suspension holds NO live lock; an independent non-conflicting run proceeds normally (PR4 #583)
   TEST 57 — parse-guard: committed reference PLAYBOOK.md at docs/samples/dev-lifecycle/ validates via
             validate_playbook_manifest (18 stages, 8 gates, merge-gate conflict_keys=('merge:main',),
-            run_cap_usd=50.00, zero warnings) (#584)
+            run_cap_usd=50.00, zero warnings) (#584); C10: automated stages carry their declared model,
+            gate stages have model=None (#668)
   TEST 58 — e2e integration: full dev-lifecycle run against a feature-issue subject; suspends at each
             of 8 gates; resumes (6x continue + 2x skip); all 8 rulings in one queryable goal ledger
-            with rationale; cumulative_spend_usd > 0 (#584)
+            with rationale; cumulative_spend_usd > 0 (#584); C10: all 10 automated stages dispatched
+            with actor_model='claude-sonnet-4-6-20260101'; no UserWarning about NOT YET APPLIED (#668)
   TEST 59 — merge-gate conflict serialization: A suspends holding 'merge:main', B defers, A
             resumes(continue), B self-releases into its own gate; real FilesystemLockBackend (#584)
+  TEST 60 (C10) — model: on gate stage is rejected at parse time with a hard validation error (#668)
+  TEST 60-strip-RED (C10) — model: on automated stage parses cleanly (negative control for TEST 60) (#668)
+  TEST 61 (C10) — actor_model threads end-to-end: _dispatch_stage passes stage.model to
+            dispatch_sub_goal_as_outcome as actor_model= (#668)
+  TEST 61-strip-RED (C10) — actor_model thread: when stage.model is None, actor_model kwarg is None
+            (or absent) — the no-model path is the same as before #668 (#668)
+  TEST 62 (C10) — OutcomeRunner.run passes model_override=self._actor_model to agent.call(); a
+            per-invocation strip-control confirms that removing actor_model from the call causes
+            the assertion to fail (#668)
+  TEST 63 (C10) — between-stage dollar halt is model-agnostic: a model-bearing stage that exhausts
+            the run cap halts the run before the next stage dispatches (the coarse between-stage
+            backstop, NOT the per-iteration clamp — that is guarded by the un-mocked OutcomeRunner
+            test test_outcome_per_iteration_treecap_clamps_under_model_override in test_outcome.py) (#668)
+  TEST 64 (C10) — fingerprint includes model conditionally: two playbooks differing only in
+            stage.model produce different fingerprints; a modelless stage hashes byte-identically
+            to its pre-#668 pin (#668)
 
 Note on dispatch patching: dispatch_sub_goal_as_outcome is imported via
 a local `from ..goal.coordinator import ...` inside _dispatch_stage(). Patch
@@ -7193,6 +7211,19 @@ def test_reference_playbook_parses_correctly() -> None:
         f"Last stage must be document-run; got {stage_ids[-1]!r}"
     )
 
+    # C10 (#668): all automated stages must carry their declared model; all gate
+    # stages must have model=None (gate-model rejection is enforced at parse time).
+    for stage in automated_stages:
+        assert stage.model == "claude-sonnet-4-6-20260101", (
+            f"Automated stage {stage.stage_id} must declare "
+            f"model='claude-sonnet-4-6-20260101'; got {stage.model!r}"
+        )
+    for stage in gate_stages:
+        assert stage.model is None, (
+            f"Gate stage {stage.stage_id} must have model=None (gate-model "
+            f"rejection is enforced at parse time); got {stage.model!r}"
+        )
+
 
 # ──────────────────────────────────────────────────────────────────
 # TEST 58 — e2e integration: full dev-lifecycle run.
@@ -7249,7 +7280,17 @@ def test_e2e_dev_lifecycle_full_run(
         f"Reference PLAYBOOK.md must parse cleanly; warnings={warnings}"
     )
 
-    _ledger_dispatch = _make_ledger_updating_dispatch(total_cost_usd=0.10)
+    # C10 (#668): capture dispatch kwargs to assert actor_model is threaded through.
+    _dispatch_calls: list[dict] = []
+    _base_ledger_dispatch = _make_ledger_updating_dispatch(total_cost_usd=0.10)
+
+    def _tracking_dispatch(
+        agent: Any, goal_manager: Any, sub_goal_id: str, **kwargs: Any
+    ) -> tuple:
+        """Intercept dispatch calls and record actor_model for C10 assertion."""
+        _dispatch_calls.append({"sub_goal_id": sub_goal_id, "kwargs": kwargs})
+        return _base_ledger_dispatch(agent, goal_manager, sub_goal_id, **kwargs)
+
     idem = _make_idempotency_backend_mock()
     outcome_backend = _make_outcome_backend_mock()
     subject = "Implement feature X from issue #584"
@@ -7257,7 +7298,7 @@ def test_e2e_dev_lifecycle_full_run(
     with (
         patch(
             "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
-            side_effect=_ledger_dispatch,
+            side_effect=_tracking_dispatch,
         ),
         patch(
             "atomic_agents.conductor.run._get_idempotency_backend",
@@ -7423,6 +7464,38 @@ def test_e2e_dev_lifecycle_full_run(
         f"got {len(state.completed_stage_ids)}: {state.completed_stage_ids}"
     )
 
+    # C10 (#668): assert that all 10 automated dispatch calls received
+    # actor_model='claude-sonnet-4-6-20260101'. This is the core C10 conformance
+    # assertion: the conductor threads stage.model through to dispatch_sub_goal_as_outcome.
+    assert len(_dispatch_calls) == 10, (
+        f"Expected 10 automated stage dispatches; got {len(_dispatch_calls)}: "
+        f"{[c['sub_goal_id'] for c in _dispatch_calls]}"
+    )
+    for call_info in _dispatch_calls:
+        actual_actor_model = call_info["kwargs"].get("actor_model")
+        assert actual_actor_model == "claude-sonnet-4-6-20260101", (
+            f"C10: automated stage {call_info['sub_goal_id']!r} must receive "
+            f"actor_model='claude-sonnet-4-6-20260101' from the conductor; "
+            f"got actor_model={actual_actor_model!r}. "
+            "This confirms the four-link wiring chain is complete: "
+            "_dispatch_stage → dispatch_sub_goal_as_outcome(actor_model=) is the link "
+            "tested here."
+        )
+
+    # C10 (#668): the 'NOT YET APPLIED' UserWarning block was removed in this PR.
+    # Verify by inspecting run.py source that the warning text is absent — if the
+    # wiring is ever reverted, the warning block would be re-added and this check
+    # would fail, serving as a regression guard.
+    import atomic_agents.conductor.run as _crun  # noqa: PLC0415
+    import inspect  # noqa: PLC0415
+
+    run_source = inspect.getsource(_crun)
+    assert "NOT YET APPLIED" not in run_source, (
+        "C10: the 'NOT YET APPLIED' sentinel text must not exist in conductor/run.py "
+        "after #668 wires the actor-model dial. Its presence indicates the UserWarning "
+        "block was not removed (incomplete removal)."
+    )
+
 
 # ──────────────────────────────────────────────────────────────────
 # TEST 59 — merge-gate conflict serialization: A suspends holding
@@ -7544,4 +7617,819 @@ def test_merge_key_conflict_serialization(
     ]
     assert any("merge:main" in k for k in held_b), (
         f"B must now hold 'merge:main' in its awaiting_decision sub-goal; held={held_b!r}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 60 (C10) — model: on gate stage rejected at parse time (#668)
+#
+# Symmetric with conflict_keys being gate-only (TEST 26): model: on an
+# is_gate=true stage makes no sense (gate stages make no actor LLM call)
+# and MUST be rejected with a hard validation error. The guard must fire
+# AFTER is_gate is resolved (from the YAML bool, not the raw string) so a
+# string "false" does not accidentally trigger the rejection on automated stages.
+
+
+def test_gate_stage_model_rejected_at_parse_time(tmp_path: Path) -> None:
+    """TEST 60 (C10) — model: on a gate stage produces a hard parse error.
+
+    The guard is placed AFTER is_gate is resolved (resolved bool, not raw string)
+    so is_gate='false' (string) on a stage with model: does NOT trigger the
+    rejection — automated stages may carry model: freely.
+    """
+    # (a) gate stage with model: — must reject
+    pb_dir = tmp_path / "gate-with-model"
+    pb_dir.mkdir()
+    gate_with_model_yaml = (
+        "stages:\n"
+        "  - stage_id: gate-one\n"
+        "    label: A gate stage with model\n"
+        "    prompt: Review and rule.\n"
+        "    model: claude-opus-4-7-20260101\n"
+        "    is_gate: true\n"
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="gate-with-model", stages=gate_with_model_yaml)
+    )
+    manifest, warnings = validate_playbook_manifest(pb_dir)
+    assert manifest is None, (
+        "A gate stage with model: must fail validation (returns None)"
+    )
+    assert any("model:" in w or "model" in w for w in warnings), (
+        f"Error message must mention 'model'; got warnings={warnings}"
+    )
+    # Error message must explain that gate stages make no actor LLM call
+    assert any("actor LLM call" in w or "human decision" in w for w in warnings), (
+        f"Error must explain why gate stages cannot have model:; got {warnings}"
+    )
+
+    # (b) strip-RED: YAML string "true" on is_gate is parsed correctly as truthy —
+    # same rejection fires when is_gate is written as the string "true".
+    pb_dir2 = tmp_path / "gate-string-true-with-model"
+    pb_dir2.mkdir()
+    gate_string_true_yaml = (
+        "stages:\n"
+        "  - stage_id: gate-str\n"
+        "    label: Gate string true\n"
+        "    prompt: Review.\n"
+        "    model: claude-opus-4-7-20260101\n"
+        "    is_gate: 'true'\n"  # YAML string "true" — still is_gate
+    )
+    (pb_dir2 / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="gate-string-true", stages=gate_string_true_yaml)
+    )
+    manifest2, warnings2 = validate_playbook_manifest(pb_dir2)
+    assert manifest2 is None, (
+        "A gate stage (is_gate='true' string) with model: must still fail"
+    )
+
+    # (c) F3 (#668 Codex review): a NON-STRING model: on a gate (e.g. `model: 123`)
+    # is coerced to None at parse but MUST still be rejected — a gate carries no
+    # actor model regardless of the value's type. Without the fix the gate check
+    # `model is not None` would slip a non-string model past the rejection because
+    # the coercion turned 123 into None.
+    pb_dir3 = tmp_path / "gate-nonstring-model"
+    pb_dir3.mkdir()
+    gate_nonstring_yaml = (
+        "stages:\n"
+        "  - stage_id: gate-int\n"
+        "    label: Gate with non-string model\n"
+        "    prompt: Review.\n"
+        "    model: 123\n"  # non-string — coerced to None, but still declared
+        "    is_gate: true\n"
+    )
+    (pb_dir3 / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="gate-nonstring", stages=gate_nonstring_yaml)
+    )
+    manifest3, warnings3 = validate_playbook_manifest(pb_dir3)
+    assert manifest3 is None, (
+        "A gate stage with a non-string model: (123) must still fail validation — "
+        "the gate-model rejection keys on declaration, not the coerced value"
+    )
+    assert any("only valid on" in w or "actor LLM call" in w for w in warnings3), (
+        f"Non-string gate model must produce the gate-model error; got {warnings3}"
+    )
+
+
+def test_gate_stage_model_rejected_automated_negative_control(tmp_path: Path) -> None:
+    """TEST 60-strip-RED (C10) — model: on an automated stage parses cleanly.
+
+    The guard must NOT fire for is_gate=false stages — model: is the C10 feature
+    for automated stages and must be accepted. This negative control ensures the
+    gate-model rejection does not accidentally break the feature it guards.
+    """
+    pb_dir = tmp_path / "auto-with-model"
+    pb_dir.mkdir()
+    auto_with_model_yaml = (
+        "stages:\n"
+        "  - stage_id: auto-one\n"
+        "    label: Automated with model\n"
+        "    prompt: Do work.\n"
+        "    model: claude-sonnet-4-6-20260101\n"
+        "    is_gate: false\n"
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="auto-with-model", stages=auto_with_model_yaml)
+    )
+    manifest, warnings = validate_playbook_manifest(pb_dir)
+    assert manifest is not None, (
+        f"Automated stage with model: must parse cleanly; warnings={warnings}"
+    )
+    assert warnings == [], (
+        f"No warnings expected for automated stage with model:; got {warnings}"
+    )
+    assert manifest.stages[0].model == "claude-sonnet-4-6-20260101", (
+        f"model must round-trip through parse; got {manifest.stages[0].model!r}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 61 (C10) — actor_model threads from _dispatch_stage to coordinator (#668)
+#
+# The four-link wiring chain for C10 is:
+#   _dispatch_stage → dispatch_sub_goal_as_outcome(actor_model=stage.model)
+#   → OutcomeRunner(actor_model=) → agent.call(model_override=actor_model)
+#
+# TEST 61 tests the FIRST LINK: _dispatch_stage must pass stage.model as
+# actor_model= to dispatch_sub_goal_as_outcome. Patching the coordinator
+# and capturing kwargs is the canonical approach (mirrors how TEST 24 tests
+# the parent_remaining_headroom_usd thread).
+#
+# TEST 61-strip-RED: when stage.model is None, actor_model kwarg must be None
+# (or absent). This ensures the zero-behavior-change guarantee for modelless
+# stages holds exactly.
+
+
+def test_dispatch_stage_threads_actor_model_to_coordinator(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """TEST 61 (C10) — _dispatch_stage passes stage.model as actor_model= to coordinator.
+
+    Verifies the first link of the four-link C10 wiring chain: the conductor
+    reads stage.model and forwards it as actor_model= to dispatch_sub_goal_as_outcome.
+    """
+    from atomic_agents.locks.filesystem import FilesystemLockBackend  # noqa: PLC0415
+
+    mock_agent.lock_backend = FilesystemLockBackend(agent_root)
+
+    # Build a one-stage playbook with an explicit model on the automated stage
+    declared_model = "claude-sonnet-4-6-20260101"
+    pb_dir = agent_root / "skills" / "model-test-pb"
+    pb_dir.mkdir(parents=True)
+    auto_stage_yaml = (
+        "stages:\n"
+        f"  - stage_id: model-stage\n"
+        f"    label: Stage with model\n"
+        f"    prompt: Do the work.\n"
+        f"    model: {declared_model}\n"
+        f"    is_gate: false\n"
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="model-test-pb", stages=auto_stage_yaml)
+    )
+    manifest, warnings = validate_playbook_manifest(pb_dir)
+    assert manifest is not None, f"Playbook must parse cleanly; warnings={warnings}"
+
+    captured_kwargs: list[dict] = []
+    _ledger_dispatch = _make_ledger_updating_dispatch(total_cost_usd=0.01)
+
+    def _capturing_dispatch(
+        agent: Any, goal_manager: Any, sub_goal_id: str, **kwargs: Any
+    ) -> tuple:
+        captured_kwargs.append(kwargs)
+        return _ledger_dispatch(agent, goal_manager, sub_goal_id, **kwargs)
+
+    idem = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+
+    with (
+        patch(
+            "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
+            side_effect=_capturing_dispatch,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend", return_value=idem
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state = run(playbook=manifest, subject="test-actor-model", agent=mock_agent)
+
+    assert state.status == "complete", f"Run must complete; got {state.status!r}"
+    assert len(captured_kwargs) == 1, (
+        f"Expected 1 dispatch call for the single automated stage; got {len(captured_kwargs)}"
+    )
+    # C10 conformance: actor_model must flow through to the coordinator
+    assert captured_kwargs[0].get("actor_model") == declared_model, (
+        f"C10: _dispatch_stage must pass actor_model={declared_model!r} to coordinator; "
+        f"got actor_model={captured_kwargs[0].get('actor_model')!r}"
+    )
+
+    # C10 audit-trail read-back: the declared model must ALSO be recorded in the
+    # conductor_stage_started ledger event. That audit branch is otherwise
+    # exercised but never verified — a regression that silently dropped
+    # actor_model from the event would leave every other C10 test green (#668
+    # Testing-review finding). Read the durable goal_history.jsonl and assert it.
+    histories = list((agent_root / "goals").glob("crun-*/goal_history.jsonl"))
+    assert histories, "run must have written a conductor goal_history.jsonl"
+    started_events = [
+        json.loads(line)
+        for h in histories
+        for line in h.read_text().splitlines()
+        if line.strip() and '"conductor_stage_started"' in line
+    ]
+    assert started_events, "expected at least one conductor_stage_started event"
+    assert any(e.get("actor_model") == declared_model for e in started_events), (
+        f"C10 audit: conductor_stage_started must record actor_model={declared_model!r}; "
+        f"got {[e.get('actor_model') for e in started_events]!r}"
+    )
+
+
+def test_dispatch_stage_actor_model_none_for_modelless_stage(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """TEST 61-strip-RED (C10) — actor_model kwarg is None when stage has no model:.
+
+    Ensures modelless stages continue to receive actor_model=None, preserving
+    the zero-behavior-change guarantee for all pre-#668 callers.
+    """
+    from atomic_agents.locks.filesystem import FilesystemLockBackend  # noqa: PLC0415
+
+    mock_agent.lock_backend = FilesystemLockBackend(agent_root)
+
+    # A stage without model: (the common case)
+    pb_dir = agent_root / "skills" / "no-model-pb"
+    pb_dir.mkdir(parents=True)
+    no_model_yaml = (
+        "stages:\n"
+        "  - stage_id: no-model-stage\n"
+        "    label: Stage without model\n"
+        "    prompt: Do the work.\n"
+        "    is_gate: false\n"
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="no-model-pb", stages=no_model_yaml)
+    )
+    manifest, warnings = validate_playbook_manifest(pb_dir)
+    assert manifest is not None
+
+    captured_kwargs: list[dict] = []
+    _ledger_dispatch = _make_ledger_updating_dispatch(total_cost_usd=0.01)
+
+    def _capturing_dispatch(
+        agent: Any, goal_manager: Any, sub_goal_id: str, **kwargs: Any
+    ) -> tuple:
+        captured_kwargs.append(kwargs)
+        return _ledger_dispatch(agent, goal_manager, sub_goal_id, **kwargs)
+
+    idem = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+
+    with (
+        patch(
+            "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
+            side_effect=_capturing_dispatch,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend", return_value=idem
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state = run(playbook=manifest, subject="no-model-subject", agent=mock_agent)
+
+    assert state.status == "complete"
+    # Assert the key is EXPLICITLY present AND None. `.get("actor_model") is None`
+    # alone cannot distinguish an explicit actor_model=None kwarg from the key
+    # being absent entirely — if the wiring silently stopped forwarding the kwarg,
+    # `.get()` would still return None and this strip-RED would false-pass (#668
+    # Testing-review finding).
+    assert "actor_model" in captured_kwargs[0], (
+        "TEST 61-strip-RED: _dispatch_stage must EXPLICITLY forward the actor_model= "
+        "kwarg (key present) even for a modelless stage; the key was absent"
+    )
+    assert captured_kwargs[0]["actor_model"] is None, (
+        "TEST 61-strip-RED: a modelless stage must pass actor_model=None (not some other value); "
+        f"got actor_model={captured_kwargs[0]['actor_model']!r}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 62 (C10) — OutcomeRunner.run() passes model_override=self._actor_model
+# to agent.call() (#668).
+#
+# This tests the LAST LINK of the four-link chain — the one with highest
+# silent-failure risk (the compiler can't enforce it). A per-invocation
+# strip-control confirms that removing _actor_model from the call would
+# cause the assertion to fail.
+
+
+def test_outcome_runner_passes_model_override_to_agent_call() -> None:
+    """TEST 62 (C10) — OutcomeRunner.run passes model_override=self._actor_model to agent.call().
+
+    Directly constructs OutcomeRunner with actor_model set, then calls run()
+    with a mocked AtomicAgent and asserts that every agent.call() invocation
+    receives model_override equal to the declared actor_model value.
+
+    The strip-control: after asserting the positive case, we verify that an
+    OutcomeRunner with actor_model=None passes model_override=None — confirming
+    the assertion is not vacuously true.
+    """
+    from atomic_agents.outcome import OutcomeRunner  # noqa: PLC0415
+
+    declared_model = "claude-sonnet-4-6-20260101"
+
+    # Build a minimal OutcomeRunner with actor_model set
+    import tempfile  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        agent_root = Path(tmpdir) / "test-runner-agent"
+        agent_root.mkdir()
+
+        # OutcomeRunner requires agent_root to exist
+        runner = OutcomeRunner(
+            agents_root=Path(tmpdir),
+            agent_name="test-runner-agent",
+            actor_model=declared_model,
+        )
+        assert runner._actor_model == declared_model, (
+            f"_actor_model must be stored in __init__; got {runner._actor_model!r}"
+        )
+
+        # Mock AtomicAgent at the outcome package level so the lazy import in run()
+        # picks up the mock (pattern from the existing outcome tests).
+        mock_agent_instance = MagicMock()
+        # Construct a minimal satisfied AgentResponse mock. Explicit numeric/string
+        # fields (not bare MagicMocks) are required because the now-satisfied run
+        # records the iteration + writes result.json (JSON-serialized) — bare
+        # MagicMock token/cost fields are not JSON-serializable (#668 P2 fix).
+        mock_response = MagicMock()
+        mock_response.text = "The answer"
+        mock_response.model = declared_model
+        mock_response.input_tokens = 100
+        mock_response.output_tokens = 50
+        mock_response.cost_usd = 0.01
+        mock_response.skipped = False
+        mock_response.skip_reason = None
+        mock_agent_instance.call.return_value = mock_response
+        mock_agent_instance._check_cost_guardrails.return_value = MagicMock(allow=True)
+
+        # Mock the judge LLM (atomic_agents.outcome._llm.call_llm) to return a
+        # SATISFIED verdict — the seam every sibling outcome test patches. The prior
+        # EvalRunner patch was INERT: the judge runs via _llm.call_llm, not EvalRunner,
+        # so the judge call hit the network and the test passed only because it never
+        # asserted result.status (it landed on the 'failed' error path). #668 P2 fix.
+        judge_resp = MagicMock()
+        judge_resp.text = json.dumps(
+            {"satisfied": True, "criterion_results": [], "explanation": "ok"}
+        )
+        judge_resp.input_tokens = 10
+        judge_resp.output_tokens = 5
+
+        model_overrides_received: list = []
+
+        def _recording_call(**kwargs: Any) -> MagicMock:
+            model_overrides_received.append(kwargs.get("model_override"))
+            return mock_response
+
+        mock_agent_instance.call.side_effect = _recording_call
+
+        with (
+            patch(
+                "atomic_agents.outcome.AtomicAgent", return_value=mock_agent_instance
+            ),
+            patch("atomic_agents.outcome._llm.call_llm", return_value=judge_resp),
+        ):
+            result = runner.run(
+                description="Test the actor model override",
+                rubric="The output must be correct.",
+                max_iterations=1,
+            )
+
+        # Happy-path explicitness: the run reached a clean satisfied verdict (not the
+        # prior unintended 'failed' path through an unmocked judge call). Guards
+        # against the test silently regressing to the error path again.
+        assert result.status == "satisfied", (
+            f"TEST 62 must exercise the satisfied happy path; got status={result.status!r}"
+        )
+
+        # C10 positive case: every agent.call invocation received model_override=declared_model
+        assert len(model_overrides_received) >= 1, (
+            "run() must call agent.call() at least once for max_iterations=1"
+        )
+        for override in model_overrides_received:
+            assert override == declared_model, (
+                f"C10: agent.call() must receive model_override={declared_model!r}; "
+                f"got model_override={override!r}. "
+                "This is the last-link check: OutcomeRunner.run() → agent.call(model_override=)."
+            )
+
+        # Strip-control: actor_model=None → model_override=None on every call
+        runner_no_model = OutcomeRunner(
+            agents_root=Path(tmpdir),
+            agent_name="test-runner-agent",
+            actor_model=None,
+        )
+        assert runner_no_model._actor_model is None
+
+        null_overrides: list = []
+
+        def _null_recording_call(**kwargs: Any) -> MagicMock:
+            null_overrides.append(kwargs.get("model_override"))
+            return mock_response
+
+        mock_agent_instance.call.side_effect = _null_recording_call
+
+        with (
+            patch(
+                "atomic_agents.outcome.AtomicAgent", return_value=mock_agent_instance
+            ),
+            patch("atomic_agents.outcome._llm.call_llm", return_value=judge_resp),
+        ):
+            runner_no_model.run(
+                description="Test null actor model",
+                rubric="Must be correct.",
+                max_iterations=1,
+            )
+
+        for override in null_overrides:
+            assert override is None, (
+                f"TEST 62-strip-RED: actor_model=None runner must pass model_override=None; "
+                f"got model_override={override!r}"
+            )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 63 (C10) — between-stage dollar halt is model-agnostic on a model-bearing
+# stage. A stage declaring a model more expensive than the default still cannot
+# bypass the tree-cap: the billing is post-hoc (actual spend) and the coarse
+# between-stage backstop gates on the dollar amount, not the model name. Dispatch
+# is mocked here, so this guards the BETWEEN-stage `run_remaining <= 0` halt only.
+# The per-iteration MIN(child_remaining, parent_remaining) clamp on the real
+# agent.call(model_override=) path is guarded separately by the un-mocked
+# OutcomeRunner test test_outcome_per_iteration_treecap_clamps_under_model_override
+# in test_outcome.py (the differing-model tree-cap guard required by the rulings).
+
+
+def test_between_stage_halt_is_model_agnostic(
+    agent_root: Path,
+    mock_agent: MagicMock,
+) -> None:
+    """TEST 63 (C10) — the between-stage dollar halt is model-agnostic on a model-bearing stage.
+
+    Both stages declare an actor model (`claude-sonnet-4-6-20260101`). Stage A
+    costs the full 0.10 run cap, so `run_remaining <= 0` after it and the coarse
+    between-stage backstop halts the run before stage B dispatches. The guard
+    this test exercises is the dollar-denominated, post-hoc between-stage halt —
+    NOT the per-iteration MIN(child_remaining, parent_remaining) clamp (dispatch
+    is mocked here, so no real `agent.call(model_override=)` / per-iteration gate
+    runs). The point it proves: declaring a per-stage `model:` does not let a
+    stage bypass the tree-cap; the cap is billed post-hoc at actual spend and is
+    independent of which model the stage declared. (The declared model is inert
+    in this mock — the mock's cost is fixed regardless — which is exactly why the
+    dollar gate is model-agnostic.)
+    """
+    from atomic_agents.locks.filesystem import FilesystemLockBackend  # noqa: PLC0415
+
+    mock_agent.lock_backend = FilesystemLockBackend(agent_root)
+
+    # Write a tiny model.md cap so the tree-cap is tight
+    (agent_root / "model.md").write_text(
+        textwrap.dedent(
+            """\
+            ---
+            provider: anthropic
+            model: claude-3-5-haiku-20241022
+            cost_guardrails:
+              max_cost_per_run_usd: 5.00
+              max_cumulative_cost_usd: 50.00
+            ---
+            """
+        )
+    )
+
+    pb_dir = agent_root / "skills" / "treecap-model-pb"
+    pb_dir.mkdir(parents=True)
+    two_stage_yaml = (
+        "stages:\n"
+        "  - stage_id: stage-a\n"
+        "    label: Stage A (pricier model)\n"
+        "    prompt: Do something.\n"
+        "    model: claude-sonnet-4-6-20260101\n"
+        "    is_gate: false\n"
+        "  - stage_id: stage-b\n"
+        "    label: Stage B\n"
+        "    prompt: Do more.\n"
+        "    model: claude-sonnet-4-6-20260101\n"
+        "    is_gate: false\n"
+    )
+    (pb_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(
+            name="treecap-model-pb",
+            stages=two_stage_yaml,
+            run_cap_usd=0.10,  # tight run cap
+        )
+    )
+    manifest, warnings = validate_playbook_manifest(pb_dir)
+    assert manifest is not None, f"Playbook must parse; warnings={warnings}"
+
+    call_count = [0]
+
+    def _make_cost_dispatch(cost: float):  # noqa: ANN202
+        def _dispatch(
+            agent: Any, goal_manager: Any, sub_goal_id: str, **kwargs: Any
+        ) -> tuple:
+            call_count[0] += 1
+            from datetime import date as _date  # noqa: PLC0415
+
+            today = _date.today()
+            goal_manager.goal_backend.apply_transition(
+                agent_id=goal_manager.agent_name,
+                sub_goal_id=sub_goal_id,
+                to_status="complete",
+                fields={"completed": today.isoformat()},
+                history_prose=f"sub_goal `{sub_goal_id}` → complete (treecap test)",
+                history_event={
+                    "ts": "2026-06-01T00:00:00+00:00",
+                    "event": "sub_goal_outcome_dispatched",
+                    "sub_goal_id": sub_goal_id,
+                    "outcome_run_id": f"outcome-mock-{sub_goal_id}",
+                    "terminal_state": "satisfied",
+                    "applied_status": "complete",
+                    "iterations": 1,
+                    "total_cost_usd": cost,
+                },
+                expected_from_status=None,
+                when=today,
+            )
+            sg = MagicMock()
+            sg.status = "complete"
+            return _make_outcome_result(status="satisfied", total_cost_usd=cost), sg
+
+        return _dispatch
+
+    # Stage A costs the full run cap (0.10) — run_remaining = 0.00 after stage-a.
+    # The between-stage halt check fires at `run_remaining <= 0`, so stage-b
+    # must not dispatch. This proves the tree-cap binds on a model-bearing stage
+    # exactly as it does on a modelless stage: billing is post-hoc at actual spend
+    # and the dollar-denominated gate is model-agnostic.
+    stage_a_cost = 0.10  # exhausts the full run cap
+    stage_b_cost = 0.05  # stage-b must never run
+
+    dispatch_call_count = [0]
+
+    def _cost_routing_dispatch(
+        agent: Any, goal_manager: Any, sub_goal_id: str, **kwargs: Any
+    ) -> tuple:
+        dispatch_call_count[0] += 1
+        if sub_goal_id == "stage-a":
+            return _make_cost_dispatch(stage_a_cost)(
+                agent, goal_manager, sub_goal_id, **kwargs
+            )
+        return _make_cost_dispatch(stage_b_cost)(
+            agent, goal_manager, sub_goal_id, **kwargs
+        )
+
+    idem = _make_idempotency_backend_mock()
+    outcome_backend = _make_outcome_backend_mock()
+
+    with (
+        patch(
+            "atomic_agents.goal.coordinator.dispatch_sub_goal_as_outcome",
+            side_effect=_cost_routing_dispatch,
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_idempotency_backend", return_value=idem
+        ),
+        patch(
+            "atomic_agents.conductor.run._get_outcome_backend",
+            return_value=outcome_backend,
+        ),
+    ):
+        state = run(playbook=manifest, subject="treecap-model-test", agent=mock_agent)
+
+    # The run must halt after stage-a depletes the budget — stage-b must NOT dispatch
+    assert state.status == "halted", (
+        f"C10 tree-cap: run must halt when cumulative spend exceeds run_cap; "
+        f"got status={state.status!r} (completed_stages={state.completed_stage_ids})"
+    )
+    assert dispatch_call_count[0] == 1, (
+        f"C10 tree-cap: only stage-a should dispatch (stage-b blocked by tree-cap); "
+        f"got {dispatch_call_count[0]} dispatches"
+    )
+    assert state.cumulative_spend_usd == pytest.approx(stage_a_cost), (
+        f"cumulative_spend must equal stage-a cost {stage_a_cost}; "
+        f"got {state.cumulative_spend_usd}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 64 (C10) — fingerprint includes model conditionally (#668).
+#
+# Two playbooks differing only in stage.model must produce different
+# fingerprints. A modelless stage must hash byte-identically to its
+# pre-#668 pin (the conditional-only pattern).
+
+
+def test_fingerprint_includes_model_conditionally() -> None:
+    """TEST 64 (C10) — playbook fingerprint includes model only when non-None.
+
+    (a) Positive case: two playbooks with the same stage structure but different
+        model: fields produce different fingerprints.
+    (b) Backward-compat case: a modelless stage produces the same fingerprint as
+        a manually computed pre-#668 digest (which omits 'model' from the hash
+        input). This ensures existing mid-suspension runs (pinned without model)
+        resume cleanly after upgrading to #668.
+    """
+    import hashlib  # noqa: PLC0415
+    import json  # noqa: PLC0415
+
+    from atomic_agents.conductor.run import _compute_playbook_fingerprint  # noqa: PLC0415
+    from atomic_agents.conductor.types import PlaybookManifest, StageSpec  # noqa: PLC0415
+
+    # Build two playbooks with the same structure but different model values
+    stage_with_model = StageSpec(
+        stage_id="work-stage",
+        label="Work Stage",
+        prompt="Do the work.",
+        model="claude-sonnet-4-6-20260101",
+    )
+    stage_with_other_model = StageSpec(
+        stage_id="work-stage",
+        label="Work Stage",
+        prompt="Do the work.",
+        model="claude-haiku-4-5",
+    )
+    stage_without_model = StageSpec(
+        stage_id="work-stage",
+        label="Work Stage",
+        prompt="Do the work.",
+    )
+
+    def _make_pb(stage: StageSpec) -> PlaybookManifest:
+        return PlaybookManifest(
+            name="fp-test",
+            description="d",
+            when_to_use=None,
+            run_cap_usd=1.0,
+            stages=[stage],
+            playbook_dir=Path("/fake"),
+            playbook_md_path=Path("/fake/PLAYBOOK.md"),
+        )
+
+    fp_with_model = _compute_playbook_fingerprint(_make_pb(stage_with_model))
+    fp_with_other_model = _compute_playbook_fingerprint(
+        _make_pb(stage_with_other_model)
+    )
+    fp_without_model = _compute_playbook_fingerprint(_make_pb(stage_without_model))
+
+    # (a) Different model values → different fingerprints
+    assert fp_with_model != fp_with_other_model, (
+        "C10: playbooks differing only in stage model must produce different fingerprints"
+    )
+    assert fp_with_model != fp_without_model, (
+        "C10: a stage with model must produce a different fingerprint than the same "
+        "stage without model"
+    )
+
+    # (b) Backward-compat: modelless stage hashes byte-identically to the pre-#668
+    # digest. Pre-#668 _compute_playbook_fingerprint did NOT include 'model' in
+    # part_dict for ANY stage. The conditional-only pattern means a modelless stage
+    # (model=None) still omits 'model' from the dict → same bytes → same digest.
+    pre_668_h = hashlib.sha256()
+    pre_668_part_dict: dict = {
+        "stage_id": "work-stage",
+        "is_gate": False,
+        "prompt": "Do the work.",
+        "prompt_ref": None,
+        "options": [],
+        "rubric_ref": None,
+        # NOTE: 'model' intentionally absent — simulates the pre-#668 hash input
+    }
+    pre_668_part = json.dumps(pre_668_part_dict, sort_keys=True, ensure_ascii=True)
+    pre_668_h.update(pre_668_part.encode("utf-8"))
+    pre_668_h.update(b"\x00")
+    pre_668_digest = pre_668_h.hexdigest()
+
+    assert fp_without_model == pre_668_digest, (
+        f"C10 backward-compat: a modelless stage must hash byte-identically to its "
+        f"pre-#668 pin (the upgrade must not break existing mid-suspension runs that "
+        f"have no model dial). Expected {pre_668_digest!r}; got {fp_without_model!r}"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# TEST 65 (C10) — unknown-model parse warning (#668).
+#
+# A normative C10 MUST: "An unknown-model value (not in _costs.PRICING) at
+# parse time MUST emit a WARNING and continue." The warning flows through the
+# structured (manifest, warnings) channel returned by validate_playbook_manifest
+# — not a logger-only side channel — so a programmatic caller sees it. The
+# stage still parses (the runtime LLMBackend is authoritative). The inline
+# in-PRICING negative control proves a known model emits NO such warning, so the
+# guard is the unknown-model branch, not a blanket model: warning.
+
+
+def test_unknown_model_emits_parse_warning(tmp_path: Path) -> None:
+    """TEST 65 (C10) — a model: absent from _costs.PRICING WARNs but still parses.
+
+    (a) Unknown-model case: an automated stage declaring a model not in
+        _costs.PRICING parses successfully (manifest is not None) AND surfaces a
+        non-blocking advisory in the returned warnings list (structured channel,
+        not logger-only).
+    (b) Inline in-PRICING strip-RED: the same shape with a KNOWN model emits no
+        such advisory — proving the warning is the not-in-PRICING branch, not a
+        blanket warning on any model:.
+    (c) Whitespace-only normalization: a `model: "   "` parses to model=None (the
+        single parse site normalizes empty-after-strip to None) — no spurious
+        PRICING advisory, so the unknown-model `is not None` gate agrees with the
+        fingerprint/audit `is not None` gates on a degenerate-empty value.
+    """
+    from atomic_agents._costs import PRICING  # noqa: PLC0415
+
+    unknown_model = "totally-made-up-model-not-in-pricing-xyz"
+    assert unknown_model not in PRICING, (
+        "test premise: model must be absent from PRICING"
+    )
+
+    # (a) Unknown model → parses, with a structured-channel warning
+    unknown_dir = tmp_path / "unknown-model-pb"
+    unknown_dir.mkdir()
+    unknown_yaml = (
+        "stages:\n"
+        "  - stage_id: auto-unknown\n"
+        "    label: Automated with unknown model\n"
+        "    prompt: Do work.\n"
+        f"    model: {unknown_model}\n"
+        "    is_gate: false\n"
+    )
+    (unknown_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="unknown-model-pb", stages=unknown_yaml)
+    )
+    manifest, warnings = validate_playbook_manifest(unknown_dir)
+    assert manifest is not None, (
+        f"Unknown model must WARN-not-block — the playbook must still parse; "
+        f"warnings={warnings}"
+    )
+    assert manifest.stages[0].model == unknown_model, (
+        "the unknown model must still round-trip into StageSpec.model (runtime "
+        "LLMBackend is authoritative, not the parse-time pricing table)"
+    )
+    assert any(unknown_model in w and "PRICING" in w for w in warnings), (
+        f"an unknown-model advisory must surface in the structured warnings list; "
+        f"got {warnings}"
+    )
+
+    # (b) Inline in-PRICING strip-RED: a KNOWN model emits NO advisory
+    known_model = "claude-sonnet-4-6-20260101"
+    assert known_model in PRICING, "test premise: control model must be in PRICING"
+    known_dir = tmp_path / "known-model-pb"
+    known_dir.mkdir()
+    known_yaml = (
+        "stages:\n"
+        "  - stage_id: auto-known\n"
+        "    label: Automated with known model\n"
+        "    prompt: Do work.\n"
+        f"    model: {known_model}\n"
+        "    is_gate: false\n"
+    )
+    (known_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="known-model-pb", stages=known_yaml)
+    )
+    known_manifest, known_warnings = validate_playbook_manifest(known_dir)
+    assert known_manifest is not None
+    assert known_warnings == [], (
+        f"a KNOWN model must emit NO pricing advisory (strip-RED control); "
+        f"got {known_warnings}"
+    )
+
+    # (c) Whitespace-only model → normalized to None, no spurious PRICING advisory
+    blank_dir = tmp_path / "blank-model-pb"
+    blank_dir.mkdir()
+    blank_yaml = (
+        "stages:\n"
+        "  - stage_id: auto-blank\n"
+        "    label: Automated with whitespace-only model\n"
+        "    prompt: Do work.\n"
+        '    model: "   "\n'
+        "    is_gate: false\n"
+    )
+    (blank_dir / PLAYBOOK_ENTRY_POINT).write_text(
+        _make_playbook_md(name="blank-model-pb", stages=blank_yaml)
+    )
+    blank_manifest, blank_warnings = validate_playbook_manifest(blank_dir)
+    assert blank_manifest is not None
+    assert blank_manifest.stages[0].model is None, (
+        "a whitespace-only model: must normalize to None at the single parse site "
+        f"(not the empty string ''); got {blank_manifest.stages[0].model!r}"
+    )
+    assert blank_warnings == [], (
+        f"a whitespace-only (normalized-to-None) model must emit NO pricing advisory; "
+        f"got {blank_warnings}"
     )
