@@ -1083,8 +1083,10 @@ def _compute_banner_stats(
             except Exception:
                 pass
 
-    # Eval score: most recent score from evals/runs/*.jsonl
+    # Eval score: most recent score from evals/runs/*.jsonl.
+    # Track which field was read so the formatter uses the correct scale.
     eval_score: "float | None" = None
+    eval_score_scale: str = "rubric"  # "rubric" (1-5) or "legacy" (0-1)
     evals_dir = agents_root / agent_id / "evals" / "runs"
     if evals_dir.exists():
         import json as _j2
@@ -1100,11 +1102,16 @@ def _compute_banner_stats(
                         rec = _j2.loads(line)
                         # weighted_score is the canonical field (1-5 rubric scale).
                         # Fall back to score (0-1) for legacy fixtures.
-                        sc = rec.get("weighted_score")
-                        if sc is None:
-                            sc = rec.get("score")
-                        if sc is not None:
-                            eval_score = float(sc)
+                        # Branch on WHICH field is present, not on the value.
+                        ws = rec.get("weighted_score")
+                        if ws is not None:
+                            eval_score = float(ws)
+                            eval_score_scale = "rubric"
+                            break
+                        legacy = rec.get("score")
+                        if legacy is not None:
+                            eval_score = float(legacy)
+                            eval_score_scale = "legacy"
                             break
                     except Exception:
                         continue
@@ -1119,6 +1126,7 @@ def _compute_banner_stats(
         "runs_7d": runs_7d,
         "failures_7d": failures_7d,
         "eval_score": eval_score,
+        "eval_score_scale": eval_score_scale,
     }
 
 
@@ -1215,16 +1223,19 @@ def _render_banner(
     def _fmt_int(v) -> str:
         return str(v) if v is not None else "—"
 
-    def _fmt_score(v) -> str:
-        # Delegates to shared helper: handles 1-5 rubric scale and 0-1 legacy scale.
-        # None → "—". Value > 1.0 → normalized from [1,5] range. ≤ 1.0 → ×100.
-        return _eval_score_fmt(v)
+    def _fmt_score(v, scale: str) -> str:
+        # Delegates to shared helper using the scale tracked by _compute_banner_stats.
+        # scale="rubric" → (v-1)/4*100 normalisation; scale="legacy" → v*100.
+        return _eval_score_fmt(v, scale=scale)
 
     spend_7d_str = _fmt_spend(banner_stats.get("spend_7d"))
     spend_30d_str = _fmt_spend(banner_stats.get("spend_30d"))
     runs_7d_str = _fmt_int(banner_stats.get("runs_7d"))
     failures_7d_str = _fmt_int(banner_stats.get("failures_7d"))
-    eval_score_str = _fmt_score(banner_stats.get("eval_score"))
+    eval_score_str = _fmt_score(
+        banner_stats.get("eval_score"),
+        banner_stats.get("eval_score_scale", "rubric"),
+    )
 
     pills_html = status_pill
     if model_pill_html:

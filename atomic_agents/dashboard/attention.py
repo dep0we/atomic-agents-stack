@@ -50,6 +50,7 @@ from typing import NamedTuple
 
 from .costs import RunRecord, discover_agents, _load_runs_with_degraded
 from .alert_state import read_alert_state
+from ._shared import eval_score_delta_fmt as _eval_score_delta_fmt
 from ._reliability import (
     ReliabilityMetrics,
     _compute_reliability,
@@ -84,7 +85,10 @@ _SEVERITY_RANK = {
 # threshold tunability is a separate follow-up.)
 _COST_SPIKE_THRESHOLD_MULT = 3.0  # alert when daily cost > N × baseline
 _COST_SPIKE_MIN_BASELINE_DAYS = 7  # need at least N days of history
-_QUALITY_REGRESSION_THRESHOLD = -0.10  # alert when delta_30d <= -10%
+_QUALITY_REGRESSION_THRESHOLD = -0.10  # alert when delta_30d <= -0.10 raw rubric points
+# Note: -0.10 on the 1-5 rubric scale = 2.5 percentage-points, NOT 10%.
+# A semantically 10%-equivalent threshold would be -0.40 raw points.
+# Changing the alert-firing value is a separate follow-up (scope: out of #690).
 
 
 # Alert key version prefix — increment when normalization logic changes
@@ -486,7 +490,9 @@ def _quality_alerts(
     if signal.delta_30d > _QUALITY_REGRESSION_THRESHOLD:
         return []
 
-    pct = int(abs(signal.delta_30d) * 100)
+    # delta_30d is a raw 1-5 rubric-scale difference; route through the
+    # rubric-delta formatter so a 1-point drop says "25%", not "100%".
+    drop_fmt = _eval_score_delta_fmt(abs(signal.delta_30d), scale="rubric")
     reason_bucket = "score_regression_threshold"
     alert_key = _make_alert_key(agent, "quality_regression", reason_bucket)
     ack_status = alert_state.get(alert_key, {}).get("status", "open")
@@ -499,7 +505,7 @@ def _quality_alerts(
             alert_class="quality_regression",
             alert_subclass="score_regression",
             severity="medium",
-            reason=f"Eval score dropped {pct}% over the last 30 days.",
+            reason=f"Eval score dropped {drop_fmt} over the last 30 days.",
             owner=None,
             next_step="Review recent eval runs. Consider tuning or prompt revision.",
             status=queue_status,

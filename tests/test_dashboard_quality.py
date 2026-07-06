@@ -265,3 +265,104 @@ def test_quality_html_renders_score_as_percentage(tmp_path):
     assert "400%" not in html_content, (
         "quality.html must not render '400%' — the 1-5 scale must be normalized. FIX #690."
     )
+
+
+# ──────────────────────────────────────────────────────────────────
+# FIX #690 round-2 — quality.html delta display (rubric scale)
+#
+# delta_30d is a raw 1-5 rubric-point difference.
+# Correct display: delta / 4 * 100.
+# Old broken display: abs(delta) * 100 (4× overstated for |delta| ≤ 1).
+
+
+def test_quality_html_delta_rubric_scale(tmp_path):
+    """FIX #690 r2: quality.html 30d delta uses rubric normalisation.
+
+    Two data points for 'alice' within the 30d window: 2.0 → 3.0.
+    delta_30d = +1.0 raw rubric points → +25% (not +100%).
+
+    Both points must be within the 30d window so the delta is computed.
+    The 30d window is [today-30d, today]; use 25d and 2d to stay inside it.
+    """
+    from atomic_agents.dashboard.quality import aggregate_quality, render_quality
+
+    today = date.today()
+    prior = (today - timedelta(days=25)).isoformat()
+    recent = (today - timedelta(days=2)).isoformat()
+
+    runs_dir = tmp_path / "alice" / "evals" / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "alice" / "log").mkdir(parents=True)
+    (tmp_path / "alice" / "model.md").write_text("# model\n")
+
+    # Prior: weighted_score=2.0; recent: weighted_score=3.0 → delta = +1.0.
+    for ts, ws in [(prior, 2.0), (recent, 3.0)]:
+        rec = {
+            "ts": f"{ts}T12:00:00+00:00",
+            "test_id": "t1",
+            "weighted_score": ws,
+            "hard_fails": [],
+            "scores": {},
+        }
+        day = ts[:10]
+        path = runs_dir / f"{day}.jsonl"
+        with path.open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+
+    data = aggregate_quality(tmp_path, today=today)
+    out_path = render_quality(tmp_path, data)
+    html_content = out_path.read_text(encoding="utf-8")
+
+    # delta_30d = +1.0 → +1.0/4*100 = +25% (rubric-correct)
+    assert "+25%" in html_content, (
+        "FIX #690 r2: delta_30d=+1.0 (rubric scale) must display as '+25%' "
+        "in quality.html, not '+100%'. Old code: abs(1.0)*100 = 100."
+    )
+    assert "+100%" not in html_content, (
+        "FIX #690 r2: '+100%' must NOT appear — that is the 4× overstated old value. "
+        "Correct display for +1.0 rubric delta is '+25%'."
+    )
+
+
+def test_quality_html_delta_small_rubric(tmp_path):
+    """FIX #690 r2: small rubric deltas are not inflated 4× by the old heuristic.
+
+    delta_30d = +0.5 raw rubric → +12% (0.5/4*100 = 12.5, banker's rounding → 12).
+    Old value-auto-detect: abs(0.5) <= 1.0 → treated as legacy → +50%. Wrong.
+
+    Both data points must be within the 30d window (use 25d and 2d).
+    """
+    from atomic_agents.dashboard.quality import aggregate_quality, render_quality
+
+    today = date.today()
+    prior = (today - timedelta(days=25)).isoformat()
+    recent = (today - timedelta(days=2)).isoformat()
+
+    runs_dir = tmp_path / "alice" / "evals" / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "alice" / "log").mkdir(parents=True)
+    (tmp_path / "alice" / "model.md").write_text("# model\n")
+
+    # Prior: 3.0; recent: 3.5 → delta = +0.5.
+    for ts, ws in [(prior, 3.0), (recent, 3.5)]:
+        rec = {
+            "ts": f"{ts}T12:00:00+00:00",
+            "test_id": "t1",
+            "weighted_score": ws,
+            "hard_fails": [],
+            "scores": {},
+        }
+        day = ts[:10]
+        path = runs_dir / f"{day}.jsonl"
+        with path.open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+
+    data = aggregate_quality(tmp_path, today=today)
+    out_path = render_quality(tmp_path, data)
+    html_content = out_path.read_text(encoding="utf-8")
+
+    # +0.5/4*100 = 12.5 → rounds to 13 (Python banker's rounding: 12.5 → 12)
+    assert "+50%" not in html_content, (
+        "FIX #690 r2: '+50%' must NOT appear — that is the old value-auto-detect "
+        "treating +0.5 as a legacy 0-1 delta (×100). Correct is +12% or +13%."
+    )

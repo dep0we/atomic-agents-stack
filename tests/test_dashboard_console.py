@@ -995,48 +995,52 @@ def test_render_all_shares_quality_signals_from_eval_trends(tmp_path):
     """
     today = date.today()
     # An agent with a clear eval score in the last 30 days.
+    # weighted_score is on the 1-5 rubric scale (spec/13). 4.28 → (4.28-1)/4*100 = 82%.
     recent = (today - timedelta(days=2)).isoformat()
     _write_eval_runs(
         tmp_path,
         "alice",
-        [{"ts": f"{recent}T12:00:00+00:00", "weighted_score": 0.82, "test_id": "t1"}],
+        [{"ts": f"{recent}T12:00:00+00:00", "weighted_score": 4.28, "test_id": "t1"}],
     )
     render_all(tmp_path, today=today, tab="all")
     console_html = (tmp_path / "_dashboard" / "index.html").read_text()
-    # The quality panel must render alice's real score (0.82 → displayed as "82%"),
+    # The quality panel must render alice's real score (4.28 → 82% on the 1-5 rubric scale),
     # proving the eval_trends share path populated quality_signals rather than no-opping.
-    # FIX #690: eval scores are 0-1 floats rendered as integer percentages.
+    # FIX #690 round-2: weighted_score is 1-5 rubric; (4.28-1)/4*100 = 82%.
     assert "82%" in console_html
     assert "no evals" not in console_html.split("Quality")[1][:400]
 
 
 def test_quality_regression_produces_attention_item(tmp_path):
-    """A regressing agent (≤ -10% over 30d) produces a quality_regression item.
+    """A regressing agent (delta_30d <= -0.10 rubric points) produces a quality_regression item.
 
     End-to-end through aggregate_console's lightweight quality reader: a prior
-    score (30–60d ago) of 0.90 dropping to a recent 0.60 (-0.30) must surface a
-    quality_regression alert. Strip-RED: a flat/improving agent does not.
+    score (30–60d ago) of 4.0 dropping to a recent 3.5 (delta -0.50, well below
+    the -0.10 threshold) must surface a quality_regression alert.
+    Strip-RED: a flat/improving agent does not.
+
+    weighted_score is on the 1-5 rubric scale (spec/13).
     """
     today = date.today()
     prior = (today - timedelta(days=45)).isoformat()
     recent = (today - timedelta(days=3)).isoformat()
 
-    # Regressing agent.
+    # Regressing agent: 4.0 → 3.5, delta = -0.50 (triggers threshold -0.10).
     _write_eval_runs(
         tmp_path,
         "regressor",
         [
-            {"ts": f"{prior}T12:00:00+00:00", "weighted_score": 0.90, "test_id": "t1"},
-            {"ts": f"{recent}T12:00:00+00:00", "weighted_score": 0.60, "test_id": "t1"},
+            {"ts": f"{prior}T12:00:00+00:00", "weighted_score": 4.0, "test_id": "t1"},
+            {"ts": f"{recent}T12:00:00+00:00", "weighted_score": 3.5, "test_id": "t1"},
         ],
     )
-    # Stable agent (no regression).
+    # Stable agent: 4.0 → 4.1, delta = +0.10 (does NOT trigger threshold).
     _write_eval_runs(
         tmp_path,
         "stable",
         [
-            {"ts": f"{prior}T12:00:00+00:00", "weighted_score": 0.88, "test_id": "t1"},
-            {"ts": f"{recent}T12:00:00+00:00", "weighted_score": 0.89, "test_id": "t1"},
+            {"ts": f"{prior}T12:00:00+00:00", "weighted_score": 4.0, "test_id": "t1"},
+            {"ts": f"{recent}T12:00:00+00:00", "weighted_score": 4.1, "test_id": "t1"},
         ],
     )
 
@@ -1978,3 +1982,82 @@ def test_home_summary_status_strip_red(tmp_path):
         "an agent with a long-past run must count STALE"
     )
     assert rendered.get("OK", 0) == 0, "the stale agent must NOT be counted OK"
+
+
+# ──────────────────────────────────────────────────────────────────
+# FIX #690 round-2 — fleet quality panel delta + attention regression text
+
+
+def test_fleet_quality_panel_rubric_delta_display(tmp_path):
+    """FIX #690 r2: fleet Console quality panel shows rubric-scale deltas.
+
+    delta_30d = +1.0 raw rubric points → '+25%', not '+100%'.
+    The fleet quality axis panel reads QualitySignal.delta_30d and passes
+    it to eval_score_delta_fmt — must use rubric scale (default).
+
+    Quality signals are shared from quality.eval_trends, which computes delta
+    from TWO data points both within the 30d window. Use 25d and 2d ago to
+    ensure both fall inside the [today-30d, today] range.
+    """
+    today = date.today()
+    prior = (today - timedelta(days=25)).isoformat()
+    recent = (today - timedelta(days=2)).isoformat()
+
+    # alice: 3.0 → 4.0, delta = +1.0 raw rubric points → +25%
+    _write_eval_runs(
+        tmp_path,
+        "alice",
+        [
+            {"ts": f"{prior}T12:00:00+00:00", "weighted_score": 3.0, "test_id": "t1"},
+            {"ts": f"{recent}T12:00:00+00:00", "weighted_score": 4.0, "test_id": "t1"},
+        ],
+    )
+    render_all(tmp_path, today=today, tab="all")
+    console_html = (tmp_path / "_dashboard" / "index.html").read_text()
+
+    # The fleet quality panel must show '+25%' (rubric) not '+100%' (legacy/broken).
+    assert "+25%" in console_html, (
+        "FIX #690 r2: fleet quality panel must show '+25%' for a +1.0 rubric delta "
+        "(= 1.0/4*100 = 25%), not '+100%' (old abs(delta)*100 path)."
+    )
+    assert "+100%" not in console_html, (
+        "FIX #690 r2: '+100%' must NOT appear in fleet console — that is the "
+        "4× overstated old value for a +1.0 rubric delta."
+    )
+
+
+def test_attention_quality_regression_reason_rubric_scale(tmp_path):
+    """FIX #690 r2: attention-queue regression reason text uses rubric-scale delta.
+
+    A delta_30d of -1.0 raw rubric points must say 'dropped +25%', not 'dropped 100%'.
+    The old code did abs(delta_30d) * 100 — 4× overstated.
+    """
+    today = date.today()
+    prior = (today - timedelta(days=45)).isoformat()
+    recent = (today - timedelta(days=3)).isoformat()
+
+    # Agent drops 4.0 → 3.0, delta = -1.0 raw rubric points.
+    _write_eval_runs(
+        tmp_path,
+        "regressor",
+        [
+            {"ts": f"{prior}T12:00:00+00:00", "weighted_score": 4.0, "test_id": "t1"},
+            {"ts": f"{recent}T12:00:00+00:00", "weighted_score": 3.0, "test_id": "t1"},
+        ],
+    )
+    data = aggregate_console(tmp_path, today=today)
+    quality_items = [
+        a for a in data.attention_queue if a.alert_class == "quality_regression"
+    ]
+    assert quality_items, "expected a quality_regression item for the regressing agent"
+
+    reason = quality_items[0].reason
+    # -1.0 rubric delta → 1.0/4*100 = 25% displayed drop.
+    assert "25%" in reason, (
+        f"FIX #690 r2: regression reason must say '25%' for a -1.0 rubric delta. "
+        f"Got: {reason!r}. Old code: abs(-1.0)*100 = '100%'."
+    )
+    assert "100%" not in reason, (
+        f"FIX #690 r2: regression reason must NOT say '100%' for a -1.0 rubric drop. "
+        f"Got: {reason!r}. That is the 4× overstated old value."
+    )

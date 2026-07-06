@@ -207,22 +207,27 @@ def relative_time(ts: datetime, now: datetime | None = None) -> str:
     return f"{days // 365}y ago"
 
 
-def eval_score_fmt(value: "float | None") -> str:
+def eval_score_fmt(value: "float | None", *, scale: str = "rubric") -> str:
     """Format an eval score float as an integer percentage string.
+
+    Parameters
+    ----------
+    value:
+        The raw score value to format.
+    scale:
+        ``"rubric"`` (default) — value is on the 1-5 rubric scale;
+        maps ``[1, 5] → [0%, 100%]`` via ``(v - 1) / 4 * 100``.
+        ``"legacy"`` — value is a 0-1 float; maps via ``v * 100``.
 
     Eval runner writes ``weighted_score`` on a 1-5 rubric scale (per spec/13;
     dimension scores clamped to [1, 5], weighted average in the same range).
-    Legacy test fixtures and some display paths write a 0-1 ``score`` field.
+    Legacy test fixtures and some early records write a 0-1 ``score`` field.
 
-    Scale auto-detection:
-    - ``value > 1.0``  → 1-5 rubric scale  → ``round((value - 1) / 4 * 100)``
-    - ``value <= 1.0`` → 0-1 float          → ``round(value * 100)``
+    The result is always clamped to [0, 100].  None/absent → "—".
 
-    The result is always clamped to [0, 100] so a misbehaving judge that
-    returns e.g. 4.8 on a 0-1 scale (highly unlikely but possible in tests)
-    still renders as "100%" rather than "480%".
-
-    None/absent → "—".
+    Do NOT infer scale from the value — call with the explicit scale that
+    matches the field you read.  Use :func:`eval_score_display` when reading
+    from a raw JSONL record that may contain either field.
     """
     if value is None:
         return "—"
@@ -230,23 +235,33 @@ def eval_score_fmt(value: "float | None") -> str:
         v = float(value)
     except (TypeError, ValueError):
         return "—"
-    if v > 1.0:
+    if scale == "rubric":
         # 1-5 rubric scale: map [1, 5] → [0, 100]
         pct = (v - 1.0) / 4.0 * 100.0
     else:
-        # 0-1 float scale
+        # 0-1 float scale (legacy)
         pct = v * 100.0
     return f"{max(0, min(100, round(pct)))}%"
 
 
-def eval_score_delta_fmt(delta: "float | None") -> str:
+def eval_score_delta_fmt(delta: "float | None", *, scale: str = "rubric") -> str:
     """Format a score delta as a signed integer percentage string.
 
-    Applies the same scale auto-detection as :func:`eval_score_fmt`:
-    ``abs(delta) > 1.0`` → 1-5 scale → ``round(delta / 4 * 100)``;
-    otherwise → 0-1 scale → ``round(delta * 100)``.
+    Parameters
+    ----------
+    delta:
+        Raw delta value (difference of two scores on the same scale).
+    scale:
+        ``"rubric"`` (default) — delta is on the 1-5 rubric scale;
+        maps via ``delta / 4 * 100`` (so ``+1.0 → +25%``, ``-1.0 → -25%``).
+        ``"legacy"`` — delta is a 0-1 float difference; maps via ``delta * 100``.
 
     Returns "—" for None; "+N%" or "-N%" (or "+0%") otherwise.
+
+    Note: previous versions auto-detected the scale from ``abs(delta) > 1.0``,
+    which is wrong for small rubric deltas (e.g. ``+0.5`` was treated as
+    legacy → ``+50%`` instead of rubric → ``+13%``).  Always pass the
+    explicit scale matching the source field.
     """
     if delta is None:
         return "—"
@@ -254,7 +269,7 @@ def eval_score_delta_fmt(delta: "float | None") -> str:
         d = float(delta)
     except (TypeError, ValueError):
         return "—"
-    if abs(d) > 1.0:
+    if scale == "rubric":
         pct = d / 4.0 * 100.0
     else:
         pct = d * 100.0
@@ -266,16 +281,22 @@ def eval_score_delta_fmt(delta: "float | None") -> str:
 def eval_score_display(record: dict) -> str:
     """Read the canonical eval score from a JSONL record and format it.
 
-    Preference order:
-    1. ``weighted_score`` — the field the eval runner actually writes (1-5 scale).
-    2. ``score`` — legacy field used by test fixtures and some early records (0-1 scale).
+    Branches on WHICH field is present, not on the value, so the correct
+    normalisation is always applied regardless of the numeric value.
 
-    Delegates formatting to :func:`eval_score_fmt`.
+    Preference order:
+    1. ``weighted_score`` — the field the eval runner actually writes (1-5
+       rubric scale).  Formatted with the rubric normalisation.
+    2. ``score`` — legacy field used by test fixtures and some early records
+       (0-1 float scale).  Formatted with the legacy (×100) normalisation.
     """
-    value = record.get("weighted_score")
-    if value is None:
-        value = record.get("score")
-    return eval_score_fmt(value)
+    weighted = record.get("weighted_score")
+    if weighted is not None:
+        return eval_score_fmt(weighted, scale="rubric")
+    legacy = record.get("score")
+    if legacy is not None:
+        return eval_score_fmt(legacy, scale="legacy")
+    return "—"
 
 
 def truncate(text: str, n: int) -> str:
