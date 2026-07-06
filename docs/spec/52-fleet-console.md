@@ -445,7 +445,7 @@ The **fleet-status count cells** (OK / WARN / ERROR / STALE) each link to `monit
 
 Each recommendation card carries a tie-back tag matching its scored/advisory status in the 3-axis composite:
 
-- **`savings_cost` recs** → teal axis tag `→ Cost · +N pts` (where N is `projected_points_delta` rounded; if N is 0, shown as `→ Cost`). These recs move the Cost axis of the composite score.
+- **`savings_cost` recs** → teal axis tag `→ Cost` (shown as `→ Cost` — no point delta displayed). After #687 (spec/53 §3.6 + MUST 14), `cheaper_model_share` and `tokens_per_output` are not health metrics, so a model swap moves no scored metric and `projected_points_delta ≈ 0.0` for all savings_cost recs. The tag signals the Cost axis without implying a composite point gain. Recs are ranked by `abs(projected_usd_delta)` (the `$/mo` savings signal) when points are zero — see spec/54 §7.
 - **`quality_report` recs** → muted `advisory · not scored` tag. Eval coverage is advisory — it does not move the 3-axis composite directly.
 - **`governance` recs** → muted `advisory · not scored` tag. Governance is a separate grade (not part of the cost/quality/reliability composite).
 

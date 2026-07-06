@@ -565,13 +565,20 @@ class TestPointImpactSymmetricBaseline:
             "is the phantom from spend_vs_trend dropping out of the counterfactual)"
         )
 
-    def test_cutoff_crossing_swap_still_moves_points(self):
-        """A sonnet→haiku swap crosses the cheap cutoff → NON-zero positive delta.
+    def test_cutoff_crossing_swap_yields_near_zero_delta(self):
+        """After #687 (MUST 14): a sonnet→haiku swap yields ~0 point delta.
 
-        This guards against an over-correction: the symmetric-baseline fix must NOT
-        flatten a swap that genuinely moves cheaper_model_share. sonnet output rate
-        15.0 is not cheap; haiku 4.0 < 5.0 cutoff is — so the swap moves
-        cheaper_model_share 0%→100% and the delta must be > 0.
+        cheaper_model_share is no longer a health metric, so crossing the cheap-model
+        cutoff moves NO scored metric. The point-impact delta reflects only what the
+        model swap can change in the HEALTH score — and since cheaper_model_share is
+        advisory-only (feeds recommendations, not health), the delta is ~0.0.
+
+        This is correct: the rec still fires on its $-savings signal (projected_usd_delta),
+        not on points. The point delta is a ranking proxy — 0 means it falls back to
+        the USD-savings ranking fallback in recommend_fleet().
+
+        NOTE: this replaces the old test that asserted delta > 0 from cheaper_model_share.
+        The symmetric-baseline fix is still tested by test_cost_neutral_same_family_swap.
         """
         from atomic_agents.advisor.recommend import (
             _compute_point_impact,
@@ -617,9 +624,12 @@ class TestPointImpactSymmetricBaseline:
             targets=targets,
             today=today,
         )
-        assert delta is not None and delta > 0.0, (
-            "a cutoff-crossing sonnet→haiku swap moves cheaper_model_share and must "
-            f"still produce a positive point delta; got {delta!r}"
+        # cheaper_model_share is NOT a health metric (#687 MUST 14) — crossing the
+        # cheap-model cutoff moves no scored metric, so delta must be ~0.
+        assert delta is not None and abs(delta) < 1.0, (
+            "After #687 a sonnet→haiku swap moves no health metric (cheaper_model_share "
+            "is advisory-only), so projected_points_delta must be ~0.0; "
+            f"got {delta!r}. The rec ranks by abs(projected_usd_delta) instead."
         )
 
 
@@ -1438,14 +1448,18 @@ class TestRecommendFleet:
         assert gov[0].agent == "opus-agent"
         assert "absent" in gov[0].rationale.lower()
 
-    def test_recommend_fleet_sorts_by_abs_points_delta(self, tmp_path):
-        """recommend_fleet results are sorted by |projected_points_delta| desc.
+    def test_recommend_fleet_sorts_by_usd_fallback_when_points_zero(self, tmp_path):
+        """After #687 (MUST 14): savings_cost recs rank by abs(projected_usd_delta)
+        when projected_points_delta is 0/None.
 
-        NON-VACUOUS: the sonnet-agent's sonnet→haiku swap crosses the cheap-model
-        cutoff (haiku 4.0 < 5.0 < sonnet 15.0), moving cheaper_model_share and
-        producing a NON-ZERO point delta, while the opus→sonnet swap stays ~0.0.
-        So the key list contains both a non-zero and zero values and the sort is
-        actually exercised (a fixture where every key is 0.0 would pass vacuously).
+        cheaper_model_share is no longer a health metric, so NO model swap moves
+        any scored metric — all savings_cost recs have projected_points_delta ~0.0.
+        The ranking fallback in recommend_fleet() sorts by abs(projected_usd_delta)
+        so that larger dollar savings rank first.
+
+        Fixture: opus-agent (opus→sonnet, large savings) vs sonnet-agent
+        (sonnet→haiku, smaller savings). Both have ~0 point delta. The opus-agent
+        savings rec should rank first because it saves more dollars.
         """
         from atomic_agents.advisor.recommend import recommend_fleet
 
@@ -1453,29 +1467,34 @@ class TestRecommendFleet:
         self._seed_fleet(tmp_path, today)
         recs = recommend_fleet(tmp_path, today=today)
 
-        keys = [
+        savings_recs = [r for r in recs if r.kind == "savings_cost"]
+        assert len(savings_recs) >= 1, "at least one savings rec must fire"
+
+        # All savings_cost recs should have ~0 projected_points_delta after #687.
+        for r in savings_recs:
+            if r.projected_points_delta is not None:
+                assert abs(r.projected_points_delta) < 1.0, (
+                    f"After #687 savings_cost recs must have ~0 point delta "
+                    f"(cheaper_model_share is not health); got {r.projected_points_delta!r} "
+                    f"for {r.agent}"
+                )
+
+        # The resulting list must be sorted correctly (pts desc, then usd desc).
+        all_pts = [
             abs(r.projected_points_delta)
             if r.projected_points_delta is not None
             else 0.0
             for r in recs
         ]
-        assert keys == sorted(keys, reverse=True), (
-            f"recs must be sorted by |projected_points_delta| desc; got {keys!r}"
+        assert all_pts == sorted(all_pts, reverse=True), (
+            f"recs must be sorted descending by point delta; got {all_pts!r}"
         )
-        # Guard against a vacuous (all-zero) sort: the sonnet→haiku swap MUST
-        # produce at least one non-zero point delta, so the first key is > 0.
-        assert keys[0] > 0.0, (
-            "expected a non-zero point-impact delta from the sonnet→haiku swap "
-            f"(cheap-cutoff crossing); got all-zero keys {keys!r} — sort is vacuous"
-        )
-        # And the non-zero-delta rec (sonnet-agent savings) must sort FIRST.
+
+        # Sonnet-agent savings rec must be present (sonnet→haiku is a valid downgrade).
         sonnet_savings = [
             r for r in recs if r.kind == "savings_cost" and r.agent == "sonnet-agent"
         ]
         assert sonnet_savings, "sonnet-agent savings rec must be present"
-        assert recs[0] is sonnet_savings[0], (
-            "the highest-|point-delta| rec (sonnet-agent savings) must rank first"
-        )
 
     def test_recommend_fleet_empty_root_no_crash(self, tmp_path):
         """recommend_fleet over an empty fleet returns [] (fail-soft, no LLM)."""
@@ -1631,3 +1650,173 @@ class TestRenderRecommendations:
         assert "Recommendations" in page
         assert "rec-kind-savings_cost" in page
         assert "$42.50/mo saved" in page
+
+
+class TestSavingsCostUSDRankingFallback:
+    """#687 ranking fallback: savings_cost recs with projected_points_delta=0/None
+    are ranked by abs(projected_usd_delta) descending.
+
+    After #687 (MUST 14), cheaper_model_share is not a health metric, so NO model
+    swap moves a scored axis — all savings_cost projected_points_delta values are
+    ~0.0. The recommend_fleet() sort key falls back to USD so larger savings rank
+    first.
+    """
+
+    def _savings_rec(
+        self,
+        agent: str,
+        usd_delta: float | None,
+        points_delta: float | None = None,
+    ) -> "Recommendation":
+        """Build a minimal savings_cost Recommendation."""
+        from atomic_agents.advisor.recommend import EvalHeadroom, Recommendation
+
+        return Recommendation(
+            agent=agent,
+            kind="savings_cost",
+            current_model="claude-opus-4-8",
+            candidate_model="claude-sonnet-4-6-20260101",
+            rationale="lower cost",
+            projected_usd_delta=usd_delta,
+            projected_points_delta=points_delta,
+            safety=EvalHeadroom(
+                weighted_score_margin=1.0,
+                pass_rate_margin=0.5,
+                hard_fails=0,
+                sample_n=10,
+                rubric_threshold=4.0,
+                passed=True,
+            ),
+        )
+
+    def test_savings_recs_ranked_by_usd_when_points_zero(self):
+        """savings_cost recs with points_delta=0 rank by abs(usd_delta) desc.
+
+        Three recs: large saver (-$50), small saver (-$5), medium saver (-$20).
+        All have points_delta=0 (post-#687: cheaper_model_share not scored).
+        Expected order: large → medium → small (by abs USD desc).
+        """
+        from atomic_agents.advisor.recommend import _rec_sort_key as _sort_key
+
+        large = self._savings_rec("agent-a", usd_delta=-50.0, points_delta=0.0)
+        small = self._savings_rec("agent-b", usd_delta=-5.0, points_delta=0.0)
+        medium = self._savings_rec("agent-c", usd_delta=-20.0, points_delta=0.0)
+
+        recs = [small, large, medium]
+        recs.sort(key=_sort_key, reverse=True)
+
+        assert recs[0].agent == "agent-a", (
+            f"largest saver ($50) must rank first; got {[r.agent for r in recs]}"
+        )
+        assert recs[1].agent == "agent-c", (
+            f"medium saver ($20) must rank second; got {[r.agent for r in recs]}"
+        )
+        assert recs[2].agent == "agent-b", (
+            f"small saver ($5) must rank last; got {[r.agent for r in recs]}"
+        )
+
+    def test_savings_recs_ranked_by_usd_when_points_none(self):
+        """savings_cost recs with points_delta=None also fall back to USD ranking."""
+        from atomic_agents.advisor.recommend import _rec_sort_key as _sort_key
+
+        large = self._savings_rec("agent-big", usd_delta=-100.0, points_delta=None)
+        small = self._savings_rec("agent-small", usd_delta=-2.0, points_delta=None)
+
+        recs = [small, large]
+        recs.sort(key=_sort_key, reverse=True)
+
+        assert recs[0].agent == "agent-big", (
+            f"larger saver must rank first when points_delta=None; "
+            f"got {[r.agent for r in recs]}"
+        )
+
+    def test_points_delta_still_outranks_usd_when_nonzero(self):
+        """If a rec has a genuine point delta, it outranks a USD-only rec.
+
+        This ensures the USD fallback doesn't override real point-delta ranking
+        (the USD path only fires when pts == 0 AND kind == savings_cost).
+        """
+        from atomic_agents.advisor.recommend import (
+            _rec_sort_key as _sort_key,
+            Recommendation,
+            EvalHeadroom,
+        )
+
+        # Rec with a non-zero point delta (e.g. from reliability improvement)
+        points_rec = Recommendation(
+            agent="agent-pts",
+            kind="quality_report",
+            current_model="claude-opus-4-8",
+            candidate_model=None,
+            rationale="quality improvement",
+            projected_usd_delta=None,
+            projected_points_delta=5.0,
+            safety=EvalHeadroom(
+                weighted_score_margin=0.0,
+                pass_rate_margin=0.0,
+                hard_fails=0,
+                sample_n=0,
+                rubric_threshold=4.0,
+                passed=False,
+            ),
+        )
+        # savings_cost rec with large USD but zero point delta
+        usd_rec = self._savings_rec("agent-usd", usd_delta=-999.0, points_delta=0.0)
+
+        recs = [usd_rec, points_rec]
+        recs.sort(key=_sort_key, reverse=True)
+
+        assert recs[0].agent == "agent-pts", (
+            "Non-zero point delta (5.0) must outrank a zero-point/$999 savings rec; "
+            f"got {[r.agent for r in recs]}"
+        )
+
+    def test_strip_red_usd_fallback_only_fires_for_savings_cost_kind(self):
+        """The USD fallback ONLY applies when kind == 'savings_cost'.
+
+        Other rec kinds with points_delta=0 must NOT get the USD boost.
+        Strip-RED: if we accidentally applied the USD fallback to governance recs
+        with a large projected_usd_delta, they'd beat out zero-delta savings_cost
+        recs — this guards that the kind guard is present.
+        """
+        from atomic_agents.advisor.recommend import (
+            _rec_sort_key as _sort_key,
+            Recommendation,
+            EvalHeadroom,
+        )
+
+        # governance rec with points_delta=0 but large USD delta
+        gov_rec = Recommendation(
+            agent="agent-gov",
+            kind="governance",
+            current_model=None,
+            candidate_model=None,
+            rationale="absent governance.md",
+            projected_usd_delta=-500.0,  # large, but should NOT trigger USD fallback
+            projected_points_delta=0.0,
+            safety=EvalHeadroom(
+                weighted_score_margin=0.0,
+                pass_rate_margin=0.0,
+                hard_fails=0,
+                sample_n=0,
+                rubric_threshold=4.0,
+                passed=False,
+            ),
+        )
+        # savings_cost rec with small USD but also zero point delta
+        savings_rec = self._savings_rec(
+            "agent-savings", usd_delta=-1.0, points_delta=0.0
+        )
+
+        # Governance: pts=0, usd=-500 but kind != savings_cost → key=(0.0, 0.0)
+        # Savings: pts=0, usd=-1 and kind == savings_cost → key=(0.0, 1.0)
+        gov_key = _sort_key(gov_rec)
+        savings_key = _sort_key(savings_rec)
+
+        assert gov_key == (0.0, 0.0), (
+            f"governance kind must NOT use USD fallback; got key {gov_key!r}"
+        )
+        assert savings_key == (0.0, 1.0), (
+            f"savings_cost kind must use USD fallback (abs $1 → 1.0); "
+            f"got key {savings_key!r}"
+        )

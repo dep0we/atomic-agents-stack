@@ -1,7 +1,10 @@
 """Fleet Health Scoring Engine — pure-compute module (spec/53).
 
 Computes a Fleet Health Score (0-100) decomposed into three sub-scores:
-  - Cost axis: cheaper-model-share, tokens-per-output, spend-vs-trend
+  - Cost axis: spend-vs-trend ONLY (#687, spec/53 §3.6 + MUST 14).
+    cheaper_model_share and tokens_per_output are computed as VALUES for the
+    recommendations engine (spec/54) but are NOT health metrics — they do not
+    enter the Cost sub-score, the composite, or the critical cap.
   - Quality axis: pass-rate, hard-fail-rate (from evals/runs/*.jsonl verdict field)
   - Reliability axis: error-rate, blocked-rate, skipped-rate
 
@@ -670,29 +673,31 @@ def _score_cost_axis(
 ) -> tuple[float | None, list[ScorecardRow]]:
     """Compute cost sub-score (0-100) and scorecard rows.
 
-    Metrics:
-    - cheaper_model_share: fraction of primary runs using cheap models
-    - tokens_per_output: mean output tokens per primary completed run (completed only)
-    - spend_vs_trend: recent 30d spend / prior 30d spend ratio (- 1.0)
+    Cost HEALTH axis (#687, spec/53 §3.6 + MUST 14):
+    - spend_vs_trend: recent 30d spend / prior 30d spend ratio (- 1.0).
+      This is the ONLY metric scored into the Cost sub-score. An unexpected
+      spend spike is a genuine failure signal.
+
+    NOT scored into health (optimization metrics — feed recommendations only):
+    - cheaper_model_share: computed as a value for recommend.py's savings_cost rec,
+      but NOT appended to metric_scores and NOT scored into cost_score.
+    - tokens_per_output: verbosity signal; similarly computed but NOT scored.
 
     spend_vs_trend_degraded: when True, the PRIOR-30d read was degraded so the
     prior-spend denominator is unreliable. spend_vs_trend is then emitted as a
-    'degraded' row and EXCLUDED from the sub-score (MUST 8) — but cheaper_model_share
-    and tokens_per_output (recent-only metrics) still score normally.
+    'degraded' row and EXCLUDED from the sub-score (MUST 8).
     """
     cost_targets = targets.axes.get("cost", {})
 
-    # Billable primary runs in the 30d window — the only primary-filtered list the
-    # cost axis consumes (cheaper_model_share + tokens_per_output below). WoW and
-    # spend_vs_trend read the raw runs_7d / runs_prior_7d / runs_prior_30d params
-    # directly (helpers + delegates are billed to the fleet too), so no
-    # primary-filtered prior/7d lists are needed here.
+    # Primary runs for the optimization metrics (cheaper_model_share,
+    # tokens_per_output) — these are computed as VALUES for the recommendation
+    # path but NOT scored into the cost sub-score or metric_scores (#687 MUST 14).
     primary_30d = [r for r in runs_30d if _is_primary_run(r)]
 
     if not primary_30d:
         return None, [
             ScorecardRow(
-                metric=m,
+                metric="spend_vs_trend",
                 axis="cost",
                 value=None,
                 target=None,
@@ -700,108 +705,27 @@ def _score_cost_axis(
                 score=None,
                 wow=None,
             )
-            for m in ("cheaper_model_share", "tokens_per_output", "spend_vs_trend")
         ]
 
     rows: list[ScorecardRow] = []
     metric_scores: list[float] = []
 
-    # ── cheaper_model_share ──────────────────────────────────────
+    # ── cheaper_model_share (VALUE only — NOT scored into health) ──────────────
+    # Computed here so the value is available via ScorecardRow for display /
+    # downstream consumers. NOT appended to metric_scores. NOT scored into the
+    # cost sub-score. NOT capable of firing the critical cap. (#687 MUST 14)
     cheap_count = sum(1 for r in primary_30d if _is_cheap_model(r.model))
     cheaper_share = cheap_count / len(primary_30d)
 
-    def _cheap_share_of(runs: list[RunRecord]) -> float | None:
-        p = [r for r in runs if _is_primary_run(r)]
-        if not p:
-            return None
-        return sum(1 for r in p if _is_cheap_model(r.model)) / len(p)
-
-    cur_cs = _cheap_share_of(runs_7d)
-    pri_cs = _cheap_share_of(runs_prior_7d)
-    wow_cs = _wow_arrow(cur_cs, pri_cs)
-
-    mt_cs = cost_targets.get("cheaper_model_share")
-    if mt_cs:
-        s = _map_metric_to_score(cheaper_share, mt_cs)
-        metric_scores.append(s)
-        status = "ok" if s >= 80 else ("warn" if s >= 60 else "crit")
-        rows.append(
-            ScorecardRow(
-                metric="cheaper_model_share",
-                axis="cost",
-                value=round(cheaper_share, 4),
-                target=mt_cs.target,
-                status=status,
-                score=round(s, 1),
-                wow=wow_cs,
-            )
-        )
-    else:
-        rows.append(
-            ScorecardRow(
-                metric="cheaper_model_share",
-                axis="cost",
-                value=round(cheaper_share, 4),
-                target=None,
-                status="no_data",
-                score=None,
-                wow=None,
-            )
-        )
-
-    # ── tokens_per_output ────────────────────────────────────────
-    # Denominator: completed primary runs with output_tokens > 0 only.
-    # (skipped/blocked/errored runs have no useful output — excluded per spec/53 §5.2)
+    # ── tokens_per_output (VALUE only — NOT scored into health) ─────────────
+    # Denominator: completed primary runs with output_tokens > 0.
+    # NOT appended to metric_scores. NOT scored into health. (#687 MUST 14)
     completed = [
         r for r in primary_30d if r.status == "completed" and r.output_tokens > 0
     ]
-
-    def _tpo_of(runs: list[RunRecord]) -> float | None:
-        c = [
-            r
-            for r in runs
-            if _is_primary_run(r) and r.status == "completed" and r.output_tokens > 0
-        ]
-        if not c:
-            return None
-        return sum(r.output_tokens for r in c) / len(c)
-
     tpo: float | None = None
     if completed:
         tpo = sum(r.output_tokens for r in completed) / len(completed)
-
-    cur_tpo = _tpo_of(runs_7d)
-    pri_tpo = _tpo_of(runs_prior_7d)
-    wow_tpo = _wow_arrow(cur_tpo, pri_tpo, threshold=10.0)
-
-    mt_tpo = cost_targets.get("tokens_per_output")
-    if mt_tpo and tpo is not None:
-        s = _map_metric_to_score(tpo, mt_tpo)
-        metric_scores.append(s)
-        status = "ok" if s >= 80 else ("warn" if s >= 60 else "crit")
-        rows.append(
-            ScorecardRow(
-                metric="tokens_per_output",
-                axis="cost",
-                value=round(tpo, 1),
-                target=mt_tpo.target,
-                status=status,
-                score=round(s, 1),
-                wow=wow_tpo,
-            )
-        )
-    else:
-        rows.append(
-            ScorecardRow(
-                metric="tokens_per_output",
-                axis="cost",
-                value=round(tpo, 1) if tpo is not None else None,
-                target=mt_tpo.target if mt_tpo else None,
-                status="no_data",
-                score=None,
-                wow=None,
-            )
-        )
 
     # ── spend_vs_trend ───────────────────────────────────────────
     # spend-vs-trend = (recent_30d_spend / prior_30d_spend) - 1.0
@@ -990,7 +914,10 @@ def _score_agent_from_data(
                     score=None,
                     wow=None,
                 )
-                for m in ("cheaper_model_share", "tokens_per_output", "spend_vs_trend")
+                # Only spend_vs_trend is a health metric in the cost axis (#687 MUST 14).
+                # cheaper_model_share and tokens_per_output are not health metrics —
+                # they are never scored into the sub-score or the critical cap.
+                for m in ("spend_vs_trend",)
                 if not any(row.metric == m for row in health.scorecard)
             ]
         )

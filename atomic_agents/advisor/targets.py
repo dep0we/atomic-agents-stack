@@ -18,16 +18,8 @@ scoring:
   axes:
     cost:
       metrics:
-        cheaper_model_share:
-          target: 0.50
-          direction: higher
-          band: 0.10
-          floor: 0.0
-        tokens_per_output:
-          target: 500
-          direction: lower
-          band: 100
-          floor: 5000
+        # Cost HEALTH axis: spend-anomaly detection only (spec/53 §3.6 + MUST 14).
+        # cheaper_model_share / tokens_per_output are NOT health metrics (#687).
         spend_vs_trend:
           target: 0.05
           direction: lower
@@ -133,18 +125,14 @@ BAND_AMBER_MIN = 60  # 60..79 = amber
 _DEFAULT_AXES: dict[str, dict] = {
     "cost": {
         "metrics": {
-            "cheaper_model_share": {
-                "target": 0.50,
-                "direction": "higher",
-                "band": 0.10,
-                "floor": 0.0,
-            },
-            "tokens_per_output": {
-                "target": 500.0,
-                "direction": "lower",
-                "band": 100.0,
-                "floor": 5000.0,
-            },
+            # Cost HEALTH axis: spend-anomaly detection only (#687, spec/53 §3.6 + MUST 14).
+            # cheaper_model_share and tokens_per_output are NOT health metrics —
+            # they are optimization signals consumed by the recommendations engine
+            # (spec/54). Neither is scored into the Cost sub-score, the composite,
+            # the critical cap, or status_for_agent(). Removed from _DEFAULT_AXES
+            # so the parser's "iterate metrics present in _DEFAULT_AXES" loop
+            # never picks them up — a legacy targets.md that still overrides them
+            # is silently ignored fail-soft (MUST 14 back-compat).
             "spend_vs_trend": {
                 "target": 0.05,
                 "direction": "lower",

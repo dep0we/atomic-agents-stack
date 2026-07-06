@@ -532,7 +532,13 @@ class TestNoDataPosture:
         )
 
     def test_zero_evals_composite_excludes_quality(self, tmp_path):
-        """Composite must be computed from cost+reliability only when quality is absent."""
+        """Composite must be computed from present axes only when quality is absent.
+
+        After #687: cost axis = spend_vs_trend only. A single run with no prior-30d
+        window means spend_vs_trend has no data (prior_spend == 0), so cost_score is
+        None. The composite therefore comes from reliability alone. The key property
+        being tested is that quality=None is excluded (not scored as 0).
+        """
         _write_agent_model_md(tmp_path, "agent-a")
         today = date.today()
         ts = datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc)
@@ -557,19 +563,23 @@ class TestNoDataPosture:
         )
         fh = compute_fleet_health(tmp_path, today=today)
         ah = fh.agents[0]
-        # Quality is absent → composite must be the RE-WEIGHTED mean of the present
-        # axes (cost + reliability) only, NOT dragged down by quality scored as 0.
-        # strip-RED: `composite > 0` alone is satisfied even if quality were scored
-        # as 0 (the bug) — assert the actual present-axes mean instead.
+        # Quality is absent → excluded from composite (not scored as 0).
         assert ah.quality_score is None
-        assert ah.cost_score is not None
+        # Reliability has data (1 completed run → 100% reliability → score = 100).
         assert ah.reliability_score is not None
         assert ah.composite is not None
-        expected = (ah.cost_score + ah.reliability_score) / 2.0
-        assert abs(ah.composite - expected) < 0.2, (
-            f"composite {ah.composite} must equal mean(cost, reliability) {expected} "
-            "(quality excluded, not scored as 0)"
-        )
+        # The composite must equal the mean of present (non-None) axes only.
+        # Cost score may be None when spend_vs_trend lacks prior-window data —
+        # that is correct behavior, NOT a bug.
+        present_scores = [
+            s for s in [ah.cost_score, ah.reliability_score] if s is not None
+        ]
+        if present_scores:
+            expected = sum(present_scores) / len(present_scores)
+            assert abs(ah.composite - expected) < 0.2, (
+                f"composite {ah.composite} must equal mean of present axes {expected} "
+                "(quality excluded, not scored as 0)"
+            )
 
     def test_strip_red_zero_evals_not_scored_as_zero(self, tmp_path):
         """strip-RED: quality=0.0 must NOT be assigned when evals are absent."""
@@ -1741,21 +1751,22 @@ class TestSpanDegeneracyValidation:
 
         strip-RED: the old code only rejected floor == target, so floor=0.45 with
         target=0.50, band=0.10 (plateau starts at 0.40) survives → span -0.05.
+
+        After #687: cheaper_model_share is no longer a health metric in _DEFAULT_AXES.
+        Test uses pass_rate (quality axis, direction=higher) to cover the same logic.
         """
         from atomic_agents.advisor.targets import parse_targets
 
         (tmp_path / "targets.md").write_text(
-            "```yaml\nscoring:\n  axes:\n    cost:\n      metrics:\n"
-            "        cheaper_model_share:\n"
+            "```yaml\nscoring:\n  axes:\n    quality:\n      metrics:\n"
+            "        pass_rate:\n"
             "          target: 0.50\n          direction: higher\n"
             "          band: 0.10\n          floor: 0.45\n```\n"
         )
         ft = parse_targets(tmp_path)
-        mt = ft.axes["cost"]["cheaper_model_share"]
+        mt = ft.axes["quality"]["pass_rate"]
         assert mt.floor == 0.0  # baked-in default, not 0.45
-        assert any(
-            "cheaper_model_share(degenerate_span)" in d for d in ft.used_defaults
-        )
+        assert any("pass_rate(degenerate_span)" in d for d in ft.used_defaults)
 
     def test_lower_floor_below_plateau_is_degenerate(self, tmp_path):
         """direction=lower needs floor > target + band."""
@@ -1865,9 +1876,9 @@ class TestPerWindowDegradation:
         svt = next(r for r in ah.scorecard if r.metric == "spend_vs_trend")
         assert svt.status == "degraded"
         assert svt.score is None
-        # cheaper_model_share + tokens_per_output (recent-only) still scored.
-        cms = next(r for r in ah.scorecard if r.metric == "cheaper_model_share")
-        assert cms.status != "degraded"
+        # After #687 (MUST 14): cheaper_model_share and tokens_per_output are
+        # NOT health metrics and are NOT in the scorecard. The cost axis is
+        # represented solely by spend_vs_trend, which is correctly degraded here.
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -2193,3 +2204,269 @@ class TestScoreAgentFromDataPureCore:
         )
         # Original still intact after counterfactual scoring
         assert run.model == original_model
+
+
+# ──────────────────────────────────────────────────────────────────
+# MUST 14 — cost-optimization metrics NOT health (#687, spec/53 §3.6)
+
+
+class TestCostOptimizationNotHealth:
+    """MUST 14: cheaper_model_share and tokens_per_output do NOT participate in
+    the health score. A 100%-premium + verbose but otherwise-healthy agent MUST
+    score OK/WARN, never ERROR and never capped_by_axis from cost.
+
+    strip-RED: re-adding EITHER metric to the Cost-axis scored/cap inputs turns
+    the healthy premium+verbose agent red — proving the guard is load-bearing.
+    """
+
+    def _make_premium_verbose_agent_health(self, tmp_path: Path) -> "AgentHealth":
+        """Build an AgentHealth for an agent that runs 100% premium models and
+        produces verbose output — but has healthy Quality + Reliability.
+
+        With #687 in place: cost_score is None (spend_vs_trend no-data — no prior
+        window), quality+reliability are healthy → composite is from reliability
+        only (or quality+reliability if evals present) → OK/WARN, not ERROR.
+
+        To ensure a non-None cost_score via spend_vs_trend, we seed runs in BOTH
+        the recent and prior 30d windows at a flat rate (trend ~= 0 → score = 100).
+        """
+        from atomic_agents.advisor.score import _score_agent_from_data
+        from atomic_agents.advisor.targets import parse_targets
+
+        # Far-future sentinel date (never near-term to avoid date-bomb per memory rule).
+        today = date(2030, 9, 15)
+        targets = parse_targets(tmp_path)  # all defaults (no targets.md)
+
+        def _mk_run(days_ago: int) -> RunRecord:
+            run_date = today - timedelta(days=days_ago)
+            ts = datetime(
+                run_date.year, run_date.month, run_date.day, 12, tzinfo=timezone.utc
+            )
+            return RunRecord(
+                ts=ts,
+                agent="premium-agent",
+                trigger="cron",
+                model="claude-opus-4-8",  # 100% premium — not cheap
+                input_tokens=5000,
+                output_tokens=4000,  # verbose: 4000 tokens > 3680 old floor
+                cost_usd=2.50,
+                cache_hit_tokens=0,
+                cache_miss_tokens=5000,
+                latency_ms=500,
+                status="completed",
+                summary="ok",
+                parent_run_id=None,
+                extra={},
+            )
+
+        # Seed flat-spend recent + prior windows so spend_vs_trend is computable.
+        runs_30d = [_mk_run(i) for i in range(1, 31)]  # recent 30d
+        runs_prior_30d = [_mk_run(i) for i in range(32, 62)]  # prior 30d
+
+        six = today - timedelta(days=6)
+        ps = today - timedelta(days=13)
+        pe = today - timedelta(days=7)
+
+        ah = _score_agent_from_data(
+            agent="premium-agent",
+            runs_30d=runs_30d,
+            runs_prior_30d=runs_prior_30d,
+            eval_records=[],  # no evals → quality excluded, not scored as 0
+            targets=targets,
+            today=today,
+            six_days_ago=six,
+            prior_7_start=ps,
+            prior_7_end=pe,
+        )
+        return ah
+
+    def test_premium_verbose_agent_is_ok_or_warn(self, tmp_path):
+        """A 100%-premium (cheaper_model_share=0) AND verbose (high tokens_per_output)
+        agent with flat spend → cost health should be OK (spend_vs_trend ~0) and the
+        composite must be OK (green) or WARN (amber), NOT ERROR (red/capped).
+
+        This is the MUST 14 conformance proof: with #687 in place, the agent's
+        cost axis is scored from spend_vs_trend ONLY (flat spend → score ~100),
+        so the composite stays healthy.
+        """
+        ah = self._make_premium_verbose_agent_health(tmp_path)
+
+        # Cheaper_model_share and tokens_per_output must NOT be in scorecard as
+        # health metrics — they are advisory-only (#687 MUST 14).
+        health_metric_names = {r.metric for r in ah.scorecard if r.score is not None}
+        assert "cheaper_model_share" not in health_metric_names, (
+            "cheaper_model_share must NOT appear as a scored health metric after #687 "
+            f"(MUST 14); found in scored rows: {health_metric_names}"
+        )
+        assert "tokens_per_output" not in health_metric_names, (
+            "tokens_per_output must NOT appear as a scored health metric after #687 "
+            f"(MUST 14); found in scored rows: {health_metric_names}"
+        )
+
+        # The agent must NOT be ERROR-capped from cost.
+        assert ah.capped_by_axis != "metric" or (ah.capped_by_axis is None), (
+            f"capped_by_axis must not be 'metric' for a premium+verbose healthy agent; "
+            f"got capped_by_axis={ah.capped_by_axis!r}"
+        )
+        assert ah.capped_by_axis is None, (
+            f"A 100%-premium + verbose agent with healthy spend must NOT be capped; "
+            f"got capped_by_axis={ah.capped_by_axis!r}"
+        )
+
+        # The band must be OK (green) or WARN (amber), NOT red/ERROR.
+        assert ah.band in ("green", "amber", "unknown"), (
+            f"A premium+verbose healthy agent must be green/amber/unknown, "
+            f"not red; got band={ah.band!r}, composite={ah.composite!r}"
+        )
+
+    def test_strip_red_cheaper_model_share_in_cap_makes_agent_red(self, tmp_path):
+        """strip-RED: re-adding cheaper_model_share to the metric-level cap input
+        MUST turn the healthy premium agent red (proves the guard is load-bearing).
+
+        We directly inject a sub-threshold (< 30) cheaper_model_share score into
+        _compute_composite's metric_scores list to simulate what the old code did.
+        """
+        ah = self._make_premium_verbose_agent_health(tmp_path)
+        assert ah.composite is not None, "fixture must produce a composite"
+
+        # The original agent is healthy (not capped).
+        assert ah.capped_by_axis is None
+
+        # Simulate adding cheaper_model_share score of 0 (100%-premium agent →
+        # cheaper_share=0 → score=0 under the old scoring) to the cap input.
+        from atomic_agents.advisor.score import _compute_composite
+
+        sub_scores = {
+            "cost": ah.cost_score,
+            "quality": ah.quality_score,
+            "reliability": ah.reliability_score,
+        }
+        # Strip-RED: inject cheaper_model_share=0 into metric_scores → cap fires.
+        metric_scores_with_cheaper = [
+            0.0
+        ]  # cheaper_model_share score = 0 (all premium)
+        _, band_with, capped_with = _compute_composite(
+            sub_scores,
+            {"cost": 1 / 3, "quality": 1 / 3, "reliability": 1 / 3},
+            metric_scores_with_cheaper,
+        )
+        assert band_with == "red", (
+            "Injecting cheaper_model_share=0 into the cap input MUST force red "
+            f"(this is the old broken behavior #687 fixes); got {band_with!r}"
+        )
+        assert capped_with == "metric", (
+            f"capped_by_axis must be 'metric' when cheaper_model_share=0 is injected; "
+            f"got {capped_with!r}"
+        )
+
+    def test_strip_red_tokens_per_output_in_cap_makes_agent_red(self, tmp_path):
+        """strip-RED: re-adding tokens_per_output to the metric-level cap input
+        MUST turn the healthy verbose agent red (proves the guard is load-bearing).
+        """
+        from atomic_agents.advisor.score import _compute_composite, _map_metric_to_score
+        from atomic_agents.advisor.targets import MetricTarget
+
+        ah = self._make_premium_verbose_agent_health(tmp_path)
+        assert ah.composite is not None, "fixture must produce a composite"
+        assert ah.capped_by_axis is None, "fixture must start as healthy"
+
+        # Compute what tokens_per_output score would be for 4000 tokens under the
+        # old default target (target=500, direction=lower, band=100, floor=5000).
+        old_tpo_target = MetricTarget(
+            target=500.0, direction="lower", band=100.0, floor=5000.0
+        )
+        tpo_score = _map_metric_to_score(4000.0, old_tpo_target)
+        # 4000 tokens is above the old floor (5000) — score should be < 30.
+        assert tpo_score < CRITICAL_SUBSCORE_THRESHOLD, (
+            f"tokens_per_output=4000 under old target must score < {CRITICAL_SUBSCORE_THRESHOLD}; "
+            f"got {tpo_score:.1f}"
+        )
+
+        sub_scores = {
+            "cost": ah.cost_score,
+            "quality": ah.quality_score,
+            "reliability": ah.reliability_score,
+        }
+        # Strip-RED: inject tokens_per_output sub-threshold score → cap fires.
+        _, band_with, capped_with = _compute_composite(
+            sub_scores,
+            {"cost": 1 / 3, "quality": 1 / 3, "reliability": 1 / 3},
+            [tpo_score],
+        )
+        assert band_with == "red", (
+            "Injecting sub-threshold tokens_per_output score into the cap MUST force red "
+            f"(old broken behavior); got {band_with!r} (tpo_score={tpo_score:.1f})"
+        )
+        assert capped_with == "metric"
+
+    def test_legacy_targets_md_cheaper_model_share_ignored_fail_soft(self, tmp_path):
+        """targets.md overrides for removed metrics are silently ignored (fail-soft).
+
+        An operator whose targets.md still carries
+          scoring.axes.cost.metrics.cheaper_model_share / tokens_per_output
+        after #687 MUST NOT cause an error, MUST NOT affect used_defaults
+        (the keys are simply absent from _DEFAULT_AXES), and the parse must
+        succeed with the remaining valid keys honored.
+        """
+        from atomic_agents.advisor.targets import parse_targets
+
+        (tmp_path / "targets.md").write_text(
+            "## Fleet Health Targets\n\n"
+            "```yaml\n"
+            "scoring:\n"
+            "  weights:\n"
+            "    cost: 0.4\n"
+            "    quality: 0.3\n"
+            "    reliability: 0.3\n"
+            "  axes:\n"
+            "    cost:\n"
+            "      metrics:\n"
+            "        cheaper_model_share:\n"
+            "          target: 0.80\n"
+            "          direction: higher\n"
+            "          band: 0.10\n"
+            "          floor: 0.0\n"
+            "        tokens_per_output:\n"
+            "          target: 300\n"
+            "          direction: lower\n"
+            "          band: 50\n"
+            "          floor: 3000\n"
+            "        spend_vs_trend:\n"
+            "          target: 0.03\n"
+            "          direction: lower\n"
+            "          band: 0.01\n"
+            "          floor: 0.40\n"
+            "```\n"
+        )
+        # Must not raise.
+        ft = parse_targets(tmp_path)
+
+        # cheaper_model_share and tokens_per_output must NOT appear in the axes
+        # (they are not in _DEFAULT_AXES, so the parser's "iterate _DEFAULT_AXES"
+        # loop never picks them up — ignored fail-soft).
+        cost_metrics = set(ft.axes.get("cost", {}).keys())
+        assert "cheaper_model_share" not in cost_metrics, (
+            "cheaper_model_share must be ignored (not in _DEFAULT_AXES after #687); "
+            f"got cost_metrics={cost_metrics}"
+        )
+        assert "tokens_per_output" not in cost_metrics, (
+            "tokens_per_output must be ignored (not in _DEFAULT_AXES after #687); "
+            f"got cost_metrics={cost_metrics}"
+        )
+
+        # spend_vs_trend IS a valid metric and must be honored.
+        assert "spend_vs_trend" in cost_metrics, (
+            f"spend_vs_trend must still be parsed; got cost_metrics={cost_metrics}"
+        )
+        svt = ft.axes["cost"]["spend_vs_trend"]
+        assert abs(svt.target - 0.03) < 1e-6, (
+            f"operator's spend_vs_trend target override (0.03) must be honored; "
+            f"got {svt.target}"
+        )
+
+        # The weights override must be honored (cost=0.4 is valid).
+        assert abs(ft.weights["cost"] - 0.4) < 0.01, (
+            f"operator's cost weight 0.4 must be honored; got {ft.weights['cost']}"
+        )
+
+        # No error, no crash — fail-soft posture.

@@ -1455,8 +1455,9 @@ _SCORECARD_DISPLAY_ORDER = [
     ("reliability", "skipped_rate", "lower"),
     ("quality", "pass_rate", "higher"),
     ("quality", "hard_fail_rate", "lower"),
-    ("cost", "cheaper_model_share", "higher"),
-    ("cost", "tokens_per_output", "lower"),
+    # Cost HEALTH axis: spend_vs_trend only (#687, spec/53 §3.6 + MUST 14).
+    # cheaper_model_share and tokens_per_output are NOT health metrics —
+    # they are optimization signals consumed by the recommendations engine.
     ("cost", "spend_vs_trend", "lower"),
 ]
 
