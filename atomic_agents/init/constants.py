@@ -324,6 +324,11 @@ RESERVED_AGENT_NAMES: Final = frozenset(
         "deploy",
         "status",
         "down",
+        # spec/55 #624: ``manage`` is a new CLI subgroup; ``govern`` is the first
+        # verb. Both are reserved so agents named "manage" or "govern" cannot
+        # produce ambiguous CLI tokens (e.g. ``atomic-agents manage govern manage``).
+        "manage",
+        "govern",
     }
 )
 
