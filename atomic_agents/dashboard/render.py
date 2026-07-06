@@ -97,10 +97,18 @@ def render_all(
         global_path = render_global(agents_root, global_summary)
         written["global"] = str(global_path)
 
-        for agent_name in discover_agents(agents_root):
-            data = aggregate_agent(agents_root, agent_name, today=today)
-            agent_path = render_agent(agents_root, data)
-            written["per_agent"].append(str(agent_path))
+        # MUST 5 (double-write guard): when render_console_tab=True the console pass
+        # will re-render per-agent detail pages with the SAME console_data/now snapshot
+        # as the Monitor.  Rendering them here too (with a standalone snapshot) would
+        # write the file twice — once without fleet_health and once with.  Skip the
+        # cost-loop write so the console pass is the sole author of detail pages when
+        # it will run.  When render_console_tab=False (e.g. tab='cost') the console
+        # pass won't run, so we must write detail pages from the cost loop.
+        if not render_console_tab:
+            for agent_name in discover_agents(agents_root):
+                data = aggregate_agent(agents_root, agent_name, today=today)
+                agent_path = render_agent(agents_root, data)
+                written["per_agent"].append(str(agent_path))
 
     if render_activity_tab:
         activity_data = aggregate_activity(agents_root, now=now)
@@ -173,6 +181,69 @@ def render_all(
                     "render_monitor failed (%s); skipping monitor.html",
                     type(exc).__name__,
                 )
+
+        # spec/57 MUST 5 — co-render per-agent detail pages with the SAME console_data
+        # (fleet_health + now) that the Monitor used so the Monitor row and the detail
+        # banner for the same agent are identical by construction (shared snapshot).
+        # This pass re-renders (or first-renders, if tab='console') the detail pages.
+        try:
+            from .render_agent_detail import (
+                render_agent_detail as _render_agent_detail,
+                render_agent_detail_resolver as _render_resolver,
+            )
+
+            _detail_agent_list = list(discover_agents(agents_root))
+            _detail_written = []
+            for _agent_id in _detail_agent_list:
+                try:
+                    _detail_path = _render_agent_detail(
+                        agents_root,
+                        _agent_id,
+                        console_data=console_data,
+                        today=today,
+                        now=now,
+                    )
+                    _detail_written.append(str(_detail_path))
+                except Exception as _exc:
+                    logger.warning(
+                        "render_agent_detail failed for '%s' (%s); skipping",
+                        _agent_id,
+                        type(_exc).__name__,
+                    )
+            # Update per_agent with the detail paths (may already have cost paths from
+            # the render_cost loop; replace them with the detail paths which are the
+            # same files — this ensures written["per_agent"] reflects the final state).
+            if _detail_written:
+                written["per_agent"] = _detail_written
+
+            # Resolver (MUST 1) — always regenerate alongside the detail pages.
+            try:
+                _resolver_path = _render_resolver(agents_root)
+                written["agent_detail_resolver"] = str(_resolver_path)
+            except Exception as _exc:
+                logger.warning(
+                    "render_agent_detail_resolver failed (%s); skipping",
+                    type(_exc).__name__,
+                )
+        except Exception as exc:
+            logger.warning(
+                "render_agent_detail pass failed (%s); detail pages not updated",
+                type(exc).__name__,
+            )
+
+    # Generate the resolver even when render_console_tab is False (e.g. tab='cost')
+    # so the _dashboard/agent-detail.html file exists whenever cost pages are written.
+    if render_cost and not render_console_tab:
+        try:
+            from .render_agent_detail import render_agent_detail_resolver as _rr
+
+            _rp = _rr(agents_root)
+            written["agent_detail_resolver"] = str(_rp)
+        except Exception as exc:
+            logger.warning(
+                "render_agent_detail_resolver (cost-only pass) failed (%s)",
+                type(exc).__name__,
+            )
 
     return written
 
@@ -342,11 +413,22 @@ def _write_rendered_alert_keys(agents_root: Path, keys: frozenset) -> None:
 
 
 def render_agent(agents_root: Path, data: AgentDashboardData) -> Path:
-    """Render <agents_root>/<agent>/dashboard.html. Returns the written path."""
-    html_content = _render_agent_template(data)
-    out_path = agents_root / data.name / "dashboard.html"
-    atomic_write(out_path, html_content)
-    return out_path
+    """Render <agents_root>/<agent>/dashboard.html as the B7 detail cockpit (spec/57).
+
+    MUST 2: path is unchanged — <agent>/dashboard.html — so render_all()["per_agent"],
+    the served /agents/<name> route, and existing consumers keep working.
+
+    Delegates to render_agent_detail() which writes the Fable "Briefing" B7 layout.
+    console_data is not available at this call site (render_agent is called from the
+    cost-aggregation loop); a standalone fresh snapshot is built inside
+    render_agent_detail(). When render_all() calls this after populating console_data,
+    the status/health come from the cost-aggregation path (standalone snapshot). For the
+    co-rendered case (render_all() with console_data), see the render_all() overload
+    below that calls render_agent_detail() directly with console_data threaded in.
+    """
+    from .render_agent_detail import render_agent_detail
+
+    return render_agent_detail(agents_root, data.name, console_data=None)
 
 
 # ──────────────────────────────────────────────────────────────────

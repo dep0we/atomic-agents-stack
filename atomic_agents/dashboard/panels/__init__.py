@@ -48,6 +48,9 @@ from . import _fleet_overview  # noqa: F401 — registration side effect (order=
 from . import _monitor_summary  # noqa: F401 — registration side effect (order=10: status-count bar)
 from . import _monitor_roster  # noqa: F401 — registration side effect (order=10: entity list/cards)
 
+# AGENT-TAB slot (spec/57 §3 — per-agent detail telemetry tabs)
+from . import _agent_tabs  # noqa: F401 — registration side effect (8 tabs: overview/cost/activity/quality/memory/goals/dreaming/efficiency)
+
 __all__ = [
     "ConsoleCapabilities",
     "PanelContext",
