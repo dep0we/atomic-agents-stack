@@ -329,6 +329,7 @@ def _render_governance_block(agent_ref) -> str:
         risk = gov.risk if gov else None
         actions = gov.actions if gov else None
 
+        # FIX 5: Include all parsed governance fields — next review, reviewed by, sources.
         gov_grid = (
             '<div class="gov-grid">'
             f'<div class="gov-kv"><div class="gk">Owner</div>'
@@ -349,9 +350,28 @@ def _render_governance_block(agent_ref) -> str:
             )
         if review:
             reviewed_at = getattr(review, "reviewed_at", None)
+            reviewer = getattr(review, "reviewer", None)
+            approved_by = getattr(review, "approved_by", None)
             gov_grid += (
                 f'<div class="gov-kv"><div class="gk">Last review</div>'
                 f'<div class="gv">{_v(reviewed_at)}</div></div>'
+            )
+            # FIX 5: Reviewed by (reviewer or approved_by)
+            reviewed_by = reviewer or approved_by
+            gov_grid += (
+                f'<div class="gov-kv"><div class="gk">Reviewed by</div>'
+                f'<div class="gv">{_v(reviewed_by)}</div></div>'
+            )
+        # FIX 5: Sources — use getattr so stub objects in tests (no sources attr) still work
+        sources = getattr(gov, "sources", None) if gov else None
+        if sources is not None:
+            primary = getattr(sources, "primary", []) or []
+            secondary = getattr(sources, "secondary", []) or []
+            all_srcs = list(primary) + list(secondary)
+            sources_str = ", ".join(str(s) for s in all_srcs[:5]) if all_srcs else None
+            gov_grid += (
+                f'<div class="gov-kv"><div class="gk">Sources</div>'
+                f'<div class="gv">{_v(sources_str)}</div></div>'
             )
         gov_grid += "</div>"
 
@@ -939,15 +959,152 @@ def _render_efficiency_tab(agent_health, data) -> str:
 # Banner rendering
 
 
+def _read_model_from_model_md(agent_root: "Path") -> str:
+    """Read the primary model id from <agent>/model.md (FIX 2).
+
+    Returns the first recognised model token found in the file, or "" if absent.
+    Reads only the first 2 KB to stay fast — model.md is always small.
+    """
+    import re as _re2
+    model_md = agent_root / "model.md"
+    if not model_md.exists():
+        return ""
+    try:
+        content = model_md.read_text(encoding="utf-8")[:2048]
+    except OSError:
+        return ""
+    # Match known model id prefixes — longest-prefix-first.
+    patterns = [
+        r"claude-[a-z0-9][a-z0-9\-\.]+",
+        r"gpt-[a-z0-9][a-z0-9\-\.]+",
+        r"moonshot/[a-z0-9][a-z0-9\-\.]+",
+        r"local/[a-z0-9][a-z0-9\-\.]+",
+        r"qwen[0-9a-z\-\.]+",
+        r"llama[0-9a-z\-\.]+",
+    ]
+    for pat in patterns:
+        m = _re2.search(pat, content, _re2.IGNORECASE)
+        if m:
+            return m.group(0)
+    return ""
+
+
+def _read_permission_tier(agent_ref) -> str:
+    """Extract permission_tier from agent_ref (FIX 2 — tier pill independent of health)."""
+    if agent_ref is None:
+        return ""
+    gov = getattr(agent_ref, "governance", None)
+    if gov is None:
+        return ""
+    if getattr(gov, "parse_errors", None):
+        return ""
+    tier = getattr(gov, "permission_tier", None)
+    return str(tier) if tier is not None else ""
+
+
+def _compute_banner_stats(
+    cost_data,
+    now: "datetime",
+    today: "date",
+    agents_root: "Path",
+    agent_id: str,
+) -> dict:
+    """Compute the banner grid metrics (FIX 3 — 8 fields matching the B7 mockup).
+
+    Returns: spend_7d, spend_30d, runs_7d, failures_7d, eval_score.
+    None = no data (renders as "—").
+    """
+    from datetime import timedelta as _td
+
+    spend_7d: "float | None" = None
+    spend_30d: "float | None" = None
+    runs_7d: "int | None" = None
+    failures_7d: "int | None" = None
+
+    if cost_data is not None:
+        # 7d spend from daily_costs dict (per-day totals this month)
+        daily = getattr(cost_data, "daily_costs", {}) or {}
+        if daily:
+            cutoff_7d_str = (today - _td(days=7)).isoformat()
+            spend_7d = sum(v for k, v in daily.items() if k >= cutoff_7d_str)
+
+        # 30d spend: monthly summary is a close proxy
+        s = getattr(cost_data, "summary_this_month", None)
+        if s is not None:
+            spend_30d = getattr(s, "cost_usd", None)
+
+        # 7d runs + failures from top_runs (time-filtered)
+        top_runs = getattr(cost_data, "top_runs", []) or []
+        if top_runs:
+            try:
+                now_tz = now
+                if now_tz.tzinfo is None:
+                    from datetime import timezone as _tz
+                    now_tz = now_tz.replace(tzinfo=_tz.utc)
+                cutoff_7d_dt = now_tz - _td(days=7)
+                runs_7d = 0
+                failures_7d = 0
+                for r in top_runs:
+                    ts = getattr(r, "ts", None)
+                    if ts is None:
+                        continue
+                    if ts.tzinfo is None:
+                        from datetime import timezone as _tz
+                        ts = ts.replace(tzinfo=_tz.utc)
+                    if ts >= cutoff_7d_dt:
+                        runs_7d += 1
+                        if getattr(r, "status", "ok") in ("error", "failed", "blocked"):
+                            failures_7d += 1
+            except Exception:
+                pass
+
+    # Eval score: most recent score from evals/runs/*.jsonl
+    eval_score: "float | None" = None
+    evals_dir = agents_root / agent_id / "evals" / "runs"
+    if evals_dir.exists():
+        import json as _j2
+        try:
+            for f in sorted(evals_dir.glob("*.jsonl"), reverse=True)[:1]:
+                lines = f.read_text(encoding="utf-8").splitlines()
+                for line in reversed(lines):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = _j2.loads(line)
+                        sc = rec.get("score")
+                        if sc is not None:
+                            eval_score = float(sc)
+                            break
+                    except Exception:
+                        continue
+                if eval_score is not None:
+                    break
+        except Exception:
+            pass
+
+    return {
+        "spend_7d": spend_7d,
+        "spend_30d": spend_30d,
+        "runs_7d": runs_7d,
+        "failures_7d": failures_7d,
+        "eval_score": eval_score,
+    }
+
+
 def _render_banner(
     agent_id: str,
     agent_ref,
     agent_health,
     status: str,
-    last_run_at: datetime | None,
-    now: datetime,
+    last_run_at: "datetime | None",
+    now: "datetime",
+    cost_data=None,
+    today: "date | None" = None,
+    agents_root: "Path | None" = None,
+    model_from_md: str = "",
 ) -> str:
-    """Render the Fable banner (MUST 3 + 5)."""
+    """Render the Fable banner (MUST 3 + 5) — full 8-field grid (FIX 2 + 3)."""
     display_name = agent_id.replace("-", " ").replace("_", " ").title()
 
     # Status pill
@@ -957,14 +1114,25 @@ def _render_banner(
         f'<span class="sdot"></span>{status.upper()}</span>'
     )
 
-    # Model pill from primary_model
+    # FIX 2: Model pill — prefer agent_health.primary_model; fall back to model.md.
+    # Independent of agent_health (renders whenever a model id is known).
     model_id = ""
     if agent_health is not None:
         model_id = getattr(agent_health, "primary_model", None) or ""
+    if not model_id:
+        model_id = model_from_md
     model_pill_html = ""
     if model_id:
         cls = _model_pill_class(model_id)
         model_pill_html = f'<span class="pill {cls}">{_html.escape(_short_model_name(model_id))}</span>'
+
+    # FIX 2: Permission-tier pill — from governance, independent of health.
+    tier_str = _read_permission_tier(agent_ref)
+    tier_pill_html = (
+        f'<span class="pill" style="color:var(--muted);border-color:var(--border);">' +
+        _html.escape(tier_str) + "</span>"
+        if tier_str else ""
+    )
 
     # Health score — 0-100 integer (MUST 5: never ×100 of raw float)
     # composite_display is already int(round(composite)) per spec/53 §3.3
@@ -1001,28 +1169,80 @@ def _render_banner(
         else:
             last_run_str = f"{secs // 86400}d ago"
 
+    # FIX 3: 8-field banner grid — matches variant-B7-agent-detail.html mockup.
+    _today_val = today or date.today()
+    banner_stats: dict = {}
+    if agents_root is not None:
+        banner_stats = _compute_banner_stats(cost_data, now, _today_val, agents_root, agent_id)
+
+    def _fmt_spend(v) -> str:
+        return f"${v:.2f}" if v is not None else "—"
+
+    def _fmt_int(v) -> str:
+        return str(v) if v is not None else "—"
+
+    def _fmt_score(v) -> str:
+        return f"{float(v):.0f}" if v is not None else "—"
+
+    spend_7d_str = _fmt_spend(banner_stats.get("spend_7d"))
+    spend_30d_str = _fmt_spend(banner_stats.get("spend_30d"))
+    runs_7d_str = _fmt_int(banner_stats.get("runs_7d"))
+    failures_7d_str = _fmt_int(banner_stats.get("failures_7d"))
+    eval_score_str = _fmt_score(banner_stats.get("eval_score"))
+
+    pills_html = status_pill
+    if model_pill_html:
+        pills_html += " " + model_pill_html
+    if tier_pill_html:
+        pills_html += " " + tier_pill_html
+
     return (
         '<div class="agent-banner">'
         '<div class="banner-row1">'
         f'<span class="banner-name">{_html.escape(display_name)}</span>'
         f'<span class="banner-id">{_html.escape(agent_id)}</span>'
         "</div>"
-        '<div class="banner-pills">'
-        + status_pill
-        + (" " + model_pill_html if model_pill_html else "")
-        + "</div>"
+        f'<div class="banner-pills">{pills_html}</div>'
         '<div class="banner-grid">'
+        # Field 1: Status
         '<div class="banner-kv">'
         '<div class="bk">Status</div>'
         f'<div class="bv status-{status_lower}">{status.upper()}</div>'
         "</div>"
+        # Field 2: Last run
         '<div class="banner-kv">'
         '<div class="bk">Last run</div>'
         f'<div class="bv">{_html.escape(last_run_str)}</div>'
         "</div>"
+        # Field 3: 7d spend
+        '<div class="banner-kv">'
+        '<div class="bk">7d spend</div>'
+        f'<div class="bv">{_html.escape(spend_7d_str)}</div>'
+        "</div>"
+        # Field 4: 30d spend
+        '<div class="banner-kv">'
+        '<div class="bk">30d spend</div>'
+        f'<div class="bv">{_html.escape(spend_30d_str)}</div>'
+        "</div>"
+        # Field 5: Failures (7d)
+        '<div class="banner-kv">'
+        '<div class="bk">Failures (7d)</div>'
+        f'<div class="bv">{_html.escape(failures_7d_str)}</div>'
+        "</div>"
+        # Field 6: Runs (7d)
+        '<div class="banner-kv">'
+        '<div class="bk">Runs (7d)</div>'
+        f'<div class="bv">{_html.escape(runs_7d_str)}</div>'
+        "</div>"
+        # Field 7: Fleet health
         '<div class="banner-kv">'
         '<div class="bk">Fleet health</div>'
         f'<div class="bv {health_class}">{health_val}</div>'
+        "</div>"
+        # Field 8: Eval score
+        '<div class="banner-kv">'
+        '<div class="bk">Eval score</div>'
+        f'<div class="bv">{_html.escape(eval_score_str)}</div>'
         "</div>"
         "</div>"  # banner-grid
         "</div>"  # agent-banner
@@ -1149,8 +1369,20 @@ def _render_detail_template(
         "</div>"
     )
 
-    # Banner (MUST 3 + 5)
-    banner = _render_banner(agent_id, agent_ref, agent_health, status, last_run_at, now)
+    # Banner (MUST 3 + 5) — pass model_from_md and cost_data for FIX 2+3+8-grid
+    _model_from_md = _read_model_from_model_md(agent_root)
+    banner = _render_banner(
+        agent_id,
+        agent_ref,
+        agent_health,
+        status,
+        last_run_at,
+        now,
+        cost_data=cost_data,
+        today=today,
+        agents_root=agents_root,
+        model_from_md=_model_from_md,
+    )
 
     # Governance block (MUST 3)
     gov_block = _render_governance_block(agent_ref)
@@ -1397,6 +1629,9 @@ def render_agent_detail(
     agent_root = agents_root / agent_id
 
     # ── Load agent health from console_data fleet_health if available ──────────
+    # FIX 1 + 6: When console_data has fleet_health, use it (MUST 5 parity).
+    # When absent (standalone call), compute a fresh self-consistent snapshot
+    # so the banner/Overview tab are FULL (not skeleton) in both modes.
     agent_health = None
     if console_data is not None:
         fh = getattr(console_data, "fleet_health", None)
@@ -1405,6 +1640,22 @@ def render_agent_detail(
                 if getattr(ah, "agent", None) == agent_id:
                     agent_health = ah
                     break
+
+    # FIX 1: Standalone self-sufficient snapshot — compute health if still None.
+    if agent_health is None:
+        try:
+            from ..advisor.score import compute_fleet_health as _cfh
+            _fh = _cfh(agents_root, today=today)
+            for ah in getattr(_fh, "agents", []):
+                if getattr(ah, "agent", None) == agent_id:
+                    agent_health = ah
+                    break
+        except Exception as _exc:
+            logger.warning(
+                "standalone compute_fleet_health failed for %s (%s); banner will show '—'",
+                agent_id,
+                type(_exc).__name__,
+            )
 
     # ── Load agent_ref from AgentRegistryBackend (fail-soft) ──────────────────
     # get_agent() returns a ref without governance (include_governance is not a
@@ -1448,6 +1699,26 @@ def render_agent_detail(
             ):
                 cost_spike = True
 
+    # FIX 1: When console_data absent, derive last_run_at from cost_data.top_runs
+    # so status_for_agent() sees a real last-run timestamp (not None → STALE).
+    # cost_data is loaded after this block, so we do a lightweight load here.
+    if last_run_at is None and console_data is None:
+        try:
+            _data = aggregate_agent(agents_root, agent_id, today=today)
+            _top = getattr(_data, "top_runs", [])
+            if _top:
+                from ..dashboard._reliability import _is_primary_run as _ipr
+                _primary = [r for r in _top if _ipr(r)]
+                if not _primary:
+                    _primary = _top  # fall back to any run
+                if _primary:
+                    _ts = _primary[0].ts
+                    if _ts.tzinfo is None:
+                        _ts = _ts.replace(tzinfo=timezone.utc)
+                    last_run_at = _ts
+        except Exception:
+            pass
+
     status = status_for_agent(
         agent_health=agent_health,
         attention_items=open_items,
@@ -1463,10 +1734,29 @@ def render_agent_detail(
     except Exception as exc:
         logger.warning("aggregate_agent failed for %s: %s", agent_id, exc)
 
-    # ── Recommendations (from console_data) ───────────────────────────────────
+    # ── Recommendations (FIX 4: from console_data OR standalone-computed) ───────
     recs = None
     if console_data is not None:
         recs = getattr(console_data, "recommendations", None)
+    if recs is None:
+        # FIX 4: standalone — compute recs for this fleet so the detail page is full.
+        try:
+            from ..advisor.recommend import recommend_fleet as _rf
+            _fh_for_rec = None
+            if agent_health is not None:
+                # Reuse the already-computed FleetHealth if we have it (avoid second pass).
+                # Wrap in a minimal FleetHealth-shaped object the recommender accepts.
+                try:
+                    from ..advisor.score import compute_fleet_health as _cfh2
+                    _fh_for_rec = _cfh2(agents_root, today=today)
+                except Exception:
+                    pass
+            recs = _rf(agents_root, today=today, fleet_health=_fh_for_rec)
+        except Exception as _exc:
+            logger.warning(
+                "standalone recommend_fleet failed (%s); recs panel will be empty",
+                type(_exc).__name__,
+            )
 
     # ── has_goals_nav (for the top nav Goals link) ─────────────────────────────
     has_goals_nav = any(

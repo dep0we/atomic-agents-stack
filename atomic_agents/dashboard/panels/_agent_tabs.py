@@ -85,7 +85,7 @@ class _QualityTab:
     slot = "agent-tab"
     order = 40
     tab_id = "quality"
-    tab_label = "Quality"
+    tab_label = "Quality (Evals)"
 
     def is_available(self, ctx: PanelContext) -> bool:
         d = getattr(ctx, "agent_detail", None)

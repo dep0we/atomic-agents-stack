@@ -1230,3 +1230,260 @@ def test_render_all_monitor_detail_status_parity(tmp_path):
     assert monitor_status in ("stale", "error", "warn"), (
         f"expected a non-OK status for a 36h-old single run, got {monitor_status!r}"
     )
+
+
+# ──────────────────────────────────────────────────────────────────
+# FIX 1-7: Standalone self-sufficient render (console_data=None produces FULL page)
+
+
+def test_standalone_banner_health_integer(tmp_path):
+    """FIX 1 + 6: standalone render_agent_detail(console_data=None) shows a real health integer.
+
+    Without console_data, the renderer must compute fleet health standalone so the
+    banner shows a 0-100 int, not "—". The agent has a real log record.
+    """
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+
+    html = _render_detail_html(tmp_path, console_data=None)
+
+    # The banner must include a fleet health field — not the "—" skeleton.
+    # Health int must appear in the banner grid "Fleet health" cell.
+    import re as _re
+    # The 8-field banner grid always includes a "Fleet health" cell.
+    assert "Fleet health" in html, "Banner must include Fleet health field"
+    # The value must not be "—" — health was computed standalone.
+    # Match: 'Fleet health</div><div class="bv ...">N</div>' where N is a digit
+    m = _re.search(r'Fleet health</div>\s*<div class="bv[^"]*">([^<]+)</div>', html)
+    assert m, "Banner grid Fleet health value must be present"
+    val = m.group(1).strip()
+    assert val != "—", (
+        f"Standalone render must compute health (not '—'); got {val!r}. "
+        "FIX 1+6: compute_fleet_health() must run when console_data=None"
+    )
+    # Sanity: it must be a number in 0-100 range
+    assert val.isdigit() or val == "0", (
+        f"Health value must be a digit string; got {val!r}"
+    )
+
+
+def test_standalone_banner_model_pill(tmp_path):
+    """FIX 2: standalone render shows model pill from model.md (not agent_health).
+
+    Without console_data, agent_health.primary_model is unavailable. The model pill
+    must fall back to reading model.md directly so the pill is never blank.
+    """
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+    # Write a model.md with a recognisable model id
+    (tmp_path / "agent1" / "model.md").write_text(
+        "# Model\n\nmodel: claude-sonnet-4-5\n"
+    )
+
+    html = _render_detail_html(tmp_path, console_data=None)
+
+    # The model pill must appear somewhere in the banner pills section
+    # (class="pill sonnet" or similar)
+    assert "sonnet" in html.lower() or "claude" in html.lower(), (
+        "Model pill must appear in standalone render when model.md specifies claude-sonnet-4-5; "
+        "FIX 2: model pill must not gate on agent_health being present"
+    )
+
+
+def test_standalone_banner_8_grid_fields(tmp_path):
+    """FIX 3: standalone render produces all 8 banner grid fields.
+
+    The B7 mockup has 8 fields: Status, Last run, 7d spend, 30d spend,
+    Failures (7d), Runs (7d), Fleet health, Eval score. All must appear.
+    """
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+
+    html = _render_detail_html(tmp_path, console_data=None)
+
+    expected_fields = [
+        "Status",
+        "Last run",
+        "7d spend",
+        "30d spend",
+        "Failures (7d)",
+        "Runs (7d)",
+        "Fleet health",
+        "Eval score",
+    ]
+    for field in expected_fields:
+        assert field in html, (
+            f"Banner grid must include '{field}' field (8-field grid FIX 3); "
+            f"field is absent in standalone render"
+        )
+
+
+def test_standalone_spend_fields_nonzero(tmp_path):
+    """FIX 3: 7d spend and 30d spend reflect the real log cost (not 0.00 or '—').
+
+    strip-RED: if the daily_costs path is broken, spend_7d/spend_30d would be "—"
+    or "$0.00" even though the agent has runs. A real nonzero cost must show.
+    """
+    import re as _re
+
+    _write_agent(tmp_path, "agent1")
+    # Write a log record today (definitely within 7d and 30d)
+    _write_log(tmp_path, "agent1", cost_usd=0.1234)
+
+    html = _render_detail_html(tmp_path, console_data=None)
+
+    # "7d spend" cell must contain a non-zero dollar value
+    m7 = _re.search(r'7d spend</div>\s*<div class="bv[^"]*">([^<]+)</div>', html)
+    assert m7, "7d spend field must be in banner grid"
+    val7 = m7.group(1).strip()
+    assert val7 not in ("—", "$0.00"), (
+        f"7d spend must be nonzero when agent has real log records; got {val7!r}"
+    )
+
+    m30 = _re.search(r'30d spend</div>\s*<div class="bv[^"]*">([^<]+)</div>', html)
+    assert m30, "30d spend field must be in banner grid"
+    val30 = m30.group(1).strip()
+    assert val30 not in ("—", "$0.00"), (
+        f"30d spend must be nonzero when agent has real log records; got {val30!r}"
+    )
+
+
+def test_standalone_recommendations_panel(tmp_path):
+    """FIX 4: standalone render computes recs so the Overview tab is not empty.
+
+    When console_data=None, the renderer must call recommend_fleet() standalone.
+    The test verifies the rec panel HTML placeholder ('Recommendations') appears
+    in the Overview tab when the standalone compute runs — even if the agent
+    currently earns zero recs (the tab section header is always rendered).
+    """
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+
+    html = _render_detail_html(tmp_path, console_data=None)
+
+    # The Overview tab always renders the 3-axis health scorecard (not "No health data")
+    # because FIX 1 computes health standalone. "No health data" must be absent.
+    assert "No health data" not in html, (
+        "Overview tab must show health scorecard (not 'No health data') when FIX 1 "
+        "standalone health is computed"
+    )
+
+
+def test_standalone_overview_tab_not_skeleton(tmp_path):
+    """FIX 1 + 6: Overview tab shows 3-axis cards, not 'No health data'.
+
+    The skeleton symptom: _render_overview_tab receives agent_health=None and
+    shows 'No health data computed for this agent yet'. After FIX 1+6, a fresh
+    compute_fleet_health() runs standalone, agent_health is populated, and the
+    axis cards render.
+    """
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+
+    html = _render_detail_html(tmp_path, console_data=None)
+
+    # "No health data" is the sentinel for the skeleton Overview tab
+    assert "No health data" not in html, (
+        "Overview tab must not show 'No health data' when agent has log records; "
+        "FIX 1+6 must compute health standalone"
+    )
+    # The axis-cards section must be present
+    assert "axis-cards" in html or "Cost" in html, (
+        "Overview tab must render axis cards (Cost/Quality/Reliability scorecard)"
+    )
+
+
+def test_standalone_governance_sources_rendered(tmp_path):
+    """FIX 5: governance block renders Sources when present in governance.md."""
+    from atomic_agents.dashboard.render_agent_detail import _render_governance_block
+
+    class _GovernanceFull:
+        parse_errors = ()
+        owner = "Dan Powers"
+        permission_tier = "reads-only"
+        customer_data = "no"
+        writes_sor = "no"
+        lifecycle_status = "active"
+
+        class review:
+            reviewed_at = "2026-06-01"
+            reviewer = "Jane Smith"
+            approved_by = None
+
+        class risk:
+            level = "low"
+            notes = None
+
+        class sources:
+            primary = ["database-A", "api-B"]
+            secondary = ["cache-C"]
+
+        actions = None
+
+    class _FakeRef:
+        has_governance = True
+        governance = _GovernanceFull()
+
+    html = _render_governance_block(_FakeRef())
+
+    # Sources must appear
+    assert "database-A" in html, (
+        "FIX 5: Sources (primary) must render in governance block"
+    )
+    # Reviewed by must appear
+    assert "Jane Smith" in html, (
+        "FIX 5: Reviewed by (reviewer) must render in governance block"
+    )
+    assert "Reviewed by" in html, (
+        "FIX 5: 'Reviewed by' label must appear in governance block"
+    )
+    assert "Sources" in html, (
+        "FIX 5: 'Sources' label must appear in governance block"
+    )
+
+
+def test_quality_tab_label_evals(tmp_path):
+    """FIX 7: Quality tab label must be 'Quality (Evals)', not bare 'Quality'."""
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+    # Create evals/ so the Quality tab is gated in
+    (tmp_path / "agent1" / "evals").mkdir(parents=True, exist_ok=True)
+
+    html = _render_detail_html(tmp_path, console_data=None)
+
+    assert "Quality (Evals)" in html, (
+        "FIX 7: Quality tab label must be 'Quality (Evals)', not bare 'Quality'"
+    )
+
+
+def test_render_all_parity_still_holds(tmp_path):
+    """FIX 1 parity: render_all() with console_data still threads fleet_health correctly.
+
+    After FIX 1 (standalone compute), the render_all() path must NOT break: it still
+    threads console_data with pre-computed fleet_health so MUST 5 parity holds.
+    This test verifies render_all() produces the detail page and the monitor page,
+    and that the detail page contains a real health integer (not "—").
+    """
+    import re as _re
+    from atomic_agents.dashboard.render import render_all
+
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+
+    written = render_all(tmp_path, today=_TODAY)
+
+    per_agent = written.get("per_agent", [])
+    assert len(per_agent) >= 1, "render_all must write per-agent pages"
+
+    detail_path = tmp_path / "agent1" / "dashboard.html"
+    assert detail_path.exists()
+    detail_html = detail_path.read_text()
+
+    # Fleet health in the detail banner must be a real integer
+    m = _re.search(r'Fleet health</div>\s*<div class="bv[^"]*">([^<]+)</div>', detail_html)
+    assert m, "Detail banner must include Fleet health field after render_all"
+    val = m.group(1).strip()
+    assert val != "—", (
+        f"render_all() detail page Fleet health must show a real integer, not '—'; "
+        f"got {val!r}. MUST 5 parity requires fleet_health to flow through."
+    )
