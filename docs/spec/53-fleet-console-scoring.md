@@ -39,9 +39,11 @@ The advisor's OWN code never directly imports `agent.py`, `eval.py`, `tuning.py`
 
 | Axis | Metrics |
 |------|---------|
-| Cost | `cheaper_model_share`, `tokens_per_output`, `spend_vs_trend` |
+| Cost | `spend_vs_trend` (cost-anomaly detection) |
 | Quality | `pass_rate`, `hard_fail_rate` |
 | Reliability | `error_rate`, `blocked_rate`, `skipped_rate` |
+
+**#687 amendment (ruled 2026-07-05, MUST 14):** cost-**optimization** metrics — `cheaper_model_share` AND `tokens_per_output` — are **NOT health metrics** (see §3.6). "Could be cheaper / could be terser" is advice, not a health failure, so neither is scored into the Cost axis, the composite, the critical cap, or `status_for_agent()`. The Cost *health* axis measures cost **anomalies** (`spend_vs_trend` — an unexpected spend spike is a real failure signal) only; the optimization metrics feed recommendations (spec/54).
 
 ### 3.2 Scoring curve (MUST 1)
 
@@ -91,6 +93,20 @@ Applied **POST-computation** (after weighted mean). Two triggers, either of whic
 
 The composite is **banded on its canonical display integer** `int(round(raw_composite))` — derived from the raw capped float AFTER this critical-cap override (§3.3, MUST 11), never off a `round(composite, 1)` intermediate — so the headline number and its color always agree across the rounding boundary.
 
+### 3.6 Cost-optimization is advisory, not health (MUST 14, #687)
+
+**Ruled 2026-07-05.** Cost-**optimization** signals — "this agent could use a cheaper model" (`cheaper_model_share`) or "could produce terser output" (`tokens_per_output`) — are **recommendations**, not health failures. Conflating optimization with health made premium-model fleets read all-red: an agent running entirely on Opus/Sonnet with zero errors scored `cheaper_model_share = 0`, which (via the metric-level critical cap, §3.5) forced `composite ≤ 60`, `band = red`, `capped_by_axis = "metric"`, hence `status_for_agent() = ERROR` (spec/52 §17.1) — every row red, no signal. `tokens_per_output` has the identical shape (a legitimately verbose agent > ~3680 output tokens/run scores < 30 → same cap → ERROR).
+
+**MUST 14:** the cost-optimization metrics `cheaper_model_share` and `tokens_per_output` MUST NOT participate in the health score in any way — MUST NOT be scored into the Cost sub-score, contribute to the composite, lower the displayed health number, fire the axis- or metric-level critical cap (§3.5), set `capped_by_axis`, or influence `status_for_agent()`. The Cost **health** axis is scored from `spend_vs_trend` alone (cost-anomaly detection — a spend spike is a genuine failure). Health/status reflect FAILURES and ANOMALIES (errors, blocked, quality, staleness, spend spikes); optimization is surfaced as recommendations (spec/54).
+
+**Build sites (Codex-enumerated — remove both metrics from the health path):** `advisor/targets.py` `_DEFAULT_AXES` cost block (drop both metric defaults; cost-axis weight normalization already reweights over present metrics); `advisor/score.py` `_score_cost_axis` (drop the scored rows + `metric_scores.append` for both, plus their WoW / no-data / degraded row handling — keep computing `cheaper_model_share` as a VALUE for the recommendation path) and the metric-level-cap input list in `_compute_composite`; `dashboard/render.py` `_SCORECARD_DISPLAY_ORDER` (remove both from the Runtime-Health scorecard — they are not health rows). `status_for_agent()` (`_status.py`) and the fleet critical cap (`compute_fleet_health`, §7) then fix themselves upstream. Update the affected tests.
+
+**targets.md back-compat (fail-soft):** an operator whose `targets.md` still carries `scoring.axes.cost.metrics.cheaper_model_share` / `tokens_per_output` overrides after removal — the override is **ignored fail-soft** (the parser only iterates metrics present in `_DEFAULT_AXES`); it MUST NOT error and MUST NOT affect `used_defaults`.
+
+**Recommendation coupling (spec/54 + spec/52 + #689):** removing `cheaper_model_share` from the composite makes a model-swap's point-impact counterfactual (`projected_points_delta`, spec/54 §7) `≈ 0.0` — the swap no longer moves the score (`_compute_point_impact` stays fail-soft, returns ~0). The `savings_cost` recommendation STILL fires — it fires on its dollar delta (`projected_usd_delta`), not on points (recommend.py:491). To keep the suggestion STRONG (the point of the ruling), **`recommend_fleet()` MUST fall back to ranking `savings_cost` recs by `abs(projected_usd_delta)` when point-impact is 0/None** — IN #687's BUILD SCOPE (else a real-dollar savings rec is buried behind a 0-point rank). The rec DISPLAY refinement (surface `$/mo saved` first, drop the `→ Cost · +0 pts` tag) is #689. spec/54 §7 and spec/52 §17.3's "savings recs move the Cost axis / +N pts" language become stale — update them (savings recs are ranked/shown by `$ saved`; point-impact is normally 0 once optimization leaves health).
+
+**Conformance (MUST 14 strip-RED):** a clean agent running 100% premium models (`cheaper_model_share = 0`) AND legitimately verbose (`tokens_per_output` above the old <30 floor), with healthy Quality + Reliability, MUST score amber/green and status OK/WARN — NOT ERROR, NOT `capped_by_axis` from cost. Stripping the removal (re-adding EITHER metric to the Cost-axis scored/cap inputs) MUST turn that agent red — proving the guard is load-bearing.
+
 ---
 
 ## 4. No-data and degraded postures (MUST 7, MUST 8)
@@ -110,9 +126,14 @@ The composite is **banded on its canonical display integer** `int(round(raw_comp
 
 ### 5.1 Cost axis
 
-- **cheaper_model_share**: fraction of primary runs using a model with `output_rate < CHEAP_OUTPUT_RATE_THRESHOLD_USD_PER_1M` ($5.00). Strict less-than (ties are NOT cheap — fail-pessimistic per MUST 9). Unknown models are pessimistic (not cheap).
-- **tokens_per_output**: mean output tokens per completed primary run (completed + output_tokens > 0 only).
-- **spend_vs_trend**: `current_30d_spend / prior_30d_spend - 1.0`. Requires the prior-30d window non-empty (`prior_spend > 0`); an empty recent window yields ratio `-1.0` (maximal-improvement) and is still scored. The recent `[today-30, today]` and prior `[today-61, today-31]` windows are EQUAL LENGTH (31 inclusive days each) and non-overlapping, so a flat-spend fleet reports `0.0`, not a one-day bias.
+One health metric — cost-**anomaly** detection (the optimization metrics below are NOT scored into health; §3.6):
+- **spend_vs_trend**: `current_30d_spend / prior_30d_spend - 1.0`. Requires the prior-30d window non-empty (`prior_spend > 0`); an empty recent window yields ratio `-1.0` (maximal-improvement) and is still scored. The recent `[today-30, today]` and prior `[today-61, today-31]` windows are EQUAL LENGTH (31 inclusive days each) and non-overlapping, so a flat-spend fleet reports `0.0`, not a one-day bias. An unexpected spend spike is a genuine failure signal (runaway loop, misconfig) — so this metric MAY fire the critical cap, unlike the optimization metrics.
+
+**Optimization metrics — recommendation inputs, NOT health metrics (#687, §3.6):**
+- **cheaper_model_share**: fraction of primary runs using a model with `output_rate < CHEAP_OUTPUT_RATE_THRESHOLD_USD_PER_1M` ($5.00). Strict less-than (ties are NOT cheap — fail-pessimistic). Unknown models are pessimistic (not cheap). Consumed ONLY by the `savings_cost` recommendation (spec/54).
+- **tokens_per_output**: mean output tokens per completed primary run (completed + output_tokens > 0 only). A verbosity signal (may inform a future terseness recommendation).
+
+Neither optimization metric is scored into the Cost axis, the composite, the critical cap, or `status_for_agent()` (§3.6, MUST 14).
 
 ### 5.2 Quality axis
 
@@ -266,6 +287,7 @@ The band renders as: composite score, band color, sub-score chips (cost/quality/
 | 11 | Display integer (`composite_display` / `fleet_composite_display`) is `int(round(raw_composite))` rounded ONCE off the raw capped float AFTER critical-cap override (never off the 1-decimal `round(v, 1)` float — the #623 fleet double-round); band is assigned from the display integer, not the raw float; render.py consumes the display integer directly (no `{:.0f}` on raw floats) (#623). Covered for BOTH the per-agent composite (`_compute_composite`) and the fleet-headline path (`compute_fleet_health`). | `TestRoundedBandConsistency`, `TestFleetDisplayIntegerBoundaries` (per-agent boundaries + `test_fleet_79_45_is_amber_display_79` / `test_fleet_59_45_is_red_display_59` drive `compute_fleet_health`) |
 | 12 | Both 7d WoW windows are exactly 7 inclusive days each: current = [today−6, today], prior = [today−13, today−7] (#623) | `TestWoW7dEqualWindows` |
 | 13 | `_score_agent_from_data` is a zero-disk-I/O pure function; takes pre-loaded run + eval records; counterfactual use with `dataclasses.replace` must not mutate originals | `TestScoreAgentFromDataPureCore` |
+| 14 | Cost-optimization metrics (`cheaper_model_share`, `tokens_per_output`) do NOT participate in health: not scored into the Cost axis / composite / displayed number, never fire the critical cap or set `capped_by_axis`, never influence `status_for_agent()`; Cost health axis = `spend_vs_trend` only. A 100%-premium + verbose but otherwise-healthy agent is OK/WARN, never ERROR-from-cost. `savings_cost` recs still fire (on `$` delta) and rank by `abs(projected_usd_delta)` when point-impact is 0/None. Legacy `targets.md` overrides for the two metrics ignored fail-soft. (#687) | `TestCostOptimizationNotHealth` (strip-RED: re-adding either metric to the cap turns the healthy premium/verbose agent red) |
 
 ---
 

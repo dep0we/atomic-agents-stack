@@ -840,6 +840,62 @@ def test_detail_layered_rec_tags(tmp_path):
     )
 
 
+def test_detail_savings_cost_tiny_pts_no_badge():
+    """Rounding consistency (detail surface): pts_delta=0.04 → NO pts suffix in the tag.
+
+    round(0.04, 1) == 0.0, so the tag must render as '→ Cost' with no pts suffix.
+    The old guard `int(round(0.04)) == 0` happened to suppress it correctly, but for
+    the wrong reason (int-rounding to 0 vs display-precision rounding to 0.0).
+    This test pins the display-precision rule on the detail surface.
+    """
+    from atomic_agents.dashboard.render_agent_detail import (
+        _render_detail_recommendations,
+    )
+
+    rec = _StubRecommendation(
+        agent="agent1",
+        kind="savings_cost",
+        projected_points_delta=0.04,
+        projected_usd_delta=-5.0,
+    )
+    html = _render_detail_recommendations([rec], "agent1")
+    assert "Cost" in html, "savings_cost rec must still carry the '→ Cost' tag"
+    assert "+0.0 pts" not in html, (
+        "'+0.0 pts' must not appear for a rec whose 1-decimal display rounds to zero"
+    )
+    assert "+0.0" not in html, (
+        "no +0.0 text of any kind for a zero-display-precision pts delta"
+    )
+    assert "pts" not in html, (
+        "no 'pts' text must appear when point-impact rounds to 0.0 at display precision"
+    )
+
+
+def test_detail_savings_cost_real_nonzero_pts_shows_suffix():
+    """Rounding consistency (detail surface): pts_delta=0.4 DOES show its pts suffix.
+
+    round(0.4, 1) == 0.4, so the tag must render '→ Cost · +0.4 pts'.
+    The old guard `int(round(0.4)) == 0` (rounds to 0) incorrectly suppressed this.
+    This is the primary regression guard for the `int(round())` bug on the detail surface.
+    """
+    from atomic_agents.dashboard.render_agent_detail import (
+        _render_detail_recommendations,
+    )
+
+    rec = _StubRecommendation(
+        agent="agent1",
+        kind="savings_cost",
+        projected_points_delta=0.4,
+        projected_usd_delta=-8.0,
+    )
+    html = _render_detail_recommendations([rec], "agent1")
+    assert "Cost" in html, "savings_cost rec must carry the '→ Cost' tag"
+    assert "+0.4 pts" in html, (
+        "'+0.4 pts' must appear in the tag — the old int(round()) guard "
+        "collapses 0.4→0 and hides it; strip-RED for that regression"
+    )
+
+
 # ──────────────────────────────────────────────────────────────────
 # MUST 8: per-tab fail-soft; unknown agent → not-found
 
@@ -1250,6 +1306,7 @@ def test_standalone_banner_health_integer(tmp_path):
     # The banner must include a fleet health field — not the "—" skeleton.
     # Health int must appear in the banner grid "Fleet health" cell.
     import re as _re
+
     # The 8-field banner grid always includes a "Fleet health" cell.
     assert "Fleet health" in html, "Banner must include Fleet health field"
     # The value must not be "—" — health was computed standalone.
@@ -1437,9 +1494,7 @@ def test_standalone_governance_sources_rendered(tmp_path):
     assert "Reviewed by" in html, (
         "FIX 5: 'Reviewed by' label must appear in governance block"
     )
-    assert "Sources" in html, (
-        "FIX 5: 'Sources' label must appear in governance block"
-    )
+    assert "Sources" in html, "FIX 5: 'Sources' label must appear in governance block"
 
 
 def test_quality_tab_label_evals(tmp_path):
@@ -1480,7 +1535,9 @@ def test_render_all_parity_still_holds(tmp_path):
     detail_html = detail_path.read_text()
 
     # Fleet health in the detail banner must be a real integer
-    m = _re.search(r'Fleet health</div>\s*<div class="bv[^"]*">([^<]+)</div>', detail_html)
+    m = _re.search(
+        r'Fleet health</div>\s*<div class="bv[^"]*">([^<]+)</div>', detail_html
+    )
     assert m, "Detail banner must include Fleet health field after render_all"
     val = m.group(1).strip()
     assert val != "—", (

@@ -466,15 +466,21 @@ def _render_detail_recommendations(recs: list | None, agent_id: str) -> str:
         else:
             title = _html.escape(kind)
 
-        # Layered rec tags: savings_cost → "→ Cost · +N pts"; governance/quality_report → "advisory · not scored"
+        # Layered rec tags: savings_cost → "→ Cost" (or "→ Cost · +N pts" if non-zero);
+        # governance/quality_report → "advisory · not scored".
         # MUST 7: governance recs must NOT get an axis tag — only advisory tag.
+        # FIX 4: suppress "+N pts" when pts_delta is 0 or None (post-#687 savings recs
+        # have ~0 point impact; showing "+0 pts" is misleading).
         tags = ""
-        if kind == "savings_cost" and pts_delta is not None:
-            tags = (
-                f'<span class="rec-tag cost">'
-                f"&#8594; Cost &middot; +{int(round(pts_delta))} pts"
-                "</span>"
-            )
+        if kind == "savings_cost":
+            if pts_delta is not None:
+                display_pts = round(pts_delta, 1)
+                pts_suffix = (
+                    f" &middot; +{display_pts:.1f} pts" if display_pts != 0.0 else ""
+                )
+            else:
+                pts_suffix = ""
+            tags = f'<span class="rec-tag cost">&#8594; Cost{pts_suffix}</span>'
         elif kind in ("governance", "quality_report"):
             tags = '<span class="rec-tag advisory">advisory &middot; not scored</span>'
 
@@ -966,6 +972,7 @@ def _read_model_from_model_md(agent_root: "Path") -> str:
     Reads only the first 2 KB to stay fast — model.md is always small.
     """
     import re as _re2
+
     model_md = agent_root / "model.md"
     if not model_md.exists():
         return ""
@@ -1040,6 +1047,7 @@ def _compute_banner_stats(
                 now_tz = now
                 if now_tz.tzinfo is None:
                     from datetime import timezone as _tz
+
                     now_tz = now_tz.replace(tzinfo=_tz.utc)
                 cutoff_7d_dt = now_tz - _td(days=7)
                 runs_7d = 0
@@ -1050,6 +1058,7 @@ def _compute_banner_stats(
                         continue
                     if ts.tzinfo is None:
                         from datetime import timezone as _tz
+
                         ts = ts.replace(tzinfo=_tz.utc)
                     if ts >= cutoff_7d_dt:
                         runs_7d += 1
@@ -1063,6 +1072,7 @@ def _compute_banner_stats(
     evals_dir = agents_root / agent_id / "evals" / "runs"
     if evals_dir.exists():
         import json as _j2
+
         try:
             for f in sorted(evals_dir.glob("*.jsonl"), reverse=True)[:1]:
                 lines = f.read_text(encoding="utf-8").splitlines()
@@ -1129,9 +1139,11 @@ def _render_banner(
     # FIX 2: Permission-tier pill — from governance, independent of health.
     tier_str = _read_permission_tier(agent_ref)
     tier_pill_html = (
-        f'<span class="pill" style="color:var(--muted);border-color:var(--border);">' +
-        _html.escape(tier_str) + "</span>"
-        if tier_str else ""
+        f'<span class="pill" style="color:var(--muted);border-color:var(--border);">'
+        + _html.escape(tier_str)
+        + "</span>"
+        if tier_str
+        else ""
     )
 
     # Health score — 0-100 integer (MUST 5: never ×100 of raw float)
@@ -1173,7 +1185,9 @@ def _render_banner(
     _today_val = today or date.today()
     banner_stats: dict = {}
     if agents_root is not None:
-        banner_stats = _compute_banner_stats(cost_data, now, _today_val, agents_root, agent_id)
+        banner_stats = _compute_banner_stats(
+            cost_data, now, _today_val, agents_root, agent_id
+        )
 
     def _fmt_spend(v) -> str:
         return f"${v:.2f}" if v is not None else "—"
@@ -1645,6 +1659,7 @@ def render_agent_detail(
     if agent_health is None:
         try:
             from ..advisor.score import compute_fleet_health as _cfh
+
             _fh = _cfh(agents_root, today=today)
             for ah in getattr(_fh, "agents", []):
                 if getattr(ah, "agent", None) == agent_id:
@@ -1708,6 +1723,7 @@ def render_agent_detail(
             _top = getattr(_data, "top_runs", [])
             if _top:
                 from ..dashboard._reliability import _is_primary_run as _ipr
+
                 _primary = [r for r in _top if _ipr(r)]
                 if not _primary:
                     _primary = _top  # fall back to any run
@@ -1742,12 +1758,14 @@ def render_agent_detail(
         # FIX 4: standalone — compute recs for this fleet so the detail page is full.
         try:
             from ..advisor.recommend import recommend_fleet as _rf
+
             _fh_for_rec = None
             if agent_health is not None:
                 # Reuse the already-computed FleetHealth if we have it (avoid second pass).
                 # Wrap in a minimal FleetHealth-shaped object the recommender accepts.
                 try:
                     from ..advisor.score import compute_fleet_health as _cfh2
+
                     _fh_for_rec = _cfh2(agents_root, today=today)
                 except Exception:
                     pass

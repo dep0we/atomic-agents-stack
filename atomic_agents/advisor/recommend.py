@@ -84,6 +84,23 @@ RECOMMENDATION_KINDS: frozenset[str] = frozenset(
 )
 
 
+def _rec_sort_key(r: "Recommendation") -> tuple[float, float]:
+    """Sort key for Recommendation objects: (|points_delta|, usd_tiebreak) desc.
+
+    Ranking fallback (#687, spec/53 §3.6 + MUST 14): cheaper_model_share and
+    tokens_per_output are not health metrics after #687, so savings_cost recs have
+    projected_points_delta ~0.0.  For savings_cost recs with zero/None point-impact,
+    the tiebreak is abs(projected_usd_delta) so larger dollar savings rank first.
+    Non-savings_cost recs with zero points_delta get usd_tiebreak=0 (kind guard).
+    """
+    pts = abs(r.projected_points_delta) if r.projected_points_delta is not None else 0.0
+    if pts == 0.0 and r.kind == "savings_cost" and r.projected_usd_delta is not None:
+        usd = abs(r.projected_usd_delta)
+    else:
+        usd = 0.0
+    return (pts, usd)
+
+
 # ──────────────────────────────────────────────────────────────────
 # Public API dataclasses (spec/54 §3)
 
@@ -877,13 +894,7 @@ def recommend_fleet(
                 type(exc).__name__,
             )
 
-    # Sort by absolute projected_points_delta descending (highest impact first)
-    all_recs.sort(
-        key=lambda r: (
-            abs(r.projected_points_delta)
-            if r.projected_points_delta is not None
-            else 0.0
-        ),
-        reverse=True,
-    )
+    # Sort by _rec_sort_key: (|points_delta|, usd_tiebreak) descending.
+    # See module-level _rec_sort_key for the #687 ranking fallback rationale.
+    all_recs.sort(key=_rec_sort_key, reverse=True)
     return all_recs
