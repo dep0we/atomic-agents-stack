@@ -214,3 +214,54 @@ def test_count_provenance_degrades_to_zero_on_read_error(tmp_path, monkeypatch):
     # False-green guard: prove the backend was consulted and the exception
     # path (not the absent-dir (0, 0) path) was exercised.
     assert mock_backend.query.called
+
+
+def test_quality_html_renders_score_as_percentage(tmp_path):
+    """FIX #690: quality.html renders eval scores as integer percentages, not raw decimals.
+
+    weighted_score=4.0 (1-5 rubric scale) → '75%' in the trend table.
+    weighted_score=2.0 (1-5)              → '25%'.
+    Neither raw decimal ('4.00', '2.00') nor an absurd value ('400%') must appear.
+    """
+    from atomic_agents.dashboard.quality import aggregate_quality, render_quality
+
+    today = date.today()
+    # Write two agents with eval data so the trend table is non-empty.
+    for agent, ws in [("alice", 4.0), ("bob", 2.0)]:
+        runs_dir = tmp_path / agent / "evals" / "runs"
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        (tmp_path / agent / "log").mkdir(parents=True)
+        (tmp_path / agent / "model.md").write_text("# model\n")
+        rec = {
+            "ts": today.isoformat(),
+            "test_id": "t1",
+            "weighted_score": ws,
+            "hard_fails": [],
+            "scores": {"accuracy": ws},
+        }
+        (runs_dir / f"{today.isoformat()}.jsonl").write_text(json.dumps(rec) + "\n")
+
+    data = aggregate_quality(tmp_path, today=today)
+    out_path = render_quality(tmp_path, data)
+    html_content = out_path.read_text(encoding="utf-8")
+
+    # weighted_score=4.0 → (4.0-1)/4*100 = 75%
+    assert "75%" in html_content, (
+        "quality.html must render weighted_score=4.0 (1-5 scale) as '75%', "
+        "not as raw '4.00' or '400%'. FIX #690."
+    )
+    # weighted_score=2.0 → (2.0-1)/4*100 = 25%
+    assert "25%" in html_content, (
+        "quality.html must render weighted_score=2.0 (1-5 scale) as '25%'. FIX #690."
+    )
+    # Raw decimals like '4.00' must not appear in score cells.
+    assert ">4.00<" not in html_content, (
+        "quality.html must not render the raw float '4.00' in a score cell. FIX #690."
+    )
+    assert ">2.00<" not in html_content, (
+        "quality.html must not render the raw float '2.00' in a score cell. FIX #690."
+    )
+    # Sanity: no absurd percentages (>100%) from un-normalized 1-5 values.
+    assert "400%" not in html_content, (
+        "quality.html must not render '400%' — the 1-5 scale must be normalized. FIX #690."
+    )

@@ -207,6 +207,77 @@ def relative_time(ts: datetime, now: datetime | None = None) -> str:
     return f"{days // 365}y ago"
 
 
+def eval_score_fmt(value: "float | None") -> str:
+    """Format an eval score float as an integer percentage string.
+
+    Eval runner writes ``weighted_score`` on a 1-5 rubric scale (per spec/13;
+    dimension scores clamped to [1, 5], weighted average in the same range).
+    Legacy test fixtures and some display paths write a 0-1 ``score`` field.
+
+    Scale auto-detection:
+    - ``value > 1.0``  → 1-5 rubric scale  → ``round((value - 1) / 4 * 100)``
+    - ``value <= 1.0`` → 0-1 float          → ``round(value * 100)``
+
+    The result is always clamped to [0, 100] so a misbehaving judge that
+    returns e.g. 4.8 on a 0-1 scale (highly unlikely but possible in tests)
+    still renders as "100%" rather than "480%".
+
+    None/absent → "—".
+    """
+    if value is None:
+        return "—"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if v > 1.0:
+        # 1-5 rubric scale: map [1, 5] → [0, 100]
+        pct = (v - 1.0) / 4.0 * 100.0
+    else:
+        # 0-1 float scale
+        pct = v * 100.0
+    return f"{max(0, min(100, round(pct)))}%"
+
+
+def eval_score_delta_fmt(delta: "float | None") -> str:
+    """Format a score delta as a signed integer percentage string.
+
+    Applies the same scale auto-detection as :func:`eval_score_fmt`:
+    ``abs(delta) > 1.0`` → 1-5 scale → ``round(delta / 4 * 100)``;
+    otherwise → 0-1 scale → ``round(delta * 100)``.
+
+    Returns "—" for None; "+N%" or "-N%" (or "+0%") otherwise.
+    """
+    if delta is None:
+        return "—"
+    try:
+        d = float(delta)
+    except (TypeError, ValueError):
+        return "—"
+    if abs(d) > 1.0:
+        pct = d / 4.0 * 100.0
+    else:
+        pct = d * 100.0
+    rounded = round(pct)
+    sign = "+" if rounded >= 0 else ""
+    return f"{sign}{rounded}%"
+
+
+def eval_score_display(record: dict) -> str:
+    """Read the canonical eval score from a JSONL record and format it.
+
+    Preference order:
+    1. ``weighted_score`` — the field the eval runner actually writes (1-5 scale).
+    2. ``score`` — legacy field used by test fixtures and some early records (0-1 scale).
+
+    Delegates formatting to :func:`eval_score_fmt`.
+    """
+    value = record.get("weighted_score")
+    if value is None:
+        value = record.get("score")
+    return eval_score_fmt(value)
+
+
 def truncate(text: str, n: int) -> str:
     """Truncate text to n characters with ellipsis."""
     if len(text) <= n:

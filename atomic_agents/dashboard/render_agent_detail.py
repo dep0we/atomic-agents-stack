@@ -27,7 +27,12 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from .._io import atomic_write
-from ._shared import CSS as _SHARED_CSS, _CSP as _SHARED_CSP
+from ._shared import (
+    CSS as _SHARED_CSS,
+    _CSP as _SHARED_CSP,
+    eval_score_display as _eval_score_display,
+    eval_score_fmt as _eval_score_fmt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -874,10 +879,8 @@ def _render_quality_tab(agent_id: str, agents_root: Path) -> str:
         ts = rec.get("ts", rec.get("timestamp", ""))
         ts_str = str(ts)[:19].replace("T", " ") if ts else "—"
         verdict = rec.get("verdict", rec.get("status", ""))
-        score = rec.get("score")
-        # Eval score is a 0-1 float — render as integer percentage (e.g. 0.88 → "88%").
-        # A None/absent score shows "—".
-        score_str = f"{float(score) * 100:.0f}%" if score is not None else "—"
+        # Reads weighted_score (1-5 rubric scale) with fallback to score (0-1 legacy).
+        score_str = _eval_score_display(rec)
         run_id = rec.get("run_id", "")[:12]
         rows.append(
             f"<tr><td class='mono' style='font-size:11px;'>{_html.escape(ts_str)}</td>"
@@ -1095,7 +1098,11 @@ def _compute_banner_stats(
                         continue
                     try:
                         rec = _j2.loads(line)
-                        sc = rec.get("score")
+                        # weighted_score is the canonical field (1-5 rubric scale).
+                        # Fall back to score (0-1) for legacy fixtures.
+                        sc = rec.get("weighted_score")
+                        if sc is None:
+                            sc = rec.get("score")
                         if sc is not None:
                             eval_score = float(sc)
                             break
@@ -1209,9 +1216,9 @@ def _render_banner(
         return str(v) if v is not None else "—"
 
     def _fmt_score(v) -> str:
-        # Eval score is a 0-1 float; render as a 0-100 integer percentage.
-        # A None/absent score shows "—" (not "0%").
-        return f"{float(v) * 100:.0f}%" if v is not None else "—"
+        # Delegates to shared helper: handles 1-5 rubric scale and 0-1 legacy scale.
+        # None → "—". Value > 1.0 → normalized from [1,5] range. ≤ 1.0 → ×100.
+        return _eval_score_fmt(v)
 
     spend_7d_str = _fmt_spend(banner_stats.get("spend_7d"))
     spend_30d_str = _fmt_spend(banner_stats.get("spend_30d"))

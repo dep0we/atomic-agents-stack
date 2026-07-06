@@ -1602,7 +1602,11 @@ def test_eval_score_banner_none_shows_dash(tmp_path):
 
 
 def test_eval_score_quality_tab_shows_percentage(tmp_path):
-    """FIX #690: Quality tab score column renders 0.88 as '88%', not '0.88'."""
+    """FIX #690: Quality tab score column renders 0.88 as '88%', not '0.88'.
+
+    Scoped to the tabpanel-quality region so the assertion is satisfied by the
+    Quality tab itself, not by the banner "88%" that happens to appear elsewhere.
+    """
     _write_agent(tmp_path, "agent1")
     _write_log(tmp_path, "agent1")
     # Create evals/ so the Quality tab gates in, and write a score
@@ -1610,14 +1614,25 @@ def test_eval_score_quality_tab_shows_percentage(tmp_path):
 
     html = _render_detail_html(tmp_path, console_data=None)
 
-    # The Quality tab score column must show "88%" and NOT the raw 0-1 representation
-    assert "88%" in html, "Quality tab must render eval score 0.88 as '88%' (FIX #690)."
-    # The raw "0.88" string must NOT appear (would mean the old format slipped through)
-    # Note: we check only the score cell context — "0.88" could theoretically appear
-    # in rationale text, but not in a score column.
-    # A simpler and safe assertion: the score table cell must not show "0.88".
-    assert ">0.88<" not in html, (
-        "Quality tab score column must not render the raw 0-1 float '0.88' — "
+    # Extract only the tabpanel-quality region — must find it before asserting its content.
+    quality_match = re.search(
+        r'id="tabpanel-quality">(.*?)</div>\s*(?:<div class="tab-panel|$)',
+        html,
+        re.DOTALL,
+    )
+    assert quality_match, (
+        "tabpanel-quality region must be present when evals/ exist (FIX #690)."
+    )
+    quality_content = quality_match.group(1)
+
+    # The Quality tab score column must show "88%" in the tab itself.
+    assert "88%" in quality_content, (
+        "Quality tab (tabpanel-quality) must render eval score 0.88 as '88%' — "
+        "not just in the banner. FIX #690."
+    )
+    # The raw decimal must not appear in the score cell.
+    assert ">0.88<" not in quality_content, (
+        "Quality tab score column must not render the raw 0-1 float '>0.88<' — "
         "must render '88%' instead (FIX #690)."
     )
 
@@ -1721,16 +1736,115 @@ def test_recs_zone_savings_rec_standalone_not_in_overview_tab(tmp_path):
         "when projected_points_delta is 0.0."
     )
 
-    # The Overview tab panel must NOT contain a rec card (recs moved out)
-    # Find the Overview tab panel content
+    # The Overview tab panel must NOT contain a rec card (recs moved out).
+    # Assert the panel was found before checking its contents — a missing match
+    # would silently pass (false-green) under the old `if overview_match:` guard.
     overview_match = re.search(
         r'id="tabpanel-overview">(.*?)</div>\s*<div class="tab-panel',
         html,
         re.DOTALL,
     )
-    if overview_match:
-        overview_content = overview_match.group(1)
-        assert "rec-card" not in overview_content, (
-            "FIX #689: rec-card must NOT appear inside the Overview tab panel — "
-            "recs were moved to the standalone zone."
+    assert overview_match, (
+        "tabpanel-overview must be present in the rendered HTML (FIX #689 guard)."
+    )
+    overview_content = overview_match.group(1)
+    assert "rec-card" not in overview_content, (
+        "FIX #689: rec-card must NOT appear inside the Overview tab panel — "
+        "recs were moved to the standalone zone."
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# FIX #690 — shared helper: weighted_score fallback + scale guard
+
+
+def _write_eval_weighted_score(
+    agents_root: Path, agent: str, weighted_score: float
+) -> None:
+    """Write a minimal eval JSONL with weighted_score (1-5 rubric scale, no 'score' key)."""
+    runs_dir = agents_root / agent / "evals" / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "ts": _RECENT.isoformat(),
+        "verdict": "pass",
+        "weighted_score": weighted_score,
+        "run_id": "run-ws-fallback",
+    }
+    (runs_dir / f"{_TODAY.isoformat()}.jsonl").write_text(json.dumps(rec) + "\n")
+
+
+def test_eval_score_weighted_score_fallback_banner(tmp_path):
+    """FIX #690: banner reads weighted_score (1-5) when 'score' is absent.
+
+    Real eval-runner logs write weighted_score, not score. A record with only
+    weighted_score=4.0 (1-5 scale) must render "75%" (=(4-1)/4*100), not "—".
+    """
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+    _write_eval_weighted_score(tmp_path, "agent1", 4.0)
+
+    html = _render_detail_html(tmp_path, console_data=None)
+
+    m = re.search(r'Eval score</div>\s*<div class="bv[^"]*">([^<]+)</div>', html)
+    assert m, "Banner must include 'Eval score' field"
+    val = m.group(1).strip()
+    assert val == "75%", (
+        f"weighted_score=4.0 (1-5 scale) must display as '75%' in banner, got {val!r}. "
+        "FIX #690: (4.0-1)/4*100 = 75. weighted_score fallback must be active."
+    )
+
+
+def test_eval_score_weighted_score_fallback_quality_tab(tmp_path):
+    """FIX #690: Quality tab reads weighted_score (1-5) with no 'score' key.
+
+    A record with only weighted_score=3.0 must render '50%' in tabpanel-quality
+    (not '—', which would mean the fallback was not wired).
+    """
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+    _write_eval_weighted_score(tmp_path, "agent1", 3.0)  # midpoint of 1-5 → 50%
+
+    html = _render_detail_html(tmp_path, console_data=None)
+
+    quality_match = re.search(
+        r'id="tabpanel-quality">(.*?)</div>\s*(?:<div class="tab-panel|$)',
+        html,
+        re.DOTALL,
+    )
+    assert quality_match, "tabpanel-quality must be present when evals/ exist"
+    quality_content = quality_match.group(1)
+
+    assert "50%" in quality_content, (
+        "Quality tab must render weighted_score=3.0 (1-5 scale) as '50%'. "
+        "FIX #690: weighted_score fallback must be active in _render_quality_tab."
+    )
+    assert ">—<" not in quality_content or "50%" in quality_content, (
+        "Quality tab must not show '—' when weighted_score is present."
+    )
+
+
+def test_eval_score_no_gt100_percent(tmp_path):
+    """FIX #690: a 1-5 scale weighted_score must never render as '>100%'.
+
+    weighted_score=4.2 (valid 1-5 value) → (4.2-1)/4*100 = 80%, not '420%'.
+    """
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+    _write_eval_weighted_score(tmp_path, "agent1", 4.2)
+
+    html = _render_detail_html(tmp_path, console_data=None)
+
+    # Check banner
+    m = re.search(r'Eval score</div>\s*<div class="bv[^"]*">([^<]+)</div>', html)
+    assert m, "Banner must include 'Eval score' field"
+    val = m.group(1).strip()
+    assert val != "420%", (
+        "FIX #690: weighted_score=4.2 must NOT render as '420%'. "
+        "The 1-5 scale must be normalized: (4.2-1)/4*100 = 80%."
+    )
+    # Must be a sane percentage (≤100%)
+    if val.endswith("%"):
+        numeric = int(val.rstrip("%"))
+        assert numeric <= 100, (
+            f"Eval score percentage must never exceed 100%, got {val!r}."
         )

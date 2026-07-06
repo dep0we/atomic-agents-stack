@@ -9,6 +9,10 @@ from __future__ import annotations
 import html as _html
 
 from ._registry import PanelContext, PanelResult, register
+from .._shared import (
+    eval_score_fmt as _eval_score_fmt,
+    eval_score_delta_fmt as _eval_score_delta_fmt,
+)
 
 
 class _TrendPanelsPanel:
@@ -75,19 +79,15 @@ def _render_quality_panel(ctx: PanelContext) -> str:
             if qs.latest_score is None:
                 score_html = '<span class="axis-muted">no evals</span>'
             else:
-                # Eval score is a 0-1 float; display as integer percentage (e.g. 0.88 → "88%").
+                # Use shared formatter: handles 1-5 rubric scale (QualitySignal carries
+                # weighted_score read directly from JSONL) and 0-1 legacy float.
+                # Never emits ">100%" regardless of scale.
                 delta_str = ""
                 if qs.delta_30d is not None:
-                    sign = "+" if qs.delta_30d >= 0 else ""
+                    delta_fmt = _eval_score_delta_fmt(qs.delta_30d)
                     delta_cls = "axis-ok" if qs.delta_30d >= 0 else "axis-spike"
-                    delta_pct = qs.delta_30d * 100
-                    delta_str = (
-                        f' <span class="{delta_cls}">{sign}{delta_pct:.0f}%</span>'
-                    )
-                score_pct = qs.latest_score * 100
-                score_html = (
-                    f'<span class="axis-val">{score_pct:.0f}%{delta_str}</span>'
-                )
+                    delta_str = f' <span class="{delta_cls}">{delta_fmt}</span>'
+                score_html = f'<span class="axis-val">{_eval_score_fmt(qs.latest_score)}{delta_str}</span>'
             qual_rows.append(
                 f'<div class="axis-row">'
                 f"<div>{_html.escape(qs.agent)}</div>"
