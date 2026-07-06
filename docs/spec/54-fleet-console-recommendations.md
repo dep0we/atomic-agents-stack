@@ -157,9 +157,9 @@ When the operator supplies a list for the agent's majority work-type, the **firs
 
 ---
 
-## 7. `savings_cost` rec: point-impact ranking (Option 1)
+## 7. `savings_cost` rec: ranking by point-impact + USD fallback (#687)
 
-Recs are ranked by fleet-health-point-impact using pure counterfactual scoring (Option 1 ruling):
+Recs are ranked by `(abs(projected_points_delta), abs(projected_usd_delta) tiebreak)` descending. After #687, `cheaper_model_share` and `tokens_per_output` are no longer health metrics, so every `savings_cost` rec produces `projected_points_delta ≈ 0.0`. When `projected_points_delta == 0` and `kind == "savings_cost"`, the tiebreak is `abs(projected_usd_delta)` — larger dollar savings rank first. For non-`savings_cost` kinds the USD tiebreak is 0. The point-impact is computed via pure counterfactual scoring (Option 1 ruling):
 
 1. Reprice the agent's **primary** 30d `run_records` (`_is_primary_run`) at `candidate_model` rates via `_reprice_run()` (uses `calc_cost()` with actual `cache_hit_tokens` — `calc_cost` applies `CACHE_HIT_DISCOUNT` internally). Helper/delegate runs are NOT repriced — a primary-model swap does not change what model a helper call ran on.
 2. Build a counterfactual `runs_30d` list using `dataclasses.replace(run, model=candidate, cost_usd=repriced)` **for primary runs only** — helper/delegate runs keep their own model and cost; originals are never mutated (MUST 8).

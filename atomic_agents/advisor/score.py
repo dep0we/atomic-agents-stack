@@ -689,48 +689,23 @@ def _score_cost_axis(
     """
     cost_targets = targets.axes.get("cost", {})
 
-    # Primary runs for the optimization metrics (cheaper_model_share,
-    # tokens_per_output) — these are computed as VALUES for the recommendation
-    # path but NOT scored into the cost sub-score or metric_scores (#687 MUST 14).
-    primary_30d = [r for r in runs_30d if _is_primary_run(r)]
-
-    if not primary_30d:
-        return None, [
-            ScorecardRow(
-                metric="spend_vs_trend",
-                axis="cost",
-                value=None,
-                target=None,
-                status="no_data",
-                score=None,
-                wow=None,
-            )
-        ]
-
     rows: list[ScorecardRow] = []
     metric_scores: list[float] = []
-
-    # ── cheaper_model_share (VALUE only — NOT scored into health) ──────────────
-    # Computed here so the value is available via ScorecardRow for display /
-    # downstream consumers. NOT appended to metric_scores. NOT scored into the
-    # cost sub-score. NOT capable of firing the critical cap. (#687 MUST 14)
-    cheap_count = sum(1 for r in primary_30d if _is_cheap_model(r.model))
-    cheaper_share = cheap_count / len(primary_30d)
-
-    # ── tokens_per_output (VALUE only — NOT scored into health) ─────────────
-    # Denominator: completed primary runs with output_tokens > 0.
-    # NOT appended to metric_scores. NOT scored into health. (#687 MUST 14)
-    completed = [
-        r for r in primary_30d if r.status == "completed" and r.output_tokens > 0
-    ]
-    tpo: float | None = None
-    if completed:
-        tpo = sum(r.output_tokens for r in completed) / len(completed)
 
     # ── spend_vs_trend ───────────────────────────────────────────
     # spend-vs-trend = (recent_30d_spend / prior_30d_spend) - 1.0
     # Requires prior 30d spend > 0. Uses ALL billable runs (not primary-only):
     # helpers and delegates are billed to the fleet.
+    #
+    # FIX 5: cheaper_model_share and tokens_per_output were previously computed
+    # here as advisory-only VALUES. They have been removed: recommend.py computes
+    # its own candidate reprice directly from run records and does NOT read
+    # cheaper_share or tpo from this function. The dead computation has been deleted.
+    #
+    # FIX 6: the previous early return on `not primary_30d` gated spend_vs_trend
+    # incorrectly. spend_vs_trend uses ALL billable runs (helpers + delegates),
+    # so an agent with only helper/delegate spend was wrongly excluded from cost
+    # scoring. The early return is removed; spend_vs_trend proceeds regardless.
     recent_spend = sum(r.cost_usd for r in runs_30d)
     prior_spend = sum(r.cost_usd for r in runs_prior_30d)
 
@@ -751,8 +726,7 @@ def _score_cost_axis(
     mt_svt = cost_targets.get("spend_vs_trend")
     if spend_vs_trend_degraded:
         # Prior-window read was degraded → prior-spend denominator is unreliable.
-        # Emit a 'degraded' row and EXCLUDE this metric from the sub-score (MUST 8),
-        # without poisoning the recent-only cheaper_share / tokens_per_output metrics.
+        # Emit a 'degraded' row and EXCLUDE this metric from the sub-score (MUST 8).
         rows.append(
             ScorecardRow(
                 metric="spend_vs_trend",
@@ -883,8 +857,7 @@ def _score_agent_from_data(
 
     # ── Cost axis ────────────────────────────────────────────────
     # A prior-window-only degrade reaches here with cost_degraded False (recent is
-    # clean): cheaper_model_share + tokens_per_output still score off recent data;
-    # spend_vs_trend alone is excluded (it is the only metric that reads prior spend).
+    # clean): spend_vs_trend is excluded (it is the only metric that reads prior spend).
     if not health.cost_degraded:
         try:
             cost_score, cost_rows = _score_cost_axis(

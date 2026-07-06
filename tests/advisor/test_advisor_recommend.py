@@ -1490,6 +1490,29 @@ class TestRecommendFleet:
             f"recs must be sorted descending by point delta; got {all_pts!r}"
         )
 
+        # FIX 2: After #687, savings_cost recs have ~0 pts. Verify USD fallback ordering:
+        # savings_cost recs with 0/None point-impact must be ordered by descending
+        # abs(projected_usd_delta). This assertion goes RED if the USD fallback sort
+        # is removed from _rec_sort_key (it would only care about pts, not USD).
+        savings_recs = [r for r in recs if r.kind == "savings_cost"]
+        if len(savings_recs) >= 2:
+            all_have_zero_pts = all(
+                r.projected_points_delta is None or abs(r.projected_points_delta) < 1.0
+                for r in savings_recs
+            )
+            if all_have_zero_pts:
+                usd_magnitudes = [
+                    abs(r.projected_usd_delta)
+                    if r.projected_usd_delta is not None
+                    else 0.0
+                    for r in savings_recs
+                ]
+                assert usd_magnitudes == sorted(usd_magnitudes, reverse=True), (
+                    "FIX 2: savings_cost recs with 0/None point-impact must be ordered by "
+                    f"descending abs(projected_usd_delta); got usd_magnitudes={usd_magnitudes!r}. "
+                    "Stripping the USD fallback from _rec_sort_key would break this order."
+                )
+
         # Sonnet-agent savings rec must be present (sonnet→haiku is a valid downgrade).
         sonnet_savings = [
             r for r in recs if r.kind == "savings_cost" and r.agent == "sonnet-agent"

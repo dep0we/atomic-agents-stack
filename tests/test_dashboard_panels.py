@@ -1308,15 +1308,28 @@ def test_savings_cost_rec_renders_axis_tag():
 
 
 def test_savings_cost_rec_zero_pts_shows_cost_only():
-    """B7: savings_cost rec with projected_points_delta=0 shows '→ Cost' without pts."""
+    """B7/FIX 4: savings_cost rec with projected_points_delta=0 shows '→ Cost' without pts.
+
+    Post-#687: model swaps produce ~0 point impact (cheaper_model_share is not a
+    health metric), so savings recs render "→ Cost" with no points suffix and NO
+    rec-delta-points badge. Asserting the badge class and any "pts" text is absent
+    prevents the "+0.0 pts" display regression.
+    """
     from atomic_agents.dashboard.render import _render_recommendations
 
     rec = _StubRec(kind="savings_cost", projected_points_delta=0.0)
     html = _render_recommendations([rec])
     assert "rec-axis-tag" in html
     assert "Cost" in html
-    # Should NOT show "+0 pts" (the pts suffix is suppressed when delta rounds to 0)
-    assert "+0 pts" not in html
+    # Must NOT show "+0 pts" or "+0.0 pts" — neither in the axis tag nor as a badge.
+    assert "+0 pts" not in html, "zero pts must not appear in axis tag"
+    assert "rec-delta-points" not in html, (
+        "FIX 4: rec-delta-points badge must be suppressed for savings_cost when pts=0; "
+        "stripping the `pts_delta != 0.0` guard would make it appear"
+    )
+    assert "pts" not in html, (
+        "FIX 4: no 'pts' text should appear for a savings rec with 0 point-impact"
+    )
 
 
 def test_savings_cost_rec_none_pts_shows_cost_tag():

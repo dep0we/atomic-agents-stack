@@ -466,15 +466,16 @@ def _render_detail_recommendations(recs: list | None, agent_id: str) -> str:
         else:
             title = _html.escape(kind)
 
-        # Layered rec tags: savings_cost → "→ Cost · +N pts"; governance/quality_report → "advisory · not scored"
+        # Layered rec tags: savings_cost → "→ Cost" (or "→ Cost · +N pts" if non-zero);
+        # governance/quality_report → "advisory · not scored".
         # MUST 7: governance recs must NOT get an axis tag — only advisory tag.
+        # FIX 4: suppress "+N pts" when pts_delta is 0 or None (post-#687 savings recs
+        # have ~0 point impact; showing "+0 pts" is misleading).
         tags = ""
-        if kind == "savings_cost" and pts_delta is not None:
-            tags = (
-                f'<span class="rec-tag cost">'
-                f"&#8594; Cost &middot; +{int(round(pts_delta))} pts"
-                "</span>"
-            )
+        if kind == "savings_cost":
+            pts_nonzero = pts_delta is not None and int(round(pts_delta)) != 0
+            pts_suffix = f" &middot; +{int(round(pts_delta))} pts" if pts_nonzero else ""
+            tags = f'<span class="rec-tag cost">&#8594; Cost{pts_suffix}</span>'
         elif kind in ("governance", "quality_report"):
             tags = '<span class="rec-tag advisory">advisory &middot; not scored</span>'
 

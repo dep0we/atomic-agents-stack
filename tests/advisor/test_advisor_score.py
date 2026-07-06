@@ -566,20 +566,29 @@ class TestNoDataPosture:
         # Quality is absent → excluded from composite (not scored as 0).
         assert ah.quality_score is None
         # Reliability has data (1 completed run → 100% reliability → score = 100).
-        assert ah.reliability_score is not None
-        assert ah.composite is not None
-        # The composite must equal the mean of present (non-None) axes only.
-        # Cost score may be None when spend_vs_trend lacks prior-window data —
-        # that is correct behavior, NOT a bug.
+        assert ah.reliability_score is not None, (
+            "reliability_score must not be None for an agent with 1 completed run"
+        )
+        assert ah.composite is not None, (
+            "composite must not be None when at least one axis (reliability) has data"
+        )
+        # FIX 3: unconditional composite invariant — do NOT silently skip if
+        # present_scores is empty. The test setup guarantees reliability_score is
+        # present; if present_scores were empty, the assertion above would have
+        # already failed. No `if present_scores:` conditional.
         present_scores = [
             s for s in [ah.cost_score, ah.reliability_score] if s is not None
         ]
-        if present_scores:
-            expected = sum(present_scores) / len(present_scores)
-            assert abs(ah.composite - expected) < 0.2, (
-                f"composite {ah.composite} must equal mean of present axes {expected} "
-                "(quality excluded, not scored as 0)"
-            )
+        # Reliability must be present (assert above guarantees it).
+        assert present_scores, (
+            "at least reliability_score must be a present axis; got no present scores — "
+            "this means the test fixture or the scorer silently dropped all axes"
+        )
+        expected = sum(present_scores) / len(present_scores)
+        assert abs(ah.composite - expected) < 0.2, (
+            f"composite {ah.composite} must equal mean of present axes {expected} "
+            "(quality excluded, not scored as 0); present_scores={present_scores}"
+        )
 
     def test_strip_red_zero_evals_not_scored_as_zero(self, tmp_path):
         """strip-RED: quality=0.0 must NOT be assigned when evals are absent."""
@@ -2320,55 +2329,112 @@ class TestCostOptimizationNotHealth:
         )
 
     def test_strip_red_cheaper_model_share_in_cap_makes_agent_red(self, tmp_path):
-        """strip-RED: re-adding cheaper_model_share to the metric-level cap input
-        MUST turn the healthy premium agent red (proves the guard is load-bearing).
+        """strip-RED PRODUCT-LEVEL: if _score_cost_axis were to re-add cheaper_model_share
+        as a SCORED ScorecardRow (score=0), the scorecard → metric_scores path MUST turn
+        the healthy premium agent red (proves the guard is load-bearing at the product level,
+        not just at the _compute_composite math level).
 
-        We directly inject a sub-threshold (< 30) cheaper_model_share score into
-        _compute_composite's metric_scores list to simulate what the old code did.
+        This exercises the full _score_agent_from_data → scorecard → metric_scores →
+        _compute_composite product path, not a synthetic _compute_composite call.
+        The baseline confirms the real agent is healthy; the patched version patches
+        _score_cost_axis to inject a scored cheaper_model_share row.
         """
+        from unittest import mock
+
+        from atomic_agents.advisor import score as score_mod
+        from atomic_agents.advisor.score import _score_agent_from_data
+
+        # The fixture helper produces a healthy agent via the real product path.
         ah = self._make_premium_verbose_agent_health(tmp_path)
         assert ah.composite is not None, "fixture must produce a composite"
+        assert ah.capped_by_axis is None, "baseline: healthy agent must not be capped"
 
-        # The original agent is healthy (not capped).
-        assert ah.capped_by_axis is None
+        # Build the inputs for a second call; reuse the fixture's run data.
+        today = date(2030, 9, 15)
+        today_dt = __import__("datetime").datetime(2030, 9, 15, tzinfo=__import__("datetime").timezone.utc)
+        targets = __import__("atomic_agents.advisor.targets", fromlist=["parse_targets"]).parse_targets(tmp_path)
 
-        # Simulate adding cheaper_model_share score of 0 (100%-premium agent →
-        # cheaper_share=0 → score=0 under the old scoring) to the cap input.
-        from atomic_agents.advisor.score import _compute_composite
+        def _mk_run(days_ago: int) -> RunRecord:
+            run_date = today - timedelta(days=days_ago)
+            ts = __import__("datetime").datetime(
+                run_date.year, run_date.month, run_date.day, 12,
+                tzinfo=__import__("datetime").timezone.utc,
+            )
+            return RunRecord(
+                ts=ts, agent="premium-agent", trigger="cron",
+                model="claude-opus-4-8", input_tokens=5000, output_tokens=4000,
+                cost_usd=2.50, cache_hit_tokens=0, cache_miss_tokens=5000,
+                latency_ms=500, status="completed", summary="ok",
+                parent_run_id=None, extra={},
+            )
 
-        sub_scores = {
-            "cost": ah.cost_score,
-            "quality": ah.quality_score,
-            "reliability": ah.reliability_score,
-        }
-        # Strip-RED: inject cheaper_model_share=0 into metric_scores → cap fires.
-        metric_scores_with_cheaper = [
-            0.0
-        ]  # cheaper_model_share score = 0 (all premium)
-        _, band_with, capped_with = _compute_composite(
-            sub_scores,
-            {"cost": 1 / 3, "quality": 1 / 3, "reliability": 1 / 3},
-            metric_scores_with_cheaper,
+        runs_30d = [_mk_run(i) for i in range(1, 31)]
+        runs_prior_30d = [_mk_run(i) for i in range(32, 62)]
+        six = today - timedelta(days=6)
+        ps = today - timedelta(days=13)
+        pe = today - timedelta(days=7)
+
+        # Capture what the REAL _score_cost_axis returns, then augment it with a
+        # scored cheaper_model_share row (score=0). This simulates what the pre-#687
+        # code did and proves the guard is load-bearing at the product path.
+        real_score_cost_axis = score_mod._score_cost_axis
+
+        def _patched_cost_axis(*args, **kwargs):
+            cost_score, rows = real_score_cost_axis(*args, **kwargs)
+            # Inject a scored cheaper_model_share row: score=0 (100% premium agent).
+            rows.append(
+                ScorecardRow(
+                    metric="cheaper_model_share",
+                    axis="cost",
+                    value=0.0,
+                    target=0.5,
+                    status="crit",
+                    score=0.0,  # sub-threshold → must fire the critical cap
+                    wow=None,
+                )
+            )
+            return cost_score, rows
+
+        with mock.patch.object(score_mod, "_score_cost_axis", side_effect=_patched_cost_axis):
+            ah_with = _score_agent_from_data(
+                agent="premium-agent",
+                runs_30d=runs_30d,
+                runs_prior_30d=runs_prior_30d,
+                eval_records=[],
+                targets=targets,
+                today=today,
+                six_days_ago=six,
+                prior_7_start=ps,
+                prior_7_end=pe,
+            )
+
+        assert ah_with.band == "red", (
+            "strip-RED: re-adding cheaper_model_share as a scored ScorecardRow (score=0) "
+            "MUST turn the healthy premium agent red via the scorecard→metric_scores path; "
+            f"got band={ah_with.band!r}, capped_by_axis={ah_with.capped_by_axis!r}"
         )
-        assert band_with == "red", (
-            "Injecting cheaper_model_share=0 into the cap input MUST force red "
-            f"(this is the old broken behavior #687 fixes); got {band_with!r}"
-        )
-        assert capped_with == "metric", (
-            f"capped_by_axis must be 'metric' when cheaper_model_share=0 is injected; "
-            f"got {capped_with!r}"
+        assert ah_with.capped_by_axis == "metric", (
+            f"capped_by_axis must be 'metric' when cheaper_model_share=0 is in scorecard; "
+            f"got {ah_with.capped_by_axis!r}"
         )
 
     def test_strip_red_tokens_per_output_in_cap_makes_agent_red(self, tmp_path):
-        """strip-RED: re-adding tokens_per_output to the metric-level cap input
-        MUST turn the healthy verbose agent red (proves the guard is load-bearing).
+        """strip-RED PRODUCT-LEVEL: if _score_cost_axis were to re-add tokens_per_output
+        as a SCORED ScorecardRow with a sub-threshold score, the full
+        _score_agent_from_data path MUST turn the healthy verbose agent red
+        (proves the guard is load-bearing at the product level).
+
+        This tests the real scorecard → metric_scores → _compute_composite path.
         """
-        from atomic_agents.advisor.score import _compute_composite, _map_metric_to_score
+        from unittest import mock
+
+        from atomic_agents.advisor import score as score_mod
+        from atomic_agents.advisor.score import _map_metric_to_score, _score_agent_from_data
         from atomic_agents.advisor.targets import MetricTarget
 
         ah = self._make_premium_verbose_agent_health(tmp_path)
         assert ah.composite is not None, "fixture must produce a composite"
-        assert ah.capped_by_axis is None, "fixture must start as healthy"
+        assert ah.capped_by_axis is None, "baseline: healthy agent must not be capped"
 
         # Compute what tokens_per_output score would be for 4000 tokens under the
         # old default target (target=500, direction=lower, band=100, floor=5000).
@@ -2376,28 +2442,75 @@ class TestCostOptimizationNotHealth:
             target=500.0, direction="lower", band=100.0, floor=5000.0
         )
         tpo_score = _map_metric_to_score(4000.0, old_tpo_target)
-        # 4000 tokens is above the old floor (5000) — score should be < 30.
         assert tpo_score < CRITICAL_SUBSCORE_THRESHOLD, (
             f"tokens_per_output=4000 under old target must score < {CRITICAL_SUBSCORE_THRESHOLD}; "
             f"got {tpo_score:.1f}"
         )
 
-        sub_scores = {
-            "cost": ah.cost_score,
-            "quality": ah.quality_score,
-            "reliability": ah.reliability_score,
-        }
-        # Strip-RED: inject tokens_per_output sub-threshold score → cap fires.
-        _, band_with, capped_with = _compute_composite(
-            sub_scores,
-            {"cost": 1 / 3, "quality": 1 / 3, "reliability": 1 / 3},
-            [tpo_score],
+        today = date(2030, 9, 15)
+        targets = __import__("atomic_agents.advisor.targets", fromlist=["parse_targets"]).parse_targets(tmp_path)
+
+        def _mk_run(days_ago: int) -> RunRecord:
+            run_date = today - timedelta(days=days_ago)
+            ts = __import__("datetime").datetime(
+                run_date.year, run_date.month, run_date.day, 12,
+                tzinfo=__import__("datetime").timezone.utc,
+            )
+            return RunRecord(
+                ts=ts, agent="premium-agent", trigger="cron",
+                model="claude-opus-4-8", input_tokens=5000, output_tokens=4000,
+                cost_usd=2.50, cache_hit_tokens=0, cache_miss_tokens=5000,
+                latency_ms=500, status="completed", summary="ok",
+                parent_run_id=None, extra={},
+            )
+
+        runs_30d = [_mk_run(i) for i in range(1, 31)]
+        runs_prior_30d = [_mk_run(i) for i in range(32, 62)]
+        six = today - timedelta(days=6)
+        ps = today - timedelta(days=13)
+        pe = today - timedelta(days=7)
+
+        real_score_cost_axis = score_mod._score_cost_axis
+
+        def _patched_cost_axis(*args, **kwargs):
+            cost_score, rows = real_score_cost_axis(*args, **kwargs)
+            # Inject scored tokens_per_output with the old target's sub-threshold score.
+            rows.append(
+                ScorecardRow(
+                    metric="tokens_per_output",
+                    axis="cost",
+                    value=4000.0,
+                    target=500.0,
+                    status="crit",
+                    score=round(tpo_score, 1),
+                    wow=None,
+                )
+            )
+            return cost_score, rows
+
+        with mock.patch.object(score_mod, "_score_cost_axis", side_effect=_patched_cost_axis):
+            ah_with = _score_agent_from_data(
+                agent="premium-agent",
+                runs_30d=runs_30d,
+                runs_prior_30d=runs_prior_30d,
+                eval_records=[],
+                targets=targets,
+                today=today,
+                six_days_ago=six,
+                prior_7_start=ps,
+                prior_7_end=pe,
+            )
+
+        assert ah_with.band == "red", (
+            "strip-RED: re-adding tokens_per_output as a scored ScorecardRow (score<30) "
+            "MUST turn the healthy verbose agent red via the scorecard→metric_scores path; "
+            f"got band={ah_with.band!r}, capped_by_axis={ah_with.capped_by_axis!r} "
+            f"(tpo_score={tpo_score:.1f})"
         )
-        assert band_with == "red", (
-            "Injecting sub-threshold tokens_per_output score into the cap MUST force red "
-            f"(old broken behavior); got {band_with!r} (tpo_score={tpo_score:.1f})"
+        assert ah_with.capped_by_axis == "metric", (
+            f"capped_by_axis must be 'metric' when tokens_per_output is scored < threshold; "
+            f"got {ah_with.capped_by_axis!r}"
         )
-        assert capped_with == "metric"
 
     def test_legacy_targets_md_cheaper_model_share_ignored_fail_soft(self, tmp_path):
         """targets.md overrides for removed metrics are silently ignored (fail-soft).
