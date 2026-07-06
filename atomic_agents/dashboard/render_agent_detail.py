@@ -27,7 +27,12 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from .._io import atomic_write
-from ._shared import CSS as _SHARED_CSS, _CSP as _SHARED_CSP
+from ._shared import (
+    CSS as _SHARED_CSS,
+    _CSP as _SHARED_CSP,
+    eval_score_display as _eval_score_display,
+    eval_score_fmt as _eval_score_fmt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -119,8 +124,15 @@ _DETAIL_CSS = """
   color: var(--error); border: 1px solid rgba(224, 108, 117, 0.25); }
 .parse-error-note { color: var(--error); font-size: 11px; margin-top: 6px; font-family: monospace; }
 
-/* Recommendations zone */
+/* Standalone Recommendations zone (B7 — between governance block and tabs) */
+.zone-label {
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.09em;
+  color: var(--accent); margin-bottom: 10px;
+}
 .rec-zone { margin-bottom: 20px; }
+.rec-empty-state {
+  color: var(--muted); font-style: italic; font-size: 13px; padding: 10px 0;
+}
 .rec-card {
   background: linear-gradient(135deg, rgba(78, 201, 176, 0.06), rgba(97, 175, 239, 0.04));
   border: 1px solid rgba(78, 201, 176, 0.2); border-radius: 10px; padding: 14px 18px;
@@ -438,12 +450,22 @@ def _short_model_name(model: str) -> str:
 
 
 def _render_detail_recommendations(recs: list | None, agent_id: str) -> str:
-    """Render the per-agent recommendations with layered tags (spec/52 §17.3, MUST 7)."""
-    if not recs:
-        return ""
-    agent_recs = [r for r in recs if getattr(r, "agent", None) == agent_id]
+    """Render the per-agent standalone recommendations zone (spec/52 §17.3, MUST 7).
+
+    Always renders a zone — empty-state placeholder when the engine produces no
+    recommendations for this agent (B7 design contract: always visible, not absent).
+
+    Zone label matches the B7 dark-teal `zone-label` style.
+    """
+    agent_recs: list = []
+    if recs:
+        agent_recs = [r for r in recs if getattr(r, "agent", None) == agent_id]
+
+    zone_label = '<div class="zone-label">&#9670; Recommendations</div>'
+
     if not agent_recs:
-        return ""
+        empty_state = '<div class="rec-empty-state">No recommendations right now.</div>'
+        return '<div class="rec-zone">' + zone_label + empty_state + "</div>"
 
     cards = []
     for rec in agent_recs:
@@ -494,7 +516,7 @@ def _render_detail_recommendations(recs: list | None, agent_id: str) -> str:
             "</div>"
         )
 
-    return '<div class="rec-zone">' + "".join(cards) + "</div>"
+    return '<div class="rec-zone">' + zone_label + "".join(cards) + "</div>"
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -668,7 +690,7 @@ def _render_dream_tab(agent_root: Path) -> str:
 
 
 def _render_overview_tab(agent_health, cost_data, recs, agent_id) -> str:
-    """Overview tab: health composite + axis breakdown + per-agent recs."""
+    """Overview tab: health composite + axis breakdown (recs moved to standalone zone)."""
     parts = []
 
     if agent_health is None:
@@ -711,13 +733,6 @@ def _render_overview_tab(agent_health, cost_data, recs, agent_id) -> str:
             f'<div class="ax-band">/ 100</div>'
             f"</div>"
             f"</div>"
-        )
-
-    # Per-agent recommendations (spec/52 §17.3, MUST 7)
-    recs_html = _render_detail_recommendations(recs, agent_id)
-    if recs_html:
-        parts.append(
-            '<div class="tab-section"><h3>Recommendations</h3>' + recs_html + "</div>"
         )
 
     return (
@@ -864,12 +879,13 @@ def _render_quality_tab(agent_id: str, agents_root: Path) -> str:
         ts = rec.get("ts", rec.get("timestamp", ""))
         ts_str = str(ts)[:19].replace("T", " ") if ts else "—"
         verdict = rec.get("verdict", rec.get("status", ""))
-        score = rec.get("score")
+        # Reads weighted_score (1-5 rubric scale) with fallback to score (0-1 legacy).
+        score_str = _eval_score_display(rec)
         run_id = rec.get("run_id", "")[:12]
         rows.append(
             f"<tr><td class='mono' style='font-size:11px;'>{_html.escape(ts_str)}</td>"
             f"<td>{_html.escape(str(verdict))}</td>"
-            f"<td class='right num'>{score if score is not None else '—'}</td>"
+            f"<td class='right num'>{score_str}</td>"
             f"<td class='mono' style='font-size:11px;'>{_html.escape(run_id)}</td></tr>"
         )
     table_html = (
@@ -1067,8 +1083,10 @@ def _compute_banner_stats(
             except Exception:
                 pass
 
-    # Eval score: most recent score from evals/runs/*.jsonl
+    # Eval score: most recent score from evals/runs/*.jsonl.
+    # Track which field was read so the formatter uses the correct scale.
     eval_score: "float | None" = None
+    eval_score_scale: str = "rubric"  # "rubric" (1-5) or "legacy" (0-1)
     evals_dir = agents_root / agent_id / "evals" / "runs"
     if evals_dir.exists():
         import json as _j2
@@ -1082,9 +1100,18 @@ def _compute_banner_stats(
                         continue
                     try:
                         rec = _j2.loads(line)
-                        sc = rec.get("score")
-                        if sc is not None:
-                            eval_score = float(sc)
+                        # weighted_score is the canonical field (1-5 rubric scale).
+                        # Fall back to score (0-1) for legacy fixtures.
+                        # Branch on WHICH field is present, not on the value.
+                        ws = rec.get("weighted_score")
+                        if ws is not None:
+                            eval_score = float(ws)
+                            eval_score_scale = "rubric"
+                            break
+                        legacy = rec.get("score")
+                        if legacy is not None:
+                            eval_score = float(legacy)
+                            eval_score_scale = "legacy"
                             break
                     except Exception:
                         continue
@@ -1099,6 +1126,7 @@ def _compute_banner_stats(
         "runs_7d": runs_7d,
         "failures_7d": failures_7d,
         "eval_score": eval_score,
+        "eval_score_scale": eval_score_scale,
     }
 
 
@@ -1195,14 +1223,19 @@ def _render_banner(
     def _fmt_int(v) -> str:
         return str(v) if v is not None else "—"
 
-    def _fmt_score(v) -> str:
-        return f"{float(v):.0f}" if v is not None else "—"
+    def _fmt_score(v, scale: str) -> str:
+        # Delegates to shared helper using the scale tracked by _compute_banner_stats.
+        # scale="rubric" → (v-1)/4*100 normalisation; scale="legacy" → v*100.
+        return _eval_score_fmt(v, scale=scale)
 
     spend_7d_str = _fmt_spend(banner_stats.get("spend_7d"))
     spend_30d_str = _fmt_spend(banner_stats.get("spend_30d"))
     runs_7d_str = _fmt_int(banner_stats.get("runs_7d"))
     failures_7d_str = _fmt_int(banner_stats.get("failures_7d"))
-    eval_score_str = _fmt_score(banner_stats.get("eval_score"))
+    eval_score_str = _fmt_score(
+        banner_stats.get("eval_score"),
+        banner_stats.get("eval_score_scale", "rubric"),
+    )
 
     pills_html = status_pill
     if model_pill_html:
@@ -1485,6 +1518,10 @@ def _render_detail_template(
     tab_nav = '<div class="detail-tabs">' + "".join(tab_nav_items) + "</div>"
     panels_html = "\n".join(panels_html_parts)
 
+    # Standalone recommendations zone (B7 design contract — always visible, between
+    # governance block and telemetry tabs; empty-state shown when engine fires nothing).
+    recs_standalone = _render_detail_recommendations(recs, agent_id)
+
     now_str = now.strftime("%Y-%m-%d %H:%M UTC")
 
     return f"""<!DOCTYPE html>
@@ -1521,6 +1558,7 @@ def _render_detail_template(
 {degraded_html}
 {banner}
 {gov_block}
+{recs_standalone}
 {tab_nav}
 {panels_html}
 

@@ -1544,3 +1544,573 @@ def test_render_all_parity_still_holds(tmp_path):
         f"render_all() detail page Fleet health must show a real integer, not '—'; "
         f"got {val!r}. MUST 5 parity requires fleet_health to flow through."
     )
+
+
+# ──────────────────────────────────────────────────────────────────
+# FIX #690 — eval score displayed as percentage (0.88 → "88%", not "1")
+
+
+def _write_eval_score(agents_root: Path, agent: str, score: float) -> None:
+    """Write a minimal eval JSONL with the given score (0-1 float)."""
+    runs_dir = agents_root / agent / "evals" / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "ts": _RECENT.isoformat(),
+        "verdict": "pass",
+        "score": score,
+        "run_id": "run-abc123def456",
+    }
+    (runs_dir / f"{_TODAY.isoformat()}.jsonl").write_text(json.dumps(rec) + "\n")
+
+
+def test_eval_score_banner_shows_percentage(tmp_path):
+    """FIX #690: banner 'Eval score' renders 0.88 as '88%', not '1'.
+
+    The bug: _fmt_score() used {float(v):.0f} which rounds 0.88 → 1.
+    The fix: multiply by 100 and render as integer percent.
+    """
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+    _write_eval_score(tmp_path, "agent1", 0.88)
+
+    html = _render_detail_html(tmp_path, console_data=None)
+
+    # Must contain "88%" somewhere in the Eval score banner cell
+    m = re.search(r'Eval score</div>\s*<div class="bv[^"]*">([^<]+)</div>', html)
+    assert m, "Banner must include 'Eval score' field"
+    val = m.group(1).strip()
+    assert val == "88%", (
+        f"Eval score 0.88 must display as '88%' in the banner, got {val!r}. "
+        "FIX #690: _fmt_score() must multiply by 100, not truncate the raw 0-1 float."
+    )
+
+
+def test_eval_score_banner_none_shows_dash(tmp_path):
+    """FIX #690 edge: absent eval score shows '—', not '0%'."""
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+    # No evals/ dir written
+
+    html = _render_detail_html(tmp_path, console_data=None)
+
+    m = re.search(r'Eval score</div>\s*<div class="bv[^"]*">([^<]+)</div>', html)
+    assert m, "Banner must include 'Eval score' field even when no evals exist"
+    val = m.group(1).strip()
+    assert val == "—", (
+        f"Missing eval score must display as '—', not '0%' or '0'; got {val!r}."
+    )
+
+
+def test_eval_score_quality_tab_shows_percentage(tmp_path):
+    """FIX #690: Quality tab score column renders 0.88 as '88%', not '0.88'.
+
+    Scoped to the tabpanel-quality region so the assertion is satisfied by the
+    Quality tab itself, not by the banner "88%" that happens to appear elsewhere.
+    """
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+    # Create evals/ so the Quality tab gates in, and write a score
+    _write_eval_score(tmp_path, "agent1", 0.88)
+
+    html = _render_detail_html(tmp_path, console_data=None)
+
+    # Extract only the tabpanel-quality region — must find it before asserting its content.
+    quality_match = re.search(
+        r'id="tabpanel-quality">(.*?)</div>\s*(?:<div class="tab-panel|$)',
+        html,
+        re.DOTALL,
+    )
+    assert quality_match, (
+        "tabpanel-quality region must be present when evals/ exist (FIX #690)."
+    )
+    quality_content = quality_match.group(1)
+
+    # The Quality tab score column must show "88%" in the tab itself.
+    assert "88%" in quality_content, (
+        "Quality tab (tabpanel-quality) must render eval score 0.88 as '88%' — "
+        "not just in the banner. FIX #690."
+    )
+    # The raw decimal must not appear in the score cell.
+    assert ">0.88<" not in quality_content, (
+        "Quality tab score column must not render the raw 0-1 float '>0.88<' — "
+        "must render '88%' instead (FIX #690)."
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# FIX #689 — standalone recommendations zone (B7 fidelity)
+
+
+def test_recs_zone_always_present_between_gov_and_tabs(tmp_path):
+    """FIX #689: recommendations zone is always rendered, between gov block and tabs.
+
+    Structural position assertion: the rec-zone div must appear AFTER the gov-block
+    div and BEFORE the detail-tabs div in the rendered HTML.
+    """
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+    # No recommendations (agent has no console_data recs)
+
+    html = _render_detail_html(tmp_path, console_data=None)
+
+    gov_pos = html.find('class="gov-block"')
+    rec_pos = html.find('class="rec-zone"')
+    tabs_pos = html.find('class="detail-tabs"')
+
+    assert gov_pos != -1, "gov-block must be present"
+    assert rec_pos != -1, (
+        "rec-zone must ALWAYS be present (FIX #689: standalone zone, not conditional)."
+    )
+    assert tabs_pos != -1, "detail-tabs must be present"
+
+    assert gov_pos < rec_pos < tabs_pos, (
+        f"rec-zone must appear AFTER gov-block and BEFORE detail-tabs. "
+        f"Got positions: gov={gov_pos}, rec={rec_pos}, tabs={tabs_pos}."
+    )
+
+
+def test_recs_zone_empty_state_when_no_recs(tmp_path):
+    """FIX #689: agent with 0 recs shows empty-state placeholder, not absent section."""
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+
+    # Pass console_data with an empty recommendations list (not None — engine fired, no recs)
+    cd = _StubConsoleData(
+        fleet_health=_StubFleetHealth(agents=[_StubAgentHealth(agent="agent1")]),
+        recommendations=[],  # engine ran, zero recs
+        last_primary_runs={"agent1": _RECENT},
+    )
+    html = _render_detail_html(tmp_path, console_data=cd)
+
+    assert "No recommendations right now" in html, (
+        "FIX #689: agent with 0 recs must show 'No recommendations right now.' "
+        "empty-state placeholder, not an absent section."
+    )
+
+
+def test_recs_zone_savings_rec_standalone_not_in_overview_tab(tmp_path):
+    """FIX #689: savings rec appears in standalone zone with '$saved'; no +0.0 pts badge.
+
+    Validates:
+    - the rec is in the standalone zone (before detail-tabs)
+    - '$ saved' text (usd_delta) present in the rec card
+    - no '+0.0 pts' badge (point-impact suppression from #687 must not regress)
+    - the rec does NOT appear inside the Overview tab panel (recs moved OUT of tab)
+    """
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+
+    # Build a savings rec with nonzero usd_delta and zero pts_delta (common post-#687)
+    @dataclass
+    class _SavingsRec:
+        agent: str = "agent1"
+        kind: str = "savings_cost"
+        current_model: str = "claude-opus-4-8"
+        candidate_model: str = "claude-sonnet-4-5"
+        projected_usd_delta: float = -11.28
+        projected_points_delta: float = 0.0  # zero pts — must NOT show "+0.0 pts"
+        rationale: str = "Switch to cheaper model and save"
+
+    cd = _StubConsoleData(
+        fleet_health=_StubFleetHealth(agents=[_StubAgentHealth(agent="agent1")]),
+        recommendations=[_SavingsRec()],
+        last_primary_runs={"agent1": _RECENT},
+    )
+    html = _render_detail_html(tmp_path, console_data=cd)
+
+    # The rec zone must be before the tabs
+    rec_pos = html.find('class="rec-zone"')
+    tabs_pos = html.find('class="detail-tabs"')
+    assert rec_pos != -1 and tabs_pos != -1, "Both rec-zone and detail-tabs must exist"
+    assert rec_pos < tabs_pos, "Standalone rec zone must appear before detail-tabs"
+
+    # "saved" text must appear (from the usd_delta display)
+    assert "saved" in html, (
+        "savings rec card must include 'saved' text from the projected_usd_delta "
+        "(FIX #689: rec must render in standalone zone)."
+    )
+
+    # +0.0 pts must NOT appear (zero pts_delta suppression from #687)
+    assert "+0.0 pts" not in html, (
+        "FIX #687 suppression must not regress: '+0.0 pts' badge must not appear "
+        "when projected_points_delta is 0.0."
+    )
+
+    # The Overview tab panel must NOT contain a rec card (recs moved out).
+    # Assert the panel was found before checking its contents — a missing match
+    # would silently pass (false-green) under the old `if overview_match:` guard.
+    overview_match = re.search(
+        r'id="tabpanel-overview">(.*?)</div>\s*<div class="tab-panel',
+        html,
+        re.DOTALL,
+    )
+    assert overview_match, (
+        "tabpanel-overview must be present in the rendered HTML (FIX #689 guard)."
+    )
+    overview_content = overview_match.group(1)
+    assert "rec-card" not in overview_content, (
+        "FIX #689: rec-card must NOT appear inside the Overview tab panel — "
+        "recs were moved to the standalone zone."
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# FIX #690 — shared helper: weighted_score fallback + scale guard
+
+
+def _write_eval_weighted_score(
+    agents_root: Path, agent: str, weighted_score: float
+) -> None:
+    """Write a minimal eval JSONL with weighted_score (1-5 rubric scale, no 'score' key)."""
+    runs_dir = agents_root / agent / "evals" / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "ts": _RECENT.isoformat(),
+        "verdict": "pass",
+        "weighted_score": weighted_score,
+        "run_id": "run-ws-fallback",
+    }
+    (runs_dir / f"{_TODAY.isoformat()}.jsonl").write_text(json.dumps(rec) + "\n")
+
+
+def test_eval_score_weighted_score_fallback_banner(tmp_path):
+    """FIX #690: banner reads weighted_score (1-5) when 'score' is absent.
+
+    Real eval-runner logs write weighted_score, not score. A record with only
+    weighted_score=4.0 (1-5 scale) must render "75%" (=(4-1)/4*100), not "—".
+    """
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+    _write_eval_weighted_score(tmp_path, "agent1", 4.0)
+
+    html = _render_detail_html(tmp_path, console_data=None)
+
+    m = re.search(r'Eval score</div>\s*<div class="bv[^"]*">([^<]+)</div>', html)
+    assert m, "Banner must include 'Eval score' field"
+    val = m.group(1).strip()
+    assert val == "75%", (
+        f"weighted_score=4.0 (1-5 scale) must display as '75%' in banner, got {val!r}. "
+        "FIX #690: (4.0-1)/4*100 = 75. weighted_score fallback must be active."
+    )
+
+
+def test_eval_score_weighted_score_fallback_quality_tab(tmp_path):
+    """FIX #690: Quality tab reads weighted_score (1-5) with no 'score' key.
+
+    A record with only weighted_score=3.0 must render '50%' in tabpanel-quality
+    (not '—', which would mean the fallback was not wired).
+    """
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+    _write_eval_weighted_score(tmp_path, "agent1", 3.0)  # midpoint of 1-5 → 50%
+
+    html = _render_detail_html(tmp_path, console_data=None)
+
+    quality_match = re.search(
+        r'id="tabpanel-quality">(.*?)</div>\s*(?:<div class="tab-panel|$)',
+        html,
+        re.DOTALL,
+    )
+    assert quality_match, "tabpanel-quality must be present when evals/ exist"
+    quality_content = quality_match.group(1)
+
+    assert "50%" in quality_content, (
+        "Quality tab must render weighted_score=3.0 (1-5 scale) as '50%'. "
+        "FIX #690: weighted_score fallback must be active in _render_quality_tab."
+    )
+    assert ">—<" not in quality_content or "50%" in quality_content, (
+        "Quality tab must not show '—' when weighted_score is present."
+    )
+
+
+def test_eval_score_no_gt100_percent(tmp_path):
+    """FIX #690: a 1-5 scale weighted_score must never render as '>100%'.
+
+    weighted_score=4.2 (valid 1-5 value) → (4.2-1)/4*100 = 80%, not '420%'.
+    """
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+    _write_eval_weighted_score(tmp_path, "agent1", 4.2)
+
+    html = _render_detail_html(tmp_path, console_data=None)
+
+    # Check banner
+    m = re.search(r'Eval score</div>\s*<div class="bv[^"]*">([^<]+)</div>', html)
+    assert m, "Banner must include 'Eval score' field"
+    val = m.group(1).strip()
+    assert val != "420%", (
+        "FIX #690: weighted_score=4.2 must NOT render as '420%'. "
+        "The 1-5 scale must be normalized: (4.2-1)/4*100 = 80%."
+    )
+    # Must be a sane percentage (≤100%)
+    if val.endswith("%"):
+        numeric = int(val.rstrip("%"))
+        assert numeric <= 100, (
+            f"Eval score percentage must never exceed 100%, got {val!r}."
+        )
+
+
+# ──────────────────────────────────────────────────────────────────
+# FIX #690 round-2 — source-aware score formatting (load-bearing table tests)
+#
+# Ground truth (per spec/13 + this task):
+#   weighted_score is ALWAYS 1-5 rubric scale.
+#   Legacy 0-1 floats live in the 'score' field only.
+#   Formatters branch on WHICH FIELD was read, never on the value.
+#
+# Rubric normalisation:  (v - 1) / 4 * 100  (clamped [0, 100])
+# Legacy normalisation:  v * 100             (clamped [0, 100])
+# Rubric delta:          delta / 4 * 100
+
+
+class TestEvalScoreFmtTable:
+    """Exact-value table tests for eval_score_fmt (scale-explicit).
+
+    FIX #690 round-2: scale parameter replaces value-based auto-detection.
+    """
+
+    def test_rubric_boundary_min(self):
+        """weighted_score=1.0 → 0% (bottom of 1-5 range)."""
+        from atomic_agents.dashboard._shared import eval_score_fmt
+
+        assert eval_score_fmt(1.0, scale="rubric") == "0%", (
+            "FIX #690 r2: (1.0-1)/4*100 = 0"
+        )
+
+    def test_rubric_boundary_max(self):
+        """weighted_score=5.0 → 100% (top of 1-5 range)."""
+        from atomic_agents.dashboard._shared import eval_score_fmt
+
+        assert eval_score_fmt(5.0, scale="rubric") == "100%", (
+            "FIX #690 r2: (5.0-1)/4*100 = 100"
+        )
+
+    def test_rubric_midpoint(self):
+        """weighted_score=3.0 → 50% (midpoint of 1-5 range)."""
+        from atomic_agents.dashboard._shared import eval_score_fmt
+
+        assert eval_score_fmt(3.0, scale="rubric") == "50%", (
+            "FIX #690 r2: (3.0-1)/4*100 = 50"
+        )
+
+    def test_rubric_4_2(self):
+        """weighted_score=4.2 → 80%."""
+        from atomic_agents.dashboard._shared import eval_score_fmt
+
+        assert eval_score_fmt(4.2, scale="rubric") == "80%", (
+            "FIX #690 r2: (4.2-1)/4*100 = 80"
+        )
+
+    def test_legacy_full(self):
+        """Legacy score=1.0 → 100% (0-1 × 100)."""
+        from atomic_agents.dashboard._shared import eval_score_fmt
+
+        assert eval_score_fmt(1.0, scale="legacy") == "100%", (
+            "FIX #690 r2: legacy 1.0 * 100 = 100"
+        )
+
+    def test_legacy_0_88(self):
+        """Legacy score=0.88 → 88% (0-1 × 100)."""
+        from atomic_agents.dashboard._shared import eval_score_fmt
+
+        assert eval_score_fmt(0.88, scale="legacy") == "88%", (
+            "FIX #690 r2: legacy 0.88 * 100 = 88"
+        )
+
+    def test_none_returns_dash(self):
+        """None → '—' on both scales."""
+        from atomic_agents.dashboard._shared import eval_score_fmt
+
+        assert eval_score_fmt(None, scale="rubric") == "—"
+        assert eval_score_fmt(None, scale="legacy") == "—"
+
+    def test_default_scale_is_rubric(self):
+        """Default scale is rubric so all existing call sites stay correct."""
+        from atomic_agents.dashboard._shared import eval_score_fmt
+
+        # All call sites pass weighted_score (1-5); default must be rubric.
+        assert eval_score_fmt(4.0) == eval_score_fmt(4.0, scale="rubric")
+        assert eval_score_fmt(4.0) == "75%"
+
+
+class TestEvalScoreDeltaFmtTable:
+    """Exact-value table tests for eval_score_delta_fmt (scale-explicit).
+
+    FIX #690 round-2: rubric delta = delta / 4 * 100, not value-auto-detected.
+    Small rubric deltas (e.g. +0.5) were previously treated as legacy (×100)
+    by the old abs(d) > 1.0 heuristic.
+    """
+
+    def test_rubric_plus_one(self):
+        """+1.0 raw rubric delta → +25%."""
+        from atomic_agents.dashboard._shared import eval_score_delta_fmt
+
+        assert eval_score_delta_fmt(1.0, scale="rubric") == "+25%", (
+            "FIX #690 r2: 1.0/4*100 = 25"
+        )
+
+    def test_rubric_minus_one(self):
+        """-1.0 raw rubric delta → -25%."""
+        from atomic_agents.dashboard._shared import eval_score_delta_fmt
+
+        assert eval_score_delta_fmt(-1.0, scale="rubric") == "-25%", (
+            "FIX #690 r2: -1.0/4*100 = -25"
+        )
+
+    def test_rubric_plus_half(self):
+        """+0.5 raw rubric delta → +12% (previously broken: old code said +50%).
+
+        0.5/4*100 = 12.5 → Python banker's rounding (round-half-to-even) → 12.
+        Old value-auto-detect: abs(0.5) <= 1.0 → treated as legacy → +50%. Wrong.
+        """
+        from atomic_agents.dashboard._shared import eval_score_delta_fmt
+
+        assert eval_score_delta_fmt(0.5, scale="rubric") == "+12%", (
+            "FIX #690 r2: 0.5/4*100 = 12.5 → banker's rounding → 12. "
+            "Old value-auto-detect treated 0.5 as legacy → +50%. That was wrong."
+        )
+
+    def test_rubric_minus_small(self):
+        """-0.10 raw rubric delta → -3% (the alert threshold in display terms)."""
+        from atomic_agents.dashboard._shared import eval_score_delta_fmt
+
+        # -0.10/4*100 = -2.5 → rounds to -3 (or -2 depending on rounding direction)
+        result = eval_score_delta_fmt(-0.10, scale="rubric")
+        # -2.5 rounds toward even (Python banker's rounding) → -2
+        assert result in ("-2%", "-3%"), (
+            f"FIX #690 r2: -0.10/4*100 = -2.5; got {result!r}. "
+            "Must be -2% or -3% (not -10%)."
+        )
+        assert result != "-10%", (
+            "FIX #690 r2: -0.10 rubric delta must NOT display as '-10%'. "
+            "Old code did abs(-0.10) * 100 = 10."
+        )
+
+    def test_rubric_zero(self):
+        """0.0 delta → +0%."""
+        from atomic_agents.dashboard._shared import eval_score_delta_fmt
+
+        assert eval_score_delta_fmt(0.0, scale="rubric") == "+0%"
+
+    def test_none_returns_dash(self):
+        """None → '—'."""
+        from atomic_agents.dashboard._shared import eval_score_delta_fmt
+
+        assert eval_score_delta_fmt(None, scale="rubric") == "—"
+
+    def test_default_scale_is_rubric(self):
+        """Default scale is rubric — all existing delta call sites stay correct."""
+        from atomic_agents.dashboard._shared import eval_score_delta_fmt
+
+        assert eval_score_delta_fmt(1.0) == eval_score_delta_fmt(1.0, scale="rubric")
+        assert eval_score_delta_fmt(1.0) == "+25%"
+
+
+class TestEvalScoreDisplayFieldBranch:
+    """Tests for eval_score_display branching on field name, not value.
+
+    FIX #690 round-2: branching on WHICH field is present eliminates the
+    boundary ambiguity in the old value-auto-detect.
+    """
+
+    def test_weighted_score_read_as_rubric(self):
+        """Record with only weighted_score → rubric normalisation."""
+        from atomic_agents.dashboard._shared import eval_score_display
+
+        rec = {"weighted_score": 4.0}
+        assert eval_score_display(rec) == "75%", (
+            "weighted_score=4.0 on 1-5 rubric: (4.0-1)/4*100 = 75"
+        )
+
+    def test_score_field_read_as_legacy(self):
+        """Record with only 'score' field → legacy (×100) normalisation."""
+        from atomic_agents.dashboard._shared import eval_score_display
+
+        rec = {"score": 1.0}
+        assert eval_score_display(rec) == "100%", (
+            "legacy score=1.0 on 0-1 scale: 1.0 * 100 = 100"
+        )
+
+    def test_weighted_score_takes_priority(self):
+        """When both fields present, weighted_score wins (rubric scale)."""
+        from atomic_agents.dashboard._shared import eval_score_display
+
+        rec = {"weighted_score": 3.0, "score": 0.5}
+        # weighted_score=3.0 → 50%; legacy score=0.5 → 50% (coincidence here, so test
+        # with values that diverge: weighted=1.0 → 0%, legacy=1.0 → 100%).
+        rec2 = {"weighted_score": 1.0, "score": 1.0}
+        assert eval_score_display(rec2) == "0%", (
+            "weighted_score=1.0 (rubric bottom) takes priority over score=1.0 (legacy top)"
+        )
+
+    def test_neither_field_returns_dash(self):
+        """Record with no eval field → '—'."""
+        from atomic_agents.dashboard._shared import eval_score_display
+
+        assert eval_score_display({}) == "—"
+        assert eval_score_display({"verdict": "pass"}) == "—"
+
+    def test_rubric_boundary_1_0_not_100(self):
+        """weighted_score=1.0 via display → 0%, NOT 100% (the old auto-detect bug).
+
+        The old heuristic treated any value <= 1.0 as legacy (×100), so
+        weighted_score=1.0 (rubric minimum) incorrectly rendered as '100%'.
+        """
+        from atomic_agents.dashboard._shared import eval_score_display
+
+        rec = {"weighted_score": 1.0}
+        assert eval_score_display(rec) == "0%", (
+            "FIX #690 r2: weighted_score=1.0 is the rubric MINIMUM (maps to 0%), "
+            "NOT the legacy maximum (100%). Old auto-detect inverted this."
+        )
+
+
+class TestBannerEvalScoreRubricBoundaries:
+    """Integration tests: banner renders rubric boundary values correctly.
+
+    FIX #690 round-2: banner must use rubric scale for weighted_score,
+    not the old value-auto-detect that misread 1.0 as legacy.
+    """
+
+    def test_banner_rubric_min_shows_0pct(self, tmp_path):
+        """weighted_score=1.0 (rubric min) → banner shows '0%', not '100%'."""
+        _write_agent(tmp_path, "agent1")
+        _write_log(tmp_path, "agent1")
+        _write_eval_weighted_score(tmp_path, "agent1", 1.0)
+
+        html = _render_detail_html(tmp_path, console_data=None)
+        m = re.search(r'Eval score</div>\s*<div class="bv[^"]*">([^<]+)</div>', html)
+        assert m, "Banner must include 'Eval score' field"
+        val = m.group(1).strip()
+        assert val == "0%", (
+            f"FIX #690 r2: weighted_score=1.0 (rubric min) must show '0%', got {val!r}. "
+            "Old value-auto-detect showed '100%' (legacy path — wrong scale)."
+        )
+
+    def test_banner_rubric_max_shows_100pct(self, tmp_path):
+        """weighted_score=5.0 (rubric max) → banner shows '100%'."""
+        _write_agent(tmp_path, "agent1")
+        _write_log(tmp_path, "agent1")
+        _write_eval_weighted_score(tmp_path, "agent1", 5.0)
+
+        html = _render_detail_html(tmp_path, console_data=None)
+        m = re.search(r'Eval score</div>\s*<div class="bv[^"]*">([^<]+)</div>', html)
+        assert m, "Banner must include 'Eval score' field"
+        val = m.group(1).strip()
+        assert val == "100%", (
+            f"FIX #690 r2: weighted_score=5.0 (rubric max) must show '100%', got {val!r}."
+        )
+
+    def test_banner_legacy_score_shows_88pct(self, tmp_path):
+        """Legacy 'score' field (0-1) → banner shows 88% via legacy path."""
+        _write_agent(tmp_path, "agent1")
+        _write_log(tmp_path, "agent1")
+        _write_eval_score(tmp_path, "agent1", 0.88)  # writes 'score' field (0-1)
+
+        html = _render_detail_html(tmp_path, console_data=None)
+        m = re.search(r'Eval score</div>\s*<div class="bv[^"]*">([^<]+)</div>', html)
+        assert m, "Banner must include 'Eval score' field"
+        val = m.group(1).strip()
+        assert val == "88%", (
+            f"FIX #690 r2: legacy score=0.88 must show '88%', got {val!r}."
+        )

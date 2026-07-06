@@ -15,6 +15,8 @@ from pathlib import Path
 
 from .costs import discover_agents, load_runs
 from ._shared import (
+    eval_score_delta_fmt,
+    eval_score_fmt,
     page_shell,
     sparkline,
     truncate,
@@ -25,23 +27,27 @@ from .._io import atomic_write
 # ──────────────────────────────────────────────────────────────────
 # Data structures
 
+
 @dataclass
 class EvalRunRecord:
     """One row from evals/runs/<YYYY-MM-DD>.jsonl."""
+
     ts: str
     agent: str
     test_id: str
     weighted_score: float
     hard_fails: list[str]
-    scores: dict[str, float]             # {dimension: score}
+    scores: dict[str, float]  # {dimension: score}
 
 
 @dataclass
 class AgentEvalTrend:
     agent: str
-    daily_scores: list[tuple[str, float]]   # [(date_iso, weighted_score), ...] sorted asc
+    daily_scores: list[
+        tuple[str, float]
+    ]  # [(date_iso, weighted_score), ...] sorted asc
     latest_score: float | None
-    delta_30d: float | None                 # latest - score 30 days ago
+    delta_30d: float | None  # latest - score 30 days ago
     per_dimension_latest: dict[str, float]  # {dimension: latest_score}
     per_dimension_delta: dict[str, float | None]  # {dimension: 30d delta}
 
@@ -84,6 +90,7 @@ class QualityData:
 # ──────────────────────────────────────────────────────────────────
 # Aggregation
 
+
 def aggregate_quality(
     agents_root: Path,
     today: date | None = None,
@@ -112,30 +119,36 @@ def aggregate_quality(
             # Hard fails (30d)
             for rec in eval_records:
                 if rec.hard_fails and _date_ge(rec.ts, cutoff_30d):
-                    all_hard_fails.append(HardFailEntry(
-                        ts=rec.ts,
-                        agent=agent,
-                        test_id=rec.test_id,
-                        hard_fails=rec.hard_fails,
-                        weighted_score=rec.weighted_score,
-                    ))
+                    all_hard_fails.append(
+                        HardFailEntry(
+                            ts=rec.ts,
+                            agent=agent,
+                            test_id=rec.test_id,
+                            hard_fails=rec.hard_fails,
+                            weighted_score=rec.weighted_score,
+                        )
+                    )
 
         # ── Tuning proposals
         tuning_dir = agents_root / agent / "evals" / "tuning_reports"
         if tuning_dir.exists():
-            for md_path in sorted(tuning_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True):
+            for md_path in sorted(
+                tuning_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True
+            ):
                 try:
                     mtime = md_path.stat().st_mtime
                 except OSError:
                     continue
                 mtime_dt = datetime.fromtimestamp(mtime, tz=timezone.utc)
-                tuning_proposals.append(TuningProposal(
-                    agent=agent,
-                    filename=md_path.name,
-                    mtime=mtime,
-                    mtime_iso=mtime_dt.strftime("%Y-%m-%d %H:%M"),
-                    rel_path=str(md_path.resolve()),
-                ))
+                tuning_proposals.append(
+                    TuningProposal(
+                        agent=agent,
+                        filename=md_path.name,
+                        mtime=mtime,
+                        mtime_iso=mtime_dt.strftime("%Y-%m-%d %H:%M"),
+                        rel_path=str(md_path.resolve()),
+                    )
+                )
 
         # ── Helper provenance health (last 30 days)
         runs_30d = load_runs(agents_root, agent, cutoff_30d, today)
@@ -145,12 +158,14 @@ def aggregate_quality(
             # optional in the log. Count how many have it set to True.
             # Since RunRecord doesn't carry this field, we reload raw lines.
             preserved, total = _count_provenance(agents_root, agent, cutoff_30d, today)
-            provenance_health.append(ProvenanceHealth(
-                agent=agent,
-                calls_total=total,
-                calls_preserved=preserved,
-                pct_preserved=preserved / total * 100 if total else 0.0,
-            ))
+            provenance_health.append(
+                ProvenanceHealth(
+                    agent=agent,
+                    calls_total=total,
+                    calls_preserved=preserved,
+                    pct_preserved=preserved / total * 100 if total else 0.0,
+                )
+            )
 
     # Sort hard fails newest first
     all_hard_fails.sort(key=lambda x: x.ts, reverse=True)
@@ -202,15 +217,21 @@ def _load_eval_runs(
             weighted = float(rec.get("weighted_score", 0.0) or 0.0)
             hard_fails = list(rec.get("hard_fails") or [])
             scores_raw = rec.get("scores") or {}
-            scores = {k: float(v) for k, v in scores_raw.items() if isinstance(v, (int, float))}
-            records.append(EvalRunRecord(
-                ts=str(ts),
-                agent=agent,
-                test_id=str(test_id),
-                weighted_score=weighted,
-                hard_fails=hard_fails,
-                scores=scores,
-            ))
+            scores = {
+                k: float(v)
+                for k, v in scores_raw.items()
+                if isinstance(v, (int, float))
+            }
+            records.append(
+                EvalRunRecord(
+                    ts=str(ts),
+                    agent=agent,
+                    test_id=str(test_id),
+                    weighted_score=weighted,
+                    hard_fails=hard_fails,
+                    scores=scores,
+                )
+            )
     return records
 
 
@@ -258,7 +279,9 @@ def _build_eval_trend(
             # 30d delta
             days_30d_in_dim = [d for d in sorted_days if d >= cutoff_30d.isoformat()]
             if len(days_30d_in_dim) >= 2:
-                first_score = sum(date_map[days_30d_in_dim[0]]) / len(date_map[days_30d_in_dim[0]])
+                first_score = sum(date_map[days_30d_in_dim[0]]) / len(
+                    date_map[days_30d_in_dim[0]]
+                )
                 per_dim_delta[dim] = round(latest_dim - first_score, 2)
             else:
                 per_dim_delta[dim] = None
@@ -328,9 +351,13 @@ def _count_provenance(
     # spec/22 read-failure addendum (issue #497): a blind read degrades to
     # (0, 0) rather than crashing the dashboard render.
     try:
-        records = backend.query(LogQuery(
-            since=since_dt, until=until_dt, agent_name=agent,
-        ))
+        records = backend.query(
+            LogQuery(
+                since=since_dt,
+                until=until_dt,
+                agent_name=agent,
+            )
+        )
     except LogBackendReadError:
         return 0, 0
     for rec in records:
@@ -346,6 +373,7 @@ def _count_provenance(
 
 # ──────────────────────────────────────────────────────────────────
 # Rendering
+
 
 def render_quality(agents_root: Path, data: QualityData) -> Path:
     """Write _dashboard/quality.html and return the path."""
@@ -368,35 +396,44 @@ def _render_quality_template(data: QualityData, has_goals: bool = True) -> str:
         trend_rows = []
         for t in data.eval_trends:
             spark_values = [s for _, s in t.daily_scores]
-            spark_html = f'<span class="sparkline">{sparkline(spark_values)}</span>' if spark_values else "—"
-            latest_str = f"{t.latest_score:.2f}" if t.latest_score is not None else "—"
+            spark_html = (
+                f'<span class="sparkline">{sparkline(spark_values)}</span>'
+                if spark_values
+                else "—"
+            )
+            # Use shared formatter: normalizes 1-5 rubric scale to 0-100%.
+            latest_str = eval_score_fmt(t.latest_score)
             delta = t.delta_30d
             if delta is None:
                 delta_str = '<span class="muted">—</span>'
-            elif delta > 0:
-                delta_str = f'<span style="color: var(--good)">+{delta:.2f}</span>'
-            elif delta < 0:
-                delta_str = f'<span style="color: var(--error)">{delta:.2f}</span>'
             else:
-                delta_str = '<span class="muted">0.00</span>'
+                _dfmt = eval_score_delta_fmt(delta)
+                if delta > 0:
+                    delta_str = f'<span style="color: var(--good)">{_dfmt}</span>'
+                elif delta < 0:
+                    delta_str = f'<span style="color: var(--error)">{_dfmt}</span>'
+                else:
+                    delta_str = f'<span class="muted">{_dfmt}</span>'
             trend_rows.append(
-                f'<tr>'
-                f'<td>{html.escape(t.agent)}</td>'
+                f"<tr>"
+                f"<td>{html.escape(t.agent)}</td>"
                 f'<td class="num">{latest_str}</td>'
-                f'<td>{delta_str}</td>'
+                f"<td>{delta_str}</td>"
                 f'<td class="num">{len(t.daily_scores)} days</td>'
-                f'<td>{spark_html}</td>'
-                f'</tr>'
+                f"<td>{spark_html}</td>"
+                f"</tr>"
             )
         eval_table = (
-            '<table>'
+            "<table>"
             '<thead><tr><th>Agent</th><th class="right">Latest score</th>'
-            '<th>30d delta</th><th>Days w/ evals</th><th>Trend (90d)</th></tr></thead>'
-            f'<tbody>{"".join(trend_rows)}</tbody>'
-            '</table>'
+            "<th>30d delta</th><th>Days w/ evals</th><th>Trend (90d)</th></tr></thead>"
+            f"<tbody>{''.join(trend_rows)}</tbody>"
+            "</table>"
         )
     else:
-        eval_table = '<p class="empty-note">No eval run data found in the last 90 days.</p>'
+        eval_table = (
+            '<p class="empty-note">No eval run data found in the last 90 days.</p>'
+        )
 
     # ── Per-dimension trend tables
     dim_panels = []
@@ -409,25 +446,27 @@ def _render_quality_template(data: QualityData, has_goals: bool = True) -> str:
             delta = t.per_dimension_delta.get(dim)
             if delta is None:
                 delta_html = '<span class="muted">—</span>'
-            elif delta > 0:
-                delta_html = f'<span style="color: var(--good)">+{delta:.2f}</span>'
-            elif delta < 0:
-                delta_html = f'<span style="color: var(--error)">{delta:.2f}</span>'
             else:
-                delta_html = '<span class="muted">0.00</span>'
+                _dfmt = eval_score_delta_fmt(delta)
+                if delta > 0:
+                    delta_html = f'<span style="color: var(--good)">{_dfmt}</span>'
+                elif delta < 0:
+                    delta_html = f'<span style="color: var(--error)">{_dfmt}</span>'
+                else:
+                    delta_html = f'<span class="muted">{_dfmt}</span>'
             rows.append(
-                f'<tr><td>{html.escape(dim)}</td>'
-                f'<td class="right num">{score:.2f}</td>'
-                f'<td>{delta_html}</td></tr>'
+                f"<tr><td>{html.escape(dim)}</td>"
+                f'<td class="right num">{eval_score_fmt(score)}</td>'
+                f"<td>{delta_html}</td></tr>"
             )
         dim_table = (
             f'<p style="font-size:12px; color: var(--muted); margin-bottom: 8px">'
-            f'{html.escape(t.agent)}</p>'
-            '<table>'
+            f"{html.escape(t.agent)}</p>"
+            "<table>"
             '<thead><tr><th>Dimension</th><th class="right">Latest</th>'
-            '<th>30d delta</th></tr></thead>'
-            f'<tbody>{"".join(rows)}</tbody>'
-            '</table>'
+            "<th>30d delta</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody>"
+            "</table>"
         )
         dim_panels.append(f'<section class="panel">{dim_table}</section>')
 
@@ -445,21 +484,23 @@ def _render_quality_template(data: QualityData, has_goals: bool = True) -> str:
             rows.append(
                 f'<tr class="row-error">'
                 f'<td class="num">{html.escape(entry.ts[:16])}</td>'
-                f'<td>{html.escape(entry.agent)}</td>'
-                f'<td>{html.escape(entry.test_id)}</td>'
+                f"<td>{html.escape(entry.agent)}</td>"
+                f"<td>{html.escape(entry.test_id)}</td>"
                 f'<td style="color: var(--error)">{hf_str}</td>'
-                f'<td class="right num">{entry.weighted_score:.2f}</td>'
-                f'</tr>'
+                f'<td class="right num">{eval_score_fmt(entry.weighted_score)}</td>'
+                f"</tr>"
             )
         hard_fail_table = (
-            '<table>'
-            '<thead><tr><th>When</th><th>Agent</th><th>Test ID</th>'
+            "<table>"
+            "<thead><tr><th>When</th><th>Agent</th><th>Test ID</th>"
             '<th>Hard fails</th><th class="right">Score</th></tr></thead>'
-            f'<tbody>{"".join(rows)}</tbody>'
-            '</table>'
+            f"<tbody>{''.join(rows)}</tbody>"
+            "</table>"
         )
     else:
-        hard_fail_table = '<p class="empty-note">No hard-fail occurrences in the last 30 days.</p>'
+        hard_fail_table = (
+            '<p class="empty-note">No hard-fail occurrences in the last 30 days.</p>'
+        )
 
     # ── Tuning proposals
     if data.tuning_proposals:
@@ -467,19 +508,19 @@ def _render_quality_template(data: QualityData, has_goals: bool = True) -> str:
         for tp in data.tuning_proposals:
             file_link = f'<a href="file://{html.escape(tp.rel_path)}" style="color: var(--accent)">review</a>'
             rows.append(
-                f'<tr>'
+                f"<tr>"
                 f'<td class="num">{html.escape(tp.mtime_iso)}</td>'
-                f'<td>{html.escape(tp.agent)}</td>'
-                f'<td>{html.escape(tp.filename)}</td>'
-                f'<td>{file_link}</td>'
-                f'</tr>'
+                f"<td>{html.escape(tp.agent)}</td>"
+                f"<td>{html.escape(tp.filename)}</td>"
+                f"<td>{file_link}</td>"
+                f"</tr>"
             )
         tuning_table = (
-            '<table>'
-            '<thead><tr><th>Generated</th><th>Agent</th><th>Report</th>'
-            '<th>Link</th></tr></thead>'
-            f'<tbody>{"".join(rows)}</tbody>'
-            '</table>'
+            "<table>"
+            "<thead><tr><th>Generated</th><th>Agent</th><th>Report</th>"
+            "<th>Link</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody>"
+            "</table>"
         )
     else:
         tuning_table = '<p class="empty-note">No tuning proposals found.</p>'
@@ -488,24 +529,26 @@ def _render_quality_template(data: QualityData, has_goals: bool = True) -> str:
     if data.provenance_health:
         rows = []
         for ph in data.provenance_health:
-            pct_color = "var(--good)" if ph.pct_preserved >= 80 else (
-                "var(--warn)" if ph.pct_preserved >= 50 else "var(--error)"
+            pct_color = (
+                "var(--good)"
+                if ph.pct_preserved >= 80
+                else ("var(--warn)" if ph.pct_preserved >= 50 else "var(--error)")
             )
             rows.append(
-                f'<tr>'
-                f'<td>{html.escape(ph.agent)}</td>'
+                f"<tr>"
+                f"<td>{html.escape(ph.agent)}</td>"
                 f'<td class="right num">{ph.calls_total}</td>'
                 f'<td class="right num">{ph.calls_preserved}</td>'
                 f'<td class="right num" style="color: {pct_color}">{ph.pct_preserved:.1f}%</td>'
-                f'</tr>'
+                f"</tr>"
             )
         prov_table = (
-            '<table>'
+            "<table>"
             '<thead><tr><th>Agent</th><th class="right">Helper calls (30d)</th>'
             '<th class="right">Provenance preserved</th>'
             '<th class="right">% preserved</th></tr></thead>'
-            f'<tbody>{"".join(rows)}</tbody>'
-            '</table>'
+            f"<tbody>{''.join(rows)}</tbody>"
+            "</table>"
         )
     else:
         prov_table = '<p class="empty-note">No helper calls with provenance data in the last 30 days.</p>'
