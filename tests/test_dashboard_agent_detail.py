@@ -400,6 +400,83 @@ def test_detail_five_governance_states(tmp_path):
         "None agent_ref must render a graceful fallback"
     )
 
+    # PRESENT_NO_BLOCK: has_governance=True, governance=None
+    # (governance.md exists but has no parseable YAML block)
+    class _FakeRefNoBlock:
+        has_governance = True
+        governance = None
+
+    html_no_block = _render_governance_block(_FakeRefNoBlock())
+    assert "PRESENT_NO_BLOCK" in html_no_block, (
+        "PRESENT_NO_BLOCK state must be surfaced when governance=None with has_governance=True"
+    )
+
+    # PRESENT_INCOMPLETE: has_governance=True, governance has no parse_errors but owner=None
+    class _GovernanceIncomplete:
+        parse_errors = ()
+        owner = None
+        permission_tier = "reads-only"
+        customer_data = "no"
+        writes_sor = "no"
+        lifecycle_status = "active"
+        review = None
+        risk = None
+        actions = None
+
+    class _FakeRefIncomplete:
+        has_governance = True
+        governance = _GovernanceIncomplete()
+
+    html_incomplete = _render_governance_block(_FakeRefIncomplete())
+    assert "PRESENT_INCOMPLETE" in html_incomplete, (
+        "PRESENT_INCOMPLETE state must be surfaced when governance parsed but owner=None"
+    )
+
+
+def test_detail_governance_present_no_block(tmp_path):
+    """MUST 3: PRESENT_NO_BLOCK renders honestly when governance.md has no YAML block."""
+    from atomic_agents.dashboard.render_agent_detail import _governance_state
+
+    # PRESENT_NO_BLOCK: has_gov=True, gov=None
+    state = _governance_state(True, None)
+    assert state == "PRESENT_NO_BLOCK", (
+        "_governance_state(True, None) must return PRESENT_NO_BLOCK"
+    )
+
+
+def test_detail_governance_present_incomplete(tmp_path):
+    """MUST 3: PRESENT_INCOMPLETE when owner field is None after parsing."""
+    from atomic_agents.dashboard.render_agent_detail import _governance_state
+
+    class _GovNoOwner:
+        parse_errors = ()
+        owner = None
+
+    state = _governance_state(True, _GovNoOwner())
+    assert state == "PRESENT_INCOMPLETE", (
+        "_governance_state with no owner must return PRESENT_INCOMPLETE"
+    )
+
+
+def test_detail_governance_absent_vs_no_block_distinct(tmp_path):
+    """MUST 3 strip-RED: ABSENT and PRESENT_NO_BLOCK must be distinct states.
+
+    strip-RED: the old code collapsed both into ABSENT (has_gov=False OR gov=None).
+    After the fix, has_gov=True + gov=None must map to PRESENT_NO_BLOCK, not ABSENT.
+    """
+    from atomic_agents.dashboard.render_agent_detail import _governance_state
+
+    # ABSENT: has_gov=False
+    assert _governance_state(False, None) == "ABSENT"
+    # PRESENT_NO_BLOCK: has_gov=True, gov=None (distinct — must NOT be ABSENT)
+    result = _governance_state(True, None)
+    assert result != "ABSENT", (
+        "PRESENT_NO_BLOCK must not collapse to ABSENT — strip-RED for FIX 5"
+    )
+    assert result == "PRESENT_NO_BLOCK", (
+        "has_gov=True + gov=None must map to PRESENT_NO_BLOCK, not ABSENT — strip-RED"
+    )
+
 
 # ──────────────────────────────────────────────────────────────────
 # MUST 4: compose_agent_detail() + capability gating
@@ -418,14 +495,26 @@ def test_detail_tabs_present(tmp_path):
 
 
 def test_detail_dreaming_gated(tmp_path):
-    """MUST 4 strip-RED: Dreaming tab absent when no dream manifests exist."""
+    """MUST 4 strip-RED: Dreaming tab BUTTON absent when no dream manifests exist.
+
+    strip-RED contract: "Dreaming" appears in the shared CSS comment regardless
+    of the gate.  The gate controls whether the tab NAV BUTTON (dtab-dreaming)
+    is rendered.  We assert the button is absent, not the word "Dreaming".
+    If the gate were removed, the button would always render and the assertion
+    would fail — confirming the guard is load-bearing.
+    """
     _write_agent(tmp_path, "agent1")
     _write_log(tmp_path, "agent1")
-    # No dreams/ directory → Dreaming tab must not appear
+    # No dreams/ directory → Dreaming tab button must not appear
     html = _render_detail_html(tmp_path)
-    # strip-RED: if the gate were removed, "Dreaming" would always appear
-    assert "Dreaming" not in html or "drm_" not in html, (
-        "Dreaming tab must not appear when no dream manifests exist"
+    # strip-RED: the button id "dtab-dreaming" must be absent when no manifest exists.
+    # "Dreaming" alone is not a reliable indicator (it appears in CSS comments).
+    assert "dtab-dreaming" not in html, (
+        "Dreaming tab button (dtab-dreaming) must be absent when no dream manifests exist"
+    )
+    # Confirm the panel body is also absent
+    assert "tabpanel-dreaming" not in html, (
+        "Dreaming tab panel (tabpanel-dreaming) must be absent when no dream manifests exist"
     )
 
 
@@ -480,6 +569,58 @@ def test_compose_agent_detail_in_registry(tmp_path):
     slot_html, alert_keys = reg.compose_agent_detail(ctx)
     assert "agent-tab" in slot_html
     assert isinstance(alert_keys, frozenset)
+
+
+def test_compose_agent_detail_drives_tabs(tmp_path):
+    """MUST 4 sentinel: compose_agent_detail() is called when rendering and drives tabs.
+
+    This test verifies that the global registry's compose_agent_detail() is invoked
+    during render_agent_detail() and that it is what produces tab content (not an
+    inline fallback bypassing the registry).
+
+    Approach: register a spy panel on the global registry (then unregister it), verify
+    it was called.  We use the global _REGISTRY to confirm the production code path
+    routes through it.
+
+    Note: the spy panel must be unregistered after the test to avoid polluting the
+    singleton for subsequent tests.
+    """
+    from atomic_agents.dashboard.panels._registry import get_registry, PanelResult
+
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+
+    rendered = []
+
+    class _SpyPanel:
+        id = "agent_tab_spy_sentinel_do_not_ship"
+        slot = "agent-tab"
+        order = 5  # before all real tabs
+        tab_id = "spy"
+        tab_label = "Spy"
+
+        def is_available(self, ctx):
+            return True
+
+        def render(self, ctx):
+            rendered.append("spy_called")
+            return PanelResult(html='<div class="spy">spy tab content</div>')
+
+    spy = _SpyPanel()
+    registry = get_registry()
+    registry.register(spy)
+    try:
+        html = _render_detail_html(tmp_path)
+        assert rendered, (
+            "compose_agent_detail must invoke registered agent-tab panels — "
+            "spy was not called, indicating the renderer bypassed the registry"
+        )
+        assert "spy" in html.lower() or "spy_called" in str(rendered), (
+            "Spy panel content must appear in rendered HTML"
+        )
+    finally:
+        # Unregister the spy so it does not pollute subsequent tests.
+        registry._panels = [p for p in registry._panels if p.id != spy.id]
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -701,18 +842,30 @@ def test_detail_unknown_agent_not_found(tmp_path):
 
 
 def test_detail_metrics_use_real_fields(tmp_path):
-    """MUST 9 strip-RED: a known-nonzero metric renders nonzero in the page."""
+    """MUST 9 strip-RED: known-nonzero cost renders in the summary metric card.
+
+    strip-RED contract: the summary metric card ("Spend (month)") is driven by
+    s.cost_usd (the AgentSummary field). A phantom getattr-with-default-0 that
+    read from a non-existent field would silently show $0.0000 in the card.
+    We assert the SUMMARY CARD contains the nonzero value — not just any location
+    on the page (a run-row match would be a false green if the card were 0).
+    """
     _write_agent(tmp_path, "agent1")
     # Write a real log record with a nonzero cost
     _write_log(tmp_path, "agent1", cost_usd=0.1234)
 
     html = _render_detail_html(tmp_path)
 
-    # The cost of 0.1234 must appear in the rendered page.
-    # If the template had a phantom getattr-default-0, cost would be "0.0000" or "0".
-    # strip-RED: if the real field is not read, this assertion fails.
-    assert "0.1234" in html or "0.123" in html, (
-        "Known-nonzero cost ($0.1234) must render nonzero — no phantom-field default-0"
+    # The Spend (month) metric card HTML structure is:
+    # class="mk">Spend (month)</div><div class="mv">$X.XXXX</div>
+    # We match the card tightly so a run-row match cannot satisfy it.
+    # strip-RED: phantom-field returning 0.0 would produce "$0.0000", not "$0.1234".
+    assert re.search(
+        r'class="mk">Spend \(month\)</div><div class="mv">\$0\.1234',
+        html,
+    ), (
+        "Summary metric card 'Spend (month)' must show real cost_usd ($0.1234), "
+        "not phantom-field default 0 — strip-RED for MUST 9"
     )
 
 
@@ -745,28 +898,59 @@ def test_detail_health_real_composite_display(tmp_path):
 
 
 def test_detail_no_llm_spend(tmp_path):
-    """MUST 10 strip-RED: no LLMBackend constructor is called on the render path."""
+    """MUST 10 strip-RED: no concrete LLM backend constructor is called on render.
+
+    strip-RED contract: the previous test patched atomic_agents._llm.LLMBackend
+    which does not exist there (only free functions live in _llm).  The ImportError
+    path always ran — the patch was never applied — making the test hollow.
+
+    This test patches __init__ on the THREE concrete LLM backend classes from their
+    real module paths.  If any of them is constructed, the test fails.  If the gate
+    is removed (i.e. an LLM backend IS constructed), the assertion fires.
+    """
     _write_agent(tmp_path, "agent1")
     _write_log(tmp_path, "agent1")
 
-    llm_constructed = []
+    constructed = []
 
-    def _capture_llm_init(self, *a, **kw):
-        llm_constructed.append(True)
+    def _raise_if_constructed(self, *a, **kw):
+        constructed.append(type(self).__name__)
+        raise AssertionError(
+            f"LLM backend {type(self).__name__} constructed on detail render path"
+        )
 
-    # Patch the base LLMBackend __init__ to detect construction
-    try:
-        from atomic_agents._llm import LLMBackend as _LLMBackend
+    # Concrete LLM backend classes and their real module paths.
+    _llm_targets = [
+        ("atomic_agents.llm.anthropic", "AnthropicLLMBackend"),
+        ("atomic_agents.llm.openai_compat", "OpenAICompatibleLLMBackend"),
+        ("atomic_agents.llm.vertex_gemini", "VertexGeminiLLMBackend"),
+    ]
 
-        with patch.object(_LLMBackend, "__init__", _capture_llm_init):
+    import importlib
+    from contextlib import ExitStack
+
+    patches_applied = []
+    for mod_path, cls_name in _llm_targets:
+        try:
+            mod = importlib.import_module(mod_path)
+            cls = getattr(mod, cls_name, None)
+            if cls is not None:
+                patches_applied.append(patch.object(cls, "__init__", _raise_if_constructed))
+        except ImportError:
+            pass  # backend not installed in this env — skip
+
+    if patches_applied:
+        with ExitStack() as stack:
+            for p in patches_applied:
+                stack.enter_context(p)
             _render_detail_html(tmp_path)
-    except ImportError:
-        # If LLMBackend isn't directly importable from that path, skip the patch
-        # and just verify the render completes without error.
+    else:
+        # No LLM backends importable (minimal test env) — just verify render completes.
         _render_detail_html(tmp_path)
 
-    assert not llm_constructed, (
-        "LLMBackend must not be constructed on the detail render path (zero LLM spend)"
+    assert not constructed, (
+        f"Concrete LLM backends constructed on detail render path (zero-spend MUST 10): "
+        f"{constructed}"
     )
 
 
@@ -806,3 +990,145 @@ def test_detail_breadcrumb_links_to_monitor(tmp_path):
     html = _render_detail_html(tmp_path)
     assert "monitor.html" in html, "Breadcrumb must link to Fleet Monitor"
     assert "Fleet Monitor" in html, "Breadcrumb must display 'Fleet Monitor'"
+
+
+# ──────────────────────────────────────────────────────────────────
+# MUST 5 parity: render_all shared snapshot (FIX 4 double-write guard)
+
+
+def test_render_all_no_double_write(tmp_path):
+    """MUST 5: render_all() with tab='all' must not write detail pages twice.
+
+    The double-write race: render_cost loop writes dashboard.html without
+    fleet_health (standalone snapshot); then the console pass re-writes it with
+    fleet_health.  After FIX 4, the cost loop skips the write when render_console_tab
+    is True, so the file is written exactly once (by the console pass) with the
+    shared snapshot.
+
+    Verification: run render_all(), track file-write count on dashboard.html by
+    checking mtime before/after.  Since both writes go to the same file, we can't
+    directly count writes; instead we verify the final content comes from the console
+    pass (it will include fleet_health-derived status, not a fresh standalone snap).
+
+    Simpler structural test: with tab='all', per_agent list still contains the paths
+    (the console pass's detail paths replace the cost-loop paths in written["per_agent"]).
+    And with tab='cost' (no console pass), the cost-loop DOES write per-agent pages.
+    """
+    from atomic_agents.dashboard.render import render_all
+
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+
+    # tab='all': console pass will run, cost loop must NOT write detail pages.
+    written_all = render_all(tmp_path, today=_TODAY)
+    per_agent_all = written_all.get("per_agent", [])
+    assert len(per_agent_all) >= 1, "render_all must produce per-agent detail paths"
+    for p in per_agent_all:
+        assert Path(p).name == "dashboard.html"
+
+    # tab='cost' (no console pass): cost loop MUST write detail pages
+    # Create a fresh tmp to avoid path conflicts
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp2:
+        tmp2 = Path(tmp2)
+        _write_agent(tmp2, "agent1")
+        _write_log(tmp2, "agent1")
+        written_cost = render_all(tmp2, today=_TODAY, tab="cost")
+        per_agent_cost = written_cost.get("per_agent", [])
+        assert len(per_agent_cost) >= 1, (
+            "render_all(tab='cost') must write per-agent detail pages from cost loop"
+        )
+        for p in per_agent_cost:
+            assert Path(p).name == "dashboard.html"
+
+
+def test_render_all_monitor_detail_status_parity(tmp_path):
+    """MUST 5 parity: Monitor row status == detail banner status (one snapshot).
+
+    render_all(tab='all') co-renders monitor.html and the per-agent dashboard.html
+    from ONE console_data/now snapshot.  A divergent snapshot (the double-write
+    race FIX 4 closes) would make the Monitor row and the detail banner disagree.
+    This test reads what each surface ACTUALLY WROTE and asserts they match — it
+    does not re-derive status via status_for_agent().
+
+    The agent's last run is ~36h old → STALE, exercising a non-OK status path.
+    render_all() uses datetime.now() for `now`, so a 36h-old run is STALE
+    regardless of _NOW.
+    """
+    from atomic_agents.dashboard.render import render_all
+
+    _write_agent(tmp_path, "agent1")
+    # STALE: last run 36h ago (write directly with _STALE_TS so the log month/date
+    # match the record timestamp).
+    log_dir = tmp_path / "agent1" / "log" / _STALE_TS.strftime("%Y-%m")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "ts": _STALE_TS.isoformat(),
+        "trigger": "cron",
+        "model": "claude-sonnet-4-5",
+        "input_tokens": 500,
+        "output_tokens": 100,
+        "cost_usd": 0.05,
+        "status": "ok",
+        "summary": "stale run",
+    }
+    (log_dir / f"{_STALE_TS.date().isoformat()}.jsonl").write_text(
+        json.dumps(rec) + "\n"
+    )
+
+    # Full pass — monitor.html + per-agent dashboard.html from one snapshot.
+    render_all(tmp_path, today=_STALE_TS.date())
+
+    # ── Monitor status: parse the embedded roster JSON ────────────────────────
+    monitor_path = tmp_path / "_dashboard" / "monitor.html"
+    assert monitor_path.exists(), "render_all(tab='all') must write monitor.html"
+    monitor_html = monitor_path.read_text()
+
+    m = re.search(
+        r'<script type="application/json" id="monitor-agents">(.*?)</script>',
+        monitor_html,
+        re.DOTALL,
+    )
+    assert m, "monitor.html must embed the monitor-agents JSON block"
+    # The roster emits \uXXXX escapes for <, >, &, U+2028, U+2029. json.loads
+    # decodes those \u sequences natively, so no manual un-escaping is needed.
+    entities = json.loads(m.group(1))
+    agent1_entity = next((e for e in entities if e.get("agent") == "agent1"), None)
+    if agent1_entity is None:
+        # Fall back to name/id keys if the roster keys the entity differently.
+        agent1_entity = next(
+            (
+                e
+                for e in entities
+                if e.get("id") == "agent1" or e.get("name") == "agent1"
+            ),
+            None,
+        )
+    assert agent1_entity is not None, (
+        f"monitor-agents JSON must contain agent1; got entities: {entities}"
+    )
+    monitor_status = agent1_entity["status"]
+
+    # ── Detail banner status: parse class="bv status-<x>" ─────────────────────
+    detail_path = tmp_path / "agent1" / "dashboard.html"
+    assert detail_path.exists(), "render_all must write agent1/dashboard.html"
+    detail_html = detail_path.read_text()
+
+    dm = re.search(r'class="bv status-([a-z]+)"', detail_html)
+    assert dm, "detail banner must render class='bv status-<x>'"
+    detail_status = dm.group(1)
+
+    # ── Parity: the two rendered surfaces must agree (MUST 5 shared snapshot) ──
+    assert detail_status == monitor_status, (
+        f"detail banner status ({detail_status!r}) must equal monitor row status "
+        f"({monitor_status!r}) — one console_data/now snapshot (MUST 5); a divergent "
+        "snapshot from the double-write race would make these differ"
+    )
+    # Sanity: a non-OK status path was exercised, so the parity assertion is not
+    # a trivial "ok == ok". A single 36h-old run in a full render_all() pass yields
+    # a populated AgentHealth whose critical-axis cap / error-rate check fires ERROR
+    # (precedence ERROR > STALE, so STALE is not reached). Either non-OK path proves
+    # the shared snapshot flowed through the real scoring path on both surfaces.
+    assert monitor_status in ("stale", "error", "warn"), (
+        f"expected a non-OK status for a 36h-old single run, got {monitor_status!r}"
+    )

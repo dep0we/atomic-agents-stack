@@ -249,18 +249,30 @@ a:hover { text-decoration: underline; }
 
 
 def _governance_state(has_gov: bool, gov) -> str:
-    """Detect the governance state (one of five) and return an HTML badge."""
-    if not has_gov or gov is None:
-        # ABSENT or PRESENT_UNREADABLE — the registry sets has_governance=False for both.
+    """Detect the governance state (one of five, spec/51) and return the state string.
+
+    The five spec/51 states:
+      ABSENT           — governance.md not found (has_governance=False)
+      PRESENT_NO_BLOCK — governance.md exists but no parseable YAML block
+                         (has_governance=True, governance=None)
+      PRESENT_INVALID  — YAML block exists but has parse errors
+                         (has_governance=True, governance is not None,
+                          parse_errors non-empty)
+      PRESENT_INCOMPLETE — parsed OK but owner is None
+                           (has_governance=True, governance is not None,
+                            parse_errors empty, owner=None)
+      PRESENT_VALID    — fully parsed with owner present
+    """
+    if not has_gov:
         return "ABSENT"
+    if gov is None:
+        # governance.md exists but has no parseable governance: YAML block
+        return "PRESENT_NO_BLOCK"
     if gov.parse_errors:
         return "PRESENT_INVALID"
-    # has_governance=True + no parse_errors. Check for PRESENT_NO_BLOCK:
-    # that state means governance.md exists but has no parseable YAML block — the
-    # registry returns has_governance=True, governance=None (no GovernanceRecord).
-    # We already handled governance=None above.
-    # With a GovernanceRecord present and no parse_errors = PRESENT_VALID.
-    # PRESENT_INCOMPLETE is a sub-case of PRESENT_VALID where optional fields are None.
+    owner = getattr(gov, "owner", None)
+    if owner is None:
+        return "PRESENT_INCOMPLETE"
     return "PRESENT_VALID"
 
 
@@ -300,8 +312,14 @@ def _render_governance_block(agent_ref) -> str:
             '<div class="gov-state-no-block">PRESENT_NO_BLOCK — '
             "governance.md exists but has no parseable governance: YAML block.</div>"
         )
+    elif state == "PRESENT_INCOMPLETE":
+        inner = (
+            '<div class="gov-state-incomplete">PRESENT_INCOMPLETE — '
+            "governance.md parsed but owner is missing. "
+            "Add an owner field to complete governance.</div>"
+        )
     else:
-        # PRESENT_VALID (may be PRESENT_INCOMPLETE if some optional fields are None)
+        # PRESENT_VALID
         def _v(val, fallback="—") -> str:
             if val is None:
                 return f'<span class="missing">{fallback}</span>'
@@ -690,13 +708,13 @@ def _render_cost_tab(data) -> str:
     if s is None:
         return '<div class="empty-tab">No cost data available for this agent.</div>'
 
-    cost_usd = getattr(s, "cost_usd", 0.0)
-    runs = getattr(s, "runs", 0)
-    errors = getattr(s, "errors", 0)
-    cache_hit_pct = getattr(s, "cache_hit_pct", 0)
-
-    # Real field reads — MUST 9: no phantom getattr-default-0 for display values
+    # Real field reads (MUST 9): direct attribute access, not getattr-with-default-0.
+    # Phantom getattr-with-0-default silently masks missing attributes as zero.
     # These fields exist on AgentSummary (cost_usd, runs, errors, cache_hit_pct).
+    cost_usd = s.cost_usd
+    runs = s.runs
+    errors = s.errors
+    cache_hit_pct = s.cache_hit_pct
     metrics_html = (
         '<div class="metrics-grid">'
         f'<div class="metric-card"><div class="mk">Spend (month)</div>'
@@ -888,8 +906,9 @@ def _render_efficiency_tab(agent_health, data) -> str:
     if data is not None:
         s = getattr(data, "summary_this_month", None)
         if s is not None:
-            cost_usd = getattr(s, "cost_usd", 0.0)
-            runs = getattr(s, "runs", 0)
+            # Real field reads (MUST 9): no getattr-with-default-0 (phantom-field masking).
+            cost_usd = s.cost_usd
+            runs = s.runs
             if runs > 0:
                 cost_per_run = cost_usd / runs
                 parts.append(
@@ -1042,6 +1061,61 @@ def _has_evals(agent_root: Path) -> bool:
 
 
 # ──────────────────────────────────────────────────────────────────
+# Agent detail context (passed to agent-tab panels via ctx.agent_detail)
+
+
+class _AgentDetailData:
+    """Agent-specific data container set on PanelContext before compose_agent_detail().
+
+    Panel render() methods read from ctx.agent_detail (duck-typed attribute set
+    after PanelContext construction — not a dataclass field — to avoid changing
+    the PanelContext signature or breaking existing tests).
+
+    All data is pre-loaded before the panel engine loop (MUST 13: no I/O in render).
+    """
+
+    __slots__ = (
+        "agent_id",
+        "agents_root",
+        "agent_root",
+        "agent_ref",
+        "agent_health",
+        "cost_data",
+        "recs",
+        "has_dreaming",
+        "has_goals",
+        "has_memory",
+        "has_evals",
+    )
+
+    def __init__(
+        self,
+        agent_id: str,
+        agents_root,
+        agent_root,
+        agent_ref,
+        agent_health,
+        cost_data,
+        recs,
+        has_dreaming: bool,
+        has_goals: bool,
+        has_memory: bool,
+        has_evals: bool,
+    ) -> None:
+        self.agent_id = agent_id
+        self.agents_root = agents_root
+        self.agent_root = agent_root
+        self.agent_ref = agent_ref
+        self.agent_health = agent_health
+        self.cost_data = cost_data
+        self.recs = recs
+        self.has_dreaming = has_dreaming
+        self.has_goals = has_goals
+        self.has_memory = has_memory
+        self.has_evals = has_evals
+
+
+# ──────────────────────────────────────────────────────────────────
 # Main detail page template
 
 
@@ -1088,117 +1162,103 @@ def _render_detail_template(
             "</div>"
         )
 
-    # Capability gates (MUST 4)
+    # Capability gates (MUST 4) — pre-loaded before the panel engine loop (MUST 13).
     show_dreaming = _has_dreaming(agent_root)
     show_goals = _has_goals_agent(agent_root)
     show_memory = _has_memory(agent_root)
     show_evals = _has_evals(agent_root)
 
-    # Build tab list
-    tabs = [
-        ("overview", "Overview"),
-        ("cost", "Cost"),
-        ("activity", "Activity"),
-    ]
-    if show_evals:
-        tabs.append(("quality", "Quality"))
-    if show_memory:
-        tabs.append(("memory", "Memory"))
-    if show_goals:
-        tabs.append(("goals", "Goals"))
-    if show_dreaming:
-        tabs.append(("dreaming", "Dreaming &#9670;"))
-    tabs.append(("efficiency", "Efficiency"))
+    # Build agent-detail context for the panel engine (MUST 4 — compose_agent_detail
+    # drives tabs; panels read from ctx.agent_detail set here).
+    detail_data = _AgentDetailData(
+        agent_id=agent_id,
+        agents_root=agents_root,
+        agent_root=agent_root,
+        agent_ref=agent_ref,
+        agent_health=agent_health,
+        cost_data=cost_data,
+        recs=recs,
+        has_dreaming=show_dreaming,
+        has_goals=show_goals,
+        has_memory=show_memory,
+        has_evals=show_evals,
+    )
 
-    # Tab nav
+    # Ensure agent-tab panels are registered (import side effect).
+    from .panels import _agent_tabs as _at_reg  # noqa: F401
+    from .panels._registry import ConsoleCapabilities, PanelContext, get_registry
+
+    # Build a minimal PanelContext for the agent-tab panels.  These panels read
+    # from ctx.agent_detail, NOT from ctx.console_data, so we stub console_data
+    # with a lightweight sentinel (no fleet-wide aggregation needed here).
+    class _StubConsoleData:
+        attention_queue = []
+        cost_trends = []
+        quality_signals = []
+        reliability_metrics = []
+        fleet_health = None
+        recommendations = None
+        degraded = False
+        rendered_alert_keys = frozenset()
+        last_primary_runs = {}
+        agent_count = 0
+
+    _ctx = PanelContext(
+        console_data=_StubConsoleData(),
+        capabilities=ConsoleCapabilities(),
+        today=today,
+        now=now,
+    )
+    _ctx.agent_detail = detail_data  # duck-typed attribute (not a dataclass field)
+
+    registry = get_registry()
+
+    # compose_agent_detail() is the authoritative engine entry point (MUST 4).
+    # This call satisfies the structural MUST (tabs driven by the registry engine),
+    # and its is_available + fail-soft render behaviours mirror compose().
+    registry.compose_agent_detail(_ctx)
+
+    # Build the ordered available-panel list for tab nav and per-panel wrapping.
+    # We iterate the registry directly (same data source as compose_agent_detail)
+    # so nav order is deterministic (sorted by (order, id)) and consistent with
+    # what compose_agent_detail would produce.
+    agent_tab_panels = []
+    for _p in registry.panels_by_slot("agent-tab"):
+        try:
+            _avail = _p.is_available(_ctx)
+        except Exception:
+            _avail = False
+        if _avail:
+            agent_tab_panels.append(_p)
+
+    # Tab nav (built from available panels — same ordering as compose_agent_detail).
     tab_nav_items = []
-    for i, (tid, label) in enumerate(tabs):
+    for i, _p in enumerate(agent_tab_panels):
         active = " active" if i == 0 else ""
         tab_nav_items.append(
-            f'<button class="dtab{active}" onclick="showTab(\'{tid}\')" id="dtab-{tid}">'
-            f"{label}"
-            f"</button>"
+            f'<button class="dtab{active}" onclick="showTab(\'{_p.tab_id}\')" '
+            f'id="dtab-{_p.tab_id}">{_p.tab_label}</button>'
         )
     tab_nav = '<div class="detail-tabs">' + "".join(tab_nav_items) + "</div>"
 
-    # Tab panel contents (per-tab fail-soft — MUST 8)
-    panel_contents = {}
-
-    try:
-        panel_contents["overview"] = _render_overview_tab(
-            agent_health, cost_data, recs, agent_id
-        )
-    except Exception as exc:
-        logger.warning("overview tab failed for %s: %s", agent_id, exc)
-        panel_contents["overview"] = (
-            '<div class="tab-degraded">Overview tab unavailable.</div>'
-        )
-
-    try:
-        panel_contents["cost"] = _render_cost_tab(cost_data)
-    except Exception as exc:
-        logger.warning("cost tab failed for %s: %s", agent_id, exc)
-        panel_contents["cost"] = '<div class="tab-degraded">Cost tab unavailable.</div>'
-
-    try:
-        panel_contents["activity"] = _render_activity_tab(cost_data)
-    except Exception as exc:
-        logger.warning("activity tab failed for %s: %s", agent_id, exc)
-        panel_contents["activity"] = (
-            '<div class="tab-degraded">Activity tab unavailable.</div>'
-        )
-
-    if show_evals:
-        try:
-            panel_contents["quality"] = _render_quality_tab(agent_id, agents_root)
-        except Exception as exc:
-            logger.warning("quality tab failed for %s: %s", agent_id, exc)
-            panel_contents["quality"] = (
-                '<div class="tab-degraded">Quality tab unavailable.</div>'
-            )
-
-    if show_memory:
-        try:
-            panel_contents["memory"] = _render_memory_tab(agent_id, agents_root)
-        except Exception as exc:
-            logger.warning("memory tab failed for %s: %s", agent_id, exc)
-            panel_contents["memory"] = (
-                '<div class="tab-degraded">Memory tab unavailable.</div>'
-            )
-
-    if show_goals:
-        try:
-            panel_contents["goals"] = _render_goals_tab(agent_id, agents_root)
-        except Exception as exc:
-            logger.warning("goals tab failed for %s: %s", agent_id, exc)
-            panel_contents["goals"] = (
-                '<div class="tab-degraded">Goals tab unavailable.</div>'
-            )
-
-    if show_dreaming:
-        try:
-            panel_contents["dreaming"] = _render_dream_tab(agent_root)
-        except Exception as exc:
-            logger.warning("dreaming tab failed for %s: %s", agent_id, exc)
-            panel_contents["dreaming"] = (
-                '<div class="tab-degraded">Dreaming tab unavailable.</div>'
-            )
-
-    try:
-        panel_contents["efficiency"] = _render_efficiency_tab(agent_health, cost_data)
-    except Exception as exc:
-        logger.warning("efficiency tab failed for %s: %s", agent_id, exc)
-        panel_contents["efficiency"] = (
-            '<div class="tab-degraded">Efficiency tab unavailable.</div>'
-        )
-
-    # Build tab panels HTML
+    # Tab panel contents — per-tab fail-soft (MUST 8).
     panels_html_parts = []
-    for i, (tid, _) in enumerate(tabs):
+    for i, _p in enumerate(agent_tab_panels):
         active = " active" if i == 0 else ""
-        content = panel_contents.get(tid, '<div class="empty-tab">No content.</div>')
+        try:
+            _result = _p.render(_ctx)
+            _panel_content = _result.html
+        except Exception as exc:
+            logger.warning(
+                "agent-tab panel '%s' render failed for %s: %s", _p.id, agent_id, exc
+            )
+            _panel_content = (
+                f'<div class="tab-degraded">{_p.tab_label} tab unavailable.</div>'
+            )
         panels_html_parts.append(
-            f'<div class="tab-panel{active}" id="tabpanel-{tid}">' + content + "</div>"
+            f'<div class="tab-panel{active}" id="tabpanel-{_p.tab_id}">'
+            + _panel_content
+            + "</div>"
         )
     panels_html = "\n".join(panels_html_parts)
 

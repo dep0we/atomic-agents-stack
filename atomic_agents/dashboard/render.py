@@ -97,10 +97,18 @@ def render_all(
         global_path = render_global(agents_root, global_summary)
         written["global"] = str(global_path)
 
-        for agent_name in discover_agents(agents_root):
-            data = aggregate_agent(agents_root, agent_name, today=today)
-            agent_path = render_agent(agents_root, data)
-            written["per_agent"].append(str(agent_path))
+        # MUST 5 (double-write guard): when render_console_tab=True the console pass
+        # will re-render per-agent detail pages with the SAME console_data/now snapshot
+        # as the Monitor.  Rendering them here too (with a standalone snapshot) would
+        # write the file twice — once without fleet_health and once with.  Skip the
+        # cost-loop write so the console pass is the sole author of detail pages when
+        # it will run.  When render_console_tab=False (e.g. tab='cost') the console
+        # pass won't run, so we must write detail pages from the cost loop.
+        if not render_console_tab:
+            for agent_name in discover_agents(agents_root):
+                data = aggregate_agent(agents_root, agent_name, today=today)
+                agent_path = render_agent(agents_root, data)
+                written["per_agent"].append(str(agent_path))
 
     if render_activity_tab:
         activity_data = aggregate_activity(agents_root, now=now)
