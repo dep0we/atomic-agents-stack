@@ -490,9 +490,11 @@ def _quality_alerts(
     if signal.delta_30d > _QUALITY_REGRESSION_THRESHOLD:
         return []
 
-    # delta_30d is a raw 1-5 rubric-scale difference; route through the
-    # rubric-delta formatter so a 1-point drop says "25%", not "100%".
-    drop_fmt = _eval_score_delta_fmt(abs(signal.delta_30d), scale="rubric")
+    # delta_30d is a raw 1-5 rubric-scale difference.  Convert to a plain
+    # magnitude percentage (no sign) — the surrounding phrasing ("dropped X%")
+    # supplies the direction, so a leading "+" would be misleading.
+    # abs(delta) / 4 * 100, rounded — a 1-point drop → "25%".
+    drop_fmt = f"{max(0, min(100, round(abs(signal.delta_30d) / 4.0 * 100.0)))}%"
     reason_bucket = "score_regression_threshold"
     alert_key = _make_alert_key(agent, "quality_regression", reason_bucket)
     ack_status = alert_state.get(alert_key, {}).get("status", "open")

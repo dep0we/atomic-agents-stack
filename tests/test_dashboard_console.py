@@ -2052,10 +2052,15 @@ def test_attention_quality_regression_reason_rubric_scale(tmp_path):
     assert quality_items, "expected a quality_regression item for the regressing agent"
 
     reason = quality_items[0].reason
-    # -1.0 rubric delta → 1.0/4*100 = 25% displayed drop.
-    assert "25%" in reason, (
-        f"FIX #690 r2: regression reason must say '25%' for a -1.0 rubric delta. "
-        f"Got: {reason!r}. Old code: abs(-1.0)*100 = '100%'."
+    # -1.0 rubric delta → magnitude = 1.0/4*100 = 25%; no leading "+".
+    # The "dropped" phrasing supplies the direction — the "+" sign is wrong here.
+    assert "dropped 25%" in reason, (
+        f"FIX #689: regression reason must say 'dropped 25%' (no sign) for a "
+        f"-1.0 rubric delta. Got: {reason!r}."
+    )
+    assert "dropped +25%" not in reason, (
+        f"FIX #689: regression reason must NOT say 'dropped +25%' — the leading "
+        f"'+' contradicts the 'dropped' phrasing. Got: {reason!r}."
     )
     assert "100%" not in reason, (
         f"FIX #690 r2: regression reason must NOT say '100%' for a -1.0 rubric drop. "

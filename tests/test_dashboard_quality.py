@@ -361,8 +361,12 @@ def test_quality_html_delta_small_rubric(tmp_path):
     out_path = render_quality(tmp_path, data)
     html_content = out_path.read_text(encoding="utf-8")
 
-    # +0.5/4*100 = 12.5 → rounds to 13 (Python banker's rounding: 12.5 → 12)
+    # +0.5/4*100 = 12.5 → Python banker's rounding → 12, so the rendered delta is "+12%".
+    assert "+12%" in html_content, (
+        "FIX #689: '+12%' must appear — 0.5 rubric delta × 100/4 = 12.5, "
+        "banker's rounding → 12. Got something else."
+    )
     assert "+50%" not in html_content, (
         "FIX #690 r2: '+50%' must NOT appear — that is the old value-auto-detect "
-        "treating +0.5 as a legacy 0-1 delta (×100). Correct is +12% or +13%."
+        "treating +0.5 as a legacy 0-1 delta (×100). Correct is +12%."
     )
