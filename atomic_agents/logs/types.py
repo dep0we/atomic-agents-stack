@@ -65,6 +65,11 @@ PRIMITIVE_POLICY_DECISION = "policy_decision"  # #89 PR 3a — Policy/Mandate ca
 # bucket is IRREVERSIBLY lossy once records are written — GROUP BY primitive cost
 # attribution for embedding spend would be permanently ambiguous (Principle #5).
 PRIMITIVE_EMBED = "embed"
+# spec/55 (#624) — management event family.
+# Every management verb (govern, set-model, set-goal, apply-rec) emits this primitive
+# so LogQuery(primitive=PRIMITIVE_MANAGE_GOVERN) returns the full management audit trail.
+# The primitive id is pinned NORMATIVELY in spec/55 M8.
+PRIMITIVE_MANAGE_GOVERN = "manage_govern"
 PRIMITIVE_OTHER = "other"
 
 
