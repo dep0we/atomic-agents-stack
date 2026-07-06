@@ -1765,10 +1765,12 @@ def _render_recommendations(recommendations) -> str:
                 f'<span class="rec-delta-badge rec-delta-savings">'
                 f"${abs(usd_delta):.2f}/mo saved</span>"
             )
-        if pts_delta is not None and pts_delta != 0.0 and kind == "savings_cost":
-            delta_parts.append(
-                f'<span class="rec-delta-badge rec-delta-points">{pts_delta:+.1f} pts</span>'
-            )
+        if pts_delta is not None and kind == "savings_cost":
+            display_pts = round(pts_delta, 1)
+            if display_pts != 0.0:
+                delta_parts.append(
+                    f'<span class="rec-delta-badge rec-delta-points">{display_pts:+.1f} pts</span>'
+                )
         delta_html = "".join(delta_parts)
 
         # Display-only "apply →" affordance (ACT zone, B6 mockup). Static span — no
@@ -1789,8 +1791,10 @@ def _render_recommendations(recommendations) -> str:
         tie_back_tag = ""
         if kind == "savings_cost":
             if pts_delta is not None:
-                pts_rounded = int(round(pts_delta))
-                pts_str = f" &middot; +{pts_rounded} pts" if pts_rounded != 0 else ""
+                display_pts = round(pts_delta, 1)
+                pts_str = (
+                    f" &middot; +{display_pts:.1f} pts" if display_pts != 0.0 else ""
+                )
             else:
                 pts_str = ""
             tie_back_tag = f'<span class="rec-axis-tag">&#8594; Cost{pts_str}</span>'

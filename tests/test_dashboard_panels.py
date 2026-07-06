@@ -1304,7 +1304,7 @@ def test_savings_cost_rec_renders_axis_tag():
     html = _render_recommendations([rec])
     assert "rec-axis-tag" in html, "savings_cost rec must have rec-axis-tag"
     assert "Cost" in html, "axis tag must reference 'Cost'"
-    assert "+7 pts" in html, "axis tag must show the rounded pts delta"
+    assert "+7.0 pts" in html, "axis tag must show the 1-decimal pts delta"
 
 
 def test_savings_cost_rec_zero_pts_shows_cost_only():
@@ -1404,3 +1404,51 @@ def test_governance_rec_must_not_get_axis_tag_strip_red():
         "strip-RED: governance rec must NOT render '+N pts' text — "
         "advisory recs carry no points badge regardless of projected_points_delta"
     )
+
+
+def test_savings_cost_rec_tiny_pts_no_badge():
+    """Rounding consistency: a savings_cost rec with pts_delta=0.04 renders NO pts badge.
+
+    0.04 rounds to 0.0 at 1-decimal precision (the displayed precision), so the
+    rec-delta-points badge must be suppressed and no '+0.0 pts' text must appear.
+    The old guard `pts_delta != 0.0` was insufficient — it let 0.04 through because
+    0.04 != 0.0, producing a '+0.0 pts' badge.
+    """
+    from atomic_agents.dashboard.render import _render_recommendations
+
+    rec = _StubRec(kind="savings_cost", projected_points_delta=0.04)
+    html = _render_recommendations([rec])
+    assert "rec-axis-tag" in html, "savings_cost rec must still have the axis tag"
+    assert "Cost" in html, "axis tag must still reference Cost"
+    assert "rec-delta-points" not in html, (
+        "pts badge must be suppressed when display_pts (round(0.04, 1)) == 0.0; "
+        "the old guard `pts_delta != 0.0` lets 0.04 through — this test catches that"
+    )
+    assert "+0.0 pts" not in html, (
+        "'+0.0 pts' must not appear for a rec whose 1-decimal display rounds to zero"
+    )
+    assert "pts" not in html, (
+        "no 'pts' text must appear when the point-impact rounds to 0.0 at display precision"
+    )
+
+
+def test_savings_cost_rec_real_nonzero_pts_shows_badge():
+    """Rounding consistency: a savings_cost rec with pts_delta=0.4 DOES show its pts badge.
+
+    0.4 rounds to 0.4 at 1-decimal precision, so the badge must appear as '+0.4 pts'.
+    The old detail-surface guard `int(round(0.4)) == 0` incorrectly suppressed this.
+    This test guards BOTH surfaces against that regression on the fleet (rec-delta-points)
+    badge and the axis tie-back tag.
+    """
+    from atomic_agents.dashboard.render import _render_recommendations
+
+    rec = _StubRec(kind="savings_cost", projected_points_delta=0.4)
+    html = _render_recommendations([rec])
+    assert "rec-delta-points" in html, (
+        "pts badge must appear for pts_delta=0.4 (display_pts=0.4, non-zero); "
+        "the old `int(round())` guard would suppress this — strip-RED"
+    )
+    assert "+0.4 pts" in html, (
+        "badge text must be '+0.4 pts' exactly — 1-decimal precision"
+    )
+    assert "+0.4 pts" in html or "+0.4" in html  # belt-and-suspenders
