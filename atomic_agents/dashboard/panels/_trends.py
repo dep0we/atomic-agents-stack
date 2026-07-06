@@ -75,15 +75,18 @@ def _render_quality_panel(ctx: PanelContext) -> str:
             if qs.latest_score is None:
                 score_html = '<span class="axis-muted">no evals</span>'
             else:
+                # Eval score is a 0-1 float; display as integer percentage (e.g. 0.88 → "88%").
                 delta_str = ""
                 if qs.delta_30d is not None:
                     sign = "+" if qs.delta_30d >= 0 else ""
                     delta_cls = "axis-ok" if qs.delta_30d >= 0 else "axis-spike"
+                    delta_pct = qs.delta_30d * 100
                     delta_str = (
-                        f' <span class="{delta_cls}">{sign}{qs.delta_30d:.2f}</span>'
+                        f' <span class="{delta_cls}">{sign}{delta_pct:.0f}%</span>'
                     )
+                score_pct = qs.latest_score * 100
                 score_html = (
-                    f'<span class="axis-val">{qs.latest_score:.2f}{delta_str}</span>'
+                    f'<span class="axis-val">{score_pct:.0f}%{delta_str}</span>'
                 )
             qual_rows.append(
                 f'<div class="axis-row">'

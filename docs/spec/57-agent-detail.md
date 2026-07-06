@@ -33,7 +33,8 @@ Adapt `variant-B7-agent-detail.html` into the shipped B7 tokens:
 
 1. **Banner** — name, id, resolved model (pill), current **status** (OK/WARN/ERROR/STALE via the SHARED `status_for_agent()`, §5), last-run, and the **FleetHealth composite** (0-100 — the SAME value the Monitor shows, never `×100`).
 2. **Governance block** — the spec/51 governance record: owner, permission tier, customer-data, writes-to-SoR, lifecycle status, review. All five governance states (PRESENT_VALID / INVALID / INCOMPLETE / NO_BLOCK / ABSENT) surfaced honestly; a missing/broken block shows a "governance gap" affordance, not a blank.
-3. **Top-tabs** — the telemetry sections (§3).
+3. **Recommendations zone** — a **standalone zone rendered between the governance block and the telemetry tabs**, always visible. When the engine produces no recommendations for this agent, an empty-state placeholder ("No recommendations right now.") is shown — not an absent section. Uses B7 dark-teal `zone-label` + `rec-panel` styling. Recommendations are NOT placed inside the Overview tab.
+4. **Top-tabs** — the telemetry sections (§3).
 
 ## 3. Telemetry tabs — panel-registry `agent-tab` slot
 
@@ -41,7 +42,7 @@ Composed via a new agent-detail composition entry point (MUST 3): the registry's
 
 | Tab | Content | Availability (capability gate, MUST 4) |
 |-----|---------|-----------------------------------------|
-| **Overview** | health composite + 3-axis breakdown, recent activity, the agent's recommendations | always |
+| **Overview** | health composite + 3-axis breakdown, recent activity | always |
 | **Cost** | 7d/30d spend, daily series, model mix, cost-guardrail refusals | always |
 | **Activity** | run history, tool calls, delegations, helper provenance | always |
 | **Quality** | eval results/scores (JudgeBackend) | **available** when an eval surface exists; **empty state** ("no evals configured") when zero evals |

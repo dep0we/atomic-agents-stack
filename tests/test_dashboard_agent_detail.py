@@ -1544,3 +1544,193 @@ def test_render_all_parity_still_holds(tmp_path):
         f"render_all() detail page Fleet health must show a real integer, not '—'; "
         f"got {val!r}. MUST 5 parity requires fleet_health to flow through."
     )
+
+
+# ──────────────────────────────────────────────────────────────────
+# FIX #690 — eval score displayed as percentage (0.88 → "88%", not "1")
+
+
+def _write_eval_score(agents_root: Path, agent: str, score: float) -> None:
+    """Write a minimal eval JSONL with the given score (0-1 float)."""
+    runs_dir = agents_root / agent / "evals" / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "ts": _RECENT.isoformat(),
+        "verdict": "pass",
+        "score": score,
+        "run_id": "run-abc123def456",
+    }
+    (runs_dir / f"{_TODAY.isoformat()}.jsonl").write_text(json.dumps(rec) + "\n")
+
+
+def test_eval_score_banner_shows_percentage(tmp_path):
+    """FIX #690: banner 'Eval score' renders 0.88 as '88%', not '1'.
+
+    The bug: _fmt_score() used {float(v):.0f} which rounds 0.88 → 1.
+    The fix: multiply by 100 and render as integer percent.
+    """
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+    _write_eval_score(tmp_path, "agent1", 0.88)
+
+    html = _render_detail_html(tmp_path, console_data=None)
+
+    # Must contain "88%" somewhere in the Eval score banner cell
+    m = re.search(r'Eval score</div>\s*<div class="bv[^"]*">([^<]+)</div>', html)
+    assert m, "Banner must include 'Eval score' field"
+    val = m.group(1).strip()
+    assert val == "88%", (
+        f"Eval score 0.88 must display as '88%' in the banner, got {val!r}. "
+        "FIX #690: _fmt_score() must multiply by 100, not truncate the raw 0-1 float."
+    )
+
+
+def test_eval_score_banner_none_shows_dash(tmp_path):
+    """FIX #690 edge: absent eval score shows '—', not '0%'."""
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+    # No evals/ dir written
+
+    html = _render_detail_html(tmp_path, console_data=None)
+
+    m = re.search(r'Eval score</div>\s*<div class="bv[^"]*">([^<]+)</div>', html)
+    assert m, "Banner must include 'Eval score' field even when no evals exist"
+    val = m.group(1).strip()
+    assert val == "—", (
+        f"Missing eval score must display as '—', not '0%' or '0'; got {val!r}."
+    )
+
+
+def test_eval_score_quality_tab_shows_percentage(tmp_path):
+    """FIX #690: Quality tab score column renders 0.88 as '88%', not '0.88'."""
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+    # Create evals/ so the Quality tab gates in, and write a score
+    _write_eval_score(tmp_path, "agent1", 0.88)
+
+    html = _render_detail_html(tmp_path, console_data=None)
+
+    # The Quality tab score column must show "88%" and NOT the raw 0-1 representation
+    assert "88%" in html, "Quality tab must render eval score 0.88 as '88%' (FIX #690)."
+    # The raw "0.88" string must NOT appear (would mean the old format slipped through)
+    # Note: we check only the score cell context — "0.88" could theoretically appear
+    # in rationale text, but not in a score column.
+    # A simpler and safe assertion: the score table cell must not show "0.88".
+    assert ">0.88<" not in html, (
+        "Quality tab score column must not render the raw 0-1 float '0.88' — "
+        "must render '88%' instead (FIX #690)."
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# FIX #689 — standalone recommendations zone (B7 fidelity)
+
+
+def test_recs_zone_always_present_between_gov_and_tabs(tmp_path):
+    """FIX #689: recommendations zone is always rendered, between gov block and tabs.
+
+    Structural position assertion: the rec-zone div must appear AFTER the gov-block
+    div and BEFORE the detail-tabs div in the rendered HTML.
+    """
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+    # No recommendations (agent has no console_data recs)
+
+    html = _render_detail_html(tmp_path, console_data=None)
+
+    gov_pos = html.find('class="gov-block"')
+    rec_pos = html.find('class="rec-zone"')
+    tabs_pos = html.find('class="detail-tabs"')
+
+    assert gov_pos != -1, "gov-block must be present"
+    assert rec_pos != -1, (
+        "rec-zone must ALWAYS be present (FIX #689: standalone zone, not conditional)."
+    )
+    assert tabs_pos != -1, "detail-tabs must be present"
+
+    assert gov_pos < rec_pos < tabs_pos, (
+        f"rec-zone must appear AFTER gov-block and BEFORE detail-tabs. "
+        f"Got positions: gov={gov_pos}, rec={rec_pos}, tabs={tabs_pos}."
+    )
+
+
+def test_recs_zone_empty_state_when_no_recs(tmp_path):
+    """FIX #689: agent with 0 recs shows empty-state placeholder, not absent section."""
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+
+    # Pass console_data with an empty recommendations list (not None — engine fired, no recs)
+    cd = _StubConsoleData(
+        fleet_health=_StubFleetHealth(agents=[_StubAgentHealth(agent="agent1")]),
+        recommendations=[],  # engine ran, zero recs
+        last_primary_runs={"agent1": _RECENT},
+    )
+    html = _render_detail_html(tmp_path, console_data=cd)
+
+    assert "No recommendations right now" in html, (
+        "FIX #689: agent with 0 recs must show 'No recommendations right now.' "
+        "empty-state placeholder, not an absent section."
+    )
+
+
+def test_recs_zone_savings_rec_standalone_not_in_overview_tab(tmp_path):
+    """FIX #689: savings rec appears in standalone zone with '$saved'; no +0.0 pts badge.
+
+    Validates:
+    - the rec is in the standalone zone (before detail-tabs)
+    - '$ saved' text (usd_delta) present in the rec card
+    - no '+0.0 pts' badge (point-impact suppression from #687 must not regress)
+    - the rec does NOT appear inside the Overview tab panel (recs moved OUT of tab)
+    """
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+
+    # Build a savings rec with nonzero usd_delta and zero pts_delta (common post-#687)
+    @dataclass
+    class _SavingsRec:
+        agent: str = "agent1"
+        kind: str = "savings_cost"
+        current_model: str = "claude-opus-4-8"
+        candidate_model: str = "claude-sonnet-4-5"
+        projected_usd_delta: float = -11.28
+        projected_points_delta: float = 0.0  # zero pts — must NOT show "+0.0 pts"
+        rationale: str = "Switch to cheaper model and save"
+
+    cd = _StubConsoleData(
+        fleet_health=_StubFleetHealth(agents=[_StubAgentHealth(agent="agent1")]),
+        recommendations=[_SavingsRec()],
+        last_primary_runs={"agent1": _RECENT},
+    )
+    html = _render_detail_html(tmp_path, console_data=cd)
+
+    # The rec zone must be before the tabs
+    rec_pos = html.find('class="rec-zone"')
+    tabs_pos = html.find('class="detail-tabs"')
+    assert rec_pos != -1 and tabs_pos != -1, "Both rec-zone and detail-tabs must exist"
+    assert rec_pos < tabs_pos, "Standalone rec zone must appear before detail-tabs"
+
+    # "saved" text must appear (from the usd_delta display)
+    assert "saved" in html, (
+        "savings rec card must include 'saved' text from the projected_usd_delta "
+        "(FIX #689: rec must render in standalone zone)."
+    )
+
+    # +0.0 pts must NOT appear (zero pts_delta suppression from #687)
+    assert "+0.0 pts" not in html, (
+        "FIX #687 suppression must not regress: '+0.0 pts' badge must not appear "
+        "when projected_points_delta is 0.0."
+    )
+
+    # The Overview tab panel must NOT contain a rec card (recs moved out)
+    # Find the Overview tab panel content
+    overview_match = re.search(
+        r'id="tabpanel-overview">(.*?)</div>\s*<div class="tab-panel',
+        html,
+        re.DOTALL,
+    )
+    if overview_match:
+        overview_content = overview_match.group(1)
+        assert "rec-card" not in overview_content, (
+            "FIX #689: rec-card must NOT appear inside the Overview tab panel — "
+            "recs were moved to the standalone zone."
+        )

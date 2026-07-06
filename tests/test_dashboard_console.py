@@ -1003,9 +1003,10 @@ def test_render_all_shares_quality_signals_from_eval_trends(tmp_path):
     )
     render_all(tmp_path, today=today, tab="all")
     console_html = (tmp_path / "_dashboard" / "index.html").read_text()
-    # The quality panel must render alice's real score (0.82), proving the
-    # eval_trends share path populated quality_signals rather than no-opping.
-    assert "0.82" in console_html
+    # The quality panel must render alice's real score (0.82 → displayed as "82%"),
+    # proving the eval_trends share path populated quality_signals rather than no-opping.
+    # FIX #690: eval scores are 0-1 floats rendered as integer percentages.
+    assert "82%" in console_html
     assert "no evals" not in console_html.split("Quality")[1][:400]
 
 
