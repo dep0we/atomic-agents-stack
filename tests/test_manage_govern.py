@@ -2456,3 +2456,484 @@ def test_govern_lf_file_round_trip_end_to_end(tmp_path):
         "incorrectly introduced carriage returns.  Check _edit_governance_block "
         "and _read_or_create_governance."
     )
+
+
+# ──────────────────────────────────────────────────────────────────
+# F1 — CRITICAL (audit integrity): quoted governance keys
+#
+# A double- or single-quoted YAML key (`"owner":` / `'owner':`) is not
+# matched by the surgical editor's key_line_pattern, so WITHOUT the guard:
+#   (a) duplicate-guard misses it (sees 0 unquoted copies)
+#   (b) absent-key path inserts a NEW unquoted key AFTER the quoted one
+#   (c) PyYAML keeps the LATER key (the quoted original) on re-read
+#   (d) the CLI audit claims `after: new` but the effective value is still old
+# The fix refuses with the `edit_error` shape before any write occurs.
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_edit_block_double_quoted_key_refuses():
+    """F1: a double-quoted key (``"owner":``) raises ValueError with 'quoted' message.
+
+    Strip control: remove the quoted-key guard in _edit_governance_block and this
+    test fails because the function falls to the absent-key insert path instead
+    of raising — silently producing a duplicate key + lying audit.
+    """
+    text = (
+        "```yaml\n"
+        "governance:\n"
+        '  "owner": old@example.com\n'
+        "  permission_tier: null\n"
+        "```\n"
+    )
+    with pytest.raises(ValueError, match="quoted"):
+        _edit_governance_block(text, "owner", "new@example.com")
+
+
+def test_edit_block_single_quoted_key_refuses():
+    """F1: a single-quoted key (``'owner':``) raises ValueError with 'quoted' message."""
+    text = (
+        "```yaml\n"
+        "governance:\n"
+        "  'owner': old@example.com\n"
+        "  permission_tier: null\n"
+        "```\n"
+    )
+    with pytest.raises(ValueError, match="quoted"):
+        _edit_governance_block(text, "owner", "new@example.com")
+
+
+def test_edit_block_quoted_key_refuses_before_absent_key_insert():
+    """F1 strip control: without the guard the absent-key path inserts a duplicate.
+
+    This test directly verifies the CONSEQUENCE of the bug: a file with
+    ``"owner": old`` would receive a SECOND ``owner: new`` line (because the
+    quoted form is invisible to key_line_pattern → ``found`` stays False →
+    insert path fires). After the fix the ValueError is raised instead.
+    If the quoted-key guard lines are removed from _edit_governance_block,
+    this ``pytest.raises`` assertion will fail because no error is raised.
+    """
+    text = (
+        "```yaml\n"
+        "governance:\n"
+        '  "owner": old@example.com\n'
+        "  permission_tier: null\n"
+        "```\n"
+    )
+    # With the fix in place the ValueError is raised.
+    with pytest.raises(ValueError, match="quoted"):
+        _edit_governance_block(text, "owner", "new@example.com")
+    # Additionally verify that without the guard the insert path would add a
+    # second owner key. We demonstrate this by confirming that the file is NOT
+    # edited in place (key_line_pattern misses the quoted form):
+    import re as _re
+
+    unquoted_pattern = _re.compile(r"^  owner:", _re.MULTILINE)
+    # The quoted line has no bare `  owner:` prefix — pattern would find 0 matches.
+    assert len(unquoted_pattern.findall(text)) == 0, (
+        "Prerequisite: the test file must not already have an unquoted owner key"
+    )
+
+
+def test_govern_double_quoted_key_refuses_no_write(tmp_path):
+    """F1 end-to-end: a governance.md with a double-quoted key refuses on --set,
+    exits 1, leaves the file byte-unchanged, and writes no audit record."""
+    agent_dir = _make_agent_dir(tmp_path)
+    quoted_content = (
+        "# Governance\n\n"
+        "```yaml\n"
+        "governance:\n"
+        '  "owner": old@example.com\n'
+        "  backup_owner: null\n"
+        "  permission_tier: null\n"
+        "  customer_data: null\n"
+        "  writes_sor: null\n"
+        "  lifecycle_status: active\n"
+        "  created_at: null\n"
+        "  updated_at: null\n"
+        "```\n"
+    )
+    gov_path = _make_governance_md(agent_dir, content=quoted_content)
+
+    args = _make_args(
+        agent_dir.name, tmp_path, set_fields=["owner=new@example.com"], yes=True
+    )
+    rc = run_govern(args, tmp_path)
+
+    assert rc == 1, "quoted key must refuse with exit 1"
+    assert gov_path.read_bytes() == quoted_content.encode("utf-8"), (
+        "file must be byte-unchanged after quoted-key refusal"
+    )
+    assert _collect_jsonl(agent_dir / "log") == [], (
+        "no audit record must be written on a refusal"
+    )
+
+
+def test_govern_double_quoted_key_json_edit_error(tmp_path, capsys):
+    """F1 + S3: --json emits {ok:false, error_type:'edit_error'} for a quoted key."""
+    agent_dir = _make_agent_dir(tmp_path)
+    quoted_content = (
+        "```yaml\n"
+        "governance:\n"
+        '  "owner": old@example.com\n'
+        "  permission_tier: null\n"
+        "  customer_data: null\n"
+        "  writes_sor: null\n"
+        "  lifecycle_status: active\n"
+        "  created_at: null\n"
+        "  updated_at: null\n"
+        "```\n"
+    )
+    _make_governance_md(agent_dir, content=quoted_content)
+
+    args = _make_args(
+        agent_dir.name,
+        tmp_path,
+        set_fields=["owner=new@example.com"],
+        yes=True,
+        use_json=True,
+    )
+    rc = run_govern(args, tmp_path)
+
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["error_type"] == "edit_error"
+    assert "quoted" in payload["reason"]
+
+
+def test_govern_single_quoted_key_refuses_no_write(tmp_path):
+    """F1 single-quoted variant: 'owner': key also refuses before write."""
+    agent_dir = _make_agent_dir(tmp_path)
+    quoted_content = (
+        "```yaml\n"
+        "governance:\n"
+        "  'owner': old@example.com\n"
+        "  permission_tier: null\n"
+        "  customer_data: null\n"
+        "  writes_sor: null\n"
+        "  lifecycle_status: active\n"
+        "  created_at: null\n"
+        "  updated_at: null\n"
+        "```\n"
+    )
+    gov_path = _make_governance_md(agent_dir, content=quoted_content)
+
+    args = _make_args(
+        agent_dir.name, tmp_path, set_fields=["owner=new@example.com"], yes=True
+    )
+    rc = run_govern(args, tmp_path)
+
+    assert rc == 1
+    assert gov_path.read_bytes() == quoted_content.encode("utf-8"), (
+        "file must be byte-unchanged after single-quoted-key refusal"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# F2 — MEDIUM (containment): snapshot path escapes via .config-snapshots symlink
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_take_config_snapshot_symlink_refused(tmp_path):
+    """F2: a .config-snapshots symlink pointing outside agent_dir is refused with OSError.
+
+    Strip control: remove the safe_resolve_under call from take_config_snapshot
+    and this test fails because no error is raised — the bytes silently land in
+    the symlink target outside agent_dir.
+    """
+    from atomic_agents.manage._routine import take_config_snapshot
+
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+
+    # Plant the symlink before the snapshot write.
+    (agent_dir / ".config-snapshots").symlink_to(outside_dir)
+
+    with pytest.raises(OSError, match="escapes"):
+        take_config_snapshot(agent_dir, "prior governance content")
+
+    # No bytes must have landed outside the agent dir.
+    assert list(outside_dir.rglob("*.md")) == [], (
+        "snapshot bytes must not escape to the symlink target"
+    )
+
+
+def test_govern_symlinked_snapshot_dir_refused_no_escape(tmp_path):
+    """F2 end-to-end: run_govern refuses + exits non-zero when .config-snapshots
+    is a symlink that would escape agent_dir, and writes no bytes outside."""
+    agent_dir = _make_agent_dir(tmp_path)
+    _make_governance_md(agent_dir)
+
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    (agent_dir / ".config-snapshots").symlink_to(outside_dir)
+
+    args = _make_args(
+        agent_dir.name, tmp_path, set_fields=["owner=alice@example.com"], yes=True
+    )
+    rc = run_govern(args, tmp_path)
+
+    assert rc != 0, "symlinked snapshot dir must refuse with a non-zero exit"
+    assert list(outside_dir.rglob("*")) == [], (
+        "no bytes must be written to the symlink target outside agent_dir"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# F3 — P2 (copilot API): snapshot_path always present in --json success
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_govern_json_create_absent_snapshot_path_is_null(tmp_path, capsys):
+    """F3: create-absent + --json must include snapshot_path: null (not omit the key).
+
+    Before the fix _emit_json_success omitted snapshot_path when None, so a
+    copilot doing payload['snapshot_path'] would raise KeyError on a create-absent
+    run.
+    """
+    agent_dir = _make_agent_dir(tmp_path)
+    # No governance.md — this is the create-absent path.
+    assert not (agent_dir / "governance.md").exists()
+
+    args = _make_args(
+        agent_dir.name,
+        tmp_path,
+        set_fields=["owner=alice@example.com"],
+        yes=True,
+        use_json=True,
+    )
+    rc = run_govern(args, tmp_path)
+    assert rc == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert "snapshot_path" in payload, "snapshot_path key must always be present"
+    assert payload["snapshot_path"] is None, "create-absent snapshot_path must be null"
+
+
+def test_govern_json_dry_run_snapshot_path_is_null(tmp_path, capsys):
+    """F3: --dry-run + --json must include snapshot_path: null (no snapshot on dry-run)."""
+    agent_dir = _make_agent_dir(tmp_path)
+    _make_governance_md(agent_dir)
+
+    args = _make_args(
+        agent_dir.name,
+        tmp_path,
+        set_fields=["owner=alice@example.com"],
+        dry_run=True,
+        use_json=True,
+    )
+    rc = run_govern(args, tmp_path)
+    assert rc == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert "snapshot_path" in payload, "snapshot_path key must always be present"
+    assert payload["snapshot_path"] is None, "dry-run snapshot_path must be null"
+
+
+# ──────────────────────────────────────────────────────────────────
+# F4 — P2 (false-green, security): --json changes redaction echo-site is tested
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_govern_json_changes_redact_secret_shaped_field(tmp_path, capsys, monkeypatch):
+    """F4: a secret-shaped field name must be <redacted> in payload['changes'][i]['after'].
+
+    Strip control: remove the _redact_if_secret call inside _json_change_list
+    and this test fails because payload['changes'][0]['after'] would be the raw
+    value instead of '<redacted>'.
+    """
+    agent_dir = _make_agent_dir(tmp_path)
+    _make_governance_md(agent_dir)
+
+    # Make 'owner' look secret-shaped for this invocation. (No real governance
+    # field is secret-shaped today; this proves the --json changes path redacts
+    # for later verbs that carry genuinely secret-named fields.)
+    from atomic_agents.manage import govern as govern_mod
+
+    monkeypatch.setattr(govern_mod, "_SECRET_SUBSTRINGS", ("owner",))
+
+    args = _make_args(
+        agent_dir.name,
+        tmp_path,
+        set_fields=["owner=topsecret@example.com"],
+        yes=True,
+        use_json=True,
+    )
+    rc = run_govern(args, tmp_path)
+    assert rc == 0
+
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+
+    # Locate the 'owner' change entry in the changes list.
+    owner_change = next(c for c in payload["changes"] if c["field"] == "owner")
+    assert owner_change["after"] == "<redacted>", (
+        "secret-shaped field must be redacted in payload['changes']['after']"
+    )
+    # The raw secret value must not appear anywhere in stdout.
+    assert "topsecret@example.com" not in out, (
+        "raw secret value must not appear in --json stdout output"
+    )
+
+
+def test_govern_json_changes_not_redacted_without_secret_shape(tmp_path, capsys):
+    """F4 strip control: a non-secret-shaped field passes through unredacted.
+
+    Verifies the guard is not over-broad: a normal owner value must appear as-is
+    in payload['changes']['after'] when the field name is not secret-shaped.
+    If this test and test_govern_json_changes_redact_secret_shaped_field BOTH
+    passed with the raw value, the redaction would be inert — this test proves
+    the guard is off for normal fields and on for secret-shaped ones.
+    """
+    agent_dir = _make_agent_dir(tmp_path)
+    _make_governance_md(agent_dir)
+
+    args = _make_args(
+        agent_dir.name,
+        tmp_path,
+        set_fields=["owner=alice@example.com"],
+        yes=True,
+        use_json=True,
+    )
+    rc = run_govern(args, tmp_path)
+    assert rc == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    owner_change = next(c for c in payload["changes"] if c["field"] == "owner")
+    assert owner_change["after"] == "alice@example.com", (
+        "non-secret-shaped field must NOT be redacted"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# F5 — P2 (false-green): CRLF snapshot byte-fidelity via read_bytes()
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_govern_snapshot_preserves_crlf_bytes(tmp_path):
+    """F5: snapshot of a CRLF governance.md must contain \\r\\n as raw bytes.
+
+    The existing test_govern_snapshot_contains_prior_content used read_text()
+    on both sides, which normalises \\r\\n → \\n and cannot prove byte-fidelity.
+    This test reads the snapshot with read_bytes() to assert the CRLF bytes
+    are physically present in the snapshot file.
+
+    Strip control: if atomic_write normalised newlines (or the read-site in
+    take_config_snapshot normalised them), b'\\r\\n' would not be in the bytes
+    → this assertion fails.
+    """
+    agent_dir = _make_agent_dir(tmp_path)
+
+    # Write a CRLF governance.md as raw bytes.
+    crlf_bytes = (
+        "# Governance: myagent\r\n"
+        "\r\n"
+        "```yaml\r\n"
+        "governance:\r\n"
+        "  owner: null\r\n"
+        "  backup_owner: null\r\n"
+        "  permission_tier: read-only\r\n"
+        "  customer_data: no\r\n"
+        "  writes_sor: no\r\n"
+        "  lifecycle_status: active\r\n"
+        "  created_at: 2026-01-01\r\n"
+        "  updated_at: 2026-01-01\r\n"
+        "```\r\n"
+    ).encode("utf-8")
+    gov_path = agent_dir / "governance.md"
+    gov_path.write_bytes(crlf_bytes)
+
+    args = _make_args(
+        agent_dir.name, tmp_path, set_fields=["owner=alice@example.com"], yes=True
+    )
+    rc = run_govern(args, tmp_path)
+    assert rc == 0
+
+    snap_dir = agent_dir / ".config-snapshots" / "govern"
+    snap_files = list(snap_dir.glob("*.md"))
+    assert len(snap_files) == 1, "expected exactly one snapshot file"
+
+    snap_bytes = snap_files[0].read_bytes()
+    assert b"\r\n" in snap_bytes, (
+        "snapshot must preserve CRLF bytes from the original governance.md; "
+        "read_bytes() sees what is physically on disk (no newline normalisation)"
+    )
+
+
+# ──────────────────────────────────────────────────────────────────
+# F6 — P2 (consistency): --json abort branches must use indent=2
+# ──────────────────────────────────────────────────────────────────
+
+
+def test_govern_json_abort_n_output_is_indented(tmp_path, capsys, monkeypatch):
+    """F6: the 'n' abort branch must emit indent=2 JSON (multi-line output).
+
+    Before the fix the two abort json.dumps calls lacked indent=2, producing
+    single-line JSON inconsistent with every other --json emitter.
+
+    Strip control: remove indent=2 from the 'n' abort json.dumps and this test
+    fails because the output becomes a single line with no embedded newlines.
+    """
+    agent_dir = _make_agent_dir(tmp_path)
+    _make_governance_md(agent_dir)
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda: "n")
+
+    args = _make_args(
+        agent_dir.name,
+        tmp_path,
+        set_fields=["owner=alice@example.com"],
+        use_json=True,
+        yes=False,
+    )
+    run_govern(args, tmp_path)
+
+    out = capsys.readouterr().out
+    # indent=2 produces a multi-line payload; without indent the entire object
+    # is on one line. A properly indented JSON object with at least one key
+    # has more than one line (print() adds one trailing \n, so the payload
+    # itself must have at least one internal \n).
+    assert out.count("\n") > 1, (
+        "abort JSON must be formatted with indent=2 (multi-line); "
+        f"got single-line output: {out!r}"
+    )
+    # The output must still be valid JSON (parseable).
+    payload = json.loads(out)
+    assert payload["ok"] is False
+    assert payload["error_type"] == "aborted"
+
+
+def test_govern_json_abort_eof_output_is_indented(tmp_path, capsys, monkeypatch):
+    """F6: the EOFError abort branch must emit indent=2 JSON (multi-line output).
+
+    Strip control: remove indent=2 from the EOFError abort json.dumps and this
+    test fails because the output becomes a single line.
+    """
+    agent_dir = _make_agent_dir(tmp_path)
+    _make_governance_md(agent_dir)
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+
+    def _raise_eof():
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", _raise_eof)
+
+    args = _make_args(
+        agent_dir.name,
+        tmp_path,
+        set_fields=["owner=alice@example.com"],
+        use_json=True,
+        yes=False,
+    )
+    run_govern(args, tmp_path)
+
+    out = capsys.readouterr().out
+    assert out.count("\n") > 1, (
+        "EOF abort JSON must be formatted with indent=2 (multi-line); "
+        f"got single-line output: {out!r}"
+    )

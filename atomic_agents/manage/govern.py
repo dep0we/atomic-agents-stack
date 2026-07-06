@@ -502,6 +502,32 @@ def _edit_governance_block(text: str, schema_key: str, new_value: str | None) ->
 
     key_line_pattern = re.compile(r"^(  " + re.escape(schema_key) + r":)(.*)$")
 
+    # Quoted-key guard (F1 — audit integrity). YAML allows a mapping key in three
+    # spellings: unquoted (  owner:), double-quoted (  "owner":), and single-quoted
+    # (  'owner':). ``key_line_pattern`` only matches the unquoted form. When a
+    # quoted form is present:
+    #   (a) the duplicate-guard below misses it — match_count counts 0 unquoted
+    #       occurrences and falls through to the absent-key insert path.
+    #   (b) the insert path appends a NEW unquoted ``owner:`` line AFTER the
+    #       quoted key — producing TWO logical copies of the key.
+    #   (c) PyYAML keeps the LATER key (the quoted original). The edit lands on
+    #       the newly-inserted dead copy; the audit claims ``after: new`` but the
+    #       effective YAML value on re-read is still the old quoted one.
+    # Refuse cleanly: the file needs manual cleanup so the CLI can safely edit it.
+    key_dquoted_re = re.compile(r'^  "' + re.escape(schema_key) + r'":')
+    key_squoted_re = re.compile(r"^  '" + re.escape(schema_key) + r"':")
+    quoted_count = sum(
+        1
+        for line in lines
+        if not line.lstrip().startswith("#")
+        and (key_dquoted_re.match(line) or key_squoted_re.match(line))
+    )
+    if quoted_count > 0:
+        raise ValueError(
+            f"governance key {schema_key!r} is quoted; not surgically settable via CLI "
+            "— edit governance.md directly"
+        )
+
     # Duplicate-key guard. PyYAML's safe_load silently keeps the LAST duplicate of
     # a mapping key, but this surgical editor rewrites only the FIRST match (it
     # stops after ``found``). On a hand-authored file with the key repeated at
@@ -747,8 +773,9 @@ def _emit_json_success(
     }
     if dry_run:
         payload["dry_run"] = True
-    if snapshot_path is not None:
-        payload["snapshot_path"] = snapshot_path
+    # F3: always include snapshot_path — null when absent (create-absent or dry-run)
+    # so a copilot can do payload["snapshot_path"] without risking KeyError.
+    payload["snapshot_path"] = snapshot_path
     payload["audit_status"] = audit_status
     print(json.dumps(payload, indent=2))
 
@@ -1065,7 +1092,8 @@ def run_govern(args: Any, agents_root: Path) -> int:
                             "ok": False,
                             "error_type": "aborted",
                             "reason": "operator declined the confirmation; no changes written",
-                        }
+                        },
+                        indent=2,
                     )
                 )
             else:
@@ -1079,7 +1107,8 @@ def run_govern(args: Any, agents_root: Path) -> int:
                             "ok": False,
                             "error_type": "aborted",
                             "reason": "operator declined the confirmation; no changes written",
-                        }
+                        },
+                        indent=2,
                     )
                 )
             else:

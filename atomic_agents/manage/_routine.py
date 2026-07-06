@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .._io import atomic_write
+from .._io import atomic_write, safe_resolve_under
 
 
 # ── Snapshot infrastructure ────────────────────────────────────────────────────
@@ -72,6 +72,23 @@ def take_config_snapshot(agent_dir: Path, content: str) -> Path:
     filename = f"{ts}-{suffix}.md"
 
     snapshot_path = agent_dir / _SNAPSHOT_DIR / _SNAPSHOT_SUBDIR / filename
+
+    # Canonical-containment invariant (F2): resolve the snapshot path and assert
+    # it stays under agent_dir. A planted symlink at agent/.config-snapshots
+    # pointing outside the agent directory causes .resolve() to follow the
+    # symlink out — safe_resolve_under raises PathTraversalError, which is
+    # re-raised as OSError so take_config_snapshot's documented OSError contract
+    # is preserved and run_govern surfaces a clean refusal before any write.
+    # This is ONE canonical invariant, not a per-name symlink check: any
+    # .config-snapshots variant that escapes agent_dir is caught here, whether
+    # it is a symlink, a bind-mount, or a future escaping scenario.
+    try:
+        safe_resolve_under(snapshot_path, agent_dir)
+    except Exception as exc:
+        raise OSError(
+            f"Snapshot path escapes agent directory — refused: {exc}"
+        ) from exc
+
     atomic_write(snapshot_path, content)
     return snapshot_path
 
