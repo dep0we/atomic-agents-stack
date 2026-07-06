@@ -224,27 +224,31 @@ class PanelRegistry:
 
         return slot_html, frozenset(all_alert_keys)
 
-    def compose_agent_detail(
-        self, ctx: "PanelContext"
-    ) -> "tuple[dict[str, str], frozenset[str]]":
-        """Run the layout engine for the Per-Agent Detail page (spec/57 §3).
+    def compose_agent_detail(self, ctx: "PanelContext") -> "list[tuple[object, str]]":
+        """Run the layout engine for the Per-Agent Detail page (spec/57 §3, MUST 4).
 
-        Mirrors compose() / compose_monitor() but iterates the 'agent-tab' slot.
+        Mirrors compose() / compose_monitor() but iterates the 'agent-tab' slot
+        and returns structured per-panel results so the caller can build BOTH the
+        tab-nav buttons AND the tab-content panes from this single call without a
+        second panels_by_slot() render pass.
+
         Per-panel fail-soft (MUST 11), is_available gate (MUST 12), and
         alert-key union (MUST 17) apply identically to the home engine.
 
         Returns
         -------
-        (slot_html, alert_keys):
-            slot_html: dict slot -> joined HTML fragments ('agent-tab' key).
-            alert_keys: frozenset (agent-tab panels carry no alert keys today).
+        list of (panel, html) tuples:
+            panel: the Panel object (exposes .tab_id, .tab_label, .id).
+            html:  the rendered HTML fragment for that panel's content area
+                   (may be a degraded placeholder if render() raised).
+
+        Only available panels (is_available returned True without raising) are
+        included.  Panels where is_available raised are silently omitted.
         """
         from ..render import logger
 
-        slot_html: dict[str, str] = {"agent-tab": ""}
-        all_alert_keys: set[str] = set()
+        results: list[tuple[object, str]] = []
 
-        fragments: list[str] = []
         for panel in self.panels_by_slot("agent-tab"):
             try:
                 available = panel.is_available(ctx)
@@ -259,22 +263,20 @@ class PanelRegistry:
                 continue
             try:
                 result = panel.render(ctx)
+                panel_html = result.html
             except Exception as exc:
                 logger.warning(
                     "agent-tab panel '%s' render failed (%s); degraded placeholder",
                     panel.id,
                     type(exc).__name__,
                 )
-                fragments.append(
+                panel_html = (
                     f'<div class="panel-degraded" data-panel-id="{panel.id}">'
                     f"Panel unavailable</div>"
                 )
-                continue
-            fragments.append(result.html)
-            all_alert_keys |= result.alert_keys
-        slot_html["agent-tab"] = "\n".join(fragments)
+            results.append((panel, panel_html))
 
-        return slot_html, frozenset(all_alert_keys)
+        return results
 
     def compose_monitor(
         self, ctx: "PanelContext"

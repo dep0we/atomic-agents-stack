@@ -546,7 +546,7 @@ def test_detail_goals_tab_present_when_goal_exists(tmp_path):
 
 
 def test_compose_agent_detail_in_registry(tmp_path):
-    """MUST 4: PanelRegistry.compose_agent_detail() exists and is callable."""
+    """MUST 4: PanelRegistry.compose_agent_detail() exists, is callable, returns list."""
     from atomic_agents.dashboard.panels._registry import (
         PanelRegistry,
         PanelContext,
@@ -558,7 +558,7 @@ def test_compose_agent_detail_in_registry(tmp_path):
     assert callable(getattr(reg, "compose_agent_detail", None)), (
         "PanelRegistry must have compose_agent_detail()"
     )
-    # With no registered agent-tab panels, returns empty slot + empty frozenset
+    # With no registered agent-tab panels, returns an empty list.
     cd = _StubConsoleData()
     ctx = PanelContext(
         console_data=cd,
@@ -566,21 +566,30 @@ def test_compose_agent_detail_in_registry(tmp_path):
         today=_TODAY,
         now=_NOW,
     )
-    slot_html, alert_keys = reg.compose_agent_detail(ctx)
-    assert "agent-tab" in slot_html
-    assert isinstance(alert_keys, frozenset)
+    result = reg.compose_agent_detail(ctx)
+    assert isinstance(result, list), (
+        "compose_agent_detail() must return a list of (panel, html) tuples"
+    )
+    assert result == [], (
+        "compose_agent_detail() with no registered panels must return an empty list"
+    )
 
 
 def test_compose_agent_detail_drives_tabs(tmp_path):
     """MUST 4 sentinel: compose_agent_detail() is called when rendering and drives tabs.
 
     This test verifies that the global registry's compose_agent_detail() is invoked
-    during render_agent_detail() and that it is what produces tab content (not an
-    inline fallback bypassing the registry).
+    during render_agent_detail() and that it is the SINGLE source of tab content —
+    no second panels_by_slot() render pass exists in the renderer.
 
-    Approach: register a spy panel on the global registry (then unregister it), verify
-    it was called.  We use the global _REGISTRY to confirm the production code path
-    routes through it.
+    Approach: register a spy panel on the global registry (then unregister it).
+    - The spy's render() appends a unique marker string to ``rendered``.
+    - We assert the marker appears in the HTML EXACTLY ONCE — not twice.
+      If compose_agent_detail() is called but its output is discarded and the panels
+      are rendered again via a second panels_by_slot() pass, the marker appears twice.
+      If compose_agent_detail() is bypassed entirely, the marker does not appear.
+    - We also assert the tab-nav button (dtab-spy) and the content pane
+      (tabpanel-spy) are both present and each appears exactly once.
 
     Note: the spy panel must be unregistered after the test to avoid polluting the
     singleton for subsequent tests.
@@ -591,6 +600,7 @@ def test_compose_agent_detail_drives_tabs(tmp_path):
     _write_log(tmp_path, "agent1")
 
     rendered = []
+    _MARKER = "spy-tab-unique-marker-63f4a9"
 
     class _SpyPanel:
         id = "agent_tab_spy_sentinel_do_not_ship"
@@ -604,23 +614,75 @@ def test_compose_agent_detail_drives_tabs(tmp_path):
 
         def render(self, ctx):
             rendered.append("spy_called")
-            return PanelResult(html='<div class="spy">spy tab content</div>')
+            return PanelResult(html=f'<div class="spy">{_MARKER}</div>')
 
     spy = _SpyPanel()
     registry = get_registry()
     registry.register(spy)
     try:
         html = _render_detail_html(tmp_path)
+
+        # render() was called — compose_agent_detail() invoked the panel
         assert rendered, (
             "compose_agent_detail must invoke registered agent-tab panels — "
             "spy was not called, indicating the renderer bypassed the registry"
         )
-        assert "spy" in html.lower() or "spy_called" in str(rendered), (
-            "Spy panel content must appear in rendered HTML"
+
+        # The marker appears EXACTLY ONCE — proves compose output is the single
+        # injection source (no double-render via a second panels_by_slot() pass).
+        marker_count = html.count(_MARKER)
+        assert marker_count == 1, (
+            f"Spy panel marker must appear exactly once in the rendered HTML "
+            f"(found {marker_count}). Double-render would produce count=2; "
+            f"bypassed registry would produce count=0."
+        )
+
+        # Tab-nav button and content pane are both present exactly once.
+        assert html.count('id="dtab-spy"') == 1, (
+            "Tab-nav button dtab-spy must appear exactly once"
+        )
+        assert html.count('id="tabpanel-spy"') == 1, (
+            "Tab content pane tabpanel-spy must appear exactly once"
         )
     finally:
         # Unregister the spy so it does not pollute subsequent tests.
         registry._panels = [p for p in registry._panels if p.id != spy.id]
+
+
+def test_memory_tab_shown_for_empty_memory_dir(tmp_path):
+    """MUST 4 / spec/57 §3: Memory tab appears when memory/ exists but is empty.
+
+    strip-RED contract: a _has_memory() guard that requires at least one *.md
+    note would suppress the Memory tab for an agent with an empty memory/ dir.
+    The spec requires an EMPTY STATE render, not no-tab.  We assert dtab-memory
+    is present even when memory/ has no notes.
+    """
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+    # Create empty memory/ surface — no .md files inside.
+    (tmp_path / "agent1" / "memory").mkdir(parents=True, exist_ok=True)
+
+    html = _render_detail_html(tmp_path)
+
+    assert "dtab-memory" in html, (
+        "Memory tab button (dtab-memory) must appear when memory/ exists, "
+        "even if there are no notes — strip-RED for MUST 4 / spec/57 §3"
+    )
+    assert "tabpanel-memory" in html, (
+        "Memory tab panel (tabpanel-memory) must appear when memory/ exists"
+    )
+
+
+def test_memory_tab_absent_when_no_memory_dir(tmp_path):
+    """MUST 4 strip-RED: Memory tab absent when memory/ surface does not exist."""
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1")
+    # No memory/ directory at all.
+    html = _render_detail_html(tmp_path)
+
+    assert "dtab-memory" not in html, (
+        "Memory tab button must be absent when memory/ directory does not exist"
+    )
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -893,6 +955,39 @@ def test_detail_health_real_composite_display(tmp_path):
     )
 
 
+def test_detail_table_fields_use_real_attributes(tmp_path):
+    """MUST 9 strip-RED: Cost and Activity table rows use direct field access.
+
+    strip-RED contract: getattr(r, "input_tokens", 0) / getattr(r, "output_tokens", 0)
+    / getattr(r, "cost_usd", 0.0) on run records are phantom-field patterns — if the
+    field is renamed, the getattr silently returns 0 instead of failing.  Direct field
+    access (r.input_tokens etc.) fails visibly on a rename.
+
+    We verify that known-nonzero token and cost values from the log record render in
+    the Cost and Activity table rows, not phantom zeros.  The log written by
+    _write_log() uses input_tokens=500, output_tokens=100 — distinct from 0.
+
+    strip-RED: a phantom getattr-default-0 would render "0 / 0" in the tokens column;
+    real field access renders "500 / 100".
+    """
+    _write_agent(tmp_path, "agent1")
+    _write_log(tmp_path, "agent1", cost_usd=0.0777)
+
+    html = _render_detail_html(tmp_path)
+
+    # Tokens column in the Cost and Activity tables: "500 / 100"
+    assert "500 / 100" in html, (
+        "Token columns in Cost/Activity table rows must show real input_tokens/output_tokens "
+        "(500 / 100), not phantom-field default 0 — strip-RED for MUST 9"
+    )
+
+    # Cost column in both tables: "$0.0777"
+    assert "$0.0777" in html, (
+        "Cost column in Cost/Activity table rows must show real cost_usd ($0.0777), "
+        "not phantom-field default 0.0 — strip-RED for MUST 9"
+    )
+
+
 # ──────────────────────────────────────────────────────────────────
 # MUST 10: pure-compute, zero LLM spend
 
@@ -935,7 +1030,9 @@ def test_detail_no_llm_spend(tmp_path):
             mod = importlib.import_module(mod_path)
             cls = getattr(mod, cls_name, None)
             if cls is not None:
-                patches_applied.append(patch.object(cls, "__init__", _raise_if_constructed))
+                patches_applied.append(
+                    patch.object(cls, "__init__", _raise_if_constructed)
+                )
         except ImportError:
             pass  # backend not installed in this env — skip
 
@@ -1029,6 +1126,7 @@ def test_render_all_no_double_write(tmp_path):
     # tab='cost' (no console pass): cost loop MUST write detail pages
     # Create a fresh tmp to avoid path conflicts
     import tempfile
+
     with tempfile.TemporaryDirectory() as tmp2:
         tmp2 = Path(tmp2)
         _write_agent(tmp2, "agent1")

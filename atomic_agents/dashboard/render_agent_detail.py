@@ -739,9 +739,9 @@ def _render_cost_tab(data) -> str:
             )
             trigger = getattr(r, "trigger", "")
             model = getattr(r, "model", "")
-            in_tok = getattr(r, "input_tokens", 0)
-            out_tok = getattr(r, "output_tokens", 0)
-            cost = getattr(r, "cost_usd", 0.0)
+            in_tok = r.input_tokens
+            out_tok = r.output_tokens
+            cost = r.cost_usd
             summary = getattr(r, "summary", "")
             rows.append(
                 f"<tr>"
@@ -787,9 +787,9 @@ def _render_activity_tab(data) -> str:
         )
         trigger = getattr(r, "trigger", "")
         model = getattr(r, "model", "")
-        in_tok = getattr(r, "input_tokens", 0)
-        out_tok = getattr(r, "output_tokens", 0)
-        cost = getattr(r, "cost_usd", 0.0)
+        in_tok = r.input_tokens
+        out_tok = r.output_tokens
+        cost = r.cost_usd
         fallback = getattr(r, "fallback", False)
         fallback_tag = (
             '<span class="pill fallback" style="margin-left:3px;">fallback</span>'
@@ -1050,9 +1050,12 @@ def _has_goals_agent(agent_root: Path) -> bool:
 
 
 def _has_memory(agent_root: Path) -> bool:
-    """True when memory/ exists with at least one .md note."""
-    md = agent_root / "memory"
-    return md.exists() and any(md.glob("*.md"))
+    """True when the memory/ surface exists (even if empty).
+
+    Per spec/57 §3: the Memory tab renders an empty state when the surface is
+    present but has no notes.  Only omit the tab when the surface is absent.
+    """
+    return (agent_root / "memory").exists()
 
 
 def _has_evals(agent_root: Path) -> bool:
@@ -1213,53 +1216,27 @@ def _render_detail_template(
 
     registry = get_registry()
 
-    # compose_agent_detail() is the authoritative engine entry point (MUST 4).
-    # This call satisfies the structural MUST (tabs driven by the registry engine),
-    # and its is_available + fail-soft render behaviours mirror compose().
-    registry.compose_agent_detail(_ctx)
+    # compose_agent_detail() is the SINGLE engine entry point (MUST 4).
+    # Its return value — an ordered list of (panel, html) for every available
+    # panel — drives BOTH the tab-nav buttons and the tab-content panes.
+    # There is no second panels_by_slot() render pass.
+    composed_tabs = registry.compose_agent_detail(_ctx)
 
-    # Build the ordered available-panel list for tab nav and per-panel wrapping.
-    # We iterate the registry directly (same data source as compose_agent_detail)
-    # so nav order is deterministic (sorted by (order, id)) and consistent with
-    # what compose_agent_detail would produce.
-    agent_tab_panels = []
-    for _p in registry.panels_by_slot("agent-tab"):
-        try:
-            _avail = _p.is_available(_ctx)
-        except Exception:
-            _avail = False
-        if _avail:
-            agent_tab_panels.append(_p)
-
-    # Tab nav (built from available panels — same ordering as compose_agent_detail).
+    # Tab nav + tab panel contents — both built from the composed list (MUST 4).
     tab_nav_items = []
-    for i, _p in enumerate(agent_tab_panels):
+    panels_html_parts = []
+    for i, (_p, _panel_content) in enumerate(composed_tabs):
         active = " active" if i == 0 else ""
         tab_nav_items.append(
             f'<button class="dtab{active}" onclick="showTab(\'{_p.tab_id}\')" '
             f'id="dtab-{_p.tab_id}">{_p.tab_label}</button>'
         )
-    tab_nav = '<div class="detail-tabs">' + "".join(tab_nav_items) + "</div>"
-
-    # Tab panel contents — per-tab fail-soft (MUST 8).
-    panels_html_parts = []
-    for i, _p in enumerate(agent_tab_panels):
-        active = " active" if i == 0 else ""
-        try:
-            _result = _p.render(_ctx)
-            _panel_content = _result.html
-        except Exception as exc:
-            logger.warning(
-                "agent-tab panel '%s' render failed for %s: %s", _p.id, agent_id, exc
-            )
-            _panel_content = (
-                f'<div class="tab-degraded">{_p.tab_label} tab unavailable.</div>'
-            )
         panels_html_parts.append(
             f'<div class="tab-panel{active}" id="tabpanel-{_p.tab_id}">'
             + _panel_content
             + "</div>"
         )
+    tab_nav = '<div class="detail-tabs">' + "".join(tab_nav_items) + "</div>"
     panels_html = "\n".join(panels_html_parts)
 
     now_str = now.strftime("%Y-%m-%d %H:%M UTC")
