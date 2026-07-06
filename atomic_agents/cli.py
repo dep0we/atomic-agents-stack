@@ -734,6 +734,132 @@ def main(argv: list[str] | None = None) -> int:
         help="override ATOMIC_AGENTS_ROOT",
     )
 
+    # ── manage subcommand (spec/55 #624) ──────────────────────────────────────
+    # Fleet-level config write verbs. Lazy-imports the manage module so the
+    # agent_registry, logs, and principal imports are not paid on every
+    # ``atomic-agents run`` / ``doctor`` invocation (principle #6 / spec/55 note).
+    manage_cmd = sub.add_parser(
+        "manage",
+        help="Apply validated, audited changes to agent config (spec/55)",
+        description=(
+            "Write verbs for the agent fleet: validate, preview, confirm, and "
+            "atomically apply changes to agent configuration files. Every verb "
+            "supports --dry-run (preview only), --yes (non-interactive), and "
+            "--json (structured output for copilot drivers). See spec/55 for "
+            "the full safety contract."
+        ),
+    )
+    manage_sub = manage_cmd.add_subparsers(dest="manage_verb", required=True)
+
+    # ── manage govern <agent> ─────────────────────────────────────────────────
+    govern_cmd = manage_sub.add_parser(
+        "govern",
+        help="Edit governance.md fields (owner, permission-tier, lifecycle-status, ...)",
+        description=(
+            "Surgical governance.md frontmatter editor. Validates field names and "
+            "enum values, previews the before/after diff, and writes atomically "
+            "with a restorable snapshot. Appends an audit event to the per-agent "
+            "log stream and to a distinct fleet stream when the log backend keeps "
+            "them separate (a shared distributed backend records one central row)."
+        ),
+    )
+    govern_cmd.add_argument(
+        "agent",
+        help="agent name (folder under agents-root)",
+    )
+    govern_cmd.add_argument(
+        "--set",
+        dest="set",
+        action="append",
+        metavar="field=value",
+        default=None,
+        help=(
+            "Set a governance field. Repeatable. Field names are hyphenated "
+            "(e.g. --set permission-tier=writes --set owner=alice@example.com). "
+            "Nested/list fields (review.*, risk.*, sources.*, actions.*) are not "
+            "yet settable via --set; edit governance.md directly. "
+            "Use --set updated-at=null to clear a field."
+        ),
+    )
+    # List-mutation flags (spec/55 CLI-surface grammar). PINNED now so the
+    # recognized-vs-unrecognized status of the flag never shifts in a later PR;
+    # PR1 recognises them but returns a clean structured "not yet settable via
+    # CLI" refusal (never an argparse ``unrecognized arguments`` parser error,
+    # which would also bypass the --json contract). PR2 implements the semantics.
+    govern_cmd.add_argument(
+        "--add",
+        dest="add",
+        action="append",
+        metavar="path=item",
+        default=None,
+        help=(
+            "Append an element to a list field (sources.*, actions.*). Reserved: "
+            "not yet settable via CLI in PR1 — edit governance.md directly."
+        ),
+    )
+    govern_cmd.add_argument(
+        "--remove",
+        dest="remove",
+        action="append",
+        metavar="path=item",
+        default=None,
+        help=(
+            "Remove an element from a list field (sources.*, actions.*). Reserved: "
+            "not yet settable via CLI in PR1 — edit governance.md directly."
+        ),
+    )
+    govern_cmd.add_argument(
+        "--set-json",
+        dest="set_json",
+        action="append",
+        metavar="path=json-array",
+        default=None,
+        help=(
+            "Replace a whole list field with a JSON array (sources.*, actions.*). "
+            "Reserved: not yet settable via CLI in PR1 — edit governance.md directly."
+        ),
+    )
+    govern_cmd.add_argument(
+        "--show",
+        dest="show",
+        action="store_true",
+        default=False,
+        help="Print the current resolved governance record and exit (read-only).",
+    )
+    govern_cmd.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        default=False,
+        help="Preview the before/after diff without writing. --yes is ignored when set.",
+    )
+    govern_cmd.add_argument(
+        "--yes",
+        dest="yes",
+        action="store_true",
+        default=False,
+        help="Apply without the interactive confirmation prompt (required on non-TTY).",
+    )
+    govern_cmd.add_argument(
+        "--json",
+        dest="json",
+        action="store_true",
+        default=False,
+        help=(
+            "Emit machine-readable JSON output (canonical underscore schema keys). "
+            "Refusals emit {ok: false, error_type, reason}; success emits "
+            "{ok: true, agent, changes, audit_status, snapshot_path?, dry_run?} "
+            "(snapshot_path present only when a prior file was snapshotted; "
+            "dry_run present on --dry-run)."
+        ),
+    )
+    govern_cmd.add_argument(
+        "--agents-root",
+        dest="agents_root",
+        default=None,
+        help="override ATOMIC_AGENTS_ROOT (fleet-scoped; matches init/registry convention)",
+    )
+
     args = parser.parse_args(argv)
 
     # `review` is a host-only subcommand — no agents-root needed (operates on
@@ -780,6 +906,12 @@ def main(argv: list[str] | None = None) -> int:
     # imported for any other CLI invocation.
     if args.cmd == "deploy":
         return _cmd_deploy(args)
+
+    # `manage` resolves its own agents_root from --agents-root or env var.
+    # Lazy-imports the manage module so agent_registry/logs/principal are not
+    # imported on every ``run`` / ``doctor`` invocation (principle #6 / spec/55).
+    if args.cmd == "manage":
+        return _cmd_manage(args)
 
     agents_root = (
         Path(args.agents_root).expanduser().resolve()
@@ -2222,6 +2354,23 @@ def _cmd_deploy(args) -> int:
     except deploy_mod.DeployError as e:
         print(f"Error: {e}", file=sys.stderr)
         return e.exit_code
+
+
+def _cmd_manage(args) -> int:
+    """Dispatch the ``atomic-agents manage`` subcommand group (spec/55 #624).
+
+    Lazy-imports the manage module so agent_registry, logs, and principal are
+    not imported on every ``atomic-agents run`` / ``doctor`` invocation.
+    Matches the lazy-import pattern from _cmd_serve / _cmd_deploy / _cmd_init.
+    """
+    from .manage import run_manage  # noqa: PLC0415 -- intentional lazy import
+
+    agents_root = (
+        Path(args.agents_root).expanduser().resolve()
+        if getattr(args, "agents_root", None)
+        else get_agents_root()
+    )
+    return run_manage(args, agents_root)
 
 
 if __name__ == "__main__":
