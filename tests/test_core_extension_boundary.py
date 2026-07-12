@@ -64,20 +64,63 @@ def _module_root_after_atomic_agents(module: str) -> str | None:
     return module[len(prefix) :].split(".", 1)[0]
 
 
+def _forbidden_root_of_module_string(module_str: str) -> str | None:
+    """Given a dynamic-import module string literal, return the forbidden
+    extension root it targets, or None.
+
+    Matches the same two shapes the static scanner treats as
+    ``atomic_agents``-internal:
+      - absolute: ``"atomic_agents.manage"`` / ``"atomic_agents.manage.foo"``
+      - relative: ``".manage"`` / ``"..dashboard.costs"`` (as passed to
+        ``importlib.import_module(".manage", __package__)`` from a module
+        inside the package)
+
+    A bare ``"manage"`` with no dots and no ``atomic_agents.`` prefix resolves
+    to a top-level third-party module, NOT our extension package, so it is
+    deliberately NOT flagged -- consistent with the static-import handling.
+    """
+    prefix = "atomic_agents."
+    if module_str.startswith(prefix):
+        root = module_str[len(prefix) :].split(".", 1)[0]
+        return root if root in FORBIDDEN_EXTENSION_PACKAGES else None
+    if module_str.startswith("."):
+        # Relative dynamic import: strip leading dots, take first component.
+        stripped = module_str.lstrip(".")
+        root = stripped.split(".", 1)[0] if stripped else None
+        return root if root in FORBIDDEN_EXTENSION_PACKAGES else None
+    return None
+
+
+def _string_literal(node: ast.expr) -> str | None:
+    """Return the value of a string-literal AST node, or None if not a
+    plain string constant (a dynamically-computed module name is out of
+    scope for a static scanner and left for the runtime sys.modules guard)."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
 def find_forbidden_imports(source: str, filename: str) -> list[str]:
     """Return a human-readable violation string per forbidden import found.
 
-    Handles all four import shapes:
+    Handles all four STATIC import shapes:
       - ``import atomic_agents.manage``               (absolute)
       - ``from atomic_agents.manage import X``         (absolute from)
       - ``from atomic_agents import manage``           (absolute from, bare pkg)
       - ``from .manage import X`` / ``from . import manage``  (relative)
 
+    ...plus two DYNAMIC import shapes with a string-literal first argument:
+      - ``importlib.import_module("atomic_agents.manage")`` (also the bare
+        ``import_module(...)`` name, and relative ``import_module(".manage")``)
+      - ``__import__("atomic_agents.dashboard")``
+
     Relative imports are resolved purely on dotted-name shape (the first
     module component, or the imported name when ``from . import X``) since
     every file scanned here already lives inside the ``atomic_agents``
     package -- a relative import can only ever resolve to a sibling/cousin
-    module within it.
+    module within it. Dynamically-computed module names (non-string-literal
+    args) are out of scope for a static scanner and are covered instead by
+    the runtime ``sys.modules`` guard in test_quickstart_core_only.py.
     """
     tree = ast.parse(source, filename=filename)
     violations: list[str] = []
@@ -90,6 +133,26 @@ def find_forbidden_imports(source: str, filename: str) -> list[str]:
                     violations.append(
                         f"{filename}:{node.lineno}: `import {alias.name}`"
                     )
+
+        elif isinstance(node, ast.Call):
+            # Dynamic imports: importlib.import_module(...) / import_module(...)
+            # / __import__(...) with a string-literal first argument.
+            func = node.func
+            is_import_module = (
+                isinstance(func, ast.Attribute) and func.attr == "import_module"
+            ) or (isinstance(func, ast.Name) and func.id == "import_module")
+            is_dunder_import = isinstance(func, ast.Name) and func.id == "__import__"
+            if (is_import_module or is_dunder_import) and node.args:
+                literal = _string_literal(node.args[0])
+                if literal is not None:
+                    root = _forbidden_root_of_module_string(literal)
+                    if root is not None:
+                        call_name = (
+                            "__import__" if is_dunder_import else "import_module"
+                        )
+                        violations.append(
+                            f"{filename}:{node.lineno}: `{call_name}({literal!r})`"
+                        )
 
         elif isinstance(node, ast.ImportFrom):
             if node.level and node.level > 0:
@@ -129,6 +192,53 @@ def find_forbidden_imports(source: str, filename: str) -> list[str]:
                             )
 
     return violations
+
+
+# ---------------------------------------------------------------------------
+# Scope helpers -- used by the cli.py assertion to prove the ONE allowed
+# `.manage` import is LAZY (nested inside _cmd_manage), not module-level.
+# ---------------------------------------------------------------------------
+
+
+def _manage_importfrom_nodes(source: str, filename: str) -> list[ast.ImportFrom]:
+    """Every `from .manage import ...` (relative, first component 'manage')
+    ImportFrom node in the source."""
+    tree = ast.parse(source, filename=filename)
+    nodes: list[ast.ImportFrom] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            first = module.split(".", 1)[0] if module else None
+            if node.level and node.level > 0 and first == "manage":
+                nodes.append(node)
+    return nodes
+
+
+def _module_level_import_linenos(source: str) -> set[int]:
+    """Line numbers of every import statement at MODULE top level (direct
+    children of the module body, i.e. not nested in any function/class)."""
+    tree = ast.parse(source)
+    linenos: set[int] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            linenos.add(node.lineno)
+    return linenos
+
+
+def _enclosing_function_name(source: str, target_lineno: int) -> str | None:
+    """Name of the innermost function whose body encloses target_lineno, or
+    None if the line is not inside any function (i.e. module-level)."""
+    tree = ast.parse(source)
+    best: tuple[int, str] | None = None  # (span, name) -- smallest span wins
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            start = node.lineno
+            end = getattr(node, "end_lineno", start)
+            if start <= target_lineno <= end:
+                span = end - start
+                if best is None or span < best[0]:
+                    best = (span, node.name)
+    return best[1] if best is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +320,30 @@ def test_named_core_files_import_nothing_from_fleet(relpath: str):
     if violations:
         assert "manage" in violations[0] and "run_manage" in violations[0]
 
+    # ...and it must be LAZY (nested inside _cmd_manage's body), not a
+    # module-level import. A module-level `from .manage import run_manage`
+    # would satisfy the "at most one, contains run_manage" checks above but
+    # defeat the whole progressive-disclosure point -- so assert on scope,
+    # not just count. This is what makes a regression to a module-top import
+    # FAIL the test.
+    manage_imports = _manage_importfrom_nodes(source, relpath)
+    assert manage_imports, (
+        "expected exactly one `from .manage import ...` in cli.py; found none "
+        "(if the import was removed entirely, update this test)"
+    )
+    module_level = _module_level_import_linenos(source)
+    for imp in manage_imports:
+        assert imp.lineno not in module_level, (
+            f"cli.py has a MODULE-LEVEL `from .manage import ...` at line "
+            f"{imp.lineno}; the manage import must be lazy (nested inside "
+            f"_cmd_manage's function body), never at module top."
+        )
+    enclosing = _enclosing_function_name(source, manage_imports[0].lineno)
+    assert enclosing == "_cmd_manage", (
+        f"cli.py's `.manage` import is inside {enclosing!r}, expected it "
+        f"nested inside `_cmd_manage`'s dispatch body."
+    )
+
 
 # ---------------------------------------------------------------------------
 # Negative control: prove the scanner actually catches what it claims to.
@@ -227,6 +361,13 @@ def test_named_core_files_import_nothing_from_fleet(relpath: str):
         "from . import manage\n",
         "from ..dashboard import costs\n",
         "import atomic_agents.advisor.score\n",
+        # Dynamic imports (finding #3): importlib.import_module + __import__.
+        'import importlib\nimportlib.import_module("atomic_agents.manage")\n',
+        'from importlib import import_module\nimport_module("atomic_agents.dashboard")\n',
+        'importlib.import_module("atomic_agents.advisor.score")\n',
+        'importlib.import_module(".manage", __package__)\n',
+        'importlib.import_module("..dashboard.costs", __package__)\n',
+        '__import__("atomic_agents.manage")\n',
     ],
 )
 def test_scanner_flags_each_forbidden_import_shape(source: str):
@@ -247,6 +388,18 @@ def test_scanner_flags_each_forbidden_import_shape(source: str):
         # A local variable/function literally named 'manage' must not false-positive
         # when it is not the target of an atomic_agents-rooted import.
         "from some_other_package import manage\n",
+        # Dynamic imports of NON-forbidden targets must not be flagged.
+        'importlib.import_module("atomic_agents.deploy")\n',  # deploy is core
+        'importlib.import_module("atomic_agents.memory")\n',
+        'importlib.import_module("some_third_party.manage")\n',  # not our package
+        '__import__("os")\n',
+        # A dynamically-computed (non-literal) module name is out of scope for
+        # the static scanner (covered by the runtime sys.modules guard).
+        'importlib.import_module("atomic_agents." + pkg)\n',
+        "importlib.import_module(mod_name)\n",
+        # An unrelated method literally named import_module-ish must not fire
+        # (attr must be exactly 'import_module').
+        'obj.import_modules("atomic_agents.manage")\n',
     ],
 )
 def test_scanner_does_not_flag_allowed_imports(source: str):
