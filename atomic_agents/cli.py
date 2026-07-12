@@ -45,8 +45,10 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import Callable
 
 from .agent import AtomicAgent
+from ._cli_registry import CliCommand, discover_commands
 from ._platform import get_agents_root
 from .memory import get_default_memory_backend
 from .memory.backend import WritePolicy
@@ -59,12 +61,7 @@ from .skills import validate_skill_manifest
 # from atomic_agents.persona so CLI handlers can catch them by name.
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="atomic-agents", description="Atomic Agents CLI"
-    )
-    sub = parser.add_subparsers(dest="cmd", required=True)
-
+def _register_run(sub: argparse._SubParsersAction) -> None:
     run = sub.add_parser("run", help="Run an agent against a work item")
     run.add_argument("agent", help="agent name (folder under agents-root)")
     run.add_argument("--work-item", required=True, help="user message / work item text")
@@ -80,10 +77,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     run.add_argument("--agents-root", default=None, help="override ATOMIC_AGENTS_ROOT")
 
+
+def _register_info(sub: argparse._SubParsersAction) -> None:
     info = sub.add_parser("info", help="Show config for an agent without running it")
     info.add_argument("agent")
     info.add_argument("--agents-root", default=None)
 
+
+def _register_skills(sub: argparse._SubParsersAction) -> None:
     skills_cmd = sub.add_parser(
         "skills",
         help="List all skills for an agent (name, description, body line count, warnings)",
@@ -93,6 +94,8 @@ def main(argv: list[str] | None = None) -> int:
         "--agents-root", default=None, help="override ATOMIC_AGENTS_ROOT"
     )
 
+
+def _register_version(sub: argparse._SubParsersAction) -> None:
     version_cmd = sub.add_parser("version", help="List versions for a memory note")
     version_cmd.add_argument("agent", help="agent name (folder under agents-root)")
     version_cmd.add_argument(
@@ -100,6 +103,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     version_cmd.add_argument("--agents-root", default=None)
 
+
+def _register_restore(sub: argparse._SubParsersAction) -> None:
     restore_cmd = sub.add_parser(
         "restore", help="Restore a memory note from a snapshot"
     )
@@ -110,6 +115,8 @@ def main(argv: list[str] | None = None) -> int:
     restore_cmd.add_argument("version_name", help="version filename to restore from")
     restore_cmd.add_argument("--agents-root", default=None)
 
+
+def _register_bundle(sub: argparse._SubParsersAction) -> None:
     bundle_cmd = sub.add_parser(
         "bundle",
         help="Pre-render the cascade into a single file for skill-mode loads (spec/26)",
@@ -181,6 +188,8 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
 
+
+def _register_doctor(sub: argparse._SubParsersAction) -> None:
     doctor_cmd = sub.add_parser(
         "doctor",
         help="Run preflight checks (env, vault, keys, model, mcp, locks, write-paths)",
@@ -206,6 +215,8 @@ def main(argv: list[str] | None = None) -> int:
         help="skip MCP server handshake (faster; useful when servers are remote)",
     )
 
+
+def _register_review(sub: argparse._SubParsersAction) -> None:
     review_cmd = sub.add_parser(
         "review",
         help="Run a cross-family adversarial code review against a target file",
@@ -264,6 +275,8 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
 
+
+def _register_persona(sub: argparse._SubParsersAction) -> None:
     # ── persona subcommand group ──────────────────────────────────────────
     persona_cmd = sub.add_parser(
         "persona",
@@ -311,6 +324,8 @@ def main(argv: list[str] | None = None) -> int:
         "target_id", help="destination persona_id (must not exist)"
     )
 
+
+def _register_corpus(sub: argparse._SubParsersAction) -> None:
     # ── corpus subcommand group ───────────────────────────────────────────
     corpus_cmd = sub.add_parser(
         "corpus",
@@ -399,6 +414,8 @@ def main(argv: list[str] | None = None) -> int:
         help="override ATOMIC_AGENTS_AGENT_ROOT (default: $ATOMIC_AGENTS_AGENT_ROOT or cwd)",
     )
 
+
+def _register_mcp_registry(sub: argparse._SubParsersAction) -> None:
     # ── mcp-registry subcommand group ────────────────────────────────────
     mcp_registry_cmd = sub.add_parser(
         "mcp-registry",
@@ -524,6 +541,8 @@ def main(argv: list[str] | None = None) -> int:
         help="override ATOMIC_AGENTS_AGENT_ROOT (default: $ATOMIC_AGENTS_AGENT_ROOT or cwd)",
     )
 
+
+def _register_secrets(sub: argparse._SubParsersAction) -> None:
     # ── secrets subcommand group ─────────────────────────────────────────
     # Secrets are flat per-deployment (NOT per-agent) so no --agent-root arg.
     # Observability only: check presence, show source, validate. Never prints
@@ -567,6 +586,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Validate the configured secret backend instantiates cleanly",
     )
 
+
+def _register_init(sub: argparse._SubParsersAction) -> None:
     # ── init subcommand ───────────────────────────────────────────────────
     init_cmd = sub.add_parser(
         "init",
@@ -603,6 +624,8 @@ def main(argv: list[str] | None = None) -> int:
         help="override ATOMIC_AGENTS_ROOT",
     )
 
+
+def _register_serve(sub: argparse._SubParsersAction) -> None:
     # ── serve subcommand ──────────────────────────────────────────────────
     serve_cmd = sub.add_parser(
         "serve",
@@ -667,6 +690,8 @@ def main(argv: list[str] | None = None) -> int:
         help="override ATOMIC_AGENTS_ROOT",
     )
 
+
+def _register_deploy(sub: argparse._SubParsersAction) -> None:
     # ── deploy subcommand ─────────────────────────────────────────────────
     # The deployment planner (spec/49). Takes a POSITIONAL agent like
     # init/serve. `deploy <agent>` plans + installs a supervised loopback
@@ -734,10 +759,14 @@ def main(argv: list[str] | None = None) -> int:
         help="override ATOMIC_AGENTS_ROOT",
     )
 
+
+def _register_manage(sub: argparse._SubParsersAction) -> None:
     # ── manage subcommand (spec/55 #624) ──────────────────────────────────────
-    # Fleet-level config write verbs. Lazy-imports the manage module so the
-    # agent_registry, logs, and principal imports are not paid on every
-    # ``atomic-agents run`` / ``doctor`` invocation (principle #6 / spec/55 note).
+    # Registration only builds argparse structure — it does NOT import the
+    # `.manage` package (which pulls in agent_registry/logs/principal). The
+    # heavy import stays lazy inside `_cmd_manage`'s dispatch (principle #6 /
+    # spec/55 note), so `atomic-agents run` / `doctor` / any other command
+    # never pays for it.
     manage_cmd = sub.add_parser(
         "manage",
         help="Apply validated, audited changes to agent config (spec/55)",
@@ -859,87 +888,6 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="override ATOMIC_AGENTS_ROOT (fleet-scoped; matches init/registry convention)",
     )
-
-    args = parser.parse_args(argv)
-
-    # `review` is a host-only subcommand — no agents-root needed (operates on
-    # arbitrary files, not agent folders). All other subcommands resolve
-    # agents_root either from --agents-root or the ATOMIC_AGENTS_ROOT env var.
-    if args.cmd == "review":
-        try:
-            return _cmd_review(args)
-        except AtomicAgentsError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            return 1
-
-    # `persona` is a host-only subcommand that resolves its own scope_root
-    # from the cwd. It does not need agents-root.
-    if args.cmd == "persona":
-        return _cmd_persona(args)
-
-    # `corpus` resolves its own agent_root from --agent-root or env var / cwd.
-    # It does not use the agents-root / agent-name hierarchy.
-    if args.cmd == "corpus":
-        return _cmd_corpus(args)
-
-    # `mcp-registry` resolves its own agent_root from --agent-root or env var / cwd.
-    if args.cmd == "mcp-registry":
-        return _cmd_mcp_registry(args)
-
-    # `secrets` is deployment-scoped (not per-agent). No path resolution needed.
-    if args.cmd == "secrets":
-        return _cmd_secrets(args)
-
-    # `init` resolves its own agents_root from --agents-root or env var.
-    # It does not use the agents-root / agent-name hierarchy.
-    if args.cmd == "init":
-        return _cmd_init(args)
-
-    # `serve` resolves its own agents_root from --agents-root or env var.
-    # Lazy-imports the serve module so Starlette/uvicorn are not imported
-    # on every CLI invocation (spec/37 MUST 1 — progressive disclosure).
-    if args.cmd == "serve":
-        return _cmd_serve(args)
-
-    # `deploy` resolves its own agents_root from --agents-root or env var.
-    # Lazy-imports the deploy module so launchd/socket machinery is not
-    # imported for any other CLI invocation.
-    if args.cmd == "deploy":
-        return _cmd_deploy(args)
-
-    # `manage` resolves its own agents_root from --agents-root or env var.
-    # Lazy-imports the manage module so agent_registry/logs/principal are not
-    # imported on every ``run`` / ``doctor`` invocation (principle #6 / spec/55).
-    if args.cmd == "manage":
-        return _cmd_manage(args)
-
-    agents_root = (
-        Path(args.agents_root).expanduser().resolve()
-        if args.agents_root
-        else get_agents_root()
-    )
-
-    # Doctor has its own exit-code semantics (0/1/2) and must never raise to the user.
-    if args.cmd == "doctor":
-        return _cmd_doctor(args)
-
-    try:
-        if args.cmd == "run":
-            return _cmd_run(args, agents_root)
-        elif args.cmd == "info":
-            return _cmd_info(args, agents_root)
-        elif args.cmd == "skills":
-            return _cmd_skills(args, agents_root)
-        elif args.cmd == "version":
-            return _cmd_version(args, agents_root)
-        elif args.cmd == "restore":
-            return _cmd_restore(args, agents_root)
-        elif args.cmd == "bundle":
-            return _cmd_bundle(args, agents_root)
-    except AtomicAgentsError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
-    return 0
 
 
 def _cmd_review(args) -> int:
@@ -2371,6 +2319,121 @@ def _cmd_manage(args) -> int:
         else get_agents_root()
     )
     return run_manage(args, agents_root)
+
+
+# ---------------------------------------------------------------------------
+# Command table -- wires each _register_* / _cmd_* pair above into a
+# CliCommand (see atomic_agents/_cli_registry.py). This replaces the old
+# hardcoded `if args.cmd == "...": ...` dispatch chain: main() below builds
+# its command table by iterating _BUILTIN_COMMANDS (extended with any
+# out-of-tree entry-point commands) instead.
+# ---------------------------------------------------------------------------
+
+
+def _dispatch_agent_scoped(
+    handler: Callable[[argparse.Namespace, Path], int],
+) -> Callable[[argparse.Namespace], int]:
+    """Wrap a handler that needs ``agents_root`` resolved + errors caught.
+
+    Reproduces exactly what ``main()`` used to do centrally for run / info /
+    skills / version / restore / bundle before this refactor: resolve
+    ``agents_root`` from ``--agents-root`` or ``ATOMIC_AGENTS_ROOT``, call the
+    handler with it, and turn an ``AtomicAgentsError`` into an ``Error: ...``
+    stderr line + exit 1 instead of an uncaught traceback.
+    """
+
+    def wrapped(args: argparse.Namespace) -> int:
+        agents_root = (
+            Path(args.agents_root).expanduser().resolve()
+            if args.agents_root
+            else get_agents_root()
+        )
+        try:
+            return handler(args, agents_root)
+        except AtomicAgentsError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+
+    return wrapped
+
+
+def _dispatch_with_error_wrap(
+    handler: Callable[[argparse.Namespace], int],
+) -> Callable[[argparse.Namespace], int]:
+    """Wrap a handler that needs no ``agents_root`` but still catches
+    ``AtomicAgentsError`` the way ``main()`` used to for ``review``."""
+
+    def wrapped(args: argparse.Namespace) -> int:
+        try:
+            return handler(args)
+        except AtomicAgentsError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+
+    return wrapped
+
+
+def _builtin_commands() -> list[CliCommand]:
+    """Build the built-in command table.
+
+    Deliberately built fresh on every call (from ``main()``) rather than
+    once as a module-level constant: each ``CliCommand`` entry below
+    resolves ``_cmd_run`` / ``_cmd_corpus`` / etc. by name at the moment
+    this function runs, so ``unittest.mock.patch("atomic_agents.cli._cmd_X",
+    ...)`` -- the pattern several existing tests already use -- is honored
+    the same way it was when ``main()`` dispatched via a bare
+    ``_cmd_x(args)`` call. A module-level constant would instead freeze in
+    the ORIGINAL function objects at import time, silently defeating that
+    patching pattern.
+    """
+    return [
+        CliCommand("run", _register_run, _dispatch_agent_scoped(_cmd_run)),
+        CliCommand("info", _register_info, _dispatch_agent_scoped(_cmd_info)),
+        CliCommand("skills", _register_skills, _dispatch_agent_scoped(_cmd_skills)),
+        CliCommand("version", _register_version, _dispatch_agent_scoped(_cmd_version)),
+        CliCommand("restore", _register_restore, _dispatch_agent_scoped(_cmd_restore)),
+        CliCommand("bundle", _register_bundle, _dispatch_agent_scoped(_cmd_bundle)),
+        # doctor has its own 0/1/2 exit-code semantics and must never raise
+        # to the user; it resolves its own agents_root internally, so it
+        # dispatches directly.
+        CliCommand("doctor", _register_doctor, _cmd_doctor),
+        CliCommand("review", _register_review, _dispatch_with_error_wrap(_cmd_review)),
+        # persona / corpus / mcp-registry / secrets resolve their own scope
+        # root (persona/corpus/mcp-registry: --*-root flag / env var / cwd;
+        # secrets: deployment-scoped, no root at all) and handle their own
+        # exceptions internally -- see each _cmd_* docstring above.
+        CliCommand("persona", _register_persona, _cmd_persona),
+        CliCommand("corpus", _register_corpus, _cmd_corpus),
+        CliCommand("mcp-registry", _register_mcp_registry, _cmd_mcp_registry),
+        CliCommand("secrets", _register_secrets, _cmd_secrets),
+        # init / serve / deploy / manage lazy-import their implementation
+        # modules inside their own _cmd_* dispatch function (progressive
+        # disclosure, principle #6) -- registration above never imports them.
+        CliCommand("init", _register_init, _cmd_init),
+        CliCommand("serve", _register_serve, _cmd_serve),
+        CliCommand("deploy", _register_deploy, _cmd_deploy),
+        CliCommand("manage", _register_manage, _cmd_manage),
+    ]
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="atomic-agents", description="Atomic Agents CLI"
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    # Build the command table: built-ins plus any out-of-tree extension
+    # commands discovered via the `atomic_agents.cli_commands` entry-point
+    # group (see _cli_registry.discover_commands). Each command registers
+    # its own subparser; main() has no per-command special-casing left.
+    commands = discover_commands(_builtin_commands())
+    command_by_name: dict[str, CliCommand] = {}
+    for command in commands:
+        command.register(sub)
+        command_by_name[command.name] = command
+
+    args = parser.parse_args(argv)
+    return command_by_name[args.cmd].dispatch(args)
 
 
 if __name__ == "__main__":
