@@ -2426,10 +2426,29 @@ def main(argv: list[str] | None = None) -> int:
     # commands discovered via the `atomic_agents.cli_commands` entry-point
     # group (see _cli_registry.discover_commands). Each command registers
     # its own subparser; main() has no per-command special-casing left.
-    commands = discover_commands(_builtin_commands())
+    builtins = _builtin_commands()
+    builtin_names = {c.name for c in builtins}
+    commands = discover_commands(builtins)
     command_by_name: dict[str, CliCommand] = {}
     for command in commands:
-        command.register(sub)
+        try:
+            command.register(sub)
+        except Exception as e:  # noqa: BLE001 -- a broken plugin must not brick the CLI
+            # A built-in's register() raising is OUR bug — re-raise it loud
+            # rather than swallow it (a silently-missing `init`/`doctor` would
+            # be far more confusing to debug than a traceback). A plugin's
+            # register() raising (its own code, or an argparse
+            # duplicate/collision error) runs on EVERY invocation before
+            # parse_args, so it must be isolated: skip that one command with a
+            # stderr warning and keep every other command working.
+            if command.name in builtin_names:
+                raise
+            print(
+                f"warning: CLI command plugin {command.name!r} failed to "
+                f"register its subparser and was skipped: {e}",
+                file=sys.stderr,
+            )
+            continue
         command_by_name[command.name] = command
 
     args = parser.parse_args(argv)

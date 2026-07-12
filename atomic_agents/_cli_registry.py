@@ -93,7 +93,12 @@ def discover_commands(builtin: list[CliCommand]) -> list[CliCommand]:
     the CLI for every other command).
     """
     commands: list[CliCommand] = list(builtin)
-    names = {c.name for c in commands}
+    # Track built-in names separately from plugin-contributed names so a
+    # collision diagnostic can say WHICH kind of command was shadowed (a
+    # built-in vs another already-accepted plugin) rather than always
+    # blaming a built-in.
+    builtin_names = {c.name for c in commands}
+    plugin_names: set[str] = set()
     try:
         eps = entry_points(group=ENTRY_POINT_GROUP)
     except Exception as e:  # noqa: BLE001 -- discovery must never break the CLI
@@ -115,7 +120,7 @@ def discover_commands(builtin: list[CliCommand]) -> list[CliCommand]:
                 file=sys.stderr,
             )
             continue
-        if command.name in names:
+        if command.name in builtin_names:
             print(
                 f"warning: CLI command plugin {ep.name!r} registers subcommand "
                 f"{command.name!r}, which is already a built-in command; "
@@ -123,6 +128,14 @@ def discover_commands(builtin: list[CliCommand]) -> list[CliCommand]:
                 file=sys.stderr,
             )
             continue
+        if command.name in plugin_names:
+            print(
+                f"warning: CLI command plugin {ep.name!r} registers subcommand "
+                f"{command.name!r}, which another plugin already registered; "
+                f"ignoring the later plugin registration",
+                file=sys.stderr,
+            )
+            continue
         commands.append(command)
-        names.add(command.name)
+        plugin_names.add(command.name)
     return commands
