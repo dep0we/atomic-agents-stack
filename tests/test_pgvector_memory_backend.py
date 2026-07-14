@@ -822,7 +822,13 @@ def test_pgvector_live_merge_embeds_post_merge_body(pgv_backend):
     row = cur.fetchone()
     conn.commit()
     assert row is not None
-    stored_vec = list(row["embedding"])
+    # pgvector >=0.4 returns a non-iterable `Vector` here (older versions / the
+    # numpy loader returned an iterable). Convert version-agnostically: a
+    # `Vector` exposes `.to_list()`; a numpy array / plain list stays `list()`.
+    _stored_raw = row["embedding"]
+    stored_vec = (
+        _stored_raw.to_list() if hasattr(_stored_raw, "to_list") else list(_stored_raw)
+    )
     # Vectors are deterministic for the stub backend; compare elementwise.
     assert len(stored_vec) == len(expected_vec)
     assert stored_vec == [pytest.approx(v) for v in expected_vec], (
