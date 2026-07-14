@@ -372,6 +372,26 @@ When transcript tokens regularly dwarf INDEX + selected notes, or multi-session 
 
 ---
 
+### 🟡 T17. Core is accreting fleet-shaped tooling — the core/extension boundary (ruled 2026-07, first guards shipped #736)
+
+**One-sentence:** The package a home user installs for one agent has grown fleet machinery (`advisor/`, `dashboard/`, the `manage/` verbs), and without a boundary core keeps absorbing at-scale concerns — burying the single-operator inception experience the throughline protects.
+
+**Ruling (2026-07, with Dan):** Core = framework + runtime + backend protocols + the single-local-agent experience. Everything fleet-shaped — observe / optimize / govern *many* agents — is the framework's **first customer**, not part of it, and extracts to its own package (`fair-copy-fleet`) that depends on core one-way. `deploy/` stays core (it is the single-agent "run my agent as a service" story, not fleet). The AgentRegistry *protocol* stays core; the `manage` *verbs* extract. The physical repo split rides the Fair Copy rename; the boundary is enforced in-repo first, so the protection is banked without waiting on the rename.
+
+**The value-threshold test** (apply to any future tool; first "yes" decides): (1) **Contract or product?** Protocol + spec + conformance tests → core. (2) **Subtraction test** — does deleting it break the one-local-agent experience (create / run / remember / audit / cost-cap)? → core. (3) **Quickstart test** — must a home user know it exists to use their one agent? → core. (4) **Cadence test** — can it lag a spec version and still work? → extension. Corollary: "the spec is the product" applies to the *agent-and-backend* spec, not to specs in general — an extension may carry its own rigorous spec without becoming core.
+
+**Guardrails (enforcement, not vibes — first three shipped in #736):**
+- **CLI namespace lock** — top-level commands register through a mechanism (`_cli_registry.py`, entry-point based) so core's `cli.py` never hardcodes a fleet verb. Adding a *core* top-level verb requires passing the value-threshold test, recorded here. (Operationalizes T11.)
+- **Import-direction CI check** — static assert no core module imports a fleet module (`advisor`/`dashboard`/`manage`); covers `cli.py` and `doctor.py` explicitly, both static and dynamic (`importlib.import_module`/`__import__`) forms.
+- **Clean-room CI** — install core-only and run the single-agent quickstart (init → edit → call → audit → cost-cap, no fleet verbs) end-to-end; fails red the instant core imports an extension.
+- **Spec-numbering policy** — `docs/spec/` numbers are reserved for agent + backend contracts; extension specs live with the extension. (Relates to T9.)
+
+**What this ruling does NOT authorize:** moving cloud/Terraform deployment tooling into the fleet package (it stays quarantined in `extras/`); folding `deploy/` into fleet (it is single-agent); exporting the `PRICING` table as a public dict at the core↔fleet seam (see T7 — expose a function so a price edit is not an API break).
+
+**Related:** the throughline (CLAUDE.md); T7 (`PRICING` as a function at the seam), T9 (spec-doc surface growth), T10 (extraction needs *tombstone* shims, distinct from rename re-export shims), T11 (module entry points → the registration mechanism), T15 (same core-vs-deployment authority split). #736 (first guards shipped), #737 (partial-plugin edge follow-up). Full plan: vault `EXTRACTION-CORE-VS-EXTENSIONS.md`, merging into the Fair Copy rename (`REBRAND-FAIR-COPY.md`).
+
+---
+
 ## Resolved tensions
 
 *(Move items here when resolved, with date + how it resolved.)*
@@ -395,6 +415,7 @@ When transcript tokens regularly dwarf INDEX + selected notes, or multi-session 
 | 2026-06-12 | T4 | **Resolved** — queue cluster carved from `_cascade.py` into `atomic_agents/queue/` as `QueueBackend` Protocol + `FilesystemQueueBackend` reference impl (SCAFFOLDING-ONLY; zero internal runtime callers wired). | #428 PR 1. Thin non-deprecated re-export shim in `_cascade.py` preserves verbatim free-function signatures for existing callers. DRAFT spec/44 ships; 12-MUST Implementer Contract. `single_host_only` capability flag mirrors `LockCapabilities` pattern. `recover_stale_claims()` is a free function above the Protocol, calling only Protocol methods. spec/40 export whitelist (queued/ + done/ + dead-letter/ only; claimed/ excluded). Doctor check SKIP for single-agent layouts (detect_cascade → None); WARN on ATOMIC_AGENTS_MULTI_HOST. Runtime adoption (cascade runner wiring) deferred to follow-up issue. |
 | 2026-06-22 | T4 | **LOCK** — spec/44 DRAFT→LOCKED; 137 tests (62 conformance + 75 filesystem-specific); all 12 MUSTs individually test-covered. Security hardening: iterdir()-walk in export() adds version-independent no-follow + a per-subdir containment re-assertion `rglob` performs nowhere (#477 — defense-in-depth; default `rglob('*')` does NOT follow directory symlinks on 3.11–3.13, so this hardens against a future `recurse_symlinks` default rather than a live DoS, live 3.13+ vector tracked in #595); no-replace mkdir + O_EXCL claim probe closes lease_token-collision clobber (#478); O_NOFOLLOW sidecar writes close sidecar-leaf perimeter escape (#479); MUST 10 fail-soft de-vacuoused + strip-RED negative control (#476). | #428 LOCK PR. Runtime adoption deferred to #469. |
 | 2026-06-19 | T16 | **Added** — raw immediate-continuity transcript injection recorded as a bounded, deliberate flex of Rule #6, with named triggers + a "does NOT authorize" boundary. | #535 ConversationBackend PR1. Conversation turns load into `messages[]` (not the system prompt, preserving T14's cacheable prefix), bounded by a token-budget window with oldest-first eviction, current-run-only, never auto-promoted to memory. Distinct from distilled INDEX-driven recall: immediate continuity for the prior few turns, ephemeral, not accumulating cross-session. Maintainer-approved wording (Dan, 2026-06-19). |
+| 2026-07-14 | T17 | **Added** — the core/extension boundary ruled + the value-threshold test + guardrails recorded; first three guards shipped (CLI namespace lock via a command-registration mechanism, import-direction CI check covering `doctor.py`, clean-room quickstart CI). | #736 (Phase 2a of the core/extension split). Core = framework + single-local-agent experience; fleet tooling (`advisor`/`dashboard`/`manage` verbs) is the framework's first customer and extracts to `fair-copy-fleet` (one-way dependency); `deploy/` + cloud tooling stay out of the fleet package. Physical repo split rides the Fair Copy rename; the boundary is enforced in-repo first. Follow-up #737 (partial-plugin argparse edge). Maintainer-approved (Dan, 2026-07-14). |
 
 ---
 
