@@ -22,7 +22,7 @@ import logging
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from .._io import atomic_write
+from ..core_api import atomic_write
 from ._shared import CSS as _SHARED_CSS, _CSP as _SHARED_CSP
 
 logger = logging.getLogger(__name__)

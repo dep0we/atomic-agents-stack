@@ -105,6 +105,28 @@ PRICING: dict[str, dict[str, float]] = {
     },  # $0.075/$0.30 per 1M
 }
 
+
+def get_model_rates(model_id: str) -> dict[str, float] | None:
+    """Return the input/output USD-per-1M rates for model_id, or None.
+
+    This is the core<->fleet seam accessor (TENSIONS T7, core_api.get_model_rates):
+    PRICING itself stays private to this module so a price-table edit is never
+    an API break. The fleet/extension seam (advisor/, dashboard/, manage/,
+    via the core_api re-export) must go through this function rather than
+    reaching into PRICING directly; core internals (e.g. doctor.py, dream.py,
+    llm/anthropic.py) may still read PRICING directly like deploy/ does.
+
+    Returns a shallow copy of the PRICING entry, so mutating the result never
+    mutates PRICING. Returns None when model_id has no entry (unpriced/unknown
+    model) — callers that need a pessimistic fallback should use calc_cost(),
+    which already applies _fallback_pricing() internally.
+    """
+    entry = PRICING.get(model_id)
+    if entry is None:
+        return None
+    return dict(entry)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Embedding pricing — SEPARATE from PRICING (chat models).
 #

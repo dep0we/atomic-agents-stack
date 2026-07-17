@@ -13,7 +13,7 @@ IMPORT DISCIPLINE (spec/53 MUST 10):
     - stdlib
     - atomic_agents.dashboard._reliability (shared reliability computations)
     - atomic_agents.dashboard.costs (_load_runs_with_degraded, discover_agents)
-    - atomic_agents._costs (PRICING)
+    - atomic_agents.core_api (get_model_rates)
     - .targets (FleetTargets, parse_targets, constants)
   Its own code NEVER directly imports agent.py, eval.py, tuning.py, dream.py,
   dashboard.attention, or dashboard.render.
@@ -45,7 +45,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from .._costs import PRICING
+from ..core_api import get_model_rates
 from ..dashboard._reliability import (
     ReliabilityMetrics,
     _compute_reliability,
@@ -345,10 +345,11 @@ def _is_cheap_model(model_id: str) -> bool:
     Unknown model_id → classified NOT cheap (fail-pessimistic, spec/53 MUST 9):
     returns False without consulting any rate or fallback sentinel.
     """
-    if model_id not in PRICING:
+    rates = get_model_rates(model_id)
+    if rates is None:
         # Unknown model → fail-pessimistic (not cheap). No rate is consulted.
         return False
-    output_rate = PRICING[model_id]["output"]
+    output_rate = rates["output"]
     # Strict less-than: ties are NOT cheap (fail-pessimistic, spec/53 MUST 9)
     return output_rate < CHEAP_OUTPUT_RATE_THRESHOLD_USD_PER_1M
 

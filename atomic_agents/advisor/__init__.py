@@ -5,8 +5,8 @@ Pure-compute module — ZERO new LLM spend (no LLMBackend constructed, no LLM ca
 Import discipline (source-level — see score.py and recommend.py for the full NOTE):
 - The advisor's OWN code reads only from atomic_agents.dashboard.costs
   (_load_runs_with_degraded / discover_agents / RunRecord),
-  atomic_agents.dashboard._reliability, atomic_agents._costs.PRICING, .targets,
-  and direct JSONL/frontmatter file readers.
+  atomic_agents.dashboard._reliability, atomic_agents.core_api.get_model_rates,
+  .targets, and direct JSONL/frontmatter file readers.
 - It NEVER DIRECTLY imports agent.py, eval.py, tuning.py, or dream.py (though the
   package __init__ loads them transitively — the guarantee is no-LLM-spend, not
   sys.modules isolation).

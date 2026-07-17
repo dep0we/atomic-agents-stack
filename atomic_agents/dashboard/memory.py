@@ -18,7 +18,7 @@ from typing import Any
 
 from .costs import discover_agents
 from ._shared import page_shell, truncate
-from .._io import atomic_write
+from ..core_api import atomic_write
 from ..memory import get_default_memory_backend
 from ..exceptions import BackendNotRegistered
 
