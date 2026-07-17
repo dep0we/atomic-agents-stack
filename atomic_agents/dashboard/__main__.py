@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .render import render_all, render_global
 from .serve import serve as serve_cmd
-from .._platform import get_agents_root
+from ..core_api import get_agents_root
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -18,8 +18,9 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     render = sub.add_parser("render", help="Render dashboards (default: all tabs)")
-    render.add_argument("--agents-root", default=None,
-                         help="Override ATOMIC_AGENTS_ROOT")
+    render.add_argument(
+        "--agents-root", default=None, help="Override ATOMIC_AGENTS_ROOT"
+    )
     render.add_argument(
         "--tab",
         default="all",
@@ -35,7 +36,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     agents_root = (
         Path(args.agents_root).expanduser().resolve()
-        if args.agents_root else get_agents_root()
+        if args.agents_root
+        else get_agents_root()
     )
 
     if not agents_root.exists():

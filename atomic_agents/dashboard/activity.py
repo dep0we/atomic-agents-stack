@@ -25,7 +25,7 @@ from ._shared import (
     truncate,
     status_pill,
 )
-from .._io import atomic_write
+from ..core_api import atomic_write
 from ..memory import get_default_memory_backend
 from ..exceptions import BackendNotRegistered
 

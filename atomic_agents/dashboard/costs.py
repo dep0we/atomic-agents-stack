@@ -14,7 +14,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .._costs import calc_cost, PRICING
+from ..core_api import calc_cost, get_model_rates
 
 logger = logging.getLogger(__name__)
 
@@ -477,9 +477,10 @@ def cache_savings_usd(runs: list[RunRecord]) -> float:
             continue
         # Saved = full input price - cached input price (10% of input)
         # = cache_hit_tokens * input_price * (1 - 0.10)
-        if r.model not in PRICING:
+        rates = get_model_rates(r.model)
+        if rates is None:
             continue
-        rate = PRICING[r.model]["input"]
+        rate = rates["input"]
         saved += r.cache_hit_tokens * rate * 0.9 / 1_000_000
     return round(saved, 6)
 

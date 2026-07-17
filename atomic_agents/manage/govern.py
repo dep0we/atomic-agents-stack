@@ -39,7 +39,7 @@ from typing import Any
 
 import yaml
 
-from .._io import atomic_write, safe_resolve_under
+from ..core_api import atomic_write, safe_resolve_under
 from ..agent_registry.types import (
     PERMISSION_TIERS,
     TRISTATES,

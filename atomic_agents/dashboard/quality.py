@@ -21,7 +21,7 @@ from ._shared import (
     sparkline,
     truncate,
 )
-from .._io import atomic_write
+from ..core_api import atomic_write
 
 
 # ──────────────────────────────────────────────────────────────────

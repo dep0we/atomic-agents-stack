@@ -14,7 +14,7 @@ Three rec kinds shipped in PR3:
 IMPORT DISCIPLINE (spec/54 MUST 10 — mirror of spec/53 §2):
   This module's OWN code imports only from:
     - stdlib (+ frontmatter, a project dependency)
-    - atomic_agents._costs (PRICING, calc_cost)
+    - atomic_agents.core_api (get_model_rates, calc_cost)
     - atomic_agents.advisor.score (_EvalRecord, _score_agent_from_data, ...)
     - atomic_agents.advisor.targets (FleetTargets, RecommendationConfig,
       _DEFAULT_SAME_FAMILY_DOWNGRADE, parse_recommendations, parse_targets)
@@ -54,7 +54,7 @@ from pathlib import Path
 
 import frontmatter  # python-frontmatter>=1.1; already a project dependency
 
-from .._costs import PRICING, calc_cost
+from ..core_api import calc_cost, get_model_rates
 from .score import (
     AgentHealth,
     FleetHealth,
@@ -296,7 +296,8 @@ def _resolve_candidate(
     Operator-configured work_type_allowed_models takes priority when present.
     The baked-in _DEFAULT_SAME_FAMILY_DOWNGRADE map is the fallback.
 
-    The candidate must be in PRICING for repricing to work (verified here).
+    The candidate must have a known rate for repricing to work (verified here
+    via get_model_rates()).
     """
     # Operator-configured path
     if (
@@ -304,8 +305,8 @@ def _resolve_candidate(
         and work_type in rec_config.work_type_allowed_models
     ):
         candidates = rec_config.work_type_allowed_models[work_type]
-        # Filter to PRICING-known models only
-        valid = [c for c in candidates if c in PRICING]
+        # Filter to models with a known rate only
+        valid = [c for c in candidates if get_model_rates(c) is not None]
         if valid:
             return valid[0], "operator_configured"
 
@@ -313,9 +314,9 @@ def _resolve_candidate(
     candidate = _DEFAULT_SAME_FAMILY_DOWNGRADE.get(model)
     if candidate is None:
         return None, "default_same_family"
-    if candidate not in PRICING:
+    if get_model_rates(candidate) is None:
         logger.warning(
-            "recommend: default candidate %r for model %r not in PRICING; skipping",
+            "recommend: default candidate %r for model %r has no known rate; skipping",
             candidate,
             model,
         )

@@ -8,7 +8,7 @@ The five-step order (MUST NOT reorder — M3):
   2. Preview   — caller renders before/after diff
   3. Confirm   — --dry-run exits here; --yes or TTY prompt
   4. Snapshot  — ``take_config_snapshot()`` — BEFORE overwrite
-  4b. Write    — ``_io.atomic_write()`` — called by the verb
+  4b. Write    — ``core_api.atomic_write()`` — called by the verb
   5. Audit     — ``append_management_audit()`` — AFTER write, non-fatal on error
 
 ``take_config_snapshot`` and ``append_management_audit`` are exported so each verb
@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .._io import atomic_write, safe_resolve_under
+from ..core_api import atomic_write, safe_resolve_under
 
 
 # ── Snapshot infrastructure ────────────────────────────────────────────────────
@@ -53,7 +53,7 @@ def take_config_snapshot(agent_dir: Path, content: str) -> Path:
     governance.md content. The snapshot_path is returned for inclusion in the
     audit extra{}.
 
-    Called BEFORE ``_io.atomic_write`` — the ordering invariant M3 requires.
+    Called BEFORE ``core_api.atomic_write`` — the ordering invariant M3 requires.
     A failure here aborts the write (snapshot is the rollback foundation;
     a write without a snapshot is unrecoverable).
 

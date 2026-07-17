@@ -38,8 +38,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from .render import render_all, _write_rendered_alert_keys
-from .._io import safe_resolve_under
-from .._platform import get_agents_root
+from ..core_api import get_agents_root, safe_resolve_under
 from ..exceptions import PathTraversalError
 
 logger = logging.getLogger(__name__)

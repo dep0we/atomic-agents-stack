@@ -24,7 +24,7 @@ import urllib.parse
 from datetime import date
 from pathlib import Path
 
-from .._io import atomic_write
+from ..core_api import atomic_write
 from .costs import (
     AgentDashboardData,
     AgentSummary,
@@ -309,7 +309,7 @@ def render_console(
     """
     from datetime import datetime, timezone
 
-    from .._io import atomic_write
+    from ..core_api import atomic_write
 
     out_dir = agents_root / "_dashboard"
     out_dir.mkdir(parents=True, exist_ok=True)
