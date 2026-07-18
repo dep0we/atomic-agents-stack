@@ -699,9 +699,11 @@ class TestCheapModelClassification:
 
     def test_haiku_is_cheap(self):
         """claude-haiku-4-5 output=$4/1M < $5 threshold → cheap."""
-        from atomic_agents._costs import PRICING
+        from atomic_agents.core_api import get_model_rates
 
-        haiku_output = PRICING["claude-haiku-4-5"]["output"]
+        haiku_rates = get_model_rates("claude-haiku-4-5")
+        assert haiku_rates is not None
+        haiku_output = haiku_rates["output"]
         assert haiku_output < CHEAP_OUTPUT_RATE_THRESHOLD_USD_PER_1M
         assert _is_cheap_model("claude-haiku-4-5") is True
 
@@ -718,26 +720,61 @@ class TestCheapModelClassification:
         """Unknown model → pessimistic (not cheap), no crash."""
         assert _is_cheap_model("some-unknown-model-v99") is False
 
-    def test_strip_red_tie_at_threshold_is_not_cheap(self):
-        """strip-RED: a model at exactly the threshold must be classified NOT cheap."""
-        from unittest.mock import patch
-        from atomic_agents import _costs
+    def test_strip_red_tie_at_threshold_is_not_cheap(self, monkeypatch):
+        """strip-RED: a model at exactly the threshold must be classified NOT cheap.
 
-        # Temporarily insert a model at exactly the cutoff
+        Monkeypatches the extension-owned binding
+        ``atomic_agents.advisor.score.get_model_rates`` (score.py:48 does
+        ``from ..core_api import get_model_rates``, and ``_is_cheap_model``
+        at score.py:348 resolves that module-global at call time) instead of
+        mutating the core-private ``_costs.PRICING`` table directly (TENSIONS
+        T17 test-fixture-surface ruling, #743). ``pytest``'s ``monkeypatch``
+        fixture auto-restores on teardown, including on assertion failure --
+        no manual try/finally needed.
+
+        The fake wraps the REAL get_model_rates for every model_id except
+        the synthetic one. Two separate guarantees are checked here, not one:
+        ``_is_cheap_model`` calls ``get_model_rates(model_id)`` FIRST in both
+        the unknown-model (returns ``None``) path and the comparison path, so
+        the spy alone would fire identically either way and can't
+        distinguish them. What proves the code reached the
+        ``output_rate < THRESHOLD`` comparison -- rather than the separate
+        unknown-model fail-pessimistic branch, which returns the same
+        ``False`` for the wrong reason -- is that the fake returns a
+        non-``None`` rate dict for ``fake_model`` and ``result is False`` is
+        still asserted below: only the threshold comparison can produce that
+        combination. The ``spy.assert_called_once_with(fake_model)`` call
+        separately proves the monkeypatched ``get_model_rates`` binding is
+        the one actually resolved at the call site -- that the patch took
+        effect and wasn't shadowed by some other reference -- not that the
+        threshold branch was reached.
+        """
+        from unittest.mock import Mock
+
+        import atomic_agents.advisor.score as score_mod
+        from atomic_agents.core_api import get_model_rates as real_get_model_rates
+
         fake_model = "_test_threshold_model"
-        original = dict(_costs.PRICING)
-        try:
-            _costs.PRICING[fake_model] = {
-                "input": 1.0,
-                "output": CHEAP_OUTPUT_RATE_THRESHOLD_USD_PER_1M,  # exactly at cutoff
-            }
-            result = _is_cheap_model(fake_model)
-            assert result is False, (
-                f"model at exactly threshold ${CHEAP_OUTPUT_RATE_THRESHOLD_USD_PER_1M}/1M "
-                "must be classified NOT cheap (fail-pessimistic, strict less-than)"
-            )
-        finally:
-            _costs.PRICING.pop(fake_model, None)
+        fake_rates = {
+            "input": 1.0,
+            "output": CHEAP_OUTPUT_RATE_THRESHOLD_USD_PER_1M,  # exactly at cutoff
+        }
+
+        def _fake_get_model_rates(model_id):
+            if model_id == fake_model:
+                return dict(fake_rates)
+            return real_get_model_rates(model_id)
+
+        spy = Mock(wraps=_fake_get_model_rates)
+        monkeypatch.setattr(score_mod, "get_model_rates", spy)
+
+        result = _is_cheap_model(fake_model)
+
+        assert result is False, (
+            f"model at exactly threshold ${CHEAP_OUTPUT_RATE_THRESHOLD_USD_PER_1M}/1M "
+            "must be classified NOT cheap (fail-pessimistic, strict less-than)"
+        )
+        spy.assert_called_once_with(fake_model)
 
 
 # ──────────────────────────────────────────────────────────────────
