@@ -642,13 +642,13 @@ class TestCandidateResolution:
 
     def test_known_model_gets_same_family_candidate(self):
         """claude-opus-4-8 → candidate in PRICING."""
-        from atomic_agents._costs import PRICING
+        from atomic_agents.core_api import get_model_rates
 
         candidate, source = _resolve_candidate(
             "claude-opus-4-8", "general", RecommendationConfig()
         )
         assert candidate is not None
-        assert candidate in PRICING
+        assert get_model_rates(candidate) is not None
         assert source == "default_same_family"
 
     def test_unknown_model_returns_none(self):

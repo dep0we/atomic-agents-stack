@@ -9,13 +9,13 @@ re-export module, ``atomic_agents.core_api``, that names itself honestly as
 the internal-stable core<->fleet contract (TENSIONS T17 / T7), not a
 broadly-advertised public API.
 
-This file covers three things:
+This file covers four things:
   1. The six names are importable from ``core_api`` and are the SAME OBJECT
      as the private originals (a re-export can't silently diverge).
   2. ``get_model_rates()`` -- the T7 payoff -- behaves correctly: known
      model, unknown model, and defensive-copy semantics.
-  3. The seam-lock guard: no file under ``advisor/``, ``dashboard/``, or
-     ``manage/`` may import ANY leading-underscore core-private module --
+  3. The seam-lock guard: no SOURCE file under ``advisor/``, ``dashboard/``,
+     or ``manage/`` may import ANY leading-underscore core-private module --
      not just the four originally repointed (``_io`` / ``_costs`` /
      ``_platform`` / ``_model``), but any future one too (e.g. ``_llm``,
      ``_capture``) -- statically, via an AST walk over every import shape,
@@ -23,6 +23,17 @@ This file covers three things:
      false-positive on a file like ``manage/set_model.py`` (``set_model``
      contains ``_model``); the AST guard matches whole dotted-path
      SEGMENTS, so it does not.
+  4. The test-layer half of the same seam (#743, TENSIONS T17
+     test-seam-guard ruling): extension-owned TEST files identified by
+     filename convention (``tests/advisor/`` as a subdirectory, plus
+     the flat, prefix-named ``tests/test_advisor_*.py``,
+     ``tests/test_dashboard_*.py``, and ``tests/test_manage_*.py`` files at
+     the ``tests/`` root) are scanned with the same AST walker. This is a
+     filename-scoped guard, not a scan of every test file that happens to
+     import extension code -- a test file outside these conventions (e.g.
+     ``tests/test_workflow_aggregate.py``, which imports dashboard code
+     under an unmatched name) is not covered; tracked as a follow-up
+     in #747.
 """
 
 from __future__ import annotations
@@ -203,9 +214,11 @@ def find_core_private_imports(
       - absolute from bare pkg: ``from atomic_agents import _io``
       - relative: ``from .._io import atomic_write`` / ``from .. import _io``
 
-    ...plus two DYNAMIC import shapes with a string-literal first argument
-    (parity with Phase 2a's ``test_core_extension_boundary.py`` guard):
-      - ``importlib.import_module("atomic_agents._costs")``
+    ...plus two DYNAMIC import shapes with an ABSOLUTE string-literal first
+    argument:
+      - ``importlib.import_module("atomic_agents._costs")`` (also the bare
+        ``import_module("atomic_agents._costs")`` name, i.e.
+        ``from importlib import import_module`` then ``import_module(...)``)
       - ``__import__("atomic_agents._io")``
 
     Relative imports are resolved against `package_parts` (this file's own
@@ -213,6 +226,22 @@ def find_core_private_imports(
     relative-import level rule: level L resolves against
     ``package_parts[: len(package_parts) - (L - 1)]``. This is a genuine
     level-aware resolution, not a naive "first dotted component" heuristic.
+
+    Coverage note -- two gaps remain versus Phase 2a's
+    ``test_core_extension_boundary.py`` guard, neither fixed here, both
+    tracked in #747:
+      1. A RELATIVE dynamic-import string, e.g.
+         ``importlib.import_module(".._costs", __package__)``, is NOT
+         resolved against `package_parts` the way Phase 2a's guard resolves
+         it -- only an ABSOLUTE ``"atomic_agents...."`` string literal is
+         recognized here, so a relative dynamic-import string silently
+         escapes this guard.
+      2. A string-literal target passed to something like
+         ``unittest.mock.patch("atomic_agents._costs.PRICING", ...)`` or
+         ``monkeypatch.setattr("atomic_agents._costs.PRICING", ...)`` is an
+         ordinary call argument, not an import node, so it is not caught
+         here either. None of the extension source or test files do this
+         today.
     """
     tree = ast.parse(source, filename=filename)
     violations: list[str] = []
@@ -238,13 +267,16 @@ def find_core_private_imports(
                 _flag_if_forbidden(target_parts, node.lineno, f"`import {alias.name}`")
 
         elif isinstance(node, ast.Call):
-            # Dynamic imports: importlib.import_module(...) / __import__(...)
-            # with a string-literal first argument -- parity with Phase 2a's
-            # dynamic-import detection.
+            # Dynamic imports: importlib.import_module(...) / bare
+            # import_module(...) / __import__(...) with an ABSOLUTE
+            # string-literal first argument. Unlike Phase 2a's guard, this
+            # does NOT resolve a RELATIVE dynamic-import string (e.g.
+            # import_module(".._costs", __package__)) -- see the coverage
+            # note in this function's docstring and #747.
             func = node.func
             is_import_module = (
                 isinstance(func, ast.Attribute) and func.attr == "import_module"
-            )
+            ) or (isinstance(func, ast.Name) and func.id == "import_module")
             is_dunder_import = isinstance(func, ast.Name) and func.id == "__import__"
             if (is_import_module or is_dunder_import) and node.args:
                 arg = node.args[0]
@@ -326,6 +358,215 @@ def test_extension_packages_import_no_core_private_module():
 
 
 # ---------------------------------------------------------------------------
+# 5. Seam-lock guard, test layer: advisor/dashboard/manage TEST files import
+#    no core-private module either (#743, TENSIONS T17 test-seam-guard).
+# ---------------------------------------------------------------------------
+
+# tests/advisor/ is a real subdirectory (has __init__.py + conftest.py) and
+# is walked recursively, the same shape as _extension_python_files() on the
+# source side. dashboard/ and manage/ tests are NOT under a tests/dashboard/
+# or tests/manage/ directory today -- verified via `ls tests/`: they are
+# flat, prefix-named files directly at the tests/ root (e.g.
+# tests/test_dashboard_console.py, tests/test_manage_govern.py). A naive
+# port of the directory-walk pattern to tests/dashboard/ and tests/manage/
+# would silently discover zero files. EXTENSION_TEST_PACKAGE_DIRS still
+# lists all three names (mirroring EXTENSION_PACKAGE_DIRS) so that if a
+# tests/dashboard/ or tests/manage/ directory is ever added, the walk below
+# picks it up automatically with no code change -- the same
+# "if not pkg_dir.is_dir(): continue" existence-check pattern
+# _extension_python_files() already uses.
+EXTENSION_TEST_PACKAGE_DIRS = ("advisor", "dashboard", "manage")
+
+# Flat-file glob patterns for the extension test suites that don't (yet)
+# live under a tests/<pkg>/ subdirectory. Matched at the tests/ root only
+# (non-recursive) -- this is a deliberate explicit allowlist, not a broad
+# "any test file" scan: roughly 40 core test files (test_core_api.py itself,
+# test_costs.py, test_llm_protocol_conformance.py, test_conductor.py, ...)
+# legitimately import core-private modules directly by design and must
+# never be swept into this scan.
+# Extension-importing test files that don't match tests/advisor/,
+# test_dashboard_*.py, or test_manage_*.py (e.g. tests/test_workflow_
+# aggregate.py) are deliberately out of scope for now -- tracked as a
+# follow-up in #747, not fixed here.
+EXTENSION_TEST_FILE_GLOB_PATTERNS = (
+    "test_advisor_*.py",
+    "test_dashboard_*.py",
+    "test_manage_*.py",
+)
+
+
+def _extension_test_files(tests_root: Path = REPO_ROOT / "tests") -> list[Path]:
+    """Every extension-owned TEST file: the test-side half of the seam guard.
+
+    ``tests_root`` defaults to the real repo ``tests/`` directory but is
+    overridable so tests can point the same discovery logic at a synthetic
+    on-disk layout (proving the glob/walk actually reaches real files, not
+    just that the shared AST walker can flag a synthetic source string).
+
+    Deliberately does NOT walk ``tests/`` as a whole and does NOT widen the
+    underlying ``_flag_if_forbidden`` predicate -- see the module docstring
+    point 4 and the EXTENSION_TEST_FILE_GLOB_PATTERNS comment above for why.
+    """
+    files: list[Path] = []
+    seen: set[Path] = set()
+
+    for pkg_name in EXTENSION_TEST_PACKAGE_DIRS:
+        pkg_dir = tests_root / pkg_name
+        if not pkg_dir.is_dir():
+            continue
+        for path in pkg_dir.rglob("*.py"):
+            if "__pycache__" in path.parts:
+                continue
+            if path not in seen:
+                seen.add(path)
+                files.append(path)
+
+    for pattern in EXTENSION_TEST_FILE_GLOB_PATTERNS:
+        for path in tests_root.glob(pattern):
+            if path not in seen:
+                seen.add(path)
+                files.append(path)
+
+    return files
+
+
+def test_extension_test_files_import_no_core_private_module():
+    """advisor/, dashboard/, manage/ TEST files import no core-private module.
+
+    The test-layer twin of ``test_extension_packages_import_no_core_private_
+    module`` above, scoped to the same filename conventions documented at
+    ``EXTENSION_TEST_FILE_GLOB_PATTERNS`` (the ``tests/advisor/`` subdir plus
+    ``test_{advisor,dashboard,manage}_*.py`` at the ``tests/`` root) -- NOT
+    every test file that happens to import extension code (see #747 for the
+    known gap). Within that scope, the read/membership sites that used to do
+    ``from atomic_agents._costs import PRICING``
+    (tests/advisor/test_advisor_recommend.py,
+    tests/advisor/test_advisor_score.py) were repointed onto
+    ``core_api.get_model_rates()`` in the same PR, so this must already be
+    green.
+    """
+    all_violations: list[str] = []
+    for path in _extension_test_files():
+        rel = str(path.relative_to(REPO_ROOT))
+        source = path.read_text(encoding="utf-8")
+        package_parts = _file_package_parts(path)
+        all_violations.extend(find_core_private_imports(source, rel, package_parts))
+
+    assert not all_violations, (
+        "Extension-owned TEST file(s) import a core-private (leading-"
+        "underscore) module directly. Route through atomic_agents.core_api "
+        "instead, or monkeypatch the extension-owned binding that resolves "
+        "it, instead of mutating the core-private table (#743 "
+        "test-seam-guard).\n" + "\n".join(all_violations)
+    )
+
+
+def test_extension_test_file_discovery_includes_known_real_files():
+    """End-to-end discovery check against the REAL repo disk layout -- not
+    just the synthetic-string unit tests below, which only prove the shared
+    AST walker can flag a violation once handed a source string. This
+    proves the glob/walk step actually reaches the files it claims to."""
+    discovered = {str(p.relative_to(REPO_ROOT)) for p in _extension_test_files()}
+    assert "tests/advisor/test_advisor_score.py" in discovered
+    assert "tests/advisor/test_advisor_recommend.py" in discovered
+    assert "tests/test_dashboard_console.py" in discovered
+    assert "tests/test_manage_govern.py" in discovered
+
+
+def test_extension_test_file_discovery_excludes_core_test_files():
+    """Must never sweep in tests/test_core_api.py (self) or other core test
+    files that legitimately import core-private modules by design -- an
+    over-broad discovery would false-positive the whole suite the moment
+    this guard runs (#743 P0/P1 findings)."""
+    discovered = {str(p.relative_to(REPO_ROOT)) for p in _extension_test_files()}
+    assert "tests/test_core_api.py" not in discovered
+    assert "tests/test_costs.py" not in discovered
+    assert "tests/test_llm_protocol_conformance.py" not in discovered
+    assert "tests/test_conductor.py" not in discovered
+
+
+def test_extension_test_file_discovery_ignores_unrelated_flat_file(tmp_path):
+    """A flat file at the tests/ root that does NOT match either glob
+    pattern (e.g. a tests/test_costs.py-shaped name) must never be
+    discovered -- proves the glob predicate is a genuine explicit allowlist,
+    not an "any .py file at the root" scan."""
+    unrelated = tmp_path / "test_costs.py"
+    unrelated.write_text("from atomic_agents._costs import PRICING\n", encoding="utf-8")
+
+    discovered = _extension_test_files(tests_root=tmp_path)
+
+    assert unrelated not in discovered
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "advisor/test_injected_violation.py",
+        "test_dashboard_injected_violation.py",
+        "test_manage_injected_violation.py",
+    ],
+)
+def test_strip_red_discovery_and_scan_fires_on_test_file_violation(
+    tmp_path, relative_path
+):
+    """strip-RED, end-to-end: proves the discovery+scan PIPELINE (not just
+    the underlying AST walker) fires when a core-private import is re-added
+    to a real file on disk shaped like each of the three extension test
+    surfaces this guard covers (tests/advisor/, test_dashboard_*.py,
+    test_manage_*.py). Mirroring only the already-tested AST predicate
+    (test_scanner_flags_each_forbidden_import_shape) would say nothing
+    about whether the NEW discovery step reaches these files at all."""
+    bad_file = tmp_path / relative_path
+    bad_file.parent.mkdir(parents=True, exist_ok=True)
+    bad_file.write_text("from atomic_agents._costs import PRICING\n", encoding="utf-8")
+
+    discovered = _extension_test_files(tests_root=tmp_path)
+    assert bad_file in discovered, (
+        f"discovery failed to find the injected violation file at {relative_path!r}"
+    )
+
+    violations: list[str] = []
+    for path in discovered:
+        rel = str(path.relative_to(tmp_path))
+        source = path.read_text(encoding="utf-8")
+        # Package parts don't need to resolve against the real repo tree for
+        # this control -- test files structurally cannot reach an
+        # atomic_agents.* module via a RELATIVE import (relative imports
+        # can't cross top-level package boundaries), so only the absolute-
+        # import branches of find_core_private_imports are exercised here.
+        violations.extend(find_core_private_imports(source, rel, ("tests",)))
+
+    assert violations, (
+        f"guard failed to fire on an injected core-private import at {relative_path!r}"
+    )
+
+
+def test_extension_test_scan_does_not_flag_extension_internal_private(tmp_path):
+    """A dashboard/manage-INTERNAL private submodule import (e.g.
+    ``atomic_agents.dashboard._status``, ``atomic_agents.manage._routine``)
+    must stay unflagged -- the shared ``_flag_if_forbidden`` predicate
+    checks only ``target_parts[1]`` (the segment immediately after
+    ``atomic_agents``), so ``dashboard``/``manage`` (not underscore-
+    prefixed) is correctly exempt. This proves that holds through the NEW
+    discovery+scan pipeline too, not just the underlying predicate."""
+    ok_file = tmp_path / "test_dashboard_ok.py"
+    ok_file.write_text(
+        "from atomic_agents.dashboard._status import status_for_agent\n",
+        encoding="utf-8",
+    )
+
+    discovered = _extension_test_files(tests_root=tmp_path)
+    assert ok_file in discovered
+
+    violations = find_core_private_imports(
+        ok_file.read_text(encoding="utf-8"), str(ok_file), ("tests",)
+    )
+    assert not violations, (
+        f"false-flagged an extension-internal (not core-private) import: {violations!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Negative controls -- prove the scanner actually catches what it claims to,
 # and that it does NOT false-positive on a lookalike name.
 # ---------------------------------------------------------------------------
@@ -351,6 +592,10 @@ def test_extension_packages_import_no_core_private_module():
         # Dynamic imports (fix 2): importlib.import_module + __import__.
         'importlib.import_module("atomic_agents._costs")\n',
         '__import__("atomic_agents._io")\n',
+        # Bare-name form (fix 3, closes a #747 gap): `from importlib import
+        # import_module` then `import_module(...)` -- Phase 2a's guard
+        # already caught this; ours did not until this fix.
+        'import_module("atomic_agents._io")\n',
     ],
 )
 def test_scanner_flags_each_forbidden_import_shape(source: str):
