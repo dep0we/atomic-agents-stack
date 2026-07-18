@@ -34,6 +34,7 @@ import pytest
 
 from atomic_agents.manage.govern import (
     _edit_governance_block,
+    _extract_governance_dict_from_text,
     _find_governance_block_span,
     _parse_set_token,
     _validate_field_value,
@@ -91,13 +92,18 @@ def _make_args(
     add: list[str] | None = None,
     remove: list[str] | None = None,
     set_json: list[str] | None = None,
+    restore: str | None = None,
+    list_snapshots: bool = False,
 ) -> Any:
     """Build a minimal argparse-like namespace for run_govern().
 
     The list-mutation flags (add/remove/set_json) mirror argparse's ``default=None``
     so the mock namespace matches the real one — otherwise a bare ``MagicMock``
     attribute would read as a truthy value and spuriously trip the PR1
-    list-mutation refusal.
+    list-mutation refusal. Same rationale for ``restore``/``list_snapshots``
+    (#710) — a bare unset MagicMock attribute is truthy, which would
+    spuriously trip the single-primary-action refusal on EVERY existing
+    ``--set`` test.
     """
     ns = MagicMock()
     ns.agent = agent
@@ -109,6 +115,8 @@ def _make_args(
     ns.add = add
     ns.remove = remove
     ns.set_json = set_json
+    ns.restore = restore
+    ns.list_snapshots = list_snapshots
     ns.agents_root = str(agents_root)
     return ns
 
@@ -1398,7 +1406,10 @@ def test_govern_json_abort_n_emits_structured_refusal(tmp_path, capsys, monkeypa
     )
     exit_code = run_govern(args, tmp_path)
 
-    assert exit_code == 0
+    # abort-exit-code ruling: 'n' decline exits 3 (NOT 0 — exit 2 is reserved
+    # for argparse usage errors, so a copilot can tell "declined" apart from
+    # "bad flags"; error_type stays 'aborted').
+    assert exit_code == 3
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is False
     assert payload["error_type"] == "aborted"
@@ -1430,10 +1441,68 @@ def test_govern_json_abort_eof_emits_structured_refusal(tmp_path, capsys, monkey
     )
     exit_code = run_govern(args, tmp_path)
 
-    assert exit_code == 0
+    # abort-exit-code ruling: EOF decline exits 3, same as an explicit 'n'.
+    assert exit_code == 3
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is False
     assert payload["error_type"] == "aborted"
+
+
+def test_govern_json_abort_sigint_exits_130(tmp_path, capsys, monkeypatch):
+    """abort-exit-code ruling: KeyboardInterrupt (SIGINT) exits 130, not 3.
+
+    Distinct from a decline ('n'/EOF, exit 3) — the operator never answered,
+    the process was interrupted. error_type stays 'aborted'; only the exit
+    code and the human-readable reason differ.
+    """
+    agent_dir = _make_agent_dir(tmp_path)
+    _make_governance_md(agent_dir)
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+
+    def _raise_sigint():
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", _raise_sigint)
+
+    args = _make_args(
+        agent_dir.name,
+        tmp_path,
+        set_fields=["owner=alice@example.com"],
+        use_json=True,
+        yes=False,
+    )
+    exit_code = run_govern(args, tmp_path)
+
+    assert exit_code == 130
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["error_type"] == "aborted"
+    assert "interrupt" in payload["reason"].lower()
+
+    # No write happened, no audit record.
+    assert _collect_jsonl(agent_dir / "log") == []
+
+
+def test_govern_abort_n_non_json_exits_3(tmp_path, capsys, monkeypatch):
+    """Non-JSON 'n' decline exits 3 and prints 'Aborted.' to stderr."""
+    agent_dir = _make_agent_dir(tmp_path)
+    _make_governance_md(agent_dir)
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda: "n")
+
+    args = _make_args(
+        agent_dir.name,
+        tmp_path,
+        set_fields=["owner=alice@example.com"],
+        use_json=False,
+        yes=False,
+    )
+    exit_code = run_govern(args, tmp_path)
+
+    assert exit_code == 3
+    assert "Aborted" in capsys.readouterr().err
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -1528,7 +1597,7 @@ def test_take_config_snapshot_creates_file(tmp_path):
     agent_dir.mkdir()
     content = "prior governance content"
 
-    snap_path = take_config_snapshot(agent_dir, content)
+    snap_path = take_config_snapshot(agent_dir, content, subdir="govern")
     assert snap_path.exists()
     assert snap_path.read_text() == content
 
@@ -1538,7 +1607,7 @@ def test_take_config_snapshot_path_pattern(tmp_path):
 
     agent_dir = tmp_path / "agent"
     agent_dir.mkdir()
-    snap_path = take_config_snapshot(agent_dir, "content")
+    snap_path = take_config_snapshot(agent_dir, "content", subdir="govern")
 
     # Must be under .config-snapshots/govern/.
     assert ".config-snapshots" in str(snap_path)
@@ -1552,8 +1621,8 @@ def test_take_config_snapshot_uuid_in_filename(tmp_path):
 
     agent_dir = tmp_path / "agent"
     agent_dir.mkdir()
-    snap1 = take_config_snapshot(agent_dir, "content1")
-    snap2 = take_config_snapshot(agent_dir, "content2")
+    snap1 = take_config_snapshot(agent_dir, "content1", subdir="govern")
+    snap2 = take_config_snapshot(agent_dir, "content2", subdir="govern")
 
     assert snap1 != snap2
 
@@ -1882,6 +1951,99 @@ def test_govern_edits_partial_file_missing_updated_at(tmp_path):
 
     block = re.search(r"```yaml\n(.*?)```", content, re.DOTALL).group(1)
     assert _yaml.safe_load(block)["governance"].get("updated_at") is not None
+
+
+def test_govern_dry_run_multi_field_precheck_chains(tmp_path):
+    """Fix 4 (adversarial review): the S2 Step 3 doomed-edit precheck loop
+    must CHAIN each field's edit onto the PREVIOUS field's result — exactly
+    like the real (post-lock) apply path's ``_apply_edit`` closure — not
+    silently re-apply every field against the SAME original preview_content
+    (a regression introduced by the #709 spine hoist).
+
+    A governance.md missing BOTH 'owner' and 'updated_at' forces every
+    real --set call (updated_at is always auto-appended, so every real
+    invocation carries >= 2 fields) through the INSERT branch twice. The
+    specific exceptions _edit_governance_block can raise (no block /
+    quoted-key / duplicate-key) are keyed to the TARGET key's own occurrence
+    count, which a DIFFERENT key's edit never changes — so the bug cannot be
+    forced to manifest as an observable crash through a normal multi-field
+    --set. Spying directly on the chain is the only way to verify it: the
+    SECOND call's input text must be the FIRST call's OUTPUT, not the
+    original preview_content repeated.
+    """
+    agent_dir = _make_agent_dir(tmp_path)
+    partial = "```yaml\ngovernance:\n  permission_tier: read-only\n```\n"
+    (agent_dir / "governance.md").write_text(partial)
+
+    from atomic_agents.manage import govern as govern_mod
+
+    orig_edit = govern_mod._edit_governance_block
+    calls: list[str] = []
+
+    def spying_edit(text, schema_key, new_value):
+        calls.append(text)
+        return orig_edit(text, schema_key, new_value)
+
+    with patch.object(govern_mod, "_edit_governance_block", spying_edit):
+        args = _make_args(
+            agent_dir.name,
+            tmp_path,
+            set_fields=["owner=alice@example.com"],
+            dry_run=True,
+            yes=True,
+        )
+        exit_code = run_govern(args, tmp_path)
+
+    assert exit_code == 0
+    # updated_at is always auto-appended -> at least 2 precheck calls (owner,
+    # updated_at), both absent from `partial` so both take the INSERT branch.
+    assert len(calls) >= 2
+    # The SECOND call's input must be the FIRST call's OUTPUT (chained) —
+    # strip-RED: reverting Fix 4 (dropping the `preview_content =`
+    # reassignment) makes every call receive the SAME original text, so
+    # calls[1] == calls[0] and this assertion fails.
+    first_call_output = orig_edit(calls[0], "owner", "alice@example.com")
+    assert calls[1] == first_call_output
+    assert calls[1] != calls[0]
+
+
+def test_govern_unexpected_error_in_write_path_surfaces_as_write_error(
+    tmp_path, capsys
+):
+    """Fix 5 (adversarial review): an unexpected (non-Value/Key/OS/lock-
+    taxonomy) exception raised from inside run_managed_write's snapshot/
+    write calls must degrade to a clean structured
+    ``{ok:false, error_type:'write_error'}`` refusal, exit 1 — never an
+    uncaught traceback (S3 --json contract). Restores the pre-hoist (#709)
+    broad-except posture the hoist had narrowed away.
+
+    Strip-RED: removing the trailing ``except Exception`` clause from
+    ``_run_set`` makes the RuntimeError below propagate UNCAUGHT out of
+    ``run_govern()`` — this test would fail with a raised RuntimeError
+    instead of asserting the exit code / JSON payload.
+    """
+    agent_dir = _make_agent_dir(tmp_path)
+    _make_governance_md(agent_dir)
+
+    from atomic_agents.manage import govern as govern_mod
+
+    def _boom(**kwargs):
+        raise RuntimeError("simulated catastrophic failure inside the write path")
+
+    with patch.object(govern_mod, "run_managed_write", _boom):
+        args = _make_args(
+            agent_dir.name,
+            tmp_path,
+            set_fields=["owner=alice@example.com"],
+            yes=True,
+            use_json=True,
+        )
+        exit_code = run_govern(args, tmp_path)
+
+    assert exit_code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["error_type"] == "write_error"
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -2653,7 +2815,7 @@ def test_take_config_snapshot_symlink_refused(tmp_path):
     (agent_dir / ".config-snapshots").symlink_to(outside_dir)
 
     with pytest.raises(OSError, match="escapes"):
-        take_config_snapshot(agent_dir, "prior governance content")
+        take_config_snapshot(agent_dir, "prior governance content", subdir="govern")
 
     # No bytes must have landed outside the agent dir.
     assert list(outside_dir.rglob("*.md")) == [], (
@@ -2937,3 +3099,74 @@ def test_govern_json_abort_eof_output_is_indented(tmp_path, capsys, monkeypatch)
         "EOF abort JSON must be formatted with indent=2 (multi-line); "
         f"got single-line output: {out!r}"
     )
+
+
+# ──────────────────────────────────────────────────────────────────
+# BOM / unicode fidelity (spec/55 M2 byte-fidelity — #709/#710 coverage gap)
+
+
+def test_govern_bom_prefix_survives_byte_for_byte(tmp_path):
+    """A UTF-8 BOM at the very start of governance.md must survive an
+    applied --set write byte-for-byte (M2 prose-body preservation).
+
+    ``governance_path.open(..., encoding="utf-8")`` (not ``utf-8-sig``)
+    decodes a BOM as a literal U+FEFF character rather than stripping it,
+    so it is read as ordinary prose content and re-encoded on write — this
+    test proves that round-trip actually holds through the full --set path.
+    """
+    agent_dir = _make_agent_dir(tmp_path)
+    content = "﻿" + _canonical_governance_md(agent_dir.name)
+    gov_path = agent_dir / "governance.md"
+    gov_path.write_bytes(content.encode("utf-8"))
+
+    args = _make_args(
+        agent_dir.name, tmp_path, set_fields=["owner=alice@example.com"], yes=True
+    )
+    exit_code = run_govern(args, tmp_path)
+
+    assert exit_code == 0
+    raw_bytes = gov_path.read_bytes()
+    assert raw_bytes.startswith(b"\xef\xbb\xbf"), "UTF-8 BOM must survive the write"
+    # The rest of the prose header (everything up to the yaml block) must be
+    # untouched aside from the BOM itself.
+    written_text = raw_bytes.decode("utf-8")
+    assert written_text.startswith("﻿# Governance")
+
+
+def test_govern_unicode_value_round_trips(tmp_path):
+    """A non-ASCII --set value (owner name with accented / CJK characters)
+    round-trips byte-identical through the quote-then-reload YAML emitter.
+    """
+    agent_dir = _make_agent_dir(tmp_path)
+    _make_governance_md(agent_dir)
+
+    unicode_value = "José 田中 owner"
+    args = _make_args(
+        agent_dir.name, tmp_path, set_fields=[f"owner={unicode_value}"], yes=True
+    )
+    exit_code = run_govern(args, tmp_path)
+    assert exit_code == 0
+
+    written = (agent_dir / "governance.md").read_text(encoding="utf-8")
+    parsed = _extract_governance_dict_from_text(written)
+    assert parsed["owner"] == unicode_value
+
+
+def test_govern_unicode_prose_survives_byte_for_byte(tmp_path):
+    """Unicode content in the prose body (outside the yaml block) survives
+    an applied --set write byte-for-byte (M2)."""
+    agent_dir = _make_agent_dir(tmp_path)
+    base = _canonical_governance_md(agent_dir.name)
+    unicode_prose = "\n\n## Notes\n\n日本語のメモ — café résumé Ω → ✓\n"
+    content = base + unicode_prose
+    gov_path = agent_dir / "governance.md"
+    gov_path.write_text(content, encoding="utf-8")
+
+    args = _make_args(
+        agent_dir.name, tmp_path, set_fields=["owner=alice@example.com"], yes=True
+    )
+    exit_code = run_govern(args, tmp_path)
+    assert exit_code == 0
+
+    written = gov_path.read_text(encoding="utf-8")
+    assert written.endswith(unicode_prose)

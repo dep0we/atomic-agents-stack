@@ -12,6 +12,16 @@ a strip-testable failure per guard. The ladder is:
       ManageNestedPathRefused    — dotted path / bare nested sub-record name (reserved, not in PR1)
       ManageListMutationRefused  — --add / --remove / --set-json flag (reserved, not in PR1)
     ManageGovernanceInvalidError — PRESENT_INVALID governance.md (parse_errors non-empty)
+    ManageAgentBusyError         — spec/55 M11: another manage write holds the per-agent
+                                    manage lease (non-blocking acquire contended)
+    ManageLockUnavailableError   — spec/55 M11: the LockBackend could not be constructed
+                                    (misconfigured env, missing extra) — fail-closed refusal,
+                                    DISTINCT from ManageAgentBusyError so a copilot driver can
+                                    tell "someone else is editing this agent, retry" apart
+                                    from "the lock infrastructure is down, don't retry-loop"
+    ManageSnapshotNotFoundError   — #710: the requested --restore <snapshot-id> does not exist
+                                    for this agent (also the cross-agent-restore refusal —
+                                    see the class docstring)
 
 Most validation subclasses are raised during S2 step 1 and propagate to the verb
 as non-zero, no-write refusals. ManageListMutationRefused is the exception: it is
@@ -146,6 +156,81 @@ class ManageListMutationRefused(ManageValidationError):
         super().__init__(
             f"List mutation via {flag} ({value!r}) is not yet settable via CLI; "
             "edit governance.md directly."
+        )
+
+
+class ManageAgentBusyError(ManageError):
+    """Spec/55 M11: the per-agent manage lease is held by another process.
+
+    Raised when the non-blocking manage-lease ``acquire(timeout=0)`` contends
+    (``LockBusy``) — another ``manage`` write verb (govern --set, govern
+    --restore, or a future set-model/apply-rec) is currently inside its
+    read-base->snapshot->atomic-write critical section for the SAME agent.
+    Caught CENTRALLY in the spine dispatcher (not per-verb) and emitted as
+    ``{ok:false, error_type:'agent_busy'}`` exit 1.
+
+    Per M8's pinned status vocabulary, a refusal — including agent_busy —
+    does NOT emit a management RunRecord (a RunRecord existing implies the
+    write was applied). Contention is visible only via this structured
+    refusal + exit 1, never via an audit line.
+
+    The spine does not retry on contention (acquire is non-blocking,
+    timeout=0, by design). Automated / fleet-scale callers are responsible
+    for their own retry-with-backoff.
+    """
+
+    error_type: str = "agent_busy"
+
+    def __init__(self, agent_id: str) -> None:
+        self.agent_id = agent_id
+        super().__init__(
+            f"Another management write is already in progress for agent "
+            f"{agent_id!r} (per-agent manage lease held). Retry shortly, or "
+            "wait for the other write to complete."
+        )
+
+
+class ManageLockUnavailableError(ManageError):
+    """Spec/55 M11: the LockBackend could not be constructed — fail-closed refusal.
+
+    Raised when ``get_default_lock_backend()`` (or its ``.capabilities()``
+    call) raises — a misconfigured ``ATOMIC_AGENTS_LOCK_BACKEND_URL``, an
+    unregistered backend id, or a missing optional extra (e.g. ``redis`` not
+    installed). Per the maintainer's fail-closed ruling, a lock backend that
+    cannot be constructed MUST refuse the write rather than silently proceed
+    unlocked. Deliberately a DISTINCT exception (and JSON ``error_type``)
+    from ``ManageAgentBusyError`` so a caller can tell "someone else is
+    editing this agent, retry" apart from "the lock infrastructure itself is
+    misconfigured, an operator must fix it, don't retry-loop against it."
+    """
+
+    error_type: str = "lock_backend_unavailable"
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+        super().__init__(f"Management lock backend unavailable — refused: {detail}")
+
+
+class ManageSnapshotNotFoundError(ManageError):
+    """#710: the requested --restore <snapshot-id> does not exist for this agent.
+
+    ALSO the refusal for cross-agent restore (no separate exception type):
+    ``resolve_snapshot_path`` resolves a snapshot_id ONLY under the TARGET
+    agent's own ``.config-snapshots/<subdir>/`` tree, so a snapshot_id that
+    belongs to a DIFFERENT agent simply does not resolve here and hits this
+    same not-found refusal. This is deliberate indistinguishability, not a
+    gap: a caller must never learn whether a given snapshot id exists under
+    some other agent (no cross-agent restore, #710 m3-conformance sub-MUST).
+    """
+
+    error_type: str = "snapshot_not_found"
+
+    def __init__(self, snapshot_id: str, agent_id: str) -> None:
+        self.snapshot_id = snapshot_id
+        self.agent_id = agent_id
+        super().__init__(
+            f"Snapshot {snapshot_id!r} not found for agent {agent_id!r}. "
+            "Use --list-snapshots to see available snapshots."
         )
 
 

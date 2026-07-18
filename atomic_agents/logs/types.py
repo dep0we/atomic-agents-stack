@@ -70,6 +70,12 @@ PRIMITIVE_EMBED = "embed"
 # so LogQuery(primitive=PRIMITIVE_MANAGE_GOVERN) returns the full management audit trail.
 # The primitive id is pinned NORMATIVELY in spec/55 M8.
 PRIMITIVE_MANAGE_GOVERN = "manage_govern"
+# spec/55 M3/M8 (#710) — governance rollback event. A restore is a distinct
+# primitive from manage_govern (not a --set variant) so fleet aggregations can
+# tell a rollback apart from an edit. Shares the same RunRecord shape (M8);
+# extra{} additionally carries restored_from (source snapshot id) and
+# snapshot_path (the pre-restore snapshot the restore itself took).
+PRIMITIVE_MANAGE_RESTORE = "manage_restore"
 PRIMITIVE_OTHER = "other"
 
 
