@@ -24,10 +24,10 @@ This spec covers:
 
 - The **foundation** — the architecture every management verb conforms to (the spine, the safety routine, the copilot properties, the authorization posture, the markdown-config rule).
 - The **first verb**, `manage govern <agent>` (#609) — a `governance.md` frontmatter editor written through `AgentRegistryBackend`. The reference verb that establishes the scaffold the rest inherit.
+- The **second verb**, `manage set-model <agent>` (#726) — a `model.md` model-swap editor; the first verb with a non-empty M9 composition set and the first surgical `model.md` field-writer. Specified below ("Second verb"); implemented in #726.
 
 **Out of scope in this arc (deferred, tracked):**
 
-- `manage set-model` — change an agent's model (`model.md`); highest console-loop value; forces Policy-composition + `_costs.PRICING`/caps checks. The next verb after `govern`.
 - `manage apply-rec <id>` — apply a #616 console recommendation; re-validates the no-quality-cost guard *at apply time*. After the primitive verbs exist.
 - `manage set-goal` (`goal.md` / GoalBackend #425, has its own history append) and lifecycle verbs (`pause`/`resume` — ambiguous in a stateless runtime; own design pass).
 - An interactive guided "fleet manager" menu — a human-facing front-end layered ON TOP of the verbs, not built first (the verbs are what the copilot and the console drive).
@@ -199,6 +199,98 @@ Every name/format here is a public operator surface (a compatibility contract) a
 - **Read/safety flags:** `--show` (print current resolved record), `--dry-run` (preview only, S2 step 2), `--yes` (apply without TTY confirm, S2 step 3), `--json` (structured output, S3).
 - **`--json` output** exposes canonical **underscore** schema keys (not CLI hyphen spellings), so a copilot reads the schema, not the typing convention.
 - **PR1 scope:** flat scalar `--set` only. `--add`/`--remove`/`--set-json` and dotted nested paths are reserved-and-documented; an unimplemented path returns a clean `"not yet settable via CLI; edit governance.md directly"` refusal — never a parser error whose meaning shifts in a later PR.
+
+---
+
+## Second verb — `manage set-model <agent>` (#726)
+
+The model-swap editor for an agent's `model.md`, written through the same hoisted S2 spine `govern` established (`atomic_agents/manage/_routine.py`, #709/#710). It is the first verb whose M9 composition set is non-empty by design — `govern`'s is empty because governance is descriptive metadata with no runtime-rejection counterpart; a model choice is the opposite case, the single field most directly wired to what the runtime actually spends and whether it runs at all. It is also the primitive the future `manage apply-rec <id>` (#727) delegates to: applying a console `savings_cost` recommendation (spec/54) is, mechanically, a `set-model` write with the recommended model id as `--model`, so `apply-rec` MUST NOT reimplement the write path — it resolves a model id and calls this verb's routine.
+
+`set-model` inherits the full spine for free, unchanged: the per-agent manage lease (M11), the snapshot + `--restore <snapshot-id>` / `--list-snapshots` rollback pair (M3/#710), confirm-by-default + `--dry-run` (M5), the copilot flags (M6), and the exit-code ladder (`0` applied/preview/read-only, `1` refused-or-error, `3` declined, `130` SIGINT). None of that is re-specified here; see "First verb" above for the normative text.
+
+### Surface
+
+```
+atomic-agents manage set-model <agent> --model <id> [options]
+atomic-agents manage set-model <agent> --show
+atomic-agents manage set-model <agent> --list-snapshots
+atomic-agents manage set-model <agent> --restore <snapshot-id> [options]
+```
+
+- `--model <id>` — the new `## Default model` value. MUST pass the full M9 composition chain (below) before anything is written. In PR1 scope regardless of how the open forks below resolve — this is the verb's reason to exist.
+- `--fallback <id>` — the new `## Fallback` value, subject to the SAME M9 composition chain as `--model`. **PR1 scope is an open fork** (see "Open forks" below); the flag name and semantics are pinned here either way, matching the CLI-surface-grammar precedent set for `govern` (pin the contract now, defer low-traffic implementation).
+- `--provider <id>` — disambiguates `find_backend_for_model` when a requested model id is claimed by more than one registered `LLMBackend`, writing (or updating) the optional `provider:` line that lives OUTSIDE the `cost_guardrails` yaml block (`atomic_agents/_model.py:105-106`). **Whether this flag is required, optional, or PR1-scoped at all is an open fork** (see below).
+- `--show` — print the current resolved model config (`default_model`, `fallback_model`, `provider`) as parsed by `parse_model_md`; read-only, respects `--json`. Same convention as `govern --show`.
+- `--list-snapshots` — print available `set-model` snapshot ids, oldest first (M3, namespaced `set-model` so they never collide with `govern`'s `.config-snapshots/govern/` tree).
+- `--restore <snapshot-id>` — roll back `model.md` to a prior `set-model` snapshot, through the SAME hoisted spine `govern --restore` uses (M3 sub-MUSTs (a)/(b)): resolves only under the target agent's own `.config-snapshots/set-model/` tree, itself takes a pre-restore snapshot, emits exactly one `PRIMITIVE_MANAGE_RESTORE` record. **Restore does NOT re-run the M9 composition chain** — identically to `govern`'s restore (§"Restore verb"), a snapshot is by definition prior content that already passed composition once; re-validating a historical write against TODAY's `_costs.PRICING`/registered backends/`policy.md` would make old snapshots unrestorable the moment a model is deprecated, defeating the point of a rollback path.
+- `--dry-run`, `--yes`, `--json`, `--agents-root` — identical semantics to `govern`'s (S2/S3), unchanged.
+
+### Behavior (the S2 routine, concretely)
+
+1. **Resolve + validate.** Load the target through `AgentRegistryBackend` (S1). Unlike `governance.md`, `model.md` is rendered by every `init` template (`atomic_agents/init/templates/*/model.md`) — its absence is not the ordinary "first time an operator configures this" case `govern`'s create-absent path exists for. If `model.md` is absent at resolve time, `set-model` MUST refuse (S2 step 1) rather than render a stub; it does not carry `govern`'s create-absent allowance. Then run the full M9 composition chain against every requested value (`--model`, and `--fallback` if in scope) before anything is previewed — refuse before step 2 on the first failing check, exactly as M4 requires.
+2. **Preview.** Show the before→after of ONLY the targeted heading value line(s) (`## Default model`, and `## Fallback` if in scope) — the `cost_guardrails` block, the `provider:` line (unless `--provider` targets it), and every prose paragraph render as unchanged.
+3. **Confirm.** Interactive y/n on a TTY, or `--yes`. Identical to `govern` — the manage lease is NOT held across this step (M11).
+4. **Snapshot + atomic write.** Acquire the per-agent manage lease (M11), re-read `model.md` FRESH from disk (the lost-update guarantee — never the step-2 preview read), snapshot that fresh content under `.config-snapshots/set-model/` (M3), then perform the surgical write per the "model.md preservation contract" below through `_io.atomic_write`, and release the lease.
+5. **Audit.** Append a `PRIMITIVE_MANAGE_SET_MODEL` `RunRecord` (see "Audit primitive" below) through `LogBackend`, dual-scope per M8's backend-aware rule, AFTER the lease is released.
+
+### Composing with the runtime — M9 made concrete
+
+`govern`'s M9 composition set is empty by design (no governance field has a runtime-rejection counterpart). `set-model` is the first verb where M9 does real work: a `--model` (or in-scope `--fallback`) value MUST be refused at write time — before preview, per M4 — unless ALL of the following hold. Each check reuses an existing pure function; `set-model` MUST NOT reimplement pricing, backend resolution, or policy evaluation:
+
+- **(a) Priced.** The value MUST be a key in `atomic_agents._costs.PRICING`. An unpriced model is not a cosmetic gap — a scaffolded agent whose default model falls outside `PRICING` bills through fallback pricing, a real, silent over-bill hazard (the same hazard the project's "bump a model" memory lesson names for registering new models). Checked via `model_id in atomic_agents._costs.PRICING`.
+- **(b) Resolvable to exactly one backend.** The value MUST resolve to exactly one registered `LLMBackend` via `atomic_agents.llm.find_backend_for_model(model_id, preferred_provider=<--provider or None>)`. Zero matches raises `UnknownModelError` (refuse: "not a known model id"); more than one match with no `--provider` given raises `AmbiguousBackendError` (refuse: "ambiguous, pass --provider") — this is the exact seam the `--provider` disambiguation flag exists for (see "Open forks" below for whether `set-model` requires it up front or only offers it on the ambiguous-refusal path).
+- **(c) Policy-compatible (caps compose is settled; the model-override interaction is an open fork).** The write MUST compose with the agent's effective Policy, not bypass it. `atomic_agents.policy.backend.PolicyBackend.get_effective_caps(agent_name)` MUST be consulted so a model swap composes with whatever `CostCaps` the fleet or agent-level policy has already pinned — a model whose spend profile those caps forbid is a compose failure. Separately, `PolicyBackend.get_effective_model(agent_name)` returns Policy's per-agent model override (or `None`); if Policy's value wins over `model.md`'s at the `agent.call()` consumption site, a `--model` that differs from a non-`None` override would write a `model.md` value the runtime will not honor. WHETHER that is a hard refusal (M9 — don't write a config the agent cannot honor) or an allowed base-layer edit (model.md is the base; Policy is a deliberate override layer) is an **open fork** (see below); the build MUST verify the actual precedence + override semantics in `policy/backend.py` before pinning it.
+
+**Alignment note (#716).** `set-model` composes `find_backend_for_model` for check (b) today. When #716 (typed LLM errors + a doctor model-resolution check) lands, `set-model`'s "backend resolves" check unifies with the doctor-shared resolution path — a reuse tidy-up, not a behavior change; this section's normative chain does not move.
+
+### model.md preservation contract
+
+`model.md` is harder to write surgically than `governance.md` was for `govern`'s M2. `governance.md` has one syntactic region (a single fenced `yaml` block). `model.md` has TWO: the `## Default model` / `## Fallback` heading values, which live in free-form PROSE (not YAML) with operator-chosen markup wrapping the value — `` **`id`** ``, `**id**`, `` `id` ``, or bare, per `_model.py`'s reader regex (`atomic_agents/_model.py:79-91`) — and the fenced `cost_guardrails` yaml block, which `set-model` does not target at all. There is also the optional `provider:` line, which lives OUTSIDE the yaml block (`_model.py:104-111`) specifically so an operator's nested `provider:` key inside `cost_guardrails` is never confused with it.
+
+Normatively, a `set-model` write MUST be surgical and byte-faithful, mirroring M2's discipline for a second syntactic shape:
+
+- (a) the `cost_guardrails` yaml block survives **byte-for-byte** — `set-model` MUST NOT touch it (that is a future `set-guardrails` verb's job, not this one's);
+- (b) every prose paragraph, HTML comment, table, and the `provider:` line (when not itself the target) survive **byte-for-byte**;
+- (c) only the targeted heading's value span is rewritten in place — the surrounding section headings, blank lines, and any commentary immediately following the value stay untouched.
+
+This makes `set-model` the framework's **first surgical `model.md` field-writer.** Today `atomic_agents/_model.py` is READER-only. The only existing WRITER, `atomic_agents/profile/filesystem.py`'s `save_profile()` (`atomic_write(agent_root / "model.md", profile.model_md_raw)`, ~line 521-524), is a wholesale blob rewrite of the whole file's raw text — correct for its job (profile round-tripping) and NOT reusable here, since it has no concept of "change one heading's value, preserve everything else" and would require the caller to already have the full correct byte content in hand. `set-model` MUST implement a NEW line-aware in-place value editor following the established idiom (`_model.py`/`_roster.py`-style regex-targeted edits, no parse→re-serialize round trip), the same discipline M2 already commits the codebase to for YAML-shaped regions, extended here to a heading-plus-prose-value shape.
+
+Whether the write preserves the operator's EXISTING markup wrapper around the value as found, or normalizes every write to one canonical form, is an open fork (see below) — it does not affect (a)-(c) above, which hold either way.
+
+### Audit primitive
+
+A new `PRIMITIVE_MANAGE_SET_MODEL = "manage_set_model"` (defined alongside `PRIMITIVE_MANAGE_GOVERN` / `PRIMITIVE_MANAGE_RESTORE` in `atomic_agents/logs/types.py`), using the M8-pinned `RunRecord` shape as-is — this section does not re-pin the shape, only names the new primitive and what rides in `extra{}`:
+
+- `model="n/a"`, `input_tokens=0`, `output_tokens=0`, `status="applied"` (refusals and dry-runs emit no record at all, per M8's pinned status vocabulary);
+- `principal_id` — the resolved Principal, `LOCAL_PRINCIPAL` for the home user;
+- `changed_fields` — the subset of `["default_model", "fallback_model"]` actually written this invocation (e.g. `["default_model"]` for a `--model`-only run);
+- `before` / `after` — the changed field(s)' prior and new values, e.g. `before={"default_model": "claude-sonnet-4-6"}`, `after={"default_model": "claude-opus-4-8"}`;
+- `snapshot_path` — the restorable pre-write snapshot under `.config-snapshots/set-model/`, relative to the agent folder (M8's generic per-verb key).
+
+`created` (govern-specific — records that `governance.md` did not previously exist) does NOT apply here: per "Behavior" step 1, an absent `model.md` is a resolve-time refusal for `set-model`, not a create-and-fill path, so no `set-model` audit record is ever emitted with `created=true`. Dual-scope append (per-agent `LogBackend` + fleet `_manage` scope, collapsing to one append under a shared distributed store) follows M8's backend-aware rule unchanged.
+
+### Conformance test outline (set-model additions)
+
+Mirrors the shape of the top-level "Conformance test outline" section; these are the set-model-specific additions to it, not a replacement:
+
+- **M9 composition refusals:** an unpriced `--model` (not in `_costs.PRICING`) refuses before write, non-zero exit, `model.md` unchanged; an unknown model id (`UnknownModelError`) refuses distinctly from an ambiguous one (`AmbiguousBackendError`) with a distinguishable structured `--json` reason for each; a Policy-overridden model (`get_effective_model` returns a conflicting non-`None` value) refuses; each of the three checks is strip-tested independently (per-invocation negative control, per the project's discipline) so a partial composition implementation cannot false-green.
+- **Surgical preservation invariant:** an applied `--model` write leaves the `cost_guardrails` yaml block byte-for-byte identical (hash-compared before/after); leaves every prose paragraph and HTML comment byte-for-byte identical; leaves the `provider:` line untouched when `--provider` is not the target of the write.
+- **Markup-style invariant:** once "Markup-style preservation" (below) is ruled, a conformance test asserts the ruled behavior across all four operator-markup variants the reader accepts (`` **`id`** ``, `**id**`, `` `id` ``, bare).
+- **Absence refusal:** `set-model` against an agent with no `model.md` refuses at S2 step 1 (distinct from `govern`'s create-absent path — asserted as a negative control so the two verbs' absence-handling never silently converge).
+- **Restore does not re-validate:** `--restore` against a snapshot whose model id is no longer in `_costs.PRICING` (deprecated since the snapshot was taken) still restores successfully — asserting the "restore does not re-run M9" rule in "Surface" above.
+
+### Open forks (arc-discovery #726)
+
+These are the genuinely undecided questions this section deliberately leaves open for arc-discovery to rule on. Nothing above depends on a particular answer to these; each is called out at its point of relevance.
+
+- **PR1 flag scope.** Does PR1 ship `--model` only, or `--model` + `--fallback` + `--provider` together?
+- **Provider disambiguation.** When `find_backend_for_model` raises `AmbiguousBackendError`, does `set-model` require `--provider` up front, or only surface the ambiguity as a refusal that tells the operator to re-run with `--provider`? Either way, how is the `provider:` line written surgically, given it lives outside the `cost_guardrails` yaml block and may be entirely absent from the file today?
+- **Unpriced-model posture.** Is an unpriced `--model` value a hard refusal always (the recommended default, given M9 and the over-bill hazard in composition check (a)), or is there an escape hatch (`--force` + a loud warning) for an operator who knowingly wants to run an unpriced/custom model?
+- **Policy model-override interaction.** If `PolicyBackend.get_effective_model` pins a model that differs from `--model`, does `set-model` refuse (the written value will not be honored at runtime — M9), or write anyway (model.md is the base layer Policy deliberately overrides)? Turns on the actual precedence semantics — confirm in `policy/backend.py` before ruling.
+- **Markup-style preservation.** Does the surgical writer preserve the operator's existing value-wrapper markup (`` **`id`** `` vs `**id**` vs `` `id` `` vs bare) exactly as found, or normalize every write to one canonical form (e.g. matching the `init` templates' `` **`id`** `` style)?
+- **Scope of the write.** If `--fallback` ships in PR1, does it target the `## Fallback` heading only? Confirmed here regardless: `set-model` never touches the `cost_guardrails` block in any scope — that is reserved for a future `set-guardrails` verb (see "model.md preservation contract" (a)), not this one.
+
+---
 
 ## Implementation notes (Tier B — agent decides at build, with justification)
 
