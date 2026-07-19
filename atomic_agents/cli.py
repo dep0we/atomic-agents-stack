@@ -855,6 +855,30 @@ def _register_manage(sub: argparse._SubParsersAction) -> None:
         default=False,
         help="Print the current resolved governance record and exit (read-only).",
     )
+    # ── restore verb (#710) ────────────────────────────────────────────────
+    govern_cmd.add_argument(
+        "--restore",
+        dest="restore",
+        metavar="snapshot-id",
+        default=None,
+        help=(
+            "Roll back governance.md to a prior snapshot taken by this verb "
+            "(see --list-snapshots). Runs the full validate/preview/confirm/"
+            "snapshot+write/audit routine — restore itself takes a "
+            "pre-restore snapshot, so a restore is always undoable via a "
+            "second --restore. Mutually exclusive with --set."
+        ),
+    )
+    govern_cmd.add_argument(
+        "--list-snapshots",
+        dest="list_snapshots",
+        action="store_true",
+        default=False,
+        help=(
+            "List snapshot ids available for --restore, oldest first "
+            "(read-only; symmetric with --show)."
+        ),
+    )
     govern_cmd.add_argument(
         "--dry-run",
         dest="dry_run",

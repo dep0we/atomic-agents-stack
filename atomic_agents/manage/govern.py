@@ -39,23 +39,40 @@ from typing import Any
 
 import yaml
 
-from ..core_api import atomic_write, safe_resolve_under
+from ..core_api import safe_resolve_under
 from ..agent_registry.types import (
     PERMISSION_TIERS,
     TRISTATES,
     LIFECYCLE_STATUSES,
 )
-from ..logs.types import PRIMITIVE_MANAGE_GOVERN, RunRecord
-from ._routine import append_management_audit, take_config_snapshot
+from ..logs.types import PRIMITIVE_MANAGE_GOVERN, PRIMITIVE_MANAGE_RESTORE, RunRecord
+from ._routine import (
+    ManagedWriteResult,
+    append_management_audit,
+    get_manage_lock_backend,
+    list_snapshots,
+    resolve_snapshot_path,
+    run_managed_write,
+)
 from .exceptions import (
+    ManageAgentBusyError,
     ManageControlCharRefused,
     ManageGovernanceInvalidError,
     ManageInvalidDateError,
     ManageInvalidEnumError,
     ManageListMutationRefused,
+    ManageLockUnavailableError,
     ManageNestedPathRefused,
+    ManageSnapshotNotFoundError,
     ManageUnknownFieldError,
 )
+
+# spec/55 #709 parameterization — govern's own snapshot namespace. Explicit,
+# not the old module-global default: a future verb (set-model, apply-rec)
+# names its own subdir so snapshot namespaces never collide (_routine.py's
+# take_config_snapshot/list_snapshots/resolve_snapshot_path all take an
+# explicit `subdir` argument now).
+_SNAPSHOT_SUBDIR = "govern"
 
 
 # ── Field metadata ─────────────────────────────────────────────────────────────
@@ -780,28 +797,166 @@ def _emit_json_success(
     print(json.dumps(payload, indent=2))
 
 
+# ── Confirm gate (S2 step 3) — shared by --set and --restore ──────────────────
+
+
+def _emit_abort(use_json: bool, *, interrupted: bool) -> None:
+    """Emit the abort refusal (S2 step 3 decline / SIGINT).
+
+    ``error_type`` stays ``'aborted'`` for BOTH cases (decline and SIGINT) —
+    only the exit code and the human-readable reason distinguish them (spec/55
+    exit-code ladder normative note).
+    """
+    reason = (
+        "operator interrupted (SIGINT); no changes written"
+        if interrupted
+        else "operator declined the confirmation; no changes written"
+    )
+    if use_json:
+        print(
+            json.dumps(
+                {"ok": False, "error_type": "aborted", "reason": reason}, indent=2
+            )
+        )
+    else:
+        msg = "\nInterrupted." if interrupted else "Aborted."
+        print(msg, file=sys.stderr)
+
+
+def _require_confirmation(use_json: bool, yes: bool) -> int | None:
+    """S2 step 3 confirm gate. Returns ``None`` to proceed, or an exit code.
+
+    Exit-code ladder (spec/55 normative note):
+      1   — non-interactive without ``--yes`` (a VALIDATION-style refusal,
+            not a decline — the operator never got to decide)
+      3   — interactive 'n' / EOF decline (``error_type`` stays ``'aborted'``;
+            exit 2 is reserved for argparse's own usage-error code, so a
+            copilot must be able to tell "bad flags" apart from "declined")
+      130 — KeyboardInterrupt / SIGINT (POSIX 128+2 convention)
+
+    MUST be called AFTER preview/dry-run and BEFORE the manage lease is
+    acquired (spec/55 M11 note) — an idle TTY prompt must never hold the
+    per-agent lease, or every other manage write on the agent starves until
+    the human answers.
+    """
+    if yes:
+        return None
+
+    if not sys.stdin.isatty():
+        reason = (
+            "--yes is required for non-interactive use "
+            "(no TTY detected; use --yes to apply)."
+        )
+        if use_json:
+            _emit_json_error("confirmation_required", reason)
+        else:
+            print(f"Error: {reason}", file=sys.stderr)
+        return 1
+
+    # Interactive confirm on a TTY. Write the prompt to stderr (not input()'s
+    # default stdout) so that under --json stdout carries ONLY the machine-
+    # readable JSON — a copilot driver on a real TTY without --yes must never
+    # see the human prompt text prepended to the JSON stream (S3 contract).
+    try:
+        print("Apply these changes? [y/N] ", end="", file=sys.stderr, flush=True)
+        answer = input().strip().lower()
+    except EOFError:
+        _emit_abort(use_json, interrupted=False)
+        return 3
+    except KeyboardInterrupt:
+        _emit_abort(use_json, interrupted=True)
+        return 130
+
+    if answer not in ("y", "yes"):
+        _emit_abort(use_json, interrupted=False)
+        return 3
+
+    return None
+
+
+# ── Restore audit-shape helper (#710) ──────────────────────────────────────────
+
+
+def _diff_governance_field_names(before: dict | None, after: dict | None) -> list[str]:
+    """Field-level diff between two raw governance dicts (restore audit shape, #710).
+
+    Restricted to the PR1 flat-scalar allowlist — the same fields ``--set``
+    can target — so restore's ``changed_fields`` shares the exact shape
+    ``govern --set`` already emits (a list of ``GovernanceRecord`` scalar
+    keys), matching the M8-pinned per-field audit shape every verb must
+    share (P1 prep finding: restore must NOT compute a whole-file diff).
+    Coerces both sides via ``_coerce_for_audit`` first so a YAML-parsed
+    ``datetime.date`` / ``bool`` does not spuriously differ from its
+    persisted string form.
+    """
+    before = before or {}
+    after = after or {}
+    changed: list[str] = []
+    for key in _FLAT_SCALAR_FIELDS:
+        if _coerce_for_audit(before.get(key)) != _coerce_for_audit(after.get(key)):
+            changed.append(key)
+    return changed
+
+
+def _principal_id() -> str:
+    """Resolve the audit identity (spec/48 PrincipalBackend, home-user default).
+
+    PR1 LIMITATION (deferred): a CLI invocation has no verified-claims identity
+    transport — Principal derivation is an HTTP/serve-layer concern (spec/48).
+    The management audit identity is therefore always LOCAL_PRINCIPAL, which is
+    the correct home-user stamp. Multi-operator identity resolution for the CLI
+    (so a shared-host fleet audit carries WHICH operator ran the command) is a
+    follow-up; it slots in here by resolving the configured principal backend.
+    """
+    try:
+        from ..principal import LocalPrincipalBackend  # noqa: PLC0415
+
+        principal = LocalPrincipalBackend().derive_principal(None)
+        return principal.identifier
+    except Exception:  # noqa: BLE001
+        return "local"  # fallback per spec/48 (LOCAL_PRINCIPAL identifier)
+
+
+def _relative_snapshot_path(snapshot_path: Path | None, agent_dir: Path) -> str | None:
+    """Snapshot path relative to agent_dir for portability, or None when absent."""
+    if snapshot_path is None:
+        return None
+    try:
+        return str(snapshot_path.relative_to(agent_dir))
+    except ValueError:
+        return str(snapshot_path)
+
+
 # ── Main verb entry point ──────────────────────────────────────────────────────
 
 
 def run_govern(args: Any, agents_root: Path) -> int:
     """Entry point for ``atomic-agents manage govern <agent> ...``.
 
-    Implements the S2 five-step safety routine for the govern verb (spec/55).
+    Dispatches to ``--show`` (read-only), ``--list-snapshots`` (read-only,
+    #710), ``--restore <snapshot-id>`` (#710 — the FULL S2 five-step routine
+    through the hoisted spine, not a bypass), or the ``--set`` field-edit
+    path (S2 five-step safety routine, spec/55).
 
     Args:
         args: parsed argparse namespace.
         agents_root: resolved fleet root (from --agents-root or env default).
 
     Returns:
-        Process exit code: 0 = applied success / dry-run preview / interactive
-        abort; 1 = validation refusal (unknown field, invalid enum/date, nested
-        path, PRESENT_INVALID, non-TTY-without-``--yes``, path traversal) or a
-        write/registry error. Structured refusals exit 1, not 0 (M4).
+        Process exit-code ladder (spec/55 normative note):
+          0   — applied success / dry-run preview / --show / --list-snapshots
+          1   — refusal (validation, registry, path, lock-backend-unavailable,
+                agent-busy — the latter two raised as exceptions and caught
+                CENTRALLY by ``run_manage()``, not here) or a write/read error
+          3   — interactive decline ('n' / EOF) — ``error_type`` stays 'aborted'
+          130 — KeyboardInterrupt / SIGINT
     """
     use_json = getattr(args, "json", False)
     dry_run = getattr(args, "dry_run", False)
     yes = getattr(args, "yes", False)
     show = getattr(args, "show", False)
+    list_snapshots_flag = getattr(args, "list_snapshots", False)
+    restore_id = getattr(args, "restore", None)
     set_pairs: list[str] = list(getattr(args, "set", None) or [])
     agent_id: str = args.agent
 
@@ -824,6 +979,31 @@ def run_govern(args: Any, agents_root: Path) -> int:
             else:
                 print(f"Error: {exc}", file=sys.stderr)
             return 1
+
+    # ── Single-primary-action refusal (#710 restore-cli-surface ruling) ──────
+    # --restore is mutually exclusive with --set (the ruling's explicit
+    # requirement) and, by the same single-primary-action intent, with --show
+    # / --list-snapshots too — each of the four is its own complete command.
+    primary_actions = [
+        name
+        for name, present in (
+            ("--restore", bool(restore_id)),
+            ("--set", bool(set_pairs)),
+            ("--show", show),
+            ("--list-snapshots", list_snapshots_flag),
+        )
+        if present
+    ]
+    if len(primary_actions) > 1:
+        reason = (
+            f"{' and '.join(primary_actions)} are mutually exclusive — pass "
+            "exactly one primary action per invocation."
+        )
+        if use_json:
+            _emit_json_error("multiple_primary_actions", reason)
+        else:
+            print(f"Error: {reason}", file=sys.stderr)
+        return 1
 
     # ── S1: Resolve through AgentRegistryBackend ──────────────────────────────
     try:
@@ -861,19 +1041,138 @@ def run_govern(args: Any, agents_root: Path) -> int:
             print(f"Error: {reason}", file=sys.stderr)
         return 1
 
-    # ── --show path ───────────────────────────────────────────────────────────
+    # ── Read-only paths (--show / --list-snapshots) — NEVER touch the manage
+    # lease (spec/55 M11 note: reads must not contend with writes) ───────────
     if show:
         return _show_governance(ref, use_json)
 
+    if list_snapshots_flag:
+        return _list_snapshots(agent_id, agent_dir, use_json)
+
+    # ── Write paths (--set / --restore) resolve the governance.md target.
+    # The manage lock backend is constructed PER-VERB, inside _run_set /
+    # _run_restore, AFTER their --dry-run early-exit (spec/55 M11 fix,
+    # adversarial review: --dry-run must never construct the lock backend,
+    # or a misconfigured/unreachable LockBackend fails a preview that never
+    # intended to touch the lease). The real write path still constructs it
+    # before run_managed_write, so a broken LockBackend refuses BEFORE any
+    # write is attempted.
+    governance_path = agent_dir / "governance.md"
+
+    # Containment guard on the governance file path itself (P1 prep finding).
+    try:
+        safe_resolve_under(governance_path, agents_root)
+    except Exception as exc:  # noqa: BLE001
+        reason = f"governance.md path outside agents_root — refused: {exc}"
+        if use_json:
+            _emit_json_error("path_traversal", reason)
+        else:
+            print(f"Error: {reason}", file=sys.stderr)
+        return 1
+
+    # Symlink check on governance.md write target (mirrors filesystem.py line 456).
+    if governance_path.exists() and governance_path.is_symlink():
+        reason = (
+            f"governance.md at {governance_path} is a symlink — write refused "
+            "(path containment guard)."
+        )
+        if use_json:
+            _emit_json_error("symlink_refused", reason)
+        else:
+            print(f"Error: {reason}", file=sys.stderr)
+        return 1
+
+    if restore_id:
+        return _run_restore(
+            agent_id=agent_id,
+            agent_dir=agent_dir,
+            agents_root=agents_root,
+            governance_path=governance_path,
+            snapshot_id=restore_id,
+            use_json=use_json,
+            dry_run=dry_run,
+            yes=yes,
+        )
+
     # ── Require at least one --set ────────────────────────────────────────────
     if not set_pairs:
-        reason = "No --set fields specified. Use --set field=value or --show."
+        reason = (
+            "No primary action specified. Use --set field=value, --show, "
+            "--list-snapshots, or --restore <snapshot-id>."
+        )
         if use_json:
             _emit_json_error("no_fields", reason)
         else:
             print(f"Error: {reason}", file=sys.stderr)
         return 1
 
+    return _run_set(
+        agent_id=agent_id,
+        agent_dir=agent_dir,
+        agents_root=agents_root,
+        governance_path=governance_path,
+        ref=ref,
+        set_pairs=set_pairs,
+        use_json=use_json,
+        dry_run=dry_run,
+        yes=yes,
+    )
+
+
+# ── --list-snapshots (#710, read-only) ─────────────────────────────────────────
+
+
+def _list_snapshots(agent_id: str, agent_dir: Path, use_json: bool) -> int:
+    """``--list-snapshots`` — read-only listing of the govern snapshot dir (#710).
+
+    Symmetric with ``--show``: a pure read, never acquires the manage lease
+    (spec/55 M11 note — reads never contend with writes).
+    """
+    snapshots = list_snapshots(agent_dir, _SNAPSHOT_SUBDIR)
+    ids = [p.name for p in snapshots]
+
+    if use_json:
+        print(json.dumps({"ok": True, "agent": agent_id, "snapshots": ids}, indent=2))
+        return 0
+
+    if not ids:
+        print(f"[{agent_id}] no governance snapshots.")
+        return 0
+
+    print(f"[{agent_id}] governance snapshots ({len(ids)}):")
+    for sid in ids:
+        print(f"  {sid}")
+    return 0
+
+
+# ── --set field-edit path (S2 five-step routine through the hoisted spine) ────
+
+
+def _run_set(
+    *,
+    agent_id: str,
+    agent_dir: Path,
+    agents_root: Path,
+    governance_path: Path,
+    ref: Any,
+    set_pairs: list[str],
+    use_json: bool,
+    dry_run: bool,
+    yes: bool,
+) -> int:
+    """``manage govern <agent> --set field=value ...`` — the original verb (#609).
+
+    Steps 1-3 (validate/preview/confirm) run against an ADVISORY pre-lock
+    read of governance.md (for dry-run/preview display + doomed-edit parity,
+    M6/M7). Step 4/4b (snapshot + atomic write) run through the hoisted
+    ``run_managed_write`` spine helper, which re-reads governance.md FRESH
+    *inside* the per-agent manage lease — the P0 fix for the lost-update
+    race (#709): a base read before an interactive confirm prompt (which can
+    block indefinitely) must never be reused as the write base, or two
+    concurrent writers can silently clobber each other. ``--set`` values are
+    absolute (not deltas), so re-applying the same parsed field tokens
+    against the fresh base is safe and needs no extra CAS logic.
+    """
     # ── S2 Step 1: Validate ───────────────────────────────────────────────────
 
     # PRESENT_INVALID guard: refuse if existing governance.md has parse errors.
@@ -941,46 +1240,14 @@ def run_govern(args: Any, agents_root: Path) -> int:
     if not explicit_updated_at:
         parsed_fields.append(("updated_at", _today_iso()))
 
-    # ── Read / create governance.md content (the write base) ─────────────────
-    governance_path = agent_dir / "governance.md"
-
-    # Containment guard on the governance file path itself (P1 prep finding).
-    try:
-        safe_resolve_under(governance_path, agents_root)
-    except Exception as exc:  # noqa: BLE001
-        reason = f"governance.md path outside agents_root — refused: {exc}"
-        if use_json:
-            _emit_json_error("path_traversal", reason)
-        else:
-            print(f"Error: {reason}", file=sys.stderr)
-        return 1
-
-    # Symlink check on governance.md write target (mirrors filesystem.py line 456).
-    if governance_path.exists() and governance_path.is_symlink():
-        reason = (
-            f"governance.md at {governance_path} is a symlink — write refused "
-            "(path containment guard)."
-        )
-        if use_json:
-            _emit_json_error("symlink_refused", reason)
-        else:
-            print(f"Error: {reason}", file=sys.stderr)
-        return 1
-
-    # Whether a governance.md existed BEFORE this run decides the snapshot:
-    # a create-absent write has no byte-faithful prior file to roll back to, so
-    # it takes no snapshot (M3 — the snapshot is meaningful only when a prior
-    # file existed). This is captured before _read_or_create_governance renders
-    # the template stub for the absent case.
-    file_existed = governance_path.exists()
-
+    # ── Advisory pre-lock read (preview/dry-run only — see docstring) ────────
     # A present-but-unreadable governance.md (e.g. chmod 000) reaches here via the
     # create-absent branch — the registry classifies PRESENT_UNREADABLE the same
     # as ABSENT, but the file exists() so _read_or_create_governance reads it. A
     # bare read would raise an uncaught PermissionError and print a traceback,
     # breaking the S3 --json structured-refusal contract. Catch and refuse cleanly.
     try:
-        prior_content = _read_or_create_governance(governance_path, agent_id)
+        preview_content = _read_or_create_governance(governance_path, agent_id)
     except OSError as exc:
         reason = f"Could not read governance.md: {exc}"
         if use_json:
@@ -988,12 +1255,12 @@ def run_govern(args: Any, agents_root: Path) -> int:
         else:
             print(f"Error: {reason}", file=sys.stderr)
         return 1
-    prior_gov_dict = _extract_governance_dict_from_text(prior_content)
+    preview_gov_dict = _extract_governance_dict_from_text(preview_content)
 
     # ── S2 Step 2: Preview ────────────────────────────────────────────────────
     changes: list[dict] = []
     for schema_key, new_value in parsed_fields:
-        before_raw = (prior_gov_dict or {}).get(schema_key)
+        before_raw = (preview_gov_dict or {}).get(schema_key)
         before = _coerce_for_audit(before_raw)
         after = new_value  # None == null
 
@@ -1021,17 +1288,20 @@ def run_govern(args: Any, agents_root: Path) -> int:
             print(f"  {c['field']}: {c['display_before']!r} -> {c['display_after']!r}")
         print()
 
-    # ── S2 Step 3 (pre-exit): Compute the edited content ─────────────────────
+    # ── S2 Step 3 (pre-exit): Compute the edited content against the ADVISORY
+    # pre-lock read ────────────────────────────────────────────────────────
     # Pure computation — no writes, no I/O side-effects. Running this BEFORE the
     # dry-run exit means a doomed edit (no governance block in the file, duplicate
     # key) fails with the same edit_error refusal on BOTH --dry-run and apply.
     # Without this ordering, --dry-run reports {ok:true, changes:[...]} and the
     # subsequent apply refuses — a preview-as-artifact break (M6/M7, P2-3 fix).
-    # Snapshot and atomic_write remain AFTER the confirm gate below.
-    new_content = prior_content
+    # This is ADVISORY (dry-run/preview parity only) — the AUTHORITATIVE edit
+    # that actually gets written is recomputed fresh, under the lock, below.
     try:
         for schema_key, new_value in parsed_fields:
-            new_content = _edit_governance_block(new_content, schema_key, new_value)
+            preview_content = _edit_governance_block(
+                preview_content, schema_key, new_value
+            )
     except (ValueError, KeyError) as exc:
         reason = f"Failed to apply --set edit: {exc}"
         if use_json:
@@ -1054,140 +1324,93 @@ def run_govern(args: Any, agents_root: Path) -> int:
             print("[dry-run] No changes written.")
         return 0
 
-    # ── S2 Step 3: Confirm ────────────────────────────────────────────────────
-    # Non-interactive guard: require --yes on non-TTY (spec/55 P1 prep finding).
-    if not sys.stdin.isatty() and not yes:
-        reason = (
-            "--yes is required for non-interactive use "
-            "(no TTY detected; use --yes to apply)."
+    # ── S2 Step 3: Confirm (BEFORE the manage lease is ever acquired) ────────
+    confirm_exit = _require_confirmation(use_json, yes)
+    if confirm_exit is not None:
+        return confirm_exit
+
+    # ── S2 Steps 4/4b: hoisted spine — lock, FRESH read, snapshot, write ─────
+    def _read_base() -> tuple[str, bool]:
+        file_existed = governance_path.exists()
+        content = _read_or_create_governance(governance_path, agent_id)
+        return content, file_existed
+
+    def _apply_edit(fresh_content: str) -> str:
+        new_content = fresh_content
+        for schema_key, new_value in parsed_fields:
+            new_content = _edit_governance_block(new_content, schema_key, new_value)
+        return new_content
+
+    # spec/55 M11 fix: construct the lock backend HERE — after --dry-run's
+    # early exit above and after the confirm gate — so a misconfigured/
+    # unreachable LockBackend never blocks a preview. The real write path
+    # still constructs it before run_managed_write is called.
+    lock_backend = get_manage_lock_backend(agent_dir)
+
+    try:
+        result: ManagedWriteResult = run_managed_write(
+            agent_dir=agent_dir,
+            agent_id=agent_id,
+            write_path=governance_path,
+            subdir=_SNAPSHOT_SUBDIR,
+            read_base=_read_base,
+            apply_edit=_apply_edit,
+            lock_backend=lock_backend,
         )
+    except (ManageAgentBusyError, ManageLockUnavailableError):
+        # Caught CENTRALLY by run_manage() — propagate uncaught (spec/55 M11
+        # ruling: these are spine-level, not per-verb, refusals).
+        raise
+    except (ValueError, KeyError) as exc:
+        reason = f"Failed to apply --set edit against the current governance.md: {exc}"
         if use_json:
-            print(
-                json.dumps(
-                    {
-                        "ok": False,
-                        "error_type": "confirmation_required",
-                        "reason": reason,
-                    },
-                    indent=2,
-                )
-            )
+            _emit_json_error("edit_error", reason)
         else:
             print(f"Error: {reason}", file=sys.stderr)
         return 1
-
-    if not yes:
-        # Interactive confirm on a TTY. Write the prompt to stderr (not input()'s
-        # default stdout) so that under --json stdout carries ONLY the machine-
-        # readable JSON — a copilot driver on a real TTY without --yes must never
-        # see the human prompt text prepended to the JSON stream (S3 contract).
-        try:
-            print("Apply these changes? [y/N] ", end="", file=sys.stderr, flush=True)
-            answer = input().strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            if use_json:
-                print(
-                    json.dumps(
-                        {
-                            "ok": False,
-                            "error_type": "aborted",
-                            "reason": "operator declined the confirmation; no changes written",
-                        },
-                        indent=2,
-                    )
-                )
-            else:
-                print("\nAborted.", file=sys.stderr)
-            return 0
-        if answer not in ("y", "yes"):
-            if use_json:
-                print(
-                    json.dumps(
-                        {
-                            "ok": False,
-                            "error_type": "aborted",
-                            "reason": "operator declined the confirmation; no changes written",
-                        },
-                        indent=2,
-                    )
-                )
-            else:
-                print("Aborted.", file=sys.stderr)
-            return 0
-
-    # ── S2 Step 4b: Snapshot the known-good prior content, then atomic_write ──
-    # The snapshot is taken only when a prior governance.md existed: a
-    # create-absent write has no restorable prior state (M3).
-    snapshot_path: Path | None = None
-    if file_existed:
-        try:
-            snapshot_path = take_config_snapshot(agent_dir, prior_content)
-        except Exception as exc:  # noqa: BLE001
-            reason = f"Failed to write pre-write snapshot: {exc}"
-            if use_json:
-                _emit_json_error("snapshot_error", reason)
-            else:
-                print(f"Error: {reason}", file=sys.stderr)
-            return 1
-
-    try:
-        atomic_write(governance_path, new_content)
-    except Exception as exc:  # noqa: BLE001
+    except OSError as exc:
         reason = f"Failed to write governance.md: {exc}"
         if use_json:
             _emit_json_error("write_error", reason)
         else:
             print(f"Error: {reason}", file=sys.stderr)
         return 1
+    except Exception as exc:  # noqa: BLE001 -- fail-closed structured refusal (Fix 5,
+        # adversarial review): run_managed_write's snapshot/write calls can raise
+        # broader than ValueError/KeyError/OSError (its own docstring says so) —
+        # an uncaught exception here must never surface a raw traceback and break
+        # the S3 --json structured-refusal contract; matches the pre-hoist
+        # (pre-#709) broad-except posture this hoist had narrowed away.
+        reason = f"Unexpected error while writing governance.md: {exc}"
+        if use_json:
+            _emit_json_error("write_error", reason)
+        else:
+            print(f"Error: {reason}", file=sys.stderr)
+        return 1
 
-    # ── S2 Step 5: Audit (AFTER write, non-fatal on error) ───────────────────
-    # Build the audit RunRecord following the established non-LLM-event precedent
-    # (policy_decision, mandate_reservation). The record uses PRIMITIVE_MANAGE_GOVERN,
-    # model='n/a', tokens=0, cost_usd=None (spec/55 M8, P2 prep finding).
-
-    # PR1 LIMITATION (deferred): a CLI invocation has no verified-claims identity
-    # transport — Principal derivation is an HTTP/serve-layer concern (spec/48).
-    # The management audit identity is therefore always LOCAL_PRINCIPAL, which is
-    # the correct home-user stamp. Multi-operator identity resolution for the CLI
-    # (so a shared-host fleet audit carries WHICH operator ran the command) is a
-    # follow-up; it slots in here by resolving the configured principal backend.
-    try:
-        from ..principal import LocalPrincipalBackend  # noqa: PLC0415
-
-        principal = LocalPrincipalBackend().derive_principal(None)
-        principal_id = principal.identifier
-    except Exception:  # noqa: BLE001
-        principal_id = "local"  # fallback per spec/48 (LOCAL_PRINCIPAL identifier)
-
-    # Build before/after dicts for the audit record. Redaction is applied at THIS
-    # (persisted) echo site — not just the console preview — so the durable JSONL
-    # record never carries a secret-shaped value in the clear (M8). Inert for
-    # govern today (no governance field name is secret-shaped) but the pinned
-    # shape is what every later verb (set-model, set-goal, apply-rec) inherits.
-    audit_changed_fields = [c["field"] for c in changes]
+    # ── S2 Step 5: Audit (lease already released — AFTER write, non-fatal) ──
+    # Recomputed from the FRESH (in-lock) read, not the advisory pre-lock
+    # preview — the P0 fix: audit before/after must reflect the actual disk
+    # state the write was based on, not a possibly-stale preview snapshot.
+    fresh_gov_dict = _extract_governance_dict_from_text(result.prior_content)
+    audit_changed_fields = [f for f, _ in parsed_fields]
     audit_before: dict[str, Any] = {}
     audit_after: dict[str, Any] = {}
-    for c in changes:
-        key = c["field"]
-        audit_before[key] = _cap_for_audit(_redact_if_secret(key, c["before"]))
-        audit_after[key] = _cap_for_audit(_redact_if_secret(key, c["after"]))
+    for schema_key, new_value in parsed_fields:
+        before_val = _coerce_for_audit((fresh_gov_dict or {}).get(schema_key))
+        audit_before[schema_key] = _cap_for_audit(
+            _redact_if_secret(schema_key, before_val)
+        )
+        audit_after[schema_key] = _cap_for_audit(
+            _redact_if_secret(schema_key, new_value)
+        )
 
-    # Snapshot path relative to agent_dir for portability (None on a create-absent
-    # write, which takes no snapshot — there was no prior file to roll back to).
-    if snapshot_path is None:
-        rel_snapshot = None
-    else:
-        try:
-            rel_snapshot = str(snapshot_path.relative_to(agent_dir))
-        except ValueError:
-            rel_snapshot = str(snapshot_path)
-
-    ts = datetime.now(timezone.utc).isoformat()
-    run_id = str(uuid.uuid4())
+    rel_snapshot = _relative_snapshot_path(result.snapshot_path, agent_dir)
+    principal_id = _principal_id()
 
     record = RunRecord(
-        ts=ts,
-        run_id=run_id,
+        ts=datetime.now(timezone.utc).isoformat(),
+        run_id=str(uuid.uuid4()),
         primitive=PRIMITIVE_MANAGE_GOVERN,
         status="applied",
         summary=f"manage govern {agent_id}: set {', '.join(audit_changed_fields)}"[
@@ -1207,33 +1430,27 @@ def run_govern(args: Any, agents_root: Path) -> int:
             # True when this write CREATED governance.md (no restorable prior
             # state; snapshot_path is null). A rollback tool reads this to know
             # the prior state was 'file absent', not a stub.
-            "created": not file_existed,
+            "created": not result.file_existed,
         },
     )
 
-    # Verify the record is JSON-serialisable before appending (P0 prep finding).
-    try:
-        json.dumps(record.to_dict())
-    except (TypeError, ValueError) as exc:
-        # This is a caller bug — warn and continue (write already succeeded).
-        print(
-            f"Warning: management audit record is not JSON-serialisable: {exc}",
-            file=sys.stderr,
-        )
-        audit_ok = False
-        audit_warnings = [str(exc)]
-    else:
-        audit_ok, audit_warnings = append_management_audit(
-            record, agent_dir, agents_root
-        )
+    audit_ok, audit_warnings = append_management_audit(record, agent_dir, agents_root)
 
     # ── Success output ────────────────────────────────────────────────────────
     audit_status = "ok" if audit_ok else "warn"
 
+    # Rebuild the --json changes payload from the AUTHORITATIVE (fresh, in-lock)
+    # before values, not the advisory pre-lock preview — same rationale as the
+    # audit record above (P0 fix).
+    authoritative_changes = [
+        {"field": k, "before": audit_before[k], "after": audit_after[k]}
+        for k in audit_changed_fields
+    ]
+
     if use_json:
         _emit_json_success(
             agent_id,
-            _json_change_list(changes),
+            authoritative_changes,
             snapshot_path=rel_snapshot,
             audit_status=audit_status,
         )
@@ -1243,6 +1460,290 @@ def run_govern(args: Any, agents_root: Path) -> int:
             print(f"  Snapshot: {rel_snapshot}")
         else:
             print("  Created governance.md (no prior file; no snapshot).")
+        if not audit_ok:
+            for w in audit_warnings:
+                print(f"  {w}")
+
+    return 0
+
+
+# ── --restore path (#710 — full S2 five-step routine, NOT a bypass) ───────────
+
+
+def _run_restore(
+    *,
+    agent_id: str,
+    agent_dir: Path,
+    agents_root: Path,
+    governance_path: Path,
+    snapshot_id: str,
+    use_json: bool,
+    dry_run: bool,
+    yes: bool,
+) -> int:
+    """``manage govern <agent> --restore <snapshot-id>`` — rollback verb (#710).
+
+    Runs the FULL S2 five-step routine through the SAME hoisted spine govern
+    --set uses (validate -> preview -> confirm -> snapshot+write -> audit) —
+    NOT a bypass. In particular, restore ITSELF snapshots the current
+    (pre-restore) governance.md before overwriting it, so a restore is
+    always itself undoable via a second restore.
+
+    Restore-validate-semantics (maintainer ruling): validation here means the
+    snapshot's governance block PARSES + the preview diff is shown — NOT a
+    full re-validation against the current schema (a snapshot is by
+    definition prior known-good content). The snapshot-belongs-to-this-agent
+    guarantee is enforced by ``resolve_snapshot_path``'s containment check
+    (the snapshot_id is resolved ONLY under the TARGET agent's own
+    ``.config-snapshots/govern/`` tree — a snapshot_id that only exists under
+    a different agent's tree simply does not resolve here, so cross-agent
+    and genuinely-nonexistent snapshot ids hit the identical
+    ``ManageSnapshotNotFoundError`` refusal; this is a deliberate
+    indistinguishability, not a gap — a caller must never learn whether a
+    given snapshot id exists under some OTHER agent).
+
+    Restore semantics decision (Tier B — not covered by a maintainer ruling,
+    decided here and documented so it is never a silent surprise): restore is
+    a BYTE-EXACT rollback. It does NOT re-stamp ``updated_at`` the way
+    ``--set`` does — the whole point of restoring a snapshot is that the
+    resulting governance.md is byte-identical to the snapshotted state (M3's
+    own "restorable to byte-faithful prior content" language), and an
+    implicit re-stamp would silently defeat that.
+    """
+    # ── Resolve + validate the snapshot belongs to THIS agent ─────────────────
+    try:
+        snapshot_src_path = resolve_snapshot_path(
+            agent_dir, _SNAPSHOT_SUBDIR, snapshot_id
+        )
+    except ManageSnapshotNotFoundError as exc:
+        if use_json:
+            _emit_json_error(exc.error_type, str(exc))
+        else:
+            print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        with snapshot_src_path.open("r", encoding="utf-8", newline="") as _f:
+            snapshot_content = _f.read()
+    except OSError as exc:
+        reason = f"Could not read snapshot {snapshot_id!r}: {exc}"
+        if use_json:
+            _emit_json_error("read_error", reason)
+        else:
+            print(f"Error: {reason}", file=sys.stderr)
+        return 1
+
+    # Restore-validate-semantics: the snapshot's governance block MUST parse.
+    # Not a full re-validation (a snapshot is by definition prior known-good
+    # content) — just confirm it still parses as a governance YAML block.
+    snapshot_gov_dict = _extract_governance_dict_from_text(snapshot_content)
+    if snapshot_gov_dict is None:
+        reason = (
+            f"Snapshot {snapshot_id!r} does not contain a parseable governance "
+            "YAML block — refusing to restore."
+        )
+        if use_json:
+            _emit_json_error("restore_snapshot_invalid", reason)
+        else:
+            print(f"Error: {reason}", file=sys.stderr)
+        return 1
+
+    # ── Advisory pre-lock read of CURRENT governance.md, for preview only ────
+    current_exists = governance_path.exists()
+    try:
+        preview_current_content = (
+            _read_or_create_governance(governance_path, agent_id)
+            if current_exists
+            else ""
+        )
+    except OSError as exc:
+        reason = f"Could not read governance.md: {exc}"
+        if use_json:
+            _emit_json_error("read_error", reason)
+        else:
+            print(f"Error: {reason}", file=sys.stderr)
+        return 1
+    preview_current_dict = (
+        _extract_governance_dict_from_text(preview_current_content)
+        if current_exists
+        else None
+    )
+
+    changed_fields = _diff_governance_field_names(
+        preview_current_dict, snapshot_gov_dict
+    )
+    preview_changes = [
+        {
+            "field": f,
+            "before": _coerce_for_audit((preview_current_dict or {}).get(f)),
+            "after": _coerce_for_audit(snapshot_gov_dict.get(f)),
+        }
+        for f in changed_fields
+    ]
+
+    if not use_json:
+        print(f"\n[{agent_id}] restoring governance.md from snapshot {snapshot_id}:")
+        if not preview_changes:
+            print(
+                "  (no field differences — governance.md already matches the snapshot)"
+            )
+        for c in preview_changes:
+            print(f"  {c['field']}: {c['before']!r} -> {c['after']!r}")
+        print()
+
+    if dry_run:
+        if use_json:
+            _emit_json_success(
+                agent_id,
+                _json_change_list(preview_changes),
+                snapshot_path=None,
+                audit_status="n/a",
+                dry_run=True,
+            )
+        else:
+            print("[dry-run] No changes written.")
+        return 0
+
+    # ── Confirm (BEFORE the manage lease is ever acquired) ───────────────────
+    confirm_exit = _require_confirmation(use_json, yes)
+    if confirm_exit is not None:
+        return confirm_exit
+
+    # ── Hoisted spine — lock, FRESH read (this IS the pre-restore snapshot
+    # base), snapshot, write ─────────────────────────────────────────────────
+    def _read_base() -> tuple[str, bool]:
+        file_existed = governance_path.exists()
+        content = (
+            _read_or_create_governance(governance_path, agent_id)
+            if file_existed
+            else ""
+        )
+        return content, file_existed
+
+    def _apply_edit(_fresh_content: str) -> str:
+        # Restore is an absolute overwrite — the fresh base is used only for
+        # the pre-restore snapshot (taken by run_managed_write when
+        # file_existed), never as an edit target.
+        return snapshot_content
+
+    # spec/55 M11 fix: construct the lock backend HERE — after --dry-run's
+    # early exit above and after the confirm gate — so a misconfigured/
+    # unreachable LockBackend never blocks a preview. The real write path
+    # still constructs it before run_managed_write is called.
+    lock_backend = get_manage_lock_backend(agent_dir)
+
+    try:
+        result: ManagedWriteResult = run_managed_write(
+            agent_dir=agent_dir,
+            agent_id=agent_id,
+            write_path=governance_path,
+            subdir=_SNAPSHOT_SUBDIR,
+            read_base=_read_base,
+            apply_edit=_apply_edit,
+            lock_backend=lock_backend,
+        )
+    except (ManageAgentBusyError, ManageLockUnavailableError):
+        # Caught CENTRALLY by run_manage() — propagate uncaught.
+        raise
+    except OSError as exc:
+        reason = f"Failed to restore governance.md: {exc}"
+        if use_json:
+            _emit_json_error("write_error", reason)
+        else:
+            print(f"Error: {reason}", file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001 -- fail-closed structured refusal (Fix 5,
+        # adversarial review): matches the pre-hoist (pre-#710) broad-except
+        # posture — an unexpected error from the snapshot/write calls must never
+        # surface a raw traceback and break the S3 --json structured-refusal
+        # contract.
+        reason = f"Unexpected error while restoring governance.md: {exc}"
+        if use_json:
+            _emit_json_error("write_error", reason)
+        else:
+            print(f"Error: {reason}", file=sys.stderr)
+        return 1
+
+    # ── Audit (lease already released — AFTER write, non-fatal) ─────────────
+    # Recomputed from the FRESH (in-lock) read, not the advisory pre-lock
+    # preview (P0 fix — same rationale as _run_set).
+    fresh_current_dict = (
+        _extract_governance_dict_from_text(result.prior_content)
+        if result.file_existed
+        else None
+    )
+    audit_changed_fields = _diff_governance_field_names(
+        fresh_current_dict, snapshot_gov_dict
+    )
+    audit_before: dict[str, Any] = {}
+    audit_after: dict[str, Any] = {}
+    for key in audit_changed_fields:
+        before_val = _coerce_for_audit((fresh_current_dict or {}).get(key))
+        after_val = _coerce_for_audit(snapshot_gov_dict.get(key))
+        audit_before[key] = _cap_for_audit(_redact_if_secret(key, before_val))
+        audit_after[key] = _cap_for_audit(_redact_if_secret(key, after_val))
+
+    # Two DISTINCT snapshot references (P1 prep finding — swap risk): the
+    # SOURCE snapshot the operator asked to restore FROM (restored_from) vs.
+    # the NEW pre-restore snapshot run_managed_write just took of the
+    # about-to-be-overwritten current state (snapshot_path). Named distinctly
+    # at construction so a swap is visually obvious in review.
+    pre_restore_snapshot_path = _relative_snapshot_path(result.snapshot_path, agent_dir)
+    source_snapshot_id = snapshot_id
+    principal_id = _principal_id()
+
+    record = RunRecord(
+        ts=datetime.now(timezone.utc).isoformat(),
+        run_id=str(uuid.uuid4()),
+        primitive=PRIMITIVE_MANAGE_RESTORE,
+        status="applied",
+        summary=f"manage govern {agent_id}: restore from {source_snapshot_id}"[:200],
+        model="n/a",
+        input_tokens=0,
+        output_tokens=0,
+        # cost_usd=None (omitted — not an LLM call; matches govern --set's convention)
+        agent_name=agent_id,
+        extra={
+            "principal_id": principal_id,
+            "changed_fields": audit_changed_fields,
+            "before": audit_before,
+            "after": audit_after,
+            # The PRE-RESTORE snapshot restore itself just took (of the state
+            # being overwritten) — restorable via a second --restore.
+            "snapshot_path": pre_restore_snapshot_path,
+            # The SOURCE snapshot this restore consumed.
+            "restored_from": source_snapshot_id,
+            "created": not result.file_existed,
+        },
+    )
+
+    # Exactly ONE RunRecord for one logical restore (manage_restore) — never a
+    # second manage_govern record (P1 prep finding: restore reuses the
+    # SNAPSHOT/CONFIRM/WRITE mechanics of the hoisted spine, not govern's own
+    # audit-emitting code path).
+    audit_ok, audit_warnings = append_management_audit(record, agent_dir, agents_root)
+
+    audit_status = "ok" if audit_ok else "warn"
+    authoritative_changes = [
+        {"field": k, "before": audit_before[k], "after": audit_after[k]}
+        for k in audit_changed_fields
+    ]
+
+    if use_json:
+        _emit_json_success(
+            agent_id,
+            authoritative_changes,
+            snapshot_path=pre_restore_snapshot_path,
+            audit_status=audit_status,
+        )
+    else:
+        print(
+            f"[{agent_id}] governance.md restored from snapshot {source_snapshot_id}."
+        )
+        if pre_restore_snapshot_path is not None:
+            print(f"  Pre-restore snapshot: {pre_restore_snapshot_path}")
+        else:
+            print("  Created governance.md (no prior file; no pre-restore snapshot).")
         if not audit_ok:
             for w in audit_warnings:
                 print(f"  {w}")
