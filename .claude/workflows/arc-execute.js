@@ -120,10 +120,11 @@ const TRIPWIRE_SCHEMA = {
 
 async function governingDocTripwire(stage) {
   return await agent(
-    `Tier A GUARDRAIL CHECK for issue ${ISSUE} (deterministic — do NOT judge whether any change is good; only whether it touches a governing doc). Read only; edit/revert nothing. Diff against the base branch \`main\` so the check catches changes whether the build committed them or left them uncommitted in the working tree. Run:
-  git --no-pager diff main --stat
-  git --no-pager diff main -- docs/TENSIONS.md
-  git --no-pager diff main -- CLAUDE.md
+    `Tier A GUARDRAIL CHECK for issue ${ISSUE} (deterministic — do NOT judge whether any change is good; only whether it touches a governing doc). Read only; edit/revert nothing. Diff against \`origin/main\` (the LIVE remote base — NOT local \`main\`, which can be stale when it is checked out in another worktree and produces false trips) so the check catches changes whether the build committed them or left them uncommitted in the working tree. Run:
+  git fetch origin main --quiet
+  git --no-pager diff origin/main --stat
+  git --no-pager diff origin/main -- docs/TENSIONS.md
+  git --no-pager diff origin/main -- CLAUDE.md
 Set \`tripped: true\` if EITHER holds:
   (1) docs/TENSIONS.md has ANY change (new/edited tension, ledger row, date, cross-ref), OR
   (2) CLAUDE.md changed inside its GOVERNING region — the throughline, the "## Design principles" section, any "### N." principle (esp. Principle #1 "the vault is the source of truth"), or the aesthetic rules.
