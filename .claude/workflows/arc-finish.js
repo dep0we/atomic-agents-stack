@@ -51,7 +51,7 @@ const TRIPWIRE_SCHEMA = {
 }
 async function governingDocTripwire(stage) {
   return await agent(
-    `Tier A GUARDRAIL CHECK for issue ${ISSUE} (deterministic — judge only whether a governing doc was touched, not whether the change is good). Read only; edit/revert nothing. Run \`git --no-pager diff ${BASE} -- docs/TENSIONS.md CLAUDE.md\`. Set \`tripped:true\` if docs/TENSIONS.md changed at all, OR CLAUDE.md changed inside its governing region (throughline, "## Design principles", any "### N." principle incl. Principle #1, or the aesthetic rules). A change ONLY to CLAUDE.md's status / backend-count / "Where things live" tables is routine doc-accounting — NOT a trip. Report offending paths + a one-line detail.`,
+    `Tier A GUARDRAIL CHECK for issue ${ISSUE} (deterministic — judge only whether a governing doc was touched, not whether the change is good). Read only; edit/revert nothing. Run \`git fetch origin ${BASE} --quiet && git --no-pager diff origin/${BASE} -- docs/TENSIONS.md CLAUDE.md\` (diff against the LIVE remote base, NOT local \`${BASE}\`, which can be stale in another worktree and cause false trips). Set \`tripped:true\` if docs/TENSIONS.md changed at all, OR CLAUDE.md changed inside its governing region (throughline, "## Design principles", any "### N." principle incl. Principle #1, or the aesthetic rules). A change ONLY to CLAUDE.md's status / backend-count / "Where things live" tables is routine doc-accounting — NOT a trip. Report offending paths + a one-line detail.`,
     { schema: TRIPWIRE_SCHEMA, label: `tripwire:${stage}`, phase: 'Review', model: 'sonnet' },
   )
 }
