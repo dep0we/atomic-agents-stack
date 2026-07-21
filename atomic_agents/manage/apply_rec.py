@@ -60,12 +60,13 @@ identified:
                                to narrow the search; see
                                `ManageRecIdAmbiguousError`.
 
-Past all five gates, apply-rec delegates into `set-model`'s OWN M9
-composition chain (PRICING/backend-resolution/policy-consult) against the
-matched `candidate_model`, unchanged, with `set-model`'s existing
-`error_type`s — a candidate since deprecated from PRICING or now ambiguous
-refuses through those gates exactly as a hand-typed `set-model --model`
-invocation would. apply-rec does not re-run or shortcut them.
+Past the integrity pre-check and all four semantic gates, apply-rec delegates
+into `set-model`'s OWN M9 composition chain (PRICING/backend-resolution/
+policy-consult) against the matched `candidate_model`, unchanged, with
+`set-model`'s existing `error_type`s — a candidate since deprecated from
+PRICING or now claimed by more than one backend refuses through those gates
+exactly as a hand-typed `set-model --model` invocation would. apply-rec does
+not re-run or shortcut them.
 
 Fourth refusal beyond the ruled three (deliberate, per the maintainer's
 skeptic's-guard ruling): folding ``rec_source_not_applicable`` into any of
