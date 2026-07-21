@@ -13,6 +13,9 @@ Verbs in this arc:
   set-model <agent> --model ...   — edit model.md's Default model field (#726)
   set-model <agent> --restore <id> — roll back model.md to a snapshot (#726)
   set-model <agent> --show/--list-snapshots — read-only (never touch the manage lease)
+  apply-rec <rec-id>              — apply a Fleet Console savings_cost
+                                     recommendation by delegating into
+                                     set-model's write routine (#727)
 
 The module is lazy-imported from cli.py so the base CLI startup for ``run``,
 ``doctor``, and other commands does not pay the manage module's import cost
@@ -70,6 +73,11 @@ def run_manage(args: Any, agents_root: Path) -> int:
             from .set_model import run_set_model  # noqa: PLC0415 -- intentional lazy import
 
             return run_set_model(args, agents_root)
+
+        if verb == "apply-rec":
+            from .apply_rec import run_apply_rec  # noqa: PLC0415 -- intentional lazy import
+
+            return run_apply_rec(args, agents_root)
 
         # Unknown verb — should not happen because argparse enforces choices,
         # but guard defensively.

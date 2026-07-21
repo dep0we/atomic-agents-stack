@@ -22,6 +22,19 @@ a strip-testable failure per guard. The ladder is:
     ManageSnapshotNotFoundError   — #710: the requested --restore <snapshot-id> does not exist
                                     for this agent (also the cross-agent-restore refusal —
                                     see the class docstring)
+    ManageRecNoLongerValidError   — #727: no current recommendation matches <rec-id>
+                                    (retryable — re-derive/reload the console)
+    ManageRecKindNotApplicableError — #727: matched a non-savings_cost recommendation
+    ManageRecGuardFailedError     — #727: the swap exists but its no-quality-cost
+                                    guard no longer passes (NOT retryable blindly —
+                                    look at the evals first)
+    ManageRecSourceNotApplicableError — #727: the matched savings rec's source is
+                                    outside apply-rec's PR1 allowlist
+    ManageRecIdAmbiguousError     — #727 review round 1: <rec-id> hash-matched
+                                    more than one DISTINCT recommendation (a
+                                    12-hex canonical_rec_id collision) — an
+                                    integrity refusal, not a semantic one;
+                                    retryable with --agent to narrow the search
 
 Most validation subclasses are raised during S2 step 1 and propagate to the verb
 as non-zero, no-write refusals. ManageListMutationRefused is the exception: it is
@@ -446,6 +459,159 @@ class ManageDeferredFlagRefused(ManageError):
         super().__init__(
             f"{flag} is not yet settable via CLI in PR1 (tracked in {issue}); "
             "edit model.md directly."
+        )
+
+
+class ManageRecNoLongerValidError(ManageError):
+    """spec/55 #727 apply-rec: no CURRENT recommendation matches ``<rec-id>``.
+
+    ``apply-rec``'s match universe (``build_rec_match_universe`` —
+    ``atomic_agents/advisor/recommend.py``) is recomputed fresh on every
+    invocation; recommendations are never persisted (spec/54). A rec-id that
+    hashed to a real recommendation at console-render time can stop matching
+    for entirely benign reasons — the agent's 30d usage repriced, the
+    candidate model changed, the underlying JSONL data moved — none of which
+    are errors. This is a first-class, EXPECTED refusal (the console card is
+    stale), not a bug: re-derive the recommendation (reload the console) and
+    retry with the new rec-id.
+    """
+
+    error_type: str = "rec_no_longer_valid"
+
+    def __init__(self, rec_id: str) -> None:
+        self.rec_id = rec_id
+        super().__init__(
+            f"No current recommendation matches rec-id {rec_id!r} — the "
+            "console card is stale (the agent's usage repriced, the "
+            "candidate changed, or the underlying data moved). Reload the "
+            "console and retry with the new rec-id."
+        )
+
+
+class ManageRecKindNotApplicableError(ManageError):
+    """spec/55 #727 apply-rec: the matched recommendation is not ``savings_cost``.
+
+    PR1 applies ``savings_cost`` recommendations only — the one kind with a
+    mechanical, unambiguous apply action (a model swap). ``quality_report``
+    and ``governance`` recommendations are, and remain, advisory-only; there
+    is no mechanical "apply" for "go read this tuning report" or "go write
+    governance.md by hand" (the latter has its own editor, ``manage govern``,
+    which ``apply-rec`` does not chain into).
+    """
+
+    error_type: str = "rec_kind_not_applicable"
+
+    def __init__(self, rec_id: str, kind: str) -> None:
+        self.rec_id = rec_id
+        self.kind = kind
+        super().__init__(
+            f"Recommendation {rec_id!r} matched a {kind!r} recommendation, "
+            "but apply-rec only applies 'savings_cost' recommendations "
+            "(quality_report/governance are advisory-only; there is no "
+            "mechanical apply for either)."
+        )
+
+
+class ManageRecGuardFailedError(ManageError):
+    """spec/55 #727 apply-rec: the swap still exists but its no-quality-cost
+    guard no longer passes.
+
+    The matched candidate's ``.safety.passed`` (an ``EvalHeadroom`` recomputed
+    fresh in the SAME ``build_rec_match_universe`` call that found the match —
+    apply-rec never re-imports advisor privates like ``_eval_headroom``
+    itself, Principle #3/T17 layering) is ``False``: a hard-fail landed, or a
+    margin eroded, since the recommendation last passed. This is distinct
+    from ``rec_no_longer_valid`` (no match at all) — the swap is a real,
+    currently-computable candidate, it just is not currently safe to apply.
+    STOP and look at the agent's evals; do NOT blindly retry — retrying
+    without investigating just re-hits this same refusal until the
+    underlying quality signal actually recovers.
+    """
+
+    error_type: str = "rec_guard_failed"
+
+    def __init__(self, rec_id: str) -> None:
+        self.rec_id = rec_id
+        super().__init__(
+            f"Recommendation {rec_id!r} still names a real candidate swap, "
+            "but its no-quality-cost guard no longer passes (a hard-fail "
+            "landed, or a margin eroded, since it last passed) — refusing "
+            "to apply. Look at the agent's evals before retrying; this is "
+            "not a transient failure to retry blindly."
+        )
+
+
+class ManageRecSourceNotApplicableError(ManageError):
+    """spec/55 #727 apply-rec: the matched savings rec's ``source`` is not in
+    apply-rec's allowlisted sources (skeptic's guard).
+
+    Only ``default_same_family``-sourced candidates are applicable in PR1
+    (``_APPLICABLE_REC_SOURCES`` in ``apply_rec.py``). ``operator_configured``
+    is excluded by design — apply-rec cannot yet re-validate the ground-truth
+    basis an operator-configured candidate was selected on, so it refuses
+    rather than silently applying a swap PR1 has no basis to vouch for. A
+    future ``measured_scorecard`` source (does not exist in code yet, see
+    #649/#644-child-D) is the primary target this refusal is designed to
+    widen for later, once a re-validation path for it is designed.
+    """
+
+    error_type: str = "rec_source_not_applicable"
+
+    def __init__(self, rec_id: str, source: str | None) -> None:
+        self.rec_id = rec_id
+        self.source = source
+        super().__init__(
+            f"Recommendation {rec_id!r} was selected via source {source!r}, "
+            "which PR1 apply-rec cannot re-validate the ground-truth basis "
+            "of — refusing rather than silently applying it (spec/55 "
+            "measured-scorecard-source ruling)."
+        )
+
+
+class ManageRecIdAmbiguousError(ManageError):
+    """spec/55 #727 review round 1: ``<rec-id>`` matched more than one DISTINCT
+    recommendation — a ``canonical_rec_id`` hash collision.
+
+    ``canonical_rec_id`` truncates a SHA-256 digest to 12 hex chars (48 bits)
+    — a deliberately short, console-legible identifier, not a
+    collision-proof one. ``build_rec_match_universe``'s dedup is keyed on the
+    full identity triple ``(agent, kind, candidate_model)``, so two
+    DIFFERENT triples that happen to hash to the SAME 12-hex id both survive
+    in the universe as distinct entries. Applying the first match in that
+    situation (the pre-fix behavior) risked silently applying the WRONG
+    recommendation's swap. This is an INTEGRITY refusal — distinct in kind
+    from the four semantic apply-rec refusals
+    (``rec_no_longer_valid``/``rec_kind_not_applicable``/
+    ``rec_source_not_applicable``/``rec_guard_failed``), which each answer a
+    question about ONE already-uniquely-identified candidate. This refusal
+    fires instead of even asking those questions, because the identifier
+    itself does not uniquely resolve.
+
+    Retryable: pass ``--agent <name>`` to narrow the match universe to one
+    agent before hashing — collapses the ambiguity in the overwhelmingly
+    common case (a collision across two DIFFERENT agents' candidates). If the
+    collision is within a single agent's own candidate set, report it — that
+    is a genuine (astronomically unlikely) hash collision, not a
+    configuration issue an operator can work around.
+
+    NOTE: this must NOT fire for an agent's own quality_report recommendations
+    — the dedup-by-triple fix (#727 review round 1) collapses every
+    quality_report rec for one agent onto the single triple
+    ``(agent, "quality_report", None)`` (candidate_model is always None for
+    that kind), so there is only ever ONE quality_report entry per agent in
+    the match universe to begin with. A quality_report rec-id therefore never
+    reaches this guard — it either matches that one entry (proceeding to
+    ``rec_kind_not_applicable``) or matches nothing.
+    """
+
+    error_type: str = "rec_id_ambiguous"
+
+    def __init__(self, rec_id: str) -> None:
+        self.rec_id = rec_id
+        super().__init__(
+            f"Rec-id {rec_id!r} matched more than one distinct recommendation "
+            "(a hash collision) — refusing rather than guessing which one you "
+            "meant. Pass --agent <name> to narrow the search, or report this."
         )
 
 

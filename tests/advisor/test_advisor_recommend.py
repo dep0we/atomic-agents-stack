@@ -1563,6 +1563,498 @@ class TestRecommendFleet:
 
 
 # ──────────────────────────────────────────────────────────────────
+# #727 Unit 1 — candidate-vs-render split + canonical rec-id
+#
+# derive_savings_candidates() / derive_savings_candidates_fleet() are the new
+# pre-guard candidate surface (spec/54 addendum). These tests lock:
+#   - canonical_rec_id determinism + source-exclusion (the rec-id apply-rec
+#     will match against, #727 Unit 2)
+#   - the bijection between recommend_fleet()'s console feed and the
+#     passed=True subset of derive_savings_candidates_fleet()
+#   - the console-feed-stays-filtered invariant (a guard-failed candidate is
+#     visible to derive_savings_candidates_fleet() but never to recommend_fleet())
+#   - derive_savings_candidates() unit behavior: guard-failing-but-floor-clearing
+#     returns one passed=False candidate; savings-eroded returns []
+
+
+class TestCanonicalRecId:
+    """canonical_rec_id: deterministic, differs on (agent, kind, candidate_model),
+    identical across `source` (source is excluded from the hash by ruling)."""
+
+    def test_deterministic_across_calls(self):
+        from atomic_agents.advisor.recommend import canonical_rec_id
+
+        a = canonical_rec_id("opus-agent", "savings_cost", "claude-sonnet-4-6-20260101")
+        b = canonical_rec_id("opus-agent", "savings_cost", "claude-sonnet-4-6-20260101")
+        assert a == b
+
+    def test_returns_12_hex_chars(self):
+        from atomic_agents.advisor.recommend import canonical_rec_id
+
+        rec_id = canonical_rec_id(
+            "opus-agent", "savings_cost", "claude-sonnet-4-6-20260101"
+        )
+        assert len(rec_id) == 12
+        int(rec_id, 16)  # raises ValueError if not valid hex
+
+    def test_differs_on_agent(self):
+        from atomic_agents.advisor.recommend import canonical_rec_id
+
+        a = canonical_rec_id("opus-agent", "savings_cost", "claude-sonnet-4-6-20260101")
+        b = canonical_rec_id(
+            "sonnet-agent", "savings_cost", "claude-sonnet-4-6-20260101"
+        )
+        assert a != b
+
+    def test_differs_on_kind(self):
+        from atomic_agents.advisor.recommend import canonical_rec_id
+
+        a = canonical_rec_id("opus-agent", "savings_cost", "claude-sonnet-4-6-20260101")
+        b = canonical_rec_id("opus-agent", "governance", "claude-sonnet-4-6-20260101")
+        assert a != b
+
+    def test_differs_on_candidate_model(self):
+        from atomic_agents.advisor.recommend import canonical_rec_id
+
+        a = canonical_rec_id("opus-agent", "savings_cost", "claude-sonnet-4-6-20260101")
+        b = canonical_rec_id("opus-agent", "savings_cost", "claude-haiku-4-5-20251001")
+        assert a != b
+
+    def test_strip_red_source_excluded_from_hash(self):
+        """strip-RED: two candidates differing ONLY in `source` must hash IDENTICAL.
+
+        `source` is not a canonical_rec_id parameter at all, so this test also
+        locks that no caller can (accidentally) thread it through — the id is
+        computed purely from (agent, kind, candidate_model).
+        """
+        from atomic_agents.advisor.recommend import canonical_rec_id
+
+        # Two logically-distinct `source` provenances for the identical swap.
+        default = canonical_rec_id(
+            "opus-agent", "savings_cost", "claude-sonnet-4-6-20260101"
+        )
+        operator = canonical_rec_id(
+            "opus-agent", "savings_cost", "claude-sonnet-4-6-20260101"
+        )
+        assert default == operator
+
+    def test_none_candidate_model_encoded_distinctly_from_empty_string_agent(self):
+        """None candidate_model (non-model recs) must not collide with an empty
+        string standing in for a field elsewhere — governance/quality_report
+        recs always pass candidate_model=None, exercised here directly."""
+        from atomic_agents.advisor.recommend import canonical_rec_id
+
+        gov_id = canonical_rec_id("opus-agent", "governance", None)
+        # Distinct from a hypothetical savings_cost rec with the same agent.
+        savings_id = canonical_rec_id(
+            "opus-agent", "savings_cost", "claude-sonnet-4-6-20260101"
+        )
+        assert gov_id != savings_id
+        assert len(gov_id) == 12
+
+
+def _seed_savings_agent(
+    root: Path,
+    agent: str,
+    model: str,
+    today: date,
+    eval_overrides: list[dict] | None = None,
+    run_cost_usd: float = 0.50,
+    n_runs: int = 12,
+) -> None:
+    """Seed one agent with model.md + N primary runs + 12 evals.
+
+    ``eval_overrides`` replaces the default 12-strong-pass eval fixture
+    wholesale — used to inject a hard-fail (guard-failing) window.
+    """
+    _write_model_md(root, agent, model)
+    runs = []
+    for i in range(n_runs):
+        ts = datetime.combine(
+            today - timedelta(days=i + 1), datetime.min.time()
+        ).replace(tzinfo=timezone.utc)
+        runs.append(
+            {
+                "ts": ts.isoformat(),
+                "trigger": "cron",
+                "model": model,
+                "input_tokens": 2000,
+                "output_tokens": 1000,
+                "cost_usd": run_cost_usd,
+                "cache_hit_tokens": 0,
+                "cache_miss_tokens": 2000,
+                "latency_ms": 100,
+                "status": "completed",
+                "summary": "ok",
+            }
+        )
+    _write_run_jsonl(root, agent, runs)
+    evals = eval_overrides or [
+        {"ts": today.isoformat(), "verdict": "pass", "weighted_score": 4.6}
+        for _ in range(12)
+    ]
+    _write_eval_jsonl(root, agent, today, evals)
+
+
+class TestFleetCandidateRenderBijection:
+    """recommend_fleet() (console feed) and derive_savings_candidates_fleet()
+    (apply-rec's match universe) must stay in sync — every rec on the console
+    must be findable among the pre-guard candidates, and vice versa for the
+    passed=True subset (spec/54 addendum)."""
+
+    def test_bijection_over_passing_fleet(self, tmp_path):
+        """Every passed=True derive_savings_candidates_fleet() candidate's
+        canonical_rec_id is present in recommend_fleet()'s savings_cost recs,
+        and every recommend_fleet() savings_cost rec's id is present among the
+        passed=True candidates. Proves both directions of the bijection."""
+        from atomic_agents.advisor.recommend import (
+            canonical_rec_id,
+            derive_savings_candidates_fleet,
+            recommend_fleet,
+        )
+
+        today = date(2026, 6, 20)
+        _seed_savings_agent(tmp_path, "opus-agent", "claude-opus-4-8", today)
+        _seed_savings_agent(
+            tmp_path, "sonnet-agent", "claude-sonnet-4-6-20260101", today
+        )
+
+        rendered = recommend_fleet(tmp_path, today=today)
+        rendered_savings = [r for r in rendered if r.kind == "savings_cost"]
+        assert rendered_savings, "fixture must yield at least one console rec"
+
+        candidates = derive_savings_candidates_fleet(tmp_path, today=today)
+        passed_candidates = [c for c in candidates if c.safety.passed]
+        assert passed_candidates, "fixture must yield at least one passing candidate"
+
+        rendered_ids = {
+            canonical_rec_id(r.agent, r.kind, r.candidate_model)
+            for r in rendered_savings
+        }
+        passed_ids = {
+            canonical_rec_id(c.agent, c.kind, c.candidate_model)
+            for c in passed_candidates
+        }
+
+        # Direction 1: every passed=True candidate is on the console.
+        assert passed_ids <= rendered_ids, (
+            f"passed candidates missing from console feed: {passed_ids - rendered_ids!r}"
+        )
+        # Direction 2: every console savings_cost rec is among the passed candidates.
+        assert rendered_ids <= passed_ids, (
+            f"console recs missing from passed candidates: {rendered_ids - passed_ids!r}"
+        )
+        # Full bijection.
+        assert rendered_ids == passed_ids
+
+    def test_console_feed_never_emits_guard_failed_savings_rec(self, tmp_path):
+        """recommend_fleet() must NEVER emit a savings_cost rec with
+        safety.passed == False — the spec/54 §5 invariant survives the split.
+
+        Fixture: a guard-failing agent (hard-fail injected in the eval window)
+        that STILL clears the savings floor (same 12x$0.50 opus runs as the
+        passing fixture). Strip-RED: appears in derive_savings_candidates_fleet
+        with passed=False, does NOT appear in recommend_fleet().
+        """
+        from atomic_agents.advisor.recommend import (
+            derive_savings_candidates_fleet,
+            recommend_fleet,
+        )
+
+        today = date(2026, 6, 20)
+        guard_failing_evals = [
+            {"ts": today.isoformat(), "verdict": "pass", "weighted_score": 4.6}
+            for _ in range(11)
+        ] + [
+            {
+                "ts": today.isoformat(),
+                "verdict": "pass",
+                "weighted_score": 4.6,
+                "hard_fails": ["critical_format_error"],
+            }
+        ]
+        _seed_savings_agent(
+            tmp_path,
+            "guard-failing-agent",
+            "claude-opus-4-8",
+            today,
+            eval_overrides=guard_failing_evals,
+        )
+
+        candidates = derive_savings_candidates_fleet(tmp_path, today=today)
+        agent_cands = [c for c in candidates if c.agent == "guard-failing-agent"]
+        assert len(agent_cands) == 1, (
+            f"guard-failing-but-floor-clearing agent must still produce a "
+            f"pre-guard candidate; got {candidates!r}"
+        )
+        assert agent_cands[0].safety.passed is False
+        assert agent_cands[0].kind == "savings_cost"
+
+        rendered = recommend_fleet(tmp_path, today=today)
+        rendered_savings = [
+            r
+            for r in rendered
+            if r.kind == "savings_cost" and r.agent == "guard-failing-agent"
+        ]
+        assert rendered_savings == [], (
+            "recommend_fleet() must NOT emit a savings_cost rec for a "
+            f"guard-failing agent; got {rendered_savings!r}"
+        )
+        # No savings_cost rec anywhere in the console feed has passed=False.
+        assert all(r.safety.passed for r in rendered if r.kind == "savings_cost"), (
+            "console feed must never carry a passed=False savings_cost rec"
+        )
+
+
+class TestBuildRecMatchUniverseDedupStaleness:
+    """build_rec_match_universe() dedup-by-triple (#727 review round 1 FIX 1).
+
+    recommend_fleet() and derive_savings_candidates_fleet() each independently
+    re-walk every agent's JSONL, at slightly different instants — so for the
+    SAME (agent, kind, candidate_model) savings_cost triple, the two loaders
+    can disagree on the guard verdict. These tests monkeypatch both loaders
+    directly (fast, deterministic — no need to race real JSONL writes) to
+    prove the merge always prefers derive_savings_candidates_fleet()'s copy,
+    never recommend_fleet()'s, and that recommend_fleet()'s OWN internally
+    computed savings_cost candidates (for a triple derive does not carry at
+    all) are discarded rather than leaking into the universe.
+    """
+
+    def _make_rec(self, *, agent, kind, candidate_model, passed, rationale):
+        headroom = EvalHeadroom(
+            weighted_score_margin=1.0 if passed else -1.0,
+            pass_rate_margin=1.0 if passed else -1.0,
+            hard_fails=0 if passed else 1,
+            sample_n=12,
+            rubric_threshold=4.0,
+            passed=passed,
+        )
+        return Recommendation(
+            agent=agent,
+            kind=kind,
+            current_model="claude-opus-4-8",
+            candidate_model=candidate_model,
+            projected_usd_delta=-5.0 if kind == "savings_cost" else None,
+            projected_points_delta=0.0 if kind == "savings_cost" else None,
+            rationale=rationale,
+            safety=headroom,
+            source="default_same_family" if kind == "savings_cost" else None,
+        )
+
+    def test_universe_prefers_derive_savings_verdict_over_stale_recommend_fleet_copy(
+        self, monkeypatch, tmp_path
+    ):
+        """The SAME savings_cost triple, disagreeing between the two loaders:
+        recommend_fleet() says passed=True (stale), derive_savings_candidates_
+        fleet() says passed=False (fresh). The universe MUST carry the fresh,
+        failing candidate — not the stale, passing one."""
+        from atomic_agents.advisor import recommend as recommend_mod
+
+        stale_passing = self._make_rec(
+            agent="opus-agent",
+            kind="savings_cost",
+            candidate_model="claude-sonnet-4-6-20260101",
+            passed=True,
+            rationale="stale-from-recommend_fleet",
+        )
+        fresh_failing = self._make_rec(
+            agent="opus-agent",
+            kind="savings_cost",
+            candidate_model="claude-sonnet-4-6-20260101",
+            passed=False,
+            rationale="fresh-from-derive",
+        )
+
+        monkeypatch.setattr(
+            recommend_mod, "compute_fleet_health", lambda *a, **k: object()
+        )
+        monkeypatch.setattr(
+            recommend_mod,
+            "recommend_fleet",
+            lambda *a, **k: [stale_passing],
+        )
+        monkeypatch.setattr(
+            recommend_mod,
+            "derive_savings_candidates_fleet",
+            lambda *a, **k: [fresh_failing],
+        )
+
+        universe = recommend_mod.build_rec_match_universe(tmp_path)
+
+        assert len(universe) == 1
+        assert universe[0].rationale == "fresh-from-derive"
+        assert universe[0].safety.passed is False, (
+            "dedup must take the savings_cost verdict from "
+            "derive_savings_candidates_fleet() (authoritative), never from "
+            "recommend_fleet()'s own (possibly stale) copy"
+        )
+
+    def test_savings_cost_never_taken_from_recommend_fleet_when_absent_from_derive(
+        self, monkeypatch, tmp_path
+    ):
+        """strip-RED: recommend_fleet() internally computes (and discards) its
+        own savings_cost candidates — a triple present ONLY in
+        recommend_fleet()'s output (never in derive_savings_candidates_fleet()'s)
+        must NOT appear in the universe at all, proving the savings_cost
+        branch is unconditionally skipped from the recommend_fleet() loop,
+        not merely deduped-away when derive also carries it."""
+        from atomic_agents.advisor import recommend as recommend_mod
+
+        recommend_fleet_only = self._make_rec(
+            agent="opus-agent",
+            kind="savings_cost",
+            candidate_model="claude-sonnet-4-6-20260101",
+            passed=True,
+            rationale="recommend_fleet-only",
+        )
+
+        monkeypatch.setattr(
+            recommend_mod, "compute_fleet_health", lambda *a, **k: object()
+        )
+        monkeypatch.setattr(
+            recommend_mod,
+            "recommend_fleet",
+            lambda *a, **k: [recommend_fleet_only],
+        )
+        monkeypatch.setattr(
+            recommend_mod, "derive_savings_candidates_fleet", lambda *a, **k: []
+        )
+
+        universe = recommend_mod.build_rec_match_universe(tmp_path)
+
+        assert universe == [], (
+            "a savings_cost triple absent from derive_savings_candidates_fleet() "
+            f"must never leak into the universe via recommend_fleet(): {universe!r}"
+        )
+
+    def test_non_savings_kinds_still_taken_from_recommend_fleet(
+        self, monkeypatch, tmp_path
+    ):
+        """governance/quality_report recs have no dual-source race — they are
+        taken from recommend_fleet() unchanged, so rec_kind_not_applicable
+        stays reachable (spec/55 'The match universe')."""
+        from atomic_agents.advisor import recommend as recommend_mod
+
+        governance_rec = self._make_rec(
+            agent="opus-agent",
+            kind="governance",
+            candidate_model=None,
+            passed=False,
+            rationale="governance.md is absent",
+        )
+
+        monkeypatch.setattr(
+            recommend_mod, "compute_fleet_health", lambda *a, **k: object()
+        )
+        monkeypatch.setattr(
+            recommend_mod, "recommend_fleet", lambda *a, **k: [governance_rec]
+        )
+        monkeypatch.setattr(
+            recommend_mod, "derive_savings_candidates_fleet", lambda *a, **k: []
+        )
+
+        universe = recommend_mod.build_rec_match_universe(tmp_path)
+
+        assert len(universe) == 1
+        assert universe[0].kind == "governance"
+        assert universe[0].rationale == "governance.md is absent"
+
+
+class TestDeriveSavingsCandidatesUnit:
+    """derive_savings_candidates() — direct unit coverage of the split (#727)."""
+
+    def test_guard_failing_floor_clearing_returns_one_passed_false_candidate(self):
+        """A hard-fail (guard-failing) agent that still clears the savings floor
+        returns exactly one candidate with safety.passed == False."""
+        from atomic_agents.advisor.recommend import derive_savings_candidates
+
+        ah = _make_agent_health(primary_model="claude-opus-4-8")
+        runs = [_make_run(model="claude-opus-4-8", cost_usd=0.50) for _ in range(10)]
+        evals = _passing_evals(n=10, score=4.8)
+        # Inject a hard-fail so predicate P3 fails (guard fails) while
+        # everything else (P1/P2/P4) still holds.
+        evals[0] = _make_eval(
+            verdict="pass", weighted_score=4.8, hard_fails=["critical_format_error"]
+        )
+        cfg = _make_rec_config(
+            score_margin_floor=0.5,
+            pass_rate_margin_floor=0.01,
+            min_eval_n=5,
+            min_savings_usd=0.01,
+        )
+
+        cands = derive_savings_candidates(
+            agent_health=ah,
+            run_records=runs,
+            eval_records=evals,
+            rec_config=cfg,
+            rubric_threshold=4.0,
+        )
+        assert len(cands) == 1
+        cand = cands[0]
+        assert cand.kind == "savings_cost"
+        assert cand.safety.passed is False
+        assert cand.safety.hard_fails == 1
+        assert cand.projected_usd_delta is not None
+        assert cand.projected_usd_delta < 0  # the swap still saves money
+
+    def test_savings_eroded_agent_returns_empty(self):
+        """strip-RED: a swap that no longer clears the savings floor returns []
+        even though the quality guard PASSES — the floor is not a leniency axis
+        the split relaxes."""
+        from atomic_agents.advisor.recommend import derive_savings_candidates
+
+        ah = _make_agent_health(primary_model="claude-opus-4-8")
+        # Tiny costs -> tiny absolute delta; a very high floor guarantees erosion.
+        runs = [_make_run(model="claude-opus-4-8", cost_usd=0.0001) for _ in range(2)]
+        evals = _passing_evals(n=10, score=4.8)  # guard PASSES
+        cfg = _make_rec_config(min_savings_usd=1000.0, min_eval_n=5)
+
+        cands = derive_savings_candidates(
+            agent_health=ah,
+            run_records=runs,
+            eval_records=evals,
+            rec_config=cfg,
+            rubric_threshold=4.0,
+        )
+        assert cands == []
+
+    def test_no_primary_model_returns_empty(self):
+        """strip-RED: primary_model=None short-circuits to []."""
+        from atomic_agents.advisor.recommend import derive_savings_candidates
+
+        ah = _make_agent_health(primary_model=None)
+        cfg = _make_rec_config(min_savings_usd=0.0)
+
+        cands = derive_savings_candidates(
+            agent_health=ah,
+            run_records=[],
+            eval_records=[],
+            rec_config=cfg,
+            rubric_threshold=4.0,
+        )
+        assert cands == []
+
+    def test_no_candidate_available_returns_empty(self):
+        """strip-RED: a model with no same-family downgrade (cheapest tier) → []."""
+        from atomic_agents.advisor.recommend import derive_savings_candidates
+
+        ah = _make_agent_health(primary_model="claude-haiku-4-5")
+        runs = [_make_run(model="claude-haiku-4-5", cost_usd=0.50) for _ in range(10)]
+        evals = _passing_evals(n=10, score=4.8)
+        cfg = _make_rec_config(min_savings_usd=0.0)
+
+        cands = derive_savings_candidates(
+            agent_health=ah,
+            run_records=runs,
+            eval_records=evals,
+            rec_config=cfg,
+            rubric_threshold=4.0,
+        )
+        assert cands == []
+
+
+# ──────────────────────────────────────────────────────────────────
 # Render panel — the operator-visible surface (spec/54 §11)
 
 

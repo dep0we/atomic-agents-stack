@@ -35,15 +35,20 @@ from typing import Any
 
 import pytest
 
+from datetime import date
+
+from atomic_agents.advisor.recommend import build_rec_match_universe, canonical_rec_id
 from atomic_agents.exceptions import LockBusy
 from atomic_agents.locks import FilesystemLockBackend
 from atomic_agents.locks.types import LockCapabilities, LockHandle
 from atomic_agents.manage import _routine
 from atomic_agents.manage import run_manage
+from atomic_agents.manage.apply_rec import run_apply_rec
 from atomic_agents.manage.exceptions import ManageAgentBusyError
 from atomic_agents.manage.govern import run_govern
 from atomic_agents.manage.set_model import run_set_model
 from atomic_agents.logs.types import (
+    PRIMITIVE_MANAGE_APPLY_REC,
     PRIMITIVE_MANAGE_GOVERN,
     PRIMITIVE_MANAGE_RESTORE,
     PRIMITIVE_MANAGE_SET_MODEL,
@@ -52,10 +57,16 @@ from atomic_agents.logs.types import (
 from tests._manage_test_helpers import (
     collect_jsonl,
     make_agent_dir,
+    make_apply_rec_args,
     make_govern_args,
     make_governance_md,
     make_model_md,
     make_set_model_args,
+)
+from tests.test_manage_apply_rec import (
+    DEFAULT_CANDIDATE,
+    DEFAULT_MODEL,
+    _seed_apply_rec_agent,
 )
 
 
@@ -1386,3 +1397,133 @@ def test_set_model_lost_update_fix_concurrent_write_survives(tmp_path, monkeypat
         "A's advisory pre-lock preview captured before B ran (the #709 P0 "
         "lost-update fix)."
     )
+
+
+# ──────────────────────────────────────────────────────────────────
+# apply-rec spine conformance (#727 Unit 2) — proves the hoisted spine serves
+# this THIRD, delegating verb too. The lost-update / lease-scope guarantees
+# themselves are inherited unchanged via the shared apply_set_model_write()
+# write function apply-rec calls into (already covered above for set-model at
+# the write-function level) — this block covers only the joins that are
+# apply-rec's own: agent_busy raised uncaught by run_apply_rec directly +
+# caught centrally by run_manage, --dry-run never acquiring the lease, and the
+# exit-code ladder, all driven through a real rec-id (not a hand-typed
+# --model).
+
+
+def _seeded_apply_rec_id(tmp_path):
+    """Seed a real passing savings_cost fixture and return its rec-id."""
+    today = date.today()
+    agent_dir = _seed_apply_rec_agent(tmp_path, "opus-agent", DEFAULT_MODEL, today)
+    universe = build_rec_match_universe(tmp_path, today=today)
+    matches = [
+        r for r in universe if r.agent == "opus-agent" and r.kind == "savings_cost"
+    ]
+    assert matches, f"fixture must yield a savings_cost candidate: {universe!r}"
+    rec_id = canonical_rec_id(
+        matches[0].agent, matches[0].kind, matches[0].candidate_model
+    )
+    return agent_dir, rec_id
+
+
+def test_apply_rec_agent_busy_is_raised_uncaught_by_run_apply_rec_directly(tmp_path):
+    """Mirrors ``test_set_model_agent_busy_is_raised_uncaught_by_run_set_model_directly``:
+    ManageAgentBusyError propagates UNCAUGHT out of run_apply_rec() — the
+    central catch lives in run_manage(), not per-verb, even though the
+    actual write happens inside the delegated apply_set_model_write()."""
+    agent_dir, rec_id = _seeded_apply_rec_id(tmp_path)
+
+    real_backend = FilesystemLockBackend(agent_dir)
+    with real_backend.acquire("manage", timeout=0):
+        args = make_apply_rec_args(rec_id, tmp_path, yes=True)
+        with pytest.raises(ManageAgentBusyError):
+            run_apply_rec(args, tmp_path)
+
+
+def test_apply_rec_agent_busy_caught_centrally_by_run_manage(tmp_path, capsys):
+    """Mirrors ``test_set_model_agent_busy_caught_centrally_by_run_manage`` —
+    the SAME contention scenario driven through run_manage(): exits 1 with
+    error_type='agent_busy'."""
+    agent_dir, rec_id = _seeded_apply_rec_id(tmp_path)
+
+    real_backend = FilesystemLockBackend(agent_dir)
+    with real_backend.acquire("manage", timeout=0):
+        args = make_apply_rec_args(rec_id, tmp_path, yes=True, use_json=True)
+        rc = run_manage(args, tmp_path)
+
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["error_type"] == "agent_busy"
+    # M8: a refusal (including agent_busy) writes NO management RunRecord.
+    # (The fixture's own seeded run records are already in this log dir, so
+    # assert on the ABSENCE of a manage_apply_rec record, not an empty log.)
+    records = collect_jsonl(agent_dir / "log")
+    assert not any(r.get("primitive") == PRIMITIVE_MANAGE_APPLY_REC for r in records)
+
+
+def test_apply_rec_dry_run_does_not_acquire_manage_lease(tmp_path):
+    """Mirrors ``test_set_model_dry_run_does_not_acquire_manage_lease``:
+    --dry-run never takes the lease — held externally, apply still previews."""
+    agent_dir, rec_id = _seeded_apply_rec_id(tmp_path)
+
+    with _routine.manage_lease(agent_dir, agent_dir.name):
+        args = make_apply_rec_args(rec_id, tmp_path, dry_run=True, yes=True)
+        assert run_apply_rec(args, tmp_path) == 0
+
+
+def test_apply_rec_exit_code_ladder_applied_is_zero(tmp_path):
+    _, rec_id = _seeded_apply_rec_id(tmp_path)
+    args = make_apply_rec_args(rec_id, tmp_path, yes=True)
+    assert run_apply_rec(args, tmp_path) == 0
+
+
+def test_apply_rec_exit_code_ladder_refusal_is_one(tmp_path):
+    agent_dir, _ = _seeded_apply_rec_id(tmp_path)
+    args = make_apply_rec_args("0" * 12, tmp_path, yes=True)
+    assert run_apply_rec(args, tmp_path) == 1
+
+
+def test_apply_rec_exit_code_ladder_decline_is_three(tmp_path, monkeypatch):
+    _, rec_id = _seeded_apply_rec_id(tmp_path)
+
+    import sys
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda: "n")
+
+    args = make_apply_rec_args(rec_id, tmp_path, yes=False)
+    assert run_apply_rec(args, tmp_path) == 3
+
+
+def test_apply_rec_exit_code_ladder_sigint_is_130(tmp_path, monkeypatch):
+    _, rec_id = _seeded_apply_rec_id(tmp_path)
+
+    import sys
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+
+    def _raise_sigint():
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", _raise_sigint)
+
+    args = make_apply_rec_args(rec_id, tmp_path, yes=False)
+    assert run_apply_rec(args, tmp_path) == 130
+
+
+def test_apply_rec_applied_write_carries_apply_rec_primitive(tmp_path):
+    """A quick join proving the delegated write really DOES land under
+    PRIMITIVE_MANAGE_APPLY_REC (not PRIMITIVE_MANAGE_SET_MODEL) even when
+    driven through the spine-level entry point (run_manage), not just the
+    verb-level entry point covered in tests/test_manage_apply_rec.py."""
+    agent_dir, rec_id = _seeded_apply_rec_id(tmp_path)
+
+    args = make_apply_rec_args(rec_id, tmp_path, yes=True)
+    rc = run_manage(args, tmp_path)
+    assert rc == 0
+
+    records = collect_jsonl(agent_dir / "log")
+    applied = [r for r in records if r.get("primitive") == PRIMITIVE_MANAGE_APPLY_REC]
+    assert len(applied) == 1
+    assert DEFAULT_CANDIDATE in (agent_dir / "model.md").read_text(encoding="utf-8")

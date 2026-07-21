@@ -1211,3 +1211,150 @@ def test_cli_set_model_show_end_to_end(tmp_path, capsys):
     assert exit_code == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["default_model"] == "claude-sonnet-4-6"
+
+
+# ── Delegation seam: native-wins merge + audit_summary (#727 review round 1) ─
+#
+# apply_set_model_write's audit_extra/json_extra/audit_summary params are the
+# #727 apply-rec delegation seam — they have no CLI surface of their own, so
+# these are exercised via DIRECT calls to _run_set_model (the
+# apply_set_model_write alias), mirroring
+# test_model_md_absent_refuses_via_direct_write_path_call's established
+# direct-call pattern above.
+
+
+class TestDelegationSeamNativeWins:
+    """FIX 3 (#727 review round 1): a delegating caller's audit_extra/
+    json_extra dicts must never be able to clobber a set-model-native key —
+    the native payload is authoritative and merged LAST (wins any collision),
+    the caller's dict is merged FIRST (additive-only in practice)."""
+
+    def test_audit_extra_cannot_clobber_native_runrecord_keys(self, tmp_path):
+        agent_dir = make_agent_dir(tmp_path, "myagent")
+        make_model_md(agent_dir)
+
+        exit_code = _run_set_model(
+            agent_id="myagent",
+            agent_dir=agent_dir,
+            agents_root=tmp_path,
+            model_path=agent_dir / "model.md",
+            model_id="claude-haiku-4-5",
+            use_json=False,
+            dry_run=False,
+            yes=True,
+            audit_extra={
+                "changed_fields": ["hijacked"],
+                "before": {"default_model": "hijacked-before"},
+                "snapshot_path": "hijacked/path.md",
+                "applied_from_rec": {"rec_id": "abc123abc123", "kind": "savings_cost"},
+            },
+        )
+        assert exit_code == 0
+
+        records = collect_jsonl(agent_dir / "log")
+        applied = [
+            r for r in records if r.get("primitive") == PRIMITIVE_MANAGE_SET_MODEL
+        ]
+        assert len(applied) == 1
+        record = applied[0]
+
+        # Native keys win — never clobbered by the caller's colliding values.
+        assert record["changed_fields"] == ["default_model"]
+        assert record["before"] == {"default_model": "claude-sonnet-4-6"}
+        assert record["snapshot_path"] is not None
+        assert record["snapshot_path"] != "hijacked/path.md"
+        # A non-colliding caller marker still lands (additive-only survives).
+        assert record["applied_from_rec"] == {
+            "rec_id": "abc123abc123",
+            "kind": "savings_cost",
+        }
+
+    def test_json_extra_cannot_clobber_native_payload_keys(self, tmp_path, capsys):
+        agent_dir = make_agent_dir(tmp_path, "myagent")
+        make_model_md(agent_dir)
+
+        exit_code = _run_set_model(
+            agent_id="myagent",
+            agent_dir=agent_dir,
+            agents_root=tmp_path,
+            model_path=agent_dir / "model.md",
+            model_id="claude-haiku-4-5",
+            use_json=True,
+            dry_run=False,
+            yes=True,
+            json_extra={
+                "ok": False,
+                "agent": "hijacked-agent",
+                "changed_fields": ["hijacked"],
+                "safety": {"passed": True},
+            },
+        )
+        assert exit_code == 0
+        payload = json.loads(capsys.readouterr().out)
+
+        # Native keys win.
+        assert payload["ok"] is True
+        assert payload["agent"] == "myagent"
+        assert payload["changed_fields"] == ["default_model"]
+        # A non-colliding caller marker still lands.
+        assert payload["safety"] == {"passed": True}
+
+
+class TestAuditSummarySeam:
+    """FIX 4 (#727 review round 1): a delegating caller can stamp the
+    RunRecord's summary so it names the primitive actually invoked."""
+
+    def test_audit_summary_overrides_default(self, tmp_path):
+        agent_dir = make_agent_dir(tmp_path, "myagent")
+        make_model_md(agent_dir)
+        custom_summary = (
+            "manage apply-rec myagent: default_model -> claude-haiku-4-5 "
+            "(rec deadbeefcafe)"
+        )
+
+        exit_code = _run_set_model(
+            agent_id="myagent",
+            agent_dir=agent_dir,
+            agents_root=tmp_path,
+            model_path=agent_dir / "model.md",
+            model_id="claude-haiku-4-5",
+            use_json=False,
+            dry_run=False,
+            yes=True,
+            audit_summary=custom_summary,
+        )
+        assert exit_code == 0
+
+        records = collect_jsonl(agent_dir / "log")
+        applied = [
+            r for r in records if r.get("primitive") == PRIMITIVE_MANAGE_SET_MODEL
+        ]
+        assert len(applied) == 1
+        assert applied[0]["summary"] == custom_summary
+        assert "manage set-model" not in applied[0]["summary"]
+
+    def test_audit_summary_none_reproduces_set_models_own_default(self, tmp_path):
+        """set-model's own CLI path never passes audit_summary — None MUST
+        reproduce the pre-existing default text byte-for-byte."""
+        agent_dir = make_agent_dir(tmp_path, "myagent")
+        make_model_md(agent_dir)
+
+        exit_code = _run_set_model(
+            agent_id="myagent",
+            agent_dir=agent_dir,
+            agents_root=tmp_path,
+            model_path=agent_dir / "model.md",
+            model_id="claude-haiku-4-5",
+            use_json=False,
+            dry_run=False,
+            yes=True,
+        )
+        assert exit_code == 0
+
+        records = collect_jsonl(agent_dir / "log")
+        applied = [
+            r for r in records if r.get("primitive") == PRIMITIVE_MANAGE_SET_MODEL
+        ]
+        assert applied[0]["summary"] == (
+            "manage set-model myagent: default_model -> claude-haiku-4-5"
+        )

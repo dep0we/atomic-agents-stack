@@ -1206,6 +1206,8 @@ _CONSOLE_CSS_EXTRA = """
 .rec-delta-badge { display: inline-block; padding: 1px 6px; border-radius: 4px; margin-right: 6px; }
 .rec-delta-savings { background: rgba(72,199,154,.14); color: var(--good); }
 .rec-delta-points { background: rgba(97,175,239,.14); color: var(--sonnet); }
+/* apply-rec rec-id badge (spec/55 #727) — muted monospace, savings_cost cards only */
+.rec-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--muted); opacity: .8; }
 """
 
 # B6 Cockpit CSS — D4 rule: B6 zone/KPI styles go ONLY here, never in the shared CSS block.
@@ -1746,6 +1748,19 @@ def _render_recommendations(recommendations) -> str:
         usd_delta = getattr(rec, "projected_usd_delta", None)
         pts_delta = getattr(rec, "projected_points_delta", None)
 
+        # rec-id badge (spec/55 #727) — only on savings_cost cards, the only
+        # kind apply-rec can act on. Lazy import keeps this module's own
+        # import surface from growing on every other render path.
+        rec_id_html = ""
+        if kind == "savings_cost":
+            from ..advisor.recommend import canonical_rec_id  # noqa: PLC0415
+
+            rec_id = canonical_rec_id(getattr(rec, "agent", ""), kind, candidate_model)
+            rec_id_html = (
+                f'<span class="rec-id" title="apply with: manage apply-rec '
+                f'{rec_id}">{rec_id}</span>'
+            )
+
         model_str = ""
         if current_model and candidate_model:
             model_str = (
@@ -1808,6 +1823,7 @@ def _render_recommendations(recommendations) -> str:
             f'<div class="rec-header">'
             f"{pill_html}"
             f'<span class="rec-agent">{agent_safe}</span>'
+            f"{rec_id_html}"
             f"{apply_cta}"
             f"{tie_back_tag}"
             f"</div>"

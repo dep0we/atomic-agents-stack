@@ -97,6 +97,7 @@ import json
 import re
 import sys
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -368,6 +369,7 @@ def _emit_json_success(
     policy_recheck_ok: bool | None = None,
     pricing_advisory: str | None = None,
     dry_run: bool = False,
+    json_extra: dict[str, Any] | None = None,
 ) -> None:
     """Emit the ``--json`` success payload.
 
@@ -388,8 +390,20 @@ def _emit_json_success(
     raised and the value fell back to the pre-confirm-wait preview
     consult. ``--restore`` does not run a post-write recompute, so it
     always passes ``None`` (not applicable, distinct from both True/False).
+
+    ``json_extra`` (#727 delegation seam; native-wins fixed at #727 review
+    round 1): additional caller-supplied keys are merged UNDER the
+    set-model-native keys — the native payload is authoritative and is
+    merged LAST (winning any name collision), so a delegating caller
+    (apply-rec) can attach its own ADDITIVE, non-colliding
+    rec-identity/safety-margin data (``applied_from_rec``, ``safety``) but
+    can never clobber a set-model-native key (``ok``, ``agent``,
+    ``changed_fields``, ``before``, ``after``, ...) by accident — the
+    M8-pinned native shape is authoritative, matching CLAUDE.md principle #5
+    (audit is structural). ``None`` (the set-model CLI path's default) adds
+    nothing.
     """
-    payload: dict = {
+    native_payload: dict = {
         "ok": True,
         "agent": agent_id,
         "changed_fields": changed_fields,
@@ -402,7 +416,10 @@ def _emit_json_success(
         "pricing_advisory": pricing_advisory,
     }
     if dry_run:
-        payload["dry_run"] = True
+        native_payload["dry_run"] = True
+    # Native-wins merge: json_extra first (caller's additive markers), then
+    # the native payload keys layered on top so they are always authoritative.
+    payload = {**(json_extra or {}), **native_payload}
     print(json.dumps(payload, indent=2))
 
 
@@ -747,7 +764,7 @@ def run_set_model(args: Any, agents_root: Path) -> int:
             print(f"Error: {reason}", file=sys.stderr)
         return 1
 
-    return _run_set_model(
+    return apply_set_model_write(
         agent_id=agent_id,
         agent_dir=agent_dir,
         agents_root=agents_root,
@@ -762,7 +779,7 @@ def run_set_model(args: Any, agents_root: Path) -> int:
 # ── --model write path (S2 five-step routine through the hoisted spine) ────
 
 
-def _run_set_model(
+def apply_set_model_write(
     *,
     agent_id: str,
     agent_dir: Path,
@@ -772,8 +789,61 @@ def _run_set_model(
     use_json: bool,
     dry_run: bool,
     yes: bool,
+    audit_primitive: str = PRIMITIVE_MANAGE_SET_MODEL,
+    audit_extra: dict[str, Any] | None = None,
+    json_extra: dict[str, Any] | None = None,
+    human_preamble: Callable[[], None] | None = None,
+    audit_summary: str | None = None,
 ) -> int:
-    """``manage set-model <agent> --model <id>`` — the write path (#726)."""
+    """``manage set-model <agent> --model <id>`` — the write path (#726).
+
+    #727 delegation seam: this is the SHARED entry point apply-rec calls to
+    apply a recommendation — apply-rec resolves a ``(agent, candidate_model)``
+    pair and calls this function directly with that pair, exactly as if an
+    operator had typed ``manage set-model <agent> --model <candidate_model>``
+    themselves. The five keyword-only params below exist ONLY for that
+    delegation; every default reproduces set-model's own CLI-path behavior
+    byte-for-byte (``audit_primitive`` defaults to set-model's own primitive,
+    ``audit_extra``/``json_extra`` default to no-op, ``human_preamble``
+    defaults to printing nothing extra, ``audit_summary`` defaults to
+    set-model's own summary text) — set-model's own observable behavior on
+    its own CLI path is unchanged by this function's existence.
+
+    Args:
+        audit_primitive: the ``RunRecord.primitive`` to stamp. Lets a
+            delegating caller (apply-rec) mint its OWN primitive
+            (``PRIMITIVE_MANAGE_APPLY_REC``) instead of set-model's, so fleet
+            aggregations can tell a rec-driven apply apart from an operator
+            hand-typing ``--model``.
+        audit_extra: merged UNDER the set-model-native ``RunRecord.extra{}``
+            keys (native-wins, fixed at #727 review round 1) — a delegating
+            caller's marker (e.g. apply-rec's ``applied_from_rec``) is
+            ADDITIVE, never able to clobber a set-model-native key
+            (``principal_id``, ``changed_fields``, ``before``, ``after``,
+            ``snapshot_path``, ``policy_override_at_write``,
+            ``policy_recheck_ok``); the M8-pinned native audit shape is
+            authoritative and a caller can never corrupt it (CLAUDE.md
+            principle #5 — audit is structural). A genuine key collision
+            between the two is a caller bug this function does not paper
+            over by silently letting the caller's value win.
+        json_extra: merged UNDER the ``--json`` native payload keys the same
+            way (see ``_emit_json_success``'s ``json_extra`` param) — native
+            wins there too.
+        human_preamble: zero-arg callable invoked right before the human-mode
+            preview block prints (never on ``--json`` — a delegating caller's
+            preamble is copilot-facing data, carried in ``json_extra``
+            instead, not printed prose). ``None`` (set-model's own CLI path)
+            prints nothing extra.
+        audit_summary: the ``RunRecord.summary`` text (capped to 200 chars
+            like set-model's own default). Lets a delegating caller (apply-rec)
+            stamp a summary that names the primitive it actually ran under
+            (e.g. ``"manage apply-rec <agent>: default_model -> <id> (rec
+            <rec_id>)"``) instead of set-model's own ``"manage set-model
+            <agent>: ..."`` text — so a human scanning raw records next to a
+            ``manage_apply_rec`` primitive never reads a "manage set-model"
+            summary. ``None`` (set-model's own CLI path) reproduces
+            set-model's own default summary text unchanged.
+    """
     # ── S2 Step 1: Validate — model.md presence (surgical editor, not a
     # scaffolder; spec/55 "Behavior" step 1) ────────────────────────────────
     # Fix 3 (spec/55 reconciliation): UNREACHABLE via the real CLI/registry
@@ -855,6 +925,13 @@ def _run_set_model(
 
     warning = _policy_override_warning(model_id, effective_model_preview)
 
+    # #727 delegation seam: a delegating caller's preamble (apply-rec's
+    # rec/EvalHeadroom context) prints BEFORE set-model's own default_model
+    # diff, human-mode only — never on --json (that data travels in
+    # json_extra instead, not as printed prose a copilot would have to parse).
+    if human_preamble is not None and not use_json:
+        human_preamble()
+
     if not use_json:
         print(f"\n[{agent_id}] model.md changes:")
         print(f"  default_model: {before_value!r} -> {model_id!r}")
@@ -874,6 +951,7 @@ def _run_set_model(
                 audit_status="n/a",
                 policy_override=warning,
                 dry_run=True,
+                json_extra=json_extra,
             )
         else:
             print("[dry-run] No changes written.")
@@ -989,9 +1067,13 @@ def _run_set_model(
     record = RunRecord(
         ts=datetime.now(timezone.utc).isoformat(),
         run_id=str(uuid.uuid4()),
-        primitive=PRIMITIVE_MANAGE_SET_MODEL,
+        primitive=audit_primitive,
         status="applied",
-        summary=f"manage set-model {agent_id}: default_model -> {model_id}"[:200],
+        summary=(
+            audit_summary
+            if audit_summary is not None
+            else f"manage set-model {agent_id}: default_model -> {model_id}"
+        )[:200],
         model="n/a",
         input_tokens=0,
         output_tokens=0,
@@ -1002,6 +1084,15 @@ def _run_set_model(
         # convention as govern's --set/--restore).
         agent_name=agent_id,
         extra={
+            # #727 delegation seam (native-wins fixed at #727 review round 1):
+            # a delegating caller's ADDITIVE marker (e.g. apply-rec's
+            # applied_from_rec) is merged FIRST, then every set-model-native
+            # key below is layered on top so it is always authoritative — the
+            # M8-pinned native audit shape can never be clobbered by a caller
+            # (CLAUDE.md principle #5 — audit is structural). A genuine key
+            # collision between the two is a caller bug this function does
+            # not paper over by letting the caller's value silently win.
+            **(audit_extra or {}),
             "principal_id": principal_id,
             "changed_fields": ["default_model"],
             "before": {"default_model": audit_before_value},
@@ -1036,6 +1127,7 @@ def _run_set_model(
             audit_status=audit_status,
             policy_override=json_policy_override,
             policy_recheck_ok=policy_recheck_ok,
+            json_extra=json_extra,
         )
     else:
         print(f"[{agent_id}] model.md updated.")
@@ -1050,6 +1142,12 @@ def _run_set_model(
                 print(f"  {w}")
 
     return 0
+
+
+# #727 delegation seam: backward-compat module-level alias so any existing
+# internal/test reference to the old private name ``_run_set_model`` still
+# resolves after the promotion to the public ``apply_set_model_write``.
+_run_set_model = apply_set_model_write
 
 
 # ── --restore path (M3/#710 shape — restore does NOT re-run M9) ────────────

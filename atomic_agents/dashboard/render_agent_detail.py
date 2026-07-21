@@ -150,6 +150,9 @@ _DETAIL_CSS = """
   border: 1px solid rgba(152, 195, 121, 0.28); }
 .rec-tag.advisory { background: rgba(209, 154, 102, 0.1); color: var(--warn);
   border: 1px solid rgba(209, 154, 102, 0.26); }
+/* apply-rec rec-id badge (spec/55 #727) — muted monospace, savings_cost cards only */
+.rec-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px;
+  color: var(--muted); opacity: .8; margin-left: 6px; }
 
 /* Telemetry tabs */
 .detail-tabs {
@@ -475,12 +478,25 @@ def _render_detail_recommendations(recs: list | None, agent_id: str) -> str:
         usd_delta = getattr(rec, "projected_usd_delta", None)
 
         # Build title
+        rec_id_html = ""
         if kind == "savings_cost":
             curr_model = getattr(rec, "current_model", None) or ""
             cand_model = getattr(rec, "candidate_model", None) or ""
             title = f"Swap {_html.escape(_short_model_name(curr_model))} → {_html.escape(_short_model_name(cand_model))}"
             if usd_delta is not None and usd_delta < 0:
                 title += f" (${-usd_delta:.2f}/mo saved)"
+            # rec-id badge (spec/55 #727) — savings_cost only, the only kind
+            # apply-rec can act on. Lazy import for surface parity with the
+            # console's own _render_recommendations badge.
+            from .. import advisor as _advisor  # noqa: PLC0415
+
+            rec_id = _advisor.canonical_rec_id(
+                getattr(rec, "agent", ""), kind, getattr(rec, "candidate_model", None)
+            )
+            rec_id_html = (
+                f'<span class="rec-id" title="apply with: manage apply-rec '
+                f'{rec_id}">{rec_id}</span>'
+            )
         elif kind == "governance":
             title = "Governance gap"
         elif kind == "quality_report":
@@ -509,7 +525,7 @@ def _render_detail_recommendations(recs: list | None, agent_id: str) -> str:
         cards.append(
             '<div class="rec-card">'
             '<div class="rec-body">'
-            f'<div class="rec-title">{title}</div>'
+            f'<div class="rec-title">{title}{rec_id_html}</div>'
             f'<div class="rec-rationale">{_html.escape(rationale[:200])}</div>'
             "</div>"
             f'<div class="rec-tags">{tags}</div>'

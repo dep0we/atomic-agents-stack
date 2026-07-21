@@ -1031,6 +1031,75 @@ def _register_manage(sub: argparse._SubParsersAction) -> None:
         help="override ATOMIC_AGENTS_ROOT (fleet-scoped; matches init/registry convention)",
     )
 
+    # ── manage apply-rec <rec-id> ───────────────────────────────────────────
+    apply_rec_cmd = manage_sub.add_parser(
+        "apply-rec",
+        help="apply a Fleet Console savings_cost recommendation by its rec-id",
+        description=(
+            "Apply a Fleet Console savings_cost recommendation (spec/54). "
+            "Re-derives and re-validates the recommendation against CURRENT "
+            "data (a fresh, unconditional recompute — recommendations are "
+            "never persisted) and, only if it still holds, delegates the "
+            "actual model.md write to set-model's write routine (#726). A "
+            "composition verb: no second write path onto model.md."
+        ),
+    )
+    apply_rec_cmd.add_argument(
+        "rec_id",
+        metavar="rec-id",
+        help=(
+            "the recommendation's rec-id, as rendered on the Fleet Console's "
+            "savings_cost card (a deterministic 12-hex-char hash of "
+            "agent + kind + candidate_model)."
+        ),
+    )
+    apply_rec_cmd.add_argument(
+        "--agent",
+        dest="agent",
+        default=None,
+        metavar="agent-name",
+        help=(
+            "narrow the rec-id search to this agent only (does not change "
+            "what the rec-id means; a purely fleet-wide search is the "
+            "default)."
+        ),
+    )
+    apply_rec_cmd.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        default=False,
+        help=(
+            "Preview the resolved swap and the full EvalHeadroom (all four "
+            "margins) without writing. --yes is ignored when set."
+        ),
+    )
+    apply_rec_cmd.add_argument(
+        "--yes",
+        dest="yes",
+        action="store_true",
+        default=False,
+        help="Apply without the interactive confirmation prompt (required on non-TTY).",
+    )
+    apply_rec_cmd.add_argument(
+        "--json",
+        dest="json",
+        action="store_true",
+        default=False,
+        help=(
+            "Emit machine-readable JSON output. Refusals emit "
+            "{ok: false, error_type, reason}; success emits the same shape "
+            "set-model's --json success payload does, plus applied_from_rec "
+            "and safety keys (the rec-id/kind and the EvalHeadroom margins)."
+        ),
+    )
+    apply_rec_cmd.add_argument(
+        "--agents-root",
+        dest="agents_root",
+        default=None,
+        help="override ATOMIC_AGENTS_ROOT (fleet-scoped; matches init/registry convention)",
+    )
+
 
 def _cmd_review(args) -> int:
     """Run a cross-family adversarial review and stream the output to stdout.

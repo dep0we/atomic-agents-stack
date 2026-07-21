@@ -5,8 +5,16 @@ ZERO new LLM spend — no LLMBackend constructed on any path.
 
 Three rec kinds shipped in PR3:
   savings_cost   — per-run reprice of 30d actual token counts at a cheaper
-                   same-family sibling model's PRICING rates; only fires when
-                   the composite conjunctive no-quality-cost guard passes.
+                   same-family sibling model's PRICING rates; recommend() /
+                   recommend_fleet() (the console feed) only ever emit this
+                   kind when the composite conjunctive no-quality-cost guard
+                   passes. derive_savings_candidates() (#727 Unit 1) is the
+                   underlying pre-guard derivation — it returns a candidate
+                   POST-savings-floor regardless of the guard verdict, so a
+                   guard-failing swap exists as DATA (safety.passed=False) for
+                   derive_savings_candidates_fleet() / apply-rec to see, even
+                   though it never reaches the console. See the spec/54
+                   addendum "candidate-vs-render split".
   quality_report — surface already-written evals/tuning_reports/*.md files;
                    flag agents below rubric threshold or with hard-fails.
   governance     — governance.md absent, no YAML block, or parse errors.
@@ -44,10 +52,11 @@ predicates silently — spec/54 MUST 11 (window alignment).
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import logging
 import math
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
@@ -82,6 +91,35 @@ logger = logging.getLogger(__name__)
 RECOMMENDATION_KINDS: frozenset[str] = frozenset(
     {"savings_cost", "quality_report", "governance"}
 )
+
+
+# ──────────────────────────────────────────────────────────────────
+# Canonical rec-id hash (spec/54 addendum / ruling rec-id-hash-recipe, #727)
+
+_REC_ID_VERSION = "v1"
+_REC_ID_PREFIX_LEN = 12
+
+
+def canonical_rec_id(agent: str, kind: str, candidate_model: str | None) -> str:
+    """Deterministic short-hex rec identity over (agent, kind, candidate_model).
+
+    THE single canonical-hash helper — both the Fleet Console render
+    (dashboard) and the apply-rec verb (manage) import THIS function, so the
+    rendered rec-id and apply-rec's match universe can never hash the same
+    swap to different ids. `source` is deliberately EXCLUDED (spec/54 addendum
+    / ruling rec-id-hash-recipe): a swap's identity is the agent + kind +
+    candidate model, not how the candidate was selected.
+
+    Recipe: sha256 over a versioned, delimiter-safe canonical string
+    'v1\\x1f{agent}\\x1f{kind}\\x1f{candidate_model}' (\\x1f = ASCII Unit
+    Separator, so a literal separator can never appear inside a field and
+    collide two distinct triples). candidate_model is None for non-model recs
+    (governance / quality_report) — encoded as empty string. Returns the first
+    12 hex chars (same short-prefix convention as dashboard/attention.py:202).
+    """
+    canonical = "\x1f".join([_REC_ID_VERSION, agent, kind, candidate_model or ""])
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return digest[:_REC_ID_PREFIX_LEN]
 
 
 def _rec_sort_key(r: "Recommendation") -> tuple[float, float]:
@@ -147,7 +185,12 @@ class Recommendation:
     projected_usd_delta: float | None  # negative = savings ($/mo); None when N/A
     projected_points_delta: float | None  # composite point improvement; None when N/A
     rationale: str
-    safety: EvalHeadroom  # always present; passed=True only for savings_cost recs
+    # Always present. For savings_cost, .passed is the no-quality-cost guard
+    # verdict — it MAY be False on a candidate returned by
+    # derive_savings_candidates() (#727 Unit 1); recommend()/recommend_fleet()
+    # only ever emit passed=True savings recs. Non-model recs carry
+    # _null_headroom() (passed=False, N/A).
+    safety: EvalHeadroom
     # How a MODEL candidate was chosen: "default_same_family" | "operator_configured".
     # None for non-model recs (governance, quality_report) — those have no candidate
     # and no "family", so labeling them with a model-selection source would be
@@ -442,6 +485,117 @@ def _null_headroom() -> EvalHeadroom:
 
 
 # ──────────────────────────────────────────────────────────────────
+# Savings candidate derivation — post-savings-floor, pre-guard (#727 Unit 1)
+
+
+def derive_savings_candidates(
+    agent_health: AgentHealth,
+    run_records: list[RunRecord],
+    eval_records: list[_EvalRecord],
+    rec_config: RecommendationConfig,
+    rubric_threshold: float = 4.0,
+    today: date | None = None,
+    targets: FleetTargets | None = None,
+) -> list[Recommendation]:
+    """The SINGLE derivation path for savings_cost candidates.
+
+    Emits a candidate POST-savings-floor, PRE-guard: the returned
+    Recommendation carries ``safety=headroom`` regardless of whether
+    ``headroom.passed`` — a guard-failing swap is still a real candidate (it
+    exists, it clears the savings floor, it just isn't SAFE to act on yet).
+    Exactly ONE axis of leniency is dropped relative to the console feed's
+    filter: the no-quality-cost guard. The savings-floor check is NOT
+    dropped — a savings-eroded swap (``projected_usd_delta >= 0``, or below
+    ``min_savings_usd``) correctly returns ``[]`` here too, because "no longer
+    saves money" is not a candidate under ANY guard state; the swap has
+    genuinely stopped existing, not merely become unsafe (spec/54 addendum,
+    ruling rec-id-hash-recipe / candidate-vs-render split).
+
+    ``recommend()`` (the console feed) calls this function and keeps only
+    ``passed=True`` results — the module's single-derivation-path ruling.
+    ``derive_savings_candidates_fleet()`` (apply-rec's match universe, #727
+    Unit 2) calls this per-agent WITHOUT the passed filter, so a
+    guard-failing candidate is visible as data.
+
+    Returns 0 or 1 candidate (a savings_cost rec is per-agent, not
+    per-work-type).
+    """
+    today = today or date.today()
+    agent = agent_health.agent
+    primary_model = agent_health.primary_model
+    if primary_model is None:
+        return []
+
+    work_type = _classify_work_type_majority(run_records)
+    candidate, source = _resolve_candidate(primary_model, work_type, rec_config)
+    if candidate is None:
+        return []
+
+    # Compute the no-quality-cost guard verdict — carried on the returned
+    # candidate as DATA (may be passed=False); never used here to suppress
+    # candidate construction.
+    headroom = _eval_headroom(eval_records, rubric_threshold, rec_config)
+
+    # Reprice 30d primary runs at candidate rates.
+    primary_30d = [r for r in run_records if _is_primary_run(r)]
+    actual_30d_cost = sum(r.cost_usd for r in primary_30d)
+    repriced_30d_cost = sum(_reprice_run(r, candidate) for r in primary_30d)
+    delta_30d = repriced_30d_cost - actual_30d_cost
+    # The 30d window IS the monthly ($/mo) estimate — ~1 month, no scaling
+    # applied (not annualized).
+    projected_usd_delta = delta_30d
+
+    # Savings-floor filter — the ONE gate that still governs candidate
+    # existence. A savings-eroded swap is NOT a candidate: it correctly
+    # surfaces later (apply-rec, Unit 2) as "no longer valid" rather than
+    # "quality guard failed", and preserving that distinction is exactly why
+    # the floor stays here rather than moving into the guard.
+    if not (
+        projected_usd_delta < 0
+        and abs(projected_usd_delta) >= rec_config.min_savings_usd
+    ):
+        return []
+
+    # Compute point-impact counterfactual (spec/54 §7) regardless of guard
+    # state — same as the console path.
+    projected_points_delta = _compute_point_impact(
+        agent_health=agent_health,
+        run_records=run_records,
+        eval_records=eval_records,
+        candidate_model=candidate,
+        repriced_cost_per_run=lambda r: _reprice_run(r, candidate),
+        targets=targets,
+        today=today,
+    )
+
+    try:
+        rec = Recommendation(
+            agent=agent,
+            kind="savings_cost",
+            current_model=primary_model,
+            candidate_model=candidate,
+            projected_usd_delta=round(projected_usd_delta, 4),
+            projected_points_delta=projected_points_delta,
+            rationale=(
+                f"Switching from {primary_model} to {candidate} "
+                f"saves ~${abs(projected_usd_delta):.2f}/mo based on 30d usage"
+            ),
+            safety=headroom,
+            source=source,
+        )
+    except ValueError as exc:
+        logger.warning(
+            "derive_savings_candidates: savings_cost rec construction failed "
+            "for %s: %s",
+            agent,
+            exc,
+        )
+        return []
+
+    return [rec]
+
+
+# ──────────────────────────────────────────────────────────────────
 # Pure recommendation core (spec/54 MUST 7 — zero I/O, zero LLM)
 
 
@@ -490,62 +644,23 @@ def recommend(
     primary_model = agent_health.primary_model
 
     # ── 1. Savings cost rec ──────────────────────────────────────
+    # Single derivation path (#727 Unit 1 ruling): derive_savings_candidates()
+    # is the ONE place the savings_cost swap is computed. The console feed
+    # keeps only the passed=True candidate — a guard-failing swap exists as
+    # data (visible to derive_savings_candidates_fleet() for apply-rec) but
+    # never reaches this rec list.
     if primary_model is not None:
-        work_type = _classify_work_type_majority(run_records)
-        candidate, source = _resolve_candidate(primary_model, work_type, rec_config)
-
-        if candidate is not None:
-            # Compute the no-quality-cost guard
-            headroom = _eval_headroom(eval_records, rubric_threshold, rec_config)
-
-            if headroom.passed:
-                # Reprice 30d primary runs at candidate rates
-                primary_30d = [r for r in run_records if _is_primary_run(r)]
-                actual_30d_cost = sum(r.cost_usd for r in primary_30d)
-                repriced_30d_cost = sum(_reprice_run(r, candidate) for r in primary_30d)
-                delta_30d = repriced_30d_cost - actual_30d_cost
-                # The 30d window IS the monthly ($/mo) estimate — ~1 month, no
-                # scaling applied (not annualized).
-                projected_usd_delta = delta_30d
-
-                if (
-                    projected_usd_delta < 0
-                    and abs(projected_usd_delta) >= rec_config.min_savings_usd
-                ):
-                    # Compute point-impact counterfactual (spec/54 §7). Scored
-                    # under the SAME operator targets as agent_health.composite so
-                    # the diff isolates the model swap. None targets → skip.
-                    projected_points_delta = _compute_point_impact(
-                        agent_health=agent_health,
-                        run_records=run_records,
-                        eval_records=eval_records,
-                        candidate_model=candidate,
-                        repriced_cost_per_run=lambda r: _reprice_run(r, candidate),
-                        targets=targets,
-                        today=today,
-                    )
-                    try:
-                        rec = Recommendation(
-                            agent=agent,
-                            kind="savings_cost",
-                            current_model=primary_model,
-                            candidate_model=candidate,
-                            projected_usd_delta=round(projected_usd_delta, 4),
-                            projected_points_delta=projected_points_delta,
-                            rationale=(
-                                f"Switching from {primary_model} to {candidate} "
-                                f"saves ~${abs(projected_usd_delta):.2f}/mo based on 30d usage"
-                            ),
-                            safety=headroom,
-                            source=source,
-                        )
-                        recs.append(rec)
-                    except ValueError as exc:
-                        logger.warning(
-                            "recommend: savings_cost rec construction failed for %s: %s",
-                            agent,
-                            exc,
-                        )
+        for cand in derive_savings_candidates(
+            agent_health=agent_health,
+            run_records=run_records,
+            eval_records=eval_records,
+            rec_config=rec_config,
+            rubric_threshold=rubric_threshold,
+            today=today,
+            targets=targets,
+        ):
+            if cand.safety.passed:
+                recs.append(cand)
 
     # ── 2. Governance rec ────────────────────────────────────────
     if governance_rationale is not None:
@@ -761,59 +876,56 @@ def _compute_point_impact(
 
 
 # ──────────────────────────────────────────────────────────────────
-# Fleet-level loader (thin wrapper — calls recommend() per agent)
+# Shared fleet-wide per-agent input loader (#727 Unit 1 anti-drift move)
+
+_FleetAgentInputs = tuple[
+    AgentHealth,
+    list[RunRecord],
+    list[_EvalRecord],
+    float,
+    str | None,
+    list[Path],
+    FleetTargets | None,
+]
 
 
-def recommend_fleet(
+def _load_fleet_agent_inputs(
     agents_root: Path,
-    today: date | None = None,
-    rec_config: RecommendationConfig | None = None,
-    fleet_health: FleetHealth | None = None,
-) -> list[Recommendation]:
-    """Load fleet data and produce Recommendation objects for all agents.
+    today: date,
+    rec_config: RecommendationConfig,
+    fleet_health: FleetHealth,
+) -> Iterator[_FleetAgentInputs]:
+    """Yield per-agent recommend()/derive_savings_candidates() inputs.
 
-    Thin loader: calls compute_fleet_health() for AgentHealth data, then
-    calls recommend() per agent. Results sorted by |projected_points_delta|
-    descending (highest fleet-health-point impact first).
+    THE single fleet-wide loading path (#727 Unit 1 — the load-bearing
+    anti-drift move from the ruling): ``recommend_fleet()`` and
+    ``derive_savings_candidates_fleet()`` BOTH iterate this generator instead
+    of each inlining their own copy of the per-agent JSONL/frontmatter reads.
+    A sibling loader would risk drifting (different window math, a missed
+    fail-soft branch) and produce mismatched inputs for the SAME agent between
+    the console feed and apply-rec's match universe — which would corrupt the
+    rec-id bijection the two surfaces depend on (``canonical_rec_id`` hashes
+    ``agent + kind + candidate_model``, so a drifted ``candidate_model`` from a
+    diverged loader would silently hash to a DIFFERENT id between the two
+    surfaces).
 
-    ``fleet_health`` may be passed in pre-computed (render_console already runs
-    compute_fleet_health for the health band) to avoid the SECOND fleet-wide
-    SCORING pass per console render (Principle #6 — don't recompute what the
-    caller already has). NOTE: the per-agent run/eval JSONL is still re-loaded in
-    the loop below to build recommend()'s pure-core inputs; the saving is the
-    compute_fleet_health scoring call (and its internal loads), not the per-agent
-    re-loads. The pre-computed object MUST have been scored with the SAME ``today``
-    reference date this call uses, or the per-agent re-load windows below would
-    diverge from the AgentHealth baselines. When None, it is computed internally
-    (the standalone-call path).
+    ``rec_config`` and ``fleet_health`` are expected ALREADY RESOLVED by the
+    caller — ``recommend_fleet()`` / ``derive_savings_candidates_fleet()`` each
+    run the same small resolution block (``parse_recommendations()`` /
+    ``compute_fleet_health()``, falling back to defaults) before calling this
+    generator. ``rec_config`` is accepted for signature symmetry with the two
+    callers and to keep it available to future per-agent loading decisions; no
+    load in this generator reads it today.
 
-    Fail-soft: per-agent exceptions produce no recommendations for that agent
-    without crashing the fleet pass.
+    Governance rationale is computed once for the whole fleet (a single
+    ``FilesystemAgentRegistryBackend.list_agents()`` call), NOT per-agent, and
+    reused inside the loop below — the governance load is a fleet-wide list
+    call, not an addressable per-agent read.
+
+    Fail-soft: a per-agent load exception logs a warning and skips that agent
+    (no crash, mirrors the prior recommend_fleet() per-agent try/except).
     """
-    today = today or date.today()
     thirty_days_ago = today - timedelta(days=30)
-
-    if rec_config is None:
-        try:
-            rec_config = parse_recommendations(agents_root)
-        except Exception as exc:
-            logger.warning(
-                "recommend_fleet: parse_recommendations failed (%s); using defaults",
-                type(exc).__name__,
-            )
-            rec_config = RecommendationConfig()
-
-    # Compute fleet health (loads all runs + evals internally with the same windows)
-    # unless the caller already computed it for the SAME reference date.
-    if fleet_health is None:
-        try:
-            fleet_health = compute_fleet_health(agents_root, today=today)
-        except Exception as exc:
-            logger.warning(
-                "recommend_fleet: compute_fleet_health failed (%s); no recommendations",
-                type(exc).__name__,
-            )
-            return []
 
     # Parse the SAME targets compute_fleet_health used internally, so the
     # point-impact counterfactual is scored under the operator's targets, not
@@ -822,7 +934,8 @@ def recommend_fleet(
         targets = parse_targets(agents_root)
     except Exception as exc:
         logger.warning(
-            "recommend_fleet: parse_targets failed (%s); point-impact deltas suppressed",
+            "_load_fleet_agent_inputs: parse_targets failed (%s); "
+            "point-impact deltas suppressed",
             type(exc).__name__,
         )
         targets = None
@@ -847,11 +960,13 @@ def recommend_fleet(
             governance_map[ref.id] = rationale
     except (AgentRegistryError, OSError) as exc:
         logger.warning(
-            "recommend_fleet: agent registry load failed (%s); skipping governance recs",
+            "_load_fleet_agent_inputs: agent registry load failed (%s); "
+            "skipping governance recs",
             type(exc).__name__,
         )
 
-    all_recs: list[Recommendation] = []
+    from ..dashboard.costs import _load_runs_with_degraded
+
     for ah in fleet_health.agents:
         agent = ah.agent
         try:
@@ -861,8 +976,6 @@ def recommend_fleet(
             )
 
             # Load run records for this agent (same 30d window)
-            from ..dashboard.costs import _load_runs_with_degraded
-
             runs_30d, _ = _load_runs_with_degraded(
                 agents_root, agent, thirty_days_ago, today
             )
@@ -876,9 +989,92 @@ def recommend_fleet(
             # Tuning report paths
             tuning_report_paths = _load_tuning_reports(agents_root, agent)
 
+            yield (
+                ah,
+                runs_30d,
+                eval_records,
+                rubric_threshold,
+                governance_rationale,
+                tuning_report_paths,
+                targets,
+            )
+        except Exception as exc:
+            logger.warning(
+                "_load_fleet_agent_inputs: load failed for %s (%s)",
+                agent,
+                type(exc).__name__,
+            )
+
+
+# ──────────────────────────────────────────────────────────────────
+# Fleet-level loader (thin wrapper — calls recommend() per agent)
+
+
+def recommend_fleet(
+    agents_root: Path,
+    today: date | None = None,
+    rec_config: RecommendationConfig | None = None,
+    fleet_health: FleetHealth | None = None,
+) -> list[Recommendation]:
+    """Load fleet data and produce Recommendation objects for all agents.
+
+    Thin loader: calls compute_fleet_health() for AgentHealth data, then
+    calls recommend() per agent (via the shared _load_fleet_agent_inputs()
+    loader). Results sorted by |projected_points_delta| descending (highest
+    fleet-health-point impact first).
+
+    ``fleet_health`` may be passed in pre-computed (render_console already runs
+    compute_fleet_health for the health band) to avoid the SECOND fleet-wide
+    SCORING pass per console render (Principle #6 — don't recompute what the
+    caller already has). NOTE: the per-agent run/eval JSONL is still re-loaded in
+    the loop below to build recommend()'s pure-core inputs; the saving is the
+    compute_fleet_health scoring call (and its internal loads), not the per-agent
+    re-loads. The pre-computed object MUST have been scored with the SAME ``today``
+    reference date this call uses, or the per-agent re-load windows below would
+    diverge from the AgentHealth baselines. When None, it is computed internally
+    (the standalone-call path).
+
+    Fail-soft: per-agent exceptions produce no recommendations for that agent
+    without crashing the fleet pass.
+    """
+    today = today or date.today()
+
+    if rec_config is None:
+        try:
+            rec_config = parse_recommendations(agents_root)
+        except Exception as exc:
+            logger.warning(
+                "recommend_fleet: parse_recommendations failed (%s); using defaults",
+                type(exc).__name__,
+            )
+            rec_config = RecommendationConfig()
+
+    # Compute fleet health (loads all runs + evals internally with the same windows)
+    # unless the caller already computed it for the SAME reference date.
+    if fleet_health is None:
+        try:
+            fleet_health = compute_fleet_health(agents_root, today=today)
+        except Exception as exc:
+            logger.warning(
+                "recommend_fleet: compute_fleet_health failed (%s); no recommendations",
+                type(exc).__name__,
+            )
+            return []
+
+    all_recs: list[Recommendation] = []
+    for (
+        ah,
+        run_records,
+        eval_records,
+        rubric_threshold,
+        governance_rationale,
+        tuning_report_paths,
+        targets,
+    ) in _load_fleet_agent_inputs(agents_root, today, rec_config, fleet_health):
+        try:
             agent_recs = recommend(
                 agent_health=ah,
-                run_records=runs_30d,
+                run_records=run_records,
                 eval_records=eval_records,
                 rec_config=rec_config,
                 rubric_threshold=rubric_threshold,
@@ -891,7 +1087,7 @@ def recommend_fleet(
         except Exception as exc:
             logger.warning(
                 "recommend_fleet: recommend failed for %s (%s)",
-                agent,
+                ah.agent,
                 type(exc).__name__,
             )
 
@@ -899,3 +1095,195 @@ def recommend_fleet(
     # See module-level _rec_sort_key for the #687 ranking fallback rationale.
     all_recs.sort(key=_rec_sort_key, reverse=True)
     return all_recs
+
+
+# ──────────────────────────────────────────────────────────────────
+# Fleet-wide savings candidates INCLUDING guard-failed (#727 Unit 1 — apply-rec's
+# match universe)
+
+
+def derive_savings_candidates_fleet(
+    agents_root: Path,
+    today: date | None = None,
+    rec_config: RecommendationConfig | None = None,
+    fleet_health: FleetHealth | None = None,
+) -> list[Recommendation]:
+    """Fleet-wide savings_cost candidates, INCLUDING guard-failing ones.
+
+    Post-savings-floor, pre-guard — the same candidate set derive_savings_candidates()
+    produces per agent, just fanned out across the fleet. Used by apply-rec (#727
+    Unit 2) to build its match universe: a guard-failing candidate (safety.passed
+    == False) is present here (unlike recommend_fleet(), which drops it), so
+    apply-rec can tell "this swap eroded on quality" (candidate present,
+    passed=False) apart from "this swap no longer exists" (candidate absent).
+
+    Mirrors recommend_fleet's loader EXACTLY — both iterate the SAME
+    _load_fleet_agent_inputs() generator (the anti-drift move; see that
+    function's docstring) — but calls derive_savings_candidates() per agent
+    instead of recommend(), with NO passed=True filter. governance_rationale
+    and tuning_report_paths are loaded by the shared generator but are
+    irrelevant here (derive_savings_candidates() has no governance/tuning
+    parameters) — this function simply ignores those two fields per tuple.
+
+    Sorted by _rec_sort_key descending — the SAME sort recommend_fleet() uses,
+    so a mixed passed/failed candidate list still ranks the largest swaps first.
+
+    Fail-soft: per-agent exceptions produce no candidates for that agent
+    without crashing the fleet pass (same posture as recommend_fleet()).
+    """
+    today = today or date.today()
+
+    if rec_config is None:
+        try:
+            rec_config = parse_recommendations(agents_root)
+        except Exception as exc:
+            logger.warning(
+                "derive_savings_candidates_fleet: parse_recommendations failed "
+                "(%s); using defaults",
+                type(exc).__name__,
+            )
+            rec_config = RecommendationConfig()
+
+    if fleet_health is None:
+        try:
+            fleet_health = compute_fleet_health(agents_root, today=today)
+        except Exception as exc:
+            logger.warning(
+                "derive_savings_candidates_fleet: compute_fleet_health failed "
+                "(%s); no candidates",
+                type(exc).__name__,
+            )
+            return []
+
+    all_cands: list[Recommendation] = []
+    for (
+        ah,
+        run_records,
+        eval_records,
+        rubric_threshold,
+        _governance_rationale,
+        _tuning_report_paths,
+        targets,
+    ) in _load_fleet_agent_inputs(agents_root, today, rec_config, fleet_health):
+        try:
+            cands = derive_savings_candidates(
+                agent_health=ah,
+                run_records=run_records,
+                eval_records=eval_records,
+                rec_config=rec_config,
+                rubric_threshold=rubric_threshold,
+                today=today,
+                targets=targets,
+            )
+            all_cands.extend(cands)
+        except Exception as exc:
+            logger.warning(
+                "derive_savings_candidates_fleet: derive failed for %s (%s)",
+                ah.agent,
+                type(exc).__name__,
+            )
+
+    all_cands.sort(key=_rec_sort_key, reverse=True)
+    return all_cands
+
+
+# ──────────────────────────────────────────────────────────────────
+# apply-rec's match universe (#727 Unit 2, spec/55) — ALL current recs union
+# guard-failed savings candidates
+
+
+def build_rec_match_universe(
+    agents_root: Path, today: date | None = None
+) -> list[Recommendation]:
+    """apply-rec's match universe (#727, spec/55): ALL current recs (every kind,
+    via recommend_fleet) UNION guard-failed savings candidates (via
+    derive_savings_candidates_fleet). compute_fleet_health is run ONCE and passed
+    into both loaders (Principle #6 — don't score the fleet twice). The all-kinds
+    union is load-bearing: it makes rec_kind_not_applicable REACHABLE (a
+    governance/quality_report rec-id hash-hits and branches to the kind gate,
+    instead of hash-missing into rec_no_longer_valid). Resolves config via the
+    SAME parse_recommendations path the console uses, so identities and
+    verdicts never diverge from the rendered card.
+
+    Fail-soft: mirrors recommend_fleet()/derive_savings_candidates_fleet()'s own
+    fail-soft posture — a compute_fleet_health failure returns [] rather than
+    raising (apply-rec's caller then sees an empty universe and every rec-id
+    correctly refuses rec_no_longer_valid, never an uncaught exception).
+
+    Dedup rule (fixed — #727 review round 1, dedup-staleness finding): dedup is
+    by the full identity triple ``(agent, kind, candidate_model)``, NOT by
+    ``canonical_rec_id`` — a 12-hex hash collision between two DIFFERENT
+    triples must not cause one to silently shadow the other here (that risk is
+    refused explicitly, at match time, by apply-rec's ambiguity guard instead;
+    see ``ManageRecIdAmbiguousError``). For a ``savings_cost`` triple, the
+    candidate + verdict are taken EXCLUSIVELY from
+    ``derive_savings_candidates_fleet()`` — never from ``recommend_fleet()`` —
+    because the two loaders each re-walk every agent's JSONL independently, at
+    slightly different instants. A savings candidate that PASSED the guard
+    when ``recommend_fleet()``'s load ran can have since started FAILING it by
+    the time ``derive_savings_candidates_fleet()``'s load runs (or vice versa)
+    — taking the stale ``recommend_fleet()`` copy risks apply-rec applying (or
+    refusing) a swap on a verdict that is no longer current.
+    ``derive_savings_candidates_fleet()`` is the authoritative, guard-verdict-
+    carrying source for every ``savings_cost`` triple (it is also the ONLY
+    loader that ever sees a guard-failing candidate at all — recommend_fleet()
+    drops those by design, spec/54), so its copy always wins. Non-savings recs
+    (``governance``/``quality_report``) have no such dual-source race — they
+    are taken from ``recommend_fleet()`` only, since
+    ``derive_savings_candidates_fleet()`` never produces them.
+
+    Accepted duplicate compute (not a bug, do not "fix" with a bigger
+    refactor): ``recommend_fleet()`` still internally computes its OWN
+    ``savings_cost`` candidates via ``derive_savings_candidates()`` (to build
+    its console-facing ``passed=True`` subset) — that computed copy is simply
+    never read as this function's savings identity/verdict source; it's
+    filtered out below. This is a small, already-accepted duplicate compute
+    (the "Accepted consequences" section of spec/55 already prices in a
+    full-fleet recompute per apply-rec invocation); collapsing the two loaders
+    into a single shared savings-computation pass is a larger refactor
+    deliberately out of scope for this fix.
+    """
+    today = today or date.today()
+
+    try:
+        fh = compute_fleet_health(agents_root, today=today)
+    except Exception as exc:
+        logger.warning(
+            "build_rec_match_universe: compute_fleet_health failed (%s); "
+            "empty match universe",
+            type(exc).__name__,
+        )
+        return []
+
+    try:
+        rec_config = parse_recommendations(agents_root)
+    except Exception as exc:
+        logger.warning(
+            "build_rec_match_universe: parse_recommendations failed (%s); "
+            "using defaults",
+            type(exc).__name__,
+        )
+        rec_config = RecommendationConfig()
+
+    all_recs = recommend_fleet(
+        agents_root, today=today, rec_config=rec_config, fleet_health=fh
+    )
+    savings_candidates = derive_savings_candidates_fleet(
+        agents_root, today=today, rec_config=rec_config, fleet_health=fh
+    )
+
+    by_triple: dict[tuple[str, str, str | None], Recommendation] = {}
+    # savings_cost identity + verdict come EXCLUSIVELY from
+    # derive_savings_candidates_fleet() — the authoritative, guard-verdict-
+    # carrying source (see docstring). Inserted FIRST so setdefault() below
+    # never lets a stale recommend_fleet() copy win the same triple.
+    for cand in savings_candidates:
+        by_triple.setdefault((cand.agent, cand.kind, cand.candidate_model), cand)
+    for rec in all_recs:
+        if rec.kind == "savings_cost":
+            # Never taken from here (see docstring) — recommend_fleet()'s own
+            # internally-computed savings_cost copy is discarded, not merged.
+            continue
+        by_triple.setdefault((rec.agent, rec.kind, rec.candidate_model), rec)
+
+    return list(by_triple.values())

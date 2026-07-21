@@ -172,6 +172,32 @@ def make_set_model_args(
     return ns
 
 
+def make_apply_rec_args(
+    rec_id: str,
+    agents_root: Path,
+    agent: str | None = None,
+    dry_run: bool = False,
+    yes: bool = True,  # default True so tests don't block on TTY
+    use_json: bool = False,
+) -> Any:
+    """Build a minimal argparse-like namespace for run_apply_rec().
+
+    Every optional flag is explicitly set (never left to MagicMock's
+    auto-attribute default) — mirrors ``make_set_model_args``'s rationale: a
+    bare unset MagicMock attribute reads as truthy, which would spuriously
+    change apply-rec's gate ordering.
+    """
+    ns = MagicMock()
+    ns.manage_verb = "apply-rec"  # so the namespace also works with run_manage()
+    ns.rec_id = rec_id
+    ns.agent = agent
+    ns.dry_run = dry_run
+    ns.yes = yes
+    ns.json = use_json
+    ns.agents_root = str(agents_root)
+    return ns
+
+
 def collect_jsonl(log_dir: Path) -> list[dict]:
     """Read every JSONL record under ``log_dir`` (recursive — FilesystemLogBackend
     nests ``YYYY-MM/YYYY-MM-DD.jsonl``), sorted by file path for determinism.

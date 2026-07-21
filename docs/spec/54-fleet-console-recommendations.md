@@ -274,6 +274,32 @@ There are no `ranking_*_weight` fields. `recommend_fleet()` ranks recs by `(abs(
 
 ---
 
+## Addendum (#727 Unit 1) — candidate-vs-render split + canonical rec-id
+
+**Status of this addendum:** DRAFT (this spec stays DRAFT; the addendum documents a shipped code change, it does not re-lock the doc).
+
+### Candidate-vs-render split
+
+Before #727, a `savings_cost` `Recommendation` object only ever existed when the no-quality-cost guard (§5) passed — the guard-failing branch of the old `recommend()` savings block never constructed a `Recommendation`, so a swap that cleared the savings floor but failed the guard left no trace as data. The planned `apply-rec` verb (#727 Unit 2, spec/55) needs to see that guard-failed state to distinguish "this swap eroded on quality" (a candidate exists, `safety.passed=False`) from "this swap no longer exists" (no candidate at all, e.g. the savings floor no longer clears, or the candidate model changed).
+
+`derive_savings_candidates()` is now the single derivation path for the `savings_cost` swap: it resolves the candidate model, applies the savings-floor filter (`projected_usd_delta < 0` and `abs(projected_usd_delta) >= min_savings_usd` — this filter is NOT relaxed; a savings-eroded swap still returns `[]`), and then constructs the `Recommendation` **regardless of the no-quality-cost guard verdict**, carrying `safety=headroom` as data. Exactly one axis of leniency is dropped relative to the old inline block: the guard. The savings floor stays a hard existence gate, because "no longer saves money" and "unsafe to act on right now" are different operator-facing states and only the second one is what the guard is for.
+
+`recommend()` (per-agent) and `recommend_fleet()` (fleet-wide, the console feed) both call `derive_savings_candidates()` / `derive_savings_candidates_fleet()` and then keep only `safety.passed == True` results. The render-facing invariant from §5 — "a `savings_cost` rec on the console means safe to act" — is unchanged; it now holds because the render path filters, not because the guard-failed state cannot be represented. `derive_savings_candidates_fleet()` (new, fleet-wide, no filter) is apply-rec's match universe (#727 Unit 2) — a guard-failing candidate is visible there with `safety.passed=False`.
+
+Both `recommend_fleet()` and `derive_savings_candidates_fleet()` iterate the same shared per-agent loader (`_load_fleet_agent_inputs()`, private) instead of each inlining their own copy of the windowed JSONL/frontmatter reads. This is the load-bearing anti-drift move: a sibling loader could diverge (different window math, a missed fail-soft branch) and hand the two surfaces different inputs for the same agent, corrupting the rec-id bijection below.
+
+### Canonical rec-id (ruling: rec-id-hash-recipe)
+
+Each `savings_cost` card the console renders needs a stable identifier a human or a script can hand to `apply-rec` to say "do this one." `canonical_rec_id(agent, kind, candidate_model)` is the ONE shared hash helper — both the Fleet Console render (dashboard) and the `apply-rec` verb (#727 Unit 2, spec/55) import it, so the id shown on a card and the id `apply-rec` matches against can never diverge.
+
+Recipe: `sha256("v1" + "\x1f" + agent + "\x1f" + kind + "\x1f" + (candidate_model or ""))`, first 12 hex characters — the same short-prefix convention `dashboard/attention.py`'s `_make_alert_key` already uses. `\x1f` (ASCII Unit Separator) is the delimiter so a literal separator character occurring inside a field can never make two distinct triples collide. The `v1` version prefix is part of the hashed string (not a display prefix) so a future recipe change can invalidate old ids by bumping it.
+
+`source` (`"default_same_family"` | `"operator_configured"`, §6) is deliberately **excluded** from the hash. A swap's identity is the agent, the rec kind, and the candidate model — not how the candidate was selected. Hashing `source` in would mean the same swap gets two different ids depending on whether an operator happened to configure `work_type_allowed_models` that day, which is not a distinction `apply-rec`'s match universe needs to make.
+
+`candidate_model` is `None` for the two non-model rec kinds (`governance`, `quality_report`); it is encoded as the empty string in the canonical form (never omitted — omission would let `("a", "governance", None)` and a hypothetical `("a", "governance", "")` collide, which the empty-string encoding rules out by construction).
+
+---
+
 ## 13. File map
 
 ```
