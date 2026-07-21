@@ -31,7 +31,8 @@ underscore-privates like ``_eval_headroom`` itself (Principle #3 / TENSIONS
 T17 layering: a verb module composes with the advisor's public recompute
 surface, it does not reach past it into internals the advisor module owns).
 
-Four refusals, each with distinct retryability semantics:
+Four SEMANTIC refusals, each with distinct retryability semantics — plus one
+INTEGRITY refusal (below) checked before any of them:
   rec_no_longer_valid       — no current recommendation matches <rec-id>.
                                EXPECTED, not an error — the console card is
                                stale. Retry: re-derive (reload the console)
@@ -50,7 +51,16 @@ Four refusals, each with distinct retryability semantics:
                                hard-fail landed, or a margin eroded). STOP,
                                look at the evals — do NOT blindly retry.
 
-Past all four gates, apply-rec delegates into `set-model`'s OWN M9
+A fifth, INTEGRITY refusal (#727 review round 1) fires BEFORE all four above,
+because it fires during matching itself, not after a candidate is uniquely
+identified:
+  rec_id_ambiguous           — <rec-id> (a 12-hex, 48-bit truncated hash)
+                               hash-matched more than one DISTINCT
+                               recommendation. Retryable with `--agent <name>`
+                               to narrow the search; see
+                               `ManageRecIdAmbiguousError`.
+
+Past all five gates, apply-rec delegates into `set-model`'s OWN M9
 composition chain (PRICING/backend-resolution/policy-consult) against the
 matched `candidate_model`, unchanged, with `set-model`'s existing
 `error_type`s — a candidate since deprecated from PRICING or now ambiguous
@@ -83,6 +93,7 @@ from ..core_api import safe_resolve_under
 from ..logs.types import PRIMITIVE_MANAGE_APPLY_REC
 from .exceptions import (
     ManageRecGuardFailedError,
+    ManageRecIdAmbiguousError,
     ManageRecKindNotApplicableError,
     ManageRecNoLongerValidError,
     ManageRecSourceNotApplicableError,
@@ -138,13 +149,34 @@ def _find_match(
     filters the universe before matching so a copilot that already knows
     which agent it is targeting avoids a fleet-wide hash collision surface,
     but it never changes what a given rec-id means.
+
+    Fail-closed ambiguity guard (#727 review round 1): ``canonical_rec_id``
+    is a 12-hex (48-bit) truncated hash, not a collision-proof identifier.
+    After the dedup-by-triple fix in ``build_rec_match_universe``, two
+    DIFFERENT ``(agent, kind, candidate_model)`` triples that happen to hash
+    to the SAME rec-id both survive as distinct universe entries. Returning
+    the first match in that case would silently pick one of two unrelated
+    recommendations to apply. Every match is collected and counted before
+    any is returned: >1 distinct match raises ``ManageRecIdAmbiguousError``
+    (refuse rather than guess); exactly 1 returns it; 0 returns ``None``
+    (→ ``rec_no_longer_valid``, unchanged).
+
+    Raises:
+        ManageRecIdAmbiguousError: more than one distinct recommendation in
+            the (possibly agent-scoped) universe hashes to ``rec_id``.
     """
     universe = build_rec_match_universe(agents_root)
     if agent_scope:
         universe = [r for r in universe if r.agent == agent_scope]
-    for rec in universe:
-        if canonical_rec_id(rec.agent, rec.kind, rec.candidate_model) == rec_id:
-            return rec
+    matches = [
+        rec
+        for rec in universe
+        if canonical_rec_id(rec.agent, rec.kind, rec.candidate_model) == rec_id
+    ]
+    if len(matches) > 1:
+        raise ManageRecIdAmbiguousError(rec_id)
+    if matches:
+        return matches[0]
     return None
 
 
@@ -172,7 +204,19 @@ def run_apply_rec(args: Any, agents_root: Path) -> int:
     rec_id: str = args.rec_id
     agent_scope: str | None = getattr(args, "agent", None)
 
-    matched = _find_match(rec_id, agent_scope, agents_root)
+    # ── Gate 0: rec-id ambiguity (integrity, not semantic — #727 review
+    # round 1) ─────────────────────────────────────────────────────────────
+    # Detected DURING matching, so it is checked first: an ambiguous rec-id
+    # cannot yet be resolved to a single candidate for the semantic gates
+    # below to even ask their questions about.
+    try:
+        matched = _find_match(rec_id, agent_scope, agents_root)
+    except ManageRecIdAmbiguousError as exc:
+        if use_json:
+            _emit_json_error(exc.error_type, str(exc))
+        else:
+            print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
     # ── Gate 1: rec-match ────────────────────────────────────────────────
     if matched is None:
@@ -304,6 +348,16 @@ def run_apply_rec(args: Any, agents_root: Path) -> int:
             f"passed={safety.passed}"
         )
 
+    # #727 review round 1 (audit legibility): a delegated RunRecord's summary
+    # must name the primitive an operator actually invoked (manage apply-rec),
+    # not set-model's own default "manage set-model ..." text — a human
+    # scanning raw records next to a manage_apply_rec primitive should never
+    # read "manage set-model" as the summary.
+    audit_summary = (
+        f"manage apply-rec {matched.agent}: default_model -> "
+        f"{matched.candidate_model} (rec {rec_id})"
+    )[:200]
+
     return apply_set_model_write(
         agent_id=matched.agent,
         agent_dir=agent_dir,
@@ -317,4 +371,5 @@ def run_apply_rec(args: Any, agents_root: Path) -> int:
         audit_extra={"applied_from_rec": rec_marker},
         json_extra={"applied_from_rec": rec_marker, "safety": safety_json},
         human_preamble=_preamble,
+        audit_summary=audit_summary,
     )

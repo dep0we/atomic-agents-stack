@@ -1806,6 +1806,160 @@ class TestFleetCandidateRenderBijection:
         )
 
 
+class TestBuildRecMatchUniverseDedupStaleness:
+    """build_rec_match_universe() dedup-by-triple (#727 review round 1 FIX 1).
+
+    recommend_fleet() and derive_savings_candidates_fleet() each independently
+    re-walk every agent's JSONL, at slightly different instants — so for the
+    SAME (agent, kind, candidate_model) savings_cost triple, the two loaders
+    can disagree on the guard verdict. These tests monkeypatch both loaders
+    directly (fast, deterministic — no need to race real JSONL writes) to
+    prove the merge always prefers derive_savings_candidates_fleet()'s copy,
+    never recommend_fleet()'s, and that recommend_fleet()'s OWN internally
+    computed savings_cost candidates (for a triple derive does not carry at
+    all) are discarded rather than leaking into the universe.
+    """
+
+    def _make_rec(self, *, agent, kind, candidate_model, passed, rationale):
+        headroom = EvalHeadroom(
+            weighted_score_margin=1.0 if passed else -1.0,
+            pass_rate_margin=1.0 if passed else -1.0,
+            hard_fails=0 if passed else 1,
+            sample_n=12,
+            rubric_threshold=4.0,
+            passed=passed,
+        )
+        return Recommendation(
+            agent=agent,
+            kind=kind,
+            current_model="claude-opus-4-8",
+            candidate_model=candidate_model,
+            projected_usd_delta=-5.0 if kind == "savings_cost" else None,
+            projected_points_delta=0.0 if kind == "savings_cost" else None,
+            rationale=rationale,
+            safety=headroom,
+            source="default_same_family" if kind == "savings_cost" else None,
+        )
+
+    def test_universe_prefers_derive_savings_verdict_over_stale_recommend_fleet_copy(
+        self, monkeypatch, tmp_path
+    ):
+        """The SAME savings_cost triple, disagreeing between the two loaders:
+        recommend_fleet() says passed=True (stale), derive_savings_candidates_
+        fleet() says passed=False (fresh). The universe MUST carry the fresh,
+        failing candidate — not the stale, passing one."""
+        from atomic_agents.advisor import recommend as recommend_mod
+
+        stale_passing = self._make_rec(
+            agent="opus-agent",
+            kind="savings_cost",
+            candidate_model="claude-sonnet-4-6-20260101",
+            passed=True,
+            rationale="stale-from-recommend_fleet",
+        )
+        fresh_failing = self._make_rec(
+            agent="opus-agent",
+            kind="savings_cost",
+            candidate_model="claude-sonnet-4-6-20260101",
+            passed=False,
+            rationale="fresh-from-derive",
+        )
+
+        monkeypatch.setattr(
+            recommend_mod, "compute_fleet_health", lambda *a, **k: object()
+        )
+        monkeypatch.setattr(
+            recommend_mod,
+            "recommend_fleet",
+            lambda *a, **k: [stale_passing],
+        )
+        monkeypatch.setattr(
+            recommend_mod,
+            "derive_savings_candidates_fleet",
+            lambda *a, **k: [fresh_failing],
+        )
+
+        universe = recommend_mod.build_rec_match_universe(tmp_path)
+
+        assert len(universe) == 1
+        assert universe[0].rationale == "fresh-from-derive"
+        assert universe[0].safety.passed is False, (
+            "dedup must take the savings_cost verdict from "
+            "derive_savings_candidates_fleet() (authoritative), never from "
+            "recommend_fleet()'s own (possibly stale) copy"
+        )
+
+    def test_savings_cost_never_taken_from_recommend_fleet_when_absent_from_derive(
+        self, monkeypatch, tmp_path
+    ):
+        """strip-RED: recommend_fleet() internally computes (and discards) its
+        own savings_cost candidates — a triple present ONLY in
+        recommend_fleet()'s output (never in derive_savings_candidates_fleet()'s)
+        must NOT appear in the universe at all, proving the savings_cost
+        branch is unconditionally skipped from the recommend_fleet() loop,
+        not merely deduped-away when derive also carries it."""
+        from atomic_agents.advisor import recommend as recommend_mod
+
+        recommend_fleet_only = self._make_rec(
+            agent="opus-agent",
+            kind="savings_cost",
+            candidate_model="claude-sonnet-4-6-20260101",
+            passed=True,
+            rationale="recommend_fleet-only",
+        )
+
+        monkeypatch.setattr(
+            recommend_mod, "compute_fleet_health", lambda *a, **k: object()
+        )
+        monkeypatch.setattr(
+            recommend_mod,
+            "recommend_fleet",
+            lambda *a, **k: [recommend_fleet_only],
+        )
+        monkeypatch.setattr(
+            recommend_mod, "derive_savings_candidates_fleet", lambda *a, **k: []
+        )
+
+        universe = recommend_mod.build_rec_match_universe(tmp_path)
+
+        assert universe == [], (
+            "a savings_cost triple absent from derive_savings_candidates_fleet() "
+            f"must never leak into the universe via recommend_fleet(): {universe!r}"
+        )
+
+    def test_non_savings_kinds_still_taken_from_recommend_fleet(
+        self, monkeypatch, tmp_path
+    ):
+        """governance/quality_report recs have no dual-source race — they are
+        taken from recommend_fleet() unchanged, so rec_kind_not_applicable
+        stays reachable (spec/55 'The match universe')."""
+        from atomic_agents.advisor import recommend as recommend_mod
+
+        governance_rec = self._make_rec(
+            agent="opus-agent",
+            kind="governance",
+            candidate_model=None,
+            passed=False,
+            rationale="governance.md is absent",
+        )
+
+        monkeypatch.setattr(
+            recommend_mod, "compute_fleet_health", lambda *a, **k: object()
+        )
+        monkeypatch.setattr(
+            recommend_mod, "recommend_fleet", lambda *a, **k: [governance_rec]
+        )
+        monkeypatch.setattr(
+            recommend_mod, "derive_savings_candidates_fleet", lambda *a, **k: []
+        )
+
+        universe = recommend_mod.build_rec_match_universe(tmp_path)
+
+        assert len(universe) == 1
+        assert universe[0].kind == "governance"
+        assert universe[0].rationale == "governance.md is absent"
+
+
 class TestDeriveSavingsCandidatesUnit:
     """derive_savings_candidates() — direct unit coverage of the split (#727)."""
 

@@ -30,6 +30,11 @@ a strip-testable failure per guard. The ladder is:
                                     look at the evals first)
     ManageRecSourceNotApplicableError — #727: the matched savings rec's source is
                                     outside apply-rec's PR1 allowlist
+    ManageRecIdAmbiguousError     — #727 review round 1: <rec-id> hash-matched
+                                    more than one DISTINCT recommendation (a
+                                    12-hex canonical_rec_id collision) — an
+                                    integrity refusal, not a semantic one;
+                                    retryable with --agent to narrow the search
 
 Most validation subclasses are raised during S2 step 1 and propagate to the verb
 as non-zero, no-write refusals. ManageListMutationRefused is the exception: it is
@@ -560,6 +565,53 @@ class ManageRecSourceNotApplicableError(ManageError):
             "which PR1 apply-rec cannot re-validate the ground-truth basis "
             "of — refusing rather than silently applying it (spec/55 "
             "measured-scorecard-source ruling)."
+        )
+
+
+class ManageRecIdAmbiguousError(ManageError):
+    """spec/55 #727 review round 1: ``<rec-id>`` matched more than one DISTINCT
+    recommendation — a ``canonical_rec_id`` hash collision.
+
+    ``canonical_rec_id`` truncates a SHA-256 digest to 12 hex chars (48 bits)
+    — a deliberately short, console-legible identifier, not a
+    collision-proof one. ``build_rec_match_universe``'s dedup is keyed on the
+    full identity triple ``(agent, kind, candidate_model)``, so two
+    DIFFERENT triples that happen to hash to the SAME 12-hex id both survive
+    in the universe as distinct entries. Applying the first match in that
+    situation (the pre-fix behavior) risked silently applying the WRONG
+    recommendation's swap. This is an INTEGRITY refusal — distinct in kind
+    from the four semantic apply-rec refusals
+    (``rec_no_longer_valid``/``rec_kind_not_applicable``/
+    ``rec_source_not_applicable``/``rec_guard_failed``), which each answer a
+    question about ONE already-uniquely-identified candidate. This refusal
+    fires instead of even asking those questions, because the identifier
+    itself does not uniquely resolve.
+
+    Retryable: pass ``--agent <name>`` to narrow the match universe to one
+    agent before hashing — collapses the ambiguity in the overwhelmingly
+    common case (a collision across two DIFFERENT agents' candidates). If the
+    collision is within a single agent's own candidate set, report it — that
+    is a genuine (astronomically unlikely) hash collision, not a
+    configuration issue an operator can work around.
+
+    NOTE: this must NOT fire for an agent's own quality_report recommendations
+    — the dedup-by-triple fix (#727 review round 1) collapses every
+    quality_report rec for one agent onto the single triple
+    ``(agent, "quality_report", None)`` (candidate_model is always None for
+    that kind), so there is only ever ONE quality_report entry per agent in
+    the match universe to begin with. A quality_report rec-id therefore never
+    reaches this guard — it either matches that one entry (proceeding to
+    ``rec_kind_not_applicable``) or matches nothing.
+    """
+
+    error_type: str = "rec_id_ambiguous"
+
+    def __init__(self, rec_id: str) -> None:
+        self.rec_id = rec_id
+        super().__init__(
+            f"Rec-id {rec_id!r} matched more than one distinct recommendation "
+            "(a hash collision) — refusing rather than guessing which one you "
+            "meant. Pass --agent <name> to narrow the search, or report this."
         )
 
 

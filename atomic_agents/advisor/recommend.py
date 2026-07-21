@@ -1198,12 +1198,11 @@ def build_rec_match_universe(
     """apply-rec's match universe (#727, spec/55): ALL current recs (every kind,
     via recommend_fleet) UNION guard-failed savings candidates (via
     derive_savings_candidates_fleet). compute_fleet_health is run ONCE and passed
-    into both loaders (Principle #6 — don't score the fleet twice). Deduped by
-    canonical_rec_id (a passed savings rec appears in both loaders; keep one).
-    The all-kinds union is load-bearing: it makes rec_kind_not_applicable
-    REACHABLE (a governance/quality_report rec-id hash-hits and branches to the
-    kind gate, instead of hash-missing into rec_no_longer_valid). Resolves config
-    via the SAME parse_recommendations path the console uses, so identities and
+    into both loaders (Principle #6 — don't score the fleet twice). The all-kinds
+    union is load-bearing: it makes rec_kind_not_applicable REACHABLE (a
+    governance/quality_report rec-id hash-hits and branches to the kind gate,
+    instead of hash-missing into rec_no_longer_valid). Resolves config via the
+    SAME parse_recommendations path the console uses, so identities and
     verdicts never diverge from the rendered card.
 
     Fail-soft: mirrors recommend_fleet()/derive_savings_candidates_fleet()'s own
@@ -1211,15 +1210,38 @@ def build_rec_match_universe(
     raising (apply-rec's caller then sees an empty universe and every rec-id
     correctly refuses rec_no_longer_valid, never an uncaught exception).
 
-    Dedup rule: recommend_fleet()'s copy is preferred over
-    derive_savings_candidates_fleet()'s copy for the SAME (agent, kind,
-    candidate_model) triple — it is the console-visible object, so apply-rec's
-    match universe presents the identical Recommendation instance an operator
-    would have read off the console card. derive_savings_candidates_fleet()
-    contributes only the candidates recommend_fleet() does NOT already carry
-    (the guard-failed ones) — concatenating recommend_fleet's list FIRST and
-    keeping first-occurrence-wins on canonical_rec_id achieves this without a
-    second explicit branch.
+    Dedup rule (fixed — #727 review round 1, dedup-staleness finding): dedup is
+    by the full identity triple ``(agent, kind, candidate_model)``, NOT by
+    ``canonical_rec_id`` — a 12-hex hash collision between two DIFFERENT
+    triples must not cause one to silently shadow the other here (that risk is
+    refused explicitly, at match time, by apply-rec's ambiguity guard instead;
+    see ``ManageRecIdAmbiguousError``). For a ``savings_cost`` triple, the
+    candidate + verdict are taken EXCLUSIVELY from
+    ``derive_savings_candidates_fleet()`` — never from ``recommend_fleet()`` —
+    because the two loaders each re-walk every agent's JSONL independently, at
+    slightly different instants. A savings candidate that PASSED the guard
+    when ``recommend_fleet()``'s load ran can have since started FAILING it by
+    the time ``derive_savings_candidates_fleet()``'s load runs (or vice versa)
+    — taking the stale ``recommend_fleet()`` copy risks apply-rec applying (or
+    refusing) a swap on a verdict that is no longer current.
+    ``derive_savings_candidates_fleet()`` is the authoritative, guard-verdict-
+    carrying source for every ``savings_cost`` triple (it is also the ONLY
+    loader that ever sees a guard-failing candidate at all — recommend_fleet()
+    drops those by design, spec/54), so its copy always wins. Non-savings recs
+    (``governance``/``quality_report``) have no such dual-source race — they
+    are taken from ``recommend_fleet()`` only, since
+    ``derive_savings_candidates_fleet()`` never produces them.
+
+    Accepted duplicate compute (not a bug, do not "fix" with a bigger
+    refactor): ``recommend_fleet()`` still internally computes its OWN
+    ``savings_cost`` candidates via ``derive_savings_candidates()`` (to build
+    its console-facing ``passed=True`` subset) — that computed copy is simply
+    never read as this function's savings identity/verdict source; it's
+    filtered out below. This is a small, already-accepted duplicate compute
+    (the "Accepted consequences" section of spec/55 already prices in a
+    full-fleet recompute per apply-rec invocation); collapsing the two loaders
+    into a single shared savings-computation pass is a larger refactor
+    deliberately out of scope for this fix.
     """
     today = today or date.today()
 
@@ -1246,17 +1268,22 @@ def build_rec_match_universe(
     all_recs = recommend_fleet(
         agents_root, today=today, rec_config=rec_config, fleet_health=fh
     )
-    guard_failed_candidates = derive_savings_candidates_fleet(
+    savings_candidates = derive_savings_candidates_fleet(
         agents_root, today=today, rec_config=rec_config, fleet_health=fh
     )
 
-    seen: set[str] = set()
-    universe: list[Recommendation] = []
-    for rec in (*all_recs, *guard_failed_candidates):
-        rec_id = canonical_rec_id(rec.agent, rec.kind, rec.candidate_model)
-        if rec_id in seen:
+    by_triple: dict[tuple[str, str, str | None], Recommendation] = {}
+    # savings_cost identity + verdict come EXCLUSIVELY from
+    # derive_savings_candidates_fleet() — the authoritative, guard-verdict-
+    # carrying source (see docstring). Inserted FIRST so setdefault() below
+    # never lets a stale recommend_fleet() copy win the same triple.
+    for cand in savings_candidates:
+        by_triple.setdefault((cand.agent, cand.kind, cand.candidate_model), cand)
+    for rec in all_recs:
+        if rec.kind == "savings_cost":
+            # Never taken from here (see docstring) — recommend_fleet()'s own
+            # internally-computed savings_cost copy is discarded, not merged.
             continue
-        seen.add(rec_id)
-        universe.append(rec)
+        by_triple.setdefault((rec.agent, rec.kind, rec.candidate_model), rec)
 
-    return universe
+    return list(by_triple.values())

@@ -1,13 +1,15 @@
 """``manage apply-rec <rec-id>`` verb tests (spec/55 #727 Unit 2 — the third verb).
 
 Covers the verb-specific surface: rec-match against the CURRENT match universe
-(``build_rec_match_universe``), the four apply-rec-introduced refusals
+(``build_rec_match_universe``), the four SEMANTIC apply-rec-introduced refusals
 (``rec_no_longer_valid`` / ``rec_kind_not_applicable`` / ``rec_source_not_applicable``
-/ ``rec_guard_failed``) each independently strip-tested, the delegation seam into
+/ ``rec_guard_failed``) each independently strip-tested, the INTEGRITY refusal
+(``rec_id_ambiguous``, #727 review round 1 — a ``canonical_rec_id`` hash
+collision) checked before all four semantic gates, the delegation seam into
 ``apply_set_model_write()`` (delegation fidelity vs. a hand-typed ``set-model
---model``), the dedicated ``PRIMITIVE_MANAGE_APPLY_REC`` audit shape, and that
-``set-model``'s own M9 composition chain still applies unchanged past all four
-apply-rec gates.
+--model``, and the ``audit_summary`` seam param), the dedicated
+``PRIMITIVE_MANAGE_APPLY_REC`` audit shape, and that ``set-model``'s own M9
+composition chain still applies unchanged past all gates.
 
 ``tests/test_manage_spine.py`` covers the verb-agnostic SPINE guarantees (lock/
 agent_busy, exit-code ladder) — apply-rec's contribution there proves the
@@ -24,6 +26,7 @@ from pathlib import Path
 
 from atomic_agents.advisor.recommend import build_rec_match_universe, canonical_rec_id
 from atomic_agents.logs.types import PRIMITIVE_MANAGE_APPLY_REC
+from atomic_agents.manage import apply_rec as apply_rec_mod
 from atomic_agents.manage.apply_rec import run_apply_rec
 from atomic_agents.manage.set_model import run_set_model
 
@@ -376,6 +379,15 @@ def test_audit_primitive_and_marker(tmp_path):
     assert record["after"] == {"default_model": DEFAULT_CANDIDATE}
     assert record["snapshot_path"] is not None
 
+    # #727 review round 1 FIX 4: the summary names apply-rec, not set-model's
+    # own default text — a human scanning raw records next to a
+    # manage_apply_rec primitive must never read "manage set-model ...".
+    assert record["summary"] == (
+        f"manage apply-rec opus-agent: default_model -> {DEFAULT_CANDIDATE} "
+        f"(rec {rec_id})"
+    )
+    assert "manage set-model" not in record["summary"]
+
     # Also lands in the fleet-wide _manage log scope (M8 dual-scope append).
     fleet_records = collect_jsonl(get_fleet_log_dir(tmp_path))
     fleet_applied = [
@@ -493,3 +505,93 @@ def test_json_refusal_shape_rec_guard_failed(tmp_path, capsys):
     assert payload["ok"] is False
     assert payload["error_type"] == "rec_guard_failed"
     assert payload["safety"]["passed"] is False
+
+
+# ── Group I: rec-id ambiguity (integrity refusal, #727 review round 1) ─────
+
+
+def test_rec_id_ambiguous_refuses_on_hash_collision(tmp_path, monkeypatch, capsys):
+    """A genuine ``canonical_rec_id`` collision between two DIFFERENT
+    (agent, kind, candidate_model) triples refuses ``rec_id_ambiguous`` rather
+    than silently applying whichever candidate happened to match first —
+    constructed by monkeypatching ``canonical_rec_id`` (as imported into
+    ``apply_rec.py``) to a constant, so two agents' genuinely distinct
+    savings_cost candidates both hash to the SAME id."""
+    today = date.today()
+    agent_dir_a = _seed_apply_rec_agent(tmp_path, "agent-a", DEFAULT_MODEL, today)
+    agent_dir_b = _seed_apply_rec_agent(tmp_path, "agent-b", DEFAULT_MODEL, today)
+    before_a = _model_md_text(agent_dir_a)
+    before_b = _model_md_text(agent_dir_b)
+
+    monkeypatch.setattr(apply_rec_mod, "canonical_rec_id", lambda *a, **k: "c" * 12)
+
+    exit_code = run_apply_rec(
+        make_apply_rec_args("c" * 12, tmp_path, use_json=True), tmp_path
+    )
+
+    assert exit_code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["error_type"] == "rec_id_ambiguous"
+    # Refused before any delegation — neither agent's model.md is touched.
+    assert _model_md_text(agent_dir_a) == before_a
+    assert _model_md_text(agent_dir_b) == before_b
+    assert not (agent_dir_a / ".config-snapshots").exists()
+    assert not (agent_dir_b / ".config-snapshots").exists()
+
+
+def test_rec_id_ambiguous_checked_before_rec_no_longer_valid(tmp_path, monkeypatch):
+    """The ambiguity gate fires even though a NON-monkeypatched lookup for
+    this rec-id would otherwise be a clean single match — proving the
+    ambiguity check runs during matching itself (Gate 0), strictly before the
+    rec_no_longer_valid / semantic gates get a chance to run at all."""
+    today = date.today()
+    _seed_apply_rec_agent(tmp_path, "agent-a", DEFAULT_MODEL, today)
+    _seed_apply_rec_agent(tmp_path, "agent-b", DEFAULT_MODEL, today)
+
+    monkeypatch.setattr(apply_rec_mod, "canonical_rec_id", lambda *a, **k: "d" * 12)
+
+    exit_code = run_apply_rec(
+        make_apply_rec_args("d" * 12, tmp_path, use_json=True), tmp_path
+    )
+    assert exit_code == 1
+
+
+def test_rec_id_ambiguous_not_spuriously_fired_by_collapsed_quality_reports(
+    tmp_path, capsys
+):
+    """Negative control (must NOT strip-RED): two tuning reports for the SAME
+    agent each independently trigger a quality_report signal, but
+    build_rec_match_universe's dedup-by-triple (FIX 1) collapses them onto the
+    single (agent, "quality_report", None) triple BEFORE matching — so there
+    is only ever ONE quality_report entry in the universe to match, and the
+    id resolves cleanly to rec_kind_not_applicable, never rec_id_ambiguous."""
+    today = date.today()
+    agent_dir = _seed_apply_rec_agent(tmp_path, "opus-agent", DEFAULT_MODEL, today)
+    reports_dir = agent_dir / "evals" / "tuning_reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    (reports_dir / "2026-06-24.md").write_text(
+        "---\nhas_hard_fails: true\nscore: 3.0\n---\n\nFirst hard-fail report.\n"
+    )
+    (reports_dir / "2026-06-25.md").write_text(
+        "---\nhas_hard_fails: true\nscore: 2.5\n---\n\nSecond hard-fail report.\n"
+    )
+
+    universe = build_rec_match_universe(tmp_path, today=today)
+    quality_recs = [
+        r for r in universe if r.agent == "opus-agent" and r.kind == "quality_report"
+    ]
+    assert len(quality_recs) == 1, (
+        "two tuning reports for one agent must collapse to ONE quality_report "
+        f"universe entry (dedup-by-triple): got {quality_recs!r}"
+    )
+
+    rec_id = canonical_rec_id("opus-agent", "quality_report", None)
+    exit_code = run_apply_rec(
+        make_apply_rec_args(rec_id, tmp_path, use_json=True), tmp_path
+    )
+
+    assert exit_code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["error_type"] == "rec_kind_not_applicable"
