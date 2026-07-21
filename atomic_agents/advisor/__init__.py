@@ -26,6 +26,9 @@ from .recommend import (
     EvalHeadroom,
     Recommendation,
     RECOMMENDATION_KINDS,
+    canonical_rec_id,
+    derive_savings_candidates,
+    derive_savings_candidates_fleet,
     recommend_fleet,
 )
 from .score import compute_fleet_health, FleetHealth, AgentHealth, ScorecardRow
@@ -47,4 +50,8 @@ __all__ = [
     "recommend_fleet",
     "parse_recommendations",
     "RecommendationConfig",
+    # #727 Unit 1 — candidate-split + shared rec-id hash
+    "canonical_rec_id",
+    "derive_savings_candidates",
+    "derive_savings_candidates_fleet",
 ]
