@@ -42,13 +42,20 @@ from atomic_agents.manage import _routine
 from atomic_agents.manage import run_manage
 from atomic_agents.manage.exceptions import ManageAgentBusyError
 from atomic_agents.manage.govern import run_govern
-from atomic_agents.logs.types import PRIMITIVE_MANAGE_GOVERN, PRIMITIVE_MANAGE_RESTORE
+from atomic_agents.manage.set_model import run_set_model
+from atomic_agents.logs.types import (
+    PRIMITIVE_MANAGE_GOVERN,
+    PRIMITIVE_MANAGE_RESTORE,
+    PRIMITIVE_MANAGE_SET_MODEL,
+)
 
 from tests._manage_test_helpers import (
     collect_jsonl,
     make_agent_dir,
     make_govern_args,
     make_governance_md,
+    make_model_md,
+    make_set_model_args,
 )
 
 
@@ -1122,3 +1129,260 @@ def test_restore_exit_code_ladder_sigint_is_130(tmp_path, monkeypatch):
 
     args = make_govern_args(agent_dir.name, tmp_path, restore=snap_id, yes=False)
     assert run_govern(args, tmp_path) == 130
+
+
+# ──────────────────────────────────────────────────────────────────
+# set-model verb SPINE coverage (spec/55 #726) — proves the hoisted spine
+# serves the SECOND write verb identically to govern's already-covered
+# guarantees above: lock/agent_busy, fail-closed, five-step ordering,
+# snapshot, audit, and the exit-code ladder. Not a re-test of govern's
+# behavior — a handful of joins proving the shared spine is verb-agnostic.
+# Verb-specific behavior (M9 composition gates, surgical value-span editing,
+# WARN-AND-WRITE) lives in ``tests/test_manage_set_model.py``.
+
+
+def test_set_model_lock_backend_construction_failure_is_fail_closed(
+    tmp_path, monkeypatch, capsys
+):
+    """Mirrors ``test_lock_backend_construction_failure_is_fail_closed``: a
+    LockBackend that cannot be constructed refuses the write (exit 1),
+    'lock_backend_unavailable', caught CENTRALLY by run_manage()."""
+    agent_dir = make_agent_dir(tmp_path)
+    make_model_md(agent_dir)
+
+    def _boom(scope_root):
+        raise ValueError("ATOMIC_AGENTS_LOCK_BACKEND=bogus is not a known backend")
+
+    monkeypatch.setattr("atomic_agents.locks.get_default_lock_backend", _boom)
+
+    args = make_set_model_args(
+        agent_dir.name, tmp_path, model="claude-opus-4-8", yes=True, use_json=True
+    )
+    rc = run_manage(args, tmp_path)
+
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["error_type"] == "lock_backend_unavailable"
+    assert collect_jsonl(agent_dir / "log") == []
+
+
+def test_set_model_agent_busy_is_raised_uncaught_by_run_set_model_directly(tmp_path):
+    """Mirrors ``test_agent_busy_is_raised_uncaught_by_run_govern_directly``:
+    ManageAgentBusyError propagates UNCAUGHT out of run_set_model() — the
+    central catch lives in run_manage(), not per-verb."""
+    agent_dir = make_agent_dir(tmp_path)
+    make_model_md(agent_dir)
+
+    real_backend = FilesystemLockBackend(agent_dir)
+    with real_backend.acquire("manage", timeout=0):
+        args = make_set_model_args(
+            agent_dir.name, tmp_path, model="claude-opus-4-8", yes=True
+        )
+        with pytest.raises(ManageAgentBusyError):
+            run_set_model(args, tmp_path)
+
+
+def test_set_model_agent_busy_caught_centrally_by_run_manage(tmp_path, capsys):
+    """Mirrors ``test_agent_busy_caught_centrally_by_run_manage`` — the SAME
+    contention scenario driven through run_manage(): exits 1 with
+    error_type='agent_busy'."""
+    agent_dir = make_agent_dir(tmp_path)
+    make_model_md(agent_dir)
+
+    real_backend = FilesystemLockBackend(agent_dir)
+    with real_backend.acquire("manage", timeout=0):
+        args = make_set_model_args(
+            agent_dir.name,
+            tmp_path,
+            model="claude-opus-4-8",
+            yes=True,
+            use_json=True,
+        )
+        rc = run_manage(args, tmp_path)
+
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["error_type"] == "agent_busy"
+    # M8: a refusal (including agent_busy) writes NO management RunRecord.
+    assert collect_jsonl(agent_dir / "log") == []
+
+
+def test_set_model_agent_busy_json_error_emitted_exactly_once(tmp_path, capsys):
+    """Mirrors ``test_agent_busy_json_error_emitted_exactly_once`` — the
+    central catch in run_manage() is the ONLY emission site."""
+    agent_dir = make_agent_dir(tmp_path)
+    make_model_md(agent_dir)
+
+    real_backend = FilesystemLockBackend(agent_dir)
+    with real_backend.acquire("manage", timeout=0):
+        args = make_set_model_args(
+            agent_dir.name,
+            tmp_path,
+            model="claude-opus-4-8",
+            yes=True,
+            use_json=True,
+        )
+        run_manage(args, tmp_path)
+
+    out = capsys.readouterr().out
+    payload = json.loads(out)
+    assert payload["error_type"] == "agent_busy"
+    assert out.count('"error_type"') == 1
+
+
+def test_set_model_dry_run_does_not_acquire_manage_lease(tmp_path):
+    """Mirrors ``test_dry_run_does_not_acquire_manage_lease``: --dry-run
+    never takes the lease — held externally, apply still previews."""
+    agent_dir = make_agent_dir(tmp_path)
+    make_model_md(agent_dir)
+
+    with _routine.manage_lease(agent_dir, agent_dir.name):
+        args = make_set_model_args(
+            agent_dir.name,
+            tmp_path,
+            model="claude-opus-4-8",
+            dry_run=True,
+            yes=True,
+        )
+        assert run_set_model(args, tmp_path) == 0
+
+
+def test_set_model_orphan_snapshot_on_write_failure(tmp_path, monkeypatch):
+    """Mirrors ``test_orphan_snapshot_on_set_write_failure``: a write failure
+    AFTER the snapshot lands leaves model.md untouched and the orphan
+    snapshot is documented-benign (M3)."""
+    agent_dir = make_agent_dir(tmp_path)
+    make_model_md(agent_dir)
+    before_content = (agent_dir / "model.md").read_text()
+
+    from atomic_agents.manage import _routine as routine_mod
+
+    orig_atomic_write = routine_mod.atomic_write
+    call_count = {"n": 0}
+
+    def failing_second_write(path, content):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            # Second call is the model.md write (first is the snapshot).
+            raise OSError("simulated disk-full on the model.md write")
+        return orig_atomic_write(path, content)
+
+    monkeypatch.setattr(routine_mod, "atomic_write", failing_second_write)
+
+    args = make_set_model_args(
+        agent_dir.name, tmp_path, model="claude-opus-4-8", yes=True
+    )
+    rc = run_set_model(args, tmp_path)
+
+    assert rc == 1
+    assert (agent_dir / "model.md").read_text() == before_content
+    snaps = _routine.list_snapshots(agent_dir, "set-model")
+    assert len(snaps) == 1
+
+
+def test_set_model_exit_code_ladder_applied_is_zero(tmp_path):
+    agent_dir = make_agent_dir(tmp_path)
+    make_model_md(agent_dir)
+    args = make_set_model_args(
+        agent_dir.name, tmp_path, model="claude-opus-4-8", yes=True
+    )
+    assert run_set_model(args, tmp_path) == 0
+
+
+def test_set_model_exit_code_ladder_refusal_is_one(tmp_path):
+    agent_dir = make_agent_dir(tmp_path)
+    make_model_md(agent_dir)
+    args = make_set_model_args(
+        agent_dir.name, tmp_path, model="totally-unpriced-model-xyz", yes=True
+    )
+    assert run_set_model(args, tmp_path) == 1
+
+
+def test_set_model_exit_code_ladder_decline_is_three(tmp_path, monkeypatch):
+    agent_dir = make_agent_dir(tmp_path)
+    make_model_md(agent_dir)
+
+    import sys
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda: "n")
+
+    args = make_set_model_args(
+        agent_dir.name, tmp_path, model="claude-opus-4-8", yes=False
+    )
+    assert run_set_model(args, tmp_path) == 3
+
+
+def test_set_model_exit_code_ladder_sigint_is_130(tmp_path, monkeypatch):
+    agent_dir = make_agent_dir(tmp_path)
+    make_model_md(agent_dir)
+
+    import sys
+
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+
+    def _raise_sigint():
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", _raise_sigint)
+
+    args = make_set_model_args(
+        agent_dir.name, tmp_path, model="claude-opus-4-8", yes=False
+    )
+    assert run_set_model(args, tmp_path) == 130
+
+
+def test_set_model_lost_update_fix_concurrent_write_survives(tmp_path, monkeypatch):
+    """#709 P0 regression test, set-model variant.
+
+    Unlike govern's owner/backup_owner variant (two DISTINCT fields), --model
+    writes the ONE '## Default model' field — there is no field-level merge
+    to prove. What the fix still guarantees here: process A's LOCKED write
+    (and its audit record) must be based on a FRESH in-lease re-read, which
+    already includes process B's landed change, not A's stale ADVISORY
+    pre-lock preview captured before B ran.
+    """
+    agent_dir = make_agent_dir(tmp_path)
+    make_model_md(agent_dir)  # starts at claude-sonnet-4-6
+
+    from atomic_agents.manage import set_model as set_model_mod
+
+    orig_read = set_model_mod._read_model_md
+    call_count = {"n": 0}
+
+    def interleaving_read(path):
+        call_count["n"] += 1
+        content = orig_read(path)
+        if call_count["n"] == 1:
+            # This is A's ADVISORY pre-lock read. Before A proceeds, run B's
+            # FULL write to completion.
+            b_args = make_set_model_args(
+                agent_dir.name, tmp_path, model="claude-haiku-4-5", yes=True
+            )
+            rc_b = run_set_model(b_args, tmp_path)
+            assert rc_b == 0
+        return content
+
+    monkeypatch.setattr(set_model_mod, "_read_model_md", interleaving_read)
+
+    a_args = make_set_model_args(
+        agent_dir.name, tmp_path, model="claude-opus-4-8", yes=True
+    )
+    rc_a = run_set_model(a_args, tmp_path)
+    assert rc_a == 0
+
+    final = (agent_dir / "model.md").read_text()
+    assert "claude-opus-4-8" in final, "A's own change must land"
+
+    records = collect_jsonl(agent_dir / "log")
+    applied = [r for r in records if r.get("primitive") == PRIMITIVE_MANAGE_SET_MODEL]
+    assert len(applied) == 2  # B's applied record, then A's
+    a_record = applied[-1]
+    assert a_record["before"]["default_model"] == "claude-haiku-4-5", (
+        "A's audit 'before' must reflect B's landed change (the FRESH "
+        "in-lease read) — not 'claude-sonnet-4-6', the stale value from "
+        "A's advisory pre-lock preview captured before B ran (the #709 P0 "
+        "lost-update fix)."
+    )

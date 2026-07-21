@@ -65,11 +65,20 @@ PRIMITIVE_POLICY_DECISION = "policy_decision"  # #89 PR 3a — Policy/Mandate ca
 # bucket is IRREVERSIBLY lossy once records are written — GROUP BY primitive cost
 # attribution for embedding spend would be permanently ambiguous (Principle #5).
 PRIMITIVE_EMBED = "embed"
-# spec/55 (#624) — management event family.
-# Every management verb (govern, set-model, set-goal, apply-rec) emits this primitive
-# so LogQuery(primitive=PRIMITIVE_MANAGE_GOVERN) returns the full management audit trail.
-# The primitive id is pinned NORMATIVELY in spec/55 M8.
+# spec/55 (#624) — management event family. The RunRecord SHAPE (fields,
+# extra{} keys, status vocabulary) is pinned NORMATIVELY in spec/55 M8 and
+# shared across every management verb — but each verb emits its OWN
+# primitive id, not this one: govern writes PRIMITIVE_MANAGE_GOVERN,
+# set-model writes PRIMITIVE_MANAGE_SET_MODEL, restore writes
+# PRIMITIVE_MANAGE_RESTORE (set-goal/apply-rec will add their own).
+# Querying the FULL management audit trail means matching every
+# LogQuery(primitive=...) against the "manage_*" family, not filtering on
+# this constant alone.
 PRIMITIVE_MANAGE_GOVERN = "manage_govern"
+# spec/55 (#726) — set-model verb event. Distinct primitive from
+# manage_govern/manage_restore so fleet aggregations can tell a model-swap
+# apart from a governance edit or a governance rollback.
+PRIMITIVE_MANAGE_SET_MODEL = "manage_set_model"
 # spec/55 M3/M8 (#710) — governance rollback event. A restore is a distinct
 # primitive from manage_govern (not a --set variant) so fleet aggregations can
 # tell a rollback apart from an edit. Shares the same RunRecord shape (M8);
