@@ -22,6 +22,14 @@ a strip-testable failure per guard. The ladder is:
     ManageSnapshotNotFoundError   — #710: the requested --restore <snapshot-id> does not exist
                                     for this agent (also the cross-agent-restore refusal —
                                     see the class docstring)
+    ManageRecNoLongerValidError   — #727: no current recommendation matches <rec-id>
+                                    (retryable — re-derive/reload the console)
+    ManageRecKindNotApplicableError — #727: matched a non-savings_cost recommendation
+    ManageRecGuardFailedError     — #727: the swap exists but its no-quality-cost
+                                    guard no longer passes (NOT retryable blindly —
+                                    look at the evals first)
+    ManageRecSourceNotApplicableError — #727: the matched savings rec's source is
+                                    outside apply-rec's PR1 allowlist
 
 Most validation subclasses are raised during S2 step 1 and propagate to the verb
 as non-zero, no-write refusals. ManageListMutationRefused is the exception: it is
@@ -446,6 +454,112 @@ class ManageDeferredFlagRefused(ManageError):
         super().__init__(
             f"{flag} is not yet settable via CLI in PR1 (tracked in {issue}); "
             "edit model.md directly."
+        )
+
+
+class ManageRecNoLongerValidError(ManageError):
+    """spec/55 #727 apply-rec: no CURRENT recommendation matches ``<rec-id>``.
+
+    ``apply-rec``'s match universe (``build_rec_match_universe`` —
+    ``atomic_agents/advisor/recommend.py``) is recomputed fresh on every
+    invocation; recommendations are never persisted (spec/54). A rec-id that
+    hashed to a real recommendation at console-render time can stop matching
+    for entirely benign reasons — the agent's 30d usage repriced, the
+    candidate model changed, the underlying JSONL data moved — none of which
+    are errors. This is a first-class, EXPECTED refusal (the console card is
+    stale), not a bug: re-derive the recommendation (reload the console) and
+    retry with the new rec-id.
+    """
+
+    error_type: str = "rec_no_longer_valid"
+
+    def __init__(self, rec_id: str) -> None:
+        self.rec_id = rec_id
+        super().__init__(
+            f"No current recommendation matches rec-id {rec_id!r} — the "
+            "console card is stale (the agent's usage repriced, the "
+            "candidate changed, or the underlying data moved). Reload the "
+            "console and retry with the new rec-id."
+        )
+
+
+class ManageRecKindNotApplicableError(ManageError):
+    """spec/55 #727 apply-rec: the matched recommendation is not ``savings_cost``.
+
+    PR1 applies ``savings_cost`` recommendations only — the one kind with a
+    mechanical, unambiguous apply action (a model swap). ``quality_report``
+    and ``governance`` recommendations are, and remain, advisory-only; there
+    is no mechanical "apply" for "go read this tuning report" or "go write
+    governance.md by hand" (the latter has its own editor, ``manage govern``,
+    which ``apply-rec`` does not chain into).
+    """
+
+    error_type: str = "rec_kind_not_applicable"
+
+    def __init__(self, rec_id: str, kind: str) -> None:
+        self.rec_id = rec_id
+        self.kind = kind
+        super().__init__(
+            f"Recommendation {rec_id!r} matched a {kind!r} recommendation, "
+            "but apply-rec only applies 'savings_cost' recommendations "
+            "(quality_report/governance are advisory-only; there is no "
+            "mechanical apply for either)."
+        )
+
+
+class ManageRecGuardFailedError(ManageError):
+    """spec/55 #727 apply-rec: the swap still exists but its no-quality-cost
+    guard no longer passes.
+
+    The matched candidate's ``.safety.passed`` (an ``EvalHeadroom`` recomputed
+    fresh in the SAME ``build_rec_match_universe`` call that found the match —
+    apply-rec never re-imports advisor privates like ``_eval_headroom``
+    itself, Principle #3/T17 layering) is ``False``: a hard-fail landed, or a
+    margin eroded, since the recommendation last passed. This is distinct
+    from ``rec_no_longer_valid`` (no match at all) — the swap is a real,
+    currently-computable candidate, it just is not currently safe to apply.
+    STOP and look at the agent's evals; do NOT blindly retry — retrying
+    without investigating just re-hits this same refusal until the
+    underlying quality signal actually recovers.
+    """
+
+    error_type: str = "rec_guard_failed"
+
+    def __init__(self, rec_id: str) -> None:
+        self.rec_id = rec_id
+        super().__init__(
+            f"Recommendation {rec_id!r} still names a real candidate swap, "
+            "but its no-quality-cost guard no longer passes (a hard-fail "
+            "landed, or a margin eroded, since it last passed) — refusing "
+            "to apply. Look at the agent's evals before retrying; this is "
+            "not a transient failure to retry blindly."
+        )
+
+
+class ManageRecSourceNotApplicableError(ManageError):
+    """spec/55 #727 apply-rec: the matched savings rec's ``source`` is not in
+    apply-rec's allowlisted sources (skeptic's guard).
+
+    Only ``default_same_family``-sourced candidates are applicable in PR1
+    (``_APPLICABLE_REC_SOURCES`` in ``apply_rec.py``). ``operator_configured``
+    is excluded by design — apply-rec cannot yet re-validate the ground-truth
+    basis an operator-configured candidate was selected on, so it refuses
+    rather than silently applying a swap PR1 has no basis to vouch for. A
+    future ``measured_scorecard`` source (does not exist in code yet, see
+    #649/#644-child-D) is the primary target this refusal is designed to
+    widen for later, once a re-validation path for it is designed.
+    """
+
+    error_type: str = "rec_source_not_applicable"
+
+    def __init__(self, rec_id: str, source: str | None) -> None:
+        self.rec_id = rec_id
+        self.source = source
+        super().__init__(
+            f"Recommendation {rec_id!r} was selected via source {source!r}, "
+            "which PR1 apply-rec cannot re-validate the ground-truth basis "
+            "of — refusing rather than silently applying it (spec/55 "
+            "measured-scorecard-source ruling)."
         )
 
 

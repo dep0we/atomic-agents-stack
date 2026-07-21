@@ -70,7 +70,8 @@ PRIMITIVE_EMBED = "embed"
 # shared across every management verb — but each verb emits its OWN
 # primitive id, not this one: govern writes PRIMITIVE_MANAGE_GOVERN,
 # set-model writes PRIMITIVE_MANAGE_SET_MODEL, restore writes
-# PRIMITIVE_MANAGE_RESTORE (set-goal/apply-rec will add their own).
+# PRIMITIVE_MANAGE_RESTORE, apply-rec writes PRIMITIVE_MANAGE_APPLY_REC
+# (set-goal will add its own).
 # Querying the FULL management audit trail means matching every
 # LogQuery(primitive=...) against the "manage_*" family, not filtering on
 # this constant alone.
@@ -85,6 +86,14 @@ PRIMITIVE_MANAGE_SET_MODEL = "manage_set_model"
 # extra{} additionally carries restored_from (source snapshot id) and
 # snapshot_path (the pre-restore snapshot the restore itself took).
 PRIMITIVE_MANAGE_RESTORE = "manage_restore"
+# spec/55 (#727 Unit 2) — apply-rec verb event. Distinct primitive from
+# manage_set_model so fleet aggregations can tell a rec-driven apply apart
+# from an operator hand-typing --model, even though apply-rec's write is
+# mechanically a set-model write delegated through apply_set_model_write().
+# extra{} additionally carries an "applied_from_rec" marker ({"rec_id":...,
+# "kind":...}) so a single manage_set_model-family query still surfaces
+# rec-driven writes as a filtered subset if ever needed.
+PRIMITIVE_MANAGE_APPLY_REC = "manage_apply_rec"
 PRIMITIVE_OTHER = "other"
 
 

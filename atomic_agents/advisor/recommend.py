@@ -1185,3 +1185,78 @@ def derive_savings_candidates_fleet(
 
     all_cands.sort(key=_rec_sort_key, reverse=True)
     return all_cands
+
+
+# ──────────────────────────────────────────────────────────────────
+# apply-rec's match universe (#727 Unit 2, spec/55) — ALL current recs union
+# guard-failed savings candidates
+
+
+def build_rec_match_universe(
+    agents_root: Path, today: date | None = None
+) -> list[Recommendation]:
+    """apply-rec's match universe (#727, spec/55): ALL current recs (every kind,
+    via recommend_fleet) UNION guard-failed savings candidates (via
+    derive_savings_candidates_fleet). compute_fleet_health is run ONCE and passed
+    into both loaders (Principle #6 — don't score the fleet twice). Deduped by
+    canonical_rec_id (a passed savings rec appears in both loaders; keep one).
+    The all-kinds union is load-bearing: it makes rec_kind_not_applicable
+    REACHABLE (a governance/quality_report rec-id hash-hits and branches to the
+    kind gate, instead of hash-missing into rec_no_longer_valid). Resolves config
+    via the SAME parse_recommendations path the console uses, so identities and
+    verdicts never diverge from the rendered card.
+
+    Fail-soft: mirrors recommend_fleet()/derive_savings_candidates_fleet()'s own
+    fail-soft posture — a compute_fleet_health failure returns [] rather than
+    raising (apply-rec's caller then sees an empty universe and every rec-id
+    correctly refuses rec_no_longer_valid, never an uncaught exception).
+
+    Dedup rule: recommend_fleet()'s copy is preferred over
+    derive_savings_candidates_fleet()'s copy for the SAME (agent, kind,
+    candidate_model) triple — it is the console-visible object, so apply-rec's
+    match universe presents the identical Recommendation instance an operator
+    would have read off the console card. derive_savings_candidates_fleet()
+    contributes only the candidates recommend_fleet() does NOT already carry
+    (the guard-failed ones) — concatenating recommend_fleet's list FIRST and
+    keeping first-occurrence-wins on canonical_rec_id achieves this without a
+    second explicit branch.
+    """
+    today = today or date.today()
+
+    try:
+        fh = compute_fleet_health(agents_root, today=today)
+    except Exception as exc:
+        logger.warning(
+            "build_rec_match_universe: compute_fleet_health failed (%s); "
+            "empty match universe",
+            type(exc).__name__,
+        )
+        return []
+
+    try:
+        rec_config = parse_recommendations(agents_root)
+    except Exception as exc:
+        logger.warning(
+            "build_rec_match_universe: parse_recommendations failed (%s); "
+            "using defaults",
+            type(exc).__name__,
+        )
+        rec_config = RecommendationConfig()
+
+    all_recs = recommend_fleet(
+        agents_root, today=today, rec_config=rec_config, fleet_health=fh
+    )
+    guard_failed_candidates = derive_savings_candidates_fleet(
+        agents_root, today=today, rec_config=rec_config, fleet_health=fh
+    )
+
+    seen: set[str] = set()
+    universe: list[Recommendation] = []
+    for rec in (*all_recs, *guard_failed_candidates):
+        rec_id = canonical_rec_id(rec.agent, rec.kind, rec.candidate_model)
+        if rec_id in seen:
+            continue
+        seen.add(rec_id)
+        universe.append(rec)
+
+    return universe
