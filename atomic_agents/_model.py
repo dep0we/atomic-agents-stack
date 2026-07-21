@@ -76,16 +76,25 @@ def parse_model_md_text(text: str) -> dict:
 
     # Find "## Default model" section — accepts `**\`model-id\`**`, `**model-id**`,
     # `\`model-id\``, or bare model-id on its own line
+    # Line-anchored (``^`` + re.MULTILINE) so an H3 subheading ("### Default
+    # model" — the trailing two ``#`` chars would otherwise satisfy ``##\s+``)
+    # or a "## Default model" mention embedded mid-sentence inside an ordinary
+    # prose paragraph never counts as THE heading — only a genuine column-0 H2
+    # does. Kept consistent with the writer's identically-anchored regex in
+    # ``atomic_agents/manage/set_model.py`` (``_HEADING_RE`` / ``_VALUE_SPAN_RE``)
+    # so a write is guaranteed re-readable here (round-trip invariant).
     m = re.search(
-        r"##\s+Default model[^\n]*\n+\s*\*{0,2}`?([a-zA-Z0-9._/-]+)`?\*{0,2}",
+        r"^##\s+Default model[^\n]*\n+\s*\*{0,2}`?([a-zA-Z0-9._/-]+)`?\*{0,2}",
         text,
+        re.MULTILINE,
     )
     if m:
         defaults["default_model"] = m.group(1).strip("`* ")
 
     m = re.search(
-        r"##\s+Fallback[^\n]*\n+\s*\*{0,2}`?([a-zA-Z0-9._/-]+)`?\*{0,2}",
+        r"^##\s+Fallback[^\n]*\n+\s*\*{0,2}`?([a-zA-Z0-9._/-]+)`?\*{0,2}",
         text,
+        re.MULTILINE,
     )
     if m:
         defaults["fallback_model"] = m.group(1).strip("`* ")

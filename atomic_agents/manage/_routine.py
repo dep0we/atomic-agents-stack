@@ -128,11 +128,14 @@ def get_manage_lock_backend(agent_dir: Path) -> Any:
     scoping for distributed backends, and a broken backend should fail this
     early, symmetric probe rather than surface only once ``acquire()`` runs.
 
-    Callers should construct ONCE (right after the agent_dir containment
-    guard, before S2 step 1) so a misconfigured lock backend refuses BEFORE
-    any validate/preview work runs, and pass the same backend into
-    ``manage_lease()`` / ``run_managed_write()`` to avoid a second
-    construction.
+    Callers should construct ONCE, LATE — on the real-write path only,
+    AFTER the S2 step 3 confirm gate (--dry-run / operator decline never
+    reaches this call) — and pass the same backend into ``manage_lease()`` /
+    ``run_managed_write()`` to avoid a second construction. This is
+    deliberate (post-#709): --dry-run and a declined confirmation take no
+    lock at all, so a misconfigured lock backend never blocks a pure preview
+    — the refusal surfaces only when a write is actually about to happen.
+
     """
     from ..locks import get_default_lock_backend  # noqa: PLC0415
 

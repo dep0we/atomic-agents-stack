@@ -79,6 +79,99 @@ def make_govern_args(
     return ns
 
 
+# spec/55 #726 — canonical model.md fixture for set-model tests. A
+# ``str.format``-style template (NOT ``string.Template``/``safe_substitute``,
+# which set_model tests never touch) with a real cost_guardrails yaml block
+# so ``_cost_guardrails_block()``-shaped tests have something to extract, a
+# real '## Fallback' heading, and a default_model (claude-sonnet-4-6) that is
+# priced AND resolves to exactly one registered LLM backend (Anthropic) —
+# so the M9 composition gates pass without monkeypatching in the common case.
+CANONICAL_MODEL_MD = """# MODEL: {agent_name}
+
+## Default model
+
+**`claude-sonnet-4-6`**
+
+Chosen for: balanced reasoning and cost for day-to-day work.
+
+## Fallback
+
+**`claude-opus-4-8`**
+
+Fires when the default model errors or a harder task needs more headroom.
+
+## Token budget
+
+| Limit | Value |
+|---|---|
+| Max system prompt | 12,000 tokens |
+| Max output per turn | 4,000 tokens |
+
+## Cost guardrail
+
+```yaml
+cost_guardrails:
+  enabled: true
+  daily_cap_usd: 0.50
+  monthly_cap_usd: 7.00
+  daily_cap_action: skip
+  monthly_cap_action: skip
+  warning_thresholds: [0.50, 0.80]
+```
+"""
+
+
+def make_model_md(agent_dir: Path, content: str | None = None) -> Path:
+    """Write model.md to agent_dir. Uses the canonical template if content is None.
+
+    Overwrites any model.md ``make_agent_dir`` already created (that fixture's
+    minimal model.md exists only to satisfy the AgentRegistryBackend discovery
+    predicate at directory-creation time; set-model tests want the richer
+    canonical fixture with a cost_guardrails block + Fallback heading).
+    """
+    model_path = agent_dir / "model.md"
+    if content is None:
+        content = CANONICAL_MODEL_MD.format(agent_name=agent_dir.name)
+    model_path.write_text(content, encoding="utf-8")
+    return model_path
+
+
+def make_set_model_args(
+    agent: str,
+    agents_root: Path,
+    model: str | None = None,
+    fallback: str | None = None,
+    provider: str | None = None,
+    show: bool = False,
+    list_snapshots: bool = False,
+    restore: str | None = None,
+    dry_run: bool = False,
+    yes: bool = True,  # default True so tests don't block on TTY
+    use_json: bool = False,
+) -> Any:
+    """Build a minimal argparse-like namespace for run_set_model().
+
+    Every optional flag is explicitly set (never left to MagicMock's
+    auto-attribute default) — a bare unset MagicMock attribute reads as
+    truthy, which would spuriously trip the single-primary-action refusal or
+    the deferred-flag refusal (mirrors ``make_govern_args``'s rationale).
+    """
+    ns = MagicMock()
+    ns.manage_verb = "set-model"  # so the namespace also works with run_manage()
+    ns.agent = agent
+    ns.model = model
+    ns.fallback = fallback
+    ns.provider = provider
+    ns.show = show
+    ns.list_snapshots = list_snapshots
+    ns.restore = restore
+    ns.dry_run = dry_run
+    ns.yes = yes
+    ns.json = use_json
+    ns.agents_root = str(agents_root)
+    return ns
+
+
 def collect_jsonl(log_dir: Path) -> list[dict]:
     """Read every JSONL record under ``log_dir`` (recursive — FilesystemLogBackend
     nests ``YYYY-MM/YYYY-MM-DD.jsonl``), sorted by file path for determinism.

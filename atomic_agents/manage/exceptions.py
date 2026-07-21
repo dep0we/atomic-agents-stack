@@ -234,6 +234,221 @@ class ManageSnapshotNotFoundError(ManageError):
         )
 
 
+class ManageUnpricedModelError(ManageError):
+    """spec/55 #726 M9 gate (a): ``model_id`` is not in ``atomic_agents._costs.PRICING``.
+
+    Routed through ``atomic_agents.core_api.get_model_rates()`` (TENSIONS T17
+    core<->extension boundary — ``manage/`` is an extension package and MUST
+    NOT reach into the core-private ``_costs.PRICING`` table directly). Hard
+    refuse always (maintainer ruling ``unpriced-model-posture`` — no
+    ``--force`` escape hatch): writing an unpriced model id to model.md would
+    silently over-bill the agent through fallback pricing at runtime, with no
+    operator-visible warning until the invoice.
+    """
+
+    error_type: str = "unpriced_model"
+
+    def __init__(self, model_id: str) -> None:
+        self.model_id = model_id
+        super().__init__(
+            f"Model {model_id!r} is unpriced (not in atomic_agents PRICING) — "
+            "refusing to write it to model.md. An unpriced model would bill "
+            "through fallback pricing at runtime with no advance warning."
+        )
+
+
+class ManageUnknownModelError(ManageError):
+    """spec/55 #726 M9 gate (b): zero registered LLM backends claim ``model_id``.
+
+    Raised when ``atomic_agents.llm.find_backend_for_model()`` raises
+    ``UnknownModelError``. ``no_backends_registered`` distinguishes a
+    deployment with ZERO registered LLM backends (a distinct, more useful
+    hint than "typo'd model id") from a deployment with backends registered
+    but none of them claiming this specific model id (spec/55 P1 prep
+    finding).
+    """
+
+    error_type: str = "unknown_model"
+
+    def __init__(self, model_id: str, *, no_backends_registered: bool = False) -> None:
+        self.model_id = model_id
+        self.no_backends_registered = no_backends_registered
+        if no_backends_registered:
+            detail = "no LLM backend is registered in this deployment"
+        else:
+            detail = f"no registered LLM backend claims model {model_id!r}"
+        super().__init__(f"Unknown model {model_id!r} — {detail}.")
+
+
+class ManageAmbiguousModelBackendError(ManageError):
+    """spec/55 #726 M9 gate (b): more than one registered backend claims ``model_id``.
+
+    Raised when ``find_backend_for_model()`` raises ``AmbiguousBackendError``.
+    Maintainer ruling ``provider-disambiguation-posture``: the message is
+    DELIBERATELY NOT ``str(exc)`` — the upstream ``AmbiguousBackendError``
+    text tells the operator to "pass --provider", which PR1 forbids
+    (``--provider`` is grammar-recognized but deferred to #755). This message
+    points at the deferred capability instead, and never mentions
+    ``--provider``.
+    """
+
+    error_type: str = "ambiguous_backend"
+
+    def __init__(self, model_id: str, candidates: list[str]) -> None:
+        self.model_id = model_id
+        self.candidates = candidates
+        super().__init__(
+            f"Model {model_id!r} is claimed by more than one registered "
+            f"backend ({', '.join(candidates)}) — refusing to guess. "
+            "Backend disambiguation is not yet settable via CLI in PR1 "
+            "(tracked in #755)."
+        )
+
+
+class ManagePolicyBackendUnavailableError(ManageError):
+    """spec/55 #726: ``PolicyBackend`` could not be constructed or read.
+
+    Tier B decision (fail-closed, spec/55 P1/P2 prep findings): a broken or
+    misconfigured PolicyBackend refuses the write rather than silently
+    skipping the CAPS-COMPOSE consult and the policy-override WARN-AND-WRITE
+    check — mirrors ``ManageLockUnavailableError``'s fail-closed posture for
+    the PRE-write consult only; the POST-write recompute degrades instead of
+    refusing an already-applied write (see ``set_model.py``'s module
+    docstring for the full two-posture rationale).
+    """
+
+    error_type: str = "policy_backend_unavailable"
+
+    def __init__(self, detail: str) -> None:
+        self.detail = detail
+        super().__init__(f"PolicyBackend unavailable — refused: {detail}")
+
+
+class ManageUnwritableModelIdError(ManageError):
+    """spec/55 #726 Fix 2 (defense-in-depth): ``new_value`` is outside the
+    surgical writer's value charset (``[a-zA-Z0-9._/-]+``).
+
+    Checked BEFORE any slicing into model.md's content, independent of the
+    M9 PRICING-membership check — PRICING is a plain dict with no charset
+    constraint of its own, so a future PRICING key containing a character
+    outside this class (e.g. "+", a space) would otherwise slice into the
+    file and silently truncate on the next ``parse_model_md`` read.
+    """
+
+    error_type: str = "unwritable_model_id"
+
+    def __init__(self, model_id: str) -> None:
+        self.model_id = model_id
+        super().__init__(
+            f"Model id {model_id!r} contains a character outside the "
+            "writer's value charset ([a-zA-Z0-9._/-]+) and would not "
+            "round-trip through model.md — refusing to write it."
+        )
+
+
+class ManageModelMdAbsentError(ManageError):
+    """spec/55 #726: model.md is absent for this agent.
+
+    UNREACHABLE via the real CLI/registry surface: model.md-presence IS the
+    ``AgentRegistryBackend`` discovery predicate (spec/37:314), so an agent
+    with no model.md never resolves a ``ref`` in the first place — S1
+    refuses with ``agent_not_found`` before ``_run_set_model`` is ever
+    called. Kept as a direct-API safety net for a caller that bypasses the
+    registry resolve entirely, and for the TOCTOU race where model.md is
+    deleted between the registry resolve and this module's own re-check
+    (see ``set_model.py``'s ``_read_base`` for the in-lock re-check).
+    """
+
+    error_type: str = "model_md_absent"
+
+    def __init__(self, agent_id: str) -> None:
+        self.agent_id = agent_id
+        super().__init__(f"model.md is absent for agent {agent_id!r}.")
+
+
+class ManageDefaultModelHeadingAbsentError(ManageError):
+    """spec/55 #726: model.md has no '## Default model' heading.
+
+    set-model is a surgical value-span editor, not a scaffolder — a
+    model.md missing the heading entirely cannot be edited in place.
+    """
+
+    error_type: str = "default_model_heading_absent"
+
+    def __init__(self, agent_id: str) -> None:
+        self.agent_id = agent_id
+        super().__init__(
+            f"model.md for agent {agent_id!r} has no '## Default model' "
+            "heading — refusing to write. Edit model.md directly to add "
+            "the heading first."
+        )
+
+
+class ManageDuplicateDefaultModelHeadingError(ManageError):
+    """spec/55 #726: model.md has more than one '## Default model' heading.
+
+    The surgical writer targets the FIRST match only (``re.search``, not
+    ``finditer``) — a duplicate heading is refused rather than silently
+    editing whichever occurrence the regex happens to find, or leaving the
+    second occurrence stale.
+    """
+
+    error_type: str = "duplicate_default_model_heading"
+
+    def __init__(self, agent_id: str, heading_count: int) -> None:
+        self.agent_id = agent_id
+        self.heading_count = heading_count
+        super().__init__(
+            f"model.md for agent {agent_id!r} has {heading_count} "
+            "'## Default model' headings (expected exactly 1) — refusing "
+            "to guess which one to edit. Edit model.md directly to remove "
+            "the duplicate."
+        )
+
+
+class ManageDefaultModelValueUnparseableError(ManageError):
+    """spec/55 #726: the '## Default model' heading is present, but no value
+    token immediately follows it.
+
+    Raised when the heading exists (so
+    ``ManageDefaultModelHeadingAbsentError`` does not fire) but the writer's
+    value-span regex cannot locate a value token to replace — e.g. the
+    heading is followed immediately by another heading, or by content
+    outside the writer's value charset.
+    """
+
+    error_type: str = "default_model_value_unparseable"
+
+    def __init__(self, agent_id: str) -> None:
+        self.agent_id = agent_id
+        super().__init__(
+            f"model.md for agent {agent_id!r} has a '## Default model' "
+            "heading but no parseable value immediately follows it — "
+            "refusing to write. Edit model.md directly to fix the value."
+        )
+
+
+class ManageDeferredFlagRefused(ManageError):
+    """spec/55 #726 PR1 scope (maintainer ruling ``pr1-flag-scope``):
+    ``--fallback`` / ``--provider`` are grammar-recognized by the CLI parser
+    but not yet settable in PR1.
+
+    Fires BEFORE the registry resolve (mirrors govern's grammar-pin-but-defer
+    precedent for --add/--remove/--set-json) — a scope refusal independent
+    of whether the target agent exists.
+    """
+
+    error_type: str = "not_yet_settable_in_pr1"
+
+    def __init__(self, flag: str, issue: str) -> None:
+        self.flag = flag
+        self.issue = issue
+        super().__init__(
+            f"{flag} is not yet settable via CLI in PR1 (tracked in {issue}); "
+            "edit model.md directly."
+        )
+
+
 class ManageGovernanceInvalidError(ManageError):
     """governance.md has parse_errors — write refused (spec/55 M4 / PRESENT_INVALID guard).
 

@@ -10,6 +10,9 @@ Verbs in this arc:
   govern <agent> --set ...        — edit governance.md frontmatter (#609)
   govern <agent> --restore <id>   — roll back governance.md to a snapshot (#710)
   govern <agent> --show/--list-snapshots — read-only (never touch the manage lease)
+  set-model <agent> --model ...   — edit model.md's Default model field (#726)
+  set-model <agent> --restore <id> — roll back model.md to a snapshot (#726)
+  set-model <agent> --show/--list-snapshots — read-only (never touch the manage lease)
 
 The module is lazy-imported from cli.py so the base CLI startup for ``run``,
 ``doctor``, and other commands does not pay the manage module's import cost
@@ -62,6 +65,11 @@ def run_manage(args: Any, agents_root: Path) -> int:
             from .govern import run_govern  # noqa: PLC0415 -- intentional lazy import
 
             return run_govern(args, agents_root)
+
+        if verb == "set-model":
+            from .set_model import run_set_model  # noqa: PLC0415 -- intentional lazy import
+
+            return run_set_model(args, agents_root)
 
         # Unknown verb — should not happen because argparse enforces choices,
         # but guard defensively.

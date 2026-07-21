@@ -913,6 +913,124 @@ def _register_manage(sub: argparse._SubParsersAction) -> None:
         help="override ATOMIC_AGENTS_ROOT (fleet-scoped; matches init/registry convention)",
     )
 
+    # ── manage set-model <agent> ────────────────────────────────────────────
+    set_model_cmd = manage_sub.add_parser(
+        "set-model",
+        help="Edit model.md's Default model (model-swap) field",
+        description=(
+            "Surgical model.md '## Default model' value-span editor. Validates "
+            "the new model id against the PRICING table and the registered LLM "
+            "backends, previews the before/after diff, and writes atomically "
+            "with a restorable snapshot. Appends an audit event to the "
+            "per-agent log stream and to the fleet stream (spec/55 M8)."
+        ),
+    )
+    set_model_cmd.add_argument(
+        "agent",
+        help="agent name (folder under agents-root)",
+    )
+    set_model_cmd.add_argument(
+        "--model",
+        dest="model",
+        default=None,
+        metavar="model-id",
+        help=(
+            "Set the '## Default model' value. Refused unless the model id is "
+            "priced (atomic_agents PRICING) and resolves to exactly one "
+            "registered LLM backend."
+        ),
+    )
+    # --fallback / --provider (spec/55 CLI-surface grammar). PINNED now so the
+    # recognized-vs-unrecognized status of the flag never shifts in a later PR;
+    # PR1 recognises them but returns a clean structured "not yet settable via
+    # CLI" refusal (never an argparse ``unrecognized arguments`` parser error,
+    # which would also bypass the --json contract). #754/#755 implement the
+    # semantics.
+    set_model_cmd.add_argument(
+        "--fallback",
+        dest="fallback",
+        default=None,
+        metavar="model-id",
+        help=(
+            "Set the '## Fallback' value. Reserved: not yet settable via CLI "
+            "in PR1 (tracked in #754) — edit model.md directly."
+        ),
+    )
+    set_model_cmd.add_argument(
+        "--provider",
+        dest="provider",
+        default=None,
+        metavar="provider-id",
+        help=(
+            "Disambiguate --model when it resolves to more than one backend. "
+            "Reserved: not yet settable via CLI in PR1 (tracked in #755) — "
+            "edit model.md directly."
+        ),
+    )
+    set_model_cmd.add_argument(
+        "--show",
+        dest="show",
+        action="store_true",
+        default=False,
+        help="Print the current resolved model config and exit (read-only).",
+    )
+    set_model_cmd.add_argument(
+        "--restore",
+        dest="restore",
+        metavar="snapshot-id",
+        default=None,
+        help=(
+            "Roll back model.md to a prior snapshot taken by this verb "
+            "(see --list-snapshots). Runs the full validate/preview/confirm/"
+            "snapshot+write/audit routine — restore itself takes a "
+            "pre-restore snapshot, so a restore is always undoable via a "
+            "second --restore. Mutually exclusive with --model. Does NOT "
+            "re-run the PRICING/backend-resolution composition chain."
+        ),
+    )
+    set_model_cmd.add_argument(
+        "--list-snapshots",
+        dest="list_snapshots",
+        action="store_true",
+        default=False,
+        help=(
+            "List snapshot ids available for --restore, oldest first "
+            "(read-only; symmetric with --show)."
+        ),
+    )
+    set_model_cmd.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        default=False,
+        help="Preview the before/after diff without writing. --yes is ignored when set.",
+    )
+    set_model_cmd.add_argument(
+        "--yes",
+        dest="yes",
+        action="store_true",
+        default=False,
+        help="Apply without the interactive confirmation prompt (required on non-TTY).",
+    )
+    set_model_cmd.add_argument(
+        "--json",
+        dest="json",
+        action="store_true",
+        default=False,
+        help=(
+            "Emit machine-readable JSON output (canonical underscore schema keys). "
+            "Refusals emit {ok: false, error_type, reason}; success emits "
+            "{ok: true, agent, changed_fields, before, after, snapshot_path?, "
+            "audit_status, policy_override?, pricing_advisory?, dry_run?}."
+        ),
+    )
+    set_model_cmd.add_argument(
+        "--agents-root",
+        dest="agents_root",
+        default=None,
+        help="override ATOMIC_AGENTS_ROOT (fleet-scoped; matches init/registry convention)",
+    )
+
 
 def _cmd_review(args) -> int:
     """Run a cross-family adversarial review and stream the output to stdout.
