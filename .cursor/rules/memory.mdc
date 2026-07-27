@@ -1,0 +1,21 @@
+---
+description: Load durable memory from the Obsidian vault at the start of work in this repo.
+alwaysApply: true
+---
+
+# Durable memory for this repo
+
+Before your first substantive response in a session here, read both of these through the Obsidian connection:
+
+1. `system/memory/global/MEMORY.md`
+2. `system/memory/atomic-agents-stack/MEMORY.md`
+
+`atomic-agents-stack` is this repo's memory folder. It is stated here so you do not have to look it up. If `system/memory/memory-map.md` disagrees with it, that file wins and you should say so.
+
+Both are indexes, one line per memory. **Open an individual note only when its line looks relevant to the task.** Do not read the whole folder.
+
+These files hold corrections already given and decisions already made. Reading them is how you avoid repeating a conversation that already happened.
+
+**Memory is read-only.** Never create, edit, delete, move, or reorganize anything under `system/`. When something is worth remembering, say so and hand over the note text instead of saving it. The full rules, including what to do when a note looks wrong or the vault is unreachable, are in the account-level User Rules.
+
+If you cannot reach the vault, say so once and work without it. Never invent what a memory says.
