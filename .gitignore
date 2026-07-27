@@ -67,7 +67,18 @@ temp/
 # Session/runtime artifacts — keep build branches showing only framework code so /ship runs clean
 # end-to-end (these never belong in a feature PR). The arc dev-harness (.claude/workflows/ +
 # .claude/skills/arc/) is intentionally TRACKED — it is project tooling, not runtime noise.
-.gstack/
+#
+# .gstack/ holds per-run scratch (arc-rulings/, deploy-reports/, browse-* logs, pr body drafts,
+# claude-available.json, etc.) AND committed project tooling metadata (arc.config.jsonc, the
+# arc-kit-version.json install manifest, arc-local-patches.md). Ignore everything under it by
+# default, then allowlist the committed files back in — narrower than a blanket ignore so the
+# dev-process-kit's config + manifest are trackable without un-ignoring genuine scratch/secrets.
+.gstack/*
+!.gstack/arc.config.jsonc
+!.gstack/arc-kit-version.json
+!.gstack/arc-local-patches.md
+.gstack/arc-rulings/
+.gstack/*.local.json
 .context/
 .claude/worktrees/
 .claude/scheduled_tasks.lock
