@@ -1,0 +1,107 @@
+// ============================================================================
+// arc.config.jsonc — per-project rules for the arc quality loop.
+//
+// This repo's config, ported from the pre-kit fork of the arc engine
+// (.claude/workflows/arc-{discovery,execute,finish}.js as they existed before
+// this repo adopted the maintained dev-process-kit). The two customizations
+// that made this repo's engine different from a generic install — the 8-item
+// Tier-A tripwire checklist and the governing-doc protection scope — now live
+// here instead of being hardcoded in the workflow scripts, so upgrading the
+// engine (via `install.sh`) no longer risks losing them.
+//
+// The /arc skill loads this file, strips comments, and injects it into every
+// arc workflow as `args.config`. Every field is OPTIONAL — omit one and the
+// workflow falls back to a sound generic default.
+// ============================================================================
+{
+  // Used in prompts so advisors reason about the right thing.
+  "projectName": "atomic-agents-stack (Fair Copy)",
+
+  // Domain of this project. "code" — a software project (Tier-A subtypes:
+  // tech-choice, schema, dependency, sequencing).
+  "domain": "code",
+
+  // What the agents read to learn this repo's design rules.
+  "designDocs": "CLAUDE.md, docs/architecture.md, and docs/TENSIONS.md",
+
+  // Branch builds diff against.
+  "baseBranch": "main",
+
+  // The exact command that runs the full test suite. The enforced TEST GATE
+  // runs this after a build reaches pr-ready and BLOCKS the hand-off to /ship
+  // unless it exits 0.
+  "testCommand": "uv run pytest",
+
+  // OPTIONAL coverage floor — not configured for this repo today (pytest-cov
+  // is a dev dependency but no --cov-fail-under threshold is enforced yet).
+  // "coverageCommand": "pytest --cov --cov-fail-under=80",
+
+  // OPTIONAL wall-clock bound on the test gate — unset preserves today's
+  // no-limit behavior (the full suite can run long; nothing in this repo's
+  // prior arc engine bounded it either).
+  // "testTimeoutSeconds": 300,
+
+  // Governing docs the build may NEVER amend unattended. Ported from the
+  // pre-kit fork's deterministic tripwire (arc-execute.js / arc-finish.js,
+  // fixed at #753 to diff against the LIVE remote base, not stale local
+  // state in this repo's multi-worktree setup). The kit's enforced gate
+  // (arc-preflight.sh govcheck) resolves an immutable BASE_SHA from
+  // origin/<base> BEFORE the build/finish run fires, which is the same fix
+  // in a stricter, deterministically-enforced form — see
+  // .gstack/arc-local-patches.md for the verification note.
+  "governingDocs": {
+    "paths": ["CLAUDE.md", "docs/TENSIONS.md"],
+    "tripDescription": "a CLAUDE.md design principle, the throughline, or an aesthetic rule changed, OR docs/TENSIONS.md changed at all — routine CLAUDE.md status / backend-count / \"Where things live\" table edits and CHANGELOG accounting do NOT count"
+  },
+
+  // Armor-B trust profile. Committed value stays "hardened" — every install
+  // defaults to full safety, no silent downgrade. Opt this machine into
+  // "solo" via a private, gitignored .gstack/arc.config.local.json if wanted.
+  "trust": "hardened",
+
+  // Cross-family reviewer — Codex joins every review round (discovery panel
+  // AND build/finish code review), matching this repo's standing rule that
+  // Codex is the default cross-family voice (CLAUDE.md rule 11).
+  "crossFamily": {
+    "enabled": true,
+    "exec": "codex exec"
+  },
+
+  // ---- DECISION INBOX NOTIFICATION ------------------------------------------
+  // Left disabled — this repo has no forwarding script configured. The
+  // always-on decision inbox (pending-decisions.json, surfaced by /arc
+  // resume) plus the durable on-disk digest at .gstack/arc-rulings/ is the
+  // fallback.
+  "notify": {
+    "command": ""
+  },
+
+  // ---- THE TIER-A TRIPWIRE CHECKLIST (the heart of the loop) ---------------
+  // Ported VERBATIM (in substance) from the pre-kit fork's arc-discovery.js
+  // TRIPWIRES constant — this repo's own materiality checklist, framework-
+  // specific to atomic-agents-stack's backend-Protocol / spec-MUST / layer-
+  // boundary / cost-guardrail / home-vs-org design.
+  "tripwires": "\nA decision is TIER A (must escalate to the maintainer — the agent may NOT decide it) if it hits ANY of:\n  1. Defines, changes, or LOCKS a backend Protocol, its dataclasses, capability advertisement, or WritePolicy.\n  2. Adds, changes, or locks a spec doc's normative content (any MUST).\n  3. Touches a layer boundary (merge/split persona·memory·notes·wiki·tool·helper·delegate) or relaxes a one-level constraint.\n  4. Changes a public or operator-facing surface: a CLI command/flag, a markdown-config schema, a public method name or signature.\n  5. Touches agent.call() control flow, a cost guardrail, or the audit-trail / JSONL shape.\n  6. Trades the home-user shape against the org shape (could helping one quietly degrade the other?).\n  7. Introduces a new dependency, a new concept/abstraction, or a new config field.\n  8. Would warrant a TENSIONS.md entry, or is irreversible without a major-version event.\n\nTIER B (agent may decide, but ONLY by emitting a justification record and passing the shortcut-hunter): a genuine fork between implementations that all stay INSIDE an existing protocol/contract — private helper structure, error-handling strategy, test layout, internal naming, refactors that change no public/protocol surface.\n\nTIER C (agent just does it, no record): one obvious idiomatic answer, mechanical edits, following a pattern already established in the codebase, doc wording that matches reality.\n\nTIE-BREAK: if you are unsure whether a fork is A or B, classify it A. Ambiguity always resolves UP.",
+
+  // ---- PREP DIMENSIONS (pre-implementation risk fan-out) -------------------
+  // Ported from the pre-kit fork's arc-execute.js PREP_DIMENSIONS — this
+  // repo's own pre-impl risk axes, in place of the kit's generic default.
+  "prepDimensions": [
+    { "key": "protocol-conformance", "prompt": "Conformance to the backend Protocol pattern (dataclasses, capability advertisement, WritePolicy, filesystem default) and the spec doc that governs this scope." },
+    { "key": "cost-and-guardrails", "prompt": "Cost guardrails and the audit/JSONL trail: does any new code path escape its cost gate, default critical=True, or fail to write its run_id / parent_run_id line?" },
+    { "key": "atomicity-idempotency", "prompt": "Atomic writes, idempotent teardown, crash-recoverability, TOCTOU races, and dedupe correctness." },
+    { "key": "throughline", "prompt": "The home-user vs org throughline: does anything here optimize one shape while degrading the other?" },
+    { "key": "docs-and-spec-drift", "prompt": "Spec/doc drift: will any doc, docstring, or error message claim something the implementation does not do?" }
+  ],
+
+  // ---- REVIEW LENSES (each adversarial round runs all of these) ------------
+  // Ported from the pre-kit fork's arc-execute.js / arc-finish.js lenses.
+  // Mark exactly one lens `"shortcut": true` — it uses the corner-cut schema.
+  "reviewLenses": [
+    { "key": "correctness", "prompt": "Find correctness bugs, edge cases, and regressions." },
+    { "key": "cost-audit", "prompt": "Find any LLM code path missing a cost gate, any default critical=True, any missing/broken audit JSONL line." },
+    { "key": "spec-conformance", "prompt": "Find divergence between the implementation and its governing spec doc / Protocol contract, and any acceptance-criterion in the issue not yet met." },
+    { "key": "shortcut-hunt", "shortcut": true, "prompt": "Assume a corner was cut. Find where the implementation took the EASY path over the best-in-class one. Each finding: the easy path taken, the right path, the named CLAUDE.md principle it violates, AND a severity — P0/P1 if it compromises correctness/security/audit-honesty/the throughline (these block the PR), P2 if it is marginal or maintainability-only (a comment that will rot, an edge no code path hits) — reported, does not block. Grade honestly: do not inflate a rot-someday nit to P1, and do not deflate a real corner-cut to P2." },
+    { "key": "docs-reality", "prompt": "Find any doc/docstring/error-message claim that does not match what the code actually does, and any user-facing reference (error strings, spec links) pointing at a file or behavior that does not exist." }
+  ]
+}
