@@ -8,7 +8,7 @@ Thanks for considering a contribution. This project is small, opinionated, and b
 
 Read these, in order:
 
-1. **[`CLAUDE.md`](CLAUDE.md)** — the project's design ethos. 14 taste rules that govern what changes get accepted (vault-as-source-of-truth, protocols-not-subclassing, layers-compose-not-merge, cost-first-class, audit-trail-structural, progressive-disclosure, markdown-config, atomic-and-idempotent, one-level-constraints, spec-is-the-product, codex-review-in-rounds, verify-before-claim, docs-match-reality, backward-compat-by-default). A change that violates one of these gets pushed back unless the rationale is named.
+1. **[`CLAUDE.md`](CLAUDE.md)** — the project's design ethos. 14 taste rules that govern what changes get accepted (vault-as-source-of-truth, protocols-not-subclassing, layers-compose-not-merge, cost-first-class, audit-trail-structural, progressive-disclosure, markdown-config, atomic-and-idempotent, one-level-constraints, spec-is-the-product, adversarial-review-in-rounds, verify-before-claim, docs-match-reality, backward-compat-by-default). A change that violates one of these gets pushed back unless the rationale is named.
 2. **[`docs/TENSIONS.md`](docs/TENSIONS.md)** — architectural tensions to protect when changing the code. Read this before proposing structural changes; the tension you're about to resolve may already be tracked.
 3. **[`docs/methodology.md`](docs/methodology.md)** — working-methods retrospective. The practices that produced this codebase's quality (codex review in rounds, verify-before-claim, bisectable commits, CHANGELOG-as-single-source-of-truth).
 
@@ -44,7 +44,7 @@ Run the full suite before pushing:
 uv run pytest
 ```
 
-4,250+ tests today; CI runs Python 3.11 + 3.12. New backend protocols add ~25 conformance tests + ~10 implementation-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol.
+the full suite (run `pytest -q` for the live count) today; CI runs Python 3.11 + 3.12. New backend protocols add ~25 conformance tests + ~10 implementation-specific tests. New features ship with tests. Migration-shaped PRs need parameterized fixture tests across the backend protocol.
 
 ### Review
 

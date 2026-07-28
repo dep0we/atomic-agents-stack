@@ -3,7 +3,7 @@
 [![Tests](https://github.com/dep0we/atomic-agents-stack/actions/workflows/test.yml/badge.svg)](https://github.com/dep0we/atomic-agents-stack/actions/workflows/test.yml)
 [![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)](https://github.com/dep0we/atomic-agents-stack/blob/main/pyproject.toml)
 [![License](https://img.shields.io/badge/license-MIT-green)](https://github.com/dep0we/atomic-agents-stack/blob/main/LICENSE)
-[![Version](https://img.shields.io/badge/version-1.1.0-blue)](https://github.com/dep0we/atomic-agents-stack/blob/main/CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.0.0-blue)](https://github.com/dep0we/atomic-agents-stack/blob/main/CHANGELOG.md)
 [![PyPI](https://img.shields.io/badge/pypi-atomic--agents--stack-blue)](https://pypi.org/project/atomic-agents-stack/)
 
 > **AI agents that live in your folder, not someone else's database.**
