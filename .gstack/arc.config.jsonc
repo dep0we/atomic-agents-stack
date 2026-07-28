@@ -59,9 +59,11 @@
   // "solo" via a private, gitignored .gstack/arc.config.local.json if wanted.
   "trust": "hardened",
 
-  // Cross-family reviewer — Codex joins every review round (discovery panel
-  // AND build/finish code review), matching this repo's standing rule that
-  // Codex is the default cross-family voice (CLAUDE.md rule 11).
+  // Cross-family reviewer. Joins every review round (discovery panel AND
+  // build/finish code review). THIS BLOCK IS THE AUTHORITY on which model
+  // reviews here; CLAUDE.md and CONTRIBUTING.md describe the practice and
+  // point back at this file rather than naming a model, so the two cannot
+  // drift apart. Changing the roster means changing it here.
   "crossFamily": {
     "enabled": true,
     "exec": "codex exec"
