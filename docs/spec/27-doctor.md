@@ -66,7 +66,7 @@ the full report every run.
 
 ### `env`
 
-**Verifies:** `ATOMIC_AGENTS_ROOT` (or the default `~/docs/agents`) resolves
+**Verifies:** `ATOMIC_AGENTS_ROOT` (or `--agents-root`) resolves
 to a directory that exists and is a directory.
 
 **Prevents:** "first run silently writes the agent vault into the wrong

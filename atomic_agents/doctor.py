@@ -8,7 +8,7 @@ e.g. as a Cloud Run liveness probe).
 
 Checks (one CheckResult per check unless noted):
 
-    env             ATOMIC_AGENTS_ROOT (or default ~/docs/agents) resolves
+    env             ATOMIC_AGENTS_ROOT (or --agents-root) resolves
                     to a directory that exists.
     python          sys.version_info satisfies pyproject's requires-python.
     vault           Required files exist under <agents_root>/<agent>/
@@ -171,6 +171,11 @@ def run_doctor(
     results.append(check_env(agents_root))
     results.append(check_python())
     results.append(check_bundle_cache_writable())
+
+    # No agents root configured: check_env already reported it as a FAIL and
+    # every downstream check needs the root, so stop here.
+    if agents_root is None and not os.environ.get("ATOMIC_AGENTS_ROOT"):
+        return results
 
     # Resolve agents_root for downstream checks. We tolerate a missing path
     # because check_env will already have flagged it; downstream checks
@@ -458,8 +463,16 @@ def check_env(agents_root_override: Path | None) -> CheckResult:
             path = Path(env_val).expanduser().resolve()
             source = f"ATOMIC_AGENTS_ROOT={env_val}"
         else:
-            path = get_agents_root()
-            source = "default ~/docs/agents (ATOMIC_AGENTS_ROOT unset)"
+            return CheckResult(
+                name="env",
+                status=FAIL,
+                message="ATOMIC_AGENTS_ROOT is not set",
+                fix_hint=(
+                    "Define ATOMIC_AGENTS_ROOT in ~/.config/data-roots.env "
+                    "(or pass --agents-root)."
+                ),
+                detail={"path": None, "source": "ATOMIC_AGENTS_ROOT unset"},
+            )
 
     if not path.exists():
         return CheckResult(

@@ -90,8 +90,8 @@ The canonical anatomy is documented in
 choice above is *where* you put `<agents_root>` — directly inside the
 synced vault rather than at `~/agents/` outside it. The framework
 resolves the root via `ATOMIC_AGENTS_ROOT` (see `atomic_agents/_platform.py`:
-`get_agents_root()` falls back to `~/docs/agents` when the env var is
-unset — for an Obsidian deployment you almost always want to set the env
+`get_agents_root()` raises an error when the env var is
+unset (there is no default location) — for an Obsidian deployment set the env
 var explicitly so the framework writes inside your vault).
 
 ### Why `agents/` and not the vault root?

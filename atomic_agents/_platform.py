@@ -7,23 +7,27 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-# Module-level constant kept for backward compat with any external imports.
-# get_agents_root() does NOT reference this constant; it computes fresh on
-# each call so test monkeypatches of HOME work correctly. New code should
-# call get_agents_root() rather than referencing this constant directly.
-DEFAULT_AGENTS_ROOT = (Path.home() / "docs" / "agents").expanduser().resolve()
+class AgentsRootNotSetError(RuntimeError):
+    """Raised when ATOMIC_AGENTS_ROOT is missing or empty."""
 
 
 def get_agents_root() -> Path:
-    """Resolve the agents root from env var or default to ~/docs/agents.
+    """Resolve the agents root from the ATOMIC_AGENTS_ROOT env var.
 
-    Reads HOME and ATOMIC_AGENTS_ROOT on EVERY call (not at import time) so
-    tests that monkeypatch HOME after framework import see the correct value.
+    There is no default location. If the variable is missing or empty this
+    raises AgentsRootNotSetError naming the variable and
+    ``~/.config/data-roots.env``, rather than silently falling back to a
+    folder under HOME.
+
+    Reads ATOMIC_AGENTS_ROOT on EVERY call (not at import time) so tests that
+    monkeypatch the environment see the correct value.
     """
     env_val = os.environ.get("ATOMIC_AGENTS_ROOT")
-    if env_val:
-        return Path(env_val).expanduser().resolve()
-    return (Path.home() / "docs" / "agents").expanduser().resolve()
+    if not env_val:
+        raise AgentsRootNotSetError(
+            "ATOMIC_AGENTS_ROOT is not set; define it in ~/.config/data-roots.env"
+        )
+    return Path(env_val).expanduser().resolve()
 
 
 def get_agent_root(agent_name: str, agents_root: Path | None = None) -> Path:

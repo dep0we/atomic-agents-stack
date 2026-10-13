@@ -113,7 +113,7 @@ class FilesystemAgentRegistryBackend:
         """Construct a registry backend for agents_root.
 
         Args:
-            agents_root: the fleet root directory. Typically ~/docs/agents or
+            agents_root: the fleet root directory. Typically the value of
                 ATOMIC_AGENTS_ROOT. May not exist yet (list_agents returns []).
         """
         # Stored UNRESOLVED: list_agents()/get_agent() pass this to

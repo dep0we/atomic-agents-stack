@@ -19,3 +19,14 @@ def _clear_jsonschema_warned_agents():
     _revise._jsonschema_warned_agents.clear()
     yield
     _revise._jsonschema_warned_agents.clear()
+
+
+@pytest.fixture(autouse=True)
+def _agents_root_env(monkeypatch, tmp_path_factory):
+    """Tests run without ~/.config/data-roots.env; give them a root.
+
+    Tests that need the variable unset call ``monkeypatch.delenv`` themselves.
+    """
+    monkeypatch.setenv(
+        "ATOMIC_AGENTS_ROOT", str(tmp_path_factory.mktemp("agents_root"))
+    )
