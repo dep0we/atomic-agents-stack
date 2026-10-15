@@ -32,3 +32,14 @@ def test_doctor_reports_unset_variable(monkeypatch):
     assert "data-roots.env" in result.fix_hint
     results = run_doctor()
     assert results[0].name == "env" and results[0].status == FAIL
+
+
+def test_cli_prints_message_not_traceback(monkeypatch, capsys):
+    from atomic_agents import cli
+
+    monkeypatch.delenv("ATOMIC_AGENTS_ROOT", raising=False)
+    rc = cli.main(["run", "foo", "--work-item", "x"])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "ATOMIC_AGENTS_ROOT is not set" in err
+    assert "Traceback" not in err

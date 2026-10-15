@@ -51,9 +51,7 @@ CHANGELOG entry.
 
 ### BEHAVIOR CHANGE
 
-- **`ATOMIC_AGENTS_ROOT` is now required; the `~/docs/agents` fallback is gone.** `get_agents_root()` raises `AgentsRootNotSetError` (naming the variable and `~/.config/data-roots.env`) when it is unset or empty, `doctor` reports a FAIL on the `env` check and stops, and `extras/cron/run-atomic-agent.sh` sources `~/.config/data-roots.env` and exits with a clear error instead of defaulting to `$HOME/agents`. `DEFAULT_AGENTS_ROOT` is removed. The tests set a temporary root automatically. Maintainer-vault pointers in `CLAUDE.md` and docs now use `$VAULT_ROOT/Atomic Agents/` (marked as a split for the folder move).
-
-### BEHAVIOR CHANGE
+- **`ATOMIC_AGENTS_ROOT` is now required; the `~/docs/agents` fallback is gone.** `get_agents_root()` raises `AgentsRootNotSetError` (naming the variable and `~/.config/data-roots.env`) when it is unset or empty, `doctor` reports a FAIL on the `env` check and stops, and `extras/cron/run-atomic-agent.sh` sources `~/.config/data-roots.env` and exits with a clear error instead of defaulting to `$HOME/agents`. `DEFAULT_AGENTS_ROOT` is removed. The tests set a temporary root automatically. Shells must load the env file (`set -a; . ~/.config/data-roots.env; set +a` in `~/.zshenv`); the CLI prints the error message instead of a traceback. Maintainer-vault pointers in `CLAUDE.md` and docs now use `<VAULT_ROOT>/Atomic Agents/`, with a note telling agents to resolve the value from the env file first (marked as a split for the folder move).
 
 - **Fleet Console is now the dashboard home page (`GET /` / `index.html`).** The global cost view has moved to `GET /cost` / `cost.html`. Bookmarks and scripts pointing at `/_dashboard/index.html` now land on the Fleet Console (spec/52 PR1, issue [#614](https://github.com/dep0we/atomic-agents-stack/issues/614)). The cost view URL was not previously served as a standalone endpoint; the `/cost` route is new. Per-agent breadcrumbs still point to `../_dashboard/index.html`, which now correctly navigates to the Fleet Console home. See spec/52 §Migration notes.
 

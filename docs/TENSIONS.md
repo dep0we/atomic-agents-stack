@@ -439,8 +439,8 @@ When transcript tokens regularly dwarf INDEX + selected notes, or multi-session 
 - [`docs/methodology.md`](methodology.md) — twin doc: working methods that produced this codebase
 - [`docs/GOVERNANCE.md`](GOVERNANCE.md) — solo / small-team operator guide
 - [`CLAUDE.md`](../CLAUDE.md) — design ethos + taste rules
-- `$VAULT_ROOT/Atomic Agents/ROADMAP.md` — strategic narrative + live backlog table; executable issues at [dep0we/atomic-agents-stack](https://github.com/dep0we/atomic-agents-stack/issues)
-- `$VAULT_ROOT/Atomic Agents/RESUME-NEXT-SESSION.md` — cross-session state pointer
+- `<VAULT_ROOT>/Atomic Agents/ROADMAP.md` — strategic narrative + live backlog table; executable issues at [dep0we/atomic-agents-stack](https://github.com/dep0we/atomic-agents-stack/issues)
+- `<VAULT_ROOT>/Atomic Agents/RESUME-NEXT-SESSION.md` — cross-session state pointer
 
 ---
 

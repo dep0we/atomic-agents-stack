@@ -25,7 +25,9 @@ def get_agents_root() -> Path:
     env_val = os.environ.get("ATOMIC_AGENTS_ROOT")
     if not env_val:
         raise AgentsRootNotSetError(
-            "ATOMIC_AGENTS_ROOT is not set; define it in ~/.config/data-roots.env"
+            "ATOMIC_AGENTS_ROOT is not set. Define it in ~/.config/data-roots.env and "
+            "make your shell load that file (add 'set -a; . ~/.config/data-roots.env; "
+            "set +a' to ~/.zshenv), or export the variable directly."
         )
     return Path(env_val).expanduser().resolve()
 

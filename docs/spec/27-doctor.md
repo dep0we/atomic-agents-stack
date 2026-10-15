@@ -826,7 +826,7 @@ doctor output or CI logs.
 ### Human (default)
 
 ```
-[ OK ]  env                       agents-root resolves to /Users/jane/docs/agents (default)
+[ OK ]  env                       agents-root resolves to /Users/jane/docs/agents (ATOMIC_AGENTS_ROOT)
 [ OK ]  python                    Python 3.12.11 (>= 3.11 required)
 [ OK ]  vault                     all required files present under …
 [FAIL]  provider-keys[anthropic]  anthropic API key not found

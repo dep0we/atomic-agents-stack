@@ -453,7 +453,7 @@ def _safe_parse_tools(agent_root: Path, cascade) -> tuple[dict, CheckResult | No
 
 
 def check_env(agents_root_override: Path | None) -> CheckResult:
-    """ATOMIC_AGENTS_ROOT or default resolves to an existing directory."""
+    """ATOMIC_AGENTS_ROOT (or --agents-root) resolves to an existing directory."""
     if agents_root_override is not None:
         path = Path(agents_root_override).expanduser().resolve()
         source = f"--agents-root {agents_root_override}"
@@ -468,8 +468,9 @@ def check_env(agents_root_override: Path | None) -> CheckResult:
                 status=FAIL,
                 message="ATOMIC_AGENTS_ROOT is not set",
                 fix_hint=(
-                    "Define ATOMIC_AGENTS_ROOT in ~/.config/data-roots.env "
-                    "(or pass --agents-root)."
+                    "Define ATOMIC_AGENTS_ROOT in ~/.config/data-roots.env and make "
+                    "your shell load it (set -a; . ~/.config/data-roots.env; "
+                    "set +a in ~/.zshenv), or pass --agents-root."
                 ),
                 detail={"path": None, "source": "ATOMIC_AGENTS_ROOT unset"},
             )
