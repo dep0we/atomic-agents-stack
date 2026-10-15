@@ -368,7 +368,7 @@ tagged" would be permanent.
 
 ## The handoff is intentional
 
-The vault file `~/ObsidianVault/Atomic Agents/RESUME-NEXT-SESSION.md`
+The vault file `<VAULT_ROOT>/Atomic Agents/RESUME-NEXT-SESSION.md`
 exists because the previous session wrote it. It is an artifact of the
 method.
 

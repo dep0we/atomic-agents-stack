@@ -8,7 +8,7 @@ e.g. as a Cloud Run liveness probe).
 
 Checks (one CheckResult per check unless noted):
 
-    env             ATOMIC_AGENTS_ROOT (or default ~/docs/agents) resolves
+    env             ATOMIC_AGENTS_ROOT (or --agents-root) resolves
                     to a directory that exists.
     python          sys.version_info satisfies pyproject's requires-python.
     vault           Required files exist under <agents_root>/<agent>/
@@ -74,7 +74,7 @@ from typing import Any
 
 from . import _cascade, _model, _tools
 from ._costs import PRICING
-from ._platform import get_agents_root
+from ._platform import get_agents_root, resolve_agents_root_source
 
 
 PASS = "pass"
@@ -171,6 +171,11 @@ def run_doctor(
     results.append(check_env(agents_root))
     results.append(check_python())
     results.append(check_bundle_cache_writable())
+
+    # No agents root configured: check_env already reported it as a FAIL and
+    # every downstream check needs the root, so stop here.
+    if agents_root is None and resolve_agents_root_source()[0] is None:
+        return results
 
     # Resolve agents_root for downstream checks. We tolerate a missing path
     # because check_env will already have flagged it; downstream checks
@@ -448,18 +453,31 @@ def _safe_parse_tools(agent_root: Path, cascade) -> tuple[dict, CheckResult | No
 
 
 def check_env(agents_root_override: Path | None) -> CheckResult:
-    """ATOMIC_AGENTS_ROOT or default resolves to an existing directory."""
+    """ATOMIC_AGENTS_ROOT (or --agents-root) resolves to an existing directory."""
     if agents_root_override is not None:
         path = Path(agents_root_override).expanduser().resolve()
         source = f"--agents-root {agents_root_override}"
     else:
-        env_val = os.environ.get("ATOMIC_AGENTS_ROOT")
+        env_val, origin = resolve_agents_root_source()
         if env_val:
             path = Path(env_val).expanduser().resolve()
-            source = f"ATOMIC_AGENTS_ROOT={env_val}"
+            if origin == "environment":
+                source = f"source: environment, ATOMIC_AGENTS_ROOT={env_val}"
+            else:
+                source = f"source: file {origin}, ATOMIC_AGENTS_ROOT={env_val}"
         else:
-            path = get_agents_root()
-            source = "default ~/docs/agents (ATOMIC_AGENTS_ROOT unset)"
+            return CheckResult(
+                name="env",
+                status=FAIL,
+                message="ATOMIC_AGENTS_ROOT is not set",
+                fix_hint=(
+                    "Add 'export ATOMIC_AGENTS_ROOT=/path/to/agents' to "
+                    "~/.config/data-roots.env (the CLI reads that line itself; "
+                    "start ~/.zshenv with '. ~/.config/data-roots.env' so other "
+                    "tools see it too), export the variable, or pass --agents-root."
+                ),
+                detail={"path": None, "source": "unset"},
+            )
 
     if not path.exists():
         return CheckResult(

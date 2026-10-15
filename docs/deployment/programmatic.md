@@ -63,7 +63,7 @@ the persona, tools, model, memory, journal, and log dir; the call writes
 its run record to `~/agents/caldwell/log/YYYY-MM/YYYY-MM-DD.jsonl`.
 
 If `agents_root` is omitted, `AtomicAgent` reads `ATOMIC_AGENTS_ROOT`
-from the environment (defaulting to `~/docs/agents`). The `trigger=`
+from the environment (required; an unset variable is an error). The `trigger=`
 field is one of `cron`, `skill`, `manual`, `api`, `http`, or `delegate` — it
 appears verbatim in the log record and influences lock-wait behaviour
 (`skill` and `http` wait up to 30s for the agent lock; others fail fast).

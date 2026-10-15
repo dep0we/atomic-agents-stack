@@ -318,6 +318,6 @@ The friction-points that caused the issue #155 work are addressed. Anything new 
 Two paths referenced earlier in this runbook live on the maintainer's machine, not in this repo, and external readers should treat them as conceptual hints rather than literal paths to follow:
 
 - `~/.claude/projects/-Users-dep0we/memory/feedback_always_ship.md` — Dan's user-level Claude Code memory file enforcing the "every PR through `/ship`" discipline. External readers should treat it as "the maintainer keeps a long-lived workflow-discipline memory enforcing this rule."
-- `~/ObsidianVault/Atomic Agents/RESUME-NEXT-SESSION.md` — the cross-session brief the maintainer writes at the end of each working session. External readers should treat it as "the maintainer keeps a per-session handoff brief."
+- `<VAULT_ROOT>/Atomic Agents/RESUME-NEXT-SESSION.md` — the cross-session brief the maintainer writes at the end of each working session. External readers should treat it as "the maintainer keeps a per-session handoff brief."
 
 When the project grows beyond a single maintainer, these references will either move to in-repo equivalents (e.g., a `CONTRIBUTING.md` section, or `docs/maintainer-handoff.md`) or be dropped. Pre-1.0 with a single contributor, the personal-machine refs are honest about the current shape.

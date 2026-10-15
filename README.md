@@ -47,7 +47,7 @@ pip install atomic-agents-stack
 # or with uv:
 uv add atomic-agents-stack
 
-# Configure your vault location (default: ~/docs/agents)
+# Configure your vault location (required; there is no default)
 export ATOMIC_AGENTS_ROOT=~/agents
 
 # Verify everything's wired up
@@ -304,11 +304,13 @@ Every release lands as a `vX.Y.Z` git tag plus a GitHub Release with the CHANGEL
 
 ### `ATOMIC_AGENTS_ROOT`
 
-Tells the framework where to find your agent vault. **Default: `~/docs/agents`** (suitable for Obsidian-backed deployments; see [`docs/deployment/obsidian.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/deployment/obsidian.md)).
+Tells the framework where to find your agent vault. **Required: there is no default.** The framework stops with an error if it is unset (suitable for Obsidian-backed deployments; see [`docs/deployment/obsidian.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/deployment/obsidian.md)).
 
 ```bash
 export ATOMIC_AGENTS_ROOT=/path/to/your/agents
 ```
+
+If the variable is unset or empty, the CLI reads the `ATOMIC_AGENTS_ROOT` line from `~/.config/data-roots.env` (override the path with `DATA_ROOTS_ENV`). That line looks like `export ATOMIC_AGENTS_ROOT=/path/to/your/agents`. The file is read as text and never executed, only that one name is read, and an empty value counts as missing. The environment variable always wins, and `atomic-agents doctor` prints which source it used.
 
 ### API keys
 

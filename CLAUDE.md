@@ -2,11 +2,13 @@
 
 This file loads in every session for this repo. It captures the *design ethos* of the framework — what to protect as it scales, what to refuse, how to make decisions that keep the codebase coherent. Project-specific tactical rules (test commands, branch shape) sit alongside.
 
-For broader context, read these in order on a fresh session:
+For broader context, read these in order on a fresh session. The `<VAULT_ROOT>` paths below are placeholders, not real paths. Before reading them, run `. ~/.config/data-roots.env && echo "$VAULT_ROOT"` and substitute the printed value. If it prints nothing or the file is missing, stop and report that; never guess a path:
 - `docs/architecture.md` — the mental model in diagrams
-- `~/ObsidianVault/Atomic Agents/ROADMAP.md` — strategic narrative + live issue links
+- `<VAULT_ROOT>/Atomic Agents/ROADMAP.md` — strategic narrative + live issue links
 - `docs/TENSIONS.md` — architectural tensions that must survive scaling
-- `~/ObsidianVault/Atomic Agents/RESUME-NEXT-SESSION.md` — current session-state pointer
+- `<VAULT_ROOT>/Atomic Agents/RESUME-NEXT-SESSION.md` — current session-state pointer
+
+<!-- env-split: SPLIT, see PR -->
 
 ---
 
@@ -281,7 +283,7 @@ The line is action-reversibility, not user-friction-minimization. Auto mode does
 
 ### The handoff is intentional
 
-`~/ObsidianVault/Atomic Agents/RESUME-NEXT-SESSION.md` exists because the previous session wrote it. The next session that opens this repo doesn't have to reconstruct context — it has a self-contained brief pointing at the four key files (CHANGELOG, ROADMAP, the spec doc establishing the protocol pattern, the GitHub issue list filters), explaining the conventions established this session, and recommending a starting point.
+`<VAULT_ROOT>/Atomic Agents/RESUME-NEXT-SESSION.md` exists because the previous session wrote it. The next session that opens this repo doesn't have to reconstruct context — it has a self-contained brief pointing at the four key files (CHANGELOG, ROADMAP, the spec doc establishing the protocol pattern, the GitHub issue list filters), explaining the conventions established this session, and recommending a starting point.
 
 **The handoff cost is paid by the session that's leaving, not the session that's arriving.**
 
@@ -312,8 +314,8 @@ If the project ever needs to optimize differently, `docs/methodology.md` is the 
 | `docs/methodology.md` | Working-methods retrospective; the methods that produced this codebase |
 | `docs/TENSIONS.md` | Architectural tensions; protect against silent drift |
 | `docs/GOVERNANCE.md` | Solo / small-team operator guide |
-| `~/ObsidianVault/Atomic Agents/ROADMAP.md` | Strategic narrative + live backlog table |
-| `~/ObsidianVault/Atomic Agents/RESUME-NEXT-SESSION.md` | Cross-session state pointer |
+| `<VAULT_ROOT>/Atomic Agents/ROADMAP.md` | Strategic narrative + live backlog table |
+| `<VAULT_ROOT>/Atomic Agents/RESUME-NEXT-SESSION.md` | Cross-session state pointer |
 | GitHub Issues | Executable backlog |
 
 ---

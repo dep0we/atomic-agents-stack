@@ -18,8 +18,16 @@ set -euo pipefail
 
 # ── Configuration ────────────────────────────────────────────────────────
 
-# Where your agent vault lives.
-export ATOMIC_AGENTS_ROOT="${ATOMIC_AGENTS_ROOT:-$HOME/agents}"
+# Where your agent vault lives. Load per-machine folder variables first, then
+# require ATOMIC_AGENTS_ROOT (no silent default).
+if [ -f "$HOME/.config/data-roots.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "$HOME/.config/data-roots.env"
+    set +a
+fi
+: "${ATOMIC_AGENTS_ROOT:?ATOMIC_AGENTS_ROOT is not set; add export ATOMIC_AGENTS_ROOT=/path to ~/.config/data-roots.env}"
+export ATOMIC_AGENTS_ROOT
 
 # Python interpreter — or a multi-word command like "uv run" or "python3.12 -W ignore".
 # Stored as an array so word-splitting is handled safely under set -u.

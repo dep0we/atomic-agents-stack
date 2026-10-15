@@ -596,7 +596,7 @@ generated against your install paths.
 
 | Check | Catches | Typical fix |
 |---|---|---|
-| `env` | `ATOMIC_AGENTS_ROOT` (or default `~/docs/agents`) does not resolve to a directory. | `mkdir -p <path>` or `export ATOMIC_AGENTS_ROOT=<existing-dir>`. |
+| `env` | `ATOMIC_AGENTS_ROOT` is unset, or does not resolve to a directory. | `mkdir -p <path>` or `export ATOMIC_AGENTS_ROOT=<existing-dir>`. |
 | `python` | Interpreter is older than 3.11. | Re-run under a newer interpreter (e.g. `uv run --python 3.12 atomic-agents doctor`). |
 | `vault` | Required files missing from the agent folder (`persona/IDENTITY.md`, `tools.md`, `model.md`, `memory/INDEX.md`). Cascade-aware: tools/model may live at the role layer. | Copy from a sample (`cp -r docs/samples/caldwell <agent-dir>`) or create the missing file. |
 | `provider-keys` | For each provider used by `model.md` (default + fallback): no key resolvable via env, Keychain, or `~/.config/atomic_agents/keys.json`; OR the optional SDK extra (`openai`) is not installed. | Either `export ATOMIC_AGENTS_<PROVIDER>_KEY=...`, or `security add-generic-password -a $USER -s atomic-agents-<provider> -w '<key>'`, or `uv add 'atomic-agents-stack[openai]'`. |

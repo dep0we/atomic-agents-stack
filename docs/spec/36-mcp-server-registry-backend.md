@@ -912,7 +912,7 @@ The backend MUST count is 10 because the static-vs-dynamic capability distinctio
 - `CHANGELOG.md` `[Unreleased]`: arc-closer entry covering the full 5-PR series.
 - `README.md` backend protocols table: flip `MCPServerRegistryBackend` row from `Planned` to `Shipped`; flip Status block from "Eleven of twelve" to "Twelve of twelve".
 - `CLAUDE.md`: add 12th backend lock-paragraph.
-- `~/ObsidianVault/Atomic Agents/ROADMAP.md`: flip MCPServerRegistry row; append the Tier 2 backend-protocol scaling roadmap closer.
+- `<VAULT_ROOT>/Atomic Agents/ROADMAP.md`: flip MCPServerRegistry row; append the Tier 2 backend-protocol scaling roadmap closer.
 
 **Expected test count delta:** +12 to +18. Total after PR 5: approximately 3,319-3,325 tests collected (base: 3,307 post-PR-4 actual).
 

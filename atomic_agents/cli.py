@@ -49,7 +49,7 @@ from typing import Callable
 
 from .agent import AtomicAgent
 from ._cli_registry import CliCommand, discover_commands
-from ._platform import get_agents_root
+from ._platform import AgentsRootNotSetError, get_agents_root
 from .memory import get_default_memory_backend
 from .memory.backend import WritePolicy
 from .exceptions import AtomicAgentsError, VersionNotFound
@@ -2663,7 +2663,11 @@ def main(argv: list[str] | None = None) -> int:
         command_by_name[command.name] = command
 
     args = parser.parse_args(argv)
-    return command_by_name[args.cmd].dispatch(args)
+    try:
+        return command_by_name[args.cmd].dispatch(args)
+    except AgentsRootNotSetError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

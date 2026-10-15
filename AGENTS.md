@@ -40,7 +40,7 @@ CI runs the full pytest matrix (Python 3.11 and 3.12) on every PR; it does not
 run ruff. Contributors run both ruff commands locally before opening a PR.
 
 Environment variables: `ATOMIC_AGENTS_ROOT` points the runtime at a vault
-(defaults to `~/docs/agents`). Individual backend protocols read their own
+(required; no default. Set the variable, or put `export ATOMIC_AGENTS_ROOT=/path` in `~/.config/data-roots.env`, which the CLI reads as text when the variable is unset). Individual backend protocols read their own
 `ATOMIC_AGENTS_<PROTOCOL>_BACKEND` override plus a connection string where a
 database substrate applies (see the relevant `docs/spec/*.md`). No variable
 here is a secret; secrets live in `.env` (gitignored) or a configured
