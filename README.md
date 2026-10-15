@@ -310,6 +310,8 @@ Tells the framework where to find your agent vault. **Required: there is no defa
 export ATOMIC_AGENTS_ROOT=/path/to/your/agents
 ```
 
+If the variable is unset or empty, the CLI reads the `ATOMIC_AGENTS_ROOT` line from `~/.config/data-roots.env` (override the path with `DATA_ROOTS_ENV`). That line looks like `export ATOMIC_AGENTS_ROOT=/path/to/your/agents`. The file is read as text and never executed, only that one name is read, and an empty value counts as missing. The environment variable always wins, and `atomic-agents doctor` prints which source it used.
+
 ### API keys
 
 The framework looks for keys in this order:

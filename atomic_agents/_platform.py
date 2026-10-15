@@ -11,25 +11,93 @@ class AgentsRootNotSetError(RuntimeError):
     """Raised when ATOMIC_AGENTS_ROOT is missing or empty."""
 
 
-def get_agents_root() -> Path:
-    """Resolve the agents root from the ATOMIC_AGENTS_ROOT env var.
+_ROOT_VAR = "ATOMIC_AGENTS_ROOT"
+_DEFAULT_ENV_FILE = "~/.config/data-roots.env"
 
-    There is no default location. If the variable is missing or empty this
-    raises AgentsRootNotSetError naming the variable and
-    ``~/.config/data-roots.env``, rather than silently falling back to a
-    folder under HOME.
 
-    Reads ATOMIC_AGENTS_ROOT on EVERY call (not at import time) so tests that
-    monkeypatch the environment see the correct value.
+def data_roots_env_path() -> Path:
+    """Path of the data-roots env file (``DATA_ROOTS_ENV`` overrides, for tests)."""
+    return Path(os.environ.get("DATA_ROOTS_ENV") or _DEFAULT_ENV_FILE).expanduser()
+
+
+def _parse_root_line(line: str) -> str | None:
+    """Return the value if ``line`` assigns ATOMIC_AGENTS_ROOT, else None.
+
+    Accepts ``export ATOMIC_AGENTS_ROOT=value`` and ``ATOMIC_AGENTS_ROOT=value``
+    with optional single or double quotes. Text only: nothing is expanded or
+    executed (``$VAR`` and backticks stay literal).
     """
-    env_val = os.environ.get("ATOMIC_AGENTS_ROOT")
-    if not env_val:
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    if line.startswith("export") and line[6:7] in (" ", "\t"):
+        line = line[6:].lstrip()
+    name, sep, rest = line.partition("=")
+    if not sep or name.strip() != _ROOT_VAR:
+        return None
+    rest = rest.strip()
+    if rest[:1] in ("'", '"'):
+        close = rest.find(rest[0], 1)
+        return rest[1:close] if close != -1 else rest[1:]
+    # Unquoted: an inline comment starts at whitespace followed by '#'.
+    for i, ch in enumerate(rest):
+        if ch == "#" and i > 0 and rest[i - 1] in (" ", "\t"):
+            rest = rest[:i]
+            break
+    return rest.strip()
+
+
+def _read_root_from_file(path: Path) -> str | None:
+    """Read ATOMIC_AGENTS_ROOT from the env file as text. Last assignment wins."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    value: str | None = None
+    for line in text.splitlines():
+        parsed = _parse_root_line(line)
+        if parsed is not None:
+            value = parsed
+    return value or None
+
+
+def resolve_agents_root_source() -> tuple[str | None, str]:
+    """Return ``(raw_value, source)`` for the agents root.
+
+    The environment variable wins. If it is unset or empty, the data-roots env
+    file is read (text only, only ATOMIC_AGENTS_ROOT). An empty value counts as
+    missing. ``source`` is "environment" or the file path; when nothing is
+    found the value is None and ``source`` is "unset".
+    """
+    env_val = os.environ.get(_ROOT_VAR)
+    if env_val:
+        return env_val, "environment"
+    path = data_roots_env_path()
+    file_val = _read_root_from_file(path)
+    if file_val:
+        return file_val, str(path)
+    return None, "unset"
+
+
+def get_agents_root() -> Path:
+    """Resolve the agents root.
+
+    Order: the ATOMIC_AGENTS_ROOT environment variable, then the
+    ``ATOMIC_AGENTS_ROOT`` line in ``~/.config/data-roots.env`` (read as text,
+    never executed). There is no other default location; if both are missing
+    or empty this raises AgentsRootNotSetError.
+
+    Reads on EVERY call (not at import time) so tests that monkeypatch the
+    environment see the correct value.
+    """
+    value, _source = resolve_agents_root_source()
+    if not value:
         raise AgentsRootNotSetError(
-            "ATOMIC_AGENTS_ROOT is not set. Define it in ~/.config/data-roots.env and "
-            "make your shell load that file (add 'set -a; . ~/.config/data-roots.env; "
-            "set +a' to ~/.zshenv), or export the variable directly."
+            "ATOMIC_AGENTS_ROOT is not set. Define it in ~/.config/data-roots.env "
+            "as 'export ATOMIC_AGENTS_ROOT=/path/to/agents' (the CLI reads that "
+            "line itself), or export the variable in your shell."
         )
-    return Path(env_val).expanduser().resolve()
+    return Path(value).expanduser().resolve()
 
 
 def get_agent_root(agent_name: str, agents_root: Path | None = None) -> Path:

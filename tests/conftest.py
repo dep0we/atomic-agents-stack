@@ -30,3 +30,7 @@ def _agents_root_env(monkeypatch, tmp_path_factory):
     monkeypatch.setenv(
         "ATOMIC_AGENTS_ROOT", str(tmp_path_factory.mktemp("agents_root"))
     )
+    # Never read the real ~/.config/data-roots.env during tests.
+    monkeypatch.setenv(
+        "DATA_ROOTS_ENV", str(tmp_path_factory.mktemp("noenv") / "absent.env")
+    )

@@ -26,7 +26,7 @@ if [ -f "$HOME/.config/data-roots.env" ]; then
     . "$HOME/.config/data-roots.env"
     set +a
 fi
-: "${ATOMIC_AGENTS_ROOT:?ATOMIC_AGENTS_ROOT is not set; define it in ~/.config/data-roots.env}"
+: "${ATOMIC_AGENTS_ROOT:?ATOMIC_AGENTS_ROOT is not set; add export ATOMIC_AGENTS_ROOT=/path to ~/.config/data-roots.env}"
 export ATOMIC_AGENTS_ROOT
 
 # Python interpreter — or a multi-word command like "uv run" or "python3.12 -W ignore".
