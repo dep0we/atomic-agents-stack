@@ -215,17 +215,18 @@ class StaleNoteRecurring(PatternDetector):
 
     def detect(self, ctx):
         findings = []
-        # Use backend.list_stale() when available (P2.6 migration), fall back to
-        # manual ctx.memory_notes scan for backward compat in tests.
+        # Age is measured from ctx.today, not the wall clock, so a run with a
+        # fixed `today` (tests, backfills) gets a stable answer. That is why
+        # this filters list_notes() itself instead of calling list_stale(),
+        # which measures from date.today().
         backend = getattr(ctx, "memory_backend", None)
         if backend is not None:
-            stale_refs = backend.list_stale(
-                threshold_days=self.stale_threshold_days, exclude_pinned=True
-            )
-            for ref in stale_refs:
-                if ref.last_seen is None:
+            for ref in backend.list_notes():
+                if ref.pinned or ref.last_seen is None:
                     continue
                 age_days = (ctx.today - ref.last_seen).days
+                if age_days <= self.stale_threshold_days:
+                    continue
                 findings.append(PatternFinding(
                     detector_id=f"{self.detector_id}_{ref.name}",
                     severity="medium",
