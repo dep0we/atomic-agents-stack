@@ -141,7 +141,7 @@ Spec lock cadence: spec gets locked when the implementation matches and tests pa
 
 ### 11. Adversarial review in rounds, not passes
 
-For any non-trivial PR — especially backend protocols, framework refactors, anything touching `agent.call()`, `_capture.py`, `_costs.py`, `_locks.py`, the protocol surfaces, AND even docs-only PRs — run **2-5 Opus adversarial rounds pre-merge**, not one thorough pass. **Which models review is set in `.gstack/arc.config.jsonc`, not here.** That file is what the loop actually executes, so it is the authority; this section describes the practice, never the roster. Read `crossFamily` there for the current answer. The full reviewer-roster rationale is in `docs/methodology.md` §"Reviewer roster — what the project actually does".
+For any non-trivial PR — especially backend protocols, framework refactors, anything touching `agent.call()`, `_capture.py`, `_costs.py`, `_locks.py`, the protocol surfaces, AND even docs-only PRs — run **2-5 Opus adversarial rounds pre-merge**, not one thorough pass. **Which models review is set in `docs/methodology.md`, not here.** This section describes the practice, never the roster. The full reviewer-roster rationale is in `docs/methodology.md` §"Reviewer roster — what the project actually does".
 
 The non-obvious property: **each round catches different things.** Not because the reviewer "tries harder" the second time. Because each fix changes the diff and exposes new edges. Recent track record: PR #75 (`doctor`) — 3 rounds, 9 P2 findings closed. PR #76 (SemVer policy) — 5 rounds, 11 P2 findings closed. Round 5 of #76 was the only round that flagged the `No migrations needed` claim — earlier rounds had cleared the diff that contained it. **PR #206 (#64 PR 4, docs-only) — 2 rounds, 11 findings + 1 new successor issue (#207). Round 2 caught a count-drift the round-1 fix commit itself introduced.** Rounds-not-passes holds even when the diff has no code.
 
@@ -210,7 +210,7 @@ ROADMAP.md is the strategic narrative; Linear issues are the executable backlog.
 
 Default workflow: feature branch → PR → adversarial review (Opus subagent, in rounds per rule 11) → self-review → merge. **Never push to main directly.** This applies even on solo work — the PR body is the audit trail and CI runs there.
 
-The `/ship` skill handles the full pipeline (branch, test, CHANGELOG, VERSION bump, PR). Use it.
+Release procedure for every PR (the full version is `docs/deployment/release-runbook.md`): branch from `origin/main`; run `uv run pytest` with CI's extras; review the diff against `.claude/skills/review/checklist.md`; run adversarial review rounds; update `## [Unreleased]` in `CHANGELOG.md` (a release cut also promotes it to a dated section and bumps `pyproject.toml` and `atomic_agents/__init__.py`); sync the docs by hand using the manual surface check; commit, push, and open a PR titled `v<version> <type>: <summary>`.
 
 ### Tests
 
@@ -235,13 +235,21 @@ Every release: `vX.Y.Z` git tag + GitHub Release with CHANGELOG entry verbatim. 
 
 These are the methods that have produced this codebase's quality (7 published tags through v1.0.0, ~160 merged PRs, ~3.3k tests, no production rollback events). Captured here to survive the session that produced them. Full retrospective in `docs/methodology.md`.
 
-### Always run `/ship` end-to-end — never bypass
+### Always follow the release procedure — never bypass
 
-**Every push goes through the `/ship` skill.** Not "merge directly," not "push and PR manually," not "I'll just bump the version this once." `/ship` is an 18-step pipeline that handles branch, tests, CHANGELOG, VERSION, commit, push, PR — and **Step 18 runs `/document-release` as a subagent** to keep the README's "What's shipped" table, package metadata, and surface docs in sync with what actually shipped.
+**Every push follows the release procedure** in `docs/deployment/release-runbook.md`. Not "merge directly," not "push and PR manually," not "I'll just bump the version this once." The steps, in order:
 
-This matters because **bypassing `/ship` once causes drift that's caught only by accident later.** The v0.10.0 release was cut without `/ship` — the README's "What's shipped" table drifted and was caught only because the maintainer noticed. Workflows are correct when run end-to-end; manual shortcuts lose the consistency check.
+1. Branch from `origin/main` and update the branch from it.
+2. Run `uv run pytest` with CI's extras (and `uv run ruff check` on your diff, advisory) (`uv sync --extra dev --extra openai --extra validation --extra redis --extra http --extra postgres --extra pgvector`).
+3. Audit test coverage against the diff.
+4. Review the diff against `.claude/skills/review/checklist.md`.
+5. Run adversarial review in rounds until a round finds nothing.
+6. Choose the version: PR-level update (no bump) or release cut (new SemVer string in `pyproject.toml` and `atomic_agents/__init__.py`).
+7. Update `CHANGELOG.md`: bullets under `## [Unreleased]`, or promote it to a dated section on a release cut.
+8. Sync the documentation by hand with the "Operator manual surface check before merge" in the runbook (README "What's shipped" table, package metadata, test and spec counts).
+9. Commit, push, and open a PR titled `v<version> <type>: <summary>`. The maintainer merges.
 
-Treat the 18 steps as load-bearing. If a step is wrong, fix `/ship`, don't skip it.
+This matters because **skipping a step causes drift that's caught only by accident later.** The v0.10.0 release was cut without the documentation sync, and the README's "What's shipped" table drifted and was caught only because the maintainer noticed. If a step is wrong for this project, fix the runbook, don't skip the step.
 
 ### Bisectable commits, not save-points
 
@@ -310,7 +318,7 @@ If the project ever needs to optimize differently, `docs/methodology.md` is the 
 | `docs/spec/01-...57-agent-detail.md` | Locked spec (56 docs today, 44 locked + 12 DRAFTs/RFCs at spec/26 (cascade bundle), spec/30 (responsibility audit), spec/37 (serve), spec/39 (otel-export), spec/49 (deploy), spec/51 (agent-registry-backend), spec/52 (fleet-console), spec/53 (fleet-console-scoring), spec/54 (fleet-console-recommendations), spec/55 (fleet-management-cli), spec/56 (fleet-monitor), and spec/57 (agent-detail)). The product. |
 | `docs/implementation/` | Build guides per runtime (cron, Claude skill, dashboard) |
 | `docs/deployment/versioning.md`, `upgrading.md` | SemVer + operator runbook |
-| `docs/deployment/release-runbook.md` | Maintainer `/ship` runbook: two-mode workflow + manual surface check |
+| `docs/deployment/release-runbook.md` | Maintainer release runbook: two-mode workflow, release procedure, manual surface check |
 | `docs/methodology.md` | Working-methods retrospective; the methods that produced this codebase |
 | `docs/TENSIONS.md` | Architectural tensions; protect against silent drift |
 | `docs/GOVERNANCE.md` | Solo / small-team operator guide |

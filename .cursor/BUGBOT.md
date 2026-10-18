@@ -43,7 +43,7 @@ Flag any new LLM call path with no guardrail. Flag a gate moved to *after* a sub
 - **Long procedural functions in the pipeline modules** (`dream.py`, `eval.py`, `tuning.py`) mirror a documented staged flow. Do not suggest decomposing them for style alone.
 - **Duplicate-looking cost gates.** `call()`, helper batches, delegation, and the long-running pipelines each have their own gate rather than one shared one. That is deliberate: every path that spends must refuse independently.
 - **Markdown as config.** Do not suggest migrating operator-facing config to YAML or TOML.
-- **`.claude/` and `.gstack/`** are committed development tooling, not application code.
+- **`.claude/`** is committed development tooling, not application code.
 - **The large test count and its fixtures.** The conformance suite is the product's guarantee, not bloat.
 
 ## House style

@@ -138,8 +138,8 @@ spell out the API surface that is then frozen behind Major.
 ## Per-PR expectations
 
 Every PR that lands on `main` adds at least one bullet to `[Unreleased]`
-under the appropriate section heading. The `/ship` skill does this
-automatically; manual PRs are responsible for the same.
+under the appropriate section heading. The release procedure in
+[`release-runbook.md`](release-runbook.md) (step 7) covers this.
 
 If a PR's diff would force operators to do work to upgrade, the PR title
 starts with `feat!:` (or `refactor!:`, `fix!:`) per Conventional

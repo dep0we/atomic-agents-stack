@@ -279,7 +279,7 @@ Nine operator runbooks under `docs/deployment/` cover the common deployment path
 - [`docs/deployment/serve.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/deployment/serve.md): deploying agents over HTTP with `atomic-agents serve`: Cloud Run / GKE / Fly.io / Render, identity-header pass-through, no-auth default, healthz/doctor probes
 - [`docs/deployment/versioning.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/deployment/versioning.md): SemVer policy; what counts as Major / Minor / Patch
 - [`docs/deployment/upgrading.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/deployment/upgrading.md): operator upgrade runbook + migration runner usage
-- [`docs/deployment/release-runbook.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/deployment/release-runbook.md): maintainer-facing `/ship` runbook: two-mode workflow (PR-level vs. release cut), local gstack patch, operator manual surface check
+- [`docs/deployment/release-runbook.md`](https://github.com/dep0we/atomic-agents-stack/blob/main/docs/deployment/release-runbook.md): maintainer-facing release runbook: two-mode workflow (PR-level vs. release cut), the explicit release procedure, operator manual surface check
 
 ---
 
