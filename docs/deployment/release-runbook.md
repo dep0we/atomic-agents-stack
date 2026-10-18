@@ -1,165 +1,100 @@
 # Release runbook — atomic-agents-stack
 
-This runbook is the operator-facing companion to [`versioning.md`](versioning.md). Where `versioning.md` defines *what* a release is (SemVer bump levels, the CHANGELOG-is-source-of-truth convention, the GitHub Release prose contract), this runbook describes *how* to actually run one through the `/ship` skill end-to-end on this project — including the project-specific adaptations that `/ship`'s gstack defaults don't cover.
+This runbook is the operator-facing companion to [`versioning.md`](versioning.md). Where `versioning.md` defines *what* a release is (SemVer bump levels, the CHANGELOG-is-source-of-truth convention, the GitHub Release prose contract), this runbook describes *how* to run one: the explicit steps every PR goes through, from branch to PR, plus the manual surface check before merge.
 
-It's the answer to issue [#155](https://github.com/dep0we/atomic-agents-stack/issues/155): "make `/ship` run end-to-end on this project without hard-failure steps, and document the manual sync responsibility for surfaces the bundled `/document-release` subagent misses."
+The steps below are the whole release procedure: tests, review, CHANGELOG, version, documentation sync, commit, push, PR. Run them by hand, in order, on every PR. They replace the retired `/ship` skill, which no longer exists in this setup.
 
 ---
 
 ## The two-mode workflow
 
-This project ships **two kinds of `/ship` invocations**, and the operator chooses which mode at Step 12 when `/ship` asks:
+This project ships **two kinds of PRs**, and the operator chooses the mode at step 6 of the procedure below:
 
-| Mode | When | Step 12 behavior | Step 13 (CHANGELOG) behavior |
-|------|------|------------------|------------------------------|
-| **PR-level update** | Default for ordinary feature / fix / refactor PRs that will be folded into a future release. | No version bump. `NEW_VERSION` is set to the *current* released version from the latest dated CHANGELOG header. | Bullets append to `## [Unreleased]`. The header is **not** promoted to a dated section. |
-| **Release cut** | When promoting accumulated `[Unreleased]` work into a tagged release. | Operator provides the new 3-digit SemVer string (validated `> CHANGELOG_VERSION`). | `## [Unreleased]` is promoted to `## [<new-version>] - <today>`. A fresh empty `## [Unreleased]` is left above it for the next cycle. |
+| Mode | When | Version (step 6) | CHANGELOG (step 7) |
+|------|------|------------------|--------------------|
+| **PR-level update** | Default for ordinary feature / fix / refactor PRs that will be folded into a future release. | No version bump. The version stays at the current released version from the latest dated CHANGELOG header. | Bullets append to `## [Unreleased]`. The header is **not** promoted to a dated section. |
+| **Release cut** | When promoting accumulated `[Unreleased]` work into a tagged release. | The operator picks the new 3-digit SemVer string, which must be greater than the latest dated CHANGELOG version. | `## [Unreleased]` is promoted to `## [<new-version>] - <today>`. A fresh empty `## [Unreleased]` is left above it for the next cycle. |
 
-This is the divergence from gstack's default model (in which every PR is its own dated release). The project follows the "accumulate then promote" CHANGELOG convention codified in [`versioning.md`](versioning.md) §"How a release happens". `/ship` supports both modes; the operator picks.
-
----
-
-## Prerequisite: the local gstack `/ship` patch
-
-`/ship` is a gstack-vendored skill at `~/.claude/skills/gstack/ship/`. The upstream skill assumes every project ships with a 4-digit `VERSION` file at the repo root. This project does not — versioning lives in CHANGELOG + git tags per `versioning.md`. Without an adaptation, `/ship` Step 9 hard-fails on the missing project-local review checklist, and Step 12 hard-fails on the missing `VERSION` file.
-
-**The adaptation lives on a local feature branch in the gstack clone**, not on the gstack `main` branch (and not yet upstreamed):
-
-- **Repo**: `~/.claude/skills/gstack/`
-- **Branch**: `fix/ship-no-version-fallback` (from `main`, with one commit on top)
-- **Patch summary**:
-  - Step 9: when `.claude/skills/review/checklist.md` is missing, falls back to a built-in default checklist + warning. An unreadable-but-present file still STOPs.
-  - Step 12: a `NO_VERSION_FILE` probe runs before the state machine. Projects without a `VERSION` file skip the bump-and-validate logic, derive the current version from the latest dated CHANGELOG header, and ask the operator to choose PR-level update vs. release cut.
-
-**To confirm the patch is active** before running `/ship`:
-
-```bash
-git -C ~/.claude/skills/gstack branch --show-current
-# Expected: fix/ship-no-version-fallback
-```
-
-If `main` is checked out instead, switch back:
-
-```bash
-git -C ~/.claude/skills/gstack checkout fix/ship-no-version-fallback
-```
-
-### Reapply procedure after `gstack-upgrade`
-
-`gstack-upgrade` (or any `cd ~/.claude/skills/gstack && git fetch origin && git reset --hard origin/main`) will discard the local branch's changes from `main`'s checkout. Reapply by either:
-
-1. **Cherry-pick the patch commit onto the new `main`** (preferred if upstream `main` has moved):
-
-   ```bash
-   cd ~/.claude/skills/gstack
-   git fetch origin
-   git checkout main && git pull
-   git checkout fix/ship-no-version-fallback
-   git rebase main
-   bun run scripts/gen-skill-docs.ts --host all
-   bun test test/skill-validation.test.ts test/gen-skill-docs.test.ts
-   ```
-
-2. **Re-create the patch from scratch** if the rebase has conflicts that aren't worth resolving:
-
-   The patch only touches `ship/SKILL.md.tmpl` Step 9 (one paragraph + one bullet list) and Step 12 (one `NO_VERSION_FILE` probe + the dispatch prose). See the commit message on the patch itself for the design rationale.
-
-The patch is filed for upstream consideration as a design discussion at `garrytan/gstack` — when (if) it lands upstream, drop the local branch and use `main`.
-
-### Cross-project impact
-
-The patch is strictly additive — both probes are guarded by "absent file" conditions:
-
-- Step 9 fallback fires only when `.claude/skills/review/checklist.md` does not exist.
-- Step 12 `NO_VERSION_FILE` path fires only when `VERSION` does not exist.
-
-Other Dan projects (Meridian, Highland, DPIC, Bishop) that ship with `VERSION` files and project-local review checklists are unaffected.
+The project follows the "accumulate then promote" CHANGELOG convention codified in [`versioning.md`](versioning.md) §"How a release happens". There is no `VERSION` file at the repo root: versioning lives in the CHANGELOG, `pyproject.toml`, `atomic_agents/__init__.py` and git tags.
 
 ---
 
-## `/ship` end-to-end on this project
+## The release procedure
 
-Once the gstack patch is in place and `.claude/skills/review/checklist.md` exists in this repo (it does, as of issue #155), `/ship` runs cleanly end-to-end. Step-by-step notes for what's specific to this project:
+Run these steps in order on every PR. The notes under each step are specific to this repo.
 
-### Step 1 — Pre-flight
+### 1. Branch and update
 
-Plan / eng-review / design-review skill outputs in `~/.gstack-dev/skills/...` are checked. This project doesn't typically use those skills for backend / Protocol work; missing plan-review output is expected and `/ship` proceeds without it.
+Work on a feature branch cut from `origin/main`. Before the checks below, merge `origin/main` into the branch (or rebase) so the tests run against current code. No merge conflicts are expected on clean feature branches.
 
-### Step 3 — Merge base branch
+### 2. Run lint and tests
 
-`origin/main`. No merge conflicts expected on clean feature branches.
+```bash
+uv sync --extra dev --extra openai --extra validation --extra redis --extra http --extra postgres --extra pgvector
+uv run ruff check
+uv run pytest
+```
 
-### Step 5 — Run tests
+These are the extras CI installs (`.github/workflows/test.yml`). `ruff check` is advisory: CI does not run it and the tree carries existing findings, so judge only the lines your diff touches. The full suite must pass on Python 3.11 and 3.12. Run `uv run pytest --collect-only -q | tail -1` for the live test count when a doc claims one.
 
-`uv run pytest`. 928+ tests on Python 3.11/3.12. All must pass.
+### 3. Test coverage audit
 
-### Step 7 — Test Coverage Audit
+Read the diff and name each new code path with no test. New backend Protocols add about 25 conformance tests and about 10 impl-specific tests as a matter of policy, so coverage gaps tend to surface naturally.
 
-Coverage audit runs against the diff. New backend Protocols add ~25 conformance tests + ~10 impl-specific tests as a matter of policy — coverage gaps tend to surface naturally.
+### 4. Pre-landing review
 
-### Step 9 — Pre-Landing Review
+Review the diff against `.claude/skills/review/checklist.md`, the project-local checklist. It is two-pass: Pass 1 critical (Backend Protocol Invariants, Cost Gate Placement, Audit Trail Shape, Atomic Write Discipline, LLM Output Trust, Schema/API Break Detection), Pass 2 informational. Anticipated false-positive patterns to watch for (hints, not verified knowledge):
 
-Reads `.claude/skills/review/checklist.md` (project-local, project-shaped). Two-pass: Pass 1 critical (Backend Protocol Invariants, Cost Gate Placement, Audit Trail Shape, Atomic Write Discipline, LLM Output Trust, Schema/API Break Detection), Pass 2 informational. See the checklist for the full rubric.
+- A maintainability reviewer may flag `@dataclass(frozen=True)` + `Protocol` shapes against an OO-inheritance default. These are the intentional design pattern for backend protocols (see `CLAUDE.md` §"Protocols, not subclassing"). Verify by reading the spec doc cited in the diff before accepting the finding.
+- A testing reviewer may flag missing pytest fixtures for parameterized conformance suites. The project's conformance shape is `pytest.mark.parametrize("backend", [...])` with a `make_backend` factory per impl (see `tests/test_memory_backend_conformance.py`). Verify before accepting any "use shared fixtures" recommendation.
+- A security reviewer may flag `_io.atomic_write` as an unusual file-write pattern. It is the project's standard atomic-write idiom. Verify against `atomic_agents/_io.py` before accepting.
 
-### Step 9.1 — Review Army (specialists)
+When a false positive lands in a real review, append the pattern here (what was flagged, why it was wrong).
 
-`/ship` dispatches specialist subagents from `~/.claude/skills/gstack/review/specialists/`. Most are framework-agnostic and apply cleanly. Specialist false-positive patterns specific to this project will be captured here as they appear in real `/ship` runs — for now, the list is empty pending empirical observation. **Anticipated** patterns to watch for (speculative, treat as hints not knowledge):
+### 5. Adversarial review in rounds
 
-- The maintainability specialist may flag `@dataclass(frozen=True)` + `Protocol` shapes against an OO-inheritance default. These are the intentional design pattern for backend protocols (see `CLAUDE.md` §"Protocols, not subclassing") — verify by reading the spec doc cited in the diff before accepting the finding.
-- The testing specialist may flag missing pytest fixtures for parameterized conformance suites. The project's conformance shape is `pytest.mark.parametrize("backend", [...])` with a `make_backend` factory per impl (see `tests/test_memory_backend_conformance.py`) — verify before accepting any "use shared fixtures" recommendation.
-- The security specialist may flag `_io.atomic_write` as an unusual file-write pattern. It's the project's standard atomic-write idiom — verify against `atomic_agents/_io.py` before accepting.
+Run the adversarial review in rounds until a round finds nothing, per [`docs/methodology.md`](../methodology.md) §"Reviewer roster". **Codex is rate-limited** (as of 2026-05-13), so the documented reviewers are:
 
-When a specialist false-positive does land in a real `/ship` run, capture the pattern (specialist name, what it flagged, why the finding was wrong) and append it here. Over time this section moves from anticipated → empirical.
+1. **Opus subagent** with the verify-against-code prompt (same-family).
+2. **`atomic-agents review --backend kimi`** (cross-family via Moonshot). Key in macOS Keychain at `atomic-agents-moonshot`; the international `.ai` endpoint requires `MOONSHOT_BASE_URL=https://api.moonshot.ai/v1` in env. Kimi K2.x thinking models have stronger reviewer signal, but their output lives in a `reasoning_content` field not yet extracted by the LLM backend ([#146](https://github.com/dep0we/atomic-agents-stack/issues/146)). Until that issue closes, expect an Opus subagent plus non-thinking Moonshot rather than two fully independent rounds.
 
-### Step 11 — Codex adversarial review
+### 6. Choose the version
 
-**Codex is rate-limited** (as of 2026-05-13). Per [`docs/methodology.md`](../methodology.md) §"Reviewer roster", the documented fallbacks are:
+Pick the mode from the two-mode table: PR-level update (default for feature and fix PRs) or release cut (a new SemVer string). For a release cut, derive the new version per [`versioning.md`](versioning.md) §"What counts as Major / Minor / Patch":
 
-1. **Opus subagent** with the verify-against-code prompt — same-family fallback.
-2. **`atomic-agents review --backend kimi`** — cross-family fallback via Moonshot. Key in macOS Keychain at `atomic-agents-moonshot`; international `.ai` endpoint requires `MOONSHOT_BASE_URL=https://api.moonshot.ai/v1` in env. Note: Kimi K2.x thinking models have stronger reviewer signal, but their output lives in a `reasoning_content` field not yet extracted by the LLM backend ([#146](https://github.com/dep0we/atomic-agents-stack/issues/146)) — until that issue closes, expect Opus subagent + non-thinking Moonshot rather than two fully-independent rounds.
-
-`/ship` falls back automatically when `codex` exits with rate-limit error codes; the operator just sees "Codex unavailable — running Opus subagent fallback" in the output.
-
-### Step 12 — Version bump
-
-Probes for the absence of a `VERSION` file (this project), enters `NO_VERSION_FILE` mode, and asks the operator: A) PR-level update (default for feature/fix PRs) or B) release cut (provide new SemVer string).
-
-For a release cut, derive the new version per [`versioning.md`](versioning.md) §"What counts as Major / Minor / Patch":
-
-- **Major / breaking** (pre-1.0: still bumps Minor with `### BREAKING` callout): schema break, framework API break, default backend change.
+- **Major / breaking** (pre-1.0: still bumps Minor with a `### BREAKING` callout): schema break, framework API break, default backend change.
 - **Minor**: new feature, new spec doc, new backend, new CLI subcommand.
 - **Patch**: bug fix, doc, test, internal refactor with no observable change.
 
-### Step 13 — CHANGELOG handling
+A release cut also bumps `pyproject.toml` and `atomic_agents/__init__.py` (`__version__`) to the same string.
 
-Mode-dependent (see "two-mode workflow" table above). The PR-level mode appends bullets to `## [Unreleased]` only. The release-cut mode promotes `## [Unreleased]` to `## [<new-version>] - <today>` and leaves a fresh empty `## [Unreleased]` above it.
+### 7. Update the CHANGELOG
 
-When the diff has **no user-facing change** (CHANGELOG bullets only, branch resync, version-bump housekeeping), the honest entry is one sentence — never pad with aspirational claims. See [`versioning.md`](versioning.md) and `CLAUDE.md` §"CHANGELOG is the single source of truth".
+PR-level mode appends bullets to `## [Unreleased]` only. Release-cut mode promotes `## [Unreleased]` to `## [<new-version>] - <today>` and leaves a fresh empty `## [Unreleased]` above it.
 
-### Step 18 — Documentation sync (via subagent)
+When the diff has **no user-facing change** (CHANGELOG bullets only, branch resync, version-bump housekeeping), the honest entry is one sentence. Never pad with aspirational claims. See [`versioning.md`](versioning.md) and `CLAUDE.md` §"CHANGELOG is the single source of truth".
 
-Dispatches `/document-release` as a subagent with a fresh context window. The subagent runs `find . -maxdepth 2 -name "*.md"` and applies named per-file checklists for `README.md`, `ARCHITECTURE.md`, `CONTRIBUTING.md`, `CLAUDE.md`; other top-two-level markdown files get a generic "determine purpose and audience" pass.
+### 8. Sync the documentation by hand
 
-What the subagent **does not** reach (verified against `~/.claude/skills/gstack/document-release/SKILL.md`):
+Walk the "Operator manual surface check before merge" section below. No tool does this for you: the surfaces most likely to drift are exactly the ones a generic markdown sweep misses.
 
-- `atomic_agents/__init__.py` — Python, not markdown. The `__version__` + `__all__` claims here are this project's job.
-- `pyproject.toml` — TOML, not markdown.
-- `docs/spec/*.md` — depth 3 under repo root (`./docs/spec/...`), past `-maxdepth 2`.
-- `docs/architecture.md` — depth 2 (reachable) but the subagent's heuristics for `architecture.md` look in the repo root; the `docs/`-prefixed version may get the generic pass instead of the named pattern. Treat it as "the operator's job" rather than relying on subagent coverage.
+- `atomic_agents/__init__.py`: Python, not markdown. The `__version__` and `__all__` claims are the operator's job.
+- `pyproject.toml`: the `version` string.
+- `docs/spec/*.md`: spec counts and cross-references.
+- `docs/architecture.md`: count claims (backends shipped, layers).
+- `README.md` and `CLAUDE.md`: version, test count, shipped-protocol list.
 
-The Operator Manual Surface Check below covers each of these explicitly.
+### 9. Commit, push, open the PR
 
-### Step 19 — Create PR
-
-PR title format: `v<NEW_VERSION> <type>: <summary>`. In PR-level mode, `NEW_VERSION` is the current release version (operator may edit if the title would be misleading). In release-cut mode, it's the new release version.
+Split non-trivial work into bisectable commits. Push the branch and open a PR. Title format: `v<NEW_VERSION> <type>: <summary>`. In PR-level mode, `NEW_VERSION` is the current release version (edit it if the title would be misleading). In release-cut mode, it is the new release version. The body carries a Test Coverage section, a Pre-Landing Review section, a Documentation section, and a "Filed-inline follow-ups" section. Never push to `main` and never merge: the maintainer merges.
 
 ---
 
 ## Operator manual surface check before merge
 
-**This is the load-bearing section.** The bundled `/document-release` subagent catches generic drift but does not know about this project's specific surfaces. The manual check below covers what would otherwise slip through. Historical reason: the v0.10.0 release shipped without `/ship`, the README's "What's shipped" table drifted, and the maintainer caught it only by accident. The same shape recurred during the v0.13.0 cut, where the `/document-release` subagent surfaced 21 doc-sync gaps total — 6 critical (version label off by two minors, `__all__` missing the new Protocol surface, related count claims stale), 6 polish-tier filed as [#156](https://github.com/dep0we/atomic-agents-stack/issues/156), and 9 already-in-sync. The numbers are documented verbatim in PR [#157](https://github.com/dep0we/atomic-agents-stack/pull/157)'s body. Don't replicate that.
+**This is the load-bearing section.** A generic markdown sweep catches generic drift but does not know about this project's specific surfaces. The manual check below covers what would otherwise slip through. Historical reason: the v0.10.0 release was cut without a documentation sync, the README's "What's shipped" table drifted, and the maintainer caught it only by accident. The same shape recurred during the v0.13.0 cut, where a documentation-sync pass surfaced 21 doc-sync gaps total — 6 critical (version label off by two minors, `__all__` missing the new Protocol surface, related count claims stale), 6 polish-tier filed as [#156](https://github.com/dep0we/atomic-agents-stack/issues/156), and 9 already-in-sync. The numbers are documented verbatim in PR [#157](https://github.com/dep0we/atomic-agents-stack/pull/157)'s body. Don't replicate that.
 
-Before merging any `/ship`-produced PR, verify these surfaces match what shipped:
+Before merging any PR, verify these surfaces match what shipped:
 
 ### Version + public surface (CRITICAL — catches "wrong version" drift)
 
@@ -194,7 +129,7 @@ Before merging any `/ship`-produced PR, verify these surfaces match what shipped
 
 ### Cross-cutting
 
-- [ ] PR body's Test Coverage section, Pre-Landing Review section, and Documentation section accurately summarize what `/ship` ran and found.
+- [ ] PR body's Test Coverage section, Pre-Landing Review section, and Documentation section accurately summarize what the procedure ran and found.
 - [ ] No new file accidentally committed (compiled binaries, `.DS_Store`, `__pycache__/`, etc.).
 - [ ] Filed-inline follow-up issues from this session are linked in the PR body's "Filed-inline follow-ups" section.
 
@@ -294,13 +229,9 @@ For PR-level merges: no post-merge ceremony. `[Unreleased]` continues accumulati
 
 ---
 
-## When `/ship` itself has friction
+## When the procedure has friction
 
-Per [`feedback_always_ship.md`](../../.claude/projects/-Users-dep0we/memory/feedback_always_ship.md) (Dan's user-level memory):
-
-> If `/ship` has hard friction in this project: file an inline issue + an inline `gstack-config` fix or escalation, but still complete the workflow through the skill, not around it.
-
-The friction-points that caused the issue #155 work are addressed. Anything new — file as an issue against this repo (`[tooling] /ship friction: ...`) and, if needed, on the gstack branch. Do not bypass `/ship`.
+If a step is wrong for this project, file an issue against this repo (`[tooling] release procedure friction: ...`) and fix the step in this runbook. Do not skip it silently.
 
 ---
 
@@ -309,15 +240,14 @@ The friction-points that caused the issue #155 work are addressed. Anything new 
 - [`versioning.md`](versioning.md) — what counts as Major/Minor/Patch + the GitHub Release prose contract
 - [`upgrading.md`](upgrading.md) — operator-facing runbook for applying a release on a running host
 - [`../methodology.md`](../methodology.md) — working-methods retrospective (reviewer roster, codex-rounds-not-passes, verify-before-claim)
-- [`../../CLAUDE.md`](../../CLAUDE.md) §"Always run `/ship` end-to-end — never bypass" + §"Working methods"
-- [`../../.claude/skills/review/checklist.md`](../../.claude/skills/review/checklist.md) — project-local Pre-Landing Review checklist (Step 9 input)
+- [`../../CLAUDE.md`](../../CLAUDE.md) §"Always follow the release procedure" + §"Working methods"
+- [`../../.claude/skills/review/checklist.md`](../../.claude/skills/review/checklist.md) — project-local Pre-Landing Review checklist (step 4 input)
 - Issue [#155](https://github.com/dep0we/atomic-agents-stack/issues/155) — the forcing function for this runbook
 
 ### Maintainer-only paths (single-operator project today)
 
-Two paths referenced earlier in this runbook live on the maintainer's machine, not in this repo, and external readers should treat them as conceptual hints rather than literal paths to follow:
+One path referenced in this runbook lives on the maintainer's machine, not in this repo, and external readers should treat it as a conceptual hint rather than a literal path to follow:
 
-- `~/.claude/projects/-Users-dep0we/memory/feedback_always_ship.md` — Dan's user-level Claude Code memory file enforcing the "every PR through `/ship`" discipline. External readers should treat it as "the maintainer keeps a long-lived workflow-discipline memory enforcing this rule."
 - `<VAULT_ROOT>/Atomic Agents/RESUME-NEXT-SESSION.md` — the cross-session brief the maintainer writes at the end of each working session. External readers should treat it as "the maintainer keeps a per-session handoff brief."
 
-When the project grows beyond a single maintainer, these references will either move to in-repo equivalents (e.g., a `CONTRIBUTING.md` section, or `docs/maintainer-handoff.md`) or be dropped. Pre-1.0 with a single contributor, the personal-machine refs are honest about the current shape.
+When the project grows beyond a single maintainer, this reference will either move to in-repo equivalents (e.g., a `CONTRIBUTING.md` section, or `docs/maintainer-handoff.md`) or be dropped. Pre-1.0 with a single contributor, the personal-machine ref is honest about the current shape.
