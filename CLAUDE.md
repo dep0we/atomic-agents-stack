@@ -2,11 +2,11 @@
 
 This file loads in every session for this repo. It captures the *design ethos* of the framework — what to protect as it scales, what to refuse, how to make decisions that keep the codebase coherent. Project-specific tactical rules (test commands, branch shape) sit alongside.
 
-For broader context, read these in order on a fresh session. The `<VAULT_ROOT>` paths below are placeholders, not real paths. Before reading them, run `. ~/.config/data-roots.env && echo "$VAULT_ROOT"` and substitute the printed value. If it prints nothing or the file is missing, stop and report that; never guess a path:
+For broader context, read these in order on a fresh session. The two Dropbox items below are not synced to every machine; if one is missing, say so and carry on:
 - `docs/architecture.md` — the mental model in diagrams
-- `<VAULT_ROOT>/Atomic Agents/ROADMAP.md` — strategic narrative + live issue links
+- `ROADMAP.md` in the repo root, and the Lab folder in Dropbox (`atomic-agents/ROADMAP.md`): strategic narrative + live issue links
 - `docs/TENSIONS.md` — architectural tensions that must survive scaling
-- `<VAULT_ROOT>/Atomic Agents/RESUME-NEXT-SESSION.md` — current session-state pointer
+- `atomic-agents/RESUME-NEXT-SESSION.md` in the Archive folder in Dropbox: session-state pointer (archived)
 
 <!-- env-split: SPLIT, see PR -->
 
@@ -200,11 +200,11 @@ When a change makes one of these worse, push back on it — even if it adds a fe
 
 ### Issues + backlog
 
-All work tracked in **GitHub Issues at dep0we/atomic-agents-stack**. Title prefixes: `[backend]`, `[deployment]`, `[polish]`, `[v0.X]`. Labels: `enhancement`, `documentation`, `infrastructure`, `polish`, `backend`, `deployment`, `spec`, `bug`. **Don't track atomic-agents work in Todoist.**
+Work is tracked in Linear, not GitHub Issues. Code and development work for this repo goes on the Dark Factory team. Title prefixes: `[backend]`, `[deployment]`, `[polish]`, `[v0.X]`.
 
 When scope creep / follow-up / future enhancement appears mid-task, **file the issue inline as part of completing the parent task**. Don't ask the maintainer to file it. The pattern from PR #57: "I noticed X; filed #58 to track it; continuing on parent scope."
 
-ROADMAP.md (in vault) is the strategic narrative; GitHub Issues are the executable backlog. The two stay in sync via the ROADMAP's "Live issue backlog" table.
+ROADMAP.md is the strategic narrative; Linear issues are the executable backlog. The ROADMAP's "Live issue backlog" table links them.
 
 ### Branches + PRs
 
@@ -271,7 +271,7 @@ Pattern: when shipping operator-facing tooling (CLI commands, runbooks, doctor c
 
 ### Scope discipline — file inline, don't accumulate
 
-When something surfaces that isn't the current task — a missing top-level subcommand, personal references that need cleanup, a follow-up to a fix — file it as a separate GitHub Issue and keep the current PR clean.
+When something surfaces that isn't the current task (a missing top-level subcommand, personal references that need cleanup, a follow-up to a fix), file it as a separate Linear issue and keep the current PR clean.
 
 **File inline as part of completing the parent task.** Don't ask the maintainer to do it. By the time they next look, the scope-creep has a bug number. There is no "we should track that" debt — there is "issue #N has it queued."
 
@@ -283,7 +283,7 @@ The line is action-reversibility, not user-friction-minimization. Auto mode does
 
 ### The handoff is intentional
 
-`<VAULT_ROOT>/Atomic Agents/RESUME-NEXT-SESSION.md` exists because the previous session wrote it. The next session that opens this repo doesn't have to reconstruct context — it has a self-contained brief pointing at the four key files (CHANGELOG, ROADMAP, the spec doc establishing the protocol pattern, the GitHub issue list filters), explaining the conventions established this session, and recommending a starting point.
+`RESUME-NEXT-SESSION.md` (now in the Archive folder in Dropbox, under `atomic-agents/`) exists because the previous session wrote it. The next session that opens this repo doesn't have to reconstruct context: it has a self-contained brief pointing at the four key files (CHANGELOG, ROADMAP, the spec doc establishing the protocol pattern, the Linear issue list filters), explaining the conventions established this session, and recommending a starting point.
 
 **The handoff cost is paid by the session that's leaving, not the session that's arriving.**
 
@@ -314,9 +314,9 @@ If the project ever needs to optimize differently, `docs/methodology.md` is the 
 | `docs/methodology.md` | Working-methods retrospective; the methods that produced this codebase |
 | `docs/TENSIONS.md` | Architectural tensions; protect against silent drift |
 | `docs/GOVERNANCE.md` | Solo / small-team operator guide |
-| `<VAULT_ROOT>/Atomic Agents/ROADMAP.md` | Strategic narrative + live backlog table |
-| `<VAULT_ROOT>/Atomic Agents/RESUME-NEXT-SESSION.md` | Cross-session state pointer |
-| GitHub Issues | Executable backlog |
+| `ROADMAP.md` (repo root; also Lab folder in Dropbox, `atomic-agents/`) | Strategic narrative + live backlog table |
+| `atomic-agents/RESUME-NEXT-SESSION.md` (Archive folder in Dropbox) | Cross-session state pointer |
+| Linear issues (Dark Factory team) | Executable backlog |
 
 ---
 

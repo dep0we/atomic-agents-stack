@@ -157,7 +157,7 @@ entire feature works end to end.
   and commits proceed freely. Pushing tags, merging PRs, and publishing a
   release require explicit maintainer approval every time.
 - **File scope creep inline.** When a follow-up surfaces mid-task that isn't
-  the current change, file it as its own GitHub issue immediately and keep
+  the current change, file it as its own Linear issue immediately and keep
   the current PR clean. Don't ask, don't accumulate untracked debt.
 - **Documentation matches reality, not aspirations.** A doc describes what
   the code does today. If a doc claim and the implementation disagree, fix
@@ -168,12 +168,9 @@ entire feature works end to end.
 
 ## Conventions
 
-- **Issues / backlog:** GitHub Issues at `dep0we/atomic-agents-stack`. Title
-  prefixes: `[backend]`, `[deployment]`, `[polish]`, `[spec]`, `[infra]`.
-  Labels: `enhancement`, `documentation`, `infrastructure`, `polish`,
-  `backend`, `deployment`, `spec`, `bug`.
-- **Branches + PRs:** cut a feature branch from `main`; never push to `main`
-  directly, even for a small change. PR body is the audit trail.
+- **Issues / backlog:** Work is tracked in Linear, not GitHub Issues. Code and development work for this repo goes on the Dark Factory team.
+  Title prefixes: `[backend]`, `[deployment]`, `[polish]`, `[spec]`, `[infra]`.
+- **Branches + PRs:** see "Git workflow" below. PR body is the audit trail.
 - **Tests:** the suite is the conformance gate. Run it before pushing. A new
   backend protocol adds roughly 25 conformance tests plus about 10
   implementation-specific tests. New features ship with tests, not follow-up
@@ -186,13 +183,38 @@ entire feature works end to end.
 
 ---
 
-## Data handling
+## Data: read freely, never publish
 
-Read operational or sensitive data freely while helping with a task; that's
-expected. Never let it leave the working tree: no raw exports, logs, or
-record-level data in a commit; no identifying details in a commit message,
-branch name, PR title, or PR body; no credentials, anywhere, including as a
-filled-in example value.
+You may read operational and sensitive data while helping with work. That is the
+point of having you. What must never happen is that data leaving the working
+directory.
+
+- **Never commit raw data.** Exports, logs, ticket contents, device or account
+  inventories, anything pulled from a live system. Add its output path to
+  `.gitignore` in the same change that creates it.
+- **Never put operational data in git metadata.** No names, identifiers, ticket
+  contents, or record details in a commit message, branch name, PR title, PR
+  body, or issue. Those reach the hosting provider even in a private repo, and
+  unlike a file they cannot cleanly be deleted afterwards.
+- **Never paste records into a tracked file.** Summarizing findings into a
+  committed document is expected. Aggregate numbers, yes. Row-level data, no.
+- **Credentials never enter a repository**, including as a filled-in example
+  value.
+
+If a change would put operational data anywhere git tracks, stop and say so
+rather than working around it.
+
+---
+
+## Git workflow: branch, PR, review, merge
+
+Every change goes feature branch, then PR, then self-review, then merge. Never
+push directly to `main` unless the maintainer explicitly says "direct push to
+main." This holds on solo repos too: the PR body records why, reading the diff
+cold catches mistakes, and CI runs before production sees the change.
+
+"Commit this," "ship this," or "push this" means run the PR workflow, not push
+to main. Follow this repo's own pipeline, as described below.
 
 ---
 
@@ -211,7 +233,8 @@ filled-in example value.
 ## Durable memory
 
 This project's durable-memory slug is `atomic-agents-stack`, at
-`system/memory/atomic-agents-stack/` in the maintainer's notes vault. The
+`memory/atomic-agents-stack/` in the Systems folder in Dropbox. Its path is the
+SYSTEMS_ROOT value in `~/.config/data-roots.env`. The
 tool-neutral memory system (where it lives, how it loads, how a lesson gets
 saved) is defined once, outside this repo. This section only names the slug.
 
