@@ -78,7 +78,7 @@ from .locks import (
     check_lock_lost,
     get_default_lock_backend,
 )
-from ._platform import resolve_agents_root_for
+from ._platform import AgentRootConflictError, resolve_agents_root_for
 from .exceptions import AtomicAgentsError, DreamInProgress, DreamNotFound
 from .memory.backend import MemoryBackend, WritePolicy
 from .memory.filesystem import FilesystemBackend, FilesystemStagedMemory
@@ -1777,11 +1777,15 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
-    agents_root = (
-        Path(args.agents_root).expanduser().resolve()
-        if args.agents_root
-        else resolve_agents_root_for(args.agent)
-    )
+    try:
+        agents_root = (
+            Path(args.agents_root).expanduser().resolve()
+            if args.agents_root
+            else resolve_agents_root_for(args.agent)
+        )
+    except AgentRootConflictError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
 
     try:
         runner = DreamRunner(agents_root, args.agent, model=args.model)

@@ -50,6 +50,7 @@ from typing import Callable
 from .agent import AtomicAgent
 from ._cli_registry import CliCommand, discover_commands
 from ._platform import (
+    AgentRootConflictError,
     AgentsRootNotSetError,
     get_agents_root,
     resolve_agents_root_for,
@@ -2675,7 +2676,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return command_by_name[args.cmd].dispatch(args)
-    except AgentsRootNotSetError as e:
+    except (AgentsRootNotSetError, AgentRootConflictError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 

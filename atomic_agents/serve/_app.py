@@ -828,7 +828,7 @@ def make_app(
         spec/37 §"GET /agents".
         MUST 10: every name is validated via safe_resolve_under.
         """
-        root = _root()
+        root = _root(_single_agent)
         names: list[str] = []
         if _single_agent is not None:
             # Single-agent mode: report only this agent (if its folder exists).

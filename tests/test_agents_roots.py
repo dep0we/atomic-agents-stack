@@ -251,3 +251,68 @@ def test_deploy_hands_full_value_to_the_plist(two_roots, monkeypatch):
         err=io.StringIO(),
     )
     assert seen["root_value"] == os.pathsep.join([str(a), str(b)])
+
+
+# ---- review fixes: conflict is a clean failure, not a traceback ----
+
+
+@pytest.fixture
+def twin_roots(tmp_path, monkeypatch):
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    (a / "twin").mkdir(parents=True)
+    (b / "twin").mkdir(parents=True)
+    _roots(monkeypatch, a, b)
+    return a, b
+
+
+@pytest.mark.parametrize("argv", [["serve", "twin"], ["deploy", "twin"]])
+def test_cli_conflict_is_clean_failure(twin_roots, capsys, argv):
+    rc = cli.main(argv)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "more than one agents root" in err
+    assert "Traceback" not in err
+
+
+@pytest.mark.parametrize(
+    "module", ["atomic_agents.eval", "atomic_agents.dream", "atomic_agents.tuning"]
+)
+def test_agent_mains_conflict_is_clean_failure(twin_roots, capsys, module):
+    import importlib
+
+    mod = importlib.import_module(module)
+    assert mod.main(["twin"]) == 1
+    assert "more than one agents root" in capsys.readouterr().err
+
+
+def test_deploy_function_conflict_returns_failure(twin_roots):
+    import io
+
+    from atomic_agents.deploy import _planner
+
+    err = io.StringIO()
+    rc = _planner.deploy("twin", assume_yes=True, out=io.StringIO(), err=err)
+    assert rc == 1
+    assert "more than one agents root" in err.getvalue()
+
+
+def test_pinned_app_lists_agent_in_second_root(two_roots):
+    from starlette.testclient import TestClient
+
+    from atomic_agents.serve._app import make_app
+
+    client = TestClient(make_app(agent_name="beta"))
+    assert client.get("/agents").json() == {"agents": ["beta"]}
+
+
+def test_doctor_separator_only_value_reports_json_and_exit(monkeypatch, capsys):
+    monkeypatch.setenv("ATOMIC_AGENTS_ROOT", os.pathsep)
+    results = run_doctor()
+    assert results[0].name == "env" and results[0].status == FAIL
+    rc = cli.main(["doctor", "--json"])
+    out = capsys.readouterr().out
+    import json
+
+    json.loads(out)
+    assert rc == 1

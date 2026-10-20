@@ -71,7 +71,7 @@ _log = logging.getLogger(__name__)
 # the patch target cannot reach.
 from .. import _llm, _costs
 from .._io import atomic_write
-from .._platform import resolve_agents_root_for
+from .._platform import AgentRootConflictError, resolve_agents_root_for
 from ..eval import EvalRunner, _provider_available
 from ..profile import AgentProfileBackend
 from ..registry import ToolRegistryBackend
@@ -976,11 +976,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    agents_root = (
-        Path(args.agents_root).expanduser().resolve()
-        if args.agents_root
-        else resolve_agents_root_for(args.agent)
-    )
+    try:
+        agents_root = (
+            Path(args.agents_root).expanduser().resolve()
+            if args.agents_root
+            else resolve_agents_root_for(args.agent)
+        )
+    except AgentRootConflictError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
 
     # Resolve rubric arg
     rubric: str | Path

@@ -16,7 +16,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from .._platform import get_agents_root, resolve_agents_root_for
+from .._platform import AgentRootConflictError, get_agents_root, resolve_agents_root_for
 from ._config import ServeConfig, is_loopback, load_serve_config
 
 
@@ -63,9 +63,13 @@ def run_server(args: object) -> int:
     if not explicit_root:
         # Several roots may be configured: a single served agent comes from the
         # root that holds it; --all serves the first root.
-        agents_root = (
-            resolve_agents_root_for(agent_name) if agent_name else get_agents_root()
-        )
+        try:
+            agents_root = (
+                resolve_agents_root_for(agent_name) if agent_name else get_agents_root()
+            )
+        except AgentRootConflictError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
 
     # Determine which serve.md to read for the server-wide bind config.
     # In single-agent mode the agent's serve.md sets host/port/identity-header

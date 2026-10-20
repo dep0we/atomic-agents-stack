@@ -76,6 +76,7 @@ from . import _cascade, _model, _tools
 from ._costs import PRICING
 from ._platform import (
     AgentRootConflictError,
+    AgentsRootNotSetError,
     get_agents_root,
     resolve_agents_root_for,
     resolve_agents_root_source,
@@ -195,6 +196,9 @@ def run_doctor(
             resolved_root = resolve_agents_root_for(agent_name)
         else:
             resolved_root = get_agents_root()
+    except AgentsRootNotSetError:
+        # e.g. a value holding only separators: check_env already reported it.
+        return results
     except AgentRootConflictError as exc:
         results.append(
             CheckResult(

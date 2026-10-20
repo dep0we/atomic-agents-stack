@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import Callable
 
 from .._model import parse_model_md
-from .._platform import get_agents_roots, resolve_agents_root_for
+from .._platform import AgentRootConflictError, get_agents_roots, resolve_agents_root_for
 from . import _exposure, _launchd, _ports, _verify
 from ._types import DeployState, LaunchdStatus, Plan, Step, StepTag
 
@@ -666,7 +666,11 @@ def deploy(
         print(f"Error: {exc}", file=err)
         return 1
 
-    resolved_root = _resolve_agents_root(agents_root, agent)
+    try:
+        resolved_root = _resolve_agents_root(agents_root, agent)
+    except AgentRootConflictError as exc:
+        print(f"Error: {exc}", file=err)
+        return 1
     # The plist gets the FULL configured value (every root, in order), not just
     # the root holding this agent, so the supervised serve process searches the
     # same roots the operator configured. An explicit override stays single.
