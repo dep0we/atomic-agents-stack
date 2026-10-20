@@ -24,7 +24,12 @@ from starlette.routing import Route
 
 from .._io import safe_resolve_under
 from .._model import parse_model_md
-from .._platform import get_agents_root, resolve_agents_root_for
+from .._platform import (
+    AgentRootConflictError,
+    AgentsRootNotSetError,
+    get_agents_root,
+    resolve_agents_root_for,
+)
 from ..exceptions import (
     AtomicAgentsError,
     LockBusy,
@@ -106,6 +111,19 @@ def make_app(
         # Several roots may be configured: use the one holding this agent.
         return resolve_agents_root_for(name) if name else get_agents_root()
 
+    def _root_or_conflict(name: str | None) -> tuple[Path | None, Response | None]:
+        """Resolve the root for ``name``; on a duplicate name return a 409."""
+        try:
+            return _root(name), None
+        except AgentRootConflictError as exc:
+            return None, JSONResponse(
+                {"status": "error", "error": str(exc)}, status_code=409
+            )
+        except AgentsRootNotSetError as exc:
+            return None, JSONResponse(
+                {"status": "error", "error": str(exc)}, status_code=503
+            )
+
     def _check_agent_allowed(name: str) -> bool:
         """Return True if name is reachable in the current serve mode."""
         return _single_agent is None or name == _single_agent
@@ -121,14 +139,18 @@ def make_app(
         MUST 10: safe_resolve_under guards path traversal.
         """
         name = request.path_params["name"]
-        root = _root(name)
-
         # Single-agent mode: 404 any agent that isn't the one being served.
+        # This runs BEFORE root resolution so an unrelated name never touches
+        # the filesystem (or trips a duplicate-name conflict).
         if not _check_agent_allowed(name):
             return JSONResponse(
                 {"status": "error", "error": f"Agent not found: {name!r}"},
                 status_code=404,
             )
+
+        root, conflict = _root_or_conflict(name)
+        if conflict is not None:
+            return conflict
 
         # MUST 10 — path traversal guard
         try:
@@ -697,14 +719,18 @@ def make_app(
           does NOT degrade healthz.
         """
         name = request.path_params["name"]
-        root = _root(name)
-
         # Single-agent mode: 404 any agent that isn't the one being served.
+        # This runs BEFORE root resolution so an unrelated name never touches
+        # the filesystem (or trips a duplicate-name conflict).
         if not _check_agent_allowed(name):
             return JSONResponse(
                 {"status": "error", "error": f"Agent not found: {name!r}"},
                 status_code=404,
             )
+
+        root, conflict = _root_or_conflict(name)
+        if conflict is not None:
+            return conflict
 
         # MUST 10 — path traversal guard
         try:
@@ -763,14 +789,18 @@ def make_app(
         from .. import doctor as doctor_module
 
         name = request.path_params["name"]
-        root = _root(name)
-
         # Single-agent mode: 404 any agent that isn't the one being served.
+        # This runs BEFORE root resolution so an unrelated name never touches
+        # the filesystem (or trips a duplicate-name conflict).
         if not _check_agent_allowed(name):
             return JSONResponse(
                 {"status": "error", "error": f"Agent not found: {name!r}"},
                 status_code=404,
             )
+
+        root, conflict = _root_or_conflict(name)
+        if conflict is not None:
+            return conflict
 
         # MUST 10 — path traversal guard
         try:
@@ -828,7 +858,9 @@ def make_app(
         spec/37 §"GET /agents".
         MUST 10: every name is validated via safe_resolve_under.
         """
-        root = _root(_single_agent)
+        root, conflict = _root_or_conflict(_single_agent)
+        if conflict is not None:
+            return conflict
         names: list[str] = []
         if _single_agent is not None:
             # Single-agent mode: report only this agent (if its folder exists).

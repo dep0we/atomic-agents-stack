@@ -316,3 +316,47 @@ def test_doctor_separator_only_value_reports_json_and_exit(monkeypatch, capsys):
 
     json.loads(out)
     assert rc == 1
+
+
+# ---- serve app: conflict handling on every route ----
+
+_ROUTES = [
+    ("post", "/agents/twin/call", {"json": {"work_item": "x"}}),
+    ("get", "/agents/twin/healthz", {}),
+    ("get", "/agents/twin/doctor", {}),
+]
+
+
+@pytest.mark.parametrize("method,path,kw", _ROUTES)
+def test_app_conflict_returns_409_naming_paths(twin_roots, method, path, kw):
+    from starlette.testclient import TestClient
+
+    from atomic_agents.serve._app import make_app
+
+    a, b = twin_roots
+    client = TestClient(make_app(), raise_server_exceptions=False)
+    resp = getattr(client, method)(path, **kw)
+    assert resp.status_code == 409
+    err = resp.json()["error"]
+    assert str((a / "twin").resolve()) in err and str((b / "twin").resolve()) in err
+
+
+@pytest.mark.parametrize("method,path,kw", _ROUTES)
+def test_pinned_app_unrelated_duplicate_is_404(twin_roots, method, path, kw):
+    from starlette.testclient import TestClient
+
+    from atomic_agents.serve._app import make_app
+
+    client = TestClient(make_app(agent_name="other"), raise_server_exceptions=False)
+    assert getattr(client, method)(path, **kw).status_code == 404
+
+
+def test_pinned_app_listing_conflict_is_409(twin_roots):
+    from starlette.testclient import TestClient
+
+    from atomic_agents.serve._app import make_app
+
+    client = TestClient(make_app(agent_name="twin"), raise_server_exceptions=False)
+    resp = client.get("/agents")
+    assert resp.status_code == 409
+    assert "more than one agents root" in resp.json()["error"]
