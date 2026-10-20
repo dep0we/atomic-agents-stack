@@ -49,6 +49,8 @@ CHANGELOG entry.
 
 ## [Unreleased]
 
+- **Project archived (October 2026).** README carries a no-longer-maintained notice. No further releases are planned.
+
 ### BEHAVIOR CHANGE
 
 - **`ATOMIC_AGENTS_ROOT` is now required; the `~/docs/agents` fallback is gone.** `get_agents_root()` raises `AgentsRootNotSetError` (naming the variable and `~/.config/data-roots.env`) when it is unset or empty and the env file has no usable `ATOMIC_AGENTS_ROOT` line, `doctor` reports a FAIL on the `env` check and stops, and `extras/cron/run-atomic-agent.sh` sources `~/.config/data-roots.env` and exits with a clear error instead of defaulting to `$HOME/agents`. `DEFAULT_AGENTS_ROOT` is removed. The tests set a temporary root automatically. The environment variable wins; if it is unset or empty, `get_agents_root()` reads only the `ATOMIC_AGENTS_ROOT` line from `~/.config/data-roots.env` (path overridable with `DATA_ROOTS_ENV`), as text and never executed. It accepts `export ATOMIC_AGENTS_ROOT=value` or `ATOMIC_AGENTS_ROOT=value`, optional single or double quotes, and ignores comments; an empty value counts as missing. `doctor` prints which source it used (environment or the file path). The env file lines carry `export`, so `. ~/.config/data-roots.env` in `~/.zshenv` also reaches child processes. The CLI prints the error message instead of a traceback. Maintainer-vault pointers in `CLAUDE.md` and docs now use `<VAULT_ROOT>/Atomic Agents/`, with a note telling agents to resolve the value from the env file first (marked as a split for the folder move).
