@@ -182,7 +182,7 @@ def render_plist(
     agent: str,
     port: int,
     *,
-    agents_root: Path,
+    agents_root: Path | str,
     environ: dict[str, str] | None = None,
     plaintext_keys: dict[str, str] | tuple[str, str] | None = None,
 ) -> PlistRenderResult:
@@ -193,7 +193,9 @@ def render_plist(
       - ABSOLUTE ``ProgramArguments`` (``shutil.which`` or ``sys.executable``).
       - ``RunAtLoad`` + ``KeepAlive`` true.
       - ``EnvironmentVariables`` ALWAYS inject HOME / USER / PATH /
-        ATOMIC_AGENTS_ROOT (MUST 5).
+        ATOMIC_AGENTS_ROOT (MUST 5). ``agents_root`` is written through as
+        given, so a multi-root value (directories joined by the OS path
+        separator) reaches the supervised process intact.
       - Provider keys are NOT written into the plist by default. They are
         injected as ``KEY=VALUE`` env vars ONLY for the keys in
         ``plaintext_keys`` (each one's sole source is an env var); the caller

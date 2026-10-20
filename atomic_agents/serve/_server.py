@@ -16,7 +16,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from .._platform import get_agents_root
+from .._platform import get_agents_root, resolve_agents_root_for
 from ._config import ServeConfig, is_loopback, load_serve_config
 
 
@@ -37,10 +37,9 @@ def run_server(args: object) -> int:
 
     # Resolve agents root
     agents_root: Path | None = None
-    if hasattr(args, "agents_root") and args.agents_root:
+    explicit_root = bool(getattr(args, "agents_root", None))
+    if explicit_root:
         agents_root = Path(args.agents_root).expanduser().resolve()
-    else:
-        agents_root = get_agents_root()
 
     # Resolve agent name (single-agent vs all-agents) and enforce mutual exclusion.
     agent_name: str | None = getattr(args, "agent", None)
@@ -60,6 +59,13 @@ def run_server(args: object) -> int:
             file=sys.stderr,
         )
         return 1
+
+    if not explicit_root:
+        # Several roots may be configured: a single served agent comes from the
+        # root that holds it; --all serves the first root.
+        agents_root = (
+            resolve_agents_root_for(agent_name) if agent_name else get_agents_root()
+        )
 
     # Determine which serve.md to read for the server-wide bind config.
     # In single-agent mode the agent's serve.md sets host/port/identity-header

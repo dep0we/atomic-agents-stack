@@ -22,7 +22,6 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from .._platform import get_agents_root
 from ..agent import AtomicAgent
 from ..conversation.types import LOCAL_PRINCIPAL, Principal
 from ..exceptions import DedupInFlight, LockBusy, UnverifiedPrincipalConversationAccess
@@ -111,7 +110,7 @@ async def run_agent_call(
                                     carries ``.run_id`` + ``.prior_run_id``
         Various                   — pass through to the HTTP handler
     """
-    _root = agents_root or get_agents_root()
+    _root = agents_root  # None: AtomicAgent searches every configured root
     loop = asyncio.get_running_loop()
 
     def _call() -> tuple[str, Any]:

@@ -24,7 +24,7 @@ from starlette.routing import Route
 
 from .._io import safe_resolve_under
 from .._model import parse_model_md
-from .._platform import get_agents_root
+from .._platform import get_agents_root, resolve_agents_root_for
 from ..exceptions import (
     AtomicAgentsError,
     LockBusy,
@@ -100,8 +100,11 @@ def make_app(
         not is_loopback(bind_host)
     )
 
-    def _root() -> Path:
-        return _agents_root or get_agents_root()
+    def _root(name: str | None = None) -> Path:
+        if _agents_root:
+            return _agents_root
+        # Several roots may be configured: use the one holding this agent.
+        return resolve_agents_root_for(name) if name else get_agents_root()
 
     def _check_agent_allowed(name: str) -> bool:
         """Return True if name is reachable in the current serve mode."""
@@ -118,7 +121,7 @@ def make_app(
         MUST 10: safe_resolve_under guards path traversal.
         """
         name = request.path_params["name"]
-        root = _root()
+        root = _root(name)
 
         # Single-agent mode: 404 any agent that isn't the one being served.
         if not _check_agent_allowed(name):
@@ -694,7 +697,7 @@ def make_app(
           does NOT degrade healthz.
         """
         name = request.path_params["name"]
-        root = _root()
+        root = _root(name)
 
         # Single-agent mode: 404 any agent that isn't the one being served.
         if not _check_agent_allowed(name):
@@ -760,7 +763,7 @@ def make_app(
         from .. import doctor as doctor_module
 
         name = request.path_params["name"]
-        root = _root()
+        root = _root(name)
 
         # Single-agent mode: 404 any agent that isn't the one being served.
         if not _check_agent_allowed(name):

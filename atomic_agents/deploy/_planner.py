@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import Callable
 
 from .._model import parse_model_md
-from .._platform import get_agents_root
+from .._platform import get_agents_roots, resolve_agents_root_for
 from . import _exposure, _launchd, _ports, _verify
 from ._types import DeployState, LaunchdStatus, Plan, Step, StepTag
 
@@ -177,11 +177,14 @@ def plan_deploy(agent: str) -> Plan:
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def _resolve_agents_root(agents_root: str | Path | None) -> Path:
-    """Resolve the agents root from an explicit override or the environment."""
+def _resolve_agents_root(agents_root: str | Path | None, agent: str) -> Path:
+    """Resolve the agents root for ``agent`` from an override or the environment.
+
+    With several roots configured, the one holding the agent is used.
+    """
     if agents_root is not None:
         return Path(agents_root).expanduser().resolve()
-    return get_agents_root()
+    return resolve_agents_root_for(agent)
 
 
 def _consent(
@@ -429,7 +432,7 @@ class _SupervisionResult:
 def _step_supervise(
     agent: str,
     agent_root: Path,
-    agents_root: Path,
+    agents_root: Path | str,
     *,
     cli_port: int | None,
     environ: dict[str, str] | None,
@@ -663,7 +666,15 @@ def deploy(
         print(f"Error: {exc}", file=err)
         return 1
 
-    resolved_root = _resolve_agents_root(agents_root)
+    resolved_root = _resolve_agents_root(agents_root, agent)
+    # The plist gets the FULL configured value (every root, in order), not just
+    # the root holding this agent, so the supervised serve process searches the
+    # same roots the operator configured. An explicit override stays single.
+    plist_root_value = (
+        str(resolved_root)
+        if agents_root is not None
+        else os.pathsep.join(str(r) for r in get_agents_roots())
+    )
     agent_root = resolved_root / agent
 
     try:
@@ -709,7 +720,7 @@ def deploy(
         supervision = _step_supervise(
             agent,
             agent_root,
-            resolved_root,
+            plist_root_value,
             cli_port=cli_port,
             environ=environ,
             launchd_runner=launchd_runner,
