@@ -71,7 +71,7 @@ _log = logging.getLogger(__name__)
 # the patch target cannot reach.
 from .. import _llm, _costs
 from .._io import atomic_write
-from .._platform import get_agents_root
+from .._platform import AgentRootConflictError, resolve_agents_root_for
 from ..eval import EvalRunner, _provider_available
 from ..profile import AgentProfileBackend
 from ..registry import ToolRegistryBackend
@@ -124,7 +124,9 @@ class OutcomeRunner:
         outcome_backend: OutcomeBackend | None = None,
         parent_remaining_headroom_usd: float | None = None,
     ):
-        self.agents_root = Path(agents_root) if agents_root else get_agents_root()
+        self.agents_root = (
+            Path(agents_root) if agents_root else resolve_agents_root_for(agent_name)
+        )
         # Tree-cap headroom threaded by a tree-capping caller (e.g. the goal-
         # outcome coordinator under the conductor's run-level cost root). This is
         # the run_remaining captured at stage ENTRY; the per-iteration cost gate
@@ -209,7 +211,7 @@ class OutcomeRunner:
         if not self.agent_root.exists():
             raise AtomicAgentsError(
                 f"Agent folder not found: {self.agent_root}. "
-                f"Set ATOMIC_AGENTS_ROOT env var or create the agent."
+                f"Check ATOMIC_AGENTS_ROOT or create the agent."
             )
 
         # OutcomeBackend instance. kwarg-wins-over-env: if a backend was explicitly
@@ -974,11 +976,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    agents_root = (
-        Path(args.agents_root).expanduser().resolve()
-        if args.agents_root
-        else get_agents_root()
-    )
+    try:
+        agents_root = (
+            Path(args.agents_root).expanduser().resolve()
+            if args.agents_root
+            else resolve_agents_root_for(args.agent)
+        )
+    except AgentRootConflictError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
 
     # Resolve rubric arg
     rubric: str | Path

@@ -42,7 +42,7 @@ import frontmatter
 
 from . import _llm, _costs
 from ._io import atomic_write, atomic_append_jsonl
-from ._platform import get_agents_root
+from ._platform import AgentRootConflictError, resolve_agents_root_for
 from .agent import AtomicAgent
 from .logs import LogBackend
 from .profile import AgentProfileBackend
@@ -135,7 +135,7 @@ class EvalRunner:
         corpus_backend: "CorpusBackend | None" = None,
         mcp_server_registry_backend: "MCPServerRegistryBackend | None" = None,
     ):
-        self.agents_root = agents_root or get_agents_root()
+        self.agents_root = agents_root or resolve_agents_root_for(agent_name)
         self.agent_name = agent_name
         self.today = today or date.today()
         self.evals_dir = self.agents_root / agent_name / "evals"
@@ -1018,11 +1018,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    agents_root = (
-        Path(args.agents_root).expanduser().resolve()
-        if args.agents_root
-        else get_agents_root()
-    )
+    try:
+        agents_root = (
+            Path(args.agents_root).expanduser().resolve()
+            if args.agents_root
+            else resolve_agents_root_for(args.agent)
+        )
+    except AgentRootConflictError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
 
     try:
         runner = EvalRunner(agents_root, args.agent)

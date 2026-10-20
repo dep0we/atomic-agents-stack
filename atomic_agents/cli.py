@@ -49,7 +49,12 @@ from typing import Callable
 
 from .agent import AtomicAgent
 from ._cli_registry import CliCommand, discover_commands
-from ._platform import AgentsRootNotSetError, get_agents_root
+from ._platform import (
+    AgentRootConflictError,
+    AgentsRootNotSetError,
+    get_agents_root,
+    resolve_agents_root_for,
+)
 from .memory import get_default_memory_backend
 from .memory.backend import WritePolicy
 from .exceptions import AtomicAgentsError, VersionNotFound
@@ -2554,12 +2559,18 @@ def _dispatch_agent_scoped(
     """
 
     def wrapped(args: argparse.Namespace) -> int:
-        agents_root = (
-            Path(args.agents_root).expanduser().resolve()
-            if args.agents_root
-            else get_agents_root()
-        )
         try:
+            if args.agents_root:
+                agents_root = Path(args.agents_root).expanduser().resolve()
+            else:
+                # Several roots may be configured: pick the one holding this
+                # agent (a name clash across roots raises, never guesses).
+                agent_name = getattr(args, "agent", None)
+                agents_root = (
+                    resolve_agents_root_for(agent_name)
+                    if agent_name
+                    else get_agents_root()
+                )
             return handler(args, agents_root)
         except AtomicAgentsError as e:
             print(f"Error: {e}", file=sys.stderr)
@@ -2665,7 +2676,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return command_by_name[args.cmd].dispatch(args)
-    except AgentsRootNotSetError as e:
+    except (AgentsRootNotSetError, AgentRootConflictError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 

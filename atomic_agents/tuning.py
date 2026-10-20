@@ -47,7 +47,7 @@ import frontmatter
 
 from . import _llm
 from ._io import atomic_write, atomic_append_jsonl
-from ._platform import get_agents_root
+from ._platform import AgentRootConflictError, resolve_agents_root_for
 from ._tools import parse_tools_md
 from ._capture import enforce_write_path
 from .exceptions import AtomicAgentsError, WritePathViolation
@@ -1011,7 +1011,7 @@ class TuningRunner:
         self, agents_root: Path | None = None, agent_name: str = "",
         today: date | None = None,
     ):
-        self.agents_root = agents_root or get_agents_root()
+        self.agents_root = agents_root or resolve_agents_root_for(agent_name)
         self.agent_name = agent_name
         self.today = today or date.today()
         self.agent_root = self.agents_root / agent_name
@@ -1195,10 +1195,15 @@ def main(argv: list[str] | None = None) -> int:
                         help="override ATOMIC_AGENTS_ROOT")
     args = parser.parse_args(argv)
 
-    agents_root = (
-        Path(args.agents_root).expanduser().resolve()
-        if args.agents_root else get_agents_root()
-    )
+    try:
+        agents_root = (
+            Path(args.agents_root).expanduser().resolve()
+            if args.agents_root
+            else resolve_agents_root_for(args.agent)
+        )
+    except AgentRootConflictError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
 
     try:
         runner = TuningRunner(agents_root, args.agent)

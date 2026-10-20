@@ -25,8 +25,8 @@ sync tool's docs. Pair this with the conflict-copy guidance in
 ## TL;DR
 
 ```bash
-# 1. Pick a vault location inside your Obsidian vault
-export ATOMIC_AGENTS_ROOT="$HOME/ObsidianVault/agents"
+# 1. Pick an agents folder inside your Obsidian vault
+export ATOMIC_AGENTS_ROOT="/path/to/your/notes/agents"
 mkdir -p "$ATOMIC_AGENTS_ROOT"
 
 # 2. Copy the Caldwell sample as your first agent
@@ -532,12 +532,12 @@ first call." Assumes you've already installed the package per
 
 ### 1. Decide your vault layout
 
-You have an Obsidian vault at `~/ObsidianVault/`. You want agents
-under `~/ObsidianVault/agents/`. Set the env var so the framework
+You have an Obsidian vault at `/path/to/your/notes/`. You want agents
+under `/path/to/your/notes/agents/`. Set the env var so the framework
 finds it:
 
 ```bash
-echo 'export ATOMIC_AGENTS_ROOT="$HOME/ObsidianVault/agents"' >> ~/.zshrc
+echo 'export ATOMIC_AGENTS_ROOT="/path/to/your/notes/agents"' >> ~/.zshrc
 source ~/.zshrc
 mkdir -p "$ATOMIC_AGENTS_ROOT"
 ```
@@ -546,8 +546,32 @@ Verify the path resolves where you expect:
 
 ```bash
 python -c "from atomic_agents._platform import get_agents_root; print(get_agents_root())"
-# /Users/you/ObsidianVault/agents
+# /path/to/your/notes/agents
 ```
+
+#### Agents in more than one folder
+
+`ATOMIC_AGENTS_ROOT` can hold several folders, separated by `:` (the OS
+path separator, like `PATH`). Use this when some agents live in one
+place and others live elsewhere:
+
+```bash
+export ATOMIC_AGENTS_ROOT="/path/to/your/notes/agents:/path/to/other/agents"
+```
+
+How it behaves:
+
+- An agent is looked up in each folder in the order listed. The first
+  folder is also where fleet-level commands that name no agent look.
+- A single folder works exactly as before.
+- If the same agent name exists in two folders, the framework stops with
+  an error naming both paths. It never picks one silently. Rename or move
+  one of them.
+- `atomic-agents doctor` lists every folder and whether it exists.
+- `atomic-agents deploy` writes the full value into the launchd plist, so
+  the supervised server searches the same folders.
+- An agent-less command such as `serve --all`, `init`, or the dashboard
+  uses the first folder only. Pass `--agents-root` to target another one.
 
 ### 2. Copy the Caldwell sample
 
@@ -577,7 +601,7 @@ In Obsidian on your primary device:
 
 1. Settings → Sync → click the gear next to "Sync".
 2. Open the "Selective sync" panel or edit `.obsidian/sync.ignore`
-   directly (the file is at `~/ObsidianVault/.obsidian/sync.ignore`).
+   directly (the file is at `/path/to/your/notes/.obsidian/sync.ignore`).
 3. Paste the [ignore block from §"Sync ignore patterns"](#obsidian-sync--obsidiansyncignore)
    above.
 4. Wait for Sync to confirm the ignore-rules update propagated. The

@@ -74,7 +74,14 @@ from typing import Any
 
 from . import _cascade, _model, _tools
 from ._costs import PRICING
-from ._platform import get_agents_root, resolve_agents_root_source
+from ._platform import (
+    AgentRootConflictError,
+    AgentsRootNotSetError,
+    get_agents_root,
+    resolve_agents_root_for,
+    resolve_agents_root_source,
+    split_agents_roots,
+)
 
 
 PASS = "pass"
@@ -180,11 +187,28 @@ def run_doctor(
     # Resolve agents_root for downstream checks. We tolerate a missing path
     # because check_env will already have flagged it; downstream checks
     # then short-circuit to SKIP.
-    resolved_root: Path = (
-        Path(agents_root).expanduser().resolve()
-        if agents_root is not None
-        else get_agents_root()
-    )
+    # With several roots configured, an agent is looked up across all of them
+    # (a name found under two roots is reported as a failure, never guessed).
+    try:
+        if agents_root is not None:
+            resolved_root: Path = Path(agents_root).expanduser().resolve()
+        elif agent_name is not None:
+            resolved_root = resolve_agents_root_for(agent_name)
+        else:
+            resolved_root = get_agents_root()
+    except AgentsRootNotSetError:
+        # e.g. a value holding only separators: check_env already reported it.
+        return results
+    except AgentRootConflictError as exc:
+        results.append(
+            CheckResult(
+                name="agent-root",
+                status=FAIL,
+                message=str(exc),
+                fix_hint="Keep the agent under one root only.",
+            )
+        )
+        return results
 
     if agent_name is None:
         # Order matches run_doctor()'s actual execution sequence below
@@ -453,14 +477,19 @@ def _safe_parse_tools(agent_root: Path, cascade) -> tuple[dict, CheckResult | No
 
 
 def check_env(agents_root_override: Path | None) -> CheckResult:
-    """ATOMIC_AGENTS_ROOT (or --agents-root) resolves to an existing directory."""
+    """ATOMIC_AGENTS_ROOT (or --agents-root) names existing directories.
+
+    ATOMIC_AGENTS_ROOT may list several directories separated by the OS path
+    separator. Every root is reported with whether it exists; the check fails
+    if any root is missing or is not a directory.
+    """
     if agents_root_override is not None:
-        path = Path(agents_root_override).expanduser().resolve()
+        paths = [Path(agents_root_override).expanduser().resolve()]
         source = f"--agents-root {agents_root_override}"
     else:
         env_val, origin = resolve_agents_root_source()
-        if env_val:
-            path = Path(env_val).expanduser().resolve()
+        paths = split_agents_roots(env_val) if env_val else []
+        if paths:
             if origin == "environment":
                 source = f"source: environment, ATOMIC_AGENTS_ROOT={env_val}"
             else:
@@ -474,35 +503,72 @@ def check_env(agents_root_override: Path | None) -> CheckResult:
                     "Add 'export ATOMIC_AGENTS_ROOT=/path/to/agents' to "
                     "~/.config/data-roots.env (the CLI reads that line itself; "
                     "start ~/.zshenv with '. ~/.config/data-roots.env' so other "
-                    "tools see it too), export the variable, or pass --agents-root."
+                    "tools see it too), export the variable, or pass --agents-root. "
+                    f"Several directories can be listed, separated by '{os.pathsep}'."
                 ),
-                detail={"path": None, "source": "unset"},
+                detail={"path": None, "source": "unset", "roots": []},
             )
 
-    if not path.exists():
+    roots_detail = [
+        {"path": str(p), "exists": p.exists(), "is_dir": p.is_dir()} for p in paths
+    ]
+    detail = {
+        "path": str(paths[0]),
+        "source": source,
+        "roots": roots_detail,
+    }
+
+    if len(paths) == 1:
+        path = paths[0]
+        if not path.exists():
+            return CheckResult(
+                name="env",
+                status=FAIL,
+                message=f"agents-root does not exist: {path} ({source})",
+                fix_hint=(
+                    f"Create it: mkdir -p {path}\n"
+                    f"  Or set ATOMIC_AGENTS_ROOT to an existing directory."
+                ),
+                detail=detail,
+            )
+        if not path.is_dir():
+            return CheckResult(
+                name="env",
+                status=FAIL,
+                message=f"agents-root is not a directory: {path}",
+                fix_hint=f"Remove the file at {path} and recreate it as a directory.",
+                detail=detail,
+            )
         return CheckResult(
             name="env",
-            status=FAIL,
-            message=f"agents-root does not exist: {path} ({source})",
-            fix_hint=(
-                f"Create it: mkdir -p {path}\n"
-                f"  Or set ATOMIC_AGENTS_ROOT to an existing directory."
-            ),
-            detail={"path": str(path), "source": source},
+            status=PASS,
+            message=f"agents-root resolves to {path} ({source})",
+            detail=detail,
         )
-    if not path.is_dir():
+
+    def _state(entry: dict) -> str:
+        if not entry["exists"]:
+            return "MISSING"
+        return "ok" if entry["is_dir"] else "NOT A DIRECTORY"
+
+    listing = "; ".join(f"{e['path']} [{_state(e)}]" for e in roots_detail)
+    bad = [e for e in roots_detail if _state(e) != "ok"]
+    if bad:
         return CheckResult(
             name="env",
             status=FAIL,
-            message=f"agents-root is not a directory: {path}",
-            fix_hint=f"Remove the file at {path} and recreate it as a directory.",
-            detail={"path": str(path), "source": source},
+            message=f"{len(paths)} agents roots, {len(bad)} unusable: {listing} ({source})",
+            fix_hint=(
+                "Create each missing directory (mkdir -p), replace any file with "
+                "a directory, or remove the entry from ATOMIC_AGENTS_ROOT."
+            ),
+            detail=detail,
         )
     return CheckResult(
         name="env",
         status=PASS,
-        message=f"agents-root resolves to {path} ({source})",
-        detail={"path": str(path), "source": source},
+        message=f"{len(paths)} agents roots: {listing} ({source})",
+        detail=detail,
     )
 
 

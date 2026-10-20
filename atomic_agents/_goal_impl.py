@@ -49,7 +49,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .outcome import OutcomeResult
 
-from ._platform import get_agents_root
+from ._platform import get_agents_root, resolve_agents_root_for
 from .exceptions import (
     AtomicAgentsError,
     GoalCorrupted,
@@ -193,7 +193,7 @@ class GoalManager:
         # crashing GoalManager construction (the journal-backend #427 precedent —
         # a raw resolve() crash must not take down a reactive construction path).
         try:
-            self.agents_root = Path(agents_root or get_agents_root()).resolve()
+            self.agents_root = Path(agents_root or resolve_agents_root_for(agent_name)).resolve()
             self.agent_root = (self.agents_root / agent_name).resolve()
         except (OSError, RuntimeError) as exc:
             raise PathTraversalError(

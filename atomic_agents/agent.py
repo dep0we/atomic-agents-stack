@@ -132,7 +132,7 @@ from .logs.types import (
     PRIMITIVE_OUTCOME_ITERATION,
     PRIMITIVE_TOOL,
 )
-from ._platform import get_agents_root
+from ._platform import resolve_agents_root_for
 from .exceptions import (
     AtomicAgentsError,
     CostGuardrailBlocked,
@@ -441,7 +441,7 @@ class AtomicAgent:
     ):
         self.name = name
         self.trigger = trigger
-        self.agents_root = agents_root or get_agents_root()
+        self.agents_root = agents_root or resolve_agents_root_for(name)
         self.agent_root = self.agents_root / name
         # Track whether the caller pinned a specific run_id (outcome, eval, dream
         # loops pin run_id so agent_call records correlate with the outer loop's
@@ -458,7 +458,7 @@ class AtomicAgent:
         if not self.agent_root.exists():
             raise AtomicAgentsError(
                 f"Agent folder not found: {self.agent_root}. "
-                f"Set ATOMIC_AGENTS_ROOT env var or create the agent."
+                f"Check ATOMIC_AGENTS_ROOT or create the agent."
             )
 
         # LockBackend instance bound to this agent's root. Operators may
