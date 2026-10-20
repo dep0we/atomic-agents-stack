@@ -235,7 +235,8 @@ whose `ProgramArguments` invoke `atomic-agents serve` via an absolute executable
 (`shutil.which` or `sys.executable -m atomic_agents.cli`), then return.
 
 **MUST 5 — Environment injection; key sourced safely:** the plist MUST set
-`EnvironmentVariables` carrying at least `HOME`, `USER`, `PATH`, `ATOMIC_AGENTS_ROOT`. The
+`EnvironmentVariables` carrying at least `HOME`, `USER`, `PATH`, `ATOMIC_AGENTS_ROOT`
+(the full configured value, including every directory when several are listed). The
 provider key MUST be sourced from Keychain / `keys.json` rather than written into the
 plist, EXCEPT when the key's only source is an env var (then it MAY be injected with a
 documented cleartext caveat). A conformance test MUST assert the four base vars and
