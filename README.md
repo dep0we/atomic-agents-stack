@@ -6,6 +6,8 @@
 [![Version](https://img.shields.io/badge/version-2.0.0-blue)](https://github.com/dep0we/atomic-agents-stack/blob/main/CHANGELOG.md)
 [![PyPI](https://img.shields.io/badge/pypi-atomic--agents--stack-blue)](https://pypi.org/project/atomic-agents-stack/)
 
+> **No longer maintained (October 2026).** This repository is archived and read-only. The code, docs and the PyPI package stay available, but there will be no further releases, fixes or reviews of issues and pull requests. You're welcome to fork it.
+
 > **AI agents that live in your folder, not someone else's database.**
 
 Vault-native, MIT-licensed, Markdown-source-of-truth.
